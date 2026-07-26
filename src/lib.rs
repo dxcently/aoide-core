@@ -8,6 +8,7 @@ pub mod adapter;
 pub mod cli;
 pub mod daemon;
 pub mod dispatch;
+pub mod graph;
 pub mod guide;
 pub mod mcp;
 pub mod notes;

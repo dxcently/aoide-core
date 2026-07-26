@@ -26,6 +26,9 @@ Tier 1 — the CLI (full capability)
   Replay: a committed song is host-agnostic — any host performs it by naming it
   in nix (`aoide.song = \"<name>\";`); the notes fan-out swaps, the venue keeps
   its own instruments. `default` is the shipped standard.
+  Graph: `aoide graph view` renders the project/session DAG (projects anchor
+  sessions by cwd; spawned-by edges nest sessions); `graph project add`,
+  `link`, `focus`, `prune` manage it and `graph emit` stages it for Quickshell.
 
 Tier 2 — stdio MCP (per-session, optional)
   A façade generated from the same command schema — one implementation, two

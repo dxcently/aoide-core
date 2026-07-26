@@ -52,7 +52,8 @@ pub fn run() -> serde_json::Value {
     // Seed the two stage files with their documented shapes (empty registries).
     let sessions = json!({
         "schemaVersion": "0",
-        // records: { sessionId, agent, windowAddress, cwd, state, startedAt }
+        // records: { sessionId, agent, windowAddress, cwd, state, startedAt,
+        //            parentSessionId? (optional spawned-by edge, `aoide graph link`) }
         "sessions": []
     });
     let hooks = json!({
@@ -87,8 +88,11 @@ pub fn run() -> serde_json::Value {
         "stageDir": stage.to_string_lossy(),
         "wrote": wrote,
         "stageFiles": {
-            "sessions.json": ["sessionId", "agent", "windowAddress", "cwd", "state", "startedAt"],
-            "hooks.json": ["sessionId", "phase", "updatedAt"]
+            "sessions.json": ["sessionId", "agent", "windowAddress", "cwd", "state", "startedAt", "parentSessionId?"],
+            "hooks.json": ["sessionId", "phase", "updatedAt"],
+            // Written by `aoide graph`, read by Quickshell (CONTRACTS.md §4):
+            "projects.json": ["name", "path"],
+            "graph.json": ["nodes", "edges"]
         },
         "atomicWrites": true
     })

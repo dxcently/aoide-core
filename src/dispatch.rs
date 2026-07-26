@@ -84,6 +84,16 @@ pub fn dispatch(inv: &Invocation) -> Outcome {
             Outcome::ok("daemon", "aoided skeleton self-check complete").with_data(status)
         }
 
+        // ── graph: project/session DAG viewer + manager (graph.rs) ──────────
+        ["graph", "view"] => crate::graph::view(inv),
+        ["graph", "project", "add"] => crate::graph::project_add(inv),
+        ["graph", "project", "remove"] => crate::graph::project_remove(inv),
+        ["graph", "project", "list"] => crate::graph::project_list(inv),
+        ["graph", "link"] => crate::graph::link(inv),
+        ["graph", "focus"] => crate::graph::focus(inv),
+        ["graph", "prune"] => crate::graph::prune(inv),
+        ["graph", "emit"] => crate::graph::emit(inv),
+
         ["shellbridge"] => {
             let status = crate::shellbridge::run();
             Outcome::ok("shellbridge", "shellbridge skeleton self-check complete").with_data(status)

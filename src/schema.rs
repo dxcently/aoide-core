@@ -270,6 +270,77 @@ pub fn commands() -> Vec<Command> {
             gated: false,
             implemented: true,
         ),
+        // ── graph: project/session DAG (concepts/Terminal-Commander) ────────
+        cmd!(
+            path: ["graph", "view"],
+            summary: "Render the project/session DAG (Unicode tree; --json emits the graph document).",
+            args: [],
+            flags: [flag!("focus", "string", "Node id to highlight with ▶ (session:<id>, project:<name>, or bare id).")],
+            gated: false,
+            implemented: true,
+        ),
+        cmd!(
+            path: ["graph", "project", "add"],
+            summary: "Register or update a project anchor root in song/stage/projects.json (atomic, idempotent).",
+            args: [
+                arg!("name", "string", true, "Project name (its node id becomes project:<name>)."),
+                arg!("path", "string", true, "Project root path; sessions anchor by cwd prefix (longest wins)."),
+            ],
+            flags: [],
+            gated: false,
+            implemented: true,
+        ),
+        cmd!(
+            path: ["graph", "project", "remove"],
+            summary: "Unregister a project anchor root (ok + no-op if absent).",
+            args: [arg!("name", "string", true, "Project name to remove.")],
+            flags: [],
+            gated: false,
+            implemented: true,
+        ),
+        cmd!(
+            path: ["graph", "project", "list"],
+            summary: "List the registered project anchor roots.",
+            args: [],
+            flags: [],
+            gated: false,
+            implemented: true,
+        ),
+        cmd!(
+            path: ["graph", "link"],
+            summary: "Record a spawned-by edge: set parentSessionId on the child session (cycle-checked).",
+            args: [
+                arg!("child", "string", true, "Session id of the spawned (child) session."),
+                arg!("parent", "string", true, "Session id of the spawning (parent) session."),
+            ],
+            flags: [],
+            gated: false,
+            implemented: true,
+        ),
+        cmd!(
+            path: ["graph", "focus"],
+            summary: "Jump to a session's window via hyprctl focuswindow (Terminal-Commander session jump).",
+            args: [arg!("node", "string", true, "Session id (or session:<id> node id) to focus.")],
+            flags: [],
+            gated: false,
+            implemented: true,
+        ),
+        cmd!(
+            path: ["graph", "prune"],
+            summary: "Drop `done` sessions and their hook records; clear orphaned parentSessionId links.",
+            args: [],
+            flags: [],
+            gated: false,
+            implemented: true,
+        ),
+        cmd!(
+            path: ["graph", "emit"],
+            summary: "Stage the resolved DAG to song/stage/graph.json for Quickshell hot-reload (atomic).",
+            args: [],
+            flags: [],
+            gated: false,
+            implemented: true,
+        ),
         // ── adapter: per-agent event-stream consumers (entities/aoided) ─────
         cmd!(
             path: ["adapter", "melete"],
@@ -309,7 +380,8 @@ mod tests {
         let v = serde_json::to_value(&doc).unwrap();
         assert_eq!(v["schemaVersion"], "0");
         assert_eq!(v["aoide"], "0.0.0");
-        assert!(v["commands"].as_array().unwrap().len() >= 15);
+        // 19 walking-skeleton commands + the 8 graph commands.
+        assert!(v["commands"].as_array().unwrap().len() >= 27);
     }
 
     #[test]
