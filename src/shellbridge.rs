@@ -22,7 +22,23 @@ pub fn socket_path() -> PathBuf {
 }
 
 /// The live-state stage directory: `~/Aoide/song/stage/`.
+///
+/// **Contract seam (CONTRACTS.md §4):** the systemd unit
+/// (`modules/nucleus/shellbridge.nix`) sets `AOIDE_STAGE_DIR=%h/Aoide/song/stage`
+/// on the service — that env var wins when set to an absolute path, so the
+/// daemon and the CLI door always agree on where the stage tree lives. The
+/// fallback below derives the same `~/Aoide/song/stage` from `aoide_home()`,
+/// so on the default layout the two paths coincide; the override only matters
+/// when the unit relocates the stage (or a test/smoke run points elsewhere).
+/// A relative or empty value is ignored (we never resolve a runtime path
+/// against an arbitrary cwd). Every stage reader/writer routes through here.
 pub fn stage_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("AOIDE_STAGE_DIR") {
+        let p = PathBuf::from(&dir);
+        if p.is_absolute() {
+            return p;
+        }
+    }
     daemon::aoide_home().join("Aoide").join("song").join("stage")
 }
 
@@ -96,4 +112,42 @@ pub fn run() -> serde_json::Value {
         },
         "atomicWrites": true
     })
+}
+
+// ── Tests (the AOIDE_STAGE_DIR precedence seam; CONTRACTS.md §4) ─────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // `stage_dir()` reads process-global env; serialise these cases so they
+    // never race each other (or any other env-touching test in the crate).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn stage_dir_honors_absolute_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+
+        std::env::set_var("AOIDE_STAGE_DIR", "/tmp/aoide-test-stage");
+        assert_eq!(stage_dir(), PathBuf::from("/tmp/aoide-test-stage"));
+
+        // Empty and relative values are ignored — we fall back, never resolve a
+        // runtime path against an arbitrary cwd.
+        std::env::set_var("AOIDE_STAGE_DIR", "");
+        assert!(stage_dir().is_absolute());
+        assert!(stage_dir().ends_with("Aoide/song/stage"));
+        std::env::set_var("AOIDE_STAGE_DIR", "relative/stage");
+        assert!(stage_dir().ends_with("Aoide/song/stage"));
+
+        // Absent → the aoide_home()-derived fallback.
+        std::env::remove_var("AOIDE_STAGE_DIR");
+        assert!(stage_dir().ends_with("Aoide/song/stage"));
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+    }
 }

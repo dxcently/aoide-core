@@ -594,8 +594,36 @@ pub fn link(inv: &Invocation) -> Outcome {
     Outcome::ok("graph.link", message).changed(changed).with_data(data)
 }
 
+/// Normalise a Hyprland window address for comparison: lowercased, with any
+/// leading `0x` stripped. The stored `windowAddress` and hyprctl's reported
+/// addresses can disagree on case and on a present/absent `0x` prefix
+/// (hyprctl reports e.g. `0x55…`); this makes the match tolerant of both.
+fn normalize_addr(addr: &str) -> String {
+    let a = addr.trim();
+    let a = a.strip_prefix("0x").or_else(|| a.strip_prefix("0X")).unwrap_or(a);
+    a.to_ascii_lowercase()
+}
+
+/// Does `want` name a live window in the parsed `hyprctl clients -j` array?
+/// Pure over the already-decoded JSON so it is unit-testable without a
+/// compositor. Matches on the normalised `address` field of any client.
+fn window_present(clients: &[Value], want: &str) -> bool {
+    let want = normalize_addr(want);
+    clients.iter().any(|c| {
+        c.get("address")
+            .and_then(Value::as_str)
+            .map(|a| normalize_addr(a) == want)
+            .unwrap_or(false)
+    })
+}
+
 /// `graph focus <node>` — jump to the session's window via hyprctl
 /// (the Terminal-Commander session-jump flow).
+///
+/// `hyprctl dispatch focuswindow` exits 0 even when the target window is gone,
+/// so we first list live clients (`hyprctl clients -j`) and verify the stored
+/// `windowAddress` is actually present before dispatching. A vanished terminal
+/// → structured `window-not-found` (exit 1), no dispatch.
 pub fn focus(inv: &Invocation) -> Outcome {
     let args = match require_args(inv, &["node"]) {
         Ok(a) => a,
@@ -619,6 +647,49 @@ pub fn focus(inv: &Invocation) -> Outcome {
         .with_data(json!({ "reason": "no-window-address", "node": id }));
     }
     let addr = rec.window_address.clone();
+
+    // Verify the window exists before dispatching: focuswindow can't tell us.
+    match std::process::Command::new("hyprctl")
+        .args(["clients", "-j"])
+        .output()
+    {
+        Err(e) => {
+            return Outcome::error("graph.focus", format!("hyprctl unavailable: {e}"))
+                .with_data(json!({ "reason": "hyprctl-unavailable", "node": id }));
+        }
+        Ok(out) if !out.status.success() => {
+            return Outcome::error(
+                "graph.focus",
+                format!("hyprctl clients failed (exit {:?})", out.status.code()),
+            )
+            .with_data(json!({
+                "reason": "hyprctl-failed",
+                "node": id,
+                "stderr": String::from_utf8_lossy(&out.stderr),
+            }));
+        }
+        Ok(out) => {
+            let clients: Vec<Value> = match serde_json::from_slice(&out.stdout) {
+                Ok(Value::Array(a)) => a,
+                _ => {
+                    return Outcome::error("graph.focus", "hyprctl clients: unparseable JSON")
+                        .with_data(json!({ "reason": "hyprctl-failed", "node": id }));
+                }
+            };
+            if !window_present(&clients, &addr) {
+                return Outcome::error(
+                    "graph.focus",
+                    format!("window {addr} for session `{id}` is gone (terminal closed?)"),
+                )
+                .with_data(json!({
+                    "reason": "window-not-found",
+                    "node": id,
+                    "windowAddress": addr,
+                }));
+            }
+        }
+    }
+
     let dispatch = format!("address:{addr}");
     match std::process::Command::new("hyprctl")
         .args(["dispatch", "focuswindow", &dispatch])
@@ -831,6 +902,32 @@ mod tests {
         // p's hook record went with it; c1's survives.
         assert_eq!(kept_h.len(), 1);
         assert_eq!(kept_h[0].session_id, "c1");
+    }
+
+    #[test]
+    fn focus_address_matching_is_prefix_and_case_tolerant() {
+        // hyprctl reports `0x…` lowercase; the stored windowAddress may differ
+        // on case and on a present/absent `0x` prefix — all must match.
+        let clients = vec![
+            json!({ "address": "0x55aabbccdd00", "class": "kitty" }),
+            json!({ "address": "0x1234ef", "class": "foot" }),
+        ];
+        assert!(window_present(&clients, "0x55aabbccdd00")); // exact
+        assert!(window_present(&clients, "55aabbccdd00")); // missing 0x prefix
+        assert!(window_present(&clients, "0x55AABBCCDD00")); // upper case
+        assert!(window_present(&clients, "55AABBCCDD00")); // both
+        assert!(window_present(&clients, "0X1234EF")); // 0X + upper
+        // A vanished window is absent.
+        assert!(!window_present(&clients, "0xdeadbeef"));
+        assert!(!window_present(&clients, ""));
+        // Client entry without an address field is ignored, not a false match.
+        let noaddr = vec![json!({ "class": "kitty" })];
+        assert!(!window_present(&noaddr, "0x1"));
+
+        // Normalisation is idempotent and prefix-agnostic.
+        assert_eq!(normalize_addr("0xABC"), "abc");
+        assert_eq!(normalize_addr("abc"), "abc");
+        assert_eq!(normalize_addr("  0Xabc  "), "abc");
     }
 
     #[test]
