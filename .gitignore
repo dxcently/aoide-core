@@ -1,0 +1,3 @@
+# Rust build artifacts — never versioned. The pure nix build vendors deps from
+# Cargo.lock; the local `target/` is dev-only ephemera.
+/target/

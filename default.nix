@@ -1,41 +1,35 @@
 # pkgs/aoide/default.nix — the `aoide` CLI + `aoided` daemon (Rust).
 #
-# ┌─ WAVE-0 PLACEHOLDER ─────────────────────────────────────────────────────┐
-# │ This is a trivial derivation so `nix flake check` evals & builds green    │
-# │ with an empty package dir. AGENT B replaces the body below with a real    │
-# │ `rustPlatform.buildRustPackage { ... }` (see docs/BUILD.md). Keep the     │
-# │ callPackage signature (pkgs args) stable so flake.nix never changes.      │
-# └──────────────────────────────────────────────────────────────────────────┘
+# Built by Agent B (Wave 1). Replaces the Wave-0 placeholder in place; the
+# `callPackage` signature is kept stable so flake.nix never changes.
 #
-# Contract Agent B must honour (so flake.nix / checks stay untouched):
-#   * This file stays `pkgs/aoide/default.nix` and is `callPackage`-able.
-#   * The built package must install a binary named `aoide` on PATH, and that
-#     binary must implement `aoide schema --json` and `aoide guide` (the CLI
-#     trunk — see CONTRACTS.md and concepts/Agent-Interface).
-#   * `pname = "aoide"`.
+# Contract honoured (docs/BUILD.md, CONTRACTS.md, concepts/Agent-Interface):
+#   * File stays `pkgs/aoide/default.nix` and is `callPackage`-able.
+#   * Installs a binary named `aoide` (meta.mainProgram) implementing the
+#     command tree, `aoide schema --json` (the source of truth) and
+#     `aoide guide`.
+#   * Also installs `aoided` (the daemon skeleton: policy / lint / gated
+#     rebuild / single audit log).
+#   * cargo deps vendored via `cargoLock.lockFile` so the build is pure/offline.
 {
   lib,
-  runCommand,
-  # ── Agent B: uncomment/add the real build inputs, e.g. ──
-  # rustPlatform,
+  rustPlatform,
   ...
 }:
-runCommand "aoide-0.0.0-placeholder"
-  {
-    pname = "aoide";
-    version = "0.0.0-placeholder";
-    meta = {
-      description = "Aoide CLI + daemon (Wave-0 placeholder; Agent B replaces).";
-      mainProgram = "aoide";
-    };
-  }
-  ''
-    mkdir -p "$out/bin"
-    cat > "$out/bin/aoide" <<'EOF'
-    #!/bin/sh
-    echo "aoide: Wave-0 placeholder — the Rust CLI has not been built yet." >&2
-    echo "See docs/BUILD.md (Agent B) and CONTRACTS.md for the CLI contract." >&2
-    exit 69
-    EOF
-    chmod +x "$out/bin/aoide"
-  ''
+rustPlatform.buildRustPackage {
+  pname = "aoide";
+  version = "0.0.0";
+
+  src = lib.cleanSource ./.;
+
+  cargoLock.lockFile = ./Cargo.lock;
+
+  # Walking skeleton: no live-system integration tests in the sandbox.
+  doCheck = true;
+
+  meta = {
+    description = "Aoide CLI + daemon — an API that happens to be typeable (agent-first NixOS desktop control).";
+    mainProgram = "aoide";
+    license = lib.licenses.mit;
+  };
+}

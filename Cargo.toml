@@ -1,0 +1,29 @@
+[package]
+name = "aoide"
+version = "0.0.0"
+edition = "2021"
+description = "Aoide CLI + daemon — an API that happens to be typeable."
+license = "MIT"
+
+# Two binaries, one crate: the CLI trunk (`aoide`) and the daemon (`aoided`).
+# Both share the same schema + handler code in `src/`, so the CLI door, the
+# MCP door, and the daemon can never drift.
+
+[[bin]]
+name = "aoide"
+path = "src/bin/aoide.rs"
+
+[[bin]]
+name = "aoided"
+path = "src/bin/aoided.rs"
+
+[lib]
+name = "aoide"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
