@@ -10,10 +10,10 @@ pub mod daemon;
 pub mod dispatch;
 pub mod guide;
 pub mod mcp;
+pub mod notes;
 pub mod output;
 pub mod schema;
 pub mod shellbridge;
-pub mod tokens;
 
 use daemon::Door;
 

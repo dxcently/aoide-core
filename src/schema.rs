@@ -11,7 +11,7 @@ use serde::Serialize;
 pub const SCHEMA_VERSION: &str = "0";
 pub const AOIDE_VERSION: &str = "0.0.0";
 /// Stage-file format version (CONTRACTS.md §4).
-pub const STAGE_TOKENS_VERSION: &str = "0";
+pub const STAGE_NOTES_VERSION: &str = "0";
 
 /// A positional argument of a command.
 #[derive(Debug, Clone, Serialize)]
@@ -55,8 +55,8 @@ pub struct Schema {
     #[serde(rename = "schemaVersion")]
     pub schema_version: &'static str,
     pub aoide: &'static str,
-    #[serde(rename = "stageTokensVersion")]
-    pub stage_tokens_version: &'static str,
+    #[serde(rename = "stageNotesVersion")]
+    pub stage_notes_version: &'static str,
     pub commands: Vec<Command>,
 }
 
@@ -142,7 +142,7 @@ pub fn commands() -> Vec<Command> {
         ),
         cmd!(
             path: ["rice", "lint"],
-            summary: "Validate a rice against the token schema (delegates to aoide-tokens).",
+            summary: "Validate a rice against the note schema (delegates to aoide-notes).",
             args: [arg!("name", "string", false, "Rice/song name to lint; defaults to the staged rice.")],
             flags: [],
             gated: false,
@@ -150,7 +150,7 @@ pub fn commands() -> Vec<Command> {
         ),
         cmd!(
             path: ["rice", "preview"],
-            summary: "Rehearse a rice live (stage/tokens.json hot-reload); nothing committed.",
+            summary: "Rehearse a rice live (stage/notes.json hot-reload); nothing committed.",
             args: [arg!("name", "string", false, "Rice/song name to preview.")],
             flags: [],
             gated: false,
@@ -287,7 +287,7 @@ pub fn schema() -> Schema {
     Schema {
         schema_version: SCHEMA_VERSION,
         aoide: AOIDE_VERSION,
-        stage_tokens_version: STAGE_TOKENS_VERSION,
+        stage_notes_version: STAGE_NOTES_VERSION,
         commands: commands(),
     }
 }

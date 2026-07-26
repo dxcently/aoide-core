@@ -1,25 +1,28 @@
-//! Locating the `aoide-tokens` binary (Agent A's package).
+//! Locating the `aoide-notes` binary (Agent A's package).
 //!
-//! `rice lint` shells out to `aoide-tokens lint`. We locate the binary via
-//! `$AOIDE_TOKENS_BIN` first, then a PATH lookup, and tolerate its absence
+//! `rice lint` shells out to `aoide-notes lint`. We locate the binary via
+//! `$AOIDE_NOTES_BIN` first, then a PATH lookup, and tolerate its absence
 //! with a structured error rather than a panic (walking-skeleton contract).
 
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Resolve the `aoide-tokens` binary path, or `None` if unavailable.
+/// Resolve the `aoide-notes` binary path, or `None` if unavailable.
 ///
-/// Order: explicit `$AOIDE_TOKENS_BIN` → PATH lookup for `aoide-tokens`.
+/// Order: explicit `$AOIDE_NOTES_BIN` (with a legacy `$AOIDE_TOKENS_BIN`
+/// fallback) → PATH lookup for `aoide-notes`.
 pub fn locate() -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var("AOIDE_TOKENS_BIN") {
-        if !explicit.is_empty() {
-            let p = PathBuf::from(&explicit);
-            if p.exists() {
-                return Some(p);
+    for var in ["AOIDE_NOTES_BIN", "AOIDE_TOKENS_BIN"] {
+        if let Ok(explicit) = std::env::var(var) {
+            if !explicit.is_empty() {
+                let p = PathBuf::from(&explicit);
+                if p.exists() {
+                    return Some(p);
+                }
             }
         }
     }
-    path_lookup("aoide-tokens")
+    path_lookup("aoide-notes")
 }
 
 /// Minimal PATH lookup (no external which dependency).
@@ -42,8 +45,8 @@ pub struct LintRun {
     pub stderr: String,
 }
 
-/// Shell out to `aoide-tokens lint [args...]`. Returns a structured result;
-/// `located: None` signals the tolerated "tokens package absent" case.
+/// Shell out to `aoide-notes lint [args...]`. Returns a structured result;
+/// `located: None` signals the tolerated "notes package absent" case.
 pub fn run_lint(extra_args: &[String]) -> LintRun {
     let Some(bin) = locate() else {
         return LintRun {
@@ -69,7 +72,7 @@ pub fn run_lint(extra_args: &[String]) -> LintRun {
             located: Some(bin),
             exit_code: None,
             stdout: String::new(),
-            stderr: format!("failed to execute aoide-tokens: {e}"),
+            stderr: format!("failed to execute aoide-notes: {e}"),
         },
     }
 }

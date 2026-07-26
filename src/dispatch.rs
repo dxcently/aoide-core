@@ -9,7 +9,7 @@ use crate::daemon::{self, Door};
 use crate::guide::GUIDE;
 use crate::output::Outcome;
 use crate::schema;
-use crate::tokens;
+use crate::notes;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -129,24 +129,24 @@ pub fn dispatch(inv: &Invocation) -> Outcome {
     }
 }
 
-/// `rice lint` — real: delegates to `aoide-tokens lint`, tolerates absence.
+/// `rice lint` — real: delegates to `aoide-notes lint`, tolerates absence.
 fn handle_rice_lint(inv: &Invocation) -> Outcome {
-    let run = tokens::run_lint(&inv.args);
+    let run = notes::run_lint(&inv.args);
     match run.located {
         None => Outcome::error(
             "rice.lint",
-            "aoide-tokens not found; set $AOIDE_TOKENS_BIN or put it on PATH",
+            "aoide-notes not found; set $AOIDE_NOTES_BIN or put it on PATH",
         )
         .with_data(json!({
-            "reason": "tokens-binary-unavailable",
-            "searched": ["$AOIDE_TOKENS_BIN", "PATH"],
+            "reason": "notes-binary-unavailable",
+            "searched": ["$AOIDE_NOTES_BIN", "PATH"],
         })),
         Some(bin) => {
             let ok = run.exit_code == Some(0);
             let mut out = if ok {
-                Outcome::ok("rice.lint", "token schema validation passed")
+                Outcome::ok("rice.lint", "note schema validation passed")
             } else {
-                Outcome::error("rice.lint", "token schema validation reported problems")
+                Outcome::error("rice.lint", "note schema validation reported problems")
             };
             out = out.with_data(json!({
                 "delegate": bin.to_string_lossy(),
