@@ -24,14 +24,18 @@ path = "src/lib.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# `aoide baton` — a hand-rolled terminal frontend (see src/baton.rs). We take
-# crossterm and NOTHING else: default features off, only `events` on (raw mode,
-# the alternate screen, and `event::poll`/`event::read` with a timeout). No
-# ratatui, no tokio, no notify — the renderer is ours, the event feed is the
-# audit log, and live state is stage-file mtime polling. This is the smallest
-# footprint that still gives us a resize-aware key loop (mio + signal-hook ride
-# in with `events`), keeping the offline cargo lock as lean as crossterm allows.
+# `aoide baton` — the conductor's terminal frontend (see src/baton.rs), built on
+# ratatui.rs over the crossterm backend (the rig's standard for every Aoide TUI:
+# no hand-rolled ANSI). ratatui owns the immediate-mode render + the double
+# buffer diff; we keep the loop, the event feed (the audit log), and mtime-poll
+# live-state ourselves — no tokio, no notify. ratatui 0.30 pins crossterm 0.29,
+# the same line we take directly for the event loop (raw mode, the alternate
+# screen, and `event::poll`/`event::read` with a timeout), so the offline cargo
+# lock carries ONE crossterm. default-features = false + only `events` on the
+# direct dep keeps our surface minimal; ratatui pulls the backend features it
+# needs (mio + signal-hook ride in with `events`).
 crossterm = { version = "0.29", default-features = false, features = ["events"] }
+ratatui = "0.30"
 
 [profile.release]
 opt-level = "s"

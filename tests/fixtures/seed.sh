@@ -28,7 +28,8 @@ cat > "$STAGE/sessions.json" <<'JSON'
   "schemaVersion": "0",
   "sessions": [
     { "sessionId": "root-1", "agent": "claude", "windowAddress": "0xaaaa01",
-      "cwd": "/home/khoa/Aoide", "state": "running", "startedAt": "2026-07-26T09:00:00Z" },
+      "cwd": "/home/khoa/Aoide", "state": "running", "startedAt": "2026-07-26T09:00:00Z",
+      "tags": ["orchestrator", "opus"] },
     { "sessionId": "child-a", "agent": "claude", "windowAddress": "0xaaaa02",
       "cwd": "/home/khoa/Aoide/pkgs", "state": "idle", "startedAt": "2026-07-26T09:05:00Z",
       "parentSessionId": "root-1" },

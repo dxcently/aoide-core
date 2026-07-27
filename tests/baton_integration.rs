@@ -92,7 +92,7 @@ fn app_loads_recomputes_selects_and_dispatches_against_the_tempdir() {
 
     // ── selection: j moves down over the flattened DAG rows (group headers
     // interleaved with session subtrees), clamped at the last row ──
-    app.select_panel(Panel::Dag);
+    app.select_panel(Panel::Sessions);
     let n_rows = app.dag_rows().len();
     app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
     assert_eq!(app.dag_sel, 1.min(n_rows - 1), "j advances one row");
@@ -143,14 +143,21 @@ fn app_loads_recomputes_selects_and_dispatches_against_the_tempdir() {
         "project persisted to stage file"
     );
 
-    // ── a full frame renders without panicking and fills the height ──
-    let frame = app.frame(100, 30);
-    assert_eq!(
-        frame.lines.len(),
-        30,
-        "frame is exactly the terminal height"
-    );
-    let joined = frame.lines.join("\n");
+    // ── a full frame renders through ratatui without panicking ──
+    // The view layer is headless-testable: a TestBackend gives us the exact
+    // buffer the tty would show, so we assert on the composed frame end to end.
+    app.select_panel(Panel::Sessions);
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| aoide::baton::ui::draw(f, &app)).unwrap();
+    let buf = term.backend().buffer();
+    assert_eq!(buf.area.height, 30, "frame is exactly the terminal height");
+    let joined: String = buf
+        .content
+        .chunks(buf.area.width.max(1) as usize)
+        .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(joined.contains("aoide"), "SESSIONS panel shows a project");
     assert!(joined.contains("SESSIONS"), "active panel title rendered");
 

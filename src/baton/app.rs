@@ -19,8 +19,6 @@
 //! terminal-watcher: sessions that appear between ticks are marked fresh for a
 //! few beats ([`FRESH_TICKS`]) so the eye catches a new arrival.
 
-use crate::baton::panels;
-use crate::baton::render::Frame;
 use crate::daemon::Door;
 use crate::dispatch::{self, Invocation};
 use crate::graph::{self, HooksFile, ProjectsFile, SessionRecord, SessionsFile};
@@ -31,20 +29,32 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-/// The four panels, in Tab / 1-4 order.
+/// The five panels, in Tab / 1-5 order. `Graph` is the visual DAG (the new hero
+/// view — nodes/edges laid out and drawn); `Sessions` is the collapsible roster
+/// (the terminal-sessions view, keyed off [`App::dag_rows`]). The two are
+/// deliberately distinct lenses on the same data: `Graph` shows the *shape* of
+/// the DAG, `Sessions` the *state* of each terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
-    Dag,
+    Graph,
+    Sessions,
     Projects,
     Log,
     Status,
 }
 
 impl Panel {
-    pub const ALL: [Panel; 4] = [Panel::Dag, Panel::Projects, Panel::Log, Panel::Status];
+    pub const ALL: [Panel; 5] = [
+        Panel::Graph,
+        Panel::Sessions,
+        Panel::Projects,
+        Panel::Log,
+        Panel::Status,
+    ];
     pub fn title(self) -> &'static str {
         match self {
-            Panel::Dag => "SESSIONS",
+            Panel::Graph => "DAG",
+            Panel::Sessions => "SESSIONS",
             Panel::Projects => "PROJECTS",
             Panel::Log => "LOG",
             Panel::Status => "STATUS",
@@ -140,6 +150,9 @@ struct StageMtimes {
 pub struct App {
     pub panel: Panel,
     pub help_open: bool,
+    /// Selected node in the DAG (Graph) panel (indexes the preorder node list
+    /// [`crate::baton::graphview::node_order`] the layout walks).
+    pub graph_sel: usize,
     /// Selected row in the SESSIONS panel (indexes [`App::dag_rows`]).
     pub dag_sel: usize,
     /// Selected row in the PROJECTS panel.
@@ -173,8 +186,9 @@ pub const LOG_CAP: usize = 500;
 impl App {
     fn empty() -> Self {
         App {
-            panel: Panel::Dag,
+            panel: Panel::Graph,
             help_open: false,
+            graph_sel: 0,
             dag_sel: 0,
             proj_sel: 0,
             projects: Vec::new(),
@@ -474,6 +488,10 @@ impl App {
         if self.proj_sel >= n_proj.max(1) {
             self.proj_sel = n_proj.saturating_sub(1);
         }
+        let n_nodes = crate::baton::graphview::node_order(self).len();
+        if self.graph_sel >= n_nodes.max(1) {
+            self.graph_sel = n_nodes.saturating_sub(1);
+        }
     }
 
     // ── Panel switching ─────────────────────────────────────────────────────
@@ -541,9 +559,43 @@ impl App {
             return;
         }
         match self.panel {
-            Panel::Dag => self.handle_dag_key(key),
+            Panel::Graph => self.handle_graph_key(key),
+            Panel::Sessions => self.handle_dag_key(key),
             Panel::Projects => self.handle_projects_key(key),
             Panel::Log | Panel::Status => {} // read-only panels
+        }
+    }
+
+    /// Keys for the DAG (Graph) panel. Navigation walks the same preorder node
+    /// list the layout draws, so `j`/`k` can never point at a node that isn't on
+    /// screen. Enter cues the selected session's window (the same
+    /// dispatch-backed `graph focus` the roster uses); `e` emits, `p` prunes —
+    /// the two graph-wide verbs — so the visual view is not read-only.
+    fn handle_graph_key(&mut self, key: KeyEvent) {
+        let nodes = crate::baton::graphview::node_order(self);
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !nodes.is_empty() && self.graph_sel + 1 < nodes.len() {
+                    self.graph_sel += 1;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.graph_sel = self.graph_sel.saturating_sub(1);
+            }
+            KeyCode::Home | KeyCode::Char('g') => self.graph_sel = 0,
+            KeyCode::End | KeyCode::Char('G') => {
+                self.graph_sel = nodes.len().saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                if let Some(node) = nodes.get(self.graph_sel) {
+                    if let Some(id) = &node.session_id {
+                        self.dispatch(&["graph", "focus"], std::slice::from_ref(id));
+                    }
+                }
+            }
+            KeyCode::Char('p') => self.dispatch(&["graph", "prune"], &[]),
+            KeyCode::Char('e') => self.dispatch(&["graph", "emit"], &[]),
+            _ => {}
         }
     }
 
@@ -731,24 +783,6 @@ impl App {
                 self.input = Some(input);
             }
         }
-    }
-
-    // ── Frame composition ───────────────────────────────────────────────────
-
-    /// Compose the full-screen frame: the panels laid out over `cols`×`rows`
-    /// with a title header and a status line, plus the help overlay when open.
-    pub fn frame(&self, cols: u16, rows: u16) -> Frame {
-        let mut lines = panels::layout(self, cols, rows);
-        if self.help_open {
-            panels::overlay_help(&mut lines, cols, rows, &self.palette);
-        }
-        // Guarantee exactly `rows` lines so the differential renderer's
-        // clear-to-end never leaves stale rows from a taller previous frame.
-        lines.truncate(rows as usize);
-        while lines.len() < rows as usize {
-            lines.push(String::new());
-        }
-        Frame::new(lines)
     }
 }
 
