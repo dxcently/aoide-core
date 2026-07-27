@@ -171,17 +171,17 @@ pub fn dispatch(inv: &Invocation) -> Outcome {
     }
 }
 
-/// `rice lint` — real: delegates to `aoide-notes lint`, tolerates absence.
+/// `rice lint` — real: delegates to `drachma lint`, tolerates absence.
 fn handle_rice_lint(inv: &Invocation) -> Outcome {
     let run = notes::run_lint(&inv.args);
     match run.located {
         None => Outcome::error(
             "rice.lint",
-            "aoide-notes not found; set $AOIDE_NOTES_BIN or put it on PATH",
+            "drachma not found; set $AOIDE_DRACHMA_BIN or put it on PATH",
         )
         .with_data(json!({
             "reason": "notes-binary-unavailable",
-            "searched": ["$AOIDE_NOTES_BIN", "PATH"],
+            "searched": ["$AOIDE_DRACHMA_BIN", "PATH"],
         })),
         Some(bin) => {
             let ok = run.exit_code == Some(0);

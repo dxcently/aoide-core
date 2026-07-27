@@ -151,7 +151,7 @@ pub fn commands() -> Vec<Command> {
         ),
         cmd!(
             path: ["rice", "lint"],
-            summary: "Validate a rice against the note schema (delegates to aoide-notes).",
+            summary: "Validate a rice against the note schema (delegates to drachma).",
             args: [arg!("name", "string", false, "Rice/song name to lint; defaults to the staged rice.")],
             flags: [],
             gated: false,

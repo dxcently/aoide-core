@@ -815,7 +815,7 @@ pub fn prune(_inv: &Invocation) -> Outcome {
 }
 
 /// `graph emit` — stage the resolved DAG for Quickshell hot-reload
-/// (mirrors the `aoide-notes emit stage` pattern; atomic write).
+/// (mirrors the `drachma emit stage` pattern; atomic write).
 pub fn emit(_inv: &Invocation) -> Outcome {
     let (p, s, h) = match load_inputs("graph.emit") {
         Ok(v) => v,
