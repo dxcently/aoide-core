@@ -327,6 +327,47 @@ pub fn commands() -> Vec<Command> {
             implemented: true,
         ),
         cmd!(
+            path: ["graph", "session", "start"],
+            summary: "Register or update a running session in song/stage/sessions.json (UPSERT; atomic; startedAt preserved on re-start).",
+            args: [],
+            flags: [
+                flag!("id", "string", "Session id (required); its node id becomes session:<id>."),
+                flag!("agent", "string", "Agent name driving the session (default claude)."),
+                flag!("cwd", "string", "Working directory; the session anchors under the longest-prefix project."),
+                flag!("window", "string", "Hyprland window address for `graph focus` to jump to."),
+                flag!("parent", "string", "Spawning session id — records the spawned-by edge (cycle-checked)."),
+            ],
+            gated: false,
+            implemented: true,
+        ),
+        cmd!(
+            path: ["graph", "session", "phase"],
+            summary: "Upsert the live hook phase for a session in song/stage/hooks.json (latest updatedAt wins).",
+            args: [],
+            flags: [
+                flag!("id", "string", "Session id (required)."),
+                flag!("phase", "string", "Live phase to record (e.g. running, waiting, done)."),
+            ],
+            gated: false,
+            implemented: true,
+        ),
+        cmd!(
+            path: ["graph", "session", "end"],
+            summary: "Mark a session done (state=done in sessions.json, phase=done in hooks.json); ok no-op if unknown.",
+            args: [],
+            flags: [flag!("id", "string", "Session id to end (required).")],
+            gated: false,
+            implemented: true,
+        ),
+        cmd!(
+            path: ["graph", "session", "hook"],
+            summary: "Hook door for agent harnesses: read one Claude-Code hook JSON from stdin and map it to a session verb (never exits non-zero).",
+            args: [],
+            flags: [],
+            gated: false,
+            implemented: true,
+        ),
+        cmd!(
             path: ["graph", "focus"],
             summary: "Jump to a session's window via hyprctl focuswindow (Terminal-Commander session jump).",
             args: [arg!("node", "string", true, "Session id (or session:<id> node id) to focus.")],
@@ -398,8 +439,8 @@ mod tests {
         let v = serde_json::to_value(&doc).unwrap();
         assert_eq!(v["schemaVersion"], "0");
         assert_eq!(v["aoide"], "0.0.0");
-        // 19 walking-skeleton commands + the 8 graph commands + `baton`.
-        assert!(v["commands"].as_array().unwrap().len() >= 28);
+        // 19 walking-skeleton commands + the 12 graph commands + `baton`.
+        assert!(v["commands"].as_array().unwrap().len() >= 32);
     }
 
     #[test]

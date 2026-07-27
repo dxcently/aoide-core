@@ -875,6 +875,399 @@ pub fn emit(_inv: &Invocation) -> Outcome {
     }))
 }
 
+// ── Session-registration verbs (the write path shellbridge does not yet own) ─
+//
+// shellbridge only ever SEEDS empty sessions.json/hooks.json (its socket accept
+// loop is future work), so nothing registers a live session — the desktop
+// widgets and `baton` read a graph that is always starved of data. These verbs
+// are the missing write door: a session harness (or a Claude Code hook) upserts
+// its own record, and every mutation re-stages graph.json so the read path
+// (build_graph → graph.json → QML FileView / baton) lights up immediately.
+
+/// UTC wall-clock now as ISO-8601 `YYYY-MM-DDTHH:MM:SSZ`.
+///
+/// The same `SystemTime`→epoch-seconds idiom daemon.rs stamps audit records
+/// with, formatted for the `startedAt` field the stage shapes carry. The civil
+/// date is hand-rolled (Howard Hinnant's `civil_from_days`, the exact inverse of
+/// [`crate::baton::theme::parse_iso_utc`], the reader) so the offline lock never
+/// grows a chrono just to write one timestamp — and a stamp we write always
+/// round-trips back through the reader baton/theme already ships.
+fn now_iso_utc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    iso_utc_from_epoch(secs)
+}
+
+/// Format Unix epoch seconds as ISO-8601 UTC (pure; unit-tested).
+fn iso_utc_from_epoch(secs: i64) -> String {
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // civil_from_days: the inverse of parse_iso_utc's days computation.
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+/// UPSERT a session record by id (pure; the handler wires I/O around it).
+///
+/// A fresh id is inserted `state="running"`, `startedAt=now`, `agent` defaulting
+/// to `claude`. A re-start of an existing id updates only the fields provided
+/// (a `None` leaves the stored value), re-marks it `running`, and NEVER clobbers
+/// `startedAt` — the record is bounded to one per id, never duplicated. Returns
+/// `true` when a new record was inserted.
+pub fn upsert_session(
+    sessions: &mut Vec<SessionRecord>,
+    id: &str,
+    agent: Option<&str>,
+    cwd: Option<&str>,
+    window: Option<&str>,
+    parent: Option<&str>,
+    now: &str,
+) -> bool {
+    if let Some(s) = sessions.iter_mut().find(|s| s.session_id == id) {
+        if let Some(a) = agent {
+            s.agent = a.to_string();
+        }
+        if let Some(c) = cwd {
+            s.cwd = c.to_string();
+        }
+        if let Some(w) = window {
+            s.window_address = w.to_string();
+        }
+        if let Some(p) = parent {
+            s.parent_session_id = Some(p.to_string());
+        }
+        s.state = "running".to_string(); // `start` means running; startedAt kept.
+        false
+    } else {
+        sessions.push(SessionRecord {
+            session_id: id.to_string(),
+            agent: agent.unwrap_or("claude").to_string(),
+            window_address: window.unwrap_or_default().to_string(),
+            cwd: cwd.unwrap_or_default().to_string(),
+            state: "running".to_string(),
+            started_at: now.to_string(),
+            parent_session_id: parent.map(str::to_string),
+            extra: Map::new(),
+        });
+        true
+    }
+}
+
+/// UPSERT the single hook record for a session (pure; bounded one-per-id).
+///
+/// `merged_sessions` keys the live phase by (latest `updatedAt`), so a single
+/// rolling record per session is all it needs — no unbounded append.
+pub fn upsert_hook(hooks: &mut Vec<HookRecord>, id: &str, phase: &str, now: &str) {
+    if let Some(h) = hooks.iter_mut().find(|h| h.session_id == id) {
+        h.phase = phase.to_string();
+        h.updated_at = now.to_string();
+    } else {
+        hooks.push(HookRecord {
+            session_id: id.to_string(),
+            phase: phase.to_string(),
+            updated_at: now.to_string(),
+            extra: Map::new(),
+        });
+    }
+}
+
+/// A required `--flag` → structured usage error (exit 2) when absent/empty.
+fn require_flag(inv: &Invocation, name: &str) -> Result<String, Outcome> {
+    match inv.flags.get(name).filter(|v| !v.is_empty()) {
+        Some(v) => Ok(v.clone()),
+        None => Err(Outcome::usage(
+            inv.dotted(),
+            format!(
+                "usage: aoide {} --{name} <value> [--json]",
+                inv.path.join(" ")
+            ),
+        )),
+    }
+}
+
+/// Core of `graph session start`: cycle-check a parent, UPSERT, re-stage.
+fn do_session_start(
+    id: &str,
+    agent: Option<&str>,
+    cwd: Option<&str>,
+    window: Option<&str>,
+    parent: Option<&str>,
+) -> Outcome {
+    let cmd = "graph.session.start";
+    let mut file: SessionsFile = match load_stage(&sessions_path()) {
+        Ok(f) => f,
+        Err(e) => return stage_error(cmd, e),
+    };
+    // Reuse `link`'s cycle guard: an id parented under its own descendant (or
+    // itself) is refused before we mutate anything.
+    if let Some(p) = parent {
+        if would_cycle(&file.sessions, id, p) {
+            return Outcome::error(
+                cmd,
+                format!("parenting `{id}` under `{p}` would create a cycle"),
+            )
+            .with_data(json!({ "reason": "cycle", "sessionId": id, "parent": p }));
+        }
+    }
+
+    let now = now_iso_utc();
+    let inserted = upsert_session(&mut file.sessions, id, agent, cwd, window, parent, &now);
+    let (r_agent, r_started) = file
+        .sessions
+        .iter()
+        .find(|s| s.session_id == id)
+        .map(|s| (s.agent.clone(), s.started_at.clone()))
+        .unwrap_or_default();
+    if file.schema_version.is_empty() {
+        file.schema_version = STAGE_GRAPH_VERSION.to_string();
+    }
+    if let Err(e) = write_stage(&sessions_path(), &file) {
+        return stage_error(cmd, e);
+    }
+
+    let mut changed = vec![if inserted {
+        format!("registered session {id} (running)")
+    } else {
+        format!("updated session {id}")
+    }];
+    match restage_graph() {
+        Ok(g) => changed.push(g.to_string_lossy().into_owned()),
+        Err(e) => return stage_error(cmd, e),
+    }
+    let message = if inserted {
+        format!("started session `{id}` (agent {r_agent}, running)")
+    } else {
+        format!("re-started session `{id}` (fields updated; startedAt preserved)")
+    };
+    Outcome::ok(cmd, message).changed(changed).with_data(json!({
+        "sessionId": id,
+        "agent": r_agent,
+        "startedAt": r_started,
+        "inserted": inserted,
+        "file": sessions_path().to_string_lossy(),
+    }))
+}
+
+/// Core of `graph session phase`: UPSERT the hook record, re-stage.
+fn do_session_phase(id: &str, phase: &str) -> Outcome {
+    let cmd = "graph.session.phase";
+    let mut file: HooksFile = match load_stage(&hooks_path()) {
+        Ok(f) => f,
+        Err(e) => return stage_error(cmd, e),
+    };
+    let now = now_iso_utc();
+    upsert_hook(&mut file.hooks, id, phase, &now);
+    if file.schema_version.is_empty() {
+        file.schema_version = STAGE_GRAPH_VERSION.to_string();
+    }
+    if let Err(e) = write_stage(&hooks_path(), &file) {
+        return stage_error(cmd, e);
+    }
+    let mut changed = vec![format!("session {id}: phase → {phase}")];
+    match restage_graph() {
+        Ok(g) => changed.push(g.to_string_lossy().into_owned()),
+        Err(e) => return stage_error(cmd, e),
+    }
+    Outcome::ok(cmd, format!("session `{id}` phase = {phase}"))
+        .changed(changed)
+        .with_data(json!({
+            "sessionId": id,
+            "phase": phase,
+            "updatedAt": now,
+            "file": hooks_path().to_string_lossy(),
+        }))
+}
+
+/// Core of `graph session end`: mark the session `done` (and its hook phase
+/// `done`), re-stage. An unknown id is an ok no-op (matching `project remove`).
+fn do_session_end(id: &str) -> Outcome {
+    let cmd = "graph.session.end";
+    let mut s_file: SessionsFile = match load_stage(&sessions_path()) {
+        Ok(f) => f,
+        Err(e) => return stage_error(cmd, e),
+    };
+    if !s_file.sessions.iter().any(|s| s.session_id == id) {
+        return Outcome::ok(
+            cmd,
+            format!("session `{id}` was not registered (no change)"),
+        )
+        .with_data(json!({ "sessionId": id }));
+    }
+    for s in s_file.sessions.iter_mut() {
+        if s.session_id == id {
+            s.state = "done".to_string();
+        }
+    }
+    if s_file.schema_version.is_empty() {
+        s_file.schema_version = STAGE_GRAPH_VERSION.to_string();
+    }
+    if let Err(e) = write_stage(&sessions_path(), &s_file) {
+        return stage_error(cmd, e);
+    }
+
+    // Mirror the terminal state into hooks.json so the merged live phase agrees.
+    let mut h_file: HooksFile = match load_stage(&hooks_path()) {
+        Ok(f) => f,
+        Err(e) => return stage_error(cmd, e),
+    };
+    let now = now_iso_utc();
+    upsert_hook(&mut h_file.hooks, id, "done", &now);
+    if h_file.schema_version.is_empty() {
+        h_file.schema_version = STAGE_GRAPH_VERSION.to_string();
+    }
+    if let Err(e) = write_stage(&hooks_path(), &h_file) {
+        return stage_error(cmd, e);
+    }
+
+    let mut changed = vec![
+        format!("session {id}: state → done"),
+        format!("session {id}: phase → done"),
+    ];
+    match restage_graph() {
+        Ok(g) => changed.push(g.to_string_lossy().into_owned()),
+        Err(e) => return stage_error(cmd, e),
+    }
+    Outcome::ok(cmd, format!("ended session `{id}`"))
+        .changed(changed)
+        .with_data(json!({ "sessionId": id, "file": sessions_path().to_string_lossy() }))
+}
+
+/// `graph session start --id <id> [--agent --cwd --window --parent]` — UPSERT a
+/// running session record (idempotent; startedAt preserved on re-start).
+pub fn session_start(inv: &Invocation) -> Outcome {
+    let id = match require_flag(inv, "id") {
+        Ok(v) => v,
+        Err(o) => return o,
+    };
+    do_session_start(
+        &id,
+        inv.flags.get("agent").map(String::as_str),
+        inv.flags.get("cwd").map(String::as_str),
+        inv.flags.get("window").map(String::as_str),
+        inv.flags.get("parent").map(String::as_str),
+    )
+}
+
+/// `graph session phase --id <id> --phase <phase>` — UPSERT the live hook phase.
+pub fn session_phase(inv: &Invocation) -> Outcome {
+    let id = match require_flag(inv, "id") {
+        Ok(v) => v,
+        Err(o) => return o,
+    };
+    let phase = match require_flag(inv, "phase") {
+        Ok(v) => v,
+        Err(o) => return o,
+    };
+    do_session_phase(&id, &phase)
+}
+
+/// `graph session end --id <id>` — mark the session done (ok no-op if unknown).
+pub fn session_end(inv: &Invocation) -> Outcome {
+    let id = match require_flag(inv, "id") {
+        Ok(v) => v,
+        Err(o) => return o,
+    };
+    do_session_end(&id)
+}
+
+/// The action a Claude-Code hook payload maps to (or nothing, for events we
+/// deliberately ignore — the door is a no-op for everything unmapped).
+#[derive(Debug)]
+enum HookAction {
+    Start { id: String, cwd: Option<String> },
+    Phase { id: String, phase: String },
+    End { id: String },
+}
+
+/// Map ONE hook payload (`session_id`, `hook_event_name`, optional `cwd`) to a
+/// session-registration action, or `None` when the event is unknown/missing or
+/// the `session_id` is absent/empty. Pure over the decoded JSON so the mapping
+/// is unit-testable without touching stdin or the stage.
+fn map_hook(payload: &Value) -> Option<HookAction> {
+    let id = payload
+        .get("session_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?;
+    let event = payload.get("hook_event_name").and_then(Value::as_str)?;
+    let cwd = payload
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    match event {
+        "SessionStart" => Some(HookAction::Start { id: id.to_string(), cwd }),
+        "UserPromptSubmit" | "PreToolUse" => Some(HookAction::Phase {
+            id: id.to_string(),
+            phase: "running".to_string(),
+        }),
+        "Stop" => Some(HookAction::Phase {
+            id: id.to_string(),
+            phase: "waiting".to_string(),
+        }),
+        "SessionEnd" => Some(HookAction::End { id: id.to_string() }),
+        _ => None,
+    }
+}
+
+/// Drive one hook payload (already read as a string) to its registration.
+///
+/// Split from `session_hook` so the whole path — parse, map, execute — is
+/// testable without a real stdin. Empty/malformed input or an unmapped event is
+/// an ok no-op; a mapped action runs the matching core but its outcome is ALWAYS
+/// folded into an ok envelope: this door runs inside interactive-session hooks
+/// and must never exit non-zero (a stage hiccup must not break the session).
+fn hook_from_str(buf: &str) -> Outcome {
+    let cmd = "graph.session.hook";
+    let noop = |reason: &str| {
+        Outcome::ok(cmd, format!("no-op ({reason})"))
+            .with_data(json!({ "action": "none", "reason": reason }))
+    };
+    let payload: Value = match serde_json::from_str(buf.trim()) {
+        Ok(v) => v,
+        Err(_) => return noop("empty-or-malformed-stdin"),
+    };
+    let Some(action) = map_hook(&payload) else {
+        return noop("unmapped-or-missing-event");
+    };
+    let inner = match action {
+        HookAction::Start { id, cwd } => {
+            do_session_start(&id, Some("claude"), cwd.as_deref(), None, None)
+        }
+        HookAction::Phase { id, phase } => do_session_phase(&id, &phase),
+        HookAction::End { id } => do_session_end(&id),
+    };
+    // Fold the inner outcome into an ok envelope — exit 0, no matter what.
+    Outcome::ok(cmd, inner.message)
+        .changed(inner.changed)
+        .with_data(json!({
+            "action": "applied",
+            "innerStatus": format!("{:?}", inner.status),
+            "innerData": inner.data,
+        }))
+}
+
+/// `graph session hook` — the hook door for agent harnesses. Reads ONE JSON
+/// object from stdin and maps Claude-Code hook events to the session verbs.
+/// Never exits non-zero (see [`hook_from_str`]).
+pub fn session_hook(_inv: &Invocation) -> Outcome {
+    use std::io::Read;
+    let mut buf = String::new();
+    let _ = std::io::stdin().lock().read_to_string(&mut buf);
+    hook_from_str(&buf)
+}
+
 // ── Tests (pure cores: anchoring, cycles, render determinism, prune) ────────
 
 #[cfg(test)]
@@ -1150,6 +1543,291 @@ mod tests {
             None => std::env::remove_var("AOIDE_STAGE_DIR"),
         }
         let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    fn flag_invocation(path: &[&str], flags: &[(&str, &str)]) -> Invocation {
+        Invocation {
+            path: path.iter().map(|s| s.to_string()).collect(),
+            args: vec![],
+            flags: flags
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            door: crate::daemon::Door::Cli,
+        }
+    }
+
+    #[test]
+    fn iso_utc_formats_and_round_trips_through_the_reader() {
+        // The Unix epoch and a known instant, formatted exactly.
+        assert_eq!(iso_utc_from_epoch(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso_utc_from_epoch(1_700_000_000), "2023-11-14T22:13:20Z");
+        // Whatever we stamp must parse back through baton's reader (the inverse).
+        let stamp = now_iso_utc();
+        let epoch = crate::baton::theme::parse_iso_utc(&stamp)
+            .expect("a stamp we write is readable by the reader that consumes it");
+        // And that epoch re-formats to the very same string (round-trip closed).
+        assert_eq!(iso_utc_from_epoch(epoch), stamp);
+    }
+
+    #[test]
+    fn upsert_session_is_idempotent_and_preserves_started_at() {
+        let mut sessions: Vec<SessionRecord> = Vec::new();
+        // First start: inserted, running, agent defaulted, startedAt stamped.
+        assert!(upsert_session(
+            &mut sessions,
+            "s1",
+            None,
+            Some("/w"),
+            None,
+            None,
+            "2026-01-01T00:00:00Z"
+        ));
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].agent, "claude");
+        assert_eq!(sessions[0].state, "running");
+        assert_eq!(sessions[0].started_at, "2026-01-01T00:00:00Z");
+
+        // Re-start with a NEW now + agent: no duplicate, fields updated, but
+        // startedAt is NEVER clobbered.
+        assert!(!upsert_session(
+            &mut sessions,
+            "s1",
+            Some("melete"),
+            None,
+            Some("0xabc"),
+            Some("parent"),
+            "2026-02-02T00:00:00Z"
+        ));
+        assert_eq!(sessions.len(), 1, "re-start never duplicates");
+        assert_eq!(sessions[0].agent, "melete");
+        assert_eq!(sessions[0].window_address, "0xabc");
+        assert_eq!(sessions[0].parent_session_id.as_deref(), Some("parent"));
+        assert_eq!(
+            sessions[0].started_at, "2026-01-01T00:00:00Z",
+            "startedAt preserved across re-start"
+        );
+    }
+
+    #[test]
+    fn upsert_hook_keeps_one_bounded_record_per_session() {
+        let mut hooks: Vec<HookRecord> = Vec::new();
+        upsert_hook(&mut hooks, "s1", "running", "2026-01-01T00:00:01Z");
+        upsert_hook(&mut hooks, "s1", "waiting", "2026-01-01T00:00:02Z");
+        upsert_hook(&mut hooks, "s2", "running", "2026-01-01T00:00:03Z");
+        assert_eq!(hooks.len(), 2, "one record per session id, never appended");
+        let s1 = hooks.iter().find(|h| h.session_id == "s1").unwrap();
+        assert_eq!(s1.phase, "waiting");
+        assert_eq!(s1.updated_at, "2026-01-01T00:00:02Z");
+        // merged_sessions tolerates the one-per-session shape: latest phase wins.
+        let sessions = vec![session("s1", "/w", "running", "t", None)];
+        let merged = merged_sessions(&sessions, &hooks);
+        assert_eq!(merged[0].state, "waiting");
+    }
+
+    #[test]
+    fn hook_event_mapping_covers_the_lifecycle_and_ignores_the_rest() {
+        let start = map_hook(
+            &json!({ "session_id": "s", "hook_event_name": "SessionStart", "cwd": "/w" }),
+        )
+        .unwrap();
+        assert!(matches!(start, HookAction::Start { cwd: Some(_), .. }));
+        assert!(matches!(
+            map_hook(&json!({ "session_id": "s", "hook_event_name": "UserPromptSubmit" })).unwrap(),
+            HookAction::Phase { ref phase, .. } if phase == "running"
+        ));
+        assert!(matches!(
+            map_hook(&json!({ "session_id": "s", "hook_event_name": "PreToolUse" })).unwrap(),
+            HookAction::Phase { ref phase, .. } if phase == "running"
+        ));
+        assert!(matches!(
+            map_hook(&json!({ "session_id": "s", "hook_event_name": "Stop" })).unwrap(),
+            HookAction::Phase { ref phase, .. } if phase == "waiting"
+        ));
+        assert!(matches!(
+            map_hook(&json!({ "session_id": "s", "hook_event_name": "SessionEnd" })).unwrap(),
+            HookAction::End { .. }
+        ));
+        // Unknown event, missing event, and empty/absent session_id → no action.
+        assert!(map_hook(&json!({ "session_id": "s", "hook_event_name": "Notification" })).is_none());
+        assert!(map_hook(&json!({ "session_id": "s" })).is_none());
+        assert!(map_hook(&json!({ "hook_event_name": "SessionStart" })).is_none());
+        assert!(map_hook(&json!({ "session_id": "", "hook_event_name": "SessionStart" })).is_none());
+    }
+
+    #[test]
+    fn hook_garbage_stdin_is_an_ok_noop_never_nonzero() {
+        // Every one of these is empty/garbage/unmapped: an ok no-op that touches
+        // no stage file (so the live stage is safe even without an override).
+        for bad in [
+            "",
+            "   ",
+            "not json at all",
+            "{",
+            "[]",
+            "42",
+            "\"a string\"",
+            r#"{ "session_id": "x" }"#,                       // no event
+            r#"{ "hook_event_name": "SessionStart" }"#,        // no id
+            r#"{ "session_id": "x", "hook_event_name": "Zzz" }"#, // unmapped
+        ] {
+            let out = hook_from_str(bad);
+            assert_eq!(out.status, crate::output::Status::Ok, "input: {bad:?}");
+            assert_eq!(out.render(false).1, crate::output::exit::OK);
+            assert_eq!(out.data.unwrap()["action"], "none", "input: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn session_start_upserts_restages_and_anchors_under_a_project() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("sess-start");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        project_add(&invocation(
+            &["graph", "project", "add"],
+            &["aoide", "/home/k/Aoide"],
+        ));
+        let out = session_start(&flag_invocation(
+            &["graph", "session", "start"],
+            &[("id", "s1"), ("cwd", "/home/k/Aoide/sub")],
+        ));
+        assert_eq!(out.status, crate::output::Status::Ok);
+
+        let s_file: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(s_file.sessions.len(), 1);
+        assert_eq!(s_file.sessions[0].state, "running");
+        let started = s_file.sessions[0].started_at.clone();
+        assert!(!started.is_empty());
+
+        // Every mutation re-stages: graph.json carries the session node + the
+        // project-anchored edge, and equals exactly what `view` computes.
+        let staged: Value =
+            serde_json::from_str(&std::fs::read_to_string(stage.join("graph.json")).unwrap())
+                .unwrap();
+        assert!(staged["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["id"] == "session:s1"));
+        assert!(staged["edges"].as_array().unwrap().iter().any(|e| {
+            e["from"] == "project:aoide" && e["to"] == "session:s1" && e["kind"] == "anchors"
+        }));
+        let view = view(&invocation(&["graph", "view"], &[]));
+        assert_eq!(&staged, view.data.as_ref().unwrap());
+
+        // Re-start updates the agent but preserves startedAt and never dupes.
+        session_start(&flag_invocation(
+            &["graph", "session", "start"],
+            &[("id", "s1"), ("agent", "melete")],
+        ));
+        let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(s2.sessions.len(), 1);
+        assert_eq!(s2.sessions[0].agent, "melete");
+        assert_eq!(s2.sessions[0].started_at, started);
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn session_start_refuses_a_cyclic_parent() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("sess-cycle");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        session_start(&flag_invocation(&["graph", "session", "start"], &[("id", "a")]));
+        session_start(&flag_invocation(
+            &["graph", "session", "start"],
+            &[("id", "b"), ("parent", "a")],
+        ));
+        // a parented under b would close b→a→…: refused (exit 1), no mutation.
+        let out = session_start(&flag_invocation(
+            &["graph", "session", "start"],
+            &[("id", "a"), ("parent", "b")],
+        ));
+        assert_eq!(out.status, crate::output::Status::Error);
+        assert_eq!(out.data.unwrap()["reason"], "cycle");
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert!(s.sessions.iter().find(|x| x.session_id == "a").unwrap().parent_session_id.is_none());
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn hook_lifecycle_start_running_waiting_end() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("sess-hook");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        // SessionStart registers the session (agent claude, cwd from payload).
+        let out = hook_from_str(
+            r#"{ "session_id": "h1", "hook_event_name": "SessionStart", "cwd": "/proj", "extra": 9 }"#,
+        );
+        assert_eq!(out.status, crate::output::Status::Ok);
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(s.sessions.len(), 1);
+        assert_eq!(s.sessions[0].agent, "claude");
+        assert_eq!(s.sessions[0].cwd, "/proj");
+
+        // PreToolUse → running, Stop → waiting (latest hook phase wins).
+        hook_from_str(r#"{ "session_id": "h1", "hook_event_name": "PreToolUse" }"#);
+        hook_from_str(r#"{ "session_id": "h1", "hook_event_name": "Stop" }"#);
+        let (_, ss, hh) = load_inputs("test").unwrap();
+        assert_eq!(merged_sessions(&ss.sessions, &hh.hooks)[0].state, "waiting");
+
+        // SessionEnd → done in both files.
+        hook_from_str(r#"{ "session_id": "h1", "hook_event_name": "SessionEnd" }"#);
+        let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(s2.sessions[0].state, "done");
+        let h2: HooksFile = load_stage(&hooks_path()).unwrap();
+        assert_eq!(h2.hooks.iter().find(|h| h.session_id == "h1").unwrap().phase, "done");
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn session_end_unknown_id_is_ok_noop() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("sess-end-unknown");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = session_end(&flag_invocation(
+            &["graph", "session", "end"],
+            &[("id", "ghost")],
+        ));
+        assert_eq!(out.status, crate::output::Status::Ok);
+        assert!(out.changed.is_empty(), "unknown id → no change");
+        // No session file was written (nothing to end).
+        assert!(!sessions_path().exists());
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn session_start_requires_the_id_flag() {
+        let out = session_start(&flag_invocation(&["graph", "session", "start"], &[]));
+        assert_eq!(out.status, crate::output::Status::Usage);
+        assert_eq!(out.render(false).1, crate::output::exit::USAGE);
     }
 
     #[test]
