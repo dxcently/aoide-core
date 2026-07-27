@@ -4,8 +4,8 @@
 //! pure. The command tree is read from `schema.rs`, so the parser and the
 //! schema can never disagree about what commands exist.
 
-use crate::dispatch::Invocation;
 use crate::daemon::Door;
+use crate::dispatch::Invocation;
 use crate::output::{exit, Outcome};
 use crate::schema;
 use std::collections::BTreeMap;
@@ -45,7 +45,10 @@ pub fn parse(argv: &[String], door: Door) -> Result<(Invocation, bool), Outcome>
                 flags.insert("json".into(), "true".into());
             } else {
                 // Peek: if the next token is a value (not a flag), consume it.
-                if i + 1 < argv.len() && !argv[i + 1].starts_with("--") && !is_command_token(&argv[i + 1], &positionals) {
+                if i + 1 < argv.len()
+                    && !argv[i + 1].starts_with("--")
+                    && !is_command_token(&argv[i + 1], &positionals)
+                {
                     flags.insert(name.to_string(), argv[i + 1].clone());
                     i += 1;
                 } else {
@@ -64,9 +67,9 @@ pub fn parse(argv: &[String], door: Door) -> Result<(Invocation, bool), Outcome>
 
     // Greedy longest-prefix match of positionals against known command paths.
     let paths = known_paths();
-    let matched = paths.into_iter().find(|p| {
-        p.len() <= positionals.len() && p.iter().zip(&positionals).all(|(a, b)| a == b)
-    });
+    let matched = paths
+        .into_iter()
+        .find(|p| p.len() <= positionals.len() && p.iter().zip(&positionals).all(|(a, b)| a == b));
 
     let path = match matched {
         Some(p) => p,

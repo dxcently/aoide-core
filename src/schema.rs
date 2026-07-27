@@ -102,13 +102,22 @@ macro_rules! cmd {
 
 macro_rules! arg {
     ($name:literal, $ty:literal, $req:expr, $desc:literal) => {
-        Arg { name: $name, ty: $ty, required: $req, description: $desc }
+        Arg {
+            name: $name,
+            ty: $ty,
+            required: $req,
+            description: $desc,
+        }
     };
 }
 
 macro_rules! flag {
     ($name:literal, $ty:literal, $desc:literal) => {
-        Flag { name: $name, ty: $ty, description: $desc }
+        Flag {
+            name: $name,
+            ty: $ty,
+            description: $desc,
+        }
     };
 }
 
@@ -350,6 +359,15 @@ pub fn commands() -> Vec<Command> {
             gated: false,
             implemented: true,
         ),
+        // ── baton: the conductor's terminal frontend over the trunk (concepts/Agent-Interface) ─
+        cmd!(
+            path: ["baton"],
+            summary: "Raise the baton: the interactive terminal UI to conduct the agent sessions — the session DAG, projects, audit log, and stage status (every action routes through the one dispatcher).",
+            args: [],
+            flags: [],
+            gated: false,
+            implemented: true,
+        ),
     ]
 }
 
@@ -380,8 +398,8 @@ mod tests {
         let v = serde_json::to_value(&doc).unwrap();
         assert_eq!(v["schemaVersion"], "0");
         assert_eq!(v["aoide"], "0.0.0");
-        // 19 walking-skeleton commands + the 8 graph commands.
-        assert!(v["commands"].as_array().unwrap().len() >= 27);
+        // 19 walking-skeleton commands + the 8 graph commands + `baton`.
+        assert!(v["commands"].as_array().unwrap().len() >= 28);
     }
 
     #[test]

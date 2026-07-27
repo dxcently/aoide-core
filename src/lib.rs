@@ -5,6 +5,7 @@
 //! once in [`dispatch`]; the two doors cannot drift (concepts/Agent-Interface).
 
 pub mod adapter;
+pub mod baton;
 pub mod cli;
 pub mod daemon;
 pub mod dispatch;
@@ -40,6 +41,29 @@ pub fn run_cli(argv: &[String]) -> i32 {
             Ok(()) => output::exit::OK,
             Err(e) => {
                 eprintln!("aoide mcp serve: {e}");
+                output::exit::ERROR
+            }
+        };
+    }
+
+    // `baton` is an interactive loop, resolved at the entry point exactly like
+    // `mcp serve --stdio` — mode resolution happens here; everything below the
+    // door is frontend-agnostic. We dispatch FIRST (so the single audit log
+    // records the launch — the very record the LOG panel then tails), then
+    // hand control to the terminal loop. The loop installs a panic hook + a
+    // Drop guard that restore the terminal (leave the alternate screen, disable
+    // raw mode) on ANY exit path, so a panic can never leave a wedged tty.
+    if inv.path == ["baton"] {
+        let launch = dispatch::dispatch(&inv);
+        if launch.status != output::Status::Ok {
+            let (body, code) = launch.render(json);
+            eprintln!("{body}");
+            return code;
+        }
+        return match baton::run() {
+            Ok(()) => output::exit::OK,
+            Err(e) => {
+                eprintln!("aoide baton: {e}");
                 output::exit::ERROR
             }
         };

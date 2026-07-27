@@ -115,7 +115,9 @@ fn graph_path() -> PathBuf {
 
 /// Load one stage file; a missing file is an empty registry (tolerated), a
 /// corrupt one is a structured error string.
-fn load_stage<T: serde::de::DeserializeOwned + Default>(path: &std::path::Path) -> Result<T, String> {
+fn load_stage<T: serde::de::DeserializeOwned + Default>(
+    path: &std::path::Path,
+) -> Result<T, String> {
     match std::fs::read_to_string(path) {
         Ok(s) => serde_json::from_str(&s)
             .map_err(|e| format!("{}: unreadable stage file: {e}", path.display())),
@@ -135,7 +137,11 @@ fn write_stage<T: Serialize>(path: &std::path::Path, value: &T) -> Result<(), St
 
 /// Is `cwd` inside the project rooted at `root`? (path-component-aware).
 fn cwd_under(cwd: &str, root: &str) -> bool {
-    let root = if root.len() > 1 { root.trim_end_matches('/') } else { root };
+    let root = if root.len() > 1 {
+        root.trim_end_matches('/')
+    } else {
+        root
+    };
     cwd == root || cwd.starts_with(&format!("{}/", root))
 }
 
@@ -196,7 +202,11 @@ fn resolved_parent<'a>(s: &SessionRecord, ids: &HashSet<&'a str>) -> Option<Stri
 /// Build the fully resolved graph document (`graph.json` v0 shape). A session
 /// with a resolved parent carries only its `spawned` edge; root sessions carry
 /// an `anchors` edge to their longest-prefix project (or none, unanchored).
-pub fn build_graph(projects: &[Project], sessions: &[SessionRecord], hooks: &[HookRecord]) -> Value {
+pub fn build_graph(
+    projects: &[Project],
+    sessions: &[SessionRecord],
+    hooks: &[HookRecord],
+) -> Value {
     let projects = sorted_projects(projects);
     let sessions = merged_sessions(sessions, hooks);
     let ids: HashSet<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
@@ -299,7 +309,9 @@ pub fn render(
         focus: Option<&str>,
         visited: &mut HashSet<String>,
     ) {
-        let Some(kids) = children.get(parent) else { return };
+        let Some(kids) = children.get(parent) else {
+            return;
+        };
         for (i, kid) in kids.iter().enumerate() {
             if !visited.insert(kid.session_id.clone()) {
                 continue;
@@ -333,7 +345,14 @@ pub fn render(
             let branch = if last { "└─ " } else { "├─ " };
             out.push(format!("{branch}{}", session_line(s, focus)));
             let deeper = if last { "   " } else { "│  " };
-            render_children(&mut *out, &s.session_id, &children, deeper, focus, &mut visited);
+            render_children(
+                &mut *out,
+                &s.session_id,
+                &children,
+                deeper,
+                focus,
+                &mut visited,
+            );
         }
     };
 
@@ -357,8 +376,10 @@ pub fn render(
 /// Would linking `child → parent` create a cycle? Walks the parent chain from
 /// `parent` upward; a visited guard also survives pre-existing bad data.
 pub fn would_cycle(sessions: &[SessionRecord], child: &str, parent: &str) -> bool {
-    let by_id: BTreeMap<&str, &SessionRecord> =
-        sessions.iter().map(|s| (s.session_id.as_str(), s)).collect();
+    let by_id: BTreeMap<&str, &SessionRecord> = sessions
+        .iter()
+        .map(|s| (s.session_id.as_str(), s))
+        .collect();
     let mut seen: HashSet<String> = HashSet::new();
     let mut cur = parent.to_string();
     loop {
@@ -368,7 +389,10 @@ pub fn would_cycle(sessions: &[SessionRecord], child: &str, parent: &str) -> boo
         if !seen.insert(cur.clone()) {
             return false; // pre-existing cycle not involving child — stop.
         }
-        match by_id.get(cur.as_str()).and_then(|s| s.parent_session_id.clone()) {
+        match by_id
+            .get(cur.as_str())
+            .and_then(|s| s.parent_session_id.clone())
+        {
             Some(next) if !next.is_empty() => cur = next,
             _ => return false,
         }
@@ -380,7 +404,12 @@ pub fn would_cycle(sessions: &[SessionRecord], child: &str, parent: &str) -> boo
 pub fn prune_done(
     sessions: Vec<SessionRecord>,
     hooks: Vec<HookRecord>,
-) -> (Vec<SessionRecord>, Vec<HookRecord>, Vec<String>, Vec<String>) {
+) -> (
+    Vec<SessionRecord>,
+    Vec<HookRecord>,
+    Vec<String>,
+    Vec<String>,
+) {
     let removed: Vec<String> = sessions
         .iter()
         .filter(|s| s.state == "done")
@@ -418,7 +447,11 @@ fn require_args(inv: &Invocation, names: &[&str]) -> Result<Vec<String>, Outcome
             format!(
                 "usage: aoide {} {} [--json]",
                 inv.path.join(" "),
-                names.iter().map(|n| format!("<{n}>")).collect::<Vec<_>>().join(" ")
+                names
+                    .iter()
+                    .map(|n| format!("<{n}>"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
             ),
         ));
     }
@@ -477,7 +510,10 @@ pub fn project_add(inv: &Invocation) -> Outcome {
             message = format!("updated project `{name}` → {path}");
         }
         None => {
-            file.projects.push(Project { name: name.clone(), path: path.clone() });
+            file.projects.push(Project {
+                name: name.clone(),
+                path: path.clone(),
+            });
             changed.push(format!("registered project {name} → {path}"));
             message = format!("registered project `{name}` → {path}");
         }
@@ -536,8 +572,7 @@ pub fn project_list(_inv: &Invocation) -> Outcome {
     for p in &projects {
         message.push_str(&format!("\n◆ {}  {}", p.name, p.path));
     }
-    Outcome::ok("graph.project.list", message)
-        .with_data(json!({ "projects": projects }))
+    Outcome::ok("graph.project.list", message).with_data(json!({ "projects": projects }))
 }
 
 /// `graph link <child> <parent>` — set the spawned-by edge on the child.
@@ -548,8 +583,11 @@ pub fn link(inv: &Invocation) -> Outcome {
     };
     let (child, parent) = (args[0].clone(), args[1].clone());
     if child == parent {
-        return Outcome::error("graph.link", format!("refusing self-link: `{child}` → itself"))
-            .with_data(json!({ "reason": "self-link" }));
+        return Outcome::error(
+            "graph.link",
+            format!("refusing self-link: `{child}` → itself"),
+        )
+        .with_data(json!({ "reason": "self-link" }));
     }
     let mut file: SessionsFile = match load_stage(&sessions_path()) {
         Ok(f) => f,
@@ -568,7 +606,11 @@ pub fn link(inv: &Invocation) -> Outcome {
     }
     let parent_known = file.sessions.iter().any(|s| s.session_id == parent);
 
-    let rec = file.sessions.iter_mut().find(|s| s.session_id == child).unwrap();
+    let rec = file
+        .sessions
+        .iter_mut()
+        .find(|s| s.session_id == child)
+        .unwrap();
     let mut changed: Vec<String> = Vec::new();
     let message;
     if rec.parent_session_id.as_deref() == Some(parent.as_str()) {
@@ -591,7 +633,9 @@ pub fn link(inv: &Invocation) -> Outcome {
     if !parent_known {
         data["warning"] = json!("parent session not (yet) registered; edge recorded anyway");
     }
-    Outcome::ok("graph.link", message).changed(changed).with_data(data)
+    Outcome::ok("graph.link", message)
+        .changed(changed)
+        .with_data(data)
 }
 
 /// Normalise a Hyprland window address for comparison: lowercased, with any
@@ -600,7 +644,10 @@ pub fn link(inv: &Invocation) -> Outcome {
 /// (hyprctl reports e.g. `0x55…`); this makes the match tolerant of both.
 fn normalize_addr(addr: &str) -> String {
     let a = addr.trim();
-    let a = a.strip_prefix("0x").or_else(|| a.strip_prefix("0X")).unwrap_or(a);
+    let a = a
+        .strip_prefix("0x")
+        .or_else(|| a.strip_prefix("0X"))
+        .unwrap_or(a);
     a.to_ascii_lowercase()
 }
 
@@ -630,7 +677,10 @@ pub fn focus(inv: &Invocation) -> Outcome {
         Err(e) => return e,
     };
     // Accept both `session:<id>` node ids and bare session ids.
-    let id = args[0].strip_prefix("session:").unwrap_or(&args[0]).to_string();
+    let id = args[0]
+        .strip_prefix("session:")
+        .unwrap_or(&args[0])
+        .to_string();
     let file: SessionsFile = match load_stage(&sessions_path()) {
         Ok(f) => f,
         Err(e) => return stage_error("graph.focus", e),
@@ -724,8 +774,10 @@ pub fn prune(_inv: &Invocation) -> Outcome {
         Err(e) => return stage_error("graph.prune", e),
     };
 
-    let (kept_s, kept_h, removed, cleared) =
-        prune_done(std::mem::take(&mut s_file.sessions), std::mem::take(&mut h_file.hooks));
+    let (kept_s, kept_h, removed, cleared) = prune_done(
+        std::mem::take(&mut s_file.sessions),
+        std::mem::take(&mut h_file.hooks),
+    );
 
     if removed.is_empty() {
         return Outcome::ok("graph.prune", "nothing to prune (no `done` sessions)")
@@ -741,11 +793,22 @@ pub fn prune(_inv: &Invocation) -> Outcome {
         return stage_error("graph.prune", e);
     }
 
-    let mut changed: Vec<String> = removed.iter().map(|id| format!("removed session {id}")).collect();
-    changed.extend(cleared.iter().map(|id| format!("cleared parentSessionId of {id}")));
+    let mut changed: Vec<String> = removed
+        .iter()
+        .map(|id| format!("removed session {id}"))
+        .collect();
+    changed.extend(
+        cleared
+            .iter()
+            .map(|id| format!("cleared parentSessionId of {id}")),
+    );
     Outcome::ok(
         "graph.prune",
-        format!("pruned {} session(s); cleared {} orphaned parent link(s)", removed.len(), cleared.len()),
+        format!(
+            "pruned {} session(s); cleared {} orphaned parent link(s)",
+            removed.len(),
+            cleared.len()
+        ),
     )
     .changed(changed)
     .with_data(json!({ "removed": removed, "clearedParents": cleared }))
@@ -767,13 +830,16 @@ pub fn emit(_inv: &Invocation) -> Outcome {
         doc["nodes"].as_array().map_or(0, Vec::len),
         doc["edges"].as_array().map_or(0, Vec::len),
     );
-    Outcome::ok("graph.emit", format!("staged graph.json ({n} node(s), {e} edge(s))"))
-        .changed([path.to_string_lossy().into_owned()])
-        .with_data(json!({
-            "path": path.to_string_lossy(),
-            "nodes": n,
-            "edges": e,
-        }))
+    Outcome::ok(
+        "graph.emit",
+        format!("staged graph.json ({n} node(s), {e} edge(s))"),
+    )
+    .changed([path.to_string_lossy().into_owned()])
+    .with_data(json!({
+        "path": path.to_string_lossy(),
+        "nodes": n,
+        "edges": e,
+    }))
 }
 
 // ── Tests (pure cores: anchoring, cycles, render determinism, prune) ────────
@@ -782,7 +848,13 @@ pub fn emit(_inv: &Invocation) -> Outcome {
 mod tests {
     use super::*;
 
-    fn session(id: &str, cwd: &str, state: &str, started: &str, parent: Option<&str>) -> SessionRecord {
+    fn session(
+        id: &str,
+        cwd: &str,
+        state: &str,
+        started: &str,
+        parent: Option<&str>,
+    ) -> SessionRecord {
         SessionRecord {
             session_id: id.into(),
             agent: "claude".into(),
@@ -797,18 +869,30 @@ mod tests {
 
     fn fixture_projects() -> Vec<Project> {
         vec![
-            Project { name: "nested".into(), path: "/home/k/Aoide/sub".into() },
-            Project { name: "aoide".into(), path: "/home/k/Aoide".into() },
+            Project {
+                name: "nested".into(),
+                path: "/home/k/Aoide/sub".into(),
+            },
+            Project {
+                name: "aoide".into(),
+                path: "/home/k/Aoide".into(),
+            },
         ]
     }
 
     #[test]
     fn anchoring_longest_prefix_wins() {
         let p = sorted_projects(&fixture_projects()); // [aoide, nested]
-        // Inside the nested project → the deeper root wins.
-        assert_eq!(anchor_for("/home/k/Aoide/sub/x", &p).map(|i| p[i].name.as_str()), Some("nested"));
+                                                      // Inside the nested project → the deeper root wins.
+        assert_eq!(
+            anchor_for("/home/k/Aoide/sub/x", &p).map(|i| p[i].name.as_str()),
+            Some("nested")
+        );
         // At the outer root → the outer project.
-        assert_eq!(anchor_for("/home/k/Aoide", &p).map(|i| p[i].name.as_str()), Some("aoide"));
+        assert_eq!(
+            anchor_for("/home/k/Aoide", &p).map(|i| p[i].name.as_str()),
+            Some("aoide")
+        );
         // Component-aware: /home/k/Aoide-extra is NOT under /home/k/Aoide.
         assert_eq!(anchor_for("/home/k/Aoide-extra", &p), None);
         assert_eq!(anchor_for("/tmp/elsewhere", &p), None);
@@ -836,14 +920,42 @@ mod tests {
         let sessions = vec![
             // Deliberately unsorted; ordering must come from (startedAt, id).
             session("s4", "/tmp", "idle", "2026-01-04T00:00:00Z", None),
-            session("s2", "/home/k/Aoide/sub/x", "running", "2026-01-02T00:00:00Z", None),
-            session("s1", "/home/k/Aoide", "running", "2026-01-01T00:00:00Z", None),
-            session("s3", "/home/k/elsewhere", "idle", "2026-01-03T00:00:00Z", Some("s1")),
+            session(
+                "s2",
+                "/home/k/Aoide/sub/x",
+                "running",
+                "2026-01-02T00:00:00Z",
+                None,
+            ),
+            session(
+                "s1",
+                "/home/k/Aoide",
+                "running",
+                "2026-01-01T00:00:00Z",
+                None,
+            ),
+            session(
+                "s3",
+                "/home/k/elsewhere",
+                "idle",
+                "2026-01-03T00:00:00Z",
+                Some("s1"),
+            ),
         ];
         // Hook state merge: s1's latest hook phase becomes its live state.
         let hooks = vec![
-            HookRecord { session_id: "s1".into(), phase: "PreToolUse".into(), updated_at: "2026-01-01T01:00:00Z".into(), extra: Map::new() },
-            HookRecord { session_id: "s1".into(), phase: "Stop".into(), updated_at: "2026-01-01T02:00:00Z".into(), extra: Map::new() },
+            HookRecord {
+                session_id: "s1".into(),
+                phase: "PreToolUse".into(),
+                updated_at: "2026-01-01T01:00:00Z".into(),
+                extra: Map::new(),
+            },
+            HookRecord {
+                session_id: "s1".into(),
+                phase: "Stop".into(),
+                updated_at: "2026-01-01T02:00:00Z".into(),
+                extra: Map::new(),
+            },
         ];
         let expected = "\
 ◆ aoide  /home/k/Aoide
@@ -890,8 +1002,18 @@ mod tests {
             session("free", "/x", "idle", "4", None),
         ];
         let hooks = vec![
-            HookRecord { session_id: "p".into(), phase: "Stop".into(), updated_at: "1".into(), extra: Map::new() },
-            HookRecord { session_id: "c1".into(), phase: "PreToolUse".into(), updated_at: "2".into(), extra: Map::new() },
+            HookRecord {
+                session_id: "p".into(),
+                phase: "Stop".into(),
+                updated_at: "1".into(),
+                extra: Map::new(),
+            },
+            HookRecord {
+                session_id: "c1".into(),
+                phase: "PreToolUse".into(),
+                updated_at: "2".into(),
+                extra: Map::new(),
+            },
         ];
         let (kept_s, kept_h, removed, cleared) = prune_done(sessions, hooks);
         assert_eq!(removed, vec!["p".to_string(), "c2".to_string()]);
@@ -917,7 +1039,7 @@ mod tests {
         assert!(window_present(&clients, "0x55AABBCCDD00")); // upper case
         assert!(window_present(&clients, "55AABBCCDD00")); // both
         assert!(window_present(&clients, "0X1234EF")); // 0X + upper
-        // A vanished window is absent.
+                                                       // A vanished window is absent.
         assert!(!window_present(&clients, "0xdeadbeef"));
         assert!(!window_present(&clients, ""));
         // Client entry without an address field is ignored, not a false match.

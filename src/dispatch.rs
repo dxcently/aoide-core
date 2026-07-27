@@ -7,9 +7,9 @@
 
 use crate::daemon::{self, Door};
 use crate::guide::GUIDE;
+use crate::notes;
 use crate::output::Outcome;
 use crate::schema;
-use crate::notes;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -56,7 +56,13 @@ pub fn dispatch(inv: &Invocation) -> Outcome {
     let cmd = inv.dotted();
     let meta = schema_for(&inv.path);
 
-    let outcome = match inv.path.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+    let outcome = match inv
+        .path
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
         ["guide"] => Outcome::ok("guide", "printed the four-tier onboarding")
             .with_data(json!({ "text": GUIDE })),
 
@@ -99,10 +105,33 @@ pub fn dispatch(inv: &Invocation) -> Outcome {
             Outcome::ok("shellbridge", "shellbridge skeleton self-check complete").with_data(status)
         }
 
+        // `baton` is interactive: like `mcp serve --stdio`, the loop itself is
+        // resolved at the entry point (lib.rs) — everything below stays
+        // frontend-agnostic. This arm only RECORDS the launch (so the audit log
+        // carries the door-open the baton then tails) and, for a non-interactive
+        // door (MCP/daemon), returns the "run it from a terminal" outcome. The
+        // CLI door short-circuits in run_cli AFTER dispatching here, so on the
+        // Cli path this is the audit record, not a stub.
+        ["baton"] => match inv.door {
+            Door::Cli => Outcome::ok("baton", "raising the baton over the agent sessions")
+                .with_data(json!({
+                    "interactive": true,
+                    "stageDir": crate::shellbridge::stage_dir().to_string_lossy(),
+                })),
+            _ => Outcome::ok(
+                "baton",
+                "baton is interactive; run `aoide baton` from a terminal (not over this door)",
+            )
+            .with_data(json!({ "interactive": true, "door": "non-cli" })),
+        },
+
         ["adapter", "melete"] => {
             let status = crate::adapter::run_melete();
-            Outcome::ok("adapter.melete", "melete-adapter skeleton self-check complete")
-                .with_data(status)
+            Outcome::ok(
+                "adapter.melete",
+                "melete-adapter skeleton self-check complete",
+            )
+            .with_data(status)
         }
 
         // ── Structured "not-implemented" stubs (walking skeleton) ───────────
@@ -112,7 +141,10 @@ pub fn dispatch(inv: &Invocation) -> Outcome {
                 "args": inv.args,
                 "flags": inv.flags,
             })),
-            None => Outcome::usage(cmd.clone(), format!("unknown command: `{}`", cmd.replace('.', " "))),
+            None => Outcome::usage(
+                cmd.clone(),
+                format!("unknown command: `{}`", cmd.replace('.', " ")),
+            ),
         },
     };
 

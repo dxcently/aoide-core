@@ -68,7 +68,9 @@ fn json_type(ty: &str) -> &'static str {
 
 /// Build an [`Invocation`] from an MCP `tools/call` (tool name + arguments).
 fn invocation_from_call(name: &str, arguments: &Value) -> Option<Invocation> {
-    let cmd = schema::commands().into_iter().find(|c| c.dotted() == name)?;
+    let cmd = schema::commands()
+        .into_iter()
+        .find(|c| c.dotted() == name)?;
     let path: Vec<String> = cmd.path.iter().map(|s| s.to_string()).collect();
 
     let mut args: Vec<String> = Vec::new();
@@ -89,7 +91,12 @@ fn invocation_from_call(name: &str, arguments: &Value) -> Option<Invocation> {
         }
     }
 
-    Some(Invocation { path, args, flags, door: Door::Mcp })
+    Some(Invocation {
+        path,
+        args,
+        flags,
+        door: Door::Mcp,
+    })
 }
 
 fn value_to_string(v: &Value) -> String {
@@ -191,7 +198,11 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect();
         for c in schema::commands() {
-            assert!(names.contains(&c.dotted()), "tool missing for {}", c.dotted());
+            assert!(
+                names.contains(&c.dotted()),
+                "tool missing for {}",
+                c.dotted()
+            );
         }
     }
 

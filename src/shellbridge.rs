@@ -18,7 +18,9 @@ use std::path::PathBuf;
 /// `$XDG_RUNTIME_DIR/aoide/shellbridge.sock`.
 pub fn socket_path() -> PathBuf {
     let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into());
-    PathBuf::from(runtime).join("aoide").join("shellbridge.sock")
+    PathBuf::from(runtime)
+        .join("aoide")
+        .join("shellbridge.sock")
 }
 
 /// The live-state stage directory: `~/Aoide/song/stage/`.
@@ -39,7 +41,10 @@ pub fn stage_dir() -> PathBuf {
             return p;
         }
     }
-    daemon::aoide_home().join("Aoide").join("song").join("stage")
+    daemon::aoide_home()
+        .join("Aoide")
+        .join("song")
+        .join("stage")
 }
 
 /// Atomic write-temp-then-rename into a file within a directory.
@@ -47,10 +52,7 @@ pub fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension(format!(
-        "tmp.{}",
-        std::process::id()
-    ));
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(contents.as_bytes())?;
