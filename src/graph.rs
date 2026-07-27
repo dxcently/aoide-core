@@ -1090,6 +1090,58 @@ fn do_session_phase(id: &str, phase: &str) -> Outcome {
         }))
 }
 
+/// Conditional sibling of [`do_session_phase`]: UPSERT `phase` for `id` ONLY when
+/// its CURRENT hook phase equals `expected`, else an ok no-op that writes nothing.
+/// hooks.json is loaded ONCE — the guard read and the write share the same load,
+/// so the current phase is never read twice. This is the door the ambiguous idle
+/// Notification walks: only a still-`running` turn becomes `blocked`.
+fn do_session_phase_if(id: &str, phase: &str, expected: &str) -> Outcome {
+    let cmd = "graph.session.phase";
+    let mut file: HooksFile = match load_stage(&hooks_path()) {
+        Ok(f) => f,
+        Err(e) => return stage_error(cmd, e),
+    };
+    let current = file
+        .hooks
+        .iter()
+        .find(|h| h.session_id == id)
+        .map(|h| h.phase.clone())
+        .unwrap_or_default();
+    if current != expected {
+        return Outcome::ok(
+            cmd,
+            format!("session `{id}` phase unchanged (current `{current}` ≠ `{expected}`)"),
+        )
+        .with_data(json!({
+            "sessionId": id,
+            "phase": current,
+            "skipped": true,
+            "expected": expected,
+        }));
+    }
+    let now = now_iso_utc();
+    upsert_hook(&mut file.hooks, id, phase, &now);
+    if file.schema_version.is_empty() {
+        file.schema_version = STAGE_GRAPH_VERSION.to_string();
+    }
+    if let Err(e) = write_stage(&hooks_path(), &file) {
+        return stage_error(cmd, e);
+    }
+    let mut changed = vec![format!("session {id}: phase → {phase}")];
+    match restage_graph() {
+        Ok(g) => changed.push(g.to_string_lossy().into_owned()),
+        Err(e) => return stage_error(cmd, e),
+    }
+    Outcome::ok(cmd, format!("session `{id}` phase = {phase}"))
+        .changed(changed)
+        .with_data(json!({
+            "sessionId": id,
+            "phase": phase,
+            "updatedAt": now,
+            "file": hooks_path().to_string_lossy(),
+        }))
+}
+
 /// Core of `graph session end`: mark the session `done` (and its hook phase
 /// `done`), re-stage. An unknown id is an ok no-op (matching `project remove`).
 fn do_session_end(id: &str) -> Outcome {
@@ -1188,6 +1240,12 @@ pub fn session_end(inv: &Invocation) -> Outcome {
 enum HookAction {
     Start { id: String, cwd: Option<String> },
     Phase { id: String, phase: String },
+    /// Conditional phase: set `phase` ONLY if the session's CURRENT hook phase is
+    /// `running`, else a no-op. Guards the ambiguous idle Notification — a
+    /// "waiting for your input" ping only means "blocked" when the turn is still
+    /// mid-flight (`running`, e.g. an unanswered AskUserQuestion); a settled
+    /// `waiting` session must not be flipped by the ~60s idle heartbeat.
+    PhaseIfRunning { id: String, phase: String },
     End { id: String },
 }
 
@@ -1208,7 +1266,10 @@ fn map_hook(payload: &Value) -> Option<HookAction> {
         .map(str::to_string);
     match event {
         "SessionStart" => Some(HookAction::Start { id: id.to_string(), cwd }),
-        "UserPromptSubmit" | "PreToolUse" => Some(HookAction::Phase {
+        // The tool ran (PostToolUse) or a new prompt/tool began: the turn is
+        // live. PostToolUse is also HALF the blocked-clearing set — an approved
+        // permission runs the tool, and this edge lifts the fermata.
+        "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => Some(HookAction::Phase {
             id: id.to_string(),
             phase: "running".to_string(),
         }),
@@ -1216,6 +1277,31 @@ fn map_hook(payload: &Value) -> Option<HookAction> {
             id: id.to_string(),
             phase: "waiting".to_string(),
         }),
+        // The one hook with no clean edge: `message` disambiguates its two moods.
+        // "permission" → a real mid-turn blocker (publish blocked at once). The
+        // ~60s "waiting for your input" idle ping is ambiguous — only a still-
+        // running turn (an unseen AskUserQuestion) becomes blocked; a settled
+        // waiting/done session is left untouched. Anything else is a no-op.
+        "Notification" => {
+            let msg = payload
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if msg.contains("permission") {
+                Some(HookAction::Phase {
+                    id: id.to_string(),
+                    phase: "blocked".to_string(),
+                })
+            } else if msg.contains("waiting for your input") {
+                Some(HookAction::PhaseIfRunning {
+                    id: id.to_string(),
+                    phase: "blocked".to_string(),
+                })
+            } else {
+                None
+            }
+        }
         "SessionEnd" => Some(HookAction::End { id: id.to_string() }),
         _ => None,
     }
@@ -1246,6 +1332,7 @@ fn hook_from_str(buf: &str) -> Outcome {
             do_session_start(&id, Some("claude"), cwd.as_deref(), None, None)
         }
         HookAction::Phase { id, phase } => do_session_phase(&id, &phase),
+        HookAction::PhaseIfRunning { id, phase } => do_session_phase_if(&id, &phase, "running"),
         HookAction::End { id } => do_session_end(&id),
     };
     // Fold the inner outcome into an ok envelope — exit 0, no matter what.
@@ -1640,6 +1727,12 @@ mod tests {
             map_hook(&json!({ "session_id": "s", "hook_event_name": "PreToolUse" })).unwrap(),
             HookAction::Phase { ref phase, .. } if phase == "running"
         ));
+        // PostToolUse joins the running arm — the tool ran, and this edge is HALF
+        // the blocked-clearing set (approval → tool runs → PostToolUse).
+        assert!(matches!(
+            map_hook(&json!({ "session_id": "s", "hook_event_name": "PostToolUse" })).unwrap(),
+            HookAction::Phase { ref phase, .. } if phase == "running"
+        ));
         assert!(matches!(
             map_hook(&json!({ "session_id": "s", "hook_event_name": "Stop" })).unwrap(),
             HookAction::Phase { ref phase, .. } if phase == "waiting"
@@ -1648,8 +1741,44 @@ mod tests {
             map_hook(&json!({ "session_id": "s", "hook_event_name": "SessionEnd" })).unwrap(),
             HookAction::End { .. }
         ));
-        // Unknown event, missing event, and empty/absent session_id → no action.
+        // Notification with a permission message → an unconditional `blocked`.
+        assert!(matches!(
+            map_hook(&json!({
+                "session_id": "s",
+                "hook_event_name": "Notification",
+                "message": "Claude needs your permission to use Bash"
+            }))
+            .unwrap(),
+            HookAction::Phase { ref phase, .. } if phase == "blocked"
+        ));
+        // The ambiguous idle ping → the CONDITIONAL variant (guarded downstream).
+        assert!(matches!(
+            map_hook(&json!({
+                "session_id": "s",
+                "hook_event_name": "Notification",
+                "message": "Claude is waiting for your input"
+            }))
+            .unwrap(),
+            HookAction::PhaseIfRunning { ref phase, .. } if phase == "blocked"
+        ));
+        // "permission" match is case-insensitive.
+        assert!(matches!(
+            map_hook(&json!({
+                "session_id": "s",
+                "hook_event_name": "Notification",
+                "message": "PERMISSION required"
+            }))
+            .unwrap(),
+            HookAction::Phase { ref phase, .. } if phase == "blocked"
+        ));
+        // A Notification with an unrecognised or absent message → no action.
+        assert!(map_hook(
+            &json!({ "session_id": "s", "hook_event_name": "Notification", "message": "hello" })
+        )
+        .is_none());
         assert!(map_hook(&json!({ "session_id": "s", "hook_event_name": "Notification" })).is_none());
+        // Unknown event, missing event, and empty/absent session_id → no action.
+        assert!(map_hook(&json!({ "session_id": "s", "hook_event_name": "Zzz" })).is_none());
         assert!(map_hook(&json!({ "session_id": "s" })).is_none());
         assert!(map_hook(&json!({ "hook_event_name": "SessionStart" })).is_none());
         assert!(map_hook(&json!({ "session_id": "", "hook_event_name": "SessionStart" })).is_none());
@@ -1792,6 +1921,82 @@ mod tests {
         assert_eq!(s2.sessions[0].state, "done");
         let h2: HooksFile = load_stage(&hooks_path()).unwrap();
         assert_eq!(h2.hooks.iter().find(|h| h.session_id == "h1").unwrap().phase, "done");
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn hook_notification_blocks_and_the_clearing_set_lifts_it() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("sess-blocked");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let live_phase = |id: &str| -> String {
+            let h: HooksFile = load_stage(&hooks_path()).unwrap();
+            h.hooks
+                .iter()
+                .find(|r| r.session_id == id)
+                .map(|r| r.phase.clone())
+                .unwrap_or_default()
+        };
+
+        // Register, then drive to a live turn.
+        hook_from_str(r#"{ "session_id": "b1", "hook_event_name": "SessionStart", "cwd": "/p" }"#);
+        hook_from_str(r#"{ "session_id": "b1", "hook_event_name": "PreToolUse" }"#);
+        assert_eq!(live_phase("b1"), "running");
+
+        // A permission Notification blocks unconditionally.
+        hook_from_str(
+            r#"{ "session_id": "b1", "hook_event_name": "Notification",
+                 "message": "Claude needs your permission to use Bash" }"#,
+        );
+        assert_eq!(live_phase("b1"), "blocked");
+
+        // PostToolUse (the approval → tool-ran edge) lifts the fermata → running.
+        hook_from_str(r#"{ "session_id": "b1", "hook_event_name": "PostToolUse" }"#);
+        assert_eq!(live_phase("b1"), "running");
+
+        // The ambiguous idle ping, mid-turn (running), is a real mid-turn
+        // question → blocked.
+        hook_from_str(
+            r#"{ "session_id": "b1", "hook_event_name": "Notification",
+                 "message": "Claude is waiting for your input" }"#,
+        );
+        assert_eq!(live_phase("b1"), "blocked");
+
+        // Stop settles the turn → waiting.
+        hook_from_str(r#"{ "session_id": "b1", "hook_event_name": "Stop" }"#);
+        assert_eq!(live_phase("b1"), "waiting");
+
+        // The SAME idle ping on a SETTLED (waiting) session is a no-op — the ~60s
+        // heartbeat must NOT flip a quietly-finished turn to blocked.
+        let out = hook_from_str(
+            r#"{ "session_id": "b1", "hook_event_name": "Notification",
+                 "message": "Claude is waiting for your input" }"#,
+        );
+        assert_eq!(out.status, crate::output::Status::Ok);
+        assert_eq!(live_phase("b1"), "waiting");
+
+        // A garbage/absent-message Notification is an ok no-op (action:none), and
+        // never touches the phase.
+        let noop = hook_from_str(
+            r#"{ "session_id": "b1", "hook_event_name": "Notification", "message": "hi" }"#,
+        );
+        assert_eq!(noop.data.unwrap()["action"], "none");
+        assert_eq!(live_phase("b1"), "waiting");
+
+        // blocked flows through the merge opaquely as the node state.
+        hook_from_str(
+            r#"{ "session_id": "b1", "hook_event_name": "Notification",
+                 "message": "permission needed" }"#,
+        );
+        let (_, ss, hh) = load_inputs("test").unwrap();
+        assert_eq!(merged_sessions(&ss.sessions, &hh.hooks)[0].state, "blocked");
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),

@@ -261,6 +261,13 @@ mod tests {
         assert_eq!(state_glyph("done"), "𝄂");
         assert_eq!(state_glyph("Stop"), "𝄂");
         assert_eq!(state_glyph("weird"), "·");
+        // The blocked fermata: a session that needs a human wears the same 𝄐
+        // hold-sign and the Awaiting (urgent) class as any awaiting state — the
+        // contract the baton and the Rust door agree on.
+        assert_eq!(state_glyph("blocked"), "𝄐");
+        assert_eq!(classify("blocked"), StateClass::Awaiting);
+        // PostToolUse (the new clearing edge) reads as Working, not Awaiting.
+        assert_eq!(classify("PostToolUse"), StateClass::Working);
     }
 
     #[test]
