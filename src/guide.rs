@@ -38,6 +38,33 @@ Tier 2 — stdio MCP (per-session, optional)
 Tier 3 — network MCP (user-only)
   Tailnet/funnel MCP is enabled by the USER only, never by an agent.
 
+Hooking any agent into the graph (the baton + widgets render what you register)
+  song/stage/{sessions,hooks,graph}.json is the one truth the baton TUI and
+  the Quickshell widgets draw. Three doors write it — pick by what the agent
+  harness can do:
+  1. Hook door (harnesses with Claude-Code-shaped hooks): pipe ONE hook JSON
+     on stdin to `aoide graph session hook`. Payload keys: session_id,
+     hook_event_name, cwd, message. Event map: SessionStart→running ·
+     UserPromptSubmit/PreToolUse/PostToolUse→running · Stop→waiting ·
+     Notification whose message says \"permission\"→blocked (\"waiting for
+     your input\" blocks only a still-running session) · SessionEnd→done.
+     The door NEVER exits non-zero — safe inside any hook config.
+  2. Explicit verbs (anything scriptable): `graph session start --id I
+     [--agent A --cwd D --parent P]` · `graph session phase --id I --phase P`
+     · `graph session end --id I`. Phase vocabulary and how it renders:
+     running ♪ (working) · waiting 𝄐 (turn over, human's move) · blocked 𝄐
+     urgent + glitch pulse (mid-turn, agent NEEDS a human) · done 𝄂.
+  3. Wrapper (hookless agents — codex, gemini, aider, anything):
+     `aoide graph wrap [--agent A] [--parent P] -- <command …>` runs the
+     command with inherited stdio, registers running, resolves done on exit
+     (crash included), and exports AOIDE_SESSION_ID so anything inside can
+     self-report richer phases:
+       aoide graph session phase --id \"$AOIDE_SESSION_ID\" --phase blocked
+  Claude Code recipe: settings.json hooks for SessionStart, UserPromptSubmit,
+  Notification, PostToolUse, Stop, SessionEnd — each command simply
+  `aoide graph session hook`. Full per-agent recipes: the wiki page
+  entities/Agent-Hooking.md.
+
 House rules (hard constraints)
   1. `song/` is your only writable domain. You commit to
      song/repertoire/<song>/ and nothing else.

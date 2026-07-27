@@ -34,6 +34,13 @@ pub fn parse(argv: &[String], door: Door) -> Result<(Invocation, bool), Outcome>
     let mut i = 0;
     while i < argv.len() {
         let a = &argv[i];
+        // A bare `--` ends flag parsing: everything after it is positional,
+        // verbatim — the wrapped-command seam (`graph wrap -- codex --model x`
+        // must not have the child's flags eaten as aoide's).
+        if a == "--" {
+            positionals.extend(argv[i + 1..].iter().cloned());
+            break;
+        }
         // `--help`/`-h` anywhere is a request for usage, never a command flag.
         if a == "--help" || a == "-h" {
             help = true;
@@ -285,6 +292,25 @@ mod tests {
         .unwrap();
         assert!(json);
         assert_eq!(inv.flags.get("audit-log").map(String::as_str), Some("/tmp/l"));
+    }
+
+    #[test]
+    fn double_dash_ends_flag_parsing_for_the_wrapped_command() {
+        // `graph wrap --agent codex -- codex --model x`: aoide takes --agent,
+        // the child keeps --model untouched (and even a --json after -- is
+        // the CHILD's, not ours).
+        let (inv, json) = parse(
+            &argv(&[
+                "graph", "wrap", "--agent", "codex", "--", "codex", "--model", "x", "--json",
+            ]),
+            Door::Cli,
+        )
+        .unwrap();
+        assert!(!json);
+        assert_eq!(inv.path, vec!["graph", "wrap"]);
+        assert_eq!(inv.flags.get("agent").map(String::as_str), Some("codex"));
+        assert_eq!(inv.args, vec!["codex", "--model", "x", "--json"]);
+        assert!(!inv.flags.contains_key("model"));
     }
 
     #[test]

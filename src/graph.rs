@@ -1234,6 +1234,80 @@ pub fn session_end(inv: &Invocation) -> Outcome {
     do_session_end(&id)
 }
 
+/// `graph wrap [--agent --parent --id] -- <command…>` — run ANY agent command
+/// as a registered session. The universal door for hookless agents: spawn with
+/// INHERITED stdio (a wrapped TUI runs undisturbed), register the session
+/// running, wait, and mark it done whatever happened — a crashed agent still
+/// resolves instead of haunting the roster. The child sees AOIDE_SESSION_ID,
+/// so anything hookable inside it can self-report richer phases through
+/// `graph session phase --id "$AOIDE_SESSION_ID" --phase blocked`.
+///
+/// Ordering: spawn FIRST, register second — a failed exec must never register
+/// a ghost session. Exit mirrors the child (Ok on success, Error otherwise)
+/// with the real code in data.exitCode; the process code stays canonical.
+pub fn session_wrap(inv: &Invocation) -> Outcome {
+    let cmd = "graph.wrap";
+    if inv.args.is_empty() {
+        return Outcome::usage(
+            cmd,
+            "usage: aoide graph wrap [--agent <name>] [--parent <sessionId>] [--id <id>] -- <command …>",
+        );
+    }
+    let program = &inv.args[0];
+    let agent = inv.flags.get("agent").cloned().unwrap_or_else(|| {
+        std::path::Path::new(program)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| program.clone())
+    });
+    let id = inv.flags.get("id").cloned().unwrap_or_else(|| {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("wrap-{}-{ts}", std::process::id())
+    });
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+
+    let mut child = match std::process::Command::new(program)
+        .args(&inv.args[1..])
+        .env("AOIDE_SESSION_ID", &id)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return Outcome::error(cmd, format!("failed to spawn `{program}`: {e}")),
+    };
+
+    let _ = do_session_start(
+        &id,
+        Some(&agent),
+        cwd.as_deref(),
+        None,
+        inv.flags.get("parent").map(String::as_str),
+    );
+
+    let status = child.wait();
+    let _ = do_session_end(&id);
+
+    match status {
+        Ok(st) if st.success() => {
+            Outcome::ok(cmd, format!("`{agent}` finished (session `{id}`)"))
+                .changed(vec![format!("session {id}: running → done")])
+                .with_data(json!({ "sessionId": id, "agent": agent, "exitCode": 0 }))
+        }
+        Ok(st) => {
+            let code = st.code().unwrap_or(-1); // -1: killed by signal
+            Outcome::error(cmd, format!("`{agent}` exited {code} (session `{id}`)"))
+                .changed(vec![format!("session {id}: running → done")])
+                .with_data(json!({ "sessionId": id, "agent": agent, "exitCode": code }))
+        }
+        Err(e) => Outcome::error(cmd, format!("wait on `{agent}` failed: {e} (session `{id}`)"))
+            .with_data(json!({ "sessionId": id, "agent": agent })),
+    }
+}
+
 /// The action a Claude-Code hook payload maps to (or nothing, for events we
 /// deliberately ignore — the door is a no-op for everything unmapped).
 #[derive(Debug)]
@@ -1586,6 +1660,83 @@ mod tests {
             flags: BTreeMap::new(),
             door: crate::daemon::Door::Cli,
         }
+    }
+
+    fn wrap_invocation(args: &[&str], flags: &[(&str, &str)]) -> Invocation {
+        Invocation {
+            path: vec!["graph".into(), "wrap".into()],
+            args: args.iter().map(|s| s.to_string()).collect(),
+            flags: flags
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            door: crate::daemon::Door::Cli,
+        }
+    }
+
+    /// The universal wrapper end-to-end: a successful child registers and
+    /// resolves done (and SEES its session id); a failing child propagates its
+    /// code through data.exitCode as an Error outcome but STILL resolves done;
+    /// a spawn failure registers nothing — no ghost sessions.
+    #[test]
+    fn wrap_registers_resolves_and_mirrors_the_child() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("wrap");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        // Success: the child asserts AOIDE_SESSION_ID is present in its env.
+        let out = session_wrap(&wrap_invocation(
+            &["sh", "-c", "test -n \"$AOIDE_SESSION_ID\""],
+            &[("id", "wrap-ok")],
+        ));
+        assert_eq!(out.status, crate::output::Status::Ok);
+        assert_eq!(out.data.as_ref().unwrap()["exitCode"], 0);
+        let s: SessionsFile =
+            serde_json::from_str(&std::fs::read_to_string(stage.join("sessions.json")).unwrap())
+                .unwrap();
+        let rec = s.sessions.iter().find(|r| r.session_id == "wrap-ok").unwrap();
+        assert_eq!(rec.state, "done");
+        assert_eq!(rec.agent, "sh"); // basename default
+
+        // Failure: exit code mirrored in data, session still resolves done.
+        let out = session_wrap(&wrap_invocation(
+            &["sh", "-c", "exit 7"],
+            &[("id", "wrap-fail"), ("agent", "sevens")],
+        ));
+        assert_eq!(out.status, crate::output::Status::Error);
+        assert_eq!(out.data.as_ref().unwrap()["exitCode"], 7);
+        let s: SessionsFile =
+            serde_json::from_str(&std::fs::read_to_string(stage.join("sessions.json")).unwrap())
+                .unwrap();
+        let rec = s
+            .sessions
+            .iter()
+            .find(|r| r.session_id == "wrap-fail")
+            .unwrap();
+        assert_eq!(rec.state, "done");
+        assert_eq!(rec.agent, "sevens");
+
+        // Spawn failure: error outcome, and NO session registered.
+        let out = session_wrap(&wrap_invocation(
+            &["/nonexistent-aoide-wrap-test"],
+            &[("id", "wrap-ghost")],
+        ));
+        assert_eq!(out.status, crate::output::Status::Error);
+        let s: SessionsFile =
+            serde_json::from_str(&std::fs::read_to_string(stage.join("sessions.json")).unwrap())
+                .unwrap();
+        assert!(s.sessions.iter().all(|r| r.session_id != "wrap-ghost"));
+
+        // No command at all → usage.
+        let out = session_wrap(&wrap_invocation(&[], &[]));
+        assert_eq!(out.status, crate::output::Status::Usage);
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
     }
 
     /// Defect: `graph view` showed 0 nodes while the staged graph.json still

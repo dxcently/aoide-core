@@ -103,6 +103,7 @@ pub fn dispatch(inv: &Invocation) -> Outcome {
         ["graph", "session", "phase"] => crate::graph::session_phase(inv),
         ["graph", "session", "end"] => crate::graph::session_end(inv),
         ["graph", "session", "hook"] => crate::graph::session_hook(inv),
+        ["graph", "wrap"] => crate::graph::session_wrap(inv),
         ["graph", "focus"] => crate::graph::focus(inv),
         ["graph", "prune"] => crate::graph::prune(inv),
         ["graph", "emit"] => crate::graph::emit(inv),

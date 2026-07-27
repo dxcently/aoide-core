@@ -368,6 +368,18 @@ pub fn commands() -> Vec<Command> {
             implemented: true,
         ),
         cmd!(
+            path: ["graph", "wrap"],
+            summary: "Run ANY agent command as a registered session: spawn with inherited stdio, register running, wait, end. Exports AOIDE_SESSION_ID so the child can self-report phases; exit mirrors the child (0 ok, 1 otherwise; real code in data.exitCode).",
+            args: [arg!("command", "string", true, "The wrapped command and its args — put them after `--` so the child's own flags pass through verbatim.")],
+            flags: [
+                flag!("agent", "string", "Agent name for the roster (default: the command's basename)."),
+                flag!("parent", "string", "Spawning session id — records the spawned-by edge."),
+                flag!("id", "string", "Session id override (default wrap-<pid>-<unixts>)."),
+            ],
+            gated: false,
+            implemented: true,
+        ),
+        cmd!(
             path: ["graph", "focus"],
             summary: "Jump to a session's window via hyprctl focuswindow (Terminal-Commander session jump).",
             args: [arg!("node", "string", true, "Session id (or session:<id> node id) to focus.")],
