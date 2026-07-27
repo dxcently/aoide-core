@@ -470,6 +470,21 @@ fn load_inputs(cmd: &str) -> Result<(ProjectsFile, SessionsFile, HooksFile), Out
     Ok((p, s, h))
 }
 
+/// Re-stage `graph.json` from the CURRENT registries so the document Quickshell
+/// hot-reloads never drifts from what `graph view` (and a fresh `graph emit`)
+/// would compute. Every mutation of projects/sessions calls this, so the staged
+/// graph is always a pure function of the registries — the staged doc can no
+/// longer go stale behind a `project add`/`remove`/`link`/`prune`.
+fn restage_graph() -> Result<PathBuf, String> {
+    let p: ProjectsFile = load_stage(&projects_path())?;
+    let s: SessionsFile = load_stage(&sessions_path())?;
+    let h: HooksFile = load_stage(&hooks_path())?;
+    let doc = build_graph(&p.projects, &s.sessions, &h.hooks);
+    let path = graph_path();
+    write_stage(&path, &doc)?;
+    Ok(path)
+}
+
 /// `graph view` — render the DAG (tree in text, graph document in `--json`).
 pub fn view(inv: &Invocation) -> Outcome {
     let (p, s, h) = match load_inputs("graph.view") {
@@ -525,6 +540,11 @@ pub fn project_add(inv: &Invocation) -> Outcome {
         if let Err(e) = write_stage(&projects_path(), &file) {
             return stage_error("graph.project.add", e);
         }
+        // Keep the staged graph.json in lock-step with the registry.
+        match restage_graph() {
+            Ok(g) => changed.push(g.to_string_lossy().into_owned()),
+            Err(e) => return stage_error("graph.project.add", e),
+        }
     }
     Outcome::ok("graph.project.add", message)
         .changed(changed)
@@ -556,8 +576,13 @@ pub fn project_remove(inv: &Invocation) -> Outcome {
     if let Err(e) = write_stage(&projects_path(), &file) {
         return stage_error("graph.project.remove", e);
     }
+    let mut changed = vec![format!("removed project {name}")];
+    match restage_graph() {
+        Ok(g) => changed.push(g.to_string_lossy().into_owned()),
+        Err(e) => return stage_error("graph.project.remove", e),
+    }
     Outcome::ok("graph.project.remove", format!("removed project `{name}`"))
-        .changed([format!("removed project {name}")])
+        .changed(changed)
         .with_data(json!({ "name": name, "file": projects_path().to_string_lossy() }))
 }
 
@@ -626,6 +651,10 @@ pub fn link(inv: &Invocation) -> Outcome {
         };
         if let Err(e) = write_stage(&sessions_path(), &file) {
             return stage_error("graph.link", e);
+        }
+        match restage_graph() {
+            Ok(g) => changed.push(g.to_string_lossy().into_owned()),
+            Err(e) => return stage_error("graph.link", e),
         }
     }
 
@@ -802,6 +831,10 @@ pub fn prune(_inv: &Invocation) -> Outcome {
             .iter()
             .map(|id| format!("cleared parentSessionId of {id}")),
     );
+    match restage_graph() {
+        Ok(g) => changed.push(g.to_string_lossy().into_owned()),
+        Err(e) => return stage_error("graph.prune", e),
+    }
     Outcome::ok(
         "graph.prune",
         format!(
@@ -1050,6 +1083,73 @@ mod tests {
         assert_eq!(normalize_addr("0xABC"), "abc");
         assert_eq!(normalize_addr("abc"), "abc");
         assert_eq!(normalize_addr("  0Xabc  "), "abc");
+    }
+
+    fn unique_stage(tag: &str) -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "aoide-graph-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn invocation(path: &[&str], args: &[&str]) -> Invocation {
+        Invocation {
+            path: path.iter().map(|s| s.to_string()).collect(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            flags: BTreeMap::new(),
+            door: crate::daemon::Door::Cli,
+        }
+    }
+
+    /// Defect: `graph view` showed 0 nodes while the staged graph.json still
+    /// held a project node from an earlier emit — the staged doc had gone stale
+    /// because `project add` mutated projects.json without re-staging graph.json.
+    /// Now every mutation re-stages, so graph.json always equals what `view`
+    /// (a fresh `build_graph` over the registries) computes.
+    #[test]
+    fn project_add_restages_graph_json_consistent_with_view() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("restage");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        // Register a project. graph.json must now exist and carry the node.
+        let out = project_add(&invocation(
+            &["graph", "project", "add"],
+            &["aoide", "/home/k/Aoide"],
+        ));
+        assert_eq!(out.status, crate::output::Status::Ok);
+
+        let staged: Value =
+            serde_json::from_str(&std::fs::read_to_string(stage.join("graph.json")).unwrap())
+                .unwrap();
+        let nodes = staged["nodes"].as_array().unwrap();
+        assert!(
+            nodes.iter().any(|n| n["id"] == "project:aoide"),
+            "staged graph.json carries the freshly-registered project"
+        );
+
+        // The staged doc equals exactly what `graph view` computes from the
+        // current registries — no drift.
+        let view = view(&invocation(&["graph", "view"], &[]));
+        assert_eq!(&staged, view.data.as_ref().unwrap());
+
+        // A fresh emit would stage the very same document (idempotent).
+        let (p, s, h) = load_inputs("test").unwrap();
+        assert_eq!(staged, build_graph(&p.projects, &s.sessions, &h.hooks));
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
     }
 
     #[test]

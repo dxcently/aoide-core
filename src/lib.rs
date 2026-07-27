@@ -28,9 +28,21 @@ pub fn run_cli(argv: &[String]) -> i32 {
     // Determine `--json` up front for uniform rendering of parse errors too.
     let (inv, json) = match cli::parse(argv, Door::Cli) {
         Ok(v) => v,
-        Err(usage) => {
-            let (body, code) = usage.render(wants_json(argv));
-            eprintln!("{body}");
+        Err(o) => {
+            let json = wants_json(argv);
+            let (body, code) = o.render(json);
+            if code == output::exit::OK {
+                // Informational (a `--help`/`-h` usage block): to stdout, exit 0.
+                // Text mode prints the raw usage; `--json` still emits the
+                // envelope so a tool reading `--help --json` gets structure.
+                if json {
+                    println!("{body}");
+                } else {
+                    println!("{}", o.message);
+                }
+            } else {
+                eprintln!("{body}");
+            }
             return code;
         }
     };
@@ -107,4 +119,14 @@ pub fn run_cli(argv: &[String]) -> i32 {
 /// Did argv contain `--json` anywhere? (used before full parse for errors).
 fn wants_json(argv: &[String]) -> bool {
     argv.iter().any(|a| a == "--json" || a == "--json=true")
+}
+
+/// A crate-wide lock serialising every test that mutates process-global env
+/// (`AOIDE_STAGE_DIR`, `PATH`, `AOIDE_DRACHMA_BIN`, …). `std::env::set_var` is
+/// process-global, so env-touching tests across modules must share ONE mutex or
+/// they race each other under the multithreaded test harness.
+#[cfg(test)]
+pub(crate) fn env_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
 }

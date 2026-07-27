@@ -47,6 +47,32 @@ pub fn stage_dir() -> PathBuf {
         .join("stage")
 }
 
+/// The song tree root (`~/Aoide/song/`) — the parent of the stage dir.
+///
+/// The stage tree is `<song>/stage`; committed songs live under
+/// `<song>/repertoire/<name>/` and cover art under `<song>/covers/`
+/// (CONTRACTS.md §1, §4). Deriving this from [`stage_dir`] rather than
+/// recomputing keeps the whole song tree coherent under an `AOIDE_STAGE_DIR`
+/// override: a test points that at `<tmp>/stage` and the repertoire + covers
+/// resolve under `<tmp>/` alongside it. Every `rice`/`song` reader routes here.
+pub fn song_dir() -> PathBuf {
+    let stage = stage_dir();
+    stage
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or(stage)
+}
+
+/// The committed-song notes file: `<song>/repertoire/<name>/notes.json`.
+pub fn repertoire_notes(name: &str) -> PathBuf {
+    song_dir().join("repertoire").join(name).join("notes.json")
+}
+
+/// The cover-art directory: `<song>/covers/`.
+pub fn covers_dir() -> PathBuf {
+    song_dir().join("covers")
+}
+
 /// Atomic write-temp-then-rename into a file within a directory.
 pub fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -121,15 +147,12 @@ pub fn run() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // `stage_dir()` reads process-global env; serialise these cases so they
-    // never race each other (or any other env-touching test in the crate).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn stage_dir_honors_absolute_env_override() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        // `stage_dir()` reads process-global env; the crate-wide lock serialises
+        // this against every other env-touching test.
+        let _guard = crate::env_lock().lock().unwrap();
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
 
         std::env::set_var("AOIDE_STAGE_DIR", "/tmp/aoide-test-stage");
@@ -146,6 +169,32 @@ mod tests {
         // Absent → the aoide_home()-derived fallback.
         std::env::remove_var("AOIDE_STAGE_DIR");
         assert!(stage_dir().ends_with("Aoide/song/stage"));
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+    }
+
+    #[test]
+    fn song_tree_resolves_under_the_stage_override() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+
+        // Point the stage at `<tmp>/stage`; the song tree is its parent, so
+        // repertoire + covers resolve as siblings of `stage/`.
+        std::env::set_var("AOIDE_STAGE_DIR", "/tmp/aoide-song-test/stage");
+        assert_eq!(song_dir(), PathBuf::from("/tmp/aoide-song-test"));
+        assert_eq!(
+            repertoire_notes("moonlight"),
+            PathBuf::from("/tmp/aoide-song-test/repertoire/moonlight/notes.json")
+        );
+        assert_eq!(covers_dir(), PathBuf::from("/tmp/aoide-song-test/covers"));
+
+        // On the default layout the song tree is `~/Aoide/song`.
+        std::env::remove_var("AOIDE_STAGE_DIR");
+        assert!(song_dir().ends_with("Aoide/song"));
+        assert!(repertoire_notes("x").ends_with("Aoide/song/repertoire/x/notes.json"));
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
