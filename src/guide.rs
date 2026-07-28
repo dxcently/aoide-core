@@ -6,8 +6,22 @@
 pub const GUIDE: &str = "\
 Aoide — how to drive it (aoide guide · tier-0 onboarding)
 
-Aoide is an agent-wearable NixOS desktop. Any agent with a shell is fully
-capable — no MCP required. Orient through four tiers, in order.
+WHAT AOIDE IS (don't conflate the two):
+  * Aoide is the ORCHESTRATION CORE — bridges and APIs between the terminal,
+    the shell, the system, and the OS: ONE interface through which agents are
+    freely orchestrated for any task. Any agent with a shell is fully capable,
+    no MCP required. Every terminal is a CONDUCTABLE, TRACKED session by
+    default, so a central agent can speak into any other running session
+    (see 'Conducting' below). This core runs anywhere there is a shell —
+    portable, headless-capable, agent-first.
+  * AoideOS is the DISTRIBUTION built on that core — the NixOS flake that
+    ADDITIONALLY ships the Quickshell widget-making toolkit (bar, dock,
+    gadgets, the DAG/baton surfaces) and the specialized ricer (the
+    song/notes theming engine). Aoide is the engine; AoideOS is the desktop
+    around it. A capability that is 'Aoide' works with only a shell; one that
+    is 'AoideOS' is desktop/Quickshell/rice.
+
+Orient through four tiers, in order.
 
 Tier 0 — onboarding (AGENTS.md + `aoide guide`)
   You are here. This is the runtime tier map. Read it before acting.
@@ -37,6 +51,18 @@ Tier 2 — stdio MCP (per-session, optional)
 
 Tier 3 — network MCP (user-only)
   Tailnet/funnel MCP is enabled by the USER only, never by an agent.
+
+Conducting — commanding other sessions (the Aoide core, on by default)
+  Every terminal runs its shell under `aoide conduct`, so it is a CONDUCTABLE,
+  TRACKED session: it registers in the graph AND holds a control socket a
+  central controller can type into. To command another session:
+    aoide graph send --id <id> [--submit] [--yes] -- <text>
+  It injects <text> into that session's stdin (+Enter with --submit). The one
+  gated door: held PENDING by default; --yes (or an autogate policy — a parent
+  may freely command its own spawned children) delivers, auto-renames the node
+  to the command, and audits every outcome. `aoide conduct -- <cmd>` wraps any
+  extra agent the same way. This is the substrate: the desktop's terminals are
+  a mesh of sessions a conductor speaks into.
 
 Hooking any agent into the graph (the baton + widgets render what you register)
   song/stage/{sessions,hooks,graph}.json is the one truth the baton TUI and
