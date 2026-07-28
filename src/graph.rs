@@ -942,46 +942,79 @@ pub fn focus(inv: &Invocation) -> Outcome {
     }
     let addr = rec.window_address.clone();
 
+    // Verify + dispatch through the shared focus fn (the same path the
+    // shellbridge socket loop drives on a widget click).
+    match focus_window(&addr) {
+        Ok(()) => Outcome::ok("graph.focus", format!("focused session `{id}`"))
+            .changed([format!("focused window {addr}")])
+            .with_data(json!({ "node": id, "windowAddress": addr, "dispatcher": "hyprctl" })),
+        Err(e) => Outcome::error("graph.focus", format!("{}: {}", id, e.message)).with_data(json!({
+            "reason": e.reason,
+            "node": id,
+            "windowAddress": addr,
+        })),
+    }
+}
+
+/// A structured failure from [`focus_window`]. `reason` is a stable machine
+/// code (`hyprctl-unavailable` / `hyprctl-failed` / `window-not-found` /
+/// `no-window-address`) reused verbatim by `graph focus`'s error envelope.
+#[derive(Debug, Clone)]
+pub struct FocusError {
+    pub reason: &'static str,
+    pub message: String,
+}
+
+/// The shared verify-then-dispatch used by BOTH `graph focus` (CLI) and the
+/// shellbridge socket loop (a widget click). `hyprctl dispatch focuswindow`
+/// exits 0 even when the target window is already gone, so we first list live
+/// clients (`hyprctl clients -j`) and confirm the address is actually present
+/// before dispatching — a vanished terminal is a `window-not-found` error, not
+/// a silent no-op. Returns `Ok(())` only on a dispatched focus; every failure
+/// (empty address, missing/failed hyprctl, unparseable JSON, absent window) is
+/// a structured `Err` — this fn NEVER panics, so a socket loop can call it on
+/// arbitrary input without risk.
+pub fn focus_window(addr: &str) -> Result<(), FocusError> {
+    let addr = addr.trim();
+    if addr.is_empty() {
+        return Err(FocusError {
+            reason: "no-window-address",
+            message: "empty window address".to_string(),
+        });
+    }
+
     // Verify the window exists before dispatching: focuswindow can't tell us.
-    match std::process::Command::new("hyprctl")
+    let clients: Vec<Value> = match std::process::Command::new("hyprctl")
         .args(["clients", "-j"])
         .output()
     {
         Err(e) => {
-            return Outcome::error("graph.focus", format!("hyprctl unavailable: {e}"))
-                .with_data(json!({ "reason": "hyprctl-unavailable", "node": id }));
+            return Err(FocusError {
+                reason: "hyprctl-unavailable",
+                message: format!("hyprctl unavailable: {e}"),
+            });
         }
         Ok(out) if !out.status.success() => {
-            return Outcome::error(
-                "graph.focus",
-                format!("hyprctl clients failed (exit {:?})", out.status.code()),
-            )
-            .with_data(json!({
-                "reason": "hyprctl-failed",
-                "node": id,
-                "stderr": String::from_utf8_lossy(&out.stderr),
-            }));
+            return Err(FocusError {
+                reason: "hyprctl-failed",
+                message: format!("hyprctl clients failed (exit {:?})", out.status.code()),
+            });
         }
-        Ok(out) => {
-            let clients: Vec<Value> = match serde_json::from_slice(&out.stdout) {
-                Ok(Value::Array(a)) => a,
-                _ => {
-                    return Outcome::error("graph.focus", "hyprctl clients: unparseable JSON")
-                        .with_data(json!({ "reason": "hyprctl-failed", "node": id }));
-                }
-            };
-            if !window_present(&clients, &addr) {
-                return Outcome::error(
-                    "graph.focus",
-                    format!("window {addr} for session `{id}` is gone (terminal closed?)"),
-                )
-                .with_data(json!({
-                    "reason": "window-not-found",
-                    "node": id,
-                    "windowAddress": addr,
-                }));
+        Ok(out) => match serde_json::from_slice(&out.stdout) {
+            Ok(Value::Array(a)) => a,
+            _ => {
+                return Err(FocusError {
+                    reason: "hyprctl-failed",
+                    message: "hyprctl clients: unparseable JSON".to_string(),
+                });
             }
-        }
+        },
+    };
+    if !window_present(&clients, addr) {
+        return Err(FocusError {
+            reason: "window-not-found",
+            message: format!("window {addr} is gone (terminal closed?)"),
+        });
     }
 
     let dispatch = format!("address:{addr}");
@@ -989,20 +1022,15 @@ pub fn focus(inv: &Invocation) -> Outcome {
         .args(["dispatch", "focuswindow", &dispatch])
         .output()
     {
-        Err(e) => Outcome::error("graph.focus", format!("hyprctl unavailable: {e}"))
-            .with_data(json!({ "reason": "hyprctl-unavailable", "node": id })),
-        Ok(out) if !out.status.success() => Outcome::error(
-            "graph.focus",
-            format!("hyprctl dispatch failed (exit {:?})", out.status.code()),
-        )
-        .with_data(json!({
-            "reason": "hyprctl-failed",
-            "node": id,
-            "stderr": String::from_utf8_lossy(&out.stderr),
-        })),
-        Ok(_) => Outcome::ok("graph.focus", format!("focused session `{id}`"))
-            .changed([format!("focused window {addr}")])
-            .with_data(json!({ "node": id, "windowAddress": addr, "dispatcher": "hyprctl" })),
+        Err(e) => Err(FocusError {
+            reason: "hyprctl-unavailable",
+            message: format!("hyprctl unavailable: {e}"),
+        }),
+        Ok(out) if !out.status.success() => Err(FocusError {
+            reason: "hyprctl-failed",
+            message: format!("hyprctl dispatch failed (exit {:?})", out.status.code()),
+        }),
+        Ok(_) => Ok(()),
     }
 }
 
@@ -1991,13 +2019,23 @@ fn pid_ancestry(pid: i32) -> Vec<i32> {
 /// `address` is non-empty. Pure over the decoded JSON + the pid list, so it is
 /// unit-testable with a fake client list and a fake ancestry — no `/proc`, no
 /// compositor. `None` when no ancestor owns a window.
+#[cfg(test)]
 fn match_window_for_ancestry(ancestry: &[i32], clients: &[Value]) -> Option<String> {
+    match_window_and_pid(ancestry, clients).map(|(addr, _)| addr)
+}
+
+/// Address-and-pid variant of the ancestor↔client match: also returns the
+/// matched client's `pid` — the terminal window's owning process. The hook door
+/// records this pid on the session so the reaper has a `/proc` liveness signal
+/// that vanishes with the window (never a false reap: the pid lives exactly as
+/// long as the window).
+fn match_window_and_pid(ancestry: &[i32], clients: &[Value]) -> Option<(String, u32)> {
     for &pid in ancestry {
         for c in clients {
             if c.get("pid").and_then(Value::as_i64) == Some(pid as i64) {
                 if let Some(addr) = c.get("address").and_then(Value::as_str) {
                     if !addr.is_empty() {
-                        return Some(addr.to_string());
+                        return Some((addr.to_string(), pid as u32));
                     }
                 }
             }
@@ -2011,6 +2049,17 @@ fn match_window_for_ancestry(ancestry: &[i32], clients: &[Value]) -> Option<Stri
 /// missing/failed `hyprctl`, unparseable JSON, or no ancestor match each yield
 /// `None` — never an error, never a slow path beyond one quick `hyprctl` call.
 fn discover_window_address() -> Option<String> {
+    discover_window().map(|(addr, _)| addr)
+}
+
+/// Best-effort discovery of THIS process's terminal window address AND that
+/// window's owning pid (see [`discover_window_address`]). Shared by `conduct`
+/// (which wants only the address) and the hook door (which records both so a
+/// hook-registered Claude session becomes `graph focus`-jumpable). Guarded
+/// end-to-end: no Hyprland instance signature, a missing/failed `hyprctl`,
+/// unparseable JSON, or no ancestor match each yield `None` — never an error,
+/// never a slow path beyond one quick `hyprctl` call.
+fn discover_window() -> Option<(String, u32)> {
     // Cheap gate: not under a Hyprland compositor → nothing to discover.
     if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
         return None;
@@ -2027,7 +2076,43 @@ fn discover_window_address() -> Option<String> {
         _ => return None,
     };
     let ancestry = pid_ancestry(std::process::id() as i32);
-    match_window_for_ancestry(&ancestry, &clients)
+    match_window_and_pid(&ancestry, &clients)
+}
+
+/// Best-effort backfill of a hook-registered session's `windowAddress` (+ owning
+/// pid) when it is still empty. The hook runs as a subprocess of the agent in
+/// its terminal, so [`discover_window`]'s pid-ancestry ↔ `hyprctl clients` walk
+/// finds that terminal window — giving a Claude Code session (which registers
+/// via `SessionStart` with no window) something for `graph focus` to jump to.
+/// Cheaply gated on `HYPRLAND_INSTANCE_SIGNATURE` and on the address being
+/// empty (so once discovered, later hooks skip all work); a miss leaves the
+/// address empty exactly as before. Only ever fills `windowAddress`/`pid` — it
+/// never touches the session `state` (that is the hook phase's job).
+fn ensure_session_window(id: &str) {
+    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
+        return;
+    }
+    let mut file: SessionsFile = match load_stage(&sessions_path()) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let needs_window =
+        matches!(file.sessions.iter().find(|s| s.session_id == id), Some(s) if s.window_address.is_empty());
+    if !needs_window {
+        return;
+    }
+    let Some((addr, pid)) = discover_window() else {
+        return;
+    };
+    if let Some(s) = file.sessions.iter_mut().find(|s| s.session_id == id) {
+        s.window_address = addr;
+        s.pid = Some(pid);
+    }
+    if file.schema_version.is_empty() {
+        file.schema_version = STAGE_GRAPH_VERSION.to_string();
+    }
+    let _ = write_stage(&sessions_path(), &file);
+    let _ = restage_graph();
 }
 
 /// `aoide conduct [--agent A] [--parent P] [--id I] -- <command …>` — the
@@ -2525,20 +2610,36 @@ fn hook_from_str(buf: &str) -> Outcome {
     };
     let inner = match action {
         HookAction::Start { id, cwd } => {
+            // Best-effort: the hook is a subprocess of the agent's terminal, so
+            // discover that window (+ its owning pid) now and register it — this
+            // is what makes a hook-only Claude session `graph focus`-jumpable.
+            let (window, pid) = match discover_window() {
+                Some((addr, pid)) => (Some(addr), Some(pid)),
+                None => (None, None),
+            };
             do_session_start(
                 &id,
                 Some("claude"),
                 cwd.as_deref(),
+                window.as_deref(),
                 None,
                 None,
                 None,
                 None,
-                None,
-                None,
+                pid,
             )
         }
-        HookAction::Phase { id, phase } => do_session_phase(&id, &phase),
-        HookAction::PhaseIfRunning { id, phase } => do_session_phase_if(&id, &phase, "running"),
+        HookAction::Phase { id, phase } => {
+            // Backfill a still-empty windowAddress on any later hook — covers a
+            // session that registered before the window mapped (or before this
+            // discovery shipped), so it becomes jumpable without a restart.
+            ensure_session_window(&id);
+            do_session_phase(&id, &phase)
+        }
+        HookAction::PhaseIfRunning { id, phase } => {
+            ensure_session_window(&id);
+            do_session_phase_if(&id, &phase, "running")
+        }
         HookAction::End { id } => do_session_end(&id),
     };
     // Fold the inner outcome into an ok envelope — exit 0, no matter what.
@@ -2814,6 +2915,62 @@ mod tests {
         // Empty inputs never match.
         assert_eq!(match_window_for_ancestry(&[], &clients), None);
         assert_eq!(match_window_for_ancestry(&ancestry, &[]), None);
+    }
+
+    #[test]
+    fn window_discovery_also_returns_the_owning_pid() {
+        // The hook door records the matched terminal pid (helps the reaper): a
+        // `/proc` liveness signal that vanishes with the window, never a false
+        // reap. The pid returned is the matched ancestor/client pid.
+        let clients = vec![
+            json!({ "pid": 42, "address": "0xKITTY", "class": "kitty" }),
+            json!({ "pid": 999, "address": "0xOTHER" }),
+        ];
+        assert_eq!(
+            match_window_and_pid(&[100, 42, 7], &clients),
+            Some(("0xKITTY".to_string(), 42))
+        );
+        // Nearest ancestor wins, and its pid comes back with it.
+        let nested = vec![
+            json!({ "pid": 42, "address": "0xOUTER" }),
+            json!({ "pid": 100, "address": "0xINNER" }),
+        ];
+        assert_eq!(
+            match_window_and_pid(&[100, 42, 7], &nested),
+            Some(("0xINNER".to_string(), 100))
+        );
+        // No match → None (address AND pid stay unset, never a partial record).
+        assert_eq!(match_window_and_pid(&[5], &clients), None);
+        assert_eq!(match_window_and_pid(&[42], &[json!({ "pid": 42, "address": "" })]), None);
+    }
+
+    #[test]
+    fn focus_window_rejects_an_empty_address_without_touching_hyprctl() {
+        // The shared focus fn is called by the socket loop on arbitrary input;
+        // an empty/blank address is a structured error, never a panic and never
+        // a stray `hyprctl` dispatch.
+        let err = focus_window("").expect_err("empty address must error");
+        assert_eq!(err.reason, "no-window-address");
+        let err = focus_window("   ").expect_err("blank address must error");
+        assert_eq!(err.reason, "no-window-address");
+    }
+
+    #[test]
+    fn focus_window_never_succeeds_for_a_nonexistent_window() {
+        // A bogus address is never a live client, so the verify step fails —
+        // either `window-not-found` (hyprctl present) or `hyprctl-unavailable`
+        // (no compositor / hyprctl absent, e.g. the build sandbox). Both are
+        // structured Errs: the fn must NEVER report a false focus and NEVER
+        // panic, whatever the environment.
+        let err = focus_window("0xdeadbeefcafe").expect_err("bogus address must not focus");
+        assert!(
+            matches!(
+                err.reason,
+                "window-not-found" | "hyprctl-unavailable" | "hyprctl-failed"
+            ),
+            "unexpected reason {}",
+            err.reason
+        );
     }
 
     #[test]
