@@ -408,6 +408,14 @@ pub fn commands() -> Vec<Command> {
             implemented: true,
         ),
         cmd!(
+            path: ["graph", "reap"],
+            summary: "Reap dead sessions: mark every KILLED session (window gone per hyprctl, or pid's /proc gone) done and drop it, then re-stage. Automatic liveness sweep for SUPER+Q / SIGKILL'd terminals whose own cleanup could never run. Falls back to pid-only liveness off Hyprland; never errors on nothing-to-reap.",
+            args: [],
+            flags: [],
+            gated: false,
+            implemented: true,
+        ),
+        cmd!(
             path: ["graph", "emit"],
             summary: "Stage the resolved DAG to song/stage/graph.json for Quickshell hot-reload (atomic).",
             args: [],

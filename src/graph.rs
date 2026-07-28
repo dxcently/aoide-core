@@ -67,6 +67,15 @@ pub struct SessionRecord {
     pub socket: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The lifecycle-OWNING process's pid (the `conduct`/`wrap` process itself,
+    /// NOT the wrapped child) — the liveness anchor for the reaper. While this
+    /// process lives, normal-exit cleanup (`do_session_end`) is guaranteed; when
+    /// it is SIGKILLed (SUPER+Q kills the whole terminal process tree,
+    /// uncatchably) the record orphans `running` and `/proc/<pid>` vanishes,
+    /// which is exactly the signal `is_session_dead` reaps on. Additive/v0-safe:
+    /// absent on a legacy record and on hook-only sessions that never had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -256,6 +265,9 @@ pub fn build_graph(
         }
         if let Some(t) = &s.title {
             node["title"] = json!(t);
+        }
+        if let Some(pid) = s.pid {
+            node["pid"] = json!(pid);
         }
         nodes.push(node);
         if let Some(parent) = resolved_parent(s, &ids) {
@@ -719,6 +731,183 @@ fn window_present(clients: &[Value], want: &str) -> bool {
     })
 }
 
+// ── Liveness reaping: mark KILLED sessions done so they cannot haunt forever ─
+//
+// A terminal killed with SUPER+Q / SIGKILL cannot run its own cleanup — the
+// `conduct`/`wrap` process is torn down uncatchably, so `do_session_end` never
+// fires and the record is stranded `running` forever (22 dead `conduct-*` piled
+// up in ~8 minutes of use). The reaper detects such orphans out-of-band and
+// resolves them, so conduct-by-default is viable. A FALSE reap of a LIVE session
+// is worse than a stale record, so the predicate never guesses.
+
+/// Does `/proc/<pid>` still exist? The real liveness probe for [`is_session_dead`]
+/// (injected as a closure in tests so the predicate stays pure).
+fn proc_exists(pid: u32) -> bool {
+    std::path::Path::new("/proc").join(pid.to_string()).exists()
+}
+
+/// Is a session DEAD — orphaned so that NO process will ever clean it up? Pure
+/// and unit-tested (feed a fake live-address set + a fake `proc_exists`).
+///
+/// DEAD when EITHER independent signal fires:
+///   * **window gone** — a non-empty `windowAddress` that is NOT among the live
+///     `hyprctl clients -j` addresses (the SUPER+Q kill: the window vanished), OR
+///   * **process gone** — a recorded `pid` whose `/proc/<pid>` no longer exists
+///     (the process-killed case).
+///
+/// The never-false-reap guards:
+///   * `live_addresses` is an `Option`: `None` means the compositor could not be
+///     queried (no Hyprland, hyprctl missing/failed) — the window signal is then
+///     UNKNOWN and contributes nothing, so we never reap a windowed session we
+///     merely failed to see. Only a `Some(live)` we actually gathered can fire it.
+///   * A session with NEITHER signal (empty `windowAddress` AND no `pid` — e.g. a
+///     hook-only session that has not yet discovered a window/pid) is left alone:
+///     absence of evidence is never evidence of death.
+pub fn is_session_dead(
+    rec: &SessionRecord,
+    live_addresses: Option<&HashSet<String>>,
+    proc_exists: impl Fn(u32) -> bool,
+) -> bool {
+    let window_signal = match live_addresses {
+        Some(live) => {
+            !rec.window_address.is_empty()
+                && !live.contains(&normalize_addr(&rec.window_address))
+        }
+        None => false, // compositor not queried — window liveness is unknown.
+    };
+    let pid_signal = matches!(rec.pid, Some(p) if !proc_exists(p));
+    window_signal || pid_signal
+}
+
+/// Gather the normalised live window addresses from `hyprctl clients -j`.
+/// Returns `None` (→ pid-only liveness) whenever the compositor cannot be
+/// consulted authoritatively: no `HYPRLAND_INSTANCE_SIGNATURE`, a missing/failed
+/// `hyprctl`, or unparseable JSON. This is the seam that keeps the reaper safe
+/// off-Hyprland — it degrades to the pid signal instead of blindly reaping every
+/// windowed session it could not see (matches [`discover_window_address`]'s gate).
+fn live_window_addresses() -> Option<HashSet<String>> {
+    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
+        return None;
+    }
+    let out = std::process::Command::new("hyprctl")
+        .args(["clients", "-j"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let clients: Vec<Value> = match serde_json::from_slice(&out.stdout) {
+        Ok(Value::Array(a)) => a,
+        _ => return None,
+    };
+    Some(
+        clients
+            .iter()
+            .filter_map(|c| c.get("address").and_then(Value::as_str))
+            .filter(|a| !a.is_empty())
+            .map(normalize_addr)
+            .collect(),
+    )
+}
+
+/// `graph reap` — the automatic liveness sweep. Marks every DEAD (killed,
+/// orphaned) session `done` (and its hook record), then reuses [`prune_done`] to
+/// drop them + clear orphaned parent links, re-staging `graph.json` atomically.
+/// Cheap: one `hyprctl` call + a stage read, and a stage WRITE only when
+/// something was actually reaped. NEVER errors non-zero on "nothing to reap" and
+/// NEVER on an unavailable compositor (it falls back to pid-only liveness).
+pub fn reap(_inv: &Invocation) -> Outcome {
+    let cmd = "graph.reap";
+    let mut s_file: SessionsFile = match load_stage(&sessions_path()) {
+        Ok(f) => f,
+        Err(e) => return stage_error(cmd, e),
+    };
+    let mut h_file: HooksFile = match load_stage(&hooks_path()) {
+        Ok(f) => f,
+        Err(e) => return stage_error(cmd, e),
+    };
+
+    let live = live_window_addresses();
+    // Only STILL-live records can be dead-by-liveness; an already-`done` session
+    // is prune's job, not a reap. This is the set the liveness predicate killed.
+    let reaped: Vec<String> = s_file
+        .sessions
+        .iter()
+        .filter(|s| s.state != "done")
+        .filter(|s| is_session_dead(s, live.as_ref(), proc_exists))
+        .map(|s| s.session_id.clone())
+        .collect();
+
+    if reaped.is_empty() {
+        return Outcome::ok(cmd, "nothing to reap (all sessions live)").with_data(json!({
+            "reaped": [],
+            "hyprctlAvailable": live.is_some(),
+        }));
+    }
+
+    // Mark each reaped session done in BOTH files, then let prune_done drop them
+    // (and any pre-existing `done`) + clear orphaned parentSessionIds.
+    let dead: HashSet<&str> = reaped.iter().map(String::as_str).collect();
+    let now = now_iso_utc();
+    for s in s_file.sessions.iter_mut() {
+        if dead.contains(s.session_id.as_str()) {
+            s.state = "done".to_string();
+        }
+    }
+    for id in &reaped {
+        upsert_hook(&mut h_file.hooks, id, "done", &now);
+    }
+
+    let (kept_s, kept_h, removed, cleared) = prune_done(
+        std::mem::take(&mut s_file.sessions),
+        std::mem::take(&mut h_file.hooks),
+    );
+    s_file.sessions = kept_s;
+    h_file.hooks = kept_h;
+    if s_file.schema_version.is_empty() {
+        s_file.schema_version = STAGE_GRAPH_VERSION.to_string();
+    }
+    if h_file.schema_version.is_empty() {
+        h_file.schema_version = STAGE_GRAPH_VERSION.to_string();
+    }
+    if let Err(e) = write_stage(&sessions_path(), &s_file) {
+        return stage_error(cmd, e);
+    }
+    if let Err(e) = write_stage(&hooks_path(), &h_file) {
+        return stage_error(cmd, e);
+    }
+
+    let mut changed: Vec<String> = reaped
+        .iter()
+        .map(|id| format!("reaped dead session {id} (killed; running → done → dropped)"))
+        .collect();
+    changed.extend(
+        cleared
+            .iter()
+            .map(|id| format!("cleared parentSessionId of {id}")),
+    );
+    match restage_graph() {
+        Ok(g) => changed.push(g.to_string_lossy().into_owned()),
+        Err(e) => return stage_error(cmd, e),
+    }
+    Outcome::ok(
+        cmd,
+        format!(
+            "reaped {} dead session(s); dropped {} total; cleared {} orphaned parent link(s)",
+            reaped.len(),
+            removed.len(),
+            cleared.len()
+        ),
+    )
+    .changed(changed)
+    .with_data(json!({
+        "reaped": reaped,
+        "removed": removed,
+        "clearedParents": cleared,
+        "hyprctlAvailable": live.is_some(),
+    }))
+}
+
 /// `graph focus <node>` — jump to the session's window via hyprctl
 /// (the Terminal-Commander session-jump flow).
 ///
@@ -962,6 +1151,7 @@ pub fn upsert_session(
     conductable: Option<bool>,
     socket: Option<&str>,
     title: Option<&str>,
+    pid: Option<u32>,
     now: &str,
 ) -> bool {
     if let Some(s) = sessions.iter_mut().find(|s| s.session_id == id) {
@@ -986,6 +1176,9 @@ pub fn upsert_session(
         if let Some(t) = title {
             s.title = Some(t.to_string());
         }
+        if let Some(p) = pid {
+            s.pid = Some(p);
+        }
         s.state = "running".to_string(); // `start` means running; startedAt kept.
         false
     } else {
@@ -1000,6 +1193,7 @@ pub fn upsert_session(
             conductable,
             socket: socket.map(str::to_string),
             title: title.map(str::to_string),
+            pid,
             extra: Map::new(),
         });
         true
@@ -1049,6 +1243,7 @@ fn do_session_start(
     conductable: Option<bool>,
     socket: Option<&str>,
     title: Option<&str>,
+    pid: Option<u32>,
 ) -> Outcome {
     let cmd = "graph.session.start";
     let mut file: SessionsFile = match load_stage(&sessions_path()) {
@@ -1078,6 +1273,7 @@ fn do_session_start(
         conductable,
         socket,
         title,
+        pid,
         &now,
     );
     let (r_agent, r_started) = file
@@ -1268,6 +1464,7 @@ pub fn session_start(inv: &Invocation) -> Outcome {
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -1348,6 +1545,11 @@ pub fn session_wrap(inv: &Invocation) -> Outcome {
         None,
         None,
         None,
+        // The lifecycle-OWNING pid is THIS wrap process, not `child`: while wrap
+        // lives it always runs the `do_session_end` below (even on a child crash),
+        // so only wrap's OWN death — a SIGKILL it cannot catch — orphans the
+        // record, and that is precisely the pid the reaper should watch.
+        Some(std::process::id()),
     );
 
     let status = child.wait();
@@ -1899,6 +2101,14 @@ pub fn session_conduct(inv: &Invocation) -> Outcome {
             None
         },
         None,
+        // Record THIS conduct process's pid (not the PTY child's): conduct owns
+        // the session lifecycle — the `do_session_end` at the bottom of this fn
+        // always resolves the record on any NORMAL exit. Only conduct's own
+        // uncatchable death (SUPER+Q SIGKILLs the whole kitty→shell→conduct tree)
+        // leaves the record stranded `running`, and then `/proc/<this-pid>`
+        // vanishes: the reaper's pid signal. (It is also the pid already embedded
+        // in the default `conduct-<pid>-<ts>` id.)
+        Some(std::process::id()),
     );
 
     // Raw-mode the real tty + arm resize passthrough. The TtyRaw guard restores
@@ -2315,7 +2525,17 @@ fn hook_from_str(buf: &str) -> Outcome {
     };
     let inner = match action {
         HookAction::Start { id, cwd } => {
-            do_session_start(&id, Some("claude"), cwd.as_deref(), None, None, None, None, None)
+            do_session_start(
+                &id,
+                Some("claude"),
+                cwd.as_deref(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
         }
         HookAction::Phase { id, phase } => do_session_phase(&id, &phase),
         HookAction::PhaseIfRunning { id, phase } => do_session_phase_if(&id, &phase, "running"),
@@ -2365,6 +2585,7 @@ mod tests {
             conductable: None,
             socket: None,
             title: None,
+            pid: None,
             extra: Map::new(),
         }
     }
@@ -2849,6 +3070,7 @@ mod tests {
             Some(true),
             Some(socket.to_str().unwrap()),
             None,
+            None,
         );
 
         // Accept + read the injected payload to EOF in a thread.
@@ -2924,6 +3146,7 @@ mod tests {
             Some(true),
             Some(socket.to_str().unwrap()),
             None,
+            None,
         );
 
         let out = session_send(&send_invocation(&["do", "a", "thing"], &[("id", id)]));
@@ -2993,6 +3216,7 @@ mod tests {
             Some(true),
             Some(socket.to_str().unwrap()),
             None,
+            None,
         );
 
         let acc = std::thread::spawn(move || {
@@ -3040,7 +3264,7 @@ mod tests {
         assert_eq!(out.data.as_ref().unwrap()["reason"], "session-not-found");
 
         // Registered but not conductable (a plain wrap/hook session).
-        do_session_start("plain", Some("claude"), None, None, None, None, None, None);
+        do_session_start("plain", Some("claude"), None, None, None, None, None, None, None);
         let out = session_send(&send_invocation(&["hi"], &[("id", "plain"), ("yes", "true")]));
         assert_eq!(out.status, crate::output::Status::Error);
         assert_eq!(out.data.as_ref().unwrap()["reason"], "not-conductable");
@@ -3196,6 +3420,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             "2026-01-01T00:00:00Z"
         ));
         assert_eq!(sessions.len(), 1);
@@ -3215,6 +3440,7 @@ mod tests {
             Some(true),
             Some("/run/user/1000/aoide/session-s1.sock"),
             Some("do the thing"),
+            None,
             "2026-02-02T00:00:00Z"
         ));
         assert_eq!(sessions.len(), 1, "re-start never duplicates");
@@ -3583,5 +3809,117 @@ mod tests {
         let back = serde_json::to_value(&rec).unwrap();
         assert_eq!(back["futureField"], 42);
         assert!(back.get("parentSessionId").is_none());
+        // A record with no pid serialises WITHOUT the key (additive/v0-safe).
+        assert!(back.get("pid").is_none());
+    }
+
+    // ── Reaper: the liveness predicate + the `graph reap` sweep ─────────────
+
+    #[test]
+    fn is_session_dead_combines_signals_and_never_false_reaps() {
+        let live: HashSet<String> = ["aaa", "bbb"].iter().map(|s| s.to_string()).collect();
+        let alive = |_p: u32| true; // /proc/<pid> exists
+        let dead_proc = |_p: u32| false; // /proc/<pid> is gone
+        let rec = |window: &str, pid: Option<u32>| SessionRecord {
+            window_address: window.into(),
+            pid,
+            ..Default::default()
+        };
+
+        // Window-gone (the SUPER+Q kill): a non-empty window absent from the live
+        // set is dead even when the pid is alive. The match is 0x/case-tolerant.
+        assert!(is_session_dead(&rec("0xCCC", None), Some(&live), alive));
+        assert!(is_session_dead(&rec("0xCCC", Some(9)), Some(&live), alive));
+        // A live window (normalised match) with a live pid → NOT dead.
+        assert!(!is_session_dead(&rec("0xAAA", Some(9)), Some(&live), alive));
+
+        // Process-gone: a pid whose /proc vanished is dead regardless of window
+        // (here the window IS live, so ONLY the pid signal fires).
+        assert!(is_session_dead(&rec("0xAAA", Some(9)), Some(&live), dead_proc));
+
+        // NEVER-FALSE-REAP #1 — neither signal (no window, no pid): left alone.
+        assert!(!is_session_dead(&rec("", None), Some(&live), dead_proc));
+
+        // NEVER-FALSE-REAP #2 — compositor NOT queried (None): the window signal
+        // is suppressed, so a windowed session we could not SEE is never reaped;
+        // only the authoritative pid signal remains.
+        assert!(!is_session_dead(&rec("0xCCC", None), None, alive));
+        assert!(!is_session_dead(&rec("0xCCC", Some(9)), None, alive)); // pid alive → alive
+        assert!(is_session_dead(&rec("0xCCC", Some(9)), None, dead_proc)); // pid gone → dead
+    }
+
+    #[test]
+    fn reap_drops_killed_sessions_but_spares_the_living() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "HYPRLAND_INSTANCE_SIGNATURE"]);
+        // Force pid-only liveness: with no compositor the window signal is
+        // suppressed, so the reap decision rests purely on /proc/<pid> — fully
+        // deterministic in a test (no hyprctl, no real windows).
+        std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
+        let stage = unique_stage("reap");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        // A pid that can NEVER exist (above every Linux pid_max) is the killed
+        // session; this very process's pid is the living one; and a hook-only
+        // session carries NEITHER signal and must be spared.
+        let dead_pid = u32::MAX;
+        let now = "2026-01-01T00:00:00Z";
+        let mut sessions = Vec::new();
+        upsert_session(
+            &mut sessions, "live", None, Some("/w"), None, None, None, None, None,
+            Some(std::process::id()), now,
+        );
+        upsert_session(
+            &mut sessions, "killed", None, Some("/w"), None, None, None, None, None,
+            Some(dead_pid), now,
+        );
+        upsert_session(
+            &mut sessions, "hookonly", None, Some("/w"), None, None, None, None, None,
+            None, now,
+        );
+        write_stage(
+            &sessions_path(),
+            &SessionsFile { schema_version: "0".into(), sessions },
+        )
+        .unwrap();
+        let mut hooks = Vec::new();
+        upsert_hook(&mut hooks, "killed", "running", now);
+        write_stage(
+            &hooks_path(),
+            &HooksFile { schema_version: "0".into(), hooks },
+        )
+        .unwrap();
+
+        let out = reap(&invocation(&["graph", "reap"], &[]));
+        assert_eq!(out.status, crate::output::Status::Ok);
+        let data = out.data.unwrap();
+        assert_eq!(data["reaped"], json!(["killed"]));
+        assert_eq!(data["hyprctlAvailable"], json!(false)); // pid-only fallback
+
+        // The killed session AND its hook are gone; live + hook-only survive.
+        let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let ids: Vec<&str> = s2.sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert!(ids.contains(&"live"), "a live session is never reaped");
+        assert!(ids.contains(&"hookonly"), "a signal-less session is never reaped");
+        assert!(!ids.contains(&"killed"), "the killed session was reaped");
+        let h2: HooksFile = load_stage(&hooks_path()).unwrap();
+        assert!(h2.hooks.iter().all(|h| h.session_id != "killed"));
+
+        // graph.json was re-staged and no longer carries the reaped node.
+        let g: Value =
+            serde_json::from_str(&std::fs::read_to_string(stage.join("graph.json")).unwrap())
+                .unwrap();
+        assert!(g["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|n| n["id"] != "session:killed"));
+
+        // Idempotent + never non-zero: a second sweep finds nothing to reap.
+        let again = reap(&invocation(&["graph", "reap"], &[]));
+        assert_eq!(again.status, crate::output::Status::Ok);
+        assert_eq!(again.data.unwrap()["reaped"], json!([]));
+
+        let _ = std::fs::remove_dir_all(&stage);
     }
 }

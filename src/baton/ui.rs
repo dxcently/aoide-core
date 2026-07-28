@@ -663,6 +663,7 @@ mod tests {
             conductable: None,
             socket: None,
             title: None,
+            pid: None,
             extra: Map::new(),
         }
     }
