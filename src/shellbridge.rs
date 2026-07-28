@@ -54,11 +54,12 @@ pub fn stage_dir() -> PathBuf {
 /// The song tree root (`~/Aoide/song/`) — the parent of the stage dir.
 ///
 /// The stage tree is `<song>/stage`; committed songs live under
-/// `<song>/repertoire/<name>/` and cover art under `<song>/covers/`
-/// (CONTRACTS.md §1, §4). Deriving this from [`stage_dir`] rather than
-/// recomputing keeps the whole song tree coherent under an `AOIDE_STAGE_DIR`
-/// override: a test points that at `<tmp>/stage` and the repertoire + covers
-/// resolve under `<tmp>/` alongside it. Every `rice`/`song` reader routes here.
+/// `<song>/songbook/<name>/` and each song's cover art under
+/// `<song>/songbook/<name>/assets/` (CONTRACTS.md §1, §4). Deriving this from
+/// [`stage_dir`] rather than recomputing keeps the whole song tree coherent
+/// under an `AOIDE_STAGE_DIR` override: a test points that at `<tmp>/stage` and
+/// the songbook resolves under `<tmp>/` alongside it. Every `rice`/`song`
+/// reader routes here.
 pub fn song_dir() -> PathBuf {
     let stage = stage_dir();
     stage
@@ -67,14 +68,9 @@ pub fn song_dir() -> PathBuf {
         .unwrap_or(stage)
 }
 
-/// The committed-song notes file: `<song>/repertoire/<name>/drachma.json`.
-pub fn repertoire_notes(name: &str) -> PathBuf {
-    song_dir().join("repertoire").join(name).join("drachma.json")
-}
-
-/// The cover-art directory: `<song>/covers/`.
-pub fn covers_dir() -> PathBuf {
-    song_dir().join("covers")
+/// The committed-song notes file: `<song>/songbook/<name>/drachma.json`.
+pub fn songbook_notes(name: &str) -> PathBuf {
+    song_dir().join("songbook").join(name).join("drachma.json")
 }
 
 /// Atomic write-temp-then-rename into a file within a directory.
@@ -344,19 +340,18 @@ mod tests {
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
 
         // Point the stage at `<tmp>/stage`; the song tree is its parent, so
-        // repertoire + covers resolve as siblings of `stage/`.
+        // the songbook resolves as a sibling of `stage/`.
         std::env::set_var("AOIDE_STAGE_DIR", "/tmp/aoide-song-test/stage");
         assert_eq!(song_dir(), PathBuf::from("/tmp/aoide-song-test"));
         assert_eq!(
-            repertoire_notes("moonlight"),
-            PathBuf::from("/tmp/aoide-song-test/repertoire/moonlight/drachma.json")
+            songbook_notes("moonlight"),
+            PathBuf::from("/tmp/aoide-song-test/songbook/moonlight/drachma.json")
         );
-        assert_eq!(covers_dir(), PathBuf::from("/tmp/aoide-song-test/covers"));
 
         // On the default layout the song tree is `~/Aoide/song`.
         std::env::remove_var("AOIDE_STAGE_DIR");
         assert!(song_dir().ends_with("Aoide/song"));
-        assert!(repertoire_notes("x").ends_with("Aoide/song/repertoire/x/drachma.json"));
+        assert!(songbook_notes("x").ends_with("Aoide/song/songbook/x/drachma.json"));
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),

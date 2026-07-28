@@ -160,7 +160,7 @@ pub fn commands() -> Vec<Command> {
         cmd!(
             path: ["rice", "preview"],
             summary: "Rehearse a rice live (stage/drachma.json hot-reload); nothing committed.",
-            args: [arg!("name", "string", true, "Rice/song name to preview (from song/repertoire/).")],
+            args: [arg!("name", "string", true, "Rice/song name to preview (from song/songbook/).")],
             flags: [],
             gated: false,
             implemented: true,
@@ -175,7 +175,7 @@ pub fn commands() -> Vec<Command> {
         ),
         cmd!(
             path: ["rice", "transpose"],
-            summary: "Replay a song in another key (palette) from song/keys/.",
+            summary: "Replay a song in another key (palette) from the song's songbook/<song>/palette/.",
             args: [
                 arg!("rice", "string", true, "Source song name."),
                 arg!("palette", "string", true, "Key/palette name to transpose into."),

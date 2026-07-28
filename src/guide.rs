@@ -93,7 +93,7 @@ Hooking any agent into the graph (the baton + widgets render what you register)
 
 House rules (hard constraints)
   1. `song/` is your only writable domain. You commit to
-     song/repertoire/<song>/ and nothing else.
+     song/songbook/<song>/ and nothing else.
   2. The rebuild is user-gated. You propose; the user admits; git records.
      No background rebuilds, no self-updaters — house policy.
   3. Read before you write. `rice gen` reads song/songbook/ and the relevant

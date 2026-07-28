@@ -190,7 +190,7 @@ pub fn dispatch(inv: &Invocation) -> Outcome {
 ///   usage error (exit 2). We never delegate to drachma with no file.
 /// * **an arg that names an existing file** — taken as a literal path.
 /// * **otherwise the arg is a committed-song NAME** →
-///   `<song>/repertoire/<name>/drachma.json` (resolved through the same stage-dir
+///   `<song>/songbook/<name>/drachma.json` (resolved through the same stage-dir
 ///   seam as `graph emit`, so an `AOIDE_STAGE_DIR` override relocates it too).
 fn resolve_rice_notes(inv: &Invocation, cmd: &str) -> Result<PathBuf, Outcome> {
     match inv.args.first() {
@@ -219,7 +219,7 @@ fn resolve_rice_notes(inv: &Invocation, cmd: &str) -> Result<PathBuf, Outcome> {
             if literal.is_file() {
                 Ok(literal)
             } else {
-                Ok(shellbridge::repertoire_notes(arg))
+                Ok(shellbridge::songbook_notes(arg))
             }
         }
     }
@@ -273,20 +273,20 @@ const COVER_EXTS: &[&str] = &["webp", "png", "jpg", "jpeg"];
 ///
 /// v0 notes carry no runtime cover field (the schema is palette-closed; the
 /// build-time `aoide.drachma.wallpaper` is a nix path, not a song/ runtime read),
-/// so a cover is only ever staged when one is physically present: first a
-/// `cover.<ext>` co-located with the song, then `<covers>/<name>.<ext>`.
+/// so a cover is only ever staged when one is physically present. Covers now
+/// live per-song under `songbook/<name>/assets/`: first a `cover.<ext>` there,
+/// then `<name>.<ext>` there.
 fn derive_cover(name: &str) -> Option<PathBuf> {
-    if let Some(dir) = shellbridge::repertoire_notes(name).parent() {
-        for ext in COVER_EXTS {
-            let p = dir.join(format!("cover.{ext}"));
-            if p.is_file() {
-                return Some(p);
-            }
+    let notes = shellbridge::songbook_notes(name);
+    let assets = notes.parent()?.join("assets");
+    for ext in COVER_EXTS {
+        let p = assets.join(format!("cover.{ext}"));
+        if p.is_file() {
+            return Some(p);
         }
     }
-    let covers = shellbridge::covers_dir();
     for ext in COVER_EXTS {
-        let p = covers.join(format!("{name}.{ext}"));
+        let p = assets.join(format!("{name}.{ext}"));
         if p.is_file() {
             return Some(p);
         }
@@ -299,7 +299,7 @@ fn derive_cover(name: &str) -> Option<PathBuf> {
 /// surfaces hot-reload it. Nothing is committed; no compositor dispatch in v1.
 ///
 /// This is the honest form of the hand-copy agents had been doing: drive the
-/// repertoire notes into the stage so the shell has a palette to render.
+/// songbook notes into the stage so the shell has a palette to render.
 fn handle_rice_preview(inv: &Invocation) -> Outcome {
     let name = match inv.args.first() {
         Some(n) => n.clone(),
@@ -309,7 +309,7 @@ fn handle_rice_preview(inv: &Invocation) -> Outcome {
         }
     };
 
-    let notes_src = shellbridge::repertoire_notes(&name);
+    let notes_src = shellbridge::songbook_notes(&name);
     let raw = match std::fs::read_to_string(&notes_src) {
         Ok(s) => s,
         Err(e) => {
@@ -484,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn lint_bare_name_resolves_to_repertoire_notes_not_a_literal_path() {
+    fn lint_bare_name_resolves_to_songbook_notes_not_a_literal_path() {
         let _g = crate::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "PATH", "AOIDE_DRACHMA_BIN"]);
         let root = unique_tmp("lint-name");
@@ -493,12 +493,12 @@ mod tests {
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
         hide_drachma();
 
-        // `moonlight` is a NAME, not a path — it must resolve under repertoire/.
+        // `moonlight` is a NAME, not a path — it must resolve under songbook/.
         let out = handle_rice_lint(&inv(&["rice", "lint"], &["moonlight"]));
         let notes = out.data.unwrap()["notes"].as_str().unwrap().to_string();
         assert!(
-            notes.ends_with("repertoire/moonlight/drachma.json"),
-            "bare name resolved to the repertoire song: {notes}"
+            notes.ends_with("songbook/moonlight/drachma.json"),
+            "bare name resolved to the songbook song: {notes}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -525,7 +525,7 @@ mod tests {
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("preview-ok");
         let stage = root.join("stage");
-        let song = root.join("repertoire").join("moonlight");
+        let song = root.join("songbook").join("moonlight");
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::create_dir_all(&song).unwrap();
         std::fs::write(song.join("drachma.json"), VALID_NOTES).unwrap();
@@ -548,18 +548,18 @@ mod tests {
     }
 
     #[test]
-    fn preview_stages_a_derivable_cover_from_covers_dir() {
+    fn preview_stages_a_derivable_cover_from_song_assets() {
         let _g = crate::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("preview-cover");
         let stage = root.join("stage");
-        let song = root.join("repertoire").join("dusk");
-        let covers = root.join("covers");
+        let song = root.join("songbook").join("dusk");
+        let assets = song.join("assets");
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::create_dir_all(&song).unwrap();
-        std::fs::create_dir_all(&covers).unwrap();
+        std::fs::create_dir_all(&assets).unwrap();
         std::fs::write(song.join("drachma.json"), VALID_NOTES).unwrap();
-        std::fs::write(covers.join("dusk.png"), b"\x89PNG stub").unwrap();
+        std::fs::write(assets.join("dusk.png"), b"\x89PNG stub").unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
         let out = handle_rice_preview(&inv(&["rice", "preview"], &["dusk"]));
@@ -568,7 +568,7 @@ mod tests {
         assert!(cover.contains("dusk.png"), "cover.json points at the derived file");
         assert!(out.changed.iter().any(|c| c.ends_with("cover.json")));
         let data = out.data.unwrap();
-        assert!(data["cover"].as_str().unwrap().ends_with("covers/dusk.png"));
+        assert!(data["cover"].as_str().unwrap().ends_with("assets/dusk.png"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
