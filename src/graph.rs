@@ -15,6 +15,8 @@ use crate::shellbridge::{atomic_write, stage_dir};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashSet};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 
 /// graph.json / projects.json stage-file format version (CONTRACTS.md §4).
@@ -54,6 +56,17 @@ pub struct SessionRecord {
         skip_serializing_if = "Option::is_none"
     )]
     pub parent_session_id: Option<String>,
+    /// Conductor-channel additive fields (v0-safe; absent on a legacy record).
+    /// `conductable` marks a session spawned under `aoide conduct` (it owns a
+    /// PTY + control socket); `socket` is that per-session injection socket
+    /// (`$XDG_RUNTIME_DIR/aoide/session-<id>.sock`); `title` is the auto-renamed
+    /// one-line task the last delivered `graph send` wrote onto the node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conductable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -223,7 +236,7 @@ pub fn build_graph(
         }));
     }
     for s in &sessions {
-        nodes.push(json!({
+        let mut node = json!({
             "id": format!("session:{}", s.session_id),
             "kind": "session",
             "agent": s.agent,
@@ -231,7 +244,20 @@ pub fn build_graph(
             "state": s.state,
             "windowAddress": s.window_address,
             "startedAt": s.started_at,
-        }));
+        });
+        // Conductor-channel fields ride onto the node only when present, so a
+        // legacy/observe-only session stays byte-for-byte as before and the
+        // baton can distinguish conductable nodes + label by title.
+        if let Some(c) = s.conductable {
+            node["conductable"] = json!(c);
+        }
+        if let Some(sock) = &s.socket {
+            node["socket"] = json!(sock);
+        }
+        if let Some(t) = &s.title {
+            node["title"] = json!(t);
+        }
+        nodes.push(node);
         if let Some(parent) = resolved_parent(s, &ids) {
             edges.push(json!({
                 "from": format!("session:{parent}"),
@@ -933,6 +959,9 @@ pub fn upsert_session(
     cwd: Option<&str>,
     window: Option<&str>,
     parent: Option<&str>,
+    conductable: Option<bool>,
+    socket: Option<&str>,
+    title: Option<&str>,
     now: &str,
 ) -> bool {
     if let Some(s) = sessions.iter_mut().find(|s| s.session_id == id) {
@@ -948,6 +977,15 @@ pub fn upsert_session(
         if let Some(p) = parent {
             s.parent_session_id = Some(p.to_string());
         }
+        if let Some(c) = conductable {
+            s.conductable = Some(c);
+        }
+        if let Some(sock) = socket {
+            s.socket = Some(sock.to_string());
+        }
+        if let Some(t) = title {
+            s.title = Some(t.to_string());
+        }
         s.state = "running".to_string(); // `start` means running; startedAt kept.
         false
     } else {
@@ -959,6 +997,9 @@ pub fn upsert_session(
             state: "running".to_string(),
             started_at: now.to_string(),
             parent_session_id: parent.map(str::to_string),
+            conductable,
+            socket: socket.map(str::to_string),
+            title: title.map(str::to_string),
             extra: Map::new(),
         });
         true
@@ -998,12 +1039,16 @@ fn require_flag(inv: &Invocation, name: &str) -> Result<String, Outcome> {
 }
 
 /// Core of `graph session start`: cycle-check a parent, UPSERT, re-stage.
+#[allow(clippy::too_many_arguments)]
 fn do_session_start(
     id: &str,
     agent: Option<&str>,
     cwd: Option<&str>,
     window: Option<&str>,
     parent: Option<&str>,
+    conductable: Option<bool>,
+    socket: Option<&str>,
+    title: Option<&str>,
 ) -> Outcome {
     let cmd = "graph.session.start";
     let mut file: SessionsFile = match load_stage(&sessions_path()) {
@@ -1023,7 +1068,18 @@ fn do_session_start(
     }
 
     let now = now_iso_utc();
-    let inserted = upsert_session(&mut file.sessions, id, agent, cwd, window, parent, &now);
+    let inserted = upsert_session(
+        &mut file.sessions,
+        id,
+        agent,
+        cwd,
+        window,
+        parent,
+        conductable,
+        socket,
+        title,
+        &now,
+    );
     let (r_agent, r_started) = file
         .sessions
         .iter()
@@ -1209,6 +1265,9 @@ pub fn session_start(inv: &Invocation) -> Outcome {
         inv.flags.get("cwd").map(String::as_str),
         inv.flags.get("window").map(String::as_str),
         inv.flags.get("parent").map(String::as_str),
+        None,
+        None,
+        None,
     )
 }
 
@@ -1286,6 +1345,9 @@ pub fn session_wrap(inv: &Invocation) -> Outcome {
         cwd.as_deref(),
         None,
         inv.flags.get("parent").map(String::as_str),
+        None,
+        None,
+        None,
     );
 
     let status = child.wait();
@@ -1306,6 +1368,746 @@ pub fn session_wrap(inv: &Invocation) -> Outcome {
         Err(e) => Outcome::error(cmd, format!("wait on `{agent}` failed: {e} (session `{id}`)"))
             .with_data(json!({ "sessionId": id, "agent": agent })),
     }
+}
+
+// ── Conductor channel: `conduct` (PTY wrap) + `graph send` (injection) ──────
+//
+// `conduct` is the controllable sibling of `wrap`: it runs the agent on its own
+// PTY so a central controller (or the baton) can type INTO the running agent
+// through a per-session control socket, while a wrapped TUI still runs
+// undisturbed. `graph send` is the one injection door — gated through aoided's
+// audit path (pending by default; `--yes`/autogate delivers). The unsafe libc
+// here is confined to `spawn_on_pty`, the raw-mode guard, the winsize ioctls,
+// and the `poll()` multiplexer; each is documented where the ordering matters.
+
+/// The command's basename (the agent-name default), e.g. `/usr/bin/claude` →
+/// `claude`.
+fn command_basename(program: &str) -> String {
+    std::path::Path::new(program)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| program.to_string())
+}
+
+fn unix_ts() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The per-session conductor control socket:
+/// `$XDG_RUNTIME_DIR/aoide/session-<id>.sock` — the same user-scoped runtime-dir
+/// convention as shellbridge's socket (never networked). A missing
+/// `XDG_RUNTIME_DIR` falls back to `/run/user/1000` like [`crate::shellbridge`].
+fn conduct_socket_path(id: &str) -> PathBuf {
+    let runtime = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/run/user/1000".into());
+    PathBuf::from(runtime)
+        .join("aoide")
+        .join(format!("session-{id}.sock"))
+}
+
+// SIGWINCH latch: the handler only flips a flag (async-signal-safe); the poll
+// loop services it (re-reading the real tty size and pushing it to the master).
+static WINCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+extern "C" fn on_winch(_sig: libc::c_int) {
+    WINCH.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Install the SIGWINCH handler WITHOUT `SA_RESTART`, so a resize interrupts
+/// `poll()` (returns `EINTR`) and the loop can propagate the new size promptly.
+fn install_winch_handler() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_winch as *const () as libc::sighandler_t;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = 0;
+        libc::sigaction(libc::SIGWINCH, &sa, std::ptr::null_mut());
+    }
+}
+
+/// The current window size of a tty fd, or `None` when it is not a terminal
+/// (a pipe / redirected stdin in a test) or reports a zero geometry.
+fn tty_winsize(fd: RawFd) -> Option<libc::winsize> {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws as *mut libc::winsize) };
+    if rc == 0 && (ws.ws_row != 0 || ws.ws_col != 0) {
+        Some(ws)
+    } else {
+        None
+    }
+}
+
+/// Push a window size onto the pty master (TIOCSWINSZ → the child sees SIGWINCH).
+fn set_winsize(master: RawFd, ws: &libc::winsize) {
+    unsafe {
+        libc::ioctl(master, libc::TIOCSWINSZ, ws as *const libc::winsize);
+    }
+}
+
+/// RAII raw-mode guard for the REAL controlling tty. `enter` saves the current
+/// termios and switches to raw (so the wrapped TUI gets keystrokes unbuffered,
+/// unechoed, and Ctrl-C flows to it as a byte instead of a signal). Drop —
+/// which runs on normal return AND on unwind (panic=unwind) — restores it, so no
+/// exit path can leave a wedged terminal. When the fd is not a tty (a test / a
+/// pipe) the guard is inert: conduct still runs, it just touches no terminal.
+struct TtyRaw {
+    fd: RawFd,
+    saved: libc::termios,
+    active: bool,
+}
+impl TtyRaw {
+    fn enter(fd: RawFd) -> Self {
+        unsafe {
+            let mut saved: libc::termios = std::mem::zeroed();
+            if libc::isatty(fd) != 1 || libc::tcgetattr(fd, &mut saved) != 0 {
+                return TtyRaw {
+                    fd,
+                    saved,
+                    active: false,
+                };
+            }
+            let mut raw = saved;
+            libc::cfmakeraw(&mut raw);
+            let _ = libc::tcsetattr(fd, libc::TCSANOW, &raw);
+            TtyRaw {
+                fd,
+                saved,
+                active: true,
+            }
+        }
+    }
+    fn restore(&mut self) {
+        if self.active {
+            unsafe {
+                libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved);
+            }
+            self.active = false;
+        }
+    }
+}
+impl Drop for TtyRaw {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+/// Open a PTY and spawn `program args` on the SLAVE as a fresh session that owns
+/// the slave as its controlling terminal. Returns the (reapable) child plus the
+/// MASTER fd (owned, so it closes on every drop path).
+///
+/// The child's `pre_exec` ordering is load-bearing and each step is a raw libc
+/// call (async-signal-safe): `setsid()` starts a new session with NO controlling
+/// tty; `ioctl(slave, TIOCSCTTY)` then acquires the slave as this session's ctty
+/// (only a session leader without a ctty may do this — hence setsid FIRST); the
+/// slave is dup'd over fds 0/1/2 so the child's std streams ARE the pty; and the
+/// master + spare slave fd are closed in the child. All of this precedes exec.
+fn spawn_on_pty(
+    program: &str,
+    args: &[String],
+    session_id: &str,
+    ws: Option<libc::winsize>,
+) -> std::io::Result<(std::process::Child, OwnedFd)> {
+    use std::os::unix::process::CommandExt;
+
+    let mut master: RawFd = -1;
+    let mut slave: RawFd = -1;
+    let wsp = ws
+        .as_ref()
+        .map(|w| w as *const libc::winsize)
+        .unwrap_or(std::ptr::null());
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            wsp,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Own the master at once: it is now closed on any early return / on drop.
+    let master_owned = unsafe { OwnedFd::from_raw_fd(master) };
+
+    let slave_fd = slave;
+    let master_fd = master;
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args).env("AOIDE_SESSION_ID", session_id);
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for target in 0..3 {
+                if libc::dup2(slave_fd, target) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            libc::close(master_fd);
+            if slave_fd > 2 {
+                libc::close(slave_fd);
+            }
+            Ok(())
+        });
+    }
+    let spawned = cmd.spawn();
+    // The parent never speaks on the slave — close it whatever spawn returned.
+    unsafe {
+        libc::close(slave);
+    }
+    let child = spawned?;
+    Ok((child, master_owned))
+}
+
+fn pollfd(fd: RawFd, events: libc::c_short) -> libc::pollfd {
+    libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    }
+}
+
+/// Write every byte of `data` to `fd`, retrying on `EINTR`. A best-effort mirror
+/// helper for the multiplexer (a torn write on abrupt child exit is tolerated).
+fn write_all_fd(fd: RawFd, mut data: &[u8]) {
+    while !data.is_empty() {
+        let n = unsafe { libc::write(fd, data.as_ptr() as *const libc::c_void, data.len()) };
+        if n <= 0 {
+            let err = std::io::Error::last_os_error();
+            if n < 0 && err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break;
+        }
+        data = &data[n as usize..];
+    }
+}
+
+/// The single-thread `poll()` multiplexer. Shuttles: real stdin → master (you
+/// type normally), master → real stdout (you read normally), and each accepted
+/// injection connection → master (INJECTION). A pending SIGWINCH re-sizes the
+/// master. Returns the child's real exit code once the master hangs up (the
+/// child's slave closed) and the child is reaped.
+fn conduct_multiplex(
+    master: RawFd,
+    listener: Option<&UnixListener>,
+    child: &mut std::process::Child,
+) -> i32 {
+    use std::sync::atomic::Ordering;
+    let stdin_fd = libc::STDIN_FILENO;
+    let stdout_fd = libc::STDOUT_FILENO;
+    let listener_fd = listener.map(|l| l.as_raw_fd());
+    let mut conns: Vec<RawFd> = Vec::new();
+    let mut stdin_eof = false;
+    let mut buf = [0u8; 8192];
+
+    loop {
+        // Service a pending resize before blocking again.
+        if WINCH.swap(false, Ordering::SeqCst) {
+            if let Some(ws) = tty_winsize(stdin_fd) {
+                set_winsize(master, &ws);
+            }
+        }
+
+        let mut fds: Vec<libc::pollfd> = Vec::new();
+        if !stdin_eof {
+            fds.push(pollfd(stdin_fd, libc::POLLIN));
+        }
+        fds.push(pollfd(master, libc::POLLIN));
+        if let Some(lfd) = listener_fd {
+            fds.push(pollfd(lfd, libc::POLLIN));
+        }
+        for &c in &conns {
+            fds.push(pollfd(c, libc::POLLIN));
+        }
+
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue; // a signal (SIGWINCH) — reloop to service the latch.
+            }
+            break;
+        }
+
+        let revents = |want: RawFd| -> libc::c_short {
+            fds.iter()
+                .find(|p| p.fd == want)
+                .map(|p| p.revents)
+                .unwrap_or(0)
+        };
+
+        // master → stdout, and hangup detection (the child's slave closed).
+        let mrev = revents(master);
+        if mrev & libc::POLLIN != 0 {
+            let n =
+                unsafe { libc::read(master, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n > 0 {
+                write_all_fd(stdout_fd, &buf[..n as usize]);
+            } else {
+                break;
+            }
+        }
+        if mrev & (libc::POLLHUP | libc::POLLERR) != 0 {
+            let n =
+                unsafe { libc::read(master, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n > 0 {
+                write_all_fd(stdout_fd, &buf[..n as usize]);
+            }
+            break;
+        }
+
+        // real stdin → master.
+        if !stdin_eof {
+            let srev = revents(stdin_fd);
+            if srev & libc::POLLIN != 0 {
+                let n = unsafe {
+                    libc::read(stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                };
+                if n > 0 {
+                    write_all_fd(master, &buf[..n as usize]);
+                } else {
+                    stdin_eof = true; // our own stdin closed; keep bridging the rest.
+                }
+            } else if srev & (libc::POLLHUP | libc::POLLERR) != 0 {
+                stdin_eof = true;
+            }
+        }
+
+        // listener → accept new injection connections.
+        if let (Some(lfd), Some(l)) = (listener_fd, listener) {
+            if revents(lfd) & libc::POLLIN != 0 {
+                loop {
+                    match l.accept() {
+                        Ok((stream, _)) => {
+                            let _ = stream.set_nonblocking(true);
+                            let fd = stream.as_raw_fd();
+                            std::mem::forget(stream); // fd owned raw; closed on drain-EOF below.
+                            conns.push(fd);
+                        }
+                        Err(_) => break, // EAGAIN — no more pending.
+                    }
+                }
+            }
+        }
+
+        // injection connections → master.
+        let mut still: Vec<RawFd> = Vec::new();
+        for &c in &conns {
+            let cr = revents(c);
+            if cr & libc::POLLIN != 0 {
+                let n =
+                    unsafe { libc::read(c, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                if n > 0 {
+                    write_all_fd(master, &buf[..n as usize]);
+                    still.push(c);
+                } else {
+                    unsafe {
+                        libc::close(c);
+                    } // EOF — this injection is done.
+                }
+            } else if cr & (libc::POLLHUP | libc::POLLERR) != 0 {
+                loop {
+                    let n =
+                        unsafe { libc::read(c, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                    if n > 0 {
+                        write_all_fd(master, &buf[..n as usize]);
+                    } else {
+                        break;
+                    }
+                }
+                unsafe {
+                    libc::close(c);
+                }
+            } else {
+                still.push(c);
+            }
+        }
+        conns = still;
+    }
+
+    for c in conns {
+        unsafe {
+            libc::close(c);
+        }
+    }
+    match child.wait() {
+        Ok(st) => st.code().unwrap_or(-1),
+        Err(_) => -1,
+    }
+}
+
+/// `aoide conduct [--agent A] [--parent P] [--id I] -- <command …>` — the
+/// PTY-backed, controllable sibling of `graph wrap`. Same registration semantics
+/// (spawn FIRST so a failed exec registers no ghost; running → done; exit
+/// mirrored, real code in `data.exitCode`; `AOIDE_SESSION_ID` exported) PLUS: its
+/// own PTY + controlling tty, a per-session injection socket, and the
+/// `conductable`/`socket` fields on the record so `graph send` can steer it.
+pub fn session_conduct(inv: &Invocation) -> Outcome {
+    let cmd = "conduct";
+    if inv.args.is_empty() {
+        return Outcome::usage(
+            cmd,
+            "usage: aoide conduct [--agent <name>] [--parent <sessionId>] [--id <id>] -- <command …>",
+        );
+    }
+    let program = inv.args[0].clone();
+    let agent = inv
+        .flags
+        .get("agent")
+        .cloned()
+        .unwrap_or_else(|| command_basename(&program));
+    let id = inv
+        .flags
+        .get("id")
+        .cloned()
+        .unwrap_or_else(|| format!("conduct-{}-{}", std::process::id(), unix_ts()));
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+    let socket_path = conduct_socket_path(&id);
+
+    // Seed the pty with the real tty's geometry so a TUI opens correctly sized.
+    let ws = tty_winsize(libc::STDIN_FILENO);
+
+    // Spawn FIRST: a failed exec must register no session (parity with `wrap`).
+    let (mut child, master) = match spawn_on_pty(&program, &inv.args[1..], &id, ws) {
+        Ok(v) => v,
+        Err(e) => return Outcome::error(cmd, format!("failed to conduct `{program}`: {e}")),
+    };
+    let master_fd = master.as_raw_fd();
+
+    // Bind the per-session injection socket (best-effort: a bind failure leaves
+    // the session running but un-injectable — recorded as conductable=false).
+    if let Some(parent) = socket_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::remove_file(&socket_path); // clear a stale socket from a prior crash.
+    let listener = UnixListener::bind(&socket_path).ok();
+    if let Some(l) = &listener {
+        let _ = l.set_nonblocking(true);
+    }
+    let conductable = listener.is_some();
+    let socket_str = socket_path.to_string_lossy().into_owned();
+
+    // Register running + conductable with its socket, so `graph send` resolves it.
+    let _ = do_session_start(
+        &id,
+        Some(&agent),
+        cwd.as_deref(),
+        None,
+        inv.flags.get("parent").map(String::as_str),
+        Some(conductable),
+        if conductable {
+            Some(socket_str.as_str())
+        } else {
+            None
+        },
+        None,
+    );
+
+    // Raw-mode the real tty + arm resize passthrough. The TtyRaw guard restores
+    // the terminal on EVERY path below — normal return and unwind alike.
+    install_winch_handler();
+    let mut tty = TtyRaw::enter(libc::STDIN_FILENO);
+    if let Some(ws) = ws {
+        set_winsize(master_fd, &ws);
+    }
+
+    let exit_code = conduct_multiplex(master_fd, listener.as_ref(), &mut child);
+
+    // Restore tty, unlink socket, resolve the session — whatever happened.
+    tty.restore();
+    let _ = std::fs::remove_file(&socket_path);
+    let _ = do_session_end(&id);
+
+    let changed = vec![format!("session {id}: running → done")];
+    let data = json!({
+        "sessionId": id,
+        "agent": agent,
+        "exitCode": exit_code,
+        "conductable": conductable,
+        "socket": socket_str,
+    });
+    if exit_code == 0 {
+        Outcome::ok(cmd, format!("`{agent}` finished (conducted session `{id}`)"))
+            .changed(changed)
+            .with_data(data)
+    } else {
+        Outcome::error(
+            cmd,
+            format!("`{agent}` exited {exit_code} (conducted session `{id}`)"),
+        )
+        .changed(changed)
+        .with_data(data)
+    }
+}
+
+// ── `graph send`: the gated injection door ──────────────────────────────────
+
+/// A pending (unapproved) injection, staged for the baton to surface for a
+/// one-key approve/deny. Written atomically to `song/stage/pending.json`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PendingSend {
+    #[serde(rename = "sessionId", default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub submit: bool,
+    #[serde(rename = "queuedAt", default)]
+    pub queued_at: String,
+}
+
+/// `pending.json` container.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PendingFile {
+    #[serde(rename = "schemaVersion", default)]
+    pub schema_version: String,
+    #[serde(default)]
+    pub pending: Vec<PendingSend>,
+}
+
+fn pending_path() -> PathBuf {
+    stage_dir().join("pending.json")
+}
+
+/// The v1 gate decision for a send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendGate {
+    /// Explicit `--yes` on this send.
+    Yes,
+    /// A standing autogate policy authorised it (no human in the loop).
+    Autogate,
+    /// No authorisation — held pending for approval.
+    Pending,
+}
+impl SendGate {
+    fn delivers(self) -> bool {
+        !matches!(self, SendGate::Pending)
+    }
+    fn label(self) -> &'static str {
+        match self {
+            SendGate::Yes => "yes",
+            SendGate::Autogate => "autogate",
+            SendGate::Pending => "pending",
+        }
+    }
+}
+
+/// v1 autogate policy: a single documented global switch. `AOIDE_CONDUCT_AUTOGATE`
+/// in {1,true,yes,all} declares an orchestration-mode where sends deliver
+/// without a human (still audited). Richer per-parent / per-agent rules (an
+/// orchestrator freely commanding its own spawned children) are a later phase;
+/// this is the minimal, documented v1 surface.
+fn autogate_env() -> bool {
+    matches!(
+        std::env::var("AOIDE_CONDUCT_AUTOGATE").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("all")
+    )
+}
+
+fn send_gate(yes: bool) -> SendGate {
+    if yes {
+        SendGate::Yes
+    } else if autogate_env() {
+        SendGate::Autogate
+    } else {
+        SendGate::Pending
+    }
+}
+
+/// A one-line, length-bounded form of the injected text — the auto-rename title.
+fn one_line_title(text: &str) -> String {
+    let first = text.lines().next().unwrap_or("").trim();
+    const MAX: usize = 60;
+    if first.chars().count() > MAX {
+        let mut t: String = first.chars().take(MAX - 1).collect();
+        t.push('…');
+        t
+    } else {
+        first.to_string()
+    }
+}
+
+fn record_pending(id: &str, text: &str, submit: bool) -> Result<(), String> {
+    let mut file: PendingFile = load_stage(&pending_path())?;
+    file.schema_version = STAGE_GRAPH_VERSION.to_string();
+    file.pending.push(PendingSend {
+        session_id: id.to_string(),
+        text: text.to_string(),
+        submit,
+        queued_at: now_iso_utc(),
+    });
+    write_stage(&pending_path(), &file)
+}
+
+/// Auto-rename: write `title` onto the session record and re-stage the graph so
+/// the node relabels. A missing id is a silent no-op (the send still succeeded).
+fn set_session_title(id: &str, title: &str) -> Result<(), String> {
+    let mut file: SessionsFile = load_stage(&sessions_path())?;
+    let mut found = false;
+    for s in file.sessions.iter_mut() {
+        if s.session_id == id {
+            s.title = Some(title.to_string());
+            found = true;
+        }
+    }
+    if !found {
+        return Ok(());
+    }
+    if file.schema_version.is_empty() {
+        file.schema_version = STAGE_GRAPH_VERSION.to_string();
+    }
+    write_stage(&sessions_path(), &file)?;
+    restage_graph().map(|_| ())
+}
+
+/// One audit line per send outcome, through aoided's audit path. The injected
+/// text rides as `untrusted_data` (never the message) — forwarded agent-bound
+/// text is data, never re-interpreted as a command (the house rule).
+fn audit_send(inv: &Invocation, status: &str, message: &str, text: &str) {
+    let log = inv
+        .flags
+        .get("audit-log")
+        .map(PathBuf::from)
+        .unwrap_or_else(crate::daemon::default_audit_log);
+    let _ = crate::daemon::append_audit(
+        &log,
+        &crate::daemon::AuditRecord {
+            ts: unix_ts(),
+            door: inv.door,
+            class: crate::daemon::EventClass::Audit,
+            command: "graph.send".to_string(),
+            status: status.to_string(),
+            message: message.to_string(),
+            untrusted_data: Some(text.to_string()),
+        },
+    );
+}
+
+/// `aoide graph send --id <id> [--submit] [--yes] -- <text …>` — the one
+/// injection door. Resolves the target's control socket from sessions.json;
+/// errors cleanly (exit 1) if the id is unknown or not conductable. Gate: WITHOUT
+/// `--yes` and no autogate, the send is recorded PENDING (atomic stage write) and
+/// NOT delivered; WITH `--yes` (or an autogate match) it connects to the socket,
+/// writes `<text>` (+ `\n` on `--submit`), auto-renames the node to a one-line
+/// form of the text, and returns delivered. Every outcome writes an audit line.
+pub fn session_send(inv: &Invocation) -> Outcome {
+    let cmd = "graph.send";
+    let id = match require_flag(inv, "id") {
+        Ok(v) => v,
+        Err(o) => return o,
+    };
+    if inv.args.is_empty() {
+        return Outcome::usage(
+            cmd,
+            "usage: aoide graph send --id <id> [--submit] [--yes] -- <text …>",
+        );
+    }
+    let text = inv.args.join(" ");
+    let submit = inv.flag_present("submit");
+    let yes = inv.flag_present("yes");
+
+    let file: SessionsFile = match load_stage(&sessions_path()) {
+        Ok(f) => f,
+        Err(e) => return stage_error(cmd, e),
+    };
+    let Some(rec) = file.sessions.iter().find(|s| s.session_id == id) else {
+        let out = Outcome::error(cmd, format!("unknown session `{id}`"))
+            .with_data(json!({ "reason": "session-not-found", "id": id }));
+        audit_send(inv, "error", &out.message, &text);
+        return out;
+    };
+    let is_conductable = rec.conductable == Some(true);
+    let socket = rec.socket.clone().filter(|s| !s.is_empty());
+    if !is_conductable || socket.is_none() {
+        let out = Outcome::error(
+            cmd,
+            format!("session `{id}` is not conductable (no control socket)"),
+        )
+        .with_data(json!({ "reason": "not-conductable", "id": id }));
+        audit_send(inv, "error", &out.message, &text);
+        return out;
+    }
+    let socket = socket.unwrap();
+
+    // The gate.
+    let gate = send_gate(yes);
+    if !gate.delivers() {
+        if let Err(e) = record_pending(&id, &text, submit) {
+            return stage_error(cmd, e);
+        }
+        let out = Outcome::ok(
+            cmd,
+            format!("send to `{id}` held pending approval (no --yes / autogate)"),
+        )
+        .changed(vec![format!("pending send queued for {id}")])
+        .with_data(json!({
+            "id": id,
+            "state": "pending",
+            "delivered": false,
+            "submit": submit,
+            "gate": gate.label(),
+        }));
+        audit_send(inv, "pending", &out.message, &text);
+        return out;
+    }
+
+    // Deliver: connect + write the payload (+ newline on --submit).
+    let mut payload = text.clone();
+    if submit {
+        payload.push('\n');
+    }
+    match UnixStream::connect(&socket) {
+        Ok(mut stream) => {
+            use std::io::Write as _;
+            if let Err(e) = stream
+                .write_all(payload.as_bytes())
+                .and_then(|_| stream.flush())
+            {
+                let out = Outcome::error(cmd, format!("failed to inject into `{id}`: {e}"))
+                    .with_data(json!({ "reason": "socket-write-failed", "id": id, "socket": socket }));
+                audit_send(inv, "error", &out.message, &text);
+                return out;
+            }
+        }
+        Err(e) => {
+            let out = Outcome::error(cmd, format!("control socket for `{id}` unreachable: {e}"))
+                .with_data(json!({ "reason": "socket-unreachable", "id": id, "socket": socket }));
+            audit_send(inv, "error", &out.message, &text);
+            return out;
+        }
+    }
+
+    // Auto-rename the node to a one-line form of the delivered task.
+    let title = one_line_title(&text);
+    let mut changed = vec![format!("injected {} byte(s) into {id}", payload.len())];
+    match set_session_title(&id, &title) {
+        Ok(()) => changed.push(format!("session {id}: title → {title}")),
+        Err(e) => changed.push(format!("(title update failed: {e})")), // delivery already happened.
+    }
+
+    let out = Outcome::ok(cmd, format!("delivered to `{id}` ({})", gate.label()))
+        .changed(changed)
+        .with_data(json!({
+            "id": id,
+            "state": "delivered",
+            "delivered": true,
+            "submit": submit,
+            "title": title,
+            "gate": gate.label(),
+        }));
+    audit_send(inv, "delivered", &out.message, &text);
+    out
 }
 
 /// The action a Claude-Code hook payload maps to (or nothing, for events we
@@ -1403,7 +2205,7 @@ fn hook_from_str(buf: &str) -> Outcome {
     };
     let inner = match action {
         HookAction::Start { id, cwd } => {
-            do_session_start(&id, Some("claude"), cwd.as_deref(), None, None)
+            do_session_start(&id, Some("claude"), cwd.as_deref(), None, None, None, None, None)
         }
         HookAction::Phase { id, phase } => do_session_phase(&id, &phase),
         HookAction::PhaseIfRunning { id, phase } => do_session_phase_if(&id, &phase, "running"),
@@ -1450,6 +2252,9 @@ mod tests {
             state: state.into(),
             started_at: started.into(),
             parent_session_id: parent.map(str::to_string),
+            conductable: None,
+            socket: None,
+            title: None,
             extra: Map::new(),
         }
     }
@@ -1674,6 +2479,316 @@ mod tests {
         }
     }
 
+    fn conduct_invocation(args: &[&str], flags: &[(&str, &str)]) -> Invocation {
+        Invocation {
+            path: vec!["conduct".into()],
+            args: args.iter().map(|s| s.to_string()).collect(),
+            flags: flags
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            door: crate::daemon::Door::Cli,
+        }
+    }
+
+    fn send_invocation(args: &[&str], flags: &[(&str, &str)]) -> Invocation {
+        Invocation {
+            path: vec!["graph".into(), "send".into()],
+            args: args.iter().map(|s| s.to_string()).collect(),
+            flags: flags
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            door: crate::daemon::Door::Cli,
+        }
+    }
+
+    /// Restore a set of env vars on drop — survives a panicking assertion so the
+    /// process-global env never leaks between the env-locked tests.
+    struct EnvVars {
+        keys: Vec<(&'static str, Option<String>)>,
+    }
+    impl EnvVars {
+        fn save(keys: &[&'static str]) -> Self {
+            EnvVars {
+                keys: keys.iter().map(|k| (*k, std::env::var(k).ok())).collect(),
+            }
+        }
+    }
+    impl Drop for EnvVars {
+        fn drop(&mut self) {
+            for (k, v) in &self.keys {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// The conductor injection path end-to-end: `conduct` a fake echo child on a
+    /// real PTY, connect to its per-session control socket, inject bytes, and
+    /// assert the CHILD received them on its stdin (it writes them to a proof
+    /// file). Also checks the record registered conductable + resolved done, and
+    /// the socket was unlinked on exit.
+    #[test]
+    fn conduct_injects_socket_bytes_into_the_child() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "XDG_RUNTIME_DIR"]);
+
+        let root = unique_stage("conduct-inject");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root); // socket → <root>/aoide/session-*.sock
+
+        let id = "conduct-test";
+        let socket = conduct_socket_path(id);
+        let proof = root.join("proof.txt");
+
+        // The child reads ONE line from its (pty) stdin and writes it to a file,
+        // then exits — proof the injected bytes reached the child's stdin.
+        let script = format!("IFS= read -r line; printf '%s' \"$line\" > {}", proof.display());
+
+        // Inject from a helper thread once the socket appears; `conduct` blocks
+        // in THIS thread until the child exits.
+        let socket_c = socket.clone();
+        let injector = std::thread::spawn(move || {
+            for _ in 0..300 {
+                if socket_c.exists() {
+                    if let Ok(mut s) = UnixStream::connect(&socket_c) {
+                        use std::io::Write as _;
+                        let _ = s.write_all(b"MARKER-42\n");
+                        let _ = s.flush();
+                        return;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
+
+        let out = session_conduct(&conduct_invocation(&["sh", "-c", &script], &[("id", id)]));
+        injector.join().unwrap();
+
+        assert_eq!(out.status, crate::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(out.data.as_ref().unwrap()["exitCode"], 0);
+        assert_eq!(out.data.as_ref().unwrap()["conductable"], true);
+
+        // The child received the injected line on its stdin.
+        let got = std::fs::read_to_string(&proof).unwrap_or_default();
+        assert_eq!(got, "MARKER-42", "child received the injected bytes");
+
+        // Registered conductable with its socket, then resolved done.
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let rec = s.sessions.iter().find(|r| r.session_id == id).unwrap();
+        assert_eq!(rec.state, "done");
+        assert_eq!(rec.conductable, Some(true));
+        assert!(rec
+            .socket
+            .as_deref()
+            .unwrap()
+            .ends_with("session-conduct-test.sock"));
+        // Socket unlinked on exit.
+        assert!(!socket.exists(), "the control socket is unlinked on exit");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A non-zero child exit is mirrored: Error outcome, real code in
+    /// data.exitCode, and the session still resolves done.
+    #[test]
+    fn conduct_mirrors_a_nonzero_child_exit() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "XDG_RUNTIME_DIR"]);
+
+        let root = unique_stage("conduct-fail");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+
+        let out = session_conduct(&conduct_invocation(
+            &["sh", "-c", "exit 7"],
+            &[("id", "conduct-fail"), ("agent", "sevens")],
+        ));
+        assert_eq!(out.status, crate::output::Status::Error);
+        assert_eq!(out.data.as_ref().unwrap()["exitCode"], 7);
+
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let rec = s.sessions.iter().find(|r| r.session_id == "conduct-fail").unwrap();
+        assert_eq!(rec.state, "done");
+        assert_eq!(rec.agent, "sevens");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `graph send --id X --yes -- hi` connects to the socket, delivers the text
+    /// (+ newline on --submit), auto-renames the node title, and audits it.
+    #[test]
+    fn send_yes_delivers_and_autorenames_the_title() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+        ]);
+
+        let root = unique_stage("send-yes");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE"); // no standing autogate.
+
+        let id = "send-target";
+        let socket = conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        // A stand-in listener plays the conducted process.
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        // Register a conductable session pointing at that socket.
+        do_session_start(
+            id,
+            Some("claude"),
+            Some("/w"),
+            None,
+            None,
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+        );
+
+        // Accept + read the injected payload to EOF in a thread.
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+
+        let out = session_send(&send_invocation(
+            &["hello", "world"],
+            &[("id", id), ("submit", "true"), ("yes", "true")],
+        ));
+        let got = acc.join().unwrap();
+
+        assert_eq!(out.status, crate::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(out.data.as_ref().unwrap()["delivered"], true);
+        assert_eq!(out.data.as_ref().unwrap()["gate"], "yes");
+        // --submit appended a newline.
+        assert_eq!(String::from_utf8(got).unwrap(), "hello world\n");
+
+        // Title auto-renamed on the record + restaged graph node.
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(
+            s.sessions.iter().find(|r| r.session_id == id).unwrap().title.as_deref(),
+            Some("hello world")
+        );
+
+        // An audit line for the delivery was written.
+        let log = std::fs::read_to_string(root.join("log")).unwrap_or_default();
+        assert!(
+            log.contains("graph.send") && log.contains("delivered"),
+            "audit log carries the delivered send: {log}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `graph send --id X -- hi` with NO --yes (and no autogate) is held pending:
+    /// recorded in pending.json, nothing delivered, title untouched.
+    #[test]
+    fn send_without_yes_is_held_pending_not_delivered() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+        ]);
+
+        let root = unique_stage("send-pending");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+
+        let id = "pend-target";
+        let socket = conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap(); // so we can assert nothing connected.
+
+        do_session_start(
+            id,
+            Some("claude"),
+            Some("/w"),
+            None,
+            None,
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+        );
+
+        let out = session_send(&send_invocation(&["do", "a", "thing"], &[("id", id)]));
+        assert_eq!(out.status, crate::output::Status::Ok);
+        assert_eq!(out.data.as_ref().unwrap()["state"], "pending");
+        assert_eq!(out.data.as_ref().unwrap()["delivered"], false);
+
+        // Nothing connected to the listener.
+        assert!(
+            matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "a held-pending send delivers nothing"
+        );
+
+        // Recorded in pending.json.
+        let pf: PendingFile = load_stage(&pending_path()).unwrap();
+        assert!(
+            pf.pending
+                .iter()
+                .any(|p| p.session_id == id && p.text == "do a thing"),
+            "the send is recorded pending"
+        );
+
+        // Title NOT changed (delivery never happened).
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert!(s.sessions.iter().find(|r| r.session_id == id).unwrap().title.is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A send to an unknown id, or to a registered-but-not-conductable session,
+    /// is a clean structured error (exit 1) — even with --yes.
+    #[test]
+    fn send_unknown_or_unconductable_is_a_clean_error() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_AUDIT_LOG"]);
+
+        let root = unique_stage("send-err");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+
+        // Unknown id.
+        let out = session_send(&send_invocation(&["hi"], &[("id", "ghost"), ("yes", "true")]));
+        assert_eq!(out.status, crate::output::Status::Error);
+        assert_eq!(out.data.as_ref().unwrap()["reason"], "session-not-found");
+
+        // Registered but not conductable (a plain wrap/hook session).
+        do_session_start("plain", Some("claude"), None, None, None, None, None, None);
+        let out = session_send(&send_invocation(&["hi"], &[("id", "plain"), ("yes", "true")]));
+        assert_eq!(out.status, crate::output::Status::Error);
+        assert_eq!(out.data.as_ref().unwrap()["reason"], "not-conductable");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The universal wrapper end-to-end: a successful child registers and
     /// resolves done (and SEES its session id); a failing child propagates its
     /// code through data.exitCode as an Error outcome but STILL resolves done;
@@ -1819,6 +2934,9 @@ mod tests {
             Some("/w"),
             None,
             None,
+            None,
+            None,
+            None,
             "2026-01-01T00:00:00Z"
         ));
         assert_eq!(sessions.len(), 1);
@@ -1826,8 +2944,8 @@ mod tests {
         assert_eq!(sessions[0].state, "running");
         assert_eq!(sessions[0].started_at, "2026-01-01T00:00:00Z");
 
-        // Re-start with a NEW now + agent: no duplicate, fields updated, but
-        // startedAt is NEVER clobbered.
+        // Re-start with a NEW now + agent + conductor fields: no duplicate,
+        // fields updated, but startedAt is NEVER clobbered.
         assert!(!upsert_session(
             &mut sessions,
             "s1",
@@ -1835,12 +2953,21 @@ mod tests {
             None,
             Some("0xabc"),
             Some("parent"),
+            Some(true),
+            Some("/run/user/1000/aoide/session-s1.sock"),
+            Some("do the thing"),
             "2026-02-02T00:00:00Z"
         ));
         assert_eq!(sessions.len(), 1, "re-start never duplicates");
         assert_eq!(sessions[0].agent, "melete");
         assert_eq!(sessions[0].window_address, "0xabc");
         assert_eq!(sessions[0].parent_session_id.as_deref(), Some("parent"));
+        assert_eq!(sessions[0].conductable, Some(true));
+        assert_eq!(
+            sessions[0].socket.as_deref(),
+            Some("/run/user/1000/aoide/session-s1.sock")
+        );
+        assert_eq!(sessions[0].title.as_deref(), Some("do the thing"));
         assert_eq!(
             sessions[0].started_at, "2026-01-01T00:00:00Z",
             "startedAt preserved across re-start"

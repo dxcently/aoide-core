@@ -36,6 +36,13 @@ serde_json = "1"
 # needs (mio + signal-hook ride in with `events`).
 crossterm = { version = "0.29", default-features = false, features = ["events"] }
 ratatui = "0.30"
+# `aoide conduct` — the PTY-backed conductor wrap (see src/graph.rs). libc gives
+# us openpty + the controlling-tty ioctls (setsid/TIOCSCTTY/TIOCSWINSZ) and the
+# poll()-based multiplexer that shuttles the real tty ↔ the pty master and the
+# per-session injection socket → master. Already vendored (0.2.189, via
+# crossterm's tree), so this is a direct edge on an already-locked crate — no new
+# vendored crate enters the offline lock.
+libc = "0.2"
 
 [profile.release]
 opt-level = "s"

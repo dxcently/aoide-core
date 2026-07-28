@@ -473,6 +473,9 @@ mod tests {
             state: state.into(),
             started_at: id.into(),
             parent_session_id: parent.map(str::to_string),
+            conductable: None,
+            socket: None,
+            title: None,
             extra: Map::new(),
         }
     }

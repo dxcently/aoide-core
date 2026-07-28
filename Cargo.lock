@@ -28,6 +28,7 @@ name = "aoide"
 version = "0.0.0"
 dependencies = [
  "crossterm",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",

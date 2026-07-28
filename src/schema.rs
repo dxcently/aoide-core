@@ -380,6 +380,18 @@ pub fn commands() -> Vec<Command> {
             implemented: true,
         ),
         cmd!(
+            path: ["graph", "send"],
+            summary: "Inject text into a conducted session's control socket (the one gated injection door). Held pending approval by default; --yes (or an autogate policy) delivers and auto-renames the node to a one-line form of the text. Every outcome is audited.",
+            args: [arg!("text", "string", true, "The text to inject — put it after `--` so its own words/flags pass through verbatim.")],
+            flags: [
+                flag!("id", "string", "Target session id (required); its socket is resolved from sessions.json."),
+                flag!("submit", "bool", "Append a newline so the agent submits the line (Enter)."),
+                flag!("yes", "bool", "Authorise delivery now (else the send is held pending approval)."),
+            ],
+            gated: false,
+            implemented: true,
+        ),
+        cmd!(
             path: ["graph", "focus"],
             summary: "Jump to a session's window via hyprctl focuswindow (Terminal-Commander session jump).",
             args: [arg!("node", "string", true, "Session id (or session:<id> node id) to focus.")],
@@ -400,6 +412,19 @@ pub fn commands() -> Vec<Command> {
             summary: "Stage the resolved DAG to song/stage/graph.json for Quickshell hot-reload (atomic).",
             args: [],
             flags: [],
+            gated: false,
+            implemented: true,
+        ),
+        // ── conduct: the PTY-backed conductable wrap (concepts/Conductor-Channel) ─
+        cmd!(
+            path: ["conduct"],
+            summary: "Run an agent command on its own PTY as a CONDUCTABLE session: like `graph wrap` (spawn, register running, wait, end, exit mirrored, AOIDE_SESSION_ID exported) but with a controlling tty + a per-session control socket, so `graph send` can type into the running agent while its TUI runs undisturbed.",
+            args: [arg!("command", "string", true, "The wrapped command and its args — put them after `--` so the child's own flags pass through verbatim.")],
+            flags: [
+                flag!("agent", "string", "Agent name for the roster (default: the command's basename)."),
+                flag!("parent", "string", "Spawning session id — records the spawned-by edge."),
+                flag!("id", "string", "Session id override (default conduct-<pid>-<unixts>)."),
+            ],
             gated: false,
             implemented: true,
         ),

@@ -104,9 +104,13 @@ pub fn dispatch(inv: &Invocation) -> Outcome {
         ["graph", "session", "end"] => crate::graph::session_end(inv),
         ["graph", "session", "hook"] => crate::graph::session_hook(inv),
         ["graph", "wrap"] => crate::graph::session_wrap(inv),
+        ["graph", "send"] => crate::graph::session_send(inv),
         ["graph", "focus"] => crate::graph::focus(inv),
         ["graph", "prune"] => crate::graph::prune(inv),
         ["graph", "emit"] => crate::graph::emit(inv),
+
+        // ── conduct: the PTY-backed conductable wrap (graph.rs) ─────────────
+        ["conduct"] => crate::graph::session_conduct(inv),
 
         ["shellbridge"] => {
             let status = crate::shellbridge::run();
