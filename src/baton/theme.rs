@@ -7,7 +7,7 @@
 //! and the `𝄂𝄚𝅦𝄚` stave-run divider [`DIVIDER`] from `AoideBar.qml`), and the
 //! roster reads in musical notation (♪ working, 𝄐 awaiting, 𝄽 idle, 𝄂 done).
 //!
-//! Colour comes from `stage/notes.json`'s palette `{bg,fg,accent,urgent}` when
+//! Colour comes from `stage/drachma.json`'s palette `{bg,fg,accent,urgent}` when
 //! present, each hex already mapped to the nearest ANSI-256 index in
 //! [`crate::baton::app`]; here we wrap those indices as `Color::Indexed`. Absent
 //! a palette key we fall back to a named ANSI colour so the TUI still reads,

@@ -6,7 +6,7 @@
 //! `draw(frame, area, app)` that composes ratatui widgets. The identity is
 //! preserved wholesale — the double box-drawing frames, the clef-tail end-cap on
 //! each footer seam, the musical state glyphs, the accent tint from
-//! `notes.json` — but expressed as [`ratatui::style::Style`] rather than raw
+//! `drachma.json` — but expressed as [`ratatui::style::Style`] rather than raw
 //! SGR. Panels stay pure over `&App`, so a `TestBackend` can render any of them
 //! headless and assert on the buffer (see the tests below).
 //!
@@ -489,7 +489,7 @@ fn draw_status_panel(f: &mut Frame, area: Rect, app: &App) {
         graph_node_count(&stage.join("graph.json")),
     ));
     lines.push(file_status(
-        &stage.join("notes.json"),
+        &stage.join("drachma.json"),
         "notes",
         palette_count(app),
     ));

@@ -159,7 +159,7 @@ pub fn commands() -> Vec<Command> {
         ),
         cmd!(
             path: ["rice", "preview"],
-            summary: "Rehearse a rice live (stage/notes.json hot-reload); nothing committed.",
+            summary: "Rehearse a rice live (stage/drachma.json hot-reload); nothing committed.",
             args: [arg!("name", "string", true, "Rice/song name to preview (from song/repertoire/).")],
             flags: [],
             gated: false,

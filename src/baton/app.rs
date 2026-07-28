@@ -65,7 +65,7 @@ impl Panel {
     }
 }
 
-/// The palette pulled from `stage/notes.json`, each hex mapped to nearest
+/// The palette pulled from `stage/drachma.json`, each hex mapped to nearest
 /// ANSI-256. `None` fields mean "no colour — inherit the terminal".
 #[derive(Debug, Clone, Default)]
 pub struct Palette {
@@ -257,14 +257,14 @@ impl App {
         self.projects = p.projects;
         self.sessions = s.sessions;
         self.hooks = h.hooks;
-        self.palette = load_palette(&dir.join("notes.json"));
+        self.palette = load_palette(&dir.join("drachma.json"));
         self.reload_log();
 
         self.mtimes = StageMtimes {
             sessions: Self::mtime(&dir.join("sessions.json")),
             hooks: Self::mtime(&dir.join("hooks.json")),
             projects: Self::mtime(&dir.join("projects.json")),
-            notes: Self::mtime(&dir.join("notes.json")),
+            notes: Self::mtime(&dir.join("drachma.json")),
             audit: Self::mtime(&Self::audit_path()),
         };
         self.note_new_sessions();
@@ -331,7 +331,7 @@ impl App {
             sessions: Self::mtime(&dir.join("sessions.json")),
             hooks: Self::mtime(&dir.join("hooks.json")),
             projects: Self::mtime(&dir.join("projects.json")),
-            notes: Self::mtime(&dir.join("notes.json")),
+            notes: Self::mtime(&dir.join("drachma.json")),
             audit: Self::mtime(&Self::audit_path()),
         };
 
@@ -351,7 +351,7 @@ impl App {
             changed = true;
         }
         if cur.notes != self.mtimes.notes {
-            self.palette = load_palette(&dir.join("notes.json"));
+            self.palette = load_palette(&dir.join("drachma.json"));
             changed = true;
         }
         if cur.audit != self.mtimes.audit {
@@ -847,9 +847,9 @@ pub fn sorted_project_names(projects: &[graph::Project]) -> Vec<String> {
     names
 }
 
-// ── notes.json palette → ANSI-256 ───────────────────────────────────────────
+// ── drachma.json palette → ANSI-256 ───────────────────────────────────────────
 
-/// Load `stage/notes.json`'s palette, mapping each hex to nearest ANSI-256.
+/// Load `stage/drachma.json`'s palette, mapping each hex to nearest ANSI-256.
 pub fn load_palette(path: &std::path::Path) -> Palette {
     let Ok(s) = std::fs::read_to_string(path) else {
         return Palette::default();

@@ -184,18 +184,18 @@ pub fn dispatch(inv: &Invocation) -> Outcome {
     }
 }
 
-/// Resolve the `notes.json` a `rice` verb should act on:
+/// Resolve the `drachma.json` a `rice` verb should act on:
 ///
-/// * **no arg** — the staged notes (`<stage>/notes.json`) if present, else a
+/// * **no arg** — the staged notes (`<stage>/drachma.json`) if present, else a
 ///   usage error (exit 2). We never delegate to drachma with no file.
 /// * **an arg that names an existing file** — taken as a literal path.
 /// * **otherwise the arg is a committed-song NAME** →
-///   `<song>/repertoire/<name>/notes.json` (resolved through the same stage-dir
+///   `<song>/repertoire/<name>/drachma.json` (resolved through the same stage-dir
 ///   seam as `graph emit`, so an `AOIDE_STAGE_DIR` override relocates it too).
 fn resolve_rice_notes(inv: &Invocation, cmd: &str) -> Result<PathBuf, Outcome> {
     match inv.args.first() {
         None => {
-            let staged = shellbridge::stage_dir().join("notes.json");
+            let staged = shellbridge::stage_dir().join("drachma.json");
             if staged.is_file() {
                 Ok(staged)
             } else {
@@ -227,7 +227,7 @@ fn resolve_rice_notes(inv: &Invocation, cmd: &str) -> Result<PathBuf, Outcome> {
 
 /// `rice lint [<name>|<path>]` — validate a rice against the note schema.
 ///
-/// Delegates to `drachma lint <notes.json>`, tolerating drachma's absence. The
+/// Delegates to `drachma lint <drachma.json>`, tolerating drachma's absence. The
 /// no-arg form lints the staged rice; a bare `<name>` resolves to the committed
 /// song's notes (never passed to drachma as a literal path). An error envelope
 /// always carries a non-zero exit (drachma failure → exit 1).
@@ -272,7 +272,7 @@ const COVER_EXTS: &[&str] = &["webp", "png", "jpg", "jpeg"];
 /// Derive a physical cover-art file for a song, or `None` when none exists.
 ///
 /// v0 notes carry no runtime cover field (the schema is palette-closed; the
-/// build-time `aoide.notes.wallpaper` is a nix path, not a song/ runtime read),
+/// build-time `aoide.drachma.wallpaper` is a nix path, not a song/ runtime read),
 /// so a cover is only ever staged when one is physically present: first a
 /// `cover.<ext>` co-located with the song, then `<covers>/<name>.<ext>`.
 fn derive_cover(name: &str) -> Option<PathBuf> {
@@ -295,7 +295,7 @@ fn derive_cover(name: &str) -> Option<PathBuf> {
 }
 
 /// `rice preview <name>` — rehearse a committed song live: stage its
-/// `notes.json` (and a derivable cover) into `<stage>/` so the Quickshell
+/// `drachma.json` (and a derivable cover) into `<stage>/` so the Quickshell
 /// surfaces hot-reload it. Nothing is committed; no compositor dispatch in v1.
 ///
 /// This is the honest form of the hand-copy agents had been doing: drive the
@@ -339,9 +339,9 @@ fn handle_rice_preview(inv: &Invocation) -> Outcome {
     }
 
     let stage = shellbridge::stage_dir();
-    let notes_dst = stage.join("notes.json");
+    let notes_dst = stage.join("drachma.json");
     if let Err(e) = shellbridge::atomic_write(&notes_dst, &raw) {
-        return Outcome::error("rice.preview", format!("failed to stage notes.json: {e}"))
+        return Outcome::error("rice.preview", format!("failed to stage drachma.json: {e}"))
             .with_data(json!({ "reason": "stage-write-failed", "target": notes_dst.to_string_lossy() }));
     }
     let mut changed: Vec<String> = vec![notes_dst.to_string_lossy().into_owned()];
@@ -380,7 +380,7 @@ fn handle_rice_preview(inv: &Invocation) -> Outcome {
         "notes": notes_dst.to_string_lossy(),
         "cover": cover.as_ref().map(|p| p.to_string_lossy().into_owned()),
         "seam": "compositor dispatch (hyprctl/OSC) not performed in v1; \
-                 Quickshell hot-reloads stage/notes.json",
+                 Quickshell hot-reloads stage/drachma.json",
     }))
 }
 
@@ -454,7 +454,7 @@ mod tests {
     fn lint_no_arg_without_staged_notes_is_usage_exit_2() {
         let _g = crate::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
-        let stage = unique_tmp("lint-nostage"); // exists, but no notes.json
+        let stage = unique_tmp("lint-nostage"); // exists, but no drachma.json
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
         let out = handle_rice_lint(&inv(&["rice", "lint"], &[]));
@@ -468,7 +468,7 @@ mod tests {
         let _g = crate::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "PATH", "AOIDE_DRACHMA_BIN"]);
         let stage = unique_tmp("lint-staged");
-        std::fs::write(stage.join("notes.json"), VALID_NOTES).unwrap();
+        std::fs::write(stage.join("drachma.json"), VALID_NOTES).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
         hide_drachma();
 
@@ -478,7 +478,7 @@ mod tests {
         assert_eq!(out.status, Status::Error);
         assert_eq!(out.render(false).1, crate::output::exit::ERROR);
         let notes = out.data.unwrap()["notes"].as_str().unwrap().to_string();
-        assert!(notes.ends_with("notes.json"), "lint targeted the staged notes: {notes}");
+        assert!(notes.ends_with("drachma.json"), "lint targeted the staged notes: {notes}");
         assert!(notes.starts_with(stage.to_str().unwrap()));
         let _ = std::fs::remove_dir_all(&stage);
     }
@@ -497,7 +497,7 @@ mod tests {
         let out = handle_rice_lint(&inv(&["rice", "lint"], &["moonlight"]));
         let notes = out.data.unwrap()["notes"].as_str().unwrap().to_string();
         assert!(
-            notes.ends_with("repertoire/moonlight/notes.json"),
+            notes.ends_with("repertoire/moonlight/drachma.json"),
             "bare name resolved to the repertoire song: {notes}"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -528,18 +528,18 @@ mod tests {
         let song = root.join("repertoire").join("moonlight");
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::create_dir_all(&song).unwrap();
-        std::fs::write(song.join("notes.json"), VALID_NOTES).unwrap();
+        std::fs::write(song.join("drachma.json"), VALID_NOTES).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
         let out = handle_rice_preview(&inv(&["rice", "preview"], &["moonlight"]));
         assert_eq!(out.status, Status::Ok);
-        // notes.json landed in the stage, byte-identical to the source.
-        let staged = std::fs::read_to_string(stage.join("notes.json")).unwrap();
+        // drachma.json landed in the stage, byte-identical to the source.
+        let staged = std::fs::read_to_string(stage.join("drachma.json")).unwrap();
         assert_eq!(staged, VALID_NOTES);
         assert!(out
             .changed
             .iter()
-            .any(|c| c.ends_with("stage/notes.json")));
+            .any(|c| c.ends_with("stage/drachma.json")));
         // No cover exists for moonlight → cover.json is left untouched.
         assert!(!stage.join("cover.json").exists());
         assert!(out.data.unwrap()["cover"].is_null());
@@ -558,7 +558,7 @@ mod tests {
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::create_dir_all(&song).unwrap();
         std::fs::create_dir_all(&covers).unwrap();
-        std::fs::write(song.join("notes.json"), VALID_NOTES).unwrap();
+        std::fs::write(song.join("drachma.json"), VALID_NOTES).unwrap();
         std::fs::write(covers.join("dusk.png"), b"\x89PNG stub").unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
