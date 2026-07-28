@@ -192,6 +192,14 @@ pub fn run() -> serde_json::Value {
         &format!("shellbridge online; listening on {}", sock.display()),
     );
 
+    // Spawn the Hyprland window→session event listener on a background thread:
+    // it is the AUTHORITATIVE, creation-time source of each session's
+    // `windowAddress` (concepts/Terminal-Commander), keeping the widget's
+    // click-to-jump reliable instead of depending on the lazy hook-time backfill.
+    // It runs concurrently with — and can never block or kill — the accept loop,
+    // and degrades to a no-op off-Hyprland (logs once, returns).
+    std::thread::spawn(crate::graph::run_hypr_window_listener);
+
     // Serve forever. `serve` never returns and never panics on client input.
     serve(&listener);
 

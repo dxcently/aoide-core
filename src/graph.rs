@@ -779,13 +779,13 @@ pub fn is_session_dead(
     window_signal || pid_signal
 }
 
-/// Gather the normalised live window addresses from `hyprctl clients -j`.
-/// Returns `None` (→ pid-only liveness) whenever the compositor cannot be
-/// consulted authoritatively: no `HYPRLAND_INSTANCE_SIGNATURE`, a missing/failed
-/// `hyprctl`, or unparseable JSON. This is the seam that keeps the reaper safe
-/// off-Hyprland — it degrades to the pid signal instead of blindly reaping every
-/// windowed session it could not see (matches [`discover_window_address`]'s gate).
-fn live_window_addresses() -> Option<HashSet<String>> {
+/// Query `hyprctl clients -j` into a decoded JSON array. Returns `None` whenever
+/// the compositor cannot be consulted authoritatively: no
+/// `HYPRLAND_INSTANCE_SIGNATURE`, a missing/failed `hyprctl`, or unparseable
+/// JSON. This is the single clients-reading seam every consumer shares — the
+/// reaper's live set, phase-② discovery, and the window-event listener — so they
+/// all degrade identically off-Hyprland (never a panic, never a false result).
+fn hyprctl_clients() -> Option<Vec<Value>> {
     if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
         return None;
     }
@@ -796,12 +796,20 @@ fn live_window_addresses() -> Option<HashSet<String>> {
     if !out.status.success() {
         return None;
     }
-    let clients: Vec<Value> = match serde_json::from_slice(&out.stdout) {
-        Ok(Value::Array(a)) => a,
-        _ => return None,
-    };
+    match serde_json::from_slice(&out.stdout) {
+        Ok(Value::Array(a)) => Some(a),
+        _ => None,
+    }
+}
+
+/// Gather the normalised live window addresses from `hyprctl clients -j`.
+/// Returns `None` (→ pid-only liveness) whenever the compositor cannot be
+/// consulted authoritatively (see [`hyprctl_clients`]). This is the seam that
+/// keeps the reaper safe off-Hyprland — it degrades to the pid signal instead of
+/// blindly reaping every windowed session it could not see.
+fn live_window_addresses() -> Option<HashSet<String>> {
     Some(
-        clients
+        hyprctl_clients()?
             .iter()
             .filter_map(|c| c.get("address").and_then(Value::as_str))
             .filter(|a| !a.is_empty())
@@ -2060,21 +2068,8 @@ fn discover_window_address() -> Option<String> {
 /// unparseable JSON, or no ancestor match each yield `None` — never an error,
 /// never a slow path beyond one quick `hyprctl` call.
 fn discover_window() -> Option<(String, u32)> {
-    // Cheap gate: not under a Hyprland compositor → nothing to discover.
-    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
-        return None;
-    }
-    let out = std::process::Command::new("hyprctl")
-        .args(["clients", "-j"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let clients: Vec<Value> = match serde_json::from_slice(&out.stdout) {
-        Ok(Value::Array(a)) => a,
-        _ => return None,
-    };
+    // Cheap gate + one quick `hyprctl` call, both inside the shared seam.
+    let clients = hyprctl_clients()?;
     let ancestry = pid_ancestry(std::process::id() as i32);
     match_window_and_pid(&ancestry, &clients)
 }
@@ -2113,6 +2108,212 @@ fn ensure_session_window(id: &str) {
     }
     let _ = write_stage(&sessions_path(), &file);
     let _ = restage_graph();
+}
+
+// ── Authoritative window capture: the Hyprland event listener ────────────────
+//
+// The hook-time backfill above is LAZY — a session's `windowAddress` only lands
+// on the *next* hook fire, so at click time it is frequently empty and the
+// widget's `graph focus` jump fails. The fix is EVENT-DRIVEN, creation-time
+// capture: the shellbridge service runs a background thread reading Hyprland's
+// `socket2` event stream and, the moment a window opens (or moves / retitles /
+// closes), it (re)resolves every tracked session's window authoritatively. This
+// is the PRIMARY source of `windowAddress`; the hook backfill stays as a
+// belt-and-suspenders fallback. All of it is best-effort and off-Hyprland-safe:
+// no instance signature → the listener logs once and returns, and the accept
+// loop keeps serving regardless.
+
+/// Path to the Hyprland event socket (`socket2`):
+/// `$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock`. Returns
+/// `None` when not under a Hyprland session (no signature, or no runtime dir) —
+/// the listener then degrades to "disabled" rather than crashing.
+pub fn hypr_event_socket_path() -> Option<PathBuf> {
+    let sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok()?;
+    if sig.trim().is_empty() {
+        return None;
+    }
+    let runtime = std::env::var("XDG_RUNTIME_DIR").ok()?;
+    Some(
+        PathBuf::from(runtime)
+            .join("hypr")
+            .join(sig)
+            .join(".socket2.sock"),
+    )
+}
+
+/// One parsed Hyprland `socket2` event we act on (window lifecycle only). Every
+/// other event line maps to `None` and is ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HyprWindowEvent {
+    /// A window opened / moved / retitled — (re)resolve pending session windows.
+    /// `address` is the raw event address (no `0x` prefix); we resolve off the
+    /// live `hyprctl clients` list rather than trusting it, so it is advisory.
+    Appeared { address: String },
+    /// A window closed — clear its address off whatever session stored it, so the
+    /// roster stops advertising a dead jump target (the reaper then removes the
+    /// record via its pid signal).
+    Closed { address: String },
+}
+
+/// Parse ONE `socket2` line (`EVENT>>DATA`) into a [`HyprWindowEvent`], or `None`
+/// for the many events we ignore. Pure and total (unit-tested): a line without
+/// `>>`, an unhandled event name, or an empty address all yield `None` — never a
+/// panic. The address is Hyprland's bare hex (e.g. `55aabb`); [`normalize_addr`]
+/// reconciles it with `hyprctl`'s `0x…` form at compare time.
+pub fn parse_hypr_window_event(line: &str) -> Option<HyprWindowEvent> {
+    let (event, data) = line.split_once(">>")?;
+    match event {
+        // openwindow>>ADDR,WORKSPACE,CLASS,TITLE · movewindow>>ADDR,WORKSPACE
+        // movewindowv2>>ADDR,WSID,WSNAME · windowtitle>>ADDR
+        // windowtitlev2>>ADDR,TITLE — in every case ADDR is the first field.
+        "openwindow" | "movewindow" | "movewindowv2" | "windowtitle" | "windowtitlev2" => {
+            let addr = data.split(',').next().unwrap_or("").trim();
+            if addr.is_empty() {
+                return None;
+            }
+            Some(HyprWindowEvent::Appeared {
+                address: addr.to_string(),
+            })
+        }
+        // closewindow>>ADDR — the whole payload is the address.
+        "closewindow" => {
+            let addr = data.trim();
+            if addr.is_empty() {
+                return None;
+            }
+            Some(HyprWindowEvent::Closed {
+                address: addr.to_string(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// (Re)resolve the `windowAddress` of every tracked session that has a recorded
+/// lifecycle `pid` but no window yet, stamping the canonical `hyprctl` address
+/// via the SAME pid-ancestry ↔ clients match discovery uses. Runs in the
+/// shellbridge process, so it walks each session's RECORDED pid (a conduct
+/// session's own pid — the window client is one of its ancestors), never its own.
+/// Cheap-guarded: if no session needs a window it does zero `hyprctl` work; it
+/// only ever FILLS an empty address (never overwrites a good one, never touches
+/// `pid` or `state`). Returns true iff `sessions.json` changed.
+pub fn resolve_pending_session_windows() -> bool {
+    let mut file: SessionsFile = match load_stage(&sessions_path()) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    // Only a session with a pid to walk AND still missing its window is
+    // resolvable from here (an external process cannot use its own ancestry).
+    if !file
+        .sessions
+        .iter()
+        .any(|s| s.window_address.is_empty() && s.pid.is_some())
+    {
+        return false;
+    }
+    let Some(clients) = hyprctl_clients() else {
+        return false;
+    };
+    let mut changed = false;
+    for s in file.sessions.iter_mut() {
+        if !s.window_address.is_empty() {
+            continue;
+        }
+        let Some(pid) = s.pid else {
+            continue;
+        };
+        let ancestry = pid_ancestry(pid as i32);
+        if let Some((addr, _)) = match_window_and_pid(&ancestry, &clients) {
+            s.window_address = addr;
+            changed = true;
+        }
+    }
+    if !changed {
+        return false;
+    }
+    if file.schema_version.is_empty() {
+        file.schema_version = STAGE_GRAPH_VERSION.to_string();
+    }
+    if write_stage(&sessions_path(), &file).is_ok() {
+        let _ = restage_graph();
+        return true;
+    }
+    false
+}
+
+/// Clear a closed window's address off any session that stored it (normalised
+/// compare, so `0x…`/case differences still match). The record is left in place
+/// for the reaper to resolve via its pid signal. Returns true iff a session was
+/// cleared.
+pub fn clear_closed_window(address: &str) -> bool {
+    let want = normalize_addr(address);
+    if want.is_empty() {
+        return false;
+    }
+    let mut file: SessionsFile = match load_stage(&sessions_path()) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut changed = false;
+    for s in file.sessions.iter_mut() {
+        if !s.window_address.is_empty() && normalize_addr(&s.window_address) == want {
+            s.window_address.clear();
+            changed = true;
+        }
+    }
+    if !changed {
+        return false;
+    }
+    if write_stage(&sessions_path(), &file).is_ok() {
+        let _ = restage_graph();
+        return true;
+    }
+    false
+}
+
+/// Run the Hyprland window→session event listener FOREVER — the shellbridge
+/// service spawns this on a background thread so it can never block or kill the
+/// socket accept loop. It connects to the `socket2` event stream and keeps
+/// `sessions.json` authoritative: an opened/moved/retitled window (re)resolves
+/// pending session windows, a closed window is cleared. Degrades gracefully — no
+/// Hyprland signature logs once and returns (headless/non-Hypr aoide is
+/// unaffected); a failed connect or a dropped socket logs and retries after a
+/// short backoff. NEVER panics.
+pub fn run_hypr_window_listener() {
+    use std::io::{BufRead, BufReader};
+    let Some(sock) = hypr_event_socket_path() else {
+        eprintln!(
+            "[aoide/shellbridge] no HYPRLAND_INSTANCE_SIGNATURE — window-event listener disabled"
+        );
+        return;
+    };
+    loop {
+        match UnixStream::connect(&sock) {
+            Ok(stream) => {
+                // On every (re)connect, sweep any windows that opened while we
+                // were not listening (service start mid-session, or a reconnect).
+                resolve_pending_session_windows();
+                for line in BufReader::new(stream).lines() {
+                    let Ok(line) = line else {
+                        break; // socket dropped → fall through to reconnect.
+                    };
+                    match parse_hypr_window_event(&line) {
+                        Some(HyprWindowEvent::Appeared { .. }) => {
+                            resolve_pending_session_windows();
+                        }
+                        Some(HyprWindowEvent::Closed { address }) => {
+                            clear_closed_window(&address);
+                        }
+                        None => {}
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[aoide/shellbridge] hypr event socket connect failed ({e}); retrying");
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
 }
 
 /// `aoide conduct [--agent A] [--parent P] [--id I] -- <command …>` — the
@@ -2942,6 +3143,97 @@ mod tests {
         // No match → None (address AND pid stay unset, never a partial record).
         assert_eq!(match_window_and_pid(&[5], &clients), None);
         assert_eq!(match_window_and_pid(&[42], &[json!({ "pid": 42, "address": "" })]), None);
+    }
+
+    #[test]
+    fn hypr_event_parses_window_lifecycle_and_ignores_the_rest() {
+        // openwindow>>ADDR,WORKSPACE,CLASS,TITLE — address is the first field
+        // (Hyprland emits it WITHOUT the `0x` prefix; a title may contain commas).
+        assert_eq!(
+            parse_hypr_window_event("openwindow>>55aabbccdd00,1,kitty,shell — /home/x, y"),
+            Some(HyprWindowEvent::Appeared {
+                address: "55aabbccdd00".to_string()
+            })
+        );
+        // movewindow / movewindowv2 re-check (session may have registered late).
+        assert_eq!(
+            parse_hypr_window_event("movewindow>>55aabb,2"),
+            Some(HyprWindowEvent::Appeared {
+                address: "55aabb".to_string()
+            })
+        );
+        assert_eq!(
+            parse_hypr_window_event("movewindowv2>>55aabb,2,two"),
+            Some(HyprWindowEvent::Appeared {
+                address: "55aabb".to_string()
+            })
+        );
+        // windowtitle (old, ADDR only) and windowtitlev2 (ADDR,TITLE).
+        assert_eq!(
+            parse_hypr_window_event("windowtitle>>55aabb"),
+            Some(HyprWindowEvent::Appeared {
+                address: "55aabb".to_string()
+            })
+        );
+        assert_eq!(
+            parse_hypr_window_event("windowtitlev2>>55aabb,a new title"),
+            Some(HyprWindowEvent::Appeared {
+                address: "55aabb".to_string()
+            })
+        );
+        // closewindow>>ADDR — the whole payload is the address.
+        assert_eq!(
+            parse_hypr_window_event("closewindow>>55aabb"),
+            Some(HyprWindowEvent::Closed {
+                address: "55aabb".to_string()
+            })
+        );
+        // Events we don't act on → None.
+        assert_eq!(parse_hypr_window_event("workspace>>2"), None);
+        assert_eq!(parse_hypr_window_event("activewindow>>kitty,shell"), None);
+        assert_eq!(parse_hypr_window_event("focusedmon>>DP-1,2"), None);
+        // Malformed / empty-address lines → None (never a panic, never a blank).
+        assert_eq!(parse_hypr_window_event("no-delimiter-here"), None);
+        assert_eq!(parse_hypr_window_event("openwindow>>"), None);
+        assert_eq!(parse_hypr_window_event("openwindow>> ,1,kitty,t"), None);
+        assert_eq!(parse_hypr_window_event("closewindow>>   "), None);
+        assert_eq!(parse_hypr_window_event(""), None);
+    }
+
+    #[test]
+    fn hypr_event_socket_path_needs_a_signature() {
+        // `hypr_event_socket_path()` reads process-global env; serialise it
+        // against the other env-touching tests with the crate-wide lock.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
+        let saved_rt = std::env::var("XDG_RUNTIME_DIR").ok();
+
+        // No signature → no socket (listener disables itself off-Hyprland).
+        std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
+        assert_eq!(hypr_event_socket_path(), None);
+
+        // A blank signature is treated as absent, not as a path segment.
+        std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", "   ");
+        std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
+        assert_eq!(hypr_event_socket_path(), None);
+
+        // Signature + runtime dir → the documented socket2 path.
+        std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", "abc123_99");
+        assert_eq!(
+            hypr_event_socket_path(),
+            Some(PathBuf::from(
+                "/run/user/1000/hypr/abc123_99/.socket2.sock"
+            ))
+        );
+
+        match saved_sig {
+            Some(v) => std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", v),
+            None => std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"),
+        }
+        match saved_rt {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
     }
 
     #[test]
