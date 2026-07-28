@@ -76,6 +76,15 @@ pub struct SessionRecord {
     /// absent on a legacy record and on hook-only sessions that never had one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    /// The Hyprland workspace id this session's window currently lives on,
+    /// stamped by the `socket2` window-event listener alongside `windowAddress`
+    /// (and re-stamped when the window moves between workspaces). Additive and
+    /// v0-safe: absent on a legacy record and whenever the window/workspace
+    /// could not be resolved (off-Hyprland, or the window not yet open). The
+    /// gadget-dock roster reads it to preview-highlight the bar's WorkspaceRow
+    /// on hover (concepts/Terminal-Commander) — a pure-data bridge, no dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<i64>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -268,6 +277,12 @@ pub fn build_graph(
         }
         if let Some(pid) = s.pid {
             node["pid"] = json!(pid);
+        }
+        // The workspace the session's window lives on — the hover-preview bridge
+        // (concepts/Terminal-Commander). Rides onto the node only when known, so
+        // a legacy/off-Hyprland record stays byte-for-byte as before.
+        if let Some(ws) = s.workspace {
+            node["workspace"] = json!(ws);
         }
         nodes.push(node);
         if let Some(parent) = resolved_parent(s, &ids) {
@@ -728,6 +743,29 @@ fn window_present(clients: &[Value], want: &str) -> bool {
             .and_then(Value::as_str)
             .map(|a| normalize_addr(a) == want)
             .unwrap_or(false)
+    })
+}
+
+/// The Hyprland workspace id of the client whose `address` matches `want` in a
+/// decoded `hyprctl clients -j` array (`workspace.id` in the client JSON).
+/// Pure over the decoded JSON — unit-testable without a compositor. Address
+/// comparison is `0x`/case-tolerant via [`normalize_addr`] (the stored
+/// `windowAddress` and hyprctl can disagree on both). `None` when the window is
+/// absent from the list or carries no numeric `workspace.id` — the caller then
+/// leaves the stored `workspace` untouched (degrade gracefully, never a panic).
+fn client_workspace_for_address(clients: &[Value], want: &str) -> Option<i64> {
+    let want = normalize_addr(want);
+    if want.is_empty() {
+        return None;
+    }
+    clients.iter().find_map(|c| {
+        let a = c.get("address").and_then(Value::as_str)?;
+        if normalize_addr(a) != want {
+            return None;
+        }
+        c.get("workspace")
+            .and_then(|w| w.get("id"))
+            .and_then(Value::as_i64)
     })
 }
 
@@ -1230,6 +1268,9 @@ pub fn upsert_session(
             socket: socket.map(str::to_string),
             title: title.map(str::to_string),
             pid,
+            // Workspace is stamped later by the window-event listener (it needs a
+            // resolved window first); a fresh record starts without one.
+            workspace: None,
             extra: Map::new(),
         });
         true
@@ -2057,7 +2098,7 @@ fn match_window_and_pid(ancestry: &[i32], clients: &[Value]) -> Option<(String, 
 /// missing/failed `hyprctl`, unparseable JSON, or no ancestor match each yield
 /// `None` — never an error, never a slow path beyond one quick `hyprctl` call.
 fn discover_window_address() -> Option<String> {
-    discover_window().map(|(addr, _)| addr)
+    discover_window().map(|(addr, _, _)| addr)
 }
 
 /// Best-effort discovery of THIS process's terminal window address AND that
@@ -2067,11 +2108,15 @@ fn discover_window_address() -> Option<String> {
 /// end-to-end: no Hyprland instance signature, a missing/failed `hyprctl`,
 /// unparseable JSON, or no ancestor match each yield `None` — never an error,
 /// never a slow path beyond one quick `hyprctl` call.
-fn discover_window() -> Option<(String, u32)> {
+fn discover_window() -> Option<(String, u32, Option<i64>)> {
     // Cheap gate + one quick `hyprctl` call, both inside the shared seam.
     let clients = hyprctl_clients()?;
     let ancestry = pid_ancestry(std::process::id() as i32);
-    match_window_and_pid(&ancestry, &clients)
+    let (addr, pid) = match_window_and_pid(&ancestry, &clients)?;
+    // Stamp the window's workspace off the SAME clients snapshot (no second
+    // hyprctl call); `None` when the client carries no numeric workspace id.
+    let workspace = client_workspace_for_address(&clients, &addr);
+    Some((addr, pid, workspace))
 }
 
 /// Best-effort backfill of a hook-registered session's `windowAddress` (+ owning
@@ -2096,12 +2141,17 @@ fn ensure_session_window(id: &str) {
     if !needs_window {
         return;
     }
-    let Some((addr, pid)) = discover_window() else {
+    let Some((addr, pid, workspace)) = discover_window() else {
         return;
     };
     if let Some(s) = file.sessions.iter_mut().find(|s| s.session_id == id) {
         s.window_address = addr;
         s.pid = Some(pid);
+        // Stamp the workspace too when known (absent → left None, degrades
+        // gracefully); the listener keeps it fresh on later moves.
+        if workspace.is_some() {
+            s.workspace = workspace;
+        }
     }
     if file.schema_version.is_empty() {
         file.schema_version = STAGE_GRAPH_VERSION.to_string();
@@ -2191,24 +2241,33 @@ pub fn parse_hypr_window_event(line: &str) -> Option<HyprWindowEvent> {
 
 /// (Re)resolve the `windowAddress` of every tracked session that has a recorded
 /// lifecycle `pid` but no window yet, stamping the canonical `hyprctl` address
-/// via the SAME pid-ancestry ↔ clients match discovery uses. Runs in the
-/// shellbridge process, so it walks each session's RECORDED pid (a conduct
-/// session's own pid — the window client is one of its ancestors), never its own.
-/// Cheap-guarded: if no session needs a window it does zero `hyprctl` work; it
-/// only ever FILLS an empty address (never overwrites a good one, never touches
-/// `pid` or `state`). Returns true iff `sessions.json` changed.
+/// via the SAME pid-ancestry ↔ clients match discovery uses — AND keep every
+/// already-resolved session's `workspace` id current off the same clients
+/// snapshot, so a terminal dragged to another workspace re-stamps here (the
+/// `movewindow`/`movewindowv2` event re-runs this pass; concepts/Terminal-
+/// Commander's hover-preview bridge). Runs in the shellbridge process, so it
+/// walks each session's RECORDED pid (a conduct session's own pid — the window
+/// client is one of its ancestors), never its own. Cheap-guarded: zero `hyprctl`
+/// work when no session has either a pending window OR a resolved one. It only
+/// ever FILLS an empty address (never overwrites a good one) and only ever
+/// updates `workspace` to a PRESENT id (a window momentarily absent from the
+/// clients list leaves its stored workspace be — never cleared); it never
+/// touches `pid` or `state`. Returns true iff `sessions.json` changed.
 pub fn resolve_pending_session_windows() -> bool {
     let mut file: SessionsFile = match load_stage(&sessions_path()) {
         Ok(f) => f,
         Err(_) => return false,
     };
-    // Only a session with a pid to walk AND still missing its window is
-    // resolvable from here (an external process cannot use its own ancestry).
-    if !file
+    // Work to do if a session still needs its window (empty address + a pid to
+    // walk) OR already has one whose workspace we can (re)stamp. The latter is
+    // what keeps `workspace` fresh across a move; without it a steady-state
+    // roster would never re-stamp.
+    let has_pending = file
         .sessions
         .iter()
-        .any(|s| s.window_address.is_empty() && s.pid.is_some())
-    {
+        .any(|s| s.window_address.is_empty() && s.pid.is_some());
+    let has_windowed = file.sessions.iter().any(|s| !s.window_address.is_empty());
+    if !has_pending && !has_windowed {
         return false;
     }
     let Some(clients) = hyprctl_clients() else {
@@ -2216,16 +2275,29 @@ pub fn resolve_pending_session_windows() -> bool {
     };
     let mut changed = false;
     for s in file.sessions.iter_mut() {
-        if !s.window_address.is_empty() {
-            continue;
-        }
-        let Some(pid) = s.pid else {
-            continue;
-        };
-        let ancestry = pid_ancestry(pid as i32);
-        if let Some((addr, _)) = match_window_and_pid(&ancestry, &clients) {
-            s.window_address = addr;
-            changed = true;
+        if s.window_address.is_empty() {
+            // Pending window: resolve it via pid-ancestry, stamping workspace off
+            // the same snapshot (None → left absent, degrades gracefully).
+            let Some(pid) = s.pid else {
+                continue;
+            };
+            let ancestry = pid_ancestry(pid as i32);
+            if let Some((addr, _)) = match_window_and_pid(&ancestry, &clients) {
+                let ws = client_workspace_for_address(&clients, &addr);
+                s.window_address = addr;
+                if s.workspace != ws {
+                    s.workspace = ws;
+                }
+                changed = true;
+            }
+        } else if let Some(ws) = client_workspace_for_address(&clients, &s.window_address) {
+            // Resolved window still live: keep its workspace current (the
+            // drag-between-workspaces re-stamp). Only a present, changed id is
+            // written; a vanished window leaves the stored workspace intact.
+            if s.workspace != Some(ws) {
+                s.workspace = Some(ws);
+                changed = true;
+            }
         }
     }
     if !changed {
@@ -2814,8 +2886,11 @@ fn hook_from_str(buf: &str) -> Outcome {
             // Best-effort: the hook is a subprocess of the agent's terminal, so
             // discover that window (+ its owning pid) now and register it — this
             // is what makes a hook-only Claude session `graph focus`-jumpable.
+            // Workspace is stamped later by the shellbridge window-event listener
+            // (resolve_pending_session_windows), which is authoritative and keeps
+            // it fresh across moves — do_session_start carries only window + pid.
             let (window, pid) = match discover_window() {
-                Some((addr, pid)) => (Some(addr), Some(pid)),
+                Some((addr, pid, _workspace)) => (Some(addr), Some(pid)),
                 None => (None, None),
             };
             do_session_start(
@@ -2888,6 +2963,7 @@ mod tests {
             socket: None,
             title: None,
             pid: None,
+            workspace: None,
             extra: Map::new(),
         }
     }
@@ -3143,6 +3219,89 @@ mod tests {
         // No match → None (address AND pid stay unset, never a partial record).
         assert_eq!(match_window_and_pid(&[5], &clients), None);
         assert_eq!(match_window_and_pid(&[42], &[json!({ "pid": 42, "address": "" })]), None);
+    }
+
+    #[test]
+    fn client_workspace_lookup_reads_workspace_id_and_tolerates_address_form() {
+        // `hyprctl clients -j` carries `workspace: { id, name }`; the lookup pulls
+        // the numeric id for the matching window. Address match is 0x/case
+        // tolerant, exactly like window_present (the stored addr may differ).
+        let clients = vec![
+            json!({ "address": "0x55aabb", "workspace": { "id": 3, "name": "3" } }),
+            json!({ "address": "0x1234ef", "workspace": { "id": 7, "name": "seven" } }),
+            // Special workspaces carry NEGATIVE ids — surfaced verbatim.
+            json!({ "address": "0xdeadbe", "workspace": { "id": -99, "name": "special:magic" } }),
+        ];
+        assert_eq!(client_workspace_for_address(&clients, "0x55aabb"), Some(3));
+        assert_eq!(client_workspace_for_address(&clients, "55AABB"), Some(3)); // no 0x + upper
+        assert_eq!(client_workspace_for_address(&clients, "0X1234EF"), Some(7));
+        assert_eq!(client_workspace_for_address(&clients, "0xdeadbe"), Some(-99));
+
+        // A window absent from the list → None (leave the stored workspace be).
+        assert_eq!(client_workspace_for_address(&clients, "0xnope"), None);
+        // An empty address never matches.
+        assert_eq!(client_workspace_for_address(&clients, ""), None);
+        // A client without a workspace object (or without a numeric id) → None,
+        // never a panic — degrade gracefully when Hyprland omits the field.
+        let noworkspace = vec![
+            json!({ "address": "0xaa" }),
+            json!({ "address": "0xbb", "workspace": {} }),
+            json!({ "address": "0xcc", "workspace": { "name": "3" } }),
+        ];
+        assert_eq!(client_workspace_for_address(&noworkspace, "0xaa"), None);
+        assert_eq!(client_workspace_for_address(&noworkspace, "0xbb"), None);
+        assert_eq!(client_workspace_for_address(&noworkspace, "0xcc"), None);
+    }
+
+    #[test]
+    fn graph_node_carries_workspace_only_when_known() {
+        // The hover-preview bridge is pure data: build_graph stamps `workspace`
+        // onto a session node when resolved, and omits it entirely otherwise so a
+        // legacy/off-Hyprland record round-trips byte-for-byte.
+        let mut with_ws = SessionRecord {
+            session_id: "a".into(),
+            window_address: "0xaaa".into(),
+            ..Default::default()
+        };
+        with_ws.workspace = Some(4);
+        let without_ws = SessionRecord {
+            session_id: "b".into(),
+            window_address: "0xbbb".into(),
+            ..Default::default()
+        };
+        let doc = build_graph(&[], &[with_ws, without_ws], &[]);
+        let nodes = doc["nodes"].as_array().unwrap();
+        let node_a = nodes.iter().find(|n| n["id"] == "session:a").unwrap();
+        let node_b = nodes.iter().find(|n| n["id"] == "session:b").unwrap();
+        assert_eq!(node_a["workspace"], json!(4));
+        assert!(node_b.get("workspace").is_none());
+    }
+
+    #[test]
+    fn session_record_workspace_round_trips_and_stays_absent_when_unset() {
+        // serde: `workspace` serialises as an integer when set, and is skipped
+        // (skip_serializing_if) when None — additive/v0-safe on the wire.
+        let mut rec = SessionRecord {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        rec.workspace = Some(2);
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("\"workspace\":2"), "serialised: {json}");
+        let back: SessionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.workspace, Some(2));
+
+        // A record without a workspace omits the key entirely (no null noise) and
+        // a legacy record with no `workspace` field parses to None.
+        let bare = SessionRecord {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        let bare_json = serde_json::to_string(&bare).unwrap();
+        assert!(!bare_json.contains("workspace"), "serialised: {bare_json}");
+        let legacy: SessionRecord =
+            serde_json::from_str(r#"{ "sessionId": "s", "windowAddress": "0x1" }"#).unwrap();
+        assert_eq!(legacy.workspace, None);
     }
 
     #[test]

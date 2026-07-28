@@ -664,6 +664,7 @@ mod tests {
             socket: None,
             title: None,
             pid: None,
+            workspace: None,
             extra: Map::new(),
         }
     }
