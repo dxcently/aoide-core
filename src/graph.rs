@@ -1745,12 +1745,96 @@ fn conduct_multiplex(
     }
 }
 
+// ── Phase ②: window-address discovery (pid-ancestry ↔ hyprctl clients) ──────
+//
+// A conducted terminal's window is the ancestor process that owns a Hyprland
+// client: conduct is exec'd (same pid) by the shell wrapper, itself a child of
+// the terminal (kitty). Walking conduct's pid up the ppid chain and matching a
+// pid against `hyprctl clients -j` finds that window — the first ancestor with a
+// client wins. All of this is BEST-EFFORT: it must never fail or slow a conduct,
+// so every impure step is guarded and an empty result just leaves the address
+// unset (exactly as before this phase).
+
+/// Read the parent pid of `pid` from `/proc/<pid>/stat`. The `comm` (2nd) field
+/// is wrapped in parens and may itself contain spaces or `)`, so ppid is parsed
+/// as the 2nd whitespace field AFTER the FINAL `)` (state, then ppid) — the only
+/// robust way to split a stat line. `None` on any read/parse miss.
+fn parent_pid(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after = &stat[stat.rfind(')')? + 1..];
+    let mut fields = after.split_whitespace();
+    let _state = fields.next()?; // the process state char
+    fields.next()?.parse().ok() // ppid
+}
+
+/// The pid-ancestry chain of `pid`, self first, walking up the ppid chain via
+/// `/proc`. Bounded (a bad `/proc` or a self-parenting loop can never spin) and
+/// stops at init (ppid ≤ 1) — the terminal is always a mid-chain ancestor.
+fn pid_ancestry(pid: i32) -> Vec<i32> {
+    let mut chain = Vec::new();
+    let mut cur = pid;
+    for _ in 0..64 {
+        chain.push(cur);
+        match parent_pid(cur) {
+            Some(p) if p > 1 && p != cur => cur = p,
+            _ => break,
+        }
+    }
+    chain
+}
+
+/// Pure core: the window address of the nearest ancestor in `ancestry` that owns
+/// a client in the decoded `hyprctl clients -j` array. Walks the ancestry from
+/// self outward and returns the first client whose `pid` matches and whose
+/// `address` is non-empty. Pure over the decoded JSON + the pid list, so it is
+/// unit-testable with a fake client list and a fake ancestry — no `/proc`, no
+/// compositor. `None` when no ancestor owns a window.
+fn match_window_for_ancestry(ancestry: &[i32], clients: &[Value]) -> Option<String> {
+    for &pid in ancestry {
+        for c in clients {
+            if c.get("pid").and_then(Value::as_i64) == Some(pid as i64) {
+                if let Some(addr) = c.get("address").and_then(Value::as_str) {
+                    if !addr.is_empty() {
+                        return Some(addr.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Best-effort discovery of THIS conduct process's terminal window address (see
+/// the phase ② note). Guarded end-to-end: no Hyprland instance signature, a
+/// missing/failed `hyprctl`, unparseable JSON, or no ancestor match each yield
+/// `None` — never an error, never a slow path beyond one quick `hyprctl` call.
+fn discover_window_address() -> Option<String> {
+    // Cheap gate: not under a Hyprland compositor → nothing to discover.
+    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
+        return None;
+    }
+    let out = std::process::Command::new("hyprctl")
+        .args(["clients", "-j"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let clients: Vec<Value> = match serde_json::from_slice(&out.stdout) {
+        Ok(Value::Array(a)) => a,
+        _ => return None,
+    };
+    let ancestry = pid_ancestry(std::process::id() as i32);
+    match_window_for_ancestry(&ancestry, &clients)
+}
+
 /// `aoide conduct [--agent A] [--parent P] [--id I] -- <command …>` — the
 /// PTY-backed, controllable sibling of `graph wrap`. Same registration semantics
 /// (spawn FIRST so a failed exec registers no ghost; running → done; exit
 /// mirrored, real code in `data.exitCode`; `AOIDE_SESSION_ID` exported) PLUS: its
-/// own PTY + controlling tty, a per-session injection socket, and the
-/// `conductable`/`socket` fields on the record so `graph send` can steer it.
+/// own PTY + controlling tty, a per-session injection socket, the
+/// `conductable`/`socket` fields on the record so `graph send` can steer it, and
+/// a best-effort `windowAddress` (phase ② discovery) so `graph focus` can jump.
 pub fn session_conduct(inv: &Invocation) -> Outcome {
     let cmd = "conduct";
     if inv.args.is_empty() {
@@ -1798,12 +1882,15 @@ pub fn session_conduct(inv: &Invocation) -> Outcome {
     let conductable = listener.is_some();
     let socket_str = socket_path.to_string_lossy().into_owned();
 
+    // Phase ②: best-effort window-address discovery (never fails/slows conduct).
+    let window = discover_window_address();
+
     // Register running + conductable with its socket, so `graph send` resolves it.
     let _ = do_session_start(
         &id,
         Some(&agent),
         cwd.as_deref(),
-        None,
+        window.as_deref(),
         inv.flags.get("parent").map(String::as_str),
         Some(conductable),
         if conductable {
@@ -1880,13 +1967,16 @@ fn pending_path() -> PathBuf {
     stage_dir().join("pending.json")
 }
 
-/// The v1 gate decision for a send.
+/// The gate decision for a send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SendGate {
     /// Explicit `--yes` on this send.
     Yes,
-    /// A standing autogate policy authorised it (no human in the loop).
+    /// The global orchestration-mode switch authorised it (no human in the loop).
     Autogate,
+    /// The sender is the target's parent — an orchestrator freely commanding a
+    /// child it spawned (the "freely orchestrated" default). No human in the loop.
+    AutogateParent,
     /// No authorisation — held pending for approval.
     Pending,
 }
@@ -1898,16 +1988,15 @@ impl SendGate {
         match self {
             SendGate::Yes => "yes",
             SendGate::Autogate => "autogate",
+            SendGate::AutogateParent => "autogate-parent",
             SendGate::Pending => "pending",
         }
     }
 }
 
-/// v1 autogate policy: a single documented global switch. `AOIDE_CONDUCT_AUTOGATE`
-/// in {1,true,yes,all} declares an orchestration-mode where sends deliver
-/// without a human (still audited). Richer per-parent / per-agent rules (an
-/// orchestrator freely commanding its own spawned children) are a later phase;
-/// this is the minimal, documented v1 surface.
+/// Global autogate switch: `AOIDE_CONDUCT_AUTOGATE` in {1,true,yes,all} declares
+/// an orchestration-mode where every send delivers without a human (still
+/// audited) — the box-wide "freely orchestrated" toggle.
 fn autogate_env() -> bool {
     matches!(
         std::env::var("AOIDE_CONDUCT_AUTOGATE").ok().as_deref(),
@@ -1915,11 +2004,28 @@ fn autogate_env() -> bool {
     )
 }
 
-fn send_gate(yes: bool) -> SendGate {
+/// The parent-autogate rule (pure, unit-tested): the sender may freely command a
+/// child it spawned. True when the target session's `parentSessionId` equals the
+/// SENDER's own `AOIDE_SESSION_ID` — both present and non-empty. A cross-tree or
+/// unrelated send (no id, empty id, or a mismatch) is NOT autogated and stays
+/// pending. This is what lets an orchestrator steer the children it conducted
+/// without a prompt while every other send remains gated.
+fn sender_is_parent(sender_session: Option<&str>, target_parent: Option<&str>) -> bool {
+    match (sender_session, target_parent) {
+        (Some(s), Some(p)) => !s.is_empty() && s == p,
+        _ => false,
+    }
+}
+
+/// Resolve the gate: `--yes`, then the global autogate switch, then the
+/// parent-of-target rule, else pending.
+fn send_gate(yes: bool, sender_is_parent: bool) -> SendGate {
     if yes {
         SendGate::Yes
     } else if autogate_env() {
         SendGate::Autogate
+    } else if sender_is_parent {
+        SendGate::AutogateParent
     } else {
         SendGate::Pending
     }
@@ -2029,6 +2135,7 @@ pub fn session_send(inv: &Invocation) -> Outcome {
     };
     let is_conductable = rec.conductable == Some(true);
     let socket = rec.socket.clone().filter(|s| !s.is_empty());
+    let target_parent = rec.parent_session_id.clone();
     if !is_conductable || socket.is_none() {
         let out = Outcome::error(
             cmd,
@@ -2040,8 +2147,11 @@ pub fn session_send(inv: &Invocation) -> Outcome {
     }
     let socket = socket.unwrap();
 
-    // The gate.
-    let gate = send_gate(yes);
+    // The gate. The sender's own session id (from the env `aoide conduct` exports)
+    // vs the target's parent decides the parent-autogate rule.
+    let sender = std::env::var("AOIDE_SESSION_ID").ok();
+    let is_parent = sender_is_parent(sender.as_deref(), target_parent.as_deref());
+    let gate = send_gate(yes, is_parent);
     if !gate.delivers() {
         if let Err(e) = record_pending(&id, &text, submit) {
             return stage_error(cmd, e);
@@ -2444,6 +2554,87 @@ mod tests {
         assert_eq!(normalize_addr("  0Xabc  "), "abc");
     }
 
+    #[test]
+    fn window_discovery_matches_the_nearest_ancestor_client() {
+        // conduct(pid 100) ← shell(same pid, exec) ← kitty(pid 42) ← hypr(pid 7).
+        // kitty owns the window; the compositor (7) does not.
+        let clients = vec![
+            json!({ "pid": 42, "address": "0xKITTY", "class": "kitty" }),
+            json!({ "pid": 999, "address": "0xOTHER", "class": "firefox" }),
+        ];
+        let ancestry = vec![100, 42, 7];
+        assert_eq!(
+            match_window_for_ancestry(&ancestry, &clients),
+            Some("0xKITTY".to_string())
+        );
+
+        // The NEAREST ancestor with a window wins (self before its parents), even
+        // if a further-up ancestor also owns a client.
+        let nested = vec![
+            json!({ "pid": 42, "address": "0xOUTER" }),
+            json!({ "pid": 100, "address": "0xINNER" }),
+        ];
+        assert_eq!(
+            match_window_for_ancestry(&[100, 42, 7], &nested),
+            Some("0xINNER".to_string())
+        );
+
+        // No ancestor owns a window → None (address stays unset, as before).
+        assert_eq!(match_window_for_ancestry(&[100, 42, 7], &[json!({ "pid": 5, "address": "0xX" })]), None);
+        // A client whose pid matches but whose address is empty/absent is skipped.
+        assert_eq!(
+            match_window_for_ancestry(&[42], &[json!({ "pid": 42, "address": "" })]),
+            None
+        );
+        assert_eq!(
+            match_window_for_ancestry(&[42], &[json!({ "pid": 42, "class": "kitty" })]),
+            None
+        );
+        // Empty inputs never match.
+        assert_eq!(match_window_for_ancestry(&[], &clients), None);
+        assert_eq!(match_window_for_ancestry(&ancestry, &[]), None);
+    }
+
+    #[test]
+    fn pid_ancestry_starts_at_self_and_is_bounded() {
+        // Real /proc: our own ancestry begins with our pid and includes a parent.
+        let me = std::process::id() as i32;
+        let chain = pid_ancestry(me);
+        assert_eq!(chain.first(), Some(&me), "self is first in the chain");
+        assert!(chain.len() >= 2, "we always have at least one ancestor");
+        assert!(chain.len() <= 64, "the walk is bounded");
+        // A nonexistent pid yields just the seed (no /proc entry to walk up).
+        assert_eq!(pid_ancestry(2_000_000_000), vec![2_000_000_000]);
+    }
+
+    #[test]
+    fn parent_autogate_decision_is_exact_and_guarded() {
+        // The sender IS the target's parent → autogated (freely orchestrated).
+        assert!(sender_is_parent(Some("orch"), Some("orch")));
+        // Mismatched ids (cross-tree / unrelated) → NOT autogated.
+        assert!(!sender_is_parent(Some("orch"), Some("other")));
+        // A missing sender or a parentless target → NOT autogated.
+        assert!(!sender_is_parent(None, Some("orch")));
+        assert!(!sender_is_parent(Some("orch"), None));
+        // Empty ids never match (a blank env var is not a parent claim).
+        assert!(!sender_is_parent(Some(""), Some("")));
+        assert!(!sender_is_parent(Some(""), Some("orch")));
+
+        // The gate resolves in priority order: --yes ▸ global env ▸ parent ▸ pending.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_CONDUCT_AUTOGATE"]);
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        assert_eq!(send_gate(true, false), SendGate::Yes); // --yes wins outright
+        assert_eq!(send_gate(false, true), SendGate::AutogateParent);
+        assert_eq!(send_gate(false, false), SendGate::Pending);
+        assert!(SendGate::AutogateParent.delivers());
+        assert_eq!(SendGate::AutogateParent.label(), "autogate-parent");
+        std::env::set_var("AOIDE_CONDUCT_AUTOGATE", "1");
+        // The global switch outranks the parent rule (both deliver; label differs).
+        assert_eq!(send_gate(false, true), SendGate::Autogate);
+        assert_eq!(send_gate(false, false), SendGate::Autogate);
+    }
+
     fn unique_stage(tag: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();
         dir.push(format!(
@@ -2758,6 +2949,74 @@ mod tests {
         // Title NOT changed (delivery never happened).
         let s: SessionsFile = load_stage(&sessions_path()).unwrap();
         assert!(s.sessions.iter().find(|r| r.session_id == id).unwrap().title.is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The parent-autogate: a send from the target's PARENT (the sender's
+    /// AOIDE_SESSION_ID equals the child's parentSessionId) delivers WITHOUT
+    /// --yes and without the global autogate — an orchestrator freely commands a
+    /// child it spawned. The gate label is `autogate-parent` and it is audited.
+    #[test]
+    fn send_delivers_when_sender_is_the_targets_parent() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+
+        let root = unique_stage("send-parent");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE"); // no global autogate.
+        // The SENDER is the orchestrator session `orch`.
+        std::env::set_var("AOIDE_SESSION_ID", "orch");
+
+        let id = "child-of-orch";
+        let socket = conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        // Register a conductable CHILD whose parent is the sender (`orch`).
+        do_session_start(
+            id,
+            Some("claude"),
+            Some("/w"),
+            None,
+            Some("orch"),
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+        );
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+
+        // No --yes: delivery is authorised purely by the parent relationship.
+        let out = session_send(&send_invocation(&["go"], &[("id", id), ("submit", "true")]));
+        let got = acc.join().unwrap();
+
+        assert_eq!(out.status, crate::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(out.data.as_ref().unwrap()["delivered"], true);
+        assert_eq!(out.data.as_ref().unwrap()["gate"], "autogate-parent");
+        assert_eq!(String::from_utf8(got).unwrap(), "go\n");
+
+        // An UNRELATED sender (different session) to the same child stays pending.
+        std::env::set_var("AOIDE_SESSION_ID", "stranger");
+        let out = session_send(&send_invocation(&["hi"], &[("id", id)]));
+        assert_eq!(out.data.as_ref().unwrap()["state"], "pending");
+        assert_eq!(out.data.as_ref().unwrap()["delivered"], false);
 
         let _ = std::fs::remove_dir_all(&root);
     }
