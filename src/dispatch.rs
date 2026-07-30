@@ -273,20 +273,14 @@ const COVER_EXTS: &[&str] = &["webp", "png", "jpg", "jpeg"];
 ///
 /// v0 notes carry no runtime cover field (the schema is palette-closed; the
 /// build-time `aoide.drachma.wallpaper` is a nix path, not a song/ runtime read),
-/// so a cover is only ever staged when one is physically present. Covers now
-/// live per-song under `songbook/<name>/assets/`: first a `cover.<ext>` there,
-/// then `<name>.<ext>` there.
+/// so a cover is only ever staged when one is physically present. Covers live
+/// in the shared library `song/covers/` — one dir any song (or other consumer)
+/// draws from — so the derivable name is `<name>.<ext>` there (a bare
+/// `cover.<ext>` would be ambiguous in a shared dir).
 fn derive_cover(name: &str) -> Option<PathBuf> {
-    let notes = shellbridge::songbook_notes(name);
-    let assets = notes.parent()?.join("assets");
+    let covers = shellbridge::song_dir().join("covers");
     for ext in COVER_EXTS {
-        let p = assets.join(format!("cover.{ext}"));
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    for ext in COVER_EXTS {
-        let p = assets.join(format!("{name}.{ext}"));
+        let p = covers.join(format!("{name}.{ext}"));
         if p.is_file() {
             return Some(p);
         }
@@ -548,18 +542,18 @@ mod tests {
     }
 
     #[test]
-    fn preview_stages_a_derivable_cover_from_song_assets() {
+    fn preview_stages_a_derivable_cover_from_the_covers_library() {
         let _g = crate::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("preview-cover");
         let stage = root.join("stage");
         let song = root.join("songbook").join("dusk");
-        let assets = song.join("assets");
+        let covers = root.join("covers");
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::create_dir_all(&song).unwrap();
-        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::create_dir_all(&covers).unwrap();
         std::fs::write(song.join("drachma.json"), VALID_NOTES).unwrap();
-        std::fs::write(assets.join("dusk.png"), b"\x89PNG stub").unwrap();
+        std::fs::write(covers.join("dusk.png"), b"\x89PNG stub").unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
         let out = handle_rice_preview(&inv(&["rice", "preview"], &["dusk"]));
@@ -568,7 +562,7 @@ mod tests {
         assert!(cover.contains("dusk.png"), "cover.json points at the derived file");
         assert!(out.changed.iter().any(|c| c.ends_with("cover.json")));
         let data = out.data.unwrap();
-        assert!(data["cover"].as_str().unwrap().ends_with("assets/dusk.png"));
+        assert!(data["cover"].as_str().unwrap().ends_with("covers/dusk.png"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

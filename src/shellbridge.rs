@@ -54,8 +54,8 @@ pub fn stage_dir() -> PathBuf {
 /// The song tree root (`~/Aoide/song/`) — the parent of the stage dir.
 ///
 /// The stage tree is `<song>/stage`; committed songs live under
-/// `<song>/songbook/<name>/` and each song's cover art under
-/// `<song>/songbook/<name>/assets/` (CONTRACTS.md §1, §4). Deriving this from
+/// `<song>/songbook/<name>/` and cover art in the shared library
+/// `<song>/covers/` (CONTRACTS.md §1, §4). Deriving this from
 /// [`stage_dir`] rather than recomputing keeps the whole song tree coherent
 /// under an `AOIDE_STAGE_DIR` override: a test points that at `<tmp>/stage` and
 /// the songbook resolves under `<tmp>/` alongside it. Every `rice`/`song`
