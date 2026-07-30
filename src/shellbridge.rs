@@ -249,6 +249,12 @@ fn seed_if_absent(path: &std::path::Path, empty_body: &str, key: &str) -> Option
 pub enum BridgeCommand {
     /// `{ "cmd": "focuswindow", "address": "0x…" }` — jump to a window.
     Focus { address: String },
+    /// `{ "cmd": "focussession", "sessionId": "…" }` — jump to a SESSION by id.
+    /// The daemon resolves id → `windowAddress` (focus the exact window), or
+    /// falls back to id → `workspace` (switch to it) when the address isn't
+    /// resolved yet. This is the source-of-truth jump: QML sends only the
+    /// sessionId a roster row already holds, never a stale/empty address.
+    FocusSession { session_id: String },
 }
 
 /// Parse ONE wire line into a [`BridgeCommand`]. Pure and total: malformed
@@ -268,6 +274,18 @@ pub fn parse_command(line: &str) -> Option<BridgeCommand> {
                 return None;
             }
             Some(BridgeCommand::Focus { address })
+        }
+        "focussession" => {
+            let session_id = v
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if session_id.is_empty() {
+                return None;
+            }
+            Some(BridgeCommand::FocusSession { session_id })
         }
         _ => None,
     }
@@ -424,6 +442,30 @@ fn handle_conn(stream: UnixStream) {
                     );
                 }
             },
+            Some(BridgeCommand::FocusSession { session_id }) => {
+                match crate::graph::focus_session(&session_id) {
+                    Ok(()) => {
+                        let _ = daemon::audit(
+                            &daemon::default_audit_log(),
+                            daemon::Door::Daemon,
+                            daemon::EventClass::Audit,
+                            "shellbridge",
+                            "focus",
+                            &format!("focused session {session_id}"),
+                        );
+                    }
+                    Err(e) => {
+                        let _ = daemon::audit(
+                            &daemon::default_audit_log(),
+                            daemon::Door::Daemon,
+                            daemon::EventClass::Audit,
+                            "shellbridge",
+                            "focus-failed",
+                            &format!("session {} ({}): {}", session_id, e.reason, e.message),
+                        );
+                    }
+                }
+            }
             None => eprintln!("[aoide/shellbridge] ignoring unknown/malformed command: {line}"),
         }
     }
@@ -451,6 +493,26 @@ mod tests {
                 address: "0xABC".to_string()
             })
         );
+    }
+
+    #[test]
+    fn parse_command_accepts_a_valid_focussession() {
+        assert_eq!(
+            parse_command(r#"{"cmd":"focussession","sessionId":"conduct-1-2"}"#),
+            Some(BridgeCommand::FocusSession {
+                session_id: "conduct-1-2".to_string()
+            })
+        );
+        // Trimmed like focuswindow's address.
+        assert_eq!(
+            parse_command("{\"cmd\":\"focussession\",\"sessionId\":\" abc \"}\n"),
+            Some(BridgeCommand::FocusSession {
+                session_id: "abc".to_string()
+            })
+        );
+        // Empty/absent sessionId → None (never dispatch a blank session jump).
+        assert_eq!(parse_command(r#"{"cmd":"focussession","sessionId":""}"#), None);
+        assert_eq!(parse_command(r#"{"cmd":"focussession"}"#), None);
     }
 
     #[test]

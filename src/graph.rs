@@ -1125,6 +1125,78 @@ pub fn focus_window(addr: &str) -> Result<(), FocusError> {
     }
 }
 
+/// Resolve a `sessionId` to a live jump and dispatch it — the socket-reachable
+/// counterpart to the CLI [`focus`]. shellbridge drives this on a roster
+/// row-click: QML sends only the sessionId (which every row already holds), and
+/// the DAEMON owns the id→window resolution, so a widget never carries a stale or
+/// empty address (the bug this fixes: the old socket verb took a window address,
+/// but the widgets passed a sessionId, so every tracked-row jump silently
+/// no-op'd as `window-not-found`). Prefers the exact `windowAddress` (which also
+/// brings its workspace forward); if that isn't resolved yet but the `workspace`
+/// is known, falls back to switching to that workspace. Never panics — a socket
+/// loop calls it on arbitrary input.
+pub fn focus_session(id: &str) -> Result<(), FocusError> {
+    let id = id.strip_prefix("session:").unwrap_or(id).trim();
+    if id.is_empty() {
+        return Err(FocusError {
+            reason: "no-session-id",
+            message: "empty session id".to_string(),
+        });
+    }
+    let file: SessionsFile = match load_stage(&sessions_path()) {
+        Ok(f) => f,
+        Err(_) => {
+            return Err(FocusError {
+                reason: "stage-unreadable",
+                message: "could not read sessions.json".to_string(),
+            });
+        }
+    };
+    let Some(rec) = file.sessions.iter().find(|s| s.session_id == id) else {
+        return Err(FocusError {
+            reason: "session-not-found",
+            message: format!("unknown session `{id}`"),
+        });
+    };
+    // Prefer the exact window — focuswindow also brings its workspace forward.
+    if !rec.window_address.trim().is_empty() {
+        return focus_window(&rec.window_address);
+    }
+    // The window isn't resolved yet (discovery is best-effort), but if we know
+    // the workspace we can still take the user there.
+    if let Some(ws) = rec.workspace {
+        return focus_workspace(ws);
+    }
+    Err(FocusError {
+        reason: "no-window-address",
+        message: format!("session `{id}` has no window or workspace to focus"),
+    })
+}
+
+/// Switch to a Hyprland workspace by numeric id (`hyprctl dispatch workspace
+/// <id>`) — the fallback jump for a session whose window address isn't resolved
+/// yet but whose workspace is known. Structured `Err` on a missing/failed
+/// hyprctl; never panics.
+pub fn focus_workspace(ws: i64) -> Result<(), FocusError> {
+    match std::process::Command::new("hyprctl")
+        .args(["dispatch", "workspace", &ws.to_string()])
+        .output()
+    {
+        Err(e) => Err(FocusError {
+            reason: "hyprctl-unavailable",
+            message: format!("hyprctl unavailable: {e}"),
+        }),
+        Ok(out) if !out.status.success() => Err(FocusError {
+            reason: "hyprctl-failed",
+            message: format!(
+                "hyprctl dispatch workspace failed (exit {:?})",
+                out.status.code()
+            ),
+        }),
+        Ok(_) => Ok(()),
+    }
+}
+
 /// `graph prune` — drop `done` sessions (+ their hooks); clear orphaned
 /// `parentSessionId`s. Idempotent; writes only when something changed.
 pub fn prune(_inv: &Invocation) -> Outcome {
