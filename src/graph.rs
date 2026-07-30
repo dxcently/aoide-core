@@ -2443,9 +2443,51 @@ fn proc_cwd(pid: i32) -> Option<String> {
         .and_then(|p| p.to_str().map(str::to_string))
 }
 
-/// A short one-line label for a process's command: `/proc/<pid>/cmdline` argv
-/// joined (shows args like `cargo test`), falling back to `comm`. Clipped to a
-/// roster-friendly width. Used as a conducted shell's live `activity`.
+/// Known interactive text-editor binaries whose activity display should read
+/// as "<editor> <file>" (or bare "<editor>" with no file), not the raw
+/// invocation. Dotfiles routinely wrap these with startup flags (an alias
+/// injecting `--cmd 'lua …'`, a resolved absolute binary path) that make the
+/// full cmdline read as noise rather than "what's being edited".
+const EDITOR_BASENAMES: &[&str] = &["nvim", "vim", "vi", "nano", "emacs", "hx", "micro"];
+
+/// If `argv[0]`'s basename is a known editor, return a friendly `"<editor>
+/// <file>"` (or bare `"<editor>"` with no file argument) — pure and
+/// unit-tested. The file is the LAST argument that doesn't look like a flag
+/// AND doesn't contain a space: flags precede the file operand in normal
+/// usage, so scanning from the end finds the real file even past a `--cmd
+/// '…'`-style startup injection (whose value sits earlier in argv, before the
+/// file) — and the no-space guard additionally rejects a bare, file-less
+/// invocation whose flag VALUE doesn't start with `-` either (e.g. `nvim --cmd
+/// 'lua x=1'` with no file): a real single-file operand essentially never
+/// contains a space, while an option's value routinely does. `None` for a
+/// non-editor binary, so the caller falls back to the generic full-cmdline
+/// display.
+fn friendly_editor_command(argv: &[String]) -> Option<String> {
+    let base = std::path::Path::new(argv.first()?).file_name()?.to_str()?;
+    if !EDITOR_BASENAMES.contains(&base) {
+        return None;
+    }
+    let file = argv[1..]
+        .iter()
+        .rev()
+        .find(|a| !a.starts_with('-') && !a.contains(' '));
+    Some(match file {
+        Some(f) => {
+            let name = std::path::Path::new(f)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(f);
+            format!("{base} {name}")
+        }
+        None => base.to_string(),
+    })
+}
+
+/// A short one-line label for a process's command: a known editor shows as
+/// `"<editor> <file>"` ([`friendly_editor_command`]); anything else shows
+/// `/proc/<pid>/cmdline` argv joined (e.g. `cargo test`), falling back to
+/// `comm`. Clipped to a roster-friendly width. Used as a conducted shell's
+/// live `activity`.
 fn proc_command(pid: i32) -> Option<String> {
     let clip = |s: &str| -> String {
         let one = s.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -2457,12 +2499,15 @@ fn proc_command(pid: i32) -> Option<String> {
         }
     };
     if let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) {
-        let joined = raw
+        let argv: Vec<String> = raw
             .split(|b| *b == 0)
             .filter(|p| !p.is_empty())
-            .map(|p| String::from_utf8_lossy(p))
-            .collect::<Vec<_>>()
-            .join(" ");
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect();
+        if let Some(friendly) = friendly_editor_command(&argv) {
+            return Some(clip(&friendly));
+        }
+        let joined = argv.join(" ");
         let joined = joined.trim();
         if !joined.is_empty() {
             return Some(clip(joined));
@@ -4537,6 +4582,53 @@ mod tests {
         let clipped = one_line_clip(&long, 10);
         assert_eq!(clipped.chars().count(), 10);
         assert!(clipped.ends_with('…'));
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn friendly_editor_command_shows_editor_and_file_by_basename() {
+        // A plain file argument, editor resolved to a full store path.
+        assert_eq!(
+            friendly_editor_command(&argv(&[
+                "/etc/profiles/per-user/khoa/bin/nvim",
+                "modules/facets/quickshell/qml/TerminalsGadget.qml",
+            ])),
+            Some("nvim TerminalsGadget.qml".to_string())
+        );
+        // Bare invocation, no file → just the editor name.
+        assert_eq!(
+            friendly_editor_command(&argv(&["/run/current-system/sw/bin/nvim"])),
+            Some("nvim".to_string())
+        );
+        // A dotfiles-style startup flag with a value ahead of the real file: the
+        // LAST non-flag argument (scanning from the end) is the file, not the
+        // flag's value.
+        assert_eq!(
+            friendly_editor_command(&argv(&[
+                "nvim",
+                "--cmd",
+                "lua vim.g.x=1",
+                "notes.md",
+            ])),
+            Some("nvim notes.md".to_string())
+        );
+        // A value-taking flag with NO file: the flag's value ("lua vim.g.x=1")
+        // contains a space, so it's rejected as a candidate file too — falls
+        // through to bare "nvim", not the flag's value misread as a filename.
+        assert_eq!(
+            friendly_editor_command(&argv(&["nvim", "--cmd", "lua vim.g.x=1"])),
+            Some("nvim".to_string())
+        );
+        // A non-editor binary → None, so the caller falls back to the generic
+        // full-cmdline display.
+        assert_eq!(
+            friendly_editor_command(&argv(&["cargo", "test"])),
+            None
+        );
+        assert_eq!(friendly_editor_command(&argv(&[])), None);
     }
 
     #[test]
