@@ -856,6 +856,46 @@ fn live_window_addresses() -> Option<HashSet<String>> {
     )
 }
 
+/// The reaper's transient-read grace (pure, unit-tested). Given the set of live
+/// window addresses the compositor just reported and the current sessions,
+/// decide the window-liveness set this reap pass should actually trust.
+///
+/// During a reload/restart (a quickshell restart, `hyprctl reload`, a nixos
+/// switch) `hyprctl clients -j` can momentarily answer SUCCESS with ZERO windows
+/// while the terminals are in fact alive — the compositor is mid-reload. Reaping
+/// the whole windowed roster off that snapshot is exactly the transient drop this
+/// fix targets, so an EMPTY gathered set against a roster that still holds
+/// windowed, not-`done` sessions is treated as degenerate and DOWNGRADED to
+/// `None` (pid-only liveness) for the pass — a vanished `/proc/<pid>` is still
+/// authoritative, so a genuinely-closed terminal (its owning pid gone too) is
+/// still reaped, while a live-but-momentarily-unlisted window is spared. A
+/// non-empty set, or an empty set with nothing windowed to protect, passes
+/// through unchanged.
+///
+/// Bounded edge (acceptable): a not-`done`, windowed, PID-LESS session whose
+/// terminal genuinely closed while the desktop is at zero windows carries neither
+/// a pid signal nor — under this downgrade — a window signal, so it is NOT reaped
+/// on that pass. It self-heals the moment ANY window exists (the snapshot is no
+/// longer empty, the stale address is then absent from a real set, and the window
+/// signal fires as normal). A lone stale record briefly lingering is the right
+/// trade for never mass-sweeping a live roster off a mid-reload read.
+fn effective_live_addresses(
+    gathered: Option<HashSet<String>>,
+    sessions: &[SessionRecord],
+) -> Option<HashSet<String>> {
+    match &gathered {
+        Some(set)
+            if set.is_empty()
+                && sessions
+                    .iter()
+                    .any(|s| s.state != "done" && !s.window_address.is_empty()) =>
+        {
+            None
+        }
+        _ => gathered,
+    }
+}
+
 /// `graph reap` — the automatic liveness sweep. Marks every DEAD (killed,
 /// orphaned) session `done` (and its hook record), then reuses [`prune_done`] to
 /// drop them + clear orphaned parent links, re-staging `graph.json` atomically.
@@ -873,7 +913,12 @@ pub fn reap(_inv: &Invocation) -> Outcome {
         Err(e) => return stage_error(cmd, e),
     };
 
-    let live = live_window_addresses();
+    let gathered = live_window_addresses();
+    let hyprctl_available = gathered.is_some();
+    // Apply the transient-read grace: a degenerate empty snapshot during a reload
+    // window falls back to pid-only liveness so we never sweep the live roster off
+    // a momentary "zero windows" answer.
+    let live = effective_live_addresses(gathered, &s_file.sessions);
     // Only STILL-live records can be dead-by-liveness; an already-`done` session
     // is prune's job, not a reap. This is the set the liveness predicate killed.
     let reaped: Vec<String> = s_file
@@ -887,7 +932,7 @@ pub fn reap(_inv: &Invocation) -> Outcome {
     if reaped.is_empty() {
         return Outcome::ok(cmd, "nothing to reap (all sessions live)").with_data(json!({
             "reaped": [],
-            "hyprctlAvailable": live.is_some(),
+            "hyprctlAvailable": hyprctl_available,
         }));
     }
 
@@ -950,7 +995,7 @@ pub fn reap(_inv: &Invocation) -> Outcome {
         "reaped": reaped,
         "removed": removed,
         "clearedParents": cleared,
-        "hyprctlAvailable": live.is_some(),
+        "hyprctlAvailable": hyprctl_available,
     }))
 }
 
@@ -4529,5 +4574,81 @@ mod tests {
         assert_eq!(again.data.unwrap()["reaped"], json!([]));
 
         let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn reap_spares_a_live_but_hook_silent_session() {
+        // The regression this whole fix pins: the reaper reaps by REAL liveness
+        // (window / pid), NEVER by hook silence. A session whose pid is alive but
+        // that has emitted NO hook — its hook stream went quiet across a
+        // reload/restart window — must survive the sweep. (hooks.json is left
+        // absent, so the session is maximally hook-silent.)
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "HYPRLAND_INSTANCE_SIGNATURE"]);
+        std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"); // pid-only liveness
+        let stage = unique_stage("reap-hooksilent");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let now = "2026-01-01T00:00:00Z";
+        let mut sessions = Vec::new();
+        upsert_session(
+            &mut sessions, "quiet", None, Some("/w"), Some("0xdead"), None, None, None, None,
+            Some(std::process::id()), now,
+        );
+        write_stage(
+            &sessions_path(),
+            &SessionsFile { schema_version: "0".into(), sessions },
+        )
+        .unwrap();
+
+        let out = reap(&invocation(&["graph", "reap"], &[]));
+        assert_eq!(out.status, crate::output::Status::Ok);
+        assert_eq!(
+            out.data.unwrap()["reaped"],
+            json!([]),
+            "a live-but-hook-silent session is never reaped"
+        );
+        let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert!(
+            s2.sessions.iter().any(|s| s.session_id == "quiet"),
+            "the hook-silent session survives the reaper pass"
+        );
+
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn reaper_grace_ignores_a_degenerate_empty_clients_snapshot() {
+        // A momentary empty `hyprctl clients` read during a reload window must not
+        // mass-reap the windowed roster: the grace downgrades it to pid-only.
+        let windowed = vec![SessionRecord {
+            window_address: "0xabc".into(),
+            state: "running".into(),
+            ..Default::default()
+        }];
+        // Empty gathered set + a windowed live session → degrade to None (pid-only).
+        assert!(effective_live_addresses(Some(HashSet::new()), &windowed).is_none());
+
+        // A NON-empty set is trusted as gathered (the normal path).
+        let set: HashSet<String> = ["0xabc".to_string()].into_iter().collect();
+        assert_eq!(
+            effective_live_addresses(Some(set.clone()), &windowed),
+            Some(set)
+        );
+
+        // Empty set but nothing windowed to protect (a genuinely empty desktop, or
+        // an all-`done` roster) → the empty set passes through; pid signal governs.
+        let done_only = vec![SessionRecord {
+            window_address: "0xabc".into(),
+            state: "done".into(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            effective_live_addresses(Some(HashSet::new()), &done_only),
+            Some(HashSet::new())
+        );
+
+        // No compositor at all stays None (unchanged).
+        assert!(effective_live_addresses(None, &windowed).is_none());
     }
 }
