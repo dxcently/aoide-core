@@ -2672,15 +2672,34 @@ fn do_session_refresh(id: &str, cwd: Option<&str>, activity: Option<&str>, state
     });
 }
 
+/// Which process's cwd a conducted shell should report, given the pty's
+/// foreground pgid `fg` and the `shell_pid`, using an injectable `cwd_of`
+/// lookup (pure and unit-tested; the real caller passes [`proc_cwd`]). At the
+/// bare prompt (`fg <= 0` or `fg == shell_pid`) it's the shell's own cwd. While
+/// a foreground command runs it's the FOREGROUND process's OWN cwd — which may
+/// navigate independently of the shell (e.g. yazi/ranger's live directory
+/// browsing calls `chdir()` on themselves, not the parent shell), so the shell's
+/// cwd alone would freeze at launch time and never reflect what the foreground
+/// process is actually showing — falling back to the shell's cwd when the
+/// foreground process's is unreadable (a permissions edge case, or it just
+/// exited in a race).
+fn cwd_for(fg: i32, shell_pid: i32, cwd_of: impl Fn(i32) -> Option<String>) -> Option<String> {
+    if fg <= 0 || fg == shell_pid {
+        cwd_of(shell_pid)
+    } else {
+        cwd_of(fg).or_else(|| cwd_of(shell_pid))
+    }
+}
+
 /// One conduct-tick refresh for a SHELL session: read the pty's foreground
-/// process group and the shell's cwd, and push cwd + the current command + the
+/// process group and the live cwd, and push cwd + the current command + the
 /// idle/working state. The shell (spawned under `setsid`) is its own process
 /// group leader, so a foreground pgid equal to the shell pid means "at the bare
 /// prompt" (idle); anything else is a command running in the foreground
 /// (working, its command captured as `activity`).
 fn conduct_refresh_shell(id: &str, master: RawFd, shell_pid: i32) {
     let fg = unsafe { libc::tcgetpgrp(master) };
-    let cwd = proc_cwd(shell_pid);
+    let cwd = cwd_for(fg, shell_pid, proc_cwd);
     let (state, activity) = if fg <= 0 || fg == shell_pid {
         // At the bare prompt: idle, but label the row with the shell PROCESS
         // itself (e.g. `bash`) so the terminal roster is never blank.
@@ -4856,6 +4875,41 @@ mod tests {
         );
         // Empty argv → None (caller falls back to `comm`).
         assert_eq!(generic_command_label(&argv(&[])), None);
+    }
+
+    #[test]
+    fn cwd_for_prefers_foreground_process_then_falls_back_to_shell() {
+        const SHELL_PID: i32 = 100;
+        const FG_PID: i32 = 200;
+        // A foreground command runs and its cwd is readable and DIFFERS from the
+        // shell's (yazi navigated elsewhere): the foreground process's own cwd
+        // wins, so the widget follows it rather than freezing at launch.
+        let lookup = |pid: i32| match pid {
+            SHELL_PID => Some("/home/khoa".to_string()),
+            FG_PID => Some("/home/khoa/dxflake".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            cwd_for(FG_PID, SHELL_PID, lookup),
+            Some("/home/khoa/dxflake".to_string())
+        );
+        // A foreground command runs but its cwd is unreadable (None — a perms
+        // edge case, or it exited in a race): fall back to the shell's cwd.
+        let unreadable_fg = |pid: i32| match pid {
+            SHELL_PID => Some("/home/khoa".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            cwd_for(FG_PID, SHELL_PID, unreadable_fg),
+            Some("/home/khoa".to_string())
+        );
+        // At the bare prompt (fg == shell_pid, and the fg <= 0 "no fg" case):
+        // always the shell's own cwd, never consulting any other pid.
+        assert_eq!(
+            cwd_for(SHELL_PID, SHELL_PID, lookup),
+            Some("/home/khoa".to_string())
+        );
+        assert_eq!(cwd_for(0, SHELL_PID, lookup), Some("/home/khoa".to_string()));
     }
 
     #[test]
