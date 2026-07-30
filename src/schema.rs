@@ -165,6 +165,15 @@ pub fn commands() -> Vec<Command> {
             gated: false,
             implemented: true,
         ),
+        // ── cover: the live wallpaper write-path (song/covers/) ─────────────
+        cmd!(
+            path: ["cover", "set"],
+            summary: "Set the live wallpaper: stage stage/cover.json (hot-swap) from a cover path or a bare name in song/covers/.",
+            args: [arg!("path", "string", true, "Absolute cover path, or a bare filename resolved against song/covers/.")],
+            flags: [],
+            gated: false,
+            implemented: true,
+        ),
         cmd!(
             path: ["rice", "adopt"],
             summary: "Commit a previewed rice and propose the gated rebuild (user gates this).",
