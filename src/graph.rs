@@ -1842,7 +1842,16 @@ fn refresh_subagent_says(session_id: &str, cwd: Option<&str>) {
 /// parent sub-node when nested, else the session). An existing node is enriched
 /// (keeps its parent + first name), so the PreToolUse(Task) and SubagentStart
 /// paths converge on one record however they race.
-fn do_subagent_spawn(sub_id: &str, owner: &str, name: &str, agent_type: &str) {
+///
+/// `allow_create` guards the create branch: the PreToolUse spawn and the classic
+/// `parent_tool_use_id` SubagentStart backstop pass `true` (they are the record's
+/// origin). The async `Agent` path's SubagentStart carries ONLY an `agent_id`
+/// and reaches here keyed `sub:<agent_id>` — but the authoritative node is the
+/// one PreToolUse created under `sub:<tool_use_id>` and PostToolUse re-keys to
+/// `sub:<agent_id>`; so that fallback passes `false` (enrich-only): it confirms
+/// the node once the re-key has landed and is a harmless no-op before then,
+/// never a duplicate.
+fn do_subagent_spawn(sub_id: &str, owner: &str, name: &str, agent_type: &str, allow_create: bool) {
     crate::shellbridge::with_stage_lock(|| {
         let mut file: SessionsFile = match load_stage(&sessions_path()) {
             Ok(f) => f,
@@ -1859,6 +1868,10 @@ fn do_subagent_spawn(sub_id: &str, owner: &str, name: &str, agent_type: &str) {
                 s.agent = agent_type.to_string();
             }
             s.kind = Some("subagent".to_string());
+        } else if !allow_create {
+            // Enrich-only: the node does not exist yet (the async re-key has not
+            // landed). Do nothing rather than create a duplicate/misparented one.
+            return;
         } else {
             file.sessions.push(SessionRecord {
                 session_id: sub_id.to_string(),
@@ -1901,6 +1914,67 @@ fn do_subagent_end(sub_id: &str) {
         if file.sessions.len() != before {
             let _ = write_stage(&sessions_path(), &file);
             let _ = restage_graph();
+        }
+    });
+}
+
+/// Re-key a sub-agent node's `sessionId` in place. An async `Agent` dispatch is
+/// created under `sub:<tool_use_id>` (all PreToolUse carries), but the only id
+/// its later SubagentStart/SubagentStop carry is the `agent_id` — a different
+/// string with no derivable link to the tool_use_id. The dispatch's OWN
+/// PostToolUse is the single payload where both co-occur (`tool_use_id` +
+/// `tool_response.agentId`), so it renames the record there from
+/// `sub:<tool_use_id>` to `sub:<agent_id>` — keeping every other field (parent,
+/// kind, state, title, startedAt) untouched — and reparents any child that
+/// pointed at the old id. Because each dispatch re-keys using the id pair from
+/// its OWN PostToolUse, two Agent calls in one turn never cross-attribute.
+///
+/// Idempotent: a no-op when the source is gone or the ids already match; if the
+/// target id somehow already exists, the stale source is dropped rather than
+/// duplicated.
+fn do_subagent_rekey(from_sub_id: &str, to_sub_id: &str) {
+    if from_sub_id == to_sub_id || from_sub_id.is_empty() || to_sub_id.is_empty() {
+        return;
+    }
+    crate::shellbridge::with_stage_lock(|| {
+        let mut file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        if !file.sessions.iter().any(|s| s.session_id == from_sub_id) {
+            return; // source gone (PreToolUse missed, or already re-keyed) — no-op
+        }
+        let target_exists = file.sessions.iter().any(|s| s.session_id == to_sub_id);
+        let mut changed = false;
+        if target_exists {
+            // A node already lives under the new id — never duplicate; drop the
+            // stale source and let the existing target stand.
+            let before = file.sessions.len();
+            file.sessions.retain(|s| s.session_id != from_sub_id);
+            changed = file.sessions.len() != before;
+        } else {
+            for s in file.sessions.iter_mut() {
+                if s.session_id == from_sub_id {
+                    s.session_id = to_sub_id.to_string();
+                    changed = true;
+                }
+            }
+        }
+        // Reparent any child that pointed at the old id (none at launch time, but
+        // keeps the tree consistent if a nested node ever raced in first).
+        for s in file.sessions.iter_mut() {
+            if s.parent_session_id.as_deref() == Some(from_sub_id) {
+                s.parent_session_id = Some(to_sub_id.to_string());
+                changed = true;
+            }
+        }
+        if changed {
+            if file.schema_version.is_empty() {
+                file.schema_version = STAGE_GRAPH_VERSION.to_string();
+            }
+            if write_stage(&sessions_path(), &file).is_ok() {
+                let _ = restage_graph();
+            }
         }
     });
 }
@@ -3937,12 +4011,27 @@ enum HookAction {
         owner: String,
         end_sub: Option<String>,
     },
-    /// SubagentStart backstop: ensure the child node exists (keyed by the Task's
-    /// tool_use_id via `parent_tool_use_id`) even if PreToolUse(Task) was missed.
+    /// PostToolUse for an ASYNC `Agent` dispatch (`tool_response.isAsync == true`):
+    /// the launch returned in single-digit ms but the background sub-agent runs
+    /// on. Do NOT tear the node down; RE-KEY it from `sub:<tool_use_id>` to
+    /// `sub:<agent_id>` (the only id the later SubagentStart/Stop carry) and clear
+    /// the owner's foreground activity like a normal tool boundary.
+    SubRekey {
+        session: String,
+        owner: String,
+        from_sub_id: String,
+        to_sub_id: String,
+    },
+    /// SubagentStart backstop: ensure the child node exists. `create` is true for
+    /// the classic path (keyed by the Task's tool_use_id via `parent_tool_use_id`)
+    /// so a missed PreToolUse(Task) is still recovered; it is false for the async
+    /// `Agent` fallback (keyed by `agent_id`), which only confirms the re-keyed
+    /// node and must never create a duplicate.
     SubEnsure {
         sub_id: String,
         session: String,
         agent_type: String,
+        create: bool,
     },
     /// SubagentStop backstop: close the child node.
     SubEnd {
@@ -4045,16 +4134,46 @@ fn map_hook(payload: &Value) -> Option<HookAction> {
                 Some(p) => format!("sub:{p}"),
                 None => id.to_string(),
             };
-            let end_sub = if is_subagent_tool(tool) && !tuid.is_empty() {
-                Some(format!("sub:{tuid}"))
+            // Async `Agent` dispatch: PostToolUse fires the instant the LAUNCH
+            // returns (`tool_response.isAsync == true`), NOT when the background
+            // agent finishes — so tearing the node down here would kill it within
+            // ~4ms of creating it. Instead re-key `sub:<tuid>` → `sub:<agentId>`
+            // (this payload's own `tool_response.agentId`, the only place both ids
+            // co-occur) so the later SubagentStop can find it. A classic Task (or a
+            // synchronous Agent with no `isAsync`) really IS done here — end it.
+            let resp = payload.get("tool_response");
+            let async_agent_id = if is_subagent_tool(tool)
+                && !tuid.is_empty()
+                && resp
+                    .and_then(|r| r.get("isAsync"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            {
+                resp.and_then(|r| r.get("agentId"))
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
             } else {
                 None
             };
-            Some(HookAction::ToolEnd {
-                session: id.to_string(),
-                owner,
-                end_sub,
-            })
+            if let Some(aid) = async_agent_id {
+                Some(HookAction::SubRekey {
+                    session: id.to_string(),
+                    owner,
+                    from_sub_id: format!("sub:{tuid}"),
+                    to_sub_id: format!("sub:{aid}"),
+                })
+            } else {
+                let end_sub = if is_subagent_tool(tool) && !tuid.is_empty() {
+                    Some(format!("sub:{tuid}"))
+                } else {
+                    None
+                };
+                Some(HookAction::ToolEnd {
+                    session: id.to_string(),
+                    owner,
+                    end_sub,
+                })
+            }
         }
         // The turn ended and it is the user's move again — but a finished turn is
         // NOT "needs input" (that would make the anxious state the resting face of
@@ -4097,29 +4216,52 @@ fn map_hook(payload: &Value) -> Option<HookAction> {
                 None
             }
         }
-        // Sub-agent lifecycle backstops (keyed by the spawning Task's tool_use_id,
-        // carried as `parent_tool_use_id`) — they converge on the same node the
-        // PreToolUse/PostToolUse(Task) path manages, whichever fires.
-        "SubagentStart" => payload
-            .get("parent_tool_use_id")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(|p| HookAction::SubEnsure {
-                sub_id: format!("sub:{p}"),
+        // Sub-agent lifecycle backstops. The classic path keys on the spawning
+        // Task's tool_use_id (carried as `parent_tool_use_id`) — it converges on
+        // the same node the PreToolUse/PostToolUse(Task) path manages, whichever
+        // fires. This harness's async `Agent` dispatch carries NEITHER
+        // tool_use_id NOR parent_tool_use_id here — only `agent_id` — so we fall
+        // back to it, keyed `sub:<agent_id>`, which is exactly what the async
+        // PostToolUse re-keyed the node to. The classic path may create a node
+        // (backstop for a missed PreToolUse); the agent_id fallback only confirms
+        // the re-keyed node (never creates a duplicate).
+        "SubagentStart" => {
+            let via_parent = payload
+                .get("parent_tool_use_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            let key = via_parent.or_else(|| {
+                payload
+                    .get("agent_id")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+            });
+            key.map(|k| HookAction::SubEnsure {
+                sub_id: format!("sub:{k}"),
                 session: id.to_string(),
                 agent_type: payload
                     .get("agent_type")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string(),
-            }),
-        "SubagentStop" => payload
-            .get("parent_tool_use_id")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(|p| HookAction::SubEnd {
-                sub_id: format!("sub:{p}"),
-            }),
+                create: via_parent.is_some(),
+            })
+        }
+        "SubagentStop" => {
+            let key = payload
+                .get("parent_tool_use_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    payload
+                        .get("agent_id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                });
+            key.map(|k| HookAction::SubEnd {
+                sub_id: format!("sub:{k}"),
+            })
+        }
         "SessionEnd" => Some(HookAction::End { id: id.to_string() }),
         _ => None,
     }
@@ -4202,7 +4344,7 @@ fn hook_from_str(buf: &str) -> Outcome {
             // Spawn the child FIRST so it exists before its parent's activity
             // points at it, then mark the owner working + its current activity.
             if let Some(sp) = spawn {
-                do_subagent_spawn(&sp.sub_id, &owner, &sp.name, &sp.agent_type);
+                do_subagent_spawn(&sp.sub_id, &owner, &sp.name, &sp.agent_type, true);
             }
             set_owner_activity(&owner, "working", activity.as_deref());
             Outcome::ok("graph.session.hook", format!("tool start → {owner}"))
@@ -4221,12 +4363,30 @@ fn hook_from_str(buf: &str) -> Outcome {
             set_owner_activity(&owner, "working", None);
             Outcome::ok("graph.session.hook", format!("tool end → {owner}"))
         }
+        HookAction::SubRekey {
+            session,
+            owner,
+            from_sub_id,
+            to_sub_id,
+        } => {
+            ensure_session_window(&session);
+            do_subagent_rekey(&from_sub_id, &to_sub_id);
+            // The launch returned; the parent is no longer running that tool in
+            // the foreground (its sub-agent runs on in the background) — clear the
+            // activity, exactly as a normal tool boundary would.
+            set_owner_activity(&owner, "working", None);
+            Outcome::ok(
+                "graph.session.hook",
+                format!("subagent rekey {from_sub_id} → {to_sub_id}"),
+            )
+        }
         HookAction::SubEnsure {
             sub_id,
             session,
             agent_type,
+            create,
         } => {
-            do_subagent_spawn(&sub_id, &session, &agent_type, &agent_type);
+            do_subagent_spawn(&sub_id, &session, &agent_type, &agent_type, create);
             Outcome::ok("graph.session.hook", format!("subagent {sub_id}"))
         }
         HookAction::SubEnd { sub_id } => {
@@ -5852,8 +6012,38 @@ mod tests {
                 "session_id": "s", "hook_event_name": "SubagentStart",
                 "parent_tool_use_id": "tuABC", "agent_type": "Explore"
             })).unwrap(),
-            HookAction::SubEnsure { ref sub_id, ref agent_type, .. }
-                if sub_id == "sub:tuABC" && agent_type == "Explore"
+            HookAction::SubEnsure { ref sub_id, ref agent_type, create, .. }
+                if sub_id == "sub:tuABC" && agent_type == "Explore" && create
+        ));
+        // ASYNC `Agent` dispatch: its PostToolUse fires at LAUNCH
+        // (`tool_response.isAsync == true`), NOT at completion. It must NOT end the
+        // node — it re-keys `sub:<tool_use_id>` → `sub:<agentId>` (the only place
+        // both ids co-occur) so the later SubagentStop can find it.
+        assert!(matches!(
+            map_hook(&json!({
+                "session_id": "s", "hook_event_name": "PostToolUse", "tool_name": "Agent",
+                "tool_use_id": "tuAsync",
+                "tool_response": { "isAsync": true, "status": "async_launched", "agentId": "agz1" }
+            })).unwrap(),
+            HookAction::SubRekey { ref from_sub_id, ref to_sub_id, .. }
+                if from_sub_id == "sub:tuAsync" && to_sub_id == "sub:agz1"
+        ));
+        // The async lifecycle events carry ONLY `agent_id` (no parent_tool_use_id):
+        // SubagentStart falls back to it as an enrich-only ensure (create=false);
+        // SubagentStop falls back to it to close the re-keyed node.
+        assert!(matches!(
+            map_hook(&json!({
+                "session_id": "s", "hook_event_name": "SubagentStart",
+                "agent_id": "agz1", "agent_type": "general-purpose"
+            })).unwrap(),
+            HookAction::SubEnsure { ref sub_id, create, .. }
+                if sub_id == "sub:agz1" && !create
+        ));
+        assert!(matches!(
+            map_hook(&json!({
+                "session_id": "s", "hook_event_name": "SubagentStop", "agent_id": "agz1"
+            })).unwrap(),
+            HookAction::SubEnd { ref sub_id } if sub_id == "sub:agz1"
         ));
         // Stop settles the turn to `idle` — a finished turn is not "needs input".
         assert!(matches!(
@@ -6372,6 +6562,167 @@ mod tests {
             find(&load(), "sub:g1").is_none(),
             "the sub-node is removed when its Agent dispatch returns"
         );
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn async_agent_dispatch_survives_launch_and_dies_on_subagent_stop() {
+        // The live-captured async `Agent` lifecycle (the reason the earlier fix
+        // did nothing on the box): PreToolUse spawns `sub:<tool_use_id>`, but the
+        // Agent's PostToolUse fires ~4ms later at LAUNCH (isAsync), NOT at
+        // completion — so it must NOT tear the node down. It re-keys the node to
+        // `sub:<agentId>`, and only the much-later SubagentStop (agent_id only)
+        // ends it.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("async-agent");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let load = || -> SessionsFile { load_stage(&sessions_path()).unwrap() };
+        let find = |ss: &SessionsFile, id: &str| ss.sessions.iter().find(|s| s.session_id == id).cloned();
+
+        hook_from_str(r#"{ "session_id": "a", "hook_event_name": "SessionStart", "cwd": "/p" }"#);
+
+        // 1) PreToolUse → the node is born under the tool_use_id.
+        hook_from_str(
+            r#"{ "session_id": "a", "hook_event_name": "PreToolUse", "tool_name": "Agent",
+                 "tool_use_id": "toolu_X",
+                 "tool_input": { "description": "diagnostic probe", "subagent_type": "general-purpose" } }"#,
+        );
+        let sub = find(&load(), "sub:toolu_X").expect("PreToolUse spawns the node under tool_use_id");
+        assert_eq!(sub.parent_session_id.as_deref(), Some("a"));
+        assert_eq!(sub.title.as_deref(), Some("diagnostic probe"));
+
+        // 2) SubagentStart (agent_id only, fires BEFORE PostToolUse) is enrich-only:
+        // the re-key has not landed, so it is a harmless no-op — it must NOT create
+        // a second, bare `sub:<agentId>` node.
+        hook_from_str(
+            r#"{ "session_id": "a", "hook_event_name": "SubagentStart",
+                 "agent_id": "agentX", "agent_type": "general-purpose" }"#,
+        );
+        assert!(
+            find(&load(), "sub:agentX").is_none(),
+            "SubagentStart must not create a node before the re-key lands"
+        );
+        assert!(find(&load(), "sub:toolu_X").is_some(), "the original node still stands");
+
+        // 3) PostToolUse (isAsync) re-keys in place: same node, new id, every field
+        // preserved. It must NOT be removed (the ~4ms teardown bug).
+        hook_from_str(
+            r#"{ "session_id": "a", "hook_event_name": "PostToolUse", "tool_name": "Agent",
+                 "tool_use_id": "toolu_X",
+                 "tool_response": { "isAsync": true, "status": "async_launched", "agentId": "agentX" } }"#,
+        );
+        let ss = load();
+        assert!(
+            find(&ss, "sub:toolu_X").is_none(),
+            "the tool_use_id key is gone (renamed, not removed)"
+        );
+        let renamed = find(&ss, "sub:agentX").expect("the node is now reachable by agent_id");
+        assert_eq!(renamed.parent_session_id.as_deref(), Some("a"), "parent preserved");
+        assert_eq!(renamed.title.as_deref(), Some("diagnostic probe"), "title preserved");
+        assert_eq!(renamed.kind.as_deref(), Some("subagent"), "kind preserved");
+        assert_eq!(renamed.state, "working", "state preserved (NOT torn down)");
+
+        // 4) A late SubagentStart on the re-keyed node just confirms it (no dup).
+        hook_from_str(
+            r#"{ "session_id": "a", "hook_event_name": "SubagentStart",
+                 "agent_id": "agentX", "agent_type": "general-purpose" }"#,
+        );
+        assert_eq!(
+            load().sessions.iter().filter(|s| s.session_id == "sub:agentX").count(),
+            1,
+            "the confirming SubagentStart never duplicates the node"
+        );
+
+        // 5) SubagentStop (agent_id only, the REAL completion) closes the node.
+        hook_from_str(
+            r#"{ "session_id": "a", "hook_event_name": "SubagentStop", "agent_id": "agentX" }"#,
+        );
+        assert!(
+            find(&load(), "sub:agentX").is_none(),
+            "SubagentStop ends the re-keyed node — the tree collapses at real completion"
+        );
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn two_concurrent_async_agents_never_cross_attribute() {
+        // Two Agent dispatches in ONE turn (parallel). They share a prompt_id, so
+        // it is NOT a reliable correlator — the tool_use_id ↔ agent_id link is
+        // established per-dispatch by each call's OWN PostToolUse. Prove each node
+        // re-keys to its own agent_id with zero cross-contamination, and each
+        // SubagentStop ends only its own node.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("async-concurrent");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let load = || -> SessionsFile { load_stage(&sessions_path()).unwrap() };
+        let find = |ss: &SessionsFile, id: &str| ss.sessions.iter().find(|s| s.session_id == id).cloned();
+
+        hook_from_str(r#"{ "session_id": "a", "hook_event_name": "SessionStart", "cwd": "/p" }"#);
+
+        // Both PreToolUse events (same prompt_id, distinct tool_use_ids).
+        hook_from_str(
+            r#"{ "session_id": "a", "hook_event_name": "PreToolUse", "tool_name": "Agent",
+                 "tool_use_id": "tuidA", "prompt_id": "P",
+                 "tool_input": { "description": "task A", "subagent_type": "Explore" } }"#,
+        );
+        hook_from_str(
+            r#"{ "session_id": "a", "hook_event_name": "PreToolUse", "tool_name": "Agent",
+                 "tool_use_id": "tuidB", "prompt_id": "P",
+                 "tool_input": { "description": "task B", "subagent_type": "Plan" } }"#,
+        );
+        assert!(find(&load(), "sub:tuidA").is_some());
+        assert!(find(&load(), "sub:tuidB").is_some());
+
+        // Each PostToolUse pairs its OWN tool_use_id with its OWN agentId. Deliver
+        // them interleaved with the SubagentStarts to stress the ordering.
+        hook_from_str(
+            r#"{ "session_id": "a", "hook_event_name": "SubagentStart",
+                 "agent_id": "aidA", "agent_type": "Explore" }"#,
+        );
+        hook_from_str(
+            r#"{ "session_id": "a", "hook_event_name": "PostToolUse", "tool_name": "Agent",
+                 "tool_use_id": "tuidB",
+                 "tool_response": { "isAsync": true, "agentId": "aidB" } }"#,
+        );
+        hook_from_str(
+            r#"{ "session_id": "a", "hook_event_name": "PostToolUse", "tool_name": "Agent",
+                 "tool_use_id": "tuidA",
+                 "tool_response": { "isAsync": true, "agentId": "aidA" } }"#,
+        );
+
+        // Each node re-keyed to ITS OWN agent_id, carrying ITS OWN title — no swap.
+        let ss = load();
+        assert!(find(&ss, "sub:tuidA").is_none() && find(&ss, "sub:tuidB").is_none());
+        let a = find(&ss, "sub:aidA").expect("dispatch A reachable by aidA");
+        let b = find(&ss, "sub:aidB").expect("dispatch B reachable by aidB");
+        assert_eq!(a.title.as_deref(), Some("task A"), "A kept its own title");
+        assert_eq!(b.title.as_deref(), Some("task B"), "B kept its own title");
+        assert_eq!(a.agent, "Explore");
+        assert_eq!(b.agent, "Plan");
+
+        // SubagentStop for A ends ONLY A; B survives until its own stop.
+        hook_from_str(
+            r#"{ "session_id": "a", "hook_event_name": "SubagentStop", "agent_id": "aidA" }"#,
+        );
+        let ss = load();
+        assert!(find(&ss, "sub:aidA").is_none(), "A's stop removes A");
+        assert!(find(&ss, "sub:aidB").is_some(), "B is untouched by A's stop");
+        hook_from_str(
+            r#"{ "session_id": "a", "hook_event_name": "SubagentStop", "agent_id": "aidB" }"#,
+        );
+        assert!(find(&load(), "sub:aidB").is_none(), "B's stop removes B");
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
