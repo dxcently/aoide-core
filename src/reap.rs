@@ -13,9 +13,9 @@
 
 use crate::dispatch::Invocation;
 use crate::graph::{
-    hooks_path, hyprctl_clients, load_stage, normalize_addr, now_iso_utc, prune_done,
-    restage_graph, sessions_path, stage_error, transcript_path_for, upsert_hook, write_stage,
-    HooksFile, SessionRecord, SessionsFile, STAGE_GRAPH_VERSION,
+    canonical_state, hooks_path, hyprctl_clients, load_stage, normalize_addr, now_iso_utc,
+    prune_done, restage_graph, sessions_path, stage_error, transcript_path_for, upsert_hook,
+    write_stage, HookRecord, HooksFile, SessionRecord, SessionsFile, STAGE_GRAPH_VERSION,
 };
 use crate::output::Outcome;
 use serde_json::{json, Value};
@@ -189,6 +189,79 @@ fn superseded_agent_duplicates(
     losers
 }
 
+// ── `stopped` → `idle` decay: the warm/cold split of "at rest" ──────────────
+//
+// `Stop` (the turn ended, the agent is at its prompt) lands `stopped`, NOT
+// `idle`: a session you just finished talking to is a different thing from one
+// that has been sitting untouched all afternoon. Nothing in the hook stream ever
+// fires again for a session that is simply left alone, so the transition out of
+// `stopped` cannot be event-driven — it is an AGE. The reaper already ticks every
+// ~12s under the stage lock with both stage files loaded, so it is where the
+// clock is read; the threshold decision itself stays pure below.
+
+/// How long a `stopped` session stays warm before it settles to plain `idle`.
+pub(crate) const STOPPED_IDLE_AFTER_SECS: i64 = 3600; // 1 hour
+
+/// Has a `stopped` session been at rest long enough to be plain `idle`? PURE —
+/// both instants are parameters (no clock read in here), so the 1h boundary is
+/// deterministically testable from either side.
+///
+/// `stopped_at` is `None` when the session carries no parseable stop instant (no
+/// hook record, or an unreadable `updatedAt`). There is then no evidence it
+/// stopped RECENTLY, and `stopped` is the claim that needs the evidence — so it
+/// decays. `idle` is the safe resting state; a warm badge invented from a missing
+/// timestamp would never expire.
+pub(crate) fn stopped_has_decayed(now_epoch: i64, stopped_at: Option<i64>) -> bool {
+    match stopped_at {
+        Some(t) => now_epoch.saturating_sub(t) >= STOPPED_IDLE_AFTER_SECS,
+        None => true,
+    }
+}
+
+/// Age every `stopped` session past the threshold down to `idle`, in BOTH stage
+/// files, and return the ids that moved. Pure over the loaded records (the caller
+/// owns the I/O and passes `now`).
+///
+/// The stop INSTANT is the session's rolling hook record's `updatedAt` — the one
+/// `upsert_hook` rewrites on every phase change, so for a session sitting in
+/// `stopped` it is exactly when `Stop` fired. No new `SessionRecord` field is
+/// needed, and nothing has to migrate.
+///
+/// hooks.json is rewritten alongside sessions.json because `merged_sessions`
+/// OVERLAYS the latest hook phase onto the roster state: decaying only
+/// sessions.json would be undone by the very next merge.
+pub(crate) fn decay_stopped_sessions(
+    sessions: &mut [SessionRecord],
+    hooks: &mut Vec<HookRecord>,
+    now_epoch: i64,
+    now: &str,
+) -> Vec<String> {
+    let stop_instant: HashMap<&str, Option<i64>> = hooks
+        .iter()
+        .map(|h| {
+            (
+                h.session_id.as_str(),
+                crate::baton::theme::parse_iso_utc(&h.updated_at),
+            )
+        })
+        .collect();
+    let mut decayed: Vec<String> = Vec::new();
+    for s in sessions.iter_mut() {
+        if canonical_state(&s.state) != "stopped" {
+            continue;
+        }
+        let at = stop_instant.get(s.session_id.as_str()).copied().flatten();
+        if stopped_has_decayed(now_epoch, at) {
+            s.state = "idle".to_string();
+            decayed.push(s.session_id.clone());
+        }
+    }
+    for id in &decayed {
+        upsert_hook(hooks, id, "idle", now);
+    }
+    decayed
+}
+
 /// `graph reap` — the automatic liveness sweep. Marks every DEAD (killed,
 /// orphaned) session `done` (and its hook record), then reuses [`prune_done`] to
 /// drop them + clear orphaned parent links, re-staging `graph.json` atomically.
@@ -247,9 +320,17 @@ fn reap_inner(_inv: &Invocation) -> Outcome {
         }
     }
 
-    if reaped.is_empty() {
+    // Age out the warm `stopped` badge: a turn that ended more than an hour ago is
+    // just `idle` now. This is the one transition no hook can ever deliver (a
+    // session left alone emits nothing), so the periodic pass owns it — and it runs
+    // on EVERY tick, independent of whether anything was reaped.
+    let now = now_iso_utc();
+    let decayed = decay_stopped_sessions(&mut s_file.sessions, &mut h_file.hooks, now_epoch, &now);
+
+    if reaped.is_empty() && decayed.is_empty() {
         return Outcome::ok(cmd, "nothing to reap (all sessions live)").with_data(json!({
             "reaped": [],
+            "decayed": [],
             "hyprctlAvailable": hyprctl_available,
         }));
     }
@@ -257,7 +338,6 @@ fn reap_inner(_inv: &Invocation) -> Outcome {
     // Mark each reaped session done in BOTH files, then let prune_done drop them
     // (and any pre-existing `done`) + clear orphaned parentSessionIds.
     let dead: HashSet<&str> = reaped.iter().map(String::as_str).collect();
-    let now = now_iso_utc();
     for s in s_file.sessions.iter_mut() {
         if dead.contains(s.session_id.as_str()) {
             s.state = "done".to_string();
@@ -267,12 +347,20 @@ fn reap_inner(_inv: &Invocation) -> Outcome {
         upsert_hook(&mut h_file.hooks, id, "done", &now);
     }
 
-    let (kept_s, kept_h, removed, cleared) = prune_done(
-        std::mem::take(&mut s_file.sessions),
-        std::mem::take(&mut h_file.hooks),
-    );
-    s_file.sessions = kept_s;
-    h_file.hooks = kept_h;
+    // Prune only when something was actually reaped — a decay-only pass must not
+    // start sweeping pre-existing `done` records out from under the widgets (that
+    // stays `graph prune`'s job, on its own schedule).
+    let (removed, cleared) = if reaped.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        let (kept_s, kept_h, removed, cleared) = prune_done(
+            std::mem::take(&mut s_file.sessions),
+            std::mem::take(&mut h_file.hooks),
+        );
+        s_file.sessions = kept_s;
+        h_file.hooks = kept_h;
+        (removed, cleared)
+    };
     if s_file.schema_version.is_empty() {
         s_file.schema_version = STAGE_GRAPH_VERSION.to_string();
     }
@@ -291,6 +379,11 @@ fn reap_inner(_inv: &Invocation) -> Outcome {
         .map(|id| format!("reaped dead session {id} (killed; running → done → dropped)"))
         .collect();
     changed.extend(
+        decayed
+            .iter()
+            .map(|id| format!("session {id} at rest > 1h (stopped → idle)")),
+    );
+    changed.extend(
         cleared
             .iter()
             .map(|id| format!("cleared parentSessionId of {id}")),
@@ -302,9 +395,10 @@ fn reap_inner(_inv: &Invocation) -> Outcome {
     Outcome::ok(
         cmd,
         format!(
-            "reaped {} dead session(s); dropped {} total; cleared {} orphaned parent link(s)",
+            "reaped {} dead session(s); dropped {} total; decayed {} stopped → idle; cleared {} orphaned parent link(s)",
             reaped.len(),
             removed.len(),
+            decayed.len(),
             cleared.len()
         ),
     )
@@ -312,6 +406,7 @@ fn reap_inner(_inv: &Invocation) -> Outcome {
     .with_data(json!({
         "reaped": reaped,
         "removed": removed,
+        "decayed": decayed,
         "clearedParents": cleared,
         "hyprctlAvailable": hyprctl_available,
     }))
@@ -358,6 +453,121 @@ mod tests {
         // just-born pair is never resolved before the real one writes a transcript).
         let all_recent = |_: &SessionRecord| true;
         assert!(superseded_agent_duplicates(&sessions, all_recent, has_tx).is_empty());
+    }
+
+    #[test]
+    fn stopped_decays_to_idle_only_past_the_one_hour_boundary() {
+        // The threshold predicate is pure — `now` and the stop instant are both
+        // parameters, so both sides of the boundary are exact, not flaky.
+        let now = 1_800_000_000_i64;
+        let minutes = |m: i64| Some(now - m * 60);
+        assert!(!stopped_has_decayed(now, minutes(0)), "just stopped");
+        assert!(
+            !stopped_has_decayed(now, minutes(59)),
+            "59m → still stopped"
+        );
+        assert!(
+            !stopped_has_decayed(now, Some(now - STOPPED_IDLE_AFTER_SECS + 1)),
+            "one second short of the hour → still stopped"
+        );
+        assert!(
+            stopped_has_decayed(now, Some(now - STOPPED_IDLE_AFTER_SECS)),
+            "exactly an hour → idle"
+        );
+        assert!(stopped_has_decayed(now, minutes(61)), "61m → idle");
+        // A clock skew that puts the stop in the FUTURE is not an hour of rest.
+        assert!(!stopped_has_decayed(now, Some(now + 600)));
+        // No parseable stop instant → no evidence of recency → settle to idle,
+        // rather than wearing a warm badge that could never expire.
+        assert!(stopped_has_decayed(now, None));
+    }
+
+    #[test]
+    fn decay_pass_ages_stopped_sessions_in_both_stage_files() {
+        // now = 2026-07-30T12:00:00Z
+        let now = "2026-07-30T12:00:00Z";
+        let now_epoch = crate::baton::theme::parse_iso_utc(now).unwrap();
+
+        let stopped = |id: &str| SessionRecord {
+            session_id: id.into(),
+            agent: "claude".into(),
+            state: "stopped".into(),
+            ..Default::default()
+        };
+        let mut sessions = vec![
+            stopped("cold"),   // stopped 2h ago → idle
+            stopped("warm"),   // stopped 10m ago → untouched
+            stopped("orphan"), // no hook record at all → idle
+            SessionRecord {
+                session_id: "busy".into(),
+                state: "working".into(),
+                ..Default::default()
+            },
+            SessionRecord {
+                session_id: "asking".into(),
+                state: "awaiting".into(),
+                ..Default::default()
+            },
+        ];
+        let hook = |id: &str, at: &str| HookRecord {
+            session_id: id.into(),
+            phase: "stopped".into(),
+            updated_at: at.into(),
+            extra: Default::default(),
+        };
+        let mut hooks = vec![
+            hook("cold", "2026-07-30T10:00:00Z"),
+            hook("warm", "2026-07-30T11:50:00Z"),
+            HookRecord {
+                session_id: "busy".into(),
+                phase: "working".into(),
+                updated_at: "2026-07-30T09:00:00Z".into(), // old, but NOT stopped
+                extra: Default::default(),
+            },
+        ];
+
+        let mut decayed = decay_stopped_sessions(&mut sessions, &mut hooks, now_epoch, now);
+        decayed.sort();
+        assert_eq!(decayed, vec!["cold".to_string(), "orphan".to_string()]);
+
+        let state = |id: &str| {
+            sessions
+                .iter()
+                .find(|s| s.session_id == id)
+                .unwrap()
+                .state
+                .clone()
+        };
+        assert_eq!(state("cold"), "idle");
+        assert_eq!(state("orphan"), "idle");
+        assert_eq!(state("warm"), "stopped", "10m of rest is still warm");
+        // A long-running turn is never aged out — only `stopped` decays.
+        assert_eq!(state("busy"), "working");
+        assert_eq!(state("asking"), "awaiting");
+
+        // hooks.json moves in lockstep: `merged_sessions` overlays the hook phase,
+        // so a decay that skipped it would be undone by the very next merge.
+        let phase = |id: &str| {
+            hooks
+                .iter()
+                .find(|h| h.session_id == id)
+                .map(|h| h.phase.clone())
+        };
+        assert_eq!(phase("cold").as_deref(), Some("idle"));
+        assert_eq!(phase("orphan").as_deref(), Some("idle"));
+        assert_eq!(phase("warm").as_deref(), Some("stopped"));
+        assert_eq!(phase("busy").as_deref(), Some("working"));
+        assert_eq!(
+            crate::graph::merged_sessions(&sessions, &hooks)
+                .iter()
+                .find(|s| s.session_id == "cold")
+                .unwrap()
+                .state,
+            "idle"
+        );
+
+        // Idempotent: a second pass over the settled roster moves nothing.
+        assert!(decay_stopped_sessions(&mut sessions, &mut hooks, now_epoch, now).is_empty());
     }
 
     #[test]

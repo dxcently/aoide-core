@@ -173,9 +173,10 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
     .split(area);
 
     // Legend: the musical glyphs ARE the content here.
-    let legend =
-        Line::from(" ♪ working   𝄐 awaiting   𝄽 idle   𝄂 done   ◆ project (h/l fold)   ‣ fresh")
-            .style(theme::dim());
+    let legend = Line::from(
+        " ♪ working  𝄐 awaiting  𝄁 stopped  𝄽 idle  𝄂 done  ◆ project (h/l fold)  ‣ fresh",
+    )
+    .style(theme::dim());
     f.render_widget(Paragraph::new(legend), parts[0]);
 
     // Roster: a stateful list so selection auto-scrolls.
@@ -592,7 +593,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         "    L                link the session under a parent",
         "    a / d            add / remove a project anchor",
         "    p / e            prune done · emit the DAG",
-        "    ♪ 𝄐 𝄽 𝄂          working · awaiting · idle · done   ‣ fresh",
+        "    ♪ 𝄐 𝄁 𝄽 𝄂        working · awaiting · stopped · idle · done   ‣ fresh",
         "",
         "  PROJECTS: a add · d remove",
         "",

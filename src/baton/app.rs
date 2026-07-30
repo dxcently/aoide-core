@@ -786,11 +786,16 @@ impl App {
     }
 }
 
-/// Is a session past its final barline? (done/Stop — the states `graph prune`
-/// sweeps and the `[live/total]` badge excludes from `live`.)
+/// Is a session past its final barline? (the state `graph prune` sweeps and the
+/// `[live/total]` badge excludes from `live`.)
+///
+/// Delegates to [`graph::canonical_state`] rather than sniffing substrings, so
+/// the baton and the door can never disagree about what "ended" means. This
+/// matters since the `stop`/`stopped` vocabulary was split off `done`: a
+/// `stopped` session finished its TURN and is still very much alive, so it must
+/// stay in the `live` count.
 pub fn is_done(state: &str) -> bool {
-    let l = state.to_ascii_lowercase();
-    l == "done" || l.contains("stop")
+    graph::canonical_state(state) == "done"
 }
 
 /// Fold `(live, total)` over one root's subtree, cycle-guarded.

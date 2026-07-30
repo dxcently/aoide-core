@@ -254,14 +254,28 @@ pub fn merged_sessions(sessions: &[SessionRecord], hooks: &[HookRecord]) -> Vec<
 ///   working  — in a turn / running a tool (or a shell running a foreground cmd)
 ///   awaiting — needs the user (a permission prompt or the idle-input ping); the
 ///              dock peeks on this and only this (`needsInput ⇔ awaiting`)
-///   idle     — alive but at rest (a fresh session, a finished turn, a bare prompt)
-///   done     — ended
+///   stopped  — the turn ENDED and the agent is sitting at the prompt, RECENTLY.
+///              Alive and warm: the natural face of a session you just finished
+///              talking to. Ages out to `idle` after
+///              [`crate::reap::STOPPED_IDLE_AFTER_SECS`] in the reaper pass.
+///   idle     — at rest and COLD: stopped for more than an hour, or freshly
+///              created / resumed and not yet active (a bare shell prompt too)
+///   done     — the session ENDED (SessionEnd / a reap). Never `stopped`.
+///
+/// `stop`/`stopped` map to `stopped`, NOT `done`: the only producer that ever
+/// writes either token is a Stop-hook adapter (`graph session phase --phase
+/// stop`, the shape `entities/Agent-Hooking` documents for a foreign harness),
+/// and the Stop hook means "the turn ended", not "the process exited". Real
+/// termination arrives as `SessionEnd` (→ `do_session_end`, which writes `done`
+/// directly and never routes through this shim) or as the explicit
+/// `exit`/`finished`/`complete` vocabulary below.
 pub fn canonical_state(s: &str) -> &'static str {
     match s.trim().to_ascii_lowercase().as_str() {
         "working" | "running" | "active" | "busy" | "tool" | "trace" => "working",
         "awaiting" | "blocked" | "await" => "awaiting",
+        "stopped" | "stop" => "stopped",
         "idle" | "waiting" | "ready" | "sleep" => "idle",
-        "done" | "stopped" | "stop" | "exit" | "finished" | "complete" => "done",
+        "done" | "exit" | "finished" | "complete" => "done",
         // Empty/unknown → at rest (never invent a working/awaiting signal).
         _ => "idle",
     }
@@ -4197,10 +4211,13 @@ fn map_hook(payload: &Value) -> Option<HookAction> {
         // The turn ended and it is the user's move again — but a finished turn is
         // NOT "needs input" (that would make the anxious state the resting face of
         // the whole roster). `awaiting` is reserved strictly for the Notification
-        // signals below, so Stop settles to `idle`.
+        // signals below, so Stop settles to `stopped`: alive, at the prompt, and
+        // RECENTLY so. It is not `done` (the session did not end — only the turn),
+        // and not `idle` (that is the COLD rest a `stopped` session decays into an
+        // hour later, in the reaper's `decay_stopped_sessions` pass).
         "Stop" => Some(HookAction::Phase {
             id: id.to_string(),
-            phase: "idle".to_string(),
+            phase: "stopped".to_string(),
             name: None,
         }),
         // The needs-input signal. Prefer the structured `notification_type`
@@ -4325,7 +4342,7 @@ fn hook_from_str(buf: &str) -> Outcome {
             let env_parent = std::env::var("AOIDE_SESSION_ID")
                 .ok()
                 .filter(|p| !p.is_empty() && *p != id);
-            do_session_start(
+            let out = do_session_start(
                 &id,
                 Some("claude"),
                 cwd.as_deref(),
@@ -4335,7 +4352,16 @@ fn hook_from_str(buf: &str) -> Outcome {
                 None,
                 None,
                 pid,
-            )
+            );
+            // A FRESH id is inserted `idle` by `upsert_session`. A RESUME (same id,
+            // SessionStart source=resume/compact/clear) deliberately preserves the
+            // stored state — a working/awaiting session must not be reset — but a
+            // session resumed out of `stopped` is by definition "not yet active"
+            // again, which is `idle`. Fold exactly that one case, conditionally, so
+            // both stage files agree (hooks.json still holds the Stop phase, and
+            // `merged_sessions` overlays it — leaving it would resurrect `stopped`).
+            do_session_phase_if(&id, "idle", "stopped");
+            out
         }
         HookAction::Phase { id, phase, name } => {
             // Backfill a still-empty windowAddress on any later hook — covers a
@@ -5968,6 +5994,35 @@ mod tests {
     }
 
     #[test]
+    fn canonical_state_folds_every_producer_onto_the_five_state_vocabulary() {
+        // The five canonical outputs, each reached by its own name.
+        assert_eq!(canonical_state("working"), "working");
+        assert_eq!(canonical_state("awaiting"), "awaiting");
+        assert_eq!(canonical_state("stopped"), "stopped");
+        assert_eq!(canonical_state("idle"), "idle");
+        assert_eq!(canonical_state("done"), "done");
+
+        // `stopped` is FIRST-CLASS, not an alias of `done`: the Stop hook ends a
+        // TURN. Both spellings a Stop-hook adapter might write land there.
+        assert_eq!(canonical_state("stopped"), "stopped");
+        assert_eq!(canonical_state("stop"), "stopped");
+        assert_eq!(canonical_state(" Stopped "), "stopped");
+        assert_ne!(canonical_state("stopped"), "done");
+
+        // Real termination keeps its own vocabulary.
+        for ended in ["done", "exit", "finished", "complete"] {
+            assert_eq!(canonical_state(ended), "done", "{ended}");
+        }
+        // Legacy vocab still migrates in passing.
+        assert_eq!(canonical_state("running"), "working");
+        assert_eq!(canonical_state("blocked"), "awaiting");
+        assert_eq!(canonical_state("waiting"), "idle");
+        // Empty/unknown never invents a signal — it rests, cold.
+        assert_eq!(canonical_state(""), "idle");
+        assert_eq!(canonical_state("mystery"), "idle");
+    }
+
+    #[test]
     fn upsert_hook_keeps_one_bounded_record_per_session() {
         let mut hooks: Vec<HookRecord> = Vec::new();
         upsert_hook(&mut hooks, "s1", "running", "2026-01-01T00:00:01Z");
@@ -6099,10 +6154,12 @@ mod tests {
             })).unwrap(),
             HookAction::SubEnd { ref sub_id } if sub_id == "sub:agz1"
         ));
-        // Stop settles the turn to `idle` — a finished turn is not "needs input".
+        // Stop settles the turn to `stopped` — a finished turn is not "needs
+        // input" (not `awaiting`), not a finished SESSION (not `done`), and not
+        // yet cold (`idle` is where the reaper ages it an hour later).
         assert!(matches!(
             map_hook(&json!({ "session_id": "s", "hook_event_name": "Stop" })).unwrap(),
-            HookAction::Phase { ref phase, .. } if phase == "idle"
+            HookAction::Phase { ref phase, .. } if phase == "stopped"
         ));
         assert!(matches!(
             map_hook(&json!({ "session_id": "s", "hook_event_name": "SessionEnd" })).unwrap(),
@@ -6351,16 +6408,39 @@ mod tests {
         assert_eq!(s.sessions[0].agent, "claude");
         assert_eq!(s.sessions[0].cwd, "/proj");
 
-        // PreToolUse → working, Stop → idle (latest hook phase wins). The
+        // A FRESH registration is at rest and cold: `idle`, never `stopped`.
+        assert_eq!(s.sessions[0].state, "idle");
+
+        // PreToolUse → working, Stop → stopped (latest hook phase wins). The
         // canonical live state now lands on sessions.json too (the widget file).
         hook_from_str(r#"{ "session_id": "h1", "hook_event_name": "PreToolUse" }"#);
         let s_working: SessionsFile = load_stage(&sessions_path()).unwrap();
         assert_eq!(s_working.sessions[0].state, "working");
         hook_from_str(r#"{ "session_id": "h1", "hook_event_name": "Stop" }"#);
         let (_, ss, hh) = load_inputs("test").unwrap();
-        assert_eq!(merged_sessions(&ss.sessions, &hh.hooks)[0].state, "idle");
-        let s_idle: SessionsFile = load_stage(&sessions_path()).unwrap();
-        assert_eq!(s_idle.sessions[0].state, "idle");
+        assert_eq!(merged_sessions(&ss.sessions, &hh.hooks)[0].state, "stopped");
+        let s_stopped: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(s_stopped.sessions[0].state, "stopped");
+
+        // A RESUME (SessionStart on the SAME id) folds that `stopped` back to
+        // `idle` — resumed and not yet active — in BOTH files, so the merge agrees.
+        hook_from_str(
+            r#"{ "session_id": "h1", "hook_event_name": "SessionStart", "cwd": "/proj", "source": "resume" }"#,
+        );
+        let s_resumed: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(s_resumed.sessions.len(), 1, "a resume never duplicates");
+        assert_eq!(s_resumed.sessions[0].state, "idle");
+        let (_, ss_r, hh_r) = load_inputs("test").unwrap();
+        assert_eq!(merged_sessions(&ss_r.sessions, &hh_r.hooks)[0].state, "idle");
+
+        // A resume must still NOT reset a live turn: back to working, resume again.
+        hook_from_str(r#"{ "session_id": "h1", "hook_event_name": "PreToolUse" }"#);
+        hook_from_str(
+            r#"{ "session_id": "h1", "hook_event_name": "SessionStart", "cwd": "/proj", "source": "resume" }"#,
+        );
+        let s_live: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(s_live.sessions[0].state, "working");
+        hook_from_str(r#"{ "session_id": "h1", "hook_event_name": "Stop" }"#);
 
         // SessionEnd → done in both files.
         hook_from_str(r#"{ "session_id": "h1", "hook_event_name": "SessionEnd" }"#);
@@ -6416,18 +6496,18 @@ mod tests {
         );
         assert_eq!(live_phase("b1"), "awaiting");
 
-        // Stop settles the turn → idle.
+        // Stop settles the turn → stopped.
         hook_from_str(r#"{ "session_id": "b1", "hook_event_name": "Stop" }"#);
-        assert_eq!(live_phase("b1"), "idle");
+        assert_eq!(live_phase("b1"), "stopped");
 
-        // The SAME idle ping on a SETTLED (idle) session is a no-op — the ~60s
+        // The SAME idle ping on a SETTLED (stopped) session is a no-op — the ~60s
         // heartbeat must NOT flip a quietly-finished turn to awaiting.
         let out = hook_from_str(
             r#"{ "session_id": "b1", "hook_event_name": "Notification",
                  "message": "Claude is waiting for your input" }"#,
         );
         assert_eq!(out.status, crate::output::Status::Ok);
-        assert_eq!(live_phase("b1"), "idle");
+        assert_eq!(live_phase("b1"), "stopped");
 
         // A garbage/absent-message Notification is an ok no-op (action:none), and
         // never touches the phase.
@@ -6435,7 +6515,7 @@ mod tests {
             r#"{ "session_id": "b1", "hook_event_name": "Notification", "message": "hi" }"#,
         );
         assert_eq!(noop.data.unwrap()["action"], "none");
-        assert_eq!(live_phase("b1"), "idle");
+        assert_eq!(live_phase("b1"), "stopped");
 
         // awaiting flows through the merge opaquely as the node state.
         hook_from_str(

@@ -355,7 +355,7 @@ pub fn commands() -> Vec<Command> {
             args: [],
             flags: [
                 flag!("id", "string", "Session id (required)."),
-                flag!("phase", "string", "Live phase to record (e.g. running, waiting, done)."),
+                flag!("phase", "string", "Live phase to record; folded to one canonical state: working | awaiting | stopped | idle | done."),
             ],
             gated: false,
             implemented: true,
@@ -418,7 +418,7 @@ pub fn commands() -> Vec<Command> {
         ),
         cmd!(
             path: ["graph", "reap"],
-            summary: "Reap dead sessions: mark every KILLED session (window gone per hyprctl, or pid's /proc gone) done and drop it, then re-stage. Automatic liveness sweep for SUPER+Q / SIGKILL'd terminals whose own cleanup could never run. Falls back to pid-only liveness off Hyprland; never errors on nothing-to-reap.",
+            summary: "Reap dead sessions: mark every KILLED session (window gone per hyprctl, or pid's /proc gone) done and drop it, decay every `stopped` session at rest over an hour to `idle`, then re-stage. Automatic liveness sweep for SUPER+Q / SIGKILL'd terminals whose own cleanup could never run. Falls back to pid-only liveness off Hyprland; never errors on nothing-to-reap.",
             args: [],
             flags: [],
             gated: false,

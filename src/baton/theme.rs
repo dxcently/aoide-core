@@ -5,7 +5,8 @@
 //! echo the gadget dock, the ornament alphabet is lifted verbatim from the
 //! Quickshell QML (the `ৎ𝄢` clef-tail end-cap [`END_CAP`] from `GadgetFrame.qml`
 //! and the `𝄂𝄚𝅦𝄚` stave-run divider [`DIVIDER`] from `AoideBar.qml`), and the
-//! roster reads in musical notation (♪ working, 𝄐 awaiting, 𝄽 idle, 𝄂 done).
+//! roster reads in musical notation (♪ working, 𝄐 awaiting, 𝄁 stopped, 𝄽 idle,
+//! 𝄂 done).
 //!
 //! Colour comes from `stage/drachma.json`'s palette `{bg,fg,accent,urgent}` when
 //! present, each hex already mapped to the nearest ANSI-256 index in
@@ -55,14 +56,16 @@ pub fn dim() -> Style {
 pub enum StateClass {
     Working,
     Awaiting,
+    Stopped,
     Idle,
     Done,
     Unknown,
 }
 
 /// Classify a raw state/phase string (the same buckets the hand-rolled renderer
-/// used: `done`/Stop → done, await/block/notification → awaiting, running/tool
-/// phases/active → working, idle → idle, everything else → unknown).
+/// used: `done`/exit → done, await/block/notification → awaiting, stop/stopped →
+/// stopped, running/tool phases/active → working, idle → idle, everything else →
+/// unknown).
 pub fn classify(state: &str) -> StateClass {
     let l = state.to_ascii_lowercase();
     if is_done(state) {
@@ -75,6 +78,11 @@ pub fn classify(state: &str) -> StateClass {
         || l.contains("active")
     {
         StateClass::Working
+    } else if l.contains("stop") {
+        // The turn ended, recently — alive at the prompt, NOT past the final
+        // barline. (`SubagentStop` lands here too, which is right: it names a
+        // finished turn, not a finished session.)
+        StateClass::Stopped
     } else if l.contains("idle") {
         StateClass::Idle
     } else {
@@ -83,12 +91,14 @@ pub fn classify(state: &str) -> StateClass {
 }
 
 /// A musical glyph for a session state — working a note (♪), awaiting-input a
-/// fermata (𝄐, the "hold" sign), idle a rest (𝄽), done the final barline (𝄂),
-/// and anything unrecognised a modest dot (·).
+/// fermata (𝄐, the "hold" sign), stopped the SECTION barline (𝄁 — the turn ended,
+/// the piece has not), idle a rest (𝄽), done the FINAL barline (𝄂), and anything
+/// unrecognised a modest dot (·).
 pub fn state_glyph(state: &str) -> &'static str {
     match classify(state) {
         StateClass::Working => "♪",
         StateClass::Awaiting => "𝄐",
+        StateClass::Stopped => "𝄁",
         StateClass::Idle => "𝄽",
         StateClass::Done => "𝄂",
         StateClass::Unknown => "·",
@@ -96,12 +106,13 @@ pub fn state_glyph(state: &str) -> &'static str {
 }
 
 /// The colour that partners the glyph — green working, the palette's urgent hue
-/// (yellow fallback) for an awaiting/blocked session that needs a human, cyan
-/// idle, dim done, inherit for the unknown.
+/// (yellow fallback) for an awaiting/blocked session that needs a human, blue
+/// stopped (warm, just finished), cyan idle, dim done, inherit for the unknown.
 pub fn state_style(state: &str, pal: &Palette) -> Style {
     match classify(state) {
         StateClass::Working => Style::default().fg(Color::Green),
         StateClass::Awaiting => Style::default().fg(opt_color(pal.urgent).unwrap_or(Color::Yellow)),
+        StateClass::Stopped => Style::default().fg(Color::Blue),
         StateClass::Idle => Style::default().fg(Color::Cyan),
         StateClass::Done => dim(),
         StateClass::Unknown => Style::default(),
@@ -259,7 +270,12 @@ mod tests {
         assert_eq!(state_glyph("awaiting-input"), "𝄐");
         assert_eq!(state_glyph("idle"), "𝄽");
         assert_eq!(state_glyph("done"), "𝄂");
-        assert_eq!(state_glyph("Stop"), "𝄂");
+        // `Stop` is the TURN's section barline, not the session's final one — a
+        // stopped session is still live (and still counts toward `[live/total]`).
+        assert_eq!(state_glyph("Stop"), "𝄁");
+        assert_eq!(state_glyph("stopped"), "𝄁");
+        assert_eq!(classify("stopped"), StateClass::Stopped);
+        assert!(!is_done("stopped"));
         assert_eq!(state_glyph("weird"), "·");
         // The blocked fermata: a session that needs a human wears the same 𝄐
         // hold-sign and the Awaiting (urgent) class as any awaiting state — the
