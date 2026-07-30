@@ -85,6 +85,14 @@ pub struct SessionRecord {
     /// on hover (concepts/Terminal-Commander) — a pure-data bridge, no dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<i64>,
+    /// The live "current command / current tool" for this session: for a
+    /// conducted SHELL it is the foreground command (`cargo test`, `vim …`),
+    /// captured by conduct's PTY tick and cleared at the bare prompt; for an
+    /// AGENT it is the tool currently running (set from the PreToolUse hook,
+    /// cleared when the turn settles). Additive/v0-safe — absent when there is
+    /// nothing running. The roster shows it so a row reads as what it is *doing*.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -312,6 +320,10 @@ pub fn build_graph(
         // a legacy/off-Hyprland record stays byte-for-byte as before.
         if let Some(ws) = s.workspace {
             node["workspace"] = json!(ws);
+        }
+        // The live current command / tool, when something is running.
+        if let Some(act) = &s.activity {
+            node["activity"] = json!(act);
         }
         nodes.push(node);
         if let Some(parent) = resolved_parent(s, &ids) {
@@ -931,7 +943,10 @@ fn effective_live_addresses(
 /// Cheap: one `hyprctl` call + a stage read, and a stage WRITE only when
 /// something was actually reaped. NEVER errors non-zero on "nothing to reap" and
 /// NEVER on an unavailable compositor (it falls back to pid-only liveness).
-pub fn reap(_inv: &Invocation) -> Outcome {
+pub fn reap(inv: &Invocation) -> Outcome {
+    crate::shellbridge::with_stage_lock(|| reap_inner(inv))
+}
+fn reap_inner(_inv: &Invocation) -> Outcome {
     let cmd = "graph.reap";
     let mut s_file: SessionsFile = match load_stage(&sessions_path()) {
         Ok(f) => f,
@@ -1424,6 +1439,7 @@ pub fn upsert_session(
             // Workspace is stamped later by the window-event listener (it needs a
             // resolved window first); a fresh record starts without one.
             workspace: None,
+            activity: None,
             extra: Map::new(),
         });
         true
@@ -1465,6 +1481,24 @@ fn require_flag(inv: &Invocation, name: &str) -> Result<String, Outcome> {
 /// Core of `graph session start`: cycle-check a parent, UPSERT, re-stage.
 #[allow(clippy::too_many_arguments)]
 fn do_session_start(
+    id: &str,
+    agent: Option<&str>,
+    cwd: Option<&str>,
+    window: Option<&str>,
+    parent: Option<&str>,
+    conductable: Option<bool>,
+    socket: Option<&str>,
+    title: Option<&str>,
+    pid: Option<u32>,
+) -> Outcome {
+    crate::shellbridge::with_stage_lock(|| {
+        do_session_start_inner(
+            id, agent, cwd, window, parent, conductable, socket, title, pid,
+        )
+    })
+}
+#[allow(clippy::too_many_arguments)]
+fn do_session_start_inner(
     id: &str,
     agent: Option<&str>,
     cwd: Option<&str>,
@@ -1574,8 +1608,13 @@ fn set_session_state(id: &str, state: &str) -> Result<bool, String> {
 }
 
 /// Core of `graph session phase`: UPSERT the hook record (audit), land the
-/// canonical live state on sessions.json (the widget file), re-stage.
+/// canonical live state on sessions.json (the widget file), re-stage. The whole
+/// load-modify-write is serialised against every other stage writer by the
+/// stage lock (its inner helpers stay lock-free — the lock is not re-entrant).
 fn do_session_phase(id: &str, phase: &str) -> Outcome {
+    crate::shellbridge::with_stage_lock(|| do_session_phase_inner(id, phase))
+}
+fn do_session_phase_inner(id: &str, phase: &str) -> Outcome {
     let cmd = "graph.session.phase";
     let mut file: HooksFile = match load_stage(&hooks_path()) {
         Ok(f) => f,
@@ -1615,6 +1654,9 @@ fn do_session_phase(id: &str, phase: &str) -> Outcome {
 /// so the current phase is never read twice. This is the door the ambiguous idle
 /// Notification walks: only a still-`working` turn becomes `awaiting`.
 fn do_session_phase_if(id: &str, phase: &str, expected: &str) -> Outcome {
+    crate::shellbridge::with_stage_lock(|| do_session_phase_if_inner(id, phase, expected))
+}
+fn do_session_phase_if_inner(id: &str, phase: &str, expected: &str) -> Outcome {
     let cmd = "graph.session.phase";
     let mut file: HooksFile = match load_stage(&hooks_path()) {
         Ok(f) => f,
@@ -1672,6 +1714,9 @@ fn do_session_phase_if(id: &str, phase: &str, expected: &str) -> Outcome {
 /// Core of `graph session end`: mark the session `done` (and its hook phase
 /// `done`), re-stage. An unknown id is an ok no-op (matching `project remove`).
 fn do_session_end(id: &str) -> Outcome {
+    crate::shellbridge::with_stage_lock(|| do_session_end_inner(id))
+}
+fn do_session_end_inner(id: &str) -> Outcome {
     let cmd = "graph.session.end";
     let mut s_file: SessionsFile = match load_stage(&sessions_path()) {
         Ok(f) => f,
@@ -2068,6 +2113,106 @@ fn write_all_fd(fd: RawFd, mut data: &[u8]) {
     }
 }
 
+/// Read `/proc/<pid>/cwd` — the live working directory (follows the shell's `cd`).
+fn proc_cwd(pid: i32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/cwd"))
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+}
+
+/// A short one-line label for a process's command: `/proc/<pid>/cmdline` argv
+/// joined (shows args like `cargo test`), falling back to `comm`. Clipped to a
+/// roster-friendly width. Used as a conducted shell's live `activity`.
+fn proc_command(pid: i32) -> Option<String> {
+    let clip = |s: &str| -> String {
+        let one = s.split_whitespace().collect::<Vec<_>>().join(" ");
+        if one.chars().count() <= 48 {
+            one
+        } else {
+            let head: String = one.chars().take(47).collect();
+            format!("{head}…")
+        }
+    };
+    if let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) {
+        let joined = raw
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .map(|p| String::from_utf8_lossy(p))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let joined = joined.trim();
+        if !joined.is_empty() {
+            return Some(clip(joined));
+        }
+    }
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|c| clip(c.trim()))
+        .filter(|c| !c.is_empty())
+}
+
+/// Update a conducted session's live shell fields — `cwd`, `activity` (the
+/// current foreground command, or cleared), and `state` (idle at the prompt,
+/// working while a command runs) — CHANGE-ONLY, under the stage lock, and
+/// re-stage graph.json only when it actually wrote. Called ~1 Hz from conduct's
+/// PTY tick for SHELL sessions (an agent's state/activity come from hooks, so
+/// conduct never drives those). No-op for an unregistered id.
+fn do_session_refresh(id: &str, cwd: Option<&str>, activity: Option<&str>, state: &str) {
+    crate::shellbridge::with_stage_lock(|| {
+        let mut file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let mut changed = false;
+        for s in file.sessions.iter_mut() {
+            if s.session_id != id {
+                continue;
+            }
+            if let Some(c) = cwd {
+                if s.cwd != c {
+                    s.cwd = c.to_string();
+                    changed = true;
+                }
+            }
+            let act = activity.filter(|a| !a.is_empty()).map(str::to_string);
+            if s.activity != act {
+                s.activity = act;
+                changed = true;
+            }
+            let canon = canonical_state(state);
+            if s.state != canon {
+                s.state = canon.to_string();
+                changed = true;
+            }
+        }
+        if changed {
+            if file.schema_version.is_empty() {
+                file.schema_version = STAGE_GRAPH_VERSION.to_string();
+            }
+            if write_stage(&sessions_path(), &file).is_ok() {
+                let _ = restage_graph();
+            }
+        }
+    });
+}
+
+/// One conduct-tick refresh for a SHELL session: read the pty's foreground
+/// process group and the shell's cwd, and push cwd + the current command + the
+/// idle/working state. The shell (spawned under `setsid`) is its own process
+/// group leader, so a foreground pgid equal to the shell pid means "at the bare
+/// prompt" (idle); anything else is a command running in the foreground
+/// (working, its command captured as `activity`).
+fn conduct_refresh_shell(id: &str, master: RawFd, shell_pid: i32) {
+    let fg = unsafe { libc::tcgetpgrp(master) };
+    let cwd = proc_cwd(shell_pid);
+    let (state, activity) = if fg <= 0 || fg == shell_pid {
+        ("idle", None)
+    } else {
+        ("working", proc_command(fg))
+    };
+    do_session_refresh(id, cwd.as_deref(), activity.as_deref(), state);
+}
+
 /// The single-thread `poll()` multiplexer. Shuttles: real stdin → master (you
 /// type normally), master → real stdout (you read normally), and each accepted
 /// injection connection → master (INJECTION). A pending SIGWINCH re-sizes the
@@ -2077,6 +2222,8 @@ fn conduct_multiplex(
     master: RawFd,
     listener: Option<&UnixListener>,
     child: &mut std::process::Child,
+    id: &str,
+    is_shell: bool,
 ) -> i32 {
     use std::sync::atomic::Ordering;
     let stdin_fd = libc::STDIN_FILENO;
@@ -2085,6 +2232,18 @@ fn conduct_multiplex(
     let mut conns: Vec<RawFd> = Vec::new();
     let mut stdin_eof = false;
     let mut buf = [0u8; 8192];
+
+    // Live cwd/command tick for a conducted SHELL. A `tail -f` (or any quiet TUI)
+    // never produces I/O, so we can't hang the refresh off output — instead the
+    // poll gets a ~1s timeout and the tick fires on the elapsed clock. Agents
+    // don't tick (state/activity come from hooks), so they keep the blocking poll.
+    let shell_pid = child.id() as i32;
+    let poll_timeout: libc::c_int = if is_shell { 1000 } else { -1 };
+    let tick_period = std::time::Duration::from_millis(950);
+    let mut last_tick = std::time::Instant::now();
+    if is_shell {
+        conduct_refresh_shell(id, master, shell_pid); // stamp initial cwd/state now.
+    }
 
     loop {
         // Service a pending resize before blocking again.
@@ -2106,13 +2265,19 @@ fn conduct_multiplex(
             fds.push(pollfd(c, libc::POLLIN));
         }
 
-        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, poll_timeout) };
         if rc < 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
                 continue; // a signal (SIGWINCH) — reloop to service the latch.
             }
             break;
+        }
+        // Refresh the conducted shell's live cwd/command/state on the ~1s clock
+        // (rc==0 is a plain timeout; a busy shell also ticks at most this often).
+        if is_shell && last_tick.elapsed() >= tick_period {
+            conduct_refresh_shell(id, master, shell_pid);
+            last_tick = std::time::Instant::now();
         }
 
         let revents = |want: RawFd| -> libc::c_short {
@@ -2675,7 +2840,8 @@ pub fn session_conduct(inv: &Invocation) -> Outcome {
         set_winsize(master_fd, &ws);
     }
 
-    let exit_code = conduct_multiplex(master_fd, listener.as_ref(), &mut child);
+    let exit_code =
+        conduct_multiplex(master_fd, listener.as_ref(), &mut child, &id, agent == "shell");
 
     // Restore tty, unlink socket, resolve the session — whatever happened.
     tty.restore();
@@ -2843,6 +3009,39 @@ fn set_session_title(id: &str, title: &str) -> Result<(), String> {
     restage_graph().map(|_| ())
 }
 
+/// Name a session from its FIRST user prompt — set the `title` slot only when it
+/// is still empty, so the opening prompt names the session and later prompts do
+/// not rename it (a deliberate `graph send` steer still overwrites via
+/// [`set_session_title`] — that IS a rename). Under the stage lock (this runs on
+/// every UserPromptSubmit hook, concurrent with conduct ticks). No-op for an
+/// unregistered id. Re-stages only when it wrote.
+fn set_session_name_if_unset(id: &str, name: &str) {
+    if name.is_empty() {
+        return;
+    }
+    crate::shellbridge::with_stage_lock(|| {
+        let mut file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let mut changed = false;
+        for s in file.sessions.iter_mut() {
+            if s.session_id == id && s.title.as_deref().unwrap_or("").is_empty() {
+                s.title = Some(name.to_string());
+                changed = true;
+            }
+        }
+        if changed {
+            if file.schema_version.is_empty() {
+                file.schema_version = STAGE_GRAPH_VERSION.to_string();
+            }
+            if write_stage(&sessions_path(), &file).is_ok() {
+                let _ = restage_graph();
+            }
+        }
+    });
+}
+
 /// One audit line per send outcome, through aoided's audit path. The injected
 /// text rides as `untrusted_data` (never the message) — forwarded agent-bound
 /// text is data, never re-interpreted as a command (the house rule).
@@ -2991,7 +3190,13 @@ pub fn session_send(inv: &Invocation) -> Outcome {
 #[derive(Debug)]
 enum HookAction {
     Start { id: String, cwd: Option<String> },
-    Phase { id: String, phase: String },
+    /// Set the live phase; `name` carries the first user prompt on
+    /// UserPromptSubmit (used to name the session set-once), `None` otherwise.
+    Phase {
+        id: String,
+        phase: String,
+        name: Option<String>,
+    },
     /// Conditional phase: set `phase` ONLY if the session is still `working`,
     /// else a no-op. Guards the ambiguous idle Notification — a "waiting for your
     /// input" ping only means `awaiting` when the turn is still mid-flight (an
@@ -3018,12 +3223,27 @@ fn map_hook(payload: &Value) -> Option<HookAction> {
         .map(str::to_string);
     match event {
         "SessionStart" => Some(HookAction::Start { id: id.to_string(), cwd }),
-        // A prompt or a tool call: the turn is live → `working`. PostToolUse is
-        // also part of the awaiting-clearing set — an approved permission runs
-        // the tool, and this edge lifts the fermata back to working.
-        "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => Some(HookAction::Phase {
+        // A new prompt: the turn is live → `working`, and the prompt text names
+        // the session (set-once, downstream).
+        "UserPromptSubmit" => {
+            let name = payload
+                .get("user_prompt")
+                .and_then(Value::as_str)
+                .map(one_line_title)
+                .filter(|s| !s.is_empty());
+            Some(HookAction::Phase {
+                id: id.to_string(),
+                phase: "working".to_string(),
+                name,
+            })
+        }
+        // A tool call: the turn is live → `working`. PostToolUse is also part of
+        // the awaiting-clearing set — an approved permission runs the tool, and
+        // this edge lifts the fermata back to working.
+        "PreToolUse" | "PostToolUse" => Some(HookAction::Phase {
             id: id.to_string(),
             phase: "working".to_string(),
+            name: None,
         }),
         // The turn ended and it is the user's move again — but a finished turn is
         // NOT "needs input" (that would make the anxious state the resting face of
@@ -3032,6 +3252,7 @@ fn map_hook(payload: &Value) -> Option<HookAction> {
         "Stop" => Some(HookAction::Phase {
             id: id.to_string(),
             phase: "idle".to_string(),
+            name: None,
         }),
         // The needs-input signal. Prefer the structured `notification_type`
         // (idle_prompt / permission_prompt, confirmed present in the CLI); fall
@@ -3054,6 +3275,7 @@ fn map_hook(payload: &Value) -> Option<HookAction> {
                 Some(HookAction::Phase {
                     id: id.to_string(),
                     phase: "awaiting".to_string(),
+                    name: None,
                 })
             } else if ntype == "idle_prompt" || msg.contains("waiting for your input") {
                 Some(HookAction::PhaseIfRunning {
@@ -3113,12 +3335,17 @@ fn hook_from_str(buf: &str) -> Outcome {
                 pid,
             )
         }
-        HookAction::Phase { id, phase } => {
+        HookAction::Phase { id, phase, name } => {
             // Backfill a still-empty windowAddress on any later hook — covers a
             // session that registered before the window mapped (or before this
             // discovery shipped), so it becomes jumpable without a restart.
             ensure_session_window(&id);
-            do_session_phase(&id, &phase)
+            let out = do_session_phase(&id, &phase);
+            // The first user prompt names the session (set-once).
+            if let Some(n) = name {
+                set_session_name_if_unset(&id, &n);
+            }
+            out
         }
         HookAction::PhaseIfRunning { id, phase } => {
             ensure_session_window(&id);
@@ -3172,6 +3399,7 @@ mod tests {
             title: None,
             pid: None,
             workspace: None,
+            activity: None,
             extra: Map::new(),
         }
     }
@@ -4606,6 +4834,85 @@ mod tests {
         );
         let (_, ss, hh) = load_inputs("test").unwrap();
         assert_eq!(merged_sessions(&ss.sessions, &hh.hooks)[0].state, "awaiting");
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn session_refresh_drives_shell_cwd_command_and_state() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("refresh");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let now = "2026-01-01T00:00:00Z";
+        let mut sessions = Vec::new();
+        upsert_session(
+            &mut sessions, "sh", Some("shell"), Some("/w"), None, None, None, None, None,
+            Some(std::process::id()), now,
+        );
+        write_stage(
+            &sessions_path(),
+            &SessionsFile { schema_version: "0".into(), sessions },
+        )
+        .unwrap();
+
+        // At the prompt: idle, no activity, cwd tracked.
+        do_session_refresh("sh", Some("/proj"), None, "idle");
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(s.sessions[0].state, "idle");
+        assert_eq!(s.sessions[0].cwd, "/proj");
+        assert_eq!(s.sessions[0].activity, None);
+
+        // A foreground command: working + the command as activity.
+        do_session_refresh("sh", Some("/proj"), Some("cargo test"), "working");
+        let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(s2.sessions[0].state, "working");
+        assert_eq!(s2.sessions[0].activity.as_deref(), Some("cargo test"));
+
+        // An unknown id is a safe no-op (never panics, never inserts).
+        do_session_refresh("nope", Some("/x"), Some("x"), "working");
+        let s3: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(s3.sessions.len(), 1);
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn first_user_prompt_names_the_session_set_once() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("name");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        hook_from_str(r#"{ "session_id": "n1", "hook_event_name": "SessionStart", "cwd": "/p" }"#);
+        // First prompt names the session.
+        hook_from_str(
+            r#"{ "session_id": "n1", "hook_event_name": "UserPromptSubmit",
+                 "user_prompt": "fix the flaky auth test\nand rerun CI" }"#,
+        );
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(s.sessions[0].title.as_deref(), Some("fix the flaky auth test"));
+
+        // A LATER prompt must NOT rename it (set-once).
+        hook_from_str(
+            r#"{ "session_id": "n1", "hook_event_name": "UserPromptSubmit",
+                 "user_prompt": "now do something else entirely" }"#,
+        );
+        let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(
+            s2.sessions[0].title.as_deref(),
+            Some("fix the flaky auth test"),
+            "the first prompt names the session; later prompts don't rename it"
+        );
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),

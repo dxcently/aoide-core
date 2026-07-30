@@ -101,6 +101,43 @@ pub fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<(
     res
 }
 
+/// Run `f` while holding an exclusive advisory lock on the stage directory,
+/// serialising the whole load-modify-write of the shared stage files across
+/// every writer (per-hook processes, the ~1 Hz conduct ticks, the window
+/// listener, the reaper). [`atomic_write`]'s rename prevents torn *reads*; this
+/// prevents lost *updates* when two writers race the same file (two concurrent
+/// read-modify-writes would otherwise silently drop each other's fields).
+///
+/// The lock is a `.stage.lock` file in the stage dir, `flock`ed `LOCK_EX` for
+/// the closure's duration. **Not re-entrant** (each call opens its own fd), so a
+/// caller must never nest it — wrap a whole mutator once at its top, never an
+/// inner helper it calls. Best-effort: if the lock file can't be created or
+/// locked we run `f` unlocked rather than block the desktop on a lock hiccup.
+pub fn with_stage_lock<T>(f: impl FnOnce() -> T) -> T {
+    use std::os::unix::io::AsRawFd;
+    let dir = stage_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join(".stage.lock"))
+        .ok();
+    let held = lock
+        .as_ref()
+        .map(|f| unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0)
+        .unwrap_or(false);
+    let out = f();
+    if held {
+        if let Some(f) = &lock {
+            unsafe {
+                libc::flock(f.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+    out
+}
+
 /// Does `/proc/<pid>` still exist? (the liveness probe [`sweep_stale_temps`] uses
 /// to tell an interrupted writer's stranded temp from a live peer's in-flight one).
 fn pid_is_alive(pid: u32) -> bool {
