@@ -479,6 +479,7 @@ mod tests {
             pid: None,
             workspace: None,
             activity: None,
+            kind: None,
             extra: Map::new(),
         }
     }

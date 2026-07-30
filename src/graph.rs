@@ -93,6 +93,13 @@ pub struct SessionRecord {
     /// nothing running. The roster shows it so a row reads as what it is *doing*.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<String>,
+    /// What KIND of thing this record is, published so the widgets never infer
+    /// it from the agent string: `agent` (a Claude/agent session), `shell` (a
+    /// conducted terminal), or `subagent` (a Task the agent spawned — a leaf of
+    /// the conductor tree). Additive/v0-safe (absent on a legacy record; readers
+    /// fall back to agent!="shell").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -324,6 +331,11 @@ pub fn build_graph(
         // The live current command / tool, when something is running.
         if let Some(act) = &s.activity {
             node["activity"] = json!(act);
+        }
+        // Session classification (agent/shell/subagent) — the node's own `kind`
+        // already denotes project-vs-session, so this rides as `role`.
+        if let Some(k) = &s.kind {
+            node["role"] = json!(k);
         }
         nodes.push(node);
         if let Some(parent) = resolved_parent(s, &ids) {
@@ -1391,7 +1403,7 @@ pub fn upsert_session(
     pid: Option<u32>,
     now: &str,
 ) -> bool {
-    if let Some(s) = sessions.iter_mut().find(|s| s.session_id == id) {
+    let inserted = if let Some(s) = sessions.iter_mut().find(|s| s.session_id == id) {
         if let Some(a) = agent {
             s.agent = a.to_string();
         }
@@ -1440,10 +1452,20 @@ pub fn upsert_session(
             // resolved window first); a fresh record starts without one.
             workspace: None,
             activity: None,
+            kind: None,
             extra: Map::new(),
         });
         true
+    };
+    // Classify an unclassified record: a conducted "shell" vs an "agent"
+    // (claude/other). Sub-agent nodes set kind="subagent" explicitly elsewhere;
+    // a legacy record with no kind is backfilled here on its next touch.
+    if let Some(s) = sessions.iter_mut().find(|s| s.session_id == id) {
+        if s.kind.is_none() {
+            s.kind = Some(if s.agent == "shell" { "shell" } else { "agent" }.to_string());
+        }
     }
+    inserted
 }
 
 /// UPSERT the single hook record for a session (pure; bounded one-per-id).
@@ -1597,6 +1619,12 @@ fn set_session_state(id: &str, state: &str) -> Result<bool, String> {
             s.state = target.to_string();
             changed = true;
         }
+        // A non-working session isn't running anything → drop its stale activity
+        // (the last tool/command). A working session keeps it (a tool hook owns it).
+        if s.session_id == id && target != "working" && s.activity.is_some() {
+            s.activity = None;
+            changed = true;
+        }
     }
     if changed {
         if file.schema_version.is_empty() {
@@ -1605,6 +1633,107 @@ fn set_session_state(id: &str, state: &str) -> Result<bool, String> {
         write_stage(&sessions_path(), &file)?;
     }
     Ok(changed)
+}
+
+/// Set the live state + `activity` (the current tool) on a session OR a sub-node
+/// — the tool hooks' writer. The "owner" is the session, or a sub-node
+/// `sub:<id>` when the tool ran inside a Task sub-agent (Fable's activity
+/// routing, so a sub-agent's churn never clobbers its parent's display). Writes
+/// the canonical phase to hooks.json (audit + graph merge) and the
+/// state+activity to sessions.json (the widgets), under one stage lock.
+fn set_owner_activity(owner: &str, state: &str, activity: Option<&str>) {
+    crate::shellbridge::with_stage_lock(|| {
+        let canon = canonical_state(state);
+        let mut h: HooksFile = load_stage(&hooks_path()).unwrap_or_default();
+        upsert_hook(&mut h.hooks, owner, canon, &now_iso_utc());
+        if h.schema_version.is_empty() {
+            h.schema_version = STAGE_GRAPH_VERSION.to_string();
+        }
+        let _ = write_stage(&hooks_path(), &h);
+        let mut file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        for s in file.sessions.iter_mut() {
+            if s.session_id == owner {
+                s.state = canon.to_string();
+                s.activity = activity.filter(|a| !a.is_empty()).map(str::to_string);
+            }
+        }
+        if file.schema_version.is_empty() {
+            file.schema_version = STAGE_GRAPH_VERSION.to_string();
+        }
+        let _ = write_stage(&sessions_path(), &file);
+        let _ = restage_graph();
+    });
+}
+
+/// Create (or refresh) a sub-agent node — a Task the agent spawned, a leaf of
+/// the conductor tree. Keyed by `sub:<tool_use_id>`; parented to `owner` (a
+/// parent sub-node when nested, else the session). An existing node is enriched
+/// (keeps its parent + first name), so the PreToolUse(Task) and SubagentStart
+/// paths converge on one record however they race.
+fn do_subagent_spawn(sub_id: &str, owner: &str, name: &str, agent_type: &str) {
+    crate::shellbridge::with_stage_lock(|| {
+        let mut file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        if let Some(s) = file.sessions.iter_mut().find(|s| s.session_id == sub_id) {
+            if s.state != "done" && s.state != "working" {
+                s.state = "working".to_string();
+            }
+            if s.title.as_deref().unwrap_or("").is_empty() && !name.is_empty() {
+                s.title = Some(name.to_string());
+            }
+            if (s.agent.is_empty() || s.agent == "subagent") && !agent_type.is_empty() {
+                s.agent = agent_type.to_string();
+            }
+            s.kind = Some("subagent".to_string());
+        } else {
+            file.sessions.push(SessionRecord {
+                session_id: sub_id.to_string(),
+                agent: if agent_type.is_empty() {
+                    "subagent".to_string()
+                } else {
+                    agent_type.to_string()
+                },
+                state: "working".to_string(),
+                started_at: now_iso_utc(),
+                parent_session_id: Some(owner.to_string()),
+                title: if name.is_empty() {
+                    None
+                } else {
+                    Some(name.to_string())
+                },
+                kind: Some("subagent".to_string()),
+                ..Default::default()
+            });
+        }
+        if file.schema_version.is_empty() {
+            file.schema_version = STAGE_GRAPH_VERSION.to_string();
+        }
+        if write_stage(&sessions_path(), &file).is_ok() {
+            let _ = restage_graph();
+        }
+    });
+}
+
+/// Close a sub-agent node — REMOVE it (a Task returned / a subagent stopped), so
+/// the tree stays clean. Idempotent; re-stages only when it removed one.
+fn do_subagent_end(sub_id: &str) {
+    crate::shellbridge::with_stage_lock(|| {
+        let mut file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let before = file.sessions.len();
+        file.sessions.retain(|s| s.session_id != sub_id);
+        if file.sessions.len() != before {
+            let _ = write_stage(&sessions_path(), &file);
+            let _ = restage_graph();
+        }
+    });
 }
 
 /// Core of `graph session phase`: UPSERT the hook record (audit), land the
@@ -1734,6 +1863,31 @@ fn do_session_end_inner(id: &str) -> Outcome {
             s.state = "done".to_string();
         }
     }
+    // Cascade: remove the session's sub-agent subtree. Task nodes carry no pid or
+    // window, so the liveness reaper can never clean them — the owning session's
+    // end IS their lifecycle end. Collect the transitive `subagent` descendants
+    // and drop them (the session itself stays, marked done).
+    let mut doomed: HashSet<String> = HashSet::new();
+    doomed.insert(id.to_string());
+    loop {
+        let mut grew = false;
+        for s in &s_file.sessions {
+            if s.kind.as_deref() == Some("subagent") && !doomed.contains(&s.session_id) {
+                if let Some(p) = &s.parent_session_id {
+                    if doomed.contains(p) {
+                        doomed.insert(s.session_id.clone());
+                        grew = true;
+                    }
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    s_file
+        .sessions
+        .retain(|s| s.session_id == id || !doomed.contains(&s.session_id));
     if s_file.schema_version.is_empty() {
         s_file.schema_version = STAGE_GRAPH_VERSION.to_string();
     }
@@ -3185,6 +3339,15 @@ pub fn session_send(inv: &Invocation) -> Outcome {
     out
 }
 
+/// A Task sub-agent to create: its node id (`sub:<tool_use_id>`), a human name
+/// (the Task description or subagent type), and the subagent type.
+#[derive(Debug)]
+struct SubSpawn {
+    sub_id: String,
+    name: String,
+    agent_type: String,
+}
+
 /// The action a Claude-Code hook payload maps to (or nothing, for events we
 /// deliberately ignore — the door is a no-op for everything unmapped).
 #[derive(Debug)]
@@ -3196,6 +3359,33 @@ enum HookAction {
         id: String,
         phase: String,
         name: Option<String>,
+    },
+    /// A tool started (PreToolUse). `owner` is the session, or `sub:<parent_
+    /// tool_use_id>` when the tool ran inside a Task sub-agent (so a sub-agent's
+    /// tool churn updates the sub-node, not its parent). `spawn` is Some when the
+    /// tool IS a Task — create that child node.
+    ToolStart {
+        session: String,
+        owner: String,
+        activity: Option<String>,
+        spawn: Option<SubSpawn>,
+    },
+    /// A tool finished (PostToolUse). `end_sub` closes the Task's child node.
+    ToolEnd {
+        session: String,
+        owner: String,
+        end_sub: Option<String>,
+    },
+    /// SubagentStart backstop: ensure the child node exists (keyed by the Task's
+    /// tool_use_id via `parent_tool_use_id`) even if PreToolUse(Task) was missed.
+    SubEnsure {
+        sub_id: String,
+        session: String,
+        agent_type: String,
+    },
+    /// SubagentStop backstop: close the child node.
+    SubEnd {
+        sub_id: String,
     },
     /// Conditional phase: set `phase` ONLY if the session is still `working`,
     /// else a no-op. Guards the ambiguous idle Notification — a "waiting for your
@@ -3237,14 +3427,74 @@ fn map_hook(payload: &Value) -> Option<HookAction> {
                 name,
             })
         }
-        // A tool call: the turn is live → `working`. PostToolUse is also part of
-        // the awaiting-clearing set — an approved permission runs the tool, and
-        // this edge lifts the fermata back to working.
-        "PreToolUse" | "PostToolUse" => Some(HookAction::Phase {
-            id: id.to_string(),
-            phase: "working".to_string(),
-            name: None,
-        }),
+        // A tool call. Route it to its OWNER — the session, or the sub-node
+        // `sub:<parent_tool_use_id>` when the tool ran inside a Task sub-agent
+        // (nesting + activity routing). The Task tool itself spawns/closes a
+        // child node; any other tool sets the owner working with the tool as its
+        // current `activity`. Both are part of the awaiting-clearing set.
+        "PreToolUse" => {
+            let tool = payload.get("tool_name").and_then(Value::as_str).unwrap_or("");
+            let tuid = payload.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
+            let owner = match payload
+                .get("parent_tool_use_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                Some(p) => format!("sub:{p}"),
+                None => id.to_string(),
+            };
+            if tool == "Task" && !tuid.is_empty() {
+                let input = payload.get("tool_input");
+                let field = |k: &str| {
+                    input
+                        .and_then(|i| i.get(k))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                };
+                let stype = field("subagent_type");
+                let desc = field("description");
+                let name = one_line_title(if desc.is_empty() { stype } else { desc });
+                Some(HookAction::ToolStart {
+                    session: id.to_string(),
+                    owner,
+                    activity: if name.is_empty() { None } else { Some(name.clone()) },
+                    spawn: Some(SubSpawn {
+                        sub_id: format!("sub:{tuid}"),
+                        name,
+                        agent_type: stype.to_string(),
+                    }),
+                })
+            } else {
+                Some(HookAction::ToolStart {
+                    session: id.to_string(),
+                    owner,
+                    activity: if tool.is_empty() { None } else { Some(tool.to_string()) },
+                    spawn: None,
+                })
+            }
+        }
+        "PostToolUse" => {
+            let tool = payload.get("tool_name").and_then(Value::as_str).unwrap_or("");
+            let tuid = payload.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
+            let owner = match payload
+                .get("parent_tool_use_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                Some(p) => format!("sub:{p}"),
+                None => id.to_string(),
+            };
+            let end_sub = if tool == "Task" && !tuid.is_empty() {
+                Some(format!("sub:{tuid}"))
+            } else {
+                None
+            };
+            Some(HookAction::ToolEnd {
+                session: id.to_string(),
+                owner,
+                end_sub,
+            })
+        }
         // The turn ended and it is the user's move again — but a finished turn is
         // NOT "needs input" (that would make the anxious state the resting face of
         // the whole roster). `awaiting` is reserved strictly for the Notification
@@ -3286,6 +3536,29 @@ fn map_hook(payload: &Value) -> Option<HookAction> {
                 None
             }
         }
+        // Sub-agent lifecycle backstops (keyed by the spawning Task's tool_use_id,
+        // carried as `parent_tool_use_id`) — they converge on the same node the
+        // PreToolUse/PostToolUse(Task) path manages, whichever fires.
+        "SubagentStart" => payload
+            .get("parent_tool_use_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(|p| HookAction::SubEnsure {
+                sub_id: format!("sub:{p}"),
+                session: id.to_string(),
+                agent_type: payload
+                    .get("agent_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            }),
+        "SubagentStop" => payload
+            .get("parent_tool_use_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(|p| HookAction::SubEnd {
+                sub_id: format!("sub:{p}"),
+            }),
         "SessionEnd" => Some(HookAction::End { id: id.to_string() }),
         _ => None,
     }
@@ -3323,12 +3596,19 @@ fn hook_from_str(buf: &str) -> Outcome {
                 Some((addr, pid, _workspace)) => (Some(addr), Some(pid)),
                 None => (None, None),
             };
+            // A claude launched INSIDE a conducted session inherits its parent's
+            // `AOIDE_SESSION_ID` in the hook process env — thread it as the
+            // parent so a claude-conducting-claude (or a claude-in-a-shell) nests
+            // in the graph. The hook door inherits the launcher's env.
+            let env_parent = std::env::var("AOIDE_SESSION_ID")
+                .ok()
+                .filter(|p| !p.is_empty() && *p != id);
             do_session_start(
                 &id,
                 Some("claude"),
                 cwd.as_deref(),
                 window.as_deref(),
-                None,
+                env_parent.as_deref(),
                 None,
                 None,
                 None,
@@ -3350,6 +3630,47 @@ fn hook_from_str(buf: &str) -> Outcome {
         HookAction::PhaseIfRunning { id, phase } => {
             ensure_session_window(&id);
             do_session_phase_if(&id, &phase, "working")
+        }
+        HookAction::ToolStart {
+            session,
+            owner,
+            activity,
+            spawn,
+        } => {
+            ensure_session_window(&session);
+            // Spawn the child FIRST so it exists before its parent's activity
+            // points at it, then mark the owner working + its current activity.
+            if let Some(sp) = spawn {
+                do_subagent_spawn(&sp.sub_id, &owner, &sp.name, &sp.agent_type);
+            }
+            set_owner_activity(&owner, "working", activity.as_deref());
+            Outcome::ok("graph.session.hook", format!("tool start → {owner}"))
+        }
+        HookAction::ToolEnd {
+            session,
+            owner,
+            end_sub,
+        } => {
+            ensure_session_window(&session);
+            if let Some(sub) = end_sub {
+                do_subagent_end(&sub);
+            }
+            // The tool finished; the owner is still in its turn (working) but no
+            // longer running that tool — clear its `activity`.
+            set_owner_activity(&owner, "working", None);
+            Outcome::ok("graph.session.hook", format!("tool end → {owner}"))
+        }
+        HookAction::SubEnsure {
+            sub_id,
+            session,
+            agent_type,
+        } => {
+            do_subagent_spawn(&sub_id, &session, &agent_type, &agent_type);
+            Outcome::ok("graph.session.hook", format!("subagent {sub_id}"))
+        }
+        HookAction::SubEnd { sub_id } => {
+            do_subagent_end(&sub_id);
+            Outcome::ok("graph.session.hook", format!("subagent end {sub_id}"))
         }
         HookAction::End { id } => do_session_end(&id),
     };
@@ -3400,6 +3721,7 @@ mod tests {
             pid: None,
             workspace: None,
             activity: None,
+            kind: None,
             extra: Map::new(),
         }
     }
@@ -4534,15 +4856,60 @@ mod tests {
             map_hook(&json!({ "session_id": "s", "hook_event_name": "UserPromptSubmit" })).unwrap(),
             HookAction::Phase { ref phase, .. } if phase == "working"
         ));
+        // A non-Task tool → ToolStart on the session (owner), tool as activity.
         assert!(matches!(
-            map_hook(&json!({ "session_id": "s", "hook_event_name": "PreToolUse" })).unwrap(),
-            HookAction::Phase { ref phase, .. } if phase == "working"
+            map_hook(&json!({ "session_id": "s", "hook_event_name": "PreToolUse", "tool_name": "Bash" }))
+                .unwrap(),
+            HookAction::ToolStart { ref owner, ref activity, spawn: None, .. }
+                if owner == "s" && activity.as_deref() == Some("Bash")
         ));
-        // PostToolUse joins the working arm — the tool ran, and this edge is HALF
-        // the awaiting-clearing set (approval → tool runs → PostToolUse).
+        // PostToolUse → ToolEnd on the same owner (part of the awaiting-clearing set).
         assert!(matches!(
-            map_hook(&json!({ "session_id": "s", "hook_event_name": "PostToolUse" })).unwrap(),
-            HookAction::Phase { ref phase, .. } if phase == "working"
+            map_hook(&json!({ "session_id": "s", "hook_event_name": "PostToolUse", "tool_name": "Bash" }))
+                .unwrap(),
+            HookAction::ToolEnd { ref owner, end_sub: None, .. } if owner == "s"
+        ));
+        // A Task tool → ToolStart carrying a SubSpawn (the child node to create),
+        // keyed by its tool_use_id, named from the description.
+        assert!(matches!(
+            map_hook(&json!({
+                "session_id": "s", "hook_event_name": "PreToolUse", "tool_name": "Task",
+                "tool_use_id": "tuABC",
+                "tool_input": { "description": "explore the auth module", "subagent_type": "Explore" }
+            })).unwrap(),
+            HookAction::ToolStart { spawn: Some(ref sp), .. }
+                if sp.sub_id == "sub:tuABC" && sp.name == "explore the auth module" && sp.agent_type == "Explore"
+        ));
+        // A tool fired INSIDE a sub-agent (parent_tool_use_id present) routes to
+        // the sub-node, not the session — the nesting/activity-routing rule.
+        assert!(matches!(
+            map_hook(&json!({
+                "session_id": "s", "hook_event_name": "PreToolUse", "tool_name": "Grep",
+                "parent_tool_use_id": "tuABC"
+            })).unwrap(),
+            HookAction::ToolStart { ref owner, .. } if owner == "sub:tuABC"
+        ));
+        // PostToolUse(Task) closes the child; SubagentStop is the backstop.
+        assert!(matches!(
+            map_hook(&json!({
+                "session_id": "s", "hook_event_name": "PostToolUse", "tool_name": "Task",
+                "tool_use_id": "tuABC"
+            })).unwrap(),
+            HookAction::ToolEnd { end_sub: Some(ref e), .. } if e == "sub:tuABC"
+        ));
+        assert!(matches!(
+            map_hook(&json!({
+                "session_id": "s", "hook_event_name": "SubagentStop", "parent_tool_use_id": "tuABC"
+            })).unwrap(),
+            HookAction::SubEnd { ref sub_id } if sub_id == "sub:tuABC"
+        ));
+        assert!(matches!(
+            map_hook(&json!({
+                "session_id": "s", "hook_event_name": "SubagentStart",
+                "parent_tool_use_id": "tuABC", "agent_type": "Explore"
+            })).unwrap(),
+            HookAction::SubEnsure { ref sub_id, ref agent_type, .. }
+                if sub_id == "sub:tuABC" && agent_type == "Explore"
         ));
         // Stop settles the turn to `idle` — a finished turn is not "needs input".
         assert!(matches!(
@@ -4913,6 +5280,73 @@ mod tests {
             Some("fix the flaky auth test"),
             "the first prompt names the session; later prompts don't rename it"
         );
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn subagent_task_builds_nests_and_collapses_the_tree() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("subagent");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let load = || -> SessionsFile { load_stage(&sessions_path()).unwrap() };
+        let find = |ss: &SessionsFile, id: &str| ss.sessions.iter().find(|s| s.session_id == id).cloned();
+
+        // A claude session runs, then spawns a Task sub-agent.
+        hook_from_str(r#"{ "session_id": "a", "hook_event_name": "SessionStart", "cwd": "/p" }"#);
+        hook_from_str(
+            r#"{ "session_id": "a", "hook_event_name": "UserPromptSubmit", "user_prompt": "audit the repo" }"#,
+        );
+        hook_from_str(
+            r#"{ "session_id": "a", "hook_event_name": "PreToolUse", "tool_name": "Task",
+                 "tool_use_id": "t1",
+                 "tool_input": { "description": "map the bridge", "subagent_type": "Explore" } }"#,
+        );
+        let ss = load();
+        let sub = find(&ss, "sub:t1").expect("the Task sub-node is created");
+        assert_eq!(sub.parent_session_id.as_deref(), Some("a"));
+        assert_eq!(sub.kind.as_deref(), Some("subagent"));
+        assert_eq!(sub.state, "working");
+        assert_eq!(sub.title.as_deref(), Some("map the bridge"));
+        assert_eq!(sub.agent, "Explore");
+        // The parent's activity reflects what its child is doing.
+        assert_eq!(find(&ss, "a").unwrap().activity.as_deref(), Some("map the bridge"));
+
+        // A tool fired INSIDE the sub-agent routes to the sub-node, not the session.
+        hook_from_str(
+            r#"{ "session_id": "a", "hook_event_name": "PreToolUse", "tool_name": "Grep",
+                 "parent_tool_use_id": "t1" }"#,
+        );
+        assert_eq!(find(&load(), "sub:t1").unwrap().activity.as_deref(), Some("Grep"));
+
+        // The Task returns → the sub-node is removed (the tree collapses).
+        hook_from_str(
+            r#"{ "session_id": "a", "hook_event_name": "PostToolUse", "tool_name": "Task",
+                 "tool_use_id": "t1" }"#,
+        );
+        assert!(
+            find(&load(), "sub:t1").is_none(),
+            "the sub-node is removed when its Task returns"
+        );
+
+        // SessionEnd cascades: a still-open sub-node is cleaned with its session.
+        hook_from_str(
+            r#"{ "session_id": "a", "hook_event_name": "PreToolUse", "tool_name": "Task",
+                 "tool_use_id": "t2", "tool_input": { "subagent_type": "Plan" } }"#,
+        );
+        assert!(find(&load(), "sub:t2").is_some());
+        hook_from_str(r#"{ "session_id": "a", "hook_event_name": "SessionEnd" }"#);
+        let end = load();
+        assert!(
+            find(&end, "sub:t2").is_none(),
+            "SessionEnd removes the sub-agent subtree"
+        );
+        assert_eq!(find(&end, "a").unwrap().state, "done");
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
