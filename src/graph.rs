@@ -100,6 +100,14 @@ pub struct SessionRecord {
     /// fall back to agent!="shell").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// The agent's latest *words* — a one-line tail of the session's Claude Code
+    /// transcript (the last non-sidechain assistant `text` block), distinct from
+    /// `activity` (the current *tool*). Read straight off the on-disk JSONL
+    /// transcript at hook boundaries (Stop / PostToolUse / Notification), so the
+    /// conductor can show what the agent is *saying*, not just what it is running.
+    /// Additive/v0-safe — absent for shells and for an agent that has not spoken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub say: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -149,10 +157,10 @@ pub struct HooksFile {
 fn projects_path() -> PathBuf {
     stage_dir().join("projects.json")
 }
-fn sessions_path() -> PathBuf {
+pub(crate) fn sessions_path() -> PathBuf {
     stage_dir().join("sessions.json")
 }
-fn hooks_path() -> PathBuf {
+pub(crate) fn hooks_path() -> PathBuf {
     stage_dir().join("hooks.json")
 }
 fn graph_path() -> PathBuf {
@@ -161,7 +169,7 @@ fn graph_path() -> PathBuf {
 
 /// Load one stage file; a missing file is an empty registry (tolerated), a
 /// corrupt one is a structured error string.
-fn load_stage<T: serde::de::DeserializeOwned + Default>(
+pub(crate) fn load_stage<T: serde::de::DeserializeOwned + Default>(
     path: &std::path::Path,
 ) -> Result<T, String> {
     match std::fs::read_to_string(path) {
@@ -173,7 +181,7 @@ fn load_stage<T: serde::de::DeserializeOwned + Default>(
 }
 
 /// Atomic write of one stage file (write-temp-then-rename, CONTRACTS.md §4).
-fn write_stage<T: Serialize>(path: &std::path::Path, value: &T) -> Result<(), String> {
+pub(crate) fn write_stage<T: Serialize>(path: &std::path::Path, value: &T) -> Result<(), String> {
     let body = serde_json::to_string_pretty(value)
         .map_err(|e| format!("{}: serialize: {e}", path.display()))?;
     atomic_write(path, &body).map_err(|e| format!("{}: {e}", path.display()))
@@ -336,6 +344,10 @@ pub fn build_graph(
         // already denotes project-vs-session, so this rides as `role`.
         if let Some(k) = &s.kind {
             node["role"] = json!(k);
+        }
+        // The agent's latest words (transcript tail), when it has spoken.
+        if let Some(say) = &s.say {
+            node["say"] = json!(say);
         }
         nodes.push(node);
         if let Some(parent) = resolved_parent(s, &ids) {
@@ -564,7 +576,7 @@ fn require_args(inv: &Invocation, names: &[&str]) -> Result<Vec<String>, Outcome
     Ok(inv.args[..names.len()].to_vec())
 }
 
-fn stage_error(cmd: &str, msg: String) -> Outcome {
+pub(crate) fn stage_error(cmd: &str, msg: String) -> Outcome {
     Outcome::error(cmd, msg).with_data(json!({ "reason": "stage-file-unreadable-or-unwritable" }))
 }
 
@@ -581,7 +593,7 @@ fn load_inputs(cmd: &str) -> Result<(ProjectsFile, SessionsFile, HooksFile), Out
 /// would compute. Every mutation of projects/sessions calls this, so the staged
 /// graph is always a pure function of the registries — the staged doc can no
 /// longer go stale behind a `project add`/`remove`/`link`/`prune`.
-fn restage_graph() -> Result<PathBuf, String> {
+pub(crate) fn restage_graph() -> Result<PathBuf, String> {
     let p: ProjectsFile = load_stage(&projects_path())?;
     let s: SessionsFile = load_stage(&sessions_path())?;
     let h: HooksFile = load_stage(&hooks_path())?;
@@ -777,7 +789,7 @@ pub fn link(inv: &Invocation) -> Outcome {
 /// leading `0x` stripped. The stored `windowAddress` and hyprctl's reported
 /// addresses can disagree on case and on a present/absent `0x` prefix
 /// (hyprctl reports e.g. `0x55…`); this makes the match tolerant of both.
-fn normalize_addr(addr: &str) -> String {
+pub(crate) fn normalize_addr(addr: &str) -> String {
     let a = addr.trim();
     let a = a
         .strip_prefix("0x")
@@ -822,61 +834,13 @@ fn client_workspace_for_address(clients: &[Value], want: &str) -> Option<i64> {
     })
 }
 
-// ── Liveness reaping: mark KILLED sessions done so they cannot haunt forever ─
-//
-// A terminal killed with SUPER+Q / SIGKILL cannot run its own cleanup — the
-// `conduct`/`wrap` process is torn down uncatchably, so `do_session_end` never
-// fires and the record is stranded `running` forever (22 dead `conduct-*` piled
-// up in ~8 minutes of use). The reaper detects such orphans out-of-band and
-// resolves them, so conduct-by-default is viable. A FALSE reap of a LIVE session
-// is worse than a stale record, so the predicate never guesses.
-
-/// Does `/proc/<pid>` still exist? The real liveness probe for [`is_session_dead`]
-/// (injected as a closure in tests so the predicate stays pure).
-fn proc_exists(pid: u32) -> bool {
-    std::path::Path::new("/proc").join(pid.to_string()).exists()
-}
-
-/// Is a session DEAD — orphaned so that NO process will ever clean it up? Pure
-/// and unit-tested (feed a fake live-address set + a fake `proc_exists`).
-///
-/// DEAD when EITHER independent signal fires:
-///   * **window gone** — a non-empty `windowAddress` that is NOT among the live
-///     `hyprctl clients -j` addresses (the SUPER+Q kill: the window vanished), OR
-///   * **process gone** — a recorded `pid` whose `/proc/<pid>` no longer exists
-///     (the process-killed case).
-///
-/// The never-false-reap guards:
-///   * `live_addresses` is an `Option`: `None` means the compositor could not be
-///     queried (no Hyprland, hyprctl missing/failed) — the window signal is then
-///     UNKNOWN and contributes nothing, so we never reap a windowed session we
-///     merely failed to see. Only a `Some(live)` we actually gathered can fire it.
-///   * A session with NEITHER signal (empty `windowAddress` AND no `pid` — e.g. a
-///     hook-only session that has not yet discovered a window/pid) is left alone:
-///     absence of evidence is never evidence of death.
-pub fn is_session_dead(
-    rec: &SessionRecord,
-    live_addresses: Option<&HashSet<String>>,
-    proc_exists: impl Fn(u32) -> bool,
-) -> bool {
-    let window_signal = match live_addresses {
-        Some(live) => {
-            !rec.window_address.is_empty()
-                && !live.contains(&normalize_addr(&rec.window_address))
-        }
-        None => false, // compositor not queried — window liveness is unknown.
-    };
-    let pid_signal = matches!(rec.pid, Some(p) if !proc_exists(p));
-    window_signal || pid_signal
-}
-
 /// Query `hyprctl clients -j` into a decoded JSON array. Returns `None` whenever
 /// the compositor cannot be consulted authoritatively: no
 /// `HYPRLAND_INSTANCE_SIGNATURE`, a missing/failed `hyprctl`, or unparseable
 /// JSON. This is the single clients-reading seam every consumer shares — the
 /// reaper's live set, phase-② discovery, and the window-event listener — so they
 /// all degrade identically off-Hyprland (never a panic, never a false result).
-fn hyprctl_clients() -> Option<Vec<Value>> {
+pub(crate) fn hyprctl_clients() -> Option<Vec<Value>> {
     if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
         return None;
     }
@@ -891,168 +855,6 @@ fn hyprctl_clients() -> Option<Vec<Value>> {
         Ok(Value::Array(a)) => Some(a),
         _ => None,
     }
-}
-
-/// Gather the normalised live window addresses from `hyprctl clients -j`.
-/// Returns `None` (→ pid-only liveness) whenever the compositor cannot be
-/// consulted authoritatively (see [`hyprctl_clients`]). This is the seam that
-/// keeps the reaper safe off-Hyprland — it degrades to the pid signal instead of
-/// blindly reaping every windowed session it could not see.
-fn live_window_addresses() -> Option<HashSet<String>> {
-    Some(
-        hyprctl_clients()?
-            .iter()
-            .filter_map(|c| c.get("address").and_then(Value::as_str))
-            .filter(|a| !a.is_empty())
-            .map(normalize_addr)
-            .collect(),
-    )
-}
-
-/// The reaper's transient-read grace (pure, unit-tested). Given the set of live
-/// window addresses the compositor just reported and the current sessions,
-/// decide the window-liveness set this reap pass should actually trust.
-///
-/// During a reload/restart (a quickshell restart, `hyprctl reload`, a nixos
-/// switch) `hyprctl clients -j` can momentarily answer SUCCESS with ZERO windows
-/// while the terminals are in fact alive — the compositor is mid-reload. Reaping
-/// the whole windowed roster off that snapshot is exactly the transient drop this
-/// fix targets, so an EMPTY gathered set against a roster that still holds
-/// windowed, not-`done` sessions is treated as degenerate and DOWNGRADED to
-/// `None` (pid-only liveness) for the pass — a vanished `/proc/<pid>` is still
-/// authoritative, so a genuinely-closed terminal (its owning pid gone too) is
-/// still reaped, while a live-but-momentarily-unlisted window is spared. A
-/// non-empty set, or an empty set with nothing windowed to protect, passes
-/// through unchanged.
-///
-/// Bounded edge (acceptable): a not-`done`, windowed, PID-LESS session whose
-/// terminal genuinely closed while the desktop is at zero windows carries neither
-/// a pid signal nor — under this downgrade — a window signal, so it is NOT reaped
-/// on that pass. It self-heals the moment ANY window exists (the snapshot is no
-/// longer empty, the stale address is then absent from a real set, and the window
-/// signal fires as normal). A lone stale record briefly lingering is the right
-/// trade for never mass-sweeping a live roster off a mid-reload read.
-fn effective_live_addresses(
-    gathered: Option<HashSet<String>>,
-    sessions: &[SessionRecord],
-) -> Option<HashSet<String>> {
-    match &gathered {
-        Some(set)
-            if set.is_empty()
-                && sessions
-                    .iter()
-                    .any(|s| s.state != "done" && !s.window_address.is_empty()) =>
-        {
-            None
-        }
-        _ => gathered,
-    }
-}
-
-/// `graph reap` — the automatic liveness sweep. Marks every DEAD (killed,
-/// orphaned) session `done` (and its hook record), then reuses [`prune_done`] to
-/// drop them + clear orphaned parent links, re-staging `graph.json` atomically.
-/// Cheap: one `hyprctl` call + a stage read, and a stage WRITE only when
-/// something was actually reaped. NEVER errors non-zero on "nothing to reap" and
-/// NEVER on an unavailable compositor (it falls back to pid-only liveness).
-pub fn reap(inv: &Invocation) -> Outcome {
-    crate::shellbridge::with_stage_lock(|| reap_inner(inv))
-}
-fn reap_inner(_inv: &Invocation) -> Outcome {
-    let cmd = "graph.reap";
-    let mut s_file: SessionsFile = match load_stage(&sessions_path()) {
-        Ok(f) => f,
-        Err(e) => return stage_error(cmd, e),
-    };
-    let mut h_file: HooksFile = match load_stage(&hooks_path()) {
-        Ok(f) => f,
-        Err(e) => return stage_error(cmd, e),
-    };
-
-    let gathered = live_window_addresses();
-    let hyprctl_available = gathered.is_some();
-    // Apply the transient-read grace: a degenerate empty snapshot during a reload
-    // window falls back to pid-only liveness so we never sweep the live roster off
-    // a momentary "zero windows" answer.
-    let live = effective_live_addresses(gathered, &s_file.sessions);
-    // Only STILL-live records can be dead-by-liveness; an already-`done` session
-    // is prune's job, not a reap. This is the set the liveness predicate killed.
-    let reaped: Vec<String> = s_file
-        .sessions
-        .iter()
-        .filter(|s| s.state != "done")
-        .filter(|s| is_session_dead(s, live.as_ref(), proc_exists))
-        .map(|s| s.session_id.clone())
-        .collect();
-
-    if reaped.is_empty() {
-        return Outcome::ok(cmd, "nothing to reap (all sessions live)").with_data(json!({
-            "reaped": [],
-            "hyprctlAvailable": hyprctl_available,
-        }));
-    }
-
-    // Mark each reaped session done in BOTH files, then let prune_done drop them
-    // (and any pre-existing `done`) + clear orphaned parentSessionIds.
-    let dead: HashSet<&str> = reaped.iter().map(String::as_str).collect();
-    let now = now_iso_utc();
-    for s in s_file.sessions.iter_mut() {
-        if dead.contains(s.session_id.as_str()) {
-            s.state = "done".to_string();
-        }
-    }
-    for id in &reaped {
-        upsert_hook(&mut h_file.hooks, id, "done", &now);
-    }
-
-    let (kept_s, kept_h, removed, cleared) = prune_done(
-        std::mem::take(&mut s_file.sessions),
-        std::mem::take(&mut h_file.hooks),
-    );
-    s_file.sessions = kept_s;
-    h_file.hooks = kept_h;
-    if s_file.schema_version.is_empty() {
-        s_file.schema_version = STAGE_GRAPH_VERSION.to_string();
-    }
-    if h_file.schema_version.is_empty() {
-        h_file.schema_version = STAGE_GRAPH_VERSION.to_string();
-    }
-    if let Err(e) = write_stage(&sessions_path(), &s_file) {
-        return stage_error(cmd, e);
-    }
-    if let Err(e) = write_stage(&hooks_path(), &h_file) {
-        return stage_error(cmd, e);
-    }
-
-    let mut changed: Vec<String> = reaped
-        .iter()
-        .map(|id| format!("reaped dead session {id} (killed; running → done → dropped)"))
-        .collect();
-    changed.extend(
-        cleared
-            .iter()
-            .map(|id| format!("cleared parentSessionId of {id}")),
-    );
-    match restage_graph() {
-        Ok(g) => changed.push(g.to_string_lossy().into_owned()),
-        Err(e) => return stage_error(cmd, e),
-    }
-    Outcome::ok(
-        cmd,
-        format!(
-            "reaped {} dead session(s); dropped {} total; cleared {} orphaned parent link(s)",
-            reaped.len(),
-            removed.len(),
-            cleared.len()
-        ),
-    )
-    .changed(changed)
-    .with_data(json!({
-        "reaped": reaped,
-        "removed": removed,
-        "clearedParents": cleared,
-        "hyprctlAvailable": hyprctl_available,
-    }))
 }
 
 /// `graph focus <node>` — jump to the session's window via hyprctl
@@ -1354,7 +1156,7 @@ pub fn emit(_inv: &Invocation) -> Outcome {
 /// [`crate::baton::theme::parse_iso_utc`], the reader) so the offline lock never
 /// grows a chrono just to write one timestamp — and a stamp we write always
 /// round-trips back through the reader baton/theme already ships.
-fn now_iso_utc() -> String {
+pub(crate) fn now_iso_utc() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -1453,6 +1255,7 @@ pub fn upsert_session(
             workspace: None,
             activity: None,
             kind: None,
+            say: None,
             extra: Map::new(),
         });
         true
@@ -1665,6 +1468,208 @@ fn set_owner_activity(owner: &str, state: &str, activity: Option<&str>) {
         }
         let _ = write_stage(&sessions_path(), &file);
         let _ = restage_graph();
+    });
+}
+
+// ── Transcript "say" — the agent's latest words, straight off its JSONL ──────
+//
+// Claude Code writes a per-session JSONL transcript at
+// `~/.claude/projects/<munge(cwd)>/<session_id>.jsonl` (also handed to every
+// hook as `transcript_path`). It is clean, structured, on-disk, and updated live
+// by claude itself — a far better "agent output" source than scraping conduct's
+// PTY (which for a live `claude` is the rendered TUI). The bridge tail-reads it
+// at hook boundaries to publish `say` (distinct from `activity` = current tool).
+
+/// Munge a cwd into Claude Code's project-dir name: every `/` and `.` → `-`
+/// (`/home/khoa/Aoide` → `-home-khoa-Aoide`). Mirrors the CLI's on-disk layout
+/// so the bridge can locate a transcript from data it already holds.
+fn munge_project_dir(cwd: &str) -> String {
+    cwd.chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect()
+}
+
+/// Resolve a session's transcript path: prefer the hook-supplied `transcript_path`
+/// when it names a real file, else derive the canonical
+/// `$HOME/.claude/projects/<munge(cwd)>/<session_id>.jsonl`. None when neither
+/// resolves to an existing file.
+pub(crate) fn transcript_path_for(
+    session_id: &str,
+    cwd: Option<&str>,
+    hinted: Option<&str>,
+) -> Option<PathBuf> {
+    if let Some(h) = hinted.filter(|s| !s.is_empty()) {
+        let p = PathBuf::from(h);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let home = std::env::var_os("HOME")?;
+    let cwd = cwd.filter(|s| !s.is_empty())?;
+    let p = PathBuf::from(home)
+        .join(".claude/projects")
+        .join(munge_project_dir(cwd))
+        .join(format!("{session_id}.jsonl"));
+    p.is_file().then_some(p)
+}
+
+/// Collapse a possibly-multiline string to one whitespace-normalised line,
+/// truncated at a char boundary to `max` chars with a trailing ellipsis.
+fn one_line_clip(s: &str, max: usize) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        let mut out: String = flat.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// Read the last ~32 KiB of the transcript as whole JSONL lines (a leading
+/// partial line dropped). Empty on any read error. Transcripts grow unbounded, so
+/// only the tail is scanned — enough for the freshest `say` + `custom-title`.
+fn transcript_tail(path: &std::path::Path) -> Vec<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 32 * 1024;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let Ok(len) = f.metadata().map(|m| m.len()) else {
+        return Vec::new();
+    };
+    let start = len.saturating_sub(TAIL);
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0); // the seek likely split a line — drop the partial head
+    }
+    lines
+}
+
+/// The agent's latest words: the last non-sidechain assistant `text` block in the
+/// tail, cleaned to a single line (≤160 chars). None when there is no such text.
+fn extract_say(lines: &[String]) -> Option<String> {
+    const SAY_MAX: usize = 160;
+    let mut found: Option<String> = None;
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        // A Task sub-agent's turns append to the SAME file with isSidechain=true;
+        // the session's own `say` is the top-level agent's words, so skip those.
+        if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let Some(content) = v
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        // The LAST text block in the turn is the agent's freshest prose (prose
+        // precedes the tool_use blocks it narrates).
+        for block in content.iter().rev() {
+            if block.get("type").and_then(Value::as_str) == Some("text") {
+                if let Some(t) = block.get("text").and_then(Value::as_str) {
+                    let t = t.trim();
+                    if !t.is_empty() {
+                        found = Some(one_line_clip(t, SAY_MAX));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The session's NAME: the last `custom-title` record's `customTitle` in the tail
+/// (Claude Code's own session title, e.g. "Aoide Dev"). None when never titled.
+fn extract_custom_title(lines: &[String]) -> Option<String> {
+    let mut found: Option<String> = None;
+    for line in lines {
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if v.get("type").and_then(Value::as_str) == Some("custom-title") {
+            if let Some(t) = v.get("customTitle").and_then(Value::as_str) {
+                let t = t.trim();
+                if !t.is_empty() {
+                    found = Some(one_line_clip(t, 48));
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Best-effort: refresh a session's transcript-derived fields at a hook boundary —
+/// its `say` (the agent's latest words) and, set-once, its `title` (the session
+/// NAME, from `custom-title`). Change-only; never touches state/activity/pid;
+/// re-stages only when something moved. Silent no-op when the transcript can't be
+/// located or read. One tail read serves both fields.
+fn refresh_transcript_fields(session_id: &str, cwd: Option<&str>, transcript_hint: Option<&str>) {
+    let Some(path) = transcript_path_for(session_id, cwd, transcript_hint) else {
+        return;
+    };
+    let lines = transcript_tail(&path);
+    if lines.is_empty() {
+        return;
+    }
+    let say = extract_say(&lines);
+    let name = extract_custom_title(&lines);
+    if say.is_none() && name.is_none() {
+        return;
+    }
+    crate::shellbridge::with_stage_lock(|| {
+        let mut file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let mut changed = false;
+        for s in file.sessions.iter_mut() {
+            if s.session_id != session_id {
+                continue;
+            }
+            if let Some(say) = &say {
+                if s.say.as_deref() != Some(say.as_str()) {
+                    s.say = Some(say.clone());
+                    changed = true;
+                }
+            }
+            // The session NAME is set ONCE — a hook-set or graph-send title wins,
+            // so a renamed conductor task is never clobbered by the tab title.
+            if let Some(name) = &name {
+                if s.title.as_deref().unwrap_or("").is_empty() {
+                    s.title = Some(name.clone());
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            if file.schema_version.is_empty() {
+                file.schema_version = STAGE_GRAPH_VERSION.to_string();
+            }
+            if write_stage(&sessions_path(), &file).is_ok() {
+                let _ = restage_graph();
+            }
+        }
     });
 }
 
@@ -2305,6 +2310,16 @@ fn proc_command(pid: i32) -> Option<String> {
         .filter(|c| !c.is_empty())
 }
 
+/// Just the process's `comm` (e.g. `bash`) — the label for an idle shell sitting
+/// at its bare prompt (no foreground command), so the roster still reads as the
+/// shell PROCESS rather than going blank.
+fn proc_comm(pid: i32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+}
+
 /// Update a conducted session's live shell fields — `cwd`, `activity` (the
 /// current foreground command, or cleared), and `state` (idle at the prompt,
 /// working while a command runs) — CHANGE-ONLY, under the stage lock, and
@@ -2360,8 +2375,12 @@ fn conduct_refresh_shell(id: &str, master: RawFd, shell_pid: i32) {
     let fg = unsafe { libc::tcgetpgrp(master) };
     let cwd = proc_cwd(shell_pid);
     let (state, activity) = if fg <= 0 || fg == shell_pid {
-        ("idle", None)
+        // At the bare prompt: idle, but label the row with the shell PROCESS
+        // itself (e.g. `bash`) so the terminal roster is never blank.
+        ("idle", proc_comm(shell_pid))
     } else {
+        // A foreground command is running: its cmdline (e.g. `nvim notes.md`,
+        // `cargo test`) — the file being edited / the process at work.
         ("working", proc_command(fg))
     };
     do_session_refresh(id, cwd.as_deref(), activity.as_deref(), state);
@@ -3674,6 +3693,33 @@ fn hook_from_str(buf: &str) -> Outcome {
         }
         HookAction::End { id } => do_session_end(&id),
     };
+    // After applying the action, refresh the session's transcript `say` at the
+    // boundaries where fresh prose has just landed: the turn end (Stop), a tool
+    // boundary (PostToolUse), a new prompt (UserPromptSubmit), or an input-needed
+    // ping (Notification). Skips the high-frequency PreToolUse (its prose is
+    // captured at the matching PostToolUse) and the lifecycle-only events. Only
+    // the TOP-LEVEL session speaks — a sub-agent tool call carries
+    // `parent_tool_use_id`, and must not overwrite its parent's say.
+    if let (Some(sid), Some(evt)) = (
+        payload
+            .get("session_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty()),
+        payload.get("hook_event_name").and_then(Value::as_str),
+    ) {
+        let is_sub = payload
+            .get("parent_tool_use_id")
+            .and_then(Value::as_str)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        if !is_sub && matches!(evt, "Stop" | "PostToolUse" | "UserPromptSubmit" | "Notification") {
+            refresh_transcript_fields(
+                sid,
+                payload.get("cwd").and_then(Value::as_str),
+                payload.get("transcript_path").and_then(Value::as_str),
+            );
+        }
+    }
     // Fold the inner outcome into an ok envelope — exit 0, no matter what.
     Outcome::ok(cmd, inner.message)
         .changed(inner.changed)
@@ -3699,6 +3745,9 @@ pub fn session_hook(_inv: &Invocation) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The reaper moved to `crate::reap`; its tests still live here (they lean on
+    // this module's stage/test helpers), so pull the moved items in by name.
+    use crate::reap::{effective_live_addresses, is_session_dead, reap};
 
     fn session(
         id: &str,
@@ -3722,6 +3771,7 @@ mod tests {
             workspace: None,
             activity: None,
             kind: None,
+            say: None,
             extra: Map::new(),
         }
     }
@@ -3771,6 +3821,76 @@ mod tests {
         // A fresh parent is fine.
         assert!(!would_cycle(&sessions, "c", "a"));
         assert!(!would_cycle(&sessions, "a", "unregistered"));
+    }
+
+    #[test]
+    fn munge_project_dir_matches_claude_layout() {
+        assert_eq!(munge_project_dir("/home/khoa/Aoide"), "-home-khoa-Aoide");
+        // A path with a dot component (worktree under `.claude/`): every `/`
+        // AND every `.` folds to `-`, matching the CLI's real dir names.
+        assert_eq!(
+            munge_project_dir("/home/khoa/Aoide/.claude/worktrees/x"),
+            "-home-khoa-Aoide--claude-worktrees-x"
+        );
+    }
+
+    #[test]
+    fn latest_say_reads_last_nonsidechain_assistant_text() {
+        let path = std::env::temp_dir().join(format!("aoide_say_{}.jsonl", std::process::id()));
+        let body = [
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"hi"}]}}"#,
+            r#"{"type":"assistant","isSidechain":false,"message":{"content":[{"type":"text","text":"first words"}]}}"#,
+            // A Task sub-agent's line in the SAME file must be ignored.
+            r#"{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"text","text":"SUBAGENT ignore me"}]}}"#,
+            // Freshest turn: thinking + multiline text + a tool_use. We take the
+            // LAST text block, whitespace-normalised.
+            r#"{"type":"assistant","isSidechain":false,"message":{"content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"  the  latest\nline  "},{"type":"tool_use","name":"Bash","input":{}}]}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, &body).unwrap();
+        let say = extract_say(&transcript_tail(&path));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(say.as_deref(), Some("the latest line"));
+    }
+
+    #[test]
+    fn latest_say_is_none_without_agent_text() {
+        let path = std::env::temp_dir().join(format!("aoide_say_none_{}.jsonl", std::process::id()));
+        let body = [
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"only a prompt"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{}}]}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, &body).unwrap();
+        let say = extract_say(&transcript_tail(&path));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(say, None);
+    }
+
+    #[test]
+    fn extract_custom_title_takes_the_last_session_title() {
+        let lines: Vec<String> = [
+            r#"{"type":"custom-title","customTitle":"Old Name","sessionId":"s"}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#,
+            r#"{"type":"custom-title","customTitle":"  Aoide Dev  ","sessionId":"s"}"#,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(extract_custom_title(&lines).as_deref(), Some("Aoide Dev"));
+        // No custom-title record → None (the session is unnamed).
+        let bare: Vec<String> =
+            vec![r#"{"type":"assistant","message":{"content":[]}}"#.to_string()];
+        assert_eq!(extract_custom_title(&bare), None);
+    }
+
+    #[test]
+    fn one_line_clip_flattens_and_truncates() {
+        assert_eq!(one_line_clip("a  b\n c", 80), "a b c");
+        let long = "x".repeat(200);
+        let clipped = one_line_clip(&long, 10);
+        assert_eq!(clipped.chars().count(), 10);
+        assert!(clipped.ends_with('…'));
     }
 
     #[test]

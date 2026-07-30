@@ -10,6 +10,7 @@ pub mod cli;
 pub mod daemon;
 pub mod dispatch;
 pub mod graph;
+pub mod reap;
 pub mod guide;
 pub mod mcp;
 pub mod notes;

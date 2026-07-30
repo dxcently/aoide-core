@@ -480,6 +480,7 @@ mod tests {
             workspace: None,
             activity: None,
             kind: None,
+            say: None,
             extra: Map::new(),
         }
     }

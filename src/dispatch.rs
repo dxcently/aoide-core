@@ -110,7 +110,7 @@ pub fn dispatch(inv: &Invocation) -> Outcome {
         ["graph", "send"] => crate::graph::session_send(inv),
         ["graph", "focus"] => crate::graph::focus(inv),
         ["graph", "prune"] => crate::graph::prune(inv),
-        ["graph", "reap"] => crate::graph::reap(inv),
+        ["graph", "reap"] => crate::reap::reap(inv),
         ["graph", "emit"] => crate::graph::emit(inv),
 
         // ── conduct: the PTY-backed conductable wrap (graph.rs) ─────────────
