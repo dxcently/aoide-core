@@ -50,7 +50,7 @@ fn seed(dir: &Path) {
         dir,
         "hooks.json",
         r#"{ "schemaVersion":"0", "hooks":[
-              {"sessionId":"a","phase":"PreToolUse","updatedAt":"3"} ] }"#,
+              {"sessionId":"a","phase":"awaiting","updatedAt":"3"} ] }"#,
     );
     write(
         dir,
@@ -77,11 +77,13 @@ fn app_loads_recomputes_selects_and_dispatches_against_the_tempdir() {
     assert_eq!(app.sessions.len(), 2, "both sessions loaded");
 
     // ── recompute: the hook phase overrides session `a`'s state ──
+    // Roster `running` folds to canonical `working`; the later hook phase
+    // `awaiting` overrides it, and both are rendered from the one vocabulary.
     let merged = app.merged();
     let a = merged.iter().find(|s| s.session_id == "a").unwrap();
     assert_eq!(
-        a.state, "PreToolUse",
-        "latest hook phase merged into live state"
+        a.state, "awaiting",
+        "latest hook phase (canonical) merged into live state"
     );
 
     // ── palette parsed from drachma.json ──

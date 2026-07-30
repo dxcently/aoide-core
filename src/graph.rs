@@ -207,12 +207,41 @@ pub fn merged_sessions(sessions: &[SessionRecord], hooks: &[HookRecord]) -> Vec<
             }
         }
     }
+    // Every producer's vocab is folded to the ONE canonical set the desktop
+    // renders — so graph.json (baton) and sessions.json (widgets) agree even for
+    // an un-migrated legacy record.
+    for s in &mut merged {
+        s.state = canonical_state(&s.state).to_string();
+    }
     // Deterministic ordering everywhere downstream: (startedAt, sessionId).
     merged.sort_by(|a, b| {
         (a.started_at.as_str(), a.session_id.as_str())
             .cmp(&(b.started_at.as_str(), b.session_id.as_str()))
     });
     merged
+}
+
+/// The canonical session-state vocabulary the desktop renders VERBATIM — no
+/// widget-side regex derivation (that split-brain is what this replaces). Every
+/// producer (hooks, `conduct`, the reaper) writes one of these onto
+/// `sessions.json`; this shim also folds the legacy / hook-phase vocab
+/// (`running`/`waiting`/`blocked`) onto it, so an old record is migrated the
+/// first time any writer touches the file — no rollout dance.
+///
+///   working  — in a turn / running a tool (or a shell running a foreground cmd)
+///   awaiting — needs the user (a permission prompt or the idle-input ping); the
+///              dock peeks on this and only this (`needsInput ⇔ awaiting`)
+///   idle     — alive but at rest (a fresh session, a finished turn, a bare prompt)
+///   done     — ended
+pub fn canonical_state(s: &str) -> &'static str {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "working" | "running" | "active" | "busy" | "tool" | "trace" => "working",
+        "awaiting" | "blocked" | "await" => "awaiting",
+        "idle" | "waiting" | "ready" | "sleep" => "idle",
+        "done" | "stopped" | "stop" | "exit" | "finished" | "complete" => "done",
+        // Empty/unknown → at rest (never invent a working/awaiting signal).
+        _ => "idle",
+    }
 }
 
 fn sorted_projects(projects: &[Project]) -> Vec<Project> {
@@ -1327,9 +1356,11 @@ fn iso_utc_from_epoch(secs: i64) -> String {
 
 /// UPSERT a session record by id (pure; the handler wires I/O around it).
 ///
-/// A fresh id is inserted `state="running"`, `startedAt=now`, `agent` defaulting
-/// to `claude`. A re-start of an existing id updates only the fields provided
-/// (a `None` leaves the stored value), re-marks it `running`, and NEVER clobbers
+/// A fresh id is inserted `state="idle"` (at rest until a prompt/tool or a
+/// foreground command moves it to `working`), `startedAt=now`, `agent`
+/// defaulting to `claude`. A re-start of an existing id updates only the fields
+/// provided (a `None` leaves the stored value), leaves the live `state`
+/// untouched (a resume must not reset a working session), and NEVER clobbers
 /// `startedAt` — the record is bounded to one per id, never duplicated. Returns
 /// `true` when a new record was inserted.
 pub fn upsert_session(
@@ -1370,7 +1401,10 @@ pub fn upsert_session(
         if let Some(p) = pid {
             s.pid = Some(p);
         }
-        s.state = "running".to_string(); // `start` means running; startedAt kept.
+        // A re-start (hook SessionStart on resume/compact, or a re-run `graph
+        // session start`) must NOT reset the live state — a working/awaiting
+        // session stays as it is; only the provided fields update. `startedAt`
+        // is likewise preserved.
         false
     } else {
         sessions.push(SessionRecord {
@@ -1378,7 +1412,9 @@ pub fn upsert_session(
             agent: agent.unwrap_or("claude").to_string(),
             window_address: window.unwrap_or_default().to_string(),
             cwd: cwd.unwrap_or_default().to_string(),
-            state: "running".to_string(),
+            // A freshly registered session is at rest until a prompt/tool (agent)
+            // or a foreground command (shell) moves it to `working`.
+            state: "idle".to_string(),
             started_at: now.to_string(),
             parent_session_id: parent.map(str::to_string),
             conductable,
@@ -1484,7 +1520,7 @@ fn do_session_start(
     }
 
     let mut changed = vec![if inserted {
-        format!("registered session {id} (running)")
+        format!("registered session {id} (idle)")
     } else {
         format!("updated session {id}")
     }];
@@ -1493,7 +1529,7 @@ fn do_session_start(
         Err(e) => return stage_error(cmd, e),
     }
     let message = if inserted {
-        format!("started session `{id}` (agent {r_agent}, running)")
+        format!("started session `{id}` (agent {r_agent}, idle)")
     } else {
         format!("re-started session `{id}` (fields updated; startedAt preserved)")
     };
@@ -1506,7 +1542,39 @@ fn do_session_start(
     }))
 }
 
-/// Core of `graph session phase`: UPSERT the hook record, re-stage.
+/// Land the canonical live `state` onto a session record in `sessions.json` —
+/// the widget-facing file. This is the fix for hook states never reaching the
+/// widgets: they watch `sessions.json`, whose `state` used to be only
+/// `running`/`done` (hook phases lived only in `hooks.json`), so `awaiting`
+/// and the dock peek could never fire. A no-op for an unregistered id.
+/// Change-only, and it migrates any other legacy state it passes, so repeated
+/// same-state phases and old vocab don't churn the file. `Ok(true)` when it wrote.
+fn set_session_state(id: &str, state: &str) -> Result<bool, String> {
+    let mut file: SessionsFile = load_stage(&sessions_path())?;
+    let canon = canonical_state(state);
+    let mut changed = false;
+    for s in file.sessions.iter_mut() {
+        let target = if s.session_id == id {
+            canon
+        } else {
+            canonical_state(&s.state) // migrate legacy vocab in passing
+        };
+        if s.state != target {
+            s.state = target.to_string();
+            changed = true;
+        }
+    }
+    if changed {
+        if file.schema_version.is_empty() {
+            file.schema_version = STAGE_GRAPH_VERSION.to_string();
+        }
+        write_stage(&sessions_path(), &file)?;
+    }
+    Ok(changed)
+}
+
+/// Core of `graph session phase`: UPSERT the hook record (audit), land the
+/// canonical live state on sessions.json (the widget file), re-stage.
 fn do_session_phase(id: &str, phase: &str) -> Outcome {
     let cmd = "graph.session.phase";
     let mut file: HooksFile = match load_stage(&hooks_path()) {
@@ -1519,6 +1587,11 @@ fn do_session_phase(id: &str, phase: &str) -> Outcome {
         file.schema_version = STAGE_GRAPH_VERSION.to_string();
     }
     if let Err(e) = write_stage(&hooks_path(), &file) {
+        return stage_error(cmd, e);
+    }
+    // Land the canonical live state on sessions.json (the widget file), so the
+    // roster/dock render working/awaiting/idle — not just running/done.
+    if let Err(e) = set_session_state(id, phase) {
         return stage_error(cmd, e);
     }
     let mut changed = vec![format!("session {id}: phase → {phase}")];
@@ -1540,7 +1613,7 @@ fn do_session_phase(id: &str, phase: &str) -> Outcome {
 /// its CURRENT hook phase equals `expected`, else an ok no-op that writes nothing.
 /// hooks.json is loaded ONCE — the guard read and the write share the same load,
 /// so the current phase is never read twice. This is the door the ambiguous idle
-/// Notification walks: only a still-`running` turn becomes `blocked`.
+/// Notification walks: only a still-`working` turn becomes `awaiting`.
 fn do_session_phase_if(id: &str, phase: &str, expected: &str) -> Outcome {
     let cmd = "graph.session.phase";
     let mut file: HooksFile = match load_stage(&hooks_path()) {
@@ -1553,7 +1626,10 @@ fn do_session_phase_if(id: &str, phase: &str, expected: &str) -> Outcome {
         .find(|h| h.session_id == id)
         .map(|h| h.phase.clone())
         .unwrap_or_default();
-    if current != expected {
+    // Compare canonically so a mid-migration legacy phase (`running`) still
+    // counts as `working` — the guard is about the effective state, not the
+    // exact stored token.
+    if canonical_state(&current) != canonical_state(expected) {
         return Outcome::ok(
             cmd,
             format!("session `{id}` phase unchanged (current `{current}` ≠ `{expected}`)"),
@@ -1571,6 +1647,11 @@ fn do_session_phase_if(id: &str, phase: &str, expected: &str) -> Outcome {
         file.schema_version = STAGE_GRAPH_VERSION.to_string();
     }
     if let Err(e) = write_stage(&hooks_path(), &file) {
+        return stage_error(cmd, e);
+    }
+    // Land the canonical live state on sessions.json (the widget file), so the
+    // roster/dock render working/awaiting/idle — not just running/done.
+    if let Err(e) = set_session_state(id, phase) {
         return stage_error(cmd, e);
     }
     let mut changed = vec![format!("session {id}: phase → {phase}")];
@@ -2911,11 +2992,11 @@ pub fn session_send(inv: &Invocation) -> Outcome {
 enum HookAction {
     Start { id: String, cwd: Option<String> },
     Phase { id: String, phase: String },
-    /// Conditional phase: set `phase` ONLY if the session's CURRENT hook phase is
-    /// `running`, else a no-op. Guards the ambiguous idle Notification — a
-    /// "waiting for your input" ping only means "blocked" when the turn is still
-    /// mid-flight (`running`, e.g. an unanswered AskUserQuestion); a settled
-    /// `waiting` session must not be flipped by the ~60s idle heartbeat.
+    /// Conditional phase: set `phase` ONLY if the session is still `working`,
+    /// else a no-op. Guards the ambiguous idle Notification — a "waiting for your
+    /// input" ping only means `awaiting` when the turn is still mid-flight (an
+    /// unanswered AskUserQuestion); a settled `idle`/`done` session must not be
+    /// flipped by the ~60s idle heartbeat.
     PhaseIfRunning { id: String, phase: String },
     End { id: String },
 }
@@ -2937,37 +3018,47 @@ fn map_hook(payload: &Value) -> Option<HookAction> {
         .map(str::to_string);
     match event {
         "SessionStart" => Some(HookAction::Start { id: id.to_string(), cwd }),
-        // The tool ran (PostToolUse) or a new prompt/tool began: the turn is
-        // live. PostToolUse is also HALF the blocked-clearing set — an approved
-        // permission runs the tool, and this edge lifts the fermata.
+        // A prompt or a tool call: the turn is live → `working`. PostToolUse is
+        // also part of the awaiting-clearing set — an approved permission runs
+        // the tool, and this edge lifts the fermata back to working.
         "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => Some(HookAction::Phase {
             id: id.to_string(),
-            phase: "running".to_string(),
+            phase: "working".to_string(),
         }),
+        // The turn ended and it is the user's move again — but a finished turn is
+        // NOT "needs input" (that would make the anxious state the resting face of
+        // the whole roster). `awaiting` is reserved strictly for the Notification
+        // signals below, so Stop settles to `idle`.
         "Stop" => Some(HookAction::Phase {
             id: id.to_string(),
-            phase: "waiting".to_string(),
+            phase: "idle".to_string(),
         }),
-        // The one hook with no clean edge: `message` disambiguates its two moods.
-        // "permission" → a real mid-turn blocker (publish blocked at once). The
-        // ~60s "waiting for your input" idle ping is ambiguous — only a still-
-        // running turn (an unseen AskUserQuestion) becomes blocked; a settled
-        // waiting/done session is left untouched. Anything else is a no-op.
+        // The needs-input signal. Prefer the structured `notification_type`
+        // (idle_prompt / permission_prompt, confirmed present in the CLI); fall
+        // back to the brittle English `message` for older payloads. A permission
+        // prompt is an unambiguous mid-turn blocker → `awaiting` at once. The ~60s
+        // idle ping is ambiguous — only a still-`working` turn (an unseen
+        // AskUserQuestion) becomes `awaiting`; a settled idle/done session is left
+        // untouched. Anything else is a no-op.
         "Notification" => {
+            let ntype = payload
+                .get("notification_type")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             let msg = payload
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            if msg.contains("permission") {
+            if ntype == "permission_prompt" || msg.contains("permission") {
                 Some(HookAction::Phase {
                     id: id.to_string(),
-                    phase: "blocked".to_string(),
+                    phase: "awaiting".to_string(),
                 })
-            } else if msg.contains("waiting for your input") {
+            } else if ntype == "idle_prompt" || msg.contains("waiting for your input") {
                 Some(HookAction::PhaseIfRunning {
                     id: id.to_string(),
-                    phase: "blocked".to_string(),
+                    phase: "awaiting".to_string(),
                 })
             } else {
                 None
@@ -3031,7 +3122,7 @@ fn hook_from_str(buf: &str) -> Outcome {
         }
         HookAction::PhaseIfRunning { id, phase } => {
             ensure_session_window(&id);
-            do_session_phase_if(&id, &phase, "running")
+            do_session_phase_if(&id, &phase, "working")
         }
         HookAction::End { id } => do_session_end(&id),
     };
@@ -3160,33 +3251,36 @@ mod tests {
                 Some("s1"),
             ),
         ];
-        // Hook state merge: s1's latest hook phase becomes its live state.
+        // Hook state merge: s1's latest hook phase becomes its live state, folded
+        // to the canonical vocab (working → idle here; latest updatedAt wins).
         let hooks = vec![
             HookRecord {
                 session_id: "s1".into(),
-                phase: "PreToolUse".into(),
+                phase: "working".into(),
                 updated_at: "2026-01-01T01:00:00Z".into(),
                 extra: Map::new(),
             },
             HookRecord {
                 session_id: "s1".into(),
-                phase: "Stop".into(),
+                phase: "idle".into(),
                 updated_at: "2026-01-01T02:00:00Z".into(),
                 extra: Map::new(),
             },
         ];
+        // Roster `running` folds to canonical `working`; the merged hook phase and
+        // the resting states render verbatim from the one vocabulary.
         let expected = "\
 ◆ aoide  /home/k/Aoide
-└─ ● s1  claude  Stop  /home/k/Aoide
+└─ ● s1  claude  idle  /home/k/Aoide
    └─ ● s3  claude  idle  /home/k/elsewhere
 ◆ nested  /home/k/Aoide/sub
-└─ ● s2  claude  running  /home/k/Aoide/sub/x
+└─ ● s2  claude  working  /home/k/Aoide/sub/x
 ◆ (unanchored)
 └─ ● s4  claude  idle  /tmp";
         assert_eq!(render(&projects, &sessions, &hooks, None), expected);
         // The focus marker singles out one node.
         let focused = render(&projects, &sessions, &hooks, Some("session:s2"));
-        assert!(focused.contains("└─ ▶ ● s2  claude  running"));
+        assert!(focused.contains("└─ ▶ ● s2  claude  working"));
         // Same inputs → same render (deterministic).
         assert_eq!(render(&projects, &sessions, &hooks, None), expected);
     }
@@ -4134,7 +4228,7 @@ mod tests {
     #[test]
     fn upsert_session_is_idempotent_and_preserves_started_at() {
         let mut sessions: Vec<SessionRecord> = Vec::new();
-        // First start: inserted, running, agent defaulted, startedAt stamped.
+        // First start: inserted, idle, agent defaulted, startedAt stamped.
         assert!(upsert_session(
             &mut sessions,
             "s1",
@@ -4150,7 +4244,7 @@ mod tests {
         ));
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].agent, "claude");
-        assert_eq!(sessions[0].state, "running");
+        assert_eq!(sessions[0].state, "idle");
         assert_eq!(sessions[0].started_at, "2026-01-01T00:00:00Z");
 
         // Re-start with a NEW now + agent + conductor fields: no duplicate,
@@ -4194,10 +4288,11 @@ mod tests {
         let s1 = hooks.iter().find(|h| h.session_id == "s1").unwrap();
         assert_eq!(s1.phase, "waiting");
         assert_eq!(s1.updated_at, "2026-01-01T00:00:02Z");
-        // merged_sessions tolerates the one-per-session shape: latest phase wins.
+        // merged_sessions tolerates the one-per-session shape: latest phase wins,
+        // folded to the canonical vocab (`waiting` → `idle`).
         let sessions = vec![session("s1", "/w", "running", "t", None)];
         let merged = merged_sessions(&sessions, &hooks);
-        assert_eq!(merged[0].state, "waiting");
+        assert_eq!(merged[0].state, "idle");
     }
 
     #[test]
@@ -4209,27 +4304,28 @@ mod tests {
         assert!(matches!(start, HookAction::Start { cwd: Some(_), .. }));
         assert!(matches!(
             map_hook(&json!({ "session_id": "s", "hook_event_name": "UserPromptSubmit" })).unwrap(),
-            HookAction::Phase { ref phase, .. } if phase == "running"
+            HookAction::Phase { ref phase, .. } if phase == "working"
         ));
         assert!(matches!(
             map_hook(&json!({ "session_id": "s", "hook_event_name": "PreToolUse" })).unwrap(),
-            HookAction::Phase { ref phase, .. } if phase == "running"
+            HookAction::Phase { ref phase, .. } if phase == "working"
         ));
-        // PostToolUse joins the running arm — the tool ran, and this edge is HALF
-        // the blocked-clearing set (approval → tool runs → PostToolUse).
+        // PostToolUse joins the working arm — the tool ran, and this edge is HALF
+        // the awaiting-clearing set (approval → tool runs → PostToolUse).
         assert!(matches!(
             map_hook(&json!({ "session_id": "s", "hook_event_name": "PostToolUse" })).unwrap(),
-            HookAction::Phase { ref phase, .. } if phase == "running"
+            HookAction::Phase { ref phase, .. } if phase == "working"
         ));
+        // Stop settles the turn to `idle` — a finished turn is not "needs input".
         assert!(matches!(
             map_hook(&json!({ "session_id": "s", "hook_event_name": "Stop" })).unwrap(),
-            HookAction::Phase { ref phase, .. } if phase == "waiting"
+            HookAction::Phase { ref phase, .. } if phase == "idle"
         ));
         assert!(matches!(
             map_hook(&json!({ "session_id": "s", "hook_event_name": "SessionEnd" })).unwrap(),
             HookAction::End { .. }
         ));
-        // Notification with a permission message → an unconditional `blocked`.
+        // Notification with a permission message → an unconditional `awaiting`.
         assert!(matches!(
             map_hook(&json!({
                 "session_id": "s",
@@ -4237,7 +4333,17 @@ mod tests {
                 "message": "Claude needs your permission to use Bash"
             }))
             .unwrap(),
-            HookAction::Phase { ref phase, .. } if phase == "blocked"
+            HookAction::Phase { ref phase, .. } if phase == "awaiting"
+        ));
+        // The structured notification_type is honoured too (permission_prompt).
+        assert!(matches!(
+            map_hook(&json!({
+                "session_id": "s",
+                "hook_event_name": "Notification",
+                "notification_type": "permission_prompt"
+            }))
+            .unwrap(),
+            HookAction::Phase { ref phase, .. } if phase == "awaiting"
         ));
         // The ambiguous idle ping → the CONDITIONAL variant (guarded downstream).
         assert!(matches!(
@@ -4247,7 +4353,17 @@ mod tests {
                 "message": "Claude is waiting for your input"
             }))
             .unwrap(),
-            HookAction::PhaseIfRunning { ref phase, .. } if phase == "blocked"
+            HookAction::PhaseIfRunning { ref phase, .. } if phase == "awaiting"
+        ));
+        // …and via notification_type idle_prompt.
+        assert!(matches!(
+            map_hook(&json!({
+                "session_id": "s",
+                "hook_event_name": "Notification",
+                "notification_type": "idle_prompt"
+            }))
+            .unwrap(),
+            HookAction::PhaseIfRunning { ref phase, .. } if phase == "awaiting"
         ));
         // "permission" match is case-insensitive.
         assert!(matches!(
@@ -4257,7 +4373,7 @@ mod tests {
                 "message": "PERMISSION required"
             }))
             .unwrap(),
-            HookAction::Phase { ref phase, .. } if phase == "blocked"
+            HookAction::Phase { ref phase, .. } if phase == "awaiting"
         ));
         // A Notification with an unrecognised or absent message → no action.
         assert!(map_hook(
@@ -4314,7 +4430,7 @@ mod tests {
 
         let s_file: SessionsFile = load_stage(&sessions_path()).unwrap();
         assert_eq!(s_file.sessions.len(), 1);
-        assert_eq!(s_file.sessions[0].state, "running");
+        assert_eq!(s_file.sessions[0].state, "idle");
         let started = s_file.sessions[0].started_at.clone();
         assert!(!started.is_empty());
 
@@ -4397,11 +4513,16 @@ mod tests {
         assert_eq!(s.sessions[0].agent, "claude");
         assert_eq!(s.sessions[0].cwd, "/proj");
 
-        // PreToolUse → running, Stop → waiting (latest hook phase wins).
+        // PreToolUse → working, Stop → idle (latest hook phase wins). The
+        // canonical live state now lands on sessions.json too (the widget file).
         hook_from_str(r#"{ "session_id": "h1", "hook_event_name": "PreToolUse" }"#);
+        let s_working: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(s_working.sessions[0].state, "working");
         hook_from_str(r#"{ "session_id": "h1", "hook_event_name": "Stop" }"#);
         let (_, ss, hh) = load_inputs("test").unwrap();
-        assert_eq!(merged_sessions(&ss.sessions, &hh.hooks)[0].state, "waiting");
+        assert_eq!(merged_sessions(&ss.sessions, &hh.hooks)[0].state, "idle");
+        let s_idle: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(s_idle.sessions[0].state, "idle");
 
         // SessionEnd → done in both files.
         hook_from_str(r#"{ "session_id": "h1", "hook_event_name": "SessionEnd" }"#);
@@ -4436,39 +4557,39 @@ mod tests {
         // Register, then drive to a live turn.
         hook_from_str(r#"{ "session_id": "b1", "hook_event_name": "SessionStart", "cwd": "/p" }"#);
         hook_from_str(r#"{ "session_id": "b1", "hook_event_name": "PreToolUse" }"#);
-        assert_eq!(live_phase("b1"), "running");
+        assert_eq!(live_phase("b1"), "working");
 
-        // A permission Notification blocks unconditionally.
+        // A permission Notification → awaiting, unconditionally.
         hook_from_str(
             r#"{ "session_id": "b1", "hook_event_name": "Notification",
                  "message": "Claude needs your permission to use Bash" }"#,
         );
-        assert_eq!(live_phase("b1"), "blocked");
+        assert_eq!(live_phase("b1"), "awaiting");
 
-        // PostToolUse (the approval → tool-ran edge) lifts the fermata → running.
+        // PostToolUse (the approval → tool-ran edge) lifts the fermata → working.
         hook_from_str(r#"{ "session_id": "b1", "hook_event_name": "PostToolUse" }"#);
-        assert_eq!(live_phase("b1"), "running");
+        assert_eq!(live_phase("b1"), "working");
 
-        // The ambiguous idle ping, mid-turn (running), is a real mid-turn
-        // question → blocked.
+        // The ambiguous idle ping, mid-turn (working), is a real mid-turn
+        // question → awaiting.
         hook_from_str(
             r#"{ "session_id": "b1", "hook_event_name": "Notification",
                  "message": "Claude is waiting for your input" }"#,
         );
-        assert_eq!(live_phase("b1"), "blocked");
+        assert_eq!(live_phase("b1"), "awaiting");
 
-        // Stop settles the turn → waiting.
+        // Stop settles the turn → idle.
         hook_from_str(r#"{ "session_id": "b1", "hook_event_name": "Stop" }"#);
-        assert_eq!(live_phase("b1"), "waiting");
+        assert_eq!(live_phase("b1"), "idle");
 
-        // The SAME idle ping on a SETTLED (waiting) session is a no-op — the ~60s
-        // heartbeat must NOT flip a quietly-finished turn to blocked.
+        // The SAME idle ping on a SETTLED (idle) session is a no-op — the ~60s
+        // heartbeat must NOT flip a quietly-finished turn to awaiting.
         let out = hook_from_str(
             r#"{ "session_id": "b1", "hook_event_name": "Notification",
                  "message": "Claude is waiting for your input" }"#,
         );
         assert_eq!(out.status, crate::output::Status::Ok);
-        assert_eq!(live_phase("b1"), "waiting");
+        assert_eq!(live_phase("b1"), "idle");
 
         // A garbage/absent-message Notification is an ok no-op (action:none), and
         // never touches the phase.
@@ -4476,15 +4597,15 @@ mod tests {
             r#"{ "session_id": "b1", "hook_event_name": "Notification", "message": "hi" }"#,
         );
         assert_eq!(noop.data.unwrap()["action"], "none");
-        assert_eq!(live_phase("b1"), "waiting");
+        assert_eq!(live_phase("b1"), "idle");
 
-        // blocked flows through the merge opaquely as the node state.
+        // awaiting flows through the merge opaquely as the node state.
         hook_from_str(
             r#"{ "session_id": "b1", "hook_event_name": "Notification",
                  "message": "permission needed" }"#,
         );
         let (_, ss, hh) = load_inputs("test").unwrap();
-        assert_eq!(merged_sessions(&ss.sessions, &hh.hooks)[0].state, "blocked");
+        assert_eq!(merged_sessions(&ss.sessions, &hh.hooks)[0].state, "awaiting");
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
