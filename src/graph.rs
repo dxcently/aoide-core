@@ -3307,6 +3307,19 @@ pub fn sync_untracked_terminal_windows() -> bool {
     })
 }
 
+/// Is `e` a read-timeout expiry rather than a genuine socket failure? A blocking
+/// read on a Unix stream whose `SO_RCVTIMEO` elapses returns `EAGAIN`, which
+/// Rust surfaces as [`ErrorKind::WouldBlock`] on Unix (Windows uses `TimedOut`);
+/// std documents either kind, so we accept both. Pure/testable, in the style of
+/// [`is_terminal_class`] & friends — the listener uses it to tell "nothing
+/// happened for 5s, re-tick" apart from "socket dropped, reconnect".
+pub(crate) fn is_read_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
 /// Run the Hyprland window→session event listener FOREVER — the shellbridge
 /// service spawns this on a background thread so it can never block or kill the
 /// socket accept loop. It connects to the `socket2` event stream and keeps
@@ -3314,7 +3327,9 @@ pub fn sync_untracked_terminal_windows() -> bool {
 /// pending session windows, a closed window is cleared. Degrades gracefully — no
 /// Hyprland signature logs once and returns (headless/non-Hypr aoide is
 /// unaffected); a failed connect or a dropped socket logs and retries after a
-/// short backoff. NEVER panics.
+/// short backoff. NEVER panics. A ~5s read timeout on the connection also
+/// re-ticks the untracked-terminal sync (see [`is_read_timeout`]) so a bare tty's
+/// cwd/title doesn't go stale between window events.
 pub fn run_hypr_window_listener() {
     use std::io::{BufRead, BufReader};
     let Some(sock) = hypr_event_socket_path() else {
@@ -3334,9 +3349,24 @@ pub fn run_hypr_window_listener() {
                 // were not listening (service start mid-session, or a reconnect).
                 resolve_pending_session_windows();
                 sync_untracked_terminal_windows();
+                // Coarse read timeout so a blocking read wakes every ~5s even
+                // when no window event fires — the periodic tick that refreshes
+                // cwd/title for bare, untracked terminals. Best-effort: if it
+                // fails the listener still works, just event-driven only.
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
                 for line in BufReader::new(stream).lines() {
-                    let Ok(line) = line else {
-                        break; // socket dropped → fall through to reconnect.
+                    let line = match line {
+                        Ok(line) => line,
+                        // Timeout expiry (no event for ~5s): stay on this SAME
+                        // connection, re-tick the untracked roster, keep reading.
+                        // The read itself blocked for the full 5s, so this paces
+                        // itself — no busy-loop.
+                        Err(e) if is_read_timeout(&e) => {
+                            sync_untracked_terminal_windows();
+                            continue;
+                        }
+                        // Any other error: socket dropped → reconnect.
+                        Err(_) => break,
                     };
                     match parse_hypr_window_event(&line) {
                         Some(HyprWindowEvent::Appeared { .. }) => {
@@ -4203,6 +4233,29 @@ mod tests {
             mapped: true,
             cwd: cwd.into(),
         }
+    }
+
+    #[test]
+    fn read_timeout_predicate_distinguishes_tick_from_drop() {
+        use std::io::{Error, ErrorKind};
+        // A read-timeout expiry surfaces as WouldBlock on Unix — that's a tick,
+        // not a failure: keep the connection.
+        assert!(is_read_timeout(&Error::new(ErrorKind::WouldBlock, "timed out")));
+        // Windows/std also documents TimedOut for the same event: accept it too.
+        assert!(is_read_timeout(&Error::new(ErrorKind::TimedOut, "timed out")));
+        // A genuine socket drop is NOT a timeout → the listener must reconnect.
+        assert!(!is_read_timeout(&Error::new(
+            ErrorKind::ConnectionReset,
+            "peer reset"
+        )));
+        assert!(!is_read_timeout(&Error::new(
+            ErrorKind::BrokenPipe,
+            "broken pipe"
+        )));
+        assert!(!is_read_timeout(&Error::new(
+            ErrorKind::UnexpectedEof,
+            "eof"
+        )));
     }
 
     #[test]
