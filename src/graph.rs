@@ -2483,11 +2483,37 @@ fn friendly_editor_command(argv: &[String]) -> Option<String> {
     })
 }
 
+/// The generic (non-editor) command label: `argv` joined into a one-liner, but
+/// with `argv[0]` collapsed to its BASENAME first (the rest of argv is left
+/// untouched). On NixOS many wrapped packages re-exec with `argv[0]` set to the
+/// full resolved `/nix/store/<hash>-<name>/bin/<name>` path (confirmed live:
+/// `yazi`) rather than the bare command the user typed, so a raw join would show
+/// an ugly store path; collapsing `argv[0]` yields a clean `yazi` while leaving
+/// arguments (which may legitimately be paths) intact. `None` for empty argv.
+fn generic_command_label(argv: &[String]) -> Option<String> {
+    let first = argv.first()?;
+    let base = std::path::Path::new(first)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(first.as_str());
+    let mut parts: Vec<&str> = Vec::with_capacity(argv.len());
+    parts.push(base);
+    parts.extend(argv[1..].iter().map(String::as_str));
+    let joined = parts.join(" ");
+    let joined = joined.trim();
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined.to_string())
+    }
+}
+
 /// A short one-line label for a process's command: a known editor shows as
 /// `"<editor> <file>"` ([`friendly_editor_command`]); anything else shows
-/// `/proc/<pid>/cmdline` argv joined (e.g. `cargo test`), falling back to
-/// `comm`. Clipped to a roster-friendly width. Used as a conducted shell's
-/// live `activity`.
+/// `/proc/<pid>/cmdline` argv joined with `argv[0]` collapsed to its basename
+/// ([`generic_command_label`], e.g. `cargo test`), falling back to `comm`.
+/// Clipped to a roster-friendly width. Used as a conducted shell's live
+/// `activity`.
 fn proc_command(pid: i32) -> Option<String> {
     let clip = |s: &str| -> String {
         let one = s.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -2507,10 +2533,8 @@ fn proc_command(pid: i32) -> Option<String> {
         if let Some(friendly) = friendly_editor_command(&argv) {
             return Some(clip(&friendly));
         }
-        let joined = argv.join(" ");
-        let joined = joined.trim();
-        if !joined.is_empty() {
-            return Some(clip(joined));
+        if let Some(label) = generic_command_label(&argv) {
+            return Some(clip(&label));
         }
     }
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
@@ -4629,6 +4653,41 @@ mod tests {
             None
         );
         assert_eq!(friendly_editor_command(&argv(&[])), None);
+    }
+
+    #[test]
+    fn generic_command_label_collapses_argv0_basename_only() {
+        // A full nix-store path single-arg command (confirmed live: a wrapped
+        // `yazi` re-execs with argv[0] set to its store path) collapses to the
+        // bare basename, not the ugly store path.
+        assert_eq!(
+            generic_command_label(&argv(&[
+                "/nix/store/0qviwy1qgq5i5yy947wv4d7656mb56vs-yazi-0.4.2/bin/yazi",
+            ])),
+            Some("yazi".to_string())
+        );
+        // A full store path WITH args: argv[0] collapses to its basename, the
+        // arguments (which may legitimately be paths) stay intact.
+        assert_eq!(
+            generic_command_label(&argv(&[
+                "/nix/store/hash-ripgrep-14.1.0/bin/rg",
+                "pattern",
+                "file.rs",
+            ])),
+            Some("rg pattern file.rs".to_string())
+        );
+        // A plain bare command (no path) is unaffected.
+        assert_eq!(
+            generic_command_label(&argv(&["yazi"])),
+            Some("yazi".to_string())
+        );
+        // Args after a bare command are left untouched.
+        assert_eq!(
+            generic_command_label(&argv(&["cargo", "test"])),
+            Some("cargo test".to_string())
+        );
+        // Empty argv → None (caller falls back to `comm`).
+        assert_eq!(generic_command_label(&argv(&[])), None);
     }
 
     #[test]
