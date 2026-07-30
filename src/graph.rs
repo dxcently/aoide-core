@@ -3165,6 +3165,14 @@ pub(crate) fn is_terminal_class(class: &str) -> bool {
     TERMINAL_CLASSES.contains(&c.as_str())
 }
 
+/// Is `tool` a sub-agent-dispatch tool? Claude Code's classic name is `Task`;
+/// this harness's own tool is named `Agent` instead — both spawn/manage a
+/// background sub-agent the same way from the hook's point of view, so both
+/// gate sub-agent node creation/teardown identically.
+fn is_subagent_tool(tool: &str) -> bool {
+    matches!(tool, "Task" | "Agent")
+}
+
 /// One live terminal window distilled from a `hyprctl clients -j` client — the
 /// pure-core input for [`reconcile_untracked_terminals`], so the reconciliation
 /// is testable without a compositor (`cwd` is pre-read from `/proc/<pid>/cwd` by
@@ -3996,7 +4004,7 @@ fn map_hook(payload: &Value) -> Option<HookAction> {
                 Some(p) => format!("sub:{p}"),
                 None => id.to_string(),
             };
-            if tool == "Task" && !tuid.is_empty() {
+            if is_subagent_tool(tool) && !tuid.is_empty() {
                 let input = payload.get("tool_input");
                 let field = |k: &str| {
                     input
@@ -4037,7 +4045,7 @@ fn map_hook(payload: &Value) -> Option<HookAction> {
                 Some(p) => format!("sub:{p}"),
                 None => id.to_string(),
             };
-            let end_sub = if tool == "Task" && !tuid.is_empty() {
+            let end_sub = if is_subagent_tool(tool) && !tuid.is_empty() {
                 Some(format!("sub:{tuid}"))
             } else {
                 None
@@ -5814,6 +5822,25 @@ mod tests {
             })).unwrap(),
             HookAction::ToolEnd { end_sub: Some(ref e), .. } if e == "sub:tuABC"
         ));
+        // This harness's own dispatch tool is named `Agent`, not `Task`. It must
+        // spawn/close the sub-node identically — same tool_input field names
+        // (`description`, `subagent_type`), so the child is named the same way.
+        assert!(matches!(
+            map_hook(&json!({
+                "session_id": "s", "hook_event_name": "PreToolUse", "tool_name": "Agent",
+                "tool_use_id": "tuAG",
+                "tool_input": { "description": "explore the auth module", "subagent_type": "Explore" }
+            })).unwrap(),
+            HookAction::ToolStart { spawn: Some(ref sp), .. }
+                if sp.sub_id == "sub:tuAG" && sp.name == "explore the auth module" && sp.agent_type == "Explore"
+        ));
+        assert!(matches!(
+            map_hook(&json!({
+                "session_id": "s", "hook_event_name": "PostToolUse", "tool_name": "Agent",
+                "tool_use_id": "tuAG"
+            })).unwrap(),
+            HookAction::ToolEnd { end_sub: Some(ref e), .. } if e == "sub:tuAG"
+        ));
         assert!(matches!(
             map_hook(&json!({
                 "session_id": "s", "hook_event_name": "SubagentStop", "parent_tool_use_id": "tuABC"
@@ -6319,6 +6346,32 @@ mod tests {
             "SessionEnd removes the sub-agent subtree"
         );
         assert_eq!(find(&end, "a").unwrap().state, "done");
+
+        // The `Agent` tool (this harness's dispatch name) drives the tree the
+        // same way `Task` does: spawn a sub-node on PreToolUse, collapse it on
+        // PostToolUse — identical tool_input field names.
+        hook_from_str(r#"{ "session_id": "b", "hook_event_name": "SessionStart", "cwd": "/p" }"#);
+        hook_from_str(
+            r#"{ "session_id": "b", "hook_event_name": "PreToolUse", "tool_name": "Agent",
+                 "tool_use_id": "g1",
+                 "tool_input": { "description": "map the bridge", "subagent_type": "Explore" } }"#,
+        );
+        let ss = load();
+        let sub = find(&ss, "sub:g1").expect("the Agent sub-node is created");
+        assert_eq!(sub.parent_session_id.as_deref(), Some("b"));
+        assert_eq!(sub.kind.as_deref(), Some("subagent"));
+        assert_eq!(sub.state, "working");
+        assert_eq!(sub.title.as_deref(), Some("map the bridge"));
+        assert_eq!(sub.agent, "Explore");
+        assert_eq!(find(&ss, "b").unwrap().activity.as_deref(), Some("map the bridge"));
+        hook_from_str(
+            r#"{ "session_id": "b", "hook_event_name": "PostToolUse", "tool_name": "Agent",
+                 "tool_use_id": "g1" }"#,
+        );
+        assert!(
+            find(&load(), "sub:g1").is_none(),
+            "the sub-node is removed when its Agent dispatch returns"
+        );
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
