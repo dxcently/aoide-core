@@ -14,7 +14,7 @@ use crate::output::Outcome;
 use crate::shellbridge::{atomic_write, stage_dir};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -3043,6 +3043,270 @@ pub fn clear_closed_window(address: &str) -> bool {
     false
 }
 
+// ── Untracked-terminal capture: publish a synthetic record per bare tty ──────
+//
+// The Terminals roster is the PROCESS view of every open terminal window, tracked
+// or not (concepts/desktop/Terminal-Commander). A bare `kitty` running a plain
+// `bash` has no Aoide hook and no `conduct` PTY, so nothing publishes it — the
+// widget used to enumerate `hyprctl clients` itself and merge, violating the
+// Widget–Bridge Contract ("never enumerate the system in QML"). This moves that
+// enumeration into the daemon: for every LIVE terminal-class window with no
+// tracked session claiming its `windowAddress`, we upsert a lightweight `shell`
+// record keyed `win:<normalized-address>`, so `sessions.json` ALONE is a complete
+// terminal roster the widget reads as a pure view.
+
+/// Terminal window CLASSES we recognize as a tty (mirrors the QML `termClassRe`
+/// this supersedes) — ascii-lowercased compare.
+const TERMINAL_CLASSES: &[&str] = &[
+    "kitty",
+    "foot",
+    "footclient",
+    "alacritty",
+    "wezterm",
+    "org.wezfurlong.wezterm",
+    "ghostty",
+    "com.mitchellh.ghostty",
+    "xterm",
+    "uxterm",
+    "konsole",
+    "urxvt",
+    "rxvt",
+    "termite",
+    "tilix",
+    "contour",
+    "rio",
+    "st",
+    "kgx",
+    "org.gnome.console",
+    "blackbox",
+    "terminator",
+    "sakura",
+    "wave",
+    "xfce4-terminal",
+    "gnome-terminal",
+    "qterminal",
+    "lxterminal",
+    "deepin-terminal",
+];
+
+/// Is a window class one we treat as a terminal (ascii-lowercased exact match
+/// against [`TERMINAL_CLASSES`])? Pure — the classification seam under test.
+pub(crate) fn is_terminal_class(class: &str) -> bool {
+    let c = class.trim().to_ascii_lowercase();
+    TERMINAL_CLASSES.contains(&c.as_str())
+}
+
+/// One live terminal window distilled from a `hyprctl clients -j` client — the
+/// pure-core input for [`reconcile_untracked_terminals`], so the reconciliation
+/// is testable without a compositor (`cwd` is pre-read from `/proc/<pid>/cwd` by
+/// the I/O wrapper).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TermWindow {
+    pub address: String,
+    pub class: String,
+    pub title: String,
+    pub workspace: Option<i64>,
+    pub pid: Option<i32>,
+    pub mapped: bool,
+    pub cwd: String,
+}
+
+/// Reconcile the synthetic `win:*` terminal records against the live terminal
+/// windows — the PURE CORE (fed fake `TermWindow`s in tests). Given the current
+/// sessions and the live windows, returns the updated sessions plus whether it
+/// changed anything.
+///
+/// Rules:
+///   * A LIVE, mapped, terminal-class window whose (normalized) address is NOT
+///     claimed by any TRACKED (non-`win:`) session gets a synthetic record keyed
+///     `win:<normalized-address>` (`agent`/`kind` = "shell", `state` = "idle").
+///     Upserted in place, so a re-scan never duplicates and only mutates the
+///     record's live fields (`cwd`/`title`/`workspace`/`pid`/`windowAddress`).
+///   * A window already claimed by a tracked session is left to that session —
+///     never double-published (the tracked record carries the rich state).
+///   * A synthetic `win:*` record whose window no longer appears live (closed, or
+///     newly claimed by a tracked session) is REMOVED.
+pub(crate) fn reconcile_untracked_terminals(
+    mut sessions: Vec<SessionRecord>,
+    windows: &[TermWindow],
+) -> (Vec<SessionRecord>, bool) {
+    // Addresses owned by a TRACKED (non-synthetic) session — a real agent/shell
+    // record already represents that window, so it is never re-published.
+    let tracked_addrs: HashSet<String> = sessions
+        .iter()
+        .filter(|s| !s.session_id.starts_with("win:"))
+        .filter(|s| !s.window_address.is_empty())
+        .map(|s| normalize_addr(&s.window_address))
+        .collect();
+
+    // The synthetic roster we WANT: one entry per live, mapped, terminal-class,
+    // unclaimed window, keyed by normalized address.
+    let mut desired: HashMap<String, &TermWindow> = HashMap::new();
+    for w in windows {
+        if !w.mapped || !is_terminal_class(&w.class) {
+            continue;
+        }
+        let na = normalize_addr(&w.address);
+        if na.is_empty() || tracked_addrs.contains(&na) {
+            continue;
+        }
+        desired.insert(na, w);
+    }
+
+    let mut changed = false;
+
+    // Drop synthetic records whose window is no longer desired (closed, or a
+    // tracked session now owns the address).
+    let before = sessions.len();
+    sessions.retain(|s| match s.session_id.strip_prefix("win:") {
+        Some(addr) => desired.contains_key(addr),
+        None => true,
+    });
+    if sessions.len() != before {
+        changed = true;
+    }
+
+    // Upsert a synthetic record per desired window.
+    for (na, w) in &desired {
+        let sid = format!("win:{na}");
+        let want_title = if w.title.is_empty() {
+            None
+        } else {
+            Some(w.title.clone())
+        };
+        let want_pid = w.pid.filter(|p| *p > 0).map(|p| p as u32);
+        if let Some(rec) = sessions.iter_mut().find(|s| s.session_id == sid) {
+            if rec.window_address != w.address {
+                rec.window_address = w.address.clone();
+                changed = true;
+            }
+            if rec.cwd != w.cwd {
+                rec.cwd = w.cwd.clone();
+                changed = true;
+            }
+            if rec.title != want_title {
+                rec.title = want_title;
+                changed = true;
+            }
+            if rec.workspace != w.workspace {
+                rec.workspace = w.workspace;
+                changed = true;
+            }
+            if rec.pid != want_pid {
+                rec.pid = want_pid;
+                changed = true;
+            }
+            // Keep the identity invariants a synthetic record always carries.
+            if rec.agent != "shell" {
+                rec.agent = "shell".to_string();
+                changed = true;
+            }
+            if rec.state != "idle" {
+                rec.state = "idle".to_string();
+                changed = true;
+            }
+            if rec.kind.as_deref() != Some("shell") {
+                rec.kind = Some("shell".to_string());
+                changed = true;
+            }
+        } else {
+            sessions.push(SessionRecord {
+                session_id: sid,
+                agent: "shell".to_string(),
+                window_address: w.address.clone(),
+                cwd: w.cwd.clone(),
+                state: "idle".to_string(),
+                kind: Some("shell".to_string()),
+                title: want_title,
+                pid: want_pid,
+                workspace: w.workspace,
+                ..Default::default()
+            });
+            changed = true;
+        }
+    }
+
+    (sessions, changed)
+}
+
+/// Extract a [`TermWindow`] from one `hyprctl clients -j` client object, reading
+/// its owning process's cwd from `/proc/<pid>/cwd`. `None` for a client with no
+/// usable `address`. The one I/O seam over the pure [`reconcile_untracked_terminals`].
+fn term_window_from_client(c: &Value) -> Option<TermWindow> {
+    let address = c.get("address").and_then(Value::as_str)?.trim().to_string();
+    if address.is_empty() {
+        return None;
+    }
+    let class = c
+        .get("class")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let title = c
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let workspace = c
+        .get("workspace")
+        .and_then(|w| w.get("id"))
+        .and_then(Value::as_i64);
+    let pid = c
+        .get("pid")
+        .and_then(Value::as_i64)
+        .map(|p| p as i32)
+        .filter(|p| *p > 0);
+    // `mapped` defaults to true when absent — a client with no `mapped` field is
+    // treated as a shown window rather than silently dropped.
+    let mapped = c.get("mapped").and_then(Value::as_bool).unwrap_or(true);
+    let cwd = pid.and_then(proc_cwd).unwrap_or_default();
+    Some(TermWindow {
+        address,
+        class,
+        title,
+        workspace,
+        pid,
+        mapped,
+        cwd,
+    })
+}
+
+/// Publish a lightweight `shell` session record for every LIVE terminal-class
+/// window that has no tracked session already claiming its `windowAddress`, and
+/// remove any synthetic `win:*` record whose window has closed — so
+/// `sessions.json` is a complete terminal roster and QML never enumerates
+/// `hyprctl` itself. The I/O wrapper over [`reconcile_untracked_terminals`]:
+/// gathers the clients, distils each into a [`TermWindow`], reconciles under the
+/// stage lock, and re-stages `graph.json` only when something changed. Best-effort
+/// and off-Hyprland-safe like its siblings — returns early (no panic) when
+/// `hyprctl_clients()` is unavailable. Returns true iff `sessions.json` changed.
+pub fn sync_untracked_terminal_windows() -> bool {
+    let Some(clients) = hyprctl_clients() else {
+        return false;
+    };
+    let windows: Vec<TermWindow> = clients.iter().filter_map(term_window_from_client).collect();
+    crate::shellbridge::with_stage_lock(|| {
+        let mut file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let (sessions, changed) =
+            reconcile_untracked_terminals(std::mem::take(&mut file.sessions), &windows);
+        file.sessions = sessions;
+        if !changed {
+            return false;
+        }
+        if file.schema_version.is_empty() {
+            file.schema_version = STAGE_GRAPH_VERSION.to_string();
+        }
+        if write_stage(&sessions_path(), &file).is_ok() {
+            let _ = restage_graph();
+            return true;
+        }
+        false
+    })
+}
+
 /// Run the Hyprland window→session event listener FOREVER — the shellbridge
 /// service spawns this on a background thread so it can never block or kill the
 /// socket accept loop. It connects to the `socket2` event stream and keeps
@@ -3059,12 +3323,17 @@ pub fn run_hypr_window_listener() {
         );
         return;
     };
+    // Populate the untracked-terminal roster once at startup, so the Terminals
+    // widget has a complete tty roster the instant shellbridge comes up — not
+    // only after the next window event fires.
+    sync_untracked_terminal_windows();
     loop {
         match UnixStream::connect(&sock) {
             Ok(stream) => {
                 // On every (re)connect, sweep any windows that opened while we
                 // were not listening (service start mid-session, or a reconnect).
                 resolve_pending_session_windows();
+                sync_untracked_terminal_windows();
                 for line in BufReader::new(stream).lines() {
                     let Ok(line) = line else {
                         break; // socket dropped → fall through to reconnect.
@@ -3072,9 +3341,11 @@ pub fn run_hypr_window_listener() {
                     match parse_hypr_window_event(&line) {
                         Some(HyprWindowEvent::Appeared { .. }) => {
                             resolve_pending_session_windows();
+                            sync_untracked_terminal_windows();
                         }
                         Some(HyprWindowEvent::Closed { address }) => {
                             clear_closed_window(&address);
+                            sync_untracked_terminal_windows();
                         }
                         None => {}
                     }
@@ -3920,6 +4191,116 @@ mod tests {
     // The reaper moved to `crate::reap`; its tests still live here (they lean on
     // this module's stage/test helpers), so pull the moved items in by name.
     use crate::reap::{effective_live_addresses, is_session_dead, reap};
+
+    // ── Untracked-terminal reconciliation (sync_untracked_terminal_windows) ──
+    fn term_win(addr: &str, class: &str, cwd: &str) -> TermWindow {
+        TermWindow {
+            address: addr.into(),
+            class: class.into(),
+            title: String::new(),
+            workspace: Some(1),
+            pid: Some(4321),
+            mapped: true,
+            cwd: cwd.into(),
+        }
+    }
+
+    #[test]
+    fn terminal_class_is_case_insensitive_and_exact() {
+        assert!(is_terminal_class("kitty"));
+        assert!(is_terminal_class("Kitty"));
+        assert!(is_terminal_class("org.wezfurlong.wezterm"));
+        assert!(!is_terminal_class("firefox"));
+        assert!(!is_terminal_class("kittyfoo"));
+        assert!(!is_terminal_class(""));
+    }
+
+    #[test]
+    fn untracked_terminal_synthesizes_a_win_record() {
+        let (out, changed) =
+            reconcile_untracked_terminals(vec![], &[term_win("0xAABB", "kitty", "/home/khoa")]);
+        assert!(changed);
+        assert_eq!(out.len(), 1);
+        let r = &out[0];
+        assert_eq!(r.session_id, "win:aabb");
+        assert_eq!(r.agent, "shell");
+        assert_eq!(r.kind.as_deref(), Some("shell"));
+        assert_eq!(r.state, "idle");
+        assert_eq!(r.window_address, "0xAABB");
+        assert_eq!(r.cwd, "/home/khoa");
+        assert_eq!(r.workspace, Some(1));
+        assert_eq!(r.pid, Some(4321));
+    }
+
+    #[test]
+    fn window_claimed_by_tracked_session_gets_no_synthetic_duplicate() {
+        // A tracked agent already owns 0xAABB (address stored 0x-prefixed here,
+        // the live client reports the same) — no `win:` record is synthesized.
+        let mut tracked = session("efdc", "/w", "working", "t", None);
+        tracked.window_address = "0xAABB".into();
+        let (out, changed) = reconcile_untracked_terminals(
+            vec![tracked],
+            &[term_win("0xAABB", "kitty", "/home/khoa")],
+        );
+        assert!(!changed);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].session_id, "efdc");
+        assert!(!out.iter().any(|s| s.session_id.starts_with("win:")));
+    }
+
+    #[test]
+    fn closed_windows_synthetic_record_is_removed() {
+        // A pre-existing synthetic record whose window no longer appears live is
+        // dropped; the surviving window keeps its record.
+        let stale = SessionRecord {
+            session_id: "win:dead".into(),
+            agent: "shell".into(),
+            window_address: "0xDEAD".into(),
+            state: "idle".into(),
+            kind: Some("shell".into()),
+            ..Default::default()
+        };
+        let (out, changed) =
+            reconcile_untracked_terminals(vec![stale], &[term_win("0xLIVE", "foot", "/tmp")]);
+        assert!(changed);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].session_id, "win:live");
+        assert!(!out.iter().any(|s| s.session_id == "win:dead"));
+    }
+
+    #[test]
+    fn non_terminal_class_window_is_ignored() {
+        let (out, changed) =
+            reconcile_untracked_terminals(vec![], &[term_win("0xAABB", "firefox", "/home/khoa")]);
+        assert!(!changed);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn unmapped_terminal_window_is_ignored() {
+        let mut w = term_win("0xAABB", "kitty", "/home/khoa");
+        w.mapped = false;
+        let (out, changed) = reconcile_untracked_terminals(vec![], &[w]);
+        assert!(!changed);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn rescan_is_idempotent_and_upserts_in_place() {
+        let (first, _) =
+            reconcile_untracked_terminals(vec![], &[term_win("0xAABB", "kitty", "/home/khoa")]);
+        // A second reconcile with the same window makes no change and no duplicate.
+        let (second, changed) =
+            reconcile_untracked_terminals(first, &[term_win("0xAABB", "kitty", "/home/khoa")]);
+        assert!(!changed);
+        assert_eq!(second.len(), 1);
+        // A cwd change upserts the existing record in place (still one record).
+        let (third, changed3) =
+            reconcile_untracked_terminals(second, &[term_win("0xAABB", "kitty", "/other")]);
+        assert!(changed3);
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].cwd, "/other");
+    }
 
     fn session(
         id: &str,
