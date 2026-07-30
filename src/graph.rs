@@ -1371,6 +1371,57 @@ fn do_session_start_inner(
         .find(|s| s.session_id == id)
         .map(|s| (s.agent.clone(), s.started_at.clone()))
         .unwrap_or_default();
+
+    // Registration-time same-window agent eviction: Claude Code fires
+    // SessionStart once per process invocation, so if this NEWLY registering
+    // session is an agent sharing a window with another still-live (not-`done`)
+    // agent record, the old one's process is necessarily gone already — a
+    // terminal cannot hold two live foreground claudes, and a window address
+    // cannot be shared by two SIMULTANEOUSLY open windows (a compositor
+    // invariant), so a same-window pair always means the other side is stale
+    // (typically a compact/resume that minted a fresh session id whose
+    // predecessor never ran its own `SessionEnd`). Collapse it the instant the
+    // new session appears — no grace needed (unlike the reaper's own dedup pass,
+    // which resolves a pair it merely OBSERVES together and so must wait to tell
+    // which twin is real; here the new registration itself is the deciding
+    // signal). The ~12s reaper (`crate::reap`) stays the safety net for the
+    // slower path where a window resolves later via the window-event listener.
+    let new_rec = file.sessions.iter().find(|s| s.session_id == id).cloned();
+    let evicted: Vec<String> = match &new_rec {
+        Some(rec) if crate::reap::is_agent_kind(rec) && !rec.window_address.is_empty() => file
+            .sessions
+            .iter()
+            .filter(|s| {
+                s.session_id != id
+                    && s.state != "done"
+                    && s.window_address == rec.window_address
+                    && crate::reap::is_agent_kind(s)
+            })
+            .map(|s| s.session_id.clone())
+            .collect(),
+        _ => Vec::new(),
+    };
+    if !evicted.is_empty() {
+        let mut h_file: HooksFile = load_stage(&hooks_path()).unwrap_or_default();
+        let done_at = now_iso_utc();
+        for eid in &evicted {
+            upsert_hook(&mut h_file.hooks, eid, "done", &done_at);
+        }
+        for s in file.sessions.iter_mut() {
+            if evicted.contains(&s.session_id) {
+                s.state = "done".to_string();
+            }
+        }
+        let (kept_s, kept_h, _removed, _cleared) =
+            prune_done(std::mem::take(&mut file.sessions), std::mem::take(&mut h_file.hooks));
+        file.sessions = kept_s;
+        h_file.hooks = kept_h;
+        if h_file.schema_version.is_empty() {
+            h_file.schema_version = STAGE_GRAPH_VERSION.to_string();
+        }
+        let _ = write_stage(&hooks_path(), &h_file);
+    }
+
     if file.schema_version.is_empty() {
         file.schema_version = STAGE_GRAPH_VERSION.to_string();
     }
@@ -1554,9 +1605,17 @@ fn transcript_tail(path: &std::path::Path) -> Vec<String> {
     lines
 }
 
-/// The agent's latest words: the last non-sidechain assistant `text` block in the
+/// The agent's latest words: the last matching assistant `text` block in the
 /// tail, cleaned to a single line (≤160 chars). None when there is no such text.
-fn extract_say(lines: &[String]) -> Option<String> {
+///
+/// `skip_sidechain`: a top-level session's own transcript never actually embeds
+/// sidechain lines inline (ground-truthed: a Task's turns live in a wholly
+/// separate `subagents/agent-<id>.jsonl` file, never inline in the parent), so
+/// this is defensive/forward-compat there — pass `true`. A sub-agent's OWN
+/// dedicated transcript file, by contrast, marks EVERY line `isSidechain:true`
+/// (it's sidechain from the top file's perspective) — pass `false` there, or
+/// every line would be skipped and `say` would always be `None`.
+fn extract_say(lines: &[String], skip_sidechain: bool) -> Option<String> {
     const SAY_MAX: usize = 160;
     let mut found: Option<String> = None;
     for line in lines {
@@ -1570,9 +1629,7 @@ fn extract_say(lines: &[String]) -> Option<String> {
         if v.get("type").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
-        // A Task sub-agent's turns append to the SAME file with isSidechain=true;
-        // the session's own `say` is the top-level agent's words, so skip those.
-        if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+        if skip_sidechain && v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
             continue;
         }
         let Some(content) = v
@@ -1632,7 +1689,7 @@ fn refresh_transcript_fields(session_id: &str, cwd: Option<&str>, transcript_hin
     if lines.is_empty() {
         return;
     }
-    let say = extract_say(&lines);
+    let say = extract_say(&lines, true);
     let name = extract_custom_title(&lines);
     if say.is_none() && name.is_none() {
         return;
@@ -1658,6 +1715,113 @@ fn refresh_transcript_fields(session_id: &str, cwd: Option<&str>, transcript_hin
             if let Some(name) = &name {
                 if s.title.as_deref().unwrap_or("").is_empty() {
                     s.title = Some(name.clone());
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            if file.schema_version.is_empty() {
+                file.schema_version = STAGE_GRAPH_VERSION.to_string();
+            }
+            if write_stage(&sessions_path(), &file).is_ok() {
+                let _ = restage_graph();
+            }
+        }
+    });
+}
+
+/// The directory of a session's sub-agent transcripts, if it exists:
+/// `…/projects/<munge(cwd)>/<session_id>/subagents/` (a Task writes its own
+/// `agent-<agent_id>.jsonl` here, beside an `agent-<agent_id>.meta.json`).
+fn subagents_dir(session_id: &str, cwd: Option<&str>) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let cwd = cwd.filter(|s| !s.is_empty())?;
+    let dir = PathBuf::from(home)
+        .join(".claude/projects")
+        .join(munge_project_dir(cwd))
+        .join(session_id)
+        .join("subagents");
+    dir.is_dir().then_some(dir)
+}
+
+/// Find the sub-agent transcript in `dir` whose sibling `*.meta.json` has
+/// `toolUseId == tuid` (the spawning Task's tool_use_id, which is the `sub:<tuid>`
+/// node key) — returning the `agent-<id>.jsonl` to read its words from.
+fn find_subagent_transcript(dir: &std::path::Path, tuid: &str) -> Option<PathBuf> {
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = e.path();
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".meta.json") {
+            continue;
+        }
+        let Ok(txt) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&txt) else {
+            continue;
+        };
+        if v.get("toolUseId").and_then(Value::as_str) == Some(tuid) {
+            let base = name.trim_end_matches(".meta.json");
+            let jsonl = dir.join(format!("{base}.jsonl"));
+            if jsonl.is_file() {
+                return Some(jsonl);
+            }
+        }
+    }
+    None
+}
+
+/// Best-effort: refresh the `say` of a session's ACTIVE sub-agent nodes from their
+/// own transcript files. Runs on each of the PARENT session's hooks, so a
+/// background Task (which outlives the turn) shows its latest words on its beamed
+/// child row; a synchronous Task blocks the parent and is too transient to catch.
+/// Change-only and bounded to the currently-live sub-nodes (depth-1).
+fn refresh_subagent_says(session_id: &str, cwd: Option<&str>) {
+    let subs: Vec<String> = match load_stage::<SessionsFile>(&sessions_path()) {
+        Ok(file) => file
+            .sessions
+            .iter()
+            .filter(|s| s.kind.as_deref() == Some("subagent"))
+            .filter(|s| s.parent_session_id.as_deref() == Some(session_id))
+            .map(|s| s.session_id.clone())
+            .collect(),
+        Err(_) => return,
+    };
+    if subs.is_empty() {
+        return;
+    }
+    let Some(dir) = subagents_dir(session_id, cwd) else {
+        return;
+    };
+    let mut updates: Vec<(String, String)> = Vec::new();
+    for sub_id in &subs {
+        let Some(tuid) = sub_id.strip_prefix("sub:") else {
+            continue;
+        };
+        let Some(file) = find_subagent_transcript(&dir, tuid) else {
+            continue;
+        };
+        // A sub-agent's OWN dedicated transcript marks every line isSidechain —
+        // don't skip them here (see `extract_say`'s doc).
+        if let Some(say) = extract_say(&transcript_tail(&file), false) {
+            updates.push((sub_id.clone(), say));
+        }
+    }
+    if updates.is_empty() {
+        return;
+    }
+    crate::shellbridge::with_stage_lock(|| {
+        let mut file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let mut changed = false;
+        for (sub_id, say) in &updates {
+            for s in file.sessions.iter_mut() {
+                if &s.session_id == sub_id && s.say.as_deref() != Some(say.as_str()) {
+                    s.say = Some(say.clone());
                     changed = true;
                 }
             }
@@ -3712,12 +3876,20 @@ fn hook_from_str(buf: &str) -> Outcome {
             .and_then(Value::as_str)
             .map(|s| !s.is_empty())
             .unwrap_or(false);
+        let cwd = payload.get("cwd").and_then(Value::as_str);
         if !is_sub && matches!(evt, "Stop" | "PostToolUse" | "UserPromptSubmit" | "Notification") {
             refresh_transcript_fields(
                 sid,
-                payload.get("cwd").and_then(Value::as_str),
+                cwd,
                 payload.get("transcript_path").and_then(Value::as_str),
             );
+        }
+        // A background Task keeps running after the parent's turn settles, so
+        // catch its words on every one of the parent's own hooks (not just the
+        // set above) — cheap: a no-op unless the session currently has a live
+        // sub-node. Deferred/direct children only (see `refresh_subagent_says`).
+        if !is_sub {
+            refresh_subagent_says(sid, cwd);
         }
     }
     // Fold the inner outcome into an ok envelope — exit 0, no matter what.
@@ -3848,7 +4020,7 @@ mod tests {
         ]
         .join("\n");
         std::fs::write(&path, &body).unwrap();
-        let say = extract_say(&transcript_tail(&path));
+        let say = extract_say(&transcript_tail(&path), true);
         let _ = std::fs::remove_file(&path);
         assert_eq!(say.as_deref(), Some("the latest line"));
     }
@@ -3862,7 +4034,7 @@ mod tests {
         ]
         .join("\n");
         std::fs::write(&path, &body).unwrap();
-        let say = extract_say(&transcript_tail(&path));
+        let say = extract_say(&transcript_tail(&path), true);
         let _ = std::fs::remove_file(&path);
         assert_eq!(say, None);
     }
@@ -3882,6 +4054,46 @@ mod tests {
         let bare: Vec<String> =
             vec![r#"{"type":"assistant","message":{"content":[]}}"#.to_string()];
         assert_eq!(extract_custom_title(&bare), None);
+    }
+
+    #[test]
+    fn find_subagent_transcript_matches_by_tool_use_id() {
+        let dir = std::env::temp_dir().join(format!("aoide_subs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Two sub-agent transcripts, each with its own meta.json — mirrors the
+        // real `agent-<agent_id>.jsonl` + `.meta.json` layout under
+        // `<session>/subagents/`.
+        std::fs::write(
+            dir.join("agent-aaa111.meta.json"),
+            r#"{"agentType":"Explore","description":"x","toolUseId":"toolu_A","spawnDepth":1}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("agent-aaa111.jsonl"),
+            r#"{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"text","text":"from A"}]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("agent-bbb222.meta.json"),
+            r#"{"agentType":"Explore","description":"y","toolUseId":"toolu_B","spawnDepth":1}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("agent-bbb222.jsonl"),
+            r#"{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"text","text":"from B"}]}}"#,
+        )
+        .unwrap();
+
+        let found = find_subagent_transcript(&dir, "toolu_B").unwrap();
+        assert_eq!(found.file_name().unwrap().to_str().unwrap(), "agent-bbb222.jsonl");
+        let say = extract_say(&transcript_tail(&found), false);
+        assert_eq!(say.as_deref(), Some("from B"));
+
+        // An unknown tool_use_id (no matching Task) finds nothing.
+        assert!(find_subagent_transcript(&dir, "toolu_nope").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5124,6 +5336,61 @@ mod tests {
             assert_eq!(out.render(false).1, crate::output::exit::OK);
             assert_eq!(out.data.unwrap()["action"], "none", "input: {bad:?}");
         }
+    }
+
+    #[test]
+    fn registration_evicts_a_same_window_agent_sibling_immediately() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("regi-evict");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        // A phantom claude registers on a window first (the old, un-ended id).
+        session_start(&flag_invocation(
+            &["graph", "session", "start"],
+            &[("id", "old"), ("agent", "claude"), ("cwd", "/p"), ("window", "0xWIN")],
+        ));
+        // A NEW claude registers on the SAME window (the real re-id after a
+        // compact/resume) — this must retire "old" immediately, no grace, no
+        // waiting on the reaper.
+        session_start(&flag_invocation(
+            &["graph", "session", "start"],
+            &[("id", "new"), ("agent", "claude"), ("cwd", "/p"), ("window", "0xWIN")],
+        ));
+
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let ids: Vec<&str> = s.sessions.iter().map(|r| r.session_id.as_str()).collect();
+        assert!(ids.contains(&"new"), "the newly-registered session survives");
+        assert!(!ids.contains(&"old"), "the same-window sibling was evicted at registration");
+
+        // A conducted SHELL registering onto the SAME window as an agent must
+        // NEVER evict it — that is the normal "shell hosts claude" pairing, not a
+        // duplicate. Re-seed "old" as a fresh agent, then register a shell.
+        session_start(&flag_invocation(
+            &["graph", "session", "start"],
+            &[("id", "again", ), ("agent", "claude"), ("cwd", "/p"), ("window", "0xWIN2")],
+        ));
+        do_session_start(
+            "shellhost",
+            Some("shell"),
+            Some("/p"),
+            Some("0xWIN2"),
+            None,
+            Some(true), // conductable → is_agent_kind() is false for this record
+            None,
+            None,
+            None,
+        );
+        let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let ids2: Vec<&str> = s2.sessions.iter().map(|r| r.session_id.as_str()).collect();
+        assert!(ids2.contains(&"again"), "a conducted shell never evicts its hosted agent");
+        assert!(ids2.contains(&"shellhost"));
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
     }
 
     #[test]

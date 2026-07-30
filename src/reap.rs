@@ -131,7 +131,7 @@ pub(crate) fn effective_live_addresses(
 /// sub-agent node? Published `kind` wins; absent, fall back to "not a shell and
 /// not a conducted PTY". Sub-nodes (`sub:*`) carry no `windowAddress`, so they
 /// never enter a window group regardless.
-fn is_agent_kind(rec: &SessionRecord) -> bool {
+pub(crate) fn is_agent_kind(rec: &SessionRecord) -> bool {
     match rec.kind.as_deref() {
         Some("agent") => true,
         Some(_) => false, // "shell" | "subagent" | any other explicit kind
