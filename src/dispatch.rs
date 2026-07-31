@@ -121,22 +121,23 @@ pub fn dispatch(inv: &Invocation) -> Outcome {
             Outcome::ok("shellbridge", "shellbridge skeleton self-check complete").with_data(status)
         }
 
-        // `baton` is interactive: like `mcp serve --stdio`, the loop itself is
-        // resolved at the entry point (lib.rs) — everything below stays
+        // `conductor` is interactive: like `mcp serve --stdio`, the loop itself
+        // is resolved at the entry point (lib.rs) — everything below stays
         // frontend-agnostic. This arm only RECORDS the launch (so the audit log
-        // carries the door-open the baton then tails) and, for a non-interactive
-        // door (MCP/daemon), returns the "run it from a terminal" outcome. The
-        // CLI door short-circuits in run_cli AFTER dispatching here, so on the
-        // Cli path this is the audit record, not a stub.
-        ["baton"] => match inv.door {
-            Door::Cli => Outcome::ok("baton", "raising the baton over the agent sessions")
+        // carries the door-open the conductor then tails) and, for a
+        // non-interactive door (MCP/daemon), returns the "run it from a
+        // terminal" outcome. The CLI door short-circuits in run_cli AFTER
+        // dispatching here, so on the Cli path this is the audit record, not a
+        // stub.
+        ["conductor"] => match inv.door {
+            Door::Cli => Outcome::ok("conductor", "raising the conductor over the agent sessions")
                 .with_data(json!({
                     "interactive": true,
                     "stageDir": crate::shellbridge::stage_dir().to_string_lossy(),
                 })),
             _ => Outcome::ok(
-                "baton",
-                "baton is interactive; run `aoide baton` from a terminal (not over this door)",
+                "conductor",
+                "conductor is interactive; run `aoide conductor` from a terminal (not over this door)",
             )
             .with_data(json!({ "interactive": true, "door": "non-cli" })),
         },
@@ -323,21 +324,39 @@ fn handle_rice_preview(inv: &Invocation) -> Outcome {
     };
     // Never stage a torn palette: require the notes to at least parse as JSON
     // (full schema validation is `rice lint`'s job / drachma's).
-    if let Err(e) = serde_json::from_str::<Value>(&raw) {
-        return Outcome::error(
-            "rice.preview",
-            format!("notes for `{name}` are not valid JSON: {e}"),
-        )
-        .with_data(json!({
-            "reason": "invalid-json",
-            "name": name,
-            "notes": notes_src.to_string_lossy(),
-        }));
-    }
+    let parsed = match serde_json::from_str::<Value>(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            return Outcome::error(
+                "rice.preview",
+                format!("notes for `{name}` are not valid JSON: {e}"),
+            )
+            .with_data(json!({
+                "reason": "invalid-json",
+                "name": name,
+                "notes": notes_src.to_string_lossy(),
+            }));
+        }
+    };
+
+    // Inject the song name into the staged notes: DrachmaState.qml's
+    // `songName` property reads this to resolve per-song flavor widgets
+    // (SongWidgets.qml / WidgetSlot.qml) — CONTRACTS.md §4's "additive"
+    // precedent (mirrors `parentSessionId` on session records). When the
+    // notes don't parse as an object (shouldn't happen for a valid drachma
+    // file, but defends against a malformed one), fall back to writing `raw`
+    // unchanged rather than fabricating a shape.
+    let staged = match parsed {
+        Value::Object(mut obj) => {
+            obj.insert("song".to_string(), json!(name));
+            serde_json::to_string_pretty(&Value::Object(obj)).unwrap_or(raw.clone()) + "\n"
+        }
+        _ => raw.clone(),
+    };
 
     let stage = shellbridge::stage_dir();
     let notes_dst = stage.join("drachma.json");
-    if let Err(e) = shellbridge::atomic_write(&notes_dst, &raw) {
+    if let Err(e) = shellbridge::atomic_write(&notes_dst, &staged) {
         return Outcome::error("rice.preview", format!("failed to stage drachma.json: {e}"))
             .with_data(json!({ "reason": "stage-write-failed", "target": notes_dst.to_string_lossy() }));
     }
@@ -601,9 +620,12 @@ mod tests {
 
         let out = handle_rice_preview(&inv(&["rice", "preview"], &["moonlight"]));
         assert_eq!(out.status, Status::Ok);
-        // drachma.json landed in the stage, byte-identical to the source.
+        // drachma.json landed in the stage with the song name injected, and
+        // its original fields (e.g. the palette) survived the round-trip.
         let staged = std::fs::read_to_string(stage.join("drachma.json")).unwrap();
-        assert_eq!(staged, VALID_NOTES);
+        let parsed: Value = serde_json::from_str(&staged).unwrap();
+        assert_eq!(parsed["song"], "moonlight");
+        assert_eq!(parsed["palette"]["bg"], "#0b1021");
         assert!(out
             .changed
             .iter()
