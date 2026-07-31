@@ -1,4 +1,4 @@
-//! The baton's core: live state, selection, and the dispatch plumbing.
+//! The conductor's core: live state, selection, and the dispatch plumbing.
 //!
 //! [`App`] is pi's "core" — it holds the world (projects/sessions/hooks loaded
 //! from the stage tree, the audit tail, the palette) and the interaction state
@@ -146,12 +146,12 @@ struct StageMtimes {
     audit: Option<SystemTime>,
 }
 
-/// The whole baton state.
+/// The whole conductor state.
 pub struct App {
     pub panel: Panel,
     pub help_open: bool,
     /// Selected node in the DAG (Graph) panel (indexes the preorder node list
-    /// [`crate::baton::graphview::node_order`] the layout walks).
+    /// [`crate::conductor::graphview::node_order`] the layout walks).
     pub graph_sel: usize,
     /// Selected row in the SESSIONS panel (indexes [`App::dag_rows`]).
     pub dag_sel: usize,
@@ -488,7 +488,7 @@ impl App {
         if self.proj_sel >= n_proj.max(1) {
             self.proj_sel = n_proj.saturating_sub(1);
         }
-        let n_nodes = crate::baton::graphview::node_order(self).len();
+        let n_nodes = crate::conductor::graphview::node_order(self).len();
         if self.graph_sel >= n_nodes.max(1) {
             self.graph_sel = n_nodes.saturating_sub(1);
         }
@@ -516,7 +516,7 @@ impl App {
 
     /// Run a command through the ONE dispatcher with `Door::Cli`, store the
     /// outcome for the status line, and refresh live state (an action likely
-    /// wrote a stage file + an audit line). This is the ONLY way the baton
+    /// wrote a stage file + an audit line). This is the ONLY way the conductor
     /// mutates anything — and it fires on the keypress itself, not on the next
     /// tick, so a cue (Enter → `graph focus` → hyprctl) lands instantly.
     pub fn dispatch(&mut self, path: &[&str], args: &[String]) {
@@ -572,7 +572,7 @@ impl App {
     /// dispatch-backed `graph focus` the roster uses); `e` emits, `p` prunes —
     /// the two graph-wide verbs — so the visual view is not read-only.
     fn handle_graph_key(&mut self, key: KeyEvent) {
-        let nodes = crate::baton::graphview::node_order(self);
+        let nodes = crate::conductor::graphview::node_order(self);
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
                 if !nodes.is_empty() && self.graph_sel + 1 < nodes.len() {
@@ -790,7 +790,7 @@ impl App {
 /// `[live/total]` badge excludes from `live`.)
 ///
 /// Delegates to [`graph::canonical_state`] rather than sniffing substrings, so
-/// the baton and the door can never disagree about what "ended" means. This
+/// the conductor and the door can never disagree about what "ended" means. This
 /// matters since the `stop`/`stopped` vocabulary was split off `done`: a
 /// `stopped` session finished its TURN and is still very much alive, so it must
 /// stay in the `live` count.

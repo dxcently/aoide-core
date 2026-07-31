@@ -454,10 +454,10 @@ pub fn commands() -> Vec<Command> {
             gated: false,
             implemented: true,
         ),
-        // ── baton: the conductor's terminal frontend over the trunk (concepts/Agent-Interface) ─
+        // ── conductor: the interactive terminal frontend over the trunk (concepts/Agent-Interface) ─
         cmd!(
-            path: ["baton"],
-            summary: "Raise the baton: the interactive terminal UI to conduct the agent sessions — the session DAG, projects, audit log, and stage status (every action routes through the one dispatcher).",
+            path: ["conductor"],
+            summary: "Raise the conductor: the interactive terminal UI to conduct the agent sessions — the session DAG, projects, audit log, and stage status (every action routes through the one dispatcher). Distinct from `aoide conduct`, which wraps a single process into the conductor channel.",
             args: [],
             flags: [],
             gated: false,
@@ -493,7 +493,7 @@ mod tests {
         let v = serde_json::to_value(&doc).unwrap();
         assert_eq!(v["schemaVersion"], "0");
         assert_eq!(v["aoide"], "0.0.0");
-        // 19 walking-skeleton commands + the 12 graph commands + `baton`.
+        // 19 walking-skeleton commands + the 12 graph commands + `conductor`.
         assert!(v["commands"].as_array().unwrap().len() >= 32);
     }
 

@@ -1,4 +1,4 @@
-//! Integration test for `aoide baton`'s core plumbing.
+//! Integration test for `aoide conductor`'s core plumbing.
 //!
 //! We point `$AOIDE_STAGE_DIR` and `$AOIDE_AUDIT_LOG` at a tempdir, seed
 //! fixture JSON, and drive the app-state layer end to end: load → recompute →
@@ -6,7 +6,7 @@
 //! the "every mutation is audited" seam works against the test rig). No
 //! terminal is opened — the app core is headless by design.
 
-use aoide::baton::app::{App, Panel};
+use aoide::conductor::app::{App, Panel};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::Path;
 
@@ -15,7 +15,7 @@ use std::path::Path;
 fn make_stage(tag: &str) -> std::path::PathBuf {
     let mut dir = std::env::temp_dir();
     let uniq = format!(
-        "aoide-baton-it-{tag}-{}-{}",
+        "aoide-conductor-it-{tag}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -151,7 +151,7 @@ fn app_loads_recomputes_selects_and_dispatches_against_the_tempdir() {
     app.select_panel(Panel::Sessions);
     let backend = ratatui::backend::TestBackend::new(100, 30);
     let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|f| aoide::baton::ui::draw(f, &app)).unwrap();
+    term.draw(|f| aoide::conductor::ui::draw(f, &app)).unwrap();
     let buf = term.backend().buffer();
     assert_eq!(buf.area.height, 30, "frame is exactly the terminal height");
     let joined: String = buf

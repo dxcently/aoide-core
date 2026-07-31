@@ -16,7 +16,7 @@ WHAT AOIDE IS (don't conflate the two):
     portable, headless-capable, agent-first.
   * AoideOS is the DISTRIBUTION built on that core — the NixOS flake that
     ADDITIONALLY ships the Quickshell widget-making toolkit (bar, dock,
-    gadgets, the DAG/baton surfaces) and the specialized ricer (the
+    gadgets, the DAG/conductor surfaces) and the specialized ricer (the
     song/notes theming engine). Aoide is the engine; AoideOS is the desktop
     around it. A capability that is 'Aoide' works with only a shell; one that
     is 'AoideOS' is desktop/Quickshell/rice.
@@ -64,8 +64,8 @@ Conducting — commanding other sessions (the Aoide core, on by default)
   extra agent the same way. This is the substrate: the desktop's terminals are
   a mesh of sessions a conductor speaks into.
 
-Hooking any agent into the graph (the baton + widgets render what you register)
-  song/stage/{sessions,hooks,graph}.json is the one truth the baton TUI and
+Hooking any agent into the graph (the conductor + widgets render what you register)
+  song/stage/{sessions,hooks,graph}.json is the one truth the conductor TUI and
   the Quickshell widgets draw. Three doors write it — pick by what the agent
   harness can do:
   1. Hook door (harnesses with Claude-Code-shaped hooks): pipe ONE hook JSON

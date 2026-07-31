@@ -241,7 +241,7 @@ pub(crate) fn decay_stopped_sessions(
         .map(|h| {
             (
                 h.session_id.as_str(),
-                crate::baton::theme::parse_iso_utc(&h.updated_at),
+                crate::conductor::theme::parse_iso_utc(&h.updated_at),
             )
         })
         .collect();
@@ -308,7 +308,7 @@ fn reap_inner(_inv: &Invocation) -> Outcome {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let is_recent = |s: &SessionRecord| {
-        crate::baton::theme::parse_iso_utc(&s.started_at)
+        crate::conductor::theme::parse_iso_utc(&s.started_at)
             .map(|t| now_epoch - t < DEDUP_GRACE_SECS)
             .unwrap_or(false) // an unparseable/empty startedAt is treated as old
     };
@@ -486,7 +486,7 @@ mod tests {
     fn decay_pass_ages_stopped_sessions_in_both_stage_files() {
         // now = 2026-07-30T12:00:00Z
         let now = "2026-07-30T12:00:00Z";
-        let now_epoch = crate::baton::theme::parse_iso_utc(now).unwrap();
+        let now_epoch = crate::conductor::theme::parse_iso_utc(now).unwrap();
 
         let stopped = |id: &str| SessionRecord {
             session_id: id.into(),

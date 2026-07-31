@@ -1,9 +1,10 @@
-//! `aoide baton` — the conductor's interactive terminal frontend over the trunk.
+//! `aoide conductor` — the interactive terminal frontend over the trunk.
 //!
-//! One rule governs this whole module: the baton is a FRONTEND, never a second
-//! implementation. Every action is `dispatch::dispatch(Invocation { door:
-//! Door::Cli, .. })` — so the single audit log records baton actions exactly
-//! like a typed command, and the two-doors-one-schema contract holds. Reads
+//! One rule governs this whole module: the conductor is a FRONTEND, never a
+//! second implementation. Every action is `dispatch::dispatch(Invocation {
+//! door: Door::Cli, .. })` — so the single audit log records conductor
+//! actions exactly like a typed command, and the two-doors-one-schema
+//! contract holds. Reads
 //! reuse the pure graph functions ([`crate::graph::build_graph`],
 //! [`crate::graph::merged_sessions`], `anchor_for`) and load the stage files
 //! directly. Nothing here parses or re-derives a command; the views only
@@ -42,7 +43,7 @@
 //! ```sh
 //! export AOIDE_STAGE_DIR=$(mktemp -d) AOIDE_AUDIT_LOG=$AOIDE_STAGE_DIR/log
 //! pkgs/aoide/tests/fixtures/seed.sh "$AOIDE_STAGE_DIR"
-//! aoide baton      # 1-5/Tab switch panels, j/k select, ? help, q quit
+//! aoide conductor  # 1-5/Tab switch panels, j/k select, ? help, q quit
 //! ```
 
 pub mod app;
@@ -102,7 +103,7 @@ fn install_panic_hook() {
     }));
 }
 
-/// Run the interactive baton to completion. Returns `Ok(())` on a clean quit.
+/// Run the interactive conductor to completion. Returns `Ok(())` on a clean quit.
 ///
 /// The dispatch that records the launch has already run (lib.rs); here we set up
 /// the terminal, build the app from the stage tree, and drive the loop.

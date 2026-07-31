@@ -108,6 +108,16 @@ pub struct SessionRecord {
     /// Additive/v0-safe — absent for shells and for an agent that has not spoken.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub say: Option<String>,
+    /// The Claude model this session is currently running, taken straight from
+    /// the freshest `type:"assistant"` line's `message.model` in the on-disk
+    /// JSONL transcript (e.g. `claude-sonnet-5`, `claude-opus-4-8`), refreshed
+    /// at the same hook boundaries as `say`. For a subagent it is that
+    /// subagent's OWN model (from its own transcript) — genuinely able to differ
+    /// from its parent's. Additive/v0-safe — absent for shells and until the
+    /// session has produced at least one assistant turn. The bar shows it as the
+    /// clock's subtext; widgets read the raw id and map it to a short label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -231,7 +241,7 @@ pub fn merged_sessions(sessions: &[SessionRecord], hooks: &[HookRecord]) -> Vec<
         }
     }
     // Every producer's vocab is folded to the ONE canonical set the desktop
-    // renders — so graph.json (baton) and sessions.json (widgets) agree even for
+    // renders — so graph.json (conductor) and sessions.json (widgets) agree even for
     // an un-migrated legacy record.
     for s in &mut merged {
         s.state = canonical_state(&s.state).to_string();
@@ -331,7 +341,7 @@ pub fn build_graph(
         });
         // Conductor-channel fields ride onto the node only when present, so a
         // legacy/observe-only session stays byte-for-byte as before and the
-        // baton can distinguish conductable nodes + label by title.
+        // conductor can distinguish conductable nodes + label by title.
         if let Some(c) = s.conductable {
             node["conductable"] = json!(c);
         }
@@ -1157,19 +1167,20 @@ pub fn emit(_inv: &Invocation) -> Outcome {
 //
 // shellbridge only ever SEEDS empty sessions.json/hooks.json (its socket accept
 // loop is future work), so nothing registers a live session — the desktop
-// widgets and `baton` read a graph that is always starved of data. These verbs
-// are the missing write door: a session harness (or a Claude Code hook) upserts
-// its own record, and every mutation re-stages graph.json so the read path
-// (build_graph → graph.json → QML FileView / baton) lights up immediately.
+// widgets and `conductor` read a graph that is always starved of data. These
+// verbs are the missing write door: a session harness (or a Claude Code hook)
+// upserts its own record, and every mutation re-stages graph.json so the read
+// path (build_graph → graph.json → QML FileView / conductor) lights up
+// immediately.
 
 /// UTC wall-clock now as ISO-8601 `YYYY-MM-DDTHH:MM:SSZ`.
 ///
 /// The same `SystemTime`→epoch-seconds idiom daemon.rs stamps audit records
 /// with, formatted for the `startedAt` field the stage shapes carry. The civil
 /// date is hand-rolled (Howard Hinnant's `civil_from_days`, the exact inverse of
-/// [`crate::baton::theme::parse_iso_utc`], the reader) so the offline lock never
+/// [`crate::conductor::theme::parse_iso_utc`], the reader) so the offline lock never
 /// grows a chrono just to write one timestamp — and a stamp we write always
-/// round-trips back through the reader baton/theme already ships.
+/// round-trips back through the reader conductor/theme already ships.
 pub(crate) fn now_iso_utc() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1270,6 +1281,7 @@ pub fn upsert_session(
             activity: None,
             kind: None,
             say: None,
+            model: None,
             extra: Map::new(),
         });
         true
@@ -1690,6 +1702,42 @@ fn extract_custom_title(lines: &[String]) -> Option<String> {
     found
 }
 
+/// The session's currently-active model: the last `type:"assistant"` line's
+/// `message.model` string in the tail (e.g. `claude-sonnet-5`). None when the
+/// tail holds no assistant turn yet. Sits at the same nesting level as the text
+/// blocks `extract_say` reads, so it shares the one tail scan. `skip_sidechain`
+/// mirrors `extract_say`: `true` for a top-level session's own transcript,
+/// `false` for a sub-agent's own (all-sidechain) transcript file.
+fn extract_model(lines: &[String], skip_sidechain: bool) -> Option<String> {
+    let mut found: Option<String> = None;
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if skip_sidechain && v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        if let Some(m) = v
+            .get("message")
+            .and_then(|m| m.get("model"))
+            .and_then(Value::as_str)
+        {
+            let m = m.trim();
+            if !m.is_empty() {
+                found = Some(m.to_string());
+            }
+        }
+    }
+    found
+}
+
 /// Best-effort: refresh a session's transcript-derived fields at a hook boundary —
 /// its `say` (the agent's latest words) and, set-once, its `title` (the session
 /// NAME, from `custom-title`). Change-only; never touches state/activity/pid;
@@ -1705,7 +1753,8 @@ fn refresh_transcript_fields(session_id: &str, cwd: Option<&str>, transcript_hin
     }
     let say = extract_say(&lines, true);
     let name = extract_custom_title(&lines);
-    if say.is_none() && name.is_none() {
+    let model = extract_model(&lines, true);
+    if say.is_none() && name.is_none() && model.is_none() {
         return;
     }
     crate::shellbridge::with_stage_lock(|| {
@@ -1729,6 +1778,12 @@ fn refresh_transcript_fields(session_id: &str, cwd: Option<&str>, transcript_hin
             if let Some(name) = &name {
                 if s.title.as_deref().unwrap_or("").is_empty() {
                     s.title = Some(name.clone());
+                    changed = true;
+                }
+            }
+            if let Some(model) = &model {
+                if s.model.as_deref() != Some(model.as_str()) {
+                    s.model = Some(model.clone());
                     changed = true;
                 }
             }
@@ -1809,7 +1864,8 @@ fn refresh_subagent_says(session_id: &str, cwd: Option<&str>) {
     let Some(dir) = subagents_dir(session_id, cwd) else {
         return;
     };
-    let mut updates: Vec<(String, String)> = Vec::new();
+    // (sub_id, say, model) — either of say/model may be None for a given sub.
+    let mut updates: Vec<(String, Option<String>, Option<String>)> = Vec::new();
     for sub_id in &subs {
         let Some(tuid) = sub_id.strip_prefix("sub:") else {
             continue;
@@ -1818,9 +1874,13 @@ fn refresh_subagent_says(session_id: &str, cwd: Option<&str>) {
             continue;
         };
         // A sub-agent's OWN dedicated transcript marks every line isSidechain —
-        // don't skip them here (see `extract_say`'s doc).
-        if let Some(say) = extract_say(&transcript_tail(&file), false) {
-            updates.push((sub_id.clone(), say));
+        // don't skip them here (see `extract_say`'s doc). Its model is its OWN
+        // (subagents can run a different model than their parent).
+        let lines = transcript_tail(&file);
+        let say = extract_say(&lines, false);
+        let model = extract_model(&lines, false);
+        if say.is_some() || model.is_some() {
+            updates.push((sub_id.clone(), say, model));
         }
     }
     if updates.is_empty() {
@@ -1832,11 +1892,22 @@ fn refresh_subagent_says(session_id: &str, cwd: Option<&str>) {
             Err(_) => return,
         };
         let mut changed = false;
-        for (sub_id, say) in &updates {
+        for (sub_id, say, model) in &updates {
             for s in file.sessions.iter_mut() {
-                if &s.session_id == sub_id && s.say.as_deref() != Some(say.as_str()) {
-                    s.say = Some(say.clone());
-                    changed = true;
+                if &s.session_id != sub_id {
+                    continue;
+                }
+                if let Some(say) = say {
+                    if s.say.as_deref() != Some(say.as_str()) {
+                        s.say = Some(say.clone());
+                        changed = true;
+                    }
+                }
+                if let Some(model) = model {
+                    if s.model.as_deref() != Some(model.as_str()) {
+                        s.model = Some(model.clone());
+                        changed = true;
+                    }
                 }
             }
         }
@@ -2306,7 +2377,7 @@ pub fn session_wrap(inv: &Invocation) -> Outcome {
 // ── Conductor channel: `conduct` (PTY wrap) + `graph send` (injection) ──────
 //
 // `conduct` is the controllable sibling of `wrap`: it runs the agent on its own
-// PTY so a central controller (or the baton) can type INTO the running agent
+// PTY so a central controller (or the conductor) can type INTO the running agent
 // through a per-session control socket, while a wrapped TUI still runs
 // undisturbed. `graph send` is the one injection door — gated through aoided's
 // audit path (pending by default; `--yes`/autogate delivers). The unsafe libc
@@ -3694,7 +3765,7 @@ pub fn session_conduct(inv: &Invocation) -> Outcome {
 
 // ── `graph send`: the gated injection door ──────────────────────────────────
 
-/// A pending (unapproved) injection, staged for the baton to surface for a
+/// A pending (unapproved) injection, staged for the conductor to surface for a
 /// one-key approve/deny. Written atomically to `song/stage/pending.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PendingSend {
@@ -4660,6 +4731,7 @@ mod tests {
             activity: None,
             kind: None,
             say: None,
+            model: None,
             extra: Map::new(),
         }
     }
@@ -4753,6 +4825,30 @@ mod tests {
         let say = extract_say(&transcript_tail(&path), true);
         let _ = std::fs::remove_file(&path);
         assert_eq!(say, None);
+    }
+
+    #[test]
+    fn extract_model_reads_last_assistant_model() {
+        let path = std::env::temp_dir().join(format!("aoide_model_{}.jsonl", std::process::id()));
+        let body = [
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"hi"}]}}"#,
+            r#"{"type":"assistant","isSidechain":false,"message":{"model":"claude-opus-4-8","content":[{"type":"text","text":"first"}]}}"#,
+            // A same-file sidechain line's model must be ignored when skipping.
+            r#"{"type":"assistant","isSidechain":true,"message":{"model":"claude-haiku-4-5","content":[{"type":"text","text":"sub"}]}}"#,
+            r#"{"type":"assistant","isSidechain":false,"message":{"model":"claude-sonnet-5","content":[{"type":"text","text":"latest"}]}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, &body).unwrap();
+        let model = extract_model(&transcript_tail(&path), true);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(model.as_deref(), Some("claude-sonnet-5"));
+    }
+
+    #[test]
+    fn extract_model_is_none_without_assistant_turn() {
+        let lines: Vec<String> =
+            vec![r#"{"type":"user","message":{"content":[{"type":"text","text":"hi"}]}}"#.to_string()];
+        assert_eq!(extract_model(&lines, true), None);
     }
 
     #[test]
@@ -5932,9 +6028,9 @@ mod tests {
         // The Unix epoch and a known instant, formatted exactly.
         assert_eq!(iso_utc_from_epoch(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso_utc_from_epoch(1_700_000_000), "2023-11-14T22:13:20Z");
-        // Whatever we stamp must parse back through baton's reader (the inverse).
+        // Whatever we stamp must parse back through conductor's reader (the inverse).
         let stamp = now_iso_utc();
-        let epoch = crate::baton::theme::parse_iso_utc(&stamp)
+        let epoch = crate::conductor::theme::parse_iso_utc(&stamp)
             .expect("a stamp we write is readable by the reader that consumes it");
         // And that epoch re-formats to the very same string (round-trip closed).
         assert_eq!(iso_utc_from_epoch(epoch), stamp);

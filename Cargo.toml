@@ -24,7 +24,7 @@ path = "src/lib.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# `aoide baton` — the conductor's terminal frontend (see src/baton.rs), built on
+# `aoide conductor` — the interactive terminal frontend (see src/conductor.rs), built on
 # ratatui.rs over the crossterm backend (the rig's standard for every Aoide TUI:
 # no hand-rolled ANSI). ratatui owns the immediate-mode render + the double
 # buffer diff; we keep the loop, the event feed (the audit log), and mtime-poll

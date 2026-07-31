@@ -11,14 +11,14 @@
 //! headless and assert on the buffer (see the tests below).
 //!
 //! Two of the five panels are the expansion this port carries: `DAG` (the
-//! visual graph, drawn by [`crate::baton::graphview`]) and `SESSIONS` (the
+//! visual graph, drawn by [`crate::conductor::graphview`]) and `SESSIONS` (the
 //! terminal roster, now split into a scrolling list + a live detail card with a
 //! focus affordance). The other three — PROJECTS, LOG, STATUS — are ports of the
 //! originals.
 
-use crate::baton::app::{App, DagRow, Panel};
-use crate::baton::graphview;
-use crate::baton::theme::{self, DIVIDER, END_CAP};
+use crate::conductor::app::{App, DagRow, Panel};
+use crate::conductor::graphview;
+use crate::conductor::theme::{self, DIVIDER, END_CAP};
 use crate::graph;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -51,7 +51,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 // ── Chrome: header, tabs, status bar ────────────────────────────────────────
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
-    let brand = format!("{END_CAP} aoide · baton {DIVIDER}  conduct the agent sessions");
+    let brand = format!("{END_CAP} aoide · conductor {DIVIDER}  conduct the agent sessions");
     let p = Paragraph::new(Line::from(brand)).style(theme::accent_style(&app.palette));
     f.render_widget(p, area);
 }
@@ -168,7 +168,7 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
     let parts = Layout::vertical([
         Constraint::Length(1), // glyph legend
         Constraint::Min(3),    // roster list
-        Constraint::Length(6), // detail card
+        Constraint::Length(8), // detail card
     ])
     .split(area);
 
@@ -286,6 +286,18 @@ fn detail_lines<'a>(rows: &[DagRow], app: &App) -> Vec<Line<'a>> {
                     theme::disp(&rec.started_at)
                 )),
             ];
+            if let Some(activity) = rec.activity.as_deref().filter(|a| !a.is_empty()) {
+                lines.push(Line::from(Span::styled(
+                    format!("  doing   ▸ {activity}"),
+                    st,
+                )));
+            }
+            if let Some(say) = rec.say.as_deref().filter(|s| !s.is_empty()) {
+                lines.push(Line::from(Span::styled(
+                    format!("  says    \"{say}\""),
+                    theme::dim(),
+                )));
+            }
             if !chain.is_empty() {
                 lines.push(Line::from(format!("  chain   {}", chain.join(" ← "))));
             }
@@ -601,7 +613,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         "  Every cue runs through the one door; the audit log records it.",
         "",
     ];
-    let title = " aoide baton — keys ";
+    let title = " aoide conductor — keys ";
     let box_w = help
         .iter()
         .map(|l| l.chars().count())
@@ -636,7 +648,7 @@ fn centered(w: u16, h: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::baton::app::{App, Panel};
+    use crate::conductor::app::{App, Panel};
     use crate::graph::{Project, SessionRecord};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -669,6 +681,7 @@ mod tests {
             activity: None,
             kind: None,
             say: None,
+            model: None,
             extra: Map::new(),
         }
     }
@@ -736,6 +749,34 @@ mod tests {
         assert!(out.contains("s1") && out.contains("claude"), "session row");
         assert!(out.contains('♪'), "working glyph in legend/row");
         assert!(out.contains("selected"), "detail card rule");
+        assert!(
+            !out.contains("doing") && !out.contains("says"),
+            "no activity/say on the fixture — lines must be gated off"
+        );
+    }
+
+    #[test]
+    fn sessions_panel_detail_shows_activity_and_say_when_present() {
+        let mut rec = session("s1", "/home/k/Aoide", "running", None);
+        rec.activity = Some("Editing ui.rs".into());
+        rec.say = Some("checking layout".into());
+        let mut app = app_with(
+            vec![Project {
+                name: "aoide".into(),
+                path: "/home/k/Aoide".into(),
+            }],
+            vec![rec],
+        );
+        app.dag_sel = 1; // row 0 is the ◆ aoide group header; row 1 is the session
+        let out = render_panel(&app, Panel::Sessions, 100, 30);
+        assert!(
+            out.contains("doing   ▸ Editing ui.rs"),
+            "activity line rendered in detail card"
+        );
+        assert!(
+            out.contains("says    \"checking layout\""),
+            "say line rendered in detail card"
+        );
     }
 
     #[test]
@@ -765,7 +806,7 @@ mod tests {
     fn log_panel_colours_and_shows_records() {
         let mut app = app_with(vec![], vec![]);
         app.log = vec![
-            crate::baton::app::LogLine {
+            crate::conductor::app::LogLine {
                 ts: 1,
                 door: "cli".into(),
                 class: "audit".into(),
@@ -773,7 +814,7 @@ mod tests {
                 status: "ok".into(),
                 message: "staged".into(),
             },
-            crate::baton::app::LogLine {
+            crate::conductor::app::LogLine {
                 ts: 2,
                 door: "cli".into(),
                 class: "audit".into(),
@@ -797,7 +838,7 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, &a)).unwrap();
         let out = dump(term.backend().buffer());
-        assert!(out.contains("aoide baton — keys"), "overlay title present");
+        assert!(out.contains("aoide conductor — keys"), "overlay title present");
         assert!(out.contains("cycle panels"));
         assert!(out.contains("read-only tag"), "DAG tag legend documented");
     }

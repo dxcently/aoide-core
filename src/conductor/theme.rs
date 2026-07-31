@@ -10,11 +10,11 @@
 //!
 //! Colour comes from `stage/drachma.json`'s palette `{bg,fg,accent,urgent}` when
 //! present, each hex already mapped to the nearest ANSI-256 index in
-//! [`crate::baton::app`]; here we wrap those indices as `Color::Indexed`. Absent
+//! [`crate::conductor::app`]; here we wrap those indices as `Color::Indexed`. Absent
 //! a palette key we fall back to a named ANSI colour so the TUI still reads,
 //! exactly as the hand-rolled renderer did.
 
-use crate::baton::app::{is_done, Palette};
+use crate::conductor::app::{is_done, Palette};
 use crate::graph::SessionRecord;
 use ratatui::style::{Color, Modifier, Style};
 
@@ -125,7 +125,7 @@ pub fn state_style(state: &str, pal: &Palette) -> Style {
 /// (`aoide schema --json` exposes no tag field or command), so we read them
 /// from the record's round-tripped `extra` map under a `tags` array — the shape
 /// a future `aoide graph tag` (or a shellbridge that writes `tags`) would use.
-/// Purely READ-ONLY: the baton renders tags it finds but cannot mint them,
+/// Purely READ-ONLY: the conductor renders tags it finds but cannot mint them,
 /// because inventing CLI surface here would break the two-doors-one-schema
 /// contract. A string value is accepted as a single tag for tolerance.
 pub fn session_tags(rec: &SessionRecord) -> Vec<String> {
@@ -279,7 +279,7 @@ mod tests {
         assert_eq!(state_glyph("weird"), "·");
         // The blocked fermata: a session that needs a human wears the same 𝄐
         // hold-sign and the Awaiting (urgent) class as any awaiting state — the
-        // contract the baton and the Rust door agree on.
+        // contract the conductor and the Rust door agree on.
         assert_eq!(state_glyph("blocked"), "𝄐");
         assert_eq!(classify("blocked"), StateClass::Awaiting);
         // PostToolUse (the new clearing edge) reads as Working, not Awaiting.

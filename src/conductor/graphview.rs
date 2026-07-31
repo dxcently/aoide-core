@@ -5,7 +5,7 @@
 //! column per depth (projects in column 0, the sessions they anchor in column
 //! 1, spawned children in column 2+), nodes wired with box-drawing edges.
 //!
-//! One rule holds, exactly as everywhere else in the baton: this view NEVER
+//! One rule holds, exactly as everywhere else in the conductor: this view NEVER
 //! re-derives the graph. The node/edge structure comes verbatim from
 //! [`crate::graph::build_graph`] — the same pure function `graph emit` stages to
 //! `song/stage/graph.json` — so the picture on screen is the document on disk.
@@ -14,11 +14,11 @@
 //! `column = depth` and `row = preorder index`, and paint chips + connectors.
 //!
 //! Tags: read-only. The schema has no tag surface (see the module note in
-//! [`crate::baton::theme::session_tags`]); tags found on a session record's
+//! [`crate::conductor::theme::session_tags`]); tags found on a session record's
 //! round-tripped `extra.tags` are rendered as accent chips, never minted here.
 
-use crate::baton::app::App;
-use crate::baton::theme;
+use crate::conductor::app::App;
+use crate::conductor::theme;
 use crate::graph;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -259,7 +259,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, sel: usize) {
             Line::from(""),
             Line::from("  Seed a stage tree:  pkgs/aoide/tests/fixtures/seed.sh $AOIDE_STAGE_DIR")
                 .style(theme::dim()),
-            Line::from("  Then re-open the baton, or press e to emit the graph.")
+            Line::from("  Then re-open the conductor, or press e to emit the graph.")
                 .style(theme::dim()),
         ];
         f.render_widget(Paragraph::new(lines), area);
@@ -292,7 +292,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, sel: usize) {
 
 /// Compose the styled cell grid: connectors first (box-drawing edges routed in
 /// the gutter left of each child column), then node chips on top.
-fn lay_out(model: &Model, sel: usize, pal: &crate::baton::app::Palette) -> Vec<Vec<GCell>> {
+fn lay_out(model: &Model, sel: usize, pal: &crate::conductor::app::Palette) -> Vec<Vec<GCell>> {
     // Pre-compose each node's chip cells so we know its on-screen width.
     let chips: Vec<Vec<GCell>> = model
         .nodes
@@ -374,7 +374,7 @@ fn lay_out(model: &Model, sel: usize, pal: &crate::baton::app::Palette) -> Vec<V
 
 /// Build a node's chip as styled cells: marker, label, a short state word, and
 /// read-only tag chips — truncated to [`CHIP_MAX`].
-fn chip_cells(n: &Node, selected: bool, pal: &crate::baton::app::Palette) -> Vec<GCell> {
+fn chip_cells(n: &Node, selected: bool, pal: &crate::conductor::app::Palette) -> Vec<GCell> {
     let accent = theme::accent(pal).unwrap_or(Color::Cyan);
     let (marker, marker_style, label_style) = match n.kind {
         NodeKind::Project | NodeKind::Unanchored => (
@@ -460,7 +460,7 @@ fn grid_to_lines(grid: &[Vec<GCell>]) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::baton::app::App;
+    use crate::conductor::app::App;
     use crate::graph::{Project, SessionRecord};
     use serde_json::Map;
 
@@ -481,6 +481,7 @@ mod tests {
             activity: None,
             kind: None,
             say: None,
+            model: None,
             extra: Map::new(),
         }
     }
