@@ -1,0 +1,524 @@
+//! The DAG computation: `build_graph` (the `graph.json` v0 document), the
+//! Unicode tree `render`, and the pure command cores (`would_cycle`,
+//! `prune_done`) the verb handlers wire I/O around. `restage_graph` is the
+//! write-side counterpart every mutating verb calls to keep `graph.json` a
+//! pure function of the registries.
+
+use super::model::{
+    anchor_for, graph_path, hooks_path, load_stage, merged_sessions, projects_path,
+    resolved_parent, sessions_path, sorted_projects, write_stage, HookRecord, HooksFile, Project,
+    ProjectsFile, SessionRecord, SessionsFile, STAGE_GRAPH_VERSION,
+};
+use serde_json::{json, Value};
+#[cfg(test)]
+use serde_json::Map;
+use std::collections::{BTreeMap, HashSet};
+use std::path::PathBuf;
+
+/// Build the fully resolved graph document (`graph.json` v0 shape). A session
+/// with a resolved parent carries only its `spawned` edge; root sessions carry
+/// an `anchors` edge to their longest-prefix project (or none, unanchored).
+pub fn build_graph(
+    projects: &[Project],
+    sessions: &[SessionRecord],
+    hooks: &[HookRecord],
+) -> Value {
+    let projects = sorted_projects(projects);
+    let sessions = merged_sessions(sessions, hooks);
+    let ids: HashSet<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+
+    let mut nodes: Vec<Value> = Vec::new();
+    let mut edges: Vec<Value> = Vec::new();
+
+    for p in &projects {
+        nodes.push(json!({
+            "id": format!("project:{}", p.name),
+            "kind": "project",
+            "name": p.name,
+            "path": p.path,
+        }));
+    }
+    for s in &sessions {
+        let mut node = json!({
+            "id": format!("session:{}", s.session_id),
+            "kind": "session",
+            "agent": s.agent,
+            "cwd": s.cwd,
+            "state": s.state,
+            "windowAddress": s.window_address,
+            "startedAt": s.started_at,
+        });
+        // Conductor-channel fields ride onto the node only when present, so a
+        // legacy/observe-only session stays byte-for-byte as before and the
+        // conductor can distinguish conductable nodes + label by title.
+        if let Some(c) = s.conductable {
+            node["conductable"] = json!(c);
+        }
+        if let Some(sock) = &s.socket {
+            node["socket"] = json!(sock);
+        }
+        if let Some(t) = &s.title {
+            node["title"] = json!(t);
+        }
+        if let Some(pid) = s.pid {
+            node["pid"] = json!(pid);
+        }
+        // The workspace the session's window lives on — the hover-preview bridge
+        // (concepts/Terminal-Commander). Rides onto the node only when known, so
+        // a legacy/off-Hyprland record stays byte-for-byte as before.
+        if let Some(ws) = s.workspace {
+            node["workspace"] = json!(ws);
+        }
+        // The live current command / tool, when something is running.
+        if let Some(act) = &s.activity {
+            node["activity"] = json!(act);
+        }
+        // Session classification (agent/shell/subagent) — the node's own `kind`
+        // already denotes project-vs-session, so this rides as `role`.
+        if let Some(k) = &s.kind {
+            node["role"] = json!(k);
+        }
+        // The agent's latest words (transcript tail), when it has spoken.
+        if let Some(say) = &s.say {
+            node["say"] = json!(say);
+        }
+        // The Claude model this session (agent or subagent) is running, when
+        // known — absent for shells and until the first assistant turn lands.
+        if let Some(m) = &s.model {
+            node["model"] = json!(m);
+        }
+        nodes.push(node);
+        if let Some(parent) = resolved_parent(s, &ids) {
+            edges.push(json!({
+                "from": format!("session:{parent}"),
+                "to": format!("session:{}", s.session_id),
+                "kind": "spawned",
+            }));
+        } else if let Some(i) = anchor_for(&s.cwd, &projects) {
+            edges.push(json!({
+                "from": format!("project:{}", projects[i].name),
+                "to": format!("session:{}", s.session_id),
+                "kind": "anchors",
+            }));
+        }
+    }
+
+    json!({
+        "schemaVersion": STAGE_GRAPH_VERSION,
+        "nodes": nodes,
+        "edges": edges,
+    })
+}
+
+// ── The Unicode tree render ─────────────────────────────────────────────────
+
+/// `--focus` marker: matches the full node id or the bare name/sessionId.
+fn marker(focus: Option<&str>, id: &str, bare: &str) -> &'static str {
+    match focus {
+        Some(f) if f == id || f == bare => "▶ ",
+        _ => "",
+    }
+}
+
+/// Render the DAG as a Unicode box-drawing tree. Projects are `◆` roots,
+/// sessions are `●` leaves; spawned children nest under their parent; sessions
+/// anchored to no project group under a synthetic `(unanchored)` root.
+pub fn render(
+    projects: &[Project],
+    sessions: &[SessionRecord],
+    hooks: &[HookRecord],
+    focus: Option<&str>,
+) -> String {
+    let projects = sorted_projects(projects);
+    let sessions = merged_sessions(sessions, hooks);
+    let ids: HashSet<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+
+    // spawn-children by parent id (already in deterministic session order).
+    let mut children: BTreeMap<String, Vec<&SessionRecord>> = BTreeMap::new();
+    let mut roots: Vec<&SessionRecord> = Vec::new(); // sessions with no resolved parent
+    for s in &sessions {
+        match resolved_parent(s, &ids) {
+            Some(p) => children.entry(p).or_default().push(s),
+            None => roots.push(s),
+        }
+    }
+
+    fn session_line(s: &SessionRecord, focus: Option<&str>) -> String {
+        let id = format!("session:{}", s.session_id);
+        // The running Claude model, when known — a compact `⟐ <model>` tag
+        // (same glyph the gadget dock uses for a subagent's model text)
+        // appended after cwd; omitted for shells and anything model-less.
+        let model_tag = match s.model.as_deref() {
+            Some(m) if !m.is_empty() => format!("  ⟐ {m}"),
+            _ => String::new(),
+        };
+        format!(
+            "{}● {}  {}  {}  {}{}",
+            marker(focus, &id, &s.session_id),
+            s.session_id,
+            s.agent,
+            s.state,
+            s.cwd,
+            model_tag
+        )
+    }
+
+    // Recursive spawn-subtree render with a visited guard (a hand-edited
+    // stage file could carry a cycle; the renderer must never loop).
+    fn render_children(
+        out: &mut Vec<String>,
+        parent: &str,
+        children: &BTreeMap<String, Vec<&SessionRecord>>,
+        prefix: &str,
+        focus: Option<&str>,
+        visited: &mut HashSet<String>,
+    ) {
+        let Some(kids) = children.get(parent) else {
+            return;
+        };
+        for (i, kid) in kids.iter().enumerate() {
+            if !visited.insert(kid.session_id.clone()) {
+                continue;
+            }
+            let last = i + 1 == kids.len();
+            let branch = if last { "└─ " } else { "├─ " };
+            out.push(format!("{prefix}{branch}{}", session_line(kid, focus)));
+            let deeper = format!("{prefix}{}", if last { "   " } else { "│  " });
+            render_children(out, &kid.session_id, children, &deeper, focus, visited);
+        }
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+
+    // Root sessions grouped per anchoring project; leftovers are unanchored.
+    let mut unanchored: Vec<&SessionRecord> = Vec::new();
+    let mut per_project: Vec<Vec<&SessionRecord>> = vec![Vec::new(); projects.len()];
+    for s in &roots {
+        match anchor_for(&s.cwd, &projects) {
+            Some(i) => per_project[i].push(s),
+            None => unanchored.push(s),
+        }
+    }
+
+    let mut render_group = |out: &mut Vec<String>, head: String, group: &[&SessionRecord]| {
+        out.push(head);
+        for (i, s) in group.iter().enumerate() {
+            visited.insert(s.session_id.clone());
+            let last = i + 1 == group.len();
+            let branch = if last { "└─ " } else { "├─ " };
+            out.push(format!("{branch}{}", session_line(s, focus)));
+            let deeper = if last { "   " } else { "│  " };
+            render_children(
+                &mut *out,
+                &s.session_id,
+                &children,
+                deeper,
+                focus,
+                &mut visited,
+            );
+        }
+    };
+
+    for (i, p) in projects.iter().enumerate() {
+        let id = format!("project:{}", p.name);
+        let head = format!("{}◆ {}  {}", marker(focus, &id, &p.name), p.name, p.path);
+        render_group(&mut out, head, &per_project[i]);
+    }
+    if !unanchored.is_empty() {
+        render_group(&mut out, "◆ (unanchored)".to_string(), &unanchored);
+    }
+
+    if out.is_empty() {
+        return "(empty graph — no projects registered, no sessions live)".to_string();
+    }
+    out.join("\n")
+}
+
+// ── Pure command cores (unit-tested; the handlers wire I/O around them) ────
+
+/// Would linking `child → parent` create a cycle? Walks the parent chain from
+/// `parent` upward; a visited guard also survives pre-existing bad data.
+pub fn would_cycle(sessions: &[SessionRecord], child: &str, parent: &str) -> bool {
+    let by_id: BTreeMap<&str, &SessionRecord> = sessions
+        .iter()
+        .map(|s| (s.session_id.as_str(), s))
+        .collect();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut cur = parent.to_string();
+    loop {
+        if cur == child {
+            return true;
+        }
+        if !seen.insert(cur.clone()) {
+            return false; // pre-existing cycle not involving child — stop.
+        }
+        match by_id
+            .get(cur.as_str())
+            .and_then(|s| s.parent_session_id.clone())
+        {
+            Some(next) if !next.is_empty() => cur = next,
+            _ => return false,
+        }
+    }
+}
+
+/// The prune computation: drop `done` sessions (+ their hook records); clear
+/// `parentSessionId` on surviving children of removed sessions.
+pub fn prune_done(
+    sessions: Vec<SessionRecord>,
+    hooks: Vec<HookRecord>,
+) -> (
+    Vec<SessionRecord>,
+    Vec<HookRecord>,
+    Vec<String>,
+    Vec<String>,
+) {
+    let removed: Vec<String> = sessions
+        .iter()
+        .filter(|s| s.state == "done")
+        .map(|s| s.session_id.clone())
+        .collect();
+    let gone: HashSet<&str> = removed.iter().map(String::as_str).collect();
+
+    let mut cleared: Vec<String> = Vec::new();
+    let kept_sessions: Vec<SessionRecord> = sessions
+        .into_iter()
+        .filter(|s| !gone.contains(s.session_id.as_str()))
+        .map(|mut s| {
+            if matches!(&s.parent_session_id, Some(p) if gone.contains(p.as_str())) {
+                s.parent_session_id = None;
+                cleared.push(s.session_id.clone());
+            }
+            s
+        })
+        .collect();
+    let kept_hooks: Vec<HookRecord> = hooks
+        .into_iter()
+        .filter(|h| !gone.contains(h.session_id.as_str()))
+        .collect();
+
+    (kept_sessions, kept_hooks, removed, cleared)
+}
+
+/// Re-stage `graph.json` from the CURRENT registries so the document Quickshell
+/// hot-reloads never drifts from what `graph view` (and a fresh `graph emit`)
+/// would compute. Every mutation of projects/sessions calls this, so the staged
+/// graph is always a pure function of the registries — the staged doc can no
+/// longer go stale behind a `project add`/`remove`/`link`/`prune`.
+pub(crate) fn restage_graph() -> Result<PathBuf, String> {
+    let p: ProjectsFile = load_stage(&projects_path())?;
+    let s: SessionsFile = load_stage(&sessions_path())?;
+    let h: HooksFile = load_stage(&hooks_path())?;
+    let doc = build_graph(&p.projects, &s.sessions, &h.hooks);
+    let path = graph_path();
+    write_stage(&path, &doc)?;
+    Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::testutil::*;
+
+    #[test]
+    fn link_cycle_rejection() {
+        let sessions = vec![
+            session("a", "/x", "running", "1", None),
+            session("b", "/x", "running", "2", Some("a")),
+            session("c", "/x", "running", "3", Some("b")),
+        ];
+        // a → c closes the chain c→b→a: cycle.
+        assert!(would_cycle(&sessions, "a", "c"));
+        // Self-parented chain data must not loop the walker.
+        assert!(would_cycle(&sessions, "b", "b"));
+        // A fresh parent is fine.
+        assert!(!would_cycle(&sessions, "c", "a"));
+        assert!(!would_cycle(&sessions, "a", "unregistered"));
+    }
+    #[test]
+    fn render_is_deterministic_snapshot() {
+        let projects = fixture_projects();
+        let sessions = vec![
+            // Deliberately unsorted; ordering must come from (startedAt, id).
+            session("s4", "/tmp", "idle", "2026-01-04T00:00:00Z", None),
+            session(
+                "s2",
+                "/home/k/Aoide/sub/x",
+                "running",
+                "2026-01-02T00:00:00Z",
+                None,
+            ),
+            session(
+                "s1",
+                "/home/k/Aoide",
+                "running",
+                "2026-01-01T00:00:00Z",
+                None,
+            ),
+            session(
+                "s3",
+                "/home/k/elsewhere",
+                "idle",
+                "2026-01-03T00:00:00Z",
+                Some("s1"),
+            ),
+        ];
+        // Hook state merge: s1's latest hook phase becomes its live state, folded
+        // to the canonical vocab (working → idle here; latest updatedAt wins).
+        let hooks = vec![
+            HookRecord {
+                session_id: "s1".into(),
+                phase: "working".into(),
+                updated_at: "2026-01-01T01:00:00Z".into(),
+                extra: Map::new(),
+            },
+            HookRecord {
+                session_id: "s1".into(),
+                phase: "idle".into(),
+                updated_at: "2026-01-01T02:00:00Z".into(),
+                extra: Map::new(),
+            },
+        ];
+        // Roster `running` folds to canonical `working`; the merged hook phase and
+        // the resting states render verbatim from the one vocabulary.
+        let expected = "\
+◆ aoide  /home/k/Aoide
+└─ ● s1  claude  idle  /home/k/Aoide
+   └─ ● s3  claude  idle  /home/k/elsewhere
+◆ nested  /home/k/Aoide/sub
+└─ ● s2  claude  working  /home/k/Aoide/sub/x
+◆ (unanchored)
+└─ ● s4  claude  idle  /tmp";
+        assert_eq!(render(&projects, &sessions, &hooks, None), expected);
+        // The focus marker singles out one node.
+        let focused = render(&projects, &sessions, &hooks, Some("session:s2"));
+        assert!(focused.contains("└─ ▶ ● s2  claude  working"));
+        // Same inputs → same render (deterministic).
+        assert_eq!(render(&projects, &sessions, &hooks, None), expected);
+    }
+    #[test]
+    fn render_shows_model_tag_on_agent_and_subagent_nodes_when_known() {
+        let projects = fixture_projects();
+        let mut parent = session("s1", "/home/k/Aoide", "running", "1", None);
+        parent.model = Some("claude-sonnet-5".into());
+        let mut sub = session("s2", "/home/k/Aoide", "working", "2", Some("s1"));
+        sub.kind = Some("subagent".into());
+        sub.model = Some("claude-fable-5".into());
+        // A shell (or any model-less record) carries no model — the tag stays
+        // absent rather than printing an empty `⟐ `.
+        let shell = session("s3", "/home/k/Aoide", "idle", "3", None);
+        let sessions = vec![parent, sub, shell];
+        let out = render(&projects, &sessions, &[], None);
+        assert!(
+            out.contains("● s1  claude  working  /home/k/Aoide  ⟐ claude-sonnet-5"),
+            "agent node carries its model tag: {out}"
+        );
+        assert!(
+            out.contains("● s2  claude  working  /home/k/Aoide  ⟐ claude-fable-5"),
+            "subagent node carries its own (possibly different) model tag: {out}"
+        );
+        assert!(
+            out.contains("● s3  claude  idle  /home/k/Aoide\n"),
+            "model-less node has no dangling tag: {out}"
+        );
+        assert!(!out.contains('⟐') || out.matches('⟐').count() == 2, "exactly two model tags: {out}");
+    }
+    #[test]
+    fn graph_document_edges_match_the_render_shape() {
+        let projects = fixture_projects();
+        let sessions = vec![
+            session("s1", "/home/k/Aoide", "running", "1", None),
+            session("s3", "/home/k/elsewhere", "idle", "2", Some("s1")),
+        ];
+        let doc = build_graph(&projects, &sessions, &[]);
+        let edges = doc["edges"].as_array().unwrap();
+        // s1 anchors under project:aoide; s3 hangs off s1 only (no anchor edge).
+        assert!(edges.iter().any(|e| e["from"] == "project:aoide"
+            && e["to"] == "session:s1"
+            && e["kind"] == "anchors"));
+        assert!(edges.iter().any(|e| e["from"] == "session:s1"
+            && e["to"] == "session:s3"
+            && e["kind"] == "spawned"));
+        assert_eq!(edges.len(), 2);
+        assert_eq!(doc["schemaVersion"], "0");
+    }
+    #[test]
+    fn prune_clears_orphaned_parent_links() {
+        let sessions = vec![
+            session("p", "/x", "done", "1", None),
+            session("c1", "/x", "running", "2", Some("p")),
+            session("c2", "/x", "done", "3", Some("p")),
+            session("free", "/x", "idle", "4", None),
+        ];
+        let hooks = vec![
+            HookRecord {
+                session_id: "p".into(),
+                phase: "Stop".into(),
+                updated_at: "1".into(),
+                extra: Map::new(),
+            },
+            HookRecord {
+                session_id: "c1".into(),
+                phase: "PreToolUse".into(),
+                updated_at: "2".into(),
+                extra: Map::new(),
+            },
+        ];
+        let (kept_s, kept_h, removed, cleared) = prune_done(sessions, hooks);
+        assert_eq!(removed, vec!["p".to_string(), "c2".to_string()]);
+        assert_eq!(cleared, vec!["c1".to_string()]);
+        let ids: Vec<&str> = kept_s.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["c1", "free"]);
+        assert!(kept_s.iter().all(|s| s.parent_session_id.is_none()));
+        // p's hook record went with it; c1's survives.
+        assert_eq!(kept_h.len(), 1);
+        assert_eq!(kept_h[0].session_id, "c1");
+    }
+    #[test]
+    fn graph_node_carries_workspace_only_when_known() {
+        // The hover-preview bridge is pure data: build_graph stamps `workspace`
+        // onto a session node when resolved, and omits it entirely otherwise so a
+        // legacy/off-Hyprland record round-trips byte-for-byte.
+        let mut with_ws = SessionRecord {
+            session_id: "a".into(),
+            window_address: "0xaaa".into(),
+            ..Default::default()
+        };
+        with_ws.workspace = Some(4);
+        let without_ws = SessionRecord {
+            session_id: "b".into(),
+            window_address: "0xbbb".into(),
+            ..Default::default()
+        };
+        let doc = build_graph(&[], &[with_ws, without_ws], &[]);
+        let nodes = doc["nodes"].as_array().unwrap();
+        let node_a = nodes.iter().find(|n| n["id"] == "session:a").unwrap();
+        let node_b = nodes.iter().find(|n| n["id"] == "session:b").unwrap();
+        assert_eq!(node_a["workspace"], json!(4));
+        assert!(node_b.get("workspace").is_none());
+    }
+    #[test]
+    fn graph_node_carries_model_only_when_known() {
+        // Mirrors the workspace test above: `model` rides onto a session node
+        // (agent or subagent alike) only when the record has one, so a
+        // legacy/model-less record round-trips byte-for-byte.
+        let with_model = SessionRecord {
+            session_id: "a".into(),
+            window_address: "0xaaa".into(),
+            model: Some("claude-fable-5".into()),
+            ..Default::default()
+        };
+        let without_model = SessionRecord {
+            session_id: "b".into(),
+            window_address: "0xbbb".into(),
+            ..Default::default()
+        };
+        let doc = build_graph(&[], &[with_model, without_model], &[]);
+        let nodes = doc["nodes"].as_array().unwrap();
+        let node_a = nodes.iter().find(|n| n["id"] == "session:a").unwrap();
+        let node_b = nodes.iter().find(|n| n["id"] == "session:b").unwrap();
+        assert_eq!(node_a["model"], json!("claude-fable-5"));
+        assert!(node_b.get("model").is_none());
+    }
+}
