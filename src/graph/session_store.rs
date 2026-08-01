@@ -128,6 +128,7 @@ pub fn upsert_session(
             kind: None,
             say: None,
             model: None,
+            context_tokens: None,
             needs_sudo: None,
             extra: Map::new(),
         });
@@ -571,6 +572,55 @@ fn extract_model(lines: &[String], skip_sidechain: bool) -> Option<String> {
     found
 }
 
+/// The session's context-window fill at its LAST request: `input_tokens +
+/// cache_creation_input_tokens + cache_read_input_tokens` off the freshest
+/// `type:"assistant"` line's `message.usage` in the tail, e.g.
+/// `"usage":{"input_tokens":2,"cache_creation_input_tokens":11803,
+/// "cache_read_input_tokens":349611,"output_tokens":459}` → `Some(361_416)`.
+/// Deliberately excludes `output_tokens` — that is what the turn just
+/// produced, not what sat in the context window when the request was made.
+/// Sits at the same nesting level `extract_model` reads, over the same
+/// freshest-assistant-line scan, so it shares the one tail read
+/// `refresh_transcript_fields` already does. Top-level-session transcripts
+/// only (mirrors `extract_model`'s `skip_sidechain=true` case — a sub-agent's
+/// own dedicated transcript file is never the tail this function sees). `None`
+/// when the tail holds no assistant turn yet, or that freshest turn carries no
+/// `usage` block.
+fn transcript_context_tokens(lines: &[String]) -> Option<u64> {
+    let mut found: Option<u64> = None;
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        if let Some(usage) = v.get("message").and_then(|m| m.get("usage")) {
+            let input = usage
+                .get("input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let cache_creation = usage
+                .get("cache_creation_input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let cache_read = usage
+                .get("cache_read_input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            found = Some(input + cache_creation + cache_read);
+        }
+    }
+    found
+}
+
 /// Best-effort: refresh a session's transcript-derived fields at a hook boundary —
 /// its `say` (the agent's latest words) and, set-once, its `title` (the session
 /// NAME, from `custom-title`). Change-only; never touches state/activity/pid;
@@ -591,7 +641,8 @@ pub(in crate::graph) fn refresh_transcript_fields(
     let say = extract_say(&lines, true);
     let name = extract_custom_title(&lines);
     let model = extract_model(&lines, true);
-    if say.is_none() && name.is_none() && model.is_none() {
+    let context_tokens = transcript_context_tokens(&lines);
+    if say.is_none() && name.is_none() && model.is_none() && context_tokens.is_none() {
         return;
     }
     with_stage_lock(|| {
@@ -621,6 +672,12 @@ pub(in crate::graph) fn refresh_transcript_fields(
             if let Some(model) = &model {
                 if s.model.as_deref() != Some(model.as_str()) {
                     s.model = Some(model.clone());
+                    changed = true;
+                }
+            }
+            if let Some(ctx) = context_tokens {
+                if s.context_tokens != Some(ctx) {
+                    s.context_tokens = Some(ctx);
                     changed = true;
                 }
             }
@@ -1300,6 +1357,40 @@ mod tests {
         let lines: Vec<String> =
             vec![r#"{"type":"user","message":{"content":[{"type":"text","text":"hi"}]}}"#.to_string()];
         assert_eq!(extract_model(&lines, true), None);
+    }
+    #[test]
+    fn context_tokens_sums_input_side_of_freshest_assistant_usage() {
+        let path =
+            std::env::temp_dir().join(format!("aoide_ctx_{}.jsonl", std::process::id()));
+        let body = [
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"hi"}]}}"#,
+            // An earlier assistant turn's usage must be superseded by the freshest.
+            r#"{"type":"assistant","isSidechain":false,"message":{"model":"claude-sonnet-5","usage":{"input_tokens":2,"cache_creation_input_tokens":100,"cache_read_input_tokens":200,"output_tokens":50}}}"#,
+            // A same-file sidechain line's usage must be ignored (a Task's own turn).
+            r#"{"type":"assistant","isSidechain":true,"message":{"usage":{"input_tokens":999999,"cache_creation_input_tokens":999999,"cache_read_input_tokens":999999,"output_tokens":1}}}"#,
+            // The freshest non-sidechain turn — output_tokens (459) must NOT be
+            // folded into the sum (2 + 11803 + 349611 = 361416, not +459).
+            r#"{"type":"assistant","isSidechain":false,"message":{"model":"claude-sonnet-5","usage":{"input_tokens":2,"cache_creation_input_tokens":11803,"cache_read_input_tokens":349611,"output_tokens":459}}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, &body).unwrap();
+        let tokens = transcript_context_tokens(&transcript_tail(&path));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(tokens, Some(361_416));
+    }
+    #[test]
+    fn context_tokens_is_none_without_assistant_usage() {
+        // No assistant line at all.
+        let no_assistant: Vec<String> =
+            vec![r#"{"type":"user","message":{"content":[{"type":"text","text":"hi"}]}}"#.to_string()];
+        assert_eq!(transcript_context_tokens(&no_assistant), None);
+
+        // An assistant line present, but its message carries no `usage` block
+        // (e.g. a stream fragment) — still None, not a false Some(0).
+        let no_usage: Vec<String> = vec![
+            r#"{"type":"assistant","isSidechain":false,"message":{"model":"claude-sonnet-5","content":[{"type":"text","text":"hi"}]}}"#.to_string(),
+        ];
+        assert_eq!(transcript_context_tokens(&no_usage), None);
     }
     #[test]
     fn extract_custom_title_takes_the_last_session_title() {

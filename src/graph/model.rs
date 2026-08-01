@@ -108,6 +108,23 @@ pub struct SessionRecord {
     /// clock's subtext; widgets read the raw id and map it to a short label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The context-window fill of this session's LAST request: `input_tokens +
+    /// cache_creation_input_tokens + cache_read_input_tokens` off the freshest
+    /// `type:"assistant"` line's `message.usage` in the on-disk JSONL transcript
+    /// (deliberately excludes `output_tokens` — that's what the turn just
+    /// produced, not what sat in the window when the request was made).
+    /// Refreshed at the same hook boundaries as `say`/`model`. Additive/v0-safe
+    /// — absent for shells and until the session has produced at least one
+    /// assistant turn (same lifecycle as `model`). The dock maps the raw count
+    /// to a context-window meter, computing its own ceiling from `model`
+    /// client-side (a 200k/1M split, with a heuristic bump for the cases where
+    /// the transcript's model id doesn't spell out its long-context tier).
+    #[serde(
+        rename = "contextTokens",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub context_tokens: Option<u64>,
     /// True while this conducted SHELL is blocked at a `sudo` password prompt
     /// — detected by conduct's PTY tick (the foreground process is `sudo`, or
     /// the `[sudo] password for` text was just seen crossing master→stdout)
@@ -385,6 +402,34 @@ mod tests {
         let legacy: SessionRecord =
             serde_json::from_str(r#"{ "sessionId": "s", "windowAddress": "0x1" }"#).unwrap();
         assert_eq!(legacy.needs_sudo, None);
+    }
+    #[test]
+    fn session_record_context_tokens_round_trips_and_stays_absent_when_unset() {
+        // serde: `contextTokens` serialises as an integer when Some, and is
+        // skipped (skip_serializing_if) when None — additive/v0-safe on the
+        // wire, matching the `needsSudo`/`workspace` fields' contract above.
+        let mut rec = SessionRecord {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        rec.context_tokens = Some(361_416);
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("\"contextTokens\":361416"), "serialised: {json}");
+        let back: SessionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.context_tokens, Some(361_416));
+
+        // A record with no contextTokens omits the key entirely (no null
+        // noise) and a legacy record with no `contextTokens` field parses to
+        // None.
+        let bare = SessionRecord {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        let bare_json = serde_json::to_string(&bare).unwrap();
+        assert!(!bare_json.contains("contextTokens"), "serialised: {bare_json}");
+        let legacy: SessionRecord =
+            serde_json::from_str(r#"{ "sessionId": "s", "windowAddress": "0x1" }"#).unwrap();
+        assert_eq!(legacy.context_tokens, None);
     }
     #[test]
     fn canonical_state_folds_every_producer_onto_the_five_state_vocabulary() {

@@ -507,6 +507,7 @@ mod tests {
             kind: None,
             say: None,
             model: None,
+            context_tokens: None,
             needs_sudo: None,
             extra: Map::new(),
         }

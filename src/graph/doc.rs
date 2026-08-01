@@ -87,6 +87,14 @@ pub fn build_graph(
         if let Some(m) = &s.model {
             node["model"] = json!(m);
         }
+        // The context-window fill of this session's last request (input-side
+        // token count off its transcript's freshest assistant `usage`), when
+        // known — absent for shells and until the first assistant turn lands.
+        // Rides alongside `model` for the same reason: the dock computes the
+        // meter (percent + ceiling) itself from the raw count.
+        if let Some(ctx) = s.context_tokens {
+            node["contextTokens"] = json!(ctx);
+        }
         // Blocked on a `sudo` password prompt — a conducted SHELL only; rides
         // onto the node only when true (never a dangling `needsSudo:false`).
         if let Some(true) = s.needs_sudo {
@@ -148,6 +156,20 @@ pub fn render(
         }
     }
 
+    // Compact token-count formatting for the `⧉` context tag below: <1000 →
+    // raw, ≥1000 → `Nk`, ≥1e6 → `N.NM` — mirrors the dock's own JS formatter
+    // (DrachmaState.qml `ctxCompact`) so the ASCII tree and the widget read
+    // the same count the same way.
+    fn compact_tokens(n: u64) -> String {
+        if n < 1_000 {
+            n.to_string()
+        } else if n < 1_000_000 {
+            format!("{}k", ((n as f64) / 1_000.0).round() as u64)
+        } else {
+            format!("{:.1}M", (n as f64) / 1_000_000.0)
+        }
+    }
+
     fn session_line(s: &SessionRecord, focus: Option<&str>) -> String {
         let id = format!("session:{}", s.session_id);
         // The running Claude model, when known — a compact `⟐ <model>` tag
@@ -155,6 +177,14 @@ pub fn render(
         // appended after cwd; omitted for shells and anything model-less.
         let model_tag = match s.model.as_deref() {
             Some(m) if !m.is_empty() => format!("  ⟐ {m}"),
+            _ => String::new(),
+        };
+        // The context-window fill of the last request, when known — a compact
+        // `⧉ 361k` tag (distinct glyph from the model's `⟐`, so the two never
+        // read as the same kind of note); omitted until an assistant turn has
+        // produced a usage block.
+        let ctx_tag = match s.context_tokens {
+            Some(t) if t > 0 => format!("  ⧉ {}", compact_tokens(t)),
             _ => String::new(),
         };
         // A compact marker for a shell blocked on `sudo` — parallel to the
@@ -165,13 +195,14 @@ pub fn render(
             _ => "",
         };
         format!(
-            "{}● {}  {}  {}  {}{}{}",
+            "{}● {}  {}  {}  {}{}{}{}",
             marker(focus, &id, &s.session_id),
             s.session_id,
             s.agent,
             s.state,
             s.cwd,
             model_tag,
+            ctx_tag,
             sudo_tag
         )
     }
@@ -533,6 +564,42 @@ mod tests {
         let node_b = nodes.iter().find(|n| n["id"] == "session:b").unwrap();
         assert_eq!(node_a["model"], json!("claude-fable-5"));
         assert!(node_b.get("model").is_none());
+    }
+    #[test]
+    fn graph_node_carries_context_tokens_only_when_known() {
+        // Mirrors the workspace/model tests above: `contextTokens` rides onto a
+        // session node only when the record has one, so a legacy/pre-assistant-
+        // turn record round-trips byte-for-byte.
+        let with_ctx = SessionRecord {
+            session_id: "a".into(),
+            window_address: "0xaaa".into(),
+            context_tokens: Some(361_416),
+            ..Default::default()
+        };
+        let without_ctx = SessionRecord {
+            session_id: "b".into(),
+            window_address: "0xbbb".into(),
+            ..Default::default()
+        };
+        let doc = build_graph(&[], &[with_ctx, without_ctx], &[]);
+        let nodes = doc["nodes"].as_array().unwrap();
+        let node_a = nodes.iter().find(|n| n["id"] == "session:a").unwrap();
+        let node_b = nodes.iter().find(|n| n["id"] == "session:b").unwrap();
+        assert_eq!(node_a["contextTokens"], json!(361_416));
+        assert!(node_b.get("contextTokens").is_none());
+    }
+    #[test]
+    fn render_shows_context_tag_when_known() {
+        // The ASCII render's `⧉ <compact>` tag mirrors the model tag's `⟐`
+        // precedent: present + compact-formatted when known, absent otherwise.
+        let mut s = session("a", "/x", "working", "2024-01-01T00:00:00Z", None);
+        s.context_tokens = Some(361_416);
+        let out = render(&[], &[s], &[], None);
+        assert!(out.contains("⧉ 361k"), "expected a compact context tag: {out}");
+
+        let bare = session("b", "/x", "working", "2024-01-01T00:00:00Z", None);
+        let out2 = render(&[], &[bare], &[], None);
+        assert!(!out2.contains('⧉'), "no dangling context tag: {out2}");
     }
     #[test]
     fn graph_node_carries_needs_sudo_only_when_true() {
