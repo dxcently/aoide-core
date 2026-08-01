@@ -53,6 +53,11 @@ pub struct Node {
     pub session_id: Option<String>,
     pub state: Option<String>,
     pub tags: Vec<String>,
+    /// The session's Claude model (agent or subagent's own), when known —
+    /// straight off `graph.json`'s node `model` field. `None` for projects,
+    /// the synthetic unanchored root, shells, and any session that hasn't
+    /// produced an assistant turn yet.
+    pub model: Option<String>,
     pub depth: usize,
     pub row: usize,
 }
@@ -64,6 +69,7 @@ struct Meta {
     session_id: Option<String>,
     state: Option<String>,
     tags: Vec<String>,
+    model: Option<String>,
 }
 
 /// The parsed + laid-out forest: nodes in preorder (the selection order) and the
@@ -118,6 +124,7 @@ pub fn build_model(app: &App) -> Model {
                         session_id: None,
                         state: None,
                         tags: Vec::new(),
+                        model: None,
                     },
                 );
             }
@@ -125,6 +132,10 @@ pub fn build_model(app: &App) -> Model {
                 let sid = id.strip_prefix("session:").unwrap_or(&id).to_string();
                 let state = str_field(n, "state");
                 let tags = tag_by_id.get(&sid).cloned().unwrap_or_default();
+                // `model` rides on the node only when the record has one (agent
+                // or subagent alike) — absent for shells, so no filter on `role`
+                // is needed here.
+                let model = n.get("model").and_then(|v| v.as_str()).map(str::to_string);
                 meta.insert(
                     id.clone(),
                     Meta {
@@ -133,6 +144,7 @@ pub fn build_model(app: &App) -> Model {
                         session_id: Some(sid),
                         state: Some(state),
                         tags,
+                        model,
                     },
                 );
             }
@@ -177,6 +189,7 @@ pub fn build_model(app: &App) -> Model {
                 session_id: None,
                 state: None,
                 tags: Vec::new(),
+                model: None,
             },
         );
         children.insert(uid.clone(), unanchored);
@@ -219,6 +232,7 @@ fn walk(
             session_id: m.session_id.clone(),
             state: m.state.clone(),
             tags: m.tags.clone(),
+            model: m.model.clone(),
             depth,
             row: out.len(),
         });
@@ -402,6 +416,17 @@ fn chip_cells(n: &Node, selected: bool, pal: &crate::conductor::app::Palette) ->
             push(&format!(" {state}"), theme::dim());
         }
     }
+    // The running Claude model, when known — same `⟐` glyph the gadget dock
+    // uses for a subagent's model text, rendered uniformly on agent AND
+    // subagent chips alike; absent for projects, unanchored, and shells.
+    if let Some(model) = &n.model {
+        if !model.is_empty() {
+            push(
+                &format!(" ⟐{model}"),
+                Style::default().fg(accent).add_modifier(Modifier::DIM),
+            );
+        }
+    }
     for t in &n.tags {
         push(
             &format!(" ⟨{t}⟩"),
@@ -522,6 +547,33 @@ mod tests {
         let m = build_model(&app);
         assert!(m.nodes.iter().any(|n| n.kind == NodeKind::Unanchored));
         assert!(m.nodes.iter().any(|n| n.label == "loose"));
+    }
+
+    #[test]
+    fn model_flows_from_the_graph_document_onto_agent_and_subagent_nodes() {
+        let mut root = session("root", "/home/k/Aoide", "running", None);
+        root.model = Some("claude-sonnet-5".into());
+        let mut sub = session("kid", "/home/k/Aoide", "working", Some("root"));
+        sub.kind = Some("subagent".into());
+        sub.model = Some("claude-fable-5".into());
+        // A shell has no model — the fixture leaves it `None`, mirroring what
+        // `extract_model` actually produces for a conducted terminal.
+        let shell = session("term", "/home/k/Aoide", "idle", None);
+        let app = App::for_test(
+            vec![Project {
+                name: "aoide".into(),
+                path: "/home/k/Aoide".into(),
+            }],
+            vec![root, sub, shell],
+            Vec::new(),
+        );
+        let m = build_model(&app);
+        let root_n = m.nodes.iter().find(|n| n.label == "root").unwrap();
+        let kid_n = m.nodes.iter().find(|n| n.label == "kid").unwrap();
+        let term_n = m.nodes.iter().find(|n| n.label == "term").unwrap();
+        assert_eq!(root_n.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(kid_n.model.as_deref(), Some("claude-fable-5"));
+        assert_eq!(term_n.model, None);
     }
 
     #[test]

@@ -168,7 +168,7 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
     let parts = Layout::vertical([
         Constraint::Length(1), // glyph legend
         Constraint::Min(3),    // roster list
-        Constraint::Length(8), // detail card
+        Constraint::Length(9), // detail card
     ])
     .split(area);
 
@@ -237,6 +237,15 @@ fn roster_item<'a>(row: &DagRow, app: &App) -> ListItem<'a> {
                 Span::styled(format!("{}  ", elapsed), theme::dim()),
                 Span::raw(cwd),
             ];
+            // The running Claude model, when known — same `⟐` glyph the
+            // gadget dock uses for a subagent's model text, shown uniformly
+            // on agent and subagent rows alike; absent for shells.
+            if let Some(model) = rec.model.as_deref().filter(|m| !m.is_empty()) {
+                let ms = accent
+                    .map(|c| Style::default().fg(c).add_modifier(Modifier::DIM))
+                    .unwrap_or_else(theme::dim);
+                spans.push(Span::styled(format!("  ⟐{model}"), ms));
+            }
             for t in theme::session_tags(rec) {
                 let ts = accent
                     .map(|c| Style::default().fg(c).add_modifier(Modifier::DIM))
@@ -286,6 +295,9 @@ fn detail_lines<'a>(rows: &[DagRow], app: &App) -> Vec<Line<'a>> {
                     theme::disp(&rec.started_at)
                 )),
             ];
+            if let Some(model) = rec.model.as_deref().filter(|m| !m.is_empty()) {
+                lines.push(Line::from(format!("  model   {model}")));
+            }
             if let Some(activity) = rec.activity.as_deref().filter(|a| !a.is_empty()) {
                 lines.push(Line::from(Span::styled(
                     format!("  doing   ▸ {activity}"),
@@ -776,6 +788,60 @@ mod tests {
         assert!(
             out.contains("says    \"checking layout\""),
             "say line rendered in detail card"
+        );
+    }
+
+    #[test]
+    fn sessions_panel_shows_model_on_roster_row_and_detail_card_for_a_subagent() {
+        let mut root = session("root", "/home/k/Aoide", "running", None);
+        root.model = Some("claude-sonnet-5".into());
+        let mut sub = session("kid", "/home/k/Aoide", "working", Some("root"));
+        sub.kind = Some("subagent".into());
+        sub.model = Some("claude-fable-5".into());
+        let mut app = app_with(
+            vec![Project {
+                name: "aoide".into(),
+                path: "/home/k/Aoide".into(),
+            }],
+            vec![root, sub],
+        );
+        // Row 0 is the ◆ aoide group header; row 1 is `root`, row 2 is `kid`.
+        app.dag_sel = 2;
+        let out = render_panel(&app, Panel::Sessions, 100, 30);
+        assert!(
+            out.contains("⟐claude-sonnet-5"),
+            "root agent's model tag on its roster row: {out}"
+        );
+        assert!(
+            out.contains("⟐claude-fable-5"),
+            "subagent's OWN model tag on its roster row: {out}"
+        );
+        assert!(
+            out.contains("model   claude-fable-5"),
+            "subagent's model line on the detail card: {out}"
+        );
+    }
+
+    #[test]
+    fn graph_panel_draws_the_model_tag_on_a_subagent_chip() {
+        let root = session("root", "/home/k/Aoide", "running", None);
+        let mut sub = session("kid", "/home/k/Aoide", "working", Some("root"));
+        sub.kind = Some("subagent".into());
+        // Short enough to survive the chip's CHIP_MAX truncation (tags/state
+        // already share that budget) — the point is the glyph+text ride the
+        // chip at all, not exercising the truncation boundary itself.
+        sub.model = Some("fable5".into());
+        let app = app_with(
+            vec![Project {
+                name: "aoide".into(),
+                path: "/home/k/Aoide".into(),
+            }],
+            vec![root, sub],
+        );
+        let out = render_panel(&app, Panel::Graph, 120, 30);
+        assert!(
+            out.contains("⟐fable5"),
+            "subagent chip carries its model tag: {out}"
         );
     }
 

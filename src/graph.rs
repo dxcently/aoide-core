@@ -373,6 +373,11 @@ pub fn build_graph(
         if let Some(say) = &s.say {
             node["say"] = json!(say);
         }
+        // The Claude model this session (agent or subagent) is running, when
+        // known — absent for shells and until the first assistant turn lands.
+        if let Some(m) = &s.model {
+            node["model"] = json!(m);
+        }
         nodes.push(node);
         if let Some(parent) = resolved_parent(s, &ids) {
             edges.push(json!({
@@ -431,13 +436,21 @@ pub fn render(
 
     fn session_line(s: &SessionRecord, focus: Option<&str>) -> String {
         let id = format!("session:{}", s.session_id);
+        // The running Claude model, when known — a compact `⟐ <model>` tag
+        // (same glyph the gadget dock uses for a subagent's model text)
+        // appended after cwd; omitted for shells and anything model-less.
+        let model_tag = match s.model.as_deref() {
+            Some(m) if !m.is_empty() => format!("  ⟐ {m}"),
+            _ => String::new(),
+        };
         format!(
-            "{}● {}  {}  {}  {}",
+            "{}● {}  {}  {}  {}{}",
             marker(focus, &id, &s.session_id),
             s.session_id,
             s.agent,
             s.state,
-            s.cwd
+            s.cwd,
+            model_tag
         )
     }
 
@@ -1813,10 +1826,21 @@ fn subagents_dir(session_id: &str, cwd: Option<&str>) -> Option<PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
-/// Find the sub-agent transcript in `dir` whose sibling `*.meta.json` has
-/// `toolUseId == tuid` (the spawning Task's tool_use_id, which is the `sub:<tuid>`
-/// node key) — returning the `agent-<id>.jsonl` to read its words from.
+/// Find the sub-agent transcript in `dir` for a `sub:<tuid>` node key. Two
+/// keying regimes reach here (see `do_subagent_spawn`'s doc comment):
+///
+/// - `sub:<agent_id>` — an async `Agent`-tool node PostToolUse has re-keyed
+///   from its tool_use_id to its agent id; the transcript file is literally
+///   named `agent-<agent_id>.jsonl`, so try that direct path FIRST (cheap,
+///   unambiguous — no need to open every `.meta.json` in the directory).
+/// - `sub:<tool_use_id>` — the classic keying, not yet (or never) re-keyed;
+///   fall back to scanning `*.meta.json` files for one whose `toolUseId ==
+///   tuid`, returning its sibling `agent-<id>.jsonl`.
 fn find_subagent_transcript(dir: &std::path::Path, tuid: &str) -> Option<PathBuf> {
+    let direct = dir.join(format!("agent-{tuid}.jsonl"));
+    if direct.is_file() {
+        return Some(direct);
+    }
     for e in std::fs::read_dir(dir).ok()?.flatten() {
         let p = e.path();
         let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
@@ -4909,6 +4933,57 @@ mod tests {
     }
 
     #[test]
+    fn find_subagent_transcript_matches_by_agent_id_filename() {
+        // The async Agent-tool path: PostToolUse re-keys the graph node from
+        // `sub:<tool_use_id>` to `sub:<agent_id>`, so lookups arrive keyed by
+        // agent id — which never equals any `meta.json`'s `toolUseId`. The
+        // transcript must still resolve via the direct `agent-<agent_id>.jsonl`
+        // filename, even though its meta.json's `toolUseId` is a DIFFERENT,
+        // unrelated tool_use_id value (the id of the Task call that originally
+        // spawned it, before the re-key).
+        let dir = std::env::temp_dir().join(format!("aoide_subs_aid_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let agent_id = "a2e15372d23f6f70d";
+        std::fs::write(
+            dir.join(format!("agent-{agent_id}.meta.json")),
+            r#"{"agentType":"Explore","description":"z","toolUseId":"toolu_UNRELATED","model":"fable"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("agent-{agent_id}.jsonl")),
+            [
+                r#"{"type":"assistant","isSidechain":true,"message":{"model":"claude-fable-5","content":[{"type":"text","text":"first"}]}}"#,
+                r#"{"type":"assistant","isSidechain":true,"message":{"model":"claude-fable-5","content":[{"type":"text","text":"from agent id"}]}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        // Looked up by agent id (the re-keyed `sub:<agent_id>` case) — resolves
+        // via the direct filename, NOT the meta scan (whose toolUseId doesn't
+        // match).
+        let found = find_subagent_transcript(&dir, agent_id).unwrap();
+        assert_eq!(
+            found.file_name().unwrap().to_str().unwrap(),
+            format!("agent-{agent_id}.jsonl")
+        );
+        let lines = transcript_tail(&found);
+        assert_eq!(extract_say(&lines, false).as_deref(), Some("from agent id"));
+        assert_eq!(extract_model(&lines, false).as_deref(), Some("claude-fable-5"));
+
+        // The pre-existing tool-use-id-keyed path still works via the meta scan.
+        let found2 = find_subagent_transcript(&dir, "toolu_UNRELATED").unwrap();
+        assert_eq!(
+            found2.file_name().unwrap().to_str().unwrap(),
+            format!("agent-{agent_id}.jsonl")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn one_line_clip_flattens_and_truncates() {
         assert_eq!(one_line_clip("a  b\n c", 80), "a b c");
         let long = "x".repeat(200);
@@ -5094,6 +5169,34 @@ mod tests {
         assert!(focused.contains("└─ ▶ ● s2  claude  working"));
         // Same inputs → same render (deterministic).
         assert_eq!(render(&projects, &sessions, &hooks, None), expected);
+    }
+
+    #[test]
+    fn render_shows_model_tag_on_agent_and_subagent_nodes_when_known() {
+        let projects = fixture_projects();
+        let mut parent = session("s1", "/home/k/Aoide", "running", "1", None);
+        parent.model = Some("claude-sonnet-5".into());
+        let mut sub = session("s2", "/home/k/Aoide", "working", "2", Some("s1"));
+        sub.kind = Some("subagent".into());
+        sub.model = Some("claude-fable-5".into());
+        // A shell (or any model-less record) carries no model — the tag stays
+        // absent rather than printing an empty `⟐ `.
+        let shell = session("s3", "/home/k/Aoide", "idle", "3", None);
+        let sessions = vec![parent, sub, shell];
+        let out = render(&projects, &sessions, &[], None);
+        assert!(
+            out.contains("● s1  claude  working  /home/k/Aoide  ⟐ claude-sonnet-5"),
+            "agent node carries its model tag: {out}"
+        );
+        assert!(
+            out.contains("● s2  claude  working  /home/k/Aoide  ⟐ claude-fable-5"),
+            "subagent node carries its own (possibly different) model tag: {out}"
+        );
+        assert!(
+            out.contains("● s3  claude  idle  /home/k/Aoide\n"),
+            "model-less node has no dangling tag: {out}"
+        );
+        assert!(!out.contains('⟐') || out.matches('⟐').count() == 2, "exactly two model tags: {out}");
     }
 
     #[test]
@@ -5297,6 +5400,30 @@ mod tests {
         let node_b = nodes.iter().find(|n| n["id"] == "session:b").unwrap();
         assert_eq!(node_a["workspace"], json!(4));
         assert!(node_b.get("workspace").is_none());
+    }
+
+    #[test]
+    fn graph_node_carries_model_only_when_known() {
+        // Mirrors the workspace test above: `model` rides onto a session node
+        // (agent or subagent alike) only when the record has one, so a
+        // legacy/model-less record round-trips byte-for-byte.
+        let with_model = SessionRecord {
+            session_id: "a".into(),
+            window_address: "0xaaa".into(),
+            model: Some("claude-fable-5".into()),
+            ..Default::default()
+        };
+        let without_model = SessionRecord {
+            session_id: "b".into(),
+            window_address: "0xbbb".into(),
+            ..Default::default()
+        };
+        let doc = build_graph(&[], &[with_model, without_model], &[]);
+        let nodes = doc["nodes"].as_array().unwrap();
+        let node_a = nodes.iter().find(|n| n["id"] == "session:a").unwrap();
+        let node_b = nodes.iter().find(|n| n["id"] == "session:b").unwrap();
+        assert_eq!(node_a["model"], json!("claude-fable-5"));
+        assert!(node_b.get("model").is_none());
     }
 
     #[test]
