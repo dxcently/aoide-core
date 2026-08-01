@@ -76,6 +76,7 @@ pub fn dispatch(inv: &Invocation) -> Outcome {
 
         ["rice", "lint"] => handle_rice_lint(inv),
         ["rice", "preview"] => handle_rice_preview(inv),
+        ["rice", "mint"] => handle_rice_mint(inv),
 
         // ── cover: the live wallpaper write-path (song/covers/ → stage) ──────
         ["cover", "set"] => handle_cover_set(inv),
@@ -294,7 +295,11 @@ fn derive_cover(name: &str) -> Option<PathBuf> {
 
 /// `rice preview <name>` — rehearse a committed song live: stage its
 /// `drachma.json` (and a derivable cover) into `<stage>/` so the Quickshell
-/// surfaces hot-reload it. Nothing is committed; no compositor dispatch in v1.
+/// surfaces hot-reload it, AND best-effort live-apply its geometry + border
+/// colours to the running compositor via `hyprctl --batch keyword …`
+/// (guarded on `$HYPRLAND_INSTANCE_SIGNATURE`; see hypr.rs). Nothing is
+/// committed; the hyprctl call is keyword-only (never `reload`) and never
+/// fatal — a failed/absent hyprctl still leaves the stage file updated.
 ///
 /// This is the honest form of the hand-copy agents had been doing: drive the
 /// songbook notes into the stage so the shell has a palette to render.
@@ -324,7 +329,7 @@ fn handle_rice_preview(inv: &Invocation) -> Outcome {
     };
     // Never stage a torn palette: require the notes to at least parse as JSON
     // (full schema validation is `rice lint`'s job / drachma's).
-    let parsed = match serde_json::from_str::<Value>(&raw) {
+    let parsed: Value = match serde_json::from_str::<Value>(&raw) {
         Ok(v) => v,
         Err(e) => {
             return Outcome::error(
@@ -339,9 +344,14 @@ fn handle_rice_preview(inv: &Invocation) -> Outcome {
         }
     };
 
+    // Compute the compositor keyword batch BEFORE `parsed` is consumed below
+    // (geometry + border colours only — see hypr.rs for why an absent/null
+    // geometry field is skipped rather than defaulted).
+    let hypr_keywords = crate::hypr::geometry_keywords(&parsed);
+
     // Inject the song name into the staged notes: DrachmaState.qml's
     // `songName` property reads this to resolve per-song flavor widgets
-    // (SongWidgets.qml / WidgetSlot.qml) — CONTRACTS.md §4's "additive"
+    // (StagingEngine.qml / WidgetSlot.qml) — CONTRACTS.md §4's "additive"
     // precedent (mirrors `parentSessionId` on session records). When the
     // notes don't parse as an object (shouldn't happen for a valid drachma
     // file, but defends against a malformed one), fall back to writing `raw`
@@ -361,6 +371,13 @@ fn handle_rice_preview(inv: &Invocation) -> Outcome {
             .with_data(json!({ "reason": "stage-write-failed", "target": notes_dst.to_string_lossy() }));
     }
     let mut changed: Vec<String> = vec![notes_dst.to_string_lossy().into_owned()];
+
+    // Live-apply geometry + border colours on the compositor side (best-effort,
+    // guarded, non-fatal). The stage-file write above is already the source of
+    // truth for the hot-reload half (Quickshell's FileView); this hyprctl call
+    // is on top of it, never a precondition for it — a failed/absent hyprctl
+    // never turns this preview into an error. No `hyprctl reload`: see hypr.rs.
+    let hyprctl_status = crate::hypr::apply_live(&hypr_keywords);
 
     // Cover: staged only when physically derivable; otherwise left untouched.
     let cover = derive_cover(&name);
@@ -395,8 +412,322 @@ fn handle_rice_preview(inv: &Invocation) -> Outcome {
         "name": name,
         "notes": notes_dst.to_string_lossy(),
         "cover": cover.as_ref().map(|p| p.to_string_lossy().into_owned()),
-        "seam": "compositor dispatch (hyprctl/OSC) not performed in v1; \
-                 Quickshell hot-reloads stage/drachma.json",
+        "hyprctl": hyprctl_status,
+        "seam": "Quickshell hot-reloads stage/drachma.json (palette + component tiers); \
+                 geometry + border colours are ALSO applied live via best-effort, \
+                 guarded `hyprctl --batch keyword …` (see hypr.rs) — keyword-only, \
+                 never `hyprctl reload`",
+    }))
+}
+
+/// A valid `rice mint`/`rice new` song name: `^[a-z0-9][a-z0-9-]*$`. This one
+/// check also rejects path traversal (`..`, `/`) and case/underscore variance
+/// by construction — nothing outside `[a-z0-9-]` is accepted, and the first
+/// character can never be a `-`.
+fn valid_song_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let first_ok = matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit());
+    first_ok && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Render one JSON scalar as a nix literal. The notes tiers `rice mint` reads
+/// (palette / window / geometry) are leaves only — string, bool, number, or
+/// null — so this never needs to handle arrays/objects.
+fn nix_scalar(v: &Value) -> String {
+    // ORDER MATTERS: backslash first (so the later escapes don't get
+    // double-escaped), then the closing quote, then `$` — `\$` is the Nix
+    // double-quoted-string escape that neutralizes `${…}` interpolation, so a
+    // notes value like `"${builtins.readFile /etc/hostname}"` round-trips
+    // into `rice.nix` as an inert literal, never live Nix interpolation.
+    fn escape(s: &str) -> String {
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('$', "\\$")
+    }
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => format!("\"{}\"", escape(s)),
+        other => format!("\"{}\"", escape(&other.to_string())),
+    }
+}
+
+/// Render `key = value;` lines (one per line, `indent`-prefixed) for a FIXED
+/// key list, pulling each value from `obj` (missing key → `null`). Used for
+/// the window/geometry tiers so a partially-set source still yields the full
+/// fixed key set — never a ragged subset a reader has to guess is exhaustive.
+fn nix_fixed_fields(obj: Option<&serde_json::Map<String, Value>>, keys: &[&str], indent: &str) -> String {
+    keys.iter()
+        .map(|k| {
+            let v = obj.and_then(|o| o.get(*k)).cloned().unwrap_or(Value::Null);
+            format!("{indent}{k} = {};\n", nix_scalar(&v))
+        })
+        .collect()
+}
+
+/// The geometry tier's fixed key set, in the order CONTRACTS.md §1's table
+/// lists them.
+const GEOMETRY_KEYS: &[&str] = &[
+    "gapsOut", "gapsIn", "borderSize", "rounding", "blurEnabled", "blurSize", "blurPasses",
+];
+/// The window (border-colour) component tier's fixed key set.
+const WINDOW_KEYS: &[&str] = &["border", "borderInactive"];
+
+/// Render one `rice.nix` for `rice mint`: a self-gating skeleton copying
+/// `notes`' palette/window/geometry into `aoide.drachma.<tier>` under
+/// `config.aoide.song == "<name>"` — the same shape as every committed song
+/// (CONTRACTS.md §5). `had_geometry`/`had_window` distinguish "copied from
+/// `from`" from "`from` set no opinion here, this is a fill template" in the
+/// leading comment of each block, so a reader never mistakes an all-null
+/// template for an intentional all-null override.
+fn render_rice_nix(name: &str, from: &str, notes: &Value) -> String {
+    let palette_lines = notes
+        .get("palette")
+        .and_then(Value::as_object)
+        .map(|p| {
+            p.iter()
+                .map(|(k, v)| format!("      \"{k}\" = {};\n", nix_scalar(v)))
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+
+    let window_obj = notes.get("window").and_then(Value::as_object);
+    let window_lines = nix_fixed_fields(window_obj, WINDOW_KEYS, "      ");
+    let window_comment = if window_obj.is_some() {
+        format!("inherited from song \"{from}\"")
+    } else {
+        format!("\"{from}\" set no window-colour overrides — null falls back to palette.accent/bg")
+    };
+
+    let geometry_obj = notes.get("geometry").and_then(Value::as_object);
+    let geometry_lines = nix_fixed_fields(geometry_obj, GEOMETRY_KEYS, "      ");
+    let geometry_comment = if geometry_obj.is_some() {
+        format!("inherited from song \"{from}\"")
+    } else {
+        format!(
+            "fill template — \"{from}\" carries no geometry tier; null leaves the \
+             host/compositor default (CONTRACTS.md §1)"
+        )
+    };
+
+    let mut s = String::new();
+    s.push_str(&format!(
+        "# song/songbook/{name}/rice.nix — scaffolded via `aoide rice mint` from song \"{from}\".\n"
+    ));
+    s.push_str("#\n");
+    s.push_str("# HOST-AGNOSTIC DISCIPLINE (CONTRACTS.md §5): a song sets ONLY aoide.drachma.\n");
+    s.push_str("# All drachma values are literal nix expressions (no song/ runtime reads).\n");
+    s.push_str("{ lib, config, ... }:\n");
+    s.push_str("{\n");
+    s.push_str(&format!(
+        "  config = lib.mkIf (config.aoide.song == \"{name}\") {{\n"
+    ));
+
+    s.push_str("\n    aoide.drachma.palette = {\n");
+    s.push_str(&palette_lines);
+    s.push_str("    };\n");
+
+    s.push_str(&format!("\n    # {window_comment}\n"));
+    s.push_str("    aoide.drachma.window = {\n");
+    s.push_str(&window_lines);
+    s.push_str("    };\n");
+
+    s.push_str(&format!("\n    # {geometry_comment}\n"));
+    s.push_str("    aoide.drachma.geometry = {\n");
+    s.push_str(&geometry_lines);
+    s.push_str("    };\n");
+
+    s.push_str("  };\n");
+    s.push_str("}\n");
+    s
+}
+
+/// Render `design/intent.md` for `rice mint`: honest-empty — no fabricated
+/// rationale, just what IS true (inherited from `from`, retune it) and where
+/// to go to actually fill it in.
+fn render_intent_md(name: &str, from: &str) -> String {
+    format!(
+        "# {name} — Design Intent\n\
+         \n\
+         **Rice:** {name}\n\
+         **Palette/geometry:** inherited from `{from}` — retune\n\
+         \n\
+         ---\n\
+         \n\
+         ## Palette Rationale\n\
+         \n\
+         (not yet written — this rice was scaffolded from `{from}` via `aoide rice mint`, not designed)\n\
+         \n\
+         ## Component Tier\n\
+         \n\
+         (not yet written)\n\
+         \n\
+         ## Geometry\n\
+         \n\
+         (not yet written)\n\
+         \n\
+         ## Iteration Log\n\
+         \n\
+         ## How to fill this rice\n\
+         \n\
+         - Slot catalog (which slots a host wires today, what each expects): \
+           `modules/facets/quickshell/qml/slots.md`\n\
+         - Per-song widget contract: `CONTRACTS.md` §5, \"Per-song flavor widgets\"\n\
+         - Songbook playbook: `song/songbook/update-playbook.md`\n\
+         - Drop a `widgets/<slot>.qml` here to dress a slot — any file under `widgets/` \
+           becomes a slot named for its basename; nothing renders until a host surface \
+           embeds a `WidgetSlot` anchor for that name.\n"
+    )
+}
+
+/// `rice mint <name> [--from <song>] [--force]` — scaffold a new committed
+/// song under `song/songbook/<name>/` by copying an existing song's notes.
+/// `aoide rice new` (cli.rs) is a pure parse alias for this same path — there
+/// is only ONE registry entry (`rice.mint`).
+///
+/// Writes ONLY inside `song/songbook/<name>/` (house rule 1): `rice.nix` (a
+/// self-gating skeleton — the sole `.nix` file, satisfying `checks.song-shape`),
+/// `drachma.json` (a mirror of `--from`'s, INCLUDING any geometry block, so
+/// `aoide rice preview <name>` renders + live-applies immediately),
+/// `design/intent.md` (honest-empty — no fabricated rationale), and
+/// `widgets/.gitkeep` (no per-song widgets yet). No `hypr/` dir: geometry
+/// lives in drachma, not a build fragment.
+fn handle_rice_mint(inv: &Invocation) -> Outcome {
+    let name = match inv.args.first() {
+        Some(n) => n.clone(),
+        None => {
+            return Outcome::usage(
+                "rice.mint",
+                "usage: aoide rice mint <name> [--from <song>] [--force] [--json]",
+            )
+            .with_data(json!({ "reason": "missing-name" }));
+        }
+    };
+
+    if !valid_song_name(&name) {
+        return Outcome::error(
+            "rice.mint",
+            format!(
+                "`{name}` is not a valid song name: must match `^[a-z0-9][a-z0-9-]*$` \
+                 (lowercase letters, digits, hyphens; no leading hyphen, no `/`, no `..`)"
+            ),
+        )
+        .with_data(json!({ "reason": "invalid-name", "name": name }));
+    }
+
+    let from = inv
+        .flags
+        .get("from")
+        .cloned()
+        .unwrap_or_else(|| "default".to_string());
+
+    if !valid_song_name(&from) {
+        return Outcome::error(
+            "rice.mint",
+            format!(
+                "`--from {from}` is not a valid song name: must match `^[a-z0-9][a-z0-9-]*$` \
+                 (lowercase letters, digits, hyphens; no leading hyphen, no `/`, no `..`)"
+            ),
+        )
+        .with_data(json!({ "reason": "invalid-from", "from": from }));
+    }
+    if from == name {
+        return Outcome::error(
+            "rice.mint",
+            format!("`--from` cannot be `{name}` itself — nothing to copy from"),
+        )
+        .with_data(json!({ "reason": "from-equals-name", "name": name }));
+    }
+
+    let force = inv.flag_present("force");
+
+    let target = shellbridge::songbook_dir(&name);
+    if target.exists() && !force {
+        return Outcome::error(
+            "rice.mint",
+            format!(
+                "song `{name}` already exists at {} (pass --force to overwrite)",
+                target.display()
+            ),
+        )
+        .with_data(json!({
+            "reason": "already-exists",
+            "name": name,
+            "path": target.to_string_lossy(),
+        }));
+    }
+
+    let from_notes_path = shellbridge::songbook_notes(&from);
+    let raw_notes = match std::fs::read_to_string(&from_notes_path) {
+        Ok(s) => s,
+        Err(e) => {
+            return Outcome::error(
+                "rice.mint",
+                format!(
+                    "--from song `{from}` not found: cannot read {} ({e})",
+                    from_notes_path.display()
+                ),
+            )
+            .with_data(json!({
+                "reason": "from-song-not-found",
+                "from": from,
+                "expected": from_notes_path.to_string_lossy(),
+            }));
+        }
+    };
+    let from_parsed: Value = match serde_json::from_str(&raw_notes) {
+        Ok(v) => v,
+        Err(e) => {
+            return Outcome::error(
+                "rice.mint",
+                format!("--from song `{from}`'s notes are not valid JSON: {e}"),
+            )
+            .with_data(json!({
+                "reason": "invalid-json",
+                "from": from,
+                "notes": from_notes_path.to_string_lossy(),
+            }));
+        }
+    };
+
+    let rice_nix = render_rice_nix(&name, &from, &from_parsed);
+    let intent_md = render_intent_md(&name, &from);
+
+    let writes: [(PathBuf, String); 4] = [
+        (target.join("rice.nix"), rice_nix),
+        (target.join("drachma.json"), raw_notes.clone()),
+        (target.join("design").join("intent.md"), intent_md),
+        (target.join("widgets").join(".gitkeep"), String::new()),
+    ];
+    let mut changed: Vec<String> = Vec::new();
+    for (path, contents) in &writes {
+        if let Err(e) = shellbridge::atomic_write(path, contents) {
+            return Outcome::error(
+                "rice.mint",
+                format!("failed to write {}: {e}", path.display()),
+            )
+            .with_data(json!({ "reason": "write-failed", "target": path.to_string_lossy() }));
+        }
+        changed.push(path.to_string_lossy().into_owned());
+    }
+
+    Outcome::ok(
+        "rice.mint",
+        format!(
+            "minted song `{name}` from `{from}` — {} file(s) written under {}",
+            changed.len(),
+            target.display()
+        ),
+    )
+    .changed(changed)
+    .with_data(json!({
+        "name": name,
+        "from": from,
+        "nextSteps": [
+            format!("truth: set aoide.song = \"{name}\" in the host's default.nix and rebuild"),
+            format!("sketch: `aoide rice preview {name}` to rehearse it live, no rebuild"),
+        ],
     }))
 }
 
@@ -529,6 +860,29 @@ mod tests {
 
     const VALID_NOTES: &str = r##"{ "schemaVersion":"0",
         "palette": {"bg":"#0b1021","fg":"#c8d3f5","accent":"#82aaff","urgent":"#ff757f"} }"##;
+
+    // Carries a `window` block (border colours), so `hyprctl` keyword-batch
+    // construction has something to resolve — VALID_NOTES deliberately does
+    // not, to exercise the "empty batch" path elsewhere.
+    const NOTES_WITH_WINDOW: &str = r##"{ "schemaVersion":"0",
+        "palette": {"bg":"#0b1021","fg":"#c8d3f5","accent":"#82aaff","urgent":"#ff757f"},
+        "window": {"border":"#82aaff","borderInactive":"#0b1021"} }"##;
+
+    // A song with palette + window + a full geometry block, for `rice mint`
+    // tests that need to assert every tier round-trips.
+    const NOTES_WITH_GEOMETRY: &str = r##"{ "schemaVersion":"0",
+        "palette": {"bg":"#0b1021","fg":"#c8d3f5","accent":"#82aaff","urgent":"#ff757f"},
+        "window": {"border":"#82aaff","borderInactive":"#0b1021"},
+        "geometry": {"gapsOut":10,"gapsIn":4,"borderSize":3,"rounding":6,
+                     "blurEnabled":false,"blurSize":5,"blurPasses":2} }"##;
+
+    // A hostile palette value carrying live Nix interpolation syntax — proves
+    // `nix_scalar` neutralizes `${…}` rather than letting it round-trip into
+    // `rice.nix` as a real interpolation (a real injection: a value like
+    // `"${builtins.readFile /etc/hostname}"` would otherwise EVALUATE).
+    const NOTES_WITH_INTERPOLATION: &str = r##"{ "schemaVersion":"0",
+        "palette": {"bg":"${builtins.currentTime}","fg":"#c8d3f5",
+                     "accent":"#82aaff","urgent":"#ff757f"} }"##;
 
     // Force drachma un-locatable so lint outcomes don't depend on the sandbox
     // PATH (drachma is not a build dep of aoide; the checkPhase has no PATH copy).
@@ -757,5 +1111,314 @@ mod tests {
         let out = handle_cover_set(&inv(&["cover", "set"], &[]));
         assert_eq!(out.status, Status::Usage);
         assert_eq!(out.render(false).1, crate::output::exit::USAGE);
+    }
+
+    // ── rice preview: the hyprctl live-apply guard (Phase F) ─────────────────
+
+    #[test]
+    fn preview_off_hyprland_skips_hyprctl_without_panicking() {
+        // The common test path: no compositor, `hyprctl` may not even exist on
+        // PATH — the guard must trip on the env var alone, never touching the
+        // process spawn.
+        let _g = crate::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "HYPRLAND_INSTANCE_SIGNATURE"]);
+        std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
+        let root = unique_tmp("preview-hypr-off");
+        let stage = root.join("stage");
+        let song = root.join("songbook").join("moonlight");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&song).unwrap();
+        std::fs::write(song.join("drachma.json"), NOTES_WITH_WINDOW).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_preview(&inv(&["rice", "preview"], &["moonlight"]));
+        assert_eq!(out.status, Status::Ok);
+        assert_eq!(
+            out.data.unwrap()["hyprctl"],
+            "skipped (HYPRLAND_INSTANCE_SIGNATURE unset)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn preview_with_no_window_or_geometry_reports_an_empty_batch() {
+        let _g = crate::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "HYPRLAND_INSTANCE_SIGNATURE"]);
+        std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
+        let root = unique_tmp("preview-hypr-empty");
+        let stage = root.join("stage");
+        let song = root.join("songbook").join("moonlight");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&song).unwrap();
+        std::fs::write(song.join("drachma.json"), VALID_NOTES).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_preview(&inv(&["rice", "preview"], &["moonlight"]));
+        assert_eq!(out.status, Status::Ok);
+        assert_eq!(
+            out.data.unwrap()["hyprctl"],
+            "skipped (no geometry/border keywords resolved)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── rice mint (Phase E) ───────────────────────────────────────────────────
+
+    #[test]
+    fn nix_scalar_neutralizes_dollar_interpolation() {
+        // `${` must never survive into the emitted literal live — `\$`
+        // (backslash-then-quote-then-dollar ordering) is what makes a Nix
+        // double-quoted string treat it as inert text.
+        assert_eq!(
+            nix_scalar(&Value::String("${builtins.currentTime}".to_string())),
+            "\"\\${builtins.currentTime}\""
+        );
+        assert_eq!(
+            nix_scalar(&Value::String("${x}".to_string())),
+            "\"\\${x}\""
+        );
+        // Backslash-first ordering: a literal backslash ahead of `$` must not
+        // get swallowed by the `$`-escape pass.
+        assert_eq!(
+            nix_scalar(&Value::String("\\${x}".to_string())),
+            "\"\\\\\\${x}\""
+        );
+    }
+
+    #[test]
+    fn mint_neutralizes_nix_interpolation_in_notes() {
+        let _g = crate::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("mint-interpolation");
+        let stage = root.join("stage");
+        let from_dir = root.join("songbook").join("default");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&from_dir).unwrap();
+        std::fs::write(from_dir.join("drachma.json"), NOTES_WITH_INTERPOLATION).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_mint(&inv(&["rice", "mint"], &["moonlight"]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+
+        let target = root.join("songbook").join("moonlight");
+        let rice_nix = std::fs::read_to_string(target.join("rice.nix")).unwrap();
+        // The hostile value must land as an inert literal (`\${`), never a
+        // live interpolation site (`"${` unescaped).
+        assert!(
+            rice_nix.contains(r#""bg" = "\${builtins.currentTime}";"#),
+            "expected inert literal, got: {rice_nix}"
+        );
+        assert!(
+            !rice_nix.contains(r#""${builtins.currentTime}"#),
+            "must not contain a live interpolation site: {rice_nix}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mint_rejects_invalid_names() {
+        for bad in ["Dusk", "dusk_two", "-dusk", "dusk/two", "../etc", "", "dusk.two"] {
+            let out = handle_rice_mint(&inv(&["rice", "mint"], &[bad]));
+            assert_eq!(out.status, Status::Error, "`{bad}` should be rejected");
+            assert_eq!(out.render(false).1, crate::output::exit::ERROR);
+            assert_eq!(out.data.unwrap()["reason"], "invalid-name", "for `{bad}`");
+        }
+    }
+
+    #[test]
+    fn mint_rejects_invalid_from() {
+        let _g = crate::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("mint-badfrom");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        for bad in ["../../etc", "../etc/passwd", "de/fault", "De Fault", ""] {
+            let target = root.join("songbook").join("moonlight");
+            let out = handle_rice_mint(&{
+                let mut i = inv(&["rice", "mint"], &["moonlight"]);
+                i.flags.insert("from".into(), bad.into());
+                i
+            });
+            assert_eq!(out.status, Status::Error, "`--from {bad}` should be rejected");
+            assert_eq!(out.render(false).1, crate::output::exit::ERROR);
+            assert_eq!(out.data.unwrap()["reason"], "invalid-from", "for `--from {bad}`");
+            assert!(!target.exists(), "nothing written for `--from {bad}`");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mint_rejects_from_equal_to_name() {
+        let _g = crate::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("mint-fromeqname");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let target = root.join("songbook").join("moonlight");
+        let out = handle_rice_mint(&{
+            let mut i = inv(&["rice", "mint"], &["moonlight"]);
+            i.flags.insert("from".into(), "moonlight".into());
+            i
+        });
+        assert_eq!(out.status, Status::Error);
+        assert_eq!(out.render(false).1, crate::output::exit::ERROR);
+        assert_eq!(out.data.unwrap()["reason"], "from-equals-name");
+        assert!(!target.exists(), "nothing written when --from == name");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn valid_song_name_accepts_the_expected_shape() {
+        for good in ["moonlight", "dusk2", "a", "song-two-3"] {
+            assert!(valid_song_name(good), "`{good}` should be valid");
+        }
+        for bad in ["Dusk", "dusk_two", "-dusk", "dusk/two", "..", ""] {
+            assert!(!valid_song_name(bad), "`{bad}` should be invalid");
+        }
+    }
+
+    #[test]
+    fn mint_missing_name_is_usage_exit_2() {
+        let out = handle_rice_mint(&inv(&["rice", "mint"], &[]));
+        assert_eq!(out.status, Status::Usage);
+        assert_eq!(out.render(false).1, crate::output::exit::USAGE);
+    }
+
+    #[test]
+    fn mint_missing_from_song_is_error() {
+        let _g = crate::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("mint-nofrom");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_mint(&inv(&["rice", "mint"], &["moonlight"]));
+        assert_eq!(out.status, Status::Error);
+        assert_eq!(out.render(false).1, crate::output::exit::ERROR);
+        assert_eq!(out.data.unwrap()["reason"], "from-song-not-found");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mint_scaffolds_every_file_from_a_from_song_with_no_window_or_geometry() {
+        let _g = crate::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("mint-ok");
+        let stage = root.join("stage");
+        let from_dir = root.join("songbook").join("default");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&from_dir).unwrap();
+        std::fs::write(from_dir.join("drachma.json"), VALID_NOTES).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_mint(&inv(&["rice", "mint"], &["moonlight"]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert_eq!(out.changed.len(), 4);
+
+        let target = root.join("songbook").join("moonlight");
+        assert!(target.join("rice.nix").is_file());
+        assert!(target.join("drachma.json").is_file());
+        assert!(target.join("design").join("intent.md").is_file());
+        assert!(target.join("widgets").join(".gitkeep").is_file());
+        // No stray .nix files (checks.song-shape requires rice.nix to be the
+        // ONLY .nix under a songbook entry).
+        assert!(!target.join("hypr").exists());
+
+        let rice_nix = std::fs::read_to_string(target.join("rice.nix")).unwrap();
+        assert!(rice_nix.contains("config.aoide.song == \"moonlight\""));
+        assert!(rice_nix.contains("\"#0b1021\""), "palette bg copied: {rice_nix}");
+        assert!(rice_nix.contains("border = null;"), "no window in `from` → null template");
+        assert!(rice_nix.contains("gapsOut = null;"), "no geometry in `from` → null template");
+        assert!(rice_nix.contains("carries no geometry tier"));
+
+        let mirrored = std::fs::read_to_string(target.join("drachma.json")).unwrap();
+        assert_eq!(mirrored, VALID_NOTES, "drachma.json mirrors --from exactly");
+
+        let intent = std::fs::read_to_string(target.join("design").join("intent.md")).unwrap();
+        assert!(intent.contains("inherited from `default` — retune"));
+        assert!(intent.contains("slots.md"));
+        assert!(intent.contains("update-playbook.md"));
+        assert_eq!(
+            std::fs::read_to_string(target.join("widgets").join(".gitkeep")).unwrap(),
+            ""
+        );
+
+        let data = out.data.unwrap();
+        assert_eq!(data["name"], "moonlight");
+        assert_eq!(data["from"], "default");
+        assert_eq!(data["nextSteps"].as_array().unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mint_with_geometry_and_window_copies_every_field_including_nulls() {
+        let _g = crate::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("mint-geo");
+        let stage = root.join("stage");
+        let from_dir = root.join("songbook").join("sonata");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&from_dir).unwrap();
+        std::fs::write(from_dir.join("drachma.json"), NOTES_WITH_GEOMETRY).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_mint(&{
+            let mut i = inv(&["rice", "mint"], &["dusk"]);
+            i.flags.insert("from".into(), "sonata".into());
+            i
+        });
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+
+        let target = root.join("songbook").join("dusk");
+        let rice_nix = std::fs::read_to_string(target.join("rice.nix")).unwrap();
+        assert!(rice_nix.contains("gapsOut = 10;"));
+        assert!(rice_nix.contains("gapsIn = 4;"));
+        assert!(rice_nix.contains("borderSize = 3;"));
+        assert!(rice_nix.contains("rounding = 6;"));
+        assert!(rice_nix.contains("blurEnabled = false;"));
+        assert!(rice_nix.contains("blurSize = 5;"));
+        assert!(rice_nix.contains("blurPasses = 2;"));
+        assert!(rice_nix.contains("border = \"#82aaff\";"));
+        assert!(rice_nix.contains("borderInactive = \"#0b1021\";"));
+        assert!(rice_nix.contains("inherited from song \"sonata\""));
+
+        let mirrored = std::fs::read_to_string(target.join("drachma.json")).unwrap();
+        assert_eq!(mirrored, NOTES_WITH_GEOMETRY, "geometry block mirrored verbatim");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mint_refuses_to_overwrite_without_force_then_succeeds_with_it() {
+        let _g = crate::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("mint-exists");
+        let stage = root.join("stage");
+        let from_dir = root.join("songbook").join("default");
+        let target = root.join("songbook").join("dusk");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&from_dir).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(from_dir.join("drachma.json"), VALID_NOTES).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_mint(&inv(&["rice", "mint"], &["dusk"]));
+        assert_eq!(out.status, Status::Error);
+        assert_eq!(out.render(false).1, crate::output::exit::ERROR);
+        assert_eq!(out.data.unwrap()["reason"], "already-exists");
+        assert!(!target.join("rice.nix").exists(), "nothing written without --force");
+
+        let out2 = handle_rice_mint(&{
+            let mut i = inv(&["rice", "mint"], &["dusk"]);
+            i.flags.insert("force".into(), "true".into());
+            i
+        });
+        assert_eq!(out2.status, Status::Ok, "{:?}", out2.data);
+        assert!(target.join("rice.nix").is_file());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

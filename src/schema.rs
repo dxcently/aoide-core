@@ -159,9 +159,20 @@ pub fn commands() -> Vec<Command> {
         ),
         cmd!(
             path: ["rice", "preview"],
-            summary: "Rehearse a rice live (stage/drachma.json hot-reload); nothing committed.",
+            summary: "Rehearse a rice live (stage/drachma.json hot-reload + best-effort hyprctl geometry/border apply); nothing committed.",
             args: [arg!("name", "string", true, "Rice/song name to preview (from song/songbook/).")],
             flags: [],
+            gated: false,
+            implemented: true,
+        ),
+        cmd!(
+            path: ["rice", "mint"],
+            summary: "Scaffold a new song under song/songbook/<name>/ by copying --from's notes (rice.nix, drachma.json, design/intent.md, widgets/); `rice new` is a parse alias for this.",
+            args: [arg!("name", "string", true, "New song name: ^[a-z0-9][a-z0-9-]*$ (lowercase, digits, hyphens).")],
+            flags: [
+                flag!("from", "string", "Source song to copy notes from (default \"default\")."),
+                flag!("force", "bool", "Overwrite the song's scaffolded files if it already exists."),
+            ],
             gated: false,
             implemented: true,
         ),
@@ -493,8 +504,10 @@ mod tests {
         let v = serde_json::to_value(&doc).unwrap();
         assert_eq!(v["schemaVersion"], "0");
         assert_eq!(v["aoide"], "0.0.0");
-        // 19 walking-skeleton commands + the 12 graph commands + `conductor`.
-        assert!(v["commands"].as_array().unwrap().len() >= 32);
+        // 19 walking-skeleton commands + the 12 graph commands + `conductor`
+        // + `rice mint` (v0 phase E — `rice new` is a parse alias, not a
+        // second registry entry).
+        assert!(v["commands"].as_array().unwrap().len() >= 33);
     }
 
     #[test]

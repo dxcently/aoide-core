@@ -68,9 +68,18 @@ pub fn song_dir() -> PathBuf {
         .unwrap_or(stage)
 }
 
+/// The committed-song directory: `<song>/songbook/<name>/`.
+///
+/// Shares [`song_dir`]'s `AOIDE_STAGE_DIR`-relative resolution, so a test that
+/// points the stage dir at a tmp dir gets an isolated songbook root alongside
+/// it (no separate `$AOIDE_SONGBOOK_DIR` needed — one seam, not two).
+pub fn songbook_dir(name: &str) -> PathBuf {
+    song_dir().join("songbook").join(name)
+}
+
 /// The committed-song notes file: `<song>/songbook/<name>/drachma.json`.
 pub fn songbook_notes(name: &str) -> PathBuf {
-    song_dir().join("songbook").join(name).join("drachma.json")
+    songbook_dir(name).join("drachma.json")
 }
 
 /// Atomic write-temp-then-rename into a file within a directory.

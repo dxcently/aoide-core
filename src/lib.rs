@@ -12,6 +12,7 @@ pub mod dispatch;
 pub mod graph;
 pub mod reap;
 pub mod guide;
+pub mod hypr;
 pub mod mcp;
 pub mod notes;
 pub mod output;
