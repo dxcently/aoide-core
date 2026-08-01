@@ -2,7 +2,8 @@
 //!
 //! The tool list is GENERATED from `schema --json` — each command becomes one
 //! tool — and `tools/call` dispatches back into the same command handlers the
-//! CLI uses. One implementation, two doors, no drift.
+//! CLI uses. One implementation, two doors, no drift (A2A, `a2a.rs`, is the
+//! third door onto the same schema — CONTRACTS.md §6).
 //!
 //! This is a minimal, dependency-free JSON-RPC 2.0 over newline-delimited
 //! stdin/stdout: enough for a per-session agent to enumerate and call tools.

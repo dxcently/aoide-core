@@ -1,6 +1,6 @@
 //! The A2A (Agent2Agent) door — a hand-rolled, dependency-free JSON-RPC 2.0
-//! over HTTP/1.1 server (CONTRACTS.md §6, Phase B: server MVP, read-only
-//! half).
+//! over HTTP/1.1 server (CONTRACTS.md §6, Phase B: server MVP, now with
+//! `message/send` execution — Phase B2).
 //!
 //! Zero new crates: a blocking `TcpListener` accept loop (thread-per-
 //! connection), a minimal HTTP/1.1 request/response layer hand-parsed off
@@ -12,19 +12,29 @@
 //! Routes (CONTRACTS.md §6 MVP surface):
 //!   - `GET  /.well-known/agent-card.json` — the AgentCard, derived from the
 //!     command registry (`schema --json`), filtered to `implemented: true`.
-//!   - `POST /` — JSON-RPC 2.0: `tasks/get` (real), `message/send` (a
-//!     well-formed "not yet" error — execution semantics land in a later
-//!     phase), anything else → `-32601 method not found`.
+//!   - `POST /` — JSON-RPC 2.0: `tasks/get` (real), `message/send` (real —
+//!     inject into a known conductable session, or spawn a freshly conducted
+//!     one; [`decide_send_action`] below), anything else → `-32601 method
+//!     not found`.
 //!
-//! A forwarded A2A message is untrusted DATA, never executed — this door
-//! only reads `sessions.json` and reports state; it runs nothing.
+//! A forwarded A2A message's TEXT is untrusted DATA, never executed as a
+//! command — `message/send`'s inject path types it into a target session
+//! exactly like `graph send` (in fact it reuses [`crate::graph::session_send`]
+//! for that), and its spawn path never runs a client-supplied command: it
+//! only ever launches the operator-configured `aoide.a2a.spawnAgent`
+//! executable (a rebuild-gated nix option — the user's admission), with the
+//! client-supplied prompt injected as its first turn. See
+//! [`decide_send_action`]'s doc comment for the full security model.
 
 use crate::daemon::{self, Door};
 use crate::dispatch::Invocation;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -87,6 +97,22 @@ pub fn resolve_bind_port(inv: &Invocation) -> (String, u16) {
         })
         .unwrap_or(8710);
     (bind, port)
+}
+
+/// Resolve `aoide.a2a.spawnAgent`: the command `message/send`'s SPAWN path
+/// conducts for a client that names no known session (or explicitly asks to
+/// spawn). `--spawn-agent` flag → `AOIDE_A2A_SPAWN_AGENT` env (set by the
+/// `aoide-a2a` systemd unit, `modules/nucleus/aoided.nix`) → default `""`
+/// (empty = spawning disabled — [`decide_send_action`] returns a structured
+/// error rather than launching anything). The client NEVER supplies this
+/// command — only the operator, via the rebuild-gated nix option
+/// (CONTRACTS.md §6, security model).
+pub fn resolve_spawn_agent(inv: &Invocation) -> String {
+    inv.flags
+        .get("spawn-agent")
+        .cloned()
+        .or_else(|| std::env::var("AOIDE_A2A_SPAWN_AGENT").ok())
+        .unwrap_or_default()
 }
 
 // ── AgentCard (derived from the command registry, CONTRACTS.md §6) ──────────
@@ -174,9 +200,12 @@ pub fn a2a_task_state(canonical: &str, needs_sudo: bool) -> &'static str {
 /// `tasks/get id:<sessionId>` — CONTRACTS.md §6 MVP simplification: the A2A
 /// Task id and its contextId are BOTH the aoide sessionId (Task=turn vs
 /// contextId=session is the real shape; this phase has no multi-task-per-
-/// session tracking yet). TODO(a2a-b2): once `message/send` lands and a
-/// session can carry more than one in-flight turn, split Task id from
-/// contextId for real.
+/// session tracking yet — `tasks/get` always reports the session's CURRENT
+/// state, not a specific past turn). TODO(a2a-b3+): splitting Task id from
+/// contextId for real per-turn tracking (so a session with several
+/// in-flight/completed turns exposes each as its own Task) is still future
+/// work — `message/send` (Phase B2) landed the inject/spawn execution
+/// semantics but kept this MVP id-collapse.
 fn task_from_sessions(
     sessions: &[crate::graph::SessionRecord],
     id: &str,
@@ -190,8 +219,8 @@ fn task_from_sessions(
     let state = a2a_task_state(canonical, needs_sudo);
     Ok(json!({
         "id": rec.session_id,
-        // TODO(a2a-b2): task id == sessionId, contextId == sessionId — see
-        // the doc comment above.
+        // MVP simplification: task id == sessionId, contextId == sessionId —
+        // see the doc comment above.
         "contextId": rec.session_id,
         "status": { "state": state, "timestamp": crate::graph::now_iso_utc() },
         "kind": "task",
@@ -206,10 +235,302 @@ fn task_get(task_id: &str) -> Result<Value, (i64, String)> {
     task_from_sessions(&sf.sessions, task_id)
 }
 
+// ── `message/send`: the inject-or-spawn execution door (Phase B2) ───────────
+//
+// SECURITY MODEL (CONTRACTS.md §6): a `message/send` SPAWN never runs a
+// client-supplied command. The executable comes ONLY from
+// `aoide.a2a.spawnAgent` — a nix option, resolved once at `a2a serve` launch
+// ([`resolve_spawn_agent`]) — which is rebuild-gated: setting it is the
+// user's admission, made once at rebuild time, not per-request. This bounds
+// what an external A2A client can do to: (1) task the ALREADY-configured
+// agent with a prompt (never a command), or (2) steer an EXISTING conductable
+// session the same way `graph send` would. If `spawnAgent` is unset (the
+// default), spawning is simply unavailable — a structured error, not a
+// silent no-op. There is deliberately no interactive per-request gate (unlike
+// `graph send`'s pending/--yes/autogate dance): a JSON-RPC request/response
+// cannot block on a human clicking "approve" mid-request, so the gate is
+// moved entirely to rebuild time, plus the standing loopback bind + the
+// Door::A2a audit trail on every inject/spawn/error.
+
+/// What [`decide_send_action`] needs to know about a session named by a
+/// `contextId`, decoupled from [`crate::graph::SessionRecord`] so the pure
+/// decision stays testable without a stage file on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionRef {
+    pub conductable: bool,
+    pub has_socket: bool,
+}
+
+/// The routing decision `message/send` resolves to — inject into a known
+/// session, spawn a fresh conducted one, or a structured JSON-RPC error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendAction {
+    Inject { session_id: String },
+    Spawn { agent_cmd: String },
+    Error { code: i64, msg: String },
+}
+
+/// The pure spawn-vs-inject-vs-error decision (CONTRACTS.md §6, "the decided
+/// semantics"). No I/O — `session_lookup` is injected so this is unit-testable
+/// without a stage file, a socket, or a process.
+///
+/// - `spawn_asked` (the client set `metadata["aoide/spawn"] == true`) OR a
+///   missing `context_id` → **Spawn** the configured agent, or **Error**
+///   (`-32004`, "A2A spawn not configured") if `spawn_agent` is empty.
+/// - A `context_id` naming a KNOWN, conductable(+socketed) session →
+///   **Inject** into it.
+/// - A `context_id` naming a known but NOT conductable session → **Error**
+///   (`-32004`, "session not conductable").
+/// - A `context_id` naming nothing → **Error** (`-32001`, "task not found").
+pub fn decide_send_action(
+    context_id: Option<&str>,
+    spawn_asked: bool,
+    spawn_agent: &str,
+    session_lookup: impl Fn(&str) -> Option<SessionRef>,
+) -> SendAction {
+    if spawn_asked || context_id.is_none() {
+        return if spawn_agent.is_empty() {
+            SendAction::Error {
+                code: -32004,
+                msg: "A2A spawn not configured".to_string(),
+            }
+        } else {
+            SendAction::Spawn {
+                agent_cmd: spawn_agent.to_string(),
+            }
+        };
+    }
+    // context_id is Some past this point (the None arm returned above).
+    let id = context_id.expect("context_id is Some (checked above)");
+    match session_lookup(id) {
+        Some(sref) if sref.conductable && sref.has_socket => SendAction::Inject {
+            session_id: id.to_string(),
+        },
+        Some(_) => SendAction::Error {
+            code: -32004,
+            msg: "session not conductable".to_string(),
+        },
+        None => SendAction::Error {
+            code: -32001,
+            msg: "task not found".to_string(),
+        },
+    }
+}
+
+/// Concatenate every text `part`'s `text` field into one prompt — A2A's
+/// `Part` union carries `text`/`file`/`data` variants; non-text parts are
+/// ignored for this MVP (a richer multi-modal prompt is a later phase). Pure.
+fn extract_prompt_text(message: &Value) -> String {
+    message
+        .get("parts")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// Resolve `contextId`: prefer `message.contextId`, fall back to the
+/// top-level `params.contextId` (both are valid per the A2A JSON-RPC binding;
+/// aoide accepts either spot). An empty string is treated as absent. Pure.
+fn extract_context_id(message: &Value, params: &Value) -> Option<String> {
+    message
+        .get("contextId")
+        .and_then(Value::as_str)
+        .or_else(|| params.get("contextId").and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// The explicit-spawn signal: `metadata["aoide/spawn"] == true`, checked on
+/// `message.metadata` first, then top-level `params.metadata` (CONTRACTS.md
+/// §6 documents this key). Pure.
+fn spawn_requested(message: &Value, params: &Value) -> bool {
+    let flagged = |v: &Value| {
+        v.get("metadata")
+            .and_then(|m| m.get("aoide/spawn"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
+    flagged(message) || flagged(params)
+}
+
+/// Parse one `message/send` `params` object into (prompt text, contextId,
+/// spawn_asked) — pure, so the parsing itself is unit-testable independent of
+/// [`decide_send_action`] and the I/O that follows it.
+fn parse_message_send_params(params: &Value) -> (String, Option<String>, bool) {
+    let message = params.get("message").cloned().unwrap_or(Value::Null);
+    let prompt = extract_prompt_text(&message);
+    let context_id = extract_context_id(&message, params);
+    let spawn_asked = spawn_requested(&message, params);
+    (prompt, context_id, spawn_asked)
+}
+
+fn unix_ts_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `session_lookup` for [`decide_send_action`]: read `sessions.json` off the
+/// stage and resolve one [`SessionRef`] by id.
+fn session_ref_lookup(id: &str) -> Option<SessionRef> {
+    let sf: crate::graph::SessionsFile = crate::graph::load_stage(&crate::graph::sessions_path()).ok()?;
+    sf.sessions.iter().find(|s| s.session_id == id).map(|s| SessionRef {
+        conductable: s.conductable == Some(true),
+        has_socket: s.socket.as_deref().map(|v| !v.is_empty()).unwrap_or(false),
+    })
+}
+
+/// Deliver into a KNOWN, conductable session: reuse
+/// [`crate::graph::session_send`] (the same gated injection door `graph send`
+/// uses) rather than reimplementing the socket write. Built with `--yes`
+/// (message/send's whole point is to deliver now, not queue a pending
+/// approval — the A2A door's own admission, rebuild-gating +
+/// loopback + audit, already stands in for that gate) and `--submit` (the
+/// prompt is a full turn, not a keystroke). Returns the freshly-reloaded Task
+/// so the caller sees the state the injection actually produced.
+fn do_inject(session_id: &str, prompt: &str, audit_log: &Path) -> Result<Value, (i64, String)> {
+    let mut flags = std::collections::BTreeMap::new();
+    flags.insert("id".to_string(), session_id.to_string());
+    flags.insert("submit".to_string(), "true".to_string());
+    flags.insert("yes".to_string(), "true".to_string());
+    flags.insert("audit-log".to_string(), audit_log.to_string_lossy().into_owned());
+    let inv = Invocation {
+        path: vec!["graph".to_string(), "send".to_string()],
+        args: vec![prompt.to_string()],
+        flags,
+        door: Door::A2a,
+    };
+    let outcome = crate::graph::session_send(&inv);
+    if outcome.status != crate::output::Status::Ok {
+        return Err((-32603, outcome.message));
+    }
+    task_get(session_id)
+}
+
+/// Best-effort: connect to a just-spawned conducted session's control socket
+/// and type `prompt` as its first turn, retrying while the child hasn't
+/// bound it yet — the same connect-and-retry shape
+/// `graph/conduct.rs`'s own PTY-injection test uses (there, proving the
+/// production socket-write path; here, actually driving it). A missed
+/// connect after the retry budget is tolerated: the session still exists and
+/// is `conductable`, just without its opening turn typed in — a client can
+/// always follow up with a plain `graph send`/another `message/send`.
+fn spawn_inject_prompt(id: &str, prompt: &str) {
+    if prompt.is_empty() {
+        return;
+    }
+    let socket = crate::graph::conduct_socket_path(id);
+    let payload = format!("{prompt}\n");
+    for _ in 0..300 {
+        if socket.exists() {
+            if let Ok(mut s) = UnixStream::connect(&socket) {
+                let _ = s.write_all(payload.as_bytes());
+                let _ = s.flush();
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Spawn a NEW conducted session running the CONFIGURED agent (never a
+/// client-supplied command — see the security-model note above `SessionRef`).
+/// Detached: launched via the aoide binary's own `conduct` subcommand
+/// (`std::env::current_exe()`), `setsid`'d so it survives this handler
+/// thread, stdio nulled, and NOT waited on — it is parented to the
+/// long-lived `a2a serve` daemon (acceptable for MVP; TODO(a2a-b3+): reap
+/// finished A2A-spawned children instead of leaking zombies under a
+/// long-lived daemon).
+fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path) -> Result<Value, (i64, String)> {
+    let id = format!("a2a-{}-{}", std::process::id(), unix_ts_now());
+    let aoide_bin = std::env::current_exe()
+        .map_err(|e| (-32603_i64, format!("resolving the aoide binary: {e}")))?;
+
+    let mut argv: Vec<String> = vec![
+        "conduct".to_string(),
+        "--agent".to_string(),
+        "a2a".to_string(),
+        "--id".to_string(),
+        id.clone(),
+        "--".to_string(),
+    ];
+    argv.extend(agent_cmd.split_whitespace().map(str::to_string));
+
+    let mut cmd = std::process::Command::new(&aoide_bin);
+    cmd.args(&argv)
+        .env("AOIDE_AUDIT_LOG", audit_log)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: `setsid()` is async-signal-safe and is the only call made in
+    // this pre_exec hook (same discipline as `graph/conduct.rs::spawn_on_pty`'s
+    // pre_exec) — it detaches the child into its own session so it survives
+    // this HTTP handler thread's lifetime. A failure here (already a session
+    // leader — vanishingly unlikely for a freshly-forked child) is not fatal
+    // to the spawn; the child would just inherit our process group instead.
+    unsafe {
+        cmd.pre_exec(|| {
+            let _ = libc::setsid();
+            Ok(())
+        });
+    }
+
+    match cmd.spawn() {
+        Ok(_child) => {
+            // Best-effort first-turn injection — see the doc comment above.
+            spawn_inject_prompt(&id, prompt);
+            let _ = daemon::audit(
+                audit_log,
+                Door::A2a,
+                daemon::EventClass::Audit,
+                "a2a.message/send",
+                "ok",
+                &format!("spawned conducted session `{id}` (configured agent)"),
+            );
+            Ok(json!({
+                "id": id,
+                "contextId": id,
+                "status": { "state": "submitted", "timestamp": crate::graph::now_iso_utc() },
+                "kind": "task",
+            }))
+        }
+        Err(e) => {
+            let msg = format!("failed to spawn A2A agent: {e}");
+            let _ = daemon::audit(
+                audit_log,
+                Door::A2a,
+                daemon::EventClass::Audit,
+                "a2a.message/send",
+                "error",
+                &msg,
+            );
+            Err((-32603, msg))
+        }
+    }
+}
+
+/// `message/send`: parse params, resolve [`decide_send_action`], execute.
+fn message_send(params: &Value, audit_log: &Path, spawn_agent: &str) -> Result<Value, (i64, String)> {
+    let (prompt, context_id, spawn_asked) = parse_message_send_params(params);
+    match decide_send_action(context_id.as_deref(), spawn_asked, spawn_agent, session_ref_lookup) {
+        SendAction::Inject { session_id } => do_inject(&session_id, &prompt, audit_log),
+        SendAction::Spawn { agent_cmd } => do_spawn(&agent_cmd, &prompt, audit_log),
+        SendAction::Error { code, msg } => Err((code, msg)),
+    }
+}
+
 /// Handle one parsed JSON-RPC 2.0 request `Value`, returning the response
 /// `Value` (always — unlike `mcp.rs`'s stdio notifications, an HTTP POST
-/// always gets a reply body).
-fn handle_jsonrpc(req: &Value) -> Value {
+/// always gets a reply body). `audit_log`/`spawn_agent` are only consulted by
+/// `message/send`.
+fn handle_jsonrpc(req: &Value, audit_log: &Path, spawn_agent: &str) -> Value {
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);
@@ -219,10 +540,7 @@ fn handle_jsonrpc(req: &Value) -> Value {
             let task_id = params.get("id").and_then(Value::as_str).unwrap_or("");
             task_get(task_id)
         }
-        "message/send" => Err((
-            -32004,
-            "message/send lands in a later A2A phase (execution semantics pending)".to_string(),
-        )),
+        "message/send" => message_send(&params, audit_log, spawn_agent),
         "" => Err((-32600, "invalid request: missing method".to_string())),
         other => Err((-32601, format!("method not found: {other}"))),
     };
@@ -239,9 +557,9 @@ fn jsonrpc_error_value(code: i64, message: impl Into<String>) -> Value {
     json!({ "jsonrpc": "2.0", "id": Value::Null, "error": { "code": code, "message": message.into() } })
 }
 
-fn handle_jsonrpc_bytes(body: &[u8]) -> Value {
+fn handle_jsonrpc_bytes(body: &[u8], audit_log: &Path, spawn_agent: &str) -> Value {
     match serde_json::from_slice::<Value>(body) {
-        Ok(req) => handle_jsonrpc(&req),
+        Ok(req) => handle_jsonrpc(&req, audit_log, spawn_agent),
         Err(e) => jsonrpc_error_value(-32700, format!("parse error: {e}")),
     }
 }
@@ -445,9 +763,17 @@ fn method_not_allowed(method: &str, path: &str) -> (u16, Vec<u8>, String) {
 }
 
 /// Route one parsed request to (HTTP status, response body, audit-log
-/// command label). Kept pure — no I/O beyond what's already in `req` — so it
-/// unit-tests without a real socket.
-fn route(req: &HttpRequest, bind: &str, port: u16) -> (u16, Vec<u8>, String) {
+/// command label). `audit_log`/`spawn_agent` are only consulted by a POST `/`
+/// whose body parses as `message/send` — every other route is pure I/O-free
+/// routing over what's already in `req`, so it still unit-tests without a
+/// real socket, spawn, or audit-log write.
+fn route(
+    req: &HttpRequest,
+    bind: &str,
+    port: u16,
+    audit_log: &Path,
+    spawn_agent: &str,
+) -> (u16, Vec<u8>, String) {
     match req.path.as_str() {
         "/.well-known/agent-card.json" => {
             if req.method == "GET" {
@@ -479,7 +805,7 @@ fn route(req: &HttpRequest, bind: &str, port: u16) -> (u16, Vec<u8>, String) {
                     Some("message/send") => "message/send",
                     _ => "rpc",
                 };
-                let resp = handle_jsonrpc_bytes(&req.body);
+                let resp = handle_jsonrpc_bytes(&req.body, audit_log, spawn_agent);
                 let body = serde_json::to_vec(&resp).unwrap_or_default();
                 (200, body, format!("a2a.{label}"))
             } else {
@@ -517,7 +843,7 @@ impl Drop for ConnGuard {
 // TODO(a2a-hardening): chunked Transfer-Encoding and extra systemd
 // sandboxing (aoide-a2a.service) are deliberately out of scope for this
 // pass — see the security-review notes that produced this hardening.
-pub fn serve(bind: &str, port: u16, audit_log: &Path) -> std::io::Result<()> {
+pub fn serve(bind: &str, port: u16, audit_log: &Path, spawn_agent: &str) -> std::io::Result<()> {
     let listener = TcpListener::bind((bind, port))?;
     eprintln!("aoide a2a: listening on http://{bind}:{port}/");
     for incoming in listener.incoming() {
@@ -545,9 +871,10 @@ pub fn serve(bind: &str, port: u16, audit_log: &Path) -> std::io::Result<()> {
 
         let bind = bind.to_string();
         let audit_log = audit_log.to_path_buf();
+        let spawn_agent = spawn_agent.to_string();
         std::thread::spawn(move || {
             let _guard = ConnGuard; // released on every exit path, incl. panic
-            if let Err(e) = handle_connection(stream, &bind, port, &audit_log) {
+            if let Err(e) = handle_connection(stream, &bind, port, &audit_log, &spawn_agent) {
                 eprintln!("aoide a2a: connection error: {e}");
             }
         });
@@ -563,6 +890,7 @@ fn handle_connection(
     bind: &str,
     port: u16,
     audit_log: &Path,
+    spawn_agent: &str,
 ) -> std::io::Result<()> {
     // Never let one slow/hostile client wedge a server thread forever: the
     // per-read timeout catches a fully-idle client, and the absolute
@@ -574,7 +902,7 @@ fn handle_connection(
 
     let start = Instant::now();
     let (status, body, audit_cmd) = match parse_http_request(&mut reader, start) {
-        Ok(req) => route(&req, bind, port),
+        Ok(req) => route(&req, bind, port, audit_log, spawn_agent),
         Err(e) => {
             let b = jsonrpc_error_value(-32700, format!("bad request: {}", e.message));
             (
@@ -697,22 +1025,238 @@ mod tests {
         assert_eq!(err.1, "task not found");
     }
 
+    // ── `decide_send_action` — every branch (pure, no I/O) ───────────────────
+
     #[test]
-    fn message_send_is_a_well_formed_not_yet_error() {
-        let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {} });
-        let resp = handle_jsonrpc(&req);
+    fn decide_send_action_spawn_asked_wins_even_with_a_valid_contextid() {
+        // spawn_asked == true short-circuits the contextId lookup entirely —
+        // the closure below panics if it's ever consulted.
+        let action = decide_send_action(Some("sess-1"), true, "claude", |_| {
+            panic!("session_lookup must not be consulted when spawn is explicitly asked")
+        });
+        assert_eq!(action, SendAction::Spawn { agent_cmd: "claude".to_string() });
+    }
+
+    #[test]
+    fn decide_send_action_no_context_id_spawns() {
+        let action = decide_send_action(None, false, "claude", |_| {
+            panic!("session_lookup must not be consulted with no contextId")
+        });
+        assert_eq!(action, SendAction::Spawn { agent_cmd: "claude".to_string() });
+    }
+
+    #[test]
+    fn decide_send_action_spawn_disabled_is_a_structured_error() {
+        // No contextId AND an empty spawn_agent (the default,
+        // `aoide.a2a.spawnAgent = ""`) → a structured error, not a silent
+        // no-op and not a fallback to something else.
+        let action = decide_send_action(None, false, "", |_| {
+            panic!("session_lookup must not be consulted with no contextId")
+        });
+        assert_eq!(
+            action,
+            SendAction::Error { code: -32004, msg: "A2A spawn not configured".to_string() }
+        );
+        // Same error when spawn IS explicitly asked but nothing is configured.
+        let action2 = decide_send_action(Some("sess-1"), true, "", |_| None);
+        assert_eq!(
+            action2,
+            SendAction::Error { code: -32004, msg: "A2A spawn not configured".to_string() }
+        );
+    }
+
+    #[test]
+    fn decide_send_action_known_conductable_session_injects() {
+        let action = decide_send_action(Some("sess-1"), false, "claude", |id| {
+            assert_eq!(id, "sess-1");
+            Some(SessionRef { conductable: true, has_socket: true })
+        });
+        assert_eq!(action, SendAction::Inject { session_id: "sess-1".to_string() });
+    }
+
+    #[test]
+    fn decide_send_action_known_but_not_conductable_is_an_error() {
+        // Registered but not conductable (no control socket) — same shape as
+        // `graph send`'s own `not-conductable` rejection.
+        let action = decide_send_action(Some("plain"), false, "claude", |_| {
+            Some(SessionRef { conductable: false, has_socket: false })
+        });
+        assert_eq!(
+            action,
+            SendAction::Error { code: -32004, msg: "session not conductable".to_string() }
+        );
+        // Conductable but socket-less (a bind failure at conduct time) is the
+        // same rejection — `has_socket` gates it too.
+        let action2 = decide_send_action(Some("nosock"), false, "claude", |_| {
+            Some(SessionRef { conductable: true, has_socket: false })
+        });
+        assert_eq!(
+            action2,
+            SendAction::Error { code: -32004, msg: "session not conductable".to_string() }
+        );
+    }
+
+    #[test]
+    fn decide_send_action_unknown_context_id_is_task_not_found() {
+        let action = decide_send_action(Some("ghost"), false, "claude", |_| None);
+        assert_eq!(
+            action,
+            SendAction::Error { code: -32001, msg: "task not found".to_string() }
+        );
+    }
+
+    // ── `message/send` param parsing (pure, no I/O) ──────────────────────────
+
+    #[test]
+    fn extract_prompt_text_concatenates_text_parts_and_ignores_others() {
+        let message = json!({
+            "parts": [
+                { "kind": "text", "text": "hello" },
+                { "kind": "file", "uri": "ignored://non-text-part" },
+                { "kind": "text", "text": "world" },
+            ]
+        });
+        assert_eq!(extract_prompt_text(&message), "hello\nworld");
+        // No parts at all → empty prompt, not a panic.
+        assert_eq!(extract_prompt_text(&json!({})), "");
+    }
+
+    #[test]
+    fn extract_context_id_prefers_message_then_falls_back_to_params() {
+        // message.contextId wins over params.contextId when both are present.
+        let message = json!({ "contextId": "from-message" });
+        let params = json!({ "contextId": "from-params" });
+        assert_eq!(extract_context_id(&message, &params), Some("from-message".to_string()));
+        // Falls back to params.contextId when the message carries none.
+        assert_eq!(
+            extract_context_id(&json!({}), &params),
+            Some("from-params".to_string())
+        );
+        // Neither present, or an empty string, is treated as absent.
+        assert_eq!(extract_context_id(&json!({}), &json!({})), None);
+        assert_eq!(
+            extract_context_id(&json!({ "contextId": "" }), &json!({})),
+            None
+        );
+    }
+
+    #[test]
+    fn spawn_requested_reads_the_aoide_spawn_metadata_key() {
+        // The documented key, on the message object.
+        let message = json!({ "metadata": { "aoide/spawn": true } });
+        assert!(spawn_requested(&message, &json!({})));
+        // Or on the top-level params object.
+        let params = json!({ "metadata": { "aoide/spawn": true } });
+        assert!(spawn_requested(&json!({}), &params));
+        // Absent, false, or a non-boolean value → not requested.
+        assert!(!spawn_requested(&json!({}), &json!({})));
+        assert!(!spawn_requested(
+            &json!({ "metadata": { "aoide/spawn": false } }),
+            &json!({})
+        ));
+        assert!(!spawn_requested(
+            &json!({ "metadata": { "aoide/spawn": "true" } }),
+            &json!({})
+        ));
+    }
+
+    #[test]
+    fn parse_message_send_params_extracts_all_three_fields_together() {
+        let params = json!({
+            "message": {
+                "role": "user",
+                "parts": [{ "kind": "text", "text": "do the thing" }],
+                "contextId": "sess-9",
+                "metadata": { "aoide/spawn": true },
+            }
+        });
+        let (prompt, context_id, spawn_asked) = parse_message_send_params(&params);
+        assert_eq!(prompt, "do the thing");
+        assert_eq!(context_id.as_deref(), Some("sess-9"));
+        assert!(spawn_asked);
+
+        // A minimal params with no `message` at all is tolerated, not a panic.
+        let (prompt2, context_id2, spawn_asked2) = parse_message_send_params(&json!({}));
+        assert_eq!(prompt2, "");
+        assert_eq!(context_id2, None);
+        assert!(!spawn_asked2);
+    }
+
+    // ── `message/send` end-to-end via `handle_jsonrpc` — ERROR branches only.
+    // Every one of these resolves to `SendAction::Error` before touching a
+    // socket or a process, so none of them spawn or bind (house rule: no
+    // real spawn/socket/bind in this suite).
+
+    #[test]
+    fn message_send_with_no_context_and_spawning_disabled_is_a2a_dash_32004() {
+        let req = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "message/send",
+            "params": { "message": { "parts": [{ "kind": "text", "text": "hi" }] } }
+        });
+        // spawn_agent == "" (the default) → decide_send_action errors out
+        // before any process would be spawned.
+        let resp = handle_jsonrpc(&req, Path::new("/dev/null"), "");
         assert_eq!(resp["error"]["code"], -32004);
-        assert!(resp["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("later A2A phase"));
+        assert_eq!(resp["error"]["message"], "A2A spawn not configured");
         assert_eq!(resp["id"], 1);
+    }
+
+    #[test]
+    fn message_send_end_to_end_unknown_and_unconductable_contexts_are_clean_errors() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = std::env::temp_dir().join(format!(
+            "aoide-a2a-send-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        // A registered session with no control socket (not conductable).
+        let sf = crate::graph::SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![fixture_session("plain", "working", None)],
+        };
+        crate::graph::write_stage(&crate::graph::sessions_path(), &sf).unwrap();
+
+        // Unknown contextId → -32001 (never reaches the socket/spawn layer).
+        let req = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "message/send",
+            "params": { "message": {
+                "parts": [{ "kind": "text", "text": "hi" }],
+                "contextId": "ghost",
+            } }
+        });
+        let resp = handle_jsonrpc(&req, Path::new("/dev/null"), "claude");
+        assert_eq!(resp["error"]["code"], -32001);
+
+        // Known but not conductable → -32004 "session not conductable".
+        let req2 = json!({
+            "jsonrpc": "2.0", "id": 2, "method": "message/send",
+            "params": { "message": {
+                "parts": [{ "kind": "text", "text": "hi" }],
+                "contextId": "plain",
+            } }
+        });
+        let resp2 = handle_jsonrpc(&req2, Path::new("/dev/null"), "claude");
+        assert_eq!(resp2["error"]["code"], -32004);
+        assert_eq!(resp2["error"]["message"], "session not conductable");
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
     }
 
     #[test]
     fn unknown_method_is_minus_32601() {
         let req = json!({ "jsonrpc": "2.0", "id": 2, "method": "bogus/verb", "params": {} });
-        let resp = handle_jsonrpc(&req);
+        let resp = handle_jsonrpc(&req, Path::new("/dev/null"), "");
         assert_eq!(resp["error"]["code"], -32601);
     }
 
@@ -738,11 +1282,11 @@ mod tests {
         crate::graph::write_stage(&crate::graph::sessions_path(), &sf).unwrap();
 
         let req = json!({ "jsonrpc": "2.0", "id": 7, "method": "tasks/get", "params": { "id": "s1" } });
-        let resp = handle_jsonrpc(&req);
+        let resp = handle_jsonrpc(&req, Path::new("/dev/null"), "");
         assert_eq!(resp["result"]["status"]["state"], "completed");
 
         let req = json!({ "jsonrpc": "2.0", "id": 8, "method": "tasks/get", "params": { "id": "ghost" } });
-        let resp = handle_jsonrpc(&req);
+        let resp = handle_jsonrpc(&req, Path::new("/dev/null"), "");
         assert_eq!(resp["error"]["code"], -32001);
 
         match saved {
@@ -861,6 +1405,8 @@ mod tests {
             &HttpRequest { method: "GET".into(), path: "/nope".into(), body: vec![] },
             "127.0.0.1",
             8710,
+            Path::new("/dev/null"),
+            "",
         );
         assert_eq!(status, 404);
         let v: Value = serde_json::from_slice(&body).unwrap();
@@ -874,6 +1420,8 @@ mod tests {
             },
             "127.0.0.1",
             8710,
+            Path::new("/dev/null"),
+            "",
         );
         assert_eq!(status, 405);
         let v: Value = serde_json::from_slice(&body).unwrap();

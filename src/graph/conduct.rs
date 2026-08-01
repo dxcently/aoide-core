@@ -41,7 +41,7 @@ pub(in crate::graph) fn unix_ts() -> u64 {
 /// `$XDG_RUNTIME_DIR/aoide/session-<id>.sock` — the same user-scoped runtime-dir
 /// convention as shellbridge's socket (never networked). A missing
 /// `XDG_RUNTIME_DIR` falls back to `/run/user/1000` like [`crate::shellbridge`].
-pub(in crate::graph) fn conduct_socket_path(id: &str) -> PathBuf {
+pub(crate) fn conduct_socket_path(id: &str) -> PathBuf {
     let runtime = std::env::var("XDG_RUNTIME_DIR")
         .ok()
         .filter(|s| !s.is_empty())

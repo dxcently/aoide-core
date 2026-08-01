@@ -2,9 +2,9 @@
 //!
 //! Every command in the tree is described here ONCE, alongside the handler
 //! that runs it. The CLI dispatcher (`dispatch.rs`), the `schema --json`
-//! emitter, and the MCP tool list all derive from this single [`Registry`] —
-//! the "two doors, one schema" contract (concepts/Agent-Interface). Nothing
-//! else in the crate enumerates commands.
+//! emitter, the MCP tool list, and the A2A AgentCard (`a2a.rs`) all derive
+//! from this single [`Registry`] — the "three doors, one schema" contract
+//! (concepts/Agent-Interface). Nothing else in the crate enumerates commands.
 //!
 //! Each command group lives in its own `commands/<group>.rs` module and
 //! contributes its entries via a `register(&mut Registry)` function; see

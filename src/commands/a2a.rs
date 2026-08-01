@@ -1,12 +1,14 @@
 //! `a2a serve` / `a2a agent add|list|remove` — the A2A (Agent2Agent) door
-//! group (CONTRACTS.md §6). Phase B flips `a2a serve` real: a read-only
-//! JSON-RPC/HTTP server (`src/a2a.rs`) — AgentCard + `tasks/get`, with
-//! `message/send` returning a well-formed "not yet" error. `a2a serve`
-//! itself is a long-running blocking server, so `lib.rs::run_cli`
-//! special-cases its launch exactly like `mcp serve --stdio`/`conductor`;
-//! the handler below only covers the non-Cli-door / metadata path (mirrors
-//! `commands/infra.rs::handle_conductor`). `a2a agent add|list|remove` stay
-//! `implemented: false` stubs — the client-side registry is a later phase.
+//! group (CONTRACTS.md §6). Phase B flipped `a2a serve` real (a JSON-RPC/HTTP
+//! server, `src/a2a.rs`: AgentCard + `tasks/get`); Phase B2 landed
+//! `message/send` execution (inject into a known conductable session, or
+//! spawn a freshly conducted one running the operator-configured
+//! `aoide.a2a.spawnAgent`). `a2a serve` itself is a long-running blocking
+//! server, so `lib.rs::run_cli` special-cases its launch exactly like
+//! `mcp serve --stdio`/`conductor`; the handler below only covers the
+//! non-Cli-door / metadata path (mirrors `commands/infra.rs::handle_conductor`).
+//! `a2a agent add|list|remove` stay `implemented: false` stubs — the
+//! client-side registry is a later phase.
 
 use crate::daemon::Door;
 use crate::dispatch::Invocation;
@@ -51,6 +53,7 @@ pub fn register(r: &mut Registry) {
         flags: [
             flag!("port", "int", "Override the A2A HTTP port (default aoide.a2a.port)."),
             flag!("bind", "string", "Override the A2A HTTP bind address (default aoide.a2a.bindAddress)."),
+            flag!("spawn-agent", "string", "Override the command message/send's spawn path conducts (default aoide.a2a.spawnAgent; empty = spawning disabled)."),
         ],
         gated: false,
         implemented: true,

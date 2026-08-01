@@ -3,6 +3,10 @@
 //! One crate, two binaries (`aoide`, `aoided`), one schema. Everything the CLI
 //! door and the MCP door can do is described once in [`schema`] and executed
 //! once in [`dispatch`]; the two doors cannot drift (concepts/Agent-Interface).
+//! A2A (`a2a.rs`, CONTRACTS.md §6) is a third door onto the same schema — its
+//! AgentCard derives from it too, and `message/send` reuses these same
+//! command handlers rather than dispatching every JSON-RPC method through
+//! here.
 
 pub mod a2a;
 pub mod adapter;
@@ -76,8 +80,9 @@ pub fn run_cli(argv: &[String]) -> i32 {
             return code;
         }
         let (bind, port) = a2a::resolve_bind_port(&inv);
+        let spawn_agent = a2a::resolve_spawn_agent(&inv);
         let audit_log = dispatch::audit_log_path(&inv);
-        return match a2a::serve(&bind, port, &audit_log) {
+        return match a2a::serve(&bind, port, &audit_log, &spawn_agent) {
             Ok(()) => output::exit::OK,
             Err(e) => {
                 eprintln!("aoide a2a serve: {e}");

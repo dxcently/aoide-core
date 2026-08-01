@@ -23,6 +23,11 @@ mod window;
 // Public API: dispatch.rs, conductor/*, and shellbridge.rs all reach these at
 // `crate::graph::*`, unchanged by the submodule split below.
 pub use self::conduct::session_conduct;
+// `a2a.rs`'s spawn path (Phase B2) computes a just-spawned conducted session's
+// deterministic control-socket path itself, to retry-connect and inject the
+// first turn before `sessions.json` necessarily reflects the new record yet —
+// the same path `graph send`/`conduct` derive internally.
+pub(crate) use self::conduct::conduct_socket_path;
 pub use self::doc::{build_graph, render};
 pub use self::model::{
     anchor_for, canonical_state, merged_sessions, HookRecord, HooksFile, Project, ProjectsFile,
