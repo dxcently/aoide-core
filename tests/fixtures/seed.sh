@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# seed.sh — write a plausible stage tree for driving `aoide baton` without a live
-# desktop. The whole baton honours $AOIDE_STAGE_DIR / $AOIDE_AUDIT_LOG, so a
+# seed.sh — write a plausible stage tree for driving `aoide conductor` without a live
+# desktop. The whole conductor honours $AOIDE_STAGE_DIR / $AOIDE_AUDIT_LOG, so a
 # throwaway tempdir is a full rig.
 #
 #   export AOIDE_STAGE_DIR=$(mktemp -d) AOIDE_AUDIT_LOG=$AOIDE_STAGE_DIR/log
 #   pkgs/aoide/tests/fixtures/seed.sh "$AOIDE_STAGE_DIR"
-#   aoide baton
+#   aoide conductor
 #
 # Arg 1: the stage dir to seed (default: $AOIDE_STAGE_DIR, else ./stage).
 set -euo pipefail
