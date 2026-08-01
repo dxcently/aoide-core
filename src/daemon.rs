@@ -53,6 +53,10 @@ pub enum Door {
     Cli,
     Mcp,
     Daemon,
+    /// The A2A (Agent2Agent) HTTP door (CONTRACTS.md §6) — `aoide a2a serve`.
+    /// Every handled HTTP request is audited through this door, same as the
+    /// other two.
+    A2a,
 }
 
 /// Event classes for the neutral event stream. Subscriptions are default-deny

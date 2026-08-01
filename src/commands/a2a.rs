@@ -1,19 +1,46 @@
 //! `a2a serve` / `a2a agent add|list|remove` — the A2A (Agent2Agent) door
-//! group (CONTRACTS.md §6, v0). Walking-skeleton CONTRACT phase: metadata-only
-//! registrations, every entry `implemented: false`. This module is the group
-//! home a later phase flips to real handlers (server + client-side registry)
-//! — `commands/mod.rs::all()` appends it last so the existing schema order is
-//! unperturbed.
+//! group (CONTRACTS.md §6). Phase B flips `a2a serve` real: a read-only
+//! JSON-RPC/HTTP server (`src/a2a.rs`) — AgentCard + `tasks/get`, with
+//! `message/send` returning a well-formed "not yet" error. `a2a serve`
+//! itself is a long-running blocking server, so `lib.rs::run_cli`
+//! special-cases its launch exactly like `mcp serve --stdio`/`conductor`;
+//! the handler below only covers the non-Cli-door / metadata path (mirrors
+//! `commands/infra.rs::handle_conductor`). `a2a agent add|list|remove` stay
+//! `implemented: false` stubs — the client-side registry is a later phase.
 
+use crate::daemon::Door;
 use crate::dispatch::Invocation;
 use crate::output::Outcome;
 use crate::registry::{arg, cmd, flag, Registry};
+use serde_json::json;
 
 /// Never invoked — `dispatch()` returns the not-implemented envelope itself
 /// for any command with `implemented: false`, without calling `handler`
 /// (same convention as `commands/stubs.rs::unimplemented`).
 fn unimplemented(_inv: &Invocation) -> Outcome {
     unreachable!("dispatch() never calls the handler of a not-implemented command")
+}
+
+/// `a2a serve`'s handler. On the Cli door this is only ever reached via
+/// `run_cli`'s special-case (dispatch first, to record the launch, THEN
+/// block in the accept loop — see `lib.rs`); on any other door (e.g. an MCP
+/// `tools/call` for `a2a.serve`) it never blocks that door, it just reports
+/// how to actually raise the server.
+fn handle_a2a_serve(inv: &Invocation) -> Outcome {
+    let (bind, port) = crate::a2a::resolve_bind_port(inv);
+    match inv.door {
+        Door::Cli => Outcome::ok(
+            "a2a.serve",
+            format!("raising the A2A server on http://{bind}:{port}/"),
+        )
+        .with_data(json!({ "interactive": true, "bind": bind, "port": port })),
+        _ => Outcome::ok(
+            "a2a.serve",
+            "a2a serve is a long-running server; run `aoide a2a serve` from a terminal \
+             or the aoide-a2a systemd unit (not over this door)",
+        )
+        .with_data(json!({ "interactive": true, "door": "non-cli" })),
+    }
 }
 
 pub fn register(r: &mut Registry) {
@@ -26,8 +53,8 @@ pub fn register(r: &mut Registry) {
             flag!("bind", "string", "Override the A2A HTTP bind address (default aoide.a2a.bindAddress)."),
         ],
         gated: false,
-        implemented: false,
-        handler: unimplemented,
+        implemented: true,
+        handler: handle_a2a_serve,
     ));
     r.insert(cmd!(
         path: ["a2a", "agent", "add"],

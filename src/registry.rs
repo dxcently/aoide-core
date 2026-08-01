@@ -52,7 +52,9 @@ pub struct Command {
     /// Routes through the user rebuild gate (CONTRACTS.md §3).
     pub gated: bool,
     /// Actually mutates the live system? (walking skeleton: many are stubs).
-    #[serde(skip_serializing)]
+    /// Additive field (CONTRACTS.md §3): serialized so a discovery consumer —
+    /// the A2A AgentCard (CONTRACTS.md §6) is the first one — can filter to
+    /// only the commands that are live, without a second command inventory.
     pub implemented: bool,
     #[serde(rename = "exitCodes", serialize_with = "exit_codes")]
     pub exit_codes: (),

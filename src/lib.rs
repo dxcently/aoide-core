@@ -4,6 +4,7 @@
 //! door and the MCP door can do is described once in [`schema`] and executed
 //! once in [`dispatch`]; the two doors cannot drift (concepts/Agent-Interface).
 
+pub mod a2a;
 pub mod adapter;
 pub mod commands;
 pub mod conductor;
@@ -56,6 +57,30 @@ pub fn run_cli(argv: &[String]) -> i32 {
             Ok(()) => output::exit::OK,
             Err(e) => {
                 eprintln!("aoide mcp serve: {e}");
+                output::exit::ERROR
+            }
+        };
+    }
+
+    // `a2a serve` is a long-running server, launched at the entry point
+    // exactly like `mcp serve --stdio` and `conductor`: dispatch FIRST (so
+    // the single audit log records the launch, and a non-Cli door — e.g. an
+    // MCP `tools/call` for `a2a.serve` — gets the "run this from a terminal"
+    // outcome via `handle_a2a_serve` instead of blocking that door), then
+    // block in the accept loop.
+    if inv.path == ["a2a", "serve"] {
+        let launch = dispatch::dispatch(&inv);
+        if launch.status != output::Status::Ok {
+            let (body, code) = launch.render(json);
+            eprintln!("{body}");
+            return code;
+        }
+        let (bind, port) = a2a::resolve_bind_port(&inv);
+        let audit_log = dispatch::audit_log_path(&inv);
+        return match a2a::serve(&bind, port, &audit_log) {
+            Ok(()) => output::exit::OK,
+            Err(e) => {
+                eprintln!("aoide a2a serve: {e}");
                 output::exit::ERROR
             }
         };

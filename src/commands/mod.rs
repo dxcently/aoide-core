@@ -17,7 +17,7 @@ use crate::registry::Registry;
 /// guide, schema, rice gen(stub), rice lint/preview/mint, cover set,
 /// rice adopt/transpose(stub), content(stub x5), make(stub), update(stub),
 /// onboard(stub), mcp serve, daemon, shellbridge, graph(x15) + conduct,
-/// adapter melete, conductor, a2a(x4, stub).
+/// adapter melete, conductor, a2a serve + agent add/list/remove(stub x3).
 pub fn all() -> Registry {
     let mut r = Registry::new();
 
@@ -33,7 +33,7 @@ pub fn all() -> Registry {
     infra::register_pre_graph(&mut r); // mcp serve, daemon, shellbridge
     graph::register(&mut r); // graph x15 + conduct
     infra::register_post_graph(&mut r); // adapter melete, conductor
-    a2a::register(&mut r); // a2a serve, agent add/list/remove (stub, CONTRACTS.md §6)
+    a2a::register(&mut r); // a2a serve (real, read-only), agent add/list/remove (stub, CONTRACTS.md §6)
 
     r
 }
