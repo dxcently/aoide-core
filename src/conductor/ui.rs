@@ -694,6 +694,7 @@ mod tests {
             kind: None,
             say: None,
             model: None,
+            needs_sudo: None,
             extra: Map::new(),
         }
     }

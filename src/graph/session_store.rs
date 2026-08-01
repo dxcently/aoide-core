@@ -128,6 +128,7 @@ pub fn upsert_session(
             kind: None,
             say: None,
             model: None,
+            needs_sudo: None,
             extra: Map::new(),
         });
         true

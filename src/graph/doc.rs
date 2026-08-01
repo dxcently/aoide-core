@@ -87,6 +87,11 @@ pub fn build_graph(
         if let Some(m) = &s.model {
             node["model"] = json!(m);
         }
+        // Blocked on a `sudo` password prompt — a conducted SHELL only; rides
+        // onto the node only when true (never a dangling `needsSudo:false`).
+        if let Some(true) = s.needs_sudo {
+            node["needsSudo"] = json!(true);
+        }
         nodes.push(node);
         if let Some(parent) = resolved_parent(s, &ids) {
             edges.push(json!({
@@ -152,14 +157,22 @@ pub fn render(
             Some(m) if !m.is_empty() => format!("  ⟐ {m}"),
             _ => String::new(),
         };
+        // A compact marker for a shell blocked on `sudo` — parallel to the
+        // model tag above, appended last so it reads as the row's most urgent
+        // trailing note.
+        let sudo_tag = match s.needs_sudo {
+            Some(true) => "  [sudo]",
+            _ => "",
+        };
         format!(
-            "{}● {}  {}  {}  {}{}",
+            "{}● {}  {}  {}  {}{}{}",
             marker(focus, &id, &s.session_id),
             s.session_id,
             s.agent,
             s.state,
             s.cwd,
-            model_tag
+            model_tag,
+            sudo_tag
         )
     }
 
@@ -520,5 +533,45 @@ mod tests {
         let node_b = nodes.iter().find(|n| n["id"] == "session:b").unwrap();
         assert_eq!(node_a["model"], json!("claude-fable-5"));
         assert!(node_b.get("model").is_none());
+    }
+    #[test]
+    fn graph_node_carries_needs_sudo_only_when_true() {
+        // Mirrors the workspace/model tests above: `needsSudo` rides onto a
+        // session node only when Some(true) — never a dangling `false`, and
+        // absent entirely for a legacy/not-blocked record.
+        let mut blocked = SessionRecord {
+            session_id: "a".into(),
+            window_address: "0xaaa".into(),
+            ..Default::default()
+        };
+        blocked.needs_sudo = Some(true);
+        let free = SessionRecord {
+            session_id: "b".into(),
+            window_address: "0xbbb".into(),
+            ..Default::default()
+        };
+        let doc = build_graph(&[], &[blocked, free], &[]);
+        let nodes = doc["nodes"].as_array().unwrap();
+        let node_a = nodes.iter().find(|n| n["id"] == "session:a").unwrap();
+        let node_b = nodes.iter().find(|n| n["id"] == "session:b").unwrap();
+        assert_eq!(node_a["needsSudo"], json!(true));
+        assert!(node_b.get("needsSudo").is_none());
+    }
+    #[test]
+    fn render_shows_sudo_marker_when_blocked() {
+        let projects = fixture_projects();
+        let mut blocked = session("s1", "/home/k/Aoide", "awaiting", "1", None);
+        blocked.needs_sudo = Some(true);
+        let free = session("s2", "/home/k/Aoide", "idle", "2", None);
+        let sessions = vec![blocked, free];
+        let out = render(&projects, &sessions, &[], None);
+        assert!(
+            out.contains("● s1  claude  awaiting  /home/k/Aoide  [sudo]"),
+            "sudo-blocked node carries the marker: {out}"
+        );
+        assert!(
+            !out.contains("s2  claude  idle  /home/k/Aoide  [sudo]"),
+            "non-blocked node carries no marker: {out}"
+        );
     }
 }

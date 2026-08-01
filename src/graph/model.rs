@@ -106,6 +106,18 @@ pub struct SessionRecord {
     /// clock's subtext; widgets read the raw id and map it to a short label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// True while this conducted SHELL is blocked at a `sudo` password prompt
+    /// — detected by conduct's PTY tick (the foreground process is `sudo`, or
+    /// the `[sudo] password for` text was just seen crossing master→stdout)
+    /// and force-published alongside `state:"awaiting"`. Additive/v0-safe:
+    /// absent on a legacy record and cleared back to `None` (never written as
+    /// `Some(false)`) the moment the prompt clears — so the key disappears
+    /// rather than lingering false. Agents are hook-driven and never set this.
+    /// The dock reads it to show a lock badge + ping distinct from an
+    /// ordinary permission-prompt `awaiting` — "it's YOUR password", not the
+    /// agent's.
+    #[serde(rename = "needsSudo", default, skip_serializing_if = "Option::is_none")]
+    pub needs_sudo: Option<bool>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -344,6 +356,33 @@ mod tests {
         let legacy: SessionRecord =
             serde_json::from_str(r#"{ "sessionId": "s", "windowAddress": "0x1" }"#).unwrap();
         assert_eq!(legacy.workspace, None);
+    }
+    #[test]
+    fn session_record_needs_sudo_round_trips_and_stays_absent_when_unset() {
+        // serde: `needsSudo` serialises as a bool when Some(true), and is
+        // skipped (skip_serializing_if) when None — additive/v0-safe on the
+        // wire, matching the `workspace` field's contract above.
+        let mut rec = SessionRecord {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        rec.needs_sudo = Some(true);
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("\"needsSudo\":true"), "serialised: {json}");
+        let back: SessionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.needs_sudo, Some(true));
+
+        // A record with no needsSudo omits the key entirely (no null/false
+        // noise) and a legacy record with no `needsSudo` field parses to None.
+        let bare = SessionRecord {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        let bare_json = serde_json::to_string(&bare).unwrap();
+        assert!(!bare_json.contains("needsSudo"), "serialised: {bare_json}");
+        let legacy: SessionRecord =
+            serde_json::from_str(r#"{ "sessionId": "s", "windowAddress": "0x1" }"#).unwrap();
+        assert_eq!(legacy.needs_sudo, None);
     }
     #[test]
     fn canonical_state_folds_every_producer_onto_the_five_state_vocabulary() {

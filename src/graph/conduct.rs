@@ -349,13 +349,50 @@ fn proc_comm(pid: i32) -> Option<String> {
         .filter(|c| !c.is_empty())
 }
 
+/// Whether `/proc/<pid>/task/<pid>/children` lists any child pid.
+/// `Some(true)` = has children, `Some(false)` = none, `None` = unreadable.
+/// A conducting `sudo` at its password prompt has NO children yet (it forks
+/// the command/monitor only after auth); once it has forked, auth is done.
+fn proc_has_children(pid: i32) -> Option<bool> {
+    std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .ok()
+        .map(|s| !s.trim().is_empty())
+}
+
+/// Is a conducted SHELL currently blocked on a `sudo` password prompt? A
+/// conducted shell is sudo-blocked iff the `[sudo] password for` prompt was
+/// just seen (booster), OR the foreground process IS `sudo` AND it has not yet
+/// forked its command child (`Some(false)` children == still in the PAM
+/// conversation, i.e. at the prompt). `Some(true)` (command already running,
+/// e.g. cached-cred `sudo nixos-rebuild`) and `None` (children unreadable →
+/// don't trust the primary, rely on the booster) both DON'T fire the primary.
+/// Pure and unit-tested; the real caller passes `proc_comm(fg) == Some("sudo")`,
+/// `proc_has_children(fg)`, and the booster's recency check.
+///
+/// WHY the children gate: `sudo` stays the process-group leader for the WHOLE
+/// runtime of `sudo <cmd>` on a PAM system (it forks the command/monitor
+/// child; it never execs in place), so `comm(fg) == "sudo"` alone would also
+/// be true for a multi-minute `sudo nixos-rebuild switch` running on CACHED
+/// credentials — no prompt at all. Gating on "sudo has not yet forked a
+/// child" narrows the primary signal to the actual PAM conversation window.
+fn sudo_awaiting(fg_is_sudo: bool, fg_has_children: Option<bool>, booster_recent: bool) -> bool {
+    booster_recent || (fg_is_sudo && fg_has_children == Some(false))
+}
+
 /// Update a conducted session's live shell fields — `cwd`, `activity` (the
-/// current foreground command, or cleared), and `state` (idle at the prompt,
-/// working while a command runs) — CHANGE-ONLY, under the stage lock, and
-/// re-stage graph.json only when it actually wrote. Called ~1 Hz from conduct's
-/// PTY tick for SHELL sessions (an agent's state/activity come from hooks, so
+/// current foreground command, or cleared), `state` (idle at the prompt,
+/// working while a command runs, or forced `awaiting` while blocked on
+/// `sudo`), and `needsSudo` — CHANGE-ONLY, under the stage lock, and re-stage
+/// graph.json only when it actually wrote. Called ~1 Hz from conduct's PTY
+/// tick for SHELL sessions (an agent's state/activity come from hooks, so
 /// conduct never drives those). No-op for an unregistered id.
-fn do_session_refresh(id: &str, cwd: Option<&str>, activity: Option<&str>, state: &str) {
+fn do_session_refresh(
+    id: &str,
+    cwd: Option<&str>,
+    activity: Option<&str>,
+    state: &str,
+    needs_sudo: bool,
+) {
     with_stage_lock(|| {
         let mut file: SessionsFile = match load_stage(&sessions_path()) {
             Ok(f) => f,
@@ -380,6 +417,13 @@ fn do_session_refresh(id: &str, cwd: Option<&str>, activity: Option<&str>, state
             let canon = canonical_state(state);
             if s.state != canon {
                 s.state = canon.to_string();
+                changed = true;
+            }
+            // Change-only, and cleared to `None` (never written as
+            // `Some(false)`) so the key disappears the moment the prompt clears.
+            let want = if needs_sudo { Some(true) } else { None };
+            if s.needs_sudo != want {
+                s.needs_sudo = want;
                 changed = true;
             }
         }
@@ -413,25 +457,71 @@ fn cwd_for(fg: i32, shell_pid: i32, cwd_of: impl Fn(i32) -> Option<String>) -> O
     }
 }
 
-/// One conduct-tick refresh for a SHELL session: read the pty's foreground
-/// process group and the live cwd, and push cwd + the current command + the
-/// idle/working state. The shell (spawned under `setsid`) is its own process
-/// group leader, so a foreground pgid equal to the shell pid means "at the bare
-/// prompt" (idle); anything else is a command running in the foreground
-/// (working, its command captured as `activity`).
-fn conduct_refresh_shell(id: &str, master: RawFd, shell_pid: i32) {
-    let fg = unsafe { libc::tcgetpgrp(master) };
-    let cwd = cwd_for(fg, shell_pid, proc_cwd);
-    let (state, activity) = if fg <= 0 || fg == shell_pid {
+/// Pure resolution of a conducted shell's (state, activity, needs_sudo) from
+/// the pty foreground pgid. Injected lookups make it unit-testable. Real caller
+/// passes (proc_comm, proc_command, proc_has_children). The shell (spawned
+/// under `setsid`) is its own process group leader, so a foreground pgid equal
+/// to the shell pid means "at the bare prompt" (idle); anything else is a
+/// command running in the foreground (working, its command captured as
+/// `activity`). `booster_recent` is the text-scan signal from
+/// `conduct_multiplex` (a `[sudo] password for` prompt seen crossing
+/// master→stdout within the last ~2s); when [`sudo_awaiting`] is true off
+/// either signal, `state` is FORCED to `awaiting` regardless of the
+/// idle/working computation above — a sudo prompt needs the user NOW.
+fn shell_snapshot(
+    fg: i32,
+    shell_pid: i32,
+    booster_recent: bool,
+    comm_of: impl Fn(i32) -> Option<String>,
+    command_of: impl Fn(i32) -> Option<String>,
+    children_of: impl Fn(i32) -> Option<bool>,
+) -> (&'static str, Option<String>, bool) {
+    let (mut state, activity) = if fg <= 0 || fg == shell_pid {
         // At the bare prompt: idle, but label the row with the shell PROCESS
         // itself (e.g. `bash`) so the terminal roster is never blank.
-        ("idle", proc_comm(shell_pid))
+        ("idle", comm_of(shell_pid))
     } else {
         // A foreground command is running: its cmdline (e.g. `nvim notes.md`,
         // `cargo test`) — the file being edited / the process at work.
-        ("working", proc_command(fg))
+        ("working", command_of(fg))
     };
-    do_session_refresh(id, cwd.as_deref(), activity.as_deref(), state);
+    let fg_is_sudo = fg > 0 && comm_of(fg).as_deref() == Some("sudo");
+    let children = if fg_is_sudo { children_of(fg) } else { None };
+    let needs_sudo = sudo_awaiting(fg_is_sudo, children, booster_recent);
+    if needs_sudo {
+        state = "awaiting";
+    }
+    (state, activity, needs_sudo)
+}
+
+/// One conduct-tick refresh for a SHELL session: read the pty's foreground
+/// process group and the live cwd, and push cwd + the current command + the
+/// idle/working state via [`shell_snapshot`].
+fn conduct_refresh_shell(id: &str, master: RawFd, shell_pid: i32, booster_recent: bool) {
+    let fg = unsafe { libc::tcgetpgrp(master) };
+    let cwd = cwd_for(fg, shell_pid, proc_cwd);
+    let (state, activity, needs_sudo) = shell_snapshot(
+        fg,
+        shell_pid,
+        booster_recent,
+        proc_comm,
+        proc_command,
+        proc_has_children,
+    );
+    do_session_refresh(id, cwd.as_deref(), activity.as_deref(), state, needs_sudo);
+}
+
+/// True iff the `[sudo] password for` prompt appears at the start of a line in
+/// `chunk` (buffer start, or right after `\n`/`\r`). The line-start guard keeps
+/// `grep '[sudo] password'` / `cat auth.log`-style output from false-triggering,
+/// while real sudo prints its prompt at line start. A needle split across two
+/// reads is tolerated (missed here, caught next tick by the primary).
+fn scan_for_sudo_prompt(chunk: &[u8]) -> bool {
+    const NEEDLE: &[u8] = b"[sudo] password for";
+    chunk
+        .windows(NEEDLE.len())
+        .enumerate()
+        .any(|(i, w)| w == NEEDLE && (i == 0 || chunk[i - 1] == b'\n' || chunk[i - 1] == b'\r'))
 }
 
 /// The single-thread `poll()` multiplexer. Shuttles: real stdin → master (you
@@ -462,8 +552,14 @@ fn conduct_multiplex(
     let poll_timeout: libc::c_int = if is_shell { 1000 } else { -1 };
     let tick_period = std::time::Duration::from_millis(950);
     let mut last_tick = std::time::Instant::now();
+    // The sudo-prompt TEXT-SCAN booster: the instant a `[sudo] password for`
+    // prompt is seen crossing master→stdout, latch a timestamp so the next
+    // tick(s) within `SUDO_BOOSTER_WINDOW` treat the shell as sudo-blocked
+    // even if `tcgetpgrp` hasn't caught `sudo` as the foreground pgid yet.
+    let mut sudo_prompt_seen_at: Option<std::time::Instant> = None;
+    const SUDO_BOOSTER_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
     if is_shell {
-        conduct_refresh_shell(id, master, shell_pid); // stamp initial cwd/state now.
+        conduct_refresh_shell(id, master, shell_pid, false); // stamp initial cwd/state now.
     }
 
     loop {
@@ -497,7 +593,10 @@ fn conduct_multiplex(
         // Refresh the conducted shell's live cwd/command/state on the ~1s clock
         // (rc==0 is a plain timeout; a busy shell also ticks at most this often).
         if is_shell && last_tick.elapsed() >= tick_period {
-            conduct_refresh_shell(id, master, shell_pid);
+            let booster_recent = sudo_prompt_seen_at
+                .map(|t| t.elapsed() < SUDO_BOOSTER_WINDOW)
+                .unwrap_or(false);
+            conduct_refresh_shell(id, master, shell_pid, booster_recent);
             last_tick = std::time::Instant::now();
         }
 
@@ -514,7 +613,14 @@ fn conduct_multiplex(
             let n =
                 unsafe { libc::read(master, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if n > 0 {
-                write_all_fd(stdout_fd, &buf[..n as usize]);
+                let n = n as usize;
+                // Booster text-scan: shells only, a cheap byte-substring search
+                // (never a String allocation of the whole buffer) over exactly
+                // what was just read, gated to a line-start match.
+                if is_shell && scan_for_sudo_prompt(&buf[..n]) {
+                    sudo_prompt_seen_at = Some(std::time::Instant::now());
+                }
+                write_all_fd(stdout_fd, &buf[..n]);
             } else {
                 break;
             }
@@ -810,6 +916,122 @@ mod tests {
         assert_eq!(generic_command_label(&argv(&[])), None);
     }
     #[test]
+    fn sudo_awaiting_gates_the_primary_signal_on_children() {
+        // The booster fires regardless of the primary signal's inputs.
+        assert!(sudo_awaiting(false, None, true));
+        assert!(sudo_awaiting(true, Some(true), true));
+        assert!(sudo_awaiting(true, Some(false), true));
+        assert!(sudo_awaiting(true, None, true));
+        // fg IS sudo, and it has forked NO children yet: still at the PAM
+        // prompt — the primary signal fires.
+        assert!(sudo_awaiting(true, Some(false), false));
+        // fg IS sudo, but it HAS forked a child: auth already succeeded and the
+        // command is running (e.g. cached-cred `sudo nixos-rebuild switch` — a
+        // multi-minute build with no prompt at all). The primary must NOT fire.
+        assert!(!sudo_awaiting(true, Some(true), false));
+        // fg IS sudo but children are unreadable: don't trust the primary,
+        // fall back to the booster alone (which is false here).
+        assert!(!sudo_awaiting(true, None, false));
+        // fg is not sudo at all: primary never fires, no booster.
+        assert!(!sudo_awaiting(false, None, false));
+        assert!(!sudo_awaiting(false, Some(false), false));
+        assert!(!sudo_awaiting(false, Some(true), false));
+    }
+    #[test]
+    fn shell_snapshot_idle_at_bare_prompt() {
+        // fg == shell_pid: idle, activity from comm_of(shell_pid), no sudo.
+        let (state, activity, needs_sudo) = shell_snapshot(
+            100,
+            100,
+            false,
+            |_| Some("bash".to_string()),
+            |_| panic!("command_of should not be consulted at the bare prompt"),
+            |_| panic!("children_of should not be consulted when fg isn't sudo"),
+        );
+        assert_eq!(state, "idle");
+        assert_eq!(activity.as_deref(), Some("bash"));
+        assert!(!needs_sudo);
+    }
+    #[test]
+    fn shell_snapshot_working_reads_foreground_command() {
+        // fg != shell_pid, and it's not sudo: working, activity from command_of(fg).
+        let (state, activity, needs_sudo) = shell_snapshot(
+            200,
+            100,
+            false,
+            |_| Some("cargo".to_string()),
+            |pid| {
+                assert_eq!(pid, 200);
+                Some("cargo test".to_string())
+            },
+            |_| panic!("children_of should not be consulted when fg isn't sudo"),
+        );
+        assert_eq!(state, "working");
+        assert_eq!(activity.as_deref(), Some("cargo test"));
+        assert!(!needs_sudo);
+    }
+    #[test]
+    fn shell_snapshot_forces_awaiting_while_sudo_has_no_children() {
+        // fg IS sudo, with no children yet (still at the password prompt):
+        // state is FORCED to awaiting and needs_sudo is true, regardless of
+        // what command_of would have said.
+        let (state, activity, needs_sudo) = shell_snapshot(
+            300,
+            100,
+            false,
+            |_| Some("sudo".to_string()),
+            |_| Some("sudo nixos-rebuild switch".to_string()),
+            |pid| {
+                assert_eq!(pid, 300);
+                Some(false)
+            },
+        );
+        assert_eq!(state, "awaiting");
+        assert_eq!(activity.as_deref(), Some("sudo nixos-rebuild switch"));
+        assert!(needs_sudo);
+    }
+    #[test]
+    fn shell_snapshot_cached_cred_sudo_does_not_force_awaiting() {
+        // fg IS sudo, but it has already forked its command child (cached
+        // creds, no prompt): state stays "working" off the normal computation,
+        // needs_sudo is false — the F1 fix's whole point.
+        let (state, activity, needs_sudo) = shell_snapshot(
+            300,
+            100,
+            false,
+            |_| Some("sudo".to_string()),
+            |_| Some("sudo nixos-rebuild switch".to_string()),
+            |pid| {
+                assert_eq!(pid, 300);
+                Some(true)
+            },
+        );
+        assert_eq!(state, "working");
+        assert_eq!(activity.as_deref(), Some("sudo nixos-rebuild switch"));
+        assert!(!needs_sudo);
+    }
+    #[test]
+    fn scan_for_sudo_prompt_requires_line_start() {
+        const NEEDLE: &str = "[sudo] password for";
+        // At the very start of the buffer: true.
+        assert!(scan_for_sudo_prompt(NEEDLE.as_bytes()));
+        // Right after a newline: true.
+        let after_nl = format!("hello\n{NEEDLE}");
+        assert!(scan_for_sudo_prompt(after_nl.as_bytes()));
+        // Right after a carriage return (a pty commonly emits \r\n): true.
+        let after_cr = format!("hello\r{NEEDLE}");
+        assert!(scan_for_sudo_prompt(after_cr.as_bytes()));
+        // Mid-line — e.g. a compiler error message or `grep` output quoting the
+        // needle — must NOT false-trigger.
+        let mid_line = format!("foo.rs:9:{NEEDLE} x");
+        assert!(!scan_for_sudo_prompt(mid_line.as_bytes()));
+        // No needle at all.
+        assert!(!scan_for_sudo_prompt(b"just some ordinary shell output"));
+        // Empty / too-short buffers must not panic.
+        assert!(!scan_for_sudo_prompt(b""));
+        assert!(!scan_for_sudo_prompt(b"[sudo]"));
+    }
+    #[test]
     fn cwd_for_prefers_foreground_process_then_falls_back_to_shell() {
         const SHELL_PID: i32 = 100;
         const FG_PID: i32 = 200;
@@ -950,22 +1172,41 @@ mod tests {
         .unwrap();
 
         // At the prompt: idle, no activity, cwd tracked.
-        do_session_refresh("sh", Some("/proj"), None, "idle");
+        do_session_refresh("sh", Some("/proj"), None, "idle", false);
         let s: SessionsFile = load_stage(&sessions_path()).unwrap();
         assert_eq!(s.sessions[0].state, "idle");
         assert_eq!(s.sessions[0].cwd, "/proj");
         assert_eq!(s.sessions[0].activity, None);
+        assert_eq!(s.sessions[0].needs_sudo, None);
 
         // A foreground command: working + the command as activity.
-        do_session_refresh("sh", Some("/proj"), Some("cargo test"), "working");
+        do_session_refresh("sh", Some("/proj"), Some("cargo test"), "working", false);
         let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
         assert_eq!(s2.sessions[0].state, "working");
         assert_eq!(s2.sessions[0].activity.as_deref(), Some("cargo test"));
+        assert_eq!(s2.sessions[0].needs_sudo, None);
+
+        // Blocked on sudo: state=awaiting and needsSudo=true, regardless of the
+        // `state` string passed in (the caller already resolves the force in
+        // `conduct_refresh_shell`, but do_session_refresh itself just persists
+        // both fields change-only).
+        do_session_refresh("sh", Some("/proj"), Some("sudo"), "awaiting", true);
+        let s3: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(s3.sessions[0].state, "awaiting");
+        assert_eq!(s3.sessions[0].needs_sudo, Some(true));
+
+        // The prompt clears: needs_sudo=false CLEARS the field back to None
+        // (never left as Some(false)) — change-only, so the key disappears.
+        do_session_refresh("sh", Some("/proj"), None, "idle", false);
+        let s4: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(s4.sessions[0].needs_sudo, None);
+        let raw = std::fs::read_to_string(sessions_path()).unwrap();
+        assert!(!raw.contains("needsSudo"), "cleared key must be absent: {raw}");
 
         // An unknown id is a safe no-op (never panics, never inserts).
-        do_session_refresh("nope", Some("/x"), Some("x"), "working");
-        let s3: SessionsFile = load_stage(&sessions_path()).unwrap();
-        assert_eq!(s3.sessions.len(), 1);
+        do_session_refresh("nope", Some("/x"), Some("x"), "working", false);
+        let s5: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(s5.sessions.len(), 1);
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
