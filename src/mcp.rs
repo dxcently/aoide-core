@@ -9,7 +9,6 @@
 
 use crate::daemon::Door;
 use crate::dispatch::{self, Invocation};
-use crate::schema;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
@@ -19,8 +18,8 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 /// Generate the MCP `tools` array from the command schema. Each command →
 /// one tool named by its dotted path; its args/flags become the inputSchema.
 pub fn tool_list() -> Value {
-    let tools: Vec<Value> = schema::commands()
-        .iter()
+    let tools: Vec<Value> = dispatch::registry()
+        .commands()
         .map(|c| {
             let mut props = serde_json::Map::new();
             let mut required: Vec<String> = Vec::new();
@@ -68,9 +67,7 @@ fn json_type(ty: &str) -> &'static str {
 
 /// Build an [`Invocation`] from an MCP `tools/call` (tool name + arguments).
 fn invocation_from_call(name: &str, arguments: &Value) -> Option<Invocation> {
-    let cmd = schema::commands()
-        .into_iter()
-        .find(|c| c.dotted() == name)?;
+    let cmd = dispatch::registry().commands().find(|c| c.dotted() == name)?;
     let path: Vec<String> = cmd.path.iter().map(|s| s.to_string()).collect();
 
     let mut args: Vec<String> = Vec::new();
@@ -116,7 +113,7 @@ fn handle(req: &Value) -> Option<Value> {
         "initialize" => Ok(json!({
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": { "tools": {} },
-            "serverInfo": { "name": "aoide", "version": schema::AOIDE_VERSION },
+            "serverInfo": { "name": "aoide", "version": crate::registry::AOIDE_VERSION },
         })),
         "tools/list" => Ok(tool_list()),
         "tools/call" => {
@@ -191,13 +188,13 @@ mod tests {
     fn tool_list_is_derived_one_to_one_from_the_schema() {
         let tools = tool_list();
         let arr = tools["tools"].as_array().unwrap();
-        assert_eq!(arr.len(), schema::commands().len());
+        assert_eq!(arr.len(), dispatch::registry().commands().count());
         // Every command name appears as a tool name.
         let names: std::collections::HashSet<String> = arr
             .iter()
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect();
-        for c in schema::commands() {
+        for c in dispatch::registry().commands() {
             assert!(
                 names.contains(&c.dotted()),
                 "tool missing for {}",

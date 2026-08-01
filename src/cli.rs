@@ -5,15 +5,15 @@
 //! schema can never disagree about what commands exist.
 
 use crate::daemon::Door;
-use crate::dispatch::Invocation;
+use crate::dispatch::{self, Invocation};
 use crate::output::{exit, Outcome};
-use crate::schema;
+use crate::registry;
 use std::collections::BTreeMap;
 
-/// All known command paths (from the schema), longest-first for greedy match.
+/// All known command paths (from the registry), longest-first for greedy match.
 fn known_paths() -> Vec<Vec<String>> {
-    let mut paths: Vec<Vec<String>> = schema::commands()
-        .iter()
+    let mut paths: Vec<Vec<String>> = dispatch::registry()
+        .commands()
         .map(|c| c.path.iter().map(|s| s.to_string()).collect())
         .collect();
     paths.sort_by_key(|p| std::cmp::Reverse(p.len()));
@@ -143,11 +143,9 @@ pub fn parse(argv: &[String], door: Door) -> Result<(Invocation, bool), Outcome>
     ))
 }
 
-/// The schema entry for a matched command path (name-for-name).
-fn command_for(path: &[String]) -> Option<schema::Command> {
-    schema::commands()
-        .into_iter()
-        .find(|c| c.path.len() == path.len() && c.path.iter().zip(path).all(|(a, b)| *a == b))
+/// The registry entry for a matched command path (name-for-name).
+fn command_for(path: &[String]) -> Option<&'static registry::Command> {
+    dispatch::registry().get(path)
 }
 
 /// Flags accepted for a command: the schema-declared ones (which already
@@ -212,14 +210,14 @@ fn command_usage(path: &[String]) -> String {
 /// Heuristic: is this token part of a command path (so a preceding `--flag`
 /// should be treated as a bare boolean rather than consuming it)?
 fn is_command_token(tok: &str, _prior: &[String]) -> bool {
-    schema::commands()
-        .iter()
+    dispatch::registry()
+        .commands()
         .any(|c| c.path.first() == Some(&tok))
 }
 
 fn usage_root() -> Outcome {
-    let cmds: Vec<String> = schema::commands()
-        .iter()
+    let cmds: Vec<String> = dispatch::registry()
+        .commands()
         .map(|c| c.path.join(" "))
         .collect();
     Outcome::usage(

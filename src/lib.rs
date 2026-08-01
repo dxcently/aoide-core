@@ -5,6 +5,7 @@
 //! once in [`dispatch`]; the two doors cannot drift (concepts/Agent-Interface).
 
 pub mod adapter;
+pub mod commands;
 pub mod conductor;
 pub mod cli;
 pub mod daemon;
@@ -16,7 +17,7 @@ pub mod hypr;
 pub mod mcp;
 pub mod notes;
 pub mod output;
-pub mod schema;
+pub mod registry;
 pub mod shellbridge;
 
 use daemon::Door;
@@ -103,7 +104,7 @@ pub fn run_cli(argv: &[String]) -> i32 {
             "ok",
             "emitted schema",
         );
-        let doc = schema::schema();
+        let doc = dispatch::registry().schema();
         let body = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into());
         println!("{body}");
         return output::exit::OK;
