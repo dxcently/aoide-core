@@ -3,6 +3,7 @@
 //! exact order that reproduces the historical `schema.rs` table order (see
 //! `registry.rs` module docs for why that order is load-bearing).
 
+mod a2a;
 mod cover;
 mod graph;
 mod infra;
@@ -16,7 +17,7 @@ use crate::registry::Registry;
 /// guide, schema, rice gen(stub), rice lint/preview/mint, cover set,
 /// rice adopt/transpose(stub), content(stub x5), make(stub), update(stub),
 /// onboard(stub), mcp serve, daemon, shellbridge, graph(x15) + conduct,
-/// adapter melete, conductor.
+/// adapter melete, conductor, a2a(x4, stub).
 pub fn all() -> Registry {
     let mut r = Registry::new();
 
@@ -32,6 +33,7 @@ pub fn all() -> Registry {
     infra::register_pre_graph(&mut r); // mcp serve, daemon, shellbridge
     graph::register(&mut r); // graph x15 + conduct
     infra::register_post_graph(&mut r); // adapter melete, conductor
+    a2a::register(&mut r); // a2a serve, agent add/list/remove (stub, CONTRACTS.md §6)
 
     r
 }
