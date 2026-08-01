@@ -283,6 +283,7 @@ mod tests {
             "schema",
             "shellbridge",
             "update",
+            "usage",
         ];
         expected.sort();
 

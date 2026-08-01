@@ -51,6 +51,26 @@ pub fn stage_dir() -> PathBuf {
         .join("stage")
 }
 
+/// The account/usage runtime state directory: `~/Aoide/state/`.
+///
+/// A NEW gitignored root-runtime dir (CONTRACTS.md §2), sibling to
+/// `song/stage/` but explicitly NOT song-scoped — account/global runtime like
+/// `state/usage.json` lives here, never under `song/`. Resolution mirrors
+/// [`stage_dir`]: prefer `$AOIDE_STATE_DIR` when set to an **absolute** path,
+/// else derive `~/Aoide/state` from `$AOIDE_USER`/`$HOME` via
+/// [`daemon::aoide_home`]. A relative or empty override is ignored — same
+/// discipline as the stage dir, so a runtime path is never resolved against an
+/// arbitrary cwd.
+pub fn state_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("AOIDE_STATE_DIR") {
+        let p = PathBuf::from(&dir);
+        if p.is_absolute() {
+            return p;
+        }
+    }
+    daemon::aoide_home().join("Aoide").join("state")
+}
+
 /// The song tree root (`~/Aoide/song/`) — the parent of the stage dir.
 ///
 /// The stage tree is `<song>/stage`; committed songs live under

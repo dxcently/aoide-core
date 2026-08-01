@@ -10,6 +10,7 @@ mod infra;
 mod meta;
 mod rice;
 mod stubs;
+mod usage;
 
 use crate::registry::Registry;
 
@@ -17,7 +18,9 @@ use crate::registry::Registry;
 /// guide, schema, rice gen(stub), rice lint/preview/mint, cover set,
 /// rice adopt/transpose(stub), content(stub x5), make(stub), update(stub),
 /// onboard(stub), mcp serve, daemon, shellbridge, graph(x15) + conduct,
-/// adapter melete, conductor, a2a serve + agent add/list/remove(stub x3).
+/// adapter melete, conductor, a2a serve + agent add/list/remove(stub x3),
+/// usage (appended — the newest group, so it never reorders the historical
+/// table above it).
 pub fn all() -> Registry {
     let mut r = Registry::new();
 
@@ -34,6 +37,7 @@ pub fn all() -> Registry {
     graph::register(&mut r); // graph x15 + conduct
     infra::register_post_graph(&mut r); // adapter melete, conductor
     a2a::register(&mut r); // a2a serve (real, read-only), agent add/list/remove (stub, CONTRACTS.md §6)
+    usage::register(&mut r); // usage — local token/cost rollup (CONTRACTS.md §4)
 
     r
 }
