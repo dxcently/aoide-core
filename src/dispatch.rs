@@ -2,8 +2,7 @@
 //!
 //! Both the CLI door (`bin/aoide.rs`) and the MCP door (`mcp.rs`) call
 //! [`dispatch`] with a command path + parsed args/flags. There is ONE
-//! implementation of every command; the two doors cannot drift because both
-//! land here (concepts/Agent-Interface: "two doors, one schema" — now three
+//! implementation of every command; the two doors cannot drift (concepts/Agent-Interface: "two doors, one schema" — now three
 //! doors onto that one schema: A2A (`a2a.rs`, CONTRACTS.md §6) reuses these
 //! same command handlers directly rather than dispatching every JSON-RPC
 //! method through here).
@@ -14,34 +13,18 @@
 //! unknown-command usage error — then appends to the single audit log and
 //! applies the gate tail uniformly. Every command's actual behavior lives in
 //! `commands/<group>.rs` (or, for `graph`/`conduct`, in `graph/`).
+//!
+//! `Invocation` moved to `aoide-protocol` (Phase 2 restructure,
+//! docs/architecture/PACKAGE-LAYOUT.md) — it's the type that broke the cycle
+//! (`Command.handler` is `fn(&Invocation) -> Outcome`) and is re-exported here
+//! so every existing `crate::dispatch::Invocation` caller is untouched.
 
-use crate::daemon::{self, Door};
+pub use aoide_protocol::Invocation;
+
+use crate::daemon;
 use crate::output::Outcome;
 use crate::registry::Registry;
-use std::collections::BTreeMap;
 use std::sync::OnceLock;
-
-/// Parsed invocation handed to the dispatcher.
-#[derive(Debug)]
-pub struct Invocation {
-    /// Command path, e.g. `["rice", "gen"]`.
-    pub path: Vec<String>,
-    /// Positional args in order.
-    pub args: Vec<String>,
-    /// Named flags (`--foo bar`, or `--foo` → `"true"`).
-    pub flags: BTreeMap<String, String>,
-    /// Which door this came through (for the audit log).
-    pub door: Door,
-}
-
-impl Invocation {
-    pub fn flag_present(&self, name: &str) -> bool {
-        self.flags.contains_key(name)
-    }
-    pub fn dotted(&self) -> String {
-        self.path.join(".")
-    }
-}
 
 /// The process-wide command registry, built once from every command group's
 /// `register()`. `cli.rs`, `mcp.rs`, and `dispatch()` all read through this
@@ -105,7 +88,9 @@ pub fn dispatch(inv: &Invocation) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::Door;
     use crate::output::Status;
+    use std::collections::BTreeMap;
 
     fn inv(path: &[&str], args: &[&str]) -> Invocation {
         Invocation {

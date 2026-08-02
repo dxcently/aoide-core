@@ -298,17 +298,12 @@ pub fn merged_sessions(sessions: &[SessionRecord], hooks: &[HookRecord]) -> Vec<
 /// termination arrives as `SessionEnd` (→ `do_session_end`, which writes `done`
 /// directly and never routes through this shim) or as the explicit
 /// `exit`/`finished`/`complete` vocabulary below.
-pub fn canonical_state(s: &str) -> &'static str {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "working" | "running" | "active" | "busy" | "tool" | "trace" => "working",
-        "awaiting" | "blocked" | "await" => "awaiting",
-        "stopped" | "stop" => "stopped",
-        "idle" | "waiting" | "ready" | "sleep" => "idle",
-        "done" | "exit" | "finished" | "complete" => "done",
-        // Empty/unknown → at rest (never invent a working/awaiting signal).
-        _ => "idle",
-    }
-}
+///
+/// Moved to `aoide-protocol` (Phase 2 restructure,
+/// docs/architecture/PACKAGE-LAYOUT.md); re-exported here so `graph.rs`'s
+/// existing `pub use self::model::{…canonical_state…}` keeps re-exporting it
+/// onward untouched (`crate::graph::canonical_state` + all its callers).
+pub use aoide_protocol::canonical_state;
 
 pub(in crate::graph) fn sorted_projects(projects: &[Project]) -> Vec<Project> {
     let mut p = projects.to_vec();

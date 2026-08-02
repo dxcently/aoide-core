@@ -25,6 +25,8 @@ pub mod output;
 pub mod registry;
 pub mod shellbridge;
 
+pub use aoide_protocol as protocol;
+
 use daemon::Door;
 
 /// Run the `aoide` CLI trunk. Returns the process exit code.
