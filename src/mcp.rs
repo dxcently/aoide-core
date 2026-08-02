@@ -10,6 +10,10 @@
 
 use crate::daemon::Door;
 use crate::dispatch::{self, Invocation};
+use aoide_protocol::wire::{
+    InitializeCapabilities, InitializeResult, JsonRpcResponse, ServerInfo, Tool, ToolAnnotations,
+    ToolCallContent, ToolCallResult, ToolInputSchema, ToolList, ToolProperty, ToolsCapability,
+};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
@@ -19,43 +23,39 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 /// Generate the MCP `tools` array from the command schema. Each command →
 /// one tool named by its dotted path; its args/flags become the inputSchema.
 pub fn tool_list() -> Value {
-    let tools: Vec<Value> = dispatch::registry()
+    let tools: Vec<Tool> = dispatch::registry()
         .commands()
         .map(|c| {
-            let mut props = serde_json::Map::new();
+            let mut properties: BTreeMap<String, ToolProperty> = BTreeMap::new();
             let mut required: Vec<String> = Vec::new();
 
             for a in c.args {
-                props.insert(
+                properties.insert(
                     a.name.to_string(),
-                    json!({ "type": json_type(a.ty), "description": a.description }),
+                    ToolProperty { kind: json_type(a.ty).to_string(), description: a.description.to_string() },
                 );
                 if a.required {
                     required.push(a.name.to_string());
                 }
             }
             for f in c.flags {
-                props.insert(
+                properties.insert(
                     f.name.to_string(),
-                    json!({ "type": json_type(f.ty), "description": f.description }),
+                    ToolProperty { kind: json_type(f.ty).to_string(), description: f.description.to_string() },
                 );
             }
 
-            json!({
-                "name": c.dotted(),
-                "description": c.summary,
-                "inputSchema": {
-                    "type": "object",
-                    "properties": props,
-                    "required": required,
-                },
+            Tool {
+                name: c.dotted(),
+                description: c.summary.to_string(),
+                input_schema: ToolInputSchema { kind: "object".to_string(), properties, required },
                 // Surface the gate so an MCP client can warn before calling.
-                "annotations": { "gated": c.gated },
-            })
+                annotations: ToolAnnotations { gated: c.gated },
+            }
         })
         .collect();
 
-    json!({ "tools": tools })
+    serde_json::to_value(ToolList { tools }).expect("ToolList always serializes")
 }
 
 fn json_type(ty: &str) -> &'static str {
@@ -111,11 +111,17 @@ fn handle(req: &Value) -> Option<Value> {
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
 
     let result: Result<Value, (i64, String)> = match method {
-        "initialize" => Ok(json!({
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": { "tools": {} },
-            "serverInfo": { "name": "aoide", "version": crate::registry::AOIDE_VERSION },
-        })),
+        "initialize" => {
+            let init = InitializeResult {
+                protocol_version: PROTOCOL_VERSION.to_string(),
+                capabilities: InitializeCapabilities { tools: ToolsCapability {} },
+                server_info: ServerInfo {
+                    name: "aoide".to_string(),
+                    version: crate::registry::AOIDE_VERSION.to_string(),
+                },
+            };
+            Ok(serde_json::to_value(init).expect("InitializeResult always serializes"))
+        }
         "tools/list" => Ok(tool_list()),
         "tools/call" => {
             let params = req.get("params").cloned().unwrap_or(Value::Null);
@@ -125,10 +131,11 @@ fn handle(req: &Value) -> Option<Value> {
                 Some(inv) => {
                     let outcome = dispatch::dispatch(&inv);
                     let text = serde_json::to_string_pretty(&outcome).unwrap_or_default();
-                    Ok(json!({
-                        "content": [ { "type": "text", "text": text } ],
-                        "isError": outcome.status != crate::output::Status::Ok,
-                    }))
+                    let result = ToolCallResult {
+                        content: vec![ToolCallContent { kind: "text".to_string(), text }],
+                        is_error: outcome.status != crate::output::Status::Ok,
+                    };
+                    Ok(serde_json::to_value(result).expect("ToolCallResult always serializes"))
                 }
                 None => Err((-32602, format!("unknown tool: {name}"))),
             }
@@ -140,13 +147,13 @@ fn handle(req: &Value) -> Option<Value> {
 
     // Notifications without an id get no response.
     id.as_ref()?;
+    let id = id.expect("id present (checked above)");
 
-    Some(match result {
-        Ok(value) => json!({ "jsonrpc": "2.0", "id": id, "result": value }),
-        Err((code, message)) => {
-            json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
-        }
-    })
+    let resp = match result {
+        Ok(value) => JsonRpcResponse::ok(id, value),
+        Err((code, message)) => JsonRpcResponse::err(id, code, message),
+    };
+    Some(serde_json::to_value(&resp).expect("JsonRpcResponse always serializes"))
 }
 
 /// Serve the MCP protocol over stdio (newline-delimited JSON-RPC).
@@ -164,10 +171,12 @@ pub fn serve_stdio() -> std::io::Result<()> {
         let req: Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
             Err(e) => {
-                let err = json!({
-                    "jsonrpc": "2.0", "id": Value::Null,
-                    "error": { "code": -32700, "message": format!("parse error: {e}") }
-                });
+                let err = serde_json::to_value(JsonRpcResponse::err(
+                    Value::Null,
+                    -32700,
+                    format!("parse error: {e}"),
+                ))
+                .expect("JsonRpcResponse always serializes");
                 writeln!(out, "{err}")?;
                 out.flush()?;
                 continue;

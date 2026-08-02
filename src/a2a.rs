@@ -28,6 +28,10 @@
 
 use crate::daemon::{self, Door};
 use crate::dispatch::Invocation;
+use aoide_protocol::wire::{
+    AgentCapabilities, AgentCard, AgentSkill, JsonRpcRequest, JsonRpcResponse, Message,
+    MessageSendParams, Part, Task, TaskStatus, TaskStatusUpdateEvent,
+};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -137,39 +141,42 @@ pub fn agent_card_from_commands<'a>(
     bind: &str,
     port: u16,
 ) -> Value {
-    let skills: Vec<Value> = commands
+    let skills: Vec<AgentSkill> = commands
         .filter(|c| c.implemented)
         .map(|c| {
             let dotted = c.dotted();
             let top_level = c.path.first().copied().unwrap_or("");
-            json!({
-                "id": dotted,
-                "name": dotted,
-                "description": c.summary,
-                "tags": [top_level],
-            })
+            AgentSkill {
+                id: dotted.clone(),
+                name: dotted,
+                description: c.summary.to_string(),
+                tags: vec![top_level.to_string()],
+            }
         })
         .collect();
 
-    json!({
-        "name": "aoide",
-        "description": "aoide — a headless conductor for agent sessions, rice \
+    let card = AgentCard {
+        name: Some("aoide".to_string()),
+        description: "aoide — a headless conductor for agent sessions, rice \
             generation, and the song/stage state tree, exposed as a \
-            discoverable A2A remote agent (CONTRACTS.md §6).",
-        "version": crate::registry::AOIDE_VERSION,
+            discoverable A2A remote agent (CONTRACTS.md §6)."
+            .to_string(),
+        version: Some(crate::registry::AOIDE_VERSION.to_string()),
         // Pinned explicitly to the A2A v0.3.x JSON-RPC binding (CONTRACTS.md
         // §6 "Version"): flat "url" below, message/send + tasks/get,
         // lowercase-kebab TaskStates. v1.0's `interfaces`-array + top-level
         // `id` card form is a later, additive follow-on — not this.
-        "protocolVersion": "0.3.0",
-        "url": format!("http://{bind}:{port}/"),
+        protocol_version: Some("0.3.0".to_string()),
+        url: Some(format!("http://{bind}:{port}/")),
         // Phase C: the server now serves `message/stream` + `tasks/resubscribe`
         // over Server-Sent Events, so streaming is advertised true.
-        "capabilities": { "streaming": true },
-        "defaultInputModes": ["text/plain"],
-        "defaultOutputModes": ["text/plain"],
-        "skills": skills,
-    })
+        capabilities: Some(AgentCapabilities { streaming: true }),
+        default_input_modes: Some(vec!["text/plain".to_string()]),
+        default_output_modes: Some(vec!["text/plain".to_string()]),
+        skills: Some(skills),
+        interfaces: None,
+    };
+    serde_json::to_value(&card).expect("AgentCard always serializes")
 }
 
 /// The real AgentCard, derived from the process-wide command registry.
@@ -274,18 +281,26 @@ pub fn parse_agent_card(
 /// Mirrors the inbound shape [`parse_message_send_params`] reads. Pure — the
 /// caller generates `message_id`, so the body stays deterministic in tests.
 pub fn build_message_send_body(text: &str, message_id: &str) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "message/send",
-        "params": {
-            "message": {
-                "role": "user",
-                "parts": [{ "kind": "text", "text": text }],
-                "messageId": message_id,
-            }
-        }
-    })
+    let params = MessageSendParams {
+        message: Message {
+            role: "user".to_string(),
+            parts: vec![Part {
+                kind: "text".to_string(),
+                text: Some(text.to_string()),
+                extra: Default::default(),
+            }],
+            message_id: Some(message_id.to_string()),
+            context_id: None,
+            metadata: None,
+        },
+    };
+    let req = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: json!(1),
+        method: "message/send".to_string(),
+        params: serde_json::to_value(&params).expect("MessageSendParams always serializes"),
+    };
+    serde_json::to_value(&req).expect("JsonRpcRequest always serializes")
 }
 
 // ── canonical_state → A2A TaskState mapping (CONTRACTS.md §6) ───────────────
@@ -342,14 +357,15 @@ fn task_from_sessions(
     let canonical = crate::graph::canonical_state(&rec.state);
     let needs_sudo = rec.needs_sudo.unwrap_or(false);
     let state = a2a_task_state(canonical, needs_sudo);
-    Ok(json!({
-        "id": rec.session_id,
+    let task = Task {
+        id: rec.session_id.clone(),
         // MVP simplification: task id == sessionId, contextId == sessionId —
         // see the doc comment above.
-        "contextId": rec.session_id,
-        "status": { "state": state, "timestamp": crate::graph::now_iso_utc() },
-        "kind": "task",
-    }))
+        context_id: rec.session_id.clone(),
+        status: TaskStatus { state: state.to_string(), timestamp: crate::graph::now_iso_utc() },
+        kind: "task".to_string(),
+    };
+    Ok(serde_json::to_value(&task).expect("Task always serializes"))
 }
 
 /// Load `sessions.json` off the stage and resolve one task by id.
@@ -619,12 +635,16 @@ fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path) -> Result<Value, (i
                 "ok",
                 &format!("spawned conducted session `{id}` (configured agent)"),
             );
-            Ok(json!({
-                "id": id,
-                "contextId": id,
-                "status": { "state": "submitted", "timestamp": crate::graph::now_iso_utc() },
-                "kind": "task",
-            }))
+            let task = Task {
+                id: id.clone(),
+                context_id: id.clone(),
+                status: TaskStatus {
+                    state: "submitted".to_string(),
+                    timestamp: crate::graph::now_iso_utc(),
+                },
+                kind: "task".to_string(),
+            };
+            Ok(serde_json::to_value(&task).expect("Task always serializes"))
         }
         Err(e) => {
             let msg = format!("failed to spawn A2A agent: {e}");
@@ -670,16 +690,16 @@ fn handle_jsonrpc(req: &Value, audit_log: &Path, spawn_agent: &str) -> Value {
         other => Err((-32601, format!("method not found: {other}"))),
     };
 
-    match result {
-        Ok(value) => json!({ "jsonrpc": "2.0", "id": id, "result": value }),
-        Err((code, message)) => {
-            json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
-        }
-    }
+    let resp = match result {
+        Ok(value) => JsonRpcResponse::ok(id, value),
+        Err((code, message)) => JsonRpcResponse::err(id, code, message),
+    };
+    serde_json::to_value(&resp).expect("JsonRpcResponse always serializes")
 }
 
 fn jsonrpc_error_value(code: i64, message: impl Into<String>) -> Value {
-    json!({ "jsonrpc": "2.0", "id": Value::Null, "error": { "code": code, "message": message.into() } })
+    serde_json::to_value(JsonRpcResponse::err(Value::Null, code, message))
+        .expect("JsonRpcResponse always serializes")
 }
 
 fn handle_jsonrpc_bytes(body: &[u8], audit_log: &Path, spawn_agent: &str) -> Value {
@@ -729,17 +749,19 @@ fn should_emit(last: Option<&str>, current: &str) -> bool {
 /// Pure — the `task` argument is whatever [`task_get`] produced.
 fn build_stream_event(rpc_id: &Value, task: &Value, is_final: bool) -> Value {
     let result = if is_final {
-        json!({
-            "taskId": task.get("id").cloned().unwrap_or(Value::Null),
-            "contextId": task.get("contextId").cloned().unwrap_or(Value::Null),
-            "status": task.get("status").cloned().unwrap_or(Value::Null),
-            "final": true,
-            "kind": "status-update",
-        })
+        let event = TaskStatusUpdateEvent {
+            task_id: task.get("id").cloned().unwrap_or(Value::Null),
+            context_id: task.get("contextId").cloned().unwrap_or(Value::Null),
+            status: task.get("status").cloned().unwrap_or(Value::Null),
+            is_final: true,
+            kind: "status-update".to_string(),
+        };
+        serde_json::to_value(&event).expect("TaskStatusUpdateEvent always serializes")
     } else {
         task.clone()
     };
-    json!({ "jsonrpc": "2.0", "id": rpc_id, "result": result })
+    serde_json::to_value(JsonRpcResponse::ok(rpc_id.clone(), result))
+        .expect("JsonRpcResponse always serializes")
 }
 
 /// Peek a parsed request: if it's a `POST /` whose JSON-RPC body names a
@@ -808,10 +830,8 @@ fn stream_task<W: Write>(
     let mut task = match resolved {
         Ok(task) => task,
         Err((code, message)) => {
-            let err = json!({
-                "jsonrpc": "2.0", "id": rpc_id,
-                "error": { "code": code, "message": message },
-            });
+            let err = serde_json::to_value(JsonRpcResponse::err(rpc_id, code, message))
+                .expect("JsonRpcResponse always serializes");
             let _ = writer.write_all(sse_event(&err).as_bytes());
             let _ = writer.flush();
             let _ = daemon::audit(

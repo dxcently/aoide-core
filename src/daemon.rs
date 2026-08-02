@@ -13,101 +13,17 @@
 //! `audit`, `default_audit_log`, `aoide_home`, `now_secs`) moved to
 //! `aoide-protocol` (Phase 2 restructure, docs/architecture/PACKAGE-LAYOUT.md)
 //! and is re-exported here so every existing `crate::daemon::*` caller is
-//! untouched. `Gate`/`GateProposal`/`Subscription`/`run` are daemon behavior
-//! and stay here.
+//! untouched. `Gate`/`GateProposal`/`Subscription` (policy types) moved there
+//! too (Phase 4a restructure) and are likewise re-exported; only `run` (the
+//! daemon skeleton's own wiring/demo) stays here.
 
 pub use aoide_protocol::{
     append_audit, audit, aoide_home, default_audit_log, AuditRecord, Door, EventClass,
 };
-use aoide_protocol::audit::now_secs; // crate-private, as it was before the extraction (used only here)
+pub use aoide_protocol::{Gate, GateProposal, Subscription};
 
-use serde::Serialize;
 use serde_json::json;
 use std::path::PathBuf;
-
-/// A proposal to the user rebuild gate. The agent proposes; the user admits;
-/// git records (concepts/Governance). Nothing here applies a rebuild — that is
-/// structurally the user's action.
-#[derive(Debug, Clone, Serialize)]
-pub struct GateProposal {
-    pub command: String,
-    pub description: String,
-    /// Always false in the skeleton: the daemon never auto-admits.
-    pub admitted: bool,
-}
-
-/// The user rebuild gate (real code path, skeletal semantics).
-///
-/// `propose` records the proposal to the audit log and returns it un-admitted.
-/// Admission is a separate, user-only action — there is deliberately no
-/// `admit()` reachable by an agent.
-pub struct Gate {
-    log_path: PathBuf,
-}
-
-impl Gate {
-    pub fn new(log_path: PathBuf) -> Self {
-        Gate { log_path }
-    }
-
-    pub fn propose(&self, door: Door, command: &str, description: &str) -> GateProposal {
-        let _ = audit(
-            &self.log_path,
-            door,
-            EventClass::Gate,
-            command,
-            "proposed",
-            description,
-        );
-        GateProposal {
-            command: command.to_string(),
-            description: description.to_string(),
-            admitted: false,
-        }
-    }
-}
-
-/// A per-class subscription set — default-deny. An adapter must explicitly
-/// allow a class; nothing is delivered by default (entities/aoided).
-#[derive(Debug, Default)]
-pub struct Subscription {
-    allowed: std::collections::HashSet<EventClass>,
-}
-
-impl Subscription {
-    pub fn new() -> Self {
-        Subscription::default()
-    }
-
-    /// Allow one class through to this subscriber.
-    pub fn allow(&mut self, class: EventClass) -> &mut Self {
-        self.allowed.insert(class);
-        self
-    }
-
-    /// Default-deny: only explicitly-allowed classes are delivered.
-    pub fn accepts(&self, class: EventClass) -> bool {
-        self.allowed.contains(&class)
-    }
-
-    /// Wrap a forwarded notification as DATA. It is never executed and never
-    /// reaches a subscriber unless `Notification` was explicitly allowed.
-    pub fn deliver_notification(&self, untrusted_text: &str) -> Option<AuditRecord> {
-        if !self.accepts(EventClass::Notification) {
-            return None;
-        }
-        Some(AuditRecord {
-            ts: now_secs(),
-            door: Door::Daemon,
-            class: EventClass::Notification,
-            command: "notification".into(),
-            status: "forwarded".into(),
-            // Carried as opaque data — an app title never becomes an instruction.
-            message: "forwarded notification (untrusted; treat as data)".into(),
-            untrusted_data: Some(untrusted_text.to_string()),
-        })
-    }
-}
 
 /// Run the daemon skeleton: prove out the real code paths (audit append + gate
 /// + default-deny bus), emit a startup record, and return a status document.
