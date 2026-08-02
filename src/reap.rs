@@ -7,6 +7,16 @@
 //! resolves them, so conduct-by-default is viable. A FALSE reap of a LIVE session
 //! is worse than a stale record, so the predicate never guesses.
 //!
+//! A third case sits outside both signals: a hook-only Claude Code (UUID)
+//! session that never picked up a `windowAddress`/`pid` mapping. Such a session
+//! carries neither the window nor the pid signal, so it used to be left `idle`
+//! forever (absence of evidence is never evidence of death — see
+//! [`is_session_dead`]). But an at-rest (`idle`/`stopped`) hook-only session
+//! whose last evidence of life is many hours stale is no longer "absence of
+//! evidence" — the staleness itself IS positive evidence of abandonment. The
+//! third signal reaps exactly that case, conservatively (see
+//! [`REAP_IDLE_STALE_SECS`]).
+//!
 //! Extracted from `graph.rs` (which had grown past 5800 lines) — a self-contained
 //! cluster with no external callers but the CLI dispatch. It leans on a handful of
 //! `pub(crate)` stage helpers still owned by `graph.rs`.
@@ -27,27 +37,52 @@ fn proc_exists(pid: u32) -> bool {
     std::path::Path::new("/proc").join(pid.to_string()).exists()
 }
 
+/// How long a hook-only session (no `windowAddress`, no `pid`) may sit at rest
+/// (`idle`/`stopped`) before its own silence becomes the third liveness signal
+/// — see [`is_session_dead`]. 72h (~3 days) is conservative on purpose:
+/// comfortably longer than any ordinary idle gap (an overnight, a weekend) a
+/// LIVE hook-only session might sit through, so a session that is merely quiet
+/// is never touched. Only a session stranded well past any plausible "still
+/// working on it" window qualifies — the two cleared-by-hand orphans that
+/// motivated this had been `idle` for days, so 72h loses nothing on the
+/// cleanup side while giving a wide berth to a quiet-but-live weekend session.
+pub const REAP_IDLE_STALE_SECS: i64 = 72 * 3600; // 72 hours (~3 days)
+
 /// Is a session DEAD — orphaned so that NO process will ever clean it up? Pure
-/// and unit-tested (feed a fake live-address set + a fake `proc_exists`).
+/// and unit-tested (feed a fake live-address set, a fake `proc_exists`, and a
+/// fake `last_seen`).
 ///
-/// DEAD when EITHER independent signal fires:
+/// DEAD when ANY of three signals fires:
 ///   * **window gone** — a non-empty `windowAddress` that is NOT among the live
 ///     `hyprctl clients -j` addresses (the SUPER+Q kill: the window vanished), OR
 ///   * **process gone** — a recorded `pid` whose `/proc/<pid>` no longer exists
-///     (the process-killed case).
+///     (the process-killed case), OR
+///   * **stale hook-only at-rest** — NO window evidence (empty `windowAddress`,
+///     so the window signal can't apply either way) AND NO pid (so the pid
+///     signal can't apply either) AND the canonical state is `idle` or
+///     `stopped` (never `working`/`awaiting`/`needsSudo` — a hook-only session
+///     mid-turn is not dead) AND `last_seen` reports evidence of life older
+///     than [`REAP_IDLE_STALE_SECS`].
 ///
 /// The never-false-reap guards:
 ///   * `live_addresses` is an `Option`: `None` means the compositor could not be
 ///     queried (no Hyprland, hyprctl missing/failed) — the window signal is then
 ///     UNKNOWN and contributes nothing, so we never reap a windowed session we
 ///     merely failed to see. Only a `Some(live)` we actually gathered can fire it.
-///   * A session with NEITHER signal (empty `windowAddress` AND no `pid` — e.g. a
-///     hook-only session that has not yet discovered a window/pid) is left alone:
-///     absence of evidence is never evidence of death.
+///   * A session with NEITHER the window NOR the pid signal (e.g. a hook-only
+///     session that has not yet discovered a window/pid) is left alone UNLESS
+///     the third signal's own positive evidence (a stale `last_seen`) fires:
+///     absence of evidence is never evidence of death, but STALENESS is
+///     evidence, not absence — `last_seen` returning `None` (no transcript, no
+///     parseable `startedAt`) is itself absence of evidence and never counts as
+///     stale, so the guard holds. A just-started hook-only session has a recent
+///     `last_seen` and sits far under the threshold, so it is never touched.
 pub fn is_session_dead(
     rec: &SessionRecord,
     live_addresses: Option<&HashSet<String>>,
     proc_exists: impl Fn(u32) -> bool,
+    now_epoch: i64,
+    last_seen: impl Fn(&SessionRecord) -> Option<i64>,
 ) -> bool {
     let window_signal = match live_addresses {
         Some(live) => {
@@ -57,7 +92,13 @@ pub fn is_session_dead(
         None => false, // compositor not queried — window liveness is unknown.
     };
     let pid_signal = matches!(rec.pid, Some(p) if !proc_exists(p));
-    window_signal || pid_signal
+    let stale_idle_signal = rec.window_address.is_empty()
+        && rec.pid.is_none()
+        && matches!(canonical_state(&rec.state), "idle" | "stopped")
+        && last_seen(rec)
+            .map(|seen| now_epoch.saturating_sub(seen) > REAP_IDLE_STALE_SECS)
+            .unwrap_or(false); // no last-seen evidence at all → not stale, not dead.
+    window_signal || pid_signal || stale_idle_signal
 }
 
 /// Gather the normalised live window addresses from `hyprctl clients -j`.
@@ -282,19 +323,60 @@ fn reap_inner(_inv: &Invocation) -> Outcome {
         Err(e) => return stage_error(cmd, e),
     };
 
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
     let gathered = live_window_addresses();
     let hyprctl_available = gathered.is_some();
     // Apply the transient-read grace: a degenerate empty snapshot during a reload
     // window falls back to pid-only liveness so we never sweep the live roster off
     // a momentary "zero windows" answer.
     let live = effective_live_addresses(gathered, &s_file.sessions);
+    // This session's hook record's `updatedAt` — the exact timestamp
+    // `decay_stopped_sessions` below reads for the `stopped` clock, mirrored
+    // here as evidence for the third signal too: a foreign-harness/headless
+    // session (no window, no pid, no transcript — the `graph session start`
+    // recipe) that fires hooks on its own cadence is proven alive by THIS
+    // timestamp even when its `startedAt` is old and no transcript exists.
+    let hook_seen: HashMap<&str, Option<i64>> = h_file
+        .hooks
+        .iter()
+        .map(|h| {
+            (
+                h.session_id.as_str(),
+                crate::conductor::theme::parse_iso_utc(&h.updated_at),
+            )
+        })
+        .collect();
+    // The third signal's evidence-of-life probe: the MAX of every timestamp we
+    // have reason to trust — the on-disk transcript's mtime (if a transcript
+    // exists), this session's hook `updatedAt` (see above), and the record's
+    // own `startedAt` (the floor — at least this recently the session came
+    // into being). `None` only when NONE of the three resolve — genuine
+    // absence of evidence, which `is_session_dead` treats as "not stale, not
+    // dead", never as staleness itself.
+    let last_seen = |s: &SessionRecord| -> Option<i64> {
+        let transcript_mtime = transcript_path_for(&s.session_id, Some(s.cwd.as_str()), None)
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64);
+        let hook_updated_at = hook_seen.get(s.session_id.as_str()).copied().flatten();
+        let started = crate::conductor::theme::parse_iso_utc(&s.started_at);
+        [transcript_mtime, hook_updated_at, started]
+            .into_iter()
+            .flatten()
+            .max()
+    };
     // Only STILL-live records can be dead-by-liveness; an already-`done` session
     // is prune's job, not a reap. This is the set the liveness predicate killed.
     let mut reaped: Vec<String> = s_file
         .sessions
         .iter()
         .filter(|s| s.state != "done")
-        .filter(|s| is_session_dead(s, live.as_ref(), proc_exists))
+        .filter(|s| is_session_dead(s, live.as_ref(), proc_exists, now_epoch, last_seen))
         .map(|s| s.session_id.clone())
         .collect();
 
@@ -303,10 +385,6 @@ fn reap_inner(_inv: &Invocation) -> Outcome {
     // ~60s off startedAt so a just-born pair settles; keeper = the one with a real
     // transcript on disk (see `superseded_agent_duplicates`).
     const DEDUP_GRACE_SECS: i64 = 60;
-    let now_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
     let is_recent = |s: &SessionRecord| {
         crate::conductor::theme::parse_iso_utc(&s.started_at)
             .map(|t| now_epoch - t < DEDUP_GRACE_SECS)
@@ -425,6 +503,183 @@ mod tests {
             started_at: started.into(),
             ..Default::default()
         }
+    }
+
+    /// A hook-only session: no `windowAddress`, no `pid` — exactly the UUID
+    /// sessions that used to strand `idle` forever (the third-signal target).
+    fn hook_only(id: &str, state: &str) -> SessionRecord {
+        SessionRecord {
+            session_id: id.into(),
+            agent: "claude".into(),
+            window_address: String::new(),
+            state: state.into(),
+            pid: None,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn stale_hook_only_at_rest_session_is_reaped() {
+        // No window, no pid, `idle`, last evidence of life 100h ago (> the 72h
+        // threshold) — the exact stranded-UUID-orphan case this signal exists
+        // for. Live-address/proc-exists probes are irrelevant here (neither
+        // window nor pid signal can fire), so wire up dummies.
+        let now = 1_800_000_000_i64;
+        let stale = |_: &SessionRecord| Some(now - 100 * 3600);
+        assert!(is_session_dead(
+            &hook_only("orphan-idle", "idle"),
+            None,
+            |_| true,
+            now,
+            stale,
+        ));
+        // `stopped` is equally "at rest" and equally reapable once stale.
+        assert!(is_session_dead(
+            &hook_only("orphan-stopped", "stopped"),
+            None,
+            |_| true,
+            now,
+            stale,
+        ));
+    }
+
+    #[test]
+    fn fresh_hook_only_idle_session_is_not_reaped() {
+        // Same shape (no window, no pid, idle) but last seen only 1h ago — well
+        // under the 72h threshold. A just-started hook-only session must never
+        // be swept.
+        let now = 1_800_000_000_i64;
+        let one_hour_ago = |_: &SessionRecord| Some(now - 3600);
+        assert!(!is_session_dead(
+            &hook_only("fresh", "idle"),
+            None,
+            |_| true,
+            now,
+            one_hour_ago,
+        ));
+    }
+
+    #[test]
+    fn hook_only_working_session_is_never_reaped_even_if_stale() {
+        // No window, no pid, but `working` (mid-turn) with a 100h-stale
+        // last-seen: the state gate must block the third signal outright — a
+        // hook-only session mid-startup/mid-turn is not dead, no matter how old
+        // its last transcript write looks.
+        let now = 1_800_000_000_i64;
+        let stale = |_: &SessionRecord| Some(now - 100 * 3600);
+        let mut rec = hook_only("busy", "working");
+        rec.state = "working".into();
+        assert!(!is_session_dead(&rec, None, |_| true, now, stale));
+        // Same for `awaiting` — waiting on a permission prompt is not at rest.
+        rec.state = "awaiting".into();
+        assert!(!is_session_dead(&rec, None, |_| true, now, stale));
+    }
+
+    #[test]
+    fn headless_session_kept_alive_by_hook_updated_at_survives_stale_started_at() {
+        // THE BLOCKER regression (Fable review): a foreign-harness/headless
+        // session (no window, no pid, no on-disk transcript — the `graph
+        // session start` recipe) can have an ANCIENT `startedAt` yet still be
+        // firing hooks on its own cadence. Its hook record's `updatedAt` is
+        // proof of life that must win over the stale `startedAt` — this is the
+        // pure-predicate half of the fix: feed `is_session_dead` a `last_seen`
+        // that (correctly) folds in a fresh hook timestamp, and the record must
+        // NOT be dead despite a `startedAt` far past the 72h threshold.
+        let now = 1_800_000_000_i64;
+        let mut rec = hook_only("headless", "idle");
+        rec.started_at = "2020-01-01T00:00:00Z".into(); // ancient birth time
+        let fresh_hook_updated_at = now - 60; // this session's hook fired 1 minute ago
+        let last_seen = move |s: &SessionRecord| -> Option<i64> {
+            // Mirrors the real `last_seen` in `reap_inner`: MAX of transcript
+            // mtime (none here), hook `updatedAt` (fresh), and `startedAt`
+            // (ancient) — the fold that closes the false-reap hole.
+            [
+                None, // no transcript
+                Some(fresh_hook_updated_at),
+                crate::conductor::theme::parse_iso_utc(&s.started_at),
+            ]
+            .into_iter()
+            .flatten()
+            .max()
+        };
+        assert!(!is_session_dead(&rec, None, |_| true, now, last_seen));
+    }
+
+    /// THE BLOCKER regression, end-to-end through `reap()`: a headless session
+    /// with an ancient `startedAt`, no transcript, no window, no pid, but a
+    /// FRESH hook `updatedAt` in `hooks.json` must survive a real reap pass —
+    /// proving `reap_inner`'s `last_seen` closure actually performs the fold
+    /// (not just the pure predicate above).
+    #[test]
+    fn reap_spares_a_headless_session_kept_alive_by_a_fresh_hook_updated_at() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env =
+            crate::graph::testutil::EnvVars::save(&["AOIDE_STAGE_DIR", "HYPRLAND_INSTANCE_SIGNATURE"]);
+        std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"); // pid-only/no-window liveness
+        let stage = crate::graph::testutil::unique_stage("reap-hookfold");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let mut rec = hook_only("headless", "idle");
+        rec.started_at = "2020-01-01T00:00:00Z".into(); // ancient — no transcript exists for it
+        rec.cwd = "/nonexistent/nowhere".into();
+        write_stage(
+            &sessions_path(),
+            &SessionsFile {
+                schema_version: "0".into(),
+                sessions: vec![rec],
+            },
+        )
+        .unwrap();
+        let mut hooks = Vec::new();
+        upsert_hook(&mut hooks, "headless", "idle", &now_iso_utc()); // fired seconds ago
+        write_stage(
+            &hooks_path(),
+            &HooksFile {
+                schema_version: "0".into(),
+                hooks,
+            },
+        )
+        .unwrap();
+
+        let out = reap(&crate::graph::testutil::invocation(&["graph", "reap"], &[]));
+        assert_eq!(out.status, crate::output::Status::Ok);
+        assert_eq!(
+            out.data.unwrap()["reaped"],
+            json!([]),
+            "a headless session kept alive by a fresh hook updatedAt must survive despite an ancient startedAt"
+        );
+        let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert!(
+            s2.sessions.iter().any(|s| s.session_id == "headless"),
+            "the headless session survives the reaper pass"
+        );
+
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn windowed_session_is_unaffected_by_the_stale_idle_signal() {
+        // A session WITH a live window is never touched by the third signal
+        // regardless of staleness — condition 1 (no window evidence) fails, so
+        // only the pre-existing window/pid signals can ever apply to it.
+        let live: HashSet<String> = ["aaa"].iter().map(|s| s.to_string()).collect();
+        let now = 1_800_000_000_i64;
+        let ancient = |_: &SessionRecord| Some(now - 100 * 3600);
+        let mut rec = agent("windowed", "0xAAA", "2026-07-30T00:00:00Z");
+        rec.state = "idle".into();
+        rec.pid = None;
+        assert!(!is_session_dead(&rec, Some(&live), |_| true, now, ancient));
+    }
+
+    #[test]
+    fn pid_dead_signal_is_unchanged_by_the_new_third_signal() {
+        // The pre-existing pid-gone signal still fires exactly as before — the
+        // third signal only ADDS a case, it never masks or weakens signal (b).
+        let now = 1_800_000_000_i64;
+        let fresh = |_: &SessionRecord| Some(now);
+        let mut rec = hook_only("pid-dead", "working");
+        rec.pid = Some(42);
+        assert!(is_session_dead(&rec, None, |_| false, now, fresh));
     }
 
     #[test]

@@ -1820,27 +1820,69 @@ mod tests {
             pid,
             ..Default::default()
         };
+        // These assertions are about the window/pid signals only; pin the third
+        // (stale hook-only) signal off by reporting "just seen right now" for
+        // every record, regardless of state.
+        let now = 0_i64;
+        let fresh = |_: &SessionRecord| Some(now);
 
         // Window-gone (the SUPER+Q kill): a non-empty window absent from the live
         // set is dead even when the pid is alive. The match is 0x/case-tolerant.
-        assert!(is_session_dead(&rec("0xCCC", None), Some(&live), alive));
-        assert!(is_session_dead(&rec("0xCCC", Some(9)), Some(&live), alive));
+        assert!(is_session_dead(&rec("0xCCC", None), Some(&live), alive, now, fresh));
+        assert!(is_session_dead(
+            &rec("0xCCC", Some(9)),
+            Some(&live),
+            alive,
+            now,
+            fresh
+        ));
         // A live window (normalised match) with a live pid → NOT dead.
-        assert!(!is_session_dead(&rec("0xAAA", Some(9)), Some(&live), alive));
+        assert!(!is_session_dead(
+            &rec("0xAAA", Some(9)),
+            Some(&live),
+            alive,
+            now,
+            fresh
+        ));
 
         // Process-gone: a pid whose /proc vanished is dead regardless of window
         // (here the window IS live, so ONLY the pid signal fires).
-        assert!(is_session_dead(&rec("0xAAA", Some(9)), Some(&live), dead_proc));
+        assert!(is_session_dead(
+            &rec("0xAAA", Some(9)),
+            Some(&live),
+            dead_proc,
+            now,
+            fresh
+        ));
 
-        // NEVER-FALSE-REAP #1 — neither signal (no window, no pid): left alone.
-        assert!(!is_session_dead(&rec("", None), Some(&live), dead_proc));
+        // NEVER-FALSE-REAP #1 — neither signal (no window, no pid), and the third
+        // signal reports "just seen": left alone.
+        assert!(!is_session_dead(
+            &rec("", None),
+            Some(&live),
+            dead_proc,
+            now,
+            fresh
+        ));
 
         // NEVER-FALSE-REAP #2 — compositor NOT queried (None): the window signal
         // is suppressed, so a windowed session we could not SEE is never reaped;
         // only the authoritative pid signal remains.
-        assert!(!is_session_dead(&rec("0xCCC", None), None, alive));
-        assert!(!is_session_dead(&rec("0xCCC", Some(9)), None, alive)); // pid alive → alive
-        assert!(is_session_dead(&rec("0xCCC", Some(9)), None, dead_proc)); // pid gone → dead
+        assert!(!is_session_dead(&rec("0xCCC", None), None, alive, now, fresh));
+        assert!(!is_session_dead(
+            &rec("0xCCC", Some(9)),
+            None,
+            alive,
+            now,
+            fresh
+        )); // pid alive → alive
+        assert!(is_session_dead(
+            &rec("0xCCC", Some(9)),
+            None,
+            dead_proc,
+            now,
+            fresh
+        )); // pid gone → dead
     }
     #[test]
     fn reap_drops_killed_sessions_but_spares_the_living() {
@@ -1855,9 +1897,15 @@ mod tests {
 
         // A pid that can NEVER exist (above every Linux pid_max) is the killed
         // session; this very process's pid is the living one; and a hook-only
-        // session carries NEITHER signal and must be spared.
+        // session carries NEITHER the window NOR the pid signal and must be
+        // spared — AS LONG AS it is fresh. It is stamped with the real "now"
+        // (not the fixed 2026-01-01 the other two use) so the reaper's new
+        // stale-hook-only-at-rest signal (which reads the real wall clock) does
+        // not fire on it: this test is about the window/pid signals, not
+        // staleness (that has its own coverage in `reap.rs`'s unit tests).
         let dead_pid = u32::MAX;
         let now = "2026-01-01T00:00:00Z";
+        let fresh_now = now_iso_utc();
         let mut sessions = Vec::new();
         upsert_session(
             &mut sessions, "live", None, Some("/w"), None, None, None, None, None,
@@ -1869,7 +1917,7 @@ mod tests {
         );
         upsert_session(
             &mut sessions, "hookonly", None, Some("/w"), None, None, None, None, None,
-            None, now,
+            None, &fresh_now,
         );
         write_stage(
             &sessions_path(),
