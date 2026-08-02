@@ -72,6 +72,25 @@ pub fn song_dir() -> std::path::PathBuf {
         .unwrap_or(stage)
 }
 
+/// The live-deployed QML tree the desktop shell reads from: `<Aoide>/run/qml/`
+/// — a sibling of the song tree ([`song_dir`]), NOT under `stage/`.
+///
+/// Mirrors [`song_dir`]'s own derivation exactly: `song_dir` takes
+/// [`stage_dir`]'s parent to reach the song tree root; this takes
+/// `song_dir`'s parent (the `Aoide` root that `song/`, `state/`, and now
+/// `run/` all sit under) and joins `run/qml`. So an `$AOIDE_STAGE_DIR`
+/// override still relocates this seam — it rides the same env var, one
+/// level further up — without a separate `$AOIDE_RUN_DIR`. Not yet used by
+/// any Phase A caller (a later phase's widget-carry write path is the first
+/// consumer); the helper + its precedence test land now so the seam exists
+/// before anything depends on it.
+pub fn run_qml_dir() -> std::path::PathBuf {
+    let song = song_dir();
+    song.parent()
+        .map(|root| root.join("run").join("qml"))
+        .unwrap_or_else(|| song.join("run").join("qml"))
+}
+
 /// The committed-song directory: `<song>/songbook/<name>/`.
 ///
 /// Shares [`song_dir`]'s `AOIDE_STAGE_DIR`-relative resolution, so a test that
@@ -358,6 +377,34 @@ mod tests {
         std::env::remove_var("AOIDE_STAGE_DIR");
         assert!(song_dir().ends_with("Aoide/song"));
         assert!(songbook_notes("x").ends_with("Aoide/song/songbook/x/drachma.json"));
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+    }
+
+    #[test]
+    fn run_qml_dir_resolves_as_a_sibling_of_song_under_the_stage_override() {
+        // Mirrors `song_tree_resolves_under_the_stage_override` above: the
+        // override's tmp root plays the role of the real `~/Aoide/` root, its
+        // child the role of `song/`, so `run/qml` lands as THAT root's sibling
+        // `run/qml`, one level up from where `song_dir()` resolves.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+
+        std::env::set_var("AOIDE_STAGE_DIR", "/tmp/aoide-run-qml-test/stage");
+        assert_eq!(
+            run_qml_dir(),
+            std::path::PathBuf::from("/tmp/run/qml"),
+            "run/qml is a sibling of song_dir(), not under stage/"
+        );
+
+        // On the default layout: `~/Aoide/song/stage` → song_dir() = `~/Aoide/song`
+        // → run_qml_dir() = `~/Aoide/run/qml`.
+        std::env::remove_var("AOIDE_STAGE_DIR");
+        assert!(run_qml_dir().ends_with("Aoide/run/qml"));
+        assert!(!run_qml_dir().ends_with("Aoide/song/run/qml"), "not nested under song/");
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),

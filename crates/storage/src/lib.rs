@@ -1,8 +1,8 @@
 //! aoide-storage — Aoide's durable session data (Phase 3a restructure,
 //! docs/architecture/PACKAGE-LAYOUT.md): the stage-file record shapes
 //! (`records`), atomic stage I/O (`fs`, `stage`), time formatting (`time`),
-//! the pure session/hook upsert ops (`session`), and the client-side A2A
-//! agent roster (`a2a_store`).
+//! the pure session/hook upsert ops (`session`), the client-side A2A agent
+//! roster (`a2a_store`), and the active design-mode marker (`design`).
 //!
 //! Extracted from root `src/` (`shellbridge.rs`, `graph/model.rs`,
 //! `graph/session_store.rs`, `conductor/theme.rs`, `a2a.rs`) following the
@@ -11,6 +11,7 @@
 //! call site changes.
 
 pub mod a2a_store;
+pub mod design;
 pub mod fs;
 pub mod records;
 pub mod session;

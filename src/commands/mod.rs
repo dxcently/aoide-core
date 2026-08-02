@@ -5,6 +5,7 @@
 
 mod a2a;
 mod cover;
+mod design;
 mod graph;
 mod infra;
 mod meta;
@@ -15,18 +16,25 @@ mod usage;
 use crate::registry::Registry;
 
 /// Build the full command registry, in the historical `schema --json` order:
-/// guide, schema, rice gen(stub), rice lint/preview/mint, cover set,
-/// rice adopt/transpose(stub), content(stub x5), make(stub), update(stub),
-/// onboard(stub), mcp serve, daemon, shellbridge, graph(x15) + conduct,
-/// adapter melete, conductor, a2a serve + agent add/list/remove(stub x3),
-/// usage (appended — the newest group, so it never reorders the historical
-/// table above it).
+/// guide, schema, rice gen(stub), rice lint/preview/mint, rice design status,
+/// cover set, rice adopt/transpose(stub), content(stub x5), make(stub),
+/// update(stub), onboard(stub), mcp serve, daemon, shellbridge, graph(x15) +
+/// conduct, adapter melete, conductor, a2a serve + agent add/list/remove(stub
+/// x3), usage (appended — the newest group, so it never reorders the
+/// historical table above it).
+///
+/// `design::register` sits directly after `rice::register` (rather than off
+/// on its own) so the whole `rice` family — `lint`/`preview`/`mint`/`design
+/// status` — stays contiguous in `schema --json`'s command order, even though
+/// `design.rs` is its own module (Phase A of the design-mode feature; see
+/// `crates/storage/src/design.rs`).
 pub fn all() -> Registry {
     let mut r = Registry::new();
 
     meta::register(&mut r); // guide, schema
     stubs::register_rice_gen(&mut r); // rice gen
     rice::register(&mut r); // rice lint, preview, mint
+    design::register(&mut r); // rice design status
     cover::register(&mut r); // cover set
     stubs::register_rice_late(&mut r); // rice adopt, transpose
     stubs::register_content(&mut r); // content register/propose/approve/ingest/query
