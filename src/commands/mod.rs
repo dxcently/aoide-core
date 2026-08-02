@@ -36,7 +36,7 @@ pub fn all() -> Registry {
     infra::register_pre_graph(&mut r); // mcp serve, daemon, shellbridge
     graph::register(&mut r); // graph x15 + conduct
     infra::register_post_graph(&mut r); // adapter melete, conductor
-    a2a::register(&mut r); // a2a serve (real, read-only), agent add/list/remove (stub, CONTRACTS.md §6)
+    a2a::register(&mut r); // a2a serve (real), agent add/list/remove/send (real, client side — CONTRACTS.md §6)
     usage::register(&mut r); // usage — local token/cost rollup (CONTRACTS.md §4)
 
     r

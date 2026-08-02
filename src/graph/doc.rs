@@ -116,6 +116,25 @@ pub fn build_graph(
         }
     }
 
+    // Fold registered EXTERNAL A2A agents into the DAG (CONTRACTS.md §6, client
+    // side). Each is a ROOT node of `kind:"a2a"` keyed by its card `name` — no
+    // edges (they anchor to nothing), so the existing spawned/anchors machinery
+    // is untouched. Additive and tolerate-missing: an absent/empty registry
+    // (`state/a2a-agents.json`) adds nothing and this whole block is a no-op.
+    for agent in crate::a2a::load_agents() {
+        let mut node = json!({
+            "id": format!("a2a:{}", agent.name),
+            "kind": "a2a",
+            "name": agent.name,
+            "url": agent.url,
+            "state": "idle",
+        });
+        if !agent.description.is_empty() {
+            node["description"] = json!(agent.description);
+        }
+        nodes.push(node);
+    }
+
     json!({
         "schemaVersion": STAGE_GRAPH_VERSION,
         "nodes": nodes,
@@ -623,6 +642,47 @@ mod tests {
         let node_b = nodes.iter().find(|n| n["id"] == "session:b").unwrap();
         assert_eq!(node_a["needsSudo"], json!(true));
         assert!(node_b.get("needsSudo").is_none());
+    }
+    #[test]
+    fn build_graph_folds_registered_a2a_agents_as_root_nodes() {
+        // CONTRACTS.md §6 client side: a registered external A2A agent folds
+        // into the DAG as a `kind:"a2a"` root node keyed by its card name, with
+        // no edges. Drive it through the on-disk registry via AOIDE_STATE_DIR.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-a2a-fold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("AOIDE_STATE_DIR", &dir);
+
+        crate::a2a::save_agents(&[crate::a2a::A2aAgent {
+            name: "peer".into(),
+            url: "http://10.0.0.5:8710/".into(),
+            description: "a friendly agent".into(),
+            registered_at: "2026-08-01T00:00:00Z".into(),
+        }])
+        .unwrap();
+
+        let doc = build_graph(&[], &[], &[]);
+        let nodes = doc["nodes"].as_array().unwrap();
+        let a2a = nodes.iter().find(|n| n["id"] == "a2a:peer").expect("a2a node folded in");
+        assert_eq!(a2a["kind"], "a2a");
+        assert_eq!(a2a["name"], "peer");
+        assert_eq!(a2a["url"], "http://10.0.0.5:8710/");
+        assert_eq!(a2a["state"], "idle");
+        assert_eq!(a2a["description"], "a friendly agent");
+        // An a2a agent is a root: it contributes no edges.
+        assert!(doc["edges"].as_array().unwrap().is_empty());
+
+        // An empty registry folds nothing (additive / no-op).
+        crate::a2a::save_agents(&[]).unwrap();
+        let doc = build_graph(&[], &[], &[]);
+        assert!(doc["nodes"].as_array().unwrap().iter().all(|n| n["kind"] != "a2a"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
     }
     #[test]
     fn render_shows_sudo_marker_when_blocked() {

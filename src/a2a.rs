@@ -28,12 +28,13 @@
 
 use crate::daemon::{self, Door};
 use crate::dispatch::Invocation;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -175,6 +176,184 @@ pub fn agent_card_from_commands<'a>(
 /// The real AgentCard, derived from the process-wide command registry.
 fn agent_card(bind: &str, port: u16) -> Value {
     agent_card_from_commands(crate::dispatch::registry().commands(), bind, port)
+}
+
+// ── Client-side registry: external A2A agents (CONTRACTS.md §4/§6) ───────────
+//
+// `state/a2a-agents.json` (v0): the set of EXTERNAL A2A agents this aoide has
+// registered by AgentCard URL (`aoide a2a agent add`). Each entry folds into
+// the session DAG as a `kind:"a2a"` node (`graph/doc.rs::build_graph`) and is
+// the outbound peer `aoide a2a agent send` drives. Tolerate-missing → empty
+// (an absent file is simply "no agents registered"); keyed by the card `name`,
+// dedupe/replace on re-add. This is the CLIENT half of §6 — the outbound,
+// aoide-drives-a-remote-agent direction — mirroring the inbound server above.
+
+/// `state/a2a-agents.json` schema version (CONTRACTS.md §4, v0).
+pub const A2A_AGENTS_VERSION: &str = "0";
+
+/// One registered external A2A agent. `url` is the RESOLVED `message/send`
+/// endpoint (the card's own `url`/first-interface url, or the origin of the
+/// fetched card URL) — what `agent send` POSTs to, NOT the card URL we GET'd.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct A2aAgent {
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(rename = "registeredAt", default)]
+    pub registered_at: String,
+}
+
+/// The `state/a2a-agents.json` container.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct A2aAgentRegistry {
+    #[serde(rename = "schemaVersion", default)]
+    pub schema_version: String,
+    #[serde(default)]
+    pub agents: Vec<A2aAgent>,
+}
+
+/// The registry path: `state/a2a-agents.json` — the gitignored root-runtime
+/// `state/` dir (CONTRACTS.md §2, the same root `state/usage.json` lives in),
+/// NOT `song/stage/`.
+pub fn agents_path() -> PathBuf {
+    crate::shellbridge::state_dir().join("a2a-agents.json")
+}
+
+/// Read the registry, tolerating a missing/corrupt/wrong-shape file as an
+/// empty list (CONTRACTS.md §4 additive discipline — an absent file is simply
+/// "no agents registered", never an error).
+pub fn load_agents() -> Vec<A2aAgent> {
+    match std::fs::read_to_string(agents_path()) {
+        Ok(raw) => serde_json::from_str::<A2aAgentRegistry>(&raw)
+            .map(|r| r.agents)
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Atomic-write the registry (v0 shape) back to `state/a2a-agents.json`.
+pub fn save_agents(agents: &[A2aAgent]) -> Result<(), String> {
+    let reg = A2aAgentRegistry {
+        schema_version: A2A_AGENTS_VERSION.to_string(),
+        agents: agents.to_vec(),
+    };
+    let body = serde_json::to_string_pretty(&reg)
+        .map_err(|e| format!("serialize a2a-agents.json: {e}"))?
+        + "\n";
+    let path = agents_path();
+    crate::shellbridge::atomic_write(&path, &body).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Insert or REPLACE an agent by `name` (dedupe on re-add — the newest card
+/// wins). Pure list mutation, so the CRUD is unit-testable off disk.
+pub fn upsert_agent(agents: &mut Vec<A2aAgent>, agent: A2aAgent) {
+    if let Some(slot) = agents.iter_mut().find(|a| a.name == agent.name) {
+        *slot = agent;
+    } else {
+        agents.push(agent);
+    }
+}
+
+/// Remove an agent by `name`. Returns whether anything was removed, so the
+/// handler can report an idempotent no-op cleanly. Pure.
+pub fn remove_agent(agents: &mut Vec<A2aAgent>, name: &str) -> bool {
+    let before = agents.len();
+    agents.retain(|a| a.name != name);
+    agents.len() != before
+}
+
+// ── AgentCard parsing (client side — the shape a REMOTE card presents) ───────
+
+/// Resolve the AgentCard URL to GET from a user-supplied `url`: if it already
+/// points at a card (`…/agent-card.json`) use it verbatim, otherwise treat it
+/// as an origin and append the well-known path. Pure.
+pub fn resolve_card_url(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.ends_with("agent-card.json") {
+        trimmed.to_string()
+    } else {
+        format!("{}/.well-known/agent-card.json", trimmed.trim_end_matches('/'))
+    }
+}
+
+/// The `scheme://host[:port]/` origin of a URL (drops path/query) — the
+/// fallback `message/send` endpoint when a card names no `url`. Pure.
+fn origin_of(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some((s, r)) => (s, r),
+        None => return url.to_string(),
+    };
+    let host = rest.split('/').next().unwrap_or(rest);
+    format!("{scheme}://{host}/")
+}
+
+/// The `message/send` endpoint a card advertises: its flat `url` (the A2A
+/// v0.3.x JSON-RPC binding — the shape aoide's own card emits), else the first
+/// `interfaces[].url` (the v1.0 form), filtered to a non-empty string. Pure.
+fn card_endpoint(card: &Value) -> Option<String> {
+    if let Some(u) = card
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(u.to_string());
+    }
+    card.get("interfaces")
+        .and_then(Value::as_array)
+        .and_then(|xs| xs.first())
+        .and_then(|i| i.get("url"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Parse a fetched AgentCard into a registry entry. Requires at least a
+/// non-empty `name`; keeps `description`; resolves the POST endpoint via
+/// [`card_endpoint`], falling back to the origin of `fetch_url` (the URL the
+/// card was GET'd from). Pure — the fetch itself is the handler's job.
+pub fn parse_agent_card(
+    card: &Value,
+    fetch_url: &str,
+    registered_at: &str,
+) -> Result<A2aAgent, String> {
+    let name = card
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "AgentCard has no `name`".to_string())?;
+    let description = card
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let url = card_endpoint(card).unwrap_or_else(|| origin_of(fetch_url));
+    Ok(A2aAgent {
+        name: name.to_string(),
+        url,
+        description,
+        registered_at: registered_at.to_string(),
+    })
+}
+
+/// Build the JSON-RPC `message/send` request body aoide POSTs when DRIVING a
+/// registered external agent (the outbound half of the bidirectional link).
+/// Mirrors the inbound shape [`parse_message_send_params`] reads. Pure — the
+/// caller generates `message_id`, so the body stays deterministic in tests.
+pub fn build_message_send_body(text: &str, message_id: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "message/send",
+        "params": {
+            "message": {
+                "role": "user",
+                "parts": [{ "kind": "text", "text": text }],
+                "messageId": message_id,
+            }
+        }
+    })
 }
 
 // ── canonical_state → A2A TaskState mapping (CONTRACTS.md §6) ───────────────
@@ -1733,5 +1912,159 @@ mod tests {
         assert_eq!(status, 405);
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert!(v["error"]["code"].is_i64());
+    }
+
+    // ── Client-side registry: CRUD (pure, in-memory) ─────────────────────────
+
+    fn fixture_agent(name: &str, url: &str) -> A2aAgent {
+        A2aAgent {
+            name: name.to_string(),
+            url: url.to_string(),
+            description: format!("{name} desc"),
+            registered_at: "2026-08-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn upsert_agent_appends_then_dedupes_by_name() {
+        let mut agents: Vec<A2aAgent> = Vec::new();
+        upsert_agent(&mut agents, fixture_agent("alpha", "http://a/"));
+        upsert_agent(&mut agents, fixture_agent("beta", "http://b/"));
+        assert_eq!(agents.len(), 2);
+
+        // Re-add `alpha` with a new endpoint → REPLACE in place (dedupe by name),
+        // preserving order, not a second entry.
+        let mut updated = fixture_agent("alpha", "http://a-new/");
+        updated.description = "updated".into();
+        upsert_agent(&mut agents, updated);
+        assert_eq!(agents.len(), 2, "re-add replaces, never duplicates");
+        assert_eq!(agents[0].name, "alpha");
+        assert_eq!(agents[0].url, "http://a-new/");
+        assert_eq!(agents[0].description, "updated");
+    }
+
+    #[test]
+    fn remove_agent_is_idempotent() {
+        let mut agents = vec![fixture_agent("alpha", "http://a/"), fixture_agent("beta", "http://b/")];
+        assert!(remove_agent(&mut agents, "alpha"));
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "beta");
+        // Removing an absent name is a no-op that reports `false`.
+        assert!(!remove_agent(&mut agents, "alpha"));
+        assert_eq!(agents.len(), 1);
+    }
+
+    #[test]
+    fn load_save_agents_round_trip_through_a_temp_state_dir() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-a2a-reg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("AOIDE_STATE_DIR", &dir);
+
+        // Missing file → empty (tolerate-missing).
+        assert!(load_agents().is_empty());
+
+        let agents = vec![fixture_agent("alpha", "http://a/"), fixture_agent("beta", "http://b/")];
+        save_agents(&agents).unwrap();
+        let back = load_agents();
+        assert_eq!(back, agents);
+
+        // The on-disk shape carries the v0 schemaVersion.
+        let raw = std::fs::read_to_string(agents_path()).unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["schemaVersion"], "0");
+        assert_eq!(v["agents"].as_array().unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    // ── AgentCard parsing (client side) ──────────────────────────────────────
+
+    #[test]
+    fn parse_agent_card_reads_name_description_and_card_url_endpoint() {
+        // A card that names its own flat `url` (aoide's own v0.3.x shape): the
+        // endpoint is that url, not the fetch origin.
+        let card = json!({
+            "name": "peer",
+            "description": "a friendly agent",
+            "url": "http://10.0.0.5:8710/",
+            "skills": [],
+        });
+        let agent = parse_agent_card(&card, "http://10.0.0.5:8710/.well-known/agent-card.json", "NOW").unwrap();
+        assert_eq!(agent.name, "peer");
+        assert_eq!(agent.description, "a friendly agent");
+        assert_eq!(agent.url, "http://10.0.0.5:8710/");
+        assert_eq!(agent.registered_at, "NOW");
+    }
+
+    #[test]
+    fn parse_agent_card_falls_back_to_fetch_origin_and_v1_interfaces() {
+        // No flat `url` → fall back to the origin of the fetch URL.
+        let card = json!({ "name": "originless" });
+        let agent = parse_agent_card(&card, "http://host:9000/.well-known/agent-card.json", "T").unwrap();
+        assert_eq!(agent.url, "http://host:9000/");
+        assert_eq!(agent.description, "");
+
+        // v1.0 `interfaces` array form → first interface url wins.
+        let card = json!({
+            "name": "v1",
+            "interfaces": [{ "transport": "JSONRPC", "url": "http://host:9000/rpc" }],
+        });
+        let agent = parse_agent_card(&card, "http://host:9000/x", "T").unwrap();
+        assert_eq!(agent.url, "http://host:9000/rpc");
+    }
+
+    #[test]
+    fn parse_agent_card_missing_name_is_an_error() {
+        assert!(parse_agent_card(&json!({ "description": "no name here" }), "http://x/", "T").is_err());
+        // A present-but-empty name is also rejected.
+        assert!(parse_agent_card(&json!({ "name": "  " }), "http://x/", "T").is_err());
+    }
+
+    #[test]
+    fn resolve_card_url_appends_well_known_unless_already_a_card() {
+        assert_eq!(
+            resolve_card_url("http://127.0.0.1:8710"),
+            "http://127.0.0.1:8710/.well-known/agent-card.json"
+        );
+        // Trailing slash is not doubled.
+        assert_eq!(
+            resolve_card_url("http://127.0.0.1:8710/"),
+            "http://127.0.0.1:8710/.well-known/agent-card.json"
+        );
+        // An explicit card URL is used verbatim.
+        assert_eq!(
+            resolve_card_url("http://h/.well-known/agent-card.json"),
+            "http://h/.well-known/agent-card.json"
+        );
+    }
+
+    // ── The outbound message/send request-body builder (pure) ────────────────
+
+    #[test]
+    fn build_message_send_body_matches_the_jsonrpc_shape() {
+        let body = build_message_send_body("hello there", "mid-123");
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 1);
+        assert_eq!(body["method"], "message/send");
+        let msg = &body["params"]["message"];
+        assert_eq!(msg["role"], "user");
+        assert_eq!(msg["messageId"], "mid-123");
+        let parts = msg["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["kind"], "text");
+        assert_eq!(parts[0]["text"], "hello there");
+
+        // The body this builds is exactly what the server's inbound parser reads
+        // back out (round-trip through `parse_message_send_params`).
+        let (prompt, ctx, spawn) = parse_message_send_params(&body["params"]);
+        assert_eq!(prompt, "hello there");
+        assert_eq!(ctx, None);
+        assert!(!spawn);
     }
 }

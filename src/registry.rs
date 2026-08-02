@@ -244,6 +244,7 @@ mod tests {
             "a2a.agent.add",
             "a2a.agent.list",
             "a2a.agent.remove",
+            "a2a.agent.send",
             "a2a.serve",
             "adapter.melete",
             "conduct",
