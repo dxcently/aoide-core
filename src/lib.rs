@@ -28,6 +28,7 @@ pub mod shellbridge;
 pub use aoide_client as client;
 pub use aoide_conduct as conduct;
 pub use aoide_protocol as protocol;
+pub use aoide_server as server;
 pub use aoide_storage as storage;
 
 use daemon::Door;
@@ -61,8 +62,11 @@ pub fn run_cli(argv: &[String]) -> i32 {
     };
 
     // `mcp serve --stdio` is a long-running server, not a one-shot dispatch.
+    // The registry + dispatcher are injected here (the DI seam
+    // `aoide-server`'s module doc comment explains — `aoide-server` cannot
+    // reach the crate-global, fully-assembled `dispatch::registry()` itself).
     if inv.path == ["mcp", "serve"] && inv.flag_present("stdio") {
-        return match mcp::serve_stdio() {
+        return match mcp::serve_stdio(dispatch::registry(), dispatch::dispatch) {
             Ok(()) => output::exit::OK,
             Err(e) => {
                 eprintln!("aoide mcp serve: {e}");
@@ -87,7 +91,9 @@ pub fn run_cli(argv: &[String]) -> i32 {
         let (bind, port) = a2a::resolve_bind_port(&inv);
         let spawn_agent = a2a::resolve_spawn_agent(&inv);
         let audit_log = dispatch::audit_log_path(&inv);
-        return match a2a::serve(&bind, port, &audit_log, &spawn_agent) {
+        // The registry is injected here too (same DI seam as `mcp serve
+        // --stdio` above) — `a2a::serve` needs it to build the AgentCard.
+        return match a2a::serve(&bind, port, &audit_log, &spawn_agent, dispatch::registry()) {
             Ok(()) => output::exit::OK,
             Err(e) => {
                 eprintln!("aoide a2a serve: {e}");

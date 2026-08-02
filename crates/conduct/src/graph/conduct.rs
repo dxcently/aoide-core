@@ -41,11 +41,12 @@ pub(in crate::graph) fn unix_ts() -> u64 {
 /// `$XDG_RUNTIME_DIR/aoide/session-<id>.sock` — the same user-scoped runtime-dir
 /// convention as shellbridge's socket (never networked). A missing
 /// `XDG_RUNTIME_DIR` falls back to `/run/user/1000` like [`crate::shellbridge`].
-/// `pub`, not `pub(crate)` (pre-Phase-3b visibility): this now crosses the
-/// aoide-conduct → aoide crate boundary too, since root's `a2a.rs` resolves a
-/// just-spawned conducted session's control-socket path via
-/// `crate::graph::conduct_socket_path` — root's own shim re-narrows this back
-/// to `pub(crate)`.
+/// `pub`, not `pub(crate)` (pre-Phase-3b visibility): this crosses the
+/// aoide-conduct → aoide-server crate boundary too, since `aoide-server`'s
+/// `a2a` (Phase 4c) resolves a just-spawned conducted session's control-socket
+/// path via `aoide_conduct::graph::conduct_socket_path` directly — root no
+/// longer re-exports this symbol at all (dropped in Phase 4c as dead once the
+/// only caller moved into `aoide-server`).
 pub fn conduct_socket_path(id: &str) -> PathBuf {
     let runtime = std::env::var("XDG_RUNTIME_DIR")
         .ok()

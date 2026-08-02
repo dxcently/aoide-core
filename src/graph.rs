@@ -10,11 +10,6 @@
 //! `crate::graph::*` caller (a2a.rs, conductor/*, commands/*) is untouched.
 
 pub use aoide_conduct::graph::session_conduct;
-// `a2a.rs`'s spawn path (Phase B2) computes a just-spawned conducted session's
-// deterministic control-socket path itself, to retry-connect and inject the
-// first turn before `sessions.json` necessarily reflects the new record yet —
-// the same path `graph send`/`conduct` derive internally.
-pub(crate) use aoide_conduct::graph::conduct_socket_path;
 pub use aoide_conduct::graph::{build_graph, render};
 pub use aoide_conduct::graph::{
     anchor_for, canonical_state, merged_sessions, HookRecord, HooksFile, Project, ProjectsFile,
@@ -27,13 +22,13 @@ pub use aoide_conduct::graph::{
     focus, focus_session, focus_window, run_hypr_window_listener, FocusError,
 };
 
-// Storage/time passthroughs `a2a.rs` / `commands/{a2a,usage}.rs` reach at
-// `crate::graph::{load_stage, now_iso_utc, sessions_path, write_stage}` —
-// unchanged paths, now sourced through `aoide-conduct`.
-pub(crate) use aoide_conduct::graph::{load_stage, now_iso_utc, sessions_path};
-// `write_stage` is reached only from `a2a.rs`'s `#[cfg(test)]` fixtures
-// (its non-test code only ever reads via `load_stage`) — cfg-gated the same
-// way, or a release build would flag it unused (the class of warning Phase
-// 3a's review caught).
-#[cfg(test)]
-pub(crate) use aoide_conduct::graph::write_stage;
+// Storage/time passthrough `commands/usage.rs` reaches at
+// `crate::graph::now_iso_utc` — unchanged path, now sourced through
+// `aoide-conduct`. `conduct_socket_path`/`load_stage`/`sessions_path`/
+// `write_stage` were re-exported here too (for `a2a.rs`'s server-region
+// code and tests), but that region moved wholesale to `aoide-server` (Phase
+// 4c restructure, docs/architecture/PACKAGE-LAYOUT.md), which reaches
+// `aoide_conduct::graph::{conduct_socket_path, load_stage, sessions_path,
+// write_stage}` directly — nothing left in THIS crate uses them, so they're
+// dropped from this shim rather than kept dead.
+pub(crate) use aoide_conduct::graph::now_iso_utc;
