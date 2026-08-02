@@ -29,12 +29,12 @@ version = "0.0.0"
 dependencies = [
  "aoide-client",
  "aoide-conduct",
+ "aoide-conductor",
  "aoide-protocol",
  "aoide-server",
  "aoide-song",
  "aoide-storage",
  "crossterm",
- "libc",
  "ratatui",
  "serde",
  "serde_json",
@@ -57,6 +57,19 @@ dependencies = [
  "aoide-protocol",
  "aoide-storage",
  "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "aoide-conductor"
+version = "0.0.0"
+dependencies = [
+ "aoide-conduct",
+ "aoide-protocol",
+ "aoide-storage",
+ "crossterm",
+ "ratatui",
  "serde",
  "serde_json",
 ]

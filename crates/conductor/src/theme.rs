@@ -10,12 +10,12 @@
 //!
 //! Colour comes from `stage/drachma.json`'s palette `{bg,fg,accent,urgent}` when
 //! present, each hex already mapped to the nearest ANSI-256 index in
-//! [`crate::conductor::app`]; here we wrap those indices as `Color::Indexed`. Absent
+//! [`crate::app`]; here we wrap those indices as `Color::Indexed`. Absent
 //! a palette key we fall back to a named ANSI colour so the TUI still reads,
 //! exactly as the hand-rolled renderer did.
 
-use crate::conductor::app::{is_done, Palette};
-use crate::graph::SessionRecord;
+use crate::app::{is_done, Palette};
+use aoide_conduct::graph::SessionRecord;
 use ratatui::style::{Color, Modifier, Style};
 
 /// Clef-tail end-cap ornament — verbatim from `GadgetFrame.qml` / `AoideBar.qml`.
@@ -216,7 +216,7 @@ pub fn elapsed_str(started_at: &str) -> String {
 /// (Phase 3a restructure, docs/architecture/PACKAGE-LAYOUT.md) as
 /// `storage::time::parse_iso_utc` (the exact inverse of
 /// `storage::time::iso_utc_from_epoch`, the writer); re-exported here so
-/// every existing `crate::conductor::theme::parse_iso_utc` caller is
+/// every existing `crate::theme::parse_iso_utc` caller is
 /// untouched.
 pub use aoide_storage::time::parse_iso_utc;
 

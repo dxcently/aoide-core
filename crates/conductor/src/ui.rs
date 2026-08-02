@@ -11,15 +11,15 @@
 //! headless and assert on the buffer (see the tests below).
 //!
 //! Two of the five panels are the expansion this port carries: `DAG` (the
-//! visual graph, drawn by [`crate::conductor::graphview`]) and `SESSIONS` (the
+//! visual graph, drawn by [`crate::graphview`]) and `SESSIONS` (the
 //! terminal roster, now split into a scrolling list + a live detail card with a
 //! focus affordance). The other three — PROJECTS, LOG, STATUS — are ports of the
 //! originals.
 
-use crate::conductor::app::{App, DagRow, Panel};
-use crate::conductor::graphview;
-use crate::conductor::theme::{self, DIVIDER, END_CAP};
-use crate::graph;
+use crate::app::{App, DagRow, Panel};
+use crate::graphview;
+use crate::theme::{self, DIVIDER, END_CAP};
+use aoide_conduct::graph;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -486,9 +486,9 @@ fn trunc(s: &str, max: usize) -> String {
 // ── [4] STATUS — stage-tree health ──────────────────────────────────────────
 
 fn draw_status_panel(f: &mut Frame, area: Rect, app: &App) {
-    let stage = crate::shellbridge::stage_dir();
-    let sock = crate::shellbridge::socket_path();
-    let audit = crate::daemon::default_audit_log();
+    let stage = aoide_storage::fs::stage_dir();
+    let sock = aoide_conduct::shellbridge::socket_path();
+    let audit = aoide_protocol::default_audit_log();
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(format!(" stage dir   {}", stage.display())));
@@ -660,8 +660,8 @@ fn centered(w: u16, h: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conductor::app::{App, Panel};
-    use crate::graph::{Project, SessionRecord};
+    use crate::app::{App, Panel};
+    use aoide_conduct::graph::{Project, SessionRecord};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use serde_json::Map;
@@ -875,7 +875,7 @@ mod tests {
     fn log_panel_colours_and_shows_records() {
         let mut app = app_with(vec![], vec![]);
         app.log = vec![
-            crate::conductor::app::LogLine {
+            crate::app::LogLine {
                 ts: 1,
                 door: "cli".into(),
                 class: "audit".into(),
@@ -883,7 +883,7 @@ mod tests {
                 status: "ok".into(),
                 message: "staged".into(),
             },
-            crate::conductor::app::LogLine {
+            crate::app::LogLine {
                 ts: 2,
                 door: "cli".into(),
                 class: "audit".into(),

@@ -1,0 +1,31 @@
+[package]
+name = "aoide-conductor"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+description = "Aoide's interactive terminal frontend: the session-DAG conductor TUI (ratatui/crossterm). A frontend over the one dispatcher -- never a second implementation."
+
+[lib]
+name = "aoide_conductor"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+aoide-protocol = { path = "../protocol" }
+aoide-conduct  = { path = "../conduct" }
+aoide-storage  = { path = "../storage" }
+# `aoide conductor` — the interactive terminal frontend, built on ratatui.rs
+# over the crossterm backend (the rig's standard for every Aoide TUI: no
+# hand-rolled ANSI). ratatui owns the immediate-mode render + the double
+# buffer diff; the conductor keeps the loop, the event feed (the audit log),
+# and mtime-poll live-state itself — no tokio, no notify. ratatui 0.30 pins
+# crossterm 0.29, the same line taken directly for the event loop (raw mode,
+# the alternate screen, and `event::poll`/`event::read` with a timeout), so
+# the offline cargo lock carries ONE crossterm. default-features = false +
+# only `events` on the direct dep keeps the surface minimal; ratatui pulls
+# the backend features it needs (mio + signal-hook ride in with `events`).
+# Moved here verbatim from root `Cargo.toml` (Phase 6b restructure,
+# docs/architecture/PACKAGE-LAYOUT.md) — same locked versions, not upgraded.
+crossterm = { version = "0.29", default-features = false, features = ["events"] }
+ratatui = "0.30"

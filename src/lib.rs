@@ -11,7 +11,6 @@
 pub mod a2a;
 pub mod adapter;
 pub mod commands;
-pub mod conductor;
 pub mod cli;
 pub mod daemon;
 pub mod dispatch;
@@ -27,6 +26,7 @@ pub mod shellbridge;
 
 pub use aoide_client as client;
 pub use aoide_conduct as conduct;
+pub use aoide_conductor as conductor;
 pub use aoide_protocol as protocol;
 pub use aoide_server as server;
 pub use aoide_song as song;

@@ -3,7 +3,7 @@
 //! [`App`] is pi's "core" — it holds the world (projects/sessions/hooks loaded
 //! from the stage tree, the audit tail, the palette) and the interaction state
 //! (which panel, which row, any inline input, the last dispatched
-//! [`Outcome`](crate::output::Outcome)). It draws nothing; it hands panels the
+//! [`Outcome`](aoide_protocol::output::Outcome)). It draws nothing; it hands panels the
 //! data and composes their rendered lines into a [`Frame`].
 //!
 //! Every mutation goes back through the ONE dispatcher via [`App::dispatch`] —
@@ -19,11 +19,11 @@
 //! terminal-watcher: sessions that appear between ticks are marked fresh for a
 //! few beats ([`FRESH_TICKS`]) so the eye catches a new arrival.
 
-use crate::daemon::Door;
-use crate::dispatch::Invocation;
-use crate::graph::{self, HooksFile, ProjectsFile, SessionRecord, SessionsFile};
-use crate::output::{Outcome, Status};
-use crate::shellbridge::stage_dir;
+use aoide_conduct::graph::{self, HooksFile, ProjectsFile, SessionRecord, SessionsFile};
+use aoide_protocol::output::{Outcome, Status};
+use aoide_protocol::Door;
+use aoide_protocol::Invocation;
+use aoide_storage::fs::stage_dir;
 use crossterm::event::{KeyCode, KeyEvent};
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
@@ -151,7 +151,7 @@ pub struct App {
     pub panel: Panel,
     pub help_open: bool,
     /// Selected node in the DAG (Graph) panel (indexes the preorder node list
-    /// [`crate::conductor::graphview::node_order`] the layout walks).
+    /// [`crate::graphview::node_order`] the layout walks).
     pub graph_sel: usize,
     /// Selected row in the SESSIONS panel (indexes [`App::dag_rows`]).
     pub dag_sel: usize,
@@ -188,7 +188,7 @@ pub struct App {
 /// How many audit lines the LOG panel keeps in memory.
 pub const LOG_CAP: usize = 500;
 
-/// A dispatch fn pointer: matches [`crate::dispatch::dispatch`]'s exact
+/// A dispatch fn pointer: matches `aoide::dispatch::dispatch`'s exact
 /// signature (a plain `fn`, not a closure), so `lib.rs`'s launch site can hand
 /// it in directly. Deliberately its own type rather than reusing
 /// `aoide_server::mcp::DispatchFn` (structurally identical, but sharing it
@@ -273,7 +273,7 @@ impl App {
         stage_dir()
     }
     fn audit_path() -> PathBuf {
-        crate::daemon::default_audit_log()
+        aoide_protocol::default_audit_log()
     }
 
     /// Reload every stage file + the audit tail and refresh recorded mtimes.
@@ -516,7 +516,7 @@ impl App {
         if self.proj_sel >= n_proj.max(1) {
             self.proj_sel = n_proj.saturating_sub(1);
         }
-        let n_nodes = crate::conductor::graphview::node_order(self).len();
+        let n_nodes = crate::graphview::node_order(self).len();
         if self.graph_sel >= n_nodes.max(1) {
             self.graph_sel = n_nodes.saturating_sub(1);
         }
@@ -600,7 +600,7 @@ impl App {
     /// dispatch-backed `graph focus` the roster uses); `e` emits, `p` prunes —
     /// the two graph-wide verbs — so the visual view is not read-only.
     fn handle_graph_key(&mut self, key: KeyEvent) {
-        let nodes = crate::conductor::graphview::node_order(self);
+        let nodes = crate::graphview::node_order(self);
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
                 if !nodes.is_empty() && self.graph_sel + 1 < nodes.len() {

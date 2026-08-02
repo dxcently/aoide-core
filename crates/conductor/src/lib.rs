@@ -5,8 +5,8 @@
 //! door: Door::Cli, .. })` — so the single audit log records conductor
 //! actions exactly like a typed command, and the two-doors-one-schema
 //! contract holds. Reads
-//! reuse the pure graph functions ([`crate::graph::build_graph`],
-//! [`crate::graph::merged_sessions`], `anchor_for`) and load the stage files
+//! reuse the pure graph functions ([`aoide_conduct::graph::build_graph`],
+//! [`aoide_conduct::graph::merged_sessions`], `anchor_for`) and load the stage files
 //! directly. Nothing here parses or re-derives a command; the views only
 //! compose calls and paint results.
 //!
@@ -17,7 +17,7 @@
 //! we keep the loop, the event feed, and the live-state polling:
 //!   * [`app::App`] is the core — live state (projects/sessions/hooks loaded
 //!     from the stage tree), the audit tail, panel + node selection, and the
-//!     last [`Outcome`](crate::output::Outcome) from a dispatched action. It
+//!     last [`Outcome`](aoide_protocol::output::Outcome) from a dispatched action. It
 //!     draws nothing.
 //!   * [`ui`] is the view layer — pure `draw(frame, area, &App)` functions built
 //!     from ratatui widgets. Given the same state they paint the same buffer, so

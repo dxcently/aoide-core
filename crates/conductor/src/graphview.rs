@@ -7,19 +7,19 @@
 //!
 //! One rule holds, exactly as everywhere else in the conductor: this view NEVER
 //! re-derives the graph. The node/edge structure comes verbatim from
-//! [`crate::graph::build_graph`] — the same pure function `graph emit` stages to
+//! [`aoide_conduct::graph::build_graph`] — the same pure function `graph emit` stages to
 //! `song/stage/graph.json` — so the picture on screen is the document on disk.
 //! We parse that document into a forest (each session has at most one incoming
 //! edge — spawned-by wins over anchors — so the layout is a tree walk), assign
 //! `column = depth` and `row = preorder index`, and paint chips + connectors.
 //!
 //! Tags: read-only. The schema has no tag surface (see the module note in
-//! [`crate::conductor::theme::session_tags`]); tags found on a session record's
+//! [`crate::theme::session_tags`]); tags found on a session record's
 //! round-tripped `extra.tags` are rendered as accent chips, never minted here.
 
-use crate::conductor::app::App;
-use crate::conductor::theme;
-use crate::graph;
+use crate::app::App;
+use crate::theme;
+use aoide_conduct::graph;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -306,7 +306,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, sel: usize) {
 
 /// Compose the styled cell grid: connectors first (box-drawing edges routed in
 /// the gutter left of each child column), then node chips on top.
-fn lay_out(model: &Model, sel: usize, pal: &crate::conductor::app::Palette) -> Vec<Vec<GCell>> {
+fn lay_out(model: &Model, sel: usize, pal: &crate::app::Palette) -> Vec<Vec<GCell>> {
     // Pre-compose each node's chip cells so we know its on-screen width.
     let chips: Vec<Vec<GCell>> = model
         .nodes
@@ -388,7 +388,7 @@ fn lay_out(model: &Model, sel: usize, pal: &crate::conductor::app::Palette) -> V
 
 /// Build a node's chip as styled cells: marker, label, a short state word, and
 /// read-only tag chips — truncated to [`CHIP_MAX`].
-fn chip_cells(n: &Node, selected: bool, pal: &crate::conductor::app::Palette) -> Vec<GCell> {
+fn chip_cells(n: &Node, selected: bool, pal: &crate::app::Palette) -> Vec<GCell> {
     let accent = theme::accent(pal).unwrap_or(Color::Cyan);
     let (marker, marker_style, label_style) = match n.kind {
         NodeKind::Project | NodeKind::Unanchored => (
@@ -485,8 +485,8 @@ fn grid_to_lines(grid: &[Vec<GCell>]) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conductor::app::App;
-    use crate::graph::{Project, SessionRecord};
+    use crate::app::App;
+    use aoide_conduct::graph::{Project, SessionRecord};
     use serde_json::Map;
 
     fn session(id: &str, cwd: &str, state: &str, parent: Option<&str>) -> SessionRecord {

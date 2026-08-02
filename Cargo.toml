@@ -13,7 +13,7 @@ license = "MIT"
 # just makes the manifest workspace-shaped.
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/storage", "crates/conduct", "crates/client", "crates/server", "crates/song"]
+members = ["crates/protocol", "crates/storage", "crates/conduct", "crates/client", "crates/server", "crates/song", "crates/conductor"]
 
 # Two binaries, one crate: the CLI trunk (`aoide`) and the daemon (`aoided`).
 # Both share the same schema + handler code in `src/`, so the CLI door, the
@@ -40,25 +40,20 @@ aoide-conduct = { path = "crates/conduct" }
 aoide-client = { path = "crates/client" }
 aoide-server = { path = "crates/server" }
 aoide-song = { path = "crates/song" }
-# `aoide conductor` — the interactive terminal frontend (see src/conductor.rs), built on
-# ratatui.rs over the crossterm backend (the rig's standard for every Aoide TUI:
-# no hand-rolled ANSI). ratatui owns the immediate-mode render + the double
-# buffer diff; we keep the loop, the event feed (the audit log), and mtime-poll
-# live-state ourselves — no tokio, no notify. ratatui 0.30 pins crossterm 0.29,
-# the same line we take directly for the event loop (raw mode, the alternate
-# screen, and `event::poll`/`event::read` with a timeout), so the offline cargo
-# lock carries ONE crossterm. default-features = false + only `events` on the
-# direct dep keeps our surface minimal; ratatui pulls the backend features it
-# needs (mio + signal-hook ride in with `events`).
+# `aoide conductor` — the interactive terminal frontend, now its own crate
+# (Phase 6b restructure, docs/architecture/PACKAGE-LAYOUT.md).
+aoide-conductor = { path = "crates/conductor" }
+
+[dev-dependencies]
+# `tests/conductor_integration.rs` drives the conductor's app/ui layer
+# directly (crossterm key events, a ratatui `TestBackend`) to exercise real
+# dispatch end to end — so root still needs these two, but only as a
+# dev-dependency now that the runtime code that used them lives in
+# `aoide-conductor` (Phase 6b restructure). Same locked versions as before,
+# not upgraded: ratatui 0.30 pins crossterm 0.29, the same line taken
+# directly for crossterm's event types.
 crossterm = { version = "0.29", default-features = false, features = ["events"] }
 ratatui = "0.30"
-# `aoide conduct` — the PTY-backed conductor wrap (see src/graph.rs). libc gives
-# us openpty + the controlling-tty ioctls (setsid/TIOCSCTTY/TIOCSWINSZ) and the
-# poll()-based multiplexer that shuttles the real tty ↔ the pty master and the
-# per-session injection socket → master. Already vendored (0.2.189, via
-# crossterm's tree), so this is a direct edge on an already-locked crate — no new
-# vendored crate enters the offline lock.
-libc = "0.2"
 
 [profile.release]
 opt-level = "s"
