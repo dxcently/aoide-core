@@ -69,6 +69,18 @@ const MAX_REQUEST: Duration = Duration::from_secs(15);
 /// unbounded threads.
 const MAX_CONN: usize = 64;
 
+/// Absolute cap on one SSE stream's lifetime (`message/stream` /
+/// `tasks/resubscribe`). A never-terminal session — an idle agent that never
+/// reaches `done` — must NOT hold a handler thread (and thus a [`MAX_CONN`]
+/// slot) forever; on timeout the loop emits one final event and closes. The
+/// [`MAX_CONN`] + [`ConnGuard`] cap already bounds CONCURRENT streams, since
+/// `stream_task` runs inside the same guarded handler thread — this cap bounds
+/// each individual stream's DURATION on top of that.
+const MAX_STREAM: Duration = Duration::from_secs(600); // 10 minutes
+
+/// Poll interval between task-status reads inside an SSE stream loop.
+const STREAM_POLL: Duration = Duration::from_millis(750);
+
 /// Count of currently in-flight (spawned) connection-handler threads —
 /// paired with [`ConnGuard`] so the count is accurate even across a panic.
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
@@ -151,7 +163,9 @@ pub fn agent_card_from_commands<'a>(
         // `id` card form is a later, additive follow-on — not this.
         "protocolVersion": "0.3.0",
         "url": format!("http://{bind}:{port}/"),
-        "capabilities": { "streaming": false },
+        // Phase C: the server now serves `message/stream` + `tasks/resubscribe`
+        // over Server-Sent Events, so streaming is advertised true.
+        "capabilities": { "streaming": true },
         "defaultInputModes": ["text/plain"],
         "defaultOutputModes": ["text/plain"],
         "skills": skills,
@@ -564,6 +578,189 @@ fn handle_jsonrpc_bytes(body: &[u8], audit_log: &Path, spawn_agent: &str) -> Val
     }
 }
 
+// ── SSE streaming: `message/stream` + `tasks/resubscribe` (Phase C) ──────────
+//
+// These two methods do NOT take the one-shot `route()`→`write_http_response`
+// path: they keep the socket open, write `text/event-stream` headers ONCE,
+// and emit a `data:` event whenever the target task's status changes, until
+// it reaches a TERMINAL state, the client disconnects, or [`MAX_STREAM`]
+// elapses. `message/stream` FIRST runs the send (inject/spawn, reusing
+// [`message_send`]) and then streams the resulting task; `tasks/resubscribe`
+// streams an already-existing task named by `params.id`.
+
+/// Format one Server-Sent-Events data frame: `data: <json>\n\n`. Pure.
+fn sse_event(value: &Value) -> String {
+    format!("data: {}\n\n", serde_json::to_string(value).unwrap_or_default())
+}
+
+/// A2A terminal `TaskState`s (JSON-RPC binding spelling): once a task reaches
+/// one of these it will not change again, so the stream emits its final event
+/// and closes. For aoide today only `completed` is actually reachable
+/// (canonical `done`/`stopped` → `completed`); `failed`/`canceled`/`rejected`
+/// have no canonical_state producer yet (CONTRACTS.md §6) but are recognised
+/// as terminal here so a future producer streams correctly with no change. Pure.
+fn is_terminal_state(state: &str) -> bool {
+    matches!(state, "completed" | "failed" | "canceled" | "rejected")
+}
+
+/// Emit-on-change: emit only when this is the first observation (`last` is
+/// `None`) or the state differs from the last emitted one. Pure. (The stream
+/// loop additionally forces the FINAL event even when the state is unchanged,
+/// so a terminal/timeout close is never swallowed.)
+fn should_emit(last: Option<&str>, current: &str) -> bool {
+    last != Some(current)
+}
+
+/// Build the JSON-RPC result envelope for one SSE stream event. A non-final
+/// event carries the Task itself as `result`; the FINAL event's `result` is
+/// shaped as A2A's `TaskStatusUpdateEvent` (`{taskId, contextId, status,
+/// final:true, kind:"status-update"}`) so the client knows it is the last one.
+/// Pure — the `task` argument is whatever [`task_get`] produced.
+fn build_stream_event(rpc_id: &Value, task: &Value, is_final: bool) -> Value {
+    let result = if is_final {
+        json!({
+            "taskId": task.get("id").cloned().unwrap_or(Value::Null),
+            "contextId": task.get("contextId").cloned().unwrap_or(Value::Null),
+            "status": task.get("status").cloned().unwrap_or(Value::Null),
+            "final": true,
+            "kind": "status-update",
+        })
+    } else {
+        task.clone()
+    };
+    json!({ "jsonrpc": "2.0", "id": rpc_id, "result": result })
+}
+
+/// Peek a parsed request: if it's a `POST /` whose JSON-RPC body names a
+/// streaming method (`message/stream` / `tasks/resubscribe`), return that
+/// method so [`handle_connection`] can hand the socket to [`stream_task`].
+/// Everything else (GET card, `tasks/get`, `message/send`, errors) returns
+/// `None` and keeps the existing one-shot path. Pure.
+fn streaming_method(req: &HttpRequest) -> Option<String> {
+    if req.method != "POST" || req.path != "/" {
+        return None;
+    }
+    let v: Value = serde_json::from_slice(&req.body).ok()?;
+    match v.get("method").and_then(Value::as_str)? {
+        m @ ("message/stream" | "tasks/resubscribe") => Some(m.to_string()),
+        _ => None,
+    }
+}
+
+/// Read the `status.state` string out of a Task JSON (`task_get`'s shape).
+fn task_state_of(task: &Value) -> String {
+    task.get("status")
+        .and_then(|s| s.get("state"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Take over the socket and stream the target task's status as SSE, until it
+/// reaches a terminal state, the client disconnects, or [`MAX_STREAM`] elapses.
+/// The request was already fully parsed by [`handle_connection`], so this only
+/// ever WRITES the socket (never reads it again) — the 10s read-timeout set on
+/// the stream by `handle_connection` therefore cannot interrupt this loop.
+fn stream_task<W: Write>(
+    writer: &mut W,
+    req: &HttpRequest,
+    method: &str,
+    audit_log: &Path,
+    spawn_agent: &str,
+) -> std::io::Result<()> {
+    let rpc: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+    let rpc_id = rpc.get("id").cloned().unwrap_or(Value::Null);
+    let params = rpc.get("params").cloned().unwrap_or(Value::Null);
+
+    // Resolve the target task + its initial state. `message/stream` runs the
+    // send FIRST (inject/spawn) and streams the task it produced;
+    // `tasks/resubscribe` streams an existing task by id.
+    let resolved: Result<Value, (i64, String)> = match method {
+        "message/stream" => message_send(&params, audit_log, spawn_agent),
+        _ /* tasks/resubscribe */ => {
+            match params.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                Some(id) => task_get(id),
+                None => Err((-32001, "task not found".to_string())),
+            }
+        }
+    };
+
+    // SSE response headers — written exactly once, before any event.
+    write!(
+        writer,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+    )?;
+    writer.flush()?;
+
+    // A resolution error (bad send, unknown resubscribe id) → one SSE event
+    // carrying the JSON-RPC error, then close.
+    let mut task = match resolved {
+        Ok(task) => task,
+        Err((code, message)) => {
+            let err = json!({
+                "jsonrpc": "2.0", "id": rpc_id,
+                "error": { "code": code, "message": message },
+            });
+            let _ = writer.write_all(sse_event(&err).as_bytes());
+            let _ = writer.flush();
+            let _ = daemon::audit(
+                audit_log,
+                Door::A2a,
+                daemon::EventClass::Audit,
+                &format!("a2a.{method}"),
+                "error",
+                &format!("stream open error {code}"),
+            );
+            return Ok(());
+        }
+    };
+    // The task id we re-poll each tick — the sessionId (Task id == contextId,
+    // MVP id-collapse — see `task_from_sessions`).
+    let task_id = task.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+
+    let stream_start = Instant::now();
+    let mut last_state: Option<String> = None;
+    loop {
+        let state = task_state_of(&task);
+        // Terminal state OR the absolute duration cap → this is the final event.
+        let is_final = is_terminal_state(&state) || stream_start.elapsed() >= MAX_STREAM;
+
+        if should_emit(last_state.as_deref(), &state) || is_final {
+            let event = build_stream_event(&rpc_id, &task, is_final);
+            // A write/flush failure means the client hung up — best-effort,
+            // just stop.
+            if writer.write_all(sse_event(&event).as_bytes()).is_err() || writer.flush().is_err() {
+                break;
+            }
+            last_state = Some(state);
+        }
+
+        if is_final {
+            break;
+        }
+        std::thread::sleep(STREAM_POLL);
+
+        // Refresh the task off the stage for the next tick. A transient
+        // not-found (e.g. a just-spawned session not yet written to
+        // sessions.json) keeps the last-known task rather than aborting — the
+        // MAX_STREAM cap still bounds the wait, and a real terminal state will
+        // be observed as soon as the record settles.
+        if let Ok(fresh) = task_get(&task_id) {
+            task = fresh;
+        }
+    }
+
+    let _ = daemon::audit(
+        audit_log,
+        Door::A2a,
+        daemon::EventClass::Audit,
+        &format!("a2a.{method}"),
+        "ok",
+        "stream closed",
+    );
+    Ok(())
+}
+
 // ── Minimal HTTP/1.1 layer (hand-rolled, zero deps) ──────────────────────────
 
 /// One parsed HTTP request: the request line + the body (read exactly
@@ -901,17 +1098,43 @@ fn handle_connection(
     let mut writer = stream;
 
     let start = Instant::now();
-    let (status, body, audit_cmd) = match parse_http_request(&mut reader, start) {
-        Ok(req) => route(&req, bind, port, audit_log, spawn_agent),
+    let req = match parse_http_request(&mut reader, start) {
+        Ok(req) => req,
         Err(e) => {
             let b = jsonrpc_error_value(-32700, format!("bad request: {}", e.message));
-            (
-                e.status,
-                serde_json::to_vec(&b).unwrap_or_default(),
-                "a2a.bad-request".to_string(),
-            )
+            let body = serde_json::to_vec(&b).unwrap_or_default();
+            let _ = daemon::audit(
+                audit_log,
+                Door::A2a,
+                daemon::EventClass::Audit,
+                "a2a.bad-request",
+                "error",
+                &format!("HTTP {}", e.status),
+            );
+            return write_http_response(&mut writer, e.status, &body);
         }
     };
+
+    // Phase C: a `message/stream` / `tasks/resubscribe` POST takes over the
+    // socket — headers-once + an SSE event loop in `stream_task` — instead of
+    // the one-shot `route()`→`write_http_response` path below (which every
+    // other request, incl. `tasks/get`/`message/send`, keeps unchanged). The
+    // stream open is audited as `Door::A2a` at start; `stream_task` audits its
+    // close. (The 10s read-timeout set above is harmless here: `stream_task`
+    // only writes the socket, never reads it again.)
+    if let Some(method) = streaming_method(&req) {
+        let _ = daemon::audit(
+            audit_log,
+            Door::A2a,
+            daemon::EventClass::Audit,
+            &format!("a2a.{method}"),
+            "open",
+            "SSE stream open",
+        );
+        return stream_task(&mut writer, &req, &method, audit_log, spawn_agent);
+    }
+
+    let (status, body, audit_cmd) = route(&req, bind, port, audit_log, spawn_agent);
 
     // Security/audit (CONTRACTS.md §6): every handled request routes through
     // the single audit log, same discipline as the CLI/MCP doors. The
@@ -974,7 +1197,7 @@ mod tests {
         assert_eq!(card["name"], "aoide");
         assert_eq!(card["version"], crate::registry::AOIDE_VERSION);
         assert_eq!(card["url"], "http://127.0.0.1:8710/");
-        assert_eq!(card["capabilities"]["streaming"], false);
+        assert_eq!(card["capabilities"]["streaming"], true);
 
         let skills = card["skills"].as_array().unwrap();
         assert_eq!(skills.len(), 1, "only the implemented command becomes a skill");
@@ -1396,6 +1619,90 @@ mod tests {
         assert_eq!(req.method, "POST");
         assert_eq!(req.path, "/");
         assert_eq!(req.body, b"{}");
+    }
+
+    // ── SSE streaming helpers (Phase C — pure, no socket, no sleep) ─────────
+
+    #[test]
+    fn sse_event_frames_json_as_a_data_line() {
+        let v = json!({ "a": 1 });
+        assert_eq!(sse_event(&v), "data: {\"a\":1}\n\n");
+    }
+
+    #[test]
+    fn is_terminal_state_covers_the_four_a2a_terminal_states_only() {
+        for terminal in ["completed", "failed", "canceled", "rejected"] {
+            assert!(is_terminal_state(terminal), "{terminal} should be terminal");
+        }
+        for live in ["working", "submitted", "input-required", "auth-required", ""] {
+            assert!(!is_terminal_state(live), "{live} should NOT be terminal");
+        }
+    }
+
+    #[test]
+    fn should_emit_fires_on_first_observation_and_on_change_but_not_on_repeat() {
+        // First observation (nothing emitted yet) always emits.
+        assert!(should_emit(None, "working"));
+        // A changed state emits.
+        assert!(should_emit(Some("working"), "completed"));
+        // The same state again does NOT emit (the loop's `|| is_final` still
+        // forces the terminal/timeout event separately).
+        assert!(!should_emit(Some("working"), "working"));
+    }
+
+    #[test]
+    fn build_stream_event_non_final_carries_the_task_and_final_is_a_status_update() {
+        let task = json!({
+            "id": "sess-1",
+            "contextId": "sess-1",
+            "status": { "state": "working", "timestamp": "2026-01-01T00:00:00Z" },
+            "kind": "task",
+        });
+        // Non-final: the result IS the task, no `final` marker.
+        let ev = build_stream_event(&json!(7), &task, false);
+        assert_eq!(ev["jsonrpc"], "2.0");
+        assert_eq!(ev["id"], 7);
+        assert_eq!(ev["result"]["kind"], "task");
+        assert_eq!(ev["result"]["status"]["state"], "working");
+        assert!(ev["result"].get("final").is_none());
+
+        // Final: a TaskStatusUpdateEvent with `final: true`.
+        let done = json!({
+            "id": "sess-1",
+            "contextId": "sess-1",
+            "status": { "state": "completed", "timestamp": "2026-01-01T00:00:01Z" },
+            "kind": "task",
+        });
+        let fev = build_stream_event(&json!(7), &done, true);
+        assert_eq!(fev["result"]["kind"], "status-update");
+        assert_eq!(fev["result"]["final"], true);
+        assert_eq!(fev["result"]["taskId"], "sess-1");
+        assert_eq!(fev["result"]["contextId"], "sess-1");
+        assert_eq!(fev["result"]["status"]["state"], "completed");
+    }
+
+    #[test]
+    fn streaming_method_only_matches_the_two_sse_methods_on_post_root() {
+        let mk = |method: &str, path: &str, body: &str| HttpRequest {
+            method: method.into(),
+            path: path.into(),
+            body: body.as_bytes().to_vec(),
+        };
+        assert_eq!(
+            streaming_method(&mk("POST", "/", r#"{"method":"message/stream"}"#)).as_deref(),
+            Some("message/stream")
+        );
+        assert_eq!(
+            streaming_method(&mk("POST", "/", r#"{"method":"tasks/resubscribe"}"#)).as_deref(),
+            Some("tasks/resubscribe")
+        );
+        // A one-shot method is NOT a streaming method.
+        assert_eq!(streaming_method(&mk("POST", "/", r#"{"method":"message/send"}"#)), None);
+        assert_eq!(streaming_method(&mk("POST", "/", r#"{"method":"tasks/get"}"#)), None);
+        // Wrong verb / path / unparseable body → not a stream.
+        assert_eq!(streaming_method(&mk("GET", "/", r#"{"method":"message/stream"}"#)), None);
+        assert_eq!(streaming_method(&mk("POST", "/other", r#"{"method":"message/stream"}"#)), None);
+        assert_eq!(streaming_method(&mk("POST", "/", "not json")), None);
     }
 
     // Routing: non-matching path/method -> 404/405 with a JSON-RPC-style body.
