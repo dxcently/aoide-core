@@ -27,11 +27,23 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 name = "aoide"
 version = "0.0.0"
 dependencies = [
+ "aoide-conduct",
  "aoide-protocol",
  "aoide-storage",
  "crossterm",
  "libc",
  "ratatui",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "aoide-conduct"
+version = "0.0.0"
+dependencies = [
+ "aoide-protocol",
+ "aoide-storage",
+ "libc",
  "serde",
  "serde_json",
 ]

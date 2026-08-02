@@ -121,7 +121,7 @@ pub fn build_graph(
     // edges (they anchor to nothing), so the existing spawned/anchors machinery
     // is untouched. Additive and tolerate-missing: an absent/empty registry
     // (`state/a2a-agents.json`) adds nothing and this whole block is a no-op.
-    for agent in crate::a2a::load_agents() {
+    for agent in aoide_storage::a2a_store::load_agents() {
         let mut node = json!({
             "id": format!("a2a:{}", agent.name),
             "kind": "a2a",
@@ -654,7 +654,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("AOIDE_STATE_DIR", &dir);
 
-        crate::a2a::save_agents(&[crate::a2a::A2aAgent {
+        aoide_storage::a2a_store::save_agents(&[aoide_storage::a2a_store::A2aAgent {
             name: "peer".into(),
             url: "http://10.0.0.5:8710/".into(),
             description: "a friendly agent".into(),
@@ -674,7 +674,7 @@ mod tests {
         assert!(doc["edges"].as_array().unwrap().is_empty());
 
         // An empty registry folds nothing (additive / no-op).
-        crate::a2a::save_agents(&[]).unwrap();
+        aoide_storage::a2a_store::save_agents(&[]).unwrap();
         let doc = build_graph(&[], &[], &[]);
         assert!(doc["nodes"].as_array().unwrap().iter().all(|n| n["kind"] != "a2a"));
 

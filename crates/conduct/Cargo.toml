@@ -1,0 +1,17 @@
+[package]
+name = "aoide-conduct"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+description = "Aoide session core: PTY multiplexer, session DAG, hook plumbing, liveness reaping."
+
+[lib]
+name = "aoide_conduct"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+aoide-protocol = { path = "../protocol" }
+aoide-storage = { path = "../storage" }
+libc = "0.2"

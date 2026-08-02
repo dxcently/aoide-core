@@ -9,9 +9,9 @@ use super::doc::restage_graph;
 use super::model::{
     load_stage, sessions_path, write_stage, SessionRecord, SessionsFile, STAGE_GRAPH_VERSION,
 };
-use crate::dispatch::Invocation;
-use crate::output::Outcome;
-use crate::shellbridge::with_stage_lock;
+use aoide_protocol::Invocation;
+use aoide_protocol::output::Outcome;
+use aoide_storage::fs::with_stage_lock;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::os::unix::net::UnixStream;

@@ -11,9 +11,9 @@ use super::model::{
 };
 use super::session_store::{do_session_end, do_session_start};
 use super::window::discover_window_address;
-use crate::dispatch::Invocation;
-use crate::output::Outcome;
-use crate::shellbridge::with_stage_lock;
+use aoide_protocol::Invocation;
+use aoide_protocol::output::Outcome;
+use aoide_storage::fs::with_stage_lock;
 use serde_json::json;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
@@ -41,7 +41,12 @@ pub(in crate::graph) fn unix_ts() -> u64 {
 /// `$XDG_RUNTIME_DIR/aoide/session-<id>.sock` — the same user-scoped runtime-dir
 /// convention as shellbridge's socket (never networked). A missing
 /// `XDG_RUNTIME_DIR` falls back to `/run/user/1000` like [`crate::shellbridge`].
-pub(crate) fn conduct_socket_path(id: &str) -> PathBuf {
+/// `pub`, not `pub(crate)` (pre-Phase-3b visibility): this now crosses the
+/// aoide-conduct → aoide crate boundary too, since root's `a2a.rs` resolves a
+/// just-spawned conducted session's control-socket path via
+/// `crate::graph::conduct_socket_path` — root's own shim re-narrows this back
+/// to `pub(crate)`.
+pub fn conduct_socket_path(id: &str) -> PathBuf {
     let runtime = std::env::var("XDG_RUNTIME_DIR")
         .ok()
         .filter(|s| !s.is_empty())
@@ -1104,7 +1109,7 @@ mod tests {
         let out = session_conduct(&conduct_invocation(&["sh", "-c", &script], &[("id", id)]));
         injector.join().unwrap();
 
-        assert_eq!(out.status, crate::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["exitCode"], 0);
         assert_eq!(out.data.as_ref().unwrap()["conductable"], true);
 
@@ -1142,7 +1147,7 @@ mod tests {
             &["sh", "-c", "exit 7"],
             &[("id", "conduct-fail"), ("agent", "sevens")],
         ));
-        assert_eq!(out.status, crate::output::Status::Error);
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
         assert_eq!(out.data.as_ref().unwrap()["exitCode"], 7);
 
         let s: SessionsFile = load_stage(&sessions_path()).unwrap();

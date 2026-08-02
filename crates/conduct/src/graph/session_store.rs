@@ -14,9 +14,9 @@ use super::model::{
 };
 #[cfg(test)]
 use super::model::HookRecord;
-use crate::dispatch::Invocation;
-use crate::output::Outcome;
-use crate::shellbridge::with_stage_lock;
+use aoide_protocol::Invocation;
+use aoide_protocol::output::Outcome;
+use aoide_storage::fs::with_stage_lock;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -1388,7 +1388,7 @@ mod tests {
             &["sh", "-c", "test -n \"$AOIDE_SESSION_ID\""],
             &[("id", "wrap-ok")],
         ));
-        assert_eq!(out.status, crate::output::Status::Ok);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         assert_eq!(out.data.as_ref().unwrap()["exitCode"], 0);
         let s: SessionsFile =
             serde_json::from_str(&std::fs::read_to_string(stage.join("sessions.json")).unwrap())
@@ -1402,7 +1402,7 @@ mod tests {
             &["sh", "-c", "exit 7"],
             &[("id", "wrap-fail"), ("agent", "sevens")],
         ));
-        assert_eq!(out.status, crate::output::Status::Error);
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
         assert_eq!(out.data.as_ref().unwrap()["exitCode"], 7);
         let s: SessionsFile =
             serde_json::from_str(&std::fs::read_to_string(stage.join("sessions.json")).unwrap())
@@ -1420,7 +1420,7 @@ mod tests {
             &["/nonexistent-aoide-wrap-test"],
             &[("id", "wrap-ghost")],
         ));
-        assert_eq!(out.status, crate::output::Status::Error);
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
         let s: SessionsFile =
             serde_json::from_str(&std::fs::read_to_string(stage.join("sessions.json")).unwrap())
                 .unwrap();
@@ -1428,7 +1428,7 @@ mod tests {
 
         // No command at all → usage.
         let out = session_wrap(&wrap_invocation(&[], &[]));
-        assert_eq!(out.status, crate::output::Status::Usage);
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage);
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
@@ -1443,7 +1443,7 @@ mod tests {
         assert_eq!(iso_utc_from_epoch(1_700_000_000), "2023-11-14T22:13:20Z");
         // Whatever we stamp must parse back through conductor's reader (the inverse).
         let stamp = now_iso_utc();
-        let epoch = crate::conductor::theme::parse_iso_utc(&stamp)
+        let epoch = aoide_storage::time::parse_iso_utc(&stamp)
             .expect("a stamp we write is readable by the reader that consumes it");
         // And that epoch re-formats to the very same string (round-trip closed).
         assert_eq!(iso_utc_from_epoch(epoch), stamp);
@@ -1585,7 +1585,7 @@ mod tests {
             &["graph", "session", "start"],
             &[("id", "s1"), ("cwd", "/home/k/Aoide/sub")],
         ));
-        assert_eq!(out.status, crate::output::Status::Ok);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
 
         let s_file: SessionsFile = load_stage(&sessions_path()).unwrap();
         assert_eq!(s_file.sessions.len(), 1);
@@ -1642,7 +1642,7 @@ mod tests {
             &["graph", "session", "start"],
             &[("id", "a"), ("parent", "b")],
         ));
-        assert_eq!(out.status, crate::output::Status::Error);
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
         assert_eq!(out.data.unwrap()["reason"], "cycle");
         let s: SessionsFile = load_stage(&sessions_path()).unwrap();
         assert!(s.sessions.iter().find(|x| x.session_id == "a").unwrap().parent_session_id.is_none());
@@ -1664,7 +1664,7 @@ mod tests {
             &["graph", "session", "end"],
             &[("id", "ghost")],
         ));
-        assert_eq!(out.status, crate::output::Status::Ok);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         assert!(out.changed.is_empty(), "unknown id → no change");
         // No session file was written (nothing to end).
         assert!(!sessions_path().exists());
@@ -1678,8 +1678,8 @@ mod tests {
     #[test]
     fn session_start_requires_the_id_flag() {
         let out = session_start(&flag_invocation(&["graph", "session", "start"], &[]));
-        assert_eq!(out.status, crate::output::Status::Usage);
-        assert_eq!(out.render(false).1, crate::output::exit::USAGE);
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage);
+        assert_eq!(out.render(false).1, aoide_protocol::output::exit::USAGE);
     }
     #[test]
     fn is_session_dead_combines_signals_and_never_false_reaps() {
@@ -1804,7 +1804,7 @@ mod tests {
         .unwrap();
 
         let out = reap(&invocation(&["graph", "reap"], &[]));
-        assert_eq!(out.status, crate::output::Status::Ok);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         let data = out.data.unwrap();
         assert_eq!(data["reaped"], json!(["killed"]));
         assert_eq!(data["hyprctlAvailable"], json!(false)); // pid-only fallback
@@ -1830,7 +1830,7 @@ mod tests {
 
         // Idempotent + never non-zero: a second sweep finds nothing to reap.
         let again = reap(&invocation(&["graph", "reap"], &[]));
-        assert_eq!(again.status, crate::output::Status::Ok);
+        assert_eq!(again.status, aoide_protocol::output::Status::Ok);
         assert_eq!(again.data.unwrap()["reaped"], json!([]));
 
         let _ = std::fs::remove_dir_all(&stage);
@@ -1861,7 +1861,7 @@ mod tests {
         .unwrap();
 
         let out = reap(&invocation(&["graph", "reap"], &[]));
-        assert_eq!(out.status, crate::output::Status::Ok);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         assert_eq!(
             out.data.unwrap()["reaped"],
             json!([]),

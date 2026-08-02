@@ -19,12 +19,17 @@ pub use aoide_storage::records::*;
 
 /// Stage I/O — `projects_path`/`graph_path` were `pub(in crate::graph)` and
 /// `sessions_path`/`hooks_path`/`load_stage`/`write_stage` were `pub(crate)`
-/// here; narrowed re-exports (rather than a glob) preserve that exact
-/// visibility at the root crate boundary even though the underlying
-/// `aoide_storage::stage` items are `pub` (required to cross the crate
-/// boundary at all).
+/// here (root-crate-scoped, pre-Phase-3b); narrowed re-exports (rather than a
+/// glob) preserve that exact split. `hooks_path` stays `pub(crate)` — only
+/// this crate's own `reap.rs` reaches it. `load_stage`/`sessions_path`/
+/// `write_stage` widen to `pub` (Phase 3b): they now cross the
+/// aoide-conduct → aoide crate boundary too, since root's `a2a.rs` and
+/// `commands/{a2a,usage}.rs` still call `crate::graph::{load_stage,
+/// sessions_path, write_stage}` there — root's own shim re-narrows them back
+/// to `pub(crate)` to match the original root-facing visibility.
 pub(in crate::graph) use aoide_storage::stage::{graph_path, projects_path};
-pub(crate) use aoide_storage::stage::{hooks_path, load_stage, sessions_path, write_stage};
+pub(crate) use aoide_storage::stage::hooks_path;
+pub use aoide_storage::stage::{load_stage, sessions_path, write_stage};
 
 // ── The DAG computation (pure; shared by view / emit / render) ──────────────
 

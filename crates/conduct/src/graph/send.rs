@@ -13,9 +13,9 @@ use super::session_store::{
     refresh_transcript_fields, set_owner_activity,
 };
 use super::window::{discover_window, ensure_session_window, is_subagent_tool};
-use crate::dispatch::Invocation;
-use crate::output::Outcome;
-use crate::shellbridge::{stage_dir, with_stage_lock};
+use aoide_protocol::Invocation;
+use aoide_protocol::output::Outcome;
+use aoide_storage::fs::{stage_dir, with_stage_lock};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::os::unix::net::UnixStream;
@@ -203,13 +203,13 @@ fn audit_send(inv: &Invocation, status: &str, message: &str, text: &str) {
         .flags
         .get("audit-log")
         .map(PathBuf::from)
-        .unwrap_or_else(crate::daemon::default_audit_log);
-    let _ = crate::daemon::append_audit(
+        .unwrap_or_else(aoide_protocol::default_audit_log);
+    let _ = aoide_protocol::append_audit(
         &log,
-        &crate::daemon::AuditRecord {
+        &aoide_protocol::AuditRecord {
             ts: super::conduct::unix_ts(),
             door: inv.door,
-            class: crate::daemon::EventClass::Audit,
+            class: aoide_protocol::EventClass::Audit,
             command: "graph.send".to_string(),
             status: status.to_string(),
             message: message.to_string(),
@@ -913,7 +913,7 @@ mod tests {
         ));
         let got = acc.join().unwrap();
 
-        assert_eq!(out.status, crate::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["delivered"], true);
         assert_eq!(out.data.as_ref().unwrap()["gate"], "yes");
         // --submit appended a newline.
@@ -972,7 +972,7 @@ mod tests {
         );
 
         let out = session_send(&send_invocation(&["do", "a", "thing"], &[("id", id)]));
-        assert_eq!(out.status, crate::output::Status::Ok);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         assert_eq!(out.data.as_ref().unwrap()["state"], "pending");
         assert_eq!(out.data.as_ref().unwrap()["delivered"], false);
 
@@ -1048,7 +1048,7 @@ mod tests {
         let out = session_send(&send_invocation(&["go"], &[("id", id), ("submit", "true")]));
         let got = acc.join().unwrap();
 
-        assert_eq!(out.status, crate::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["delivered"], true);
         assert_eq!(out.data.as_ref().unwrap()["gate"], "autogate-parent");
         assert_eq!(String::from_utf8(got).unwrap(), "go\n");
@@ -1074,13 +1074,13 @@ mod tests {
 
         // Unknown id.
         let out = session_send(&send_invocation(&["hi"], &[("id", "ghost"), ("yes", "true")]));
-        assert_eq!(out.status, crate::output::Status::Error);
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
         assert_eq!(out.data.as_ref().unwrap()["reason"], "session-not-found");
 
         // Registered but not conductable (a plain wrap/hook session).
         do_session_start("plain", Some("claude"), None, None, None, None, None, None, None);
         let out = session_send(&send_invocation(&["hi"], &[("id", "plain"), ("yes", "true")]));
-        assert_eq!(out.status, crate::output::Status::Error);
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
         assert_eq!(out.data.as_ref().unwrap()["reason"], "not-conductable");
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1290,8 +1290,8 @@ mod tests {
             r#"{ "session_id": "x", "hook_event_name": "Zzz" }"#, // unmapped
         ] {
             let out = hook_from_str(bad);
-            assert_eq!(out.status, crate::output::Status::Ok, "input: {bad:?}");
-            assert_eq!(out.render(false).1, crate::output::exit::OK);
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "input: {bad:?}");
+            assert_eq!(out.render(false).1, aoide_protocol::output::exit::OK);
             assert_eq!(out.data.unwrap()["action"], "none", "input: {bad:?}");
         }
     }
@@ -1306,7 +1306,7 @@ mod tests {
         let out = hook_from_str(
             r#"{ "session_id": "h1", "hook_event_name": "SessionStart", "cwd": "/proj", "extra": 9 }"#,
         );
-        assert_eq!(out.status, crate::output::Status::Ok);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         let s: SessionsFile = load_stage(&sessions_path()).unwrap();
         assert_eq!(s.sessions.len(), 1);
         assert_eq!(s.sessions[0].agent, "claude");
@@ -1409,7 +1409,7 @@ mod tests {
             r#"{ "session_id": "b1", "hook_event_name": "Notification",
                  "message": "Claude is waiting for your input" }"#,
         );
-        assert_eq!(out.status, crate::output::Status::Ok);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         assert_eq!(live_phase("b1"), "stopped");
 
         // A garbage/absent-message Notification is an ok no-op (action:none), and

@@ -7,7 +7,7 @@
 
 use super::model::{Project, SessionRecord};
 use super::window::TermWindow;
-use crate::dispatch::Invocation;
+use aoide_protocol::Invocation;
 use serde_json::Map;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -84,7 +84,7 @@ pub(crate) fn invocation(path: &[&str], args: &[&str]) -> Invocation {
         path: path.iter().map(|s| s.to_string()).collect(),
         args: args.iter().map(|s| s.to_string()).collect(),
         flags: BTreeMap::new(),
-        door: crate::daemon::Door::Cli,
+        door: aoide_protocol::Door::Cli,
     }
 }
 pub(crate) fn wrap_invocation(args: &[&str], flags: &[(&str, &str)]) -> Invocation {
@@ -95,7 +95,7 @@ pub(crate) fn wrap_invocation(args: &[&str], flags: &[(&str, &str)]) -> Invocati
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
-        door: crate::daemon::Door::Cli,
+        door: aoide_protocol::Door::Cli,
     }
 }
 pub(crate) fn conduct_invocation(args: &[&str], flags: &[(&str, &str)]) -> Invocation {
@@ -106,7 +106,7 @@ pub(crate) fn conduct_invocation(args: &[&str], flags: &[(&str, &str)]) -> Invoc
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
-        door: crate::daemon::Door::Cli,
+        door: aoide_protocol::Door::Cli,
     }
 }
 pub(crate) fn send_invocation(args: &[&str], flags: &[(&str, &str)]) -> Invocation {
@@ -117,7 +117,7 @@ pub(crate) fn send_invocation(args: &[&str], flags: &[(&str, &str)]) -> Invocati
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
-        door: crate::daemon::Door::Cli,
+        door: aoide_protocol::Door::Cli,
     }
 }
 pub(crate) struct EnvVars {
@@ -148,6 +148,6 @@ pub(crate) fn flag_invocation(path: &[&str], flags: &[(&str, &str)]) -> Invocati
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
-        door: crate::daemon::Door::Cli,
+        door: aoide_protocol::Door::Cli,
     }
 }

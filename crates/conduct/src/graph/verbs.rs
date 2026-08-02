@@ -8,8 +8,8 @@ use super::model::{
     graph_path, hooks_path, load_stage, projects_path, sessions_path, sorted_projects,
     write_stage, HooksFile, Project, ProjectsFile, SessionsFile, STAGE_GRAPH_VERSION,
 };
-use crate::dispatch::Invocation;
-use crate::output::Outcome;
+use aoide_protocol::Invocation;
+use aoide_protocol::output::Outcome;
 use serde_json::json;
 #[cfg(test)]
 use serde_json::Value;
@@ -297,7 +297,7 @@ mod tests {
             &["graph", "project", "add"],
             &["aoide", "/home/k/Aoide"],
         ));
-        assert_eq!(out.status, crate::output::Status::Ok);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
 
         let staged: Value =
             serde_json::from_str(&std::fs::read_to_string(stage.join("graph.json")).unwrap())

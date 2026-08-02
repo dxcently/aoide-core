@@ -5,8 +5,8 @@
 use super::model::{
     hooks_path, load_stage, projects_path, sessions_path, HooksFile, ProjectsFile, SessionsFile,
 };
-use crate::dispatch::Invocation;
-use crate::output::Outcome;
+use aoide_protocol::Invocation;
+use aoide_protocol::output::Outcome;
 use serde_json::json;
 
 /// Positional-arg check → structured usage error (exit 2) on a miss.
