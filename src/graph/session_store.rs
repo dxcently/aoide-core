@@ -9,159 +9,30 @@
 use super::common::{require_flag, stage_error};
 use super::doc::{prune_done, restage_graph, would_cycle};
 use super::model::{
-    canonical_state, hooks_path, load_stage, sessions_path, write_stage, HookRecord, HooksFile,
+    canonical_state, hooks_path, load_stage, sessions_path, write_stage, HooksFile,
     SessionRecord, SessionsFile, STAGE_GRAPH_VERSION,
 };
+#[cfg(test)]
+use super::model::HookRecord;
 use crate::dispatch::Invocation;
 use crate::output::Outcome;
 use crate::shellbridge::with_stage_lock;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-/// UTC wall-clock now as ISO-8601 `YYYY-MM-DDTHH:MM:SSZ`.
-///
-/// The same `SystemTime`→epoch-seconds idiom daemon.rs stamps audit records
-/// with, formatted for the `startedAt` field the stage shapes carry. The civil
-/// date is hand-rolled (Howard Hinnant's `civil_from_days`, the exact inverse of
-/// [`crate::conductor::theme::parse_iso_utc`], the reader) so the offline lock never
-/// grows a chrono just to write one timestamp — and a stamp we write always
-/// round-trips back through the reader conductor/theme already ships.
-pub(crate) fn now_iso_utc() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    iso_utc_from_epoch(secs)
-}
-
-/// Format Unix epoch seconds as ISO-8601 UTC (pure; unit-tested).
-fn iso_utc_from_epoch(secs: i64) -> String {
-    let days = secs.div_euclid(86400);
-    let rem = secs.rem_euclid(86400);
-    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    // civil_from_days: the inverse of parse_iso_utc's days computation.
-    let z = days + 719468;
-    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if m <= 2 { y + 1 } else { y };
-    format!("{year:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
-}
-
-/// UPSERT a session record by id (pure; the handler wires I/O around it).
-///
-/// A fresh id is inserted `state="idle"` (at rest until a prompt/tool or a
-/// foreground command moves it to `working`), `startedAt=now`, `agent`
-/// defaulting to `claude`. A re-start of an existing id updates only the fields
-/// provided (a `None` leaves the stored value), leaves the live `state`
-/// untouched (a resume must not reset a working session), and NEVER clobbers
-/// `startedAt` — the record is bounded to one per id, never duplicated. Returns
-/// `true` when a new record was inserted.
-pub fn upsert_session(
-    sessions: &mut Vec<SessionRecord>,
-    id: &str,
-    agent: Option<&str>,
-    cwd: Option<&str>,
-    window: Option<&str>,
-    parent: Option<&str>,
-    conductable: Option<bool>,
-    socket: Option<&str>,
-    title: Option<&str>,
-    pid: Option<u32>,
-    now: &str,
-) -> bool {
-    let inserted = if let Some(s) = sessions.iter_mut().find(|s| s.session_id == id) {
-        if let Some(a) = agent {
-            s.agent = a.to_string();
-        }
-        if let Some(c) = cwd {
-            s.cwd = c.to_string();
-        }
-        if let Some(w) = window {
-            s.window_address = w.to_string();
-        }
-        if let Some(p) = parent {
-            s.parent_session_id = Some(p.to_string());
-        }
-        if let Some(c) = conductable {
-            s.conductable = Some(c);
-        }
-        if let Some(sock) = socket {
-            s.socket = Some(sock.to_string());
-        }
-        if let Some(t) = title {
-            s.title = Some(t.to_string());
-        }
-        if let Some(p) = pid {
-            s.pid = Some(p);
-        }
-        // A re-start (hook SessionStart on resume/compact, or a re-run `graph
-        // session start`) must NOT reset the live state — a working/awaiting
-        // session stays as it is; only the provided fields update. `startedAt`
-        // is likewise preserved.
-        false
-    } else {
-        sessions.push(SessionRecord {
-            session_id: id.to_string(),
-            agent: agent.unwrap_or("claude").to_string(),
-            window_address: window.unwrap_or_default().to_string(),
-            cwd: cwd.unwrap_or_default().to_string(),
-            // A freshly registered session is at rest until a prompt/tool (agent)
-            // or a foreground command (shell) moves it to `working`.
-            state: "idle".to_string(),
-            started_at: now.to_string(),
-            parent_session_id: parent.map(str::to_string),
-            conductable,
-            socket: socket.map(str::to_string),
-            title: title.map(str::to_string),
-            pid,
-            // Workspace is stamped later by the window-event listener (it needs a
-            // resolved window first); a fresh record starts without one.
-            workspace: None,
-            activity: None,
-            kind: None,
-            say: None,
-            model: None,
-            context_tokens: None,
-            needs_sudo: None,
-            extra: Map::new(),
-        });
-        true
-    };
-    // Classify an unclassified record: a conducted "shell" vs an "agent"
-    // (claude/other). Sub-agent nodes set kind="subagent" explicitly elsewhere;
-    // a legacy record with no kind is backfilled here on its next touch.
-    if let Some(s) = sessions.iter_mut().find(|s| s.session_id == id) {
-        if s.kind.is_none() {
-            s.kind = Some(if s.agent == "shell" { "shell" } else { "agent" }.to_string());
-        }
-    }
-    inserted
-}
-
-/// UPSERT the single hook record for a session (pure; bounded one-per-id).
-///
-/// `merged_sessions` keys the live phase by (latest `updatedAt`), so a single
-/// rolling record per session is all it needs — no unbounded append.
-pub fn upsert_hook(hooks: &mut Vec<HookRecord>, id: &str, phase: &str, now: &str) {
-    if let Some(h) = hooks.iter_mut().find(|h| h.session_id == id) {
-        h.phase = phase.to_string();
-        h.updated_at = now.to_string();
-    } else {
-        hooks.push(HookRecord {
-            session_id: id.to_string(),
-            phase: phase.to_string(),
-            updated_at: now.to_string(),
-            extra: Map::new(),
-        });
-    }
-}
+/// `now_iso_utc`/`iso_utc_from_epoch` (time) and `upsert_session`/
+/// `upsert_hook` (pure Vec<Record> mutators — verified DAG-free: neither
+/// touches `restage_graph`/`would_cycle`/`require_flag`/`stage_error`) moved
+/// to `aoide-storage` (Phase 3a restructure,
+/// docs/architecture/PACKAGE-LAYOUT.md); re-exported here so every existing
+/// `crate::graph::session_store::{now_iso_utc, upsert_session, …}` caller
+/// (and this file's own `do_session_*`/`do_subagent_*` handlers below, which
+/// stay in root through Phase 3b) is untouched.
+pub use aoide_storage::session::{upsert_hook, upsert_session};
+pub use aoide_storage::time::now_iso_utc;
+#[cfg(test)]
+use aoide_storage::time::iso_utc_from_epoch;
 
 /// Core of `graph session start`: cycle-check a parent, UPSERT, re-stage.
 #[allow(clippy::too_many_arguments)]

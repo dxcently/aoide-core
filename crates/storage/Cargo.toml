@@ -1,0 +1,16 @@
+[package]
+name = "aoide-storage"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+description = "Aoide durable session data: stage-file records, atomic stage I/O, the a2a roster, time."
+
+[lib]
+name = "aoide_storage"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+aoide-protocol = { path = "../protocol" }
+libc = "0.2"

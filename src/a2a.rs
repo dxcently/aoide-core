@@ -28,13 +28,12 @@
 
 use crate::daemon::{self, Door};
 use crate::dispatch::Invocation;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -187,81 +186,14 @@ fn agent_card(bind: &str, port: u16) -> Value {
 // (an absent file is simply "no agents registered"); keyed by the card `name`,
 // dedupe/replace on re-add. This is the CLIENT half of §6 — the outbound,
 // aoide-drives-a-remote-agent direction — mirroring the inbound server above.
-
-/// `state/a2a-agents.json` schema version (CONTRACTS.md §4, v0).
-pub const A2A_AGENTS_VERSION: &str = "0";
-
-/// One registered external A2A agent. `url` is the RESOLVED `message/send`
-/// endpoint (the card's own `url`/first-interface url, or the origin of the
-/// fetched card URL) — what `agent send` POSTs to, NOT the card URL we GET'd.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct A2aAgent {
-    pub name: String,
-    pub url: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(rename = "registeredAt", default)]
-    pub registered_at: String,
-}
-
-/// The `state/a2a-agents.json` container.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct A2aAgentRegistry {
-    #[serde(rename = "schemaVersion", default)]
-    pub schema_version: String,
-    #[serde(default)]
-    pub agents: Vec<A2aAgent>,
-}
-
-/// The registry path: `state/a2a-agents.json` — the gitignored root-runtime
-/// `state/` dir (CONTRACTS.md §2, the same root `state/usage.json` lives in),
-/// NOT `song/stage/`.
-pub fn agents_path() -> PathBuf {
-    crate::shellbridge::state_dir().join("a2a-agents.json")
-}
-
-/// Read the registry, tolerating a missing/corrupt/wrong-shape file as an
-/// empty list (CONTRACTS.md §4 additive discipline — an absent file is simply
-/// "no agents registered", never an error).
-pub fn load_agents() -> Vec<A2aAgent> {
-    match std::fs::read_to_string(agents_path()) {
-        Ok(raw) => serde_json::from_str::<A2aAgentRegistry>(&raw)
-            .map(|r| r.agents)
-            .unwrap_or_default(),
-        Err(_) => Vec::new(),
-    }
-}
-
-/// Atomic-write the registry (v0 shape) back to `state/a2a-agents.json`.
-pub fn save_agents(agents: &[A2aAgent]) -> Result<(), String> {
-    let reg = A2aAgentRegistry {
-        schema_version: A2A_AGENTS_VERSION.to_string(),
-        agents: agents.to_vec(),
-    };
-    let body = serde_json::to_string_pretty(&reg)
-        .map_err(|e| format!("serialize a2a-agents.json: {e}"))?
-        + "\n";
-    let path = agents_path();
-    crate::shellbridge::atomic_write(&path, &body).map_err(|e| format!("{}: {e}", path.display()))
-}
-
-/// Insert or REPLACE an agent by `name` (dedupe on re-add — the newest card
-/// wins). Pure list mutation, so the CRUD is unit-testable off disk.
-pub fn upsert_agent(agents: &mut Vec<A2aAgent>, agent: A2aAgent) {
-    if let Some(slot) = agents.iter_mut().find(|a| a.name == agent.name) {
-        *slot = agent;
-    } else {
-        agents.push(agent);
-    }
-}
-
-/// Remove an agent by `name`. Returns whether anything was removed, so the
-/// handler can report an idempotent no-op cleanly. Pure.
-pub fn remove_agent(agents: &mut Vec<A2aAgent>, name: &str) -> bool {
-    let before = agents.len();
-    agents.retain(|a| a.name != name);
-    agents.len() != before
-}
+//
+// Moved to `aoide-storage` (Phase 3a restructure,
+// docs/architecture/PACKAGE-LAYOUT.md); re-exported here so every existing
+// `crate::a2a::{A2aAgent, load_agents, …}` caller is untouched.
+pub use aoide_storage::a2a_store::{
+    agents_path, load_agents, remove_agent, save_agents, upsert_agent, A2aAgent, A2aAgentRegistry,
+    A2A_AGENTS_VERSION,
+};
 
 // ── AgentCard parsing (client side — the shape a REMOTE card presents) ───────
 
@@ -1954,34 +1886,11 @@ mod tests {
         assert_eq!(agents.len(), 1);
     }
 
-    #[test]
-    fn load_save_agents_round_trip_through_a_temp_state_dir() {
-        let _g = crate::env_lock().lock().unwrap();
-        let saved = std::env::var("AOIDE_STATE_DIR").ok();
-        let dir = std::env::temp_dir().join(format!("aoide-a2a-reg-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("AOIDE_STATE_DIR", &dir);
-
-        // Missing file → empty (tolerate-missing).
-        assert!(load_agents().is_empty());
-
-        let agents = vec![fixture_agent("alpha", "http://a/"), fixture_agent("beta", "http://b/")];
-        save_agents(&agents).unwrap();
-        let back = load_agents();
-        assert_eq!(back, agents);
-
-        // The on-disk shape carries the v0 schemaVersion.
-        let raw = std::fs::read_to_string(agents_path()).unwrap();
-        let v: Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(v["schemaVersion"], "0");
-        assert_eq!(v["agents"].as_array().unwrap().len(), 2);
-
-        let _ = std::fs::remove_dir_all(&dir);
-        match saved {
-            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
-            None => std::env::remove_var("AOIDE_STATE_DIR"),
-        }
-    }
+    // `load_save_agents_round_trip_through_a_temp_state_dir` moved to
+    // `aoide-storage`'s `a2a_store::tests` alongside `load_agents`/
+    // `save_agents`/`agents_path` (Phase 3a restructure) — those are no
+    // longer defined in this crate, only re-exported, so a real-I/O test of
+    // them belongs where they're actually implemented.
 
     // ── AgentCard parsing (client side) ──────────────────────────────────────
 

@@ -26,6 +26,7 @@ pub mod registry;
 pub mod shellbridge;
 
 pub use aoide_protocol as protocol;
+pub use aoide_storage as storage;
 
 use daemon::Door;
 

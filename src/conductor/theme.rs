@@ -211,33 +211,14 @@ pub fn elapsed_str(started_at: &str) -> String {
     }
 }
 
-/// Parse `YYYY-MM-DDTHH:MM:SS` (a trailing `Z` tolerated) to UTC epoch seconds,
-/// or `None` when the shape doesn't hold — a hand-rolled civil-days conversion
-/// so the lock never grows a chrono just to subtract two timestamps.
-pub fn parse_iso_utc(s: &str) -> Option<i64> {
-    let s = s.trim();
-    let bytes = s.as_bytes();
-    if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
-        return None;
-    }
-    let num = |a: usize, b: usize| -> Option<i64> { s.get(a..b)?.parse().ok() };
-    let year = num(0, 4)?;
-    let month = num(5, 7)?;
-    let day = num(8, 10)?;
-    let hour = num(11, 13)?;
-    let min = num(14, 16)?;
-    let sec = num(17, 19)?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = (if y >= 0 { y } else { y - 399 }) / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    Some(days * 86400 + hour * 3600 + min * 60 + sec)
-}
+/// Parse `YYYY-MM-DDTHH:MM:SS` (a trailing `Z` tolerated) to UTC epoch
+/// seconds, or `None` when the shape doesn't hold. Moved to `aoide-storage`
+/// (Phase 3a restructure, docs/architecture/PACKAGE-LAYOUT.md) as
+/// `storage::time::parse_iso_utc` (the exact inverse of
+/// `storage::time::iso_utc_from_epoch`, the writer); re-exported here so
+/// every existing `crate::conductor::theme::parse_iso_utc` caller is
+/// untouched.
+pub use aoide_storage::time::parse_iso_utc;
 
 /// `—` for an empty field, else the field.
 pub fn disp(s: &str) -> &str {
