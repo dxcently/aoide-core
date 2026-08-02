@@ -147,7 +147,7 @@ fn handle_agent_add(inv: &Invocation) -> Outcome {
                 .with_data(json!({ "reason": "card-unparseable", "url": card_url }))
         }
     };
-    let now = crate::graph::now_iso_utc();
+    let now = aoide_storage::time::now_iso_utc();
     let agent = match crate::a2a::parse_agent_card(&card, &card_url, &now) {
         Ok(a) => a,
         Err(e) => {

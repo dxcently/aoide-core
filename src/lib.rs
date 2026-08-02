@@ -25,6 +25,7 @@ pub mod output;
 pub mod registry;
 pub mod shellbridge;
 
+pub use aoide_client as client;
 pub use aoide_conduct as conduct;
 pub use aoide_protocol as protocol;
 pub use aoide_storage as storage;
