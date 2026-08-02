@@ -1,0 +1,13 @@
+[package]
+name = "aoide-song"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+description = "Aoide's ricing/design engine: drachma locate + lint delegation, geometry/border keyword computation, and live compositor apply. Rices portably."
+
+[lib]
+name = "aoide_song"
+path = "src/lib.rs"
+
+[dependencies]
+serde_json = "1"

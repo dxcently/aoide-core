@@ -29,6 +29,7 @@ pub use aoide_client as client;
 pub use aoide_conduct as conduct;
 pub use aoide_protocol as protocol;
 pub use aoide_server as server;
+pub use aoide_song as song;
 pub use aoide_storage as storage;
 
 use daemon::Door;

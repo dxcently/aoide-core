@@ -13,7 +13,7 @@ license = "MIT"
 # just makes the manifest workspace-shaped.
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/storage", "crates/conduct", "crates/client", "crates/server"]
+members = ["crates/protocol", "crates/storage", "crates/conduct", "crates/client", "crates/server", "crates/song"]
 
 # Two binaries, one crate: the CLI trunk (`aoide`) and the daemon (`aoided`).
 # Both share the same schema + handler code in `src/`, so the CLI door, the
@@ -39,6 +39,7 @@ aoide-storage = { path = "crates/storage" }
 aoide-conduct = { path = "crates/conduct" }
 aoide-client = { path = "crates/client" }
 aoide-server = { path = "crates/server" }
+aoide-song = { path = "crates/song" }
 # `aoide conductor` — the interactive terminal frontend (see src/conductor.rs), built on
 # ratatui.rs over the crossterm backend (the rig's standard for every Aoide TUI:
 # no hand-rolled ANSI). ratatui owns the immediate-mode render + the double
