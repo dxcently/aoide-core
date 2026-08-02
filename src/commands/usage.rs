@@ -3,9 +3,16 @@
 //! Claude Code's own on-disk transcripts (`~/.claude/projects/**/*.jsonl`),
 //! same read pattern `graph/session_store.rs`'s `transcript_context_tokens`
 //! uses for the context-window meter. No network, no credentials — this
-//! machine's transcripts only. The `live` block in the written document is a
-//! clearly-marked stub for a LATER task to fill in (the claude.ai account
-//! usage fetch); readers must tolerate `live.ok == false`.
+//! machine's transcripts only.
+//!
+//! The `live` block IS now wired to a real fetch ([`fetch_live_usage`]): it
+//! reads the consumer OAuth token from `~/.claude/.credentials.json` and calls
+//! Claude Code's own (unofficial, ToS-gray) `/api/oauth/usage` endpoint via
+//! curl, with the token kept out of argv and off disk (the curl config is
+//! piped over stdin, `--config -`, so the token never touches a file). ANY
+//! failure degrades to `live.ok:false` + a **tokenless** reason, so readers
+//! (the widget) must still tolerate `live.ok == false`. The token is never
+//! logged, printed, or embedded in an error string or the written state file.
 
 use crate::dispatch::Invocation;
 use crate::output::Outcome;
@@ -13,7 +20,9 @@ use crate::registry::{cmd, Registry};
 use crate::shellbridge;
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 pub fn register(r: &mut Registry) {
     r.insert(cmd!(
@@ -47,33 +56,319 @@ pub(crate) struct LocalUsage {
 
 const LOCAL_NOTE: &str = "local estimate, this machine only";
 
-/// The `live` block — a stub in THIS task. `ok:false` always, with a reason;
-/// readers (the widget) must tolerate this and fall back to `local`.
+/// One live utilization meter — a `{utilization, resetsAt}` pair (the JSON keys
+/// the widget reads). `resetsAt` is optional (some blocks omit it).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct UsageMeter {
+    pub utilization: f64,
+    #[serde(rename = "resetsAt", skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<String>,
+}
+
+/// The `extraUsage` block — pay-as-you-go credit state.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct ExtraUsage {
+    #[serde(rename = "isEnabled")]
+    pub is_enabled: bool,
+    #[serde(rename = "monthlyLimit", skip_serializing_if = "Option::is_none")]
+    pub monthly_limit: Option<f64>,
+    #[serde(rename = "usedCredits", skip_serializing_if = "Option::is_none")]
+    pub used_credits: Option<f64>,
+}
+
+/// The `live` block — the claude.ai account-usage fetch. On a clean 200 this
+/// carries the real plan/weekly utilization (`ok:true` + the optional blocks);
+/// on ANY failure it degrades to `ok:false` + a **tokenless** reason and every
+/// data field stays `None`, so `ok:false` still serializes as just
+/// `{ok:false, error}` (shape-compatible with the v0 stub — the widget guards
+/// every sub-field). SOURCE IS UNOFFICIAL: this reads Claude Code's own
+/// `/api/oauth/usage` endpoint, which is undocumented and ToS-gray; treat a
+/// failure as normal and fall back to `local`.
 #[derive(Debug, Clone, Serialize)]
 struct LiveUsage {
     ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(rename = "fiveHour", skip_serializing_if = "Option::is_none")]
+    five_hour: Option<UsageMeter>,
+    #[serde(rename = "sevenDay", skip_serializing_if = "Option::is_none")]
+    seven_day: Option<UsageMeter>,
+    #[serde(rename = "sevenDayOpus", skip_serializing_if = "Option::is_none")]
+    seven_day_opus: Option<UsageMeter>,
+    #[serde(rename = "sevenDaySonnet", skip_serializing_if = "Option::is_none")]
+    seven_day_sonnet: Option<UsageMeter>,
+    #[serde(rename = "extraUsage", skip_serializing_if = "Option::is_none")]
+    extra_usage: Option<ExtraUsage>,
 }
 
 impl LiveUsage {
+    /// A clean failure: `ok:false` + a short tokenless reason, all data `None`.
     fn unavailable(reason: impl Into<String>) -> Self {
         LiveUsage {
             ok: false,
             error: Some(reason.into()),
+            five_hour: None,
+            seven_day: None,
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+            extra_usage: None,
         }
     }
 }
 
-/// The live-fetch seam. THIS task ships only the offline half (no network, no
-/// credential reads anywhere in this module) — `fetch_live_usage` always
-/// returns the stub below. A later task plugs the claude.ai OAuth/usage fetch
-/// in here and flips `ok:true` on success; until then every `aoide usage` run
-/// writes `live.ok:false` and callers must tolerate it (CONTRACTS.md §4).
-//
-// TODO(usage-live): the oauth/usage fetch plugs in here.
+/// The unofficial account-usage endpoint (Claude Code's own `/usage` fetch).
+const OAUTH_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+/// The OAuth beta gate the endpoint requires.
+const OAUTH_BETA: &str = "oauth-2025-04-20";
+/// A sane `claude-code/<version>` fallback when `claude --version` can't be
+/// read and `AOIDE_USAGE_UA` isn't set (a wrong/absent UA gets 429'd).
+const FALLBACK_UA: &str = "claude-code/2.1.0";
+
+// ── Pure parsing (no I/O, no network — unit-tested directly) ────────────────
+
+/// Extract the consumer OAuth access token from a parsed `.credentials.json`
+/// value: `.claudeAiOauth.accessToken`. `None` when the path is absent or the
+/// value is empty. Never logs or returns anything but the token itself.
+fn oauth_token_from_credentials(v: &Value) -> Option<String> {
+    let tok = v
+        .get("claudeAiOauth")
+        .and_then(|o| o.get("accessToken"))
+        .and_then(Value::as_str)?;
+    if tok.is_empty() {
+        None
+    } else {
+        Some(tok.to_string())
+    }
+}
+
+/// Parse one `{utilization, resets_at}` API block into a [`UsageMeter`].
+/// `None` when the block isn't an object with a numeric `utilization`.
+fn parse_meter(v: &Value) -> Option<UsageMeter> {
+    let obj = v.as_object()?;
+    let utilization = obj.get("utilization").and_then(Value::as_f64)?;
+    let resets_at = obj
+        .get("resets_at")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some(UsageMeter {
+        utilization,
+        resets_at,
+    })
+}
+
+/// Parse the `extra_usage` API block into an [`ExtraUsage`]. `None` when it
+/// isn't an object; missing sub-fields default (`is_enabled:false`, limits
+/// `None`).
+fn parse_extra(v: &Value) -> Option<ExtraUsage> {
+    let obj = v.as_object()?;
+    Some(ExtraUsage {
+        is_enabled: obj
+            .get("is_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        monthly_limit: obj.get("monthly_limit").and_then(Value::as_f64),
+        used_credits: obj.get("used_credits").and_then(Value::as_f64),
+    })
+}
+
+/// Pure core: turn a parsed 200-response body into a [`LiveUsage`]. Maps the
+/// snake_case API blocks (`five_hour`, `seven_day`, `seven_day_opus`,
+/// `seven_day_sonnet`, `extra_usage`) onto our camelCase `live` shape. A body
+/// that is not an object, or carries none of the recognized blocks, degrades
+/// to `unavailable("unparseable response")` — we never claim `ok:true` on a
+/// shape we didn't recognize.
+fn parse_oauth_usage(v: &Value) -> LiveUsage {
+    let obj = match v.as_object() {
+        Some(o) => o,
+        None => return LiveUsage::unavailable("unparseable response"),
+    };
+    let five_hour = obj.get("five_hour").and_then(parse_meter);
+    let seven_day = obj.get("seven_day").and_then(parse_meter);
+    let seven_day_opus = obj.get("seven_day_opus").and_then(parse_meter);
+    let seven_day_sonnet = obj.get("seven_day_sonnet").and_then(parse_meter);
+    let extra_usage = obj.get("extra_usage").and_then(parse_extra);
+    if five_hour.is_none()
+        && seven_day.is_none()
+        && seven_day_opus.is_none()
+        && seven_day_sonnet.is_none()
+        && extra_usage.is_none()
+    {
+        return LiveUsage::unavailable("unparseable response");
+    }
+    LiveUsage {
+        ok: true,
+        error: None,
+        five_hour,
+        seven_day,
+        seven_day_opus,
+        seven_day_sonnet,
+        extra_usage,
+    }
+}
+
+// ── The live fetch (curl, token kept out of argv) ───────────────────────────
+
+/// Resolve the `.credentials.json` path: `$AOIDE_CLAUDE_CREDENTIALS` override
+/// (a test/smoke seam) else `$HOME/.claude/.credentials.json`.
+fn credentials_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("AOIDE_CLAUDE_CREDENTIALS") {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".claude").join(".credentials.json"))
+}
+
+/// Strip anything that could break out of a curl-config quoted value or an
+/// HTTP header line: the quote/backslash that would end/escape the quoted
+/// value, plus ALL control chars (CR/LF/NUL/TAB/VT/…) so a hostile
+/// `$AOIDE_USAGE_UA` can carry no control bytes into the header at all.
+fn sanitize_header_value(s: &str) -> String {
+    s.chars()
+        .filter(|c| !(c.is_control() || matches!(c, '"' | '\\')))
+        .collect()
+}
+
+/// The `User-Agent` to send. Precedence: `$AOIDE_USAGE_UA` (used verbatim,
+/// sanitized) → `claude-code/<version>` parsed from `claude --version` →
+/// [`FALLBACK_UA`]. A wrong/absent UA is 429'd, so this is required.
+fn resolve_user_agent() -> String {
+    if let Ok(ua) = std::env::var("AOIDE_USAGE_UA") {
+        let ua = sanitize_header_value(ua.trim());
+        if !ua.is_empty() {
+            return ua;
+        }
+    }
+    if let Some(ver) = claude_cli_version() {
+        return format!("claude-code/{ver}");
+    }
+    FALLBACK_UA.to_string()
+}
+
+/// Parse the version out of `claude --version` (`"2.1.217 (Claude Code)"` →
+/// `"2.1.217"`). `None` when the binary is absent or the output is unusable.
+fn claude_cli_version() -> Option<String> {
+    let out = std::process::Command::new("claude")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let tok = s.split_whitespace().next()?;
+    let ver: String = tok
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .collect();
+    if ver.is_empty() {
+        None
+    } else {
+        Some(ver)
+    }
+}
+
+/// Build the curl config body carrying the URL, the Bearer token, and the
+/// beta/UA/content headers. **The token lives ONLY in this in-memory `String`**,
+/// which is fed to curl over stdin (`--config -`) and never touches a file or
+/// argv (`curl -H "Authorization: …"` would leak it to `ps`; a temp file could
+/// be pre-created/symlink-raced by a second local uid). The token has already
+/// been rejected if it carries a quote/newline/backslash, so the quoted
+/// Authorization value can't be broken out of.
+fn build_curl_config(token: &str, ua: &str) -> String {
+    format!(
+        "url = \"{OAUTH_USAGE_URL}\"\n\
+         header = \"Authorization: Bearer {token}\"\n\
+         header = \"anthropic-beta: {OAUTH_BETA}\"\n\
+         header = \"User-Agent: {ua}\"\n\
+         header = \"Content-Type: application/json\"\n"
+    )
+}
+
+/// Run `curl -sS --max-time 15 -w '\n%{http_code}' --config -` with the config
+/// `body` piped over stdin, and return `(http_code, body)`. The trailing line
+/// printed by `-w` is the status; the rest is the response body. A spawn/pipe
+/// failure, empty output, or a `000` (connection failure/timeout) code all map
+/// to `Err("curl failed")`. `stderr` is discarded (`Stdio::null`) so nothing
+/// curl prints can surface. The token exists only inside `body` (a private
+/// `String` piped straight to curl) — never a file, never argv.
+fn run_curl(body: &str) -> Result<(u16, String), String> {
+    let mut child = std::process::Command::new("curl")
+        .args(["-sS", "--max-time", "15", "-w", "\n%{http_code}", "--config", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "curl failed".to_string())?;
+    // Write the config to stdin and drop it (EOF) BEFORE waiting, so curl can
+    // finish and we can't deadlock. The config is tiny (~few hundred bytes).
+    {
+        let mut si = child.stdin.take().ok_or("curl failed".to_string())?;
+        si.write_all(body.as_bytes())
+            .map_err(|_| "curl failed".to_string())?;
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|_| "curl failed".to_string())?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (body, code_str) = match stdout.rsplit_once('\n') {
+        Some((b, c)) => (b, c.trim()),
+        None => ("", stdout.trim()),
+    };
+    let code: u16 = code_str.parse().map_err(|_| "curl failed".to_string())?;
+    if code == 0 {
+        return Err("curl failed".to_string());
+    }
+    Ok((code, body.to_string()))
+}
+
+/// The live-fetch seam. Reads the consumer OAuth token from `.credentials.json`
+/// at runtime, calls the unofficial `/api/oauth/usage` endpoint via curl (token
+/// piped over stdin as a `--config -` body, never a file and never argv), and
+/// maps a clean 200 onto the `live` block. ANY failure — missing credentials,
+/// the "authorized for Claude Code only" rejection, a transport error, a
+/// non-200, or an unparseable body — degrades to `ok:false` + a **tokenless**
+/// reason. The token is never logged, printed, or embedded in an error string.
 fn fetch_live_usage() -> LiveUsage {
-    LiveUsage::unavailable("live fetch not wired yet")
+    let path = match credentials_path() {
+        Some(p) => p,
+        None => return LiveUsage::unavailable("no ~/.claude credentials"),
+    };
+    let creds = match std::fs::read_to_string(&path) {
+        Ok(raw) => match serde_json::from_str::<Value>(&raw) {
+            Ok(v) => v,
+            Err(_) => return LiveUsage::unavailable("no ~/.claude credentials"),
+        },
+        Err(_) => return LiveUsage::unavailable("no ~/.claude credentials"),
+    };
+    let token = match oauth_token_from_credentials(&creds) {
+        Some(t) => t,
+        None => return LiveUsage::unavailable("no ~/.claude credentials"),
+    };
+    // The token becomes a quoted curl-config value; a token carrying a
+    // quote/newline/backslash is malformed and would break the config line, so
+    // reject it rather than emit a corrupt config. (Never log the token itself.)
+    if token.contains(['"', '\n', '\r', '\\']) {
+        return LiveUsage::unavailable("no ~/.claude credentials");
+    }
+    let ua = resolve_user_agent();
+    // The config body — including the token — lives only in this in-memory
+    // String and goes only over the pipe to curl's stdin, on every branch below.
+    let body = build_curl_config(&token, &ua);
+    match run_curl(&body) {
+        Ok((200, body)) => match serde_json::from_str::<Value>(&body) {
+            Ok(v) => parse_oauth_usage(&v),
+            Err(_) => LiveUsage::unavailable("unparseable response"),
+        },
+        // The consumer OAuth token is only authorized for Claude Code itself;
+        // this endpoint rejects other callers. Report it cleanly, don't retry.
+        Ok((401, _)) | Ok((403, _)) => {
+            LiveUsage::unavailable("unauthorized (consumer OAuth restricted to Claude Code)")
+        }
+        Ok((code, _)) => LiveUsage::unavailable(format!("http {code}")),
+        Err(reason) => LiveUsage::unavailable(reason),
+    }
 }
 
 // ── Pricing (approximate — embedded, not fetched) ───────────────────────────
@@ -256,9 +551,11 @@ fn claude_projects_dir() -> Option<PathBuf> {
 
 // ── The command handler ─────────────────────────────────────────────────────
 
-/// `aoide usage [--json]` — compute the local rollup, stamp the (stub) live
-/// block, atomic-write `state/usage.json`, and report today's tokens/cost.
-/// No secrets are read or written (there are none in this task's scope).
+/// `aoide usage [--json]` — compute the local rollup, stamp the live block,
+/// atomic-write `state/usage.json`, and report today's tokens/cost. The live
+/// fetch reads the consumer OAuth token at runtime but never writes, logs, or
+/// embeds it (it goes only over the pipe to curl's stdin); only the parsed
+/// usage numbers ever reach `state/usage.json`.
 fn handle_usage(_inv: &Invocation) -> Outcome {
     let cmd = "usage";
     let now = std::time::SystemTime::now()
@@ -478,15 +775,22 @@ mod tests {
     // ── handle_usage (end-to-end: writes state/usage.json) ─────────────────
 
     #[test]
-    fn handle_usage_writes_state_usage_json_with_stub_live_block() {
+    fn handle_usage_writes_state_usage_json_and_degrades_live_cleanly() {
         let _g = crate::env_lock().lock().unwrap();
-        let _s = EnvSaver::capture(&["AOIDE_STATE_DIR", "AOIDE_CLAUDE_PROJECTS_DIR"]);
+        let _s = EnvSaver::capture(&[
+            "AOIDE_STATE_DIR",
+            "AOIDE_CLAUDE_PROJECTS_DIR",
+            "AOIDE_CLAUDE_CREDENTIALS",
+        ]);
         let root = unique_tmp("usage-handle");
         let state = root.join("state");
         let claude = root.join("claude-projects");
         std::fs::create_dir_all(&claude).unwrap();
         std::env::set_var("AOIDE_STATE_DIR", &state);
         std::env::set_var("AOIDE_CLAUDE_PROJECTS_DIR", &claude);
+        // Point the live fetch at a nonexistent credentials file so it degrades
+        // deterministically to ok:false — this test is hermetic (no network).
+        std::env::set_var("AOIDE_CLAUDE_CREDENTIALS", root.join("no-such-creds.json"));
 
         let out = handle_usage(&inv(&["usage"], &[]));
         assert_eq!(out.status, Status::Ok);
@@ -495,10 +799,145 @@ mod tests {
         let written = std::fs::read_to_string(state.join("usage.json")).unwrap();
         let v: Value = serde_json::from_str(&written).unwrap();
         assert_eq!(v["schemaVersion"], "0");
+        // Missing credentials → clean, tokenless degrade; ok:false emits only
+        // {ok,error} (no data sub-fields leak in).
         assert_eq!(v["live"]["ok"], false);
-        assert!(v["live"]["error"].is_string());
+        assert_eq!(v["live"]["error"], "no ~/.claude credentials");
+        assert!(v["live"].get("fiveHour").is_none());
+        assert!(v["live"].get("extraUsage").is_none());
         assert_eq!(v["local"]["note"], LOCAL_NOTE);
         assert_eq!(v["local"]["today"]["tokens"], 0);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── oauth_token_from_credentials (pure) ─────────────────────────────────
+
+    #[test]
+    fn oauth_token_from_credentials_reads_nested_path() {
+        let creds = json!({
+            "claudeAiOauth": {
+                "accessToken": "tok-abc123",
+                "refreshToken": "refresh-xyz",
+                "expiresAt": 0
+            }
+        });
+        assert_eq!(
+            oauth_token_from_credentials(&creds),
+            Some("tok-abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn oauth_token_from_credentials_missing_or_empty_is_none() {
+        assert_eq!(oauth_token_from_credentials(&json!({})), None);
+        assert_eq!(
+            oauth_token_from_credentials(&json!({"claudeAiOauth": {}})),
+            None
+        );
+        assert_eq!(
+            oauth_token_from_credentials(&json!({"claudeAiOauth": {"accessToken": ""}})),
+            None
+        );
+        // Wrong shape entirely.
+        assert_eq!(oauth_token_from_credentials(&json!("nope")), None);
+    }
+
+    // ── parse_oauth_usage (pure) ────────────────────────────────────────────
+
+    /// A representative 200 body (snake_case, as the endpoint returns it).
+    fn usage_200_body() -> Value {
+        json!({
+            "five_hour":        { "utilization": 42.5, "resets_at": "2026-08-01T18:00:00Z" },
+            "seven_day":        { "utilization": 12,   "resets_at": "2026-08-07T00:00:00Z" },
+            "seven_day_opus":   { "utilization": 5.0,  "resets_at": "2026-08-07T00:00:00Z" },
+            "seven_day_sonnet": { "utilization": 7.0,  "resets_at": "2026-08-07T00:00:00Z" },
+            "extra_usage":      { "is_enabled": true, "monthly_limit": 100.0, "used_credits": 3.5 }
+        })
+    }
+
+    #[test]
+    fn parse_oauth_usage_maps_full_body_to_camelcase_live_block() {
+        let live = parse_oauth_usage(&usage_200_body());
+        assert!(live.ok);
+        assert!(live.error.is_none());
+
+        let five = live.five_hour.as_ref().unwrap();
+        assert!((five.utilization - 42.5).abs() < 1e-9);
+        assert_eq!(five.resets_at.as_deref(), Some("2026-08-01T18:00:00Z"));
+        // Integer utilization parses as f64.
+        assert!((live.seven_day.as_ref().unwrap().utilization - 12.0).abs() < 1e-9);
+        assert!((live.seven_day_opus.as_ref().unwrap().utilization - 5.0).abs() < 1e-9);
+        assert!((live.seven_day_sonnet.as_ref().unwrap().utilization - 7.0).abs() < 1e-9);
+
+        let extra = live.extra_usage.as_ref().unwrap();
+        assert!(extra.is_enabled);
+        assert_eq!(extra.monthly_limit, Some(100.0));
+        assert_eq!(extra.used_credits, Some(3.5));
+
+        // ok:true serializes the real camelCase shape.
+        let v = serde_json::to_value(&live).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["fiveHour"]["utilization"], 42.5);
+        assert_eq!(v["fiveHour"]["resetsAt"], "2026-08-01T18:00:00Z");
+        assert_eq!(v["extraUsage"]["isEnabled"], true);
+        assert_eq!(v["extraUsage"]["monthlyLimit"], 100.0);
+        assert_eq!(v["extraUsage"]["usedCredits"], 3.5);
+        // No stray `error` key on success.
+        assert!(v.get("error").is_none());
+    }
+
+    #[test]
+    fn parse_oauth_usage_tolerates_partial_and_missing_subfields() {
+        // Only five_hour present, and it omits resets_at.
+        let live = parse_oauth_usage(&json!({ "five_hour": { "utilization": 9.0 } }));
+        assert!(live.ok);
+        let five = live.five_hour.as_ref().unwrap();
+        assert!((five.utilization - 9.0).abs() < 1e-9);
+        assert!(five.resets_at.is_none());
+        assert!(live.seven_day.is_none());
+        // resetsAt skipped when None.
+        let v = serde_json::to_value(&live).unwrap();
+        assert!(v["fiveHour"].get("resetsAt").is_none());
+        assert!(v.get("sevenDay").is_none());
+    }
+
+    #[test]
+    fn parse_oauth_usage_malformed_degrades_to_ok_false() {
+        // Not an object.
+        let live = parse_oauth_usage(&json!("garbage"));
+        assert!(!live.ok);
+        assert_eq!(live.error.as_deref(), Some("unparseable response"));
+
+        // An object with none of the recognized blocks.
+        let live = parse_oauth_usage(&json!({ "unrelated": 1 }));
+        assert!(!live.ok);
+        assert_eq!(live.error.as_deref(), Some("unparseable response"));
+
+        // A block whose utilization isn't numeric is dropped; if that leaves
+        // nothing recognized, the whole thing degrades.
+        let live = parse_oauth_usage(&json!({ "five_hour": { "utilization": "high" } }));
+        assert!(!live.ok);
+        assert_eq!(live.error.as_deref(), Some("unparseable response"));
+    }
+
+    #[test]
+    fn unavailable_serializes_as_just_ok_false_and_error() {
+        // Shape-compatibility with the v0 stub: ok:false emits ONLY {ok,error}.
+        let live = LiveUsage::unavailable("no ~/.claude credentials");
+        let v = serde_json::to_value(&live).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"], "no ~/.claude credentials");
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj.len(), 2, "only ok + error, no data fields");
+        assert!(obj.get("fiveHour").is_none());
+        assert!(obj.get("extraUsage").is_none());
+    }
+
+    #[test]
+    fn sanitize_header_value_strips_breakout_chars() {
+        assert_eq!(
+            sanitize_header_value("claude-code/1.2.3\n\"evil\\"),
+            "claude-code/1.2.3evil"
+        );
     }
 }
