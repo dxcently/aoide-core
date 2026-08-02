@@ -5,7 +5,6 @@ use crate::output::Outcome;
 use crate::registry::{arg, cmd, Registry};
 use crate::shellbridge;
 use serde_json::json;
-use std::path::PathBuf;
 
 pub fn register(r: &mut Registry) {
     r.insert(cmd!(
@@ -44,12 +43,7 @@ fn handle_cover_set(inv: &Invocation) -> Outcome {
     };
 
     // Absolute path → literal; anything else → the shared covers/ library.
-    let literal = PathBuf::from(&arg);
-    let resolved = if literal.is_absolute() {
-        literal
-    } else {
-        shellbridge::song_dir().join("covers").join(&arg)
-    };
+    let resolved = aoide_song::cover::resolve_cover_arg(&arg);
 
     if !resolved.is_file() {
         return Outcome::error(

@@ -86,6 +86,7 @@ dependencies = [
 name = "aoide-song"
 version = "0.0.0"
 dependencies = [
+ "aoide-storage",
  "serde_json",
 ]
 

@@ -3,10 +3,14 @@
 //! `notes` locates the `drachma` binary and delegates lint runs to it;
 //! `live` computes the Hyprland geometry/border keyword list a staged notes
 //! document implies and (best-effort) applies it to a running compositor.
-//! Both are dependency-free leaves (Phase 5a); `mint`/`cover` land in a
-//! later phase with a storage dependency.
+//! `notes`/`live` are dependency-free leaves (Phase 5a). `mint` (the pure
+//! `rice mint` scaffolding/rendering engine) and `cover` (cover-art
+//! derivation + resolution) land in Phase 5b with a `aoide-storage`
+//! dependency (`aoide_storage::fs::song_dir`).
 
+pub mod cover;
 pub mod live;
+pub mod mint;
 pub mod notes;
 
 /// A crate-wide lock serialising every test that mutates process-global env
