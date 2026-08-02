@@ -118,7 +118,7 @@ pub fn run_cli(argv: &[String]) -> i32 {
             eprintln!("{body}");
             return code;
         }
-        return match conductor::run() {
+        return match conductor::run(dispatch::dispatch) {
             Ok(()) => output::exit::OK,
             Err(e) => {
                 eprintln!("aoide conductor: {e}");

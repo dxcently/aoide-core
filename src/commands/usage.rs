@@ -441,7 +441,7 @@ fn parse_turn_usage(line: &str) -> Option<TurnUsage> {
         return None;
     }
     let ts = v.get("timestamp").and_then(Value::as_str)?;
-    let epoch = crate::conductor::theme::parse_iso_utc(ts)?;
+    let epoch = crate::storage::time::parse_iso_utc(ts)?;
     let usage = v.get("message").and_then(|m| m.get("usage"))?;
     let get_u64 = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
     let input = get_u64("input_tokens");
@@ -626,7 +626,7 @@ mod tests {
     }
 
     fn epoch(ts: &str) -> i64 {
-        crate::conductor::theme::parse_iso_utc(ts).unwrap()
+        crate::storage::time::parse_iso_utc(ts).unwrap()
     }
 
     // ── model_price ──────────────────────────────────────────────────────────

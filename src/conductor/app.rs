@@ -20,7 +20,7 @@
 //! few beats ([`FRESH_TICKS`]) so the eye catches a new arrival.
 
 use crate::daemon::Door;
-use crate::dispatch::{self, Invocation};
+use crate::dispatch::Invocation;
 use crate::graph::{self, HooksFile, ProjectsFile, SessionRecord, SessionsFile};
 use crate::output::{Outcome, Status};
 use crate::shellbridge::stage_dir;
@@ -178,10 +178,33 @@ pub struct App {
     /// False until the first load — the opening roster is not "new arrivals".
     initialized: bool,
     mtimes: StageMtimes,
+    /// The injected dispatcher every mutation runs through ([`App::dispatch`]
+    /// calls it). Defaults to [`no_dispatch`] until [`App::load`] wires the
+    /// real one in — see [`DispatchFn`]'s doc comment for why this is
+    /// injected rather than reached for as a trunk global.
+    dispatch_fn: DispatchFn,
 }
 
 /// How many audit lines the LOG panel keeps in memory.
 pub const LOG_CAP: usize = 500;
+
+/// A dispatch fn pointer: matches [`crate::dispatch::dispatch`]'s exact
+/// signature (a plain `fn`, not a closure), so `lib.rs`'s launch site can hand
+/// it in directly. Deliberately its own type rather than reusing
+/// `aoide_server::mcp::DispatchFn` (structurally identical, but sharing it
+/// would wire an unwanted `conductor → server` coupling once `conductor`
+/// becomes its own crate) — the conductor is a FRONTEND over the trunk's
+/// dispatcher, and this is the seam that lets it stop reaching for the
+/// trunk's `dispatch::dispatch` / `dispatch::registry()` globals directly.
+pub type DispatchFn = fn(&Invocation) -> Outcome;
+
+/// The `dispatch_fn` fallback for an [`App`] that was never wired to a real
+/// dispatcher ([`App::empty`], the `#[cfg(test)]` [`App::for_test`]): none of
+/// the in-crate unit tests actually dispatch (they only render/select/
+/// navigate), so this just needs to be a harmless, well-typed placeholder.
+fn no_dispatch(_: &Invocation) -> Outcome {
+    Outcome::usage("conductor", "dispatch not wired for this App")
+}
 
 impl App {
     fn empty() -> Self {
@@ -203,6 +226,7 @@ impl App {
             known: HashSet::new(),
             initialized: false,
             mtimes: StageMtimes::default(),
+            dispatch_fn: no_dispatch,
         }
     }
 
@@ -222,8 +246,12 @@ impl App {
     }
 
     /// Build the app from the stage tree (missing files → empty, tolerated).
-    pub fn load() -> Self {
+    /// `dispatch` is the real dispatcher ([`App::dispatch`] threads every
+    /// mutation through it) — injected here rather than reached for as a
+    /// trunk global, so the conductor stays a pure frontend.
+    pub fn load(dispatch: DispatchFn) -> Self {
         let mut app = App::empty();
+        app.dispatch_fn = dispatch;
         app.reload_all();
         app
     }
@@ -526,7 +554,7 @@ impl App {
             flags: BTreeMap::new(),
             door: Door::Cli,
         };
-        let outcome = dispatch::dispatch(&inv);
+        let outcome = (self.dispatch_fn)(&inv);
         self.last_outcome = Some(outcome);
         // The action wrote to disk; pick it up immediately rather than waiting a
         // tick, so the panel reflects the change on the very next paint.

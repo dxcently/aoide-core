@@ -72,7 +72,7 @@ fn app_loads_recomputes_selects_and_dispatches_against_the_tempdir() {
     seed(&stage);
 
     // ── load ──
-    let mut app = App::load();
+    let mut app = App::load(aoide::dispatch::dispatch);
     assert_eq!(app.projects.len(), 2, "both projects loaded");
     assert_eq!(app.sessions.len(), 2, "both sessions loaded");
 

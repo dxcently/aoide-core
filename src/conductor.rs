@@ -61,7 +61,7 @@ use ratatui::Terminal;
 use std::io::{self, Stdout};
 use std::time::Duration;
 
-use app::{App, Panel};
+use app::{App, DispatchFn, Panel};
 
 /// How long each `event::poll` waits before we tick: the mtime-poll cadence.
 const TICK: Duration = Duration::from_millis(500);
@@ -107,13 +107,18 @@ fn install_panic_hook() {
 ///
 /// The dispatch that records the launch has already run (lib.rs); here we set up
 /// the terminal, build the app from the stage tree, and drive the loop.
-pub fn run() -> io::Result<()> {
+///
+/// `dispatch` is the real dispatcher, injected by the caller (`lib.rs` passes
+/// `dispatch::dispatch`) — see [`app::DispatchFn`]'s doc comment for why the
+/// conductor takes this in rather than reaching for the trunk's dispatcher
+/// itself.
+pub fn run(dispatch: DispatchFn) -> io::Result<()> {
     install_panic_hook();
     let _guard = TermGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal: Terminal<CrosstermBackend<Stdout>> = Terminal::new(backend)?;
 
-    let mut app = App::load();
+    let mut app = App::load(dispatch);
     event_loop(&mut terminal, &mut app)
     // `_guard` drops here (or on `?`/panic): terminal restored.
 }
