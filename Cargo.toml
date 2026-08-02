@@ -5,6 +5,15 @@ edition = "2021"
 description = "Aoide CLI + daemon — an API that happens to be typeable."
 license = "MIT"
 
+# Phase-1 workspace scaffold (see docs/architecture/PACKAGE-LAYOUT.md): this
+# manifest is both the `aoide` package and the workspace root, with the
+# package as the workspace's sole member (no `members`/`crates/*` glob yet —
+# there's nothing under crates/ to point it at). Future single-charter crates
+# land under `crates/*` in later phases; until then this is a no-op that
+# just makes the manifest workspace-shaped.
+[workspace]
+resolver = "2"
+
 # Two binaries, one crate: the CLI trunk (`aoide`) and the daemon (`aoided`).
 # Both share the same schema + handler code in `src/`, so the CLI door, the
 # MCP door, and the daemon can never drift.
