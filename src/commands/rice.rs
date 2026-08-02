@@ -156,7 +156,14 @@ fn derive_cover(name: &str) -> Option<PathBuf> {
 ///
 /// This is the honest form of the hand-copy agents had been doing: drive the
 /// songbook notes into the stage so the shell has a palette to render.
-fn handle_rice_preview(inv: &Invocation) -> Outcome {
+///
+/// `pub(crate)`, not private: `rice design enter` (Phase B,
+/// `commands/design.rs`) calls this directly to get the SAME live-apply side
+/// effects a bare `rice preview <name>` has, rather than reimplementing them
+/// — it hands this the identical `Invocation` it was given (both commands
+/// take the song name as their first positional arg, and this function reads
+/// nothing else off `inv`), so no adapter/duplication is needed.
+pub(crate) fn handle_rice_preview(inv: &Invocation) -> Outcome {
     let name = match inv.args.first() {
         Some(n) => n.clone(),
         None => {

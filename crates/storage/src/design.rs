@@ -2,11 +2,12 @@
 //! particular song is being actively iterated on right now (concepts/
 //! Self-Ricing's design-mode extension).
 //!
-//! Phase A only defines the shape + `load`/`save` pair and ships a read-only
-//! `aoide rice design status`. Nothing writes this file yet — `rice design
-//! enter`/`exit` (which would call [`save_design_marker`]) are later-phase
-//! work; `status` today reports whatever a marker was dropped here some other
-//! way (or `None`, honestly, when nothing has).
+//! Phase A defined the shape + `load`/`save` pair and shipped a read-only
+//! `aoide rice design status`. Phase B (`commands/design.rs`'s `rice design
+//! enter`/`exit`) is the write side: `enter` calls [`save_design_marker`],
+//! `exit` calls [`delete_design_marker`]. A `rice design sync` verb (Phase D)
+//! and widget live-carry into `run/qml/songs/` (Phase C, which is what would
+//! ever populate `carried_slots`) are still later-phase work.
 
 use crate::fs::{atomic_write, stage_dir};
 use serde::{Deserialize, Serialize};
@@ -61,6 +62,21 @@ pub fn save_design_marker(marker: &DesignMarker) -> Result<(), String> {
         + "\n";
     let path = design_marker_path();
     atomic_write(&path, &body).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Remove `stage/design.json` — `rice design exit`'s primitive. Tolerates the
+/// file already being gone (a double `exit`, or one racing something else
+/// that cleared it) as success, same "absent is never an error" discipline
+/// [`load_design_marker`] follows. Only the marker is touched — never
+/// `run/qml/` or any song file; the live sketch a design session left behind
+/// stays exactly as it was until the next `rice preview`/`enter` resets it.
+pub fn delete_design_marker() -> Result<(), String> {
+    let path = design_marker_path();
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
 }
 
 #[cfg(test)]
@@ -137,6 +153,43 @@ mod tests {
         let v: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["song"], "moonlight");
         assert!(v.get("by").is_none(), "by omitted when None");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+    }
+
+    #[test]
+    fn delete_design_marker_removes_an_existing_one_and_tolerates_absence() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-design-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("AOIDE_STAGE_DIR", &dir);
+
+        // Deleting when nothing is there is still `Ok` (idempotent, never an error).
+        assert!(delete_design_marker().is_ok());
+
+        let marker = DesignMarker {
+            song: "moonlight".to_string(),
+            entered_at: "2026-08-02T00:00:00Z".to_string(),
+            by: None,
+            intent: "/x/intent.md".to_string(),
+            intent_present: false,
+            sources: vec![],
+            carried_slots: vec![],
+        };
+        save_design_marker(&marker).unwrap();
+        assert!(design_marker_path().is_file());
+
+        assert!(delete_design_marker().is_ok());
+        assert!(!design_marker_path().is_file(), "marker file is gone");
+        assert!(load_design_marker().is_none());
+
+        // A second delete on an already-gone file is still `Ok`.
+        assert!(delete_design_marker().is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
         match saved {

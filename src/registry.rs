@@ -145,6 +145,8 @@ mod tests {
             "mcp.serve",
             "onboard",
             "rice.adopt",
+            "rice.design.enter",
+            "rice.design.exit",
             "rice.design.status",
             "rice.gen",
             "rice.lint",
