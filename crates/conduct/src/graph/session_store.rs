@@ -545,6 +545,16 @@ pub(in crate::graph) fn refresh_transcript_fields(
                     s.model = Some(model.clone());
                     changed = true;
                 }
+                // Publish the model's context ceiling (CONTRACTS.md §4) — re-derived
+                // here so a mid-session model switch re-caps the meter without a
+                // widget guess.
+                let ceiling = Some(aoide_protocol::context_ceiling_for_model(Some(
+                    model.as_str(),
+                )));
+                if s.context_ceiling != ceiling {
+                    s.context_ceiling = ceiling;
+                    changed = true;
+                }
             }
             if let Some(ctx) = context_tokens {
                 if s.context_tokens != Some(ctx) {
@@ -682,6 +692,16 @@ pub(in crate::graph) fn refresh_subagent_says(session_id: &str, cwd: Option<&str
                 if let Some(model) = model {
                     if s.model.as_deref() != Some(model.as_str()) {
                         s.model = Some(model.clone());
+                        changed = true;
+                    }
+                    // Publish the subagent's own context ceiling — parity with the
+                    // parent-session derivation in `refresh_transcript_fields`, so a
+                    // subagent card gets a correct meter too (it runs its own model).
+                    let ceiling = Some(aoide_protocol::context_ceiling_for_model(Some(
+                        model.as_str(),
+                    )));
+                    if s.context_ceiling != ceiling {
+                        s.context_ceiling = ceiling;
                         changed = true;
                     }
                 }

@@ -90,6 +90,7 @@ pub fn upsert_session(
             say: None,
             model: None,
             context_tokens: None,
+            context_ceiling: None,
             needs_sudo: None,
             extra: Map::new(),
         });

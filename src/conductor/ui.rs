@@ -696,6 +696,7 @@ mod tests {
             model: None,
             context_tokens: None,
             needs_sudo: None,
+            context_ceiling: None,
             extra: Map::new(),
         }
     }

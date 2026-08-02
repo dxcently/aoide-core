@@ -47,6 +47,7 @@ pub(crate) fn session(
         say: None,
         model: None,
         context_tokens: None,
+        context_ceiling: None,
         needs_sudo: None,
         extra: Map::new(),
     }

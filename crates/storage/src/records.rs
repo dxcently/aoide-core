@@ -116,16 +116,29 @@ pub struct SessionRecord {
     /// produced, not what sat in the window when the request was made).
     /// Refreshed at the same hook boundaries as `say`/`model`. Additive/v0-safe
     /// — absent for shells and until the session has produced at least one
-    /// assistant turn (same lifecycle as `model`). The dock maps the raw count
-    /// to a context-window meter, computing its own ceiling from `model`
-    /// client-side (a 200k/1M split, with a heuristic bump for the cases where
-    /// the transcript's model id doesn't spell out its long-context tier).
+    /// assistant turn (same lifecycle as `model`). The dock reads the published
+    /// `context_ceiling` field (below) to turn this raw count into a meter,
+    /// rather than computing its own ceiling from `model` client-side.
     #[serde(
         rename = "contextTokens",
         default,
         skip_serializing_if = "Option::is_none"
     )]
     pub context_tokens: Option<u64>,
+    /// The context-window ceiling (tokens) for this session's current `model`,
+    /// computed at refresh time by `aoide_protocol::context_ceiling_for_model`
+    /// and published so the dock renders the fill meter without reimplementing the
+    /// 200k/1M split (the widget-side guessing this replaces). Re-derived whenever
+    /// `model` changes, so a mid-session model switch re-caps automatically.
+    /// Additive/v0-safe — absent for shells and until the first assistant turn
+    /// lands (same lifecycle as `model`/`contextTokens`); a legacy record without
+    /// it falls back to 200k client-side.
+    #[serde(
+        rename = "contextCeiling",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub context_ceiling: Option<u64>,
     /// True while this conducted SHELL is blocked at a `sudo` password prompt
     /// — detected by conduct's PTY tick (the foreground process is `sudo`, or
     /// the `[sudo] password for` text was just seen crossing master→stdout)
@@ -266,6 +279,34 @@ mod tests {
         let legacy: SessionRecord =
             serde_json::from_str(r#"{ "sessionId": "s", "windowAddress": "0x1" }"#).unwrap();
         assert_eq!(legacy.context_tokens, None);
+    }
+    #[test]
+    fn session_record_context_ceiling_round_trips_and_stays_absent_when_unset() {
+        // serde: `contextCeiling` serialises as an integer when Some, and is
+        // skipped (skip_serializing_if) when None — same additive/v0-safe wire
+        // contract as `contextTokens` above.
+        let mut rec = SessionRecord {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        rec.context_ceiling = Some(1_000_000);
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("\"contextCeiling\":1000000"), "serialised: {json}");
+        let back: SessionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.context_ceiling, Some(1_000_000));
+
+        // A record with no contextCeiling omits the key entirely (no null
+        // noise) and a legacy record with no `contextCeiling` field parses to
+        // None.
+        let bare = SessionRecord {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        let bare_json = serde_json::to_string(&bare).unwrap();
+        assert!(!bare_json.contains("contextCeiling"), "serialised: {bare_json}");
+        let legacy: SessionRecord =
+            serde_json::from_str(r#"{ "sessionId": "s", "windowAddress": "0x1" }"#).unwrap();
+        assert_eq!(legacy.context_ceiling, None);
     }
     #[test]
     fn session_records_round_trip_unknown_fields() {

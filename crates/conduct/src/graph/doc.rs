@@ -95,6 +95,11 @@ pub fn build_graph(
         if let Some(ctx) = s.context_tokens {
             node["contextTokens"] = json!(ctx);
         }
+        // The context-window ceiling for the node's model (aoide's published fact),
+        // so the dock's meter needs no client-side 200k/1M guess. Absent with `model`.
+        if let Some(ceil) = s.context_ceiling {
+            node["contextCeiling"] = json!(ceil);
+        }
         // Blocked on a `sudo` password prompt — a conducted SHELL only; rides
         // onto the node only when true (never a dangling `needsSudo:false`).
         if let Some(true) = s.needs_sudo {
