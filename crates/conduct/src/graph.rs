@@ -64,5 +64,5 @@ pub use self::session_store::now_iso_utc;
 pub(crate) use self::common::stage_error;
 pub(crate) use self::doc::{prune_done, restage_graph};
 pub(crate) use self::model::{hooks_path, STAGE_GRAPH_VERSION};
-pub(crate) use self::session_store::{transcript_path_for, upsert_hook};
+pub(crate) use self::session_store::upsert_hook;
 pub(crate) use self::window::{hyprctl_clients, normalize_addr};

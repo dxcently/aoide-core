@@ -96,9 +96,9 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["graph", "session", "hook"],
-        summary: "Hook door for agent harnesses: read one Claude-Code hook JSON from stdin and map it to a session verb (never exits non-zero).",
+        summary: "Hook door for agent harnesses: read one hook JSON from stdin and map it to a session verb through the agent's profile (never exits non-zero for a payload problem).",
         args: [],
-        flags: [],
+        flags: [flag!("agent", "string", "Agent harness the payload comes from: claude (default) or kimi.")],
         gated: false,
         implemented: true,
         handler: crate::graph::session_hook,

@@ -12,6 +12,7 @@
 //! Phase 3b.
 
 use crate::records::{HookRecord, SessionRecord};
+use aoide_protocol::agents::CLAUDE_PROFILE;
 use serde_json::Map;
 
 /// UPSERT a session record by id (pure; the handler wires I/O around it).
@@ -70,7 +71,7 @@ pub fn upsert_session(
     } else {
         sessions.push(SessionRecord {
             session_id: id.to_string(),
-            agent: agent.unwrap_or("claude").to_string(),
+            agent: agent.unwrap_or(CLAUDE_PROFILE.name).to_string(),
             window_address: window.unwrap_or_default().to_string(),
             cwd: cwd.unwrap_or_default().to_string(),
             // A freshly registered session is at rest until a prompt/tool (agent)

@@ -22,9 +22,10 @@
 //! `pub(crate)` stage helpers still owned by `graph.rs`.
 
 use aoide_protocol::Invocation;
+use aoide_protocol::agents::{agent_profile, AgentProfile, CLAUDE_PROFILE};
 use crate::graph::{
     canonical_state, hooks_path, hyprctl_clients, load_stage, normalize_addr, now_iso_utc,
-    prune_done, restage_graph, sessions_path, stage_error, transcript_path_for, upsert_hook,
+    prune_done, restage_graph, sessions_path, stage_error, upsert_hook,
     write_stage, HookRecord, HooksFile, SessionRecord, SessionsFile, STAGE_GRAPH_VERSION,
 };
 use aoide_protocol::output::Outcome;
@@ -169,9 +170,13 @@ pub(crate) fn effective_live_addresses(
 // same-window agent duplicates down to the real one.
 
 /// Is this a top-level AGENT session (a claude), vs a shell or a synthetic
-/// sub-agent node? Published `kind` wins; absent, fall back to "not a shell and
-/// not a conducted PTY". Sub-nodes (`sub:*`) carry no `windowAddress`, so they
-/// never enter a window group regardless.
+/// sub-agent node? A conducted PTY host (`conductable` — the control-socket
+/// owner) is a HOST, never an agent-duplicate candidate, whatever kind it
+/// published (`upsert_session` classifies a `conduct -- kimi` wrapper as
+/// "agent" from its child's basename, and the wrapper is not a second
+/// foreground agent). Otherwise published `kind` wins; absent, fall back to
+/// "not a shell and not a conducted PTY". Sub-nodes (`sub:*`) carry no
+/// `windowAddress`, so they never enter a window group regardless.
 ///
 /// `pub`, not `pub(crate)` (pre-Phase-3b visibility): root's
 /// `graph::session_store::do_session_start_inner` (same-window agent
@@ -180,11 +185,22 @@ pub(crate) fn effective_live_addresses(
 /// same-crate; kept `pub` (rather than narrowed) because root's own
 /// `reap.rs` shim also re-exports it onward at the old path.
 pub fn is_agent_kind(rec: &SessionRecord) -> bool {
+    if rec.conductable == Some(true) {
+        return false; // a conducted PTY host — never an agent duplicate
+    }
     match rec.kind.as_deref() {
         Some("agent") => true,
         Some(_) => false, // "shell" | "subagent" | any other explicit kind
-        None => rec.agent != "shell" && rec.conductable != Some(true),
+        None => rec.agent != "shell",
     }
+}
+
+/// The profile a record's transcript probes dispatch through: its own agent's
+/// when the bridge has one registered, else the claude layout — exactly what
+/// every record used before the seam (a profile-less harness simply has no
+/// transcript for the locator to find).
+fn profile_for(rec: &SessionRecord) -> &'static AgentProfile {
+    agent_profile(&rec.agent).unwrap_or(&CLAUDE_PROFILE)
 }
 
 /// Among not-`done` agent records sharing one non-empty `windowAddress`, at most
@@ -368,7 +384,7 @@ fn reap_inner(_inv: &Invocation) -> Outcome {
     // absence of evidence, which `is_session_dead` treats as "not stale, not
     // dead", never as staleness itself.
     let last_seen = |s: &SessionRecord| -> Option<i64> {
-        let transcript_mtime = transcript_path_for(&s.session_id, Some(s.cwd.as_str()), None)
+        let transcript_mtime = (profile_for(s).transcript.locate)(&s.session_id, Some(s.cwd.as_str()), None)
             .and_then(|p| std::fs::metadata(p).ok())
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -400,8 +416,9 @@ fn reap_inner(_inv: &Invocation) -> Outcome {
             .map(|t| now_epoch - t < DEDUP_GRACE_SECS)
             .unwrap_or(false) // an unparseable/empty startedAt is treated as old
     };
-    let has_transcript =
-        |s: &SessionRecord| transcript_path_for(&s.session_id, Some(s.cwd.as_str()), None).is_some();
+    let has_transcript = |s: &SessionRecord| {
+        (profile_for(s).transcript.locate)(&s.session_id, Some(s.cwd.as_str()), None).is_some()
+    };
     for id in superseded_agent_duplicates(&s_file.sessions, is_recent, has_transcript) {
         if !reaped.contains(&id) {
             reaped.push(id);
@@ -853,6 +870,15 @@ mod tests {
         conducted.agent = "shell".into();
         conducted.conductable = Some(true);
         assert!(!is_agent_kind(&conducted));
+        // a conducted wrapper OF an agent (`conduct -- kimi`): upsert_session
+        // classifies it kind="agent" from the child's basename, yet the
+        // control-socket owner is a HOST, never a duplicate candidate — the
+        // conductable clause precedes the published-kind match
+        let mut host = agent("h", "0xW", "t");
+        host.kind = Some("agent".into());
+        host.agent = "kimi".into();
+        host.conductable = Some(true);
+        assert!(!is_agent_kind(&host));
         let mut bare = agent("b", "0xW", "t");
         bare.kind = None; // agent="claude", not conductable → agent
         assert!(is_agent_kind(&bare));

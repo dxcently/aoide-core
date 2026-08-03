@@ -141,6 +141,7 @@ mod tests {
             "graph.view",
             "graph.wrap",
             "guide",
+            "hooks.install",
             "make",
             "mcp.serve",
             "onboard",

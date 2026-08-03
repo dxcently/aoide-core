@@ -7,6 +7,7 @@ mod a2a;
 mod cover;
 mod design;
 mod graph;
+mod hooks;
 mod infra;
 mod meta;
 mod rice;
@@ -46,6 +47,7 @@ pub fn all() -> Registry {
     infra::register_post_graph(&mut r); // adapter melete, conductor
     a2a::register(&mut r); // a2a serve (real), agent add/list/remove/send (real, client side — CONTRACTS.md §6)
     usage::register(&mut r); // usage — local token/cost rollup (CONTRACTS.md §4)
+    hooks::register(&mut r); // hooks install — the hook-installer verb (appended newest)
 
     r
 }

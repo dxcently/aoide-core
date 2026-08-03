@@ -659,14 +659,6 @@ pub(crate) fn is_terminal_class(class: &str) -> bool {
     TERMINAL_CLASSES.contains(&c.as_str())
 }
 
-/// Is `tool` a sub-agent-dispatch tool? Claude Code's classic name is `Task`;
-/// this harness's own tool is named `Agent` instead — both spawn/manage a
-/// background sub-agent the same way from the hook's point of view, so both
-/// gate sub-agent node creation/teardown identically.
-pub(in crate::graph) fn is_subagent_tool(tool: &str) -> bool {
-    matches!(tool, "Task" | "Agent")
-}
-
 /// One live terminal window distilled from a `hyprctl clients -j` client — the
 /// pure-core input for [`reconcile_untracked_terminals`], so the reconciliation
 /// is testable without a compositor (`cwd` is pre-read from `/proc/<pid>/cwd` by

@@ -69,12 +69,15 @@ Hooking any agent into the graph (the conductor + widgets render what you regist
   the Quickshell widgets draw. Three doors write it — pick by what the agent
   harness can do:
   1. Hook door (harnesses with Claude-Code-shaped hooks): pipe ONE hook JSON
-     on stdin to `aoide graph session hook`. Payload keys: session_id,
+     on stdin to `aoide graph session hook [--agent <name>]` — the profile
+     (claude by default; kimi is registered too) supplies the event map. Payload keys: session_id,
      hook_event_name, cwd, message. Event map: SessionStart→running ·
      UserPromptSubmit/PreToolUse/PostToolUse→running · Stop→waiting ·
      Notification whose message says \"permission\"→blocked (\"waiting for
      your input\" blocks only a still-running session) · SessionEnd→done.
      The door NEVER exits non-zero — safe inside any hook config.
+     Install the wiring with `aoide hooks install <claude|kimi>` — an
+     idempotent merge into the harness's settings file (never clobbers).
   2. Explicit verbs (anything scriptable): `graph session start --id I
      [--agent A --cwd D --parent P]` · `graph session phase --id I --phase P`
      · `graph session end --id I`. Phase vocabulary and how it renders:

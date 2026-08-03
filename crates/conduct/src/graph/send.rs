@@ -12,7 +12,8 @@ use super::session_store::{
     do_subagent_rekey, do_subagent_spawn, now_iso_utc, refresh_subagent_says,
     refresh_transcript_fields, set_owner_activity,
 };
-use super::window::{discover_window, ensure_session_window, is_subagent_tool};
+use super::window::{discover_window, ensure_session_window};
+use aoide_protocol::agents::{agent_profile, known_agents, AgentProfile, HookClass, CLAUDE_PROFILE};
 use aoide_protocol::Invocation;
 use aoide_protocol::output::Outcome;
 use aoide_storage::fs::{stage_dir, with_stage_lock};
@@ -413,8 +414,10 @@ enum HookAction {
 /// Map ONE hook payload (`session_id`, `hook_event_name`, optional `cwd`) to a
 /// session-registration action, or `None` when the event is unknown/missing or
 /// the `session_id` is absent/empty. Pure over the decoded JSON so the mapping
-/// is unit-testable without touching stdin or the stage.
-fn map_hook(payload: &Value) -> Option<HookAction> {
+/// is unit-testable without touching stdin or the stage. The event vocabulary
+/// itself lives in the agent's profile (`hook_event_map`); this collapses the
+/// semantic classes onto the session verbs.
+fn map_hook(profile: &AgentProfile, payload: &Value) -> Option<HookAction> {
     let id = payload
         .get("session_id")
         .and_then(Value::as_str)
@@ -425,11 +428,13 @@ fn map_hook(payload: &Value) -> Option<HookAction> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    match event {
-        "SessionStart" => Some(HookAction::Start { id: id.to_string(), cwd }),
+    // Is `tool` a sub-agent-dispatch tool for this harness (claude: Task/Agent)?
+    let is_subagent_tool = |tool: &str| profile.subagent_tools.contains(&tool);
+    match (profile.hook_event_map)(event) {
+        HookClass::SessionStart => Some(HookAction::Start { id: id.to_string(), cwd }),
         // A new prompt: the turn is live → `working`, and the prompt text names
         // the session (set-once, downstream).
-        "UserPromptSubmit" => {
+        HookClass::PromptSubmit => {
             let name = payload
                 .get("user_prompt")
                 .and_then(Value::as_str)
@@ -446,7 +451,7 @@ fn map_hook(payload: &Value) -> Option<HookAction> {
         // (nesting + activity routing). The Task tool itself spawns/closes a
         // child node; any other tool sets the owner working with the tool as its
         // current `activity`. Both are part of the awaiting-clearing set.
-        "PreToolUse" => {
+        HookClass::PreToolUse => {
             let tool = payload.get("tool_name").and_then(Value::as_str).unwrap_or("");
             let tuid = payload.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
             let owner = match payload
@@ -487,7 +492,7 @@ fn map_hook(payload: &Value) -> Option<HookAction> {
                 })
             }
         }
-        "PostToolUse" => {
+        HookClass::PostToolUse => {
             let tool = payload.get("tool_name").and_then(Value::as_str).unwrap_or("");
             let tuid = payload.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
             let owner = match payload
@@ -546,7 +551,7 @@ fn map_hook(payload: &Value) -> Option<HookAction> {
         // RECENTLY so. It is not `done` (the session did not end — only the turn),
         // and not `idle` (that is the COLD rest a `stopped` session decays into an
         // hour later, in the reaper's `decay_stopped_sessions` pass).
-        "Stop" => Some(HookAction::Phase {
+        HookClass::Stop => Some(HookAction::Phase {
             id: id.to_string(),
             phase: "stopped".to_string(),
             name: None,
@@ -557,8 +562,9 @@ fn map_hook(payload: &Value) -> Option<HookAction> {
         // prompt is an unambiguous mid-turn blocker → `awaiting` at once. The ~60s
         // idle ping is ambiguous — only a still-`working` turn (an unseen
         // AskUserQuestion) becomes `awaiting`; a settled idle/done session is left
-        // untouched. Anything else is a no-op.
-        "Notification" => {
+        // untouched. Anything else is a no-op. The vocabulary lives in the
+        // profile; the unconditional permission tier wins across BOTH sources.
+        HookClass::Notification => {
             let ntype = payload
                 .get("notification_type")
                 .and_then(Value::as_str)
@@ -568,13 +574,17 @@ fn map_hook(payload: &Value) -> Option<HookAction> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            if ntype == "permission_prompt" || msg.contains("permission") {
+            let by_type = (profile.hook_event_map)(&format!("ntype:{ntype}"));
+            let by_msg = (profile.hook_event_map)(&format!("msg:{msg}"));
+            if matches!(by_type, HookClass::Awaiting) || matches!(by_msg, HookClass::Awaiting) {
                 Some(HookAction::Phase {
                     id: id.to_string(),
                     phase: "awaiting".to_string(),
                     name: None,
                 })
-            } else if ntype == "idle_prompt" || msg.contains("waiting for your input") {
+            } else if matches!(by_type, HookClass::AwaitingIfRunning)
+                || matches!(by_msg, HookClass::AwaitingIfRunning)
+            {
                 Some(HookAction::PhaseIfRunning {
                     id: id.to_string(),
                     phase: "awaiting".to_string(),
@@ -592,7 +602,7 @@ fn map_hook(payload: &Value) -> Option<HookAction> {
         // PostToolUse re-keyed the node to. The classic path may create a node
         // (backstop for a missed PreToolUse); the agent_id fallback only confirms
         // the re-keyed node (never creates a duplicate).
-        "SubagentStart" => {
+        HookClass::SubagentStart => {
             let via_parent = payload
                 .get("parent_tool_use_id")
                 .and_then(Value::as_str)
@@ -614,7 +624,7 @@ fn map_hook(payload: &Value) -> Option<HookAction> {
                 create: via_parent.is_some(),
             })
         }
-        "SubagentStop" => {
+        HookClass::SubagentStop => {
             let key = payload
                 .get("parent_tool_use_id")
                 .and_then(Value::as_str)
@@ -629,29 +639,53 @@ fn map_hook(payload: &Value) -> Option<HookAction> {
                 sub_id: format!("sub:{k}"),
             })
         }
-        "SessionEnd" => Some(HookAction::End { id: id.to_string() }),
+        HookClass::SessionEnd => Some(HookAction::End { id: id.to_string() }),
+        // A DEDICATED needs-input event (kimi: `PermissionRequest`) — the same
+        // unconditional `awaiting` a permission Notification yields. Claude's
+        // map can never produce this class at the top level (its Awaiting only
+        // answers prefixed notification-detail queries), so claude is unchanged.
+        HookClass::Awaiting => Some(HookAction::Phase {
+            id: id.to_string(),
+            phase: "awaiting".to_string(),
+            name: None,
+        }),
+        // Unknown events (and the conditional idle class, which only the
+        // Notification arm acts on) map to nothing.
         _ => None,
     }
 }
 
-/// Drive one hook payload (already read as a string) to its registration.
+/// Drive one hook payload (already read as a string) through the claude
+/// profile — the test-facing wrapper (production resolves the profile from
+/// `--agent` via [`hook_profile_for`] and calls [`hook_for_profile`]).
+#[cfg(test)]
+fn hook_from_str(buf: &str) -> Outcome {
+    let profile = agent_profile(CLAUDE_PROFILE.name).expect("the claude profile is registered");
+    hook_for_profile(profile, buf)
+}
+
+/// The profile-parametrized core of [`hook_from_str`].
 ///
 /// Split from `session_hook` so the whole path — parse, map, execute — is
 /// testable without a real stdin. Empty/malformed input or an unmapped event is
 /// an ok no-op; a mapped action runs the matching core but its outcome is ALWAYS
 /// folded into an ok envelope: this door runs inside interactive-session hooks
 /// and must never exit non-zero (a stage hiccup must not break the session).
-fn hook_from_str(buf: &str) -> Outcome {
+fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
     let cmd = "graph.session.hook";
     let noop = |reason: &str| {
         Outcome::ok(cmd, format!("no-op ({reason})"))
             .with_data(json!({ "action": "none", "reason": reason }))
     };
-    let payload: Value = match serde_json::from_str(buf.trim()) {
+    let mut payload: Value = match serde_json::from_str(buf.trim()) {
         Ok(v) => v,
         Err(_) => return noop("empty-or-malformed-stdin"),
     };
-    let Some(action) = map_hook(&payload) else {
+    // Map harness-native field names onto the canonical contract before
+    // mapping (identity for claude; kimi's prompt array, tool_call_id, and
+    // agent_name land on user_prompt / tool_use_id / agent_type).
+    (profile.normalize_payload)(&mut payload);
+    let Some(action) = map_hook(profile, &payload) else {
         return noop("unmapped-or-missing-event");
     };
     let inner = match action {
@@ -675,7 +709,7 @@ fn hook_from_str(buf: &str) -> Outcome {
                 .filter(|p| !p.is_empty() && *p != id);
             let out = do_session_start(
                 &id,
-                Some("claude"),
+                Some(profile.name),
                 cwd.as_deref(),
                 window.as_deref(),
                 env_parent.as_deref(),
@@ -791,8 +825,13 @@ fn hook_from_str(buf: &str) -> Outcome {
             .map(|s| !s.is_empty())
             .unwrap_or(false);
         let cwd = payload.get("cwd").and_then(Value::as_str);
-        if !is_sub && matches!(evt, "Stop" | "PostToolUse" | "UserPromptSubmit" | "Notification") {
+        let say_boundary = matches!(
+            (profile.hook_event_map)(evt),
+            HookClass::Stop | HookClass::PostToolUse | HookClass::PromptSubmit | HookClass::Notification
+        );
+        if !is_sub && say_boundary {
             refresh_transcript_fields(
+                profile,
                 sid,
                 cwd,
                 payload.get("transcript_path").and_then(Value::as_str),
@@ -803,7 +842,7 @@ fn hook_from_str(buf: &str) -> Outcome {
         // set above) — cheap: a no-op unless the session currently has a live
         // sub-node. Deferred/direct children only (see `refresh_subagent_says`).
         if !is_sub {
-            refresh_subagent_says(sid, cwd);
+            refresh_subagent_says(profile, sid, cwd);
         }
     }
     // Fold the inner outcome into an ok envelope — exit 0, no matter what.
@@ -816,14 +855,37 @@ fn hook_from_str(buf: &str) -> Outcome {
         }))
 }
 
-/// `graph session hook` — the hook door for agent harnesses. Reads ONE JSON
-/// object from stdin and maps Claude-Code hook events to the session verbs.
-/// Never exits non-zero (see [`hook_from_str`]).
-pub fn session_hook(_inv: &Invocation) -> Outcome {
+/// Resolve the agent profile for a hook invocation: `--agent <name>` selects
+/// it (default claude, until harnesses self-report); an unknown name is a
+/// structured error naming the registered agents.
+fn hook_profile_for(inv: &Invocation) -> Result<&'static AgentProfile, Outcome> {
+    let name = inv
+        .flags
+        .get("agent")
+        .map(String::as_str)
+        .unwrap_or(CLAUDE_PROFILE.name);
+    agent_profile(name).ok_or_else(|| {
+        Outcome::error(
+            "graph.session.hook",
+            format!("unknown agent `{name}` (known: {})", known_agents().join(", ")),
+        )
+        .with_data(json!({ "reason": "unknown-agent", "agent": name, "known": known_agents() }))
+    })
+}
+
+/// `graph session hook [--agent <name>]` — the hook door for agent harnesses.
+/// Reads ONE JSON object from stdin and maps it (through the selected agent
+/// profile) to the session verbs. Never exits non-zero for a payload problem
+/// (see [`hook_for_profile`]); a bogus `--agent` is a plain CLI error.
+pub fn session_hook(inv: &Invocation) -> Outcome {
     use std::io::Read;
+    let profile = match hook_profile_for(inv) {
+        Ok(p) => p,
+        Err(o) => return o,
+    };
     let mut buf = String::new();
     let _ = std::io::stdin().lock().read_to_string(&mut buf);
-    hook_from_str(&buf)
+    hook_for_profile(profile, &buf)
 }
 
 #[cfg(test)]
@@ -1088,31 +1150,32 @@ mod tests {
     #[test]
     fn hook_event_mapping_covers_the_lifecycle_and_ignores_the_rest() {
         let start = map_hook(
+            &CLAUDE_PROFILE,
             &json!({ "session_id": "s", "hook_event_name": "SessionStart", "cwd": "/w" }),
         )
         .unwrap();
         assert!(matches!(start, HookAction::Start { cwd: Some(_), .. }));
         assert!(matches!(
-            map_hook(&json!({ "session_id": "s", "hook_event_name": "UserPromptSubmit" })).unwrap(),
+            map_hook(&CLAUDE_PROFILE, &json!({ "session_id": "s", "hook_event_name": "UserPromptSubmit" })).unwrap(),
             HookAction::Phase { ref phase, .. } if phase == "working"
         ));
         // A non-Task tool → ToolStart on the session (owner), tool as activity.
         assert!(matches!(
-            map_hook(&json!({ "session_id": "s", "hook_event_name": "PreToolUse", "tool_name": "Bash" }))
+            map_hook(&CLAUDE_PROFILE, &json!({ "session_id": "s", "hook_event_name": "PreToolUse", "tool_name": "Bash" }))
                 .unwrap(),
             HookAction::ToolStart { ref owner, ref activity, spawn: None, .. }
                 if owner == "s" && activity.as_deref() == Some("Bash")
         ));
         // PostToolUse → ToolEnd on the same owner (part of the awaiting-clearing set).
         assert!(matches!(
-            map_hook(&json!({ "session_id": "s", "hook_event_name": "PostToolUse", "tool_name": "Bash" }))
+            map_hook(&CLAUDE_PROFILE, &json!({ "session_id": "s", "hook_event_name": "PostToolUse", "tool_name": "Bash" }))
                 .unwrap(),
             HookAction::ToolEnd { ref owner, end_sub: None, .. } if owner == "s"
         ));
         // A Task tool → ToolStart carrying a SubSpawn (the child node to create),
         // keyed by its tool_use_id, named from the description.
         assert!(matches!(
-            map_hook(&json!({
+            map_hook(&CLAUDE_PROFILE, &json!({
                 "session_id": "s", "hook_event_name": "PreToolUse", "tool_name": "Task",
                 "tool_use_id": "tuABC",
                 "tool_input": { "description": "explore the auth module", "subagent_type": "Explore" }
@@ -1123,7 +1186,7 @@ mod tests {
         // A tool fired INSIDE a sub-agent (parent_tool_use_id present) routes to
         // the sub-node, not the session — the nesting/activity-routing rule.
         assert!(matches!(
-            map_hook(&json!({
+            map_hook(&CLAUDE_PROFILE, &json!({
                 "session_id": "s", "hook_event_name": "PreToolUse", "tool_name": "Grep",
                 "parent_tool_use_id": "tuABC"
             })).unwrap(),
@@ -1131,7 +1194,7 @@ mod tests {
         ));
         // PostToolUse(Task) closes the child; SubagentStop is the backstop.
         assert!(matches!(
-            map_hook(&json!({
+            map_hook(&CLAUDE_PROFILE, &json!({
                 "session_id": "s", "hook_event_name": "PostToolUse", "tool_name": "Task",
                 "tool_use_id": "tuABC"
             })).unwrap(),
@@ -1141,7 +1204,7 @@ mod tests {
         // spawn/close the sub-node identically — same tool_input field names
         // (`description`, `subagent_type`), so the child is named the same way.
         assert!(matches!(
-            map_hook(&json!({
+            map_hook(&CLAUDE_PROFILE, &json!({
                 "session_id": "s", "hook_event_name": "PreToolUse", "tool_name": "Agent",
                 "tool_use_id": "tuAG",
                 "tool_input": { "description": "explore the auth module", "subagent_type": "Explore" }
@@ -1150,20 +1213,20 @@ mod tests {
                 if sp.sub_id == "sub:tuAG" && sp.name == "explore the auth module" && sp.agent_type == "Explore"
         ));
         assert!(matches!(
-            map_hook(&json!({
+            map_hook(&CLAUDE_PROFILE, &json!({
                 "session_id": "s", "hook_event_name": "PostToolUse", "tool_name": "Agent",
                 "tool_use_id": "tuAG"
             })).unwrap(),
             HookAction::ToolEnd { end_sub: Some(ref e), .. } if e == "sub:tuAG"
         ));
         assert!(matches!(
-            map_hook(&json!({
+            map_hook(&CLAUDE_PROFILE, &json!({
                 "session_id": "s", "hook_event_name": "SubagentStop", "parent_tool_use_id": "tuABC"
             })).unwrap(),
             HookAction::SubEnd { ref sub_id } if sub_id == "sub:tuABC"
         ));
         assert!(matches!(
-            map_hook(&json!({
+            map_hook(&CLAUDE_PROFILE, &json!({
                 "session_id": "s", "hook_event_name": "SubagentStart",
                 "parent_tool_use_id": "tuABC", "agent_type": "Explore"
             })).unwrap(),
@@ -1175,7 +1238,7 @@ mod tests {
         // node — it re-keys `sub:<tool_use_id>` → `sub:<agentId>` (the only place
         // both ids co-occur) so the later SubagentStop can find it.
         assert!(matches!(
-            map_hook(&json!({
+            map_hook(&CLAUDE_PROFILE, &json!({
                 "session_id": "s", "hook_event_name": "PostToolUse", "tool_name": "Agent",
                 "tool_use_id": "tuAsync",
                 "tool_response": { "isAsync": true, "status": "async_launched", "agentId": "agz1" }
@@ -1187,7 +1250,7 @@ mod tests {
         // SubagentStart falls back to it as an enrich-only ensure (create=false);
         // SubagentStop falls back to it to close the re-keyed node.
         assert!(matches!(
-            map_hook(&json!({
+            map_hook(&CLAUDE_PROFILE, &json!({
                 "session_id": "s", "hook_event_name": "SubagentStart",
                 "agent_id": "agz1", "agent_type": "general-purpose"
             })).unwrap(),
@@ -1195,7 +1258,7 @@ mod tests {
                 if sub_id == "sub:agz1" && !create
         ));
         assert!(matches!(
-            map_hook(&json!({
+            map_hook(&CLAUDE_PROFILE, &json!({
                 "session_id": "s", "hook_event_name": "SubagentStop", "agent_id": "agz1"
             })).unwrap(),
             HookAction::SubEnd { ref sub_id } if sub_id == "sub:agz1"
@@ -1204,16 +1267,16 @@ mod tests {
         // input" (not `awaiting`), not a finished SESSION (not `done`), and not
         // yet cold (`idle` is where the reaper ages it an hour later).
         assert!(matches!(
-            map_hook(&json!({ "session_id": "s", "hook_event_name": "Stop" })).unwrap(),
+            map_hook(&CLAUDE_PROFILE, &json!({ "session_id": "s", "hook_event_name": "Stop" })).unwrap(),
             HookAction::Phase { ref phase, .. } if phase == "stopped"
         ));
         assert!(matches!(
-            map_hook(&json!({ "session_id": "s", "hook_event_name": "SessionEnd" })).unwrap(),
+            map_hook(&CLAUDE_PROFILE, &json!({ "session_id": "s", "hook_event_name": "SessionEnd" })).unwrap(),
             HookAction::End { .. }
         ));
         // Notification with a permission message → an unconditional `awaiting`.
         assert!(matches!(
-            map_hook(&json!({
+            map_hook(&CLAUDE_PROFILE, &json!({
                 "session_id": "s",
                 "hook_event_name": "Notification",
                 "message": "Claude needs your permission to use Bash"
@@ -1223,7 +1286,7 @@ mod tests {
         ));
         // The structured notification_type is honoured too (permission_prompt).
         assert!(matches!(
-            map_hook(&json!({
+            map_hook(&CLAUDE_PROFILE, &json!({
                 "session_id": "s",
                 "hook_event_name": "Notification",
                 "notification_type": "permission_prompt"
@@ -1233,7 +1296,7 @@ mod tests {
         ));
         // The ambiguous idle ping → the CONDITIONAL variant (guarded downstream).
         assert!(matches!(
-            map_hook(&json!({
+            map_hook(&CLAUDE_PROFILE, &json!({
                 "session_id": "s",
                 "hook_event_name": "Notification",
                 "message": "Claude is waiting for your input"
@@ -1243,7 +1306,7 @@ mod tests {
         ));
         // …and via notification_type idle_prompt.
         assert!(matches!(
-            map_hook(&json!({
+            map_hook(&CLAUDE_PROFILE, &json!({
                 "session_id": "s",
                 "hook_event_name": "Notification",
                 "notification_type": "idle_prompt"
@@ -1253,7 +1316,7 @@ mod tests {
         ));
         // "permission" match is case-insensitive.
         assert!(matches!(
-            map_hook(&json!({
+            map_hook(&CLAUDE_PROFILE, &json!({
                 "session_id": "s",
                 "hook_event_name": "Notification",
                 "message": "PERMISSION required"
@@ -1263,15 +1326,16 @@ mod tests {
         ));
         // A Notification with an unrecognised or absent message → no action.
         assert!(map_hook(
+            &CLAUDE_PROFILE,
             &json!({ "session_id": "s", "hook_event_name": "Notification", "message": "hello" })
         )
         .is_none());
-        assert!(map_hook(&json!({ "session_id": "s", "hook_event_name": "Notification" })).is_none());
+        assert!(map_hook(&CLAUDE_PROFILE, &json!({ "session_id": "s", "hook_event_name": "Notification" })).is_none());
         // Unknown event, missing event, and empty/absent session_id → no action.
-        assert!(map_hook(&json!({ "session_id": "s", "hook_event_name": "Zzz" })).is_none());
-        assert!(map_hook(&json!({ "session_id": "s" })).is_none());
-        assert!(map_hook(&json!({ "hook_event_name": "SessionStart" })).is_none());
-        assert!(map_hook(&json!({ "session_id": "", "hook_event_name": "SessionStart" })).is_none());
+        assert!(map_hook(&CLAUDE_PROFILE, &json!({ "session_id": "s", "hook_event_name": "Zzz" })).is_none());
+        assert!(map_hook(&CLAUDE_PROFILE, &json!({ "session_id": "s" })).is_none());
+        assert!(map_hook(&CLAUDE_PROFILE, &json!({ "hook_event_name": "SessionStart" })).is_none());
+        assert!(map_hook(&CLAUDE_PROFILE, &json!({ "session_id": "", "hook_event_name": "SessionStart" })).is_none());
     }
     #[test]
     fn hook_garbage_stdin_is_an_ok_noop_never_nonzero() {
@@ -1718,5 +1782,172 @@ mod tests {
             None => std::env::remove_var("AOIDE_STAGE_DIR"),
         }
         let _ = std::fs::remove_dir_all(&stage);
+    }
+    #[test]
+    fn kimi_hook_lifecycle_start_prompt_permission_end() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("kimi-hook");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let kimi = agent_profile("kimi").unwrap();
+        let live_state = || -> String {
+            let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+            s.sessions[0].state.clone()
+        };
+
+        // SessionStart registers the session — agent recorded as kimi.
+        let out = hook_for_profile(
+            kimi,
+            r#"{ "session_id": "k1", "hook_event_name": "SessionStart", "cwd": "/proj" }"#,
+        );
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(s.sessions.len(), 1);
+        assert_eq!(s.sessions[0].agent, "kimi");
+        assert_eq!(s.sessions[0].cwd, "/proj");
+        assert_eq!(s.sessions[0].state, "idle");
+
+        // UserPromptSubmit → working.
+        hook_for_profile(
+            kimi,
+            r#"{ "session_id": "k1", "hook_event_name": "UserPromptSubmit", "user_prompt": "do the thing" }"#,
+        );
+        assert_eq!(live_state(), "working");
+
+        // PermissionRequest → awaiting (kimi's dedicated needs-input event).
+        hook_for_profile(kimi, r#"{ "session_id": "k1", "hook_event_name": "PermissionRequest" }"#);
+        assert_eq!(live_state(), "awaiting");
+
+        // Kimi-only observational events are ok no-ops that never move the phase.
+        for evt in ["Interrupt", "PreCompact", "PostCompact", "PermissionResult", "StopFailure", "PostToolUseFailure"] {
+            let out = hook_for_profile(
+                kimi,
+                &format!(r#"{{ "session_id": "k1", "hook_event_name": "{evt}" }}"#),
+            );
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "event: {evt}");
+            assert_eq!(out.data.unwrap()["action"], "none", "event: {evt}");
+        }
+        assert_eq!(live_state(), "awaiting", "observational events never move the phase");
+
+        // A kimi Notification carries background-task status, NOT a permission
+        // prompt — no vocab, no awaiting.
+        let out = hook_for_profile(
+            kimi,
+            r#"{ "session_id": "k1", "hook_event_name": "Notification", "notification_type": "task.completed" }"#,
+        );
+        assert_eq!(out.data.unwrap()["action"], "none");
+        assert_eq!(live_state(), "awaiting");
+
+        // Stop settles the turn; SessionEnd ends the session.
+        hook_for_profile(kimi, r#"{ "session_id": "k1", "hook_event_name": "Stop" }"#);
+        assert_eq!(live_state(), "stopped");
+        hook_for_profile(kimi, r#"{ "session_id": "k1", "hook_event_name": "SessionEnd" }"#);
+        assert_eq!(live_state(), "done");
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+    #[test]
+    fn kimi_hook_normalizes_native_fields_and_drives_the_subagent_lifecycle() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("kimi-norm");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let kimi = agent_profile("kimi").unwrap();
+        let load = || -> SessionsFile { load_stage(&sessions_path()).unwrap() };
+        let find = |ss: &SessionsFile, id: &str| ss.sessions.iter().find(|s| s.session_id == id).cloned();
+
+        hook_for_profile(kimi, r#"{ "session_id": "k1", "hook_event_name": "SessionStart", "cwd": "/p" }"#);
+
+        // UserPromptSubmit with kimi's content-block ARRAY names the session
+        // (set-once) and moves it to working.
+        hook_for_profile(
+            kimi,
+            r#"{ "session_id": "k1", "hook_event_name": "UserPromptSubmit",
+                 "prompt": [{"type":"text","text":"fix the flaky auth test"}] }"#,
+        );
+        let s = load();
+        assert_eq!(s.sessions[0].title.as_deref(), Some("fix the flaky auth test"));
+        assert_eq!(s.sessions[0].state, "working");
+        hook_for_profile(
+            kimi,
+            r#"{ "session_id": "k1", "hook_event_name": "UserPromptSubmit",
+                 "prompt": [{"type":"text","text":"renamed? no"}] }"#,
+        );
+        assert_eq!(
+            load().sessions[0].title.as_deref(),
+            Some("fix the flaky auth test"),
+            "set-once survives normalization"
+        );
+
+        // PreToolUse(Agent) with kimi's tool_call_id spawns the child node —
+        // this is kimi's ONLY sub-spawn path (its SubagentStart carries no ids).
+        hook_for_profile(
+            kimi,
+            r#"{ "session_id": "k1", "hook_event_name": "PreToolUse",
+                 "tool_name": "Agent", "tool_call_id": "tool_VvbM0",
+                 "tool_input": { "description": "probe the repo", "prompt": "…" } }"#,
+        );
+        let s = load();
+        let sub = find(&s, "sub:tool_VvbM0").expect("PreToolUse(Agent) spawns sub:<tool_call_id>");
+        assert_eq!(sub.title.as_deref(), Some("probe the repo"));
+
+        // Kimi's SubagentStart (agent_name only, no tool/agent id) is an ok
+        // no-op: it must neither error nor mint a second node.
+        let out = hook_for_profile(
+            kimi,
+            r#"{ "session_id": "k1", "hook_event_name": "SubagentStart",
+                 "agent_name": "coder", "prompt": "do the child thing" }"#,
+        );
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+        assert_eq!(out.data.unwrap()["action"], "none");
+        assert_eq!(
+            load().sessions.iter().filter(|x| x.session_id.starts_with("sub:")).count(),
+            1,
+            "no id-less SubagentStart duplicate"
+        );
+
+        // PostToolUse(Agent) closes the node: kimi's Agent is SYNCHRONOUS
+        // (status: completed in tool_output) and 0.31.1's SubagentStop is
+        // unreliable/never fired — the tool boundary IS the close path.
+        hook_for_profile(
+            kimi,
+            r#"{ "session_id": "k1", "hook_event_name": "PostToolUse",
+                 "tool_name": "Agent", "tool_call_id": "tool_VvbM0",
+                 "tool_input": { "description": "probe the repo", "prompt": "…" },
+                 "tool_output": "agent_id: agent-0\nstatus: completed\n\n[summary]\ndone" }"#,
+        );
+        assert!(find(&load(), "sub:tool_VvbM0").is_none(), "PostToolUse(Agent) closed the sub node");
+        assert_eq!(load().sessions[0].state, "working", "the parent's turn runs on");
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+    #[test]
+    fn hook_agent_flag_selects_the_profile_or_errors() {
+        // No flag → the claude default.
+        let inv = flag_invocation(&["graph", "session", "hook"], &[]);
+        assert_eq!(hook_profile_for(&inv).unwrap().name, "claude");
+        // --agent kimi → the kimi profile.
+        let inv = flag_invocation(&["graph", "session", "hook"], &[("agent", "kimi")]);
+        assert_eq!(hook_profile_for(&inv).unwrap().name, "kimi");
+        // --agent bogus → a structured error (exit 1, reason + the known list).
+        let inv = flag_invocation(&["graph", "session", "hook"], &[("agent", "bogus")]);
+        let out = match hook_profile_for(&inv) {
+            Err(o) => o,
+            Ok(p) => panic!("bogus agent resolved to {}", p.name),
+        };
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
+        assert_eq!(out.render(false).1, aoide_protocol::output::exit::ERROR);
+        let data = out.data.unwrap();
+        assert_eq!(data["reason"], "unknown-agent");
+        assert_eq!(data["agent"], "bogus");
+        assert_eq!(data["known"], json!(["claude", "kimi"]));
     }
 }

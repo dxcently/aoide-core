@@ -14,12 +14,14 @@ use super::model::{
 };
 #[cfg(test)]
 use super::model::HookRecord;
+use aoide_protocol::agents::AgentProfile;
 use aoide_protocol::Invocation;
 use aoide_protocol::output::Outcome;
 use aoide_storage::fs::with_stage_lock;
-use serde_json::{json, Value};
+use serde_json::json;
+#[cfg(test)]
+use serde_json::Value;
 use std::collections::HashSet;
-use std::path::PathBuf;
 
 /// `now_iso_utc`/`iso_utc_from_epoch` (time) and `upsert_session`/
 /// `upsert_hook` (pure Vec<Record> mutators — verified DAG-free: neither
@@ -117,6 +119,11 @@ fn do_session_start_inner(
     // which twin is real; here the new registration itself is the deciding
     // signal). The ~12s reaper (`crate::reap`) stays the safety net for the
     // slower path where a window resolves later via the window-event listener.
+    // Two carve-outs: a conducted PTY host (`conductable` — e.g. `conduct --
+    // kimi`'s wrapper, which `is_agent_kind` refuses despite its published
+    // "agent" kind) is the control-socket owner, not a second foreground
+    // agent; and the new record's own parent (the wrapper id threaded to the
+    // child via AOIDE_SESSION_ID) is excluded outright.
     let new_rec = file.sessions.iter().find(|s| s.session_id == id).cloned();
     let evicted: Vec<String> = match &new_rec {
         Some(rec) if crate::reap::is_agent_kind(rec) && !rec.window_address.is_empty() => file
@@ -124,6 +131,11 @@ fn do_session_start_inner(
             .iter()
             .filter(|s| {
                 s.session_id != id
+                    // Never evict the new record's own parent: a hook session
+                    // carries the wrapper id (threaded via AOIDE_SESSION_ID),
+                    // and that conducted PTY host is the control-socket owner,
+                    // not a foreground-agent duplicate.
+                    && rec.parent_session_id.as_deref() != Some(s.session_id.as_str())
                     && s.state != "done"
                     && s.window_address == rec.window_address
                     && crate::reap::is_agent_kind(s)
@@ -255,264 +267,35 @@ pub(in crate::graph) fn set_owner_activity(owner: &str, state: &str, activity: O
 
 // ── Transcript "say" — the agent's latest words, straight off its JSONL ──────
 //
-// Claude Code writes a per-session JSONL transcript at
-// `~/.claude/projects/<munge(cwd)>/<session_id>.jsonl` (also handed to every
-// hook as `transcript_path`). It is clean, structured, on-disk, and updated live
-// by claude itself — a far better "agent output" source than scraping conduct's
-// PTY (which for a live `claude` is the rendered TUI). The bridge tail-reads it
-// at hook boundaries to publish `say` (distinct from `activity` = current tool).
-
-/// Munge a cwd into Claude Code's project-dir name: every `/` and `.` → `-`
-/// (`/home/khoa/Aoide` → `-home-khoa-Aoide`). Mirrors the CLI's on-disk layout
-/// so the bridge can locate a transcript from data it already holds.
-fn munge_project_dir(cwd: &str) -> String {
-    cwd.chars()
-        .map(|c| if c == '/' || c == '.' { '-' } else { c })
-        .collect()
-}
-
-/// Resolve a session's transcript path: prefer the hook-supplied `transcript_path`
-/// when it names a real file, else derive the canonical
-/// `$HOME/.claude/projects/<munge(cwd)>/<session_id>.jsonl`. None when neither
-/// resolves to an existing file.
-pub(crate) fn transcript_path_for(
-    session_id: &str,
-    cwd: Option<&str>,
-    hinted: Option<&str>,
-) -> Option<PathBuf> {
-    if let Some(h) = hinted.filter(|s| !s.is_empty()) {
-        let p = PathBuf::from(h);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    let home = std::env::var_os("HOME")?;
-    let cwd = cwd.filter(|s| !s.is_empty())?;
-    let p = PathBuf::from(home)
-        .join(".claude/projects")
-        .join(munge_project_dir(cwd))
-        .join(format!("{session_id}.jsonl"));
-    p.is_file().then_some(p)
-}
-
-/// Collapse a possibly-multiline string to one whitespace-normalised line,
-/// truncated at a char boundary to `max` chars with a trailing ellipsis.
-fn one_line_clip(s: &str, max: usize) -> String {
-    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= max {
-        flat
-    } else {
-        let mut out: String = flat.chars().take(max.saturating_sub(1)).collect();
-        out.push('…');
-        out
-    }
-}
-
-/// Read the last ~32 KiB of the transcript as whole JSONL lines (a leading
-/// partial line dropped). Empty on any read error. Transcripts grow unbounded, so
-/// only the tail is scanned — enough for the freshest `say` + `custom-title`.
-fn transcript_tail(path: &std::path::Path) -> Vec<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    const TAIL: u64 = 32 * 1024;
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return Vec::new();
-    };
-    let Ok(len) = f.metadata().map(|m| m.len()) else {
-        return Vec::new();
-    };
-    let start = len.saturating_sub(TAIL);
-    if f.seek(SeekFrom::Start(start)).is_err() {
-        return Vec::new();
-    }
-    let mut buf = Vec::new();
-    if f.read_to_end(&mut buf).is_err() {
-        return Vec::new();
-    }
-    let text = String::from_utf8_lossy(&buf);
-    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-    if start > 0 && !lines.is_empty() {
-        lines.remove(0); // the seek likely split a line — drop the partial head
-    }
-    lines
-}
-
-/// The agent's latest words: the last matching assistant `text` block in the
-/// tail, cleaned to a single line (≤160 chars). None when there is no such text.
-///
-/// `skip_sidechain`: a top-level session's own transcript never actually embeds
-/// sidechain lines inline (ground-truthed: a Task's turns live in a wholly
-/// separate `subagents/agent-<id>.jsonl` file, never inline in the parent), so
-/// this is defensive/forward-compat there — pass `true`. A sub-agent's OWN
-/// dedicated transcript file, by contrast, marks EVERY line `isSidechain:true`
-/// (it's sidechain from the top file's perspective) — pass `false` there, or
-/// every line would be skipped and `say` would always be `None`.
-fn extract_say(lines: &[String], skip_sidechain: bool) -> Option<String> {
-    const SAY_MAX: usize = 160;
-    let mut found: Option<String> = None;
-    for line in lines {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if v.get("type").and_then(Value::as_str) != Some("assistant") {
-            continue;
-        }
-        if skip_sidechain && v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-            continue;
-        }
-        let Some(content) = v
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .and_then(Value::as_array)
-        else {
-            continue;
-        };
-        // The LAST text block in the turn is the agent's freshest prose (prose
-        // precedes the tool_use blocks it narrates).
-        for block in content.iter().rev() {
-            if block.get("type").and_then(Value::as_str) == Some("text") {
-                if let Some(t) = block.get("text").and_then(Value::as_str) {
-                    let t = t.trim();
-                    if !t.is_empty() {
-                        found = Some(one_line_clip(t, SAY_MAX));
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    found
-}
-
-/// The session's NAME: the last `custom-title` record's `customTitle` in the tail
-/// (Claude Code's own session title, e.g. "Aoide Dev"). None when never titled.
-fn extract_custom_title(lines: &[String]) -> Option<String> {
-    let mut found: Option<String> = None;
-    for line in lines {
-        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
-            continue;
-        };
-        if v.get("type").and_then(Value::as_str) == Some("custom-title") {
-            if let Some(t) = v.get("customTitle").and_then(Value::as_str) {
-                let t = t.trim();
-                if !t.is_empty() {
-                    found = Some(one_line_clip(t, 48));
-                }
-            }
-        }
-    }
-    found
-}
-
-/// The session's currently-active model: the last `type:"assistant"` line's
-/// `message.model` string in the tail (e.g. `claude-sonnet-5`). None when the
-/// tail holds no assistant turn yet. Sits at the same nesting level as the text
-/// blocks `extract_say` reads, so it shares the one tail scan. `skip_sidechain`
-/// mirrors `extract_say`: `true` for a top-level session's own transcript,
-/// `false` for a sub-agent's own (all-sidechain) transcript file.
-fn extract_model(lines: &[String], skip_sidechain: bool) -> Option<String> {
-    let mut found: Option<String> = None;
-    for line in lines {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if v.get("type").and_then(Value::as_str) != Some("assistant") {
-            continue;
-        }
-        if skip_sidechain && v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-            continue;
-        }
-        if let Some(m) = v
-            .get("message")
-            .and_then(|m| m.get("model"))
-            .and_then(Value::as_str)
-        {
-            let m = m.trim();
-            if !m.is_empty() {
-                found = Some(m.to_string());
-            }
-        }
-    }
-    found
-}
-
-/// The session's context-window fill at its LAST request: `input_tokens +
-/// cache_creation_input_tokens + cache_read_input_tokens` off the freshest
-/// `type:"assistant"` line's `message.usage` in the tail, e.g.
-/// `"usage":{"input_tokens":2,"cache_creation_input_tokens":11803,
-/// "cache_read_input_tokens":349611,"output_tokens":459}` → `Some(361_416)`.
-/// Deliberately excludes `output_tokens` — that is what the turn just
-/// produced, not what sat in the context window when the request was made.
-/// Sits at the same nesting level `extract_model` reads, over the same
-/// freshest-assistant-line scan, so it shares the one tail read
-/// `refresh_transcript_fields` already does. Top-level-session transcripts
-/// only (mirrors `extract_model`'s `skip_sidechain=true` case — a sub-agent's
-/// own dedicated transcript file is never the tail this function sees). `None`
-/// when the tail holds no assistant turn yet, or that freshest turn carries no
-/// `usage` block.
-fn transcript_context_tokens(lines: &[String]) -> Option<u64> {
-    let mut found: Option<u64> = None;
-    for line in lines {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if v.get("type").and_then(Value::as_str) != Some("assistant") {
-            continue;
-        }
-        if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-            continue;
-        }
-        if let Some(usage) = v.get("message").and_then(|m| m.get("usage")) {
-            let input = usage
-                .get("input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let cache_creation = usage
-                .get("cache_creation_input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let cache_read = usage
-                .get("cache_read_input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            found = Some(input + cache_creation + cache_read);
-        }
-    }
-    found
-}
+// The transcript layout, locator, and JSONL extractors are agent-harness
+// knowledge: they live in the profile (`aoide_protocol::agents::TranscriptSpec`,
+// claude: `~/.claude/projects/<munge(cwd)>/<session_id>.jsonl`). The refresh
+// verbs below dispatch through the profile the hook door hands down.
 
 /// Best-effort: refresh a session's transcript-derived fields at a hook boundary —
 /// its `say` (the agent's latest words) and, set-once, its `title` (the session
 /// NAME, from `custom-title`). Change-only; never touches state/activity/pid;
 /// re-stages only when something moved. Silent no-op when the transcript can't be
-/// located or read. One tail read serves both fields.
+/// located or read. One tail read serves both fields. All harness knowledge is
+/// dispatched through the session agent's `profile`.
 pub(in crate::graph) fn refresh_transcript_fields(
+    profile: &'static AgentProfile,
     session_id: &str,
     cwd: Option<&str>,
     transcript_hint: Option<&str>,
 ) {
-    let Some(path) = transcript_path_for(session_id, cwd, transcript_hint) else {
+    let spec = &profile.transcript;
+    let Some(path) = (spec.locate)(session_id, cwd, transcript_hint) else {
         return;
     };
-    let lines = transcript_tail(&path);
+    let lines = (spec.tail)(&path);
     if lines.is_empty() {
         return;
     }
-    let say = extract_say(&lines, true);
-    let name = extract_custom_title(&lines);
-    let model = extract_model(&lines, true);
-    let context_tokens = transcript_context_tokens(&lines);
+    let say = (spec.say)(&lines, true);
+    let name = (spec.title)(&lines);
+    let model = (spec.model)(&lines, true);
+    let context_tokens = (spec.context_tokens)(&lines);
     if say.is_none() && name.is_none() && model.is_none() && context_tokens.is_none() {
         return;
     }
@@ -548,9 +331,7 @@ pub(in crate::graph) fn refresh_transcript_fields(
                 // Publish the model's context ceiling (CONTRACTS.md §4) — re-derived
                 // here so a mid-session model switch re-caps the meter without a
                 // widget guess.
-                let ceiling = Some(aoide_protocol::context_ceiling_for_model(Some(
-                    model.as_str(),
-                )));
+                let ceiling = Some((profile.model_ceiling)(Some(model.as_str())));
                 if s.context_ceiling != ceiling {
                     s.context_ceiling = ceiling;
                     changed = true;
@@ -574,66 +355,14 @@ pub(in crate::graph) fn refresh_transcript_fields(
     });
 }
 
-/// The directory of a session's sub-agent transcripts, if it exists:
-/// `…/projects/<munge(cwd)>/<session_id>/subagents/` (a Task writes its own
-/// `agent-<agent_id>.jsonl` here, beside an `agent-<agent_id>.meta.json`).
-fn subagents_dir(session_id: &str, cwd: Option<&str>) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let cwd = cwd.filter(|s| !s.is_empty())?;
-    let dir = PathBuf::from(home)
-        .join(".claude/projects")
-        .join(munge_project_dir(cwd))
-        .join(session_id)
-        .join("subagents");
-    dir.is_dir().then_some(dir)
-}
-
-/// Find the sub-agent transcript in `dir` for a `sub:<tuid>` node key. Two
-/// keying regimes reach here (see `do_subagent_spawn`'s doc comment):
-///
-/// - `sub:<agent_id>` — an async `Agent`-tool node PostToolUse has re-keyed
-///   from its tool_use_id to its agent id; the transcript file is literally
-///   named `agent-<agent_id>.jsonl`, so try that direct path FIRST (cheap,
-///   unambiguous — no need to open every `.meta.json` in the directory).
-/// - `sub:<tool_use_id>` — the classic keying, not yet (or never) re-keyed;
-///   fall back to scanning `*.meta.json` files for one whose `toolUseId ==
-///   tuid`, returning its sibling `agent-<id>.jsonl`.
-fn find_subagent_transcript(dir: &std::path::Path, tuid: &str) -> Option<PathBuf> {
-    let direct = dir.join(format!("agent-{tuid}.jsonl"));
-    if direct.is_file() {
-        return Some(direct);
-    }
-    for e in std::fs::read_dir(dir).ok()?.flatten() {
-        let p = e.path();
-        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if !name.ends_with(".meta.json") {
-            continue;
-        }
-        let Ok(txt) = std::fs::read_to_string(&p) else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_str::<Value>(&txt) else {
-            continue;
-        };
-        if v.get("toolUseId").and_then(Value::as_str) == Some(tuid) {
-            let base = name.trim_end_matches(".meta.json");
-            let jsonl = dir.join(format!("{base}.jsonl"));
-            if jsonl.is_file() {
-                return Some(jsonl);
-            }
-        }
-    }
-    None
-}
-
 /// Best-effort: refresh the `say` of a session's ACTIVE sub-agent nodes from their
 /// own transcript files. Runs on each of the PARENT session's hooks, so a
 /// background Task (which outlives the turn) shows its latest words on its beamed
 /// child row; a synchronous Task blocks the parent and is too transient to catch.
-/// Change-only and bounded to the currently-live sub-nodes (depth-1).
-pub(in crate::graph) fn refresh_subagent_says(session_id: &str, cwd: Option<&str>) {
+/// Change-only and bounded to the currently-live sub-nodes (depth-1). The
+/// sub-agent transcript layout is the profile's (`spec.subagents_dir` /
+/// `spec.find_subagent`).
+pub(in crate::graph) fn refresh_subagent_says(profile: &'static AgentProfile, session_id: &str, cwd: Option<&str>) {
     let subs: Vec<String> = match load_stage::<SessionsFile>(&sessions_path()) {
         Ok(file) => file
             .sessions
@@ -647,7 +376,8 @@ pub(in crate::graph) fn refresh_subagent_says(session_id: &str, cwd: Option<&str
     if subs.is_empty() {
         return;
     }
-    let Some(dir) = subagents_dir(session_id, cwd) else {
+    let spec = &profile.transcript;
+    let Some(dir) = (spec.subagents_dir)(session_id, cwd) else {
         return;
     };
     // (sub_id, say, model) — either of say/model may be None for a given sub.
@@ -656,15 +386,15 @@ pub(in crate::graph) fn refresh_subagent_says(session_id: &str, cwd: Option<&str
         let Some(tuid) = sub_id.strip_prefix("sub:") else {
             continue;
         };
-        let Some(file) = find_subagent_transcript(&dir, tuid) else {
+        let Some(file) = (spec.find_subagent)(&dir, tuid) else {
             continue;
         };
         // A sub-agent's OWN dedicated transcript marks every line isSidechain —
         // don't skip them here (see `extract_say`'s doc). Its model is its OWN
         // (subagents can run a different model than their parent).
-        let lines = transcript_tail(&file);
-        let say = extract_say(&lines, false);
-        let model = extract_model(&lines, false);
+        let lines = (spec.tail)(&file);
+        let say = (spec.say)(&lines, false);
+        let model = (spec.model)(&lines, false);
         if say.is_some() || model.is_some() {
             updates.push((sub_id.clone(), say, model));
         }
@@ -697,9 +427,7 @@ pub(in crate::graph) fn refresh_subagent_says(session_id: &str, cwd: Option<&str
                     // Publish the subagent's own context ceiling — parity with the
                     // parent-session derivation in `refresh_transcript_fields`, so a
                     // subagent card gets a correct meter too (it runs its own model).
-                    let ceiling = Some(aoide_protocol::context_ceiling_for_model(Some(
-                        model.as_str(),
-                    )));
+                    let ceiling = Some((profile.model_ceiling)(Some(model.as_str())));
                     if s.context_ceiling != ceiling {
                         s.context_ceiling = ceiling;
                         changed = true;
@@ -1187,216 +915,6 @@ mod tests {
     use crate::reap::{effective_live_addresses, is_session_dead, reap};
 
     #[test]
-    fn munge_project_dir_matches_claude_layout() {
-        assert_eq!(munge_project_dir("/home/khoa/Aoide"), "-home-khoa-Aoide");
-        // A path with a dot component (worktree under `.claude/`): every `/`
-        // AND every `.` folds to `-`, matching the CLI's real dir names.
-        assert_eq!(
-            munge_project_dir("/home/khoa/Aoide/.claude/worktrees/x"),
-            "-home-khoa-Aoide--claude-worktrees-x"
-        );
-    }
-    #[test]
-    fn latest_say_reads_last_nonsidechain_assistant_text() {
-        let path = std::env::temp_dir().join(format!("aoide_say_{}.jsonl", std::process::id()));
-        let body = [
-            r#"{"type":"user","message":{"content":[{"type":"text","text":"hi"}]}}"#,
-            r#"{"type":"assistant","isSidechain":false,"message":{"content":[{"type":"text","text":"first words"}]}}"#,
-            // A Task sub-agent's line in the SAME file must be ignored.
-            r#"{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"text","text":"SUBAGENT ignore me"}]}}"#,
-            // Freshest turn: thinking + multiline text + a tool_use. We take the
-            // LAST text block, whitespace-normalised.
-            r#"{"type":"assistant","isSidechain":false,"message":{"content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"  the  latest\nline  "},{"type":"tool_use","name":"Bash","input":{}}]}}"#,
-        ]
-        .join("\n");
-        std::fs::write(&path, &body).unwrap();
-        let say = extract_say(&transcript_tail(&path), true);
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(say.as_deref(), Some("the latest line"));
-    }
-    #[test]
-    fn latest_say_is_none_without_agent_text() {
-        let path = std::env::temp_dir().join(format!("aoide_say_none_{}.jsonl", std::process::id()));
-        let body = [
-            r#"{"type":"user","message":{"content":[{"type":"text","text":"only a prompt"}]}}"#,
-            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{}}]}}"#,
-        ]
-        .join("\n");
-        std::fs::write(&path, &body).unwrap();
-        let say = extract_say(&transcript_tail(&path), true);
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(say, None);
-    }
-    #[test]
-    fn extract_model_reads_last_assistant_model() {
-        let path = std::env::temp_dir().join(format!("aoide_model_{}.jsonl", std::process::id()));
-        let body = [
-            r#"{"type":"user","message":{"content":[{"type":"text","text":"hi"}]}}"#,
-            r#"{"type":"assistant","isSidechain":false,"message":{"model":"claude-opus-4-8","content":[{"type":"text","text":"first"}]}}"#,
-            // A same-file sidechain line's model must be ignored when skipping.
-            r#"{"type":"assistant","isSidechain":true,"message":{"model":"claude-haiku-4-5","content":[{"type":"text","text":"sub"}]}}"#,
-            r#"{"type":"assistant","isSidechain":false,"message":{"model":"claude-sonnet-5","content":[{"type":"text","text":"latest"}]}}"#,
-        ]
-        .join("\n");
-        std::fs::write(&path, &body).unwrap();
-        let model = extract_model(&transcript_tail(&path), true);
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(model.as_deref(), Some("claude-sonnet-5"));
-    }
-    #[test]
-    fn extract_model_is_none_without_assistant_turn() {
-        let lines: Vec<String> =
-            vec![r#"{"type":"user","message":{"content":[{"type":"text","text":"hi"}]}}"#.to_string()];
-        assert_eq!(extract_model(&lines, true), None);
-    }
-    #[test]
-    fn context_tokens_sums_input_side_of_freshest_assistant_usage() {
-        let path =
-            std::env::temp_dir().join(format!("aoide_ctx_{}.jsonl", std::process::id()));
-        let body = [
-            r#"{"type":"user","message":{"content":[{"type":"text","text":"hi"}]}}"#,
-            // An earlier assistant turn's usage must be superseded by the freshest.
-            r#"{"type":"assistant","isSidechain":false,"message":{"model":"claude-sonnet-5","usage":{"input_tokens":2,"cache_creation_input_tokens":100,"cache_read_input_tokens":200,"output_tokens":50}}}"#,
-            // A same-file sidechain line's usage must be ignored (a Task's own turn).
-            r#"{"type":"assistant","isSidechain":true,"message":{"usage":{"input_tokens":999999,"cache_creation_input_tokens":999999,"cache_read_input_tokens":999999,"output_tokens":1}}}"#,
-            // The freshest non-sidechain turn — output_tokens (459) must NOT be
-            // folded into the sum (2 + 11803 + 349611 = 361416, not +459).
-            r#"{"type":"assistant","isSidechain":false,"message":{"model":"claude-sonnet-5","usage":{"input_tokens":2,"cache_creation_input_tokens":11803,"cache_read_input_tokens":349611,"output_tokens":459}}}"#,
-        ]
-        .join("\n");
-        std::fs::write(&path, &body).unwrap();
-        let tokens = transcript_context_tokens(&transcript_tail(&path));
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(tokens, Some(361_416));
-    }
-    #[test]
-    fn context_tokens_is_none_without_assistant_usage() {
-        // No assistant line at all.
-        let no_assistant: Vec<String> =
-            vec![r#"{"type":"user","message":{"content":[{"type":"text","text":"hi"}]}}"#.to_string()];
-        assert_eq!(transcript_context_tokens(&no_assistant), None);
-
-        // An assistant line present, but its message carries no `usage` block
-        // (e.g. a stream fragment) — still None, not a false Some(0).
-        let no_usage: Vec<String> = vec![
-            r#"{"type":"assistant","isSidechain":false,"message":{"model":"claude-sonnet-5","content":[{"type":"text","text":"hi"}]}}"#.to_string(),
-        ];
-        assert_eq!(transcript_context_tokens(&no_usage), None);
-    }
-    #[test]
-    fn extract_custom_title_takes_the_last_session_title() {
-        let lines: Vec<String> = [
-            r#"{"type":"custom-title","customTitle":"Old Name","sessionId":"s"}"#,
-            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#,
-            r#"{"type":"custom-title","customTitle":"  Aoide Dev  ","sessionId":"s"}"#,
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        assert_eq!(extract_custom_title(&lines).as_deref(), Some("Aoide Dev"));
-        // No custom-title record → None (the session is unnamed).
-        let bare: Vec<String> =
-            vec![r#"{"type":"assistant","message":{"content":[]}}"#.to_string()];
-        assert_eq!(extract_custom_title(&bare), None);
-    }
-    #[test]
-    fn find_subagent_transcript_matches_by_tool_use_id() {
-        let dir = std::env::temp_dir().join(format!("aoide_subs_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // Two sub-agent transcripts, each with its own meta.json — mirrors the
-        // real `agent-<agent_id>.jsonl` + `.meta.json` layout under
-        // `<session>/subagents/`.
-        std::fs::write(
-            dir.join("agent-aaa111.meta.json"),
-            r#"{"agentType":"Explore","description":"x","toolUseId":"toolu_A","spawnDepth":1}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("agent-aaa111.jsonl"),
-            r#"{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"text","text":"from A"}]}}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("agent-bbb222.meta.json"),
-            r#"{"agentType":"Explore","description":"y","toolUseId":"toolu_B","spawnDepth":1}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("agent-bbb222.jsonl"),
-            r#"{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"text","text":"from B"}]}}"#,
-        )
-        .unwrap();
-
-        let found = find_subagent_transcript(&dir, "toolu_B").unwrap();
-        assert_eq!(found.file_name().unwrap().to_str().unwrap(), "agent-bbb222.jsonl");
-        let say = extract_say(&transcript_tail(&found), false);
-        assert_eq!(say.as_deref(), Some("from B"));
-
-        // An unknown tool_use_id (no matching Task) finds nothing.
-        assert!(find_subagent_transcript(&dir, "toolu_nope").is_none());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    #[test]
-    fn find_subagent_transcript_matches_by_agent_id_filename() {
-        // The async Agent-tool path: PostToolUse re-keys the graph node from
-        // `sub:<tool_use_id>` to `sub:<agent_id>`, so lookups arrive keyed by
-        // agent id — which never equals any `meta.json`'s `toolUseId`. The
-        // transcript must still resolve via the direct `agent-<agent_id>.jsonl`
-        // filename, even though its meta.json's `toolUseId` is a DIFFERENT,
-        // unrelated tool_use_id value (the id of the Task call that originally
-        // spawned it, before the re-key).
-        let dir = std::env::temp_dir().join(format!("aoide_subs_aid_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let agent_id = "a2e15372d23f6f70d";
-        std::fs::write(
-            dir.join(format!("agent-{agent_id}.meta.json")),
-            r#"{"agentType":"Explore","description":"z","toolUseId":"toolu_UNRELATED","model":"fable"}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join(format!("agent-{agent_id}.jsonl")),
-            [
-                r#"{"type":"assistant","isSidechain":true,"message":{"model":"claude-fable-5","content":[{"type":"text","text":"first"}]}}"#,
-                r#"{"type":"assistant","isSidechain":true,"message":{"model":"claude-fable-5","content":[{"type":"text","text":"from agent id"}]}}"#,
-            ]
-            .join("\n"),
-        )
-        .unwrap();
-
-        // Looked up by agent id (the re-keyed `sub:<agent_id>` case) — resolves
-        // via the direct filename, NOT the meta scan (whose toolUseId doesn't
-        // match).
-        let found = find_subagent_transcript(&dir, agent_id).unwrap();
-        assert_eq!(
-            found.file_name().unwrap().to_str().unwrap(),
-            format!("agent-{agent_id}.jsonl")
-        );
-        let lines = transcript_tail(&found);
-        assert_eq!(extract_say(&lines, false).as_deref(), Some("from agent id"));
-        assert_eq!(extract_model(&lines, false).as_deref(), Some("claude-fable-5"));
-
-        // The pre-existing tool-use-id-keyed path still works via the meta scan.
-        let found2 = find_subagent_transcript(&dir, "toolu_UNRELATED").unwrap();
-        assert_eq!(
-            found2.file_name().unwrap().to_str().unwrap(),
-            format!("agent-{agent_id}.jsonl")
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    #[test]
-    fn one_line_clip_flattens_and_truncates() {
-        assert_eq!(one_line_clip("a  b\n c", 80), "a b c");
-        let long = "x".repeat(200);
-        let clipped = one_line_clip(&long, 10);
-        assert_eq!(clipped.chars().count(), 10);
-        assert!(clipped.ends_with('…'));
-    }
-    #[test]
     fn wrap_registers_resolves_and_mirrors_the_child() {
         let _guard = crate::env_lock().lock().unwrap();
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
@@ -1583,6 +1101,68 @@ mod tests {
         let ids2: Vec<&str> = s2.sessions.iter().map(|r| r.session_id.as_str()).collect();
         assert!(ids2.contains(&"again"), "a conducted shell never evicts its hosted agent");
         assert!(ids2.contains(&"shellhost"));
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+    #[test]
+    fn registration_never_evicts_a_conducted_pty_host() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("regi-host");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        // The wrapper: `aoide conduct -- kimi` registers its own record —
+        // agent name = the child's basename, conductable + socket (the
+        // control-socket owner). upsert_session classifies it kind="agent"
+        // from that basename; it is the HOST, not a foreground agent.
+        do_session_start(
+            "conduct-1",
+            Some("kimi"),
+            Some("/p"),
+            Some("0xWIN3"),
+            None,
+            Some(true),
+            Some("/run/aoide/conduct-1.sock"),
+            None,
+            None,
+        );
+        // kimi's SessionStart hook fires inside the conducted child:
+        // agent-kind, SAME window, parent = the wrapper id (threaded via
+        // AOIDE_SESSION_ID). Before the host carve-outs this registration
+        // evicted the wrapper — `graph send --id conduct-1` then failed
+        // "unknown session" and the session could never be commanded.
+        do_session_start(
+            "kimi-hook-1",
+            Some("kimi"),
+            Some("/p"),
+            Some("0xWIN3"),
+            Some("conduct-1"),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let ids: Vec<&str> = s.sessions.iter().map(|r| r.session_id.as_str()).collect();
+        assert!(
+            ids.contains(&"conduct-1"),
+            "the conducted PTY host survives its child's SessionStart"
+        );
+        assert!(
+            ids.contains(&"kimi-hook-1"),
+            "the hook session registers alongside its host"
+        );
+        // The record really is the shape that fooled the old
+        // published-kind-wins rule: kind="agent" AND conductable.
+        let host = s.sessions.iter().find(|r| r.session_id == "conduct-1").unwrap();
+        assert_eq!(host.kind.as_deref(), Some("agent"));
+        assert_eq!(host.conductable, Some(true));
+        assert_eq!(host.state, "idle", "still live, not evicted-done");
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),

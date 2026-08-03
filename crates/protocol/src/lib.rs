@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod audit;
 pub mod invocation;
 pub mod model;
