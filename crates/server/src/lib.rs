@@ -27,6 +27,7 @@
 //! `Cargo.toml`) — the outbound A2A client stays entirely in root/`aoide-client`.
 
 pub mod a2a;
+pub mod commands;
 pub mod daemon;
 pub mod mcp;
 

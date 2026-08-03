@@ -24,6 +24,13 @@ rustPlatform.buildRustPackage {
 
   cargoLock.lockFile = ./Cargo.lock;
 
+  # The workspace root is VIRTUAL (Phase 9 restructure,
+  # docs/architecture/PACKAGE-LAYOUT.md): the `aoide`/`aoided` binaries come
+  # from the `aoide-cli` app crate, so cargo builds/tests/installs from its
+  # subdir (the workspace lock + every `crates/*` path dep still resolve
+  # upward to the root).
+  buildAndTestSubdir = "crates/cli";
+
   # Walking skeleton: no live-system integration tests in the sandbox.
   doCheck = true;
 

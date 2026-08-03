@@ -9,20 +9,15 @@
 //! here.
 
 pub mod a2a;
-pub mod adapter;
 pub mod commands;
 pub mod cli;
 pub mod daemon;
 pub mod dispatch;
 pub mod graph;
-pub mod reap;
 pub mod guide;
-pub mod hypr;
 pub mod mcp;
-pub mod notes;
 pub mod output;
 pub mod registry;
-pub mod shellbridge;
 
 pub use aoide_client as client;
 pub use aoide_conduct as conduct;
@@ -165,14 +160,4 @@ pub fn run_cli(argv: &[String]) -> i32 {
 /// Did argv contain `--json` anywhere? (used before full parse for errors).
 fn wants_json(argv: &[String]) -> bool {
     argv.iter().any(|a| a == "--json" || a == "--json=true")
-}
-
-/// A crate-wide lock serialising every test that mutates process-global env
-/// (`AOIDE_STAGE_DIR`, `PATH`, `AOIDE_DRACHMA_BIN`, …). `std::env::set_var` is
-/// process-global, so env-touching tests across modules must share ONE mutex or
-/// they race each other under the multithreaded test harness.
-#[cfg(test)]
-pub(crate) fn env_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    &LOCK
 }

@@ -1,9 +1,9 @@
 //! `cover set` — the live wallpaper write-path (song/covers/).
 
-use crate::dispatch::Invocation;
-use crate::output::Outcome;
-use crate::registry::{arg, cmd, Registry};
-use crate::shellbridge;
+use aoide_protocol::Invocation;
+use aoide_protocol::output::Outcome;
+use aoide_protocol::registry::{arg, cmd, Registry};
+use aoide_storage::fs as shellbridge;
 use serde_json::json;
 
 pub fn register(r: &mut Registry) {
@@ -43,7 +43,7 @@ fn handle_cover_set(inv: &Invocation) -> Outcome {
     };
 
     // Absolute path → literal; anything else → the shared covers/ library.
-    let resolved = aoide_song::cover::resolve_cover_arg(&arg);
+    let resolved = crate::cover::resolve_cover_arg(&arg);
 
     if !resolved.is_file() {
         return Outcome::error(
@@ -88,12 +88,12 @@ fn handle_cover_set(inv: &Invocation) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_support::*;
-    use crate::output::Status;
+    use aoide_test_support::*;
+    use aoide_protocol::output::Status;
 
     #[test]
     fn cover_set_stages_an_absolute_path() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("cover-abs");
         let stage = root.join("stage");
@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn cover_set_resolves_a_bare_name_against_the_covers_library() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("cover-name");
         let stage = root.join("stage");
@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn cover_set_missing_file_is_error_exit_1() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("cover-missing");
         let stage = root.join("stage");
@@ -151,7 +151,7 @@ mod tests {
 
         let out = handle_cover_set(&inv(&["cover", "set"], &["nope.png"]));
         assert_eq!(out.status, Status::Error);
-        assert_eq!(out.render(false).1, crate::output::exit::ERROR);
+        assert_eq!(out.render(false).1, aoide_protocol::output::exit::ERROR);
         assert_eq!(out.data.unwrap()["reason"], "cover-not-found");
         // Nothing was staged for a missing file.
         assert!(!stage.join("cover.json").exists());
@@ -162,6 +162,6 @@ mod tests {
     fn cover_set_missing_arg_is_usage_exit_2() {
         let out = handle_cover_set(&inv(&["cover", "set"], &[]));
         assert_eq!(out.status, Status::Usage);
-        assert_eq!(out.render(false).1, crate::output::exit::USAGE);
+        assert_eq!(out.render(false).1, aoide_protocol::output::exit::USAGE);
     }
 }

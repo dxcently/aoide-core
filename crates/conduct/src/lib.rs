@@ -11,6 +11,7 @@
 //! (the durable session-record substrate) and `aoide-protocol` (the
 //! Invocation/Outcome/audit contract every door shares).
 
+pub mod commands;
 pub mod graph;
 pub mod reap;
 pub mod shellbridge;

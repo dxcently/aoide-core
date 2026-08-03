@@ -11,6 +11,7 @@
 //! call site changes.
 
 pub mod a2a_store;
+pub mod commands;
 pub mod design;
 pub mod fs;
 pub mod records;
@@ -19,12 +20,11 @@ pub mod stage;
 pub mod time;
 
 /// A crate-wide lock serialising every test that mutates process-global env
-/// (`AOIDE_STAGE_DIR`, `AOIDE_STATE_DIR`, …) — mirrors `aoide::env_lock()`
-/// (root `src/lib.rs`), needed here because the moved fs/a2a_store tests
-/// touch the same process-global env vars and must serialise against each
-/// other under the multithreaded test harness.
+/// (`AOIDE_STAGE_DIR`, `AOIDE_STATE_DIR`, …). Delegates to
+/// `aoide-test-support`'s single mutex (Phase 9 restructure): the `commands`
+/// tests moved INTO this crate's test binary hold that lock, so every
+/// env-touching test in the binary must share it or they race.
 #[cfg(test)]
 pub(crate) fn env_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    &LOCK
+    aoide_test_support::env_lock()
 }

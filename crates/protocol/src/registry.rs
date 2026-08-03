@@ -6,11 +6,13 @@
 //! from this single [`Registry`] — the "three doors, one schema" contract
 //! (concepts/Agent-Interface). Nothing else in the crate enumerates commands.
 //!
-//! Each command group lives in its own `commands/<group>.rs` module and
-//! contributes its entries via a `register(&mut Registry)` function; see
-//! `commands/mod.rs::all()` for the assembly order (which reproduces the
+//! Each command group lives in its DOMAIN crate's `commands` module (Phase 9
+//! restructure, docs/architecture/PACKAGE-LAYOUT.md) and contributes its
+//! entries via a `register(&mut Registry)` function; the root package's
+//! `commands/mod.rs::all()` assembles them (in the order that reproduces the
 //! historical `schema.rs` table order byte-for-byte — `schema --json` and the
-//! MCP tool list must never reorder).
+//! MCP tool list must never reorder). Nothing outside those `register()`
+//! functions enumerates commands.
 
 use crate::invocation::Invocation;
 use crate::output::Outcome;
@@ -151,3 +153,65 @@ impl Registry {
         }
     }
 }
+
+/// Small helper: a leaf command whose only flag is `--json`, wired to a
+/// handler fn. Every command group's `register()` uses this to build its
+/// `Command` entries — metadata copied verbatim from the pre-registry
+/// `schema.rs` table.
+///
+/// Moved from the root package's `src/registry.rs` (Phase 9 restructure,
+/// docs/architecture/PACKAGE-LAYOUT.md) so every domain crate's
+/// `commands::register()` can describe its own verbs; the `$crate::registry::*`
+/// expansions resolve identically inside THIS crate, which owns the types.
+#[macro_export]
+macro_rules! cmd {
+    (
+        path: [$($seg:literal),*],
+        summary: $summary:literal,
+        args: [$($arg:expr),* $(,)?],
+        flags: [$($flag:expr),* $(,)?],
+        gated: $gated:expr,
+        implemented: $impl:expr,
+        handler: $handler:expr $(,)?
+    ) => {
+        $crate::registry::Command {
+            path: &[$($seg),*],
+            summary: $summary,
+            args: &[$($arg),*],
+            flags: &[$crate::registry::JSON_FLAG, $($flag),*],
+            gated: $gated,
+            implemented: $impl,
+            exit_codes: (),
+            handler: $handler,
+            available: || true,
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! arg {
+    ($name:literal, $ty:literal, $req:expr, $desc:literal) => {
+        $crate::registry::Arg {
+            name: $name,
+            ty: $ty,
+            required: $req,
+            description: $desc,
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! flag {
+    ($name:literal, $ty:literal, $desc:literal) => {
+        $crate::registry::Flag {
+            name: $name,
+            ty: $ty,
+            description: $desc,
+        }
+    };
+}
+
+// Re-export at this module's path too, so a domain crate's
+// `use aoide_protocol::registry::{arg, cmd, flag, Registry};` reads exactly
+// like the root package's historical `use crate::registry::{…}`.
+pub use crate::{arg, cmd, flag};

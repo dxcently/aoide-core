@@ -11,9 +11,9 @@
 //! `design.json` entry for the honest state of the lifecycle today.
 
 use super::rice::handle_rice_preview;
-use crate::dispatch::Invocation;
-use crate::output::{Outcome, Status};
-use crate::registry::{arg, cmd, flag, Registry};
+use aoide_protocol::Invocation;
+use aoide_protocol::output::{Outcome, Status};
+use aoide_protocol::registry::{arg, cmd, flag, Registry};
 use aoide_storage::design::{delete_design_marker, design_marker_path, save_design_marker, DesignMarker};
 use serde_json::json;
 
@@ -104,7 +104,7 @@ fn handle_design_enter(inv: &Invocation) -> Outcome {
     // Re-validated by handle_rice_preview above; args.first() is Some.
     let name = inv.args.first().cloned().unwrap_or_default();
     let by = inv.flags.get("by").cloned();
-    let intent_path = crate::shellbridge::songbook_dir(&name)
+    let intent_path = aoide_storage::fs::songbook_dir(&name)
         .join("design")
         .join("intent.md");
     let intent_present = intent_path.is_file();
@@ -182,11 +182,11 @@ fn handle_design_exit(_inv: &Invocation) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_support::*;
+    use aoide_test_support::*;
 
     #[test]
     fn status_reports_inactive_when_no_marker_exists() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("design-status-none");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn status_reports_the_marker_fields_when_one_exists() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("design-status-active");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn enter_on_an_existing_song_writes_a_marker_and_is_reenterable() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("design-enter-ok");
         let stage = root.join("stage");
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn enter_records_the_optional_by_flag() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("design-enter-by");
         let stage = root.join("stage");
@@ -295,7 +295,7 @@ mod tests {
             path: vec!["rice".to_string(), "design".to_string(), "enter".to_string()],
             args: vec!["moonlight".to_string()],
             flags,
-            door: crate::daemon::Door::Cli,
+            door: aoide_protocol::Door::Cli,
         };
         let out = handle_design_enter(&invocation);
         assert_eq!(out.status, Status::Ok);
@@ -309,13 +309,13 @@ mod tests {
     fn enter_missing_name_is_usage_exit_2() {
         let out = handle_design_enter(&inv(&["rice", "design", "enter"], &[]));
         assert_eq!(out.status, Status::Usage);
-        assert_eq!(out.render(false).1, crate::output::exit::USAGE);
+        assert_eq!(out.render(false).1, aoide_protocol::output::exit::USAGE);
         assert_eq!(out.data.unwrap()["reason"], "missing-name");
     }
 
     #[test]
     fn enter_nonexistent_song_reports_the_same_song_not_found_reason_preview_uses() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("design-enter-missing").join("stage");
         std::fs::create_dir_all(&stage).unwrap();
@@ -323,7 +323,7 @@ mod tests {
 
         let out = handle_design_enter(&inv(&["rice", "design", "enter"], &["nope"]));
         assert_eq!(out.status, Status::Error);
-        assert_eq!(out.render(false).1, crate::output::exit::ERROR);
+        assert_eq!(out.render(false).1, aoide_protocol::output::exit::ERROR);
         assert_eq!(out.data.unwrap()["reason"], "song-not-found");
         // A failed preview must never leave a marker behind.
         assert!(aoide_storage::design::load_design_marker().is_none());
@@ -334,21 +334,21 @@ mod tests {
 
     #[test]
     fn exit_with_no_marker_is_ok_not_an_error() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("design-exit-none");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
         let out = handle_design_exit(&inv(&["rice", "design", "exit"], &[]));
         assert_eq!(out.status, Status::Ok);
-        assert_eq!(out.render(false).1, crate::output::exit::OK);
+        assert_eq!(out.render(false).1, aoide_protocol::output::exit::OK);
         assert_eq!(out.data.unwrap()["wasActive"], false);
         let _ = std::fs::remove_dir_all(&stage);
     }
 
     #[test]
     fn exit_with_an_active_marker_removes_it_and_reports_was_active() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("design-exit-active");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -376,7 +376,7 @@ mod tests {
 
     #[test]
     fn exit_only_removes_the_marker_and_leaves_every_other_stage_file_untouched() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("design-exit-scoped");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);

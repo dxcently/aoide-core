@@ -24,7 +24,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "aoide"
+name = "aoide-cli"
 version = "0.0.0"
 dependencies = [
  "aoide-client",
@@ -56,6 +56,7 @@ version = "0.0.0"
 dependencies = [
  "aoide-protocol",
  "aoide-storage",
+ "aoide-test-support",
  "libc",
  "serde",
  "serde_json",
@@ -99,7 +100,9 @@ dependencies = [
 name = "aoide-song"
 version = "0.0.0"
 dependencies = [
+ "aoide-protocol",
  "aoide-storage",
+ "aoide-test-support",
  "serde_json",
 ]
 
@@ -108,9 +111,17 @@ name = "aoide-storage"
 version = "0.0.0"
 dependencies = [
  "aoide-protocol",
+ "aoide-test-support",
  "libc",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "aoide-test-support"
+version = "0.0.0"
+dependencies = [
+ "aoide-protocol",
 ]
 
 [[package]]

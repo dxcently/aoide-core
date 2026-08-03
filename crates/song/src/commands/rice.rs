@@ -2,10 +2,11 @@
 //! (concepts/Self-Ricing). `rice gen`/`rice adopt`/`rice transpose` are still
 //! walking-skeleton stubs; their metadata lives in `commands/stubs.rs`.
 
-use crate::dispatch::Invocation;
-use crate::output::Outcome;
-use crate::registry::{arg, cmd, flag, Registry};
-use crate::{notes, shellbridge};
+use aoide_protocol::Invocation;
+use aoide_protocol::output::Outcome;
+use aoide_protocol::registry::{arg, cmd, flag, Registry};
+use crate::notes;
+use aoide_storage::fs as shellbridge;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
@@ -185,7 +186,7 @@ pub(crate) fn handle_rice_preview(inv: &Invocation) -> Outcome {
     // Compute the compositor keyword batch BEFORE `parsed` is consumed below
     // (geometry + border colours only — see hypr.rs for why an absent/null
     // geometry field is skipped rather than defaulted).
-    let hypr_keywords = crate::hypr::geometry_keywords(&parsed);
+    let hypr_keywords = crate::live::geometry_keywords(&parsed);
 
     // Inject the song name into the staged notes: DrachmaState.qml's
     // `songName` property reads this to resolve per-song flavor widgets
@@ -215,10 +216,10 @@ pub(crate) fn handle_rice_preview(inv: &Invocation) -> Outcome {
     // truth for the hot-reload half (Quickshell's FileView); this hyprctl call
     // is on top of it, never a precondition for it — a failed/absent hyprctl
     // never turns this preview into an error. No `hyprctl reload`: see hypr.rs.
-    let hyprctl_status = crate::hypr::apply_live(&hypr_keywords);
+    let hyprctl_status = crate::live::apply_live(&hypr_keywords);
 
     // Cover: staged only when physically derivable; otherwise left untouched.
-    let cover = aoide_song::cover::derive_cover(&name);
+    let cover = crate::cover::derive_cover(&name);
     let cover_note = match &cover {
         Some(path) => {
             let cover_dst = stage.join("cover.json");
@@ -282,7 +283,7 @@ fn handle_rice_mint(inv: &Invocation) -> Outcome {
         }
     };
 
-    if !aoide_song::mint::valid_song_name(&name) {
+    if !crate::mint::valid_song_name(&name) {
         return Outcome::error(
             "rice.mint",
             format!(
@@ -299,7 +300,7 @@ fn handle_rice_mint(inv: &Invocation) -> Outcome {
         .cloned()
         .unwrap_or_else(|| "default".to_string());
 
-    if !aoide_song::mint::valid_song_name(&from) {
+    if !crate::mint::valid_song_name(&from) {
         return Outcome::error(
             "rice.mint",
             format!(
@@ -368,8 +369,8 @@ fn handle_rice_mint(inv: &Invocation) -> Outcome {
         }
     };
 
-    let rice_nix = aoide_song::mint::render_rice_nix(&name, &from, &from_parsed);
-    let intent_md = aoide_song::mint::render_intent_md(&name, &from);
+    let rice_nix = crate::mint::render_rice_nix(&name, &from, &from_parsed);
+    let intent_md = crate::mint::render_intent_md(&name, &from);
 
     let writes: [(PathBuf, String); 4] = [
         (target.join("rice.nix"), rice_nix),
@@ -412,25 +413,25 @@ fn handle_rice_mint(inv: &Invocation) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_support::*;
-    use crate::output::Status;
+    use aoide_test_support::*;
+    use aoide_protocol::output::Status;
 
     #[test]
     fn lint_no_arg_without_staged_notes_is_usage_exit_2() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("lint-nostage"); // exists, but no drachma.json
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
         let out = handle_rice_lint(&inv(&["rice", "lint"], &[]));
         assert_eq!(out.status, Status::Usage, "no-arg + no staged notes → usage");
-        assert_eq!(out.render(false).1, crate::output::exit::USAGE);
+        assert_eq!(out.render(false).1, aoide_protocol::output::exit::USAGE);
         let _ = std::fs::remove_dir_all(&stage);
     }
 
     #[test]
     fn lint_no_arg_resolves_staged_default_and_errors_nonzero() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "PATH", "AOIDE_DRACHMA_BIN"]);
         let stage = unique_tmp("lint-staged");
         std::fs::write(stage.join("drachma.json"), VALID_NOTES).unwrap();
@@ -441,7 +442,7 @@ mod tests {
         // Resolved the STAGED default (else this would be a Usage error), and
         // with drachma absent the envelope is an error → exit 1, never 0.
         assert_eq!(out.status, Status::Error);
-        assert_eq!(out.render(false).1, crate::output::exit::ERROR);
+        assert_eq!(out.render(false).1, aoide_protocol::output::exit::ERROR);
         let notes = out.data.unwrap()["notes"].as_str().unwrap().to_string();
         assert!(notes.ends_with("drachma.json"), "lint targeted the staged notes: {notes}");
         assert!(notes.starts_with(stage.to_str().unwrap()));
@@ -450,7 +451,7 @@ mod tests {
 
     #[test]
     fn lint_bare_name_resolves_to_songbook_notes_not_a_literal_path() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "PATH", "AOIDE_DRACHMA_BIN"]);
         let root = unique_tmp("lint-name");
         let stage = root.join("stage");
@@ -470,7 +471,7 @@ mod tests {
 
     #[test]
     fn lint_existing_path_arg_is_taken_literally() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "PATH", "AOIDE_DRACHMA_BIN"]);
         let root = unique_tmp("lint-path");
         let file = root.join("elsewhere.json");
@@ -486,7 +487,7 @@ mod tests {
 
     #[test]
     fn preview_stages_notes_and_reports_no_derivable_cover() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("preview-ok");
         let stage = root.join("stage");
@@ -517,7 +518,7 @@ mod tests {
 
     #[test]
     fn preview_stages_a_derivable_cover_from_the_covers_library() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("preview-cover");
         let stage = root.join("stage");
@@ -542,7 +543,7 @@ mod tests {
 
     #[test]
     fn preview_missing_song_is_error_exit_1() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("preview-missing").join("stage");
         std::fs::create_dir_all(&stage).unwrap();
@@ -550,7 +551,7 @@ mod tests {
 
         let out = handle_rice_preview(&inv(&["rice", "preview"], &["nope"]));
         assert_eq!(out.status, Status::Error);
-        assert_eq!(out.render(false).1, crate::output::exit::ERROR);
+        assert_eq!(out.render(false).1, aoide_protocol::output::exit::ERROR);
         assert_eq!(out.data.unwrap()["reason"], "song-not-found");
     }
 
@@ -558,7 +559,7 @@ mod tests {
     fn preview_missing_name_is_usage_exit_2() {
         let out = handle_rice_preview(&inv(&["rice", "preview"], &[]));
         assert_eq!(out.status, Status::Usage);
-        assert_eq!(out.render(false).1, crate::output::exit::USAGE);
+        assert_eq!(out.render(false).1, aoide_protocol::output::exit::USAGE);
     }
 
     // ── rice preview: the hyprctl live-apply guard (Phase F) ─────────────────
@@ -568,7 +569,7 @@ mod tests {
         // The common test path: no compositor, `hyprctl` may not even exist on
         // PATH — the guard must trip on the env var alone, never touching the
         // process spawn.
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "HYPRLAND_INSTANCE_SIGNATURE"]);
         std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
         let root = unique_tmp("preview-hypr-off");
@@ -590,7 +591,7 @@ mod tests {
 
     #[test]
     fn preview_with_no_window_or_geometry_reports_an_empty_batch() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "HYPRLAND_INSTANCE_SIGNATURE"]);
         std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
         let root = unique_tmp("preview-hypr-empty");
@@ -613,13 +614,13 @@ mod tests {
     // ── rice mint (Phase E) ───────────────────────────────────────────────────
     //
     // The PURE `nix_scalar`/`valid_song_name` unit tests moved to
-    // `aoide_song::mint`'s own test module (Phase 5b restructure) alongside
+    // `crate::mint`'s own test module (Phase 5b restructure) alongside
     // the functions they exercise. Everything below is handler-level: it
     // drives `handle_rice_mint` through `Invocation`/`Outcome`.
 
     #[test]
     fn mint_neutralizes_nix_interpolation_in_notes() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("mint-interpolation");
         let stage = root.join("stage");
@@ -652,14 +653,14 @@ mod tests {
         for bad in ["Dusk", "dusk_two", "-dusk", "dusk/two", "../etc", "", "dusk.two"] {
             let out = handle_rice_mint(&inv(&["rice", "mint"], &[bad]));
             assert_eq!(out.status, Status::Error, "`{bad}` should be rejected");
-            assert_eq!(out.render(false).1, crate::output::exit::ERROR);
+            assert_eq!(out.render(false).1, aoide_protocol::output::exit::ERROR);
             assert_eq!(out.data.unwrap()["reason"], "invalid-name", "for `{bad}`");
         }
     }
 
     #[test]
     fn mint_rejects_invalid_from() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("mint-badfrom");
         let stage = root.join("stage");
@@ -674,7 +675,7 @@ mod tests {
                 i
             });
             assert_eq!(out.status, Status::Error, "`--from {bad}` should be rejected");
-            assert_eq!(out.render(false).1, crate::output::exit::ERROR);
+            assert_eq!(out.render(false).1, aoide_protocol::output::exit::ERROR);
             assert_eq!(out.data.unwrap()["reason"], "invalid-from", "for `--from {bad}`");
             assert!(!target.exists(), "nothing written for `--from {bad}`");
         }
@@ -683,7 +684,7 @@ mod tests {
 
     #[test]
     fn mint_rejects_from_equal_to_name() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("mint-fromeqname");
         let stage = root.join("stage");
@@ -697,7 +698,7 @@ mod tests {
             i
         });
         assert_eq!(out.status, Status::Error);
-        assert_eq!(out.render(false).1, crate::output::exit::ERROR);
+        assert_eq!(out.render(false).1, aoide_protocol::output::exit::ERROR);
         assert_eq!(out.data.unwrap()["reason"], "from-equals-name");
         assert!(!target.exists(), "nothing written when --from == name");
         let _ = std::fs::remove_dir_all(&root);
@@ -707,12 +708,12 @@ mod tests {
     fn mint_missing_name_is_usage_exit_2() {
         let out = handle_rice_mint(&inv(&["rice", "mint"], &[]));
         assert_eq!(out.status, Status::Usage);
-        assert_eq!(out.render(false).1, crate::output::exit::USAGE);
+        assert_eq!(out.render(false).1, aoide_protocol::output::exit::USAGE);
     }
 
     #[test]
     fn mint_missing_from_song_is_error() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("mint-nofrom");
         let stage = root.join("stage");
@@ -721,14 +722,14 @@ mod tests {
 
         let out = handle_rice_mint(&inv(&["rice", "mint"], &["moonlight"]));
         assert_eq!(out.status, Status::Error);
-        assert_eq!(out.render(false).1, crate::output::exit::ERROR);
+        assert_eq!(out.render(false).1, aoide_protocol::output::exit::ERROR);
         assert_eq!(out.data.unwrap()["reason"], "from-song-not-found");
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn mint_scaffolds_every_file_from_a_from_song_with_no_window_or_geometry() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("mint-ok");
         let stage = root.join("stage");
@@ -779,7 +780,7 @@ mod tests {
 
     #[test]
     fn mint_with_geometry_and_window_copies_every_field_including_nulls() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("mint-geo");
         let stage = root.join("stage");
@@ -816,7 +817,7 @@ mod tests {
 
     #[test]
     fn mint_refuses_to_overwrite_without_force_then_succeeds_with_it() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("mint-exists");
         let stage = root.join("stage");
@@ -830,7 +831,7 @@ mod tests {
 
         let out = handle_rice_mint(&inv(&["rice", "mint"], &["dusk"]));
         assert_eq!(out.status, Status::Error);
-        assert_eq!(out.render(false).1, crate::output::exit::ERROR);
+        assert_eq!(out.render(false).1, aoide_protocol::output::exit::ERROR);
         assert_eq!(out.data.unwrap()["reason"], "already-exists");
         assert!(!target.join("rice.nix").exists(), "nothing written without --force");
 

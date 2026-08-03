@@ -1,53 +1,28 @@
-//! `a2a serve` / `a2a agent add|list|remove|send` — the A2A (Agent2Agent) door
-//! group (CONTRACTS.md §6). Phase B flipped `a2a serve` real (a JSON-RPC/HTTP
-//! server, `src/a2a.rs`: AgentCard + `tasks/get`); Phase B2 landed
-//! `message/send` execution (inject into a known conductable session, or
-//! spawn a freshly conducted one running the operator-configured
-//! `aoide.a2a.spawnAgent`). `a2a serve` itself is a long-running blocking
-//! server, so `lib.rs::run_cli` special-cases its launch exactly like
-//! `mcp serve --stdio`/`conductor`; the `serve` handler below only covers the
-//! non-Cli-door / metadata path (mirrors `commands/infra.rs::handle_conductor`).
+//! The client domain's CLI verbs (CONTRACTS.md §6): `a2a agent
+//! add|list|remove|send` (the outbound half — aoide DRIVES external A2A
+//! agents) and `adapter melete` (the neutral-event consumer).
 //!
-//! Phase D (CLIENT side) makes the `agent` verbs real: aoide registers an
-//! EXTERNAL A2A agent by its AgentCard URL (`agent add`), lists/removes them
-//! (`agent list`/`remove`), and DRIVES one (`agent send`) — the outbound half
-//! of the bidirectional link. The registry lives in `state/a2a-agents.json`
-//! (`src/a2a.rs`: [`crate::a2a::load_agents`] et al) and folds into the session
-//! DAG as `kind:"a2a"` nodes (`graph/doc.rs::build_graph`). These endpoints are
-//! external and carry NO local credential, so — unlike `commands/usage.rs`'s
-//! token fetch — a plain curl (url/body in argv or stdin) is fine; we reuse its
-//! `(code, body)` parsing discipline. SSRF isn't guarded: the url is the user's
-//! own CLI argument, a user-initiated fetch.
+//! Moved from the root package's `src/commands/a2a.rs` + the client half of
+//! `src/commands/infra.rs` (Phase 9 restructure,
+//! docs/architecture/PACKAGE-LAYOUT.md): a domain's CLI verbs live with the
+//! domain. The root package's `commands::all()` calls [`register_agents`]
+//! directly after `aoide_server::commands::register_a2a_serve` and
+//! [`register_post_graph`] directly before `aoide_conductor::commands::register`,
+//! so `schema --json` order never shifts.
+//!
+//! The registry lives in `state/a2a-agents.json` (`aoide_storage::a2a_store`)
+//! and folds into the session DAG as `kind:"a2a"` nodes
+//! (`graph/doc.rs::build_graph`). These endpoints are external and carry NO
+//! local credential, so a plain curl (url/body in argv or stdin) is fine;
+//! SSRF isn't guarded: the url is the user's own CLI argument, a
+//! user-initiated fetch.
 
-use crate::daemon::Door;
-use crate::dispatch::Invocation;
-use crate::output::Outcome;
-use crate::registry::{arg, cmd, flag, Registry};
+use aoide_protocol::output::Outcome;
+use aoide_protocol::registry::{arg, cmd, flag, Registry};
+use aoide_protocol::Invocation;
 use serde_json::{json, Value};
 use std::io::Write;
 use std::process::Stdio;
-
-/// `a2a serve`'s handler. On the Cli door this is only ever reached via
-/// `run_cli`'s special-case (dispatch first, to record the launch, THEN
-/// block in the accept loop — see `lib.rs`); on any other door (e.g. an MCP
-/// `tools/call` for `a2a.serve`) it never blocks that door, it just reports
-/// how to actually raise the server.
-fn handle_a2a_serve(inv: &Invocation) -> Outcome {
-    let (bind, port) = crate::a2a::resolve_bind_port(inv);
-    match inv.door {
-        Door::Cli => Outcome::ok(
-            "a2a.serve",
-            format!("raising the A2A server on http://{bind}:{port}/"),
-        )
-        .with_data(json!({ "interactive": true, "bind": bind, "port": port })),
-        _ => Outcome::ok(
-            "a2a.serve",
-            "a2a serve is a long-running server; run `aoide a2a serve` from a terminal \
-             or the aoide-a2a systemd unit (not over this door)",
-        )
-        .with_data(json!({ "interactive": true, "door": "non-cli" })),
-    }
-}
 
 // ── curl transport ((code, body) discipline from commands/usage.rs) ─────────
 
@@ -128,7 +103,7 @@ fn handle_agent_add(inv: &Invocation) -> Outcome {
         Some(u) => u.to_string(),
         None => return Outcome::usage(cmd, "usage: aoide a2a agent add <url> [--json]"),
     };
-    let card_url = crate::a2a::resolve_card_url(&url);
+    let card_url = crate::wire::resolve_card_url(&url);
     let (code, body) = match run_curl(&["--", &card_url], None) {
         Ok(v) => v,
         Err(e) => {
@@ -148,17 +123,17 @@ fn handle_agent_add(inv: &Invocation) -> Outcome {
         }
     };
     let now = aoide_storage::time::now_iso_utc();
-    let agent = match crate::a2a::parse_agent_card(&card, &card_url, &now) {
+    let agent = match crate::wire::parse_agent_card(&card, &card_url, &now) {
         Ok(a) => a,
         Err(e) => {
             return Outcome::error(cmd, format!("invalid AgentCard {card_url}: {e}"))
                 .with_data(json!({ "reason": "card-invalid", "url": card_url }))
         }
     };
-    let mut agents = crate::a2a::load_agents();
+    let mut agents = aoide_storage::a2a_store::load_agents();
     let replaced = agents.iter().any(|a| a.name == agent.name);
-    crate::a2a::upsert_agent(&mut agents, agent.clone());
-    if let Err(e) = crate::a2a::save_agents(&agents) {
+    aoide_storage::a2a_store::upsert_agent(&mut agents, agent.clone());
+    if let Err(e) = aoide_storage::a2a_store::save_agents(&agents) {
         return Outcome::error(cmd, format!("writing the agent registry: {e}"))
             .with_data(json!({ "reason": "registry-write-failed" }));
     }
@@ -172,14 +147,14 @@ fn handle_agent_add(inv: &Invocation) -> Outcome {
             agents.len()
         ),
     )
-    .changed(vec![crate::a2a::agents_path().to_string_lossy().into_owned()])
+    .changed(vec![aoide_storage::a2a_store::agents_path().to_string_lossy().into_owned()])
     .with_data(json!({ "agent": agent, "count": agents.len(), "replaced": replaced }))
 }
 
 /// `a2a agent list` — the registered agents (name · url · description).
 fn handle_agent_list(_inv: &Invocation) -> Outcome {
     let cmd = "a2a.agent.list";
-    let agents = crate::a2a::load_agents();
+    let agents = aoide_storage::a2a_store::load_agents();
     let msg = if agents.is_empty() {
         "no external A2A agents registered".to_string()
     } else {
@@ -209,12 +184,12 @@ fn handle_agent_remove(inv: &Invocation) -> Outcome {
         Some(n) => n.to_string(),
         None => return Outcome::usage(cmd, "usage: aoide a2a agent remove <name> [--json]"),
     };
-    let mut agents = crate::a2a::load_agents();
-    if !crate::a2a::remove_agent(&mut agents, &name) {
+    let mut agents = aoide_storage::a2a_store::load_agents();
+    if !aoide_storage::a2a_store::remove_agent(&mut agents, &name) {
         return Outcome::ok(cmd, format!("no A2A agent named `{name}` (nothing to remove)"))
             .with_data(json!({ "removed": false, "name": name, "count": agents.len() }));
     }
-    if let Err(e) = crate::a2a::save_agents(&agents) {
+    if let Err(e) = aoide_storage::a2a_store::save_agents(&agents) {
         return Outcome::error(cmd, format!("writing the agent registry: {e}"))
             .with_data(json!({ "reason": "registry-write-failed" }));
     }
@@ -222,7 +197,7 @@ fn handle_agent_remove(inv: &Invocation) -> Outcome {
         cmd,
         format!("removed A2A agent `{name}` ({} remaining)", agents.len()),
     )
-    .changed(vec![crate::a2a::agents_path().to_string_lossy().into_owned()])
+    .changed(vec![aoide_storage::a2a_store::agents_path().to_string_lossy().into_owned()])
     .with_data(json!({ "removed": true, "name": name, "count": agents.len() }))
 }
 
@@ -239,7 +214,7 @@ fn handle_agent_send(inv: &Invocation) -> Outcome {
         Some(m) => m.to_string(),
         None => return Outcome::usage(cmd, "usage: aoide a2a agent send <name> <message> [--json]"),
     };
-    let agents = crate::a2a::load_agents();
+    let agents = aoide_storage::a2a_store::load_agents();
     let agent = match agents.iter().find(|a| a.name == name) {
         Some(a) => a.clone(),
         None => {
@@ -251,7 +226,7 @@ fn handle_agent_send(inv: &Invocation) -> Outcome {
         }
     };
     let message_id = gen_message_id();
-    let body = crate::a2a::build_message_send_body(&message, &message_id);
+    let body = crate::wire::build_message_send_body(&message, &message_id);
     let body_str = serde_json::to_string(&body).unwrap_or_default();
     let (code, resp) = match run_curl(
         &[
@@ -298,20 +273,19 @@ fn handle_agent_send(inv: &Invocation) -> Outcome {
     }))
 }
 
-pub fn register(r: &mut Registry) {
-    r.insert(cmd!(
-        path: ["a2a", "serve"],
-        summary: "Run the A2A (Agent2Agent) server: expose aoide-orchestrated sessions as a discoverable A2A agent (AgentCard + message/send + tasks/get). Localhost, user-only, off by default.",
-        args: [],
-        flags: [
-            flag!("port", "int", "Override the A2A HTTP port (default aoide.a2a.port)."),
-            flag!("bind", "string", "Override the A2A HTTP bind address (default aoide.a2a.bindAddress)."),
-            flag!("spawn-agent", "string", "Override the command message/send's spawn path conducts (default aoide.a2a.spawnAgent; empty = spawning disabled)."),
-        ],
-        gated: false,
-        implemented: true,
-        handler: handle_a2a_serve,
-    ));
+/// `adapter melete`'s handler (moved from the root package's `infra.rs`).
+fn handle_adapter_melete(_inv: &Invocation) -> Outcome {
+    let status = crate::adapter::run_melete();
+    Outcome::ok(
+        "adapter.melete",
+        "melete-adapter skeleton self-check complete",
+    )
+    .with_data(status)
+}
+
+/// The four `agent` verbs, registered at the historical `a2a` position
+/// (directly after `a2a serve`, which `aoide-server` registers).
+pub fn register_agents(r: &mut Registry) {
     r.insert(cmd!(
         path: ["a2a", "agent", "add"],
         summary: "Register an external A2A agent (by AgentCard URL) as a node in the session DAG.",
@@ -350,5 +324,19 @@ pub fn register(r: &mut Registry) {
         gated: false,
         implemented: true,
         handler: handle_agent_send,
+    ));
+}
+
+/// The post-`graph` client verb: `adapter melete` (registered directly
+/// before `conductor`, which `aoide-conductor` registers).
+pub fn register_post_graph(r: &mut Registry) {
+    r.insert(cmd!(
+        path: ["adapter", "melete"],
+        summary: "Run the melete-adapter: consume the neutral event stream (default-deny per class).",
+        args: [],
+        flags: [flag!("run", "bool", "Run the long-lived adapter process.")],
+        gated: false,
+        implemented: true,
+        handler: handle_adapter_melete,
     ));
 }

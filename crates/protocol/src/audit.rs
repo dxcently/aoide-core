@@ -30,6 +30,18 @@ pub fn default_audit_log() -> PathBuf {
     Path::new(&home).join("Aoide").join("log")
 }
 
+/// The audit-log path in effect for one invocation (flag override →
+/// `aoide.auditLog` default). Moved from the root package's `dispatch.rs`
+/// (Phase 9 restructure, docs/architecture/PACKAGE-LAYOUT.md) — both inputs
+/// (`Invocation.flags`, `default_audit_log`) are protocol types, so the
+/// policy lives here and every crate's handlers consult it directly.
+pub fn audit_log_path(inv: &crate::invocation::Invocation) -> PathBuf {
+    if let Some(p) = inv.flags.get("audit-log") {
+        return PathBuf::from(p);
+    }
+    default_audit_log()
+}
+
 /// The Aoide user's home (`$AOIDE_USER` → `/home/<user>`, else `$HOME`).
 pub fn aoide_home() -> PathBuf {
     if let Ok(user) = std::env::var("AOIDE_USER") {

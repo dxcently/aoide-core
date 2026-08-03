@@ -22,13 +22,9 @@ pub use aoide_conduct::graph::{
     focus, focus_session, focus_window, run_hypr_window_listener, FocusError,
 };
 
-// Storage/time passthrough `commands/usage.rs` reaches at
-// `crate::graph::now_iso_utc` — unchanged path, now sourced through
-// `aoide-conduct`. `conduct_socket_path`/`load_stage`/`sessions_path`/
-// `write_stage` were re-exported here too (for `a2a.rs`'s server-region
-// code and tests), but that region moved wholesale to `aoide-server` (Phase
-// 4c restructure, docs/architecture/PACKAGE-LAYOUT.md), which reaches
-// `aoide_conduct::graph::{conduct_socket_path, load_stage, sessions_path,
-// write_stage}` directly — nothing left in THIS crate uses them, so they're
-// dropped from this shim rather than kept dead.
-pub(crate) use aoide_conduct::graph::now_iso_utc;
+// The `now_iso_utc` passthrough this shim used to carry for
+// `commands/usage.rs` is gone (Phase 9 restructure): `usage` moved to
+// `aoide-storage`, which owns `time::now_iso_utc` natively — nothing left in
+// THIS crate uses it, so it's dropped rather than kept dead (the same
+// discipline the `conduct_socket_path`/`load_stage`/`sessions_path`/
+// `write_stage` drop below established in Phase 4c).

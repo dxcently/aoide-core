@@ -1,59 +1,31 @@
-[package]
-name = "aoide"
-version = "0.0.0"
-edition = "2021"
-description = "Aoide CLI + daemon — an API that happens to be typeable."
-license = "MIT"
-
-# Phase-1 workspace scaffold (see docs/architecture/PACKAGE-LAYOUT.md): this
-# manifest is both the `aoide` package and the workspace root, with the
-# package as the workspace's sole member (no `members`/`crates/*` glob yet —
-# there's nothing under crates/ to point it at). Future single-charter crates
-# land under `crates/*` in later phases; until then this is a no-op that
-# just makes the manifest workspace-shaped.
+# Virtual workspace root (Phase 9 restructure,
+# docs/architecture/PACKAGE-LAYOUT.md): NO [package], NO src/ — the app crate
+# lives at `crates/cli`, single-charter crates under `crates/*`.
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/storage", "crates/conduct", "crates/client", "crates/server", "crates/song", "crates/conductor"]
+members = ["crates/protocol", "crates/storage", "crates/conduct", "crates/client", "crates/server", "crates/song", "crates/conductor", "crates/test-support", "crates/cli"]
 
-# Two binaries, one crate: the CLI trunk (`aoide`) and the daemon (`aoided`).
-# Both share the same schema + handler code in `src/`, so the CLI door, the
-# MCP door, and the daemon can never drift.
-
-[[bin]]
-name = "aoide"
-path = "src/bin/aoide.rs"
-
-[[bin]]
-name = "aoided"
-path = "src/bin/aoided.rs"
-
-[lib]
-name = "aoide"
-path = "src/lib.rs"
-
-[dependencies]
+# ONE version source for the whole workspace (the monorepo standard): every
+# crate inherits via `{ workspace = true }` — no per-manifest version repeats.
+# Versions match the pre-centralization manifests exactly; Cargo.lock must
+# not shift. `crossterm`/`ratatui` carry the conductor TUI's pinning notes:
+# ratatui 0.30 pins crossterm 0.29 (the rig's TUI standard — no hand-rolled
+# ANSI); default-features = false + only `events` on the direct dep keeps the
+# surface minimal and the offline lock on ONE crossterm (Phase 6b).
+[workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+libc = "0.2"
+crossterm = { version = "0.29", default-features = false, features = ["events"] }
+ratatui = "0.30"
 aoide-protocol = { path = "crates/protocol" }
 aoide-storage = { path = "crates/storage" }
 aoide-conduct = { path = "crates/conduct" }
 aoide-client = { path = "crates/client" }
 aoide-server = { path = "crates/server" }
 aoide-song = { path = "crates/song" }
-# `aoide conductor` — the interactive terminal frontend, now its own crate
-# (Phase 6b restructure, docs/architecture/PACKAGE-LAYOUT.md).
 aoide-conductor = { path = "crates/conductor" }
-
-[dev-dependencies]
-# `tests/conductor_integration.rs` drives the conductor's app/ui layer
-# directly (crossterm key events, a ratatui `TestBackend`) to exercise real
-# dispatch end to end — so root still needs these two, but only as a
-# dev-dependency now that the runtime code that used them lives in
-# `aoide-conductor` (Phase 6b restructure). Same locked versions as before,
-# not upgraded: ratatui 0.30 pins crossterm 0.29, the same line taken
-# directly for crossterm's event types.
-crossterm = { version = "0.29", default-features = false, features = ["events"] }
-ratatui = "0.30"
+aoide-test-support = { path = "crates/test-support" }
 
 [profile.release]
 opt-level = "s"

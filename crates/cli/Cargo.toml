@@ -1,0 +1,46 @@
+[package]
+name = "aoide-cli"
+version = "0.0.0"
+edition = "2021"
+description = "Aoide CLI + daemon — an API that happens to be typeable."
+license = "MIT"
+
+# The app crate (Phase 9 restructure, docs/architecture/PACKAGE-LAYOUT.md):
+# the composition root that assembles every domain crate's
+# `commands::register()` into the one Registry — the DAG sink (depends on all
+# crates, nothing depends on it). Two binaries share the same schema +
+# handler code, so the CLI door, the MCP door, and the daemon can never
+# drift. The lib keeps the historical name `aoide` so no `use aoide::…`
+# caller (bins, integration tests) changes.
+
+[[bin]]
+name = "aoide"
+path = "src/bin/aoide.rs"
+
+[[bin]]
+name = "aoided"
+path = "src/bin/aoided.rs"
+
+[lib]
+name = "aoide"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+aoide-protocol = { workspace = true }
+aoide-storage = { workspace = true }
+aoide-conduct = { workspace = true }
+aoide-client = { workspace = true }
+aoide-server = { workspace = true }
+aoide-song = { workspace = true }
+# `aoide conductor` — the interactive terminal frontend, its own crate
+# (Phase 6b restructure, docs/architecture/PACKAGE-LAYOUT.md).
+aoide-conductor = { workspace = true }
+
+[dev-dependencies]
+# `tests/conductor_integration.rs` drives the conductor's app/ui layer
+# directly (crossterm key events, a ratatui `TestBackend`) to exercise real
+# dispatch end to end — versions inherit from `[workspace.dependencies]`.
+crossterm = { workspace = true }
+ratatui = { workspace = true }

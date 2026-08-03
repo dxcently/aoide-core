@@ -14,10 +14,10 @@
 //! (the widget) must still tolerate `live.ok == false`. The token is never
 //! logged, printed, or embedded in an error string or the written state file.
 
-use crate::dispatch::Invocation;
-use crate::output::Outcome;
-use crate::registry::{cmd, Registry};
-use crate::shellbridge;
+use aoide_protocol::Invocation;
+use aoide_protocol::output::Outcome;
+use aoide_protocol::registry::{cmd, Registry};
+use crate::fs as shellbridge;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::io::Write;
@@ -441,7 +441,7 @@ fn parse_turn_usage(line: &str) -> Option<TurnUsage> {
         return None;
     }
     let ts = v.get("timestamp").and_then(Value::as_str)?;
-    let epoch = crate::storage::time::parse_iso_utc(ts)?;
+    let epoch = crate::time::parse_iso_utc(ts)?;
     let usage = v.get("message").and_then(|m| m.get("usage"))?;
     let get_u64 = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
     let input = get_u64("input_tokens");
@@ -575,7 +575,7 @@ fn handle_usage(_inv: &Invocation) -> Outcome {
 
     let body = json!({
         "schemaVersion": "0",
-        "fetchedAt": crate::graph::now_iso_utc(),
+        "fetchedAt": crate::time::now_iso_utc(),
         "live": live,
         "local": local,
     });
@@ -605,8 +605,8 @@ fn handle_usage(_inv: &Invocation) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_support::*;
-    use crate::output::Status;
+    use aoide_test_support::*;
+    use aoide_protocol::output::Status;
 
     fn assistant_line(ts: &str, model: &str, input: u64, cache_creation: u64, cache_read: u64, output: u64) -> String {
         json!({
@@ -626,7 +626,7 @@ mod tests {
     }
 
     fn epoch(ts: &str) -> i64 {
-        crate::storage::time::parse_iso_utc(ts).unwrap()
+        crate::time::parse_iso_utc(ts).unwrap()
     }
 
     // ── model_price ──────────────────────────────────────────────────────────
@@ -776,7 +776,7 @@ mod tests {
 
     #[test]
     fn handle_usage_writes_state_usage_json_and_degrades_live_cleanly() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&[
             "AOIDE_STATE_DIR",
             "AOIDE_CLAUDE_PROJECTS_DIR",

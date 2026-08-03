@@ -10,4 +10,5 @@
 //! path via `pub use`, so no existing call site changes.
 
 pub mod adapter;
+pub mod commands;
 pub mod wire;

@@ -47,6 +47,7 @@
 //! ```
 
 pub mod app;
+pub mod commands;
 pub mod graphview;
 pub mod theme;
 pub mod ui;

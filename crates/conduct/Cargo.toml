@@ -10,8 +10,13 @@ name = "aoide_conduct"
 path = "src/lib.rs"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-aoide-protocol = { path = "../protocol" }
-aoide-storage = { path = "../storage" }
-libc = "0.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+aoide-protocol = { workspace = true }
+aoide-storage = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+# The commands/hooks tests share the workspace rig (scratch dirs, EnvSaver,
+# `env_lock`) — dev-only edge.
+aoide-test-support = { workspace = true }

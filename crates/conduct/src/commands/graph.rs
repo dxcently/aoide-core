@@ -1,10 +1,16 @@
-//! `graph *` / `conduct` — thin registrations over the `graph/` domain
-//! (concepts/Terminal-Commander, concepts/Conductor-Channel). Handler bodies
-//! live in `graph/` (Phase 1); this module only wires schema metadata to the
+//! `graph *` / `conduct` — thin registrations over this crate's `graph/`
+//! domain (concepts/Terminal-Commander, concepts/Conductor-Channel). Handler
+//! bodies live in `graph/`; this module only wires schema metadata to the
 //! already-public `crate::graph::*` functions — nothing here duplicates
 //! graph-domain logic.
+//!
+//! Moved from the root package's `src/commands/graph.rs` (Phase 9
+//! restructure, docs/architecture/PACKAGE-LAYOUT.md): a domain's CLI verbs
+//! live with the domain; the root package's `commands::all()` calls
+//! [`register`] at the exact historical position so `schema --json` order
+//! never shifts.
 
-use crate::registry::{arg, cmd, flag, Registry};
+use aoide_protocol::registry::{arg, cmd, flag, Registry};
 
 pub fn register(r: &mut Registry) {
     r.insert(cmd!(

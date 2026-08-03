@@ -10,10 +10,10 @@
 //! idempotency key, so capture entries coexist with plain ones
 //! (installing without `--capture` replaces nothing) and are removed manually.
 
-use crate::dispatch::Invocation;
-use crate::output::Outcome;
-use crate::protocol::agents::{agent_profile, known_agents, AgentProfile, SettingsFormat};
-use crate::registry::{arg, cmd, flag, Registry};
+use aoide_protocol::Invocation;
+use aoide_protocol::output::Outcome;
+use aoide_protocol::agents::{agent_profile, known_agents, AgentProfile, SettingsFormat};
+use aoide_protocol::registry::{arg, cmd, flag, Registry};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -300,7 +300,7 @@ fn hooks_install(inv: &Invocation) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_support::{unique_tmp, EnvSaver};
+    use aoide_test_support::{unique_tmp, EnvSaver};
     use std::collections::BTreeMap;
 
     fn install_inv(agent: &str, capture: bool) -> Invocation {
@@ -312,13 +312,13 @@ mod tests {
             path: vec!["hooks".into(), "install".into()],
             args: vec![agent.to_string()],
             flags,
-            door: crate::daemon::Door::Cli,
+            door: aoide_protocol::Door::Cli,
         }
     }
 
     #[test]
     fn kimi_install_creates_merges_and_is_idempotent() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _env = EnvSaver::capture(&["KIMI_CODE_HOME", "HOME"]);
         let root = unique_tmp("hooks-kimi");
         std::env::set_var("KIMI_CODE_HOME", root.join("kimi"));
@@ -328,7 +328,7 @@ mod tests {
         std::fs::write(&path, "default_model = \"kimi-code/k3-256k\"\n\n[providers.\"managed:kimi-code\"]\ntype = \"kimi\"\n").unwrap();
 
         let out = hooks_install(&install_inv("kimi", false));
-        assert_eq!(out.status, crate::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         let data = out.data.unwrap();
         assert_eq!(data["changed"], true);
         assert_eq!(data["added"].as_array().unwrap().len(), 10);
@@ -359,7 +359,7 @@ mod tests {
 
     #[test]
     fn kimi_capture_entries_coexist_with_plain_and_are_idempotent() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _env = EnvSaver::capture(&["KIMI_CODE_HOME", "HOME"]);
         let root = unique_tmp("hooks-kimi-cap");
         std::env::set_var("KIMI_CODE_HOME", root.join("kimi"));
@@ -388,7 +388,7 @@ mod tests {
 
     #[test]
     fn claude_install_reports_present_and_preserves_the_document() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
         let _env = EnvSaver::capture(&["HOME"]);
         let root = unique_tmp("hooks-claude");
         std::env::set_var("HOME", &root);
@@ -441,8 +441,8 @@ mod tests {
     #[test]
     fn install_unknown_agent_is_a_structured_error() {
         let out = hooks_install(&install_inv("bogus", false));
-        assert_eq!(out.status, crate::output::Status::Error);
-        assert_eq!(out.render(false).1, crate::output::exit::ERROR);
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
+        assert_eq!(out.render(false).1, aoide_protocol::output::exit::ERROR);
         let data = out.data.unwrap();
         assert_eq!(data["reason"], "unknown-agent");
         assert_eq!(data["agent"], "bogus");

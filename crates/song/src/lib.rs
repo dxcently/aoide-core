@@ -8,6 +8,7 @@
 //! derivation + resolution) land in Phase 5b with a `aoide-storage`
 //! dependency (`aoide_storage::fs::song_dir`).
 
+pub mod commands;
 pub mod cover;
 pub mod live;
 pub mod mint;

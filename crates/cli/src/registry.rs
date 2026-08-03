@@ -16,63 +16,12 @@
 //! the version consts) moved to `aoide-protocol` (Phase 2 restructure,
 //! docs/architecture/PACKAGE-LAYOUT.md) and are re-exported here so every
 //! existing `crate::registry::*` caller is untouched. The `cmd!`/`arg!`/`flag!`
-//! macros stay here — they expand to `$crate::registry::Command { .. }`
-//! literals reached through THIS crate's path, not the protocol crate's.
+//! macros moved there too (Phase 9 restructure) so every domain crate's
+//! `commands::register()` can describe its own verbs — they expand to
+//! `$crate::registry::Command { .. }` literals resolved inside the protocol
+//! crate, and are re-exported here under the same names.
 
 pub use aoide_protocol::registry::*;
-
-/// Small helper: a leaf command whose only flag is `--json`, wired to a
-/// handler fn. Every command group's `register()` uses this to build its
-/// `Command` entries — metadata copied verbatim from the pre-registry
-/// `schema.rs` table.
-macro_rules! cmd {
-    (
-        path: [$($seg:literal),*],
-        summary: $summary:literal,
-        args: [$($arg:expr),* $(,)?],
-        flags: [$($flag:expr),* $(,)?],
-        gated: $gated:expr,
-        implemented: $impl:expr,
-        handler: $handler:expr $(,)?
-    ) => {
-        $crate::registry::Command {
-            path: &[$($seg),*],
-            summary: $summary,
-            args: &[$($arg),*],
-            flags: &[$crate::registry::JSON_FLAG, $($flag),*],
-            gated: $gated,
-            implemented: $impl,
-            exit_codes: (),
-            handler: $handler,
-            available: || true,
-        }
-    };
-}
-
-macro_rules! arg {
-    ($name:literal, $ty:literal, $req:expr, $desc:literal) => {
-        $crate::registry::Arg {
-            name: $name,
-            ty: $ty,
-            required: $req,
-            description: $desc,
-        }
-    };
-}
-
-macro_rules! flag {
-    ($name:literal, $ty:literal, $desc:literal) => {
-        $crate::registry::Flag {
-            name: $name,
-            ty: $ty,
-            description: $desc,
-        }
-    };
-}
-
-pub(crate) use arg;
-pub(crate) use cmd;
-pub(crate) use flag;
 
 #[cfg(test)]
 mod tests {

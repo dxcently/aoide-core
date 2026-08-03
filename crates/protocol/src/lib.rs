@@ -8,7 +8,7 @@ pub mod registry;
 pub mod state;
 pub mod wire;
 
-pub use audit::{append_audit, audit, aoide_home, default_audit_log, AuditRecord, Door, EventClass};
+pub use audit::{append_audit, audit, aoide_home, audit_log_path, default_audit_log, AuditRecord, Door, EventClass};
 pub use invocation::Invocation;
 pub use model::context_ceiling_for_model;
 pub use policy::{Gate, GateProposal, Subscription};

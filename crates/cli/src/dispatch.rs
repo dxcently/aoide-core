@@ -12,7 +12,10 @@
 //! handler, returns the not-implemented envelope, or returns an
 //! unknown-command usage error — then appends to the single audit log and
 //! applies the gate tail uniformly. Every command's actual behavior lives in
-//! `commands/<group>.rs` (or, for `graph`/`conduct`, in `graph/`).
+//! its DOMAIN crate's `commands` module (`aoide_conduct::commands`,
+//! `aoide_song::commands`, … — Phase 9 restructure,
+//! docs/architecture/PACKAGE-LAYOUT.md), assembled here by
+//! `commands/mod.rs::all()`.
 //!
 //! `Invocation` moved to `aoide-protocol` (Phase 2 restructure,
 //! docs/architecture/PACKAGE-LAYOUT.md) — it's the type that broke the cycle
@@ -35,12 +38,10 @@ pub fn registry() -> &'static Registry {
 }
 
 /// The audit-log path in effect (flag override → `aoide.auditLog` default).
-pub(crate) fn audit_log_path(inv: &Invocation) -> std::path::PathBuf {
-    if let Some(p) = inv.flags.get("audit-log") {
-        return std::path::PathBuf::from(p);
-    }
-    daemon::default_audit_log()
-}
+/// The function itself moved to `aoide-protocol` (Phase 9 restructure) — both
+/// its inputs are protocol types; re-exported here so every existing
+/// `crate::dispatch::audit_log_path` caller is untouched.
+pub(crate) use aoide_protocol::audit_log_path;
 
 /// Dispatch one invocation to its handler and return the structured outcome.
 /// Every path here also appends to the single audit log — both doors inherit
