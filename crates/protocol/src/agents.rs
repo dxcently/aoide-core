@@ -4,7 +4,7 @@
 //! behind ONE lookup table, so a second harness lands as a new entry rather
 //! than a scatter of conditionals. The table is open (`agent_profile` returns
 //! `Option`); it holds `claude` (the first harness, moved here verbatim from
-//! `conduct`'s hook door and transcript readers) and `kimi`.
+//! `conduct`'s hook door and transcript readers), `kimi`, and `pi`.
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -67,6 +67,11 @@ pub struct TranscriptSpec {
 pub enum SettingsFormat {
     Json,
     Toml,
+    /// The harness's hook wiring is a DECLARATIVE file, not a settings file
+    /// the installer writes. pi's extension (`~/.pi/agent/extensions/`) is
+    /// managed by the NixOS dendrite, so `hooks install` short-circuits with a
+    /// clear message instead of writing a file the harness never reads.
+    Declarative,
 }
 
 /// Where an agent's hook settings live (a later installer verb writes them;
@@ -807,8 +812,262 @@ pub static KIMI_PROFILE: AgentProfile = AgentProfile {
     },
 };
 
+// ── pi ─────────────────────────────────────────────────────────────────────
+
+/// The Pi hook event map — exactly the events the aoide-pi-session extension
+/// emits (SessionStart/UserPromptSubmit/PreToolUse/PostToolUse/Stop/SessionEnd,
+/// canonical claude-shaped payloads). pi has no notification or sub-agent
+/// vocabulary visible to its extension API, so those classes never arise and
+/// every other name is an ok no-op.
+fn pi_hook_event(name: &str) -> HookClass {
+    match name {
+        "SessionStart" => HookClass::SessionStart,
+        "UserPromptSubmit" => HookClass::PromptSubmit,
+        "PreToolUse" => HookClass::PreToolUse,
+        "PostToolUse" => HookClass::PostToolUse,
+        "Stop" => HookClass::Stop,
+        "SessionEnd" => HookClass::SessionEnd,
+        _ => HookClass::Unknown,
+    }
+}
+
+// ── pi transcript layout ────────────────────────────────────────────────────
+//
+// pi writes one JSONL per session at
+// `~/.pi/agent/sessions/--<bucket(cwd)>--/<ISO-timestamp>_<session-uuid>.jsonl`
+// (or under the session root pi itself resolves — precedence: `--session-dir`
+// flag, `$PI_CODING_AGENT_SESSION_DIR`, then settings.json's `sessionDir`;
+// the locator honors only the env var, so a sessionDir-only config is a known
+// miss class). The uuid in the filename IS the session id (the file's header
+// `id` field).
+// Ground-truthed record types: `session` (header: id/cwd), `model_change`
+// (provider/modelId — the active model), `message` (user/assistant/toolResult;
+// an assistant message carries `provider` + `model` + `usage`), `session_info`
+// (name — pi's /rename), `thinking_level_change`.
+
+/// The pi sessions root: `$PI_CODING_AGENT_SESSION_DIR` when set, else
+/// `~/.pi/agent/sessions`.
+fn pi_sessions_root() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("PI_CODING_AGENT_SESSION_DIR").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    Some(PathBuf::from(std::env::var_os("HOME")?).join(".pi/agent/sessions"))
+}
+
+/// pi's own cwd bucket derivation (session-manager.js: strip a single leading
+/// `/` (or `\`), map `/`, `\`, `:` to `-` — dots and everything else
+/// preserved — then wrap in `--…--`). `/home/khoa/Aoide` →
+/// `--home-khoa-Aoide--`; `/home/khoa/.dotfiles` → `--home-khoa-.dotfiles--`.
+/// The claude munge is deliberately NOT reused: it also maps dots, which pi
+/// does not.
+fn pi_bucket(cwd: &str) -> String {
+    let stripped = cwd
+        .strip_prefix('/')
+        .or_else(|| cwd.strip_prefix('\\'))
+        .unwrap_or(cwd);
+    let mapped: String = stripped
+        .chars()
+        .map(|c| if c == '/' || c == '\\' || c == ':' { '-' } else { c })
+        .collect();
+    format!("--{mapped}--")
+}
+
+/// Resolve a session's transcript: prefer the hook-supplied hint when it names
+/// a real file (the pi extension hands over `getSessionFile()`), else the
+/// `<ts>_<session_id>.jsonl` file under the session's cwd bucket
+/// ([`pi_bucket`]).
+fn pi_transcript_locate(
+    session_id: &str,
+    cwd: Option<&str>,
+    hinted: Option<&str>,
+) -> Option<PathBuf> {
+    if let Some(h) = hinted.filter(|s| !s.is_empty()) {
+        let p = PathBuf::from(h);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let cwd = cwd.filter(|s| !s.is_empty())?;
+    let dir = pi_sessions_root()?.join(pi_bucket(cwd));
+    let suffix = format!("_{session_id}.jsonl");
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let Some(name) = e.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if name.ends_with(&suffix) && e.path().is_file() {
+            return Some(e.path());
+        }
+    }
+    None
+}
+
+/// The agent's latest words off a pi jsonl tail: the last `message` line whose
+/// `role` is `assistant`, taking its LAST `text` content block (the freshest
+/// prose; `thinking`/`toolCall` blocks are not words). `skip_sidechain` is a
+/// claude-ism — pi has no sidechain concept — so it is accepted and ignored.
+fn pi_extract_say(lines: &[String], _: bool) -> Option<String> {
+    const SAY_MAX: usize = 160;
+    let mut found: Option<String> = None;
+    for line in lines {
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if v.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let m = v.get("message");
+        if m.and_then(|m| m.get("role")).and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(content) = m.and_then(|m| m.get("content")).and_then(Value::as_array) else {
+            continue;
+        };
+        for block in content.iter().rev() {
+            if block.get("type").and_then(Value::as_str) == Some("text") {
+                if let Some(t) = block.get("text").and_then(Value::as_str) {
+                    let t = t.trim();
+                    if !t.is_empty() {
+                        found = Some(one_line_clip(t, SAY_MAX));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The session's NAME: the last `session_info` entry's `name` in the tail
+/// (pi's /rename — the session selector's display name). None when never
+/// renamed (the graph names the session from the first prompt instead).
+fn pi_extract_title(lines: &[String]) -> Option<String> {
+    let mut found: Option<String> = None;
+    for line in lines {
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if v.get("type").and_then(Value::as_str) != Some("session_info") {
+            continue;
+        }
+        if let Some(n) = v.get("name").and_then(Value::as_str) {
+            let n = n.trim();
+            if !n.is_empty() {
+                found = Some(one_line_clip(n, 48));
+            }
+        }
+    }
+    found
+}
+
+/// The session's active model: the freshest `model_change` (provider/modelId)
+/// or assistant `message` (provider/model) — both written per model/turn, last
+/// wins. The provider prefix mirrors kimi's provider-prefixed on-disk ids: pi
+/// can run ANY provider, so the bare model id alone is ambiguous.
+fn pi_extract_model(lines: &[String], _: bool) -> Option<String> {
+    let mut found: Option<String> = None;
+    for line in lines {
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        let (provider, model) = match v.get("type").and_then(Value::as_str) {
+            Some("model_change") => (v.get("provider"), v.get("modelId")),
+            Some("message") => {
+                let m = v.get("message");
+                if m.and_then(|m| m.get("role")).and_then(Value::as_str) != Some("assistant") {
+                    continue;
+                }
+                (m.and_then(|m| m.get("provider")), m.and_then(|m| m.get("model")))
+            }
+            _ => continue,
+        };
+        let (Some(p), Some(m)) = (provider.and_then(Value::as_str), model.and_then(Value::as_str))
+        else {
+            continue;
+        };
+        let p = p.trim();
+        let m = m.trim();
+        if p.is_empty() || m.is_empty() {
+            continue;
+        }
+        found = Some(format!("{p}/{m}"));
+    }
+    found
+}
+
+/// The context-window fill at the last request: the freshest assistant
+/// `message`'s input-side `usage` — `input + cacheRead + cacheWrite` (mirrors
+/// claude's input + cache-creation + cache-read; output and reasoning are what
+/// the turn produced, not what sat in the window).
+///
+/// `None` when the tail holds no assistant turn with a usage block.
+fn pi_context_tokens(lines: &[String]) -> Option<u64> {
+    let mut found: Option<u64> = None;
+    for line in lines {
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if v.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let m = v.get("message");
+        if m.and_then(|m| m.get("role")).and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(usage) = m.and_then(|m| m.get("usage")) else {
+            continue;
+        };
+        let sum = ["input", "cacheRead", "cacheWrite"]
+            .iter()
+            .map(|k| usage.get(k).and_then(Value::as_u64).unwrap_or(0))
+            .sum();
+        found = Some(sum);
+    }
+    found
+}
+
+/// pi has no sub-agent transcripts: its children (pi-subagents) are separate
+/// pi processes, excluded from tracking on the extension side (non-tui) —
+/// never a `sub:` node. Always None.
+fn pi_subagents_dir(_: &str, _: Option<&str>) -> Option<PathBuf> {
+    None
+}
+
+/// Unreachable for pi (no sub-agent dir); mirrors the seam's signature.
+fn pi_find_subagent(_: &Path, _: &str) -> Option<PathBuf> {
+    None
+}
+
+/// The Pi profile. The aoide-pi-session extension emits canonical
+/// claude-shaped payloads, so normalize is identity. Its sub-agent children
+/// run non-interactively (never reach the graph) and its permissions are
+/// invisible to the extension API, so both vocabularies are empty. The model
+/// ceiling reuses the shared logic (claude-family ids resolve to their real
+/// tiers; kimi/deepseek/other ids take the conservative 200k default).
+pub static PI_PROFILE: AgentProfile = AgentProfile {
+    name: "pi",
+    hook_event_map: pi_hook_event,
+    permission_vocab: &[],
+    subagent_tools: &[],
+    normalize_payload: normalize_identity,
+    model_ceiling: crate::model::context_ceiling_for_model,
+    transcript: TranscriptSpec {
+        locate: pi_transcript_locate,
+        tail: transcript_tail,
+        say: pi_extract_say,
+        title: pi_extract_title,
+        model: pi_extract_model,
+        context_tokens: pi_context_tokens,
+        subagents_dir: pi_subagents_dir,
+        find_subagent: pi_find_subagent,
+    },
+    hook_settings: SettingsSpec {
+        relative_path: ".pi/agent/extensions/aoide-pi-session.ts",
+        format: SettingsFormat::Declarative,
+    },
+};
+
 /// The profile table. New harnesses land here as another entry.
-static PROFILES: &[&'static AgentProfile] = &[&CLAUDE_PROFILE, &KIMI_PROFILE];
+static PROFILES: &[&AgentProfile] = &[&CLAUDE_PROFILE, &KIMI_PROFILE, &PI_PROFILE];
 
 /// Look up an agent harness's profile by name (`claude`, `kimi`, …). `None`
 /// for a harness the bridge has no profile for.
@@ -818,7 +1077,7 @@ pub fn agent_profile(name: &str) -> Option<&'static AgentProfile> {
 
 /// Every agent name with a registered profile.
 pub fn known_agents() -> &'static [&'static str] {
-    &["claude", "kimi"]
+    &["claude", "kimi", "pi"]
 }
 
 #[cfg(test)]
@@ -832,9 +1091,10 @@ mod tests {
         let p = agent_profile("claude").expect("claude is registered");
         assert_eq!(p.name, "claude");
         assert_eq!(agent_profile("kimi").expect("kimi is registered").name, "kimi");
+        assert_eq!(agent_profile("pi").expect("pi is registered").name, "pi");
         assert!(agent_profile("nope").is_none());
         assert!(agent_profile("").is_none());
-        assert_eq!(known_agents(), &["claude", "kimi"]);
+        assert_eq!(known_agents(), &["claude", "kimi", "pi"]);
     }
 
     #[test]
@@ -1137,6 +1397,145 @@ mod tests {
         match saved {
             Some(v) => std::env::set_var("KIMI_CODE_HOME", v),
             None => std::env::remove_var("KIMI_CODE_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── the pi profile ────────────────────────────────────────────────────
+
+    #[test]
+    fn pi_hook_event_map_covers_the_lifecycle_only() {
+        let map = PI_PROFILE.hook_event_map;
+        assert_eq!(map("SessionStart"), HookClass::SessionStart);
+        assert_eq!(map("UserPromptSubmit"), HookClass::PromptSubmit);
+        assert_eq!(map("PreToolUse"), HookClass::PreToolUse);
+        assert_eq!(map("PostToolUse"), HookClass::PostToolUse);
+        assert_eq!(map("Stop"), HookClass::Stop);
+        assert_eq!(map("SessionEnd"), HookClass::SessionEnd);
+        // pi has no notification/sub-agent vocabulary — those are ok no-ops.
+        for evt in ["Notification", "SubagentStart", "SubagentStop", "Zzz", ""] {
+            assert_eq!(map(evt), HookClass::Unknown, "event: {evt}");
+        }
+    }
+
+    #[test]
+    fn pi_profile_pins_vocab_tools_ceiling_and_settings() {
+        assert!(PI_PROFILE.permission_vocab.is_empty());
+        assert!(PI_PROFILE.subagent_tools.is_empty());
+        // The shared ceiling logic: claude-family ids resolve, everything else
+        // (kimi/deepseek ids, garbage, None) takes the conservative default.
+        let ceil = PI_PROFILE.model_ceiling;
+        assert_eq!(ceil(Some("claude-sonnet-5")), 1_000_000);
+        assert_eq!(ceil(Some("deepseek/deepseek-v4-flash")), 200_000);
+        assert_eq!(ceil(Some("kimi-code/k3")), 200_000);
+        assert_eq!(ceil(None), 200_000);
+        assert_eq!(
+            PI_PROFILE.hook_settings.relative_path,
+            ".pi/agent/extensions/aoide-pi-session.ts"
+        );
+        assert_eq!(PI_PROFILE.hook_settings.format, SettingsFormat::Declarative);
+    }
+
+    #[test]
+    fn pi_transcript_extractors_read_the_jsonl_layout() {
+        // Fixture mirrors the real pi jsonl record shapes (session
+        // 019ff466-… capture): header, model_change, user/assistant messages
+        // with provider/model/usage, session_info naming, thinking + toolCall
+        // content blocks.
+        let lines: Vec<String> = [
+            r#"{"type":"session","version":3,"id":"s1","cwd":"/p"}"#,
+            r#"{"type":"model_change","provider":"deepseek","modelId":"deepseek-v4-flash"}"#,
+            r#"{"type":"message","message":{"role":"user","content":[{"type":"text","text":"do it"}]}}"#,
+            r#"{"type":"message","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"first words"},{"type":"toolCall","id":"c1","name":"bash","arguments":{}}]}}"#,
+            r#"{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"  the  latest\nwords  "}],"provider":"deepseek","model":"deepseek-v4-flash","usage":{"input":100,"output":9,"cacheRead":20,"cacheWrite":3,"reasoning":5}}}"#,
+            r#"{"type":"session_info","name":"Refactor Module"}"#,
+            r#"{"type":"message","message":{"role":"toolResult","toolCallId":"c1","toolName":"bash","content":[]}}"#,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let spec = &PI_PROFILE.transcript;
+        // say: the LAST text block of the freshest assistant message;
+        // thinking/toolCall blocks are not words, toolResult/user are not
+        // assistant.
+        assert_eq!((spec.say)(&lines, true).as_deref(), Some("the latest words"));
+        // model: freshest provider/model (deepseek/deepseek-v4-flash), last
+        // wins over the earlier model_change.
+        assert_eq!(
+            (spec.model)(&lines, true).as_deref(),
+            Some("deepseek/deepseek-v4-flash")
+        );
+        // context: freshest assistant usage's input side only (100+20+3;
+        // output/reasoning excluded).
+        assert_eq!((spec.context_tokens)(&lines), Some(123));
+        // title: last session_info name; a never-renamed session has none.
+        assert_eq!((spec.title)(&lines).as_deref(), Some("Refactor Module"));
+        let bare: Vec<String> =
+            vec![r#"{"type":"session","id":"s1"}"#.to_string()];
+        assert_eq!((spec.title)(&bare), None);
+        assert!((spec.say)(&bare, true).is_none());
+        assert!((spec.model)(&bare, true).is_none());
+        assert!((spec.context_tokens)(&bare).is_none());
+    }
+
+    #[test]
+    fn pi_transcript_locate_finds_the_cwd_bucket_file() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap();
+        let saved = std::env::var_os("PI_CODING_AGENT_SESSION_DIR");
+        let root = std::env::temp_dir().join(format!("aoide_pi_home_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // The real on-disk shape: --<bucket(cwd)>--/<ts>_<session_id>.jsonl,
+        // with the header id matching the filename uuid.
+        let bucket = root.join("--home-khoa-Aoide--");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(
+            bucket.join("2026-08-12T05-16-56-318Z_s1.jsonl"),
+            concat!(
+                "{\"type\":\"session\",\"version\":3,\"id\":\"s1\"}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"provider\":\"deepseek\",\"model\":\"deepseek-v4-flash\"}}\n"
+            ),
+        )
+        .unwrap();
+        std::env::set_var("PI_CODING_AGENT_SESSION_DIR", &root);
+
+        let spec = &PI_PROFILE.transcript;
+        // locate: the cwd bucket + filename uuid resolve; the hint wins over
+        // any derivation; a wrong bucket or unknown id is None.
+        let found = (spec.locate)("s1", Some("/home/khoa/Aoide"), None).unwrap();
+        assert!(found.ends_with("2026-08-12T05-16-56-318Z_s1.jsonl"));
+        assert_eq!(
+            (spec.locate)("s2", None, Some(found.to_str().unwrap())),
+            Some(found.clone())
+        );
+        assert!((spec.locate)("s1", Some("/elsewhere"), None).is_none());
+        assert!((spec.locate)("s2", Some("/home/khoa/Aoide"), None).is_none());
+        // Dots are PRESERVED in pi's buckets (unlike claude's munge):
+        // /home/khoa/.dotfiles → --home-khoa-.dotfiles--, never
+        // --home-khoa--dotfiles--. Pin the divergence.
+        let dotbucket = root.join("--home-khoa-.dotfiles--");
+        std::fs::create_dir_all(&dotbucket).unwrap();
+        std::fs::write(dotbucket.join("2026-08-12T05-16-56-318Z_s3.jsonl"), "\n").unwrap();
+        assert!(
+            (spec.locate)("s3", Some("/home/khoa/.dotfiles"), None)
+                .unwrap()
+                .ends_with("2026-08-12T05-16-56-318Z_s3.jsonl")
+        );
+        assert!((spec.locate)("s3", Some("/home/khoa/Aoide"), None).is_none());
+        // The tail + extractors work end-to-end through the spec.
+        let lines = (spec.tail)(&found);
+        assert_eq!((spec.say)(&lines, true).as_deref(), Some("hi"));
+        assert_eq!(
+            (spec.model)(&lines, true).as_deref(),
+            Some("deepseek/deepseek-v4-flash")
+        );
+        // No sub-agent machinery for pi.
+        assert!((spec.subagents_dir)("s1", None).is_none());
+        assert!((spec.subagents_dir)("s_nope", None).is_none());
+
+        match saved {
+            Some(v) => std::env::set_var("PI_CODING_AGENT_SESSION_DIR", v),
+            None => std::env::remove_var("PI_CODING_AGENT_SESSION_DIR"),
         }
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -21,7 +21,7 @@ pub fn register(r: &mut Registry) {
     r.insert(cmd!(
         path: ["hooks", "install"],
         summary: "Wire an agent harness's settings file to pipe its hooks into `graph session hook` (idempotent merge; never clobbers existing config).",
-        args: [arg!("agent", "string", true, "Agent harness to wire up (claude | kimi).")],
+        args: [arg!("agent", "string", true, "Agent harness to wire up (claude | kimi | pi).")],
         flags: [flag!("capture", "bool", "TEMPORARY debugging: wrap the hook command to tee raw payloads to ~/Aoide/state/<agent>-hooks.jsonl. Capture entries coexist with the plain ones (installing without --capture replaces nothing); remove them manually when done.")],
         gated: false,
         implemented: true,
@@ -70,6 +70,9 @@ fn door_command(profile: &AgentProfile, capture: bool) -> String {
                     .to_string()
             }
             SettingsFormat::Toml => format!("aoide graph session hook --agent {}", profile.name),
+            // Unreachable for the declarative profiles — `hooks_install`
+            // short-circuits before any door command is built.
+            SettingsFormat::Declarative => format!("aoide graph session hook --agent {}", profile.name),
         }
     }
 }
@@ -235,6 +238,22 @@ fn hooks_install(inv: &Invocation) -> Outcome {
         .with_data(json!({ "reason": "unknown-agent", "agent": agent, "known": known_agents() }));
     };
     let capture = inv.flag_present("capture");
+    // A declaratively-wired harness (pi: the ~/.pi/agent/extensions/ file the
+    // NixOS dendrite manages) has no settings file for this verb to write —
+    // report it as already wired instead of minting a file the harness never
+    // reads.
+    if profile.hook_settings.format == SettingsFormat::Declarative {
+        let message = format!(
+            "{}'s hooks are wired declaratively ({}); nothing to install here (capture is N/A)",
+            profile.name, profile.hook_settings.relative_path
+        );
+        return Outcome::ok(cmd, message).with_data(json!({
+            "agent": profile.name,
+            "reason": "declarative",
+            "settings": profile.hook_settings.relative_path,
+            "changed": false,
+        }));
+    }
     let path = match settings_path(profile) {
         Ok(p) => p,
         Err(e) => {
@@ -244,6 +263,7 @@ fn hooks_install(inv: &Invocation) -> Outcome {
     let result = match profile.hook_settings.format {
         SettingsFormat::Toml => install_toml(&path, profile, capture),
         SettingsFormat::Json => install_json(&path, profile, capture),
+        SettingsFormat::Declarative => unreachable!("short-circuited in hooks_install"),
     };
     let report = match result {
         Ok(r) => r,
@@ -439,6 +459,25 @@ mod tests {
     }
 
     #[test]
+    fn pi_install_is_declarative_and_writes_nothing() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _env = EnvSaver::capture(&["HOME"]);
+        let root = unique_tmp("hooks-pi");
+        std::env::set_var("HOME", &root);
+
+        let out = hooks_install(&install_inv("pi", false));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+        let data = out.data.unwrap();
+        assert_eq!(data["reason"], "declarative");
+        assert_eq!(data["changed"], false);
+        assert_eq!(data["settings"], ".pi/agent/extensions/aoide-pi-session.ts");
+        // No settings file was minted anywhere under the fake home.
+        assert!(!root.join(".pi").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn install_unknown_agent_is_a_structured_error() {
         let out = hooks_install(&install_inv("bogus", false));
         assert_eq!(out.status, aoide_protocol::output::Status::Error);
@@ -446,6 +485,6 @@ mod tests {
         let data = out.data.unwrap();
         assert_eq!(data["reason"], "unknown-agent");
         assert_eq!(data["agent"], "bogus");
-        assert_eq!(data["known"], json!(["claude", "kimi"]));
+        assert_eq!(data["known"], json!(["claude", "kimi", "pi"]));
     }
 }

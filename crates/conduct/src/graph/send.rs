@@ -1930,6 +1930,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(&stage);
     }
     #[test]
+    fn pi_hook_lifecycle_start_prompt_tools_stop_end() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("pi-hook");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let pi = agent_profile("pi").unwrap();
+        let live_state = || -> String {
+            let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+            s.sessions[0].state.clone()
+        };
+
+        // SessionStart registers the session — agent recorded as pi, idle.
+        let out = hook_for_profile(
+            pi,
+            r#"{ "session_id": "p1", "hook_event_name": "SessionStart", "cwd": "/proj" }"#,
+        );
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(s.sessions.len(), 1);
+        assert_eq!(s.sessions[0].agent, "pi");
+        assert_eq!(s.sessions[0].cwd, "/proj");
+        assert_eq!(s.sessions[0].state, "idle");
+
+        // UserPromptSubmit names the session (set-once) and → working.
+        hook_for_profile(
+            pi,
+            r#"{ "session_id": "p1", "hook_event_name": "UserPromptSubmit", "user_prompt": "do the thing" }"#,
+        );
+        assert_eq!(live_state(), "working");
+        assert_eq!(
+            load_stage::<SessionsFile>(&sessions_path()).unwrap().sessions[0].title.as_deref(),
+            Some("do the thing")
+        );
+
+        // PreToolUse sets the tool as activity; PostToolUse clears it — with
+        // pi's empty subagent_tools, no sub-node is ever spawned.
+        hook_for_profile(
+            pi,
+            r#"{ "session_id": "p1", "hook_event_name": "PreToolUse", "tool_name": "bash", "tool_use_id": "call_1" }"#,
+        );
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(s.sessions[0].activity.as_deref(), Some("bash"));
+        assert_eq!(
+            s.sessions.iter().filter(|x| x.session_id.starts_with("sub:")).count(),
+            0,
+            "pi never spawns sub-nodes"
+        );
+        assert_eq!(live_state(), "working");
+        hook_for_profile(
+            pi,
+            r#"{ "session_id": "p1", "hook_event_name": "PostToolUse", "tool_name": "bash", "tool_use_id": "call_1" }"#,
+        );
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert!(s.sessions[0].activity.is_none(), "activity cleared at the tool end");
+        assert_eq!(live_state(), "working");
+
+        // pi events with no pi vocabulary are ok no-ops (never an error).
+        for evt in ["Notification", "SubagentStart", "SubagentStop", "PermissionRequest"] {
+            let out = hook_for_profile(
+                pi,
+                &format!(r#"{{ "session_id": "p1", "hook_event_name": "{evt}" }}"#),
+            );
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "event: {evt}");
+            assert_eq!(out.data.unwrap()["action"], "none", "event: {evt}");
+        }
+        assert_eq!(live_state(), "working", "no-op events never move the phase");
+
+        // Stop settles the turn; SessionEnd ends the session.
+        hook_for_profile(pi, r#"{ "session_id": "p1", "hook_event_name": "Stop" }"#);
+        assert_eq!(live_state(), "stopped");
+        hook_for_profile(pi, r#"{ "session_id": "p1", "hook_event_name": "SessionEnd" }"#);
+        assert_eq!(live_state(), "done");
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+    #[test]
     fn hook_agent_flag_selects_the_profile_or_errors() {
         // No flag → the claude default.
         let inv = flag_invocation(&["graph", "session", "hook"], &[]);
@@ -1937,6 +2017,9 @@ mod tests {
         // --agent kimi → the kimi profile.
         let inv = flag_invocation(&["graph", "session", "hook"], &[("agent", "kimi")]);
         assert_eq!(hook_profile_for(&inv).unwrap().name, "kimi");
+        // --agent pi → the pi profile.
+        let inv = flag_invocation(&["graph", "session", "hook"], &[("agent", "pi")]);
+        assert_eq!(hook_profile_for(&inv).unwrap().name, "pi");
         // --agent bogus → a structured error (exit 1, reason + the known list).
         let inv = flag_invocation(&["graph", "session", "hook"], &[("agent", "bogus")]);
         let out = match hook_profile_for(&inv) {
@@ -1948,6 +2031,6 @@ mod tests {
         let data = out.data.unwrap();
         assert_eq!(data["reason"], "unknown-agent");
         assert_eq!(data["agent"], "bogus");
-        assert_eq!(data["known"], json!(["claude", "kimi"]));
+        assert_eq!(data["known"], json!(["claude", "kimi", "pi"]));
     }
 }
