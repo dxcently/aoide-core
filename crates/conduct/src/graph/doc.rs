@@ -331,6 +331,41 @@ pub fn would_cycle(sessions: &[SessionRecord], child: &str, parent: &str) -> boo
     }
 }
 
+/// Transitive `kind=="subagent"` descendants of `roots` — NOT including the
+/// roots themselves. A Task node carries no pid/window, so cascading it out
+/// when its owning session ends/is pruned/is reaped is its ONLY cleanup path
+/// (`is_session_dead` structurally can never fire for one). Walks
+/// `parent_session_id` via a fixed-point loop so subagent-of-subagent nesting
+/// resolves in one call. Shared by `prune_done` (below) and
+/// `do_session_end_inner` (`session_store.rs`) — the two cascade paths that
+/// used to diverge (this fix's root cause).
+pub(in crate::graph) fn doomed_subagent_descendants(
+    sessions: &[SessionRecord],
+    roots: &HashSet<&str>,
+) -> HashSet<String> {
+    let mut doomed: HashSet<String> = HashSet::new();
+    loop {
+        let mut grew = false;
+        for s in sessions {
+            if s.kind.as_deref() == Some("subagent")
+                && !roots.contains(s.session_id.as_str())
+                && !doomed.contains(s.session_id.as_str())
+            {
+                if let Some(p) = &s.parent_session_id {
+                    if roots.contains(p.as_str()) || doomed.contains(p.as_str()) {
+                        doomed.insert(s.session_id.clone());
+                        grew = true;
+                    }
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    doomed
+}
+
 /// The prune computation: drop `done` sessions (+ their hook records); clear
 /// `parentSessionId` on surviving children of removed sessions.
 pub fn prune_done(
@@ -342,11 +377,19 @@ pub fn prune_done(
     Vec<String>,
     Vec<String>,
 ) {
-    let removed: Vec<String> = sessions
+    let mut removed: Vec<String> = sessions
         .iter()
         .filter(|s| s.state == "done")
         .map(|s| s.session_id.clone())
         .collect();
+    // Cascade: a subagent descendant of anything just marked done is ALSO
+    // gone — closes the gap where this function (unlike `do_session_end_inner`)
+    // only cleared the child's dangling `parentSessionId` instead of dropping
+    // it, stranding un-reapable `kind:"subagent"` ghosts (state stuck
+    // "working" forever — see `is_session_dead` in reap.rs).
+    let gone_direct: HashSet<&str> = removed.iter().map(String::as_str).collect();
+    let cascaded = doomed_subagent_descendants(&sessions, &gone_direct);
+    removed.extend(cascaded);
     let gone: HashSet<&str> = removed.iter().map(String::as_str).collect();
 
     let mut cleared: Vec<String> = Vec::new();
@@ -542,6 +585,26 @@ mod tests {
         // p's hook record went with it; c1's survives.
         assert_eq!(kept_h.len(), 1);
         assert_eq!(kept_h[0].session_id, "c1");
+    }
+    #[test]
+    fn prune_cascades_subagent_descendants_of_a_done_session() {
+        let top = session("top", "/x", "done", "1", None);
+        let mut sub1 = session("sub:t1", "/x", "working", "2", Some("top"));
+        sub1.kind = Some("subagent".into());
+        // subagent-of-subagent: multi-level nesting must cascade in one pass.
+        let mut sub2 = session("sub:t2", "/x", "working", "3", Some("sub:t1"));
+        sub2.kind = Some("subagent".into());
+        let free = session("free", "/x", "idle", "4", None);
+        let sessions = vec![top, sub1, sub2, free];
+
+        let (kept_s, _kept_h, mut removed, _cleared) = prune_done(sessions, vec![]);
+        removed.sort();
+        assert_eq!(
+            removed,
+            vec!["sub:t1".to_string(), "sub:t2".to_string(), "top".to_string()]
+        );
+        let ids: Vec<&str> = kept_s.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["free"], "the whole subagent subtree cascades with its done parent");
     }
     #[test]
     fn graph_node_carries_workspace_only_when_known() {

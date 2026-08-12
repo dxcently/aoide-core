@@ -7,7 +7,7 @@
 //! graph.json so the read path lights up immediately.
 
 use super::common::{require_flag, stage_error};
-use super::doc::{prune_done, restage_graph, would_cycle};
+use super::doc::{doomed_subagent_descendants, prune_done, restage_graph, would_cycle};
 use super::model::{
     canonical_state, hooks_path, load_stage, sessions_path, write_stage, HooksFile,
     SessionRecord, SessionsFile, STAGE_GRAPH_VERSION,
@@ -724,28 +724,11 @@ fn do_session_end_inner(id: &str) -> Outcome {
     // Cascade: remove the session's sub-agent subtree. Task nodes carry no pid or
     // window, so the liveness reaper can never clean them — the owning session's
     // end IS their lifecycle end. Collect the transitive `subagent` descendants
-    // and drop them (the session itself stays, marked done).
-    let mut doomed: HashSet<String> = HashSet::new();
-    doomed.insert(id.to_string());
-    loop {
-        let mut grew = false;
-        for s in &s_file.sessions {
-            if s.kind.as_deref() == Some("subagent") && !doomed.contains(&s.session_id) {
-                if let Some(p) = &s.parent_session_id {
-                    if doomed.contains(p) {
-                        doomed.insert(s.session_id.clone());
-                        grew = true;
-                    }
-                }
-            }
-        }
-        if !grew {
-            break;
-        }
-    }
-    s_file
-        .sessions
-        .retain(|s| s.session_id == id || !doomed.contains(&s.session_id));
+    // (shared with `prune_done`'s own cascade, `doomed_subagent_descendants`) and
+    // drop them (the session itself stays, marked done).
+    let roots: HashSet<&str> = std::iter::once(id).collect();
+    let doomed = doomed_subagent_descendants(&s_file.sessions, &roots);
+    s_file.sessions.retain(|s| !doomed.contains(&s.session_id));
     if s_file.schema_version.is_empty() {
         s_file.schema_version = STAGE_GRAPH_VERSION.to_string();
     }
@@ -1432,6 +1415,59 @@ mod tests {
         let again = reap(&invocation(&["graph", "reap"], &[]));
         assert_eq!(again.status, aoide_protocol::output::Status::Ok);
         assert_eq!(again.data.unwrap()["reaped"], json!([]));
+
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+    #[test]
+    fn reap_cascades_an_orphaned_subagent_when_its_top_level_parent_is_reaped() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "HYPRLAND_INSTANCE_SIGNATURE"]);
+        std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"); // pid-only liveness
+        let stage = unique_stage("reap-subagent-cascade");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        // A pid that cannot possibly be alive → the pid-dead signal fires for `top`.
+        let dead_pid = u32::MAX;
+        let now = "2026-01-01T00:00:00Z";
+        let mut sessions = Vec::new();
+        upsert_session(
+            &mut sessions, "top", None, Some("/w"), None, None, None, None, None,
+            Some(dead_pid), now,
+        );
+        // The orphaned Task node — no window, no pid, kind:"subagent" — exactly
+        // the shape of the two live ghosts this fix targets.
+        sessions.push(SessionRecord {
+            session_id: "sub:orphan".into(),
+            agent: "general-purpose".into(),
+            state: "working".into(),
+            started_at: now.into(),
+            parent_session_id: Some("top".into()),
+            kind: Some("subagent".into()),
+            ..Default::default()
+        });
+        write_stage(
+            &sessions_path(),
+            &SessionsFile { schema_version: "0".into(), sessions },
+        )
+        .unwrap();
+        let mut hooks = Vec::new();
+        upsert_hook(&mut hooks, "top", "running", now);
+        write_stage(
+            &hooks_path(),
+            &HooksFile { schema_version: "0".into(), hooks },
+        )
+        .unwrap();
+
+        let out = reap(&invocation(&["graph", "reap"], &[]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+
+        let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let ids: Vec<&str> = s2.sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert!(!ids.contains(&"top"), "the pid-dead top-level session was reaped");
+        assert!(
+            !ids.contains(&"sub:orphan"),
+            "its orphaned subagent child cascades away with it — the gap this test guards"
+        );
 
         let _ = std::fs::remove_dir_all(&stage);
     }
