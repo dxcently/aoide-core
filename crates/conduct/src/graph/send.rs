@@ -671,6 +671,46 @@ fn hook_from_str(buf: &str) -> Outcome {
 /// an ok no-op; a mapped action runs the matching core but its outcome is ALWAYS
 /// folded into an ok envelope: this door runs inside interactive-session hooks
 /// and must never exit non-zero (a stage hiccup must not break the session).
+/// Self-heal for the hook door: a live session whose store record was ended
+/// or pruned mid-process (an errant SessionEnd payload, a conversation switch
+/// that fired End, a store reset, a reap during a hook-silent restart window)
+/// re-registers on its NEXT real event — harnesses fire SessionStart only at
+/// launch, so without this the session is permanently invisible to the graph
+/// until the harness restarts. Mirror of the `Start` arm's registration
+/// (window discovery + `AOIDE_SESSION_ID` env-parent threading), inserting a
+/// fresh idle record; no-op when the id already exists. `sub:` ids are never
+/// implicit-started — they exist only as children of a registered parent.
+fn hook_ensure_session(profile: &AgentProfile, payload: &Value, id: &str) {
+    if id.starts_with("sub:") {
+        return;
+    }
+    let exists = load_stage::<SessionsFile>(&sessions_path())
+        .map(|f| f.sessions.iter().any(|s| s.session_id == id))
+        .unwrap_or(false);
+    if exists {
+        return;
+    }
+    let cwd = payload.get("cwd").and_then(Value::as_str).map(str::to_string);
+    let (window, pid) = match discover_window() {
+        Some((addr, pid, _workspace)) => (Some(addr), Some(pid)),
+        None => (None, None),
+    };
+    let env_parent = std::env::var("AOIDE_SESSION_ID")
+        .ok()
+        .filter(|p| !p.is_empty() && *p != id);
+    let _ = do_session_start(
+        &id,
+        Some(profile.name),
+        cwd.as_deref(),
+        window.as_deref(),
+        env_parent.as_deref(),
+        None,
+        None,
+        None,
+        pid,
+    );
+}
+
 fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
     let cmd = "graph.session.hook";
     let noop = |reason: &str| {
@@ -729,6 +769,14 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
             out
         }
         HookAction::Phase { id, phase, name } => {
+            // Self-heal: a live session whose store record was ended or pruned
+            // mid-process (an errant SessionEnd payload, a conversation switch,
+            // a store reset, a reap during a hook-silent restart window) comes
+            // back on its NEXT event — harnesses fire SessionStart only at
+            // launch, so without this the session is permanently invisible until
+            // the harness restarts. Same registration path as Start (window +
+            // env-parent threading), fresh idle.
+            hook_ensure_session(profile, &payload, &id);
             // Backfill a still-empty windowAddress on any later hook — covers a
             // session that registered before the window mapped (or before this
             // discovery shipped), so it becomes jumpable without a restart.
@@ -741,6 +789,7 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
             out
         }
         HookAction::PhaseIfRunning { id, phase } => {
+            hook_ensure_session(profile, &payload, &id);
             ensure_session_window(&id);
             do_session_phase_if(&id, &phase, "working")
         }
@@ -750,6 +799,7 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
             activity,
             spawn,
         } => {
+            hook_ensure_session(profile, &payload, &session);
             ensure_session_window(&session);
             // Spawn the child FIRST so it exists before its parent's activity
             // points at it, then mark the owner working + its current activity.
@@ -764,6 +814,7 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
             owner,
             end_sub,
         } => {
+            hook_ensure_session(profile, &payload, &session);
             ensure_session_window(&session);
             if let Some(sub) = end_sub {
                 do_subagent_end(&sub);
@@ -779,6 +830,7 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
             from_sub_id,
             to_sub_id,
         } => {
+            hook_ensure_session(profile, &payload, &session);
             ensure_session_window(&session);
             do_subagent_rekey(&from_sub_id, &to_sub_id);
             // The launch returned; the parent is no longer running that tool in
@@ -796,6 +848,7 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
             agent_type,
             create,
         } => {
+            hook_ensure_session(profile, &payload, &session);
             do_subagent_spawn(&sub_id, &session, &agent_type, &agent_type, create);
             Outcome::ok("graph.session.hook", format!("subagent {sub_id}"))
         }
@@ -893,6 +946,7 @@ mod tests {
     use super::*;
     use crate::graph::common::load_inputs;
     use crate::graph::conduct::conduct_socket_path;
+    use crate::graph::doc::prune_done;
     use crate::graph::model::{hooks_path, merged_sessions, HooksFile};
     use crate::graph::testutil::*;
 
@@ -2009,6 +2063,91 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&stage);
     }
+    #[test]
+    fn hook_self_heals_a_pruned_session_on_its_next_event() {
+        // The kimi regression: a live session got a SessionEnd payload (the
+        // process never exited), was pruned as `done`, and no further event
+        // could ever re-register it — SessionStart fires only at harness
+        // launch. The door must treat the first event for an unknown id as an
+        // implicit start.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("hook-heal");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let kimi = agent_profile("kimi").unwrap();
+        let pay = |name: &str, extra: serde_json::Value| {
+            let mut m = serde_json::Map::new();
+            m.insert("hook_event_name".into(), name.into());
+            m.insert("session_id".into(), "ghost-1".into());
+            m.insert("cwd".into(), "/proj".into());
+            for (k, v) in extra.as_object().unwrap() {
+                m.insert(k.clone(), v.clone());
+            }
+            serde_json::Value::Object(m).to_string()
+        };
+
+        // SessionStart -> SessionEnd -> prune: the store record is GONE.
+        hook_for_profile(kimi, &pay("SessionStart", json!({})));
+        hook_for_profile(kimi, &pay("SessionEnd", json!({})));
+        let mut f: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let mut h: HooksFile = load_stage(&hooks_path()).unwrap();
+        let (kept, kept_h, _removed, _cleared) = prune_done(f.sessions, h.hooks);
+        f.sessions = kept;
+        h.hooks = kept_h;
+        write_stage(&sessions_path(), &f).unwrap();
+        write_stage(&hooks_path(), &h).unwrap();
+        assert!(
+            load_stage::<SessionsFile>(&sessions_path()).unwrap().sessions.is_empty(),
+            "precondition: the session record is gone"
+        );
+
+        // The next real event (a prompt) re-registers it, working + named.
+        let out =
+            hook_for_profile(kimi, &pay("UserPromptSubmit", json!({ "user_prompt": "revive" })));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(s.sessions.len(), 1);
+        assert_eq!(s.sessions[0].agent, "kimi");
+        assert_eq!(s.sessions[0].state, "working");
+        assert_eq!(s.sessions[0].title.as_deref(), Some("revive"));
+        assert_eq!(s.sessions[0].cwd, "/proj");
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+    #[test]
+    fn hook_end_for_an_unknown_session_stays_a_noop() {
+        // SessionEnd must NOT create a session — ending something that never
+        // existed is a no-op, not an implicit start.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("hook-end-noop");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let kimi = agent_profile("kimi").unwrap();
+        let payload = json!({
+            "hook_event_name": "SessionEnd",
+            "session_id": "ghost-2",
+            "cwd": "/proj",
+        })
+        .to_string();
+        let out = hook_for_profile(kimi, &payload);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert!(
+            s.sessions.is_empty(),
+            "SessionEnd for an unknown id never creates a session"
+        );
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
     #[test]
     fn hook_agent_flag_selects_the_profile_or_errors() {
         // No flag → the claude default.
