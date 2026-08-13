@@ -1,4 +1,4 @@
-//! The stage emitter — `song/stage/drachma.json` for Quickshell
+//! The stage emitter — `song/stage/livery.json` for Quickshell
 //! (CONTRACTS.md §4). Port of `emitters.js::emitStage`.
 //!
 //! The resolved, flattened values — component fallbacks are already applied
@@ -6,7 +6,7 @@
 //! matches CONTRACTS.md §4 exactly: schemaVersion + palette + bar/notif/window,
 //! with base16 riding through when the note carries it. Serde's JSON map is
 //! BTreeMap-backed, so the emitted `Value`'s key order is alphabetical —
-//! readers (Quickshell `DrachmaState.qml`, the conductor) read by key, and
+//! readers (Quickshell `LiveryState.qml`, the conductor) read by key, and
 //! the golden parity contract for stage is SEMANTIC (parse + compare), not
 //! byte-for-byte (that's osc/hyprctl).
 
@@ -44,7 +44,7 @@ pub fn emit_stage(r: &Resolved) -> Value {
         "window": pairs(&r.window),
     });
     // The base16 tier rides through untouched when present (Quickshell reads
-    // the wireframe accents from it — DrachmaState.qml). Omitted when the
+    // the wireframe accents from it — LiveryState.qml). Omitted when the
     // note lacks it.
     if let Some(b16) = &r.base16 {
         out["base16"] = pairs(b16);

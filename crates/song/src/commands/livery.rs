@@ -1,6 +1,6 @@
 //! `livery emit` / `livery resolve` / `livery lint` — the native note-engine
-//! verb group (LIVERY-MERGE.md Phase 1): the `drachma` CLI's surface,
-//! native, inside aoide's `Invocation`/`Outcome` shell.
+//! verb group (LIVERY-MERGE.md Phase 1): the former standalone note CLI's
+//! surface, native, inside aoide's `Invocation`/`Outcome` shell.
 //!
 //! The handlers carry the engine's raw byte output in `data["stdout"]` — the
 //! exact bytes the Node CLI printed (resolve JSON, shell-quoted hyprctl
@@ -47,7 +47,7 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["livery", "lint"],
-        summary: "Validate a note file against the closed v0 schema (the drachma lint contract, native).",
+        summary: "Validate a note file against the closed v0 schema.",
         args: [arg!("name", "string", false, "Song name or path to a note file; defaults to the staged notes.")],
         flags: [],
         gated: false,
@@ -62,18 +62,18 @@ pub fn register(r: &mut Registry) {
 /// `livery`-local copy with a `skip` offset for the verb's own leading
 /// positionals — two implementations, one resolution rule:
 ///
-/// * **no arg** — the staged notes (`<stage>/drachma.json`) if present, else
+/// * **no arg** — the staged notes (`<stage>/livery.json`) if present, else
 ///   a usage error (exit 2),
 /// * **an arg that names an existing file** — taken as a literal path,
 /// * **otherwise the arg is a committed-song NAME** →
-///   `<song>/songbook/<name>/drachma.json`.
+///   `<song>/songbook/<name>/livery.json`.
 ///
 /// `skip` offsets past the verb's own leading positionals (`livery emit`
 /// takes `<target>` first, so its note name lives at args[1]).
 fn resolve_notes(inv: &Invocation, cmd: &str, skip: usize) -> Result<PathBuf, Outcome> {
     match inv.args.get(skip) {
         None => {
-            let staged = shellbridge::stage_dir().join("drachma.json");
+            let staged = shellbridge::stage_dir().join("livery.json");
             if staged.is_file() {
                 Ok(staged)
             } else {

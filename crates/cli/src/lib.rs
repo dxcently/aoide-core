@@ -148,7 +148,7 @@ pub fn run_cli(argv: &[String]) -> i32 {
     }
 
     // `livery emit` / `livery resolve` / `livery lint` print the engine's raw
-    // byte output in text mode (the drachma CLI contract: terminal consumers
+    // byte output in text mode (the livery CLI contract: terminal consumers
     // pipe the OSC stream / hyprctl lines / resolve JSON straight out), NOT
     // the outcome envelope — same posture as `schema` above. The handler
     // carries the exact bytes in `data["stdout"]`; errors render normally

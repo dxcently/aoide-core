@@ -45,9 +45,8 @@ pub fn register(r: &mut Registry) {
 
 /// Resolve the `livery.json` a `rice` verb should act on:
 ///
-/// * **no arg** — the staged notes (`<stage>/drachma.json` — the legacy
-///   mirror, kept valid by every writer during the LIVERY-MERGE transition)
-///   if present, else a usage error (exit 2). We never lint with no file.
+/// * **no arg** — the staged notes (`<stage>/livery.json`) if present, else
+///   a usage error (exit 2). We never lint with no file.
 /// * **an arg that names an existing file** — taken as a literal path.
 /// * **otherwise the arg is a committed-song NAME** →
 ///   `<song>/songbook/<name>/livery.json` (resolved through the same stage-dir
@@ -60,7 +59,7 @@ pub fn register(r: &mut Registry) {
 pub(crate) fn resolve_rice_notes(inv: &Invocation, cmd: &str) -> Result<PathBuf, Outcome> {
     match inv.args.first() {
         None => {
-            let staged = shellbridge::stage_dir().join("drachma.json");
+            let staged = shellbridge::stage_dir().join("livery.json");
             if staged.is_file() {
                 Ok(staged)
             } else {
@@ -92,8 +91,8 @@ pub(crate) fn resolve_rice_notes(inv: &Invocation, cmd: &str) -> Result<PathBuf,
 
 /// `rice lint [<name>|<path>]` — validate a rice against the note schema.
 ///
-/// Runs the NATIVE `livery::lint` engine (the Rust port of `drachma lint`)
-/// in-process — no external binary, no PATH lookup. The no-arg form lints
+/// Runs the NATIVE `livery::lint` engine in-process — no external binary, no
+/// PATH lookup. The no-arg form lints
 /// the staged rice; a bare `<name>` resolves to the committed song's notes
 /// (never treated as a literal path). An error envelope always carries a
 /// non-zero exit (schema failure → exit 1).
@@ -120,8 +119,7 @@ fn handle_rice_lint(inv: &Invocation) -> Outcome {
 }
 
 /// `rice preview <name>` — rehearse a committed song live: stage its
-/// `livery.json` (mirroring the legacy `drachma.json` for pre-livery readers,
-/// LIVERY-MERGE §2.3, and a derivable cover) into `<stage>/` so the Quickshell
+/// `livery.json` (plus a derivable cover) into `<stage>/` so the Quickshell
 /// surfaces hot-reload it, AND best-effort live-apply its geometry + border
 /// colours to the running compositor via `hyprctl --batch keyword …`
 /// (guarded on `$HYPRLAND_INSTANCE_SIGNATURE`; see hypr.rs). Nothing is
@@ -183,7 +181,7 @@ pub(crate) fn handle_rice_preview(inv: &Invocation) -> Outcome {
     // geometry field is skipped rather than defaulted).
     let hypr_keywords = crate::live::geometry_keywords(&parsed);
 
-    // Inject the song name into the staged notes: DrachmaState.qml's
+    // Inject the song name into the staged notes: LiveryState.qml's
     // `songName` property reads this to resolve per-song flavor widgets
     // (StagingEngine.qml / WidgetSlot.qml) — CONTRACTS.md §4's "additive"
     // precedent (mirrors `parentSessionId` on session records). When the
@@ -204,21 +202,7 @@ pub(crate) fn handle_rice_preview(inv: &Invocation) -> Outcome {
         return Outcome::error("rice.preview", format!("failed to stage livery.json: {e}"))
             .with_data(json!({ "reason": "stage-write-failed", "target": notes_dst.to_string_lossy() }));
     }
-    // Legacy mirror (LIVERY-MERGE.md §2.3): pre-livery readers still on
-    // `stage/drachma.json` (a conductor/QML not yet restarted) keep finding a
-    // valid file at every instant of the transition. Both writes go through
-    // `atomic_write`, so neither reader ever sees a torn file; a mirror
-    // failure errors the preview, because the twin is only trustworthy when
-    // BOTH readers find one. Drop this write in Phase 4.
-    let legacy_mirror = stage.join("drachma.json");
-    if let Err(e) = shellbridge::atomic_write(&legacy_mirror, &staged) {
-        return Outcome::error("rice.preview", format!("failed to mirror stage/drachma.json: {e}"))
-            .with_data(json!({ "reason": "stage-write-failed", "target": legacy_mirror.to_string_lossy() }));
-    }
-    let mut changed: Vec<String> = vec![
-        notes_dst.to_string_lossy().into_owned(),
-        legacy_mirror.to_string_lossy().into_owned(),
-    ];
+    let mut changed: Vec<String> = vec![notes_dst.to_string_lossy().into_owned()];
 
     // Live-apply geometry + border colours on the compositor side (best-effort,
     // guarded, non-fatal). The stage-file write above is already the source of
@@ -261,9 +245,8 @@ pub(crate) fn handle_rice_preview(inv: &Invocation) -> Outcome {
         "notes": notes_dst.to_string_lossy(),
         "cover": cover.as_ref().map(|p| p.to_string_lossy().into_owned()),
         "hyprctl": hyprctl_status,
-        "seam": "Quickshell hot-reloads stage/livery.json (palette + component tiers; \
-                 the legacy stage/drachma.json mirror is also written so a pre-livery \
-                 reader keeps rendering); geometry + border colours are ALSO applied \
+        "seam": "Quickshell hot-reloads stage/livery.json (palette + component tiers); \
+                 geometry + border colours are ALSO applied \
                  live via best-effort, guarded `hyprctl --batch keyword …` (see hypr.rs) \
                  — keyword-only, never `hyprctl reload`",
     }))
@@ -430,7 +413,7 @@ mod tests {
     fn lint_no_arg_without_staged_notes_is_usage_exit_2() {
         let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
-        let stage = unique_tmp("lint-nostage"); // exists, but no drachma.json
+        let stage = unique_tmp("lint-nostage"); // exists, but no livery.json
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
         let out = handle_rice_lint(&inv(&["rice", "lint"], &[]));
@@ -444,7 +427,7 @@ mod tests {
         let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("lint-staged");
-        std::fs::write(stage.join("drachma.json"), VALID_NOTES).unwrap();
+        std::fs::write(stage.join("livery.json"), VALID_NOTES).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
         let out = handle_rice_lint(&inv(&["rice", "lint"], &[]));
@@ -454,7 +437,7 @@ mod tests {
         assert_eq!(out.render(false).1, aoide_protocol::output::exit::OK);
         let data = out.data.unwrap();
         let notes = data["notes"].as_str().unwrap().to_string();
-        assert!(notes.ends_with("drachma.json"), "lint targeted the staged notes: {notes}");
+        assert!(notes.ends_with("livery.json"), "lint targeted the staged notes: {notes}");
         assert!(notes.starts_with(stage.to_str().unwrap()));
         assert_eq!(data["schemaVersion"], "0");
         assert_eq!(data["engine"], "livery");
@@ -535,23 +518,21 @@ mod tests {
         let out = handle_rice_preview(&inv(&["rice", "preview"], &["moonlight"]));
         assert_eq!(out.status, Status::Ok);
         // livery.json landed in the stage with the song name injected, its
-        // original fields (e.g. the palette) survived the round-trip, and the
-        // legacy drachma.json mirror is byte-identical (LIVERY-MERGE §2.3
-        // dual-write) so a pre-livery reader finds the same file.
+        // original fields (e.g. the palette) survived the round-trip, and no
+        // legacy mirror is written any more (Phase 4 dropped it).
         let staged = std::fs::read_to_string(stage.join("livery.json")).unwrap();
         let parsed: Value = serde_json::from_str(&staged).unwrap();
         assert_eq!(parsed["song"], "moonlight");
         assert_eq!(parsed["palette"]["bg"], "#0b1021");
-        let mirrored = std::fs::read_to_string(stage.join("drachma.json")).unwrap();
-        assert_eq!(mirrored, staged, "legacy mirror is byte-identical");
+        assert_eq!(
+            out.changed.len(),
+            1,
+            "only livery.json is staged — no legacy mirror (Phase 4)"
+        );
         assert!(out
             .changed
             .iter()
             .any(|c| c.ends_with("stage/livery.json")));
-        assert!(out
-            .changed
-            .iter()
-            .any(|c| c.ends_with("stage/drachma.json")));
         // No cover exists for moonlight → cover.json is left untouched.
         assert!(!stage.join("cover.json").exists());
         assert!(out.data.unwrap()["cover"].is_null());

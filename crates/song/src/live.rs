@@ -1,7 +1,7 @@
 //! Hyprland live-apply helpers — the compositor half of `rice preview`.
 //!
 //! `handle_rice_preview` (dispatch.rs) already hot-reloads the palette by
-//! staging `stage/drachma.json`; Quickshell's own FileView watches that file
+//! staging `stage/livery.json`; Quickshell's own FileView watches that file
 //! and needs no compositor call. Geometry (gaps/border-size/rounding/blur)
 //! and the border *colours* have no such watcher on the Hyprland side, so
 //! this module turns the staged notes into a single best-effort

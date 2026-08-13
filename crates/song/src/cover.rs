@@ -16,7 +16,7 @@ pub const COVER_EXTS: &[&str] = &["webp", "png", "jpg", "jpeg"];
 /// Derive a physical cover-art file for a song, or `None` when none exists.
 ///
 /// v0 notes carry no runtime cover field (the schema is palette-closed; the
-/// build-time `aoide.drachma.wallpaper` is a nix path, not a song/ runtime read),
+/// build-time `aoide.livery.wallpaper` is a nix path, not a song/ runtime read),
 /// so a cover is only ever staged when one is physically present. Covers live
 /// in the shared library `song/covers/` — one dir any song (or other consumer)
 /// draws from — so the derivable name is `<name>.<ext>` there (a bare

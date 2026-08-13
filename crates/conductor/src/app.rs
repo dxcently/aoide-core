@@ -65,8 +65,7 @@ impl Panel {
     }
 }
 
-/// The palette pulled from `stage/livery.json` (falling back to the legacy
-/// `stage/drachma.json` mirror), each hex mapped to nearest
+/// The palette pulled from `stage/livery.json`, each hex mapped to nearest
 /// ANSI-256. `None` fields mean "no colour — inherit the terminal".
 #[derive(Debug, Clone, Default)]
 pub struct Palette {
@@ -883,23 +882,14 @@ pub fn sorted_project_names(projects: &[graph::Project]) -> Vec<String> {
 
 // ── livery.json palette → ANSI-256 ─────────────────────────────────────────
 
-/// The stage notes path — `stage/livery.json` (canonical) with fallback to
-/// the legacy mirror `stage/drachma.json` (LIVERY-MERGE.md §2.3): a fresh
-/// conductor that starts before any new livery write still finds the file
-/// the old seed left. Both the palette load and the mtime watch go through
-/// this, so the watch tracks whichever file is authoritative at the moment.
-/// Phase 4 drops the fallback with the mirror.
+/// The stage notes path — `stage/livery.json`, the canonical stage note file
+/// (CONTRACTS.md §4). Both the palette load and the mtime watch go through
+/// this, so the watch tracks the same file the palette loads.
 fn stage_notes_path(dir: &std::path::Path) -> std::path::PathBuf {
-    let canonical = dir.join("livery.json");
-    if canonical.is_file() {
-        canonical
-    } else {
-        dir.join("drachma.json")
-    }
+    dir.join("livery.json")
 }
 
-/// Load `stage/livery.json`'s palette (falling back to the legacy
-/// `stage/drachma.json` mirror), mapping each hex to nearest ANSI-256.
+/// Load `stage/livery.json`'s palette, mapping each hex to nearest ANSI-256.
 pub fn load_palette(path: &std::path::Path) -> Palette {
     let Ok(s) = std::fs::read_to_string(path) else {
         return Palette::default();
@@ -997,9 +987,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stage_notes_path_prefers_livery_and_falls_back_to_the_legacy_mirror() {
-        // A fresh conductor before the first livery write: only the legacy
-        // mirror exists → the fallback resolves it.
+    fn stage_notes_path_is_unconditionally_livery_json() {
+        // Phase 4: no fallback — the function returns dir/livery.json without
+        // probing for any other file, even when no note file exists yet.
         let dir = std::env::temp_dir().join(format!(
             "aoide-conductor-stage-notes-{}-{}",
             std::process::id(),
@@ -1009,20 +999,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("drachma.json"), "{}").unwrap();
-        assert_eq!(
-            stage_notes_path(&dir),
-            dir.join("drachma.json"),
-            "legacy mirror resolves when livery.json is absent"
-        );
-
-        // Once a livery write lands, the canonical file wins.
-        std::fs::write(dir.join("livery.json"), "{}").unwrap();
-        assert_eq!(
-            stage_notes_path(&dir),
-            dir.join("livery.json"),
-            "canonical livery.json wins when present"
-        );
+        assert_eq!(stage_notes_path(&dir), dir.join("livery.json"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
