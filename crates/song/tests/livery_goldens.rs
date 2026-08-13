@@ -1,7 +1,7 @@
 //! Golden-parity integration tests for the livery engine (LIVERY-MERGE.md
 //! Phase 1) — the native Rust pipeline asserted against bytes captured from
 //! the Node engine BEFORE it was cut: `tests/goldens/<fixture>.<target>.golden`
-//! (Step 1.0, via `pkgs/drachma`).
+//! (LIVERY-MERGE Step 1.0).
 //!
 //! Parity contract (plan §1.3):
 //! * `resolve`   — byte-identical (`JSON.stringify(…, null, 2)`, insertion

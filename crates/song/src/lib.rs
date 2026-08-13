@@ -1,8 +1,8 @@
 //! aoide-song — Aoide's ricing/design engine.
 //!
-//! `livery` is the native note engine (the drachma pipeline ported into
-//! Rust: schema validation, `{group.key}` deref + component fallback, and
-//! the stage/hyprctl/osc/file emitters). `live` computes the Hyprland
+//! `livery` is the native note engine: schema validation, `{group.key}`
+//! deref + component fallback, and the stage/hyprctl/osc/file emitters.
+//! `live` computes the Hyprland
 //! geometry/border keyword list a staged notes document implies and
 //! (best-effort) applies it to a running compositor. `notes`/`live` are
 //! dependency-free leaves (Phase 5a). `mint` (the pure `rice mint`

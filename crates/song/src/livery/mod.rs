@@ -1,8 +1,9 @@
-//! `livery` — the native note engine (the drachma pipeline, ported into
-//! song; see docs/architecture/LIVERY-MERGE.md).
+//! `livery` — the native note engine, ported into song from the standalone
+//! Node engine (see docs/architecture/LIVERY-MERGE.md).
 //!
-//! The engine is the port of `pkgs/drachma/src/{schema,resolve,emitters,cli}.js`
-//! into pure Rust, folded into song's charter ("the ricing / design engine"):
+//! The engine is a pure-Rust port of the standalone Node note engine's
+//! `{schema,resolve,emitters,cli}.js`, folded into song's charter ("the
+//! ricing / design engine"):
 //!
 //! ```text
 //!   schema.rs   validate the raw container against the closed v0 schema
@@ -29,7 +30,7 @@ pub(crate) mod json;
 pub use resolve::{Resolved, resolve, strip_hash, with_hash};
 pub use schema::SCHEMA_VERSION;
 
-/// Validate a raw note container against the v0 schema (the `drachma lint`
+/// Validate a raw note container against the v0 schema (the `livery lint`
 /// contract: `{ ok, errors }`).
 pub fn lint(container: &serde_json::Value) -> schema::Validation {
     schema::validate(container)

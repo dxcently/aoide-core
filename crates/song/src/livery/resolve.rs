@@ -1,4 +1,4 @@
-//! The tiered resolver — port of `pkgs/drachma/src/resolve.js`.
+//! The tiered resolver — native port of the standalone Node engine's resolver.
 //!
 //! The Node engine hands the raw container to Style Dictionary to
 //! dereference the W3C `{group.name}` alias syntax, then applies the v0

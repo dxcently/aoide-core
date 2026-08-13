@@ -1,8 +1,6 @@
 //! The note-engine seam — `rice lint`'s validator.
 //!
-//! Was: locating a `drachma` binary on PATH and shelling out to `drachma
-//! lint` (LIVERY-MERGE.md Phase 1). Now: a thin wrapper over the native
-//! `livery::lint` — the Rust port of the same validator — so `rice lint`
+//! A thin wrapper over the native `livery::lint` validator, so `rice lint`
 //! validates in-process: no binary to locate, no Node on PATH. The
 //! `run_lint` shape (`file` → structured result) is kept so its caller's
 //! call site reads unchanged.

@@ -1,5 +1,4 @@
-//! The authoritative v0 note schema — port of `pkgs/drachma/src/schema.js`
-//! (CONTRACTS.md §1).
+//! The authoritative v0 note schema validator (CONTRACTS.md §1).
 //!
 //! This is what `livery lint` (and, transitively, `rice lint`) validates
 //! against. The nix option type (modules/nucleus/options.nix) is a permissive
@@ -17,7 +16,7 @@
 //! "required" at the palette tier but "missing (expected hex #rrggbb)" at the
 //! component tier, and a missing key validates exactly like an explicit `null`
 //! (JS `node == null` catches both). The unit tests mirror
-//! `pkgs/drachma/test/run.js` cases 1–9 against the SAME fixtures.
+//! the original JS test suite's cases 1–9 against the SAME fixtures.
 //!
 //! One known residual divergence (D3), in the RESOLVER not the errors: a
 //! W3C-wrapped non-string leaf (`{"$value": 42}`) — which `lint` rejects in
@@ -285,7 +284,7 @@ pub fn validate(container: &Value) -> Validation {
     }
 }
 
-// ── Tests — mirror pkgs/drachma/test/run.js cases 1–9 ───────────────────────
+// ── Tests — mirror the original JS test suite, cases 1–9 ────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
