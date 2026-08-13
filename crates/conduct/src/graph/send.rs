@@ -1563,7 +1563,7 @@ mod tests {
         // First prompt names the session.
         hook_from_str(
             r#"{ "session_id": "n1", "hook_event_name": "UserPromptSubmit",
-                 "user_prompt": "fix the flaky auth test\nand rerun CI" }"#,
+                 "prompt": "fix the flaky auth test\nand rerun CI" }"#,
         );
         let s: SessionsFile = load_stage(&sessions_path()).unwrap();
         assert_eq!(s.sessions[0].title.as_deref(), Some("fix the flaky auth test"));
@@ -1571,7 +1571,7 @@ mod tests {
         // A LATER prompt must NOT rename it (set-once).
         hook_from_str(
             r#"{ "session_id": "n1", "hook_event_name": "UserPromptSubmit",
-                 "user_prompt": "now do something else entirely" }"#,
+                 "prompt": "now do something else entirely" }"#,
         );
         let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
         assert_eq!(
@@ -1598,7 +1598,7 @@ mod tests {
         // A claude session runs, then spawns a Task sub-agent.
         hook_from_str(r#"{ "session_id": "a", "hook_event_name": "SessionStart", "cwd": "/p" }"#);
         hook_from_str(
-            r#"{ "session_id": "a", "hook_event_name": "UserPromptSubmit", "user_prompt": "audit the repo" }"#,
+            r#"{ "session_id": "a", "hook_event_name": "UserPromptSubmit", "prompt": "audit the repo" }"#,
         );
         hook_from_str(
             r#"{ "session_id": "a", "hook_event_name": "PreToolUse", "tool_name": "Task",

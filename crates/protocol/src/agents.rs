@@ -102,7 +102,7 @@ pub struct AgentProfile {
     /// Normalize a raw hook payload onto the canonical field names the hook
     /// door reads (`user_prompt`, `tool_use_id`, `agent_type`, …), in place,
     /// before `map_hook` runs. Identity for a harness whose payloads already
-    /// speak the contract (claude).
+    /// speak the contract (pi, via its own extension).
     pub normalize_payload: fn(&mut Value),
     /// The context-window ceiling for a model id (see `model.rs`).
     pub model_ceiling: fn(Option<&str>) -> u64,
@@ -441,9 +441,34 @@ fn find_subagent_transcript(dir: &Path, tuid: &str) -> Option<PathBuf> {
     None
 }
 
-/// Claude's payloads already speak the canonical field names (`user_prompt`,
-/// `tool_use_id`, `subagent_type`, …) — nothing to map.
+/// Identity normalizer for a harness whose payloads already speak the
+/// canonical field names — currently just pi (see [`PI_PROFILE`]'s doc).
 fn normalize_identity(_: &mut Value) {}
+
+/// Normalize a claude hook payload onto the canonical (aoide-internal) field
+/// name, in place. Copy-only, same shape as [`kimi_normalize_payload`] below.
+/// Ground-truthed against the installed Claude Code binary's own
+/// hook-payload-construction JS: `UserPromptSubmit` sends the prompt text as
+/// `prompt` (a plain string) — NOT `user_prompt`, despite `user_prompt` being
+/// this door's own canonical/internal name for it (the name `map_hook` reads
+/// downstream). Gated to `UserPromptSubmit` so a same-named `prompt` field
+/// possibly carried by some other event never misreads as a turn-naming
+/// user prompt (mirrors kimi's own guard against the same hazard, there done
+/// by content-shape instead of by event).
+fn claude_normalize_payload(p: &mut Value) {
+    let Some(obj) = p.as_object_mut() else {
+        return;
+    };
+    if obj.get("hook_event_name").and_then(Value::as_str) != Some("UserPromptSubmit") {
+        return;
+    }
+    if !obj.contains_key("user_prompt") {
+        let text = obj.get("prompt").and_then(Value::as_str).map(str::to_string);
+        if let Some(text) = text.filter(|t| !t.trim().is_empty()) {
+            obj.insert("user_prompt".to_string(), Value::String(text));
+        }
+    }
+}
 
 /// The Claude Code profile — every claude-specific fact the bridge knows,
 /// in one place.
@@ -456,7 +481,7 @@ pub static CLAUDE_PROFILE: AgentProfile = AgentProfile {
     // same way from the hook's point of view, so both gate sub-agent node
     // creation/teardown identically.
     subagent_tools: &["Task", "Agent"],
-    normalize_payload: normalize_identity,
+    normalize_payload: claude_normalize_payload,
     model_ceiling: crate::model::context_ceiling_for_model,
     transcript: TranscriptSpec {
         locate: transcript_path_for,
@@ -1037,8 +1062,9 @@ fn pi_find_subagent(_: &Path, _: &str) -> Option<PathBuf> {
     None
 }
 
-/// The Pi profile. The aoide-pi-session extension emits canonical
-/// claude-shaped payloads, so normalize is identity. Its sub-agent children
+/// The Pi profile. The aoide-pi-session extension emits Aoide's own
+/// canonical field names directly (it's aoide-owned code, not a foreign
+/// harness to translate), so normalize is identity. Its sub-agent children
 /// run non-interactively (never reach the graph) and its permissions are
 /// invisible to the extension API, so both vocabularies are empty. The model
 /// ceiling reuses the shared logic (claude-family ids resolve to their real
@@ -1258,10 +1284,52 @@ mod tests {
         norm(&mut sub);
         assert_eq!(sub["agent_type"], "coder");
         assert!(sub.get("user_prompt").is_none(), "a string prompt is not user_prompt");
-        // Claude's normalizer is the identity.
-        let mut c = serde_json::json!({"user_prompt": "x", "tool_use_id": "tu"});
-        (CLAUDE_PROFILE.normalize_payload)(&mut c);
-        assert_eq!(c, serde_json::json!({"user_prompt": "x", "tool_use_id": "tu"}));
+    }
+
+    #[test]
+    fn claude_normalize_maps_the_real_prompt_field_onto_the_contract() {
+        let norm = CLAUDE_PROFILE.normalize_payload;
+        // Ground-truthed: claude's UserPromptSubmit sends the text as `prompt`
+        // (a plain string), not `user_prompt` — map it onto the contract.
+        let mut p = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "s",
+            "prompt": "fix the flaky auth test"
+        });
+        norm(&mut p);
+        assert_eq!(p["user_prompt"], "fix the flaky auth test");
+        assert_eq!(p["prompt"], "fix the flaky auth test", "the native field is preserved");
+
+        // An already-canonical payload is left alone (copy, never clobber).
+        let mut c = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "user_prompt": "canonical wins",
+            "prompt": "native loses",
+            "tool_use_id": "tu"
+        });
+        norm(&mut c);
+        assert_eq!(c["user_prompt"], "canonical wins");
+
+        // Gated to UserPromptSubmit: a `prompt` field on any other event (e.g.
+        // a sub-agent dispatch's task text) must never misread as the user's
+        // turn-naming prompt — same hazard kimi guards against on SubagentStart.
+        let mut other = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "s",
+            "prompt": "not a user prompt"
+        });
+        norm(&mut other);
+        assert!(other.get("user_prompt").is_none(), "non-UserPromptSubmit prompt is not user_prompt");
+
+        // Garbage payloads and empty/missing prompt text don't panic or insert.
+        let mut garbage = serde_json::json!(["not", "an", "object"]);
+        norm(&mut garbage);
+        let mut empty = serde_json::json!({ "hook_event_name": "UserPromptSubmit", "prompt": "   " });
+        norm(&mut empty);
+        assert!(empty.get("user_prompt").is_none(), "blank prompt text is not inserted");
+        let mut missing = serde_json::json!({ "hook_event_name": "UserPromptSubmit" });
+        norm(&mut missing);
+        assert!(missing.get("user_prompt").is_none(), "no prompt field at all is a no-op");
     }
 
     #[test]
