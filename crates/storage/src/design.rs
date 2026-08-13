@@ -95,7 +95,7 @@ mod tests {
             by: Some("khoa".to_string()),
             intent: "/home/khoa/Aoide/song/songbook/moonlight/design/intent.md".to_string(),
             intent_present: true,
-            sources: vec!["stage/drachma.json".to_string()],
+            sources: vec!["stage/livery.json".to_string()],
             carried_slots: vec![],
         };
         let json = serde_json::to_string(&marker).unwrap();

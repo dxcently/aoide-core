@@ -54,7 +54,7 @@ fn seed(dir: &Path) {
     );
     write(
         dir,
-        "drachma.json",
+        "livery.json",
         r##"{ "palette": {"bg":"#1e1e2e","fg":"#cdd6f4","accent":"#89b4fa","urgent":"#f38ba8"} }"##,
     );
 }
@@ -86,10 +86,10 @@ fn app_loads_recomputes_selects_and_dispatches_against_the_tempdir() {
         "latest hook phase (canonical) merged into live state"
     );
 
-    // ── palette parsed from drachma.json ──
+    // ── palette parsed from livery.json ──
     assert!(
         app.palette.accent.is_some(),
-        "accent colour mapped from drachma.json"
+        "accent colour mapped from livery.json"
     );
 
     // ── selection: j moves down over the flattened DAG rows (group headers

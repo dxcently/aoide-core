@@ -51,7 +51,7 @@ cat > "$STAGE/hooks.json" <<'JSON'
 }
 JSON
 
-cat > "$STAGE/drachma.json" <<'JSON'
+cat > "$STAGE/livery.json" <<'JSON'
 {
   "schemaVersion": "0",
   "palette": { "bg": "#1e1e2e", "fg": "#cdd6f4", "accent": "#89b4fa", "urgent": "#f38ba8" }

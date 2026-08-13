@@ -100,9 +100,9 @@ pub fn songbook_dir(name: &str) -> std::path::PathBuf {
     song_dir().join("songbook").join(name)
 }
 
-/// The committed-song notes file: `<song>/songbook/<name>/drachma.json`.
+/// The committed-song notes file: `<song>/songbook/<name>/livery.json`.
 pub fn songbook_notes(name: &str) -> std::path::PathBuf {
-    songbook_dir(name).join("drachma.json")
+    songbook_dir(name).join("livery.json")
 }
 
 /// Atomic write-temp-then-rename into a file within a directory.
@@ -370,13 +370,13 @@ mod tests {
         assert_eq!(song_dir(), std::path::PathBuf::from("/tmp/aoide-song-test"));
         assert_eq!(
             songbook_notes("moonlight"),
-            std::path::PathBuf::from("/tmp/aoide-song-test/songbook/moonlight/drachma.json")
+            std::path::PathBuf::from("/tmp/aoide-song-test/songbook/moonlight/livery.json")
         );
 
         // On the default layout the song tree is `~/Aoide/song`.
         std::env::remove_var("AOIDE_STAGE_DIR");
         assert!(song_dir().ends_with("Aoide/song"));
-        assert!(songbook_notes("x").ends_with("Aoide/song/songbook/x/drachma.json"));
+        assert!(songbook_notes("x").ends_with("Aoide/song/songbook/x/livery.json"));
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),

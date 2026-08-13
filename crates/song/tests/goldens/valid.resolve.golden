@@ -1,0 +1,23 @@
+{
+  "schemaVersion": "0",
+  "palette": {
+    "bg": "#1e1e2e",
+    "fg": "#cdd6f4",
+    "accent": "#89b4fa",
+    "urgent": "#f38ba8"
+  },
+  "bar": {
+    "bg": "#1e1e2e",
+    "fg": "#cdd6f4",
+    "accent": "#a6e3a1"
+  },
+  "notif": {
+    "bg": "#1e1e2e",
+    "fg": "#cdd6f4",
+    "urgent": "#f38ba8"
+  },
+  "window": {
+    "border": "#89b4fa",
+    "borderInactive": "#1e1e2e"
+  }
+}

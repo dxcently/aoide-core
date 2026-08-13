@@ -147,6 +147,34 @@ pub fn run_cli(argv: &[String]) -> i32 {
         return output::exit::OK;
     }
 
+    // `livery emit` / `livery resolve` / `livery lint` print the engine's raw
+    // byte output in text mode (the drachma CLI contract: terminal consumers
+    // pipe the OSC stream / hyprctl lines / resolve JSON straight out), NOT
+    // the outcome envelope — same posture as `schema` above. The handler
+    // carries the exact bytes in `data["stdout"]`; errors render normally
+    // (envelope to stderr, exit 1). `--json` keeps the structured envelope.
+    if inv.path.len() == 2 && inv.path[0] == "livery" && !json {
+        let outcome = dispatch::dispatch(&inv);
+        if outcome.status == output::Status::Ok {
+            if let Some(stdout) = outcome
+                .data
+                .as_ref()
+                .and_then(|d| d.get("stdout"))
+                .and_then(|s| s.as_str())
+            {
+                print!("{stdout}");
+                return output::exit::OK;
+            }
+        }
+        let (body, code) = outcome.render(false);
+        if code == output::exit::OK {
+            println!("{body}");
+        } else {
+            eprintln!("{body}");
+        }
+        return code;
+    }
+
     let outcome = dispatch::dispatch(&inv);
     let (body, code) = outcome.render(json);
     if code == output::exit::OK {

@@ -1,0 +1,25 @@
+{
+  "palette": {
+    "bg":     "#1e1e2e",
+    "fg":     "#cdd6f4",
+    "accent": "#89b4fa",
+    "urgent": "#f38ba8"
+  },
+  "base16": {
+    "base00": "#0a0a0d",
+    "base01": "#141419",
+    "base02": "#26262e",
+    "base03": "#55555f",
+    "base04": "#9a9aa5",
+    "base05": "#e8e8ec",
+    "base06": "#f5f5f7",
+    "base07": "#ffffff",
+    "base08": "#ff5f87",
+    "base09": "#d9a066",
+    "base0A": "#d8e07a",
+    "base0B": "#3fe97f",
+    "base0C": "#5fd8e8",
+    "base0D": "#7d9bff",
+    "base0E": "#c583f2"
+  }
+}

@@ -3,7 +3,7 @@ name = "aoide-song"
 version = "0.0.0"
 edition = "2021"
 license = "MIT"
-description = "Aoide's ricing/design engine: drachma locate + lint delegation, geometry/border keyword computation, and live compositor apply. Rices portably."
+description = "Aoide's ricing/design engine: the livery engine (schema validation, alias resolution, stage/hyprctl/osc/file emitters), geometry/border keyword computation, and live compositor apply. Rices portably."
 
 [lib]
 name = "aoide_song"

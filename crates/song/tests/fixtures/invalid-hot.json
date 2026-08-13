@@ -1,0 +1,9 @@
+{
+  "palette": {
+    "bg":     "#1e1e2e",
+    "fg":     "#cdd6f4",
+    "accent": "#89b4fa",
+    "urgent": "#f38ba8",
+    "hot":    "#nothex"
+  }
+}

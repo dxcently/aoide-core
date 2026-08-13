@@ -8,7 +8,8 @@
 //! roster reads in musical notation (♪ working, 𝄐 awaiting, 𝄁 stopped, 𝄽 idle,
 //! 𝄂 done).
 //!
-//! Colour comes from `stage/drachma.json`'s palette `{bg,fg,accent,urgent}` when
+//! Colour comes from `stage/livery.json`'s palette `{bg,fg,accent,urgent}`
+//! (falling back to the legacy `stage/drachma.json` mirror, LIVERY-MERGE §2.3) when
 //! present, each hex already mapped to the nearest ANSI-256 index in
 //! [`crate::app`]; here we wrap those indices as `Color::Indexed`. Absent
 //! a palette key we fall back to a named ANSI colour so the TUI still reads,

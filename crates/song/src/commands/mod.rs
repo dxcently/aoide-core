@@ -9,4 +9,5 @@
 
 pub mod cover;
 pub mod design;
+pub mod livery;
 pub mod rice;

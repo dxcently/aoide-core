@@ -65,7 +65,7 @@ pub const GEOMETRY_KEYS: &[&str] = &[
 pub const WINDOW_KEYS: &[&str] = &["border", "borderInactive"];
 
 /// Render one `rice.nix` for `rice mint`: a self-gating skeleton copying
-/// `notes`' palette/window/geometry into `aoide.drachma.<tier>` under
+/// `notes`' palette/window/geometry into `aoide.livery.<tier>` under
 /// `config.aoide.song == "<name>"` — the same shape as every committed song
 /// (CONTRACTS.md §5). `had_geometry`/`had_window` distinguish "copied from
 /// `from`" from "`from` set no opinion here, this is a fill template" in the
@@ -106,25 +106,25 @@ pub fn render_rice_nix(name: &str, from: &str, notes: &Value) -> String {
         "# song/songbook/{name}/rice.nix — scaffolded via `aoide rice mint` from song \"{from}\".\n"
     ));
     s.push_str("#\n");
-    s.push_str("# HOST-AGNOSTIC DISCIPLINE (CONTRACTS.md §5): a song sets ONLY aoide.drachma.\n");
-    s.push_str("# All drachma values are literal nix expressions (no song/ runtime reads).\n");
+    s.push_str("# HOST-AGNOSTIC DISCIPLINE (CONTRACTS.md §5): a song sets ONLY aoide.livery.\n");
+    s.push_str("# All livery values are literal nix expressions (no song/ runtime reads).\n");
     s.push_str("{ lib, config, ... }:\n");
     s.push_str("{\n");
     s.push_str(&format!(
         "  config = lib.mkIf (config.aoide.song == \"{name}\") {{\n"
     ));
 
-    s.push_str("\n    aoide.drachma.palette = {\n");
+    s.push_str("\n    aoide.livery.palette = {\n");
     s.push_str(&palette_lines);
     s.push_str("    };\n");
 
     s.push_str(&format!("\n    # {window_comment}\n"));
-    s.push_str("    aoide.drachma.window = {\n");
+    s.push_str("    aoide.livery.window = {\n");
     s.push_str(&window_lines);
     s.push_str("    };\n");
 
     s.push_str(&format!("\n    # {geometry_comment}\n"));
-    s.push_str("    aoide.drachma.geometry = {\n");
+    s.push_str("    aoide.livery.geometry = {\n");
     s.push_str(&geometry_lines);
     s.push_str("    };\n");
 

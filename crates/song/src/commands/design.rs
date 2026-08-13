@@ -29,7 +29,7 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["rice", "design", "enter"],
-        summary: "Enter design mode for a song: preview it live (drachma + hyprctl) and record that it's being actively iterated on.",
+        summary: "Enter design mode for a song: preview it live (livery + hyprctl) and record that it's being actively iterated on.",
         args: [arg!("name", "string", true, "Song to open for live design (from song/songbook/).")],
         flags: [
             flag!("by", "string", "Optional owner/agent id recorded in the design marker."),
@@ -73,7 +73,7 @@ fn handle_design_status(_inv: &Invocation) -> Outcome {
 }
 
 /// `rice design enter <name> [--by <id>]` — open a song for live design
-/// iteration: reuse `rice preview <name>`'s live-apply (drachma.json +
+/// iteration: reuse `rice preview <name>`'s live-apply (livery.json +
 /// best-effort hyprctl geometry/border) so `enter` has the EXACT same
 /// side effects a bare `rice preview` has (no reimplementation), then record
 /// a [`DesignMarker`] so other tooling (`status`, and later `sync`) knows a
@@ -116,7 +116,7 @@ fn handle_design_enter(inv: &Invocation) -> Outcome {
         intent: intent_path.to_string_lossy().into_owned(),
         intent_present,
         sources: vec![
-            "stage/drachma.json".to_string(),
+            "stage/livery.json".to_string(),
             format!("song/songbook/{name}/widgets"),
         ],
         carried_slots: vec![],
@@ -210,7 +210,7 @@ mod tests {
             by: Some("khoa".to_string()),
             intent: "/home/khoa/Aoide/song/songbook/moonlight/design/intent.md".to_string(),
             intent_present: true,
-            sources: vec!["stage/drachma.json".to_string()],
+            sources: vec!["stage/livery.json".to_string()],
             carried_slots: vec![],
         };
         save_design_marker(&marker).unwrap();
@@ -227,7 +227,7 @@ mod tests {
             "/home/khoa/Aoide/song/songbook/moonlight/design/intent.md"
         );
         assert_eq!(data["intentPresent"], true);
-        assert_eq!(data["sources"][0], "stage/drachma.json");
+        assert_eq!(data["sources"][0], "stage/livery.json");
         assert!(data["carriedSlots"].as_array().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&stage);
     }
@@ -243,7 +243,7 @@ mod tests {
         let song = root.join("songbook").join("moonlight");
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::create_dir_all(song.join("design")).unwrap();
-        std::fs::write(song.join("drachma.json"), VALID_NOTES).unwrap();
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
         std::fs::write(song.join("design").join("intent.md"), "# intent\n").unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
@@ -255,7 +255,7 @@ mod tests {
         assert!(data["intent"].as_str().unwrap().ends_with("moonlight/design/intent.md"));
         assert!(data["nextSteps"].is_array());
         // Both the preview's stage write and the marker itself are reported.
-        assert!(out.changed.iter().any(|c| c.ends_with("stage/drachma.json")));
+        assert!(out.changed.iter().any(|c| c.ends_with("stage/livery.json")));
         assert!(out.changed.iter().any(|c| c.ends_with("stage/design.json")));
 
         // The marker actually landed on disk with the right shape.
@@ -263,7 +263,7 @@ mod tests {
         assert_eq!(marker.song, "moonlight");
         assert_eq!(marker.by, None);
         assert!(marker.intent_present);
-        assert_eq!(marker.sources[0], "stage/drachma.json");
+        assert_eq!(marker.sources[0], "stage/livery.json");
         assert_eq!(marker.sources[1], "song/songbook/moonlight/widgets");
         assert!(marker.carried_slots.is_empty());
 
@@ -286,7 +286,7 @@ mod tests {
         let song = root.join("songbook").join("moonlight");
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::create_dir_all(&song).unwrap();
-        std::fs::write(song.join("drachma.json"), VALID_NOTES).unwrap();
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
         let mut flags = std::collections::BTreeMap::new();
@@ -359,7 +359,7 @@ mod tests {
             by: None,
             intent: "/x/intent.md".to_string(),
             intent_present: false,
-            sources: vec!["stage/drachma.json".to_string()],
+            sources: vec!["stage/livery.json".to_string()],
             carried_slots: vec![],
         };
         save_design_marker(&marker).unwrap();
@@ -391,7 +391,7 @@ mod tests {
             carried_slots: vec![],
         };
         save_design_marker(&marker).unwrap();
-        std::fs::write(stage.join("drachma.json"), VALID_NOTES).unwrap();
+        std::fs::write(stage.join("livery.json"), VALID_NOTES).unwrap();
         std::fs::write(stage.join("cover.json"), "{\"path\":\"x\"}").unwrap();
 
         let out = handle_design_exit(&inv(&["rice", "design", "exit"], &[]));
@@ -401,7 +401,7 @@ mod tests {
         // untouched (`exit` never reaches into `run/qml/` or song files).
         assert!(!aoide_storage::design::design_marker_path().exists());
         assert_eq!(
-            std::fs::read_to_string(stage.join("drachma.json")).unwrap(),
+            std::fs::read_to_string(stage.join("livery.json")).unwrap(),
             VALID_NOTES
         );
         assert_eq!(

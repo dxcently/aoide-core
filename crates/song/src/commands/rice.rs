@@ -13,7 +13,7 @@ use std::path::PathBuf;
 pub fn register(r: &mut Registry) {
     r.insert(cmd!(
         path: ["rice", "lint"],
-        summary: "Validate a rice against the note schema (delegates to drachma).",
+        summary: "Validate a rice against the note schema (native livery engine).",
         args: [arg!("name", "string", false, "Rice/song name to lint; defaults to the staged rice.")],
         flags: [],
         gated: false,
@@ -22,7 +22,7 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["rice", "preview"],
-        summary: "Rehearse a rice live (stage/drachma.json hot-reload + best-effort hyprctl geometry/border apply); nothing committed.",
+        summary: "Rehearse a rice live (stage/livery.json hot-reload + legacy mirror + best-effort hyprctl geometry/border apply); nothing committed.",
         args: [arg!("name", "string", true, "Rice/song name to preview (from song/songbook/).")],
         flags: [],
         gated: false,
@@ -31,7 +31,7 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["rice", "mint"],
-        summary: "Scaffold a new song under song/songbook/<name>/ by copying --from's notes (rice.nix, drachma.json, design/intent.md, widgets/); `rice new` is a parse alias for this.",
+        summary: "Scaffold a new song under song/songbook/<name>/ by copying --from's notes (rice.nix, livery.json, design/intent.md, widgets/); `rice new` is a parse alias for this.",
         args: [arg!("name", "string", true, "New song name: ^[a-z0-9][a-z0-9-]*$ (lowercase, digits, hyphens).")],
         flags: [
             flag!("from", "string", "Source song to copy notes from (default \"default\")."),
@@ -43,15 +43,21 @@ pub fn register(r: &mut Registry) {
     ));
 }
 
-/// Resolve the `drachma.json` a `rice` verb should act on:
+/// Resolve the `livery.json` a `rice` verb should act on:
 ///
-/// * **no arg** — the staged notes (`<stage>/drachma.json`) if present, else a
-///   usage error (exit 2). We never delegate to drachma with no file.
+/// * **no arg** — the staged notes (`<stage>/drachma.json` — the legacy
+///   mirror, kept valid by every writer during the LIVERY-MERGE transition)
+///   if present, else a usage error (exit 2). We never lint with no file.
 /// * **an arg that names an existing file** — taken as a literal path.
 /// * **otherwise the arg is a committed-song NAME** →
-///   `<song>/songbook/<name>/drachma.json` (resolved through the same stage-dir
+///   `<song>/songbook/<name>/livery.json` (resolved through the same stage-dir
 ///   seam as `graph emit`, so an `AOIDE_STAGE_DIR` override relocates it too).
-fn resolve_rice_notes(inv: &Invocation, cmd: &str) -> Result<PathBuf, Outcome> {
+///
+/// The `livery` verb group (`commands/livery.rs`) re-implements this SAME rule
+/// as its own `resolve_notes` with a `skip` offset (its `emit` takes the target
+/// first) — two implementations, one rule. Kept `pub(crate)` so that seam stays
+/// reachable crate-internally.
+pub(crate) fn resolve_rice_notes(inv: &Invocation, cmd: &str) -> Result<PathBuf, Outcome> {
     match inv.args.first() {
         None => {
             let staged = shellbridge::stage_dir().join("drachma.json");
@@ -86,47 +92,36 @@ fn resolve_rice_notes(inv: &Invocation, cmd: &str) -> Result<PathBuf, Outcome> {
 
 /// `rice lint [<name>|<path>]` — validate a rice against the note schema.
 ///
-/// Delegates to `drachma lint <drachma.json>`, tolerating drachma's absence. The
-/// no-arg form lints the staged rice; a bare `<name>` resolves to the committed
-/// song's notes (never passed to drachma as a literal path). An error envelope
-/// always carries a non-zero exit (drachma failure → exit 1).
+/// Runs the NATIVE `livery::lint` engine (the Rust port of `drachma lint`)
+/// in-process — no external binary, no PATH lookup. The no-arg form lints
+/// the staged rice; a bare `<name>` resolves to the committed song's notes
+/// (never treated as a literal path). An error envelope always carries a
+/// non-zero exit (schema failure → exit 1).
 fn handle_rice_lint(inv: &Invocation) -> Outcome {
     let target = match resolve_rice_notes(inv, "rice.lint") {
         Ok(p) => p,
         Err(o) => return o,
     };
-    let run = notes::run_lint(&[target.to_string_lossy().into_owned()]);
-    match run.located {
-        None => Outcome::error(
-            "rice.lint",
-            "drachma not found; set $AOIDE_DRACHMA_BIN or put it on PATH",
-        )
-        .with_data(json!({
-            "reason": "notes-binary-unavailable",
-            "searched": ["$AOIDE_DRACHMA_BIN", "PATH"],
+    let run = notes::run_lint(&target);
+    if run.ok {
+        Outcome::ok("rice.lint", "note schema validation passed").with_data(json!({
             "notes": target.to_string_lossy(),
-        })),
-        Some(bin) => {
-            let ok = run.exit_code == Some(0);
-            let out = if ok {
-                Outcome::ok("rice.lint", "note schema validation passed")
-            } else {
-                // Error status → exit 1 (never a status:error with exit 0).
-                Outcome::error("rice.lint", "note schema validation reported problems")
-            };
-            out.with_data(json!({
-                "delegate": bin.to_string_lossy(),
+            "schemaVersion": crate::livery::SCHEMA_VERSION,
+            "engine": "livery",
+        }))
+    } else {
+        // Error status → exit 1 (never a status:error with exit 0).
+        Outcome::error("rice.lint", "note schema validation reported problems")
+            .with_data(json!({
                 "notes": target.to_string_lossy(),
-                "exitCode": run.exit_code,
-                "stdout": run.stdout,
-                "stderr": run.stderr,
+                "errors": run.errors,
             }))
-        }
     }
 }
 
 /// `rice preview <name>` — rehearse a committed song live: stage its
-/// `drachma.json` (and a derivable cover) into `<stage>/` so the Quickshell
+/// `livery.json` (mirroring the legacy `drachma.json` for pre-livery readers,
+/// LIVERY-MERGE §2.3, and a derivable cover) into `<stage>/` so the Quickshell
 /// surfaces hot-reload it, AND best-effort live-apply its geometry + border
 /// colours to the running compositor via `hyprctl --batch keyword …`
 /// (guarded on `$HYPRLAND_INSTANCE_SIGNATURE`; see hypr.rs). Nothing is
@@ -167,7 +162,7 @@ pub(crate) fn handle_rice_preview(inv: &Invocation) -> Outcome {
         }
     };
     // Never stage a torn palette: require the notes to at least parse as JSON
-    // (full schema validation is `rice lint`'s job / drachma's).
+    // (full schema validation is `rice lint`'s job — the livery engine).
     let parsed: Value = match serde_json::from_str::<Value>(&raw) {
         Ok(v) => v,
         Err(e) => {
@@ -192,7 +187,7 @@ pub(crate) fn handle_rice_preview(inv: &Invocation) -> Outcome {
     // `songName` property reads this to resolve per-song flavor widgets
     // (StagingEngine.qml / WidgetSlot.qml) — CONTRACTS.md §4's "additive"
     // precedent (mirrors `parentSessionId` on session records). When the
-    // notes don't parse as an object (shouldn't happen for a valid drachma
+    // notes don't parse as an object (shouldn't happen for a valid notes
     // file, but defends against a malformed one), fall back to writing `raw`
     // unchanged rather than fabricating a shape.
     let staged = match parsed {
@@ -204,12 +199,26 @@ pub(crate) fn handle_rice_preview(inv: &Invocation) -> Outcome {
     };
 
     let stage = shellbridge::stage_dir();
-    let notes_dst = stage.join("drachma.json");
+    let notes_dst = stage.join("livery.json");
     if let Err(e) = shellbridge::atomic_write(&notes_dst, &staged) {
-        return Outcome::error("rice.preview", format!("failed to stage drachma.json: {e}"))
+        return Outcome::error("rice.preview", format!("failed to stage livery.json: {e}"))
             .with_data(json!({ "reason": "stage-write-failed", "target": notes_dst.to_string_lossy() }));
     }
-    let mut changed: Vec<String> = vec![notes_dst.to_string_lossy().into_owned()];
+    // Legacy mirror (LIVERY-MERGE.md §2.3): pre-livery readers still on
+    // `stage/drachma.json` (a conductor/QML not yet restarted) keep finding a
+    // valid file at every instant of the transition. Both writes go through
+    // `atomic_write`, so neither reader ever sees a torn file; a mirror
+    // failure errors the preview, because the twin is only trustworthy when
+    // BOTH readers find one. Drop this write in Phase 4.
+    let legacy_mirror = stage.join("drachma.json");
+    if let Err(e) = shellbridge::atomic_write(&legacy_mirror, &staged) {
+        return Outcome::error("rice.preview", format!("failed to mirror stage/drachma.json: {e}"))
+            .with_data(json!({ "reason": "stage-write-failed", "target": legacy_mirror.to_string_lossy() }));
+    }
+    let mut changed: Vec<String> = vec![
+        notes_dst.to_string_lossy().into_owned(),
+        legacy_mirror.to_string_lossy().into_owned(),
+    ];
 
     // Live-apply geometry + border colours on the compositor side (best-effort,
     // guarded, non-fatal). The stage-file write above is already the source of
@@ -252,10 +261,11 @@ pub(crate) fn handle_rice_preview(inv: &Invocation) -> Outcome {
         "notes": notes_dst.to_string_lossy(),
         "cover": cover.as_ref().map(|p| p.to_string_lossy().into_owned()),
         "hyprctl": hyprctl_status,
-        "seam": "Quickshell hot-reloads stage/drachma.json (palette + component tiers); \
-                 geometry + border colours are ALSO applied live via best-effort, \
-                 guarded `hyprctl --batch keyword …` (see hypr.rs) — keyword-only, \
-                 never `hyprctl reload`",
+        "seam": "Quickshell hot-reloads stage/livery.json (palette + component tiers; \
+                 the legacy stage/drachma.json mirror is also written so a pre-livery \
+                 reader keeps rendering); geometry + border colours are ALSO applied \
+                 live via best-effort, guarded `hyprctl --batch keyword …` (see hypr.rs) \
+                 — keyword-only, never `hyprctl reload`",
     }))
 }
 
@@ -266,11 +276,11 @@ pub(crate) fn handle_rice_preview(inv: &Invocation) -> Outcome {
 ///
 /// Writes ONLY inside `song/songbook/<name>/` (house rule 1): `rice.nix` (a
 /// self-gating skeleton — the sole `.nix` file, satisfying `checks.song-shape`),
-/// `drachma.json` (a mirror of `--from`'s, INCLUDING any geometry block, so
+/// `livery.json` (a mirror of `--from`'s, INCLUDING any geometry block, so
 /// `aoide rice preview <name>` renders + live-applies immediately),
 /// `design/intent.md` (honest-empty — no fabricated rationale), and
 /// `widgets/.gitkeep` (no per-song widgets yet). No `hypr/` dir: geometry
-/// lives in drachma, not a build fragment.
+/// lives in the livery tier, not a build fragment.
 fn handle_rice_mint(inv: &Invocation) -> Outcome {
     let name = match inv.args.first() {
         Some(n) => n.clone(),
@@ -374,7 +384,7 @@ fn handle_rice_mint(inv: &Invocation) -> Outcome {
 
     let writes: [(PathBuf, String); 4] = [
         (target.join("rice.nix"), rice_nix),
-        (target.join("drachma.json"), raw_notes.clone()),
+        (target.join("livery.json"), raw_notes.clone()),
         (target.join("design").join("intent.md"), intent_md),
         (target.join("widgets").join(".gitkeep"), String::new()),
     ];
@@ -430,40 +440,45 @@ mod tests {
     }
 
     #[test]
-    fn lint_no_arg_resolves_staged_default_and_errors_nonzero() {
+    fn lint_no_arg_resolves_staged_default_and_passes_natively() {
         let _g = aoide_test_support::env_lock().lock().unwrap();
-        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "PATH", "AOIDE_DRACHMA_BIN"]);
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("lint-staged");
         std::fs::write(stage.join("drachma.json"), VALID_NOTES).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
-        hide_drachma();
 
         let out = handle_rice_lint(&inv(&["rice", "lint"], &[]));
         // Resolved the STAGED default (else this would be a Usage error), and
-        // with drachma absent the envelope is an error → exit 1, never 0.
-        assert_eq!(out.status, Status::Error);
-        assert_eq!(out.render(false).1, aoide_protocol::output::exit::ERROR);
-        let notes = out.data.unwrap()["notes"].as_str().unwrap().to_string();
+        // the native engine validates it in-process — Ok, exit 0, no binary.
+        assert_eq!(out.status, Status::Ok);
+        assert_eq!(out.render(false).1, aoide_protocol::output::exit::OK);
+        let data = out.data.unwrap();
+        let notes = data["notes"].as_str().unwrap().to_string();
         assert!(notes.ends_with("drachma.json"), "lint targeted the staged notes: {notes}");
         assert!(notes.starts_with(stage.to_str().unwrap()));
+        assert_eq!(data["schemaVersion"], "0");
+        assert_eq!(data["engine"], "livery");
         let _ = std::fs::remove_dir_all(&stage);
     }
 
     #[test]
     fn lint_bare_name_resolves_to_songbook_notes_not_a_literal_path() {
         let _g = aoide_test_support::env_lock().lock().unwrap();
-        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "PATH", "AOIDE_DRACHMA_BIN"]);
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("lint-name");
         let stage = root.join("stage");
+        let song = root.join("songbook").join("moonlight");
         std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&song).unwrap();
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
-        hide_drachma();
 
         // `moonlight` is a NAME, not a path — it must resolve under songbook/.
         let out = handle_rice_lint(&inv(&["rice", "lint"], &["moonlight"]));
+        assert_eq!(out.status, Status::Ok, "songbook notes lint natively");
         let notes = out.data.unwrap()["notes"].as_str().unwrap().to_string();
         assert!(
-            notes.ends_with("songbook/moonlight/drachma.json"),
+            notes.ends_with("songbook/moonlight/livery.json"),
             "bare name resolved to the songbook song: {notes}"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -472,16 +487,36 @@ mod tests {
     #[test]
     fn lint_existing_path_arg_is_taken_literally() {
         let _g = aoide_test_support::env_lock().lock().unwrap();
-        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "PATH", "AOIDE_DRACHMA_BIN"]);
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("lint-path");
         let file = root.join("elsewhere.json");
         std::fs::write(&file, VALID_NOTES).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", root.join("stage"));
-        hide_drachma();
 
         let out = handle_rice_lint(&inv(&["rice", "lint"], &[file.to_str().unwrap()]));
+        assert_eq!(out.status, Status::Ok, "an existing path lints literally");
         let notes = out.data.unwrap()["notes"].as_str().unwrap().to_string();
         assert_eq!(notes, file.to_string_lossy(), "an existing path is literal");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lint_invalid_notes_report_the_schema_errors_natively() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("lint-invalid");
+        let file = root.join("bad.json");
+        std::fs::write(&file, r##"{ "palette": { "bg": "#nope" } }"##).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", root.join("stage"));
+
+        let out = handle_rice_lint(&inv(&["rice", "lint"], &[file.to_str().unwrap()]));
+        assert_eq!(out.status, Status::Error);
+        assert_eq!(out.render(false).1, aoide_protocol::output::exit::ERROR);
+        let errors = out.data.unwrap()["errors"].as_array().unwrap().clone();
+        assert!(
+            errors.iter().any(|e| e.as_str().unwrap().contains("palette.bg")),
+            "schema errors surface natively: {errors:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -494,17 +529,25 @@ mod tests {
         let song = root.join("songbook").join("moonlight");
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::create_dir_all(&song).unwrap();
-        std::fs::write(song.join("drachma.json"), VALID_NOTES).unwrap();
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
         let out = handle_rice_preview(&inv(&["rice", "preview"], &["moonlight"]));
         assert_eq!(out.status, Status::Ok);
-        // drachma.json landed in the stage with the song name injected, and
-        // its original fields (e.g. the palette) survived the round-trip.
-        let staged = std::fs::read_to_string(stage.join("drachma.json")).unwrap();
+        // livery.json landed in the stage with the song name injected, its
+        // original fields (e.g. the palette) survived the round-trip, and the
+        // legacy drachma.json mirror is byte-identical (LIVERY-MERGE §2.3
+        // dual-write) so a pre-livery reader finds the same file.
+        let staged = std::fs::read_to_string(stage.join("livery.json")).unwrap();
         let parsed: Value = serde_json::from_str(&staged).unwrap();
         assert_eq!(parsed["song"], "moonlight");
         assert_eq!(parsed["palette"]["bg"], "#0b1021");
+        let mirrored = std::fs::read_to_string(stage.join("drachma.json")).unwrap();
+        assert_eq!(mirrored, staged, "legacy mirror is byte-identical");
+        assert!(out
+            .changed
+            .iter()
+            .any(|c| c.ends_with("stage/livery.json")));
         assert!(out
             .changed
             .iter()
@@ -527,7 +570,7 @@ mod tests {
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::create_dir_all(&song).unwrap();
         std::fs::create_dir_all(&covers).unwrap();
-        std::fs::write(song.join("drachma.json"), VALID_NOTES).unwrap();
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
         std::fs::write(covers.join("dusk.png"), b"\x89PNG stub").unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
@@ -577,7 +620,7 @@ mod tests {
         let song = root.join("songbook").join("moonlight");
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::create_dir_all(&song).unwrap();
-        std::fs::write(song.join("drachma.json"), NOTES_WITH_WINDOW).unwrap();
+        std::fs::write(song.join("livery.json"), NOTES_WITH_WINDOW).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
         let out = handle_rice_preview(&inv(&["rice", "preview"], &["moonlight"]));
@@ -599,7 +642,7 @@ mod tests {
         let song = root.join("songbook").join("moonlight");
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::create_dir_all(&song).unwrap();
-        std::fs::write(song.join("drachma.json"), VALID_NOTES).unwrap();
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
         let out = handle_rice_preview(&inv(&["rice", "preview"], &["moonlight"]));
@@ -627,7 +670,7 @@ mod tests {
         let from_dir = root.join("songbook").join("default");
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::create_dir_all(&from_dir).unwrap();
-        std::fs::write(from_dir.join("drachma.json"), NOTES_WITH_INTERPOLATION).unwrap();
+        std::fs::write(from_dir.join("livery.json"), NOTES_WITH_INTERPOLATION).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
         let out = handle_rice_mint(&inv(&["rice", "mint"], &["moonlight"]));
@@ -736,7 +779,7 @@ mod tests {
         let from_dir = root.join("songbook").join("default");
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::create_dir_all(&from_dir).unwrap();
-        std::fs::write(from_dir.join("drachma.json"), VALID_NOTES).unwrap();
+        std::fs::write(from_dir.join("livery.json"), VALID_NOTES).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
         let out = handle_rice_mint(&inv(&["rice", "mint"], &["moonlight"]));
@@ -745,7 +788,7 @@ mod tests {
 
         let target = root.join("songbook").join("moonlight");
         assert!(target.join("rice.nix").is_file());
-        assert!(target.join("drachma.json").is_file());
+        assert!(target.join("livery.json").is_file());
         assert!(target.join("design").join("intent.md").is_file());
         assert!(target.join("widgets").join(".gitkeep").is_file());
         // No stray .nix files (checks.song-shape requires rice.nix to be the
@@ -759,8 +802,8 @@ mod tests {
         assert!(rice_nix.contains("gapsOut = null;"), "no geometry in `from` → null template");
         assert!(rice_nix.contains("carries no geometry tier"));
 
-        let mirrored = std::fs::read_to_string(target.join("drachma.json")).unwrap();
-        assert_eq!(mirrored, VALID_NOTES, "drachma.json mirrors --from exactly");
+        let mirrored = std::fs::read_to_string(target.join("livery.json")).unwrap();
+        assert_eq!(mirrored, VALID_NOTES, "livery.json mirrors --from exactly");
 
         let intent = std::fs::read_to_string(target.join("design").join("intent.md")).unwrap();
         assert!(intent.contains("inherited from `default` — retune"));
@@ -787,7 +830,7 @@ mod tests {
         let from_dir = root.join("songbook").join("sonata");
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::create_dir_all(&from_dir).unwrap();
-        std::fs::write(from_dir.join("drachma.json"), NOTES_WITH_GEOMETRY).unwrap();
+        std::fs::write(from_dir.join("livery.json"), NOTES_WITH_GEOMETRY).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
         let out = handle_rice_mint(&{
@@ -810,7 +853,7 @@ mod tests {
         assert!(rice_nix.contains("borderInactive = \"#0b1021\";"));
         assert!(rice_nix.contains("inherited from song \"sonata\""));
 
-        let mirrored = std::fs::read_to_string(target.join("drachma.json")).unwrap();
+        let mirrored = std::fs::read_to_string(target.join("livery.json")).unwrap();
         assert_eq!(mirrored, NOTES_WITH_GEOMETRY, "geometry block mirrored verbatim");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -826,7 +869,7 @@ mod tests {
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::create_dir_all(&from_dir).unwrap();
         std::fs::create_dir_all(&target).unwrap();
-        std::fs::write(from_dir.join("drachma.json"), VALID_NOTES).unwrap();
+        std::fs::write(from_dir.join("livery.json"), VALID_NOTES).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
         let out = handle_rice_mint(&inv(&["rice", "mint"], &["dusk"]));

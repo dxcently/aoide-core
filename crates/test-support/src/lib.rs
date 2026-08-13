@@ -83,15 +83,8 @@ pub const NOTES_WITH_INTERPOLATION: &str = r##"{ "schemaVersion":"0",
     "palette": {"bg":"${builtins.currentTime}","fg":"#c8d3f5",
                  "accent":"#82aaff","urgent":"#ff757f"} }"##;
 
-// Force drachma un-locatable so lint outcomes don't depend on the sandbox
-// PATH (drachma is not a build dep of aoide; the checkPhase has no PATH copy).
-pub fn hide_drachma() {
-    std::env::set_var("PATH", "");
-    std::env::set_var("AOIDE_DRACHMA_BIN", "");
-}
-
 /// A suite-wide lock serialising every test that mutates process-global env
-/// (`AOIDE_STAGE_DIR`, `PATH`, `AOIDE_DRACHMA_BIN`, …). `std::env::set_var` is
+/// (`AOIDE_STAGE_DIR`, `PATH`, …). `std::env::set_var` is
 /// process-global, so env-touching tests across modules must share ONE mutex or
 /// they race each other under the multithreaded test harness.
 pub fn env_lock() -> &'static std::sync::Mutex<()> {

@@ -1,0 +1,15 @@
+{
+  "palette": {
+    "bg":     { "$type": "color", "$value": "#1e1e2e" },
+    "fg":     { "$type": "color", "$value": "#cdd6f4" },
+    "accent": { "$type": "color", "$value": "#89b4fa" },
+    "urgent": { "$type": "color", "$value": "#f38ba8" }
+  },
+  "bar": {
+    "bg":     { "$value": "{palette.bg}" },
+    "accent": { "$value": "#a6e3a1" }
+  },
+  "window": {
+    "border": { "$value": "{palette.accent}" }
+  }
+}
