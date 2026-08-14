@@ -69,7 +69,7 @@ pub fn save_design_marker(marker: &DesignMarker) -> Result<(), String> {
 /// that cleared it) as success, same "absent is never an error" discipline
 /// [`load_design_marker`] follows. Only the marker is touched — never
 /// `run/qml/` or any song file; the live sketch a design session left behind
-/// stays exactly as it was until the next `rice preview`/`enter` resets it.
+/// stays exactly as it was until the next `rice stage`/`enter` resets it.
 pub fn delete_design_marker() -> Result<(), String> {
     let path = design_marker_path();
     match std::fs::remove_file(&path) {

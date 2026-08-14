@@ -9,13 +9,28 @@ use serde_json::json;
 pub fn register(r: &mut Registry) {
     r.insert(cmd!(
         path: ["cover", "set"],
-        summary: "Set the live wallpaper: stage stage/cover.json (hot-swap) from a cover path or a bare name in song/covers/.",
+        summary: "Set the live wallpaper: stage stage/cover.json (hot-swap) from a cover path or a bare name in song/covers/. Refuses while `rice mode declarative` is locked.",
         args: [arg!("path", "string", true, "Absolute cover path, or a bare filename resolved against song/covers/.")],
         flags: [],
         gated: false,
         implemented: true,
-        handler: handle_cover_set,
+        handler: handle_cover_set_entry,
     ));
+}
+
+/// `cover set` registry entrypoint — refuses while `rice mode declarative`
+/// is locked, same guard as `rice stage`'s own entrypoint
+/// (`commands/rice.rs::handle_rice_stage_entry`, khoa 2026-08-14). The pure
+/// write logic stays in [`handle_cover_set`] guard-free.
+fn handle_cover_set_entry(inv: &Invocation) -> Outcome {
+    if aoide_storage::mode::load_mode_marker().mode == aoide_storage::mode::RiceMode::Declarative {
+        return Outcome::error(
+            "cover.set",
+            "declarative mode is locked — run `aoide rice mode stage` to unlock hot-loading first",
+        )
+        .with_data(json!({ "reason": "declarative-mode-locked" }));
+    }
+    handle_cover_set(inv)
 }
 
 /// `cover set <path>` — switch the live wallpaper by staging a new cover.
@@ -23,7 +38,7 @@ pub fn register(r: &mut Registry) {
 /// This is the WRITE path the Quickshell wallpaper picker shells out to (QML has
 /// no file-write primitive). It resolves `<path>` to an absolute cover file, then
 /// atomic-writes `{ "path": "<abs>" }` to `<stage>/cover.json` — exactly the seam
-/// `rice preview` uses, which `AoideWallpaper.qml`'s FileView watches and
+/// `rice stage` uses, which `AoideWallpaper.qml`'s FileView watches and
 /// hot-swaps live. Nothing is committed; the baked `AOIDE_WALLPAPER` remains the
 /// boot/rebuild fallback.
 ///
@@ -57,7 +72,7 @@ fn handle_cover_set(inv: &Invocation) -> Outcome {
         }));
     }
 
-    // Stage cover.json exactly like `rice preview`: pretty `{ "path": … }`
+    // Stage cover.json exactly like `rice stage`: pretty `{ "path": … }`
     // with a trailing newline, atomic write into the stage dir.
     let stage = shellbridge::stage_dir();
     let cover_dst = stage.join("cover.json");
@@ -107,7 +122,7 @@ mod tests {
         // cover.json landed in the stage and points at the absolute path.
         let cover = std::fs::read_to_string(stage.join("cover.json")).unwrap();
         assert!(cover.contains("elsewhere.png"), "cover.json points at the file: {cover}");
-        assert!(cover.ends_with("\n"), "trailing newline mirrors rice preview");
+        assert!(cover.ends_with("\n"), "trailing newline mirrors rice stage");
         assert!(out.changed.iter().any(|c| c.ends_with("cover.json")));
         assert_eq!(
             out.data.unwrap()["cover"].as_str().unwrap(),
@@ -163,5 +178,48 @@ mod tests {
         let out = handle_cover_set(&inv(&["cover", "set"], &[]));
         assert_eq!(out.status, Status::Usage);
         assert_eq!(out.render(false).1, aoide_protocol::output::exit::USAGE);
+    }
+
+    // ── cover set: the declarative-mode write guard (khoa 2026-08-14) ────────
+
+    #[test]
+    fn cover_set_entry_refuses_while_declarative_mode_is_locked() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("cover-entry-locked");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        let img = root.join("elsewhere.png");
+        std::fs::write(&img, b"\x89PNG stub").unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_cover_set_entry(&inv(&["cover", "set"], &[img.to_str().unwrap()]));
+        assert_eq!(out.status, Status::Error);
+        assert_eq!(out.data.unwrap()["reason"], "declarative-mode-locked");
+        assert!(!stage.join("cover.json").exists(), "nothing staged while locked");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cover_set_entry_allows_writes_once_staging_mode_is_unlocked() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("cover-entry-unlocked");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        let img = root.join("elsewhere.png");
+        std::fs::write(&img, b"\x89PNG stub").unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        aoide_storage::mode::save_mode_marker(&aoide_storage::mode::ModeMarker {
+            mode: aoide_storage::mode::RiceMode::Staging,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let out = handle_cover_set_entry(&inv(&["cover", "set"], &[img.to_str().unwrap()]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert!(stage.join("cover.json").is_file());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

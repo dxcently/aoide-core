@@ -5,16 +5,16 @@
 //! `live` computes the Hyprland
 //! geometry/border keyword list a staged notes document implies and
 //! (best-effort) applies it to a running compositor. `notes`/`live` are
-//! dependency-free leaves (Phase 5a). `mint` (the pure `rice mint`
+//! dependency-free leaves (Phase 5a). `compose` (the pure `rice compose`
 //! scaffolding/rendering engine) and `cover` (cover-art derivation +
 //! resolution) land in Phase 5b with a `aoide-storage` dependency
 //! (`aoide_storage::fs::song_dir`).
 
 pub mod commands;
+pub mod compose;
 pub mod cover;
 pub mod live;
 pub mod livery;
-pub mod mint;
 pub mod notes;
 
 /// A crate-wide lock serialising every test that mutates process-global env

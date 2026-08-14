@@ -1,6 +1,6 @@
-//! Hyprland live-apply helpers — the compositor half of `rice preview`.
+//! Hyprland live-apply helpers — the compositor half of `rice stage`.
 //!
-//! `handle_rice_preview` (dispatch.rs) already hot-reloads the palette by
+//! `handle_rice_stage` (dispatch.rs) already hot-reloads the palette by
 //! staging `stage/livery.json`; Quickshell's own FileView watches that file
 //! and needs no compositor call. Geometry (gaps/border-size/rounding/blur)
 //! and the border *colours* have no such watcher on the Hyprland side, so
@@ -89,7 +89,7 @@ pub fn batch_command(keywords: &[String]) -> String {
 
 /// Guarded, best-effort live-apply. Returns a short status string for the
 /// caller's outcome envelope; NEVER a `Result` — a failed or absent `hyprctl`
-/// must not fail `rice preview` (the stage file is already the source of
+/// must not fail `rice stage` (the stage file is already the source of
 /// truth for the hot-reload half; this is best-effort on top of it).
 ///
 /// Guard: only runs `hyprctl` when `$HYPRLAND_INSTANCE_SIGNATURE` is set

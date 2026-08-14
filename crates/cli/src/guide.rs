@@ -35,8 +35,8 @@ Tier 1 — the CLI (full capability)
   - `aoide schema --json` is the machine-readable backstop at any tier — the
     MCP tool list generates from it.
   Rice loop (headline): `aoide rice gen <prompt|wallpaper>` → `rice lint` →
-  `rice preview` (rehearsal, nothing committed) → `rice adopt <name>` (USER
-  gates this) → commit + gated rebuild.
+  `rice stage` (hot-load live, nothing committed) → `rice adopt <name>`
+  (USER gates this) → commit + gated rebuild.
   Replay: a committed song is host-agnostic — any host performs it by naming it
   in nix (`aoide.song = \"<name>\";`); the notes fan-out swaps, the venue keeps
   its own instruments. `default` is the shipped standard.

@@ -1,18 +1,18 @@
-//! The pure `rice mint` scaffolding engine: name validation, the Nix-literal
-//! renderer, and the `rice.nix`/`design/intent.md` templates.
+//! The pure `rice compose` scaffolding engine: name validation, the
+//! Nix-literal renderer, and the `rice.nix`/`design/intent.md` templates.
 //!
 //! Moved out of `pkgs/aoide/src/commands/rice.rs` (Phase 5b restructure,
 //! docs/architecture/PACKAGE-LAYOUT.md) — everything here is a pure function
 //! of its inputs (no `Outcome`/`Invocation`, no filesystem I/O). The command
-//! handler (`handle_rice_mint`, still in root `commands/rice.rs`) owns the
-//! I/O (reading `--from`'s notes, writing the scaffolded files) and calls
+//! handler (`handle_rice_compose`, in `commands/rice.rs`) owns the I/O
+//! (reading `--from`'s notes, writing the scaffolded files) and calls
 //! through to this module for the actual rendering.
 
 use serde_json::Value;
 
-/// A valid `rice mint`/`rice new` song name: `^[a-z0-9][a-z0-9-]*$`. This one
-/// check also rejects path traversal (`..`, `/`) and case/underscore variance
-/// by construction — nothing outside `[a-z0-9-]` is accepted, and the first
+/// A valid `rice compose` song name: `^[a-z0-9][a-z0-9-]*$`. This one check
+/// also rejects path traversal (`..`, `/`) and case/underscore variance by
+/// construction — nothing outside `[a-z0-9-]` is accepted, and the first
 /// character can never be a `-`.
 pub fn valid_song_name(name: &str) -> bool {
     let mut chars = name.chars();
@@ -20,9 +20,9 @@ pub fn valid_song_name(name: &str) -> bool {
     first_ok && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// Render one JSON scalar as a nix literal. The notes tiers `rice mint` reads
-/// (palette / window / geometry) are leaves only — string, bool, number, or
-/// null — so this never needs to handle arrays/objects.
+/// Render one JSON scalar as a nix literal. The notes tiers `rice compose`
+/// reads (palette / window / geometry) are leaves only — string, bool,
+/// number, or null — so this never needs to handle arrays/objects.
 pub fn nix_scalar(v: &Value) -> String {
     // ORDER MATTERS: backslash first (so the later escapes don't get
     // double-escaped), then the closing quote, then `$` — `\$` is the Nix
@@ -64,7 +64,7 @@ pub const GEOMETRY_KEYS: &[&str] = &[
 /// The window (border-colour) component tier's fixed key set.
 pub const WINDOW_KEYS: &[&str] = &["border", "borderInactive"];
 
-/// Render one `rice.nix` for `rice mint`: a self-gating skeleton copying
+/// Render one `rice.nix` for `rice compose`: a self-gating skeleton copying
 /// `notes`' palette/window/geometry into `aoide.livery.<tier>` under
 /// `config.aoide.song == "<name>"` — the same shape as every committed song
 /// (CONTRACTS.md §5). `had_geometry`/`had_window` distinguish "copied from
@@ -103,7 +103,7 @@ pub fn render_rice_nix(name: &str, from: &str, notes: &Value) -> String {
 
     let mut s = String::new();
     s.push_str(&format!(
-        "# song/songbook/{name}/rice.nix — scaffolded via `aoide rice mint` from song \"{from}\".\n"
+        "# song/songbook/{name}/rice.nix — scaffolded via `aoide rice compose` from song \"{from}\".\n"
     ));
     s.push_str("#\n");
     s.push_str("# HOST-AGNOSTIC DISCIPLINE (CONTRACTS.md §5): a song sets ONLY aoide.livery.\n");
@@ -133,9 +133,9 @@ pub fn render_rice_nix(name: &str, from: &str, notes: &Value) -> String {
     s
 }
 
-/// Render `design/intent.md` for `rice mint`: honest-empty — no fabricated
-/// rationale, just what IS true (inherited from `from`, retune it) and where
-/// to go to actually fill it in.
+/// Render `design/intent.md` for `rice compose`: honest-empty — no
+/// fabricated rationale, just what IS true (inherited from `from`, retune
+/// it) and where to go to actually fill it in.
 pub fn render_intent_md(name: &str, from: &str) -> String {
     format!(
         "# {name} — Design Intent\n\
@@ -147,7 +147,7 @@ pub fn render_intent_md(name: &str, from: &str) -> String {
          \n\
          ## Palette Rationale\n\
          \n\
-         (not yet written — this rice was scaffolded from `{from}` via `aoide rice mint`, not designed)\n\
+         (not yet written — this rice was scaffolded from `{from}` via `aoide rice compose`, not designed)\n\
          \n\
          ## Component Tier\n\
          \n\

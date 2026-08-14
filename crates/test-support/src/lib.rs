@@ -67,7 +67,7 @@ pub const NOTES_WITH_WINDOW: &str = r##"{ "schemaVersion":"0",
     "palette": {"bg":"#0b1021","fg":"#c8d3f5","accent":"#82aaff","urgent":"#ff757f"},
     "window": {"border":"#82aaff","borderInactive":"#0b1021"} }"##;
 
-// A song with palette + window + a full geometry block, for `rice mint`
+// A song with palette + window + a full geometry block, for `rice compose`
 // tests that need to assert every tier round-trips.
 pub const NOTES_WITH_GEOMETRY: &str = r##"{ "schemaVersion":"0",
     "palette": {"bg":"#0b1021","fg":"#c8d3f5","accent":"#82aaff","urgent":"#ff757f"},

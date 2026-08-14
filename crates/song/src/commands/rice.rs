@@ -1,4 +1,4 @@
-//! `rice lint` / `rice preview` / `rice mint` — the self-ricing loop
+//! `rice lint` / `rice stage` / `rice compose` — the self-ricing loop
 //! (concepts/Self-Ricing). `rice gen`/`rice adopt`/`rice transpose` are still
 //! walking-skeleton stubs; their metadata lives in `commands/stubs.rs`.
 
@@ -21,17 +21,17 @@ pub fn register(r: &mut Registry) {
         handler: handle_rice_lint,
     ));
     r.insert(cmd!(
-        path: ["rice", "preview"],
-        summary: "Rehearse a rice live (stage/livery.json hot-reload + legacy mirror + best-effort hyprctl geometry/border apply); nothing committed.",
-        args: [arg!("name", "string", true, "Rice/song name to preview (from song/songbook/).")],
+        path: ["rice", "stage"],
+        summary: "Hot-load a rice live (stage/livery.json hot-reload + best-effort hyprctl geometry/border apply); nothing committed. Refuses while `rice mode declarative` is locked.",
+        args: [arg!("name", "string", true, "Rice/song name to stage (from song/songbook/).")],
         flags: [],
         gated: false,
         implemented: true,
-        handler: handle_rice_preview,
+        handler: handle_rice_stage_entry,
     ));
     r.insert(cmd!(
-        path: ["rice", "mint"],
-        summary: "Scaffold a new song under song/songbook/<name>/ by copying --from's notes (rice.nix, livery.json, design/intent.md, widgets/); `rice new` is a parse alias for this.",
+        path: ["rice", "compose"],
+        summary: "Scaffold a new song under song/songbook/<name>/ by copying --from's notes (rice.nix, livery.json, design/intent.md, widgets/).",
         args: [arg!("name", "string", true, "New song name: ^[a-z0-9][a-z0-9-]*$ (lowercase, digits, hyphens).")],
         flags: [
             flag!("from", "string", "Source song to copy notes from (default \"default\")."),
@@ -39,7 +39,7 @@ pub fn register(r: &mut Registry) {
         ],
         gated: false,
         implemented: true,
-        handler: handle_rice_mint,
+        handler: handle_rice_compose,
     ));
 }
 
@@ -118,7 +118,26 @@ fn handle_rice_lint(inv: &Invocation) -> Outcome {
     }
 }
 
-/// `rice preview <name>` — rehearse a committed song live: stage its
+/// `rice stage` registry entrypoint — refuses while `rice mode declarative`
+/// is locked (`aoide_storage::mode`, khoa 2026-08-14): `rice mode stage`
+/// unlocks it first. The pure staging logic stays in [`handle_rice_stage`]
+/// itself (`pub(crate)`, kept guard-free) so `rice design enter` and `rice
+/// mode`'s own writes can reuse it directly — including `rice mode
+/// declarative <name>`'s re-pin, which legitimately writes WHILE the mode
+/// marker is still whatever it was before this call (the marker only flips
+/// to `declarative` after that write succeeds).
+fn handle_rice_stage_entry(inv: &Invocation) -> Outcome {
+    if aoide_storage::mode::load_mode_marker().mode == aoide_storage::mode::RiceMode::Declarative {
+        return Outcome::error(
+            "rice.stage",
+            "declarative mode is locked — run `aoide rice mode stage` to unlock hot-loading first",
+        )
+        .with_data(json!({ "reason": "declarative-mode-locked" }));
+    }
+    handle_rice_stage(inv)
+}
+
+/// `rice stage <name>` — hot-load a committed song live: stage its
 /// `livery.json` (plus a derivable cover) into `<stage>/` so the Quickshell
 /// surfaces hot-reload it, AND best-effort live-apply its geometry + border
 /// colours to the running compositor via `hyprctl --batch keyword …`
@@ -131,15 +150,15 @@ fn handle_rice_lint(inv: &Invocation) -> Outcome {
 ///
 /// `pub(crate)`, not private: `rice design enter` (Phase B,
 /// `commands/design.rs`) calls this directly to get the SAME live-apply side
-/// effects a bare `rice preview <name>` has, rather than reimplementing them
+/// effects a bare `rice stage <name>` has, rather than reimplementing them
 /// — it hands this the identical `Invocation` it was given (both commands
 /// take the song name as their first positional arg, and this function reads
 /// nothing else off `inv`), so no adapter/duplication is needed.
-pub(crate) fn handle_rice_preview(inv: &Invocation) -> Outcome {
+pub(crate) fn handle_rice_stage(inv: &Invocation) -> Outcome {
     let name = match inv.args.first() {
         Some(n) => n.clone(),
         None => {
-            return Outcome::usage("rice.preview", "usage: aoide rice preview <name> [--json]")
+            return Outcome::usage("rice.stage", "usage: aoide rice stage <name> [--json]")
                 .with_data(json!({ "reason": "missing-name" }));
         }
     };
@@ -149,7 +168,7 @@ pub(crate) fn handle_rice_preview(inv: &Invocation) -> Outcome {
         Ok(s) => s,
         Err(e) => {
             return Outcome::error(
-                "rice.preview",
+                "rice.stage",
                 format!("no song `{name}`: cannot read {} ({e})", notes_src.display()),
             )
             .with_data(json!({
@@ -165,7 +184,7 @@ pub(crate) fn handle_rice_preview(inv: &Invocation) -> Outcome {
         Ok(v) => v,
         Err(e) => {
             return Outcome::error(
-                "rice.preview",
+                "rice.stage",
                 format!("notes for `{name}` are not valid JSON: {e}"),
             )
             .with_data(json!({
@@ -199,7 +218,7 @@ pub(crate) fn handle_rice_preview(inv: &Invocation) -> Outcome {
     let stage = shellbridge::stage_dir();
     let notes_dst = stage.join("livery.json");
     if let Err(e) = shellbridge::atomic_write(&notes_dst, &staged) {
-        return Outcome::error("rice.preview", format!("failed to stage livery.json: {e}"))
+        return Outcome::error("rice.stage", format!("failed to stage livery.json: {e}"))
             .with_data(json!({ "reason": "stage-write-failed", "target": notes_dst.to_string_lossy() }));
     }
     let mut changed: Vec<String> = vec![notes_dst.to_string_lossy().into_owned()];
@@ -221,7 +240,7 @@ pub(crate) fn handle_rice_preview(inv: &Invocation) -> Outcome {
                 + "\n";
             if let Err(e) = shellbridge::atomic_write(&cover_dst, &body) {
                 return Outcome::error(
-                    "rice.preview",
+                    "rice.stage",
                     format!("failed to stage cover.json: {e}"),
                 )
                 .with_data(json!({ "reason": "stage-write-failed", "target": cover_dst.to_string_lossy() }));
@@ -233,9 +252,9 @@ pub(crate) fn handle_rice_preview(inv: &Invocation) -> Outcome {
     };
 
     Outcome::ok(
-        "rice.preview",
+        "rice.stage",
         format!(
-            "previewing `{name}` — {} stage file(s) live for hot-reload; {cover_note}",
+            "staged `{name}` — {} stage file(s) live for hot-reload; {cover_note}",
             changed.len()
         ),
     )
@@ -252,33 +271,32 @@ pub(crate) fn handle_rice_preview(inv: &Invocation) -> Outcome {
     }))
 }
 
-/// `rice mint <name> [--from <song>] [--force]` — scaffold a new committed
-/// song under `song/songbook/<name>/` by copying an existing song's notes.
-/// `aoide rice new` (cli.rs) is a pure parse alias for this same path — there
-/// is only ONE registry entry (`rice.mint`).
+/// `rice compose <name> [--from <song>] [--force]` — scaffold a new
+/// committed song under `song/songbook/<name>/` by copying an existing
+/// song's notes.
 ///
 /// Writes ONLY inside `song/songbook/<name>/` (house rule 1): `rice.nix` (a
 /// self-gating skeleton — the sole `.nix` file, satisfying `checks.song-shape`),
 /// `livery.json` (a mirror of `--from`'s, INCLUDING any geometry block, so
-/// `aoide rice preview <name>` renders + live-applies immediately),
+/// `aoide rice stage <name>` renders + live-applies immediately),
 /// `design/intent.md` (honest-empty — no fabricated rationale), and
 /// `widgets/.gitkeep` (no per-song widgets yet). No `hypr/` dir: geometry
 /// lives in the livery tier, not a build fragment.
-fn handle_rice_mint(inv: &Invocation) -> Outcome {
+fn handle_rice_compose(inv: &Invocation) -> Outcome {
     let name = match inv.args.first() {
         Some(n) => n.clone(),
         None => {
             return Outcome::usage(
-                "rice.mint",
-                "usage: aoide rice mint <name> [--from <song>] [--force] [--json]",
+                "rice.compose",
+                "usage: aoide rice compose <name> [--from <song>] [--force] [--json]",
             )
             .with_data(json!({ "reason": "missing-name" }));
         }
     };
 
-    if !crate::mint::valid_song_name(&name) {
+    if !crate::compose::valid_song_name(&name) {
         return Outcome::error(
-            "rice.mint",
+            "rice.compose",
             format!(
                 "`{name}` is not a valid song name: must match `^[a-z0-9][a-z0-9-]*$` \
                  (lowercase letters, digits, hyphens; no leading hyphen, no `/`, no `..`)"
@@ -293,9 +311,9 @@ fn handle_rice_mint(inv: &Invocation) -> Outcome {
         .cloned()
         .unwrap_or_else(|| "default".to_string());
 
-    if !crate::mint::valid_song_name(&from) {
+    if !crate::compose::valid_song_name(&from) {
         return Outcome::error(
-            "rice.mint",
+            "rice.compose",
             format!(
                 "`--from {from}` is not a valid song name: must match `^[a-z0-9][a-z0-9-]*$` \
                  (lowercase letters, digits, hyphens; no leading hyphen, no `/`, no `..`)"
@@ -305,7 +323,7 @@ fn handle_rice_mint(inv: &Invocation) -> Outcome {
     }
     if from == name {
         return Outcome::error(
-            "rice.mint",
+            "rice.compose",
             format!("`--from` cannot be `{name}` itself — nothing to copy from"),
         )
         .with_data(json!({ "reason": "from-equals-name", "name": name }));
@@ -316,7 +334,7 @@ fn handle_rice_mint(inv: &Invocation) -> Outcome {
     let target = shellbridge::songbook_dir(&name);
     if target.exists() && !force {
         return Outcome::error(
-            "rice.mint",
+            "rice.compose",
             format!(
                 "song `{name}` already exists at {} (pass --force to overwrite)",
                 target.display()
@@ -334,7 +352,7 @@ fn handle_rice_mint(inv: &Invocation) -> Outcome {
         Ok(s) => s,
         Err(e) => {
             return Outcome::error(
-                "rice.mint",
+                "rice.compose",
                 format!(
                     "--from song `{from}` not found: cannot read {} ({e})",
                     from_notes_path.display()
@@ -351,7 +369,7 @@ fn handle_rice_mint(inv: &Invocation) -> Outcome {
         Ok(v) => v,
         Err(e) => {
             return Outcome::error(
-                "rice.mint",
+                "rice.compose",
                 format!("--from song `{from}`'s notes are not valid JSON: {e}"),
             )
             .with_data(json!({
@@ -362,8 +380,8 @@ fn handle_rice_mint(inv: &Invocation) -> Outcome {
         }
     };
 
-    let rice_nix = crate::mint::render_rice_nix(&name, &from, &from_parsed);
-    let intent_md = crate::mint::render_intent_md(&name, &from);
+    let rice_nix = crate::compose::render_rice_nix(&name, &from, &from_parsed);
+    let intent_md = crate::compose::render_intent_md(&name, &from);
 
     let writes: [(PathBuf, String); 4] = [
         (target.join("rice.nix"), rice_nix),
@@ -375,7 +393,7 @@ fn handle_rice_mint(inv: &Invocation) -> Outcome {
     for (path, contents) in &writes {
         if let Err(e) = shellbridge::atomic_write(path, contents) {
             return Outcome::error(
-                "rice.mint",
+                "rice.compose",
                 format!("failed to write {}: {e}", path.display()),
             )
             .with_data(json!({ "reason": "write-failed", "target": path.to_string_lossy() }));
@@ -384,9 +402,9 @@ fn handle_rice_mint(inv: &Invocation) -> Outcome {
     }
 
     Outcome::ok(
-        "rice.mint",
+        "rice.compose",
         format!(
-            "minted song `{name}` from `{from}` — {} file(s) written under {}",
+            "composed song `{name}` from `{from}` — {} file(s) written under {}",
             changed.len(),
             target.display()
         ),
@@ -397,12 +415,12 @@ fn handle_rice_mint(inv: &Invocation) -> Outcome {
         "from": from,
         "nextSteps": [
             format!("truth: set aoide.song = \"{name}\" in the host's default.nix and rebuild"),
-            format!("sketch: `aoide rice preview {name}` to rehearse it live, no rebuild"),
+            format!("sketch: `aoide rice stage {name}` to hot-load it live, no rebuild"),
         ],
     }))
 }
 
-// ── Tests (rice lint resolution + rice preview staging + rice mint) ─────────
+// ── Tests (rice lint resolution + rice stage staging + rice compose) ────────
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,10 +522,10 @@ mod tests {
     }
 
     #[test]
-    fn preview_stages_notes_and_reports_no_derivable_cover() {
+    fn stage_writes_notes_and_reports_no_derivable_cover() {
         let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
-        let root = unique_tmp("preview-ok");
+        let root = unique_tmp("stage-ok");
         let stage = root.join("stage");
         let song = root.join("songbook").join("moonlight");
         std::fs::create_dir_all(&stage).unwrap();
@@ -515,7 +533,7 @@ mod tests {
         std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
-        let out = handle_rice_preview(&inv(&["rice", "preview"], &["moonlight"]));
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
         assert_eq!(out.status, Status::Ok);
         // livery.json landed in the stage with the song name injected, its
         // original fields (e.g. the palette) survived the round-trip, and no
@@ -541,10 +559,10 @@ mod tests {
     }
 
     #[test]
-    fn preview_stages_a_derivable_cover_from_the_covers_library() {
+    fn stage_writes_a_derivable_cover_from_the_covers_library() {
         let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
-        let root = unique_tmp("preview-cover");
+        let root = unique_tmp("stage-cover");
         let stage = root.join("stage");
         let song = root.join("songbook").join("dusk");
         let covers = root.join("covers");
@@ -555,7 +573,7 @@ mod tests {
         std::fs::write(covers.join("dusk.png"), b"\x89PNG stub").unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
-        let out = handle_rice_preview(&inv(&["rice", "preview"], &["dusk"]));
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["dusk"]));
         assert_eq!(out.status, Status::Ok);
         let cover = std::fs::read_to_string(stage.join("cover.json")).unwrap();
         assert!(cover.contains("dusk.png"), "cover.json points at the derived file");
@@ -566,37 +584,84 @@ mod tests {
     }
 
     #[test]
-    fn preview_missing_song_is_error_exit_1() {
+    fn stage_missing_song_is_error_exit_1() {
         let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
-        let stage = unique_tmp("preview-missing").join("stage");
+        let stage = unique_tmp("stage-missing").join("stage");
         std::fs::create_dir_all(&stage).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
-        let out = handle_rice_preview(&inv(&["rice", "preview"], &["nope"]));
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["nope"]));
         assert_eq!(out.status, Status::Error);
         assert_eq!(out.render(false).1, aoide_protocol::output::exit::ERROR);
         assert_eq!(out.data.unwrap()["reason"], "song-not-found");
     }
 
     #[test]
-    fn preview_missing_name_is_usage_exit_2() {
-        let out = handle_rice_preview(&inv(&["rice", "preview"], &[]));
+    fn stage_missing_name_is_usage_exit_2() {
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &[]));
         assert_eq!(out.status, Status::Usage);
         assert_eq!(out.render(false).1, aoide_protocol::output::exit::USAGE);
     }
 
-    // ── rice preview: the hyprctl live-apply guard (Phase F) ─────────────────
+    // ── rice stage: the declarative-mode write guard (khoa 2026-08-14) ───────
 
     #[test]
-    fn preview_off_hyprland_skips_hyprctl_without_panicking() {
+    fn stage_entry_refuses_while_declarative_mode_is_locked() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("stage-entry-locked");
+        let stage = root.join("stage");
+        let song = root.join("songbook").join("moonlight");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&song).unwrap();
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        // No marker file at all IS declarative (the safe default) — the
+        // entry must refuse, not silently write.
+        let out = handle_rice_stage_entry(&inv(&["rice", "stage"], &["moonlight"]));
+        assert_eq!(out.status, Status::Error);
+        assert_eq!(out.data.unwrap()["reason"], "declarative-mode-locked");
+        assert!(!stage.join("livery.json").exists(), "nothing staged while locked");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stage_entry_allows_writes_once_staging_mode_is_unlocked() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("stage-entry-unlocked");
+        let stage = root.join("stage");
+        let song = root.join("songbook").join("moonlight");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&song).unwrap();
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        aoide_storage::mode::save_mode_marker(&aoide_storage::mode::ModeMarker {
+            mode: aoide_storage::mode::RiceMode::Staging,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let out = handle_rice_stage_entry(&inv(&["rice", "stage"], &["moonlight"]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert!(stage.join("livery.json").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── rice stage: the hyprctl live-apply guard (Phase F) ───────────────────
+
+    #[test]
+    fn stage_off_hyprland_skips_hyprctl_without_panicking() {
         // The common test path: no compositor, `hyprctl` may not even exist on
         // PATH — the guard must trip on the env var alone, never touching the
         // process spawn.
         let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "HYPRLAND_INSTANCE_SIGNATURE"]);
         std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
-        let root = unique_tmp("preview-hypr-off");
+        let root = unique_tmp("stage-hypr-off");
         let stage = root.join("stage");
         let song = root.join("songbook").join("moonlight");
         std::fs::create_dir_all(&stage).unwrap();
@@ -604,7 +669,7 @@ mod tests {
         std::fs::write(song.join("livery.json"), NOTES_WITH_WINDOW).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
-        let out = handle_rice_preview(&inv(&["rice", "preview"], &["moonlight"]));
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
         assert_eq!(out.status, Status::Ok);
         assert_eq!(
             out.data.unwrap()["hyprctl"],
@@ -614,11 +679,11 @@ mod tests {
     }
 
     #[test]
-    fn preview_with_no_window_or_geometry_reports_an_empty_batch() {
+    fn stage_with_no_window_or_geometry_reports_an_empty_batch() {
         let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "HYPRLAND_INSTANCE_SIGNATURE"]);
         std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
-        let root = unique_tmp("preview-hypr-empty");
+        let root = unique_tmp("stage-hypr-empty");
         let stage = root.join("stage");
         let song = root.join("songbook").join("moonlight");
         std::fs::create_dir_all(&stage).unwrap();
@@ -626,7 +691,7 @@ mod tests {
         std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
-        let out = handle_rice_preview(&inv(&["rice", "preview"], &["moonlight"]));
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
         assert_eq!(out.status, Status::Ok);
         assert_eq!(
             out.data.unwrap()["hyprctl"],
@@ -635,18 +700,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // ── rice mint (Phase E) ───────────────────────────────────────────────────
+    // ── rice compose (Phase E) ────────────────────────────────────────────────
     //
     // The PURE `nix_scalar`/`valid_song_name` unit tests moved to
-    // `crate::mint`'s own test module (Phase 5b restructure) alongside
+    // `crate::compose`'s own test module (Phase 5b restructure) alongside
     // the functions they exercise. Everything below is handler-level: it
-    // drives `handle_rice_mint` through `Invocation`/`Outcome`.
+    // drives `handle_rice_compose` through `Invocation`/`Outcome`.
 
     #[test]
-    fn mint_neutralizes_nix_interpolation_in_notes() {
+    fn compose_neutralizes_nix_interpolation_in_notes() {
         let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
-        let root = unique_tmp("mint-interpolation");
+        let root = unique_tmp("compose-interpolation");
         let stage = root.join("stage");
         let from_dir = root.join("songbook").join("default");
         std::fs::create_dir_all(&stage).unwrap();
@@ -654,7 +719,7 @@ mod tests {
         std::fs::write(from_dir.join("livery.json"), NOTES_WITH_INTERPOLATION).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
-        let out = handle_rice_mint(&inv(&["rice", "mint"], &["moonlight"]));
+        let out = handle_rice_compose(&inv(&["rice", "compose"], &["moonlight"]));
         assert_eq!(out.status, Status::Ok, "{:?}", out.data);
 
         let target = root.join("songbook").join("moonlight");
@@ -673,9 +738,9 @@ mod tests {
     }
 
     #[test]
-    fn mint_rejects_invalid_names() {
+    fn compose_rejects_invalid_names() {
         for bad in ["Dusk", "dusk_two", "-dusk", "dusk/two", "../etc", "", "dusk.two"] {
-            let out = handle_rice_mint(&inv(&["rice", "mint"], &[bad]));
+            let out = handle_rice_compose(&inv(&["rice", "compose"], &[bad]));
             assert_eq!(out.status, Status::Error, "`{bad}` should be rejected");
             assert_eq!(out.render(false).1, aoide_protocol::output::exit::ERROR);
             assert_eq!(out.data.unwrap()["reason"], "invalid-name", "for `{bad}`");
@@ -683,18 +748,18 @@ mod tests {
     }
 
     #[test]
-    fn mint_rejects_invalid_from() {
+    fn compose_rejects_invalid_from() {
         let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
-        let root = unique_tmp("mint-badfrom");
+        let root = unique_tmp("compose-badfrom");
         let stage = root.join("stage");
         std::fs::create_dir_all(&stage).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
         for bad in ["../../etc", "../etc/passwd", "de/fault", "De Fault", ""] {
             let target = root.join("songbook").join("moonlight");
-            let out = handle_rice_mint(&{
-                let mut i = inv(&["rice", "mint"], &["moonlight"]);
+            let out = handle_rice_compose(&{
+                let mut i = inv(&["rice", "compose"], &["moonlight"]);
                 i.flags.insert("from".into(), bad.into());
                 i
             });
@@ -707,17 +772,17 @@ mod tests {
     }
 
     #[test]
-    fn mint_rejects_from_equal_to_name() {
+    fn compose_rejects_from_equal_to_name() {
         let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
-        let root = unique_tmp("mint-fromeqname");
+        let root = unique_tmp("compose-fromeqname");
         let stage = root.join("stage");
         std::fs::create_dir_all(&stage).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
         let target = root.join("songbook").join("moonlight");
-        let out = handle_rice_mint(&{
-            let mut i = inv(&["rice", "mint"], &["moonlight"]);
+        let out = handle_rice_compose(&{
+            let mut i = inv(&["rice", "compose"], &["moonlight"]);
             i.flags.insert("from".into(), "moonlight".into());
             i
         });
@@ -729,22 +794,22 @@ mod tests {
     }
 
     #[test]
-    fn mint_missing_name_is_usage_exit_2() {
-        let out = handle_rice_mint(&inv(&["rice", "mint"], &[]));
+    fn compose_missing_name_is_usage_exit_2() {
+        let out = handle_rice_compose(&inv(&["rice", "compose"], &[]));
         assert_eq!(out.status, Status::Usage);
         assert_eq!(out.render(false).1, aoide_protocol::output::exit::USAGE);
     }
 
     #[test]
-    fn mint_missing_from_song_is_error() {
+    fn compose_missing_from_song_is_error() {
         let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
-        let root = unique_tmp("mint-nofrom");
+        let root = unique_tmp("compose-nofrom");
         let stage = root.join("stage");
         std::fs::create_dir_all(&stage).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
-        let out = handle_rice_mint(&inv(&["rice", "mint"], &["moonlight"]));
+        let out = handle_rice_compose(&inv(&["rice", "compose"], &["moonlight"]));
         assert_eq!(out.status, Status::Error);
         assert_eq!(out.render(false).1, aoide_protocol::output::exit::ERROR);
         assert_eq!(out.data.unwrap()["reason"], "from-song-not-found");
@@ -752,10 +817,10 @@ mod tests {
     }
 
     #[test]
-    fn mint_scaffolds_every_file_from_a_from_song_with_no_window_or_geometry() {
+    fn compose_scaffolds_every_file_from_a_from_song_with_no_window_or_geometry() {
         let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
-        let root = unique_tmp("mint-ok");
+        let root = unique_tmp("compose-ok");
         let stage = root.join("stage");
         let from_dir = root.join("songbook").join("default");
         std::fs::create_dir_all(&stage).unwrap();
@@ -763,7 +828,7 @@ mod tests {
         std::fs::write(from_dir.join("livery.json"), VALID_NOTES).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
-        let out = handle_rice_mint(&inv(&["rice", "mint"], &["moonlight"]));
+        let out = handle_rice_compose(&inv(&["rice", "compose"], &["moonlight"]));
         assert_eq!(out.status, Status::Ok, "{:?}", out.data);
         assert_eq!(out.changed.len(), 4);
 
@@ -803,10 +868,10 @@ mod tests {
     }
 
     #[test]
-    fn mint_with_geometry_and_window_copies_every_field_including_nulls() {
+    fn compose_with_geometry_and_window_copies_every_field_including_nulls() {
         let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
-        let root = unique_tmp("mint-geo");
+        let root = unique_tmp("compose-geo");
         let stage = root.join("stage");
         let from_dir = root.join("songbook").join("sonata");
         std::fs::create_dir_all(&stage).unwrap();
@@ -814,8 +879,8 @@ mod tests {
         std::fs::write(from_dir.join("livery.json"), NOTES_WITH_GEOMETRY).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
-        let out = handle_rice_mint(&{
-            let mut i = inv(&["rice", "mint"], &["dusk"]);
+        let out = handle_rice_compose(&{
+            let mut i = inv(&["rice", "compose"], &["dusk"]);
             i.flags.insert("from".into(), "sonata".into());
             i
         });
@@ -840,10 +905,10 @@ mod tests {
     }
 
     #[test]
-    fn mint_refuses_to_overwrite_without_force_then_succeeds_with_it() {
+    fn compose_refuses_to_overwrite_without_force_then_succeeds_with_it() {
         let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
-        let root = unique_tmp("mint-exists");
+        let root = unique_tmp("compose-exists");
         let stage = root.join("stage");
         let from_dir = root.join("songbook").join("default");
         let target = root.join("songbook").join("dusk");
@@ -853,14 +918,14 @@ mod tests {
         std::fs::write(from_dir.join("livery.json"), VALID_NOTES).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
-        let out = handle_rice_mint(&inv(&["rice", "mint"], &["dusk"]));
+        let out = handle_rice_compose(&inv(&["rice", "compose"], &["dusk"]));
         assert_eq!(out.status, Status::Error);
         assert_eq!(out.render(false).1, aoide_protocol::output::exit::ERROR);
         assert_eq!(out.data.unwrap()["reason"], "already-exists");
         assert!(!target.join("rice.nix").exists(), "nothing written without --force");
 
-        let out2 = handle_rice_mint(&{
-            let mut i = inv(&["rice", "mint"], &["dusk"]);
+        let out2 = handle_rice_compose(&{
+            let mut i = inv(&["rice", "compose"], &["dusk"]);
             i.flags.insert("force".into(), "true".into());
             i
         });

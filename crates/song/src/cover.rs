@@ -1,5 +1,5 @@
 //! Cover-art derivation + resolution — the shared logic `cover set` and
-//! `rice preview` both need to turn a name/arg into a physical cover file
+//! `rice stage` both need to turn a name/arg into a physical cover file
 //! under the shared library `song/covers/`.
 //!
 //! Moved out of `pkgs/aoide/src/commands/rice.rs` and

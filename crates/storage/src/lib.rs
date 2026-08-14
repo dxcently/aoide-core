@@ -14,6 +14,7 @@ pub mod a2a_store;
 pub mod commands;
 pub mod design;
 pub mod fs;
+pub mod mode;
 pub mod records;
 pub mod session;
 pub mod stage;

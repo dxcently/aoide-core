@@ -2,15 +2,15 @@
 //! `stage/design.json` (concepts/Self-Ricing's design-mode extension).
 //!
 //! Phase A shipped `status` (read-only). Phase B (this file, now) adds the
-//! write side: `enter` reuses `rice preview`'s live-apply side effects
-//! (`handle_rice_preview` in `commands/rice.rs`, made `pub(crate)` for this)
+//! write side: `enter` reuses `rice stage`'s live-apply side effects
+//! (`handle_rice_stage` in `commands/rice.rs`, made `pub(crate)` for this)
 //! and then records a [`aoide_storage::design::DesignMarker`]; `exit` clears
 //! it. `rice design sync` (Phase D) and widget live-carry into
 //! `run/qml/songs/` (Phase C, the only thing that would ever populate
 //! `carriedSlots`) are still later-phase work — see CONTRACTS.md §4's
 //! `design.json` entry for the honest state of the lifecycle today.
 
-use super::rice::handle_rice_preview;
+use super::rice::handle_rice_stage;
 use aoide_protocol::Invocation;
 use aoide_protocol::output::{Outcome, Status};
 use aoide_protocol::registry::{arg, cmd, flag, Registry};
@@ -73,16 +73,16 @@ fn handle_design_status(_inv: &Invocation) -> Outcome {
 }
 
 /// `rice design enter <name> [--by <id>]` — open a song for live design
-/// iteration: reuse `rice preview <name>`'s live-apply (livery.json +
+/// iteration: reuse `rice stage <name>`'s live-apply (livery.json +
 /// best-effort hyprctl geometry/border) so `enter` has the EXACT same
-/// side effects a bare `rice preview` has (no reimplementation), then record
+/// side effects a bare `rice stage` has (no reimplementation), then record
 /// a [`DesignMarker`] so other tooling (`status`, and later `sync`) knows a
 /// session is active.
 ///
-/// Song-not-found / missing-name validation is `handle_rice_preview`'s own
-/// check, reused as-is: `enter` and `preview` both take the song name as
+/// Song-not-found / missing-name validation is `handle_rice_stage`'s own
+/// check, reused as-is: `enter` and `stage` both take the song name as
 /// their first positional arg and nothing else off the `Invocation`, so the
-/// SAME `inv` this handler was given is handed straight to `handle_rice_preview`
+/// SAME `inv` this handler was given is handed straight to `handle_rice_stage`
 /// — no adapter needed. Its `Outcome` is relabelled to `rice.design.enter`
 /// (keeping its `message`/`data`/`changed`) and returned as-is on anything
 /// other than success; only on success do we go on to write the marker.
@@ -95,13 +95,13 @@ fn handle_design_enter(inv: &Invocation) -> Outcome {
         .with_data(json!({ "reason": "missing-name" }));
     }
 
-    let mut preview = handle_rice_preview(inv);
+    let mut preview = handle_rice_stage(inv);
     if preview.status != Status::Ok {
         preview.command = "rice.design.enter".to_string();
         return preview;
     }
 
-    // Re-validated by handle_rice_preview above; args.first() is Some.
+    // Re-validated by handle_rice_stage above; args.first() is Some.
     let name = inv.args.first().cloned().unwrap_or_default();
     let by = inv.flags.get("by").cloned();
     let intent_path = aoide_storage::fs::songbook_dir(&name)
@@ -156,7 +156,7 @@ fn handle_design_enter(inv: &Invocation) -> Outcome {
 /// Idempotent (no marker present is `ok`, not an error) and deliberately
 /// narrow: it never touches `run/qml/` or any song file — the live sketch a
 /// design session leaves behind stays exactly as it was until the next
-/// `rice preview`/`rice design enter` resets it (an explicit invariant of
+/// `rice stage`/`rice design enter` resets it (an explicit invariant of
 /// this feature, not an oversight).
 fn handle_design_exit(_inv: &Invocation) -> Outcome {
     match aoide_storage::design::load_design_marker() {

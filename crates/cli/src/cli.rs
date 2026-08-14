@@ -85,13 +85,6 @@ pub fn parse(argv: &[String], door: Door) -> Result<(Invocation, bool), Outcome>
         };
     }
 
-    // `aoide rice new …` is a pure parse alias for `aoide rice mint …` —
-    // there is only ONE registry entry (`rice.mint`, schema.rs); canonicalize
-    // here so schema, dispatch, and the audit log only ever see that one path.
-    if positionals.len() >= 2 && positionals[0] == "rice" && positionals[1] == "new" {
-        positionals[1] = "mint".to_string();
-    }
-
     // Greedy longest-prefix match of positionals against known command paths.
     let paths = known_paths();
     let matched = paths
@@ -318,16 +311,20 @@ mod tests {
         assert!(!inv.flags.contains_key("model"));
     }
 
+    // No CLI-internal aliases (khoa, 2026-08-14): each command has exactly one
+    // spelling. Retired names are plain unknown commands, same as a typo.
     #[test]
-    fn rice_new_is_a_parse_alias_for_rice_mint() {
-        let (inv, _) = parse(
-            &argv(&["rice", "new", "dusk", "--from", "default"]),
-            Door::Cli,
-        )
-        .unwrap();
-        assert_eq!(inv.path, vec!["rice", "mint"]);
-        assert_eq!(inv.args, vec!["dusk"]);
-        assert_eq!(inv.flags.get("from").map(String::as_str), Some("default"));
+    fn rice_new_is_not_an_alias_it_is_an_unknown_command() {
+        let err = parse(&argv(&["rice", "new", "dusk"]), Door::Cli).unwrap_err();
+        assert_eq!(err.status, Status::Usage);
+        assert!(err.message.contains("unknown command"), "{}", err.message);
+    }
+
+    #[test]
+    fn rice_preview_is_not_an_alias_it_is_an_unknown_command() {
+        let err = parse(&argv(&["rice", "preview", "dusk"]), Door::Cli).unwrap_err();
+        assert_eq!(err.status, Status::Usage);
+        assert!(err.message.contains("unknown command"), "{}", err.message);
     }
 
     #[test]
