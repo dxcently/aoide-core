@@ -272,6 +272,32 @@ pub(in crate::graph) fn set_owner_activity(owner: &str, state: &str, activity: O
 // claude: `~/.claude/projects/<munge(cwd)>/<session_id>.jsonl`). The refresh
 // verbs below dispatch through the profile the hook door hands down.
 
+/// Publish a harness-reported context-window ceiling onto the session record
+/// (pi's extension reports its active model's `contextWindow` on every hook
+/// payload). A locked read-modify-write like every other stage writer; only
+/// touches the stage when the value actually changed, and an absent report
+/// never clears a stored ceiling.
+pub(in crate::graph) fn ensure_session_ceiling(id: &str, ceiling: u64) {
+    with_stage_lock(|| {
+        let mut file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        if let Some(s) = file
+            .sessions
+            .iter_mut()
+            .find(|s| s.session_id == id && s.context_ceiling != Some(ceiling))
+        {
+            s.context_ceiling = Some(ceiling);
+            if file.schema_version.is_empty() {
+                file.schema_version = STAGE_GRAPH_VERSION.to_string();
+            }
+            let _ = write_stage(&sessions_path(), &file);
+            let _ = restage_graph();
+        }
+    });
+}
+
 /// Best-effort: refresh a session's transcript-derived fields at a hook boundary —
 /// its `say` (the agent's latest words) and, set-once, its `title` (the session
 /// NAME, from `custom-title`). Change-only; never touches state/activity/pid;
@@ -283,6 +309,7 @@ pub(in crate::graph) fn refresh_transcript_fields(
     session_id: &str,
     cwd: Option<&str>,
     transcript_hint: Option<&str>,
+    preferred_ceiling: Option<u64>,
 ) {
     let spec = &profile.transcript;
     let Some(path) = (spec.locate)(session_id, cwd, transcript_hint) else {
@@ -328,10 +355,14 @@ pub(in crate::graph) fn refresh_transcript_fields(
                     s.model = Some(model.clone());
                     changed = true;
                 }
-                // Publish the model's context ceiling (CONTRACTS.md §4) — re-derived
-                // here so a mid-session model switch re-caps the meter without a
-                // widget guess.
-                let ceiling = Some((profile.model_ceiling)(Some(model.as_str())));
+                // Publish the model's context ceiling (CONTRACTS.md §4). A
+                // harness-reported ceiling (pi's payload `context_ceiling`)
+                // WINS over the aoide catalog — a custom/provider model the
+                // catalog has never heard of gets the right meter; the catalog
+                // stays the fallback for harnesses that don't self-report.
+                let ceiling = Some(preferred_ceiling.unwrap_or_else(|| {
+                    (profile.model_ceiling)(Some(model.as_str()))
+                }));
                 if s.context_ceiling != ceiling {
                     s.context_ceiling = ceiling;
                     changed = true;
@@ -1282,10 +1313,18 @@ mod tests {
 
         // Window-gone (the SUPER+Q kill): a non-empty window absent from the live
         // set is dead even when the pid is alive. The match is 0x/case-tolerant.
-        assert!(is_session_dead(&rec("0xCCC", None), Some(&live), alive, now, fresh));
+        assert!(is_session_dead(
+            &rec("0xCCC", None),
+            Some(&live),
+            None,
+            alive,
+            now,
+            fresh
+        ));
         assert!(is_session_dead(
             &rec("0xCCC", Some(9)),
             Some(&live),
+            None,
             alive,
             now,
             fresh
@@ -1294,6 +1333,7 @@ mod tests {
         assert!(!is_session_dead(
             &rec("0xAAA", Some(9)),
             Some(&live),
+            None,
             alive,
             now,
             fresh
@@ -1304,6 +1344,7 @@ mod tests {
         assert!(is_session_dead(
             &rec("0xAAA", Some(9)),
             Some(&live),
+            None,
             dead_proc,
             now,
             fresh
@@ -1314,6 +1355,7 @@ mod tests {
         assert!(!is_session_dead(
             &rec("", None),
             Some(&live),
+            None,
             dead_proc,
             now,
             fresh
@@ -1322,9 +1364,17 @@ mod tests {
         // NEVER-FALSE-REAP #2 — compositor NOT queried (None): the window signal
         // is suppressed, so a windowed session we could not SEE is never reaped;
         // only the authoritative pid signal remains.
-        assert!(!is_session_dead(&rec("0xCCC", None), None, alive, now, fresh));
+        assert!(!is_session_dead(
+            &rec("0xCCC", None),
+            None,
+            None,
+            alive,
+            now,
+            fresh
+        ));
         assert!(!is_session_dead(
             &rec("0xCCC", Some(9)),
+            None,
             None,
             alive,
             now,
@@ -1332,6 +1382,7 @@ mod tests {
         )); // pid alive → alive
         assert!(is_session_dead(
             &rec("0xCCC", Some(9)),
+            None,
             None,
             dead_proc,
             now,

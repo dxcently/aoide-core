@@ -1068,7 +1068,8 @@ fn pi_find_subagent(_: &Path, _: &str) -> Option<PathBuf> {
 /// run non-interactively (never reach the graph) and its permissions are
 /// invisible to the extension API, so both vocabularies are empty. The model
 /// ceiling reuses the shared logic (claude-family ids resolve to their real
-/// tiers; kimi/deepseek/other ids take the conservative 200k default).
+/// tiers; the deepseek-v4 line resolves to 1M; kimi/other ids take the
+/// conservative 200k default).
 pub static PI_PROFILE: AgentProfile = AgentProfile {
     name: "pi",
     hook_event_map: pi_hook_event,
@@ -1490,11 +1491,13 @@ mod tests {
     fn pi_profile_pins_vocab_tools_ceiling_and_settings() {
         assert!(PI_PROFILE.permission_vocab.is_empty());
         assert!(PI_PROFILE.subagent_tools.is_empty());
-        // The shared ceiling logic: claude-family ids resolve, everything else
-        // (kimi/deepseek ids, garbage, None) takes the conservative default.
+        // The shared ceiling logic: claude-family ids resolve, the deepseek-v4
+        // line resolves to 1M, everything else (kimi ids, garbage, None) takes
+        // the conservative default.
         let ceil = PI_PROFILE.model_ceiling;
         assert_eq!(ceil(Some("claude-sonnet-5")), 1_000_000);
-        assert_eq!(ceil(Some("deepseek/deepseek-v4-flash")), 200_000);
+        assert_eq!(ceil(Some("deepseek/deepseek-v4-flash")), 1_000_000);
+        assert_eq!(ceil(Some("deepseek/deepseek-v4-pro")), 1_000_000);
         assert_eq!(ceil(Some("kimi-code/k3")), 200_000);
         assert_eq!(ceil(None), 200_000);
         assert_eq!(

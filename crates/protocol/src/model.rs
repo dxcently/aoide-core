@@ -44,6 +44,12 @@ pub fn context_ceiling_for_model(model: Option<&str>) -> u64 {
     if let Some((maj, min)) = ver_after(&id, "opus") {
         return if maj > 4 || (maj == 4 && min >= 6) { M1 } else { K200 };
     }
+    // DeepSeek: the V4 line runs a 1M window (ground truth: pi's models-store —
+    // `deepseek-v4-flash`/`deepseek-v4-pro` both publish contextWindow 1_000_000
+    // and maxTokens 384_000). Older ids fall through to the 200k default.
+    if let Some((maj, _)) = ver_after(&id, "deepseek") {
+        return if maj >= 4 { M1 } else { K200 };
+    }
     K200 // haiku, legacy dated ids, or anything unrecognised
 }
 
@@ -64,6 +70,13 @@ mod tests {
         assert_eq!(context_ceiling_for_model(Some("claude-3-5-sonnet-20241022")), 200_000);
         assert_eq!(context_ceiling_for_model(Some("")), 200_000);
         assert_eq!(context_ceiling_for_model(Some("garbage")), 200_000);
+        // The deepseek-v4 line runs a 1M window (pi's models-store ground
+        // truth); the provider-prefixed on-disk id resolves the same — the
+        // family token matches inside the prefix. Older deepseek ids stay
+        // conservative.
+        assert_eq!(context_ceiling_for_model(Some("deepseek-v4-flash")), 1_000_000);
+        assert_eq!(context_ceiling_for_model(Some("deepseek/deepseek-v4-pro")), 1_000_000);
+        assert_eq!(context_ceiling_for_model(Some("deepseek-v3-2")), 200_000);
         // Single-component version ids where a legacy dated snapshot lands in
         // the MINOR slot, not the major slot (the bug the minor-slot date
         // guard fixes) — these are real Anthropic API ids for 200k models.

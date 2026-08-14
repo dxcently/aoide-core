@@ -6,11 +6,13 @@
 
 use super::common::{require_flag, stage_error};
 use super::doc::restage_graph;
-use super::model::{load_stage, sessions_path, write_stage, SessionsFile, STAGE_GRAPH_VERSION};
+use super::model::{
+    load_stage, sessions_path, write_stage, SessionsFile, STAGE_GRAPH_VERSION,
+};
 use super::session_store::{
     do_session_end, do_session_phase, do_session_phase_if, do_session_start, do_subagent_end,
-    do_subagent_rekey, do_subagent_spawn, now_iso_utc, refresh_subagent_says,
-    refresh_transcript_fields, set_owner_activity,
+    do_subagent_rekey, do_subagent_spawn, ensure_session_ceiling, now_iso_utc,
+    refresh_subagent_says, refresh_transcript_fields, set_owner_activity,
 };
 use super::window::{discover_window, ensure_session_window};
 use aoide_protocol::agents::{agent_profile, known_agents, AgentProfile, HookClass, CLAUDE_PROFILE};
@@ -664,6 +666,41 @@ fn hook_from_str(buf: &str) -> Outcome {
     hook_for_profile(profile, buf)
 }
 
+/// A hook payload's self-reported `pid` — the harness process's OWN pid, when
+/// the harness can know it (pi's extension runs INSIDE the pi process and
+/// reports `process.pid`). This is the liveness anchor the reaper's `/proc`
+/// signal needs for a harness that can die inside a still-open terminal: the
+/// door's ancestry walk can only ever find the TERMINAL's owning pid, which
+/// outlives the agent, so a killed agent (no SessionEnd, terminal alive) was
+/// invisible to every reaper signal. A payload pid flips that: the record's
+/// `pid` dies when the agent dies, whatever the terminal does. Accepts a JSON
+/// number or a numeric string; anything else is ignored (claude/kimi payloads
+/// never carry it).
+fn payload_pid(payload: &Value) -> Option<u32> {
+    let raw = payload.get("pid")?;
+    raw.as_u64()
+        .or_else(|| {
+            raw.as_str()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+        })
+        .and_then(|p| u32::try_from(p).ok())
+}
+
+/// A hook payload's self-reported `context_ceiling` — the active model's
+/// context-window size in tokens, straight from the harness's own model
+/// catalog (pi's extension reads `ctx.getContextUsage().contextWindow`).
+/// This outranks the aoide catalog: a custom/provider model the catalog has
+/// never heard of gets the RIGHT meter instead of the conservative default.
+/// Accepts a JSON number or a numeric string; zero/absent is ignored (never a
+/// signal to clear — an unknown window simply doesn't overwrite).
+fn payload_ceiling(payload: &Value) -> Option<u64> {
+    let raw = payload.get("context_ceiling")?;
+    let n = raw
+        .as_u64()
+        .or_else(|| raw.as_str().and_then(|s| s.trim().parse::<u64>().ok()))?;
+    (n > 0).then_some(n)
+}
+
 /// The profile-parametrized core of [`hook_from_str`].
 ///
 /// Split from `session_hook` so the whole path — parse, map, execute — is
@@ -680,21 +717,58 @@ fn hook_from_str(buf: &str) -> Outcome {
 /// (window discovery + `AOIDE_SESSION_ID` env-parent threading), inserting a
 /// fresh idle record; no-op when the id already exists. `sub:` ids are never
 /// implicit-started — they exist only as children of a registered parent.
+///
+/// An EXISTING record gets one refresh: when the payload self-reports a `pid`
+/// (pi), the stored pid is rewritten to it if it differs. This is the
+/// self-heal for the liveness anchor — a record born before the payload-pid
+/// seam (pid = terminal) converges to the harness's real pid on its very next
+/// hook, so a later agent death becomes reapable without a re-registration.
 fn hook_ensure_session(profile: &AgentProfile, payload: &Value, id: &str) {
     if id.starts_with("sub:") {
         return;
     }
+    let reported = payload_pid(payload);
     let exists = load_stage::<SessionsFile>(&sessions_path())
         .map(|f| f.sessions.iter().any(|s| s.session_id == id))
         .unwrap_or(false);
     if exists {
+        if let Some(pid) = reported {
+            // The write takes the SAME stage lock every other stage writer
+            // holds (do_session_phase, refresh_transcript_fields, the reaper):
+            // an unlocked read-modify-write here raced the locked writers and
+            // clobbered their fresh contextTokens/contextCeiling/say updates
+            // with this process's stale snapshot (observed: a live session's
+            // ceiling flip-flopping between 1M and null as the two writers
+            // interleaved).
+            aoide_storage::fs::with_stage_lock(|| {
+                let mut file: SessionsFile = match load_stage(&sessions_path()) {
+                    Ok(f) => f,
+                    Err(_) => return,
+                };
+                if let Some(s) = file
+                    .sessions
+                    .iter_mut()
+                    .find(|s| s.session_id == id && s.pid != Some(pid))
+                {
+                    s.pid = Some(pid);
+                    if file.schema_version.is_empty() {
+                        file.schema_version = STAGE_GRAPH_VERSION.to_string();
+                    }
+                    let _ = write_stage(&sessions_path(), &file);
+                    let _ = restage_graph();
+                }
+            });
+        }
         return;
     }
     let cwd = payload.get("cwd").and_then(Value::as_str).map(str::to_string);
-    let (window, pid) = match discover_window() {
+    let (window, discovered) = match discover_window() {
         Some((addr, pid, _workspace)) => (Some(addr), Some(pid)),
         None => (None, None),
     };
+    // The harness's own pid wins over the discovered terminal pid — see
+    // [`payload_pid`].
+    let pid = reported.or(discovered);
     let env_parent = std::env::var("AOIDE_SESSION_ID")
         .ok()
         .filter(|p| !p.is_empty() && *p != id);
@@ -736,10 +810,15 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
             // Workspace is stamped later by the shellbridge window-event listener
             // (resolve_pending_session_windows), which is authoritative and keeps
             // it fresh across moves — do_session_start carries only window + pid.
-            let (window, pid) = match discover_window() {
+            let (window, discovered) = match discover_window() {
                 Some((addr, pid, _workspace)) => (Some(addr), Some(pid)),
                 None => (None, None),
             };
+            // The harness's own pid wins over the discovered terminal pid (see
+            // [`payload_pid`]) — pi reports `process.pid`, so a pi that dies
+            // inside a still-open terminal still trips the reaper's `/proc`
+            // signal.
+            let pid = payload_pid(&payload).or(discovered);
             // A claude launched INSIDE a conducted session inherits its parent's
             // `AOIDE_SESSION_ID` in the hook process env — thread it as the
             // parent so a claude-conducting-claude (or a claude-in-a-shell) nests
@@ -858,6 +937,21 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
         }
         HookAction::End { id } => do_session_end(&id),
     };
+    // Publish a harness-reported context-window ceiling onto the record
+    // IMMEDIATELY (every hook carries it — pi's extension reads the active
+    // model's window on every payload). Covers SessionStart and the
+    // high-frequency PreToolUse too, where the transcript refresh below never
+    // runs; that refresh prefers this same value over the aoide catalog, so
+    // the two writers can never disagree.
+    if let Some(ceiling) = payload_ceiling(&payload) {
+        if let Some(sid) = payload
+            .get("session_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            ensure_session_ceiling(sid, ceiling);
+        }
+    }
     // After applying the action, refresh the session's transcript `say` at the
     // boundaries where fresh prose has just landed: the turn end (Stop), a tool
     // boundary (PostToolUse), a new prompt (UserPromptSubmit), or an input-needed
@@ -888,6 +982,7 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
                 sid,
                 cwd,
                 payload.get("transcript_path").and_then(Value::as_str),
+                payload_ceiling(&payload),
             );
         }
         // A background Task keeps running after the parent's turn settles, so
@@ -947,7 +1042,7 @@ mod tests {
     use crate::graph::common::load_inputs;
     use crate::graph::conduct::conduct_socket_path;
     use crate::graph::doc::prune_done;
-    use crate::graph::model::{hooks_path, merged_sessions, HooksFile};
+    use crate::graph::model::{hooks_path, merged_sessions, HooksFile, SessionRecord};
     use crate::graph::testutil::*;
 
     #[test]
@@ -2056,6 +2151,148 @@ mod tests {
         assert_eq!(live_state(), "stopped");
         hook_for_profile(pi, r#"{ "session_id": "p1", "hook_event_name": "SessionEnd" }"#);
         assert_eq!(live_state(), "done");
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+    #[test]
+    fn pi_payload_pid_anchors_liveness_to_the_agent_process() {
+        // THE pi regression: the door's ancestry walk can only discover the
+        // TERMINAL's owning pid, which outlives a pi killed inside a
+        // still-open terminal — the record then carries no signal that dies
+        // with the agent, and the reaper can never reap it. The pi extension
+        // self-reports `process.pid`; the door must store THAT as the
+        // session's pid (at Start AND as a refresh on any later hook), so the
+        // reaper's /proc signal fires when the agent dies, terminal or not.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("pi-pid");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let pi = agent_profile("pi").unwrap();
+
+        // SessionStart with a self-reported pid: the record anchors on it (the
+        // discovered terminal window is still stamped; the payload only
+        // overrides the pid).
+        hook_for_profile(
+            pi,
+            r#"{ "session_id": "p9", "hook_event_name": "SessionStart", "cwd": "/proj", "pid": 4242 }"#,
+        );
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(s.sessions[0].pid, Some(4242));
+
+        // Refresh: a record born with a terminal pid converges to the reported
+        // pid on its next hook — the self-heal for pre-seam records, so a live
+        // pi session becomes reapable without waiting for a fresh registration.
+        // (A numeric-string pid is accepted too; pi's `process.pid` is a
+        // number, this just pins the tolerant parse.)
+        let mut f: SessionsFile = load_stage(&sessions_path()).unwrap();
+        f.sessions.push(SessionRecord {
+            session_id: "old".into(),
+            agent: "pi".into(),
+            state: "idle".into(),
+            pid: Some(7),
+            ..Default::default()
+        });
+        write_stage(&sessions_path(), &f).unwrap();
+        hook_for_profile(
+            pi,
+            r#"{ "session_id": "old", "hook_event_name": "UserPromptSubmit", "user_prompt": "hi", "pid": "5150" }"#,
+        );
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(
+            s.sessions.iter().find(|x| x.session_id == "old").unwrap().pid,
+            Some(5150)
+        );
+
+        // A payload WITHOUT pid (claude/kimi) never rewrites the stored pid.
+        hook_for_profile(pi, r#"{ "session_id": "old", "hook_event_name": "Stop" }"#);
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(
+            s.sessions.iter().find(|x| x.session_id == "old").unwrap().pid,
+            Some(5150)
+        );
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+    #[test]
+    fn pi_payload_ceiling_publishes_and_outranks_the_catalog() {
+        // pi's extension reports its active model's `contextWindow` on every
+        // hook payload. The door must publish it immediately (SessionStart
+        // included) and the transcript refresh must PREFER it over the aoide
+        // catalog — a custom/provider model the catalog has never heard of
+        // gets the right meter instead of the conservative default.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("pi-ceil");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let pi = agent_profile("pi").unwrap();
+        let ceil = |f: &SessionsFile| {
+            f.sessions
+                .iter()
+                .find(|s| s.session_id == "pc1")
+                .and_then(|s| s.context_ceiling)
+        };
+
+        // SessionStart carries the harness-reported window — published at once.
+        hook_for_profile(
+            pi,
+            r#"{ "session_id": "pc1", "hook_event_name": "SessionStart", "cwd": "/proj", "context_ceiling": 1500000 }"#,
+        );
+        assert_eq!(ceil(&load_stage(&sessions_path()).unwrap()), Some(1_500_000));
+
+        // A hook WITHOUT the field never clears the stored ceiling.
+        hook_for_profile(
+            pi,
+            r#"{ "session_id": "pc1", "hook_event_name": "PreToolUse", "tool_name": "bash" }"#,
+        );
+        assert_eq!(ceil(&load_stage(&sessions_path()).unwrap()), Some(1_500_000));
+
+        // The transcript refresh (say_boundary) prefers the reported ceiling:
+        // the fixture's model resolves to 200k in the aoide catalog, but the
+        // payload's 1.5M must win.
+        let tx = std::path::Path::new(&stage).join("pc1.jsonl");
+        std::fs::write(
+            &tx,
+            [
+                r#"{"type":"model_change","provider":"claude","modelId":"claude-haiku-4-5"}"#,
+                r#"{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"provider":"claude","model":"claude-haiku-4-5","usage":{"input":10,"output":5,"cacheRead":1,"cacheWrite":0}}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let pay = format!(
+            r#"{{ "session_id": "pc1", "hook_event_name": "PostToolUse", "tool_name": "bash", "cwd": "/proj", "transcript_path": "{}", "context_ceiling": 1500000 }}"#,
+            tx.display()
+        );
+        hook_for_profile(pi, &pay);
+        let f: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(ceil(&f), Some(1_500_000));
+        assert_eq!(
+            f.sessions
+                .iter()
+                .find(|s| s.session_id == "pc1")
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("claude/claude-haiku-4-5"),
+            "the refresh ran and read the fixture"
+        );
+
+        // WITHOUT the field, the same refresh falls back to the aoide catalog
+        // (claude-haiku-4-5 → 200k).
+        let pay = format!(
+            r#"{{ "session_id": "pc1", "hook_event_name": "PostToolUse", "tool_name": "bash", "cwd": "/proj", "transcript_path": "{}" }}"#,
+            tx.display()
+        );
+        hook_for_profile(pi, &pay);
+        assert_eq!(ceil(&load_stage(&sessions_path()).unwrap()), Some(200_000));
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),

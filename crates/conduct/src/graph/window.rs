@@ -409,7 +409,14 @@ pub(in crate::graph) fn ensure_session_window(id: &str) {
     };
     if let Some(s) = file.sessions.iter_mut().find(|s| s.session_id == id) {
         s.window_address = addr;
-        s.pid = Some(pid);
+        // Only fill a MISSING pid. A pid the harness self-reported (pi's
+        // `process.pid` — the hook door's payload-pid seam) is the agent's own
+        // liveness anchor and must outrank the terminal's; the discovery walk
+        // can only ever produce the terminal's pid, which outlives a killed
+        // agent and would strand it unreapable.
+        if s.pid.is_none() {
+            s.pid = Some(pid);
+        }
         // Stamp the workspace too when known (absent → left None, degrades
         // gracefully); the listener keeps it fresh on later moves.
         if workspace.is_some() {

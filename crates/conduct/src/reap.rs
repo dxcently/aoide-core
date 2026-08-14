@@ -17,6 +17,21 @@
 //! third signal reaps exactly that case, conservatively (see
 //! [`REAP_IDLE_STALE_SECS`]).
 //!
+//! Hardened against the two ghost classes a still-live window/pid used to
+//! shield forever:
+//!   * an AGENT killed inside its still-open terminal or parent session: the
+//!     recorded pid is the TERMINAL's (it outlives the agent), the window is
+//!     live — every old signal blind. The staleness evidence now also judges
+//!     agent records whose window/pid are live, discriminated by the
+//!     window-owner map: a live pid that is NOT its window's owner is the
+//!     agent's own process (the payload-pid seam) and vetoes the signal;
+//!   * a HEADLESS record stuck mid-turn (`working`/`awaiting`) whose process
+//!     is gone: silence past a week-long band (see
+//!     [`REAP_WORKING_STALE_SECS`]) condemns it, while a live harness firing
+//!     hooks on its own cadence is proven alive by its fresh hook `updatedAt`.
+//! A false reap of a merely-quiet live session self-heals: the hook door
+//! re-registers the record on the session's next event.
+//!
 //! Extracted from `graph.rs` (which had grown past 5800 lines) — a self-contained
 //! cluster with no external callers but the CLI dispatch. It leans on a handful of
 //! `pub(crate)` stage helpers still owned by `graph.rs`.
@@ -38,49 +53,72 @@ fn proc_exists(pid: u32) -> bool {
     std::path::Path::new("/proc").join(pid.to_string()).exists()
 }
 
-/// How long a hook-only session (no `windowAddress`, no `pid`) may sit at rest
-/// (`idle`/`stopped`) before its own silence becomes the third liveness signal
-/// — see [`is_session_dead`]. 72h (~3 days) is conservative on purpose:
-/// comfortably longer than any ordinary idle gap (an overnight, a weekend) a
-/// LIVE hook-only session might sit through, so a session that is merely quiet
+/// How long an AT-REST (`idle`/`stopped`) record that staleness may judge (see
+/// [`is_session_dead`]) may go without any evidence of life before its own
+/// silence becomes the abandonment signal. 72h (~3 days) is conservative on
+/// purpose: comfortably longer than any ordinary idle gap (an overnight, a
+/// weekend) a LIVE session might sit through, so a session that is merely quiet
 /// is never touched. Only a session stranded well past any plausible "still
 /// working on it" window qualifies — the two cleared-by-hand orphans that
 /// motivated this had been `idle` for days, so 72h loses nothing on the
 /// cleanup side while giving a wide berth to a quiet-but-live weekend session.
 pub const REAP_IDLE_STALE_SECS: i64 = 72 * 3600; // 72 hours (~3 days)
 
+/// How long a MID-TURN (`working`/`awaiting`) record may go without any
+/// evidence of life before its own silence becomes the abandonment signal —
+/// see [`is_session_dead`]. Deliberately LONGER than the at-rest band: a
+/// legitimate long-running headless turn (a multi-day build/training whose
+/// harness fires hooks only at start and end) can be silent for days while
+/// very much alive. 168h (a full week) gives that case a wide berth; silence
+/// past it is not plausibly "still working" — the process is gone and the
+/// record is a ghost.
+pub const REAP_WORKING_STALE_SECS: i64 = 7 * 24 * 3600; // 7 days (~168 hours)
+
 /// Is a session DEAD — orphaned so that NO process will ever clean it up? Pure
-/// and unit-tested (feed a fake live-address set, a fake `proc_exists`, and a
-/// fake `last_seen`).
+/// and unit-tested (feed a fake live-address set + window-owner map, a fake
+/// `proc_exists`, and a fake `last_seen`).
 ///
 /// DEAD when ANY of three signals fires:
 ///   * **window gone** — a non-empty `windowAddress` that is NOT among the live
 ///     `hyprctl clients -j` addresses (the SUPER+Q kill: the window vanished), OR
 ///   * **process gone** — a recorded `pid` whose `/proc/<pid>` no longer exists
 ///     (the process-killed case), OR
-///   * **stale hook-only at-rest** — NO window evidence (empty `windowAddress`,
-///     so the window signal can't apply either way) AND NO pid (so the pid
-///     signal can't apply either) AND the canonical state is `idle` or
-///     `stopped` (never `working`/`awaiting`/`needsSudo` — a hook-only session
-///     mid-turn is not dead) AND `last_seen` reports evidence of life older
-///     than [`REAP_IDLE_STALE_SECS`].
+///   * **stale abandonment** — every evidence stream (`last_seen` — the MAX of
+///     transcript mtime, hook `updatedAt`, and `startedAt`) has been silent
+///     past a state-dependent band, for a record staleness may judge:
+///       - **at rest** (`idle`/`stopped`), silent past
+///         [`REAP_IDLE_STALE_SECS`] (72h), OR
+///       - **mid-turn** (`working`/`awaiting`), silent past
+///         [`REAP_WORKING_STALE_SECS`] (7 days).
+///     Eligible records: a HEADLESS one (no window AND no pid — the classic
+///     hook-only shape) or an AGENT one ([`is_agent_kind`]). The agent arm is
+///     the hardening: an agent killed inside its still-open terminal/parent
+///     keeps a live window and a live TERMINAL pid forever, so only the
+///     silence of every evidence stream can condemn it. The kind gate keeps
+///     SHELLS out — a shell record's pid IS its terminal, so a live pid means
+///     the shell is alive and staleness must never overrule it. One veto on
+///     top: a live pid that is NOT its window's owning pid is the agent's OWN
+///     process (the payload-pid seam) — positive proof of life, governed by
+///     the pid signal alone.
 ///
 /// The never-false-reap guards:
 ///   * `live_addresses` is an `Option`: `None` means the compositor could not be
 ///     queried (no Hyprland, hyprctl missing/failed) — the window signal is then
 ///     UNKNOWN and contributes nothing, so we never reap a windowed session we
 ///     merely failed to see. Only a `Some(live)` we actually gathered can fire it.
-///   * A session with NEITHER the window NOR the pid signal (e.g. a hook-only
-///     session that has not yet discovered a window/pid) is left alone UNLESS
-///     the third signal's own positive evidence (a stale `last_seen`) fires:
-///     absence of evidence is never evidence of death, but STALENESS is
+///   * Absence of evidence is never evidence of death, but STALENESS is
 ///     evidence, not absence — `last_seen` returning `None` (no transcript, no
-///     parseable `startedAt`) is itself absence of evidence and never counts as
-///     stale, so the guard holds. A just-started hook-only session has a recent
-///     `last_seen` and sits far under the threshold, so it is never touched.
+///     parseable `startedAt`, no hook record) never counts as stale, so the
+///     guard holds. A just-started session has a recent `last_seen` and sits
+///     far under every band.
+///   * A false reap of a merely-quiet live session is recoverable: the hook
+///     door re-registers the record on the session's next event
+///     (`hook_ensure_session`), so the cost is a temporarily missing row,
+///     never a lost session.
 pub fn is_session_dead(
     rec: &SessionRecord,
     live_addresses: Option<&HashSet<String>>,
+    window_owners: Option<&HashMap<String, u32>>,
     proc_exists: impl Fn(u32) -> bool,
     now_epoch: i64,
     last_seen: impl Fn(&SessionRecord) -> Option<i64>,
@@ -93,29 +131,70 @@ pub fn is_session_dead(
         None => false, // compositor not queried — window liveness is unknown.
     };
     let pid_signal = matches!(rec.pid, Some(p) if !proc_exists(p));
-    let stale_idle_signal = rec.window_address.is_empty()
-        && rec.pid.is_none()
-        && matches!(canonical_state(&rec.state), "idle" | "stopped")
-        && last_seen(rec)
-            .map(|seen| now_epoch.saturating_sub(seen) > REAP_IDLE_STALE_SECS)
-            .unwrap_or(false); // no last-seen evidence at all → not stale, not dead.
-    window_signal || pid_signal || stale_idle_signal
+    let state = canonical_state(&rec.state);
+    let at_rest = matches!(state, "idle" | "stopped");
+    let mid_turn = matches!(state, "working" | "awaiting");
+    let stale_beyond = |secs: i64| {
+        last_seen(rec)
+            .map(|seen| now_epoch.saturating_sub(seen) > secs)
+            .unwrap_or(false)
+    };
+    // A LIVE pid that is NOT its window's owning pid is the agent's OWN process
+    // (the payload-pid seam) — positive proof of life: the pid signal alone
+    // governs that record and staleness must never fire over it. A pid equal to
+    // the window's owner is the TERMINAL's, which outlives the agent, so it
+    // cannot veto. No owner map (compositor unqueried) reads a live pid
+    // conservatively as the agent's own.
+    let live_agent_pid = rec.pid.is_some_and(|p| {
+        proc_exists(p)
+            && !window_owners
+                .and_then(|m| m.get(&normalize_addr(&rec.window_address)).copied())
+                .is_some_and(|owner| owner == p)
+    });
+    // WHO staleness may judge: a headless record (no window AND no pid — the
+    // classic hook-only shape) or an AGENT record (the hardened arm — see the
+    // doc above for why shells are excluded).
+    let stale_eligible =
+        (rec.window_address.is_empty() && rec.pid.is_none()) || is_agent_kind(rec);
+    let stale_abandoned = stale_eligible
+        && !live_agent_pid
+        && ((at_rest && stale_beyond(REAP_IDLE_STALE_SECS))
+            || (mid_turn && stale_beyond(REAP_WORKING_STALE_SECS)));
+    window_signal || pid_signal || stale_abandoned
 }
 
-/// Gather the normalised live window addresses from `hyprctl clients -j`.
-/// Returns `None` (→ pid-only liveness) whenever the compositor cannot be
-/// consulted authoritatively (see [`crate::graph::hyprctl_clients`]). This is the
-/// seam that keeps the reaper safe off-Hyprland — it degrades to the pid signal
-/// instead of blindly reaping every windowed session it could not see.
-fn live_window_addresses() -> Option<HashSet<String>> {
-    Some(
-        hyprctl_clients()?
-            .iter()
-            .filter_map(|c| c.get("address").and_then(Value::as_str))
-            .filter(|a| !a.is_empty())
-            .map(normalize_addr)
-            .collect(),
-    )
+/// Gather the live windows from `hyprctl clients -j` — BOTH the normalised
+/// addresses (for the window-liveness signal and the transient-read grace)
+/// and each window's OWNING pid (for the staleness veto in
+/// [`is_session_dead`]: a record's pid equal to its window's owner is the
+/// TERMINAL's pid, which outlives the agent — the owners map is how that is
+/// told apart from an agent's self-reported pid). Returns `None` whenever the
+/// compositor cannot be consulted authoritatively (see
+/// [`crate::graph::hyprctl_clients`]). This is the seam that keeps the reaper
+/// safe off-Hyprland — it degrades to the pid signal instead of blindly
+/// reaping every windowed session it could not see.
+fn live_windows() -> Option<(HashSet<String>, HashMap<String, u32>)> {
+    let clients = hyprctl_clients()?;
+    let mut addrs = HashSet::new();
+    let mut owners = HashMap::new();
+    for c in &clients {
+        let Some(addr) = c.get("address").and_then(Value::as_str) else {
+            continue;
+        };
+        if addr.is_empty() {
+            continue;
+        }
+        let addr = normalize_addr(addr);
+        addrs.insert(addr.clone());
+        if let Some(pid) = c
+            .get("pid")
+            .and_then(Value::as_i64)
+            .and_then(|p| u32::try_from(p).ok())
+        {
+            owners.insert(addr, pid);
+        }
+    }
+    Some((addrs, owners))
 }
 
 /// The reaper's transient-read grace (pure, unit-tested). Given the set of live
@@ -354,12 +433,15 @@ fn reap_inner(_inv: &Invocation) -> Outcome {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    let gathered = live_window_addresses();
-    let hyprctl_available = gathered.is_some();
+    let (gathered_addrs, window_owners) = match live_windows() {
+        Some((addrs, owners)) => (Some(addrs), Some(owners)),
+        None => (None, None),
+    };
+    let hyprctl_available = gathered_addrs.is_some();
     // Apply the transient-read grace: a degenerate empty snapshot during a reload
     // window falls back to pid-only liveness so we never sweep the live roster off
     // a momentary "zero windows" answer.
-    let live = effective_live_addresses(gathered, &s_file.sessions);
+    let live = effective_live_addresses(gathered_addrs, &s_file.sessions);
     // This session's hook record's `updatedAt` — the exact timestamp
     // `decay_stopped_sessions` below reads for the `stopped` clock, mirrored
     // here as evidence for the third signal too: a foreign-harness/headless
@@ -402,7 +484,14 @@ fn reap_inner(_inv: &Invocation) -> Outcome {
         .sessions
         .iter()
         .filter(|s| s.state != "done")
-        .filter(|s| is_session_dead(s, live.as_ref(), proc_exists, now_epoch, last_seen))
+        .filter(|s| is_session_dead(
+            s,
+            live.as_ref(),
+            window_owners.as_ref(),
+            proc_exists,
+            now_epoch,
+            last_seen,
+        ))
         .map(|s| s.session_id.clone())
         .collect();
 
@@ -556,6 +645,7 @@ mod tests {
         assert!(is_session_dead(
             &hook_only("orphan-idle", "idle"),
             None,
+            None,
             |_| true,
             now,
             stale,
@@ -563,6 +653,7 @@ mod tests {
         // `stopped` is equally "at rest" and equally reapable once stale.
         assert!(is_session_dead(
             &hook_only("orphan-stopped", "stopped"),
+            None,
             None,
             |_| true,
             now,
@@ -580,6 +671,7 @@ mod tests {
         assert!(!is_session_dead(
             &hook_only("fresh", "idle"),
             None,
+            None,
             |_| true,
             now,
             one_hour_ago,
@@ -587,19 +679,39 @@ mod tests {
     }
 
     #[test]
-    fn hook_only_working_session_is_never_reaped_even_if_stale() {
-        // No window, no pid, but `working` (mid-turn) with a 100h-stale
-        // last-seen: the state gate must block the third signal outright — a
-        // hook-only session mid-startup/mid-turn is not dead, no matter how old
-        // its last transcript write looks.
+    fn midturn_sessions_reaped_only_past_the_week_band() {
+        // No window, no pid, `working` — the headless record stuck mid-turn
+        // whose process is gone. 100h of silence is under the 7-day band (a
+        // legitimate long-running headless turn can be hook-silent for days);
+        // 200h is past it — silence that long IS abandonment.
         let now = 1_800_000_000_i64;
-        let stale = |_: &SessionRecord| Some(now - 100 * 3600);
-        let mut rec = hook_only("busy", "working");
-        rec.state = "working".into();
-        assert!(!is_session_dead(&rec, None, |_| true, now, stale));
-        // Same for `awaiting` — waiting on a permission prompt is not at rest.
-        rec.state = "awaiting".into();
-        assert!(!is_session_dead(&rec, None, |_| true, now, stale));
+        let hundred_hours = |_: &SessionRecord| Some(now - 100 * 3600);
+        let two_hundred_hours = |_: &SessionRecord| Some(now - 200 * 3600);
+        assert!(!is_session_dead(
+            &hook_only("busy", "working"),
+            None,
+            None,
+            |_| true,
+            now,
+            hundred_hours,
+        ));
+        assert!(is_session_dead(
+            &hook_only("busy", "working"),
+            None,
+            None,
+            |_| true,
+            now,
+            two_hundred_hours,
+        ));
+        // `awaiting` is equally mid-turn.
+        assert!(is_session_dead(
+            &hook_only("asking", "awaiting"),
+            None,
+            None,
+            |_| true,
+            now,
+            two_hundred_hours,
+        ));
     }
 
     #[test]
@@ -629,7 +741,7 @@ mod tests {
             .flatten()
             .max()
         };
-        assert!(!is_session_dead(&rec, None, |_| true, now, last_seen));
+        assert!(!is_session_dead(&rec, None, None, |_| true, now, last_seen));
     }
 
     /// THE BLOCKER regression, end-to-end through `reap()`: a headless session
@@ -685,17 +797,84 @@ mod tests {
     }
 
     #[test]
-    fn windowed_session_is_unaffected_by_the_stale_idle_signal() {
-        // A session WITH a live window is never touched by the third signal
-        // regardless of staleness — condition 1 (no window evidence) fails, so
-        // only the pre-existing window/pid signals can ever apply to it.
-        let live: HashSet<String> = ["aaa"].iter().map(|s| s.to_string()).collect();
+    fn windowed_agent_at_rest_with_stale_evidence_is_reaped() {
+        // THE hardened corpse: an agent killed inside its still-open terminal —
+        // live window, live TERMINAL-owner pid, yet every evidence stream 100h
+        // stale. Before the hardening, the live pid + live window shielded this
+        // record from every signal forever; the staleness bands now condemn it.
         let now = 1_800_000_000_i64;
-        let ancient = |_: &SessionRecord| Some(now - 100 * 3600);
-        let mut rec = agent("windowed", "0xAAA", "2026-07-30T00:00:00Z");
+        let stale = |_: &SessionRecord| Some(now - 100 * 3600);
+        let mut rec = agent("ghost", "0xAAA", "2026-07-30T00:00:00Z");
         rec.state = "idle".into();
-        rec.pid = None;
-        assert!(!is_session_dead(&rec, Some(&live), |_| true, now, ancient));
+        rec.pid = Some(42); // the terminal's pid — alive
+        let live: HashSet<String> = ["aaa"].iter().map(|s| s.to_string()).collect();
+        let mut owners: HashMap<String, u32> = HashMap::new();
+        owners.insert("aaa".into(), 42); // the window belongs to pid 42
+        assert!(is_session_dead(
+            &rec,
+            Some(&live),
+            Some(&owners),
+            |_| true,
+            now,
+            stale,
+        ));
+    }
+
+    #[test]
+    fn windowed_agent_with_a_live_agent_pid_is_never_staleness_reaped() {
+        // Post-payload-pid pi: the record's pid is the AGENT's own process —
+        // alive and NOT the window's owner. Positive proof of life: staleness
+        // must never fire over it, however stale the evidence — the pid signal
+        // alone governs it (and fires the moment that process dies).
+        let now = 1_800_000_000_i64;
+        let stale = |_: &SessionRecord| Some(now - 100 * 3600);
+        let mut rec = agent("p9", "0xAAA", "2026-07-30T00:00:00Z");
+        rec.state = "idle".into();
+        rec.pid = Some(999); // the agent's own pid — alive
+        let live: HashSet<String> = ["aaa"].iter().map(|s| s.to_string()).collect();
+        let mut owners: HashMap<String, u32> = HashMap::new();
+        owners.insert("aaa".into(), 42); // the window belongs to the terminal
+        assert!(!is_session_dead(
+            &rec,
+            Some(&live),
+            Some(&owners),
+            |_| true, // pid 999 alive
+            now,
+            stale,
+        ));
+        // Its death is caught by the pid signal, exactly as before.
+        assert!(is_session_dead(
+            &rec,
+            Some(&live),
+            Some(&owners),
+            |p| p != 999, // pid 999 gone
+            now,
+            stale,
+        ));
+    }
+
+    #[test]
+    fn windowed_shell_with_stale_evidence_is_spared() {
+        // The kind gate: a shell record's pid IS its terminal — a live pid
+        // means the shell is alive, and staleness must never overrule that.
+        let now = 1_800_000_000_i64;
+        let stale = |_: &SessionRecord| Some(now - 100 * 3600);
+        let mut shell = agent("sh", "0xAAA", "2026-07-30T00:00:00Z");
+        shell.agent = "shell".into();
+        shell.kind = Some("shell".into());
+        shell.state = "idle".into();
+        shell.pid = Some(42);
+        let live: HashSet<String> = ["aaa"].iter().map(|s| s.to_string()).collect();
+        let mut owners: HashMap<String, u32> = HashMap::new();
+        owners.insert("aaa".into(), 42);
+        assert!(!is_session_dead(
+            &shell,
+            Some(&live),
+            Some(&owners),
+            |_| true,
+            now,
+            stale,
+        ));
     }
 
     #[test]
@@ -706,7 +885,7 @@ mod tests {
         let fresh = |_: &SessionRecord| Some(now);
         let mut rec = hook_only("pid-dead", "working");
         rec.pid = Some(42);
-        assert!(is_session_dead(&rec, None, |_| false, now, fresh));
+        assert!(is_session_dead(&rec, None, None, |_| false, now, fresh));
     }
 
     #[test]

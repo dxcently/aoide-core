@@ -333,8 +333,10 @@ pub fn would_cycle(sessions: &[SessionRecord], child: &str, parent: &str) -> boo
 
 /// Transitive `kind=="subagent"` descendants of `roots` — NOT including the
 /// roots themselves. A Task node carries no pid/window, so cascading it out
-/// when its owning session ends/is pruned/is reaped is its ONLY cleanup path
-/// (`is_session_dead` structurally can never fire for one). Walks
+/// when its owning session ends/is pruned/is reaped is its PRIMARY cleanup
+/// path — `is_session_dead` has no fast signal for one (the reaper's staleness
+/// bands can condemn a stranded sub-node left `working` past a week of
+/// silence, but that is the slow backstop, not the live cleanup). Walks
 /// `parent_session_id` via a fixed-point loop so subagent-of-subagent nesting
 /// resolves in one call. Shared by `prune_done` (below) and
 /// `do_session_end_inner` (`session_store.rs`) — the two cascade paths that
