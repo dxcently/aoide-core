@@ -202,16 +202,16 @@ mod tests {
 
     #[test]
     fn apply_live_skips_off_hyprland() {
-        let _guard = crate::env_lock().lock().unwrap();
-        let saved = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
+        // Shares `aoide_test_support::env_lock()` with every other
+        // env-touching test in the crate (rice.rs's own
+        // `HYPRLAND_INSTANCE_SIGNATURE`-touching tests included) — this used
+        // to lock a separate crate-local mutex, racing rice.rs tests that
+        // touch the SAME env var under the other lock.
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = aoide_test_support::EnvSaver::capture(&["HYPRLAND_INSTANCE_SIGNATURE"]);
         std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
 
         let kw = vec!["keyword general:gaps_out 8".to_string()];
         assert_eq!(apply_live(&kw), "skipped (HYPRLAND_INSTANCE_SIGNATURE unset)");
-
-        match saved {
-            Some(v) => std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", v),
-            None => std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"),
-        }
     }
 }

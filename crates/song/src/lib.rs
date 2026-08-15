@@ -17,15 +17,12 @@ pub mod live;
 pub mod livery;
 pub mod notes;
 pub mod reap;
+pub mod widgets;
 
-/// A crate-wide lock serialising every test that mutates process-global env
-/// (`HYPRLAND_INSTANCE_SIGNATURE`, …). `std::env::set_var` is process-global,
-/// so env-touching tests across modules must share ONE mutex or they race
-/// each other under the multithreaded test harness. Mirrors the root
-/// `aoide` crate's `env_lock()` (src/lib.rs) — this is the crate-local copy
-/// for `aoide-song`'s own tests.
-#[cfg(test)]
-pub(crate) fn env_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    &LOCK
-}
+// Every env-touching test in this crate now shares ONE lock —
+// `aoide_test_support::env_lock()` (a dev-dependency) — instead of this
+// crate-local mutex. Two locks meant `cover.rs`/`live.rs` tests weren't
+// serialised against `commands/rice.rs`/`commands/mode.rs`/`commands/draft.rs`
+// tests that touch the SAME process-global env vars (`AOIDE_STAGE_DIR`,
+// `HYPRLAND_INSTANCE_SIGNATURE`), racing them under the default multithreaded
+// test harness. Removed now that nothing in the crate references it.

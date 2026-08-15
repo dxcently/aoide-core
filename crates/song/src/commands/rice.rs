@@ -203,9 +203,14 @@ fn handle_rice_stage_entry(inv: &Invocation) -> Outcome {
 /// `livery.json` (plus a derivable cover) into `<stage>/` so the Quickshell
 /// surfaces hot-reload it, AND best-effort live-apply its geometry + border
 /// colours to the running compositor via `hyprctl --batch keyword …`
-/// (guarded on `$HYPRLAND_INSTANCE_SIGNATURE`; see hypr.rs). Nothing is
-/// committed; the hyprctl call is keyword-only (never `reload`) and never
-/// fatal — a failed/absent hyprctl still leaves the stage file updated.
+/// (guarded on `$HYPRLAND_INSTANCE_SIGNATURE`; see hypr.rs). ALSO syncs the
+/// song's widget QML bodies (`song/songbook/<name>/widgets/*.qml`) into the
+/// live runtime tree (`run/qml/songs/<name>/`, `crate::widgets`) so
+/// Quickshell's own file-watcher hot-reloads an edited EXISTING widget file
+/// too — no rebuild for that either (a brand-new widget file still needs a
+/// service restart to be discovered). Nothing is committed; the hyprctl
+/// call is keyword-only (never `reload`) and never fatal — a failed/absent
+/// hyprctl still leaves the stage file updated.
 ///
 /// This is the honest form of the hand-copy agents had been doing: drive the
 /// songbook notes into the stage so the shell has a palette to render.
@@ -317,11 +322,35 @@ pub(crate) fn handle_rice_stage(inv: &Invocation) -> Outcome {
         None => "no derivable cover; cover.json left untouched".to_string(),
     };
 
+    // Captured BEFORE the widget sync below so the outcome message's "N
+    // stage file(s) live for hot-reload" clause keeps meaning "stage-dir
+    // files" — widget bodies get their own clause, not folded into this count.
+    let stage_file_count = changed.len();
+
+    // Widget bodies: the runtime-tree half of `rice stage` — carries
+    // song/songbook/<name>/widgets/*.qml into run/qml/songs/<name>/ so
+    // Quickshell's own file-watcher hot-reloads an edited EXISTING widget
+    // file too, no rebuild. Fatal on failure, mirroring the cover-write
+    // IO-failure path above: a torn widget copy/manifest write is worse
+    // than refusing the whole call.
+    let widget_sync = match crate::widgets::sync_song_widgets(&name) {
+        Ok(sync) => sync,
+        Err(e) => {
+            return Outcome::error(
+                "rice.stage",
+                format!("failed to sync widget bodies: {}", e.error),
+            )
+            .with_data(json!({ "reason": "widget-sync-failed", "target": e.target }));
+        }
+    };
+    changed.extend(widget_sync.changed);
+
     Outcome::ok(
         "rice.stage",
         format!(
-            "staged `{name}` — {} stage file(s) live for hot-reload; {cover_note}",
-            changed.len()
+            "staged `{name}` — {stage_file_count} stage file(s) live for hot-reload; \
+             {cover_note}; {}",
+            widget_sync.note
         ),
     )
     .changed(changed)
@@ -330,6 +359,8 @@ pub(crate) fn handle_rice_stage(inv: &Invocation) -> Outcome {
         "notes": notes_dst.to_string_lossy(),
         "cover": cover.as_ref().map(|p| p.to_string_lossy().into_owned()),
         "hyprctl": hyprctl_status,
+        "widgets": widget_sync.note,
+        "slots": widget_sync.slots,
         "seam": "Quickshell hot-reloads stage/livery.json (palette + component tiers); \
                  geometry + border colours are ALSO applied \
                  live via best-effort, guarded `hyprctl --batch keyword …` (see hypr.rs) \
@@ -871,6 +902,272 @@ mod tests {
         assert_eq!(
             out.data.unwrap()["hyprctl"],
             "skipped (no geometry/border keywords resolved)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── rice stage: widget-body runtime sync (the widgets.rs module) ─────────
+    //
+    // `run_qml_dir()` resolves ONE LEVEL ABOVE `song_dir()`
+    // (aoide_storage::fs::run_qml_dir): `song_dir()` is `stage_dir()`'s
+    // parent, and `run_qml_dir()` is `song_dir()`'s parent joined with
+    // `run/qml`. Every OTHER test in this file uses a 2-level layout
+    // (`<root>/stage`, `<root>/songbook/<name>`), under which `run/qml`
+    // would resolve OUTSIDE the test's own tmp root (a sibling of `<root>`
+    // itself) — fine for tests that never touch it, but wrong for these.
+    // `widget_sync_tmp` adds one more level (`<root>/aoide/…`) so
+    // `run_qml_dir()` lands under the SAME per-test root as `song/stage`/
+    // `song/songbook`, keeping these tests isolated from each other and
+    // from any stray `/tmp/run` a prior run might have left behind.
+
+    /// Builds the 3-level tmp layout the widget-sync tests need. Returns
+    /// `(root, stage, run_qml)`; callers still
+    /// `std::env::set_var("AOIDE_STAGE_DIR", &stage)` themselves (matching
+    /// every other test here) and own `remove_dir_all(&root)` at the end.
+    fn widget_sync_tmp(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = unique_tmp(tag);
+        let aoide_root = root.join("aoide");
+        let stage = aoide_root.join("song").join("stage");
+        let run_qml = aoide_root.join("run").join("qml");
+        std::fs::create_dir_all(&stage).unwrap();
+        (root, stage, run_qml)
+    }
+
+    #[test]
+    fn stage_syncs_an_edited_widget_body_into_the_runtime_tree() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, stage, run_qml) = widget_sync_tmp("stage-widget-edit");
+        let song = root.join("aoide").join("song").join("songbook").join("moonlight");
+        std::fs::create_dir_all(song.join("widgets")).unwrap();
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
+        std::fs::write(song.join("widgets").join("bar.qml"), "// new bar body\n").unwrap();
+        let runtime_song_dir = run_qml.join("songs").join("moonlight");
+        std::fs::create_dir_all(&runtime_song_dir).unwrap();
+        std::fs::write(runtime_song_dir.join("bar.qml"), "// stale bar body\n").unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert_eq!(
+            std::fs::read_to_string(runtime_song_dir.join("bar.qml")).unwrap(),
+            "// new bar body\n"
+        );
+        assert!(
+            out.changed.iter().any(|c| c.ends_with("run/qml/songs/moonlight/bar.qml")),
+            "the synced runtime widget is reported changed: {:?}",
+            out.changed
+        );
+        let data = out.data.unwrap();
+        assert_eq!(data["slots"], json!(["bar"]));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stage_leaves_an_unchanged_widget_body_untouched() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, stage, run_qml) = widget_sync_tmp("stage-widget-unchanged");
+        let song = root.join("aoide").join("song").join("songbook").join("moonlight");
+        std::fs::create_dir_all(song.join("widgets")).unwrap();
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
+        let body = "// stable bar body\n";
+        std::fs::write(song.join("widgets").join("bar.qml"), body).unwrap();
+        let runtime_song_dir = run_qml.join("songs").join("moonlight");
+        std::fs::create_dir_all(&runtime_song_dir).unwrap();
+        std::fs::write(runtime_song_dir.join("bar.qml"), body).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert!(
+            !out.changed.iter().any(|c| c.ends_with("run/qml/songs/moonlight/bar.qml")),
+            "a byte-identical widget body must not be reported as changed: {:?}",
+            out.changed
+        );
+        assert_eq!(std::fs::read_to_string(runtime_song_dir.join("bar.qml")).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stage_regenerates_the_manifest_for_a_newly_present_slot() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, stage, run_qml) = widget_sync_tmp("stage-widget-manifest");
+        let song = root.join("aoide").join("song").join("songbook").join("moonlight");
+        std::fs::create_dir_all(song.join("widgets")).unwrap();
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
+        std::fs::write(song.join("widgets").join("bar.qml"), "// bar\n").unwrap();
+        std::fs::write(song.join("widgets").join("calendar.qml"), "// calendar\n").unwrap();
+        let songs_dir = run_qml.join("songs");
+        std::fs::create_dir_all(&songs_dir).unwrap();
+        std::fs::write(
+            songs_dir.join("manifest.json"),
+            r#"{"moonlight":["bar"],"dusk":["clock"]}"#,
+        )
+        .unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        let manifest: Value = serde_json::from_str(
+            &std::fs::read_to_string(songs_dir.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["moonlight"], json!(["bar", "calendar"]));
+        assert_eq!(
+            manifest["dusk"],
+            json!(["clock"]),
+            "another song's manifest entry survives the rewrite untouched"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stage_skips_widget_sync_when_no_runtime_tree_exists() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, stage, _run_qml) = widget_sync_tmp("stage-widget-no-runtime");
+        let song = root.join("aoide").join("song").join("songbook").join("moonlight");
+        std::fs::create_dir_all(song.join("widgets")).unwrap();
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
+        std::fs::write(song.join("widgets").join("bar.qml"), "// bar\n").unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert!(
+            !out.changed.iter().any(|c| c.contains("/run/qml")),
+            "no runtime tree deployed → nothing widget-synced: {:?}",
+            out.changed
+        );
+        assert!(!root.join("aoide").join("run").exists(), "no run/ dir was created");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stage_skips_widget_sync_when_song_has_no_widgets_dir() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, stage, run_qml) = widget_sync_tmp("stage-widget-no-widgets-dir");
+        let song = root.join("aoide").join("song").join("songbook").join("moonlight");
+        std::fs::create_dir_all(&song).unwrap();
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
+        std::fs::create_dir_all(&run_qml).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        // Same shape the pre-existing (2-level, no widgets/) fixtures assert:
+        // only livery.json is staged.
+        assert_eq!(out.changed.len(), 1, "no widgets/ dir → nothing else to sync");
+        assert!(out.changed.iter().any(|c| c.ends_with("stage/livery.json")));
+        assert!(!run_qml.join("songs").join("moonlight").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stage_entry_refuses_and_syncs_nothing_while_declarative_locked() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, stage, run_qml) = widget_sync_tmp("stage-entry-widget-locked");
+        let song = root.join("aoide").join("song").join("songbook").join("moonlight");
+        std::fs::create_dir_all(song.join("widgets")).unwrap();
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
+        std::fs::write(song.join("widgets").join("bar.qml"), "// new bar body\n").unwrap();
+        let runtime_song_dir = run_qml.join("songs").join("moonlight");
+        std::fs::create_dir_all(&runtime_song_dir).unwrap();
+        std::fs::write(runtime_song_dir.join("bar.qml"), "// stale bar body\n").unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        // No marker file at all IS declarative (the safe default).
+        let out = handle_rice_stage_entry(&inv(&["rice", "stage"], &["moonlight"]));
+        assert_eq!(out.status, Status::Error);
+        assert_eq!(out.data.unwrap()["reason"], "declarative-mode-locked");
+        assert_eq!(
+            std::fs::read_to_string(runtime_song_dir.join("bar.qml")).unwrap(),
+            "// stale bar body\n",
+            "the declarative-mode lock covers widget bodies too, not just livery.json"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stage_entry_with_no_name_syncs_the_current_songs_widgets() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, stage, run_qml) = widget_sync_tmp("stage-entry-widget-bare");
+        let song = root.join("aoide").join("song").join("songbook").join("moonlight");
+        std::fs::create_dir_all(song.join("widgets")).unwrap();
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
+        std::fs::write(song.join("widgets").join("bar.qml"), "// new bar body\n").unwrap();
+        let runtime_song_dir = run_qml.join("songs").join("moonlight");
+        std::fs::create_dir_all(&runtime_song_dir).unwrap();
+        std::fs::write(runtime_song_dir.join("bar.qml"), "// stale bar body\n").unwrap();
+        // The stage already carries the "song" breadcrumb `current_staged_song`
+        // reads, as if a prior `rice mode stage moonlight` had run.
+        std::fs::write(
+            stage.join("livery.json"),
+            r##"{"schemaVersion":"0","song":"moonlight",
+                "palette":{"bg":"#111111","fg":"#000000","accent":"#000000","urgent":"#000000"}}"##,
+        )
+        .unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        aoide_storage::mode::save_mode_marker(&aoide_storage::mode::ModeMarker {
+            mode: aoide_storage::mode::RiceMode::Staging,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let out = handle_rice_stage_entry(&inv(&["rice", "stage"], &[]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert_eq!(
+            std::fs::read_to_string(runtime_song_dir.join("bar.qml")).unwrap(),
+            "// new bar body\n",
+            "the no-arg path syncs widgets the same as the named-song path"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stage_copies_helper_and_asset_files_not_just_slots() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, stage, run_qml) = widget_sync_tmp("stage-widget-helpers");
+        let song = root.join("aoide").join("song").join("songbook").join("moonlight");
+        std::fs::create_dir_all(song.join("widgets").join("assets")).unwrap();
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
+        std::fs::write(song.join("widgets").join("bar.qml"), "// bar\n").unwrap();
+        std::fs::write(
+            song.join("widgets").join("WorkspaceRow.qml"),
+            "// helper component\n",
+        )
+        .unwrap();
+        std::fs::write(song.join("widgets").join("assets").join("logo.txt"), "logo data").unwrap();
+        std::fs::create_dir_all(&run_qml).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        let runtime_song_dir = run_qml.join("songs").join("moonlight");
+        assert_eq!(
+            std::fs::read_to_string(runtime_song_dir.join("bar.qml")).unwrap(),
+            "// bar\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(runtime_song_dir.join("WorkspaceRow.qml")).unwrap(),
+            "// helper component\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(runtime_song_dir.join("assets").join("logo.txt")).unwrap(),
+            "logo data"
+        );
+        let data = out.data.unwrap();
+        assert_eq!(
+            data["slots"],
+            json!(["bar"]),
+            "the helper component and asset file are carried but excluded from the manifest"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

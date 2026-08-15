@@ -50,6 +50,7 @@ pub fn resolve_cover_arg(arg: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aoide_test_support::*;
 
     #[test]
     fn resolve_cover_arg_takes_an_absolute_path_literally() {
@@ -59,8 +60,13 @@ mod tests {
 
     #[test]
     fn resolve_cover_arg_resolves_a_bare_name_against_the_covers_library() {
-        let _guard = crate::env_lock().lock().unwrap();
-        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        // Shares `aoide_test_support::env_lock()` with every other env-touching
+        // test in the crate (rice.rs, mode.rs, draft.rs) — this used to lock a
+        // separate crate-local mutex, so its `set_var("AOIDE_STAGE_DIR", …)`
+        // could race a rice.rs/mode.rs test holding the OTHER lock and clobber
+        // its env mid-flight.
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         std::env::set_var("AOIDE_STAGE_DIR", "/tmp/aoide-cover-test/stage");
 
         let resolved = resolve_cover_arg("sonata.webp");
@@ -68,17 +74,12 @@ mod tests {
             resolved,
             PathBuf::from("/tmp/aoide-cover-test/covers/sonata.webp")
         );
-
-        match saved {
-            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
-            None => std::env::remove_var("AOIDE_STAGE_DIR"),
-        }
     }
 
     #[test]
     fn derive_cover_finds_the_first_matching_extension_or_none() {
-        let _guard = crate::env_lock().lock().unwrap();
-        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root =
             std::env::temp_dir().join(format!("aoide-song-derive-cover-{}", std::process::id()));
         let stage = root.join("stage");
@@ -92,9 +93,5 @@ mod tests {
         assert_eq!(derive_cover("nope"), None);
 
         let _ = std::fs::remove_dir_all(&root);
-        match saved {
-            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
-            None => std::env::remove_var("AOIDE_STAGE_DIR"),
-        }
     }
 }

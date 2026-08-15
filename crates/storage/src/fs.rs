@@ -148,7 +148,12 @@ pub fn draft_dir(song: &str, draft: &str) -> std::path::PathBuf {
 /// SIGKILL, or a power-cut (a stale `graph.tmp.464255` was found on disk) — can
 /// never clean up after itself, so every successful write also sweeps sibling
 /// temps left by a pid that is no longer alive ([`sweep_stale_temps`]).
-pub fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+///
+/// Bytes-oriented; [`atomic_write`] is the `&str` convenience wrapper every
+/// existing JSON/text caller uses. Binary payloads (a widget QML file carried
+/// verbatim into the runtime tree, `crate::widgets`-equivalent callers) route
+/// through here directly instead of paying a lossy UTF-8 round-trip.
+pub fn atomic_write_bytes(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     let target = match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => {
             let link = std::fs::read_link(path)?;
@@ -166,7 +171,7 @@ pub fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<(
     let tmp = target.with_extension(format!("tmp.{}", std::process::id()));
     {
         let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(contents.as_bytes())?;
+        f.write_all(contents)?;
         f.sync_all()?;
     }
     let res = std::fs::rename(&tmp, &target);
@@ -177,6 +182,12 @@ pub fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<(
     }
     sweep_stale_temps(&target);
     res
+}
+
+/// `&str` convenience wrapper over [`atomic_write_bytes`] — every existing
+/// JSON/text stage-file writer routes through here.
+pub fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    atomic_write_bytes(path, contents.as_bytes())
 }
 
 /// Run `f` while holding an exclusive advisory lock on the stage directory,
@@ -616,6 +627,23 @@ mod tests {
         atomic_write(&link, "routed").unwrap();
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "routed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_bytes_round_trips_binary_content() {
+        // The bytes-oriented primitive `atomic_write` now delegates to — a
+        // widget QML file (or any non-UTF-8 payload) must round-trip exactly,
+        // not just the `&str` callers `atomic_write` itself covers.
+        let dir = std::env::temp_dir().join(format!("aoide-atomic-bytes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("binary.dat");
+
+        let bytes: &[u8] = &[0u8, 159, 146, 150];
+        atomic_write_bytes(&path, bytes).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
