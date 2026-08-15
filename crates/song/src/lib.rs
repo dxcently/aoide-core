@@ -16,6 +16,7 @@ pub mod cover;
 pub mod live;
 pub mod livery;
 pub mod notes;
+pub mod reap;
 
 /// A crate-wide lock serialising every test that mutates process-global env
 /// (`HYPRLAND_INSTANCE_SIGNATURE`, …). `std::env::set_var` is process-global,

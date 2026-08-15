@@ -112,11 +112,11 @@ mod tests {
 
     #[test]
     fn not_implemented_command_carries_the_stub_envelope_and_gate() {
-        // `rice adopt` is gated + not implemented.
-        let out = dispatch(&inv(&["rice", "adopt"], &["dusk"]));
+        // `rice declare` is gated + not implemented.
+        let out = dispatch(&inv(&["rice", "declare"], &["dusk"]));
         assert_eq!(out.status, Status::NotImplemented);
         assert_eq!(out.render(false).1, crate::output::exit::NOT_IMPLEMENTED);
-        assert!(out.gated, "rice.adopt is a gated command");
+        assert!(out.gated, "rice.declare is a gated command");
         assert_eq!(out.data.unwrap()["args"][0], "dusk");
     }
 

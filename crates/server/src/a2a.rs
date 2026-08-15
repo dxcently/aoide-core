@@ -10,13 +10,17 @@
 //! (mirroring `mcp.rs`'s stdio JSON-RPC server — this is that same shape over
 //! a socket instead of stdio).
 //!
-//! Routes (CONTRACTS.md §6 MVP surface):
+//! Routes (CONTRACTS.md §6 MVP surface, plus §7's peer federation):
 //!   - `GET  /.well-known/agent-card.json` — the AgentCard, derived from the
 //!     command registry, filtered to `implemented: true`.
 //!   - `POST /` — JSON-RPC 2.0: `tasks/get` (real), `message/send` (real —
 //!     inject into a known conductable session, or spawn a freshly conducted
-//!     one; [`decide_send_action`] below), anything else → `-32601 method
-//!     not found`.
+//!     one; [`decide_send_action`] below — a non-loopback Inject queues
+//!     pending unless the caller matches an `autogate` peer, CONTRACTS.md §6
+//!     amendment 2026-08-14; see [`PeerOrigin`]/[`should_deliver_now`]),
+//!     `aoide/graphSummary` (real — CONTRACTS.md §7: wraps
+//!     [`resolve_graph_document`] in the federation envelope; see
+//!     [`graph_summary`]), anything else → `-32601 method not found`.
 //!
 //! A forwarded A2A message's TEXT is untrusted DATA, never executed as a
 //! command — `message/send`'s inject path types it into a target session
@@ -45,8 +49,8 @@
 //! (they only ever touched session state), so they're untouched.
 
 use aoide_conduct::graph::{
-    canonical_state, load_stage, now_iso_utc, session_send, sessions_path, SessionRecord,
-    SessionsFile,
+    canonical_state, load_stage, now_iso_utc, resolve_graph_document, session_send,
+    sessions_path, SessionRecord, SessionsFile,
 };
 use aoide_protocol::output::Status;
 use aoide_protocol::registry::{Command, Registry};
@@ -55,9 +59,9 @@ use aoide_protocol::wire::{
     TaskStatusUpdateEvent,
 };
 use aoide_protocol::{audit, Door, EventClass, Invocation};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -67,6 +71,8 @@ use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use aoide_conduct::graph::write_stage;
+#[cfg(test)]
+use std::os::unix::net::UnixListener;
 
 // ── Hostile-input hardening limits (security review, pre-commit) ────────────
 //
@@ -155,6 +161,83 @@ pub fn resolve_spawn_agent(inv: &Invocation) -> String {
         .cloned()
         .or_else(|| std::env::var("AOIDE_A2A_SPAWN_AGENT").ok())
         .unwrap_or_default()
+}
+
+/// Resolve this instance's `aoide/graphSummary` `instance.name` (CONTRACTS.md
+/// §7): `--peer-name` flag → `AOIDE_A2A_PEER_NAME` env (set by the
+/// `aoide-a2a` systemd unit, mirroring `resolve_bind_port`/
+/// `resolve_spawn_agent`'s precedence) → the OS hostname (`libc::gethostname`
+/// — this crate already carries `libc`, so no new dependency) → the literal
+/// `"aoide"` if even that fails. Resolved once at `a2a serve` launch, same as
+/// bind/port/spawn-agent.
+pub fn resolve_peer_name(inv: &Invocation) -> String {
+    inv.flags
+        .get("peer-name")
+        .cloned()
+        .or_else(|| std::env::var("AOIDE_A2A_PEER_NAME").ok().filter(|s| !s.is_empty()))
+        .or_else(os_hostname)
+        .unwrap_or_else(|| "aoide".to_string())
+}
+
+/// The OS hostname via `libc::gethostname`, or `None` on any failure
+/// (truncated/non-UTF8/errno) — best-effort, never a panic.
+fn os_hostname() -> Option<String> {
+    let mut buf = vec![0u8; 256];
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let s = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+// ── Where a `message/send`/`message/stream` connection originated ───────────
+//
+// CONTRACTS.md §6 amendment (2026-08-14): the non-loopback pending-gate fix.
+// A connection's ORIGIN (not any client-supplied field — TCP `peer_addr()`,
+// which a hostile client cannot spoof from off-box) decides whether an
+// Inject auto-delivers or queues pending, exactly the same shape `graph
+// send`'s own gate already resolves (`conduct::graph::send::send_gate`).
+
+/// Where one `message/send` (or `message/stream`) request's TCP connection
+/// came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerOrigin {
+    /// The connection's peer IP is loopback (127.0.0.0/8, `::1`) — today's
+    /// trusted-by-bind-address default. UNCHANGED behavior: auto-delivers,
+    /// exactly as before this amendment (hard regression requirement).
+    Loopback,
+    /// A non-loopback peer IP — gated UNLESS it matches an `autogate`-marked
+    /// entry in `state/peers.json`.
+    Remote(IpAddr),
+    /// The peer address could not be determined (e.g. `peer_addr()` failed).
+    /// Fails SAFE: treated exactly like an unmatched [`Self::Remote`] — never
+    /// auto-delivered, never autogate-matched.
+    Unknown,
+}
+
+/// Classify a raw `peer_addr()` result into a [`PeerOrigin`]. Pure.
+pub fn classify_origin(peer_ip: Option<IpAddr>) -> PeerOrigin {
+    match peer_ip {
+        Some(ip) if ip.is_loopback() => PeerOrigin::Loopback,
+        Some(ip) => PeerOrigin::Remote(ip),
+        None => PeerOrigin::Unknown,
+    }
+}
+
+/// Should an Inject auto-deliver (`--yes`) rather than queue pending? Pure —
+/// unit-tested directly; the one place I/O (`autogate_match`, a
+/// `state/peers.json` lookup) enters is the caller. Loopback is
+/// unconditionally trusted (today's behavior, unchanged); a non-loopback or
+/// unknown-origin peer only bypasses the queue when it matches an
+/// `autogate`-marked registry entry.
+fn should_deliver_now(origin: PeerOrigin, autogate_match: bool) -> bool {
+    match origin {
+        PeerOrigin::Loopback => true,
+        PeerOrigin::Remote(_) => autogate_match,
+        PeerOrigin::Unknown => false,
+    }
 }
 
 // ── AgentCard (derived from the command registry, CONTRACTS.md §6) ──────────
@@ -435,17 +518,39 @@ fn session_ref_lookup(id: &str) -> Option<SessionRef> {
 
 /// Deliver into a KNOWN, conductable session: reuse
 /// [`aoide_conduct::graph::session_send`] (the same gated injection door
-/// `graph send` uses) rather than reimplementing the socket write. Built with
-/// `--yes` (message/send's whole point is to deliver now, not queue a pending
-/// approval — the A2A door's own admission, rebuild-gating +
-/// loopback + audit, already stands in for that gate) and `--submit` (the
-/// prompt is a full turn, not a keystroke). Returns the freshly-reloaded Task
-/// so the caller sees the state the injection actually produced.
-fn do_inject(session_id: &str, prompt: &str, audit_log: &Path) -> Result<Value, (i64, String)> {
+/// `graph send` uses) rather than reimplementing the socket write or its
+/// pending-queue.
+///
+/// `deliver_now` decides whether `--yes` is forced:
+/// - `true` (a loopback connection, or a non-loopback one from an
+///   `autogate`-marked peer — [`should_deliver_now`]) forces delivery, same
+///   as this door's original behavior: `--submit` (the prompt is a full
+///   turn, not a keystroke), `--yes` (deliver now, don't queue).
+/// - `false` (a non-loopback, non-autogated connection — CONTRACTS.md §6
+///   amendment, 2026-08-14) OMITS `--yes` entirely: `session_send`'s own
+///   gate then does exactly what a local ungated `graph send` does — writes
+///   `pending.json` and reports `delivered:false`, never touching the
+///   socket. No pending-queue logic is reimplemented here.
+///
+/// A delivered send returns the freshly-reloaded Task (unchanged from
+/// before). A held-pending send returns a Task in `submitted` state built
+/// directly (NOT `task_get`, which would report the SESSION's current
+/// phase — an unrelated prior turn's state — rather than "this particular
+/// message is queued") so the synchronous JSON-RPC caller gets an honest
+/// immediate response; `tasks/get`/the SSE stream reflect the real session
+/// state once/if a human approves and delivers it.
+fn do_inject(
+    session_id: &str,
+    prompt: &str,
+    audit_log: &Path,
+    deliver_now: bool,
+) -> Result<Value, (i64, String)> {
     let mut flags = std::collections::BTreeMap::new();
     flags.insert("id".to_string(), session_id.to_string());
     flags.insert("submit".to_string(), "true".to_string());
-    flags.insert("yes".to_string(), "true".to_string());
+    if deliver_now {
+        flags.insert("yes".to_string(), "true".to_string());
+    }
     flags.insert("audit-log".to_string(), audit_log.to_string_lossy().into_owned());
     let inv = Invocation {
         path: vec!["graph".to_string(), "send".to_string()],
@@ -457,7 +562,23 @@ fn do_inject(session_id: &str, prompt: &str, audit_log: &Path) -> Result<Value, 
     if outcome.status != Status::Ok {
         return Err((-32603, outcome.message));
     }
-    task_get(session_id)
+    let delivered = outcome
+        .data
+        .as_ref()
+        .and_then(|d| d.get("delivered"))
+        .and_then(Value::as_bool)
+        .unwrap_or(deliver_now);
+    if delivered {
+        task_get(session_id)
+    } else {
+        let task = Task {
+            id: session_id.to_string(),
+            context_id: session_id.to_string(),
+            status: TaskStatus { state: "submitted".to_string(), timestamp: now_iso_utc() },
+            kind: "task".to_string(),
+        };
+        Ok(serde_json::to_value(&task).expect("Task always serializes"))
+    }
 }
 
 /// Best-effort: connect to a just-spawned conducted session's control socket
@@ -568,20 +689,69 @@ fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path) -> Result<Value, (i
 }
 
 /// `message/send`: parse params, resolve [`decide_send_action`], execute.
-fn message_send(params: &Value, audit_log: &Path, spawn_agent: &str) -> Result<Value, (i64, String)> {
+/// `origin` (CONTRACTS.md §6 amendment) only ever affects the Inject branch —
+/// spawn keeps its existing rebuild-time-only admission model unchanged (see
+/// the module doc comment's security model note); the ONE must-fix gap was
+/// Inject's unconditional `--yes`, not spawn's separate admission story.
+fn message_send(
+    params: &Value,
+    audit_log: &Path,
+    spawn_agent: &str,
+    origin: PeerOrigin,
+) -> Result<Value, (i64, String)> {
     let (prompt, context_id, spawn_asked) = parse_message_send_params(params);
     match decide_send_action(context_id.as_deref(), spawn_asked, spawn_agent, session_ref_lookup) {
-        SendAction::Inject { session_id } => do_inject(&session_id, &prompt, audit_log),
+        SendAction::Inject { session_id } => {
+            let autogate_match = match origin {
+                PeerOrigin::Remote(ip) => {
+                    aoide_storage::peer_store::is_autogated_peer_addr(&aoide_storage::peer_store::load_peers(), ip)
+                }
+                PeerOrigin::Loopback | PeerOrigin::Unknown => false,
+            };
+            let deliver_now = should_deliver_now(origin, autogate_match);
+            do_inject(&session_id, &prompt, audit_log, deliver_now)
+        }
         SendAction::Spawn { agent_cmd } => do_spawn(&agent_cmd, &prompt, audit_log),
         SendAction::Error { code, msg } => Err((code, msg)),
     }
 }
 
+/// `aoide/graphSummary` (CONTRACTS.md §7): wrap the EXISTING resolved
+/// `graph.json` v0 document ([`resolve_graph_document`], the exact same
+/// function `graph view`/`graph emit` build their document with) in the
+/// federation envelope. No new graph vocabulary — `graph` below is that
+/// document verbatim.
+fn graph_summary(peer_name: &str, self_url: &str) -> Result<Value, (i64, String)> {
+    let graph = resolve_graph_document().map_err(|e| (-32603_i64, format!("internal error: {e}")))?;
+    Ok(json!({
+        "schemaVersion": "0",
+        "instance": {
+            "name": peer_name,
+            "url": self_url,
+            "emittedAt": now_iso_utc(),
+        },
+        "graph": graph,
+    }))
+}
+
+/// Per-request context [`handle_jsonrpc`]/[`handle_jsonrpc_bytes`] thread
+/// through to whichever method needs it: `message/send` needs
+/// `audit_log`/`spawn_agent`/`origin`; `aoide/graphSummary` (CONTRACTS.md §7)
+/// needs `peer_name`/`self_url`. Bundled into one struct once a second method
+/// needed request-scoped dependencies, rather than growing `handle_jsonrpc`'s
+/// positional-arg list again.
+struct RequestCtx<'a> {
+    audit_log: &'a Path,
+    spawn_agent: &'a str,
+    origin: PeerOrigin,
+    peer_name: &'a str,
+    self_url: &'a str,
+}
+
 /// Handle one parsed JSON-RPC 2.0 request `Value`, returning the response
 /// `Value` (always — unlike `mcp.rs`'s stdio notifications, an HTTP POST
-/// always gets a reply body). `audit_log`/`spawn_agent` are only consulted by
-/// `message/send`.
-fn handle_jsonrpc(req: &Value, audit_log: &Path, spawn_agent: &str) -> Value {
+/// always gets a reply body).
+fn handle_jsonrpc(req: &Value, ctx: &RequestCtx) -> Value {
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);
@@ -591,7 +761,8 @@ fn handle_jsonrpc(req: &Value, audit_log: &Path, spawn_agent: &str) -> Value {
             let task_id = params.get("id").and_then(Value::as_str).unwrap_or("");
             task_get(task_id)
         }
-        "message/send" => message_send(&params, audit_log, spawn_agent),
+        "message/send" => message_send(&params, ctx.audit_log, ctx.spawn_agent, ctx.origin),
+        "aoide/graphSummary" => graph_summary(ctx.peer_name, ctx.self_url),
         "" => Err((-32600, "invalid request: missing method".to_string())),
         other => Err((-32601, format!("method not found: {other}"))),
     };
@@ -608,9 +779,9 @@ fn jsonrpc_error_value(code: i64, message: impl Into<String>) -> Value {
         .expect("JsonRpcResponse always serializes")
 }
 
-fn handle_jsonrpc_bytes(body: &[u8], audit_log: &Path, spawn_agent: &str) -> Value {
+fn handle_jsonrpc_bytes(body: &[u8], ctx: &RequestCtx) -> Value {
     match serde_json::from_slice::<Value>(body) {
-        Ok(req) => handle_jsonrpc(&req, audit_log, spawn_agent),
+        Ok(req) => handle_jsonrpc(&req, ctx),
         Err(e) => jsonrpc_error_value(-32700, format!("parse error: {e}")),
     }
 }
@@ -706,6 +877,7 @@ fn stream_task<W: Write>(
     method: &str,
     audit_log: &Path,
     spawn_agent: &str,
+    origin: PeerOrigin,
 ) -> std::io::Result<()> {
     let rpc: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
     let rpc_id = rpc.get("id").cloned().unwrap_or(Value::Null);
@@ -715,7 +887,7 @@ fn stream_task<W: Write>(
     // send FIRST (inject/spawn) and streams the task it produced;
     // `tasks/resubscribe` streams an existing task by id.
     let resolved: Result<Value, (i64, String)> = match method {
-        "message/stream" => message_send(&params, audit_log, spawn_agent),
+        "message/stream" => message_send(&params, audit_log, spawn_agent, origin),
         _ /* tasks/resubscribe */ => {
             match params.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
                 Some(id) => task_get(id),
@@ -997,17 +1169,21 @@ fn method_not_allowed(method: &str, path: &str) -> (u16, Vec<u8>, String) {
 }
 
 /// Route one parsed request to (HTTP status, response body, audit-log
-/// command label). `audit_log`/`spawn_agent` are only consulted by a POST `/`
-/// whose body parses as `message/send`; `registry` is only consulted by the
-/// AgentCard GET — every other route is pure I/O-free routing over what's
-/// already in `req`, so it still unit-tests without a real socket, spawn, or
-/// audit-log write.
+/// command label). `audit_log`/`spawn_agent`/`origin` are only consulted by a
+/// POST `/` whose body parses as `message/send`; `peer_name` (plus the
+/// `self_url` this function derives from `bind`/`port`, the same way
+/// [`agent_card`]'s own `url` field does) is only consulted by
+/// `aoide/graphSummary`; `registry` is only consulted by the AgentCard GET —
+/// every other route is pure I/O-free routing over what's already in `req`,
+/// so it still unit-tests without a real socket, spawn, or audit-log write.
 fn route(
     req: &HttpRequest,
     bind: &str,
     port: u16,
     audit_log: &Path,
     spawn_agent: &str,
+    peer_name: &str,
+    origin: PeerOrigin,
     registry: &Registry,
 ) -> (u16, Vec<u8>, String) {
     match req.path.as_str() {
@@ -1039,9 +1215,18 @@ fn route(
                 let label = match parsed_method.as_deref() {
                     Some("tasks/get") => "tasks/get",
                     Some("message/send") => "message/send",
+                    Some("aoide/graphSummary") => "aoide/graphSummary",
                     _ => "rpc",
                 };
-                let resp = handle_jsonrpc_bytes(&req.body, audit_log, spawn_agent);
+                let self_url = format!("http://{bind}:{port}/");
+                let ctx = RequestCtx {
+                    audit_log,
+                    spawn_agent,
+                    origin,
+                    peer_name,
+                    self_url: &self_url,
+                };
+                let resp = handle_jsonrpc_bytes(&req.body, &ctx);
                 let body = serde_json::to_vec(&resp).unwrap_or_default();
                 (200, body, format!("a2a.{label}"))
             } else {
@@ -1090,6 +1275,7 @@ pub fn serve(
     port: u16,
     audit_log: &Path,
     spawn_agent: &str,
+    peer_name: &str,
     registry: &'static Registry,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind((bind, port))?;
@@ -1120,9 +1306,12 @@ pub fn serve(
         let bind = bind.to_string();
         let audit_log = audit_log.to_path_buf();
         let spawn_agent = spawn_agent.to_string();
+        let peer_name = peer_name.to_string();
         std::thread::spawn(move || {
             let _guard = ConnGuard; // released on every exit path, incl. panic
-            if let Err(e) = handle_connection(stream, &bind, port, &audit_log, &spawn_agent, registry) {
+            if let Err(e) =
+                handle_connection(stream, &bind, port, &audit_log, &spawn_agent, &peer_name, registry)
+            {
                 eprintln!("aoide a2a: connection error: {e}");
             }
         });
@@ -1139,8 +1328,17 @@ fn handle_connection(
     port: u16,
     audit_log: &Path,
     spawn_agent: &str,
+    peer_name: &str,
     registry: &Registry,
 ) -> std::io::Result<()> {
+    // The connection's ORIGIN (CONTRACTS.md §6 amendment, 2026-08-14): TCP
+    // `peer_addr()`, not any client-supplied field — a hostile client cannot
+    // spoof this. Resolved once, BEFORE the read-timeout/BufReader wrapping
+    // below (which only affect reading, not this), and threaded to every
+    // path that can reach `message/send` (the one-shot route below AND the
+    // `message/stream` SSE path).
+    let origin = classify_origin(stream.peer_addr().ok().map(|sa| sa.ip()));
+
     // Never let one slow/hostile client wedge a server thread forever: the
     // per-read timeout catches a fully-idle client, and the absolute
     // `MAX_REQUEST` deadline (checked inside `parse_http_request`) catches
@@ -1183,10 +1381,11 @@ fn handle_connection(
             "open",
             "SSE stream open",
         );
-        return stream_task(&mut writer, &req, &method, audit_log, spawn_agent);
+        return stream_task(&mut writer, &req, &method, audit_log, spawn_agent, origin);
     }
 
-    let (status, body, audit_cmd) = route(&req, bind, port, audit_log, spawn_agent, registry);
+    let (status, body, audit_cmd) =
+        route(&req, bind, port, audit_log, spawn_agent, peer_name, origin, registry);
 
     // Security/audit (CONTRACTS.md §6): every handled request routes through
     // the single audit log, same discipline as the CLI/MCP doors. The
@@ -1220,6 +1419,22 @@ mod tests {
 
     fn fake_handler(_inv: &Invocation) -> aoide_protocol::output::Outcome {
         aoide_protocol::output::Outcome::ok("fake", "fake")
+    }
+
+    /// A loopback `RequestCtx` — every pre-existing test below predates the
+    /// non-loopback pending-gate amendment and exercises the historical
+    /// "trusted, loopback caller" behavior, so this preserves that intent
+    /// exactly (none of them touch the Inject-delivery branch anyway — they
+    /// all resolve to `SendAction::Error`/`tasks/get`, which never consult
+    /// `origin`).
+    fn test_ctx<'a>(audit_log: &'a Path, spawn_agent: &'a str) -> RequestCtx<'a> {
+        RequestCtx {
+            audit_log,
+            spawn_agent,
+            origin: PeerOrigin::Loopback,
+            peer_name: "aoide",
+            self_url: "http://127.0.0.1:8710/",
+        }
     }
 
     // (a) AgentCard generation from a small fake schema.
@@ -1491,7 +1706,7 @@ mod tests {
         });
         // spawn_agent == "" (the default) → decide_send_action errors out
         // before any process would be spawned.
-        let resp = handle_jsonrpc(&req, Path::new("/dev/null"), "");
+        let resp = handle_jsonrpc(&req, &test_ctx(Path::new("/dev/null"), ""));
         assert_eq!(resp["error"]["code"], -32004);
         assert_eq!(resp["error"]["message"], "A2A spawn not configured");
         assert_eq!(resp["id"], 1);
@@ -1527,7 +1742,7 @@ mod tests {
                 "contextId": "ghost",
             } }
         });
-        let resp = handle_jsonrpc(&req, Path::new("/dev/null"), "claude");
+        let resp = handle_jsonrpc(&req, &test_ctx(Path::new("/dev/null"), "claude"));
         assert_eq!(resp["error"]["code"], -32001);
 
         // Known but not conductable → -32004 "session not conductable".
@@ -1538,7 +1753,7 @@ mod tests {
                 "contextId": "plain",
             } }
         });
-        let resp2 = handle_jsonrpc(&req2, Path::new("/dev/null"), "claude");
+        let resp2 = handle_jsonrpc(&req2, &test_ctx(Path::new("/dev/null"), "claude"));
         assert_eq!(resp2["error"]["code"], -32004);
         assert_eq!(resp2["error"]["message"], "session not conductable");
 
@@ -1552,7 +1767,7 @@ mod tests {
     #[test]
     fn unknown_method_is_minus_32601() {
         let req = json!({ "jsonrpc": "2.0", "id": 2, "method": "bogus/verb", "params": {} });
-        let resp = handle_jsonrpc(&req, Path::new("/dev/null"), "");
+        let resp = handle_jsonrpc(&req, &test_ctx(Path::new("/dev/null"), ""));
         assert_eq!(resp["error"]["code"], -32601);
     }
 
@@ -1578,12 +1793,378 @@ mod tests {
         write_stage(&sessions_path(), &sf).unwrap();
 
         let req = json!({ "jsonrpc": "2.0", "id": 7, "method": "tasks/get", "params": { "id": "s1" } });
-        let resp = handle_jsonrpc(&req, Path::new("/dev/null"), "");
+        let resp = handle_jsonrpc(&req, &test_ctx(Path::new("/dev/null"), ""));
         assert_eq!(resp["result"]["status"]["state"], "completed");
 
         let req = json!({ "jsonrpc": "2.0", "id": 8, "method": "tasks/get", "params": { "id": "ghost" } });
-        let resp = handle_jsonrpc(&req, Path::new("/dev/null"), "");
+        let resp = handle_jsonrpc(&req, &test_ctx(Path::new("/dev/null"), ""));
         assert_eq!(resp["error"]["code"], -32001);
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    // ── The non-loopback pending-gate amendment (CONTRACTS.md §6, 2026-08-14) ──
+    //
+    // The one must-fix security gap: `do_inject` used to force `--yes`
+    // UNCONDITIONALLY, so any reachable peer could inject text into any
+    // local conductable session with zero approval the moment the door binds
+    // somewhere other than loopback. These tests drive `message_send`
+    // directly (the same function `handle_jsonrpc`'s `message/send` arm
+    // calls) with a real `UnixListener` standing in for the target session's
+    // control socket, exactly like `conduct::graph::send`'s own gate tests.
+
+    fn conductable_session(id: &str, socket: &std::path::Path) -> SessionRecord {
+        let mut rec = fixture_session(id, "working", None);
+        rec.conductable = Some(true);
+        rec.socket = Some(socket.to_string_lossy().into_owned());
+        rec
+    }
+
+    #[test]
+    fn classify_origin_maps_loopback_remote_and_unknown() {
+        assert_eq!(classify_origin(Some("127.0.0.1".parse().unwrap())), PeerOrigin::Loopback);
+        assert_eq!(classify_origin(Some("::1".parse().unwrap())), PeerOrigin::Loopback);
+        assert_eq!(
+            classify_origin(Some("10.0.0.5".parse().unwrap())),
+            PeerOrigin::Remote("10.0.0.5".parse().unwrap())
+        );
+        assert_eq!(classify_origin(None), PeerOrigin::Unknown);
+    }
+
+    #[test]
+    fn should_deliver_now_covers_every_origin_autogate_combination() {
+        // Loopback is unconditionally trusted — unchanged from before this
+        // amendment, regardless of any autogate match.
+        assert!(should_deliver_now(PeerOrigin::Loopback, false));
+        assert!(should_deliver_now(PeerOrigin::Loopback, true));
+        // A remote origin only delivers when it matched an autogate peer.
+        let remote = PeerOrigin::Remote("10.0.0.5".parse().unwrap());
+        assert!(!should_deliver_now(remote, false));
+        assert!(should_deliver_now(remote, true));
+        // An unresolvable origin never delivers, even if (hypothetically) an
+        // autogate match were somehow claimed for it — fail-safe.
+        assert!(!should_deliver_now(PeerOrigin::Unknown, false));
+        assert!(!should_deliver_now(PeerOrigin::Unknown, true));
+    }
+
+    #[test]
+    fn non_loopback_message_send_is_held_pending_not_delivered() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-nonloopback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_STATE_DIR", root.join("state"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        let id = "remote-target";
+        let socket = aoide_conduct::graph::conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        // A listener stands in for the conducted process — if a delivery
+        // were WRONGLY attempted, connecting to it would succeed; the
+        // assertions below prove the connect never happens at all.
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![conductable_session(id, &socket)],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let audit_log = root.join("log");
+        let params = serde_json::json!({
+            "message": { "parts": [{ "kind": "text", "text": "inject me" }], "contextId": id }
+        });
+        let remote_origin = PeerOrigin::Remote("10.0.0.9".parse().unwrap());
+        let result = message_send(&params, &audit_log, "", remote_origin);
+        let task = result.expect("a pending send is still an Ok Task, not a JSON-RPC error");
+        assert_eq!(task["id"], id);
+        assert_eq!(
+            task["status"]["state"], "submitted",
+            "the synchronous response reports `submitted`, not the session's unrelated state"
+        );
+
+        // Nothing connected to the socket — no delivery was attempted.
+        assert!(listener.accept().is_err(), "a non-loopback, non-autogated send must never touch the socket");
+
+        // `pending.json` carries the queued entry.
+        let pending: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(stage.join("pending.json")).unwrap(),
+        )
+        .unwrap();
+        let entries = pending["pending"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["sessionId"], id);
+        assert_eq!(entries[0]["text"], "inject me");
+
+        // Audited through the single Door::A2a log, "pending" status — every
+        // outcome (queued/auto-delivered/error) routes through the SAME
+        // audit path `graph send` already uses (`conduct::graph::send::
+        // audit_send`), never a second logging path.
+        let log = std::fs::read_to_string(&audit_log).unwrap_or_default();
+        assert!(log.contains("\"door\":\"a2a\""), "audited through Door::A2a: {log}");
+        assert!(log.contains("\"status\":\"pending\""), "audited as pending: {log}");
+        assert!(log.contains("graph.send"), "reuses graph send's own audit command label: {log}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
+    fn loopback_message_send_still_auto_delivers_exactly_as_before() {
+        // Regression test (hard requirement): this amendment must NOT change
+        // loopback semantics at all — a loopback origin still auto-delivers,
+        // byte-for-byte the same as `do_inject`'s pre-amendment unconditional
+        // `--yes` behavior.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-loopback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_STATE_DIR", root.join("state"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        let id = "local-target";
+        let socket = aoide_conduct::graph::conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![conductable_session(id, &socket)],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+
+        let audit_log = root.join("log");
+        let params = serde_json::json!({
+            "message": { "parts": [{ "kind": "text", "text": "hello loopback" }], "contextId": id }
+        });
+        let result = message_send(&params, &audit_log, "", PeerOrigin::Loopback);
+        let got = acc.join().unwrap();
+        assert_eq!(String::from_utf8(got).unwrap(), "hello loopback\n");
+
+        let task = result.unwrap();
+        assert_eq!(task["id"], id);
+
+        let log = std::fs::read_to_string(&audit_log).unwrap_or_default();
+        assert!(log.contains("\"status\":\"delivered\""), "audited as delivered: {log}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
+    fn autogated_peer_delivers_despite_being_non_loopback() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-autogate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let stage = root.join("stage");
+        let state = root.join("state");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        // A peer explicitly marked `autogate: true`, whose url resolves (as
+        // an IP literal — no real DNS) to the connecting address.
+        aoide_storage::peer_store::save_peers(&[aoide_storage::peer_store::Peer {
+            name: "trusted-peer".into(),
+            url: "http://10.0.0.9:8710/".into(),
+            autogate: true,
+            added_at: "2026-08-14T00:00:00Z".into(),
+        }])
+        .unwrap();
+
+        let id = "autogate-target";
+        let socket = aoide_conduct::graph::conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![conductable_session(id, &socket)],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+
+        let audit_log = root.join("log");
+        let params = serde_json::json!({
+            "message": { "parts": [{ "kind": "text", "text": "trusted send" }], "contextId": id }
+        });
+        let remote_origin = PeerOrigin::Remote("10.0.0.9".parse().unwrap());
+        let result = message_send(&params, &audit_log, "", remote_origin);
+        let got = acc.join().unwrap();
+        assert_eq!(
+            String::from_utf8(got).unwrap(),
+            "trusted send\n",
+            "an autogate-marked peer's non-loopback send still auto-delivers"
+        );
+        assert!(result.is_ok());
+
+        // No pending.json entry was ever queued for this delivered send.
+        let pending_path = stage.join("pending.json");
+        if pending_path.exists() {
+            let pending: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&pending_path).unwrap()).unwrap();
+            assert!(pending["pending"].as_array().map(Vec::is_empty).unwrap_or(true));
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    // ── `resolve_peer_name` precedence (flag → env → hostname → default) ────
+
+    #[test]
+    fn resolve_peer_name_prefers_flag_then_env_then_falls_back() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_A2A_PEER_NAME").ok();
+
+        let mut flags = std::collections::BTreeMap::new();
+        flags.insert("peer-name".to_string(), "flag-name".to_string());
+        let inv = Invocation { path: vec![], args: vec![], flags, door: Door::Cli };
+        std::env::set_var("AOIDE_A2A_PEER_NAME", "env-name");
+        assert_eq!(resolve_peer_name(&inv), "flag-name", "an explicit flag wins outright");
+
+        let inv_no_flag = Invocation {
+            path: vec![],
+            args: vec![],
+            flags: std::collections::BTreeMap::new(),
+            door: Door::Cli,
+        };
+        assert_eq!(resolve_peer_name(&inv_no_flag), "env-name", "falls back to the env var");
+
+        std::env::remove_var("AOIDE_A2A_PEER_NAME");
+        // Falls back to the OS hostname (or, failing that, "aoide") — either
+        // way, never empty.
+        assert!(!resolve_peer_name(&inv_no_flag).is_empty());
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_A2A_PEER_NAME", v),
+            None => std::env::remove_var("AOIDE_A2A_PEER_NAME"),
+        }
+    }
+
+    // ── `aoide/graphSummary` (CONTRACTS.md §7) ───────────────────────────────
+
+    #[test]
+    fn graph_summary_wraps_the_resolved_graph_document_verbatim() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = std::env::temp_dir().join(format!(
+            "aoide-a2a-graphsummary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let resp = graph_summary("test-instance", "http://127.0.0.1:8710/").unwrap();
+        assert_eq!(resp["schemaVersion"], "0");
+        assert_eq!(resp["instance"]["name"], "test-instance");
+        assert_eq!(resp["instance"]["url"], "http://127.0.0.1:8710/");
+        assert!(resp["instance"]["emittedAt"].as_str().unwrap().ends_with('Z'));
+        // `graph` is EXACTLY what `resolve_graph_document` (the same function
+        // `graph view`/`graph emit` use) produces — no second vocabulary.
+        assert_eq!(resp["graph"], resolve_graph_document().unwrap());
+        assert_eq!(resp["graph"]["schemaVersion"], "0");
+        assert!(resp["graph"]["nodes"].is_array());
+        assert!(resp["graph"]["edges"].is_array());
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn handle_jsonrpc_routes_aoide_graph_summary_and_still_32601s_everything_else() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = std::env::temp_dir().join(format!(
+            "aoide-a2a-graphsummary-rpc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "aoide/graphSummary", "params": {} });
+        let resp = handle_jsonrpc(&req, &test_ctx(Path::new("/dev/null"), ""));
+        assert_eq!(resp["result"]["schemaVersion"], "0");
+        assert_eq!(resp["result"]["instance"]["name"], "aoide");
+        assert!(resp["result"]["graph"]["nodes"].is_array());
+
+        // An unrelated unknown method is still a clean -32601, unaffected by
+        // the new method joining the dispatch table (JSON-RPC spec).
+        let req2 = json!({ "jsonrpc": "2.0", "id": 2, "method": "aoide/notARealMethod", "params": {} });
+        let resp2 = handle_jsonrpc(&req2, &test_ctx(Path::new("/dev/null"), ""));
+        assert_eq!(resp2["error"]["code"], -32601);
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
@@ -1788,6 +2369,8 @@ mod tests {
             8710,
             Path::new("/dev/null"),
             "",
+            "aoide",
+            PeerOrigin::Loopback,
             &registry,
         );
         assert_eq!(status, 404);
@@ -1804,6 +2387,8 @@ mod tests {
             8710,
             Path::new("/dev/null"),
             "",
+            "aoide",
+            PeerOrigin::Loopback,
             &registry,
         );
         assert_eq!(status, 405);

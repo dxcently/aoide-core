@@ -49,6 +49,65 @@ pub enum BridgeCommand {
     /// resolved yet. This is the source-of-truth jump: QML sends only the
     /// sessionId a roster row already holds, never a stale/empty address.
     FocusSession { session_id: String },
+    /// `{ "cmd": "power", "action": "lock|logout|suspend|hibernate|reboot|shutdown" }`
+    /// — a system action from the Exodos powermenu (AoideExodos.qml). QML never
+    /// shells out; this verb is the gate through which the six endings reach
+    /// hyprlock / hyprctl / systemctl.
+    Power { action: PowerAction },
+}
+
+/// The six system actions the powermenu can request. A closed set — an unknown
+/// action string parses to `None` at the wire, never to a dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerAction {
+    Lock,
+    Logout,
+    Suspend,
+    Hibernate,
+    Reboot,
+    Shutdown,
+}
+
+impl PowerAction {
+    /// Parse the wire's `action` string. Case-sensitive lowercase by contract
+    /// (ShellBridge.qml sends exactly these), anything else is `None`.
+    fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "lock" => Some(Self::Lock),
+            "logout" => Some(Self::Logout),
+            "suspend" => Some(Self::Suspend),
+            "hibernate" => Some(Self::Hibernate),
+            "reboot" => Some(Self::Reboot),
+            "shutdown" => Some(Self::Shutdown),
+            _ => None,
+        }
+    }
+
+    /// The program + args this action spawns. `lock` matches the existing
+    /// `lock` shell alias (hyprlock); `logout` exits the compositor; the rest
+    /// are systemd verbs.
+    fn command(self) -> (&'static str, &'static [&'static str]) {
+        match self {
+            Self::Lock => ("hyprlock", &[]),
+            Self::Logout => ("hyprctl", &["dispatch", "exit"]),
+            Self::Suspend => ("systemctl", &["suspend"]),
+            Self::Hibernate => ("systemctl", &["hibernate"]),
+            Self::Reboot => ("systemctl", &["reboot"]),
+            Self::Shutdown => ("systemctl", &["poweroff"]),
+        }
+    }
+
+    /// The wire name back, for audit lines.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lock => "lock",
+            Self::Logout => "logout",
+            Self::Suspend => "suspend",
+            Self::Hibernate => "hibernate",
+            Self::Reboot => "reboot",
+            Self::Shutdown => "shutdown",
+        }
+    }
 }
 
 /// Parse ONE wire line into a [`BridgeCommand`]. Pure and total: malformed
@@ -81,8 +140,32 @@ pub fn parse_command(line: &str) -> Option<BridgeCommand> {
             }
             Some(BridgeCommand::FocusSession { session_id })
         }
+        "power" => {
+            let action = v
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            PowerAction::from_wire(&action).map(|action| BridgeCommand::Power { action })
+        }
         _ => None,
     }
+}
+
+/// Dispatch ONE power action: spawn the mapped command and return. NEVER waits
+/// for exit — several of these actions kill or freeze the very process that
+/// would be waiting (logout tears the session down, suspend stops the clock) —
+/// a detached reaper thread collects the child's status so it never lingers as
+/// a zombie. A spawn failure is an `Err` for the caller to log; nothing here
+/// can take down the accept loop.
+fn dispatch_power(action: PowerAction) -> std::io::Result<()> {
+    let (prog, args) = action.command();
+    let mut child = std::process::Command::new(prog).args(args).spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 /// Run shellbridge: seed the `sessions.json`/`hooks.json` stage files (v0
@@ -260,6 +343,28 @@ fn handle_conn(stream: UnixStream) {
                     }
                 }
             }
+            Some(BridgeCommand::Power { action }) => match dispatch_power(action) {
+                Ok(()) => {
+                    let _ = daemon::audit(
+                        &daemon::default_audit_log(),
+                        daemon::Door::Daemon,
+                        daemon::EventClass::Audit,
+                        "shellbridge",
+                        "power",
+                        &format!("spawned power action {}", action.as_str()),
+                    );
+                }
+                Err(e) => {
+                    let _ = daemon::audit(
+                        &daemon::default_audit_log(),
+                        daemon::Door::Daemon,
+                        daemon::EventClass::Audit,
+                        "shellbridge",
+                        "power-failed",
+                        &format!("power action {}: {e}", action.as_str()),
+                    );
+                }
+            },
             None => eprintln!("[aoide/shellbridge] ignoring unknown/malformed command: {line}"),
         }
     }
@@ -307,6 +412,45 @@ mod tests {
         // Empty/absent sessionId → None (never dispatch a blank session jump).
         assert_eq!(parse_command(r#"{"cmd":"focussession","sessionId":""}"#), None);
         assert_eq!(parse_command(r#"{"cmd":"focussession"}"#), None);
+    }
+
+    #[test]
+    fn parse_command_accepts_every_valid_power_action() {
+        let cases = [
+            ("lock", PowerAction::Lock),
+            ("logout", PowerAction::Logout),
+            ("suspend", PowerAction::Suspend),
+            ("hibernate", PowerAction::Hibernate),
+            ("reboot", PowerAction::Reboot),
+            ("shutdown", PowerAction::Shutdown),
+        ];
+        for (wire, want) in cases {
+            assert_eq!(
+                parse_command(&format!(r#"{{"cmd":"power","action":"{wire}"}}"#)),
+                Some(BridgeCommand::Power { action: want }),
+                "power action {wire} must parse"
+            );
+        }
+        // Whitespace around the action is trimmed (wire lines arrive
+        // newline-terminated), same tolerance as focuswindow's address.
+        assert_eq!(
+            parse_command("  {\"cmd\":\"power\",\"action\":\" lock \"}\n"),
+            Some(BridgeCommand::Power {
+                action: PowerAction::Lock
+            })
+        );
+    }
+
+    #[test]
+    fn parse_command_rejects_bad_power_actions() {
+        // Unknown action → None (a typo must never reach a dispatch).
+        assert_eq!(parse_command(r#"{"cmd":"power","action":"explode"}"#), None);
+        // Case matters — the wire contract is lowercase.
+        assert_eq!(parse_command(r#"{"cmd":"power","action":"Reboot"}"#), None);
+        // Empty / absent / non-string action → None.
+        assert_eq!(parse_command(r#"{"cmd":"power","action":""}"#), None);
+        assert_eq!(parse_command(r#"{"cmd":"power"}"#), None);
+        assert_eq!(parse_command(r#"{"cmd":"power","action":42}"#), None);
     }
 
     #[test]

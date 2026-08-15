@@ -25,7 +25,7 @@
 // ── SERVER half (aoide-server, Phase 4c) ─────────────────────────────────────
 pub use aoide_server::a2a::{
     a2a_task_state, agent_card, agent_card_from_commands, decide_send_action, resolve_bind_port,
-    resolve_spawn_agent, serve, SendAction, SessionRef,
+    resolve_peer_name, resolve_spawn_agent, serve, PeerOrigin, SendAction, SessionRef,
 };
 
 // ── Client-side registry: external A2A agents (CONTRACTS.md §4/§6) ───────────

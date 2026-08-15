@@ -273,6 +273,301 @@ fn handle_agent_send(inv: &Invocation) -> Outcome {
     }))
 }
 
+// ── The five `peer` verbs (CONTRACTS.md §7: same-network federation) ────────
+//
+// A peer is ANOTHER aoide instance, addressed by URL (topology-agnostic —
+// the protocol never cares whether that URL happens to resolve on the same
+// loopback host, a LAN, or a tailnet; it's just a URL). `peer add` verifies
+// by fetching the peer's AgentCard first (mirrors `a2a agent add`'s
+// verification-before-registering pattern exactly); `peer pull` calls the
+// NEW `aoide/graphSummary` method (`aoide-server::a2a::graph_summary`) and
+// caches the result; `build_graph` (`aoide-conduct`) folds a fresh cache in
+// as a `peer:<name>` root node. The registry lives in `state/peers.json`
+// (`aoide_storage::peer_store`), mirroring `state/a2a-agents.json` — external
+// registry-style state, not song-scoped rehearsal state.
+
+/// `peer add <name> <url> [--autogate]` — verify the peer by fetching its
+/// AgentCard first (mirrors `a2a agent add`'s verification-before-registering
+/// pattern above exactly), then register `name` → `url`. Unlike `a2a agent
+/// add`'s upsert-replace-on-readd, a duplicate `name` is rejected cleanly —
+/// CONTRACTS.md §7's explicit divergence (a peer's local nickname should
+/// never be silently repointed at a different URL by a second `add`).
+fn handle_peer_add(inv: &Invocation) -> Outcome {
+    let cmd = "peer.add";
+    let name = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(n) => n.to_string(),
+        None => return Outcome::usage(cmd, "usage: aoide peer add <name> <url> [--autogate] [--json]"),
+    };
+    let url = match inv.args.get(1).map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(u) => u.to_string(),
+        None => return Outcome::usage(cmd, "usage: aoide peer add <name> <url> [--autogate] [--json]"),
+    };
+    let autogate = inv.flag_present("autogate");
+
+    let mut peers = aoide_storage::peer_store::load_peers();
+    if peers.iter().any(|p| p.name == name) {
+        return Outcome::error(cmd, format!("peer `{name}` is already registered — remove it first to re-add"))
+            .with_data(json!({ "reason": "duplicate-name", "name": name }));
+    }
+
+    // Verify: fetch the peer's AgentCard BEFORE registering anything — a
+    // peer that fails this fetch never gets added.
+    let card_url = crate::wire::resolve_card_url(&url);
+    let (code, body) = match run_curl(&["--", &card_url], None) {
+        Ok(v) => v,
+        Err(e) => {
+            return Outcome::error(cmd, format!("verifying peer AgentCard at {card_url}: {e}"))
+                .with_data(json!({ "reason": "fetch-failed", "url": card_url }))
+        }
+    };
+    if code != 200 {
+        return Outcome::error(cmd, format!("verifying peer AgentCard at {card_url}: HTTP {code}"))
+            .with_data(json!({ "reason": "fetch-http-error", "url": card_url, "httpCode": code }));
+    }
+    if serde_json::from_str::<Value>(&body).is_err() {
+        return Outcome::error(cmd, format!("verifying peer AgentCard at {card_url}: unparseable response"))
+            .with_data(json!({ "reason": "card-unparseable", "url": card_url }));
+    }
+
+    let peer = aoide_storage::peer_store::Peer {
+        name: name.clone(),
+        url: url.clone(),
+        autogate,
+        added_at: aoide_storage::time::now_iso_utc(),
+    };
+    aoide_storage::peer_store::insert_peer(&mut peers, peer.clone());
+    if let Err(e) = aoide_storage::peer_store::save_peers(&peers) {
+        return Outcome::error(cmd, format!("writing the peer registry: {e}"))
+            .with_data(json!({ "reason": "registry-write-failed" }));
+    }
+    Outcome::ok(
+        cmd,
+        format!(
+            "registered peer `{name}` → {url}{} ({} total)",
+            if autogate { " (autogate)" } else { "" },
+            peers.len()
+        ),
+    )
+    .changed(vec![aoide_storage::peer_store::peers_path().to_string_lossy().into_owned()])
+    .with_data(json!({ "peer": peer, "count": peers.len() }))
+}
+
+/// `peer list` — the registered peers (name · url · autogate).
+fn handle_peer_list(_inv: &Invocation) -> Outcome {
+    let cmd = "peer.list";
+    let peers = aoide_storage::peer_store::load_peers();
+    let msg = if peers.is_empty() {
+        "no peers registered".to_string()
+    } else {
+        let lines: Vec<String> = peers
+            .iter()
+            .map(|p| {
+                if p.autogate {
+                    format!("{} · {} · autogate", p.name, p.url)
+                } else {
+                    format!("{} · {}", p.name, p.url)
+                }
+            })
+            .collect();
+        format!("{} registered peer(s):\n{}", peers.len(), lines.join("\n"))
+    };
+    Outcome::ok(cmd, msg).with_data(json!({ "peers": peers, "count": peers.len() }))
+}
+
+/// `peer remove <name>` — deregister; a MISSING name is a clean error, not
+/// idempotent-silent (following `rice draft drop <name>`'s precedent: a
+/// missing target is a real mistake worth surfacing, unlike `a2a agent
+/// remove`'s tolerate-missing stance — CONTRACTS.md §7 calls this out
+/// explicitly as the deliberately different one). Also drops the peer's
+/// cache file, if any, so a re-added-under-the-same-name peer never starts
+/// from a stale leftover.
+fn handle_peer_remove(inv: &Invocation) -> Outcome {
+    let cmd = "peer.remove";
+    let name = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(n) => n.to_string(),
+        None => return Outcome::usage(cmd, "usage: aoide peer remove <name> [--json]"),
+    };
+    let mut peers = aoide_storage::peer_store::load_peers();
+    if !aoide_storage::peer_store::remove_peer(&mut peers, &name) {
+        return Outcome::error(cmd, format!("no peer named `{name}`"))
+            .with_data(json!({ "reason": "unknown-peer", "name": name }));
+    }
+    if let Err(e) = aoide_storage::peer_store::save_peers(&peers) {
+        return Outcome::error(cmd, format!("writing the peer registry: {e}"))
+            .with_data(json!({ "reason": "registry-write-failed" }));
+    }
+    let _ = std::fs::remove_file(aoide_storage::peer_store::peer_cache_path(&name));
+    Outcome::ok(cmd, format!("removed peer `{name}` ({} remaining)", peers.len()))
+        .changed(vec![aoide_storage::peer_store::peers_path().to_string_lossy().into_owned()])
+        .with_data(json!({ "removed": true, "name": name, "count": peers.len() }))
+}
+
+/// Pull ONE peer: POST `aoide/graphSummary`, parse, write the cache. On ANY
+/// failure (unreachable, timeout, non-200, malformed) — mark the cache
+/// STALE with the failure reason rather than deleting it or propagating the
+/// error to the caller, so one peer being down never breaks `peer pull` for
+/// the others (`handle_peer_pull` below iterates every selected peer through
+/// this regardless of an individual failure). Returns a small JSON summary
+/// row for the aggregate Outcome's `data.results`.
+fn pull_one_peer(peer: &aoide_storage::peer_store::Peer) -> Value {
+    let now = aoide_storage::time::now_iso_utc();
+    let body = crate::peer::build_graph_summary_request();
+    let body_str = serde_json::to_string(&body).unwrap_or_default();
+
+    let attempt: Result<aoide_storage::peer_store::PeerCacheEntry, String> = (|| {
+        let (code, resp_body) = run_curl(
+            &["-X", "POST", "-H", "Content-Type: application/json", "--data-binary", "@-", "--", &peer.url],
+            Some(&body_str),
+        )?;
+        if code != 200 {
+            return Err(format!("HTTP {code}"));
+        }
+        let resp: Value =
+            serde_json::from_str(&resp_body).map_err(|e| format!("unparseable response: {e}"))?;
+        crate::peer::parse_graph_summary_response(&resp, &peer.name, &now)
+    })();
+
+    match attempt {
+        Ok(entry) => {
+            let write_err = aoide_storage::peer_store::save_peer_cache(&entry).err();
+            match write_err {
+                None => json!({ "name": peer.name, "ok": true, "fetchedAt": now }),
+                Some(e) => json!({ "name": peer.name, "ok": false, "error": format!("cache write failed: {e}") }),
+            }
+        }
+        Err(e) => {
+            // Preserve whatever was already cached (the last GOOD pull) —
+            // only flip `stale`/`lastError`; never delete, never blank the
+            // peer out of the fold over a transient outage.
+            let mut entry = aoide_storage::peer_store::load_peer_cache(&peer.name).unwrap_or_else(|| {
+                aoide_storage::peer_store::PeerCacheEntry {
+                    schema_version: "0".to_string(),
+                    name: peer.name.clone(),
+                    ..Default::default()
+                }
+            });
+            entry.stale = true;
+            entry.last_error = Some(e.clone());
+            let _ = aoide_storage::peer_store::save_peer_cache(&entry);
+            json!({ "name": peer.name, "ok": false, "error": e })
+        }
+    }
+}
+
+/// `peer pull [<name>]` — pull `aoide/graphSummary` from one (or, with no
+/// name, EVERY) registered peer. One peer being down must never break the
+/// command for the others — see [`pull_one_peer`].
+fn handle_peer_pull(inv: &Invocation) -> Outcome {
+    let cmd = "peer.pull";
+    let peers = aoide_storage::peer_store::load_peers();
+    let target = inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty());
+    let selected: Vec<aoide_storage::peer_store::Peer> = match target {
+        Some(name) => match peers.iter().find(|p| p.name == name) {
+            Some(p) => vec![p.clone()],
+            None => {
+                return Outcome::error(cmd, format!("no peer named `{name}`"))
+                    .with_data(json!({ "reason": "unknown-peer", "name": name }))
+            }
+        },
+        None => peers,
+    };
+    if selected.is_empty() {
+        return Outcome::ok(cmd, "no peers registered — nothing to pull").with_data(json!({ "results": [] }));
+    }
+
+    let results: Vec<Value> = selected.iter().map(pull_one_peer).collect();
+    let ok_count = results.iter().filter(|r| r["ok"] == true).count();
+    Outcome::ok(cmd, format!("pulled {ok_count}/{} peer(s) successfully", selected.len()))
+        .with_data(json!({ "results": results }))
+}
+
+/// `peer status` — each registered peer's last-pull outcome and staleness
+/// (`fresh` within [`aoide_storage::peer_store::PEER_CACHE_TTL_SECS`],
+/// `stale` past it or explicitly marked so, `never-pulled` with no cache
+/// file at all) — the same three-way classification `build_graph`'s fold
+/// uses (`aoide-conduct::graph::doc`), so this and the DAG never disagree.
+fn handle_peer_status(_inv: &Invocation) -> Outcome {
+    let cmd = "peer.status";
+    let peers = aoide_storage::peer_store::load_peers();
+    let now_epoch =
+        aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
+    let rows: Vec<Value> = peers
+        .iter()
+        .map(|p| {
+            let cache = aoide_storage::peer_store::load_peer_cache(&p.name);
+            let (state, fetched_at, error) = match &cache {
+                Some(entry) if aoide_storage::peer_store::is_cache_fresh(entry, now_epoch) => {
+                    ("fresh", entry.fetched_at.clone(), None)
+                }
+                Some(entry) => ("stale", entry.fetched_at.clone(), entry.last_error.clone()),
+                None => ("never-pulled", None, None),
+            };
+            json!({
+                "name": p.name, "url": p.url, "autogate": p.autogate,
+                "state": state, "fetchedAt": fetched_at, "error": error,
+            })
+        })
+        .collect();
+    let msg = if rows.is_empty() {
+        "no peers registered".to_string()
+    } else {
+        format!("{} peer(s) registered", rows.len())
+    };
+    Outcome::ok(cmd, msg).with_data(json!({ "peers": rows }))
+}
+
+/// The five `peer` verbs (CONTRACTS.md §7), registered as their own group.
+pub fn register_peers(r: &mut Registry) {
+    r.insert(cmd!(
+        path: ["peer", "add"],
+        summary: "Register a peer aoide instance (verified by AgentCard fetch first) as a federation node in the session DAG.",
+        args: [
+            arg!("name", "string", true, "A local nickname for this peer."),
+            arg!("url", "string", true, "The peer's A2A door URL (e.g. http://host:8710/)."),
+        ],
+        flags: [flag!("autogate", "bool", "Trust this peer: its inbound message/send auto-delivers without the pending queue.")],
+        gated: false,
+        implemented: true,
+        handler: handle_peer_add,
+    ));
+    r.insert(cmd!(
+        path: ["peer", "list"],
+        summary: "List registered peers.",
+        args: [],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_peer_list,
+    ));
+    r.insert(cmd!(
+        path: ["peer", "remove"],
+        summary: "Unregister a peer (a missing name is an error, not a silent no-op).",
+        args: [arg!("name", "string", true, "The registered peer's name.")],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_peer_remove,
+    ));
+    r.insert(cmd!(
+        path: ["peer", "pull"],
+        summary: "Pull aoide/graphSummary from one (or, with no name, every) registered peer and refresh its cache.",
+        args: [arg!("name", "string", false, "Pull only this peer; omit to pull every registered peer.")],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_peer_pull,
+    ));
+    r.insert(cmd!(
+        path: ["peer", "status"],
+        summary: "Report each registered peer's last-pull outcome and cache staleness.",
+        args: [],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_peer_status,
+    ));
+}
+
 /// `adapter melete`'s handler (moved from the root package's `infra.rs`).
 fn handle_adapter_melete(_inv: &Invocation) -> Outcome {
     let status = crate::adapter::run_melete();

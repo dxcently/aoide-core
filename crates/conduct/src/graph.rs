@@ -39,7 +39,7 @@ pub use self::conduct::session_conduct;
 // first turn before `sessions.json` necessarily reflects the new record yet —
 // the same path `graph send`/`conduct` derive internally.
 pub use self::conduct::conduct_socket_path;
-pub use self::doc::{build_graph, render};
+pub use self::doc::{build_graph, render, resolve_graph_document};
 pub use self::model::{
     anchor_for, canonical_state, merged_sessions, HookRecord, HooksFile, Project, ProjectsFile,
     SessionRecord, SessionsFile,

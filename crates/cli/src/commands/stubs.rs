@@ -19,26 +19,13 @@ fn unimplemented(_inv: &Invocation) -> Outcome {
     unreachable!("dispatch() never calls the handler of a not-implemented command")
 }
 
-/// `rice gen` — sits between `schema` and `rice lint` in the historical order.
-pub fn register_rice_gen(r: &mut Registry) {
-    r.insert(cmd!(
-        path: ["rice", "gen"],
-        summary: "Generate a rice from a prompt or wallpaper (reads songbook/ first).",
-        args: [arg!("prompt", "string", false, "Prompt or wallpaper path; defaults to shipped rice.")],
-        flags: [flag!("full", "bool", "Full orchestration tier (greeter, per-app, chimes).")],
-        gated: false,
-        implemented: false,
-        handler: unimplemented,
-    ));
-}
-
-/// `rice adopt` / `rice transpose` — sit after `cover set` in the historical
+/// `rice declare` / `rice transpose` — sit after `cover set` in the historical
 /// order.
 pub fn register_rice_late(r: &mut Registry) {
     r.insert(cmd!(
-        path: ["rice", "adopt"],
-        summary: "Commit a previewed rice and propose the gated rebuild (user gates this).",
-        args: [arg!("name", "string", true, "Rice/song name to adopt.")],
+        path: ["rice", "declare"],
+        summary: "Commit a staged rice into declarative state and propose the gated rebuild (user gates this).",
+        args: [arg!("name", "string", true, "Rice/song name to declare.")],
         flags: [],
         gated: true,
         implemented: false,

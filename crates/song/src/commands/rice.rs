@@ -1,6 +1,9 @@
 //! `rice lint` / `rice stage` / `rice compose` — the self-ricing loop
-//! (concepts/Self-Ricing). `rice gen`/`rice adopt`/`rice transpose` are still
+//! (concepts/Self-Ricing). `rice declare`/`rice transpose` are still
 //! walking-skeleton stubs; their metadata lives in `commands/stubs.rs`.
+//! `rice gen` (a speculative prompt/wallpaper generator) was cut outright
+//! (khoa 2026-08-14) — never built, no design for it existed; `rice compose`
+//! is the real scaffolding entry point.
 
 use aoide_protocol::Invocation;
 use aoide_protocol::output::Outcome;
@@ -22,8 +25,8 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["rice", "stage"],
-        summary: "Hot-load a rice live (stage/livery.json hot-reload + best-effort hyprctl geometry/border apply); nothing committed. Refuses while `rice mode declarative` is locked.",
-        args: [arg!("name", "string", true, "Rice/song name to stage (from song/songbook/).")],
+        summary: "Hot-load a rice live — ALWAYS the declared committed content, ignoring any saved draft (stage/livery.json hot-reload + best-effort hyprctl geometry/border apply); nothing committed. No <name>: re-stages the currently active song's declared content, overriding whatever draft `rice mode stage` may have auto-loaded. Refuses while `rice mode declarative` is locked.",
+        args: [arg!("name", "string", false, "Rice/song name to stage; defaults to the currently active song's declared content.")],
         flags: [],
         gated: false,
         implemented: true,
@@ -34,7 +37,7 @@ pub fn register(r: &mut Registry) {
         summary: "Scaffold a new song under song/songbook/<name>/ by copying --from's notes (rice.nix, livery.json, design/intent.md, widgets/).",
         args: [arg!("name", "string", true, "New song name: ^[a-z0-9][a-z0-9-]*$ (lowercase, digits, hyphens).")],
         flags: [
-            flag!("from", "string", "Source song to copy notes from (default \"default\")."),
+            flag!("from", "string", "Source song to copy notes from (default \"sonata\")."),
             flag!("force", "bool", "Overwrite the song's scaffolded files if it already exists."),
         ],
         gated: false,
@@ -121,20 +124,79 @@ fn handle_rice_lint(inv: &Invocation) -> Outcome {
 /// `rice stage` registry entrypoint — refuses while `rice mode declarative`
 /// is locked (`aoide_storage::mode`, khoa 2026-08-14): `rice mode stage`
 /// unlocks it first. The pure staging logic stays in [`handle_rice_stage`]
-/// itself (`pub(crate)`, kept guard-free) so `rice design enter` and `rice
-/// mode`'s own writes can reuse it directly — including `rice mode
-/// declarative <name>`'s re-pin, which legitimately writes WHILE the mode
-/// marker is still whatever it was before this call (the marker only flips
-/// to `declarative` after that write succeeds).
+/// itself (`pub(crate)`, kept guard-free) so `rice mode`'s own writes can
+/// reuse it directly — including `rice mode declarative <name>`'s re-pin,
+/// which legitimately writes WHILE the mode marker is still whatever it was
+/// before this call (the marker only flips to `declarative` after that
+/// write succeeds).
+///
+/// No `<name>`: resolves the current song the same way `rice mode stage`'s
+/// own no-arg form does ([`super::mode::current_staged_song`], off
+/// `stage/livery.json`'s own `"song"` field) and stages its committed
+/// content — so "restage the declared truth for whatever's active" never
+/// requires retyping the song name. No resolvable song → the same
+/// `missing-name` usage error a truly bare call always had.
+///
+/// **Marker bookkeeping while in `Staging` mode:** on success, updates
+/// `mode.json`'s `song` to the name just staged (`draft` stays/becomes
+/// `None` — this handler always writes plain declared content, never a
+/// draft). **While in `Draft` mode, the marker is left completely
+/// untouched.** This is deliberate, not an oversight: `stage/livery.json`
+/// may currently be a symlink into `songbook/<song>/drafts/<name>/livery.json`
+/// (`rice mode draft`, `commands/mode.rs`), and `handle_rice_stage`'s write
+/// below carries zero symlink-awareness — it transparently lands wherever
+/// the symlink points (`aoide_storage::fs::atomic_write` is
+/// symlink-transparent), so the routing itself is unaffected and the
+/// `mode`/`song`/`draft` triple the marker already carries stays accurate.
+/// Mutating `song`/`draft` here while `mode` stays `Draft` would violate the
+/// "`draft` is `Some` iff `mode == Draft`" invariant if this handler ever
+/// diverged from the song the draft actually belongs to — leaving the
+/// marker alone sidesteps that entirely. Only `rice mode stage`/`rice mode
+/// declarative` ever transition OUT of `Draft` (tearing the symlink down
+/// first); this entrypoint is not one of those.
 fn handle_rice_stage_entry(inv: &Invocation) -> Outcome {
-    if aoide_storage::mode::load_mode_marker().mode == aoide_storage::mode::RiceMode::Declarative {
+    let mode_marker = aoide_storage::mode::load_mode_marker();
+    if mode_marker.mode == aoide_storage::mode::RiceMode::Declarative {
         return Outcome::error(
             "rice.stage",
             "declarative mode is locked — run `aoide rice mode stage` to unlock hot-loading first",
         )
         .with_data(json!({ "reason": "declarative-mode-locked" }));
     }
-    handle_rice_stage(inv)
+
+    let resolved_inv: Invocation;
+    let inv: &Invocation = if inv.args.first().is_some() {
+        inv
+    } else if let Some(name) = super::mode::current_staged_song() {
+        resolved_inv = Invocation {
+            path: inv.path.clone(),
+            args: vec![name],
+            flags: inv.flags.clone(),
+            door: inv.door,
+        };
+        &resolved_inv
+    } else {
+        inv
+    };
+
+    let mut out = handle_rice_stage(inv);
+    if out.status == aoide_protocol::output::Status::Ok
+        && mode_marker.mode != aoide_storage::mode::RiceMode::Draft
+    {
+        if let Some(name) = inv.args.first() {
+            let updated = aoide_storage::mode::ModeMarker {
+                mode: mode_marker.mode,
+                song: Some(name.clone()),
+                draft: None,
+                since: mode_marker.since,
+            };
+            if aoide_storage::mode::save_mode_marker(&updated).is_ok() {
+                out.changed
+                    .push(aoide_storage::mode::mode_marker_path().to_string_lossy().into_owned());
+            }
+        }
+    }
+    out
 }
 
 /// `rice stage <name>` — hot-load a committed song live: stage its
@@ -148,12 +210,16 @@ fn handle_rice_stage_entry(inv: &Invocation) -> Outcome {
 /// This is the honest form of the hand-copy agents had been doing: drive the
 /// songbook notes into the stage so the shell has a palette to render.
 ///
-/// `pub(crate)`, not private: `rice design enter` (Phase B,
-/// `commands/design.rs`) calls this directly to get the SAME live-apply side
+/// `pub(crate)`, not private: `rice mode`'s `stage`/`declarative` handlers
+/// (`commands/mode.rs`) call this directly to get the SAME live-apply side
 /// effects a bare `rice stage <name>` has, rather than reimplementing them
 /// — it hands this the identical `Invocation` it was given (both commands
 /// take the song name as their first positional arg, and this function reads
-/// nothing else off `inv`), so no adapter/duplication is needed.
+/// nothing else off `inv`), so no adapter/duplication is needed. Writes
+/// through `aoide_storage::fs::atomic_write`, which is symlink-transparent —
+/// while `stage/livery.json` is routed into a draft (`rice mode draft`,
+/// `Draft` mode), this function's write lands straight in the draft file
+/// with zero symlink-awareness needed here, which is the entire mechanism.
 pub(crate) fn handle_rice_stage(inv: &Invocation) -> Outcome {
     let name = match inv.args.first() {
         Some(n) => n.clone(),
@@ -309,7 +375,7 @@ fn handle_rice_compose(inv: &Invocation) -> Outcome {
         .flags
         .get("from")
         .cloned()
-        .unwrap_or_else(|| "default".to_string());
+        .unwrap_or_else(|| "sonata".to_string());
 
     if !crate::compose::valid_song_name(&from) {
         return Outcome::error(
@@ -651,6 +717,115 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // ── rice stage: bare form auto-resolves the current song (khoa
+    // ── 2026-08-14) — same "no name = current song" convenience `rice mode
+    // ── stage` already documents its own no-arg form with ─────────────────
+
+    #[test]
+    fn stage_entry_with_no_name_resolves_the_current_song() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("stage-entry-bare-resolve");
+        let stage = root.join("stage");
+        let song = root.join("songbook").join("moonlight");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&song).unwrap();
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
+        // The stage already carries the "song" breadcrumb `current_staged_song`
+        // reads, as if a prior `rice mode stage moonlight` had run.
+        std::fs::write(
+            stage.join("livery.json"),
+            r##"{"schemaVersion":"0","song":"moonlight",
+                "palette":{"bg":"#111111","fg":"#000000","accent":"#000000","urgent":"#000000"}}"##,
+        )
+        .unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        aoide_storage::mode::save_mode_marker(&aoide_storage::mode::ModeMarker {
+            mode: aoide_storage::mode::RiceMode::Staging,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let out = handle_rice_stage_entry(&inv(&["rice", "stage"], &[]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        let restaged = std::fs::read_to_string(stage.join("livery.json")).unwrap();
+        assert!(restaged.contains("#82aaff"), "VALID_NOTES's declared accent landed: {restaged}");
+        let marker = aoide_storage::mode::load_mode_marker();
+        assert_eq!(marker.song, Some("moonlight".to_string()));
+        assert_eq!(marker.draft, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stage_entry_while_in_draft_mode_writes_through_the_symlink_and_leaves_the_marker_untouched() {
+        // The new mechanism (khoa 2026-08-14): `rice stage` carries zero
+        // symlink-awareness. If `stage/livery.json` is CURRENTLY routed into
+        // a draft (`rice mode draft`, `Draft` mode), a plain `rice stage
+        // <name>` call still writes its declared content — but that write
+        // transparently lands in the draft file (atomic_write is
+        // symlink-transparent), and this entrypoint deliberately leaves
+        // `mode.json` completely alone: the routing (mode/song/draft) is
+        // unaffected by this write, so touching the marker here would be
+        // both unnecessary and risk contradicting it.
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("stage-entry-draft-mode-symlink");
+        let stage = root.join("stage");
+        let song = root.join("songbook").join("moonlight");
+        let draft_dir = song.join("drafts").join("neon-night");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&song).unwrap();
+        std::fs::create_dir_all(&draft_dir).unwrap();
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
+        let draft_livery = draft_dir.join("livery.json");
+        std::fs::write(&draft_livery, "stale draft content").unwrap();
+        std::os::unix::fs::symlink(&draft_livery, stage.join("livery.json")).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        aoide_storage::mode::save_mode_marker(&aoide_storage::mode::ModeMarker {
+            mode: aoide_storage::mode::RiceMode::Draft,
+            song: Some("moonlight".to_string()),
+            draft: Some("neon-night".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let out = handle_rice_stage_entry(&inv(&["rice", "stage"], &["moonlight"]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        // The symlink itself survives, and the declared content landed in
+        // the draft file it points at, not a fresh plain file.
+        assert!(std::fs::symlink_metadata(stage.join("livery.json")).unwrap().file_type().is_symlink());
+        let draft_now = std::fs::read_to_string(&draft_livery).unwrap();
+        assert!(draft_now.contains("#82aaff"), "declared content landed in the draft file: {draft_now}");
+        // The marker is completely untouched — still Draft, still neon-night.
+        let marker = aoide_storage::mode::load_mode_marker();
+        assert_eq!(marker.mode, aoide_storage::mode::RiceMode::Draft);
+        assert_eq!(marker.song, Some("moonlight".to_string()));
+        assert_eq!(marker.draft, Some("neon-night".to_string()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stage_entry_with_no_name_and_nothing_resolvable_is_usage_exit_2() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let stage = unique_tmp("stage-entry-bare-unresolvable").join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        aoide_storage::mode::save_mode_marker(&aoide_storage::mode::ModeMarker {
+            mode: aoide_storage::mode::RiceMode::Staging,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let out = handle_rice_stage_entry(&inv(&["rice", "stage"], &[]));
+        assert_eq!(out.status, Status::Usage);
+        assert_eq!(out.render(false).1, aoide_protocol::output::exit::USAGE);
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
     // ── rice stage: the hyprctl live-apply guard (Phase F) ───────────────────
 
     #[test]
@@ -713,7 +888,7 @@ mod tests {
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("compose-interpolation");
         let stage = root.join("stage");
-        let from_dir = root.join("songbook").join("default");
+        let from_dir = root.join("songbook").join("sonata");
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::create_dir_all(&from_dir).unwrap();
         std::fs::write(from_dir.join("livery.json"), NOTES_WITH_INTERPOLATION).unwrap();
@@ -822,7 +997,7 @@ mod tests {
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("compose-ok");
         let stage = root.join("stage");
-        let from_dir = root.join("songbook").join("default");
+        let from_dir = root.join("songbook").join("sonata");
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::create_dir_all(&from_dir).unwrap();
         std::fs::write(from_dir.join("livery.json"), VALID_NOTES).unwrap();
@@ -852,7 +1027,7 @@ mod tests {
         assert_eq!(mirrored, VALID_NOTES, "livery.json mirrors --from exactly");
 
         let intent = std::fs::read_to_string(target.join("design").join("intent.md")).unwrap();
-        assert!(intent.contains("inherited from `default` — retune"));
+        assert!(intent.contains("inherited from `sonata` — retune"));
         assert!(intent.contains("slots.md"));
         assert!(intent.contains("update-playbook.md"));
         assert_eq!(
@@ -862,7 +1037,7 @@ mod tests {
 
         let data = out.data.unwrap();
         assert_eq!(data["name"], "moonlight");
-        assert_eq!(data["from"], "default");
+        assert_eq!(data["from"], "sonata");
         assert_eq!(data["nextSteps"].as_array().unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -910,7 +1085,7 @@ mod tests {
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("compose-exists");
         let stage = root.join("stage");
-        let from_dir = root.join("songbook").join("default");
+        let from_dir = root.join("songbook").join("sonata");
         let target = root.join("songbook").join("dusk");
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::create_dir_all(&from_dir).unwrap();

@@ -11,4 +11,5 @@
 
 pub mod adapter;
 pub mod commands;
+pub mod peer;
 pub mod wire;

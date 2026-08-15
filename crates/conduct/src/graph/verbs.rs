@@ -286,6 +286,82 @@ mod tests {
     use crate::graph::testutil::*;
 
     #[test]
+    fn local_only_verbs_ignore_peer_ids_exactly_like_a2a_ids_today() {
+        // CONTRACTS.md §7: `link`/`prune` (and, by the same construction,
+        // `focus`/`reap`) must keep ignoring `peer:*` ids exactly as they
+        // already ignore `a2a:*` ids — neither reads `peer_store` at all, so
+        // a registered peer (with its own cache) sitting alongside real
+        // sessions must never appear as a `link`/`prune` target and must
+        // never break either verb. This is the "confirm it, don't assume it
+        // generalizes for free" test the plan called for.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let stage = unique_stage("peer-ids-ignored");
+        let state = std::env::temp_dir().join(format!(
+            "aoide-peer-ids-ignored-state-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+
+        aoide_storage::peer_store::save_peers(&[aoide_storage::peer_store::Peer {
+            name: "yomi-strix".into(),
+            url: "http://yomi-strix:8710/".into(),
+            autogate: false,
+            added_at: "2026-08-14T00:00:00Z".into(),
+        }])
+        .unwrap();
+
+        // A real local session to link/prune against.
+        let sf = SessionsFile {
+            schema_version: "0".into(),
+            sessions: vec![
+                session("s1", "/x", "working", "1", None),
+                session("s2", "/x", "done", "2", None),
+            ],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        // `link` never resolves `peer:yomi-strix` as a valid child (it isn't
+        // a session id) — this is the SAME rejection an unknown local id gets.
+        let out = link(&invocation(&["graph", "link"], &["peer:yomi-strix", "s1"]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
+        assert_eq!(out.data.as_ref().unwrap()["reason"], "child-not-found");
+
+        // `prune` runs clean (drops the `done` s2) with the peer registry
+        // sitting alongside — it never touches `peer_store`, so a peer being
+        // registered changes nothing about what gets pruned.
+        let out = prune(&invocation(&["graph", "prune"], &[]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+        assert_eq!(out.data.as_ref().unwrap()["removed"], json!(["s2"]));
+
+        // The peer registry itself is untouched by either verb.
+        assert_eq!(aoide_storage::peer_store::load_peers().len(), 1);
+
+        // And the resolved graph document still folds the peer in as its own
+        // root node alongside whatever local nodes/edges link/prune left.
+        let (p, s, h) = load_inputs("test").unwrap();
+        let doc = build_graph(&p.projects, &s.sessions, &h.hooks);
+        assert!(doc["nodes"].as_array().unwrap().iter().any(|n| n["id"] == "peer:yomi-strix"));
+
+        let _ = std::fs::remove_dir_all(&stage);
+        let _ = std::fs::remove_dir_all(&state);
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
     fn project_add_restages_graph_json_consistent_with_view() {
         let _guard = crate::env_lock().lock().unwrap();
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();

@@ -71,7 +71,7 @@ pub struct Command {
 }
 
 impl Command {
-    /// The dotted path used as an MCP tool name, e.g. `rice.gen`.
+    /// The dotted path used as an MCP tool name, e.g. `rice.lint`.
     pub fn dotted(&self) -> String {
         self.path.join(".")
     }

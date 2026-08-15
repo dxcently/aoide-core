@@ -75,7 +75,7 @@ pub enum EventClass {
     Audit,
     /// User-gate proposals awaiting admission.
     Gate,
-    /// Rice-loop lifecycle (gen/preview/adopt).
+    /// Rice-loop lifecycle (gen/stage/declare).
     Rice,
     /// Content-pipeline lifecycle.
     Content,

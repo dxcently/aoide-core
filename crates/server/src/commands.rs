@@ -89,6 +89,7 @@ pub fn register_a2a_serve(r: &mut Registry) {
             flag!("port", "int", "Override the A2A HTTP port (default aoide.a2a.port)."),
             flag!("bind", "string", "Override the A2A HTTP bind address (default aoide.a2a.bindAddress)."),
             flag!("spawn-agent", "string", "Override the command message/send's spawn path conducts (default aoide.a2a.spawnAgent; empty = spawning disabled)."),
+            flag!("peer-name", "string", "Override this instance's aoide/graphSummary instance name (default: the OS hostname)."),
         ],
         gated: false,
         implemented: true,

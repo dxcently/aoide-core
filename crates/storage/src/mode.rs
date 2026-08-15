@@ -1,12 +1,25 @@
 //! `stage/mode.json` — whether the rice system is in STAGING mode (hot-load
-//! unlocked: `rice stage`/`cover set` write live) or DECLARATIVE mode (nix/
-//! home-manager is the only writer; staging writers refuse) — Self-Ricing's
-//! mode-toggle extension (khoa, 2026-08-14).
+//! unlocked: `rice stage`/`cover set` write live), DECLARATIVE mode (nix/
+//! home-manager is the only writer; staging writers refuse), or DRAFT mode
+//! (`stage/livery.json` is a symlink routed into a saved
+//! `songbook/<song>/drafts/<name>/livery.json` — every writer that ever
+//! touches the stage lands directly in the draft file, transparently, via
+//! [`crate::fs::atomic_write`]'s symlink-resolving rename) — Self-Ricing's
+//! mode-toggle extension (khoa, 2026-08-14; draft mode, khoa, 2026-08-14).
 //!
 //! Absent file = `declarative` (the safe default: nothing has ever unlocked
-//! staging writes, so nothing should silently be mutable — same "an absent
-//! stage file means the safe default, never an error" discipline
-//! `design.rs`'s [`crate::design::load_design_marker`] follows).
+//! staging writes, so nothing should silently be mutable — the same "an
+//! absent stage file means the safe default, never an error" discipline
+//! this module's own [`load_mode_marker`] follows).
+//!
+//! `Draft` is a distinct THIRD mode, not a flag riding on top of `Staging` —
+//! routing, not guessing: entering it (`rice mode draft <name>`,
+//! `crates/song/src/commands/mode.rs`) is the only way to reach a saved
+//! draft at all. `rice stage`/`rice mode stage` never auto-prefer or
+//! auto-detect a draft; they always mean plain declared content, and are
+//! simply unaware that the file they write might currently be routed
+//! elsewhere (that unawareness, plus `atomic_write`'s symlink transparency,
+//! is the entire mechanism).
 
 use crate::fs::{atomic_write, stage_dir};
 use serde::{Deserialize, Serialize};
@@ -16,6 +29,7 @@ use serde::{Deserialize, Serialize};
 pub enum RiceMode {
     Staging,
     Declarative,
+    Draft,
 }
 
 impl Default for RiceMode {
@@ -24,9 +38,11 @@ impl Default for RiceMode {
     }
 }
 
-/// The active mode marker. `song`/`draft` name what a `staging`-mode session
-/// is pointed at (mirrors [`crate::design::DesignMarker::song`]); both stay
-/// absent in the common `declarative`-with-no-marker-file case.
+/// The active mode marker. `song` names what a `staging`- or `draft`-mode
+/// session is pointed at (absent in the common
+/// `declarative`-with-no-marker-file case). `draft` is `Some(name)`
+/// **if and only if** `mode == Draft` — every other mode always carries
+/// `draft: None`; nothing in the codebase ever sets one without the other.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ModeMarker {
     #[serde(default)]
@@ -122,6 +138,36 @@ mod tests {
         assert_eq!(v["mode"], "staging");
         assert_eq!(v["song"], "moonlight");
         assert!(v.get("draft").is_none(), "draft omitted when None");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+    }
+
+    #[test]
+    fn draft_mode_round_trips_with_a_draft_name_and_serializes_lowercase() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-mode-draft-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("AOIDE_STAGE_DIR", &dir);
+
+        let marker = ModeMarker {
+            mode: RiceMode::Draft,
+            song: Some("sonata".to_string()),
+            draft: Some("neon-night".to_string()),
+            since: "2026-08-14T00:00:00Z".to_string(),
+        };
+        save_mode_marker(&marker).unwrap();
+        let back = load_mode_marker();
+        assert_eq!(back, marker);
+
+        let raw = std::fs::read_to_string(mode_marker_path()).unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["mode"], "draft");
+        assert_eq!(v["draft"], "neon-night");
 
         let _ = std::fs::remove_dir_all(&dir);
         match saved {

@@ -140,6 +140,53 @@ pub fn build_graph(
         nodes.push(node);
     }
 
+    // Fold registered PEERS into the DAG (CONTRACTS.md §7): each a ROOT node
+    // `kind:"peer"`, `id:"peer:<name>"` — one level richer than the a2a fold
+    // above (which folds in one opaque node): a peer's own ALREADY-RESOLVED
+    // graph document nests as `children` on its node, verbatim, never
+    // flattened into this document's own `nodes`/`edges` — so a peer's ids
+    // can never collide with local ones or another peer's, and no new edge
+    // vocabulary is needed. Only a FRESH (non-stale, within
+    // `PEER_CACHE_TTL_SECS`) cache contributes `children`; a stale or
+    // never-pulled peer still surfaces (so `peer add` is visible
+    // immediately) with an explicit `state` and no children — never a
+    // crash, never a silently-dropped peer. Additive and tolerate-missing,
+    // mirroring the a2a fold's discipline exactly.
+    let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
+    for peer in aoide_storage::peer_store::load_peers() {
+        let mut node = json!({
+            "id": format!("peer:{}", peer.name),
+            "kind": "peer",
+            "name": peer.name,
+            "url": peer.url,
+        });
+        let cache = aoide_storage::peer_store::load_peer_cache(&peer.name);
+        let fresh = cache
+            .as_ref()
+            .map(|c| aoide_storage::peer_store::is_cache_fresh(c, now_epoch))
+            .unwrap_or(false);
+        if let Some(entry) = &cache {
+            if let Some(fa) = &entry.fetched_at {
+                node["fetchedAt"] = json!(fa);
+            }
+            if let Some(err) = &entry.last_error {
+                node["error"] = json!(err);
+            }
+        }
+        if fresh {
+            let entry = cache.expect("fresh implies a cache entry was loaded");
+            let graph = entry.graph.unwrap_or_else(|| json!({ "nodes": [], "edges": [] }));
+            node["state"] = json!("fresh");
+            node["children"] = json!({
+                "nodes": graph.get("nodes").cloned().unwrap_or_else(|| json!([])),
+                "edges": graph.get("edges").cloned().unwrap_or_else(|| json!([])),
+            });
+        } else {
+            node["state"] = json!("stale");
+        }
+        nodes.push(node);
+    }
+
     json!({
         "schemaVersion": STAGE_GRAPH_VERSION,
         "nodes": nodes,
@@ -427,6 +474,20 @@ pub(crate) fn restage_graph() -> Result<PathBuf, String> {
     let path = graph_path();
     write_stage(&path, &doc)?;
     Ok(path)
+}
+
+/// Resolve the CURRENT graph document straight off the stage registries —
+/// the exact same three-file-load-then-`build_graph` shape [`restage_graph`]
+/// runs (minus the write). `pub`, not `pub(crate)`: `aoide-server`'s
+/// `aoide/graphSummary` (CONTRACTS.md §7) reuses this so the wire response
+/// and a fresh `graph view --json` / `graph emit` can never diverge into two
+/// graph vocabularies — the whole point of wrapping `build_graph`'s output
+/// verbatim rather than inventing a second shape for the federation door.
+pub fn resolve_graph_document() -> Result<Value, String> {
+    let p: ProjectsFile = load_stage(&projects_path())?;
+    let s: SessionsFile = load_stage(&sessions_path())?;
+    let h: HooksFile = load_stage(&hooks_path())?;
+    Ok(build_graph(&p.projects, &s.sessions, &h.hooks))
 }
 
 #[cfg(test)]
@@ -753,6 +814,171 @@ mod tests {
             Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
             None => std::env::remove_var("AOIDE_STATE_DIR"),
         }
+    }
+    #[test]
+    fn build_graph_folds_a_fresh_peer_as_a_root_node_with_nested_children() {
+        // CONTRACTS.md §7: a registered peer with a FRESH (non-stale,
+        // within-TTL) pulled cache folds in as a `kind:"peer"` root node
+        // whose own resolved graph nests as `children` — never flattened
+        // into this document's own top-level `nodes`/`edges` (unlike the
+        // a2a fold's single opaque node, this is a whole subtree).
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-peer-fold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("AOIDE_STATE_DIR", &dir);
+
+        aoide_storage::peer_store::save_peers(&[aoide_storage::peer_store::Peer {
+            name: "yomi-strix".into(),
+            url: "http://yomi-strix:8710/".into(),
+            autogate: false,
+            added_at: "2026-08-14T00:00:00Z".into(),
+        }])
+        .unwrap();
+        let peer_graph = json!({
+            "schemaVersion": "0",
+            "nodes": [{ "id": "project:remote", "kind": "project", "name": "remote", "path": "/x" }],
+            "edges": [],
+        });
+        aoide_storage::peer_store::save_peer_cache(&aoide_storage::peer_store::PeerCacheEntry {
+            schema_version: "0".into(),
+            name: "yomi-strix".into(),
+            instance: Some(json!({ "name": "yomi-strix", "url": "http://yomi-strix:8710/" })),
+            graph: Some(peer_graph.clone()),
+            fetched_at: Some(aoide_storage::time::now_iso_utc()),
+            stale: false,
+            last_error: None,
+        })
+        .unwrap();
+
+        let doc = build_graph(&[], &[], &[]);
+        let nodes = doc["nodes"].as_array().unwrap();
+        let peer = nodes
+            .iter()
+            .find(|n| n["id"] == "peer:yomi-strix")
+            .expect("peer node folded in");
+        assert_eq!(peer["kind"], "peer");
+        assert_eq!(peer["name"], "yomi-strix");
+        assert_eq!(peer["url"], "http://yomi-strix:8710/");
+        assert_eq!(peer["state"], "fresh");
+        assert_eq!(peer["children"]["nodes"], peer_graph["nodes"].clone());
+        // A fresh peer contributes no TOP-LEVEL nodes/edges of its own — its
+        // subtree is nested, never merged into this document's flat lists,
+        // so a peer's ids can never collide with a local session/project id.
+        assert!(nodes.iter().all(|n| n["id"] != "project:remote"));
+        assert!(doc["edges"].as_array().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+    #[test]
+    fn build_graph_shows_a_stale_or_never_pulled_peer_with_no_children() {
+        // A registered peer is visible IMMEDIATELY on `peer add`, before any
+        // pull ever succeeds — and stays visible (never silently dropped)
+        // once a pull goes stale. Either way: an explicit `state`, no
+        // `children`, never a crash.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-peer-fold-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("AOIDE_STATE_DIR", &dir);
+
+        // Never pulled: no cache file at all.
+        aoide_storage::peer_store::save_peers(&[aoide_storage::peer_store::Peer {
+            name: "never-pulled".into(),
+            url: "http://never:8710/".into(),
+            autogate: false,
+            added_at: "2026-08-14T00:00:00Z".into(),
+        }])
+        .unwrap();
+        let doc = build_graph(&[], &[], &[]);
+        let nodes = doc["nodes"].as_array().unwrap();
+        let node = nodes.iter().find(|n| n["id"] == "peer:never-pulled").unwrap();
+        assert_eq!(node["state"], "stale");
+        assert!(node.get("children").is_none());
+
+        // Explicitly stale (a failed pull) — still visible, still no children,
+        // and carries the last error for `peer status` to surface.
+        aoide_storage::peer_store::save_peers(&[aoide_storage::peer_store::Peer {
+            name: "flaky".into(),
+            url: "http://flaky:8710/".into(),
+            autogate: false,
+            added_at: "2026-08-14T00:00:00Z".into(),
+        }])
+        .unwrap();
+        aoide_storage::peer_store::save_peer_cache(&aoide_storage::peer_store::PeerCacheEntry {
+            schema_version: "0".into(),
+            name: "flaky".into(),
+            instance: None,
+            graph: None,
+            fetched_at: None,
+            stale: true,
+            last_error: Some("connection refused".into()),
+        })
+        .unwrap();
+        let doc = build_graph(&[], &[], &[]);
+        let nodes = doc["nodes"].as_array().unwrap();
+        let node = nodes.iter().find(|n| n["id"] == "peer:flaky").unwrap();
+        assert_eq!(node["state"], "stale");
+        assert_eq!(node["error"], "connection refused");
+        assert!(node.get("children").is_none());
+
+        // An expired-TTL (but not explicitly marked stale) cache is ALSO
+        // reported stale by the fold.
+        aoide_storage::peer_store::save_peers(&[aoide_storage::peer_store::Peer {
+            name: "expired".into(),
+            url: "http://expired:8710/".into(),
+            autogate: false,
+            added_at: "2026-08-14T00:00:00Z".into(),
+        }])
+        .unwrap();
+        let ancient = aoide_storage::time::iso_utc_from_epoch(
+            aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap()
+                - aoide_storage::peer_store::PEER_CACHE_TTL_SECS as i64
+                - 1,
+        );
+        aoide_storage::peer_store::save_peer_cache(&aoide_storage::peer_store::PeerCacheEntry {
+            schema_version: "0".into(),
+            name: "expired".into(),
+            instance: Some(json!({})),
+            graph: Some(json!({ "nodes": [], "edges": [] })),
+            fetched_at: Some(ancient),
+            stale: false,
+            last_error: None,
+        })
+        .unwrap();
+        let doc = build_graph(&[], &[], &[]);
+        let nodes = doc["nodes"].as_array().unwrap();
+        let node = nodes.iter().find(|n| n["id"] == "peer:expired").unwrap();
+        assert_eq!(node["state"], "stale");
+        assert!(node.get("children").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+    #[test]
+    fn resolve_graph_document_matches_build_graph_off_the_current_stage() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("resolve-graph-doc");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        // Empty stage: still resolves cleanly to the empty v0 shape, matching
+        // what `build_graph(&[], &[], &[])` would produce.
+        let doc = resolve_graph_document().unwrap();
+        assert_eq!(doc, build_graph(&[], &[], &[]));
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
     }
     #[test]
     fn render_shows_sudo_marker_when_blocked() {

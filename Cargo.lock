@@ -34,6 +34,7 @@ dependencies = [
  "aoide-server",
  "aoide-song",
  "aoide-storage",
+ "aoide-test-support",
  "crossterm",
  "ratatui",
  "serde",

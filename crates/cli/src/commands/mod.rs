@@ -16,31 +16,39 @@ mod stubs;
 use crate::registry::Registry;
 
 /// Build the full command registry, in the historical `schema --json` order:
-/// guide, schema, rice gen(stub), rice lint/stage/compose, rice design
-/// status/enter/exit, rice mode status/stage/declarative, cover set, rice
-/// adopt/transpose(stub), content(stub x5), make(stub), update(stub),
+/// guide, schema, rice lint/stage/compose, rice draft
+/// save/list/drop, rice mode status/stage/declarative/draft, cover set, rice
+/// declare/transpose(stub), content(stub x5), make(stub), update(stub),
 /// onboard(stub), mcp serve, daemon, shellbridge, graph(x15) + conduct,
-/// adapter melete, conductor, a2a serve + agent add/list/remove, usage
-/// (appended — the newest group, so it never reorders the historical table
-/// above it), hooks install (newest).
+/// adapter melete, conductor, a2a serve + agent add/list/remove, peer
+/// add/list/remove/pull/status (CONTRACTS.md §7, slotted directly after the
+/// `a2a agent` group it's the same-network-federation sibling of — nothing
+/// EXISTING moves, so the historical table above it is still untouched),
+/// usage, hooks install (newest).
 ///
-/// `design::register`/`mode::register` sit directly after `rice::register`
+/// `rice gen` was cut outright (khoa 2026-08-14) — a speculative
+/// prompt/wallpaper generator that was never built and had no path to being
+/// built without a design nobody had; `rice compose` (scaffold) → `rice
+/// mode stage` (go live) → `rice mode draft` (route into a saved
+/// iteration) → `rice declare` (commit) is the real loop.
+///
+/// `draft::register`/`mode::register` sit directly after `rice::register`
 /// (rather than off on their own) so the whole `rice` family —
-/// `lint`/`stage`/`compose`/`design status`/`mode status` — stays contiguous
-/// in `schema --json`'s command order, even though each is its own module
-/// (Phase A of the design-mode feature; see `crates/storage/src/design.rs`;
-/// the mode-toggle feature; see `crates/storage/src/mode.rs`).
+/// `lint`/`stage`/`compose`/`draft *`/`mode *` — stays contiguous in
+/// `schema --json`'s command order, even though each is its own module (the
+/// draft feature; see `crates/song/src/commands/draft.rs`; the mode-toggle
+/// feature, now three-way (`staging`/`declarative`/`draft`) with `rice mode
+/// draft`'s symlink routing; see `crates/storage/src/mode.rs`).
 pub fn all() -> Registry {
     let mut r = Registry::new();
 
     meta::register(&mut r); // guide, schema
-    stubs::register_rice_gen(&mut r); // rice gen
     aoide_song::commands::rice::register(&mut r); // rice lint, stage, compose
-    aoide_song::commands::design::register(&mut r); // rice design status/enter/exit
+    aoide_song::commands::draft::register(&mut r); // rice draft save/list/stage/drop
     aoide_song::commands::mode::register(&mut r); // rice mode status/stage/declarative
     aoide_song::commands::cover::register(&mut r); // cover set
     aoide_song::commands::livery::register(&mut r); // livery emit, resolve, lint (the native note engine's verbs)
-    stubs::register_rice_late(&mut r); // rice adopt, transpose
+    stubs::register_rice_late(&mut r); // rice declare, transpose
     stubs::register_content(&mut r); // content register/propose/approve/ingest/query
     stubs::register_make(&mut r); // make
     stubs::register_update(&mut r); // update
@@ -52,6 +60,7 @@ pub fn all() -> Registry {
     aoide_conductor::commands::register(&mut r); // conductor
     aoide_server::commands::register_a2a_serve(&mut r); // a2a serve
     aoide_client::commands::register_agents(&mut r); // a2a agent add/list/remove/send (CONTRACTS.md §6)
+    aoide_client::commands::register_peers(&mut r); // peer add/list/remove/pull/status — same-network federation (CONTRACTS.md §7, appended newest)
     aoide_storage::commands::register(&mut r); // usage — local token/cost rollup (CONTRACTS.md §4)
     aoide_conduct::commands::hooks::register(&mut r); // hooks install — the hook-installer verb (appended newest)
 

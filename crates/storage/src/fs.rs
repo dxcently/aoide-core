@@ -105,7 +105,42 @@ pub fn songbook_notes(name: &str) -> std::path::PathBuf {
     songbook_dir(name).join("livery.json")
 }
 
-/// Atomic write-temp-then-rename into a file within a directory.
+/// A committed song's drafts root: `<song>/songbook/<name>/drafts/` —
+/// durable scratch for `rice draft save`, gitignored and outside `stage/` (a
+/// draft is NOT the live stage, and NOT committed truth; that distinction is
+/// the entire point of the feature). Nested under the song it varies, not a
+/// flat top-level dir: a draft is fundamentally a variation of an ALREADY
+/// COMPOSED song, so it belongs inside that song's own directory, not a
+/// separate global namespace. Shares [`songbook_dir`]'s
+/// `AOIDE_STAGE_DIR`-relative resolution.
+pub fn song_drafts_dir(song: &str) -> std::path::PathBuf {
+    songbook_dir(song).join("drafts")
+}
+
+/// One named draft's directory: `<song>/songbook/<name>/drafts/<draft>/` —
+/// holds a snapshot of `stage/livery.json` (always) and `stage/cover.json`
+/// (when the stage had one) at the moment `rice draft save <draft>` was run.
+pub fn draft_dir(song: &str, draft: &str) -> std::path::PathBuf {
+    song_drafts_dir(song).join(draft)
+}
+
+/// Atomic write-temp-then-rename into a file within a directory —
+/// symlink-transparent: if `path` is CURRENTLY a symlink, the temp is
+/// renamed into whatever it points at instead, leaving the symlink itself
+/// intact.
+///
+/// POSIX `rename()` replaces whatever directory entry sits at its
+/// destination — it does NOT dereference a symlink there and write through
+/// it. Without this, the very first write after something pointed `path` at
+/// a symlink (rice draft mode's `stage/livery.json` → `songbook/<song>/
+/// drafts/<name>/livery.json` routing) would silently REPLACE the symlink
+/// with a plain file, breaking the routing after one write. Resolving the
+/// link ourselves (`symlink_metadata` to detect it without following,
+/// `read_link` to read where it points, resolved against `path`'s parent
+/// when the link is relative) and renaming into THAT path instead makes
+/// every caller of `atomic_write` symlink-transparent for free — this is
+/// general behavior, not draft-specific, since every stage-file writer in
+/// the codebase routes through here.
 ///
 /// The temp is `<stem>.tmp.<pid>`; on success the rename replaces the target and
 /// removes the temp in one step. A FAILED rename would strand the temp we just
@@ -114,22 +149,33 @@ pub fn songbook_notes(name: &str) -> std::path::PathBuf {
 /// never clean up after itself, so every successful write also sweeps sibling
 /// temps left by a pid that is no longer alive ([`sweep_stale_temps`]).
 pub fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
+    let target = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            let link = std::fs::read_link(path)?;
+            if link.is_absolute() {
+                link
+            } else {
+                path.parent().map(|p| p.join(&link)).unwrap_or(link)
+            }
+        }
+        _ => path.to_path_buf(),
+    };
+    if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    let tmp = target.with_extension(format!("tmp.{}", std::process::id()));
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(contents.as_bytes())?;
         f.sync_all()?;
     }
-    let res = std::fs::rename(&tmp, path);
+    let res = std::fs::rename(&tmp, &target);
     if res.is_err() {
         // The rename failed; drop the temp we just wrote so a failed write never
         // leaks its own `<stem>.tmp.<pid>`.
         let _ = std::fs::remove_file(&tmp);
     }
-    sweep_stale_temps(path);
+    sweep_stale_temps(&target);
     res
 }
 
@@ -385,6 +431,37 @@ mod tests {
     }
 
     #[test]
+    fn song_drafts_dir_and_draft_dir_nest_under_the_songs_own_songbook_entry() {
+        // Mirrors `song_tree_resolves_under_the_stage_override`: a draft nests
+        // under ITS song's songbook dir, not a flat top-level `drafts/` —
+        // a draft is a variation of an already-composed song.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+
+        std::env::set_var("AOIDE_STAGE_DIR", "/tmp/aoide-drafts-test/stage");
+        assert_eq!(
+            song_drafts_dir("sonata"),
+            std::path::PathBuf::from("/tmp/aoide-drafts-test/songbook/sonata/drafts")
+        );
+        assert_eq!(
+            draft_dir("sonata", "neon-night"),
+            std::path::PathBuf::from("/tmp/aoide-drafts-test/songbook/sonata/drafts/neon-night")
+        );
+
+        // On the default layout: `~/Aoide/song/stage` → songbook_dir("x") =
+        // `~/Aoide/song/songbook/x` → song_drafts_dir("x") =
+        // `~/Aoide/song/songbook/x/drafts`.
+        std::env::remove_var("AOIDE_STAGE_DIR");
+        assert!(song_drafts_dir("x").ends_with("Aoide/song/songbook/x/drafts"));
+        assert!(draft_dir("x", "y").ends_with("Aoide/song/songbook/x/drafts/y"));
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+    }
+
+    #[test]
     fn run_qml_dir_resolves_as_a_sibling_of_song_under_the_stage_override() {
         // Mirrors `song_tree_resolves_under_the_stage_override` above: the
         // override's tmp root plays the role of the real `~/Aoide/` root, its
@@ -489,6 +566,72 @@ mod tests {
         assert!(!leaked.exists(), "a dead pid's leaked temp is swept on the next write");
         assert!(live_peer.exists(), "a live pid's in-flight temp is left untouched");
         assert!(target.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── atomic_write is symlink-transparent (rice draft mode's routing) ──
+
+    #[test]
+    fn atomic_write_writes_through_a_symlink_leaving_the_link_itself_intact() {
+        let dir = std::env::temp_dir().join(format!("aoide-atomic-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.json");
+        let link = dir.join("link.json");
+        std::fs::write(&real, "seed").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        atomic_write(&link, "first").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            "the symlink itself must survive the write, not get replaced by rename()"
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "first", "the LINK TARGET carries the content");
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "first", "reading through the link agrees");
+
+        // A second write must keep working the same way — the fix isn't a
+        // one-shot "first write creates a real file" side effect.
+        atomic_write(&link, "second").unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "second");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_resolves_a_relative_symlink_target() {
+        // The exact shape `rice mode draft` creates: stage/livery.json (a
+        // relative symlink) → ../../songbook/<song>/drafts/<name>/livery.json.
+        let dir = std::env::temp_dir().join(format!("aoide-atomic-symlink-rel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sub = dir.join("drafts").join("neon-night");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(dir.join("stage")).unwrap();
+        let real = sub.join("livery.json");
+        std::fs::write(&real, "seed").unwrap();
+        let link = dir.join("stage").join("livery.json");
+        std::os::unix::fs::symlink("../drafts/neon-night/livery.json", &link).unwrap();
+
+        atomic_write(&link, "routed").unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "routed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_creates_a_plain_file_when_path_is_not_a_symlink() {
+        // Regression coverage: the overwhelming common case (no symlink at
+        // all) must behave exactly as before this fix.
+        let dir = std::env::temp_dir().join(format!("aoide-atomic-plain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plain.json");
+
+        atomic_write(&path, "content").unwrap();
+        assert!(!std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "content");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

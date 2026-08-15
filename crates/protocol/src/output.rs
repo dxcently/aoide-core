@@ -41,7 +41,7 @@ impl Status {
 #[derive(Debug, Clone, Serialize)]
 pub struct Outcome {
     pub status: Status,
-    /// The command path that produced this, e.g. `rice.adopt`.
+    /// The command path that produced this, e.g. `rice.declare`.
     pub command: String,
     /// Human-readable summary line.
     pub message: String,
