@@ -22,6 +22,7 @@
 
 use aoide_protocol as daemon;
 use aoide_storage::fs::{seed_if_absent, stage_dir};
+use aoide_storage::mode::{load_mode_marker, RiceMode};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -54,6 +55,12 @@ pub enum BridgeCommand {
     /// shells out; this verb is the gate through which the six endings reach
     /// hyprlock / hyprctl / systemctl.
     Power { action: PowerAction },
+    /// `{ "cmd": "ricemode" }` — a click on the bar's rice-mode cell
+    /// (bar.qml's `modeText`). No payload: the daemon reads
+    /// `stage/mode.json` itself and decides the target — a two-way toggle
+    /// (`staging ⇄ declarative`), never a picker QML would need to supply
+    /// state for. See [`dispatch_rice_mode_toggle`].
+    ToggleRiceMode,
 }
 
 /// The six system actions the powermenu can request. A closed set — an unknown
@@ -149,6 +156,7 @@ pub fn parse_command(line: &str) -> Option<BridgeCommand> {
                 .to_string();
             PowerAction::from_wire(&action).map(|action| BridgeCommand::Power { action })
         }
+        "ricemode" => Some(BridgeCommand::ToggleRiceMode),
         _ => None,
     }
 }
@@ -166,6 +174,84 @@ fn dispatch_power(action: PowerAction) -> std::io::Result<()> {
         let _ = child.wait();
     });
     Ok(())
+}
+
+/// Pure decision: which `rice mode <word>` this toggle targets, given the
+/// CURRENT mode. A two-way toggle, not a three-way cycle — `Staging` locks
+/// to `declarative`; `Declarative` OR `Draft` both unlock back to `stage`
+/// (exiting a draft session to plain staging this way is deliberate:
+/// `rice mode stage` already tears down the draft's routing symlink on its
+/// own, `commands/mode.rs`'s `handle_mode_stage`). There is no generic "next
+/// draft" a bare click could cycle into without a name, so draft is only
+/// ever reachable via `rice mode draft <name>`, never this toggle.
+fn rice_mode_toggle_target(current: RiceMode) -> &'static str {
+    match current {
+        RiceMode::Staging => "declarative",
+        RiceMode::Declarative | RiceMode::Draft => "stage",
+    }
+}
+
+/// Dispatch ONE rice-mode toggle. Unlike [`dispatch_power`], this WAITS for
+/// the child (`.output()`, not spawn-and-detach): a mode switch never kills
+/// or freezes this process the way logout/suspend do, so it's safe — and
+/// necessary — to know synchronously whether the switch actually succeeded
+/// before deciding whether to fire a notification.
+///
+/// Re-execs THIS SAME running binary (`std::env::current_exe()`, the same
+/// self-re-exec idiom `server/src/a2a.rs`'s `do_spawn` uses — never a bare
+/// `"aoide"` relying on PATH) as `rice mode <target> --json`. On success
+/// (exit 0), returns the CLI's own `message` string verbatim — reusing that
+/// exact copy rather than inventing new wording — and fires a detached
+/// `notify-send "Aoide" <message>` (same reaper-thread idiom as
+/// `dispatch_power`'s spawned child, so a slow/hung `notify-send` can never
+/// block the accept loop; a `notify-send` spawn failure is a soft, eprintln
+/// -only failure — the mode DID switch, so it must not be reported as a
+/// toggle failure). On failure (non-zero exit, a spawn error, or unparsable
+/// JSON on an exit-0 that shouldn't happen) returns `Err` for the caller to
+/// audit-log — no notification fires for a failed toggle.
+fn dispatch_rice_mode_toggle() -> Result<String, String> {
+    let current = load_mode_marker().mode;
+    let target = rice_mode_toggle_target(current);
+
+    let exe = std::env::current_exe().map_err(|e| format!("resolving the aoide binary: {e}"))?;
+    let output = std::process::Command::new(&exe)
+        .args(["rice", "mode", target, "--json"])
+        .output()
+        .map_err(|e| format!("spawning `aoide rice mode {target}`: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "`aoide rice mode {target}` exited {}: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+
+    let message = serde_json::from_slice::<Value>(&output.stdout)
+        .ok()
+        .and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_else(|| format!("rice mode: {target}"));
+
+    match std::process::Command::new("notify-send")
+        .arg("Aoide")
+        .arg(&message)
+        .spawn()
+    {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(e) => {
+            // The mode switch itself already succeeded above — a dead/missing
+            // notify-send must not turn a successful toggle into a reported
+            // failure, so this is logged, not returned as `Err`.
+            eprintln!("[aoide/shellbridge] notify-send failed (mode switch itself succeeded): {e}");
+        }
+    }
+
+    Ok(message)
 }
 
 /// Run shellbridge: seed the `sessions.json`/`hooks.json` stage files (v0
@@ -365,6 +451,28 @@ fn handle_conn(stream: UnixStream) {
                     );
                 }
             },
+            Some(BridgeCommand::ToggleRiceMode) => match dispatch_rice_mode_toggle() {
+                Ok(message) => {
+                    let _ = daemon::audit(
+                        &daemon::default_audit_log(),
+                        daemon::Door::Daemon,
+                        daemon::EventClass::Audit,
+                        "shellbridge",
+                        "ricemode",
+                        &message,
+                    );
+                }
+                Err(e) => {
+                    let _ = daemon::audit(
+                        &daemon::default_audit_log(),
+                        daemon::Door::Daemon,
+                        daemon::EventClass::Audit,
+                        "shellbridge",
+                        "ricemode-failed",
+                        &e,
+                    );
+                }
+            },
             None => eprintln!("[aoide/shellbridge] ignoring unknown/malformed command: {line}"),
         }
     }
@@ -451,6 +559,29 @@ mod tests {
         assert_eq!(parse_command(r#"{"cmd":"power","action":""}"#), None);
         assert_eq!(parse_command(r#"{"cmd":"power"}"#), None);
         assert_eq!(parse_command(r#"{"cmd":"power","action":42}"#), None);
+    }
+
+    #[test]
+    fn parse_command_accepts_a_valid_ricemode() {
+        assert_eq!(
+            parse_command(r#"{"cmd":"ricemode"}"#),
+            Some(BridgeCommand::ToggleRiceMode)
+        );
+        // No payload is expected or read — extra fields are simply ignored.
+        assert_eq!(
+            parse_command("  {\"cmd\":\"ricemode\"}\n"),
+            Some(BridgeCommand::ToggleRiceMode)
+        );
+    }
+
+    #[test]
+    fn rice_mode_toggle_target_is_a_two_way_toggle_not_a_three_way_cycle() {
+        // Staging locks to declarative...
+        assert_eq!(rice_mode_toggle_target(RiceMode::Staging), "declarative");
+        // ...and BOTH declarative and draft unlock back to plain staging —
+        // there is no generic "next draft" a bare click could cycle into.
+        assert_eq!(rice_mode_toggle_target(RiceMode::Declarative), "stage");
+        assert_eq!(rice_mode_toggle_target(RiceMode::Draft), "stage");
     }
 
     #[test]
