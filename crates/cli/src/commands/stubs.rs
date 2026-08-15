@@ -124,7 +124,7 @@ pub fn register_update(r: &mut Registry) {
 pub fn register_onboard(r: &mut Registry) {
     r.insert(cmd!(
         path: ["onboard"],
-        summary: "First-boot flow: register the fork, seed songbook, print the guide.",
+        summary: "First-boot flow: register the clone, seed songbook, print the guide.",
         args: [],
         flags: [],
         gated: false,
