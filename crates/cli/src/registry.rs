@@ -115,6 +115,7 @@ mod tests {
             "rice.stage",
             "rice.transpose",
             "schema",
+            "shell.reload",
             "shellbridge",
             "update",
             "usage",

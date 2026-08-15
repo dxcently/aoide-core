@@ -24,7 +24,8 @@ use crate::registry::Registry;
 /// add/list/remove/pull/status (CONTRACTS.md §7, slotted directly after the
 /// `a2a agent` group it's the same-network-federation sibling of — nothing
 /// EXISTING moves, so the historical table above it is still untouched),
-/// usage, hooks install (newest).
+/// usage, hooks install, shell reload (appended newest — the Quickshell IPC
+/// hot-reload trigger, `crates/song/src/ipc.rs`).
 ///
 /// `rice gen` was cut outright (khoa 2026-08-14) — a speculative
 /// prompt/wallpaper generator that was never built and had no path to being
@@ -63,6 +64,7 @@ pub fn all() -> Registry {
     aoide_client::commands::register_peers(&mut r); // peer add/list/remove/pull/status — same-network federation (CONTRACTS.md §7, appended newest)
     aoide_storage::commands::register(&mut r); // usage — local token/cost rollup (CONTRACTS.md §4)
     aoide_conduct::commands::hooks::register(&mut r); // hooks install — the hook-installer verb (appended newest)
+    aoide_song::commands::shell::register(&mut r); // shell reload — quickshell IPC hot-reload trigger (appended newest)
 
     r
 }

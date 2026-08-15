@@ -343,7 +343,24 @@ pub(crate) fn handle_rice_stage(inv: &Invocation) -> Outcome {
             .with_data(json!({ "reason": "widget-sync-failed", "target": e.target }));
         }
     };
+    let widget_sync_changed = !widget_sync.changed.is_empty();
     changed.extend(widget_sync.changed);
+
+    // Quickshell IPC hot-reload (best-effort, non-fatal — same tier as
+    // hyprctl_status above). The palette/notes tier written above is
+    // already covered by LiveryState's own FileView watch — a full-scene
+    // rebuild is only worth it when the widget-body sync (dynamically
+    // `Qt.createComponent`-loaded QML, which no file watcher tracks) wrote
+    // something. A total widget-sync no-op re-stage never reloads.
+    let reload_data = if widget_sync_changed {
+        let status = crate::ipc::quickshell_ipc_reload();
+        json!({ "status": status.tag(), "message": status.message() })
+    } else {
+        json!({
+            "status": "skipped",
+            "message": "no widget bodies changed; nothing to reload",
+        })
+    };
 
     Outcome::ok(
         "rice.stage",
@@ -361,6 +378,7 @@ pub(crate) fn handle_rice_stage(inv: &Invocation) -> Outcome {
         "hyprctl": hyprctl_status,
         "widgets": widget_sync.note,
         "slots": widget_sync.slots,
+        "reload": reload_data,
         "seam": "Quickshell hot-reloads stage/livery.json (palette + component tiers); \
                  geometry + border colours are ALSO applied \
                  live via best-effort, guarded `hyprctl --batch keyword …` (see hypr.rs) \

@@ -86,7 +86,7 @@ fn all_pids() -> Vec<u32> {
 /// but nothing fails either (the sweep just proceeds without a systemd
 /// opinion, matching the rest of this codebase's guarded-optional posture
 /// toward system services it doesn't own).
-fn quickshell_service_main_pid() -> Option<u32> {
+pub(crate) fn quickshell_service_main_pid() -> Option<u32> {
     let out = std::process::Command::new("systemctl")
         .args(["--user", "show", "aoide-quickshell.service", "--property=MainPID", "--value"])
         .output()

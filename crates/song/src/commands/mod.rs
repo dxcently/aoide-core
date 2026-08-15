@@ -12,3 +12,4 @@ pub mod draft;
 pub mod livery;
 pub mod mode;
 pub mod rice;
+pub mod shell;
