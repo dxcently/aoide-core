@@ -311,6 +311,33 @@ mod tests {
         assert!(!inv.flags.contains_key("model"));
     }
 
+    // Regression (khoa, 2026-08-15): `--agent shell -- <program>` broke every
+    // terminal on this desktop for real — `is_command_token` (below) treats
+    // any bare token matching a REGISTERED command's first path segment as
+    // the start of a new subcommand rather than a flag's value, and a
+    // command named `shell` briefly existed (the Quickshell IPC reload
+    // trigger), colliding with `--agent shell`, the value `graph
+    // conduct`/kitty's shell wrapper have used for a long time. The command
+    // was renamed to `quickshell` to end THIS collision, but `is_command_token`
+    // itself is still collision-prone by construction — it does not consider
+    // that the token immediately follows a flag expecting a value. This test
+    // guards the specific incident (a bare `shell` value must be consumed by
+    // `--agent`, not treated as a subcommand); it does NOT guard the general
+    // class — a *future* command whose first segment matches some agent name
+    // in use can reintroduce the same failure mode. `_prior` on
+    // `is_command_token` is unused today; making it flag-position-aware would
+    // close the general case, flagged here rather than rushed.
+    #[test]
+    fn agent_value_shell_is_consumed_as_a_flag_value_not_treated_as_a_command() {
+        let (inv, _) = parse(
+            &argv(&["graph", "wrap", "--agent", "shell", "--", "bash", "-c", "true"]),
+            Door::Cli,
+        )
+        .unwrap();
+        assert_eq!(inv.flags.get("agent").map(String::as_str), Some("shell"));
+        assert_eq!(inv.args, vec!["bash", "-c", "true"]);
+    }
+
     // No CLI-internal aliases (khoa, 2026-08-14): each command has exactly one
     // spelling. Retired names are plain unknown commands, same as a typo.
     #[test]

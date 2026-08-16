@@ -11,5 +11,5 @@ pub mod cover;
 pub mod draft;
 pub mod livery;
 pub mod mode;
+pub mod quickshell;
 pub mod rice;
-pub mod shell;
