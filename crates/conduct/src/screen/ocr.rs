@@ -106,8 +106,15 @@ pub struct OcrResult {
 /// acts on a lie" failure mode this codebase's review culture rules out
 /// elsewhere (`capture.rs`'s clamp-announcement discipline). This feeds
 /// agent clicks downstream, so it fails loudly (`sidecar-corrupt`) instead.
+///
+/// One-line delegation to `capture::scale_is_valid` (khoa, 2026-08-17, Phase
+/// D of the pointer-emulation workstream) — moved there so `screen ocr`'s
+/// guard and `Sidecar::image_point_to_screen`'s own (the `--from-shot`
+/// coordinate conversion) share exactly one definition; this file keeps its
+/// own name so nothing downstream (this module's own tests included) has to
+/// change.
 fn scale_is_valid(scale: f64) -> bool {
-    scale > 0.0 && scale.is_finite()
+    super::capture::scale_is_valid(scale)
 }
 
 /// `screen = origin + image_px / scale` — the inverse of
@@ -117,12 +124,23 @@ fn scale_is_valid(scale: f64) -> bool {
 /// width/height`, which only coincide with logical pixels at `scale == 1.0`.
 /// Rounds to the nearest pixel — same convention `expected_image_size`
 /// already uses for the forward direction.
+///
+/// The math itself now lives in `capture::transform_point`/
+/// `capture::scale_div_round` (khoa, 2026-08-17, Phase D) — hoisted out so
+/// there is exactly ONE transform implementation in the crate, shared with
+/// `Sidecar::image_point_to_screen` (`--from-shot`'s conversion). This
+/// function calls the point version once for the bbox's top-left corner,
+/// then the shared division again for width/height (an extent has no
+/// corner of its own to transform) — same semantics as before the hoist,
+/// this file's own tests below prove the delegation didn't change a single
+/// output.
 pub fn image_bbox_to_screen(origin: hypr::Point, scale: f64, image_bbox: hypr::Region) -> hypr::Region {
+    let top_left = super::capture::transform_point(origin, scale, image_bbox.x, image_bbox.y);
     hypr::Region {
-        x: origin.x + (image_bbox.x as f64 / scale).round() as i64,
-        y: origin.y + (image_bbox.y as f64 / scale).round() as i64,
-        w: (image_bbox.w as f64 / scale).round() as i64,
-        h: (image_bbox.h as f64 / scale).round() as i64,
+        x: top_left.x,
+        y: top_left.y,
+        w: super::capture::scale_div_round(image_bbox.w, scale),
+        h: super::capture::scale_div_round(image_bbox.h, scale),
     }
 }
 
@@ -143,12 +161,32 @@ struct RawWord {
     text: String,
 }
 
-/// Do `a`'s and `b`'s vertical spans (`[top, top+height)`) overlap at all?
-/// The line-break heuristic — see the module header's PSM-11 quirk note.
+/// Do two `[top, top+height)` vertical spans overlap at all? THE same-line
+/// predicate this module's line-break heuristic reduces to — see the module
+/// header's PSM-11 quirk note. `pub(crate)` (khoa, 2026-08-17, Phase F of the
+/// pointer-emulation workstream): `screen::text`'s multi-word phrase matcher
+/// reuses this EXACT rule for its own same-line join, rather than growing a
+/// second copy of "what counts as one line" free to drift from this one.
+/// Saturating on purpose: `assemble`'s own call site only ever passes real
+/// tesseract TSV rows (small, well-formed, plain `+` would do), but
+/// `screen::text`'s phrase matcher now feeds this the same function bbox
+/// values straight off a sidecar `.json` file on disk — a hand-edited
+/// `"y": 9223372036854775807` is agent-reachable input, not a hypothetical,
+/// and plain `+` on that panics in debug / silently wraps in release
+/// (`union_bbox` one call away in `text.rs` already saturates for the exact
+/// same reason). No behavior change on the tesseract path: real TSV rows
+/// never get near either bound.
+pub(crate) fn vertical_spans_overlap(a_top: i64, a_height: i64, b_top: i64, b_height: i64) -> bool {
+    let a_bottom = a_top.saturating_add(a_height);
+    let b_bottom = b_top.saturating_add(b_height);
+    a_bottom.min(b_bottom) > a_top.max(b_top)
+}
+
+/// Do `a`'s and `b`'s vertical spans overlap at all? Thin delegation to
+/// [`vertical_spans_overlap`] (this file's own call sites/tests keep this
+/// `RawWord`-shaped name unchanged).
 fn vertically_overlaps(a: &RawWord, b: &RawWord) -> bool {
-    let a_bottom = a.top + a.height;
-    let b_bottom = b.top + b.height;
-    a_bottom.min(b_bottom) > a.top.max(b.top)
+    vertical_spans_overlap(a.top, a.height, b.top, b.height)
 }
 
 /// Parse tesseract's `--psm N tsv` stdout into word-level rows, image-pixel
@@ -272,7 +310,7 @@ const OCR_PSM: u8 = 11;
 /// function decides WHAT to do with the result; this decides HOW. Today:
 /// one `tesseract` shell-out — the ONLY place `tesseract` is named anywhere
 /// in this crate. Judged the ordinary way (like `capture_image`/
-/// `run_wlrctl_pointer`): tesseract prints diagnostics to stderr and TSV to
+/// `synth::synthesize`): tesseract prints diagnostics to stderr and TSV to
 /// stdout, exit 0 means stdout holds the result — CONFIRMED live on this rig
 /// (2026-08-16): `Estimating resolution as N` / `Empty page!!` land on
 /// stderr only, never stdout, so there is no output-vs-exit-code mismatch to
@@ -312,19 +350,16 @@ pub fn ocr(inv: &Invocation) -> Outcome {
             .with_data(json!({ "reason": "capture-not-found" }));
     }
     let sidecar_path = image_path.with_extension("json");
-    let sidecar_text = match std::fs::read_to_string(&sidecar_path) {
-        Ok(t) => t,
-        Err(e) => {
-            return Outcome::error(cmd, format!("cannot read sidecar {}: {e}", sidecar_path.display()))
-                .with_data(json!({ "reason": "sidecar-missing" }))
-        }
-    };
-    let mut sidecar: Sidecar = match serde_json::from_str(&sidecar_text) {
+    // Delegates to `capture::read_sidecar` (khoa's Phase D review nit) —
+    // this was a byte-identical inline copy of that function's own missing/
+    // corrupt handling (same two reason codes, same message shapes), the
+    // third reader of the same two-case logic where two already sufficed
+    // (`capture::read_sidecar` itself, and `send.rs`'s own deliberately
+    // DIFFERENT lenient reader — see that function's doc on why THAT one
+    // stays separate).
+    let mut sidecar: Sidecar = match super::capture::read_sidecar(&image_path) {
         Ok(s) => s,
-        Err(e) => {
-            return Outcome::error(cmd, format!("sidecar {} is corrupt: {e}", sidecar_path.display()))
-                .with_data(json!({ "reason": "sidecar-corrupt" }))
-        }
+        Err((reason, detail)) => return Outcome::error(cmd, detail).with_data(json!({ "reason": reason })),
     };
     if !scale_is_valid(sidecar.scale) {
         // Same `sidecar-corrupt` reason as a JSON-parse failure above — this
@@ -506,6 +541,26 @@ mod tests {
         assert!(!vertically_overlaps(&rw(0, 10), &rw(10, 10)));
     }
 
+    #[test]
+    fn vertical_spans_overlap_saturates_instead_of_panicking_on_adversarial_extremes() {
+        // A hand-edited sidecar `.json` can carry any i64 in `bbox.y`/`bbox.h`
+        // — `screen::text`'s phrase matcher feeds this function that field
+        // straight off disk, unlike `assemble`'s own real-TSV call site.
+        // Plain `+` here would panic in debug / wrap in release; must not.
+
+        // An overflow-prone height (10 + i64::MAX would panic/wrap) still
+        // correctly detects a genuine overlap once saturated.
+        assert!(vertical_spans_overlap(10, i64::MAX, 8, 5));
+
+        // Saturating the bottom to i64::MAX doesn't fabricate an overlap —
+        // the OTHER span's top (100) is still past where it actually ends.
+        assert!(!vertical_spans_overlap(100, i64::MAX, 0, 10));
+
+        // Opposite extremes, one side saturates: genuinely far apart, no
+        // panic, no false overlap.
+        assert!(!vertical_spans_overlap(i64::MIN, 5, i64::MAX, 5));
+    }
+
     // ── scale_is_valid — the ocr() call-site guard (khoa's review polish:
     // a hand-edited/corrupt sidecar's scale must not reach the division in
     // image_bbox_to_screen unchecked) ───────────────────────────────────
@@ -608,6 +663,30 @@ mod tests {
 
     #[test]
     fn sidecar_round_trips_with_the_ocr_block_populated_and_the_rest_intact() {
+        // `desktop` is POPULATED here, not `None` (khoa's Phase D review nit)
+        // — `ocr()`'s write-back reserializes the WHOLE sidecar, and only a
+        // typed `Option<hypr::DesktopSnapshot>` field surviving that
+        // round-trip actually proves it; a `None` value would pass even if
+        // the field were silently dropped somewhere in the pipe.
+        let desktop = hypr::DesktopSnapshot {
+            cursor: hypr::Point { x: 500, y: 18 },
+            clients: vec![hypr::Client {
+                address: "0xabc".to_string(),
+                class: "kitty".to_string(),
+                title: "agent".to_string(),
+                at: hypr::Point { x: 10, y: 46 },
+                size: hypr::Size { w: 942, h: 1024 },
+                pid: 5703,
+                focused: true,
+            }],
+            layers: vec![hypr::Layer {
+                monitor: "DP-1".to_string(),
+                level: 2,
+                namespace: "aoide-bar".to_string(),
+                at: hypr::Point { x: 0, y: 0 },
+                size: hypr::Size { w: 1920, h: 36 },
+            }],
+        };
         let mut sidecar = Sidecar {
             schema_version: super::super::capture::SIDECAR_SCHEMA_VERSION.to_string(),
             captured_at: "2026-08-16T05:00:00Z".to_string(),
@@ -622,10 +701,21 @@ mod tests {
             class: None,
             title: None,
             comment: None,
+            cursor_drawn: Some(true),
+            desktop: Some(desktop),
             ocr: None,
+            // Populated here too (khoa, 2026-08-17, Phase E) — same reason
+            // as `desktop` just above: only a POPULATED `Option<Value>`
+            // actually proves ocr()'s write-back doesn't silently drop a
+            // field it never reads, a `None` would pass even if the field
+            // vanished somewhere in the pipe.
+            diff: Some(serde_json::json!({ "changed": false, "changedFraction": 0.0 })),
+            region: None,
         };
         let before_text = serde_json::to_string(&sidecar).unwrap();
         assert!(before_text.contains("\"ocr\":null"));
+        assert!(before_text.contains("\"desktop\":"));
+        assert!(before_text.contains("\"diff\":{"));
 
         let result = assemble(TSV_BAR, sidecar.origin, sidecar.scale);
         sidecar.ocr = Some(serde_json::to_value(&result).unwrap());
@@ -638,7 +728,9 @@ mod tests {
         let ocr_value = back.ocr.unwrap();
         assert_eq!(ocr_value["text"], "4 == I");
         assert_eq!(ocr_value["words"].as_array().unwrap().len(), 3);
-        // ...and everything else round-tripped untouched.
+        // ...and everything else round-tripped untouched — desktop/
+        // cursorDrawn/diff INCLUDED, pinning that ocr()'s write-back doesn't
+        // silently drop the Phase D/E fields it never even reads.
         assert_eq!(back.origin, sidecar.origin);
         assert_eq!(back.size, sidecar.size);
         assert_eq!(back.scale, sidecar.scale);
@@ -646,6 +738,9 @@ mod tests {
         assert_eq!(back.quality, sidecar.quality);
         assert_eq!(back.schema_version, sidecar.schema_version);
         assert_eq!(back.captured_at, sidecar.captured_at);
+        assert_eq!(back.cursor_drawn, sidecar.cursor_drawn);
+        assert_eq!(back.desktop, sidecar.desktop);
+        assert_eq!(back.diff, sidecar.diff);
     }
 
     // ── OcrResult / Word JSON shape matches the brief's contract exactly ─

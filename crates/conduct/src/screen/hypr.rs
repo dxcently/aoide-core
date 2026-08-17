@@ -78,7 +78,7 @@ pub struct Workspace {
     pub name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Client {
     /// The Hyprland window address (e.g. `0x55...`) — absent (`""`) only on
     /// a malformed/legacy payload missing the field; a real `hyprctl -j
@@ -93,7 +93,15 @@ pub struct Client {
     pub focused: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// `PartialEq`/`Deserialize` added Phase D (khoa, 2026-08-17, pointer-
+/// emulation workstream): `screen shot`'s sidecar now embeds a whole desktop
+/// snapshot (`capture::Sidecar::desktop` → [`DesktopSnapshot`] → `Vec<Layer>`
+/// among others), and `Sidecar` itself derives `PartialEq`/`Deserialize` for
+/// its own existing round-trip tests — that derive chain reaches every field
+/// transitively, so `Layer` needs both too. `PartialEq` specifically is NOT
+/// resurrected for its own sake; it's the minimum this crate's existing
+/// derive contract on `Sidecar` requires now that a `Layer` sits inside it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Layer {
     pub monitor: String,
     pub level: i64,
@@ -318,12 +326,14 @@ fn run_hyprctl_json<T: serde::de::DeserializeOwned>(args: &[&str]) -> Result<T, 
 //
 // This is a WARP, not synthesized motion — see `tools/pointer.sh`'s own
 // header on why a warp is normally the WRONG tool for pointer synthesis (no
-// `wl_pointer.motion` event, so hover never updates). `screen point`'s
-// motion-synthesizing verbs (`move`/`click`/`scroll`, `point.rs`) go through
-// wlrctl instead and never call this. `restore` is the one deliberate
-// exception: returning to a previously-saved spot is not simulating a human
-// gesture, so no motion event is owed to anything the cursor passes over
-// along the way (khoa's Phase 2 brief, explicit).
+// `wl_pointer.motion` event, so hover never updates). `screen point`'s five
+// motion-synthesizing verbs (`move`/`click`/`drag`/`hover`/`scroll`,
+// `point.rs` — `drag`/`hover` added Phase B) go through the
+// pointer-synthesis boundary (`screen::synth`) instead and never call this.
+// `restore` is the one deliberate exception: returning to a previously-saved
+// spot is not simulating a human gesture, so no motion event is owed to
+// anything the cursor passes over along the way (khoa's Phase 2 brief,
+// explicit).
 
 /// Judge one FINISHED `hyprctl dispatch <...>` invocation — pure, unit
 /// tested. Unlike [`classify_json`], there is no stdout to parse: a
@@ -426,9 +436,18 @@ pub fn layers() -> Result<Vec<Layer>, HyprError> {
 pub fn layout_bounds(monitors: &[Monitor]) -> Option<Region> {
     let x1 = monitors.iter().map(|m| m.origin.x).min()?;
     let y1 = monitors.iter().map(|m| m.origin.y).min()?;
-    let x2 = monitors.iter().map(|m| m.origin.x + m.size.w).max()?;
-    let y2 = monitors.iter().map(|m| m.origin.y + m.size.h).max()?;
-    Some(Region { x: x1, y: y1, w: x2 - x1, h: y2 - y1 })
+    let x2 = monitors.iter().map(|m| m.origin.x.saturating_add(m.size.w)).max()?;
+    let y2 = monitors.iter().map(|m| m.origin.y.saturating_add(m.size.h)).max()?;
+    // Saturating, not plain `+`/`-` (khoa, 2026-08-17, Phase D of the
+    // pointer-emulation workstream — folds this file's own D3 discipline in:
+    // `capture::clamp_region`/`point::interpolate` already saturate for the
+    // exact same reason). This now sits on `point_drag`'s pre-flight path
+    // (`point::point_drag` calls `layout_bounds` before touching the
+    // pointer-synthesis boundary) — unreachable with any sane `hyprctl`
+    // reading (a monitor's own `x`/`width` are bounded by real hardware),
+    // but a debug-build panic on a pathological reading would be worse than
+    // this costs.
+    Some(Region { x: x1, y: y1, w: x2.saturating_sub(x1), h: y2.saturating_sub(y1) })
 }
 
 /// A `HyprError` folded into the command's structured error `Outcome` — the
@@ -438,6 +457,151 @@ pub fn layout_bounds(monitors: &[Monitor]) -> Option<Region> {
 pub(crate) fn hypr_error_outcome(cmd: &str, e: &HyprError) -> Outcome {
     Outcome::error(cmd, format!("{}: {}", e.reason(), e.detail()))
         .with_data(json!({ "reason": e.reason() }))
+}
+
+// ── `screen point hover`'s before/after diff (khoa, 2026-08-17, Phase B of
+// the pointer-emulation workstream) ────────────────────────────────────────
+//
+// `hover` parks the pointer at a target for a settle window and reports what
+// changed on the desktop while it sat there — a tooltip or context menu
+// opening under a synthesized hover IS a new layer surface, so this delta is
+// the verb's whole output, not a side note (see `point::point_hover`'s own
+// doc). Layers are identified by `(monitor, namespace)` TOGETHER (Opus's
+// Phase B review, F3 — namespace alone collapses two monitors that both
+// carry the same namespace, e.g. a per-monitor bar/dock, into one identity;
+// an appear/disappear on ONE monitor while the other still holds that
+// namespace would then report no change at all, exactly wrong for a verb
+// whose entire output is the delta). Hyprland reissues layer surface
+// addresses freely, so `namespace` (paired with its monitor) is still the
+// stable half of the identity — `screen info` already treats bare namespace
+// this way for the single-monitor case, which is why the bug was latent
+// until a second monitor entered the picture. Clients are identified by
+// `address`, the same identity `capture::find_window` already keys off.
+// `retitled` applies only to clients — a layer surface carries no title.
+
+/// Both live signals [`info_delta`] compares, taken together so a caller
+/// (`point_hover`'s handler) can gather one BEFORE and one AFTER around its
+/// settle sleep.
+#[derive(Debug, Clone)]
+pub struct InfoSnapshot {
+    pub clients: Vec<Client>,
+    pub layers: Vec<Layer>,
+}
+
+/// What changed between two [`InfoSnapshot`]s. Every field is sorted
+/// (`Vec<String>` sorted ascending) so the diff — and any test asserting
+/// against it — never depends on hyprctl's own, unspecified, listing order.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct InfoDelta {
+    /// `"layer:<monitor>:<namespace>"` / `"window:<address>"` entries
+    /// present AFTER but not BEFORE.
+    pub appeared: Vec<String>,
+    /// Same identity scheme, present BEFORE but not AFTER.
+    pub disappeared: Vec<String>,
+    /// `"<address>: \"<old title>\" -> \"<new title>\""` for every client
+    /// present in both snapshots whose title changed. Layers have no title,
+    /// so they never appear here — only in appeared/disappeared.
+    pub retitled: Vec<String>,
+}
+
+/// Gather one [`InfoSnapshot`] live — two `hyprctl -j` spawns
+/// ([`all_clients`]/[`layers`]). NOT unit-tested (real process spawns, same
+/// split every other live query in this module already draws); the pure
+/// comparison it feeds, [`info_delta`], is.
+pub fn snapshot() -> Result<InfoSnapshot, HyprError> {
+    Ok(InfoSnapshot { clients: all_clients()?, layers: layers()? })
+}
+
+// ── Phase D of the pointer-emulation workstream (khoa, 2026-08-17): a full
+// desktop snapshot embedded in every `screen shot` sidecar ─────────────────
+
+/// Cursor position plus every mapped client/layer surface — `screen shot`'s
+/// sidecar `desktop` field. Reuses [`InfoSnapshot`]'s own clients/layers
+/// gathering (`screen point hover`'s before/after diff already established
+/// it as the "whole live desktop" shape) plus one more `hyprctl cursorpos`
+/// call. `Serialize`/`Deserialize`/`PartialEq` so it round-trips through the
+/// sidecar JSON — `capture.rs`'s `Sidecar` owns the FIELD, this module owns
+/// the SHAPE (this file's own header: hyprctl-specific JSON stays here,
+/// generic capture concerns stay in `capture.rs`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DesktopSnapshot {
+    pub cursor: Point,
+    pub clients: Vec<Client>,
+    pub layers: Vec<Layer>,
+}
+
+/// Gather a full [`DesktopSnapshot`] live: [`snapshot`] (clients+layers)
+/// plus one more `hyprctl cursorpos` call. `Err` on ANY of the three
+/// underlying `hyprctl` calls failing — the call site (`capture::shot`)
+/// degrades this to `desktop: null` in the sidecar rather than failing the
+/// capture itself (the shot is the product; the desktop snapshot is a
+/// bonus on top of it, per this phase's brief). NOT unit-tested itself
+/// (real process spawns, same split every other live query in this module
+/// already draws).
+pub fn desktop_snapshot() -> Result<DesktopSnapshot, HyprError> {
+    let cursor = cursor()?;
+    let snap = snapshot()?;
+    Ok(DesktopSnapshot { cursor, clients: snap.clients, layers: snap.layers })
+}
+
+/// Pure diff of two [`InfoSnapshot`]s — see this section's header on
+/// identity choice (namespace for layers, address for clients) and why the
+/// delta is sorted.
+pub fn info_delta(before: &InfoSnapshot, after: &InfoSnapshot) -> InfoDelta {
+    // Layers key on (monitor, namespace) TOGETHER — see this section's
+    // header, F3 — never namespace alone.
+    let before_layers: BTreeMap<(&str, &str), &Layer> = before
+        .layers
+        .iter()
+        .map(|l| ((l.monitor.as_str(), l.namespace.as_str()), l))
+        .collect();
+    let after_layers: BTreeMap<(&str, &str), &Layer> = after
+        .layers
+        .iter()
+        .map(|l| ((l.monitor.as_str(), l.namespace.as_str()), l))
+        .collect();
+    let before_clients: BTreeMap<&str, &Client> =
+        before.clients.iter().map(|c| (c.address.as_str(), c)).collect();
+    let after_clients: BTreeMap<&str, &Client> =
+        after.clients.iter().map(|c| (c.address.as_str(), c)).collect();
+
+    let mut appeared: Vec<String> = after_layers
+        .keys()
+        .filter(|k| !before_layers.contains_key(*k))
+        .map(|(mon, ns)| format!("layer:{mon}:{ns}"))
+        .chain(
+            after_clients
+                .keys()
+                .filter(|addr| !before_clients.contains_key(*addr))
+                .map(|addr| format!("window:{addr}")),
+        )
+        .collect();
+    appeared.sort();
+
+    let mut disappeared: Vec<String> = before_layers
+        .keys()
+        .filter(|k| !after_layers.contains_key(*k))
+        .map(|(mon, ns)| format!("layer:{mon}:{ns}"))
+        .chain(
+            before_clients
+                .keys()
+                .filter(|addr| !after_clients.contains_key(*addr))
+                .map(|addr| format!("window:{addr}")),
+        )
+        .collect();
+    disappeared.sort();
+
+    let mut retitled: Vec<String> = after_clients
+        .iter()
+        .filter_map(|(addr, after_c)| {
+            let before_c = before_clients.get(addr)?;
+            (before_c.title != after_c.title)
+                .then(|| format!("{addr}: \"{}\" -> \"{}\"", before_c.title, after_c.title))
+        })
+        .collect();
+    retitled.sort();
+
+    InfoDelta { appeared, disappeared, retitled }
 }
 
 // ── `aoide screen info` ───────────────────────────────────────────────────
@@ -652,6 +816,31 @@ mod tests {
         assert_eq!(layout_bounds(&[]), None);
     }
 
+    // ── Phase D: layout_bounds' saturating arithmetic near the i64 extremes
+    // never panics (this file's own D3 discipline, folded in per khoa's
+    // Phase B review — see `layout_bounds`'s own doc) ───────────────────
+
+    #[test]
+    fn layout_bounds_with_a_pathological_monitor_size_does_not_panic() {
+        let mons = vec![Monitor {
+            name: "X".into(),
+            origin: Point { x: 1, y: 1 },
+            size: Size { w: i64::MAX, h: i64::MAX },
+            scale: 1.0,
+            transform: 0,
+            reserved: [0; 4],
+            usable: Region { x: 1, y: 1, w: i64::MAX, h: i64::MAX },
+        }];
+        // origin.x + size.w would overflow plain i64 addition; saturating
+        // clamps to i64::MAX instead of panicking, and the final width
+        // (x2.saturating_sub(x1)) likewise never overflows.
+        let bounds = layout_bounds(&mons).unwrap();
+        assert_eq!(bounds.x, 1);
+        assert_eq!(bounds.y, 1);
+        assert_eq!(bounds.w, i64::MAX - 1);
+        assert_eq!(bounds.h, i64::MAX - 1);
+    }
+
     #[test]
     fn exit_nonzero_with_stderr_is_a_failed_reason() {
         let r: Result<Vec<RawMonitor>, String> = classify_json(false, "", "no compositor");
@@ -712,5 +901,113 @@ mod tests {
         let raw: Vec<RawClient> = classify_json(true, NO_FOCUS_FIELD, "").unwrap();
         let c = Client::from(raw.into_iter().next().unwrap());
         assert!(!c.focused, "an absent field must never default to \"assume focused\"");
+    }
+
+    // ── Phase B: info_delta (screen point hover's before/after diff) ────
+
+    fn client_fixture(address: &str, title: &str) -> Client {
+        Client {
+            address: address.to_string(),
+            class: "kitty".to_string(),
+            title: title.to_string(),
+            at: Point { x: 0, y: 0 },
+            size: Size { w: 100, h: 100 },
+            pid: 1,
+            focused: false,
+        }
+    }
+
+    fn layer_fixture(namespace: &str) -> Layer {
+        Layer {
+            monitor: "DP-1".to_string(),
+            level: 2,
+            namespace: namespace.to_string(),
+            at: Point { x: 0, y: 0 },
+            size: Size { w: 200, h: 40 },
+        }
+    }
+
+    #[test]
+    fn info_delta_no_change_is_all_empty() {
+        let snap = InfoSnapshot {
+            clients: vec![client_fixture("0x1", "a")],
+            layers: vec![layer_fixture("aoide-bar")],
+        };
+        let delta = info_delta(&snap.clone(), &snap);
+        assert_eq!(delta, InfoDelta::default());
+    }
+
+    #[test]
+    fn info_delta_detects_appeared_layers_and_clients() {
+        let before = InfoSnapshot { clients: vec![], layers: vec![layer_fixture("aoide-bar")] };
+        let after = InfoSnapshot {
+            clients: vec![client_fixture("0x2", "new window")],
+            layers: vec![layer_fixture("aoide-bar"), layer_fixture("tooltip")],
+        };
+        let delta = info_delta(&before, &after);
+        assert_eq!(delta.appeared, vec!["layer:DP-1:tooltip".to_string(), "window:0x2".to_string()]);
+        assert!(delta.disappeared.is_empty());
+        assert!(delta.retitled.is_empty());
+    }
+
+    #[test]
+    fn info_delta_detects_disappeared_layers_and_clients() {
+        let before = InfoSnapshot {
+            clients: vec![client_fixture("0x1", "a")],
+            layers: vec![layer_fixture("aoide-bar"), layer_fixture("tooltip")],
+        };
+        let after = InfoSnapshot { clients: vec![], layers: vec![layer_fixture("aoide-bar")] };
+        let delta = info_delta(&before, &after);
+        assert!(delta.appeared.is_empty());
+        assert_eq!(delta.disappeared, vec!["layer:DP-1:tooltip".to_string(), "window:0x1".to_string()]);
+        assert!(delta.retitled.is_empty());
+    }
+
+    #[test]
+    fn info_delta_keys_layers_by_monitor_and_namespace_not_namespace_alone() {
+        // Two monitors can each carry a layer surface with the same
+        // namespace (e.g. a per-monitor bar/dock, "aoide-dock") — keying by
+        // namespace alone would collapse them into one identity and hide an
+        // appear/disappear on one monitor while the other still holds that
+        // namespace (Opus's Phase B review, F3).
+        fn layer_on(monitor: &str, namespace: &str) -> Layer {
+            Layer {
+                monitor: monitor.to_string(),
+                level: 3,
+                namespace: namespace.to_string(),
+                at: Point { x: 0, y: 0 },
+                size: Size { w: 442, h: 960 },
+            }
+        }
+        let before = InfoSnapshot {
+            clients: vec![],
+            layers: vec![layer_on("DP-1", "aoide-dock"), layer_on("HDMI-A-1", "aoide-dock")],
+        };
+        let after = InfoSnapshot {
+            // DP-1's dock closed; HDMI-A-1's is untouched and must not mask
+            // the disappearance via a shared namespace-only key.
+            clients: vec![],
+            layers: vec![layer_on("HDMI-A-1", "aoide-dock")],
+        };
+        let delta = info_delta(&before, &after);
+        assert_eq!(delta.disappeared, vec!["layer:DP-1:aoide-dock".to_string()]);
+        assert!(delta.appeared.is_empty(), "HDMI-A-1's dock is present in both — not appeared");
+    }
+
+    #[test]
+    fn info_delta_detects_a_retitled_client_by_matching_address() {
+        let before = InfoSnapshot { clients: vec![client_fixture("0x1", "Loading…")], layers: vec![] };
+        let after = InfoSnapshot { clients: vec![client_fixture("0x1", "Done")], layers: vec![] };
+        let delta = info_delta(&before, &after);
+        assert!(delta.appeared.is_empty());
+        assert!(delta.disappeared.is_empty());
+        assert_eq!(delta.retitled, vec!["0x1: \"Loading…\" -> \"Done\"".to_string()]);
+    }
+
+    #[test]
+    fn info_delta_ignores_a_client_present_in_both_with_an_unchanged_title() {
+        let before = InfoSnapshot { clients: vec![client_fixture("0x1", "same")], layers: vec![] };
+        let after = InfoSnapshot { clients: vec![client_fixture("0x1", "same")], layers: vec![] };
+        assert_eq!(info_delta(&before, &after), InfoDelta::default());
     }
 }

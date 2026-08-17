@@ -18,6 +18,25 @@ serde_json = "1"
 libc = "0.2"
 crossterm = { version = "0.29", default-features = false, features = ["events"] }
 ratatui = "0.30"
+# `screen::synth`'s pointer-synthesis backend (Phase A of the
+# pointer-emulation workstream, khoa, 2026-08-17): default features only —
+# wayland-backend's pure-Rust `rs` implementation, its own wire-protocol
+# codec with no C library involved at all. NOT the `system` feature (which
+# would link, or with the separate `dlopen` feature ALSO on, dynamically
+# load, the real libwayland-client.so) — `dlopen` only toggles link-vs-dlopen
+# for the `system` backend and does nothing here, since `system` itself is
+# off. No pkg-config, no `default.nix` change (`nix build` proves this: the
+# vendored `cargoLock.lockFile` build never touches a system Wayland lib).
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+# `screen::diff`'s decode boundary (Phase E of the pointer-emulation
+# workstream, khoa, 2026-08-17): the first image-DECODING dependency this
+# workspace carries (`capture.rs`'s own `expected_image_size` doc used to
+# promise "no image-decoding dependency" — that promise is now scoped to the
+# capture path only, `screen::diff` is the sole consumer). png+jpeg only —
+# every format `screen shot` can actually produce (`capture::Format`); no
+# other codec this crate has any use for.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 aoide-protocol = { path = "crates/protocol" }
 aoide-storage = { path = "crates/storage" }
 aoide-conduct = { path = "crates/conduct" }

@@ -21,6 +21,14 @@ aoide-storage = { workspace = true }
 # (client has no dependency back on conduct).
 aoide-client = { workspace = true }
 libc = { workspace = true }
+# `screen::synth`'s pointer-synthesis backend (Phase A of the
+# pointer-emulation workstream) — see the workspace manifest's own comment on
+# why default features (pure-Rust, no system libwayland link).
+wayland-client = { workspace = true }
+wayland-protocols-wlr = { workspace = true }
+# `screen::diff`'s decode boundary (Phase E) — see the workspace manifest's
+# own comment on why png+jpeg-only.
+image = { workspace = true }
 
 [dev-dependencies]
 # The commands/hooks tests share the workspace rig (scratch dirs, EnvSaver,
