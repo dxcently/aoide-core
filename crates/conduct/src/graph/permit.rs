@@ -193,9 +193,11 @@ fn profile_for_agent(agent: &str) -> &'static AgentProfile {
 
 /// Raise the summons and block until it is answered. Returns dunstify's one
 /// line of stdout, or an error string when the client could not be run at all.
-fn raise_summons(agent: &str, id: &str, summary: &str, body: &str) -> Result<String, String> {
-    let out = std::process::Command::new("dunstify")
-        .args([
+/// The exact dunstify argv the summons is raised with. Split out from
+/// [`raise_summons`] for one reason: the `--` terminator below is load-bearing
+/// and a test can hold it in place, where a spawned process cannot.
+fn summons_argv(agent: &str, id: &str, summary: &str, body: &str) -> Vec<String> {
+    [
             "--wait",
             "--urgency",
             "critical",
@@ -211,9 +213,23 @@ fn raise_summons(agent: &str, id: &str, summary: &str, body: &str) -> Result<Str
             &format!("aoide-permit-{id}"),
             "--action",
             &format!("{APPROVE_ACTION},approve"),
+            // `--` FIRST, then the positionals. Both of them start life as
+            // hook text from the agent, and dunstify parses a leading `-` as
+            // an option: without this terminator a body opening with a dash
+            // dies on `Invalid commandline: Unknown option ...` and the
+            // summons never rises at all (verified against dunstify 1.13.2).
+            "--",
             summary,
             body,
-        ])
+    ]
+    .map(str::to_string)
+    .into_iter()
+    .collect()
+}
+
+fn raise_summons(agent: &str, id: &str, summary: &str, body: &str) -> Result<String, String> {
+    let out = std::process::Command::new("dunstify")
+        .args(summons_argv(agent, id, summary, body))
         .output()
         .map_err(|e| format!("cannot run dunstify (is the dunst dendrite enabled?): {e}"))?;
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
@@ -409,6 +425,16 @@ pub(in crate::graph) fn spawn_summons(id: &str, what: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_summons_argv_terminates_its_options_before_the_agents_text() {
+        let argv = summons_argv("claude", "sess-1", "-summary", "--force-with-lease");
+        let dashdash = argv.iter().position(|a| a == "--").expect("no -- terminator");
+        // everything the agent wrote sits AFTER the terminator, in order
+        assert_eq!(&argv[dashdash + 1..], ["-summary", "--force-with-lease"]);
+        // and nothing before it came from the agent's text
+        assert!(!argv[..dashdash].iter().any(|a| a.starts_with("-summary")));
+    }
 
     #[test]
     fn read_verdict_maps_the_three_outcomes_and_nothing_else() {
