@@ -1466,9 +1466,16 @@ mod tests {
         let now = "2026-01-01T00:00:00Z";
         let fresh_now = now_iso_utc();
         let mut sessions = Vec::new();
+        // `live` is stamped with the real "now" for the same reason `hookonly`
+        // below is: every reaper signal that reads the wall clock must find it
+        // current. The pre-boot signal is the second of those — a record whose
+        // every timestamp predates the machine's boot is condemned however
+        // alive its pid looks, precisely because a pid outliving a reboot is a
+        // recycled one. A fixed 2026-01-01 birth date beside a live pid is a
+        // state the world cannot produce.
         upsert_session(
             &mut sessions, "live", None, Some("/w"), None, None, None, None, None,
-            Some(std::process::id()), now,
+            Some(std::process::id()), &fresh_now,
         );
         upsert_session(
             &mut sessions, "killed", None, Some("/w"), None, None, None, None, None,
@@ -1589,11 +1596,16 @@ mod tests {
         let stage = unique_stage("reap-hooksilent");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
-        let now = "2026-01-01T00:00:00Z";
+        // The real "now", not a fixed date: this record must survive every
+        // signal that reads the wall clock, and the pre-boot one condemns a
+        // record whose whole timeline predates the machine's boot — a live pid
+        // on a session born before the last reboot is a recycled pid, which is
+        // exactly the ghost that signal exists for.
+        let now = now_iso_utc();
         let mut sessions = Vec::new();
         upsert_session(
             &mut sessions, "quiet", None, Some("/w"), Some("0xdead"), None, None, None, None,
-            Some(std::process::id()), now,
+            Some(std::process::id()), &now,
         );
         write_stage(
             &sessions_path(),

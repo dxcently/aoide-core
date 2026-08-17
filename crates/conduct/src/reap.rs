@@ -29,6 +29,14 @@
 //!     is gone: silence past a week-long band (see
 //!     [`REAP_WORKING_STALE_SECS`]) condemns it, while a live harness firing
 //!     hooks on its own cadence is proven alive by its fresh hook `updatedAt`.
+//! And three ghosts that answer NO to every signal above and are dead anyway:
+//! a record whose evidence all predates the machine's own boot instant (see
+//! [`pre_boot_ghosts`] — the case a recycled pid shields forever), a sub-agent
+//! node whose parent has left the roster entirely (see [`orphaned_subagents`]),
+//! and the control socket a killed `conduct` left in `$XDG_RUNTIME_DIR` (see
+//! [`sweep_orphan_sockets`] — not a session record at all, but this sweep's
+//! leavings and nobody else's job).
+//!
 //! A false reap of a merely-quiet live session self-heals: the hook door
 //! re-registers the record on the session's next event.
 //!
@@ -422,6 +430,182 @@ fn superseded_done_siblings(sessions: &[SessionRecord]) -> Vec<String> {
     losers
 }
 
+// ── Three ghosts every signal above walks past ──────────────────────────────
+//
+// The liveness predicate asks "is this record's process/window gone, or has it
+// been silent past its band". Each of the three below is a record that answers
+// NO to all of that and is dead anyway: one because the machine rebooted under
+// it, one because the node it hangs off no longer exists, and one because it is
+// not a session record at all but the file a dead session left in /run.
+
+/// Grace on the boot-instant comparison, absorbing early-boot clock skew: a
+/// record can be written before NTP steps the clock, landing a timestamp a
+/// little BEHIND the `btime` recorded moments earlier. Five minutes is far
+/// wider than any plausible step and far narrower than the hours a real
+/// pre-boot ghost sits at.
+const BOOT_SKEW_GRACE_SECS: i64 = 300; // 5 minutes
+
+/// How long a control socket must have sat untouched before the sweep will
+/// consider unlinking it. `conduct` binds its socket a moment BEFORE its
+/// `session start` lands in sessions.json, so an infant socket is briefly
+/// roster-less through no fault of its own; 60s is the same settle window the
+/// duplicate dedup uses.
+const SOCKET_SETTLE_SECS: i64 = 60;
+
+/// The instant this machine booted, epoch seconds — `btime` out of
+/// `/proc/stat`. `None` whenever it cannot be read or parsed (no `/proc`, a
+/// stripped container): the pre-boot signal then never fires at all, which is
+/// the safe direction.
+fn boot_epoch() -> Option<i64> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    stat.lines()
+        .find_map(|l| l.strip_prefix("btime "))
+        .and_then(|v| v.trim().parse::<i64>().ok())
+}
+
+/// Sessions whose every evidence of life predates the current boot. PURE —
+/// both the boot instant and `last_seen` are injected.
+///
+/// A reboot is a hard fact about the world: no process, no window address and
+/// no pty survives one. A record that has shown no sign of life since the
+/// machine came up therefore cannot be attached to anything running, and all
+/// three existing signals can miss it:
+///   * the window signal only fires when `hyprctl` answers, and a compositor
+///     that also restarted may not be up yet on the first passes;
+///   * the pid signal reads a RECYCLED pid as alive — on a busy box (22 dead
+///     `conduct-*` in eight minutes of use) a fresh process lands on the old
+///     number and `/proc/<pid>` exists again, shielding the ghost forever;
+///   * the staleness bands hold their fire for 72h / 7 days, and the live-pid
+///     veto can stop them firing at all.
+/// This collapses that wait to the one thing already known for certain: the
+/// box rebooted, and this record never woke up.
+///
+/// Absence of evidence is still never evidence of death — an unreadable
+/// `/proc/stat` (`boot_epoch` `None`) and a record with no parseable evidence
+/// (`last_seen` `None`) both leave the record alone.
+///
+/// Known caveat, deliberately accepted: on a kernel that recomputes `btime`
+/// across a long suspend, the boot instant can drift FORWARD past a live
+/// session's last hook, and a quiet-but-live record is then reaped. It
+/// self-heals on that session's next event exactly like every other false
+/// reap (`hook_ensure_session` re-registers it), and the grace above absorbs
+/// the small drifts.
+fn pre_boot_ghosts(
+    sessions: &[SessionRecord],
+    boot_epoch: Option<i64>,
+    last_seen: impl Fn(&SessionRecord) -> Option<i64>,
+) -> Vec<String> {
+    let Some(boot) = boot_epoch else {
+        return Vec::new();
+    };
+    sessions
+        .iter()
+        .filter(|s| s.state != "done")
+        .filter(|s| last_seen(s).is_some_and(|seen| seen + BOOT_SKEW_GRACE_SECS < boot))
+        .map(|s| s.session_id.clone())
+        .collect()
+}
+
+/// Sub-agent records whose parent is gone from the roster entirely. PURE —
+/// `is_recent` is injected.
+///
+/// A `subagent` node exists only inside its parent's Task-tool call: its id is
+/// minted from that call, and it owns no process, window or transcript of its
+/// own. `doomed_subagent_descendants` (in `graph/doc.rs`) is the primary
+/// cleanup and takes the sub-agents down with a parent that ends HERE — but a
+/// parent that left through another door (`graph prune` on its own schedule,
+/// or an earlier pass that cleared the dangling link) leaves the sub-agent as
+/// a parentless root node, and there it sits for its full staleness band
+/// (2h mid-turn, 72h at rest) still claiming to be working.
+///
+/// Narrow on purpose: only a record whose parent id is EMPTY or names a
+/// session that is not in the roster AT ALL. A parent that is present but
+/// `done` is the cascade's business and is left to it. `is_recent` spares an
+/// infant, since a reap racing the hook door's own write would otherwise judge
+/// a record whose parent link is a moment away.
+fn orphaned_subagents(
+    sessions: &[SessionRecord],
+    is_recent: impl Fn(&SessionRecord) -> bool,
+) -> Vec<String> {
+    let known: HashSet<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+    sessions
+        .iter()
+        .filter(|s| s.state != "done")
+        .filter(|s| s.kind.as_deref() == Some("subagent") || s.session_id.starts_with("sub:"))
+        .filter(|s| !is_recent(s))
+        .filter(|s| {
+            s.parent_session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .is_none_or(|p| !known.contains(p))
+        })
+        .map(|s| s.session_id.clone())
+        .collect()
+}
+
+/// Unlink the control sockets left behind by sessions that are no longer on
+/// the roster, and return the ids swept.
+///
+/// `conduct` binds `$XDG_RUNTIME_DIR/aoide/session-<id>.sock` at start and
+/// unlinks it on exit — but the sessions this whole module exists for are
+/// precisely the ones that never got to run their exit path (SUPER+Q,
+/// SIGKILL), so every reap leaves a socket file behind it. Nothing else ever
+/// collects them, and the reaper is already the sweep that knows who is gone.
+///
+/// Three guards, so this can never take a live session's socket:
+///   * only `session-*.sock` names are candidates, so the shellbridge's own
+///     socket sharing that directory is never one whatever the roster says;
+///   * a candidate whose id IS on the roster is skipped outright;
+///   * a candidate nothing is listening on is the only one unlinked — a
+///     successful `connect` is positive proof of a live `conduct` accept loop,
+///     and outranks a roster that merely fails to mention it. (This is also
+///     what keeps the unit tests honest: they run against a temp stage whose
+///     roster knows none of the desktop's real sessions, and every one of
+///     those sockets answers.)
+/// Plus [`SOCKET_SETTLE_SECS`] off the file's mtime, for the moment between
+/// `bind` and `listen` where an infant socket would refuse a connection.
+fn sweep_orphan_sockets(live_ids: &HashSet<&str>, now_epoch: i64) -> Vec<String> {
+    use std::os::unix::net::UnixStream;
+    let Some(dir) = crate::graph::conduct_socket_path("probe")
+        .parent()
+        .map(|d| d.to_path_buf())
+    else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut swept = Vec::new();
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("session-"))
+            .and_then(|n| n.strip_suffix(".sock"))
+        else {
+            continue;
+        };
+        if id.is_empty() || live_ids.contains(id) {
+            continue;
+        }
+        let settled = e
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_some_and(|d| now_epoch.saturating_sub(d.as_secs() as i64) >= SOCKET_SETTLE_SECS);
+        if !settled || UnixStream::connect(e.path()).is_ok() {
+            continue;
+        }
+        if std::fs::remove_file(e.path()).is_ok() {
+            swept.push(id.to_string());
+        }
+    }
+    swept.sort();
+    swept
+}
+
 // ── `stopped` → `idle` decay: the warm/cold split of "at rest" ──────────────
 //
 // `Stop` (the turn ended, the agent is at its prompt) lands `stopped`, NOT
@@ -555,10 +739,18 @@ pub fn reap(inv: &Invocation) -> Outcome {
 ///   * `--announce` toasts unconditionally: it marks a HUMAN gesture (the dock's
 ///     `[ reap ]` control, via shellbridge), and a pressed button must answer
 ///     even when the answer is "nothing to reap".
+///
+/// Whether the toast was actually handed off lands in `data.announced`, so the
+/// shellbridge's audit log answers "did the button ring the daemon" on its own
+/// — a missing notifier is otherwise an `eprintln` into a systemd child's
+/// stderr, i.e. invisible exactly when someone is asking why nothing appeared.
 pub fn reap_and_announce(inv: &Invocation) -> Outcome {
-    let outcome = reap(inv);
+    let mut outcome = reap(inv);
     if inv.flag_present("announce") || !outcome.changed.is_empty() {
-        announce_reap(&outcome.message);
+        let announced = announce_reap(&outcome.message);
+        if let Some(data) = outcome.data.as_mut() {
+            data["announced"] = json!(announced);
+        }
     }
     outcome
 }
@@ -570,11 +762,30 @@ pub fn reap_and_announce(inv: &Invocation) -> Outcome {
 /// error: the sweep already happened, and losing the toast must not turn a
 /// successful reap into a failed one. Same idiom as shellbridge's
 /// `dispatch_rice_mode_toggle`.
-fn announce_reap(message: &str) {
+///
+/// Returns whether the notifier was handed the toast at all (the spawn
+/// succeeded) — never whether the daemon drew it, which is dunst's business
+/// and the herald's after that.
+fn announce_reap(message: &str) -> bool {
     match std::process::Command::new("notify-send")
         // No `--icon`: dunst stacks the icon slot on TOP of the stele at up to
-        // 48px, and a picture is not what a one-line sweep report needs.
-        .args(["--app-name=aoide", "Aoide · reap"])
+        // 48px, and a picture is not what a one-line sweep report needs. The
+        // sweep's mark is a GLYPH in the summary instead — 𓌳 (U+13333, the
+        // Egyptian sickle), which costs no layout slot at all and reads as
+        // this verb and no other in the herald ledger. U+13333 and not its
+        // neighbour U+13334: the two are the same sign, and 13334 is the
+        // variant drawn as a bare blade — 13333 is the one that keeps the
+        // upright shaft, and a scythe with no handle is a knife. The shaft
+        // survives down to 18px, well under the herald title's size.
+        // Covered by the rig's
+        // own font set: `noto-fonts` (modules/dendrites/fonts.nix) ships
+        // NotoSansEgyptianHieroglyphs, so pango's and Qt's fontconfig
+        // fallback both resolve it rather than drawing tofu.
+        //
+        // The word leads and the sickle follows: the herald card already
+        // carries `aoide` in its own header row, so the summary owes no app
+        // name — it says what happened, and the glyph closes the line.
+        .args(["--app-name=aoide", "reaped 𓌳"])
         .arg(message)
         .spawn()
     {
@@ -582,8 +793,12 @@ fn announce_reap(message: &str) {
             std::thread::spawn(move || {
                 let _ = child.wait();
             });
+            true
         }
-        Err(e) => eprintln!("[aoide/reap] notify-send failed (the sweep itself succeeded): {e}"),
+        Err(e) => {
+            eprintln!("[aoide/reap] notify-send failed (the sweep itself succeeded): {e}");
+            false
+        }
     }
 }
 
@@ -728,6 +943,27 @@ fn reap_inner(
         }
     }
 
+    // The pre-boot ghosts: a record whose every evidence stream is older than
+    // the machine's own boot instant cannot be attached to anything running —
+    // the case a recycled pid otherwise shields forever (see
+    // `pre_boot_ghosts`). Reads `/proc/stat` once per pass; unreadable there
+    // means the signal simply does not fire.
+    for id in pre_boot_ghosts(&s_file.sessions, boot_epoch(), last_seen) {
+        if !reaped.contains(&id) {
+            reaped.push(id);
+        }
+    }
+
+    // And the parentless sub-agents — nodes hanging off a Task call whose
+    // parent is no longer in the roster at all (see `orphaned_subagents`).
+    // Same settle grace as the dedup above, so an infant awaiting its own
+    // parent link is never judged.
+    for id in orphaned_subagents(&s_file.sessions, is_recent) {
+        if !reaped.contains(&id) {
+            reaped.push(id);
+        }
+    }
+
     // And the tombstones a re-identified terminal leaves behind: `done` agent
     // records whose window already holds a LIVE agent (see
     // `superseded_done_siblings`). Kept OUT of `reaped` deliberately — these
@@ -759,6 +995,24 @@ fn reap_inner(
         .map(|h| h.session_id.clone())
         .collect();
 
+    // The control sockets dead sessions left in `$XDG_RUNTIME_DIR/aoide`
+    // (see `sweep_orphan_sockets`). Computed against the roster MINUS what
+    // this pass is about to reap, so a session dropped now has its socket
+    // collected on the same pass rather than the next one. Runs BEFORE the
+    // quiet-pass early return below on purpose: like the orphaned hooks, the
+    // steady state these accumulate in is exactly the pass where nothing else
+    // happened.
+    let orphan_sockets = {
+        let dead: HashSet<&str> = reaped.iter().map(String::as_str).collect();
+        let surviving: HashSet<&str> = s_file
+            .sessions
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .filter(|id| !dead.contains(id))
+            .collect();
+        sweep_orphan_sockets(&surviving, now_epoch)
+    };
+
     // Age out the warm `stopped` badge: a turn that ended more than an hour ago is
     // just `idle` now. This is the one transition no hook can ever deliver (a
     // session left alone emits nothing), so the periodic pass owns it — and it runs
@@ -770,12 +1024,14 @@ fn reap_inner(
         && decayed.is_empty()
         && orphan_hooks.is_empty()
         && superseded_done.is_empty()
+        && orphan_sockets.is_empty()
     {
         return Outcome::ok(cmd, "nothing to reap (all sessions live)").with_data(json!({
             "reaped": [],
             "decayed": [],
             "orphanHooks": [],
             "supersededDone": [],
+            "orphanSockets": [],
             "hyprctlAvailable": hyprctl_available,
         }));
     }
@@ -871,6 +1127,11 @@ fn reap_inner(
             .iter()
             .map(|id| format!("dropped superseded session {id} (its terminal has a live agent)")),
     );
+    changed.extend(
+        orphan_sockets
+            .iter()
+            .map(|id| format!("unlinked orphaned control socket of {id} (nothing listening)")),
+    );
     match restage_graph() {
         Ok(g) => changed.push(g.to_string_lossy().into_owned()),
         Err(e) => return stage_error(cmd, e),
@@ -878,13 +1139,14 @@ fn reap_inner(
     Outcome::ok(
         cmd,
         format!(
-            "reaped {} dead session(s); dropped {} total; decayed {} stopped → idle; cleared {} orphaned parent link(s); dropped {} orphaned hook record(s); dropped {} superseded session(s)",
+            "reaped {} dead session(s); dropped {} total; decayed {} stopped → idle; cleared {} orphaned parent link(s); dropped {} orphaned hook record(s); dropped {} superseded session(s); unlinked {} orphaned socket(s)",
             reaped.len(),
             removed.len(),
             decayed.len(),
             cleared.len(),
             orphan_hooks.len(),
-            superseded_done.len()
+            superseded_done.len(),
+            orphan_sockets.len()
         ),
     )
     .changed(changed)
@@ -895,6 +1157,7 @@ fn reap_inner(
         "clearedParents": cleared,
         "orphanHooks": orphan_hooks,
         "supersededDone": superseded_done,
+        "orphanSockets": orphan_sockets,
         "hyprctlAvailable": hyprctl_available,
     }))
 }
@@ -1732,5 +1995,144 @@ mod tests {
         let mut bare = agent("b", "0xW", "t");
         bare.kind = None; // agent="claude", not conductable → agent
         assert!(is_agent_kind(&bare));
+    }
+
+    #[test]
+    fn pre_boot_ghosts_are_condemned_and_everything_since_the_boot_is_spared() {
+        // The signal the recycled pid used to shield: a record whose evidence
+        // is all older than the machine's boot instant cannot be attached to
+        // anything running, whatever `/proc/<pid>` now says.
+        let boot = 1_800_000_000_i64;
+        let ghost = hook_only("from-last-boot", "working");
+        let live = hook_only("since-boot", "working");
+        let sessions = vec![ghost, live, hook_only("already-done", "done")];
+
+        // An hour before boot for the ghost, a minute after it for the live
+        // one; the `done` record is never in scope whatever its evidence.
+        let seen = |s: &SessionRecord| match s.session_id.as_str() {
+            "from-last-boot" | "already-done" => Some(boot - 3600),
+            _ => Some(boot + 60),
+        };
+        assert_eq!(
+            pre_boot_ghosts(&sessions, Some(boot), seen),
+            vec!["from-last-boot".to_string()],
+        );
+
+        // Inside the skew grace: evidence a minute before boot is a clock
+        // step, not a previous boot.
+        let just_before = |_: &SessionRecord| Some(boot - 60);
+        assert!(pre_boot_ghosts(&sessions, Some(boot), just_before).is_empty());
+
+        // Both "no evidence" directions leave everything alone: an unreadable
+        // /proc/stat, and a record with nothing parseable to date.
+        assert!(pre_boot_ghosts(&sessions, None, seen).is_empty());
+        assert!(pre_boot_ghosts(&sessions, Some(boot), |_| None).is_empty());
+    }
+
+    #[test]
+    fn orphaned_subagents_take_only_the_ones_whose_parent_left_the_roster() {
+        let sub = |id: &str, parent: Option<&str>| {
+            let mut s = subagent(id, "working");
+            s.parent_session_id = parent.map(str::to_string);
+            s
+        };
+        let sessions = vec![
+            hook_only("parent-live", "working"),
+            hook_only("parent-done", "done"),
+            sub("kept-parent-live", Some("parent-live")),
+            sub("kept-parent-done", Some("parent-done")), // the cascade's job
+            sub("orphan-missing-parent", Some("parent-pruned-away")),
+            sub("orphan-no-parent", None),
+            sub("orphan-blank-parent", Some("   ")),
+            hook_only("not-a-subagent", "working"), // parentless, but not a sub
+        ];
+
+        let mut got = orphaned_subagents(&sessions, |_| false);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "orphan-blank-parent".to_string(),
+                "orphan-missing-parent".to_string(),
+                "orphan-no-parent".to_string(),
+            ],
+        );
+
+        // The settle grace: an infant whose parent link is a moment away is
+        // never judged.
+        assert!(orphaned_subagents(&sessions, |_| true).is_empty());
+
+        // The `sub:` id prefix classifies too, for a record that published no
+        // kind at all.
+        let mut bare = hook_only("sub:t1", "working");
+        bare.kind = None;
+        assert_eq!(
+            orphaned_subagents(&[bare], |_| false),
+            vec!["sub:t1".to_string()],
+        );
+    }
+
+    #[test]
+    fn orphan_control_sockets_are_unlinked_only_with_nothing_listening() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::net::UnixListener;
+
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = crate::graph::testutil::EnvVars::save(&["XDG_RUNTIME_DIR"]);
+        let runtime = crate::graph::testutil::unique_stage("reap-sockets");
+        std::fs::create_dir_all(runtime.join("aoide")).unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &runtime);
+        let dir = runtime.join("aoide");
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        // Backdate past the settle window — the sweep only considers a socket
+        // that has sat still for a minute.
+        let backdate = |p: &std::path::Path| {
+            let t = (now - 600) as libc::time_t;
+            let tv = [libc::timeval {
+                tv_sec: t,
+                tv_usec: 0,
+            }; 2];
+            let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::utimes(c.as_ptr(), tv.as_ptr()) }, 0);
+        };
+
+        // Dropping the listener leaves the socket FILE behind with nobody
+        // accepting — exactly what a SIGKILLed `conduct` leaves.
+        let dead = dir.join("session-killed.sock");
+        drop(UnixListener::bind(&dead).unwrap());
+        backdate(&dead);
+        // Same shape, but its session is still on the roster.
+        let on_roster = dir.join("session-alive-record.sock");
+        drop(UnixListener::bind(&on_roster).unwrap());
+        backdate(&on_roster);
+        // A real live conduct: the listener is held for the whole test, so a
+        // connect succeeds and outranks a roster that never mentions it.
+        let listening = dir.join("session-listening.sock");
+        let _held = UnixListener::bind(&listening).unwrap();
+        backdate(&listening);
+        // Bound a moment ago — inside the settle window between `bind` and the
+        // session record reaching sessions.json.
+        let infant = dir.join("session-infant.sock");
+        drop(UnixListener::bind(&infant).unwrap());
+        // Not a session socket at all: the shellbridge shares this directory.
+        let bridge = dir.join("shellbridge.sock");
+        drop(UnixListener::bind(&bridge).unwrap());
+        backdate(&bridge);
+
+        let live: HashSet<&str> = ["alive-record"].into_iter().collect();
+        assert_eq!(
+            sweep_orphan_sockets(&live, now),
+            vec!["killed".to_string()],
+            "only the dead, settled, roster-less session socket is swept",
+        );
+        assert!(!dead.exists(), "the killed session's socket is unlinked");
+        for spared in [&on_roster, &listening, &infant, &bridge] {
+            assert!(spared.exists(), "spared: {}", spared.display());
+        }
+        let _ = std::fs::remove_dir_all(&runtime);
     }
 }
