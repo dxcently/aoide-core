@@ -1147,7 +1147,17 @@ pub fn point_hover(inv: &Invocation) -> Outcome {
     if !delta.retitled.is_empty() {
         parts.push(format!("{} retitled", delta.retitled.len()));
     }
-    let summary = if parts.is_empty() { "no change".to_string() } else { parts.join(", ") };
+    // An empty delta says only that no TOPLEVEL and no LAYER SURFACE came or
+    // went — the two things `hypr::snapshot` can see. Tooltips, menus and the
+    // rice's own bar popouts are `xdg_popup`s, which `hyprctl` lists nowhere
+    // (measured live 2026-08-17: a GTK tooltip's prelight repainted a 34x34
+    // rect that `screen diff` caught while this delta stayed empty), so the
+    // message must not read as "hovering did nothing".
+    let summary = if parts.is_empty() {
+        "no window/layer change (popups are invisible here — verify with `screen diff`)".to_string()
+    } else {
+        parts.join(", ")
+    };
 
     let mut data = json!({
         "x": got.x, "y": got.y,
