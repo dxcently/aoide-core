@@ -15,6 +15,12 @@
 //! unfiltered (helper components, asset subdirs, `.gitkeep`, everything),
 //! while the manifest only ever lists top-level lowercase-kebab `.qml`
 //! files as slots.
+//!
+//! **Phase 3 addition:** [`sync_song_registry`] carries the declared
+//! widget-TYPE registry (CONTRACTS.md §5; `aoide.arrangement.widgets`) the
+//! same way — a song's `livery.json` `.widgets` key into that song's
+//! `run/qml/songs/registry.json` entry, mirroring the same nix
+//! derivation's build-time `registry.json` walk (Phase 2).
 
 use std::path::Path;
 
@@ -35,6 +41,19 @@ pub struct WidgetSyncOk {
 pub struct WidgetSyncErr {
     pub error: String,
     pub target: String,
+}
+
+/// A successful widget-TYPE registry sync — including the clean no-op
+/// "nothing to do" case (no deployed `run/qml` runtime tree).
+pub struct RegistrySyncOk {
+    /// `run/qml`-rooted files actually (re)written, absolute paths — 0 or 1
+    /// entries (`registry.json`'s own path), same shape as
+    /// [`WidgetSyncOk::changed`].
+    pub changed: Vec<String>,
+    /// This song's synced `.widgets` value (`{}` when absent/malformed).
+    pub widgets: serde_json::Value,
+    /// Human summary for the caller's `Outcome` message/data.
+    pub note: String,
 }
 
 /// Sync `<song>/songbook/<name>/widgets/` into `run/qml/songs/<name>/` and
@@ -201,4 +220,74 @@ fn sync_manifest_entry(
     }
 
     Ok(slots)
+}
+
+/// Rewrite `<name>`'s entry in `run/qml/songs/registry.json` from that
+/// song's CURRENT committed `livery.json` `.widgets` key (CONTRACTS.md §5;
+/// `aoide.arrangement.widgets`) — the RUNTIME hot-sync counterpart to Phase
+/// 2's BUILD-TIME walk (`modules/facets/quickshell/default.nix`'s
+/// `quickshellConfig` derivation, which generates the same file for every
+/// song at build time). Keeps ONE song's entry current after a live edit to
+/// its `livery.json`, no rebuild needed — same preserve-other-songs-entries
+/// + atomic-write pattern [`sync_manifest_entry`] already uses for
+/// `manifest.json`.
+///
+/// Tolerant of a song with no `livery.json` at all, or one with no
+/// `.widgets` key (or a malformed one) — all read as `{}`, mirroring the
+/// build-time walk's own `.widgets // {}` (never an error, never a skipped
+/// song). Independent of whether the song has a `widgets/` dir: `.widgets`
+/// is a sibling field of `livery.json`, not physically tied to widget QML
+/// bodies, exactly as the build-time walk treats it (every committed song
+/// gets an entry there regardless of its `widgets/*.qml` files).
+///
+/// Clean-skips (`Ok`, empty `changed`) when no `run/qml` runtime tree is
+/// deployed at all — mirrors [`sync_song_widgets`]'s own not-yet-switched
+/// early return (`registry.json` lives under the same tree).
+pub fn sync_song_registry(name: &str) -> Result<RegistrySyncOk, WidgetSyncErr> {
+    let run_qml = aoide_storage::fs::run_qml_dir();
+    if !run_qml.is_dir() {
+        return Ok(RegistrySyncOk {
+            changed: vec![],
+            widgets: serde_json::json!({}),
+            note: "no run/qml runtime tree deployed; registry not synced".into(),
+        });
+    }
+
+    let notes_path = aoide_storage::fs::songbook_notes(name);
+    let widgets = std::fs::read_to_string(&notes_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("widgets").cloned())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let registry_path = run_qml.join("songs").join("registry.json");
+    let existing = std::fs::read_to_string(&registry_path).ok();
+    let mut registry: serde_json::Value = existing
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    registry
+        .as_object_mut()
+        .expect("normalized to an object above")
+        .insert(name.to_string(), widgets.clone());
+
+    let body = serde_json::to_string_pretty(&registry).unwrap_or_default() + "\n";
+    let differs = existing.as_deref() != Some(body.as_str());
+    let mut changed: Vec<String> = Vec::new();
+    if differs {
+        aoide_storage::fs::atomic_write(&registry_path, &body).map_err(|e| WidgetSyncErr {
+            error: e.to_string(),
+            target: registry_path.to_string_lossy().into_owned(),
+        })?;
+        changed.push(registry_path.to_string_lossy().into_owned());
+    }
+
+    let note = if differs {
+        format!("synced `{name}`'s widget-type registry entry")
+    } else {
+        "widget-type registry entry already current".to_string()
+    };
+    Ok(RegistrySyncOk { changed, widgets, note })
 }

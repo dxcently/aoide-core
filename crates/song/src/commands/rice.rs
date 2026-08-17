@@ -188,6 +188,11 @@ fn handle_rice_stage_entry(inv: &Invocation) -> Outcome {
                 mode: mode_marker.mode,
                 song: Some(name.clone()),
                 draft: None,
+                // Out of scope for this entrypoint (the direct, guard-checked
+                // `rice stage <name>` CLI, not `rice mode stage`) — carry the
+                // existing "what was I staging" memory forward unchanged
+                // rather than deriving a new opinion about it here.
+                staging_song: mode_marker.staging_song,
                 since: mode_marker.since,
             };
             if aoide_storage::mode::save_mode_marker(&updated).is_ok() {
@@ -363,6 +368,23 @@ pub(crate) fn handle_rice_stage(inv: &Invocation) -> Outcome {
     let widget_sync_changed = !widget_sync.changed.is_empty();
     changed.extend(widget_sync.changed);
 
+    // Widget-TYPE registry (Phase 3): the runtime hot-sync counterpart to
+    // Phase 2's build-time registry.json walk — rewrites this song's entry
+    // from its current livery.json `.widgets` key. Same call site, same
+    // trigger (unconditional on `rice stage`/`preview`), same fatal-on-IO
+    // posture as the widget-body sync just above.
+    let registry_sync = match crate::widgets::sync_song_registry(&name) {
+        Ok(sync) => sync,
+        Err(e) => {
+            return Outcome::error(
+                "rice.stage",
+                format!("failed to sync widget-type registry: {}", e.error),
+            )
+            .with_data(json!({ "reason": "registry-sync-failed", "target": e.target }));
+        }
+    };
+    changed.extend(registry_sync.changed);
+
     // Quickshell IPC hot-reload (best-effort, non-fatal — same tier as
     // hyprctl_status above). The palette/notes tier written above is
     // already covered by LiveryState's own FileView watch — a full-scene
@@ -395,6 +417,7 @@ pub(crate) fn handle_rice_stage(inv: &Invocation) -> Outcome {
         "hyprctl": hyprctl_status,
         "widgets": widget_sync.note,
         "slots": widget_sync.slots,
+        "registry": registry_sync.note,
         "reload": reload_data,
         "seam": "Quickshell hot-reloads stage/livery.json (palette + component tiers); \
                  geometry + border colours are ALSO applied \
@@ -1112,11 +1135,152 @@ mod tests {
 
         let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
         assert_eq!(out.status, Status::Ok, "{:?}", out.data);
-        // Same shape the pre-existing (2-level, no widgets/) fixtures assert:
-        // only livery.json is staged.
-        assert_eq!(out.changed.len(), 1, "no widgets/ dir → nothing else to sync");
+        // livery.json is staged and registry.json is (re)synced — a widget
+        // TYPE declaration lives in livery.json, not the widgets/ dir, so
+        // the registry sync runs independently of it (Phase 3). No widget
+        // BODIES are copied though: no widgets/ dir → no per-song run/qml
+        // songs/moonlight/ dir.
+        assert_eq!(
+            out.changed.len(),
+            2,
+            "no widgets/ dir → no bodies synced, but registry.json still is: {:?}",
+            out.changed
+        );
         assert!(out.changed.iter().any(|c| c.ends_with("stage/livery.json")));
+        assert!(out.changed.iter().any(|c| c.ends_with("run/qml/songs/registry.json")));
         assert!(!run_qml.join("songs").join("moonlight").exists());
+        let registry: Value = serde_json::from_str(
+            &std::fs::read_to_string(run_qml.join("songs").join("registry.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            registry["moonlight"],
+            json!({}),
+            "VALID_NOTES carries no .widgets key → registry entry is {{}}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stage_syncs_a_widget_type_declaration_into_the_registry() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, stage, run_qml) = widget_sync_tmp("stage-registry-declare");
+        let song = root.join("aoide").join("song").join("songbook").join("moonlight");
+        std::fs::create_dir_all(song.join("widgets")).unwrap();
+        let notes = r##"{ "schemaVersion":"0",
+            "palette": {"bg":"#0b1021","fg":"#c8d3f5","accent":"#82aaff","urgent":"#ff757f"},
+            "widgets": { "grimoire": { "kind": "surface", "layer": "top" } } }"##;
+        std::fs::write(song.join("livery.json"), notes).unwrap();
+        std::fs::write(song.join("widgets").join("grimoire.qml"), "// grimoire\n").unwrap();
+        std::fs::create_dir_all(&run_qml).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        let registry: Value = serde_json::from_str(
+            &std::fs::read_to_string(run_qml.join("songs").join("registry.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            registry["moonlight"],
+            json!({ "grimoire": { "kind": "surface", "layer": "top" } })
+        );
+        assert!(
+            out.changed.iter().any(|c| c.ends_with("run/qml/songs/registry.json")),
+            "registry.json write is reported changed: {:?}",
+            out.changed
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stage_syncs_a_dock_kind_widget_declaration_with_order_into_the_registry() {
+        // Phase 9 v2 expansion: `sync_song_registry` passes `.widgets`
+        // through verbatim with no per-field inspection, so a `dock`-kind
+        // entry carrying an `order` field should round-trip unchanged —
+        // same as any other widgets shape (confirms no code change needed
+        // here for the new kind).
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, stage, run_qml) = widget_sync_tmp("stage-registry-dock-order");
+        let song = root.join("aoide").join("song").join("songbook").join("moonlight");
+        std::fs::create_dir_all(song.join("widgets")).unwrap();
+        let notes = r##"{ "schemaVersion":"0",
+            "palette": {"bg":"#0b1021","fg":"#c8d3f5","accent":"#82aaff","urgent":"#ff757f"},
+            "widgets": { "usage": { "kind": "dock", "order": 2 } } }"##;
+        std::fs::write(song.join("livery.json"), notes).unwrap();
+        std::fs::write(song.join("widgets").join("usage.qml"), "// usage\n").unwrap();
+        std::fs::create_dir_all(&run_qml).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        let registry: Value = serde_json::from_str(
+            &std::fs::read_to_string(run_qml.join("songs").join("registry.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            registry["moonlight"],
+            json!({ "usage": { "kind": "dock", "order": 2 } }),
+            "a dock-kind entry with `order` round-trips through sync_song_registry unchanged"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stage_regenerates_the_registry_preserving_other_songs() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, stage, run_qml) = widget_sync_tmp("stage-registry-preserve");
+        let song = root.join("aoide").join("song").join("songbook").join("moonlight");
+        std::fs::create_dir_all(&song).unwrap();
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
+        let songs_dir = run_qml.join("songs");
+        std::fs::create_dir_all(&songs_dir).unwrap();
+        std::fs::write(
+            songs_dir.join("registry.json"),
+            r#"{"dusk":{"clock":{"kind":"surface"}}}"#,
+        )
+        .unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        let registry: Value =
+            serde_json::from_str(&std::fs::read_to_string(songs_dir.join("registry.json")).unwrap())
+                .unwrap();
+        assert_eq!(registry["moonlight"], json!({}), "no .widgets key → {{}}");
+        assert_eq!(
+            registry["dusk"],
+            json!({"clock":{"kind":"surface"}}),
+            "another song's registry entry survives the rewrite untouched"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stage_leaves_the_registry_untouched_when_already_current() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, stage, run_qml) = widget_sync_tmp("stage-registry-unchanged");
+        let song = root.join("aoide").join("song").join("songbook").join("moonlight");
+        std::fs::create_dir_all(&song).unwrap();
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
+        let songs_dir = run_qml.join("songs");
+        std::fs::create_dir_all(&songs_dir).unwrap();
+        // Already current — byte-identical to what the sync would write.
+        let body = serde_json::to_string_pretty(&json!({"moonlight": {}})).unwrap() + "\n";
+        std::fs::write(songs_dir.join("registry.json"), &body).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert!(
+            !out.changed.iter().any(|c| c.ends_with("run/qml/songs/registry.json")),
+            "a byte-identical registry entry must not be reported as changed: {:?}",
+            out.changed
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

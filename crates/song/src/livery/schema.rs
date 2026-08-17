@@ -75,6 +75,26 @@ pub const COMPONENT_FALLBACK: [(&str, &[(&str, &str)]); 3] = [
 /// The v0 schema version, carried into every resolved/emitted document.
 pub const SCHEMA_VERSION: &str = "0";
 
+/// The widgets-tier per-entry field set (CONTRACTS.md §5 "Per-song flavor
+/// widgets"; `modules/nucleus/options.nix`'s `widgetType` submodule — this
+/// validator is that option's authoritative Rust-side twin, same
+/// permissive-nix/authoritative-Rust split as the rest of this file). Each
+/// entry under the top-level `widgets` key is CLOSED, exactly like the
+/// palette/base16/component groups above.
+pub const WIDGET_KEYS: [&str; 6] =
+    ["kind", "namespace", "layer", "shortcut", "blur", "order"];
+
+/// The only valid `widgets.<slot>.layer` values (`options.nix`'s
+/// `types.enum [ "overlay" "top" ]`).
+pub const WIDGET_LAYER_VALUES: [&str; 2] = ["overlay", "top"];
+
+/// The only valid `widgets.<slot>.kind` values (`options.nix`'s
+/// `types.enum [ "surface" "dock" ]`). `"surface"` mounts into a layer-shell
+/// surface (`namespace`/`layer`/`shortcut`/`blur` apply); `"dock"` mounts
+/// into `AoidePanel`'s gadget column instead (`order` applies) — the two
+/// kinds' extra fields are mutually exclusive, enforced below.
+pub const WIDGET_KIND_VALUES: [&str; 2] = ["surface", "dock"];
+
 // ── JS-shape helpers ─────────────────────────────────────────────────────────
 //
 // JS `typeof [] === "object"` and `Object.keys(arr)` yields index strings —
@@ -278,6 +298,147 @@ pub fn validate(container: &Value) -> Validation {
         }
     }
 
+    // Widgets tier — optional top-level key, an object keyed by slot name
+    // (CONTRACTS.md §5; `aoide.arrangement.widgets`, options.nix). Absent
+    // means "no declared widget types", treated as `{}` — same posture the
+    // build-time walk already uses (`modules/facets/quickshell/default.nix`'s
+    // `.widgets // {}`). These fields are plain configuration, not W3C
+    // design-token notes (no `{group.key}` refs, no `$value` wrapping), so
+    // they are matched directly against `Value`, unlike the colour tiers
+    // above.
+    match object_get(container, "widgets") {
+        None | Some(Value::Null) => {}
+        Some(w) if !is_objectish(w) => {
+            errors.push("widgets: expected an object keyed by slot name".to_string());
+        }
+        Some(widgets) => {
+            for slot in object_keys(widgets) {
+                let entry = object_get(widgets, &slot).unwrap();
+                let path = format!("widgets.{slot}");
+                if !is_objectish(entry) {
+                    errors.push(format!("{path}: expected a widget declaration object"));
+                    continue;
+                }
+
+                // kind — required; "surface" or "dock" are the valid v1
+                // values (WIDGET_KIND_VALUES). Captured for the
+                // kind-conditional field checks below: `namespace`/`layer`/
+                // `shortcut`/`blur` are surface-only, `order` is dock-only.
+                let kind: Option<&str> = match object_get(entry, "kind") {
+                    None | Some(Value::Null) => {
+                        errors.push(format!("{path}.kind: required"));
+                        None
+                    }
+                    Some(Value::String(s)) => {
+                        if WIDGET_KIND_VALUES.contains(&s.as_str()) {
+                            Some(s.as_str())
+                        } else {
+                            errors.push(format!(
+                                "{path}.kind: \"{s}\" is not a valid kind (expected \"surface\" or \"dock\")"
+                            ));
+                            None
+                        }
+                    }
+                    Some(other) => {
+                        errors.push(format!(
+                            "{path}.kind: expected string, got {}",
+                            js_typeof(other)
+                        ));
+                        None
+                    }
+                };
+
+                // namespace — optional string; null/absent both mean
+                // "derive from the slot name" (options.nix
+                // `widgetType.namespace`). Surface-only: a dock entry has no
+                // layer-shell surface, so a namespace on one is almost
+                // certainly a copy-paste mistake.
+                match object_get(entry, "namespace") {
+                    None | Some(Value::Null) => {}
+                    Some(_) if kind == Some("dock") => errors.push(format!(
+                        "{path}.namespace: not valid for kind \"dock\" (namespace only applies to kind \"surface\")"
+                    )),
+                    Some(Value::String(_)) => {}
+                    Some(other) => errors.push(format!(
+                        "{path}.namespace: expected string, got {}",
+                        js_typeof(other)
+                    )),
+                }
+
+                // layer — optional string; surface-only, same posture as
+                // namespace. When present for "surface", must be "overlay"
+                // or "top" (default "overlay" is applied downstream, not
+                // here).
+                match object_get(entry, "layer") {
+                    None => {}
+                    Some(_) if kind == Some("dock") => errors.push(format!(
+                        "{path}.layer: not valid for kind \"dock\" (layer only applies to kind \"surface\")"
+                    )),
+                    Some(Value::String(s)) if WIDGET_LAYER_VALUES.contains(&s.as_str()) => {}
+                    Some(Value::String(s)) => errors.push(format!(
+                        "{path}.layer: \"{s}\" is not a valid layer (expected \"overlay\" or \"top\")"
+                    )),
+                    Some(other) => errors.push(format!(
+                        "{path}.layer: expected string, got {}",
+                        js_typeof(other)
+                    )),
+                }
+
+                // shortcut — optional string or null; surface-only, same
+                // posture as namespace.
+                match object_get(entry, "shortcut") {
+                    None | Some(Value::Null) => {}
+                    Some(_) if kind == Some("dock") => errors.push(format!(
+                        "{path}.shortcut: not valid for kind \"dock\" (shortcut only applies to kind \"surface\")"
+                    )),
+                    Some(Value::String(_)) => {}
+                    Some(other) => errors.push(format!(
+                        "{path}.shortcut: expected string, got {}",
+                        js_typeof(other)
+                    )),
+                }
+
+                // blur — optional bool; surface-only, same posture as
+                // namespace/layer/shortcut (default true is applied
+                // downstream, not here).
+                match object_get(entry, "blur") {
+                    None => {}
+                    Some(_) if kind == Some("dock") => errors.push(format!(
+                        "{path}.blur: not valid for kind \"dock\" (blur only applies to kind \"surface\")"
+                    )),
+                    Some(Value::Bool(_)) => {}
+                    Some(other) => errors.push(format!(
+                        "{path}.blur: expected boolean, got {}",
+                        js_typeof(other)
+                    )),
+                }
+
+                // order — optional integer; dock-only (dock-column
+                // ordering — surfaces don't participate in the dock column,
+                // so an order on one is almost certainly a copy-paste
+                // mistake).
+                match object_get(entry, "order") {
+                    None | Some(Value::Null) => {}
+                    Some(_) if kind == Some("surface") => errors.push(format!(
+                        "{path}.order: not valid for kind \"surface\" (order only applies to kind \"dock\")"
+                    )),
+                    Some(Value::Number(n)) if n.is_i64() => {}
+                    Some(other) => errors.push(format!(
+                        "{path}.order: expected integer, got {}",
+                        js_typeof(other)
+                    )),
+                }
+
+                // Unknown keys — widget entries are closed.
+                for k in object_keys(entry) {
+                    if !WIDGET_KEYS.contains(&k.as_str()) {
+                        errors.push(format!("{path}.{k}: unknown key ({path} is closed)"));
+                    }
+                }
+            }
+        }
+    }
+
     Validation {
         ok: errors.is_empty(),
         errors,
@@ -408,5 +569,284 @@ mod tests {
         let r = validate(&v);
         check("bar.bg with $value null is accepted at lint", r.ok);
         check("no errors reported", r.errors.is_empty());
+    }
+
+    // ── Widgets tier (CONTRACTS.md §5 / options.nix `widgetType`) ───────────
+
+    // 12. widgets absent stays valid — same optionality as base16/hot.
+    #[test]
+    fn widgets_absent_is_accepted() {
+        let r = validate(&load("valid.json"));
+        check("valid.json (no widgets) is accepted", r.ok);
+    }
+
+    // 13. An empty widgets object is accepted.
+    #[test]
+    fn widgets_empty_object_is_accepted() {
+        let mut v = load("valid.json");
+        v["widgets"] = serde_json::json!({});
+        let r = validate(&v);
+        check("widgets: {} is accepted", r.ok);
+    }
+
+    // 14. A fully-specified valid widget entry is accepted.
+    #[test]
+    fn widgets_full_entry_is_accepted() {
+        let mut v = load("valid.json");
+        v["widgets"] = serde_json::json!({
+            "grimoire": {
+                "kind": "surface",
+                "namespace": "aoide-grimoire",
+                "layer": "top",
+                "shortcut": "aoide:grimoire",
+                "blur": false
+            }
+        });
+        let r = validate(&v);
+        check("a full valid widget entry is accepted", r.ok);
+    }
+
+    // 15. A widget entry with only the required `kind` field is accepted —
+    // namespace/layer/shortcut/blur are all optional.
+    #[test]
+    fn widgets_entry_with_only_kind_is_accepted() {
+        let mut v = load("valid.json");
+        v["widgets"] = serde_json::json!({ "grimoire": { "kind": "surface" } });
+        let r = validate(&v);
+        check("a widget entry with only `kind` is accepted", r.ok);
+    }
+
+    // 16. A missing `kind` is rejected, naming the slot.
+    #[test]
+    fn widgets_missing_kind_is_rejected_and_named() {
+        let mut v = load("valid.json");
+        v["widgets"] = serde_json::json!({ "grimoire": {} });
+        let r = validate(&v);
+        check("a widget entry with no kind is rejected", !r.ok);
+        check(
+            "rejection error names widgets.grimoire.kind",
+            r.errors.iter().any(|e| e == "widgets.grimoire.kind: required"),
+        );
+    }
+
+    // 17. An invalid `kind` value is rejected — "surface" and "dock" are the
+    // only v1 values, and the error enumerates both.
+    #[test]
+    fn widgets_invalid_kind_is_rejected_and_named() {
+        let mut v = load("valid.json");
+        v["widgets"] = serde_json::json!({ "grimoire": { "kind": "popup" } });
+        let r = validate(&v);
+        check("kind \"popup\" is rejected", !r.ok);
+        check(
+            "rejection error enumerates both valid kind values",
+            r.errors.iter().any(|e| {
+                e == "widgets.grimoire.kind: \"popup\" is not a valid kind (expected \"surface\" or \"dock\")"
+            }),
+        );
+    }
+
+    // 18. An invalid `layer` value is rejected — only overlay/top are valid.
+    #[test]
+    fn widgets_invalid_layer_is_rejected_and_named() {
+        let mut v = load("valid.json");
+        v["widgets"] =
+            serde_json::json!({ "grimoire": { "kind": "surface", "layer": "bottom" } });
+        let r = validate(&v);
+        check("layer \"bottom\" is rejected", !r.ok);
+        check(
+            "rejection error names widgets.grimoire.layer",
+            r.errors.iter().any(|e| e.contains("widgets.grimoire.layer")),
+        );
+    }
+
+    // 19. `namespace`/`shortcut` explicit `null` are tolerated (both mean
+    // "derive"/"none"), same JS-`== null` posture as the colour tiers.
+    #[test]
+    fn widgets_null_namespace_and_shortcut_are_accepted() {
+        let mut v = load("valid.json");
+        v["widgets"] = serde_json::json!({
+            "grimoire": { "kind": "surface", "namespace": null, "shortcut": null }
+        });
+        let r = validate(&v);
+        check("null namespace/shortcut are accepted", r.ok);
+    }
+
+    // 20. A non-bool `blur` is rejected, naming the slot.
+    #[test]
+    fn widgets_non_bool_blur_is_rejected_and_named() {
+        let mut v = load("valid.json");
+        v["widgets"] = serde_json::json!({ "grimoire": { "kind": "surface", "blur": "yes" } });
+        let r = validate(&v);
+        check("a non-bool blur is rejected", !r.ok);
+        check(
+            "rejection error names widgets.grimoire.blur",
+            r.errors.iter().any(|e| e.contains("widgets.grimoire.blur")),
+        );
+    }
+
+    // 21. An unknown key inside a widget entry is rejected — widget entries
+    // are closed, same discipline as base16/palette/component.
+    #[test]
+    fn widgets_unknown_key_inside_entry_is_rejected() {
+        let mut v = load("valid.json");
+        v["widgets"] =
+            serde_json::json!({ "grimoire": { "kind": "surface", "bogus": "nope" } });
+        let r = validate(&v);
+        check("an unknown key inside a widget entry is rejected", !r.ok);
+        check(
+            "rejection error names widgets.grimoire.bogus",
+            r.errors.iter().any(|e| e.contains("widgets.grimoire.bogus")),
+        );
+    }
+
+    // 22. `widgets` itself must be an object keyed by slot name.
+    #[test]
+    fn widgets_non_object_is_rejected() {
+        let mut v = load("valid.json");
+        v["widgets"] = serde_json::json!("nope");
+        let r = validate(&v);
+        check("a non-object widgets value is rejected", !r.ok);
+        check(
+            "rejection error names widgets",
+            r.errors.iter().any(|e| e.starts_with("widgets:")),
+        );
+    }
+
+    // ── `kind: "dock"` (Phase 9 v2 expansion) ────────────────────────────────
+
+    // 23. A `dock`-kind entry with ONLY `kind` is accepted — namespace,
+    // layer, shortcut, and blur are surface-only, and `order` is optional
+    // even for dock.
+    #[test]
+    fn widgets_dock_kind_with_only_kind_is_accepted() {
+        let mut v = load("valid.json");
+        v["widgets"] = serde_json::json!({ "dockwidget": { "kind": "dock" } });
+        let r = validate(&v);
+        check("a dock-kind entry with only `kind` is accepted", r.ok);
+    }
+
+    // 24. A `dock`-kind entry with `kind` and `order` is accepted.
+    #[test]
+    fn widgets_dock_kind_with_order_is_accepted() {
+        let mut v = load("valid.json");
+        v["widgets"] = serde_json::json!({ "dockwidget": { "kind": "dock", "order": 2 } });
+        let r = validate(&v);
+        check("a dock-kind entry with kind + order is accepted", r.ok);
+    }
+
+    // 25. A `dock`-kind entry with `namespace` present is rejected —
+    // namespace is surface-only; the error names both the field and the
+    // entry's actual kind.
+    #[test]
+    fn widgets_dock_kind_with_namespace_is_rejected_and_named() {
+        let mut v = load("valid.json");
+        v["widgets"] =
+            serde_json::json!({ "dockwidget": { "kind": "dock", "namespace": "aoide-dock" } });
+        let r = validate(&v);
+        check("dock + namespace is rejected", !r.ok);
+        check(
+            "error names widgets.dockwidget.namespace and kind \"dock\"",
+            r.errors.iter().any(|e| {
+                e == "widgets.dockwidget.namespace: not valid for kind \"dock\" (namespace only applies to kind \"surface\")"
+            }),
+        );
+    }
+
+    // 26. A `dock`-kind entry with `layer` present is rejected — same
+    // surface-only posture as namespace.
+    #[test]
+    fn widgets_dock_kind_with_layer_is_rejected_and_named() {
+        let mut v = load("valid.json");
+        v["widgets"] = serde_json::json!({ "dockwidget": { "kind": "dock", "layer": "top" } });
+        let r = validate(&v);
+        check("dock + layer is rejected", !r.ok);
+        check(
+            "error names widgets.dockwidget.layer and kind \"dock\"",
+            r.errors.iter().any(|e| {
+                e == "widgets.dockwidget.layer: not valid for kind \"dock\" (layer only applies to kind \"surface\")"
+            }),
+        );
+    }
+
+    // 27. A `dock`-kind entry with `shortcut` present is rejected — same
+    // surface-only posture as namespace.
+    #[test]
+    fn widgets_dock_kind_with_shortcut_is_rejected_and_named() {
+        let mut v = load("valid.json");
+        v["widgets"] = serde_json::json!({
+            "dockwidget": { "kind": "dock", "shortcut": "aoide:dockwidget" }
+        });
+        let r = validate(&v);
+        check("dock + shortcut is rejected", !r.ok);
+        check(
+            "error names widgets.dockwidget.shortcut and kind \"dock\"",
+            r.errors.iter().any(|e| {
+                e == "widgets.dockwidget.shortcut: not valid for kind \"dock\" (shortcut only applies to kind \"surface\")"
+            }),
+        );
+    }
+
+    // 28. A `dock`-kind entry with `blur` present is rejected — same
+    // surface-only posture as namespace.
+    #[test]
+    fn widgets_dock_kind_with_blur_is_rejected_and_named() {
+        let mut v = load("valid.json");
+        v["widgets"] = serde_json::json!({ "dockwidget": { "kind": "dock", "blur": false } });
+        let r = validate(&v);
+        check("dock + blur is rejected", !r.ok);
+        check(
+            "error names widgets.dockwidget.blur and kind \"dock\"",
+            r.errors.iter().any(|e| {
+                e == "widgets.dockwidget.blur: not valid for kind \"dock\" (blur only applies to kind \"surface\")"
+            }),
+        );
+    }
+
+    // 29. A `surface`-kind entry with `order` present is rejected — order is
+    // dock-only (dock-column ordering; surfaces don't participate).
+    #[test]
+    fn widgets_surface_kind_with_order_is_rejected_and_named() {
+        let mut v = load("valid.json");
+        v["widgets"] = serde_json::json!({ "grimoire": { "kind": "surface", "order": 1 } });
+        let r = validate(&v);
+        check("surface + order is rejected", !r.ok);
+        check(
+            "error names widgets.grimoire.order and kind \"surface\"",
+            r.errors.iter().any(|e| {
+                e == "widgets.grimoire.order: not valid for kind \"surface\" (order only applies to kind \"dock\")"
+            }),
+        );
+    }
+
+    // 30. A non-integer `order` (a string) is rejected with a type-mismatch
+    // error using js_typeof.
+    #[test]
+    fn widgets_non_integer_order_string_is_rejected_and_named() {
+        let mut v = load("valid.json");
+        v["widgets"] = serde_json::json!({ "dockwidget": { "kind": "dock", "order": "first" } });
+        let r = validate(&v);
+        check("a string order is rejected", !r.ok);
+        check(
+            "rejection error names widgets.dockwidget.order via js_typeof",
+            r.errors
+                .iter()
+                .any(|e| e == "widgets.dockwidget.order: expected integer, got string"),
+        );
+    }
+
+    // 31. A non-integer `order` (a float) is rejected the same way — JS
+    // makes no int/float distinction, so js_typeof still reports "number".
+    #[test]
+    fn widgets_non_integer_order_float_is_rejected_and_named() {
+        let mut v = load("valid.json");
+        v["widgets"] = serde_json::json!({ "dockwidget": { "kind": "dock", "order": 1.5 } });
+        let r = validate(&v);
+        check("a float order is rejected", !r.ok);
+        check(
+            "rejection error names widgets.dockwidget.order via js_typeof",
+            r.errors
+                .iter()
+                .any(|e| e == "widgets.dockwidget.order: expected integer, got number"),
+        );
     }
 }
