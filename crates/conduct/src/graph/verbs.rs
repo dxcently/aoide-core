@@ -30,13 +30,28 @@ pub fn view(inv: &Invocation) -> Outcome {
     Outcome::ok("graph.view", format!("{n} node(s), {e} edge(s)\n{tree}")).with_data(doc)
 }
 
-/// `graph project add <name> <path>` — register/update an anchor root.
+/// `graph project add <name> [<path>]` — register/update an anchor root.
+/// `path` defaults to the current working directory, so a bare
+/// `aoide graph project add <name>` registers the dir you're in — and a
+/// session started there anchors to it by cwd prefix.
 pub fn project_add(inv: &Invocation) -> Outcome {
-    let args = match require_args(inv, &["name", "path"]) {
+    let args = match require_args(inv, &["name"]) {
         Ok(a) => a,
         Err(e) => return e,
     };
-    let (name, path) = (args[0].clone(), args[1].clone());
+    let name = args[0].clone();
+    let path = match inv.args.get(1) {
+        Some(p) => p.clone(),
+        None => match std::env::current_dir() {
+            Ok(d) => d.to_string_lossy().into_owned(),
+            Err(e) => {
+                return Outcome::error(
+                    "graph.project.add",
+                    format!("no path given and the working directory is unavailable: {e}"),
+                )
+            }
+        },
+    };
     let mut file: ProjectsFile = match load_stage(&projects_path()) {
         Ok(f) => f,
         Err(e) => return stage_error("graph.project.add", e),
@@ -283,6 +298,7 @@ pub fn emit(_inv: &Invocation) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::anchor_for;
     use crate::graph::testutil::*;
 
     #[test]
@@ -394,6 +410,41 @@ mod tests {
         assert_eq!(staged, build_graph(&p.projects, &s.sessions, &h.hooks));
 
         match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn project_add_defaults_path_to_cwd() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_cwd = std::env::current_dir().ok();
+        let stage = unique_stage("cwd-default");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        // Bare `project add <name>` registers the cwd as the anchor root.
+        std::env::set_current_dir(&stage).unwrap();
+        let out = project_add(&invocation(&["graph", "project", "add"], &["aoide"]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+
+        let file: ProjectsFile = load_stage(&projects_path()).unwrap();
+        let p = file.projects.iter().find(|p| p.name == "aoide").unwrap();
+        assert_eq!(
+            p.path,
+            stage.to_string_lossy().into_owned(),
+            "bare `project add <name>` registers the cwd"
+        );
+
+        // A session started in that cwd anchors under the project.
+        let (ps, _, _) = load_inputs("test").unwrap();
+        assert_eq!(anchor_for(&stage.to_string_lossy(), &ps.projects), Some(0));
+
+        if let Some(c) = saved_cwd {
+            std::env::set_current_dir(c).unwrap();
+        }
+        match saved_stage {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
             None => std::env::remove_var("AOIDE_STAGE_DIR"),
         }

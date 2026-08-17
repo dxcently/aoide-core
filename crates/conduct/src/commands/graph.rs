@@ -27,7 +27,7 @@ pub fn register(r: &mut Registry) {
         summary: "Register or update a project anchor root in song/stage/projects.json (atomic, idempotent).",
         args: [
             arg!("name", "string", true, "Project name (its node id becomes project:<name>)."),
-            arg!("path", "string", true, "Project root path; sessions anchor by cwd prefix (longest wins)."),
+            arg!("path", "string", false, "Project root path (defaults to the current working directory); sessions anchor by cwd prefix (longest wins)."),
         ],
         flags: [],
         gated: false,
