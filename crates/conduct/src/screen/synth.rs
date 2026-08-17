@@ -271,10 +271,11 @@ impl PointerError {
 /// old `scroll_notches`, now deleted): that scaling was wlrctl's own
 /// invention, not a compositor requirement — `wl_pointer`'s documented
 /// convention for one physical wheel click is `120/8 = 15.0` continuous
-/// units alongside `discrete = 1`. `15.0` here means **n notches now means
-/// n real wheel detents**, not n arbitrary wlrctl units; Phase C (this
-/// workstream's live-verification phase) confirms the magnitude feels right
-/// against a real compositor before this is called settled.
+/// units alongside `discrete = 1`. `15.0` here means **n notches means
+/// n real wheel detents**, not n arbitrary wlrctl units — settled by live
+/// measurement against Hyprland (2026-08-17): `scroll 3` moved kitty by
+/// exactly 15 lines under its default 5-lines-per-detent multiplier, so
+/// one notch is one physical detent.
 const WHEEL_VALUE: f64 = 15.0;
 
 /// Defense-in-depth bound on wheel notches PER [`Step::Wheel`] (khoa's Phase
