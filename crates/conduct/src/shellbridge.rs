@@ -61,6 +61,23 @@ pub enum BridgeCommand {
     /// (`staging ⇄ declarative`), never a picker QML would need to supply
     /// state for. See [`dispatch_rice_mode_toggle`].
     ToggleRiceMode,
+    /// `{ "cmd": "refreshusage" }` — a click on the CLAUDE ledger gadget's ❋
+    /// spark (UsageGadget.qml). No payload: the daemon re-runs `aoide usage`
+    /// itself, which atomic-writes `state/usage.json`, and the gadget's own
+    /// FileView watch picks the new file up and re-renders — the manual
+    /// analogue of the poller timer's periodic write. See
+    /// [`dispatch_usage_refresh`].
+    RefreshUsage,
+    /// `{ "cmd": "rechecksessions" }` — a click on the Terminals/Conductor
+    /// header recheck control. No payload: the daemon re-execs `aoide graph
+    /// reap` itself — the liveness/rehook sweep (reap dead sessions, decay
+    /// `stopped` → `idle`, prune orphaned hook records) the ~12s
+    /// `aoide-graph-reap.timer` runs periodically — so a resumed/exited session
+    /// is re-evaluated NOW instead of waiting up to a full timer period. The
+    /// gadgets refresh off the resulting `sessions.json`/`hooks.json`/
+    /// `graph.json` writes through their own FileView watches. See
+    /// [`dispatch_recheck_sessions`].
+    RecheckSessions,
 }
 
 /// The six system actions the powermenu can request. A closed set — an unknown
@@ -157,6 +174,8 @@ pub fn parse_command(line: &str) -> Option<BridgeCommand> {
             PowerAction::from_wire(&action).map(|action| BridgeCommand::Power { action })
         }
         "ricemode" => Some(BridgeCommand::ToggleRiceMode),
+        "refreshusage" => Some(BridgeCommand::RefreshUsage),
+        "rechecksessions" => Some(BridgeCommand::RecheckSessions),
         _ => None,
     }
 }
@@ -184,6 +203,11 @@ fn dispatch_power(action: PowerAction) -> std::io::Result<()> {
 /// own, `commands/mode.rs`'s `handle_mode_stage`). There is no generic "next
 /// draft" a bare click could cycle into without a name, so draft is only
 /// ever reachable via `rice mode draft <name>`, never this toggle.
+///
+/// This decides ONLY the target word, not which song it acts on — see
+/// [`dispatch_rice_mode_toggle`] for the asymmetric song-arg resolution
+/// (`declarative` explicitly re-pins to `AOIDE_DEFAULT_SONG`; `stage` stays
+/// bare).
 fn rice_mode_toggle_target(current: RiceMode) -> &'static str {
     match current {
         RiceMode::Staging => "declarative",
@@ -199,9 +223,29 @@ fn rice_mode_toggle_target(current: RiceMode) -> &'static str {
 ///
 /// Re-execs THIS SAME running binary (`std::env::current_exe()`, the same
 /// self-re-exec idiom `server/src/a2a.rs`'s `do_spawn` uses — never a bare
-/// `"aoide"` relying on PATH) as `rice mode <target> --json`. On success
-/// (exit 0), returns the CLI's own `message` string verbatim — reusing that
-/// exact copy rather than inventing new wording — and fires a detached
+/// `"aoide"` relying on PATH) as `rice mode <target> --json`.
+///
+/// The two toggle directions are deliberately asymmetric about which song
+/// they act on. `stage` (declarative/draft → staging) passes no song arg —
+/// `handle_mode_stage` resolves via its own `current_staged_song()`, and
+/// staying on whatever's currently being edited is the reasonable default
+/// there. `declarative` (staging → declarative) is different: that
+/// direction is supposed to mean "matches nix," not "frozen wherever I
+/// happened to be," so it explicitly appends the nix-declared baseline song
+/// (`AOIDE_DEFAULT_SONG`, baked into shellbridge.service by
+/// modules/nucleus/shellbridge.nix — the same env-var precedent as
+/// AOIDE_WALLPAPER) as the CLI arg, overriding `handle_mode_declarative`'s
+/// bare-call fallback to whatever song is currently staged
+/// (`commands/mode.rs`). If the env var is absent or empty (outside the
+/// systemd service, or before a rebuild lands it) this falls back to the
+/// existing bare no-arg call rather than erroring — a missing env var must
+/// never turn a working toggle into a broken one. This asymmetry is scoped
+/// to THIS dispatch path only: a bare `aoide rice mode declarative` typed
+/// directly in a terminal is untouched and keeps resolving via
+/// `current_staged_song()`.
+///
+/// On success (exit 0), returns the CLI's own `message` string verbatim —
+/// reusing that exact copy rather than inventing new wording — and fires a detached
 /// `notify-send "Aoide" <message>` (same reaper-thread idiom as
 /// `dispatch_power`'s spawned child, so a slow/hung `notify-send` can never
 /// block the accept loop; a `notify-send` spawn failure is a soft, eprintln
@@ -209,13 +253,38 @@ fn rice_mode_toggle_target(current: RiceMode) -> &'static str {
 /// toggle failure). On failure (non-zero exit, a spawn error, or unparsable
 /// JSON on an exit-0 that shouldn't happen) returns `Err` for the caller to
 /// audit-log — no notification fires for a failed toggle.
+/// Pure decision: does the declarative-direction toggle have an explicit
+/// baseline song to pass, given the toggle's target word and the CURRENT
+/// `AOIDE_DEFAULT_SONG` env value (read by the caller, passed in untouched —
+/// kept pure and out of `std::env` here so this is unit-testable without
+/// mutating process-wide env state, which races under parallel tests). The
+/// `stage` direction never gets one (see [`dispatch_rice_mode_toggle`]'s doc
+/// comment for why); an absent or blank/whitespace-only value also yields
+/// `None` — never pass an empty arg, and never let a missing env var
+/// (outside the systemd service, or before a rebuild lands it) turn the
+/// toggle into anything but the existing bare call.
+fn rice_mode_toggle_default_song(target: &str, env_value: Option<&str>) -> Option<String> {
+    if target != "declarative" {
+        return None;
+    }
+    let trimmed = env_value?.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 fn dispatch_rice_mode_toggle() -> Result<String, String> {
     let current = load_mode_marker().mode;
     let target = rice_mode_toggle_target(current);
+    let default_song =
+        rice_mode_toggle_default_song(target, std::env::var("AOIDE_DEFAULT_SONG").ok().as_deref());
 
     let exe = std::env::current_exe().map_err(|e| format!("resolving the aoide binary: {e}"))?;
-    let output = std::process::Command::new(&exe)
-        .args(["rice", "mode", target, "--json"])
+    let mut command = std::process::Command::new(&exe);
+    command.args(["rice", "mode", target]);
+    if let Some(song) = &default_song {
+        command.arg(song);
+    }
+    command.arg("--json");
+    let output = command
         .output()
         .map_err(|e| format!("spawning `aoide rice mode {target}`: {e}"))?;
 
@@ -252,6 +321,210 @@ fn dispatch_rice_mode_toggle() -> Result<String, String> {
     }
 
     Ok(message)
+}
+
+/// Pure decision: did one finished `aoide usage --json` actually refresh the
+/// state file? Judged on the CLI's own JSON envelope `status`, NOT the exit
+/// code alone — the same "success is the real output, not the exit status"
+/// rule `song/src/ipc.rs`'s `classify_call` is built on. `aoide usage` prints
+/// `{"status":"ok",…,"message":"…"}` and exits 0 on a real `state/usage.json`
+/// write, and an error envelope (or a non-zero exit) when the atomic write
+/// itself fails.
+///
+/// A DEGRADED live block is NOT a failure: a `live:{ok:false}` payload (no
+/// credentials, the Claude-Code-only OAuth rejection, a transport error) still
+/// yields status `ok` and a written file — exactly the graceful-degrade the
+/// gadget is built to render — so the refresh SUCCEEDED. Only a failed write,
+/// a non-zero exit, or unparseable output is an `Err`. Returns the CLI's own
+/// `message` on success so the audit line reuses that exact wording rather than
+/// inventing new copy (same discipline as [`dispatch_rice_mode_toggle`]).
+fn classify_usage_refresh(exited_ok: bool, stdout: &str, stderr: &str) -> Result<String, String> {
+    if !exited_ok {
+        // `--json` still prints the structured envelope on failure; prefer a
+        // spoken stderr, fall back to stdout, never a blank reason.
+        let said = {
+            let e = stderr.trim();
+            if e.is_empty() {
+                stdout.trim()
+            } else {
+                e
+            }
+        };
+        return Err(if said.is_empty() {
+            "`aoide usage` exited nonzero with no message".to_string()
+        } else {
+            said.to_string()
+        });
+    }
+    let v: Value = serde_json::from_str(stdout.trim())
+        .map_err(|_| "`aoide usage --json` printed no parseable envelope".to_string())?;
+    let message = v
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("usage refreshed")
+        .to_string();
+    match v.get("status").and_then(Value::as_str) {
+        Some("ok") => Ok(message),
+        Some(other) => Err(format!("`aoide usage` reported status {other}: {message}")),
+        None => Err("`aoide usage --json` output had no status field".to_string()),
+    }
+}
+
+/// Dispatch ONE usage refresh: re-exec THIS running binary as `aoide usage
+/// --json` (the same `std::env::current_exe()` self-re-exec idiom as
+/// [`dispatch_rice_mode_toggle`], never a bare `"aoide"` off PATH) and audit
+/// the outcome, judged on its real output via [`classify_usage_refresh`].
+///
+/// Runs on a DETACHED thread. Unlike the rice-mode toggle (a fast local switch,
+/// safe to `.output()` inline), `aoide usage`'s live fetch is `curl --max-time
+/// 15`, so waiting for it inline would freeze the whole accept loop
+/// (session-jumps, power, ricemode all queue behind one usage click) for up to
+/// 15 s. So this SPAWNS and returns immediately — the same no-block posture
+/// [`dispatch_power`] takes — and the thread collects the child and audits the
+/// result so it neither lingers nor blocks. The gadget updates itself off the
+/// resulting `state/usage.json` write through its own FileView watch regardless
+/// of what this logs; the audit line exists for the operator, not to push data.
+/// Best-effort throughout: a spawn failure or a classify error is audited,
+/// never panicked or propagated.
+fn dispatch_usage_refresh() {
+    std::thread::spawn(|| {
+        let exe = match std::env::current_exe() {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = daemon::audit(
+                    &daemon::default_audit_log(),
+                    daemon::Door::Daemon,
+                    daemon::EventClass::Audit,
+                    "shellbridge",
+                    "usage-refresh-failed",
+                    &format!("resolving the aoide binary: {e}"),
+                );
+                return;
+            }
+        };
+        let result = match std::process::Command::new(&exe).args(["usage", "--json"]).output() {
+            Ok(out) => classify_usage_refresh(
+                out.status.success(),
+                &String::from_utf8_lossy(&out.stdout),
+                &String::from_utf8_lossy(&out.stderr),
+            ),
+            Err(e) => Err(format!("spawning `aoide usage`: {e}")),
+        };
+        let (event, detail) = match result {
+            Ok(msg) => ("usage-refresh", msg),
+            Err(e) => ("usage-refresh-failed", e),
+        };
+        let _ = daemon::audit(
+            &daemon::default_audit_log(),
+            daemon::Door::Daemon,
+            daemon::EventClass::Audit,
+            "shellbridge",
+            event,
+            &detail,
+        );
+    });
+}
+
+/// Pure decision: did one finished `aoide graph reap --json` actually run the
+/// sweep? Judged on the CLI's own JSON envelope `status`, NOT the exit code
+/// alone — the same "success is the real output, not the exit status" rule
+/// [`classify_usage_refresh`] follows. `aoide graph reap` prints
+/// `{"status":"ok",…,"message":"…"}` and exits 0 on every real pass, INCLUDING
+/// a no-op "nothing to reap (all sessions live)" one — a quiet sweep is a
+/// successful sweep, not a failure — and an error envelope (or a non-zero exit)
+/// only when a stage read/write actually failed. Returns the CLI's own
+/// `message` on success so the audit line reuses that exact wording rather than
+/// inventing new copy.
+fn classify_recheck(exited_ok: bool, stdout: &str, stderr: &str) -> Result<String, String> {
+    if !exited_ok {
+        let said = {
+            let e = stderr.trim();
+            if e.is_empty() {
+                stdout.trim()
+            } else {
+                e
+            }
+        };
+        return Err(if said.is_empty() {
+            "`aoide graph reap` exited nonzero with no message".to_string()
+        } else {
+            said.to_string()
+        });
+    }
+    let v: Value = serde_json::from_str(stdout.trim())
+        .map_err(|_| "`aoide graph reap --json` printed no parseable envelope".to_string())?;
+    let message = v
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("sessions rechecked")
+        .to_string();
+    match v.get("status").and_then(Value::as_str) {
+        Some("ok") => Ok(message),
+        Some(other) => Err(format!("`aoide graph reap` reported status {other}: {message}")),
+        None => Err("`aoide graph reap --json` output had no status field".to_string()),
+    }
+}
+
+/// Dispatch ONE session recheck: re-exec THIS running binary as `aoide graph
+/// reap --json` — the liveness/rehook sweep (reap dead sessions, decay
+/// `stopped` → `idle`, prune orphaned hook records) the ~12s
+/// `aoide-graph-reap.timer` runs periodically — so the Terminals/Conductor
+/// recheck control triggers it NOW instead of waiting up to a full timer
+/// period. Same `std::env::current_exe()` self-re-exec idiom as
+/// [`dispatch_rice_mode_toggle`]/[`dispatch_usage_refresh`], never a bare
+/// `"aoide"` off PATH.
+///
+/// Runs on a DETACHED thread. `graph reap` shells out to `hyprctl clients -j`
+/// for window liveness; that is normally instant, but a hung compositor query
+/// must never freeze the single-threaded accept loop (session-jumps, power,
+/// ricemode all queue behind one recheck click). So this SPAWNS and returns
+/// immediately — the same no-block posture [`dispatch_usage_refresh`] takes —
+/// and the thread collects the child and audits the outcome via
+/// [`classify_recheck`]. The Terminals/Conductor gadgets update themselves off
+/// the resulting `sessions.json`/`hooks.json`/`graph.json` writes through their
+/// own FileView watches regardless of what this logs; the audit line is for the
+/// operator, not to push data. Best-effort throughout: a spawn failure or a
+/// classify error is audited, never panicked or propagated.
+fn dispatch_recheck_sessions() {
+    std::thread::spawn(|| {
+        let exe = match std::env::current_exe() {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = daemon::audit(
+                    &daemon::default_audit_log(),
+                    daemon::Door::Daemon,
+                    daemon::EventClass::Audit,
+                    "shellbridge",
+                    "recheck-failed",
+                    &format!("resolving the aoide binary: {e}"),
+                );
+                return;
+            }
+        };
+        let result = match std::process::Command::new(&exe)
+            .args(["graph", "reap", "--json"])
+            .output()
+        {
+            Ok(out) => classify_recheck(
+                out.status.success(),
+                &String::from_utf8_lossy(&out.stdout),
+                &String::from_utf8_lossy(&out.stderr),
+            ),
+            Err(e) => Err(format!("spawning `aoide graph reap`: {e}")),
+        };
+        let (event, detail) = match result {
+            Ok(msg) => ("recheck", msg),
+            Err(e) => ("recheck-failed", e),
+        };
+        let _ = daemon::audit(
+            &daemon::default_audit_log(),
+            daemon::Door::Daemon,
+            daemon::EventClass::Audit,
+            "shellbridge",
+            event,
+            &detail,
+        );
+    });
 }
 
 /// Run shellbridge: seed the `sessions.json`/`hooks.json` stage files (v0
@@ -473,6 +746,16 @@ fn handle_conn(stream: UnixStream) {
                     );
                 }
             },
+            // Fire-and-forget: dispatch_usage_refresh audits its OWN outcome from
+            // a detached thread (the re-exec's live fetch is ≤15s, too long to
+            // block the accept loop inline — see the function). Nothing to match
+            // on here, unlike the arms above.
+            Some(BridgeCommand::RefreshUsage) => dispatch_usage_refresh(),
+            // Fire-and-forget, same posture: dispatch_recheck_sessions re-execs
+            // `aoide graph reap` on a detached thread and audits its own outcome
+            // (the sweep shells out to hyprctl, which must never block the accept
+            // loop). The gadgets refresh off the resulting stage writes.
+            Some(BridgeCommand::RecheckSessions) => dispatch_recheck_sessions(),
             None => eprintln!("[aoide/shellbridge] ignoring unknown/malformed command: {line}"),
         }
     }
@@ -575,6 +858,147 @@ mod tests {
     }
 
     #[test]
+    fn parse_command_accepts_a_valid_refreshusage() {
+        assert_eq!(
+            parse_command(r#"{"cmd":"refreshusage"}"#),
+            Some(BridgeCommand::RefreshUsage)
+        );
+        // No payload is expected or read — extra fields are simply ignored,
+        // and surrounding whitespace/newline is tolerated like every verb.
+        assert_eq!(
+            parse_command("  {\"cmd\":\"refreshusage\"}\n"),
+            Some(BridgeCommand::RefreshUsage)
+        );
+        // A typo is NOT this verb (the gatekeeper rule — an unparsed verb goes
+        // nowhere, the `{cmd:"powermenu"}` scar).
+        assert_eq!(parse_command(r#"{"cmd":"refresh"}"#), None);
+        assert_eq!(parse_command(r#"{"cmd":"usagerefresh"}"#), None);
+    }
+
+    #[test]
+    fn parse_command_accepts_a_valid_rechecksessions() {
+        assert_eq!(
+            parse_command(r#"{"cmd":"rechecksessions"}"#),
+            Some(BridgeCommand::RecheckSessions)
+        );
+        // No payload is expected or read — extra fields ignored, surrounding
+        // whitespace/newline tolerated like every verb.
+        assert_eq!(
+            parse_command("  {\"cmd\":\"rechecksessions\"}\n"),
+            Some(BridgeCommand::RecheckSessions)
+        );
+        // A near-miss is NOT this verb — an unparsed cmd goes nowhere.
+        assert_eq!(parse_command(r#"{"cmd":"recheck"}"#), None);
+        assert_eq!(parse_command(r#"{"cmd":"recheckSession"}"#), None);
+    }
+
+    // ── classify_recheck (a quiet sweep is a successful sweep) ─────────────────
+
+    #[test]
+    fn classify_recheck_ok_envelope_returns_its_message() {
+        let s = classify_recheck(
+            true,
+            r#"{"status":"ok","command":"graph.reap","message":"reaped 1 dead session(s); dropped 1 total; decayed 0 stopped → idle; cleared 0 orphaned parent link(s); dropped 2 orphaned hook record(s)"}"#,
+            "",
+        );
+        assert!(s.is_ok());
+        assert!(s.unwrap().contains("orphaned hook record"));
+    }
+
+    #[test]
+    fn classify_recheck_nothing_to_reap_still_succeeds() {
+        // The common case: a periodic-cadence sweep with nothing dead. Status is
+        // "ok" and the file is untouched — that is a successful recheck, NOT a
+        // failure (the whole point of judging the envelope, not just exit 0).
+        let s = classify_recheck(
+            true,
+            r#"{"status":"ok","command":"graph.reap","message":"nothing to reap (all sessions live)"}"#,
+            "",
+        );
+        assert_eq!(s, Ok("nothing to reap (all sessions live)".to_string()));
+    }
+
+    #[test]
+    fn classify_recheck_error_status_and_nonzero_exit_are_failures() {
+        // A real stage read/write failure exits 0-in-shape but reports "error".
+        let s = classify_recheck(
+            true,
+            r#"{"status":"error","command":"graph.reap","message":"could not write sessions.json: permission denied"}"#,
+            "",
+        );
+        assert!(s.is_err());
+        assert!(s.unwrap_err().contains("permission denied"));
+        // Non-zero exit, reason spoken on stderr.
+        assert_eq!(
+            classify_recheck(false, "", "boom on stderr"),
+            Err("boom on stderr".to_string())
+        );
+        // Non-zero exit, silent → still explains itself, never a blank reason.
+        assert!(classify_recheck(false, "", "").unwrap_err().contains("nonzero"));
+        // Exit 0 but not the JSON envelope → not a proven sweep (the ipc.rs lesson).
+        assert!(classify_recheck(true, "not json at all", "").unwrap_err().contains("parseable"));
+    }
+
+    // ── classify_usage_refresh (success is the real output, not the exit) ─────
+
+    #[test]
+    fn classify_usage_refresh_ok_envelope_returns_its_message() {
+        let s = classify_usage_refresh(
+            true,
+            r#"{"status":"ok","command":"usage","message":"today 42 tokens — state/usage.json written"}"#,
+            "",
+        );
+        assert_eq!(s, Ok("today 42 tokens — state/usage.json written".to_string()));
+    }
+
+    #[test]
+    fn classify_usage_refresh_degraded_live_still_succeeds() {
+        // The whole point: a `live:{ok:false}` block (no creds / OAuth rejection
+        // / transport error) is NOT a refresh failure — the file was still
+        // written and the gadget renders it degraded. Status stays "ok".
+        let s = classify_usage_refresh(
+            true,
+            r#"{"status":"ok","command":"usage","message":"written","data":{"live":{"ok":false,"error":"no ~/.claude credentials"}}}"#,
+            "",
+        );
+        assert!(s.is_ok(), "degraded live must not read as a failed refresh: {s:?}");
+    }
+
+    #[test]
+    fn classify_usage_refresh_error_status_is_a_failure() {
+        // A real write failure exits 0-in-shape but reports status "error".
+        let s = classify_usage_refresh(
+            true,
+            r#"{"status":"error","command":"usage","message":"failed to write state/usage.json: permission denied"}"#,
+            "",
+        );
+        assert!(s.is_err());
+        assert!(s.unwrap_err().contains("permission denied"));
+    }
+
+    #[test]
+    fn classify_usage_refresh_nonzero_exit_is_a_failure_with_a_reason() {
+        // Non-zero exit, reason spoken on stderr.
+        let s = classify_usage_refresh(false, "", "boom on stderr");
+        assert_eq!(s, Err("boom on stderr".to_string()));
+        // Non-zero exit, silent → still explains itself, never a blank reason.
+        let s = classify_usage_refresh(false, "", "");
+        assert!(s.unwrap_err().contains("nonzero"));
+    }
+
+    #[test]
+    fn classify_usage_refresh_unparseable_exit_zero_is_a_failure() {
+        // Exit 0 alone is NOT success — output that isn't the JSON envelope
+        // means the call didn't land the way we think (the ipc.rs lesson).
+        let s = classify_usage_refresh(true, "not json at all", "");
+        assert!(s.is_err());
+        assert!(s.unwrap_err().contains("parseable"));
+        // Valid JSON but no status field is likewise not a proven refresh.
+        let s = classify_usage_refresh(true, r#"{"command":"usage"}"#, "");
+        assert!(s.is_err());
+    }
+
+    #[test]
     fn rice_mode_toggle_target_is_a_two_way_toggle_not_a_three_way_cycle() {
         // Staging locks to declarative...
         assert_eq!(rice_mode_toggle_target(RiceMode::Staging), "declarative");
@@ -582,6 +1006,41 @@ mod tests {
         // there is no generic "next draft" a bare click could cycle into.
         assert_eq!(rice_mode_toggle_target(RiceMode::Declarative), "stage");
         assert_eq!(rice_mode_toggle_target(RiceMode::Draft), "stage");
+    }
+
+    // ── rice_mode_toggle_default_song (the bar-toggle-only baseline-song fix) ──
+
+    #[test]
+    fn declarative_toggle_passes_the_env_song_explicitly_when_set() {
+        assert_eq!(
+            rice_mode_toggle_default_song("declarative", Some("sonata")),
+            Some("sonata".to_string())
+        );
+        // Surrounding whitespace is trimmed, same tolerance as the wire verbs.
+        assert_eq!(
+            rice_mode_toggle_default_song("declarative", Some("  sonata  ")),
+            Some("sonata".to_string())
+        );
+    }
+
+    #[test]
+    fn declarative_toggle_falls_back_to_the_bare_call_when_env_is_absent_or_blank() {
+        // Unset (outside the systemd service, or before a rebuild lands the
+        // env var) must not turn a working toggle into a broken one.
+        assert_eq!(rice_mode_toggle_default_song("declarative", None), None);
+        // Present but blank/whitespace-only is treated the same as absent.
+        assert_eq!(rice_mode_toggle_default_song("declarative", Some("")), None);
+        assert_eq!(rice_mode_toggle_default_song("declarative", Some("   ")), None);
+    }
+
+    #[test]
+    fn stage_toggle_is_unaffected_by_the_env_var_either_way() {
+        // The staging direction stays on whatever's currently being edited
+        // (current_staged_song()-driven, commands/mode.rs) regardless of
+        // AOIDE_DEFAULT_SONG — this fix is scoped to the declarative
+        // direction only.
+        assert_eq!(rice_mode_toggle_default_song("stage", Some("sonata")), None);
+        assert_eq!(rice_mode_toggle_default_song("stage", None), None);
     }
 
     #[test]

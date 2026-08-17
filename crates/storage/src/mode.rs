@@ -51,6 +51,18 @@ pub struct ModeMarker {
     pub song: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft: Option<String>,
+    /// The last song actively used in `Staging` mode — distinct from `song`
+    /// (the CURRENTLY active song, which `Declarative` locking legitimately
+    /// overwrites). Locking declarative must never touch or clear this
+    /// field: it is the only durable memory of "what was I staging" that
+    /// survives a declarative round-trip, so a bare `rice mode stage` (no
+    /// explicit name — what the bar toggle sends) can resolve back to it
+    /// instead of re-reading `stage/livery.json`'s own `"song"` field (which
+    /// `Declarative` just overwrote to something else). Absent on a fresh
+    /// marker or one written before this field existed — callers fall back
+    /// to `current_staged_song()` in that cold-start case.
+    #[serde(default, rename = "stagingSong", skip_serializing_if = "Option::is_none")]
+    pub staging_song: Option<String>,
     /// ISO-8601 UTC (`aoide_storage::time::now_iso_utc`) — when this mode was
     /// entered. Empty string on the zero-value `Default` (no marker ever
     /// written), never fabricated.
@@ -127,6 +139,7 @@ mod tests {
             mode: RiceMode::Staging,
             song: Some("moonlight".to_string()),
             draft: None,
+            staging_song: None,
             since: "2026-08-14T00:00:00Z".to_string(),
         };
         save_mode_marker(&marker).unwrap();
@@ -138,6 +151,7 @@ mod tests {
         assert_eq!(v["mode"], "staging");
         assert_eq!(v["song"], "moonlight");
         assert!(v.get("draft").is_none(), "draft omitted when None");
+        assert!(v.get("stagingSong").is_none(), "stagingSong omitted when None");
 
         let _ = std::fs::remove_dir_all(&dir);
         match saved {
@@ -158,6 +172,7 @@ mod tests {
             mode: RiceMode::Draft,
             song: Some("sonata".to_string()),
             draft: Some("neon-night".to_string()),
+            staging_song: Some("sonata".to_string()),
             since: "2026-08-14T00:00:00Z".to_string(),
         };
         save_mode_marker(&marker).unwrap();
@@ -168,6 +183,7 @@ mod tests {
         let v: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["mode"], "draft");
         assert_eq!(v["draft"], "neon-night");
+        assert_eq!(v["stagingSong"], "sonata");
 
         let _ = std::fs::remove_dir_all(&dir);
         match saved {
