@@ -137,7 +137,7 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["graph", "permit"],
-        summary: "Raise the herald's permission SUMMONS for a session blocked on a permission prompt and type the human's verdict back into it: left-click approves, middle-click (dismiss) denies. Blocks until the card is answered — the hook door spawns it detached when a session goes `awaiting`. Only ever raised for a conductable session whose harness has verified prompt keys, and only injected while the session is still awaiting.",
+        summary: "Publish the herald's permission SUMMONS for a session blocked on a permission prompt. The card is filed into the herald ledger (stage/herald.json) and this verb RETURNS — the Quickshell herald draws it with real approve/deny buttons, and the click routes back through the shellbridge to type the verdict in. The hook door raises it automatically when a session goes `awaiting`. Only ever raised for a conductable session whose harness has verified prompt keys, and the verdict is only typed while the session is still awaiting.",
         args: [],
         flags: [
             flag!("id", "string", "Target session id (required); its socket is resolved from sessions.json."),

@@ -13,6 +13,7 @@
 
 pub mod commands;
 pub mod graph;
+pub mod herald;
 pub mod reap;
 pub mod screen;
 pub mod shellbridge;

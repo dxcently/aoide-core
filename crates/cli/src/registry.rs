@@ -91,6 +91,7 @@ mod tests {
             "graph.view",
             "graph.wrap",
             "guide",
+            "herald.push",
             "hooks.install",
             "livery.emit",
             "livery.lint",

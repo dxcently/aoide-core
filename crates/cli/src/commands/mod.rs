@@ -69,6 +69,7 @@ pub fn all() -> Registry {
     aoide_conduct::commands::hooks::register(&mut r); // hooks install — the hook-installer verb (appended newest)
     aoide_song::commands::quickshell::register(&mut r); // quickshell reload — IPC hot-reload trigger
     aoide_conduct::commands::screen::register(&mut r); // screen info, screen shot — Phase 1 of the `screen` verb family (appended newest)
+    aoide_conduct::commands::herald::register(&mut r); // herald push — dunst's script hook into the notification ledger (appended newest)
 
     r
 }

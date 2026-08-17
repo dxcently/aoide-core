@@ -78,6 +78,26 @@ pub enum BridgeCommand {
     /// `graph.json` writes through their own FileView watches. See
     /// [`dispatch_recheck_sessions`].
     RecheckSessions,
+    /// `{ "cmd": "heraldpush", "notification": { … } }` — file one notification
+    /// into `stage/herald.json`. Sent by `aoide herald push` (dunst's `script`
+    /// hook) and by `graph permit` for a summons; NOT by QML, which only reads
+    /// the ledger. The daemon is the single writer, which is the whole point:
+    /// dunst runs its scripts asynchronously, so two notifications arriving
+    /// together would otherwise race and one would be lost. See
+    /// [`dispatch_herald_push`].
+    HeraldPush { notification: Box<Value> },
+    /// `{ "cmd": "heraldverdict", "id": "…", "verdict": "approve|deny" }` — the
+    /// human clicked a summons' approve or deny button in the QML herald. The
+    /// daemon types the verdict into the waiting session through
+    /// `graph send`, the one gated injection door. This is the button that
+    /// dunst physically could not draw: it had no per-region hit testing, so a
+    /// drawn deny chip fired the window-wide left-click binding and APPROVED.
+    HeraldVerdict { id: String, verdict: String },
+    /// `{ "cmd": "heralddismiss", "id": "…" }` — drop one card from the ledger.
+    /// The QML herald owns the dismiss clock (a notification dunst never
+    /// displays is never expired by dunst either), so this is how a timeout or
+    /// a click closes a card. `"*"` clears the desk.
+    HeraldDismiss { id: String },
 }
 
 /// The six system actions the powermenu can request. A closed set — an unknown
@@ -176,6 +196,37 @@ pub fn parse_command(line: &str) -> Option<BridgeCommand> {
         "ricemode" => Some(BridgeCommand::ToggleRiceMode),
         "refreshusage" => Some(BridgeCommand::RefreshUsage),
         "rechecksessions" => Some(BridgeCommand::RecheckSessions),
+        "heraldpush" => {
+            let notification = v.get("notification")?.clone();
+            // A record with no id is unfilable — it could neither replace its
+            // predecessor nor be dismissed later.
+            let id = notification.get("id").and_then(Value::as_str)?;
+            if id.trim().is_empty() {
+                return None;
+            }
+            Some(BridgeCommand::HeraldPush {
+                notification: Box::new(notification),
+            })
+        }
+        "heraldverdict" => {
+            let id = v.get("id").and_then(Value::as_str)?.trim().to_string();
+            let verdict = v.get("verdict").and_then(Value::as_str)?.trim().to_string();
+            // A closed set: only the two real answers reach the injection door.
+            // Anything else — a typo, a truncated wire line — is dropped here
+            // rather than resolved to a default, because both defaults are
+            // wrong on a permission gate.
+            if id.is_empty() || !matches!(verdict.as_str(), "approve" | "deny") {
+                return None;
+            }
+            Some(BridgeCommand::HeraldVerdict { id, verdict })
+        }
+        "heralddismiss" => {
+            let id = v.get("id").and_then(Value::as_str)?.trim().to_string();
+            if id.is_empty() {
+                return None;
+            }
+            Some(BridgeCommand::HeraldDismiss { id })
+        }
         _ => None,
     }
 }
@@ -637,6 +688,116 @@ pub fn run() -> serde_json::Value {
 /// The accept loop: one connection at a time (commands are rare). A failed
 /// `accept()` is logged and the loop continues — a transient accept error must
 /// never end the service.
+// ── the herald ledger ─────────────────────────────────────────────────────
+
+/// Read `stage/herald.json`, apply `f`, write it back atomically.
+///
+/// Every ledger mutation goes through here, in the daemon, single-threaded by
+/// the accept loop — the serialisation the whole socket hop exists to buy. A
+/// missing or corrupt file is not an error: it reads as an empty ledger and is
+/// rewritten whole, so a truncated write can never wedge notifications shut.
+fn edit_ledger<F, T>(f: F) -> std::io::Result<T>
+where
+    F: FnOnce(&mut Vec<crate::herald::Notification>) -> T,
+{
+    let path = crate::herald::herald_path();
+    let mut file: crate::herald::HeraldFile = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let out = f(&mut file.notifications);
+    file.schema_version = crate::herald::HERALD_SCHEMA.to_string();
+    let text = serde_json::to_string_pretty(&file)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    aoide_storage::fs::atomic_write(&path, &format!("{text}\n"))?;
+    Ok(out)
+}
+
+/// File one notification. Sender text is DATA: it is deserialised into the
+/// record shape and written back out, never parsed or interpreted.
+fn dispatch_herald_push(notification: Value) {
+    let notif: crate::herald::Notification = match serde_json::from_value(notification) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("[aoide/shellbridge] herald push with a malformed record: {e}");
+            return;
+        }
+    };
+    let id = notif.id.clone();
+    if let Err(e) = edit_ledger(move |list| {
+        let taken = std::mem::take(list);
+        *list = crate::herald::apply_push(taken, notif);
+    }) {
+        eprintln!("[aoide/shellbridge] could not write the herald ledger: {e}");
+    } else {
+        let _ = daemon::audit(
+            &daemon::default_audit_log(),
+            daemon::Door::Daemon,
+            daemon::EventClass::Audit,
+            "shellbridge",
+            "herald.push",
+            &format!("filed notification {id}"),
+        );
+    }
+}
+
+/// Drop one card from the ledger (or all of them on `*`).
+fn dispatch_herald_dismiss(id: String) {
+    let res = edit_ledger(|list| {
+        if id == "*" {
+            let n = list.len();
+            list.clear();
+            n > 0
+        } else {
+            crate::herald::apply_dismiss(list, &id)
+        }
+    });
+    if let Err(e) = res {
+        eprintln!("[aoide/shellbridge] could not write the herald ledger: {e}");
+    }
+}
+
+/// Type a summons verdict into the waiting session, then drop the card.
+///
+/// Runs on a DETACHED thread and audits its own outcome: the injection walks
+/// the stage files and writes to the session's control socket, which must never
+/// block the accept loop — the same posture `dispatch_usage_refresh` and
+/// `dispatch_recheck_sessions` already take. The `still awaiting` guard lives
+/// inside `graph permit`'s answer path, not here, so a human who answered in
+/// the terminal while the card stood is never typed over.
+fn dispatch_herald_verdict(id: String, verdict: String) {
+    std::thread::spawn(move || {
+        let outcome = crate::graph::answer_summons(&id, &verdict);
+        let _ = daemon::audit(
+            &daemon::default_audit_log(),
+            daemon::Door::Daemon,
+            daemon::EventClass::Audit,
+            "shellbridge",
+            "herald.verdict",
+            &outcome.message,
+        );
+        // The card comes down either way — an answered summons is answered
+        // even if the session had already moved on and nothing was typed.
+        // NOTE the id swap: the wire carries the SESSION id (that is what a
+        // verdict is addressed to), while the ledger entry is keyed by the
+        // CARD id. `summons_card_id` is the one place that mapping lives.
+        dispatch_herald_dismiss(crate::graph::summons_card_id(&id));
+    });
+}
+
+/// Send one newline-delimited JSON line to the running shellbridge.
+///
+/// The client half of this module: `aoide herald push` and `graph permit` reach
+/// the daemon through here rather than writing `stage/herald.json` themselves,
+/// so the daemon stays the single writer.
+pub fn send_line(line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut stream = UnixStream::connect(socket_path())?;
+    stream.write_all(line.trim_end().as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()
+}
+
 fn serve(listener: &UnixListener) {
     for conn in listener.incoming() {
         match conn {
@@ -762,6 +923,18 @@ fn handle_conn(stream: UnixStream) {
             // (the sweep shells out to hyprctl, which must never block the accept
             // loop). The gadgets refresh off the resulting stage writes.
             Some(BridgeCommand::RecheckSessions) => dispatch_recheck_sessions(),
+            // The ledger writes are inline: they are a read-modify-write of one
+            // small local file, and running them ON the accept loop is exactly
+            // what serialises concurrent notifications.
+            Some(BridgeCommand::HeraldPush { notification }) => {
+                dispatch_herald_push(*notification)
+            }
+            Some(BridgeCommand::HeraldDismiss { id }) => dispatch_herald_dismiss(id),
+            // Detached, like the other two fire-and-forget arms: this one walks
+            // the stage files and writes to a session's control socket.
+            Some(BridgeCommand::HeraldVerdict { id, verdict }) => {
+                dispatch_herald_verdict(id, verdict)
+            }
             None => eprintln!("[aoide/shellbridge] ignoring unknown/malformed command: {line}"),
         }
     }
@@ -809,6 +982,76 @@ mod tests {
         // Empty/absent sessionId → None (never dispatch a blank session jump).
         assert_eq!(parse_command(r#"{"cmd":"focussession","sessionId":""}"#), None);
         assert_eq!(parse_command(r#"{"cmd":"focussession"}"#), None);
+    }
+
+    #[test]
+    fn parse_command_accepts_a_herald_push_and_rejects_an_unfilable_one() {
+        let line = r#"{"cmd":"heraldpush","notification":{"id":"7","summary":"hi"}}"#;
+        match parse_command(line) {
+            Some(BridgeCommand::HeraldPush { notification }) => {
+                assert_eq!(notification.get("id").unwrap(), "7");
+            }
+            other => panic!("expected a herald push, got {other:?}"),
+        }
+        // A record with no usable id could neither replace its predecessor nor
+        // be dismissed later, so it never reaches the ledger.
+        assert_eq!(
+            parse_command(r#"{"cmd":"heraldpush","notification":{"summary":"hi"}}"#),
+            None
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"heraldpush","notification":{"id":"  "}}"#),
+            None
+        );
+        assert_eq!(parse_command(r#"{"cmd":"heraldpush"}"#), None);
+    }
+
+    #[test]
+    fn a_verdict_is_only_ever_one_of_the_two_real_answers() {
+        assert_eq!(
+            parse_command(r#"{"cmd":"heraldverdict","id":"s1","verdict":"approve"}"#),
+            Some(BridgeCommand::HeraldVerdict {
+                id: "s1".to_string(),
+                verdict: "approve".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"heraldverdict","id":" s1 ","verdict":" deny "}"#),
+            Some(BridgeCommand::HeraldVerdict {
+                id: "s1".to_string(),
+                verdict: "deny".to_string(),
+            })
+        );
+        // A permission gate has no safe direction to default to, so anything
+        // that is not exactly one of the two answers is dropped at the wire
+        // rather than resolved. This is the defect the whole herald retcon
+        // exists to kill — the old daemon-drawn card could not tell a click on
+        // "deny" from a click anywhere else, and approved.
+        for bad in [
+            r#"{"cmd":"heraldverdict","id":"s1","verdict":"approved"}"#,
+            r#"{"cmd":"heraldverdict","id":"s1","verdict":"APPROVE"}"#,
+            r#"{"cmd":"heraldverdict","id":"s1","verdict":"yes"}"#,
+            r#"{"cmd":"heraldverdict","id":"s1","verdict":""}"#,
+            r#"{"cmd":"heraldverdict","id":"","verdict":"approve"}"#,
+            r#"{"cmd":"heraldverdict","id":"s1"}"#,
+        ] {
+            assert_eq!(parse_command(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn parse_command_accepts_a_herald_dismiss() {
+        assert_eq!(
+            parse_command(r#"{"cmd":"heralddismiss","id":"7"}"#),
+            Some(BridgeCommand::HeraldDismiss { id: "7".to_string() })
+        );
+        // `*` is the clear-the-desk form.
+        assert_eq!(
+            parse_command(r#"{"cmd":"heralddismiss","id":"*"}"#),
+            Some(BridgeCommand::HeraldDismiss { id: "*".to_string() })
+        );
+        assert_eq!(parse_command(r#"{"cmd":"heralddismiss","id":""}"#), None);
+        assert_eq!(parse_command(r#"{"cmd":"heralddismiss"}"#), None);
     }
 
     #[test]
