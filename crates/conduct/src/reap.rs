@@ -562,6 +562,29 @@ fn reap_inner(
         }
     }
 
+    // Orphaned hook records: a `hooks.json` entry whose sessionId matches NO
+    // session record anywhere in the roster. The hook door always writes the
+    // session record before (or with) its hook — `hook_ensure_session`
+    // re-creates one on ANY later non-`sub:` event, and a `sub:` phase never
+    // upserts a hook at all — so in a lock-consistent snapshot a hook with no
+    // session is pure cruft. Neither existing collector reaches it: the liveness
+    // predicate above only iterates `sessions.json`, and `prune_done` only drops
+    // the hooks of *done sessions*. Left alone it accretes forever (observed
+    // live: a `sub:testT1` fixture weeks stale, plus two `stopped` UUID
+    // leftovers). Computed against the FULL roster (every state), so it is
+    // invariant under the reap-mark / decay / prune that follow — a done
+    // session's hook is prune's job and is never miscounted here. A false drop
+    // self-heals exactly like a false reap: the hook door re-upserts the record
+    // on the session's next event.
+    let live_ids: HashSet<&str> =
+        s_file.sessions.iter().map(|s| s.session_id.as_str()).collect();
+    let orphan_hooks: Vec<String> = h_file
+        .hooks
+        .iter()
+        .filter(|h| !live_ids.contains(h.session_id.as_str()))
+        .map(|h| h.session_id.clone())
+        .collect();
+
     // Age out the warm `stopped` badge: a turn that ended more than an hour ago is
     // just `idle` now. This is the one transition no hook can ever deliver (a
     // session left alone emits nothing), so the periodic pass owns it — and it runs
@@ -569,10 +592,11 @@ fn reap_inner(
     let now = now_iso_utc();
     let decayed = decay_stopped_sessions(&mut s_file.sessions, &mut h_file.hooks, now_epoch, &now);
 
-    if reaped.is_empty() && decayed.is_empty() {
+    if reaped.is_empty() && decayed.is_empty() && orphan_hooks.is_empty() {
         return Outcome::ok(cmd, "nothing to reap (all sessions live)").with_data(json!({
             "reaped": [],
             "decayed": [],
+            "orphanHooks": [],
             "hyprctlAvailable": hyprctl_available,
         }));
     }
@@ -603,6 +627,19 @@ fn reap_inner(
         h_file.hooks = kept_h;
         (removed, cleared)
     };
+
+    // Drop the orphaned hook records identified above. Independent of prune
+    // (which only fires when something was reaped): orphans must be collected on
+    // a decay-only or otherwise-quiet pass too — that steady state is exactly
+    // where they otherwise sit forever. Whatever `h_file.hooks` now holds —
+    // prune's `kept_h` on a reaping pass, or the decay-updated vector on a
+    // non-reaping one — the orphan ids are absent from the live roster either
+    // way, so this retain is correct against both.
+    if !orphan_hooks.is_empty() {
+        let orphaned: HashSet<&str> = orphan_hooks.iter().map(String::as_str).collect();
+        h_file.hooks.retain(|h| !orphaned.contains(h.session_id.as_str()));
+    }
+
     if s_file.schema_version.is_empty() {
         s_file.schema_version = STAGE_GRAPH_VERSION.to_string();
     }
@@ -630,6 +667,11 @@ fn reap_inner(
             .iter()
             .map(|id| format!("cleared parentSessionId of {id}")),
     );
+    changed.extend(
+        orphan_hooks
+            .iter()
+            .map(|id| format!("dropped orphaned hook record {id} (no session)")),
+    );
     match restage_graph() {
         Ok(g) => changed.push(g.to_string_lossy().into_owned()),
         Err(e) => return stage_error(cmd, e),
@@ -637,11 +679,12 @@ fn reap_inner(
     Outcome::ok(
         cmd,
         format!(
-            "reaped {} dead session(s); dropped {} total; decayed {} stopped → idle; cleared {} orphaned parent link(s)",
+            "reaped {} dead session(s); dropped {} total; decayed {} stopped → idle; cleared {} orphaned parent link(s); dropped {} orphaned hook record(s)",
             reaped.len(),
             removed.len(),
             decayed.len(),
-            cleared.len()
+            cleared.len(),
+            orphan_hooks.len()
         ),
     )
     .changed(changed)
@@ -650,6 +693,7 @@ fn reap_inner(
         "removed": removed,
         "decayed": decayed,
         "clearedParents": cleared,
+        "orphanHooks": orphan_hooks,
         "hyprctlAvailable": hyprctl_available,
     }))
 }
@@ -925,6 +969,73 @@ mod tests {
             s2.sessions.iter().any(|s| s.session_id == "headless"),
             "the headless session survives the reaper pass"
         );
+
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    /// The orphan-hook gap, end-to-end through `reap()`: a `hooks.json` record
+    /// whose sessionId matches no session anywhere (the `sub:testT1` /
+    /// stale-UUID leftovers seen live) is collected by a reap pass — neither the
+    /// liveness predicate (it iterates `sessions.json` only) nor `prune_done` (it
+    /// drops the hooks of *done sessions* only) ever reached it, so it used to
+    /// sit forever, even on an otherwise-quiet pass that reaps and decays
+    /// nothing. A live session's own hook is untouched.
+    #[test]
+    fn reap_drops_orphaned_hook_records_with_no_session() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env =
+            crate::graph::testutil::EnvVars::save(&["AOIDE_STAGE_DIR", "HYPRLAND_INSTANCE_SIGNATURE"]);
+        std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"); // pid-only/no-window liveness
+        let stage = crate::graph::testutil::unique_stage("reap-orphan-hooks");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        // One live session (fresh hook, so never reaped) plus two orphan hooks
+        // whose ids match no session record at all.
+        let mut live = hook_only("live-1", "idle");
+        live.started_at = now_iso_utc();
+        live.cwd = "/nonexistent/nowhere".into();
+        write_stage(
+            &sessions_path(),
+            &SessionsFile {
+                schema_version: "0".into(),
+                sessions: vec![live],
+            },
+        )
+        .unwrap();
+        let mut hooks = Vec::new();
+        upsert_hook(&mut hooks, "live-1", "idle", &now_iso_utc()); // matches a session — kept
+        upsert_hook(&mut hooks, "sub:testT1", "working", "2026-07-30T15:44:37Z"); // orphan
+        upsert_hook(&mut hooks, "ghost-uuid", "stopped", "2026-08-03T08:58:21Z"); // orphan
+        write_stage(
+            &hooks_path(),
+            &HooksFile {
+                schema_version: "0".into(),
+                hooks,
+            },
+        )
+        .unwrap();
+
+        let out = reap(&crate::graph::testutil::invocation(&["graph", "reap"], &[]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+        let data = out.data.unwrap();
+        let mut orphans: Vec<String> = data["orphanHooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        orphans.sort();
+        assert_eq!(
+            orphans,
+            vec!["ghost-uuid".to_string(), "sub:testT1".to_string()],
+            "both session-less hook records are collected"
+        );
+
+        let h2: HooksFile = load_stage(&hooks_path()).unwrap();
+        let ids: HashSet<&str> = h2.hooks.iter().map(|h| h.session_id.as_str()).collect();
+        assert!(ids.contains("live-1"), "the live session's hook survives");
+        assert!(!ids.contains("sub:testT1"), "the orphan hook is dropped from the file");
+        assert!(!ids.contains("ghost-uuid"), "the orphan hook is dropped from the file");
 
         let _ = std::fs::remove_dir_all(&stage);
     }
