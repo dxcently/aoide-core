@@ -50,6 +50,12 @@ pub struct TranscriptSpec {
     /// for a top-level session's own transcript, false for a sub-agent's own
     /// (all-sidechain) file.
     pub say: fn(lines: &[String], skip_sidechain: bool) -> Option<String>,
+    /// The agent's latest TOOL CALL off the tail lines, as a one-line label
+    /// (`Bash: cargo test`) — see [`tool_label`]. Distinct from the hook-set
+    /// `activity`: that is only ever the tool running RIGHT NOW and is cleared
+    /// when the turn settles, while this is read from the transcript and so
+    /// survives as "the last thing it did". `skip_sidechain` as `say`.
+    pub tool: fn(lines: &[String], skip_sidechain: bool) -> Option<String>,
     /// The session's NAME (claude: the last `custom-title` record).
     pub title: fn(lines: &[String]) -> Option<String>,
     /// The session's currently-active model id (`skip_sidechain` as `say`).
@@ -201,12 +207,30 @@ fn transcript_path_for(
         }
     }
     let home = std::env::var_os("HOME")?;
-    let cwd = cwd.filter(|s| !s.is_empty())?;
-    let p = PathBuf::from(home)
-        .join(".claude/projects")
-        .join(munge_project_dir(cwd))
-        .join(format!("{session_id}.jsonl"));
-    p.is_file().then_some(p)
+    let projects = PathBuf::from(home).join(".claude/projects");
+    let file = format!("{session_id}.jsonl");
+    if let Some(cwd) = cwd.filter(|s| !s.is_empty()) {
+        let p = projects.join(munge_project_dir(cwd)).join(&file);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    // The cwd derivation MISSES whenever the session has moved: Claude Code
+    // fixes its project bucket at launch, while the roster's `cwd` tracks the
+    // session's current directory — a session launched in `~/Aoide` but working
+    // in `~/Aoide/pkgs/aoide` derives a bucket that does not exist. The hook
+    // path never noticed (its payload carries `transcript_path`); the reaper's
+    // refresh, which has no hint, saw every such session as transcript-less and
+    // silently skipped it. So: fall back to asking each project bucket whether
+    // it holds this session id. A direct `is_file` per bucket — one readdir of
+    // `projects/` and a handful of stats, no directory contents walked.
+    for e in std::fs::read_dir(&projects).ok()?.flatten() {
+        let p = e.path().join(&file);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// Collapse a possibly-multiline string to one whitespace-normalised line,
@@ -298,6 +322,90 @@ fn extract_say(lines: &[String], skip_sidechain: bool) -> Option<String> {
                         break;
                     }
                 }
+            }
+        }
+    }
+    found
+}
+
+/// One line of tool call: the tool's NAME, plus the first argument that says
+/// WHAT it is acting on (`Bash: cargo test --workspace`, `Edit: reap.rs`).
+///
+/// Harness-neutral on purpose — claude's `tool_use`, pi's `toolCall` and kimi's
+/// `tool.call` carry different envelopes but the same two facts, so all three
+/// extractors funnel through here and a card reads identically whichever agent
+/// filled it. An unrecognised argument shape degrades to the bare name rather
+/// than to nothing: the tool that ran is worth showing even when its subject
+/// isn't legible.
+fn tool_label(name: &str, args: Option<&Value>) -> Option<String> {
+    const TOOL_MAX: usize = 120;
+    /// Argument keys that name a tool's SUBJECT, most specific first. Every
+    /// harness's file/search/shell tools use one of these.
+    const SUBJECT_KEYS: [&str; 8] = [
+        "command",
+        "file_path",
+        "path",
+        "pattern",
+        "query",
+        "url",
+        "description",
+        "prompt",
+    ];
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let subject = args
+        .and_then(|a| {
+            SUBJECT_KEYS
+                .iter()
+                .find_map(|k| a.get(*k).and_then(Value::as_str))
+        })
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    Some(match subject {
+        Some(s) => one_line_clip(&format!("{name}: {s}"), TOOL_MAX),
+        None => one_line_clip(name, TOOL_MAX),
+    })
+}
+
+/// The agent's latest tool call: the last `tool_use` block of the freshest
+/// matching `type:"assistant"` line in the tail. `skip_sidechain` mirrors
+/// [`extract_say`]. None when the tail holds no tool call — a session that has
+/// only talked shows no tool row rather than a stale one.
+fn extract_tool(lines: &[String], skip_sidechain: bool) -> Option<String> {
+    let mut found: Option<String> = None;
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if skip_sidechain && v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let Some(content) = v
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for block in content.iter().rev() {
+            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            let Some(name) = block.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(label) = tool_label(name, block.get("input")) {
+                found = Some(label);
+                break;
             }
         }
     }
@@ -518,6 +626,7 @@ pub static CLAUDE_PROFILE: AgentProfile = AgentProfile {
         locate: transcript_path_for,
         tail: transcript_tail,
         say: extract_say,
+        tool: extract_tool,
         title: extract_custom_title,
         model: extract_model,
         context_tokens: transcript_context_tokens,
@@ -749,6 +858,35 @@ fn kimi_extract_say(lines: &[String], _: bool) -> Option<String> {
     found
 }
 
+/// The agent's latest tool call off a `wire.jsonl` tail: the last
+/// `context.append_loop_event` whose event is a `tool.call` — its `name` plus
+/// its `args` (the same object kimi's own `display` renders from).
+/// `skip_sidechain` is a claude-ism, accepted and ignored (as `kimi_extract_say`).
+fn kimi_extract_tool(lines: &[String], _: bool) -> Option<String> {
+    let mut found: Option<String> = None;
+    for line in lines {
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if v.get("type").and_then(Value::as_str) != Some("context.append_loop_event") {
+            continue;
+        }
+        let Some(event) = v.get("event") else {
+            continue;
+        };
+        if event.get("type").and_then(Value::as_str) != Some("tool.call") {
+            continue;
+        }
+        let Some(name) = event.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(label) = tool_label(name, event.get("args")) {
+            found = Some(label);
+        }
+    }
+    found
+}
+
 /// The session's NAME: kimi's `state.json` `title`, ONLY when `isCustomTitle`
 /// is true (a derived placeholder is not a name — mirrors claude's
 /// custom-title semantics). Reaches here as the minified state line
@@ -861,6 +999,7 @@ pub static KIMI_PROFILE: AgentProfile = AgentProfile {
         locate: kimi_transcript_locate,
         tail: kimi_wire_tail,
         say: kimi_extract_say,
+        tool: kimi_extract_tool,
         title: kimi_extract_title,
         model: kimi_extract_model,
         context_tokens: kimi_context_tokens,
@@ -998,6 +1137,42 @@ fn pi_extract_say(lines: &[String], _: bool) -> Option<String> {
     found
 }
 
+/// The agent's latest tool call off a pi jsonl tail: the last `toolCall`
+/// content block of the freshest assistant `message` line — its `name` plus its
+/// `arguments`. `skip_sidechain` is a claude-ism, accepted and ignored (as
+/// `pi_extract_say`).
+fn pi_extract_tool(lines: &[String], _: bool) -> Option<String> {
+    let mut found: Option<String> = None;
+    for line in lines {
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if v.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let m = v.get("message");
+        if m.and_then(|m| m.get("role")).and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(content) = m.and_then(|m| m.get("content")).and_then(Value::as_array) else {
+            continue;
+        };
+        for block in content.iter().rev() {
+            if block.get("type").and_then(Value::as_str) != Some("toolCall") {
+                continue;
+            }
+            let Some(name) = block.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(label) = tool_label(name, block.get("arguments")) {
+                found = Some(label);
+                break;
+            }
+        }
+    }
+    found
+}
+
 /// The session's NAME: the last `session_info` entry's `name` in the tail
 /// (pi's /rename — the session selector's display name). None when never
 /// renamed (the graph names the session from the first prompt instead).
@@ -1120,6 +1295,7 @@ pub static PI_PROFILE: AgentProfile = AgentProfile {
         locate: pi_transcript_locate,
         tail: transcript_tail,
         say: pi_extract_say,
+        tool: pi_extract_tool,
         title: pi_extract_title,
         model: pi_extract_model,
         context_tokens: pi_context_tokens,
@@ -1872,6 +2048,83 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn every_harness_extracts_its_latest_tool_call_into_one_label() {
+        // claude: `tool_use` blocks inside an assistant message's content.
+        let claude: Vec<String> = [
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/p/reap.rs"}}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"now the build"},{"type":"tool_use","name":"Bash","input":{"command":"cargo  test\n--workspace"}}]}}"#,
+            r#"{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"tool_use","name":"Grep","input":{"pattern":"fn reap"}}]}}"#,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let spec = &CLAUDE_PROFILE.transcript;
+        // The freshest NON-sidechain tool call wins, flattened to one line.
+        assert_eq!(
+            (spec.tool)(&claude, true).as_deref(),
+            Some("Bash: cargo test --workspace")
+        );
+        // A sub-agent's own file is all-sidechain — read it with skip off.
+        assert_eq!((spec.tool)(&claude, false).as_deref(), Some("Grep: fn reap"));
+
+        // pi: `toolCall` blocks with `arguments`.
+        let pi: Vec<String> = [
+            r#"{"type":"message","message":{"role":"user","content":[{"type":"text","text":"go"}]}}"#,
+            r#"{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"bash","arguments":{"command":"git status"}}]}}"#,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            (PI_PROFILE.transcript.tool)(&pi, true).as_deref(),
+            Some("bash: git status")
+        );
+
+        // kimi: a `tool.call` loop event with `args`.
+        let kimi: Vec<String> = [
+            r#"{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"hi"}}}"#,
+            r#"{"type":"context.append_loop_event","event":{"type":"tool.call","name":"Bash","args":{"command":"nix build"}}}"#,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            (KIMI_PROFILE.transcript.tool)(&kimi, true).as_deref(),
+            Some("Bash: nix build")
+        );
+
+        // No tool call in the tail → nothing (never a stale or invented label).
+        let quiet: Vec<String> =
+            vec![r#"{"type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}"#.to_string()];
+        assert!((spec.tool)(&quiet, true).is_none());
+    }
+
+    #[test]
+    fn tool_label_falls_back_to_the_bare_name_and_clips() {
+        // An argument shape with no recognised subject key still names the tool.
+        assert_eq!(
+            tool_label("TodoWrite", Some(&serde_json::json!({ "todos": [] }))).as_deref(),
+            Some("TodoWrite")
+        );
+        assert_eq!(tool_label("Bash", None).as_deref(), Some("Bash"));
+        // An empty subject is no subject.
+        assert_eq!(
+            tool_label("Bash", Some(&serde_json::json!({ "command": "   " }))).as_deref(),
+            Some("Bash")
+        );
+        // A nameless call is not a tool call.
+        assert_eq!(tool_label("  ", None), None);
+        // Long subjects are clipped to one bounded line.
+        let long = tool_label(
+            "Bash",
+            Some(&serde_json::json!({ "command": "x".repeat(400) })),
+        )
+        .unwrap();
+        assert_eq!(long.chars().count(), 120);
+        assert!(long.starts_with("Bash: x") && long.ends_with('…'));
+    }
+
     #[test]
     fn one_line_clip_flattens_and_truncates() {
         assert_eq!(one_line_clip("a  b\n c", 80), "a b c");

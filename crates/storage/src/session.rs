@@ -89,6 +89,7 @@ pub fn upsert_session(
             activity: None,
             kind: None,
             say: None,
+            tool: None,
             model: None,
             context_tokens: None,
             context_ceiling: None,

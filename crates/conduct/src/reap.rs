@@ -39,9 +39,10 @@
 use aoide_protocol::Invocation;
 use aoide_protocol::agents::{agent_profile, AgentProfile, CLAUDE_PROFILE};
 use crate::graph::{
-    canonical_state, hooks_path, hyprctl_clients, load_stage, normalize_addr, now_iso_utc,
-    prune_done, restage_graph, sessions_path, stage_error, upsert_hook,
-    write_stage, HookRecord, HooksFile, SessionRecord, SessionsFile, STAGE_GRAPH_VERSION,
+    canonical_state, drop_sessions, hooks_path, hyprctl_clients, load_stage, normalize_addr,
+    now_iso_utc, prune_done, refresh_subagent_says, refresh_transcript_fields, restage_graph,
+    sessions_path, stage_error, upsert_hook, write_stage, HookRecord, HooksFile, SessionRecord,
+    SessionsFile, STAGE_GRAPH_VERSION,
 };
 use aoide_protocol::output::Outcome;
 use serde_json::{json, Value};
@@ -364,6 +365,63 @@ fn superseded_agent_duplicates(
     losers
 }
 
+/// Among agent records sharing one non-empty `windowAddress`, return the ids of
+/// the SUPERSEDED `done` ones — the tombstones a terminal piles up as its
+/// foreground agent is re-identified. One terminal, one agent row.
+///
+/// The live shape this closes (four `claude` rows for ONE kitty window): every
+/// `/clear`, compact or resume mints a NEW sessionId, and the outgoing session
+/// ends cleanly — so unlike the phantoms [`superseded_agent_duplicates`]
+/// retires, these records are legitimately `done`, invisible to the liveness
+/// predicate (which only judges not-`done` records) and skipped by the dedup
+/// above (which only groups not-`done` ones). Nothing in a reap pass collected
+/// them: [`prune_done`] runs only when something else was already reaped, so on
+/// a quiet desktop the tombstones sat in `sessions.json` indefinitely — one
+/// Conductor card each, and (before the widget's own rank fix) the Terminals
+/// row for that window rendered a DEAD agent, because the shared-window merge
+/// took the first agent record it saw.
+///
+/// A terminal hosts ONE foreground agent, so the window's history is never the
+/// roster's business — only its present:
+///   * a window with a LIVE agent keeps that one; every `done` predecessor in
+///     it is superseded outright (the roster shows what is running NOW), and
+///   * a window with only tombstones keeps exactly the NEWEST (`startedAt`,
+///     then the id as a stable final tiebreak) — the agent that actually just
+///     finished, whose done pose the widgets deliberately show until
+///     `graph prune` sweeps it. Its predecessors are as superseded as they
+///     would be beside a live one.
+/// So this never empties a window's roster entry, and never leaves two.
+///
+/// [`prune_done`]: crate::graph::prune_done
+fn superseded_done_siblings(sessions: &[SessionRecord]) -> Vec<String> {
+    let mut by_window: HashMap<&str, Vec<&SessionRecord>> = HashMap::new();
+    for s in sessions {
+        if s.window_address.is_empty() || !is_agent_kind(s) {
+            continue;
+        }
+        by_window
+            .entry(s.window_address.as_str())
+            .or_default()
+            .push(s);
+    }
+    let mut losers = Vec::new();
+    for group in by_window.values() {
+        let mut tombs: Vec<&&SessionRecord> =
+            group.iter().filter(|s| s.state == "done").collect();
+        if !group.iter().any(|s| s.state != "done") {
+            // No live agent here — the newest tombstone is the one still owed a
+            // done pose, so it is spared and only its predecessors are dropped.
+            let keeper = tombs
+                .iter()
+                .max_by_key(|s| (&s.started_at, &s.session_id))
+                .map(|s| s.session_id.clone());
+            tombs.retain(|s| Some(&s.session_id) != keeper.as_ref());
+        }
+        losers.extend(tombs.into_iter().map(|s| s.session_id.clone()));
+    }
+    losers
+}
+
 // ── `stopped` → `idle` decay: the warm/cold split of "at rest" ──────────────
 //
 // `Stop` (the turn ended, the agent is at its prompt) lands `stopped`, NOT
@@ -463,7 +521,115 @@ pub fn reap(inv: &Invocation) -> Outcome {
         Some((addrs, owners)) => (Some(addrs), Some(owners)),
         None => (None, None),
     };
-    aoide_storage::fs::with_stage_lock(move || reap_inner(inv, gathered_addrs, window_owners))
+    let mut outcome =
+        aoide_storage::fs::with_stage_lock(move || reap_inner(inv, gathered_addrs, window_owners));
+    // The refresh is reported but deliberately NOT folded into `changed`: that
+    // vec is the sweep's ledger (what entered or left the roster), and it is
+    // what decides whether the timer toasts. An agent merely speaking must not
+    // ring the desktop every twelve seconds.
+    let refreshed = refresh_live_agents();
+    if !refreshed.is_empty() {
+        outcome.message = format!(
+            "{}; refreshed {} live agent(s)",
+            outcome.message,
+            refreshed.len()
+        );
+        if let Some(data) = outcome.data.as_mut() {
+            data["refreshed"] = json!(refreshed);
+        }
+    }
+    outcome
+}
+
+/// The `graph reap` VERB — [`reap`], plus the desktop toast that says what it
+/// did. Registered as the command handler while `reap` itself stays toast-free,
+/// so every in-crate caller (and every unit test) gets the sweep without
+/// spawning notifiers.
+///
+/// Two callers, one rule each:
+///   * the ~12s timer sweeps unannounced and toasts only when it CHANGED
+///     something (`outcome.changed` — the reaped/dropped/decayed lines). A
+///     death is worth a toast; a quiet pass twelve seconds later is not, and
+///     the transcript refresh never counts (it moves no session in or out of
+///     the roster, and would toast every time an agent spoke).
+///   * `--announce` toasts unconditionally: it marks a HUMAN gesture (the dock's
+///     `[ reap ]` control, via shellbridge), and a pressed button must answer
+///     even when the answer is "nothing to reap".
+pub fn reap_and_announce(inv: &Invocation) -> Outcome {
+    let outcome = reap(inv);
+    if inv.flag_present("announce") || !outcome.changed.is_empty() {
+        announce_reap(&outcome.message);
+    }
+    outcome
+}
+
+/// Raise the reap toast through the stock freedesktop client, detached: spawned
+/// and collected on its own thread so a slow/hung `notify-send` can never delay
+/// the sweep's own exit (the reaper is a `oneshot` on a 12s timer — a wedged
+/// child would stack units). A missing/failed notifier is an eprintln, never an
+/// error: the sweep already happened, and losing the toast must not turn a
+/// successful reap into a failed one. Same idiom as shellbridge's
+/// `dispatch_rice_mode_toggle`.
+fn announce_reap(message: &str) {
+    match std::process::Command::new("notify-send")
+        // No `--icon`: dunst stacks the icon slot on TOP of the stele at up to
+        // 48px, and a picture is not what a one-line sweep report needs.
+        .args(["--app-name=aoide", "Aoide · reap"])
+        .arg(message)
+        .spawn()
+    {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(e) => eprintln!("[aoide/reap] notify-send failed (the sweep itself succeeded): {e}"),
+    }
+}
+
+/// Re-read every SURVIVING agent's transcript and publish what changed — its
+/// `say`, `tool`, `model` and context fill (and the same for its sub-agents).
+///
+/// Those fields are otherwise only refreshed when a hook fires, so an agent
+/// whose harness has no hooks wired (or which is mid-turn between boundaries)
+/// shows whatever it last said an hour ago. The reaper already runs every ~12s
+/// and is what BOTH dock refresh buttons invoke, so this is where "make the
+/// roster current" belongs: reaping decides who is alive, this decides what the
+/// living are doing.
+///
+/// Runs AFTER `reap_inner`'s lock is released, never inside it: each refresh
+/// takes the stage lock itself (they are the same functions the hook path
+/// calls), so doing this under the reap lock would deadlock. That means it acts
+/// on the post-sweep roster — the dead are already gone and never get a read.
+///
+/// Best-effort throughout: a session whose transcript can't be located is
+/// silently skipped, and every write is change-only, so a quiet desktop does no
+/// stage writes at all. Sub-agents are refreshed through their PARENT (their
+/// `sub:<tuid>` id has no transcript of its own to locate); shells and a2a
+/// records have no transcript at all and are skipped outright.
+/// Returns the ids of the agents whose records actually MOVED, so the sweep can
+/// report (and toast) how many it brought current — an empty vec on a desktop
+/// where nothing has been said since the last pass.
+fn refresh_live_agents() -> Vec<String> {
+    let Ok(file) = load_stage::<SessionsFile>(&sessions_path()) else {
+        return Vec::new();
+    };
+    let live: Vec<&SessionRecord> = file
+        .sessions
+        .iter()
+        .filter(|s| s.state != "done" && is_agent_kind(s))
+        .collect();
+    let mut refreshed = Vec::new();
+    for s in live {
+        let profile = profile_for(s);
+        let cwd = (!s.cwd.is_empty()).then_some(s.cwd.as_str());
+        let own = refresh_transcript_fields(profile, &s.session_id, cwd, None, None);
+        let subs = refresh_subagent_says(profile, &s.session_id, cwd);
+        if own || subs {
+            refreshed.push(s.session_id.clone());
+        }
+    }
+    refreshed
 }
 fn reap_inner(
     _inv: &Invocation,
@@ -562,6 +728,14 @@ fn reap_inner(
         }
     }
 
+    // And the tombstones a re-identified terminal leaves behind: `done` agent
+    // records whose window already holds a LIVE agent (see
+    // `superseded_done_siblings`). Kept OUT of `reaped` deliberately — these
+    // records are already `done`, so there is nothing to reap, and folding them
+    // in would trip the `prune_done` call below into sweeping every unrelated
+    // `done` record on the desktop, which stays `graph prune`'s job.
+    let superseded_done = superseded_done_siblings(&s_file.sessions);
+
     // Orphaned hook records: a `hooks.json` entry whose sessionId matches NO
     // session record anywhere in the roster. The hook door always writes the
     // session record before (or with) its hook — `hook_ensure_session`
@@ -592,11 +766,16 @@ fn reap_inner(
     let now = now_iso_utc();
     let decayed = decay_stopped_sessions(&mut s_file.sessions, &mut h_file.hooks, now_epoch, &now);
 
-    if reaped.is_empty() && decayed.is_empty() && orphan_hooks.is_empty() {
+    if reaped.is_empty()
+        && decayed.is_empty()
+        && orphan_hooks.is_empty()
+        && superseded_done.is_empty()
+    {
         return Outcome::ok(cmd, "nothing to reap (all sessions live)").with_data(json!({
             "reaped": [],
             "decayed": [],
             "orphanHooks": [],
+            "supersededDone": [],
             "hyprctlAvailable": hyprctl_available,
         }));
     }
@@ -616,7 +795,7 @@ fn reap_inner(
     // Prune only when something was actually reaped — a decay-only pass must not
     // start sweeping pre-existing `done` records out from under the widgets (that
     // stays `graph prune`'s job, on its own schedule).
-    let (removed, cleared) = if reaped.is_empty() {
+    let (removed, mut cleared) = if reaped.is_empty() {
         (Vec::new(), Vec::new())
     } else {
         let (kept_s, kept_h, removed, cleared) = prune_done(
@@ -627,6 +806,21 @@ fn reap_inner(
         h_file.hooks = kept_h;
         (removed, cleared)
     };
+
+    // Drop the superseded tombstones, narrowly — only the ids identified above,
+    // never the whole `done` set. Runs on a quiet (non-reaping) pass too, which
+    // is the steady state they otherwise accumulate in; when a reaping pass
+    // already ran `prune_done` they are gone with the rest, and `drop_sessions`
+    // no-ops over ids it cannot find. Routed through the same computation prune
+    // uses so the subagent cascade and the dangling-parent clearing still apply.
+    if !superseded_done.is_empty() {
+        let doomed: HashSet<&str> = superseded_done.iter().map(String::as_str).collect();
+        let (kept_s, kept_h, _, also_cleared) =
+            drop_sessions(&s_file.sessions, &doomed, std::mem::take(&mut h_file.hooks));
+        s_file.sessions = kept_s;
+        h_file.hooks = kept_h;
+        cleared.extend(also_cleared);
+    }
 
     // Drop the orphaned hook records identified above. Independent of prune
     // (which only fires when something was reaped): orphans must be collected on
@@ -672,6 +866,11 @@ fn reap_inner(
             .iter()
             .map(|id| format!("dropped orphaned hook record {id} (no session)")),
     );
+    changed.extend(
+        superseded_done
+            .iter()
+            .map(|id| format!("dropped superseded session {id} (its terminal has a live agent)")),
+    );
     match restage_graph() {
         Ok(g) => changed.push(g.to_string_lossy().into_owned()),
         Err(e) => return stage_error(cmd, e),
@@ -679,12 +878,13 @@ fn reap_inner(
     Outcome::ok(
         cmd,
         format!(
-            "reaped {} dead session(s); dropped {} total; decayed {} stopped → idle; cleared {} orphaned parent link(s); dropped {} orphaned hook record(s)",
+            "reaped {} dead session(s); dropped {} total; decayed {} stopped → idle; cleared {} orphaned parent link(s); dropped {} orphaned hook record(s); dropped {} superseded session(s)",
             reaped.len(),
             removed.len(),
             decayed.len(),
             cleared.len(),
-            orphan_hooks.len()
+            orphan_hooks.len(),
+            superseded_done.len()
         ),
     )
     .changed(changed)
@@ -694,6 +894,7 @@ fn reap_inner(
         "decayed": decayed,
         "clearedParents": cleared,
         "orphanHooks": orphan_hooks,
+        "supersededDone": superseded_done,
         "hyprctlAvailable": hyprctl_available,
     }))
 }
@@ -1158,6 +1359,232 @@ mod tests {
         // just-born pair is never resolved before the real one writes a transcript).
         let all_recent = |_: &SessionRecord| true;
         assert!(superseded_agent_duplicates(&sessions, all_recent, has_tx).is_empty());
+    }
+
+    #[test]
+    fn superseded_done_siblings_drops_tombstones_only_beside_a_live_agent() {
+        // The live shape: ONE kitty window (0xW) whose claude was re-identified
+        // three times — three `done` records plus the working one — beside the
+        // conducted shell that hosts them all. A second window (0xZ) holds a
+        // lone `done` agent: nothing supersedes it, so that tombstone is the
+        // done pose the widgets deliberately show and must survive.
+        let done = |id: &str, win: &str, started: &str| {
+            let mut r = agent(id, win, started);
+            r.kind = Some("agent".into());
+            r.state = "done".into();
+            r
+        };
+        let mut live = agent("0f317777", "0xW", "2026-08-17T07:57:00Z");
+        live.kind = Some("agent".into());
+        let mut shell = agent("conduct-865994", "0xW", "2026-08-17T01:00:00Z");
+        shell.agent = "shell".into();
+        shell.kind = Some("shell".into());
+        shell.conductable = Some(true);
+        shell.state = "done".into(); // even a done SHELL is not an agent tombstone
+        let sessions = vec![
+            done("14bc78ab", "0xW", "2026-08-17T07:56:00Z"),
+            done("cc55b87b", "0xW", "2026-08-17T07:56:20Z"),
+            done("e0eb7197", "0xW", "2026-08-17T07:56:40Z"),
+            live,
+            shell,
+            done("lonely", "0xZ", "2026-08-17T07:00:00Z"),
+        ];
+
+        let mut losers = superseded_done_siblings(&sessions);
+        losers.sort();
+        assert_eq!(
+            losers,
+            vec![
+                "14bc78ab".to_string(),
+                "cc55b87b".to_string(),
+                "e0eb7197".to_string()
+            ],
+            "a live agent supersedes EVERY tombstone in its window; the lone one elsewhere stands"
+        );
+    }
+
+    #[test]
+    fn superseded_done_siblings_keeps_the_newest_tombstone_when_nothing_is_live() {
+        // The same terminal one moment later — its last claude has exited too,
+        // so the window holds nothing but tombstones. Exactly one survives (the
+        // NEWEST — the agent that actually just finished, whose done pose is
+        // owed), not all four: a window is never left with two agent rows, and
+        // never with none.
+        let done = |id: &str, started: &str| {
+            let mut r = agent(id, "0xW", started);
+            r.kind = Some("agent".into());
+            r.state = "done".into();
+            r
+        };
+        let sessions = vec![
+            done("14bc78ab", "2026-08-17T07:56:00Z"),
+            done("newest", "2026-08-17T07:57:00Z"),
+            done("cc55b87b", "2026-08-17T07:56:20Z"),
+        ];
+        let mut losers = superseded_done_siblings(&sessions);
+        losers.sort();
+        assert_eq!(losers, vec!["14bc78ab".to_string(), "cc55b87b".to_string()]);
+
+        // A lone tombstone is never touched — nothing supersedes it.
+        assert!(superseded_done_siblings(&[done("solo", "2026-08-17T07:56:00Z")]).is_empty());
+    }
+
+    #[test]
+    fn superseded_done_siblings_ignores_windowless_and_unwindowed_records() {
+        // A `sub:` node carries no windowAddress, so it never enters a window
+        // group however it is stated — and a done subagent beside a live main
+        // agent is the cascade's business, not this one's.
+        let mut sub = subagent("sub:x", "done");
+        sub.window_address = String::new();
+        let mut live = agent("main", "0xW", "2026-08-17T07:57:00Z");
+        live.kind = Some("agent".into());
+        assert!(superseded_done_siblings(&[sub, live]).is_empty());
+    }
+
+    /// End-to-end through `reap()`: the tombstones go, on a pass that reaps
+    /// nothing else — the quiet steady state they used to accumulate in,
+    /// because `prune_done` fires only when something was actually reaped. The
+    /// live sibling and an unrelated lone tombstone both survive.
+    #[test]
+    fn reap_refreshes_a_live_agents_say_and_tool_from_its_transcript() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = crate::graph::testutil::EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "HYPRLAND_INSTANCE_SIGNATURE",
+            "HOME",
+        ]);
+        std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"); // pid-only/no-window liveness
+        let stage = crate::graph::testutil::unique_stage("reap-refresh");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        // A transcript in a project bucket that does NOT match the session's
+        // cwd — the real drift (Claude Code fixes its bucket at launch, the
+        // roster's cwd follows the session), and the case the reaper must still
+        // find, since it has no hook payload to hint with.
+        let home = stage.join("home");
+        let bucket = home.join(".claude/projects/-somewhere-else");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(
+            bucket.join("talker.jsonl"),
+            concat!(
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"on it"},"#,
+                r#"{"type":"tool_use","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        std::env::set_var("HOME", &home);
+
+        let now = now_iso_utc();
+        let mut rec = agent("talker", "0xW", &now);
+        rec.kind = Some("agent".into());
+        rec.state = "working".into();
+        rec.pid = None; // no pid signal — nothing here is liveness-reapable
+        rec.cwd = "/some/deep/subdir".into();
+        write_stage(
+            &sessions_path(),
+            &SessionsFile {
+                schema_version: "0".into(),
+                sessions: vec![rec],
+            },
+        )
+        .unwrap();
+        write_stage(
+            &hooks_path(),
+            &HooksFile {
+                schema_version: "0".into(),
+                hooks: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        // A QUIET pass — nothing to reap — still refreshes the living.
+        let out = reap(&crate::graph::testutil::invocation(&["graph", "reap"], &[]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+        let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let got = &s2.sessions[0];
+        assert_eq!(got.say.as_deref(), Some("on it"));
+        assert_eq!(got.tool.as_deref(), Some("Bash: cargo test"));
+
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+    #[test]
+    fn reap_drops_superseded_done_siblings_on_an_otherwise_quiet_pass() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env =
+            crate::graph::testutil::EnvVars::save(&["AOIDE_STAGE_DIR", "HYPRLAND_INSTANCE_SIGNATURE"]);
+        std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"); // pid-only/no-window liveness
+        let stage = crate::graph::testutil::unique_stage("reap-superseded-done");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let now = now_iso_utc();
+        let mk = |id: &str, win: &str, state: &str| {
+            let mut r = agent(id, win, &now);
+            r.kind = Some("agent".into());
+            r.state = state.into();
+            r.pid = None; // no pid signal — nothing here is liveness-reapable
+            r.cwd = "/nonexistent/nowhere".into();
+            r
+        };
+        write_stage(
+            &sessions_path(),
+            &SessionsFile {
+                schema_version: "0".into(),
+                sessions: vec![
+                    mk("ghost-1", "0xW", "done"),
+                    mk("ghost-2", "0xW", "done"),
+                    mk("live", "0xW", "working"),
+                    mk("lonely", "0xZ", "done"),
+                ],
+            },
+        )
+        .unwrap();
+        let mut hooks = Vec::new();
+        for id in ["ghost-1", "ghost-2", "live", "lonely"] {
+            upsert_hook(&mut hooks, id, "working", &now);
+        }
+        write_stage(
+            &hooks_path(),
+            &HooksFile {
+                schema_version: "0".into(),
+                hooks,
+            },
+        )
+        .unwrap();
+
+        let out = reap(&crate::graph::testutil::invocation(&["graph", "reap"], &[]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+        let data = out.data.unwrap();
+        assert_eq!(data["reaped"], json!([]), "nothing here is liveness-dead");
+        let mut superseded: Vec<String> = data["supersededDone"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        superseded.sort();
+        assert_eq!(
+            superseded,
+            vec!["ghost-1".to_string(), "ghost-2".to_string()]
+        );
+
+        let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let ids: HashSet<&str> = s2.sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["live", "lonely"].into_iter().collect::<HashSet<&str>>(),
+            "the tombstones beside a live agent go; the live one and the lone tombstone stay"
+        );
+        // Their hook records leave with them (else the next pass reads them as
+        // orphans), and the survivors keep theirs.
+        let h2: HooksFile = load_stage(&hooks_path()).unwrap();
+        let hook_ids: HashSet<&str> = h2.hooks.iter().map(|h| h.session_id.as_str()).collect();
+        assert_eq!(
+            hook_ids,
+            ["live", "lonely"].into_iter().collect::<HashSet<&str>>()
+        );
+
+        let _ = std::fs::remove_dir_all(&stage);
     }
 
     #[test]

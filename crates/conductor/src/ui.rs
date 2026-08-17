@@ -693,6 +693,7 @@ mod tests {
             activity: None,
             kind: None,
             say: None,
+            tool: None,
             model: None,
             context_tokens: None,
             needs_sudo: None,

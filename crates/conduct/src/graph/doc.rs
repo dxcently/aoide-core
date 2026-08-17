@@ -82,6 +82,12 @@ pub fn build_graph(
         if let Some(say) = &s.say {
             node["say"] = json!(say);
         }
+        // The agent's latest tool call (transcript-derived), when it has made
+        // one. Rides beside `activity` rather than replacing it: `activity` is
+        // what is running now, this is what was last reached for.
+        if let Some(tool) = &s.tool {
+            node["tool"] = json!(tool);
+        }
         // The Claude model this session (agent or subagent) is running, when
         // known — absent for shells and until the first assistant turn lands.
         if let Some(m) = &s.model {
@@ -426,25 +432,55 @@ pub fn prune_done(
     Vec<String>,
     Vec<String>,
 ) {
-    let mut removed: Vec<String> = sessions
+    let doomed: HashSet<&str> = sessions
         .iter()
         .filter(|s| s.state == "done")
+        .map(|s| s.session_id.as_str())
+        .collect();
+    drop_sessions(&sessions, &doomed, hooks)
+}
+
+/// Drop exactly `roots` (+ their subagent descendants, + their hook records)
+/// from the roster; clear `parentSessionId` on surviving children of anything
+/// removed. [`prune_done`] is this over the whole `done` set — factored apart
+/// because the reaper needs the same drop over a NARROWER one (the superseded
+/// `done` agent siblings of a terminal that still holds a live agent — see
+/// `superseded_done_siblings` in `reap.rs`), and a second hand-rolled retain
+/// there would have missed the cascade and the parent-clearing this owns. A
+/// root absent from `sessions` contributes nothing.
+///
+/// `sessions` is borrowed (not consumed like `prune_done`'s) so the caller can
+/// compute the root set against the same slice it passes in.
+pub(crate) fn drop_sessions(
+    sessions: &[SessionRecord],
+    roots: &HashSet<&str>,
+    hooks: Vec<HookRecord>,
+) -> (
+    Vec<SessionRecord>,
+    Vec<HookRecord>,
+    Vec<String>,
+    Vec<String>,
+) {
+    let mut removed: Vec<String> = sessions
+        .iter()
+        .filter(|s| roots.contains(s.session_id.as_str()))
         .map(|s| s.session_id.clone())
         .collect();
-    // Cascade: a subagent descendant of anything just marked done is ALSO
+    // Cascade: a subagent descendant of anything being dropped is ALSO
     // gone — closes the gap where this function (unlike `do_session_end_inner`)
     // only cleared the child's dangling `parentSessionId` instead of dropping
     // it, stranding un-reapable `kind:"subagent"` ghosts (state stuck
     // "working" forever — see `is_session_dead` in reap.rs).
     let gone_direct: HashSet<&str> = removed.iter().map(String::as_str).collect();
-    let cascaded = doomed_subagent_descendants(&sessions, &gone_direct);
+    let cascaded = doomed_subagent_descendants(sessions, &gone_direct);
     removed.extend(cascaded);
     let gone: HashSet<&str> = removed.iter().map(String::as_str).collect();
 
     let mut cleared: Vec<String> = Vec::new();
     let kept_sessions: Vec<SessionRecord> = sessions
-        .into_iter()
+        .iter()
         .filter(|s| !gone.contains(s.session_id.as_str()))
+        .cloned()
         .map(|mut s| {
             if matches!(&s.parent_session_id, Some(p) if gone.contains(p.as_str())) {
                 s.parent_session_id = None;

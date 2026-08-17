@@ -170,10 +170,10 @@ pub fn register(r: &mut Registry) {
         path: ["graph", "reap"],
         summary: "Reap dead sessions: mark every KILLED session (window gone per hyprctl, or pid's /proc gone) done and drop it, decay every `stopped` session at rest over an hour to `idle`, then re-stage. Automatic liveness sweep for SUPER+Q / SIGKILL'd terminals whose own cleanup could never run. Falls back to pid-only liveness off Hyprland; never errors on nothing-to-reap.",
         args: [],
-        flags: [],
+        flags: [flag!("announce", "bool", "Always raise the desktop toast, even on a quiet pass — for the dock's reap control, where a human pressed something and is owed an answer. Unflagged, the sweep only toasts when it actually changed the roster.")],
         gated: false,
         implemented: true,
-        handler: crate::reap::reap,
+        handler: crate::reap::reap_and_announce,
     ));
     r.insert(cmd!(
         path: ["graph", "emit"],

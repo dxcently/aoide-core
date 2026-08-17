@@ -466,13 +466,19 @@ fn classify_recheck(exited_ok: bool, stdout: &str, stderr: &str) -> Result<Strin
 }
 
 /// Dispatch ONE session recheck: re-exec THIS running binary as `aoide graph
-/// reap --json` — the liveness/rehook sweep (reap dead sessions, decay
-/// `stopped` → `idle`, prune orphaned hook records) the ~12s
-/// `aoide-graph-reap.timer` runs periodically — so the Terminals/Conductor
-/// recheck control triggers it NOW instead of waiting up to a full timer
-/// period. Same `std::env::current_exe()` self-re-exec idiom as
+/// reap --announce --json` — the liveness/rehook sweep (reap dead sessions,
+/// decay `stopped` → `idle`, prune orphaned hook records, refresh every live
+/// agent's transcript fields) the ~12s `aoide-graph-reap.timer` runs
+/// periodically — so the Terminals/Conductor `[ reap ]` control triggers it NOW
+/// instead of waiting up to a full timer period. Same
+/// `std::env::current_exe()` self-re-exec idiom as
 /// [`dispatch_rice_mode_toggle`]/[`dispatch_usage_refresh`], never a bare
 /// `"aoide"` off PATH.
+///
+/// `--announce` is what makes the click ANSWER: the toast is unconditional here,
+/// where a human pressed something, while the timer's own sweeps stay silent
+/// unless they actually changed the roster (see `reap::reap_and_announce`). The
+/// notification is raised by the child, not here — this thread only audits.
 ///
 /// Runs on a DETACHED thread. `graph reap` shells out to `hyprctl clients -j`
 /// for window liveness; that is normally instant, but a hung compositor query
@@ -502,7 +508,7 @@ fn dispatch_recheck_sessions() {
             }
         };
         let result = match std::process::Command::new(&exe)
-            .args(["graph", "reap", "--json"])
+            .args(["graph", "reap", "--announce", "--json"])
             .output()
         {
             Ok(out) => classify_recheck(

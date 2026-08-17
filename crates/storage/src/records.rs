@@ -99,6 +99,15 @@ pub struct SessionRecord {
     /// Additive/v0-safe — absent for shells and for an agent that has not spoken.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub say: Option<String>,
+    /// The agent's latest TOOL CALL as a one-line label (`Bash: cargo test`),
+    /// read off the same transcript tail as `say` at the same refresh points.
+    /// Deliberately not `activity`: that field is the tool running RIGHT NOW
+    /// (hook-set, cleared the moment the turn settles), so a card between tools
+    /// shows nothing; this one is the transcript's record of what the agent last
+    /// reached for and stays put until it reaches for something else.
+    /// Additive/v0-safe — absent for shells and until the first tool call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
     /// The Claude model this session is currently running, taken straight from
     /// the freshest `type:"assistant"` line's `message.model` in the on-disk
     /// JSONL transcript (e.g. `claude-sonnet-5`, `claude-opus-4-8`), refreshed

@@ -326,32 +326,42 @@ pub(in crate::graph) fn ensure_session_ceiling(id: &str, ceiling: u64) {
 /// re-stages only when something moved. Silent no-op when the transcript can't be
 /// located or read. One tail read serves both fields. All harness knowledge is
 /// dispatched through the session agent's `profile`.
-pub(in crate::graph) fn refresh_transcript_fields(
+///
+/// Returns whether it actually WROTE — the hook callers ignore it; the reaper's
+/// sweep counts it, so its toast can say how many agents it brought current
+/// (see `reap::refresh_live_agents`).
+pub(crate) fn refresh_transcript_fields(
     profile: &'static AgentProfile,
     session_id: &str,
     cwd: Option<&str>,
     transcript_hint: Option<&str>,
     preferred_ceiling: Option<u64>,
-) {
+) -> bool {
     let spec = &profile.transcript;
     let Some(path) = (spec.locate)(session_id, cwd, transcript_hint) else {
-        return;
+        return false;
     };
     let lines = (spec.tail)(&path);
     if lines.is_empty() {
-        return;
+        return false;
     }
     let say = (spec.say)(&lines, true);
     let name = (spec.title)(&lines);
     let model = (spec.model)(&lines, true);
     let context_tokens = (spec.context_tokens)(&lines);
-    if say.is_none() && name.is_none() && model.is_none() && context_tokens.is_none() {
-        return;
+    let tool = (spec.tool)(&lines, true);
+    if say.is_none()
+        && name.is_none()
+        && model.is_none()
+        && context_tokens.is_none()
+        && tool.is_none()
+    {
+        return false;
     }
     with_stage_lock(|| {
         let mut file: SessionsFile = match load_stage(&sessions_path()) {
             Ok(f) => f,
-            Err(_) => return,
+            Err(_) => return false,
         };
         let mut changed = false;
         for s in file.sessions.iter_mut() {
@@ -361,6 +371,12 @@ pub(in crate::graph) fn refresh_transcript_fields(
             if let Some(say) = &say {
                 if s.say.as_deref() != Some(say.as_str()) {
                     s.say = Some(say.clone());
+                    changed = true;
+                }
+            }
+            if let Some(tool) = &tool {
+                if s.tool.as_deref() != Some(tool.as_str()) {
+                    s.tool = Some(tool.clone());
                     changed = true;
                 }
             }
@@ -405,7 +421,8 @@ pub(in crate::graph) fn refresh_transcript_fields(
                 let _ = restage_graph();
             }
         }
-    });
+        changed
+    })
 }
 
 /// Best-effort: refresh the `say` of a session's ACTIVE sub-agent nodes from their
@@ -415,7 +432,14 @@ pub(in crate::graph) fn refresh_transcript_fields(
 /// Change-only and bounded to the currently-live sub-nodes (depth-1). The
 /// sub-agent transcript layout is the profile's (`spec.subagents_dir` /
 /// `spec.find_subagent`).
-pub(in crate::graph) fn refresh_subagent_says(profile: &'static AgentProfile, session_id: &str, cwd: Option<&str>) {
+///
+/// Returns whether it WROTE, same as [`refresh_transcript_fields`] and for the
+/// same one caller — the reaper counts what it brought current.
+pub(crate) fn refresh_subagent_says(
+    profile: &'static AgentProfile,
+    session_id: &str,
+    cwd: Option<&str>,
+) -> bool {
     let subs: Vec<String> = match load_stage::<SessionsFile>(&sessions_path()) {
         Ok(file) => file
             .sessions
@@ -424,17 +448,17 @@ pub(in crate::graph) fn refresh_subagent_says(profile: &'static AgentProfile, se
             .filter(|s| s.parent_session_id.as_deref() == Some(session_id))
             .map(|s| s.session_id.clone())
             .collect(),
-        Err(_) => return,
+        Err(_) => return false,
     };
     if subs.is_empty() {
-        return;
+        return false;
     }
     let spec = &profile.transcript;
     let Some(dir) = (spec.subagents_dir)(session_id, cwd) else {
-        return;
+        return false;
     };
-    // (sub_id, say, model) — either of say/model may be None for a given sub.
-    let mut updates: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+    // (sub_id, say, model, tool) — any of the three may be None for a given sub.
+    let mut updates: Vec<(String, Option<String>, Option<String>, Option<String>)> = Vec::new();
     for sub_id in &subs {
         let Some(tuid) = sub_id.strip_prefix("sub:") else {
             continue;
@@ -448,20 +472,21 @@ pub(in crate::graph) fn refresh_subagent_says(profile: &'static AgentProfile, se
         let lines = (spec.tail)(&file);
         let say = (spec.say)(&lines, false);
         let model = (spec.model)(&lines, false);
-        if say.is_some() || model.is_some() {
-            updates.push((sub_id.clone(), say, model));
+        let tool = (spec.tool)(&lines, false);
+        if say.is_some() || model.is_some() || tool.is_some() {
+            updates.push((sub_id.clone(), say, model, tool));
         }
     }
     if updates.is_empty() {
-        return;
+        return false;
     }
     with_stage_lock(|| {
         let mut file: SessionsFile = match load_stage(&sessions_path()) {
             Ok(f) => f,
-            Err(_) => return,
+            Err(_) => return false,
         };
         let mut changed = false;
-        for (sub_id, say, model) in &updates {
+        for (sub_id, say, model, tool) in &updates {
             for s in file.sessions.iter_mut() {
                 if &s.session_id != sub_id {
                     continue;
@@ -469,6 +494,12 @@ pub(in crate::graph) fn refresh_subagent_says(profile: &'static AgentProfile, se
                 if let Some(say) = say {
                     if s.say.as_deref() != Some(say.as_str()) {
                         s.say = Some(say.clone());
+                        changed = true;
+                    }
+                }
+                if let Some(tool) = tool {
+                    if s.tool.as_deref() != Some(tool.as_str()) {
+                        s.tool = Some(tool.clone());
                         changed = true;
                     }
                 }
@@ -496,7 +527,8 @@ pub(in crate::graph) fn refresh_subagent_says(profile: &'static AgentProfile, se
                 let _ = restage_graph();
             }
         }
-    });
+        changed
+    })
 }
 
 /// Create (or refresh) a sub-agent node — a Task the agent spawned, a leaf of
