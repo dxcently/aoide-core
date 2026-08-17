@@ -67,7 +67,8 @@ pub fn all() -> Registry {
     aoide_client::commands::register_peers(&mut r); // peer add/list/remove/pull/status — same-network federation (CONTRACTS.md §7, appended newest)
     aoide_storage::commands::register(&mut r); // usage — local token/cost rollup (CONTRACTS.md §4)
     aoide_conduct::commands::hooks::register(&mut r); // hooks install — the hook-installer verb (appended newest)
-    aoide_song::commands::quickshell::register(&mut r); // quickshell reload — IPC hot-reload trigger (appended newest)
+    aoide_song::commands::quickshell::register(&mut r); // quickshell reload — IPC hot-reload trigger
+    aoide_conduct::commands::screen::register(&mut r); // screen info, screen shot — Phase 1 of the `screen` verb family (appended newest)
 
     r
 }

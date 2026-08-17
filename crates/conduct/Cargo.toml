@@ -14,6 +14,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 aoide-protocol = { workspace = true }
 aoide-storage = { workspace = true }
+# Phase 5 (`screen send --agent`): reuses `client::commands::handle_agent_send`
+# directly rather than reinventing an A2A driver here. Bends the charter
+# table's "conduct/client are independent leaves under cli" a little — see
+# `screen/send.rs`'s module header for why this edge exists and doesn't cycle
+# (client has no dependency back on conduct).
+aoide-client = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]

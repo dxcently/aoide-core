@@ -204,7 +204,14 @@ fn handle_agent_remove(inv: &Invocation) -> Outcome {
 /// `a2a agent send <name> <message>` — DRIVE a registered external agent: POST
 /// a JSON-RPC `message/send` to its endpoint and report the returned
 /// Task/Message. The outbound half of the bidirectional A2A link.
-fn handle_agent_send(inv: &Invocation) -> Outcome {
+///
+/// `pub` (not just crate-local): `aoide-conduct`'s `screen send --agent`
+/// (Phase 5 of the `screen` verb family) calls this DIRECTLY — a same-process
+/// function call via a synthesized `Invocation`, never a subprocess shell-out
+/// to `aoide a2a agent send` — so a captured screenshot's hand-off reuses this
+/// EXACT driver (curl transport, JSON-RPC body, error surfacing) instead of a
+/// second one. Visibility-only change; the body is untouched.
+pub fn handle_agent_send(inv: &Invocation) -> Outcome {
     let cmd = "a2a.agent.send";
     let name = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         Some(n) => n.to_string(),

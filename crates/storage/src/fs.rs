@@ -55,6 +55,32 @@ pub fn state_dir() -> std::path::PathBuf {
     aoide_protocol::aoide_home().join("Aoide").join("state")
 }
 
+/// Screen-capture artifacts: `~/Aoide/state/captures/` (`aoide screen shot`,
+/// PACKAGE-LAYOUT.md Phase-1 `screen` verb family).
+///
+/// Under [`state_dir`], not [`stage_dir`]: a capture is a DURABLE artifact a
+/// caller asked for and keeps around (like `state/usage.json`,
+/// `state/a2a-agents.json`) — never song-scoped, never reset by a `rice
+/// mode`/stage-reseed the way live rehearsal state is. One-line rationale:
+/// lean state, not stage — captures persist, stage doesn't.
+pub fn captures_dir() -> std::path::PathBuf {
+    state_dir().join("captures")
+}
+
+/// Saved pointer position: `~/Aoide/state/pointer-pos.json` (`aoide screen
+/// point save`/`restore`, Phase 2 of the `screen` verb family).
+///
+/// Under [`state_dir`], not [`stage_dir`] — same reasoning as
+/// [`captures_dir`]: a saved cursor position is durable operator-convenience
+/// state that outlives one invocation (the entire point of `save` in one
+/// process and `restore` in a later one), never song-scoped, never reset by
+/// a rice-mode/stage reseed. A single flat file, not a directory like
+/// captures — there is only ever one "current" saved position, never a
+/// history of them.
+pub fn pointer_state_file() -> std::path::PathBuf {
+    state_dir().join("pointer-pos.json")
+}
+
 /// The song tree root (`~/Aoide/song/`) — the parent of the stage dir.
 ///
 /// The stage tree is `<song>/stage`; committed songs live under
@@ -662,5 +688,46 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "content");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn captures_dir_nests_under_state_dir_and_honors_its_override() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+
+        std::env::set_var("AOIDE_STATE_DIR", "/tmp/aoide-captures-test/state");
+        assert_eq!(
+            captures_dir(),
+            std::path::PathBuf::from("/tmp/aoide-captures-test/state/captures")
+        );
+
+        // On the default layout: `~/Aoide/state` → captures_dir() = `~/Aoide/state/captures`.
+        std::env::remove_var("AOIDE_STATE_DIR");
+        assert!(captures_dir().ends_with("Aoide/state/captures"));
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
+    fn pointer_state_file_nests_under_state_dir_and_honors_its_override() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+
+        std::env::set_var("AOIDE_STATE_DIR", "/tmp/aoide-pointer-test/state");
+        assert_eq!(
+            pointer_state_file(),
+            std::path::PathBuf::from("/tmp/aoide-pointer-test/state/pointer-pos.json")
+        );
+
+        std::env::remove_var("AOIDE_STATE_DIR");
+        assert!(pointer_state_file().ends_with("Aoide/state/pointer-pos.json"));
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
     }
 }
