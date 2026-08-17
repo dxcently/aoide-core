@@ -281,3 +281,46 @@ fn peer_add_against_an_unreachable_url_never_registers_and_pull_of_a_down_peer_m
     std::env::remove_var("XDG_RUNTIME_DIR");
     std::env::remove_var("AOIDE_AUDIT_LOG");
 }
+
+// ── Peer nickname validation — NOT `#[ignore]`'d: both handlers reject a
+// ── bad name before ever reaching `run_curl`, so this needs no real network
+// ── and runs in the ordinary sandboxed `cargo test` pass. ────────────────
+
+#[test]
+fn peer_add_rejects_a_path_traversal_name_without_touching_the_network_or_registry() {
+    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let root = unique_root("add-traversal");
+    let _stage = setup_env(&root);
+
+    // The url points at a port nothing listens on — if the name check didn't
+    // short-circuit first, this would fail on the curl fetch instead, which
+    // would also assert Error but for the WRONG reason; asserting
+    // `invalid-name` specifically proves the traversal guard fired first.
+    let out = dispatch(&cli_invocation(&["peer", "add"], &["../../evil", "http://127.0.0.1:1/"], &[]));
+    assert_eq!(out.status, Status::Error);
+    assert_eq!(out.data.unwrap()["reason"], "invalid-name");
+    assert!(aoide_storage::peer_store::load_peers().is_empty(), "nothing registered");
+
+    let _ = std::fs::remove_dir_all(&root);
+    std::env::remove_var("AOIDE_STAGE_DIR");
+    std::env::remove_var("AOIDE_STATE_DIR");
+    std::env::remove_var("XDG_RUNTIME_DIR");
+    std::env::remove_var("AOIDE_AUDIT_LOG");
+}
+
+#[test]
+fn peer_remove_rejects_a_path_traversal_name_before_touching_the_cache_file() {
+    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let root = unique_root("remove-traversal");
+    let _stage = setup_env(&root);
+
+    let out = dispatch(&cli_invocation(&["peer", "remove"], &["../../evil"], &[]));
+    assert_eq!(out.status, Status::Error);
+    assert_eq!(out.data.unwrap()["reason"], "invalid-name");
+
+    let _ = std::fs::remove_dir_all(&root);
+    std::env::remove_var("AOIDE_STAGE_DIR");
+    std::env::remove_var("AOIDE_STATE_DIR");
+    std::env::remove_var("XDG_RUNTIME_DIR");
+    std::env::remove_var("AOIDE_AUDIT_LOG");
+}

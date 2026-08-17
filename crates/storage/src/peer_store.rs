@@ -105,6 +105,19 @@ pub fn remove_peer(peers: &mut Vec<Peer>, name: &str) -> bool {
     peers.len() != before
 }
 
+/// A valid peer nickname: `^[a-z0-9][a-z0-9-]*$` — the same shape as
+/// `aoide_song::compose::valid_song_name` (this crate sits below `song` in
+/// the dependency graph, so it defines its own copy rather than depending
+/// upward). A peer's nickname is joined directly into
+/// [`peer_cache_path`]'s `state/peer-cache/<name>.json` — this one check
+/// rejects path traversal (`..`, `/`) by construction, the same way it does
+/// for a song name.
+pub fn valid_peer_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let first_ok = matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit());
+    first_ok && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
 /// The `scheme://host[:port]` authority of a URL (drops any path/query),
 /// bare (no trailing slash) — pure. Mirrors `aoide-client`'s private
 /// `wire::origin_of`, but lives here (not `aoide-client`) since the SERVER
@@ -286,6 +299,22 @@ mod tests {
             Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
             None => std::env::remove_var("AOIDE_STATE_DIR"),
         }
+    }
+
+    // ── Peer nickname validation (path-traversal guard) ──────────────────────
+
+    #[test]
+    fn valid_peer_name_accepts_the_expected_shape_and_rejects_traversal() {
+        assert!(valid_peer_name("yomi-strix"));
+        assert!(valid_peer_name("ghost"));
+        assert!(valid_peer_name("a1-2b"));
+        assert!(!valid_peer_name(""));
+        assert!(!valid_peer_name("../../evil"));
+        assert!(!valid_peer_name("../etc"));
+        assert!(!valid_peer_name("a/b"));
+        assert!(!valid_peer_name("-leading-hyphen"));
+        assert!(!valid_peer_name("Upper"));
+        assert!(!valid_peer_name("under_score"));
     }
 
     // ── URL host parsing + autogate address matching (pure — no real DNS) ────

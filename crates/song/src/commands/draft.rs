@@ -375,6 +375,16 @@ fn handle_draft_drop(inv: &Invocation) -> Outcome {
             .with_data(json!({ "reason": "missing-name" }));
         }
     };
+    if !crate::compose::valid_song_name(&name) {
+        return Outcome::error(
+            "rice.draft.drop",
+            format!(
+                "`{name}` is not a valid draft name: must match `^[a-z0-9][a-z0-9-]*$` \
+                 (lowercase letters, digits, hyphens; no leading hyphen, no `/`, no `..`)"
+            ),
+        )
+        .with_data(json!({ "reason": "invalid-name", "name": name }));
+    }
     let song = match super::mode::current_staged_song() {
         Some(s) => s,
         None => return no_resolvable_song("rice.draft.drop"),
@@ -759,6 +769,25 @@ mod tests {
         let out = handle_draft_drop(&inv(&["rice", "draft", "drop"], &["neon-night"]));
         assert_eq!(out.status, Status::Ok, "{:?}", out.data);
         assert!(!dir.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn drop_rejects_a_path_traversal_name_before_touching_the_filesystem() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("draft-drop-traversal");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        stage_with_song(&stage, "sonata");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        // `draft_dir(song, name)` joins `name` straight into a path — a
+        // traversal name must be rejected before it ever reaches
+        // `remove_dir_all`, same guard `handle_draft_save` already applies.
+        let out = handle_draft_drop(&inv(&["rice", "draft", "drop"], &["../../evil"]));
+        assert_eq!(out.status, Status::Error);
+        assert_eq!(out.data.unwrap()["reason"], "invalid-name");
         let _ = std::fs::remove_dir_all(&root);
     }
 

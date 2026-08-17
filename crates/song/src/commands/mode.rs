@@ -137,7 +137,15 @@ pub(crate) fn current_staged_song() -> Option<String> {
     let path = shellbridge::stage_dir().join("livery.json");
     let raw = std::fs::read_to_string(path).ok()?;
     let parsed: Value = serde_json::from_str(&raw).ok()?;
-    parsed.get("song")?.as_str().map(str::to_string)
+    let song = parsed.get("song")?.as_str()?.to_string();
+    // The stage file is writable outside this CLI (a hand-edit, a rogue
+    // writer) and every caller of this function joins the result straight
+    // into a path (`draft_dir(song, name)` in `draft.rs`/`mode.rs`) — same
+    // traversal class `rice compose`/`rice stage` guard on the WRITE side;
+    // this is the same guard on the READ side, so a poisoned `"song"` field
+    // can never resolve to anything at all rather than resolving to
+    // something unsafe.
+    crate::compose::valid_song_name(&song).then_some(song)
 }
 
 /// Remove any `Draft`-mode routing symlink currently at `stage/livery.json`,
@@ -451,6 +459,29 @@ fn handle_mode_draft(inv: &Invocation) -> Outcome {
 mod tests {
     use super::*;
     use aoide_test_support::*;
+
+    #[test]
+    fn current_staged_song_rejects_a_hand_edited_path_traversal_song_field() {
+        // `current_staged_song()`'s result is joined straight into
+        // `draft_dir(song, name)` by both `draft.rs` and `handle_mode_draft`
+        // below — a stage/livery.json hand-edited (or written by some other
+        // process) with a traversal `"song"` must resolve to nothing at all,
+        // same as a missing/absent one, rather than resolving to something
+        // a caller then treats as a safe directory component.
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let stage = unique_tmp("current-staged-song-traversal");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(
+            stage.join("livery.json"),
+            r##"{"schemaVersion":"0","song":"../../evil","palette":{"bg":"#000"}}"##,
+        )
+        .unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        assert_eq!(current_staged_song(), None);
+        let _ = std::fs::remove_dir_all(&stage);
+    }
 
     #[test]
     fn status_reports_the_declarative_default_with_no_marker_file() {

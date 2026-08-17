@@ -302,6 +302,20 @@ fn handle_peer_add(inv: &Invocation) -> Outcome {
         Some(u) => u.to_string(),
         None => return Outcome::usage(cmd, "usage: aoide peer add <name> <url> [--autogate] [--json]"),
     };
+    // `name` is joined straight into `state/peer-cache/<name>.json`
+    // (`peer_store::peer_cache_path`) — reject a traversal shape here,
+    // before it's ever registered, same guard `rice compose` applies to a
+    // song name.
+    if !aoide_storage::peer_store::valid_peer_name(&name) {
+        return Outcome::error(
+            cmd,
+            format!(
+                "`{name}` is not a valid peer nickname: must match `^[a-z0-9][a-z0-9-]*$` \
+                 (lowercase letters, digits, hyphens; no leading hyphen, no `/`, no `..`)"
+            ),
+        )
+        .with_data(json!({ "reason": "invalid-name", "name": name }));
+    }
     let autogate = inv.flag_present("autogate");
 
     let mut peers = aoide_storage::peer_store::load_peers();
@@ -387,6 +401,21 @@ fn handle_peer_remove(inv: &Invocation) -> Outcome {
         Some(n) => n.to_string(),
         None => return Outcome::usage(cmd, "usage: aoide peer remove <name> [--json]"),
     };
+    // Defense in depth (mirrors `handle_peer_add`'s own guard): `name` is
+    // about to reach `peer_cache_path(&name)` below via `remove_file`, a
+    // DELETE — refuse a traversal shape even if it somehow got past `add`
+    // (e.g. a hand-edited `state/peers.json`) before it ever reaches that
+    // path join.
+    if !aoide_storage::peer_store::valid_peer_name(&name) {
+        return Outcome::error(
+            cmd,
+            format!(
+                "`{name}` is not a valid peer nickname: must match `^[a-z0-9][a-z0-9-]*$` \
+                 (lowercase letters, digits, hyphens; no leading hyphen, no `/`, no `..`)"
+            ),
+        )
+        .with_data(json!({ "reason": "invalid-name", "name": name }));
+    }
     let mut peers = aoide_storage::peer_store::load_peers();
     if !aoide_storage::peer_store::remove_peer(&mut peers, &name) {
         return Outcome::error(cmd, format!("no peer named `{name}`"))

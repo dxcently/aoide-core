@@ -233,6 +233,23 @@ pub(crate) fn handle_rice_stage(inv: &Invocation) -> Outcome {
                 .with_data(json!({ "reason": "missing-name" }));
         }
     };
+    // Same guard `rice compose` applies to its own `<name>`: this string is
+    // joined straight into `songbook_notes(&name)` below (a read path — an
+    // unvalidated `../../x` would let `rice stage` read any JSON-parseable
+    // file on the box) AND gets written verbatim into the staged notes'
+    // `"song"` field, which `current_staged_song()` later trusts for
+    // `draft`/`mode` verbs' own path-building. Reject it here, once, at the
+    // source.
+    if !crate::compose::valid_song_name(&name) {
+        return Outcome::error(
+            "rice.stage",
+            format!(
+                "`{name}` is not a valid song name: must match `^[a-z0-9][a-z0-9-]*$` \
+                 (lowercase letters, digits, hyphens; no leading hyphen, no `/`, no `..`)"
+            ),
+        )
+        .with_data(json!({ "reason": "invalid-name", "name": name }));
+    }
 
     let notes_src = shellbridge::songbook_notes(&name);
     let raw = match std::fs::read_to_string(&notes_src) {
@@ -717,6 +734,25 @@ mod tests {
         let out = handle_rice_stage(&inv(&["rice", "stage"], &[]));
         assert_eq!(out.status, Status::Usage);
         assert_eq!(out.render(false).1, aoide_protocol::output::exit::USAGE);
+    }
+
+    #[test]
+    fn stage_rejects_a_path_traversal_name_before_reading_or_writing_anything() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("stage-traversal");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        // A file OUTSIDE songbook/ that a `../../` traversal could reach if
+        // the name were joined unvalidated into `songbook_notes(&name)`.
+        std::fs::write(root.join("secret.json"), VALID_NOTES).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["../secret"]));
+        assert_eq!(out.status, Status::Error);
+        assert_eq!(out.data.unwrap()["reason"], "invalid-name");
+        assert!(!stage.join("livery.json").exists(), "nothing staged from a rejected name");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ── rice stage: the declarative-mode write guard (khoa 2026-08-14) ───────

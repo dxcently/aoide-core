@@ -14,6 +14,7 @@
 //! a reload would find nothing new to pick up and would needlessly reset
 //! every OTHER live-tweaked keyword a user has set out-of-band.
 
+use crate::livery::schema;
 use serde_json::Value;
 
 /// Build the `hyprctl keyword …` list for one staged notes document, in the
@@ -43,17 +44,30 @@ pub fn geometry_keywords(notes: &Value) -> Vec<String> {
     push_int(&mut out, geo, "gapsIn", "general:gaps_in");
     push_int(&mut out, geo, "borderSize", "general:border_size");
 
+    // `schema::is_hex` lints BEFORE the value ever reaches `to_hyprland_rgb`
+    // — this string is interpolated straight into a `;`-joined `hyprctl
+    // --batch` command, so anything that isn't a clean `#rrggbb`/`rrggbb` hex
+    // (e.g. `0; dispatch exec <cmd>`) must never reach it. A staged notes
+    // document is normally already `rice lint`-clean by the time it lands
+    // here, but this is the last line of defense in the actual hot path
+    // (`handle_rice_stage` stages+applies without re-linting), so an invalid
+    // value is silently skipped — same "no opinion" treatment as an absent
+    // geometry field — rather than passed through or defaulted.
     if let Some(hex) = notes.pointer("/window/border").and_then(Value::as_str) {
-        out.push(format!(
-            "keyword general:col.active_border {}",
-            to_hyprland_rgb(hex)
-        ));
+        if schema::is_hex(hex) {
+            out.push(format!(
+                "keyword general:col.active_border {}",
+                to_hyprland_rgb(hex)
+            ));
+        }
     }
     if let Some(hex) = notes.pointer("/window/borderInactive").and_then(Value::as_str) {
-        out.push(format!(
-            "keyword general:col.inactive_border {}",
-            to_hyprland_rgb(hex)
-        ));
+        if schema::is_hex(hex) {
+            out.push(format!(
+                "keyword general:col.inactive_border {}",
+                to_hyprland_rgb(hex)
+            ));
+        }
     }
 
     push_int(&mut out, geo, "rounding", "decoration:rounding");
@@ -177,6 +191,34 @@ mod tests {
         assert_eq!(
             geometry_keywords(&notes),
             vec!["keyword general:gaps_in 6".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_non_hex_border_is_never_interpolated_into_the_batch_command() {
+        // `to_hyprland_rgb` interpolates this string directly into a
+        // `;`-joined `hyprctl --batch` payload (see `batch_command`) — a
+        // value shaped like a second command must be dropped, not passed
+        // through, since a staged notes file may not have been re-linted by
+        // the time it reaches this hot path (`handle_rice_stage`).
+        let notes = json!({
+            "window": { "border": "0; dispatch exec touch /tmp/pwned" }
+        });
+        assert!(
+            geometry_keywords(&notes).is_empty(),
+            "an injection-shaped border value must be skipped entirely"
+        );
+    }
+
+    #[test]
+    fn a_non_hex_border_inactive_is_skipped_while_a_valid_border_still_emits() {
+        let notes = json!({
+            "window": { "border": "#89b4fa", "borderInactive": "'; rm -rf ~; '" }
+        });
+        assert_eq!(
+            geometry_keywords(&notes),
+            vec!["keyword general:col.active_border rgb(89b4fa)".to_string()],
+            "the valid sibling field still emits; only the malformed one is dropped"
         );
     }
 

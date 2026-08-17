@@ -238,6 +238,15 @@ fn set_session_state(id: &str, state: &str) -> Result<bool, String> {
 /// routing, so a sub-agent's churn never clobbers its parent's display). Writes
 /// the canonical phase to hooks.json (audit + graph merge) and the
 /// state+activity to sessions.json (the widgets), under one stage lock.
+///
+/// hooks.json is written unconditionally — [`upsert_hook`] always stamps a
+/// fresh `updatedAt`, so its content is genuinely new on every call (it's the
+/// per-hook heartbeat, not a mirror of session state). sessions.json (and the
+/// `graph.json` restage it triggers) is CHANGE-ONLY, same discipline as
+/// `conduct.rs`'s `do_session_refresh`: a tool hook fires far more often than
+/// `state`/`activity` actually change, and this file is what the widgets'
+/// FileView watches — an unconditional rewrite here churns the UI on every
+/// single hook, not just the ones that moved anything.
 pub(in crate::graph) fn set_owner_activity(owner: &str, state: &str, activity: Option<&str>) {
     with_stage_lock(|| {
         let canon = canonical_state(state);
@@ -247,21 +256,34 @@ pub(in crate::graph) fn set_owner_activity(owner: &str, state: &str, activity: O
             h.schema_version = STAGE_GRAPH_VERSION.to_string();
         }
         let _ = write_stage(&hooks_path(), &h);
+
         let mut file: SessionsFile = match load_stage(&sessions_path()) {
             Ok(f) => f,
             Err(_) => return,
         };
+        let want_activity = activity.filter(|a| !a.is_empty()).map(str::to_string);
+        let mut changed = false;
         for s in file.sessions.iter_mut() {
-            if s.session_id == owner {
+            if s.session_id != owner {
+                continue;
+            }
+            if s.state != canon {
                 s.state = canon.to_string();
-                s.activity = activity.filter(|a| !a.is_empty()).map(str::to_string);
+                changed = true;
+            }
+            if s.activity != want_activity {
+                s.activity = want_activity.clone();
+                changed = true;
             }
         }
-        if file.schema_version.is_empty() {
-            file.schema_version = STAGE_GRAPH_VERSION.to_string();
+        if changed {
+            if file.schema_version.is_empty() {
+                file.schema_version = STAGE_GRAPH_VERSION.to_string();
+            }
+            if write_stage(&sessions_path(), &file).is_ok() {
+                let _ = restage_graph();
+            }
         }
-        let _ = write_stage(&sessions_path(), &file);
-        let _ = restage_graph();
     });
 }
 

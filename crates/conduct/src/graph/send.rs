@@ -133,36 +133,40 @@ fn one_line_title(text: &str) -> String {
 }
 
 fn record_pending(id: &str, text: &str, submit: bool) -> Result<(), String> {
-    let mut file: PendingFile = load_stage(&pending_path())?;
-    file.schema_version = STAGE_GRAPH_VERSION.to_string();
-    file.pending.push(PendingSend {
-        session_id: id.to_string(),
-        text: text.to_string(),
-        submit,
-        queued_at: now_iso_utc(),
-    });
-    write_stage(&pending_path(), &file)
+    with_stage_lock(|| {
+        let mut file: PendingFile = load_stage(&pending_path())?;
+        file.schema_version = STAGE_GRAPH_VERSION.to_string();
+        file.pending.push(PendingSend {
+            session_id: id.to_string(),
+            text: text.to_string(),
+            submit,
+            queued_at: now_iso_utc(),
+        });
+        write_stage(&pending_path(), &file)
+    })
 }
 
 /// Auto-rename: write `title` onto the session record and re-stage the graph so
 /// the node relabels. A missing id is a silent no-op (the send still succeeded).
 fn set_session_title(id: &str, title: &str) -> Result<(), String> {
-    let mut file: SessionsFile = load_stage(&sessions_path())?;
-    let mut found = false;
-    for s in file.sessions.iter_mut() {
-        if s.session_id == id {
-            s.title = Some(title.to_string());
-            found = true;
+    with_stage_lock(|| {
+        let mut file: SessionsFile = load_stage(&sessions_path())?;
+        let mut found = false;
+        for s in file.sessions.iter_mut() {
+            if s.session_id == id {
+                s.title = Some(title.to_string());
+                found = true;
+            }
         }
-    }
-    if !found {
-        return Ok(());
-    }
-    if file.schema_version.is_empty() {
-        file.schema_version = STAGE_GRAPH_VERSION.to_string();
-    }
-    write_stage(&sessions_path(), &file)?;
-    restage_graph().map(|_| ())
+        if !found {
+            return Ok(());
+        }
+        if file.schema_version.is_empty() {
+            file.schema_version = STAGE_GRAPH_VERSION.to_string();
+        }
+        write_stage(&sessions_path(), &file)?;
+        restage_graph().map(|_| ())
+    })
 }
 
 /// Name a session from its FIRST user prompt — set the `title` slot only when it

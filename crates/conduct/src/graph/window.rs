@@ -395,19 +395,41 @@ pub(in crate::graph) fn ensure_session_window(id: &str) {
     if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
         return;
     }
-    let mut file: SessionsFile = match load_stage(&sessions_path()) {
-        Ok(f) => f,
+    // Cheap, unlocked pre-check: bail before paying for a `hyprctl` round
+    // trip (`discover_window`, below) when this session's window is already
+    // known — `load_stage`/`write_stage` are atomic-rename based, so an
+    // unlocked read never tears, only occasionally stales; a stale "still
+    // needs a window" reading here costs one redundant discovery at worst,
+    // never a lost update (the actual write is locked+re-checked below).
+    let needs_window = match load_stage::<SessionsFile>(&sessions_path()) {
+        Ok(f) => {
+            matches!(f.sessions.iter().find(|s| s.session_id == id), Some(s) if s.window_address.is_empty())
+        }
         Err(_) => return,
     };
-    let needs_window =
-        matches!(file.sessions.iter().find(|s| s.session_id == id), Some(s) if s.window_address.is_empty());
     if !needs_window {
         return;
     }
     let Some((addr, pid, workspace)) = discover_window() else {
         return;
     };
-    if let Some(s) = file.sessions.iter_mut().find(|s| s.session_id == id) {
+    // The actual load-mutate-write is locked and re-loads fresh (rather than
+    // reusing the pre-check's copy above) so a concurrent writer's changes —
+    // made anywhere between the pre-check and here — are never clobbered;
+    // the `window_address.is_empty()` re-check right below is what makes
+    // that safe even though `discover_window`'s hyprctl round trip ran
+    // unlocked.
+    with_stage_lock(|| {
+        let mut file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let Some(s) = file.sessions.iter_mut().find(|s| s.session_id == id) else {
+            return;
+        };
+        if !s.window_address.is_empty() {
+            return; // filled by a concurrent writer while we were discovering
+        }
         s.window_address = addr;
         // Only fill a MISSING pid. A pid the harness self-reported (pi's
         // `process.pid` — the hook door's payload-pid seam) is the agent's own
@@ -422,12 +444,13 @@ pub(in crate::graph) fn ensure_session_window(id: &str) {
         if workspace.is_some() {
             s.workspace = workspace;
         }
-    }
-    if file.schema_version.is_empty() {
-        file.schema_version = STAGE_GRAPH_VERSION.to_string();
-    }
-    let _ = write_stage(&sessions_path(), &file);
-    let _ = restage_graph();
+        if file.schema_version.is_empty() {
+            file.schema_version = STAGE_GRAPH_VERSION.to_string();
+        }
+        if write_stage(&sessions_path(), &file).is_ok() {
+            let _ = restage_graph();
+        }
+    });
 }
 
 // ── Authoritative window capture: the Hyprland event listener ────────────────
@@ -524,63 +547,72 @@ pub fn parse_hypr_window_event(line: &str) -> Option<HyprWindowEvent> {
 /// clients list leaves its stored workspace be — never cleared); it never
 /// touches `pid` or `state`. Returns true iff `sessions.json` changed.
 pub fn resolve_pending_session_windows() -> bool {
-    let mut file: SessionsFile = match load_stage(&sessions_path()) {
-        Ok(f) => f,
+    // Cheap, unlocked pre-check (see `ensure_session_window`'s identical
+    // reasoning above): skip the `hyprctl` round trip entirely when there's
+    // nothing to do. A stale reading here costs one redundant `hyprctl`
+    // call at worst — the write below is locked and re-loads fresh.
+    let has_work = match load_stage::<SessionsFile>(&sessions_path()) {
+        Ok(f) => {
+            // Work to do if a session still needs its window (empty address +
+            // a pid to walk) OR already has one whose workspace we can
+            // (re)stamp. The latter is what keeps `workspace` fresh across a
+            // move; without it a steady-state roster would never re-stamp.
+            let has_pending = f.sessions.iter().any(|s| s.window_address.is_empty() && s.pid.is_some());
+            let has_windowed = f.sessions.iter().any(|s| !s.window_address.is_empty());
+            has_pending || has_windowed
+        }
         Err(_) => return false,
     };
-    // Work to do if a session still needs its window (empty address + a pid to
-    // walk) OR already has one whose workspace we can (re)stamp. The latter is
-    // what keeps `workspace` fresh across a move; without it a steady-state
-    // roster would never re-stamp.
-    let has_pending = file
-        .sessions
-        .iter()
-        .any(|s| s.window_address.is_empty() && s.pid.is_some());
-    let has_windowed = file.sessions.iter().any(|s| !s.window_address.is_empty());
-    if !has_pending && !has_windowed {
+    if !has_work {
         return false;
     }
     let Some(clients) = hyprctl_clients() else {
         return false;
     };
-    let mut changed = false;
-    for s in file.sessions.iter_mut() {
-        if s.window_address.is_empty() {
-            // Pending window: resolve it via pid-ancestry, stamping workspace off
-            // the same snapshot (None → left absent, degrades gracefully).
-            let Some(pid) = s.pid else {
-                continue;
-            };
-            let ancestry = pid_ancestry(pid as i32);
-            if let Some((addr, _)) = match_window_and_pid(&ancestry, &clients) {
-                let ws = client_workspace_for_address(&clients, &addr);
-                s.window_address = addr;
-                if s.workspace != ws {
-                    s.workspace = ws;
+    with_stage_lock(|| {
+        let mut file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let mut changed = false;
+        for s in file.sessions.iter_mut() {
+            if s.window_address.is_empty() {
+                // Pending window: resolve it via pid-ancestry, stamping workspace off
+                // the same snapshot (None → left absent, degrades gracefully).
+                let Some(pid) = s.pid else {
+                    continue;
+                };
+                let ancestry = pid_ancestry(pid as i32);
+                if let Some((addr, _)) = match_window_and_pid(&ancestry, &clients) {
+                    let ws = client_workspace_for_address(&clients, &addr);
+                    s.window_address = addr;
+                    if s.workspace != ws {
+                        s.workspace = ws;
+                    }
+                    changed = true;
                 }
-                changed = true;
-            }
-        } else if let Some(ws) = client_workspace_for_address(&clients, &s.window_address) {
-            // Resolved window still live: keep its workspace current (the
-            // drag-between-workspaces re-stamp). Only a present, changed id is
-            // written; a vanished window leaves the stored workspace intact.
-            if s.workspace != Some(ws) {
-                s.workspace = Some(ws);
-                changed = true;
+            } else if let Some(ws) = client_workspace_for_address(&clients, &s.window_address) {
+                // Resolved window still live: keep its workspace current (the
+                // drag-between-workspaces re-stamp). Only a present, changed id is
+                // written; a vanished window leaves the stored workspace intact.
+                if s.workspace != Some(ws) {
+                    s.workspace = Some(ws);
+                    changed = true;
+                }
             }
         }
-    }
-    if !changed {
-        return false;
-    }
-    if file.schema_version.is_empty() {
-        file.schema_version = STAGE_GRAPH_VERSION.to_string();
-    }
-    if write_stage(&sessions_path(), &file).is_ok() {
-        let _ = restage_graph();
-        return true;
-    }
-    false
+        if !changed {
+            return false;
+        }
+        if file.schema_version.is_empty() {
+            file.schema_version = STAGE_GRAPH_VERSION.to_string();
+        }
+        if write_stage(&sessions_path(), &file).is_ok() {
+            let _ = restage_graph();
+            return true;
+        }
+        false
+    })
 }
 
 /// Clear a closed window's address off any session that stored it (normalised
@@ -592,25 +624,27 @@ pub fn clear_closed_window(address: &str) -> bool {
     if want.is_empty() {
         return false;
     }
-    let mut file: SessionsFile = match load_stage(&sessions_path()) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    let mut changed = false;
-    for s in file.sessions.iter_mut() {
-        if !s.window_address.is_empty() && normalize_addr(&s.window_address) == want {
-            s.window_address.clear();
-            changed = true;
+    with_stage_lock(|| {
+        let mut file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let mut changed = false;
+        for s in file.sessions.iter_mut() {
+            if !s.window_address.is_empty() && normalize_addr(&s.window_address) == want {
+                s.window_address.clear();
+                changed = true;
+            }
         }
-    }
-    if !changed {
-        return false;
-    }
-    if write_stage(&sessions_path(), &file).is_ok() {
-        let _ = restage_graph();
-        return true;
-    }
-    false
+        if !changed {
+            return false;
+        }
+        if write_stage(&sessions_path(), &file).is_ok() {
+            let _ = restage_graph();
+            return true;
+        }
+        false
+    })
 }
 
 // ── Untracked-terminal capture: publish a synthetic record per bare tty ──────
@@ -821,10 +855,16 @@ fn term_window_from_client(c: &Value) -> Option<TermWindow> {
         .get("workspace")
         .and_then(|w| w.get("id"))
         .and_then(Value::as_i64);
+    // Checked, not `as i32`: hyprctl's JSON pid is an i64, and a value outside
+    // i32's range would otherwise silently wrap into an arbitrary in-range
+    // pid before it's used both for `/proc/<pid>/cwd` below and, later, a
+    // widening `as u32` in `reconcile_untracked_terminals`. `try_from` simply
+    // drops an out-of-range value (`None`) rather than wrapping it into a
+    // bogus one.
     let pid = c
         .get("pid")
         .and_then(Value::as_i64)
-        .map(|p| p as i32)
+        .and_then(|p| i32::try_from(p).ok())
         .filter(|p| *p > 0);
     // `mapped` defaults to true when absent — a client with no `mapped` field is
     // treated as a shown window rather than silently dropped.
@@ -995,6 +1035,24 @@ mod tests {
         assert!(!is_terminal_class("kittyfoo"));
         assert!(!is_terminal_class(""));
     }
+    #[test]
+    fn term_window_from_client_drops_a_pid_outside_i32_range_instead_of_wrapping() {
+        // Before the fix, `as i32` on an out-of-range i64 would silently wrap
+        // into an arbitrary (possibly small, positive) i32 — which then feeds
+        // `/proc/<pid>/cwd` right below, and later a widening `as u32` in
+        // `reconcile_untracked_terminals`. The checked conversion must drop
+        // it instead of wrapping.
+        let c = serde_json::json!({
+            "address": "0xAABB",
+            "class": "kitty",
+            "title": "t",
+            "pid": (i32::MAX as i64) + 1,
+            "mapped": true,
+        });
+        let w = term_window_from_client(&c).expect("a valid address still yields a TermWindow");
+        assert_eq!(w.pid, None, "an out-of-i32-range pid must be dropped, never wrapped");
+    }
+
     #[test]
     fn untracked_terminal_synthesizes_a_win_record() {
         let (out, changed) =

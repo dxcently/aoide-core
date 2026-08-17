@@ -74,6 +74,25 @@ pub const REAP_IDLE_STALE_SECS: i64 = 72 * 3600; // 72 hours (~3 days)
 /// record is a ghost.
 pub const REAP_WORKING_STALE_SECS: i64 = 7 * 24 * 3600; // 7 days (~168 hours)
 
+/// How long a MID-TURN (`working`/`awaiting`) **`subagent`-kind** record may
+/// go without any evidence of life before its own silence becomes the
+/// abandonment signal — see [`is_session_dead`]. Overrides
+/// [`REAP_WORKING_STALE_SECS`] for that one kind specifically, and is FAR
+/// shorter: a subagent record is spawned by its parent session's own
+/// Task-tool call and lives entirely inside that single call (see
+/// `doomed_subagent_descendants` in `graph/doc.rs` — the cascade is its
+/// PRIMARY cleanup path when the parent ends; this band is only the slow
+/// backstop for a subagent stranded while its parent lives on). There is no
+/// scenario where a subagent is still genuinely "working" long after that —
+/// unlike an independent long-running headless agent (the case
+/// [`REAP_WORKING_STALE_SECS`] protects), which can legitimately go
+/// hook-silent for days. 2h sits comfortably clear on both sides: well past
+/// an ordinary subagent turn (real multi-tool work running 20-30 minutes is
+/// normal) and well short of the multi-hour staleness that actually strands
+/// one — the two ghost records that motivated this constant were still
+/// `working` 11+ hours after their parent's Task call had already returned.
+pub const REAP_SUBAGENT_STALE_SECS: i64 = 2 * 3600; // 2 hours
+
 /// Is a session DEAD — orphaned so that NO process will ever clean it up? Pure
 /// and unit-tested (feed a fake live-address set + window-owner map, a fake
 /// `proc_exists`, and a fake `last_seen`).
@@ -89,9 +108,14 @@ pub const REAP_WORKING_STALE_SECS: i64 = 7 * 24 * 3600; // 7 days (~168 hours)
 ///       - **at rest** (`idle`/`stopped`), silent past
 ///         [`REAP_IDLE_STALE_SECS`] (72h), OR
 ///       - **mid-turn** (`working`/`awaiting`), silent past
-///         [`REAP_WORKING_STALE_SECS`] (7 days).
+///         [`REAP_WORKING_STALE_SECS`] (7 days) — except a `subagent`-kind
+///         record, which judges mid-turn silence against
+///         [`REAP_SUBAGENT_STALE_SECS`] (2h) instead: it cannot legitimately
+///         outlive its parent's own Task-tool call, so it needs no week-long
+///         grace.
 ///     Eligible records: a HEADLESS one (no window AND no pid — the classic
-///     hook-only shape) or an AGENT one ([`is_agent_kind`]). The agent arm is
+///     hook-only shape; every `subagent` record is shaped this way) or an
+///     AGENT one ([`is_agent_kind`]). The agent arm is
 ///     the hardening: an agent killed inside its still-open terminal/parent
 ///     keeps a live window and a live TERMINAL pid forever, so only the
 ///     silence of every evidence stream can condemn it. The kind gate keeps
@@ -156,10 +180,18 @@ pub fn is_session_dead(
     // doc above for why shells are excluded).
     let stale_eligible =
         (rec.window_address.is_empty() && rec.pid.is_none()) || is_agent_kind(rec);
+    // A subagent cannot legitimately outlive its parent's own Task-tool call
+    // (see REAP_SUBAGENT_STALE_SECS), so its mid-turn silence is judged
+    // against a far shorter band than the general working/awaiting case.
+    let working_band = if rec.kind.as_deref() == Some("subagent") {
+        REAP_SUBAGENT_STALE_SECS
+    } else {
+        REAP_WORKING_STALE_SECS
+    };
     let stale_abandoned = stale_eligible
         && !live_agent_pid
         && ((at_rest && stale_beyond(REAP_IDLE_STALE_SECS))
-            || (mid_turn && stale_beyond(REAP_WORKING_STALE_SECS)));
+            || (mid_turn && stale_beyond(working_band)));
     window_signal || pid_signal || stale_abandoned
 }
 
@@ -414,10 +446,30 @@ pub(crate) fn decay_stopped_sessions(
 /// Cheap: one `hyprctl` call + a stage read, and a stage WRITE only when
 /// something was actually reaped. NEVER errors non-zero on "nothing to reap" and
 /// NEVER on an unavailable compositor (it falls back to pid-only liveness).
+///
+/// `hyprctl clients -j` is gathered BEFORE the stage lock is taken, not inside
+/// it: it is a subprocess call (real wall-clock cost, and a hung `hyprctl`
+/// would otherwise hang indefinitely) that touches no stage file, so it needs
+/// none of the lock's atomicity — holding the lock across it would block
+/// every other stage writer (`graph send`, session-start/end, hook updates,
+/// …) for as long as it runs. The window-liveness signal is already treated
+/// as a best-effort, racy-by-nature snapshot throughout this module (see
+/// `effective_live_addresses`'s transient-read grace), so gathering it a
+/// moment before the lock rather than inside it changes nothing about
+/// correctness — only the sessions/hooks read-decide-write below needs the
+/// lock, and that still happens entirely inside it.
 pub fn reap(inv: &Invocation) -> Outcome {
-    aoide_storage::fs::with_stage_lock(|| reap_inner(inv))
+    let (gathered_addrs, window_owners) = match live_windows() {
+        Some((addrs, owners)) => (Some(addrs), Some(owners)),
+        None => (None, None),
+    };
+    aoide_storage::fs::with_stage_lock(move || reap_inner(inv, gathered_addrs, window_owners))
 }
-fn reap_inner(_inv: &Invocation) -> Outcome {
+fn reap_inner(
+    _inv: &Invocation,
+    gathered_addrs: Option<HashSet<String>>,
+    window_owners: Option<HashMap<String, u32>>,
+) -> Outcome {
     let cmd = "graph.reap";
     let mut s_file: SessionsFile = match load_stage(&sessions_path()) {
         Ok(f) => f,
@@ -433,10 +485,6 @@ fn reap_inner(_inv: &Invocation) -> Outcome {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    let (gathered_addrs, window_owners) = match live_windows() {
-        Some((addrs, owners)) => (Some(addrs), Some(owners)),
-        None => (None, None),
-    };
     let hyprctl_available = gathered_addrs.is_some();
     // Apply the transient-read grace: a degenerate empty snapshot during a reload
     // window falls back to pid-only liveness so we never sweep the live roster off
@@ -621,6 +669,21 @@ mod tests {
         }
     }
 
+    /// A `kind:"subagent"` Task-tool node: no `windowAddress`, no `pid` —
+    /// exactly the shape of the two 11h-stale `working` ghosts
+    /// `REAP_SUBAGENT_STALE_SECS` exists for.
+    fn subagent(id: &str, state: &str) -> SessionRecord {
+        SessionRecord {
+            session_id: id.into(),
+            agent: "general-purpose".into(),
+            window_address: String::new(),
+            state: state.into(),
+            pid: None,
+            kind: Some("subagent".into()),
+            ..Default::default()
+        }
+    }
+
     /// A hook-only session: no `windowAddress`, no `pid` — exactly the UUID
     /// sessions that used to strand `idle` forever (the third-signal target).
     fn hook_only(id: &str, state: &str) -> SessionRecord {
@@ -711,6 +774,76 @@ mod tests {
             |_| true,
             now,
             two_hundred_hours,
+        ));
+    }
+
+    #[test]
+    fn subagent_midturn_sessions_reaped_past_the_subagent_band_not_the_week_band() {
+        // A `kind:"subagent"` record cannot outlive its parent's own Task
+        // call, so mid-turn silence is judged against the much shorter
+        // REAP_SUBAGENT_STALE_SECS (2h) — NOT the general 7-day
+        // REAP_WORKING_STALE_SECS band `hook_only` records above use.
+        let now = 1_800_000_000_i64;
+        let thirty_minutes = |_: &SessionRecord| Some(now - 30 * 60);
+        let three_hours = |_: &SessionRecord| Some(now - 3 * 3600);
+        let eleven_hours = |_: &SessionRecord| Some(now - 11 * 3600);
+
+        // 30m of silence: comfortably inside a real multi-tool subagent turn.
+        assert!(!is_session_dead(
+            &subagent("busy-sub", "working"),
+            None,
+            None,
+            |_| true,
+            now,
+            thirty_minutes,
+        ));
+        // 3h: past the 2h subagent band (though still nowhere near the 7-day
+        // general one) — silence that long is abandonment for a subagent.
+        assert!(is_session_dead(
+            &subagent("busy-sub", "working"),
+            None,
+            None,
+            |_| true,
+            now,
+            three_hours,
+        ));
+        // `awaiting` is equally mid-turn for a subagent.
+        assert!(is_session_dead(
+            &subagent("asking-sub", "awaiting"),
+            None,
+            None,
+            |_| true,
+            now,
+            three_hours,
+        ));
+        // The actual 11h-stale shape of the two live ghosts that motivated
+        // this constant is caught, well past the 2h band.
+        assert!(is_session_dead(
+            &subagent("ghost-sub", "working"),
+            None,
+            None,
+            |_| true,
+            now,
+            eleven_hours,
+        ));
+    }
+
+    #[test]
+    fn subagent_band_does_not_shrink_the_general_headless_working_band() {
+        // The short band is SPECIFIC to kind=="subagent" — an ordinary
+        // headless `working` record (a real long-running headless agent, no
+        // window, no pid, kind neither "agent" nor "subagent") must still get
+        // the full week-long grace, not accidentally inherit the short one.
+        // 3h is past the subagent band but nowhere near the week-long one.
+        let now = 1_800_000_000_i64;
+        let three_hours = |_: &SessionRecord| Some(now - 3 * 3600);
+        assert!(!is_session_dead(
+            &hook_only("busy-headless", "working"),
+            None,
+            None,
+            |_| true,
+            now,
+            three_hours,
         ));
     }
 
