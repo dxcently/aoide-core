@@ -119,6 +119,16 @@ fn send_gate(yes: bool, sender_is_parent: bool) -> SendGate {
     }
 }
 
+/// Does this injected text NAME the node? A `graph send` steer is a task, so it
+/// renames; a bare KEYSTROKE answer is not. `graph permit` types a single digit
+/// to answer a permission prompt (and a human answering a numbered prompt by
+/// hand types the same thing), and letting that overwrite the node's title with
+/// `1` would erase the one label the dock and the graph tree identify the
+/// session by. A title is words: text carrying no letter at all is an answer.
+fn names_the_node(text: &str) -> bool {
+    text.chars().any(char::is_alphabetic)
+}
+
 /// A one-line, length-bounded form of the injected text — the auto-rename title.
 fn one_line_title(text: &str) -> String {
     let first = text.lines().next().unwrap_or("").trim();
@@ -231,7 +241,8 @@ fn audit_send(inv: &Invocation, status: &str, message: &str, text: &str) {
 /// `--yes` and no autogate, the send is recorded PENDING (atomic stage write) and
 /// NOT delivered; WITH `--yes` (or an autogate match) it connects to the socket,
 /// writes `<text>` (+ `\n` on `--submit`), auto-renames the node to a one-line
-/// form of the text, and returns delivered. Every outcome writes an audit line.
+/// form of the text (unless the text is a bare keystroke answer — see
+/// [`names_the_node`]), and returns delivered. Every outcome writes an audit line.
 pub fn session_send(inv: &Invocation) -> Outcome {
     let cmd = "graph.send";
     let id = match require_flag(inv, "id") {
@@ -323,12 +334,20 @@ pub fn session_send(inv: &Invocation) -> Outcome {
         }
     }
 
-    // Auto-rename the node to a one-line form of the delivered task.
-    let title = one_line_title(&text);
+    // Auto-rename the node to a one-line form of the delivered task — unless
+    // the text is a keystroke answer rather than a task (see [`names_the_node`]).
+    let renamed = names_the_node(&text);
+    let title = if renamed {
+        one_line_title(&text)
+    } else {
+        String::new()
+    };
     let mut changed = vec![format!("injected {} byte(s) into {id}", payload.len())];
-    match set_session_title(&id, &title) {
-        Ok(()) => changed.push(format!("session {id}: title → {title}")),
-        Err(e) => changed.push(format!("(title update failed: {e})")), // delivery already happened.
+    if renamed {
+        match set_session_title(&id, &title) {
+            Ok(()) => changed.push(format!("session {id}: title → {title}")),
+            Err(e) => changed.push(format!("(title update failed: {e})")), // delivery already happened.
+        }
     }
 
     let out = Outcome::ok(cmd, format!("delivered to `{id}` ({})", gate.label()))
@@ -869,6 +888,24 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
             if let Some(n) = name {
                 set_session_name_if_unset(&id, &n);
             }
+            // `awaiting` reached THIS arm means an unconditional blocker — a
+            // permission prompt (claude's `notification_type: permission_prompt`,
+            // kimi's PermissionRequest); the ambiguous idle ping takes
+            // PhaseIfRunning instead and never summons. Raise the herald's
+            // approve/deny card, detached, after the phase is on disk so the
+            // card's own still-awaiting guard reads the state it was raised for.
+            // Best-effort throughout: a notification problem never fails a hook.
+            if phase == "awaiting" {
+                // The harness's OWN human-readable line ("Claude needs your
+                // permission to use Bash") rides along as the card's context
+                // tier — passed through verbatim as untrusted display data,
+                // never parsed for the tool name (that English-sniffing is
+                // exactly what `notification_type` exists to replace).
+                super::permit::spawn_summons(
+                    &id,
+                    payload.get("message").and_then(Value::as_str),
+                );
+            }
             out
         }
         HookAction::PhaseIfRunning { id, phase } => {
@@ -1146,6 +1183,90 @@ mod tests {
         assert!(
             log.contains("graph.send") && log.contains("delivered"),
             "audit log carries the delivered send: {log}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn a_keystroke_answer_is_delivered_but_never_renames_the_node() {
+        // `graph permit` types a bare verdict digit through this door; a title
+        // of `1` would erase the only label the dock identifies the session by.
+        assert!(names_the_node("hello world"));
+        assert!(names_the_node("fix the auth test"));
+        assert!(names_the_node("見て")); // any script's letters name a node
+        assert!(!names_the_node("1"));
+        assert!(!names_the_node("3\n"));
+        assert!(!names_the_node("  2  "));
+        assert!(!names_the_node("")); // an empty send names nothing either
+
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+        ]);
+
+        let root = unique_stage("send-key");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+
+        let id = "key-t";
+        let socket = conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        do_session_start(
+            id,
+            Some("claude"),
+            Some("/w"),
+            None,
+            None,
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+            None,
+        );
+        // A real steer names the node first, so the test can prove the digit
+        // leaves that name STANDING rather than merely never setting one.
+        let acc = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let (mut conn, _) = listener.accept().unwrap();
+                use std::io::Read as _;
+                let mut buf = Vec::new();
+                let _ = conn.read_to_end(&mut buf);
+                seen.push(String::from_utf8_lossy(&buf).into_owned());
+            }
+            seen
+        });
+        let steer = session_send(&send_invocation(
+            &["fix", "the", "reaper"],
+            &[("id", id), ("yes", "true")],
+        ));
+        assert_eq!(steer.status, aoide_protocol::output::Status::Ok);
+
+        // Now the verdict keystroke: delivered, no newline, no rename.
+        let out = session_send(&send_invocation(&["3"], &[("id", id), ("yes", "true")]));
+        let seen = acc.join().unwrap();
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(out.data.as_ref().unwrap()["delivered"], true);
+        assert_eq!(out.data.as_ref().unwrap()["title"], "", "no title was written");
+        assert_eq!(seen, vec!["fix the reaper".to_string(), "3".to_string()]);
+        assert!(
+            !out.changed.iter().any(|c| c.contains("title")),
+            "the keystroke reports no rename: {:?}",
+            out.changed
+        );
+
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(
+            s.sessions.iter().find(|r| r.session_id == id).unwrap().title.as_deref(),
+            Some("fix the reaper"),
+            "the steer's name survived the verdict keystroke"
         );
 
         let _ = std::fs::remove_dir_all(&root);

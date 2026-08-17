@@ -124,7 +124,7 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["graph", "send"],
-        summary: "Inject text into a conducted session's control socket (the one gated injection door). Held pending approval by default; --yes (or an autogate policy) delivers and auto-renames the node to a one-line form of the text. Every outcome is audited.",
+        summary: "Inject text into a conducted session's control socket (the one gated injection door). Held pending approval by default; --yes (or an autogate policy) delivers and auto-renames the node to a one-line form of the text — except for a bare keystroke answer (text with no letters, e.g. a permission verdict digit), which is not a task and leaves the node's name alone. Every outcome is audited.",
         args: [arg!("text", "string", true, "The text to inject — put it after `--` so its own words/flags pass through verbatim.")],
         flags: [
             flag!("id", "string", "Target session id (required); its socket is resolved from sessions.json."),
@@ -134,6 +134,19 @@ pub fn register(r: &mut Registry) {
         gated: false,
         implemented: true,
         handler: crate::graph::session_send,
+    ));
+    r.insert(cmd!(
+        path: ["graph", "permit"],
+        summary: "Raise the herald's permission SUMMONS for a session blocked on a permission prompt and type the human's verdict back into it: left-click approves, middle-click (dismiss) denies. Blocks until the card is answered — the hook door spawns it detached when a session goes `awaiting`. Only ever raised for a conductable session whose harness has verified prompt keys, and only injected while the session is still awaiting.",
+        args: [],
+        flags: [
+            flag!("id", "string", "Target session id (required); its socket is resolved from sessions.json."),
+            flag!("tool", "string", "Tool the permission is being asked for — the card's title tier."),
+            flag!("what", "string", "One line describing the ask — the card's context tier (rendered as plain text)."),
+        ],
+        gated: false,
+        implemented: true,
+        handler: crate::graph::session_permit,
     ));
     r.insert(cmd!(
         path: ["graph", "focus"],

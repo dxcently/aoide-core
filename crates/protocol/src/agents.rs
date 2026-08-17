@@ -74,6 +74,25 @@ pub enum SettingsFormat {
     Declarative,
 }
 
+/// The keystrokes that answer a harness's INTERACTIVE permission prompt, for
+/// the one consumer that needs them: the herald's permission summons
+/// (`aoide graph permit`), which types the human's verdict back into the
+/// conducted session's pty.
+///
+/// These are the prompt's own hotkeys, verified by READING the live prompt on
+/// screen — never guessed. Claude Code renders a numbered select
+/// (`❯ 1. Yes / 2. Yes, allow all … / 3. No`), so its answers are the bare
+/// digits `1` and `3` and no Enter is needed.
+///
+/// Deliberately printable digits rather than control keys: if the summons is
+/// answered a moment after the prompt already resolved elsewhere, a stray
+/// digit lands harmlessly (and visibly) in the composer, where an Escape
+/// would have interrupted a live turn.
+pub struct PermissionKeys {
+    pub approve: &'static str,
+    pub deny: &'static str,
+}
+
 /// Where an agent's hook settings live (a later installer verb writes them;
 /// today this is declarative only).
 pub struct SettingsSpec {
@@ -99,6 +118,11 @@ pub struct AgentProfile {
     pub permission_vocab: &'static [&'static str],
     /// Tool names that dispatch a sub-agent (spawn/manage a child node).
     pub subagent_tools: &'static [&'static str],
+    /// How to answer this harness's interactive permission prompt from the
+    /// herald summons, or `None` when its prompt shape has not been verified
+    /// on a live screen — in which case `graph permit` refuses to raise a
+    /// summons at all rather than typing a guess into someone's session.
+    pub permission_keys: Option<PermissionKeys>,
     /// Normalize a raw hook payload onto the canonical field names the hook
     /// door reads (`user_prompt`, `tool_use_id`, `agent_type`, …), in place,
     /// before `map_hook` runs. Identity for a harness whose payloads already
@@ -481,6 +505,13 @@ pub static CLAUDE_PROFILE: AgentProfile = AgentProfile {
     // same way from the hook's point of view, so both gate sub-agent node
     // creation/teardown identically.
     subagent_tools: &["Task", "Agent"],
+    // Read off the live prompt: "❯ 1. Yes / 2. Yes, allow all edits during
+    // this session / 3. No". Option 2 is deliberately NOT the approve key —
+    // a summons approves THIS request, never the rest of the session.
+    permission_keys: Some(PermissionKeys {
+        approve: "1",
+        deny: "3",
+    }),
     normalize_payload: claude_normalize_payload,
     model_ceiling: crate::model::context_ceiling_for_model,
     transcript: TranscriptSpec {
@@ -819,6 +850,11 @@ pub static KIMI_PROFILE: AgentProfile = AgentProfile {
     // Kimi's dispatch tool IS `Agent` — confirmed in captured 0.31.1 hook
     // payloads (`tool_name:"Agent"`); this harness has no `Task` alias.
     subagent_tools: &["Agent"],
+    // Kimi's own permission prompt shape has never been read on a live
+    // screen, so the herald summons stays off for it rather than typing a
+    // guessed hotkey into a session. Its `PermissionRequest` hook still
+    // drives the roster's `awaiting` face.
+    permission_keys: None,
     normalize_payload: kimi_normalize_payload,
     model_ceiling: kimi_context_ceiling,
     transcript: TranscriptSpec {
@@ -1075,6 +1111,9 @@ pub static PI_PROFILE: AgentProfile = AgentProfile {
     hook_event_map: pi_hook_event,
     permission_vocab: &[],
     subagent_tools: &[],
+    // pi's permissions are invisible to the extension API (see above), so
+    // there is no prompt for a summons to answer.
+    permission_keys: None,
     normalize_payload: normalize_identity,
     model_ceiling: crate::model::context_ceiling_for_model,
     transcript: TranscriptSpec {

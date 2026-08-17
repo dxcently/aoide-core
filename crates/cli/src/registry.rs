@@ -77,6 +77,7 @@ mod tests {
             "graph.emit",
             "graph.focus",
             "graph.link",
+            "graph.permit",
             "graph.project.add",
             "graph.project.list",
             "graph.project.remove",
