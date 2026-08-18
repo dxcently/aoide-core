@@ -94,6 +94,18 @@ pub fn register(r: &mut Registry) {
         handler: handle_rice_take_mark,
     ));
     r.insert(cmd!(
+        path: ["rice", "take", "diff"],
+        summary: "Key-wise diff between a base take's livery and the routed draft's CURRENT staged livery (added/removed/changed paths, never a text diff — key reordering is not a change). Base defaults to the nearest mark on the head's ancestry (falling back to the head's own parent, or an `ok` 'nothing to diff against' when there is neither); --take N or --mark <letter> override it explicitly.",
+        args: [],
+        flags: [
+            flag!("take", "int", "Take number to diff against, overriding the default base."),
+            flag!("mark", "string", "Mark letter to diff against, resolved through takes/marks.json."),
+        ],
+        gated: false,
+        implemented: true,
+        handler: handle_rice_take_diff,
+    ));
+    r.insert(cmd!(
         path: ["rice", "back"],
         summary: "Revert the routed draft's live stage to an earlier take (--take N or --mark <letter>) and move the head cursor there — the NEXT write hangs off it, branching implicitly with no branch verb. Un-taken drift on the stage is snapshotted first so nothing is destroyed. Draft mode only. A bare `rice back` (neither flag) always refuses in this build — the interactive picker is a later step, not built here.",
         args: [],
@@ -608,6 +620,214 @@ fn handle_rice_take_mark(inv: &Invocation) -> Outcome {
         }
         Err(o) => o,
     }
+}
+
+// ── `rice take diff` — key-wise livery diff (phase A7) ─────────────────────
+
+/// Pure key-wise diff between two livery documents, walking dotted paths through nested
+/// objects. Returns one entry per path where the two documents differ: `(dotted_path,
+/// old_value, new_value)`, where `None` on either side means the key is absent there — added
+/// when `old` is `None`, removed when `new` is `None`, changed when both are `Some` but differ.
+///
+/// Deliberately a VALUE walk, never a text differ (advisor verdict, fork 7): liveries are
+/// shallow key/value trees, and a text diff of pretty-printed JSON reports key REORDERING as a
+/// change — `serde_json::to_string_pretty` makes no promise about key order surviving a
+/// round-trip, so a text diff would be a false-positive generator for reviewer agents flagging
+/// changes nobody made. Comparing parsed [`Value`]s side by side, keyed by name rather than by
+/// line, is immune to that by construction: two documents with the same keys in different orders
+/// produce an empty diff here, exactly the same "compare values, not bytes" discipline
+/// [`snapshot_if_drifted_unlocked`]'s own `livery == head_take.livery` check already relies on
+/// above in this file.
+///
+/// An equal value at any level (an `a == b` bailout before the match) recurses no further, which
+/// is also what keeps whole untouched subtrees out of the output even when they are nested deep.
+/// A key present as an object on BOTH sides recurses into it, appending its own child keys to the
+/// path with `.`; anything else (a scalar, an array, or a type change — an object on one side and
+/// something else on the other) is a single leaf entry at its own path, `old`/`new` holding the
+/// two whole values verbatim. Arrays are compared as opaque values, never walked element by
+/// element — nothing in the plan or the shallow-tree livery shape this exists to serve asks for
+/// array-index diffing.
+pub fn diff_livery(a: &Value, b: &Value) -> Vec<(String, Option<Value>, Option<Value>)> {
+    let mut out = Vec::new();
+    diff_at(String::new(), a, b, &mut out);
+    out
+}
+
+/// [`diff_livery`]'s own recursive walk. `prefix` is the dotted path built up by every ancestor
+/// call so far (empty at the root). Bails out immediately when `a == b` — the check that makes
+/// key reordering a no-op, since `serde_json::Value`'s own `PartialEq` for an object compares
+/// keys and values, never insertion order.
+fn diff_at(prefix: String, a: &Value, b: &Value, out: &mut Vec<(String, Option<Value>, Option<Value>)>) {
+    if a == b {
+        return;
+    }
+    match (a, b) {
+        (Value::Object(am), Value::Object(bm)) => {
+            let mut keys: BTreeSet<&String> = am.keys().collect();
+            keys.extend(bm.keys());
+            for k in keys {
+                let path = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                match (am.get(k), bm.get(k)) {
+                    (Some(av), Some(bv)) => diff_at(path, av, bv, out),
+                    (Some(av), None) => out.push((path, Some(av.clone()), None)),
+                    (None, Some(bv)) => out.push((path, None, Some(bv.clone()))),
+                    (None, None) => unreachable!("k came from am's or bm's own keys"),
+                }
+            }
+        }
+        _ => out.push((prefix, Some(a.clone()), Some(b.clone()))),
+    }
+}
+
+/// Compact single-line rendering of one side of a diff entry for [`handle_rice_take_diff`]'s text
+/// message — `serde_json::to_string` (not the pretty printer), so a nested value stays on one row
+/// per diff line instead of spilling the report across many.
+fn render_diff_value(v: &Value) -> String {
+    serde_json::to_string(v).unwrap_or_else(|_| "?".to_string())
+}
+
+/// Resolve `rice take diff`'s comparison base. `--take N` names it directly (`take-not-found` if
+/// absent); `--mark X` resolves through `takes/marks.json` exactly like [`back_unlocked`]'s own
+/// resolution (`mark-not-found` for an unstamped letter, or one naming a take that no longer
+/// exists — the map's self-healing read, D6). With neither flag, the default is the NEAREST MARK
+/// ON THE HEAD'S ANCESTRY (plan §3.3): walk [`aoide_storage::takes::ancestry`] from the head
+/// itself — its own first element — back toward the root, and stop at the first take carrying any
+/// mark letter. Checking the head first is deliberate: a head that was just marked diffs against
+/// itself, and "what changed since the last mark" is correctly empty for un-staged content in
+/// that case. When nothing in the WHOLE ancestry carries a mark, the fallback is the head's own
+/// PARENT, unmarked (`anc[1]`, since `anc[0]` is the head itself) — and `Ok(None)` ("nothing to
+/// diff against") only when the head has no parent either (the store's own unmarked root, or an
+/// empty store with no head at all).
+///
+/// A GLOBAL-MAX letter — the highest mark stamped anywhere in the draft, on ANY branch — is
+/// deliberately NOT what this resolves to: under a tree, a higher letter can sit on a branch the
+/// head never descends from, and comparing against it would report changes that were never made
+/// on the head's own line at all. Only the ancestry walk decides; `marked` below is consulted as
+/// a plain membership set, never sorted or compared by letter.
+fn resolve_base(
+    cmd: &str,
+    song: &str,
+    draft: &str,
+    take_flag: Option<u32>,
+    mark_flag: Option<String>,
+    head: Option<u32>,
+) -> Result<Option<u32>, Outcome> {
+    if let Some(n) = take_flag {
+        return if takes::load_take(song, draft, n).is_some() {
+            Ok(Some(n))
+        } else {
+            Err(Outcome::error(cmd, format!("take {n:04} does not exist — nothing to diff against"))
+                .with_data(json!({ "reason": "take-not-found", "take": n })))
+        };
+    }
+    if let Some(letter) = mark_flag {
+        let marks = takes::load_marks(song, draft);
+        return match marks.get(&letter).copied() {
+            Some(n) if takes::load_take(song, draft, n).is_some() => Ok(Some(n)),
+            _ => Err(Outcome::error(cmd, format!("mark `{letter}` is not stamped on any take"))
+                .with_data(json!({ "reason": "mark-not-found", "mark": letter }))),
+        };
+    }
+
+    let Some(head) = head else {
+        return Ok(None); // an empty store — nothing minted yet, nothing to diff against.
+    };
+    let all = takes::list_takes(song, draft);
+    let marks = takes::load_marks(song, draft);
+    let marked: BTreeSet<u32> = marks.values().copied().collect();
+    let anc = takes::ancestry(&all, head); // [head, parent, grandparent, ..., root]
+    if let Some(&nearest) = anc.iter().find(|n| marked.contains(n)) {
+        return Ok(Some(nearest));
+    }
+    Ok(anc.get(1).copied()) // no mark anywhere on the ancestry — the head's own parent, if any.
+}
+
+/// `rice take diff [--take N | --mark <letter>] [--json]` — the reviewer's view (plan §3.3):
+/// "what changed since the last mark". Read-only, so unlike every mutator above in this file it
+/// takes NO lock at all — nothing here writes, and [`resolve_base`]/[`read_staged_content`] are
+/// both plain reads of state some other locked mutator already made durable.
+///
+/// Flags are syntax-validated first, same order [`handle_rice_back`] uses and for the same
+/// reason: a malformed `--take`/`--mark` is a usage error regardless of draft state. Then
+/// [`resolve_draft`] gates on Draft mode, [`resolve_base`] picks the comparison base (see its own
+/// doc for the ancestral-mark default), and — only once a real base is in hand — the routed
+/// draft's CURRENT staged content is read via [`read_staged_content`], the same seam every other
+/// take verb in this file reads through: comparing against the stage is comparing against the
+/// live draft, exactly like [`snapshot_if_drifted_unlocked`]'s own drift check does.
+fn handle_rice_take_diff(inv: &Invocation) -> Outcome {
+    let take_flag = match inv.flags.get("take") {
+        Some(raw) => match raw.parse::<u32>() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                return Outcome::usage("rice.take.diff", format!("`--take {raw}` is not a valid take number"))
+                    .with_data(json!({ "reason": "invalid-take", "take": raw }));
+            }
+        },
+        None => None,
+    };
+    let mark_flag = match inv.flags.get("mark") {
+        Some(letter) => {
+            if !valid_mark_letter(letter) {
+                return Outcome::error(
+                    "rice.take.diff",
+                    format!("`{letter}` is not a valid mark: must be a single letter A-Z"),
+                )
+                .with_data(json!({ "reason": "invalid-mark", "mark": letter }));
+            }
+            Some(letter.clone())
+        }
+        None => None,
+    };
+
+    let (song, draft) = match resolve_draft("rice.take.diff") {
+        Ok(v) => v,
+        Err(o) => return o,
+    };
+
+    let head = takes::load_head(&song, &draft);
+    let base = match resolve_base("rice.take.diff", &song, &draft, take_flag, mark_flag, head) {
+        Ok(v) => v,
+        Err(o) => return o,
+    };
+
+    let Some(base) = base else {
+        return Outcome::ok(
+            "rice.take.diff",
+            "nothing to diff against — the head has no marked ancestor and no parent \
+             (the draft's first take, never marked)",
+        )
+        .with_data(json!({ "base": Value::Null, "diff": [] }));
+    };
+
+    let (staged, _cover) = match read_staged_content("rice.take.diff") {
+        Ok(v) => v,
+        Err(o) => return o,
+    };
+    let base_record = takes::load_take(&song, &draft, base).expect("resolve_base only returns an existing take");
+
+    let diff = diff_livery(&base_record.livery, &staged);
+    let message = if diff.is_empty() {
+        format!("no change since take {base:04}")
+    } else {
+        let mut lines = vec![format!("diff since take {base:04} ({} key(s) changed):", diff.len())];
+        for (path, old, new) in &diff {
+            let line = match (old, new) {
+                (None, Some(n)) => format!("  + {path}: {}", render_diff_value(n)),
+                (Some(o), None) => format!("  - {path}: {}", render_diff_value(o)),
+                (Some(o), Some(n)) => format!("  ~ {path}: {} -> {}", render_diff_value(o), render_diff_value(n)),
+                (None, None) => unreachable!("diff_livery never emits a (None, None) entry"),
+            };
+            lines.push(line);
+        }
+        lines.join("\n")
+    };
+
+    let entries: Vec<Value> = diff
+        .iter()
+        .map(|(path, old, new)| json!({ "path": path, "old": old, "new": new }))
+        .collect();
+
+    Outcome::ok("rice.take.diff", message).with_data(json!({ "base": base, "diff": entries }))
 }
 
 // ── `rice back` — the revert that lands the branch-from-any-mark ask ───────
@@ -2017,5 +2237,400 @@ mod tests {
         assert_eq!(entries.len(), 2, "the orphan is still listed: {entries:?}");
         assert!(entries.iter().any(|e| e["take"] == 5), "take 5 is present even though its parent is gone");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── `rice take diff` — key-wise livery diff (phase A7) ──────────────
+
+    #[test]
+    fn diff_livery_detects_added_removed_and_changed_keys_at_depth() {
+        let a = json!({
+            "schemaVersion": "0",
+            "palette": { "bg": "#111111", "fg": "#eeeeee" },
+            "widgets": { "clock": { "enabled": true } },
+        });
+        let b = json!({
+            "schemaVersion": "0",
+            "palette": { "bg": "#222222" },
+            "widgets": { "clock": { "enabled": true }, "battery": { "enabled": false } },
+        });
+
+        let diff = diff_livery(&a, &b);
+        let find = |path: &str| diff.iter().find(|(p, _, _)| p == path);
+
+        let changed = find("palette.bg").expect("changed key at depth found");
+        assert_eq!(changed.1, Some(json!("#111111")));
+        assert_eq!(changed.2, Some(json!("#222222")));
+
+        let removed = find("palette.fg").expect("removed key at depth found");
+        assert_eq!(removed.1, Some(json!("#eeeeee")));
+        assert_eq!(removed.2, None);
+
+        let added = find("widgets.battery").expect("added key at depth found");
+        assert_eq!(added.1, None);
+        assert_eq!(added.2, Some(json!({ "enabled": false })));
+
+        assert!(find("widgets.clock").is_none(), "an unchanged subtree produces no entries");
+        assert!(find("schemaVersion").is_none(), "an unchanged top-level scalar produces no entry");
+        assert_eq!(diff.len(), 3, "exactly the three real differences, nothing else");
+    }
+
+    #[test]
+    fn diff_livery_key_reordering_alone_produces_an_empty_diff() {
+        // Fork 7's whole reason for a key-wise diff over a text diff: the same keys/values in a
+        // different insertion order must NOT read as a change.
+        let a = json!({ "schemaVersion": "0", "palette": { "bg": "#111111", "fg": "#222222" } });
+        let b: Value =
+            serde_json::from_str(r##"{"palette":{"fg":"#222222","bg":"#111111"},"schemaVersion":"0"}"##).unwrap();
+        assert!(diff_livery(&a, &b).is_empty(), "reordered keys, identical values: no diff");
+    }
+
+    #[test]
+    fn diff_livery_identical_documents_produce_an_empty_diff() {
+        let a = json!({ "schemaVersion": "0", "palette": { "bg": "#111111" } });
+        assert!(diff_livery(&a, &a.clone()).is_empty());
+    }
+
+    fn inv_diff(mark: Option<&str>, take: Option<u32>) -> Invocation {
+        let mut flags = std::collections::BTreeMap::new();
+        if let Some(m) = mark {
+            flags.insert("mark".to_string(), m.to_string());
+        }
+        if let Some(t) = take {
+            flags.insert("take".to_string(), t.to_string());
+        }
+        Invocation {
+            path: vec!["rice".to_string(), "take".to_string(), "diff".to_string()],
+            args: vec![],
+            flags,
+            door: aoide_protocol::Door::Cli,
+        }
+    }
+
+    /// THE branch-specific assertion the plan calls out as the one that matters most: the
+    /// default base must be the nearest mark ON THE HEAD'S OWN ANCESTRY, never the highest
+    /// letter stamped anywhere in the draft. The store below is built so those two answers
+    /// differ — mark B is minted LATER and sorts higher than mark A, but B lands on a branch
+    /// the head never descends from, while A sits directly on the head's own line. A
+    /// highest-letter (or most-recently-stamped) implementation picks B/take 4 here; the
+    /// correct ancestry walk picks A/take 2.
+    #[test]
+    fn diff_default_base_is_the_nearest_ancestral_mark_on_the_current_branch_not_the_highest_letter() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, song, draft, _draft_livery) = routed_draft_symlinked("diff-nearest-ancestral-mark");
+        let stage = shellbridge::stage_dir();
+
+        // take 1 — the root.
+        write_livery(&stage, "#111111");
+        snapshot("rice.take", "stage").unwrap();
+
+        // take 2 — mark A here. This IS on the branch the head ends up on.
+        write_livery(&stage, "#222222");
+        let take2 = snapshot("rice.take", "stage").unwrap();
+        assert_eq!(take2.parent, Some(1));
+        mark("rice.take.mark", "A", 2).unwrap();
+
+        // Branch off the ROOT instead (a sibling of take 2, not a descendant): revert to take
+        // 1, then take again. The counter is flat and monotone (never per-branch), so this
+        // mints take 3, not take 4 — reverting alone never mints anything by itself.
+        let back1 = handle_rice_back(&inv_back(None, Some(1)));
+        assert_eq!(back1.status, Status::Ok, "{:?}", back1.data);
+        write_livery(&stage, "#444444");
+        let take3 = snapshot("rice.take", "stage").unwrap();
+        assert_eq!(take3.parent, Some(1), "take 3 hangs off the root, a sibling of take 2");
+        // Mark B here — mint order AND alphabet both put it "highest", but the head below
+        // never descends from it.
+        mark("rice.take.mark", "B", 3).unwrap();
+
+        // Return to take 2's branch and extend it — this is where the head ends up.
+        let back2 = handle_rice_back(&inv_back(None, Some(2)));
+        assert_eq!(back2.status, Status::Ok, "{:?}", back2.data);
+        write_livery(&stage, "#333333");
+        let take4 = snapshot("rice.take", "stage").unwrap();
+        assert_eq!(take4.parent, Some(2));
+        assert_eq!(takes::load_head(&song, &draft), Some(4));
+
+        let out = handle_rice_take_diff(&inv_diff(None, None));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        let data = out.data.unwrap();
+        assert_eq!(
+            data["base"], 2,
+            "the nearest mark ON THE HEAD'S ANCESTRY (A/take 2), not the highest letter (B/take 3)"
+        );
+
+        let diff = data["diff"].as_array().unwrap();
+        assert_eq!(diff.len(), 1);
+        assert_eq!(diff[0]["path"], "palette.bg");
+        assert_eq!(diff[0]["old"], "#222222");
+        assert_eq!(diff[0]["new"], "#333333");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every OTHER default-base test in this file happens to put the nearest mark at ancestry
+    /// depth 0 (the head itself) or depth 1 (its immediate parent) — nothing before this test
+    /// empirically proved the walk goes any further than `anc.get(0)`/`anc.get(1)`. This store
+    /// puts an UNMARKED two-take gap between the head and the marked ancestor, so the mark sits
+    /// at depth 3: a shallow implementation that only ever inspects the head and its immediate
+    /// parent (falling back to the parent unconditionally, marked or not) lands on take 3
+    /// instead — this asserts the real answer, take 1.
+    #[test]
+    fn diff_default_base_finds_a_mark_at_ancestry_depth_three_not_just_the_head_or_its_immediate_parent() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, _song, _draft) = routed_draft("diff-depth-three-mark");
+        std::fs::write(shellbridge::stage_dir().join("livery.json"), VALID_NOTES).unwrap();
+        snapshot("rice.take", "stage").unwrap(); // take 1 — the root, marked
+        mark("rice.take.mark", "A", 1).unwrap();
+
+        std::fs::write(
+            shellbridge::stage_dir().join("livery.json"),
+            r##"{"schemaVersion":"0","palette":{"bg":"#222222"}}"##,
+        )
+        .unwrap();
+        snapshot("rice.take", "stage").unwrap(); // take 2 — unmarked
+        std::fs::write(
+            shellbridge::stage_dir().join("livery.json"),
+            r##"{"schemaVersion":"0","palette":{"bg":"#333333"}}"##,
+        )
+        .unwrap();
+        snapshot("rice.take", "stage").unwrap(); // take 3 — unmarked
+        std::fs::write(
+            shellbridge::stage_dir().join("livery.json"),
+            r##"{"schemaVersion":"0","palette":{"bg":"#444444"}}"##,
+        )
+        .unwrap();
+        snapshot("rice.take", "stage").unwrap(); // take 4 — head, unmarked
+
+        // ancestry(4) = [4, 3, 2, 1] — the mark sits at index 3, two whole unmarked takes (3
+        // and 2) away from the head.
+        let out = handle_rice_take_diff(&inv_diff(None, None));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert_eq!(
+            out.data.unwrap()["base"], 1,
+            "the mark at ancestry depth 3 must still be found, not just depth 0 (head) or depth 1 (its parent)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn diff_falls_back_to_the_heads_parent_when_nothing_in_the_ancestry_is_marked() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, _song, _draft) = routed_draft("diff-fallback-parent");
+        std::fs::write(shellbridge::stage_dir().join("livery.json"), VALID_NOTES).unwrap();
+        snapshot("rice.take", "stage").unwrap(); // take 1
+        std::fs::write(
+            shellbridge::stage_dir().join("livery.json"),
+            r##"{"schemaVersion":"0","palette":{"bg":"#222222"}}"##,
+        )
+        .unwrap();
+        snapshot("rice.take", "stage").unwrap(); // take 2, head, unmarked
+
+        let out = handle_rice_take_diff(&inv_diff(None, None));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert_eq!(out.data.unwrap()["base"], 1, "no marks anywhere — falls back to the head's own parent");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn diff_on_an_entirely_empty_store_reports_nothing_to_diff_against() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, _song, _draft) = routed_draft("diff-empty-store");
+
+        let out = handle_rice_take_diff(&inv_diff(None, None));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        let data = out.data.unwrap();
+        assert!(data["base"].is_null());
+        assert_eq!(data["diff"].as_array().unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn diff_with_a_single_unmarked_root_take_reports_nothing_to_diff_against() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, _song, _draft) = routed_draft("diff-root-only-unmarked");
+        std::fs::write(shellbridge::stage_dir().join("livery.json"), VALID_NOTES).unwrap();
+        snapshot("rice.take", "stage").unwrap(); // take 1 — the only take, no parent, no mark
+
+        let out = handle_rice_take_diff(&inv_diff(None, None));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        let data = out.data.unwrap();
+        assert!(data["base"].is_null(), "the root has no parent and no mark on its own ancestry");
+        assert_eq!(data["diff"].as_array().unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn diff_identical_content_against_a_self_marked_head_is_an_empty_diff() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, _song, _draft) = routed_draft("diff-identical-self-mark");
+        std::fs::write(shellbridge::stage_dir().join("livery.json"), VALID_NOTES).unwrap();
+        let take1 = snapshot("rice.take", "stage").unwrap();
+        mark("rice.take.mark", "A", take1.take).unwrap();
+
+        // The head itself is marked and the stage has not changed since — base resolves to the
+        // head, and comparing it to itself is an empty diff.
+        let out = handle_rice_take_diff(&inv_diff(None, None));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        let data = out.data.unwrap();
+        assert_eq!(data["base"], 1);
+        assert_eq!(data["diff"].as_array().unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn diff_take_flag_overrides_the_default_base() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, _song, _draft) = routed_draft("diff-take-flag");
+        std::fs::write(shellbridge::stage_dir().join("livery.json"), VALID_NOTES).unwrap();
+        snapshot("rice.take", "stage").unwrap(); // take 1
+        std::fs::write(
+            shellbridge::stage_dir().join("livery.json"),
+            r##"{"schemaVersion":"0","palette":{"bg":"#222222"}}"##,
+        )
+        .unwrap();
+        snapshot("rice.take", "stage").unwrap(); // take 2, head
+
+        let out = handle_rice_take_diff(&inv_diff(None, Some(1)));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert_eq!(out.data.unwrap()["base"], 1, "--take overrides the default ancestral-mark resolution");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn diff_mark_flag_overrides_the_default_base() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, _song, _draft) = routed_draft("diff-mark-flag");
+        std::fs::write(shellbridge::stage_dir().join("livery.json"), VALID_NOTES).unwrap();
+        snapshot("rice.take", "stage").unwrap(); // take 1
+        mark("rice.take.mark", "A", 1).unwrap();
+        std::fs::write(
+            shellbridge::stage_dir().join("livery.json"),
+            r##"{"schemaVersion":"0","palette":{"bg":"#222222"}}"##,
+        )
+        .unwrap();
+        snapshot("rice.take", "stage").unwrap(); // take 2, head, unmarked
+
+        let out = handle_rice_take_diff(&inv_diff(Some("A"), None));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert_eq!(out.data.unwrap()["base"], 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `takes::load_marks`' own doc says it never filters a stale entry — that's the caller's
+    /// job. This pins that [`resolve_base`] actually does that filtering for `--mark`, rather
+    /// than trusting the map and falling through to some default base (or panicking on the
+    /// `expect` a few lines later in [`handle_rice_take_diff`]). Distinct from the existing
+    /// `diff_take_not_found_and_mark_not_found` test below, which only covers a letter that was
+    /// NEVER stamped — a different branch than a letter whose take existed and was then removed.
+    #[test]
+    fn diff_mark_flag_naming_a_take_that_no_longer_exists_is_mark_not_found_not_a_silent_default() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, song, draft) = routed_draft("diff-mark-dangling");
+        std::fs::write(shellbridge::stage_dir().join("livery.json"), VALID_NOTES).unwrap();
+        snapshot("rice.take", "stage").unwrap(); // take 1
+        std::fs::write(
+            shellbridge::stage_dir().join("livery.json"),
+            r##"{"schemaVersion":"0","palette":{"bg":"#222222"}}"##,
+        )
+        .unwrap();
+        snapshot("rice.take", "stage").unwrap(); // take 2, head
+        mark("rice.take.mark", "A", 1).unwrap(); // A names take 1
+
+        // Take 1's own file is removed out from under the map — `marks.json` still says A -> 1,
+        // but take 1 itself is gone (a hand edit, or pruning without a matching map rewrite).
+        std::fs::remove_file(takes::take_path(&song, &draft, 1)).unwrap();
+
+        let out = handle_rice_take_diff(&inv_diff(Some("A"), None));
+        assert_eq!(out.status, Status::Error, "{:?}", out.data);
+        assert_eq!(out.data.unwrap()["reason"], "mark-not-found");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Mirrors `back_with_both_take_and_mark_given_take_wins` — the same silent priority rule,
+    /// pinned for `rice take diff` too, so a future reordering inside `resolve_base` can't flip
+    /// it without a test noticing.
+    #[test]
+    fn diff_with_both_take_and_mark_given_take_wins() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, _song, _draft) = routed_draft("diff-both-flags-take-wins");
+        std::fs::write(shellbridge::stage_dir().join("livery.json"), VALID_NOTES).unwrap();
+        snapshot("rice.take", "stage").unwrap(); // take 1
+        std::fs::write(
+            shellbridge::stage_dir().join("livery.json"),
+            r##"{"schemaVersion":"0","palette":{"bg":"#222222"}}"##,
+        )
+        .unwrap();
+        snapshot("rice.take", "stage").unwrap(); // take 2, head
+        mark("rice.take.mark", "A", 2).unwrap(); // A names take 2 — the OTHER selection
+
+        let out = handle_rice_take_diff(&inv_diff(Some("A"), Some(1)));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert_eq!(out.data.unwrap()["base"], 1, "--take wins over a co-present --mark naming a different take");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn diff_take_not_found_and_mark_not_found() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, _song, _draft) = routed_draft("diff-not-found");
+        std::fs::write(shellbridge::stage_dir().join("livery.json"), VALID_NOTES).unwrap();
+        snapshot("rice.take", "stage").unwrap(); // only take 1 exists, no marks
+
+        let missing_take = handle_rice_take_diff(&inv_diff(None, Some(99)));
+        assert_eq!(missing_take.status, Status::Error);
+        assert_eq!(missing_take.data.unwrap()["reason"], "take-not-found");
+
+        let missing_mark = handle_rice_take_diff(&inv_diff(Some("Z"), None));
+        assert_eq!(missing_mark.status, Status::Error);
+        assert_eq!(missing_mark.data.unwrap()["reason"], "mark-not-found");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn diff_invalid_take_and_mark_flags_are_rejected_before_anything_else() {
+        let bad_take = handle_rice_take_diff(&Invocation {
+            path: vec!["rice".to_string(), "take".to_string(), "diff".to_string()],
+            args: vec![],
+            flags: std::collections::BTreeMap::from([("take".to_string(), "nope".to_string())]),
+            door: aoide_protocol::Door::Cli,
+        });
+        assert_eq!(bad_take.status, Status::Usage);
+        assert_eq!(bad_take.data.unwrap()["reason"], "invalid-take");
+
+        let bad_mark = handle_rice_take_diff(&inv_diff(Some("ab"), None));
+        assert_eq!(bad_mark.status, Status::Error);
+        assert_eq!(bad_mark.data.unwrap()["reason"], "invalid-mark");
+    }
+
+    #[test]
+    fn diff_refuses_outside_draft_mode() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let stage = unique_tmp("diff-not-draft");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_take_diff(&inv_diff(None, None));
+        assert_eq!(out.status, Status::Error);
+        assert_eq!(out.data.unwrap()["reason"], "not-in-draft-mode");
+        let _ = std::fs::remove_dir_all(&stage);
     }
 }
