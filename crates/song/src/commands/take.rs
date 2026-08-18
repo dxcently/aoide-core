@@ -15,19 +15,46 @@
 //! wrapping its whole body in a second acquire, or (worse, silently) run the
 //! rest of its body unlocked if it called the cores without wrapping at all.
 //! [`snapshot`] is the ONLY locked entrypoint here — a single
-//! `with_stage_lock` around [`snapshot_unlocked`], fine for a caller (this
-//! file's own `rice take` handler, and the auto-take hook a later step adds
-//! to `rice stage`/`cover set`) whose write isn't already folded into
-//! someone else's locked mutator. [`snapshot_if_drifted_unlocked`] carries
-//! no locked counterpart at all: its only planned caller, `rice back`, folds
-//! the drift check into its OWN single lock alongside the revert write and
-//! the head-cursor save, so a locked wrapper here would never have a caller
-//! — a caller that needs the drift check must call the `_unlocked` core
-//! directly, inside its own single lock acquisition.
+//! `with_stage_lock` around [`snapshot_unlocked`], fine for any caller whose
+//! write isn't already folded into someone else's locked mutator. That
+//! covers this file's own `rice take` handler AND `rice stage`/`cover
+//! set`'s auto-take hooks (phase A3, `commands/rice.rs`/`commands/cover.rs`)
+//! — both call [`snapshot`] plainly, unconditionally, on every successful
+//! Draft-mode write. [`snapshot_if_drifted_unlocked`] carries NO locked
+//! counterpart at all, deliberately not reintroduced, because it has
+//! exactly ONE sanctioned caller: `rice back` (a later step), which must
+//! snapshot-if-drifted, write the revert, AND advance the head cursor as
+//! ONE atomic unit — the drift check has to fold into that SAME single
+//! lock, not a second acquire, so it stays `_unlocked` and `rice back`
+//! wraps `with_stage_lock` around its own whole body itself. The auto-take
+//! hooks are NOT a second caller of the drift check: a take records every
+//! write, not just the ones that changed something
+//! (`aoide_storage::takes`' own module doc: "minted on every rehearsal
+//! write") — a content-identical restage still mints, and the resulting
+//! noise is `rice take prune`'s problem (phase A9, §7.1), not write-time
+//! suppression's. The drift check's whole reason to exist is different: A5
+//! calls it because a revert is ABOUT TO OVERWRITE the stage and must
+//! preserve un-taken edits before destroying them. A3's hooks run AFTER a
+//! write has already landed — nothing is about to be destroyed — so that
+//! rationale never applied to them, and reusing the drift core there was
+//! this file's own earlier mistake, corrected before landing.
 //!
 //! Everything else about the model — the parent pointer, the flat monotone
 //! counter, the head cursor — lives in `aoide_storage::takes`; this module
 //! is CLI + orchestration on top of that pure store.
+//!
+//! **Command-name threading (phase A3, advisor-flagged).** [`snapshot_unlocked`],
+//! [`snapshot`], and [`snapshot_if_drifted_unlocked`] all take a `cmd: &str`
+//! first argument — the SAME dotted command name [`resolve_draft`] already
+//! threads through, not the take-store's own `cause` vocabulary. This was
+//! harmless while `rice take` (cmd `"rice.take"`) was the only caller: every
+//! refusal `Outcome` these cores build could safely hardcode that string.
+//! Phase A3 adds a SECOND caller — the auto-take hooks in `rice stage`/
+//! `cover set` — so a refusal bubbling out of an auto-take must report the
+//! command that actually invoked it (`"rice.stage"`, `"cover.set"`), not
+//! `"rice.take"`. Every caller passes its own dotted name straight through,
+//! exactly like [`resolve_draft(cmd)`] already did and following the
+//! `no_resolvable_song(cmd)` precedent in `draft.rs`.
 
 use aoide_protocol::Invocation;
 use aoide_protocol::output::Outcome;
@@ -117,13 +144,16 @@ fn read_staged_content(cmd: &str) -> Result<(Value, Option<Value>), Outcome> {
 /// The unlocked snapshot core (see the module doc for why it is unlocked):
 /// read the routed draft's current content, allocate the next take number,
 /// stamp it as a child of whatever the head cursor currently names, write
-/// the record, and advance the head to it. `cause` is the take-store's own
-/// event vocabulary (`"explicit"`, `"stage"`, `"cover-set"`, `"drift"` —
-/// distinct from an `Outcome` reason string, `aoide_storage::takes`'
-/// `TakeRecord::cause` doc explains why).
-pub(crate) fn snapshot_unlocked(cause: &str) -> Result<TakeRecord, Outcome> {
-    let (song, draft) = resolve_draft("rice.take")?;
-    let (livery, cover) = read_staged_content("rice.take")?;
+/// the record, and advance the head to it. `cmd` is the caller's own dotted
+/// command name (`"rice.take"`, `"rice.stage"`, `"cover.set"`, …), threaded
+/// into every `Outcome` this builds so a refusal reports who actually asked
+/// — see the module doc's "command-name threading" note. `cause` is the
+/// take-store's own event vocabulary (`"explicit"`, `"stage"`, `"cover-set"`,
+/// `"drift"` — distinct from an `Outcome` reason string,
+/// `aoide_storage::takes`' `TakeRecord::cause` doc explains why).
+pub(crate) fn snapshot_unlocked(cmd: &str, cause: &str) -> Result<TakeRecord, Outcome> {
+    let (song, draft) = resolve_draft(cmd)?;
+    let (livery, cover) = read_staged_content(cmd)?;
 
     let take = takes::next_take_number(&song, &draft);
     let record = TakeRecord {
@@ -137,11 +167,11 @@ pub(crate) fn snapshot_unlocked(cause: &str) -> Result<TakeRecord, Outcome> {
     };
 
     takes::save_take(&song, &draft, &record).map_err(|e| {
-        Outcome::error("rice.take", format!("failed to write take {take}: {e}"))
+        Outcome::error(cmd, format!("failed to write take {take}: {e}"))
             .with_data(json!({ "reason": "write-failed" }))
     })?;
     takes::save_head(&song, &draft, take).map_err(|e| {
-        Outcome::error("rice.take", format!("failed to advance the head cursor: {e}"))
+        Outcome::error(cmd, format!("failed to advance the head cursor: {e}"))
             .with_data(json!({ "reason": "write-failed" }))
     })?;
 
@@ -151,9 +181,10 @@ pub(crate) fn snapshot_unlocked(cause: &str) -> Result<TakeRecord, Outcome> {
 /// `rice take`'s locked entrypoint: exactly ONE `with_stage_lock` around
 /// [`snapshot_unlocked`]'s whole read-allocate-write. Safe to call from any
 /// site that is not itself already inside a locked mutator — see the module
-/// doc for the rule and who must NOT call this.
-pub(crate) fn snapshot(cause: &str) -> Result<TakeRecord, Outcome> {
-    shellbridge::with_stage_lock(|| snapshot_unlocked(cause))
+/// doc for the rule and who must NOT call this. `cmd`/`cause` pass straight
+/// through to [`snapshot_unlocked`].
+pub(crate) fn snapshot(cmd: &str, cause: &str) -> Result<TakeRecord, Outcome> {
+    shellbridge::with_stage_lock(|| snapshot_unlocked(cmd, cause))
 }
 
 /// The unlocked drift-check core: mint a take only when the routed draft's
@@ -166,19 +197,20 @@ pub(crate) fn snapshot(cause: &str) -> Result<TakeRecord, Outcome> {
 /// there is nothing on record yet, and the first content a store ever sees
 /// is always worth capturing. `Ok(None)` is the no-op case; `Ok(Some(_))` is
 /// the minted take; `Err` is any of [`snapshot_unlocked`]'s own failures
-/// (not routed, nothing staged, a write failure).
-pub(crate) fn snapshot_if_drifted_unlocked(cause: &str) -> Result<Option<TakeRecord>, Outcome> {
-    let (song, draft) = resolve_draft("rice.take")?;
+/// (not routed, nothing staged, a write failure). `cmd` threads through the
+/// same way as [`snapshot_unlocked`]'s own — see the module doc.
+pub(crate) fn snapshot_if_drifted_unlocked(cmd: &str, cause: &str) -> Result<Option<TakeRecord>, Outcome> {
+    let (song, draft) = resolve_draft(cmd)?;
 
     let head_take = takes::load_head(&song, &draft).and_then(|n| takes::load_take(&song, &draft, n));
     if let Some(head_take) = &head_take {
-        let (livery, cover) = read_staged_content("rice.take")?;
+        let (livery, cover) = read_staged_content(cmd)?;
         if livery == head_take.livery && cover == head_take.cover {
             return Ok(None);
         }
     }
 
-    snapshot_unlocked(cause).map(Some)
+    snapshot_unlocked(cmd, cause).map(Some)
 }
 
 /// `rice take` — the explicit snapshot verb (cause `"explicit"`). A bare
@@ -192,7 +224,7 @@ fn handle_rice_take(_inv: &Invocation) -> Outcome {
         Err(o) => return o,
     };
 
-    match snapshot("explicit") {
+    match snapshot("rice.take", "explicit") {
         Ok(record) => {
             let take_file = takes::take_path(&song, &draft, record.take);
             let head_file = takes::head_path(&song, &draft);
@@ -258,7 +290,7 @@ mod tests {
         let (root, song, draft) = routed_draft("take-first");
         std::fs::write(shellbridge::stage_dir().join("livery.json"), VALID_NOTES).unwrap();
 
-        let record = snapshot("explicit").unwrap();
+        let record = snapshot("rice.take", "explicit").unwrap();
         assert_eq!(record.take, 1);
         assert_eq!(record.parent, None, "the very first take has no parent");
         assert_eq!(record.cause, "explicit");
@@ -274,7 +306,7 @@ mod tests {
         let (root, song, draft) = routed_draft("take-second");
         std::fs::write(shellbridge::stage_dir().join("livery.json"), VALID_NOTES).unwrap();
 
-        let first = snapshot("stage").unwrap();
+        let first = snapshot("rice.take", "stage").unwrap();
         assert_eq!(first.take, 1);
 
         std::fs::write(
@@ -282,7 +314,7 @@ mod tests {
             r##"{"schemaVersion":"0","palette":{"bg":"#111111"}}"##,
         )
         .unwrap();
-        let second = snapshot("stage").unwrap();
+        let second = snapshot("rice.take", "stage").unwrap();
         assert_eq!(second.take, 2);
         assert_eq!(second.parent, Some(1), "hangs off the head at the time of the mint");
         assert_eq!(takes::load_head(&song, &draft), Some(2));
@@ -300,7 +332,7 @@ mod tests {
 
         // No marker at all IS declarative (the safe default) — refused, same
         // as an explicit non-Draft mode below.
-        let err = snapshot("explicit").unwrap_err();
+        let err = snapshot("rice.take", "explicit").unwrap_err();
         assert_eq!(err.status, Status::Error);
         assert_eq!(err.data.clone().unwrap()["reason"], "not-in-draft-mode");
 
@@ -311,9 +343,46 @@ mod tests {
         })
         .unwrap();
         std::fs::write(stage.join("livery.json"), VALID_NOTES).unwrap();
-        let err = snapshot("explicit").unwrap_err();
+        let err = snapshot("rice.take", "explicit").unwrap_err();
         assert_eq!(err.data.unwrap()["reason"], "not-in-draft-mode", "Staging mode is refused too");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── command-name threading: a refusal reports the ACTUAL caller ─────
+    //
+    // The known issue A3 exists to fix: before this, every refusal built
+    // inside these cores hardcoded `"rice.take"`, harmless while `rice
+    // take` was the only caller. `rice stage`/`cover set`'s auto-take hooks
+    // are a second caller — a refusal bubbling out of THEIR snapshot must
+    // name `"rice.stage"`/`"cover.set"`, not `"rice.take"`, or an agent
+    // reading the error would think the wrong command failed.
+
+    #[test]
+    fn snapshot_unlocked_refusal_reports_the_invoking_command_not_rice_take() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let stage = unique_tmp("take-cmd-thread-snapshot");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        // No marker at all IS declarative — refused before this even reaches
+        // the take store, so the refusal must name the REAL caller.
+        let err = snapshot_unlocked("rice.stage", "stage").unwrap_err();
+        assert_eq!(err.command, "rice.stage", "not the hardcoded rice.take");
+        assert_eq!(err.data.unwrap()["reason"], "not-in-draft-mode");
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn snapshot_if_drifted_unlocked_refusal_reports_the_invoking_command_not_rice_take() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let stage = unique_tmp("take-cmd-thread-drift");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let err = snapshot_if_drifted_unlocked("cover.set", "cover-set").unwrap_err();
+        assert_eq!(err.command, "cover.set", "not the hardcoded rice.take");
+        assert_eq!(err.data.unwrap()["reason"], "not-in-draft-mode");
+        let _ = std::fs::remove_dir_all(&stage);
     }
 
     // ── snapshot_if_drifted_unlocked: no-op vs. mint ────────────────────
@@ -332,14 +401,14 @@ mod tests {
         let (root, song, draft) = routed_draft("take-drift");
         std::fs::write(shellbridge::stage_dir().join("livery.json"), VALID_NOTES).unwrap();
 
-        let first = snapshot("stage").unwrap();
+        let first = snapshot("rice.take", "stage").unwrap();
         assert_eq!(first.take, 1);
 
         // Re-serialized but VALUE-identical content must not read as drift.
         let reparsed: Value = serde_json::from_str(VALID_NOTES).unwrap();
         let reserialized = serde_json::to_string_pretty(&reparsed).unwrap();
         std::fs::write(shellbridge::stage_dir().join("livery.json"), reserialized).unwrap();
-        let noop = snapshot_if_drifted_unlocked("drift").unwrap();
+        let noop = snapshot_if_drifted_unlocked("rice.take", "drift").unwrap();
         assert!(noop.is_none(), "byte-different, value-identical content is not drift");
         assert_eq!(takes::list_takes(&song, &draft).len(), 1, "no new take minted");
 
@@ -349,7 +418,7 @@ mod tests {
             r##"{"schemaVersion":"0","palette":{"bg":"#222222"}}"##,
         )
         .unwrap();
-        let drifted = snapshot_if_drifted_unlocked("drift").unwrap();
+        let drifted = snapshot_if_drifted_unlocked("rice.take", "drift").unwrap();
         let drifted = drifted.expect("a real content change is drift");
         assert_eq!(drifted.take, 2);
         assert_eq!(drifted.parent, Some(1));
@@ -367,7 +436,7 @@ mod tests {
 
         // No head exists yet — there is nothing to compare against, so the
         // very first content is always worth capturing.
-        let minted = snapshot_if_drifted_unlocked("drift").unwrap();
+        let minted = snapshot_if_drifted_unlocked("rice.take", "drift").unwrap();
         let minted = minted.expect("an empty store has nothing to be identical to");
         assert_eq!(minted.take, 1);
         assert_eq!(minted.parent, None);
@@ -384,11 +453,11 @@ mod tests {
         std::fs::write(shellbridge::stage_dir().join("livery.json"), VALID_NOTES).unwrap();
 
         std::env::remove_var("AOIDE_SESSION_ID");
-        let no_session = snapshot("explicit").unwrap();
+        let no_session = snapshot("rice.take", "explicit").unwrap();
         assert_eq!(no_session.session_id, None);
 
         std::env::set_var("AOIDE_SESSION_ID", "sess-123");
-        let with_session = snapshot("explicit").unwrap();
+        let with_session = snapshot("rice.take", "explicit").unwrap();
         assert_eq!(with_session.session_id, Some("sess-123".to_string()));
         let _ = std::fs::remove_dir_all(&root);
     }

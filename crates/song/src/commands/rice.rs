@@ -181,6 +181,72 @@ fn handle_rice_stage_entry(inv: &Invocation) -> Outcome {
     };
 
     let mut out = handle_rice_stage(inv);
+
+    // Auto-take (phase A3, `references/fleshing-out-aoide-ricing.md` §5.2 —
+    // the whole point of the feature: an agent's edits get snapshotted
+    // without it having to remember `rice take`, so the take tree reflects
+    // what actually happened, not what someone remembered to record). Gated
+    // on `mode_marker` — the marker as READ AT THE TOP of this function,
+    // before `handle_rice_stage` ran — because this entrypoint deliberately
+    // leaves `mode.json` untouched for a Draft-mode write (see this
+    // function's own doc comment above); it cannot have changed underneath
+    // us. Outside Draft mode there is no draft directory to nest a `takes/`
+    // under at all, so nothing fires — `take::resolve_draft` would refuse it
+    // anyway, this just skips the call.
+    //
+    // Unconditional `snapshot`, not the drift-checking core: a take records
+    // every write, not just the ones that changed something —
+    // `aoide_storage::takes`' own module doc says it plainly ("minted on
+    // every rehearsal write"). A content-identical restage still mints. The
+    // resulting noise is pruning's problem (`rice take prune`, phase A9,
+    // §7.1), not write-time suppression's — suppressing here would make the
+    // take tree an incomplete record of what happened, which is a bigger
+    // cost than a few prunable duplicates. (The drift-checking core exists
+    // for a genuinely different job: `rice back`, a later step, must
+    // preserve un-taken edits that are ABOUT TO BE DESTROYED by an
+    // overwrite. This hook runs after a write has already landed — nothing
+    // is about to be destroyed, so that rationale does not transfer here.)
+    // `snapshot` (the locked wrapper) is correct: `handle_rice_stage` just
+    // above holds no stage lock of its own for this to nest inside.
+    //
+    // Non-fatal, same tier as the hyprctl/widget-registry calls inside
+    // `handle_rice_stage` itself: a bookkeeping failure must never turn a
+    // successful live write into an error, so a failed snapshot is reported
+    // in `data` (`"take": null, "takeError": "…"`) rather than flipping
+    // `out.status`. The command name passed is `"rice.stage"` (not
+    // `"rice.take"`) so a refusal — however unlikely once we're already
+    // known to be routed in Draft mode — names the command that actually
+    // asked (advisor-flagged known issue, see `commands/take.rs`).
+    if out.status == aoide_protocol::output::Status::Ok
+        && mode_marker.mode == aoide_storage::mode::RiceMode::Draft
+    {
+        match super::take::snapshot("rice.stage", "stage") {
+            Ok(record) => {
+                if let (Some(song), Some(draft)) = (&mode_marker.song, &mode_marker.draft) {
+                    out.changed.push(
+                        aoide_storage::takes::take_path(song, draft, record.take)
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                    out.changed.push(
+                        aoide_storage::takes::head_path(song, draft)
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+                if let Some(Value::Object(map)) = &mut out.data {
+                    map.insert("take".to_string(), json!(record.take));
+                }
+            }
+            Err(err) => {
+                if let Some(Value::Object(map)) = &mut out.data {
+                    map.insert("take".to_string(), Value::Null);
+                    map.insert("takeError".to_string(), json!(err.message));
+                }
+            }
+        }
+    }
+
     if out.status == aoide_protocol::output::Status::Ok
         && mode_marker.mode != aoide_storage::mode::RiceMode::Draft
     {
@@ -912,6 +978,98 @@ mod tests {
         assert_eq!(marker.mode, aoide_storage::mode::RiceMode::Draft);
         assert_eq!(marker.song, Some("moonlight".to_string()));
         assert_eq!(marker.draft, Some("neon-night".to_string()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── rice stage: the auto-take hook (phase A3) ────────────────────────
+
+    /// Shared rig for the auto-take tests below: routes `stage/livery.json`
+    /// into `songbook/moonlight/drafts/neon-night/livery.json` through a
+    /// symlink (the same layout `stage_entry_while_in_draft_mode_…` above
+    /// uses) and marks `mode.json` `Draft`. Returns
+    /// `(root, stage, song_dir)` — callers write `song_dir/livery.json`
+    /// themselves before each `handle_rice_stage_entry` call, matching how
+    /// `rice stage <name>` actually gets its content (the COMMITTED
+    /// songbook notes, never the previous stage content).
+    fn draft_routed_for_auto_take(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = unique_tmp(tag);
+        let stage = root.join("stage");
+        let song = root.join("songbook").join("moonlight");
+        let draft_dir = song.join("drafts").join("neon-night");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&song).unwrap();
+        std::fs::create_dir_all(&draft_dir).unwrap();
+        let draft_livery = draft_dir.join("livery.json");
+        std::fs::write(&draft_livery, "{}").unwrap();
+        std::os::unix::fs::symlink(&draft_livery, stage.join("livery.json")).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        aoide_storage::mode::save_mode_marker(&aoide_storage::mode::ModeMarker {
+            mode: aoide_storage::mode::RiceMode::Draft,
+            song: Some("moonlight".to_string()),
+            draft: Some("neon-night".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        (root, stage, song)
+    }
+
+    #[test]
+    fn stage_entry_in_draft_mode_mints_an_auto_take_on_a_real_change() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, _stage, song) = draft_routed_for_auto_take("stage-autotake-fires");
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
+
+        let out = handle_rice_stage_entry(&inv(&["rice", "stage"], &["moonlight"]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        // A successful write never turns into an error over take bookkeeping,
+        // and here the take succeeded too: reported in `data`, and both the
+        // take file and the head cursor are in `changed`.
+        assert_eq!(out.data.as_ref().unwrap()["take"], 1);
+        assert!(out.changed.iter().any(|c| c.ends_with("takes/0001.json")));
+        assert!(out.changed.iter().any(|c| c.ends_with("takes/head.json")));
+
+        let record = aoide_storage::takes::load_take("moonlight", "neon-night", 1).unwrap();
+        assert_eq!(record.cause, "stage", "auto-take from rice stage carries cause \"stage\"");
+        assert_eq!(record.parent, None, "first take in an empty store has no parent");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stage_entry_in_draft_mode_mints_again_on_a_content_identical_restage() {
+        // The pinned invariant (orchestrator correction over this step's own
+        // earlier draft): a take records EVERY write, not just the ones that
+        // changed something. A `rice stage` re-run with unchanged committed
+        // notes produces byte-identical content to what take 1 already
+        // holds — it must STILL mint. Suppressing on no drift would make the
+        // take tree an incomplete record of write events; the resulting
+        // duplicate-take noise is `rice take prune`'s problem (phase A9),
+        // not this hook's.
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, _stage, song) = draft_routed_for_auto_take("stage-autotake-repeat");
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
+
+        let first = handle_rice_stage_entry(&inv(&["rice", "stage"], &["moonlight"]));
+        assert_eq!(first.status, Status::Ok, "{:?}", first.data);
+        assert_eq!(first.data.unwrap()["take"], 1);
+
+        let second = handle_rice_stage_entry(&inv(&["rice", "stage"], &["moonlight"]));
+        assert_eq!(second.status, Status::Ok, "{:?}", second.data);
+        assert_eq!(
+            second.data.unwrap()["take"], 2,
+            "a content-identical restage still mints its own take"
+        );
+        assert!(second.changed.iter().any(|c| c.ends_with("takes/0002.json")));
+
+        let record = aoide_storage::takes::load_take("moonlight", "neon-night", 2).unwrap();
+        assert_eq!(record.parent, Some(1), "the second take hangs off the first");
+        assert_eq!(
+            aoide_storage::takes::list_takes("moonlight", "neon-night").len(),
+            2,
+            "both writes are on record, even though their content is identical"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

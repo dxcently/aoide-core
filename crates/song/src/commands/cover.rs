@@ -4,7 +4,7 @@ use aoide_protocol::Invocation;
 use aoide_protocol::output::Outcome;
 use aoide_protocol::registry::{arg, cmd, Registry};
 use aoide_storage::fs as shellbridge;
-use serde_json::json;
+use serde_json::{json, Value};
 
 pub fn register(r: &mut Registry) {
     r.insert(cmd!(
@@ -23,14 +23,56 @@ pub fn register(r: &mut Registry) {
 /// (`commands/rice.rs::handle_rice_stage_entry`, khoa 2026-08-14). The pure
 /// write logic stays in [`handle_cover_set`] guard-free.
 fn handle_cover_set_entry(inv: &Invocation) -> Outcome {
-    if aoide_storage::mode::load_mode_marker().mode == aoide_storage::mode::RiceMode::Declarative {
+    let mode_marker = aoide_storage::mode::load_mode_marker();
+    if mode_marker.mode == aoide_storage::mode::RiceMode::Declarative {
         return Outcome::error(
             "cover.set",
             "declarative mode is locked — run `aoide rice mode stage` to unlock hot-loading first",
         )
         .with_data(json!({ "reason": "declarative-mode-locked" }));
     }
-    handle_cover_set(inv)
+    let mut out = handle_cover_set(inv);
+
+    // Auto-take (phase A3) — same hook, same posture, same rationale as
+    // `rice stage`'s own in `commands/rice.rs::handle_rice_stage_entry`; see
+    // that function's doc comment for the full write-up (Draft-mode-only
+    // gate off `mode_marker` read before the write; unconditional
+    // `snapshot` — not the drift-checking core — because a take records
+    // every write and the resulting noise is pruning's problem, not
+    // write-time suppression's; the non-fatal `"take"/"takeError"`
+    // reporting posture). `cause` is `"cover-set"` and `cmd` is
+    // `"cover.set"` — its own dotted name, not `rice.stage`'s, so a
+    // refusal names the command that actually ran.
+    if out.status == aoide_protocol::output::Status::Ok
+        && mode_marker.mode == aoide_storage::mode::RiceMode::Draft
+    {
+        match super::take::snapshot("cover.set", "cover-set") {
+            Ok(record) => {
+                if let (Some(song), Some(draft)) = (&mode_marker.song, &mode_marker.draft) {
+                    out.changed.push(
+                        aoide_storage::takes::take_path(song, draft, record.take)
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                    out.changed.push(
+                        aoide_storage::takes::head_path(song, draft)
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+                if let Some(Value::Object(map)) = &mut out.data {
+                    map.insert("take".to_string(), json!(record.take));
+                }
+            }
+            Err(err) => {
+                if let Some(Value::Object(map)) = &mut out.data {
+                    map.insert("take".to_string(), Value::Null);
+                    map.insert("takeError".to_string(), json!(err.message));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// `cover set <path>` — switch the live wallpaper by staging a new cover.
@@ -220,6 +262,90 @@ mod tests {
         let out = handle_cover_set_entry(&inv(&["cover", "set"], &[img.to_str().unwrap()]));
         assert_eq!(out.status, Status::Ok, "{:?}", out.data);
         assert!(stage.join("cover.json").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── cover set: the auto-take hook (phase A3) ─────────────────────────
+
+    #[test]
+    fn cover_set_entry_in_draft_mode_mints_an_auto_take_on_a_real_change() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("cover-autotake-fires");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("livery.json"), VALID_NOTES).unwrap();
+        let img = root.join("elsewhere.png");
+        std::fs::write(&img, b"\x89PNG stub").unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        aoide_storage::mode::save_mode_marker(&aoide_storage::mode::ModeMarker {
+            mode: aoide_storage::mode::RiceMode::Draft,
+            song: Some("moonlight".to_string()),
+            draft: Some("neon-night".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let out = handle_cover_set_entry(&inv(&["cover", "set"], &[img.to_str().unwrap()]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert_eq!(out.data.as_ref().unwrap()["take"], 1);
+        assert!(out.changed.iter().any(|c| c.ends_with("takes/0001.json")));
+        assert!(out.changed.iter().any(|c| c.ends_with("takes/head.json")));
+
+        let record = aoide_storage::takes::load_take("moonlight", "neon-night", 1).unwrap();
+        assert_eq!(record.cause, "cover-set");
+        assert!(record.cover.is_some(), "the cover that was just set is carried on the take");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cover_set_entry_in_draft_mode_mints_again_on_a_content_identical_reset() {
+        // The pinned invariant (orchestrator correction over this step's own
+        // earlier draft): a take records EVERY write, not just the ones that
+        // changed something. Setting the SAME cover twice in a row produces
+        // byte-identical content to what take 1 already holds — it must
+        // STILL mint a second take. Suppressing on no drift would make the
+        // take tree an incomplete record of write events; the resulting
+        // duplicate-take noise is `rice take prune`'s problem (phase A9),
+        // not this hook's.
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("cover-autotake-repeat");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("livery.json"), VALID_NOTES).unwrap();
+        let img = root.join("elsewhere.png");
+        std::fs::write(&img, b"\x89PNG stub").unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        aoide_storage::mode::save_mode_marker(&aoide_storage::mode::ModeMarker {
+            mode: aoide_storage::mode::RiceMode::Draft,
+            song: Some("moonlight".to_string()),
+            draft: Some("neon-night".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let first = handle_cover_set_entry(&inv(&["cover", "set"], &[img.to_str().unwrap()]));
+        assert_eq!(first.status, Status::Ok, "{:?}", first.data);
+        assert_eq!(first.data.unwrap()["take"], 1);
+
+        let second = handle_cover_set_entry(&inv(&["cover", "set"], &[img.to_str().unwrap()]));
+        assert_eq!(second.status, Status::Ok, "{:?}", second.data);
+        assert_eq!(
+            second.data.unwrap()["take"], 2,
+            "a content-identical cover reset still mints its own take"
+        );
+        assert!(second.changed.iter().any(|c| c.ends_with("takes/0002.json")));
+
+        let record = aoide_storage::takes::load_take("moonlight", "neon-night", 2).unwrap();
+        assert_eq!(record.parent, Some(1), "the second take hangs off the first");
+        assert_eq!(
+            aoide_storage::takes::list_takes("moonlight", "neon-night").len(),
+            2,
+            "both writes are on record, even though their content is identical"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
