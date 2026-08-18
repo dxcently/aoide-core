@@ -1,0 +1,21 @@
+[package]
+name = "aoide-upkeep"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+description = "Aoide mechanical integrity: `aoide soundcheck`, a report-only sweep of the WORKING tree (repo-root slop, orphaned tracked/ignored files, build clutter) — the working-tree half of the mechanical-integrity design; `nix flake check`'s own checks own the COMMITTED half."
+
+[lib]
+name = "aoide_upkeep"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+aoide-protocol = { workspace = true }
+aoide-storage = { workspace = true }
+
+[dev-dependencies]
+# `commands` tests share the workspace rig (scratch dirs, EnvSaver, env_lock)
+# — the same dev-only edge every other domain crate's command tests take.
+aoide-test-support = { workspace = true }

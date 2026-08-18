@@ -41,6 +41,7 @@ dependencies = [
  "aoide-song",
  "aoide-storage",
  "aoide-test-support",
+ "aoide-upkeep",
  "crossterm",
  "ratatui",
  "serde",
@@ -133,6 +134,17 @@ name = "aoide-test-support"
 version = "0.0.0"
 dependencies = [
  "aoide-protocol",
+]
+
+[[package]]
+name = "aoide-upkeep"
+version = "0.0.0"
+dependencies = [
+ "aoide-protocol",
+ "aoide-storage",
+ "aoide-test-support",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

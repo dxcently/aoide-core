@@ -3,7 +3,7 @@
 # lives at `crates/cli`, single-charter crates under `crates/*`.
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/storage", "crates/conduct", "crates/client", "crates/server", "crates/song", "crates/conductor", "crates/test-support", "crates/cli"]
+members = ["crates/protocol", "crates/storage", "crates/conduct", "crates/client", "crates/server", "crates/song", "crates/conductor", "crates/test-support", "crates/cli", "crates/upkeep"]
 
 # ONE version source for the whole workspace (the monorepo standard): every
 # crate inherits via `{ workspace = true }` — no per-manifest version repeats.
@@ -45,6 +45,10 @@ aoide-server = { path = "crates/server" }
 aoide-song = { path = "crates/song" }
 aoide-conductor = { path = "crates/conductor" }
 aoide-test-support = { path = "crates/test-support" }
+# `aoide soundcheck` — the mechanical-integrity verb's WORKING-tree half
+# (soundcheck design doc, FORK 3, advisor-confirmed new crate: repo hygiene
+# is not `aoide-storage`'s "durable session data" charter).
+aoide-upkeep = { path = "crates/upkeep" }
 
 [profile.release]
 opt-level = "s"

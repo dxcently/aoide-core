@@ -117,6 +117,24 @@ pub fn run_qml_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| song.join("run").join("qml"))
 }
 
+/// The Aoide repo root: `~/Aoide` — the same root [`run_qml_dir`] takes as
+/// `song/`'s sibling, one level up from where [`song_dir`] resolves.
+///
+/// Mirrors [`run_qml_dir`]'s own derivation exactly (`song_dir().parent()`),
+/// so an `$AOIDE_STAGE_DIR` override relocates this too — `aoide soundcheck`
+/// (`aoide-upkeep`, the mechanical-integrity verb) scans the WORKING tree
+/// starting here, and a test pointing the stage dir at a scratch tree gets an
+/// isolated fake repo root alongside it for free, same as every other seam in
+/// this file. Consequence, flagged once: `soundcheck` always inspects the ONE
+/// `~/Aoide` checkout this env resolves to, never an arbitrary cwd — there is
+/// no `--root` flag.
+pub fn repo_root() -> std::path::PathBuf {
+    let song = song_dir();
+    song.parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or(song)
+}
+
 /// The committed-song directory: `<song>/songbook/<name>/`.
 ///
 /// Shares [`song_dir`]'s `AOIDE_STAGE_DIR`-relative resolution, so a test that
@@ -519,6 +537,39 @@ mod tests {
         std::env::remove_var("AOIDE_STAGE_DIR");
         assert!(run_qml_dir().ends_with("Aoide/run/qml"));
         assert!(!run_qml_dir().ends_with("Aoide/song/run/qml"), "not nested under song/");
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+    }
+
+    #[test]
+    fn repo_root_resolves_as_the_grandparent_of_stage_dir_and_honors_its_override() {
+        // Mirrors `run_qml_dir_resolves_as_a_sibling_of_song_under_the_stage_override`:
+        // the override's tmp root plays the role of the real `~/Aoide/` root,
+        // its child the role of `song/`, so `repo_root()` lands on that root
+        // itself — one level up from where `song_dir()` resolves, same as
+        // `run_qml_dir`'s own `Aoide` root.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+
+        // `song_dir` peels one level (stage → its parent); `repo_root` peels
+        // ANOTHER (song_dir → its parent) — so the override needs a `song/`
+        // segment between the repo root and `stage` to land on a real root,
+        // same shape the default layout itself uses (`<root>/song/stage`).
+        std::env::set_var("AOIDE_STAGE_DIR", "/tmp/aoide-repo-root-test/song/stage");
+        assert_eq!(
+            repo_root(),
+            std::path::PathBuf::from("/tmp/aoide-repo-root-test"),
+            "repo_root is song_dir's parent, not song_dir itself"
+        );
+
+        // On the default layout: `~/Aoide/song/stage` → song_dir() = `~/Aoide/song`
+        // → repo_root() = `~/Aoide`.
+        std::env::remove_var("AOIDE_STAGE_DIR");
+        assert!(repo_root().ends_with("Aoide"));
+        assert!(!repo_root().ends_with("Aoide/song"), "one level above song_dir, not song_dir itself");
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),

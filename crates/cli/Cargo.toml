@@ -37,6 +37,8 @@ aoide-song = { workspace = true }
 # `aoide conductor` — the interactive terminal frontend, its own crate
 # (Phase 6b restructure, docs/architecture/PACKAGE-LAYOUT.md).
 aoide-conductor = { workspace = true }
+# `aoide soundcheck` — the mechanical-integrity verb (working-tree half).
+aoide-upkeep = { workspace = true }
 
 [dev-dependencies]
 # `tests/conductor_integration.rs` drives the conductor's app/ui layer
