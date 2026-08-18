@@ -129,6 +129,7 @@ mod tests {
             "peer.remove",
             "peer.status",
             "quickshell.reload",
+            "rice.back",
             "rice.declare",
             "rice.draft.drop",
             "rice.draft.list",
@@ -159,6 +160,7 @@ mod tests {
             "screen.send",
             "screen.shot",
             "shellbridge",
+            "soundcheck",
             "update",
             "usage",
         ];

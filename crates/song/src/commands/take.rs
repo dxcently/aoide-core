@@ -83,6 +83,18 @@ pub fn register(r: &mut Registry) {
         implemented: true,
         handler: handle_rice_take_mark,
     ));
+    r.insert(cmd!(
+        path: ["rice", "back"],
+        summary: "Revert the routed draft's live stage to an earlier take (--take N or --mark <letter>) and move the head cursor there — the NEXT write hangs off it, branching implicitly with no branch verb. Un-taken drift on the stage is snapshotted first so nothing is destroyed. Draft mode only. A bare `rice back` (neither flag) always refuses in this build — the interactive picker is a later step, not built here.",
+        args: [],
+        flags: [
+            flag!("take", "int", "Take number to revert to."),
+            flag!("mark", "string", "Mark letter to revert to (resolved through takes/marks.json)."),
+        ],
+        gated: false,
+        implemented: true,
+        handler: handle_rice_back,
+    ));
 }
 
 /// The shared "must be routed into a draft" guard every take verb starts
@@ -400,6 +412,294 @@ fn handle_rice_take_mark(inv: &Invocation) -> Outcome {
                     "take": take,
                     "moved": moved,
                     "from": previous,
+                }))
+        }
+        Err(o) => o,
+    }
+}
+
+// ── `rice back` — the revert that lands the branch-from-any-mark ask ───────
+//
+// Everything below is ONE mutator: [`back_unlocked`] does drift-snapshot →
+// livery/cover write-back → compositor apply → registry re-sync → head
+// advance as a single `with_stage_lock` body (advisor verdict D2 — see the
+// module doc's "Locking discipline" section, which this function is the
+// concrete case that section was written for). It calls ONLY the `_unlocked`
+// cores above, never [`snapshot`]/[`mark`] — those re-acquire the lock and
+// `with_stage_lock` is documented not re-entrant (`aoide-storage/src/fs.rs`).
+
+/// Everything [`handle_rice_back`] needs to build its `Outcome`, assembled
+/// INSIDE the lock so nothing here re-reads state the write already changed
+/// underneath it.
+struct BackResult {
+    /// The head cursor's value BEFORE this call touched anything — captured
+    /// before the drift snapshot runs, so it names where the caller was
+    /// actually standing, not an intermediate value the drift mint produced.
+    from: Option<u32>,
+    to: u32,
+    /// The mark letter used to select the target, if `--mark` was given —
+    /// `None` for a `--take` selection, even if that take happens to carry a
+    /// letter (the report says how the caller ASKED, not what the take owns).
+    mark: Option<String>,
+    /// The take the pre-overwrite drift snapshot minted, if content on the
+    /// stage differed from the head take it was about to clobber.
+    drifted: Option<u32>,
+    changed: Vec<String>,
+    registry_note: String,
+    hyprctl_status: &'static str,
+}
+
+/// The unlocked revert core — see the section banner above for the shape.
+/// `cmd` threads through to every `Outcome` built here (module doc's
+/// command-name-threading note); `take_flag`/`mark_flag` are already
+/// syntax-validated by [`handle_rice_back`] (a parse/letter-shape failure is
+/// a usage error surfaced before this ever runs, and before the lock is even
+/// taken) — this function's job is resolving WHICH one names a real take and
+/// then acting on it.
+fn back_unlocked(cmd: &str, take_flag: Option<u32>, mark_flag: Option<String>) -> Result<BackResult, Outcome> {
+    let (song, draft) = resolve_draft(cmd)?;
+
+    // D7: refuse before touching anything if the draft's routing symlink is
+    // gone, dangling, or was ever replaced by a plain file. `atomic_write`'s
+    // symlink transparency (`aoide-storage/src/fs.rs`) is the ENTIRE
+    // mechanism a revert rides on — the write-back below carries zero
+    // symlink-awareness of its own, exactly like `rice stage`'s. Without
+    // this check, a broken routing symlink would make the write below land
+    // in a plain `stage/livery.json` instead of the draft file: the draft
+    // itself untouched, the take store and the live stage silently
+    // disagreeing about which draft is "current". `symlink_metadata` never
+    // follows the link, so this answers "is `stage/livery.json` ITSELF a
+    // symlink" without caring whether its target exists.
+    let stage = shellbridge::stage_dir();
+    let livery_path = stage.join("livery.json");
+    let routed = std::fs::symlink_metadata(&livery_path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    if !routed {
+        return Err(Outcome::error(
+            cmd,
+            format!(
+                "draft routing is broken: {} is not a symlink — refusing to revert rather than \
+                 silently writing a plain stage file that leaves the draft untouched \
+                 (`aoide rice mode draft {draft}` re-routes it)",
+                livery_path.display()
+            ),
+        )
+        .with_data(json!({ "reason": "routing-broken", "expected": livery_path.to_string_lossy() })));
+    }
+
+    // Resolve the target: `--take N` names it directly; `--mark X` resolves
+    // through `takes/marks.json`. A map entry naming a take that no longer
+    // exists (a hand-edited marks file, or — once pruning lands — a take
+    // pruned without also rewriting the map) reads exactly like an
+    // unstamped letter from here: both are "that mark doesn't name anything
+    // real", so they share `mark-not-found` rather than inventing a second
+    // reason for the same practical failure (mirrors `mark_unlocked`'s own
+    // take-not-found/no-head collapse just above).
+    let (target, mark_used) = if let Some(n) = take_flag {
+        if takes::load_take(&song, &draft, n).is_none() {
+            return Err(Outcome::error(cmd, format!("take {n:04} does not exist — nothing to revert to"))
+                .with_data(json!({ "reason": "take-not-found", "take": n })));
+        }
+        (n, None)
+    } else {
+        let letter = mark_flag.expect("handle_rice_back guarantees take_flag or mark_flag is Some");
+        let marks = takes::load_marks(&song, &draft);
+        match marks.get(&letter).copied() {
+            Some(n) if takes::load_take(&song, &draft, n).is_some() => (n, Some(letter)),
+            _ => {
+                return Err(
+                    Outcome::error(cmd, format!("mark `{letter}` is not stamped on any take"))
+                        .with_data(json!({ "reason": "mark-not-found", "mark": letter })),
+                );
+            }
+        }
+    };
+    let target_record =
+        takes::load_take(&song, &draft, target).expect("existence just confirmed above");
+
+    let head_before = takes::load_head(&song, &draft);
+
+    // The rail that makes "nothing is destroyed" literally true even for
+    // un-taken hand-edits: preserve whatever is CURRENTLY on the stage
+    // before the write below overwrites it, if it differs from the head
+    // take it's about to clobber. Folded into THIS lock, not a second
+    // acquisition — see the module doc; this is `snapshot_if_drifted_unlocked`'s
+    // one sanctioned caller.
+    let drifted = snapshot_if_drifted_unlocked(cmd, "drift")?;
+
+    let mut changed = Vec::new();
+    if let Some(rec) = &drifted {
+        changed.push(takes::take_path(&song, &draft, rec.take).to_string_lossy().into_owned());
+        changed.push(takes::head_path(&song, &draft).to_string_lossy().into_owned());
+    }
+
+    // The write-back IS the routing (plan §5.2): the identical `atomic_write`
+    // seam `rice stage` writes (`commands/rice.rs::handle_rice_stage`),
+    // symlink-transparent, so this lands in the draft file the same way
+    // every other stage writer does. No new apply path — this reuses the
+    // one that already exists.
+    let livery_body = serde_json::to_string_pretty(&target_record.livery)
+        .map_err(|e| {
+            Outcome::error(cmd, format!("failed to serialize take {target:04}'s livery: {e}"))
+                .with_data(json!({ "reason": "write-failed" }))
+        })?
+        + "\n";
+    shellbridge::atomic_write(&livery_path, &livery_body).map_err(|e| {
+        Outcome::error(cmd, format!("failed to write {}: {e}", livery_path.display()))
+            .with_data(json!({ "reason": "write-failed", "target": livery_path.to_string_lossy() }))
+    })?;
+    changed.push(livery_path.to_string_lossy().into_owned());
+
+    // Best-effort compositor live-apply — the exact sequencing
+    // `handle_rice_stage` uses (geometry/border keywords derived from the
+    // SAME livery just written), never fatal: the stage-file write above is
+    // already the source of truth for the hot-reload half.
+    let hyprctl_status = crate::live::apply_live(&crate::live::geometry_keywords(&target_record.livery));
+
+    // Cover restore is narrowed to the STAGE ONLY (advisor verdict D4):
+    // `stage/cover.json` is not symlink-routed the way `livery.json` is
+    // (`storage/src/mode.rs`'s `handle_mode_draft` symlinks exactly one
+    // file), so this writes the same seam `cover set` writes
+    // (`commands/cover.rs::handle_cover_set`), never the draft directory's
+    // own `cover.json` — that file is a `draft save`-time archive copy no
+    // write path maintains and no read path consumes (draft verbs are
+    // save/list/drop only). A take minted with NO cover must not leave the
+    // previous wallpaper lying on the stage — mirror `draft.rs`'s own
+    // fork-time stale-cover removal (`rice.draft.save`'s `cover_src.is_file()`
+    // else-branch) rather than leaving a cover the target take never had.
+    let cover_path = stage.join("cover.json");
+    match &target_record.cover {
+        Some(cover_value) => {
+            let cover_body = serde_json::to_string_pretty(cover_value).unwrap_or_default() + "\n";
+            shellbridge::atomic_write(&cover_path, &cover_body).map_err(|e| {
+                Outcome::error(cmd, format!("failed to write {}: {e}", cover_path.display()))
+                    .with_data(json!({ "reason": "write-failed", "target": cover_path.to_string_lossy() }))
+            })?;
+            changed.push(cover_path.to_string_lossy().into_owned());
+        }
+        None => {
+            if cover_path.exists() {
+                let _ = std::fs::remove_file(&cover_path);
+                changed.push(cover_path.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    // Registry re-sync, no IPC reload (advisor verdict D1). `registry.json`
+    // is derived from the livery's `.widgets` key, so a reverted livery with
+    // a different widget set would leave it stale without this — but every
+    // file this whole function writes (livery, cover, registry) is
+    // FileView-watched by Quickshell exactly like `rice stage`'s own palette
+    // tier, so there is nothing for a Quickshell IPC reload to do. The ONE
+    // reload lane that exists anywhere in this codebase
+    // (`ipc::quickshell_ipc_reload`, gated in `handle_rice_stage`) exists
+    // ONLY for dynamically `Qt.createComponent`-loaded widget BODIES, which
+    // a revert never touches by design (widget bodies are git's substrate,
+    // §5.2) — so that call is never reached from here, deliberately, not by
+    // omission.
+    let registry_sync = crate::widgets::sync_song_registry(&song).map_err(|e| {
+        Outcome::error(cmd, format!("failed to sync widget-type registry: {}", e.error))
+            .with_data(json!({ "reason": "registry-sync-failed", "target": e.target }))
+    })?;
+    changed.extend(registry_sync.changed.clone());
+
+    // A revert is NOT a take (advisor verdict, fork 8) — only the cursor
+    // moves. This is the step where branching actually happens: the NEXT
+    // snapshot parents off whatever `save_head` names here, not off
+    // whatever the head happened to be a moment ago.
+    takes::save_head(&song, &draft, target).map_err(|e| {
+        Outcome::error(cmd, format!("failed to advance the head cursor: {e}"))
+            .with_data(json!({ "reason": "write-failed" }))
+    })?;
+    changed.push(takes::head_path(&song, &draft).to_string_lossy().into_owned());
+
+    Ok(BackResult {
+        from: head_before,
+        to: target,
+        mark: mark_used,
+        drifted: drifted.map(|r| r.take),
+        changed,
+        registry_note: registry_sync.note,
+        hyprctl_status,
+    })
+}
+
+/// `rice back [--take N | --mark <letter>]` — the verb the branch-from-any-
+/// mark ask lands on. Syntax-validates its flags BEFORE taking the lock (a
+/// malformed `--take`/`--mark` is a usage error regardless of draft state,
+/// so there is no reason to acquire anything to report it), then wraps
+/// [`back_unlocked`]'s whole read-drift-write-advance body in exactly ONE
+/// `with_stage_lock` — see that function's own doc and the module doc's
+/// locking-discipline section.
+fn handle_rice_back(inv: &Invocation) -> Outcome {
+    let take_flag = match inv.flags.get("take") {
+        Some(raw) => match raw.parse::<u32>() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                return Outcome::usage("rice.back", format!("`--take {raw}` is not a valid take number"))
+                    .with_data(json!({ "reason": "invalid-take", "take": raw }));
+            }
+        },
+        None => None,
+    };
+    let mark_flag = match inv.flags.get("mark") {
+        Some(letter) => {
+            if !valid_mark_letter(letter) {
+                return Outcome::error(
+                    "rice.back",
+                    format!("`{letter}` is not a valid mark: must be a single letter A-Z"),
+                )
+                .with_data(json!({ "reason": "invalid-mark", "mark": letter }));
+            }
+            Some(letter.clone())
+        }
+        None => None,
+    };
+
+    // Dual entrance (§7): a bare `rice back` on a tty is EVENTUALLY meant to
+    // open a numbered picker defaulting to the head's parent (one Enter is
+    // §5.2's one-step undo) — but that picker is a later step (A8), not this
+    // one, and half-building tty-detection with no picker on the other end
+    // of it would be worse than not building it at all. So THIS build
+    // refuses unconditionally whenever neither flag is given, tty or not,
+    // and never reads stdin either way: an agent (never a tty) and a User on
+    // a bare terminal get the IDENTICAL message pointing at the two flags
+    // that work today.
+    if take_flag.is_none() && mark_flag.is_none() {
+        return Outcome::usage(
+            "rice.back",
+            "usage: aoide rice back --take N | --mark <letter> [--json] \
+             (a bare `rice back` will open a picker on a tty in a later step; \
+             not built yet — pass --take or --mark)",
+        )
+        .with_data(json!({ "reason": "no-selection" }));
+    }
+
+    match shellbridge::with_stage_lock(|| back_unlocked("rice.back", take_flag, mark_flag)) {
+        Ok(result) => {
+            let drift_note = result
+                .drifted
+                .map(|d| format!("; take {d:04} preserved the un-taken edit that was about to be overwritten"))
+                .unwrap_or_default();
+            let mark_note = result
+                .mark
+                .as_ref()
+                .map(|m| format!(" (mark {m})"))
+                .unwrap_or_default();
+            let message = format!(
+                "reverted to take {:04}{mark_note} — head now {:04}{drift_note}",
+                result.to, result.to
+            );
+            Outcome::ok("rice.back", message)
+                .changed(result.changed)
+                .with_data(json!({
+                    "from": result.from,
+                    "to": result.to,
+                    "mark": result.mark,
+                    "drifted": result.drifted,
+                    "hyprctl": result.hyprctl_status,
+                    "registry": result.registry_note,
                 }))
         }
         Err(o) => o,
@@ -854,5 +1154,462 @@ mod tests {
         assert_eq!(out.status, Status::Usage);
         assert_eq!(out.data.unwrap()["reason"], "invalid-take");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── `rice back` — the revert that lands the branch-from-any-mark ask ───
+    //
+    // Unlike `routed_draft` above (a bare Draft-mode marker over a PLAIN
+    // stage/livery.json — fine for the snapshot/mark cores, which never
+    // check routing), every `rice back` test needs stage/livery.json to be a
+    // REAL symlink into the draft file, because `back_unlocked`'s
+    // routing-broken rail (D7) checks exactly that before writing anything.
+
+    fn routed_draft_symlinked(tag: &str) -> (std::path::PathBuf, String, String, std::path::PathBuf) {
+        let root = unique_tmp(tag);
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let song = "sonata".to_string();
+        let draft = "neon-night".to_string();
+        let draft_dir = shellbridge::draft_dir(&song, &draft);
+        std::fs::create_dir_all(&draft_dir).unwrap();
+        let draft_livery = draft_dir.join("livery.json");
+        std::fs::write(&draft_livery, "{}").unwrap();
+        std::os::unix::fs::symlink(&draft_livery, stage.join("livery.json")).unwrap();
+        save_mode_marker(&ModeMarker {
+            mode: RiceMode::Draft,
+            song: Some(song.clone()),
+            draft: Some(draft.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        (root, song, draft, draft_livery)
+    }
+
+    /// Writes new content THROUGH the routing symlink — plain `std::fs::write`
+    /// (unlike `atomic_write`'s rename) follows a symlink transparently, so
+    /// this lands in the draft file while leaving the symlink itself intact,
+    /// exactly the property every test below relies on to keep re-editing
+    /// "the draft" across multiple snapshots.
+    fn write_livery(stage: &std::path::Path, bg: &str) {
+        std::fs::write(
+            stage.join("livery.json"),
+            format!(r##"{{"schemaVersion":"0","palette":{{"bg":"{bg}"}}}}"##),
+        )
+        .unwrap();
+    }
+
+    fn inv_back(mark: Option<&str>, take: Option<u32>) -> Invocation {
+        let mut flags = std::collections::BTreeMap::new();
+        if let Some(m) = mark {
+            flags.insert("mark".to_string(), m.to_string());
+        }
+        if let Some(t) = take {
+            flags.insert("take".to_string(), t.to_string());
+        }
+        Invocation {
+            path: vec!["rice".to_string(), "back".to_string()],
+            args: vec![],
+            flags,
+            door: aoide_protocol::Door::Cli,
+        }
+    }
+
+    /// The acceptance test for the whole ask: revert to a mark, keep
+    /// editing, and the takes after the mark survive as siblings of the new
+    /// branch rather than being destroyed or renumbered.
+    #[test]
+    fn revert_to_a_mark_branches_and_leaves_the_old_line_intact() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, song, draft, draft_livery) = routed_draft_symlinked("back-branch-acceptance");
+        let stage = shellbridge::stage_dir();
+
+        write_livery(&stage, "#111111");
+        let take1 = snapshot("rice.take", "stage").unwrap();
+        assert_eq!((take1.take, take1.parent), (1, None));
+
+        write_livery(&stage, "#222222");
+        let take2 = snapshot("rice.take", "stage").unwrap();
+        assert_eq!((take2.take, take2.parent), (2, Some(1)));
+
+        mark("rice.take.mark", "A", 2).unwrap();
+
+        write_livery(&stage, "#333333");
+        let take3 = snapshot("rice.take", "stage").unwrap();
+        assert_eq!((take3.take, take3.parent), (3, Some(2)));
+        assert_eq!(takes::load_head(&song, &draft), Some(3));
+
+        // `rice back --mark A` — the stage exactly matches the head (take 3)
+        // it's about to overwrite, so nothing drifts.
+        let out = handle_rice_back(&inv_back(Some("A"), None));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        let data = out.data.clone().unwrap();
+        assert_eq!(data["from"], 3, "head before the revert");
+        assert_eq!(data["to"], 2);
+        assert_eq!(data["mark"], "A");
+        assert!(data["drifted"].is_null(), "stage matched the head exactly — nothing to preserve");
+        assert!(
+            data.get("reload").is_none(),
+            "a revert never touches Quickshell IPC (D1) — no reload field at all, unlike `rice stage`'s outcome"
+        );
+        assert_eq!(takes::load_head(&song, &draft), Some(2), "head moved to the mark's take");
+
+        let restored: Value = serde_json::from_str(&std::fs::read_to_string(&draft_livery).unwrap()).unwrap();
+        assert_eq!(restored, take2.livery, "the draft file (through the symlink) now holds take 2's content");
+
+        // Takes 3 is completely untouched — nothing destroyed, nothing
+        // renumbered.
+        let take3_after = takes::load_take(&song, &draft, 3).unwrap();
+        assert_eq!(take3_after, take3);
+
+        // Branch out again: the next write hangs off the REVERTED head (2),
+        // not off take 3 — this is where branching actually happens.
+        write_livery(&stage, "#444444");
+        let take4 = snapshot("rice.take", "stage").unwrap();
+        assert_eq!((take4.take, take4.parent), (4, Some(2)), "branches off the reverted head, not off take 3");
+
+        // Take 3 is STILL there, still parented on 2 — a sibling of take 4,
+        // not overwritten and not renumbered.
+        let take3_final = takes::load_take(&song, &draft, 3).unwrap();
+        assert_eq!(take3_final.parent, Some(2));
+        assert_eq!(takes::children(&takes::list_takes(&song, &draft), 2), vec![3, 4], "two branches off the same mark");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn revert_by_take_number_moves_head_and_restores_content() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, song, draft, draft_livery) = routed_draft_symlinked("back-by-take");
+        let stage = shellbridge::stage_dir();
+
+        write_livery(&stage, "#aaaaaa");
+        let take1 = snapshot("rice.take", "stage").unwrap();
+        write_livery(&stage, "#bbbbbb");
+        snapshot("rice.take", "stage").unwrap(); // take 2, now head
+
+        let out = handle_rice_back(&inv_back(None, Some(1)));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        let data = out.data.unwrap();
+        assert_eq!(data["to"], 1);
+        assert!(data["mark"].is_null(), "a --take selection reports no mark");
+        assert_eq!(takes::load_head(&song, &draft), Some(1));
+
+        let restored: Value = serde_json::from_str(&std::fs::read_to_string(&draft_livery).unwrap()).unwrap();
+        assert_eq!(restored, take1.livery);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn back_by_take_reports_null_mark_even_when_the_target_take_carries_one() {
+        // Pins the "how was I asked" semantics [`BackResult::mark`]'s own
+        // doc comment claims: the report reflects the SELECTOR the caller
+        // used, not whatever the resolved take happens to own. Both of this
+        // file's other `--take` tests target unmarked takes, so this was
+        // otherwise asserted nowhere.
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, song, draft, _draft_livery) = routed_draft_symlinked("back-take-target-has-mark");
+        let stage = shellbridge::stage_dir();
+
+        write_livery(&stage, "#111111");
+        snapshot("rice.take", "stage").unwrap(); // take 1
+        write_livery(&stage, "#222222");
+        snapshot("rice.take", "stage").unwrap(); // take 2, head
+        mark("rice.take.mark", "A", 1).unwrap(); // take 1 — the REVERT TARGET — carries a mark
+
+        let out = handle_rice_back(&inv_back(None, Some(1)));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert!(
+            out.data.unwrap()["mark"].is_null(),
+            "selected via --take, not --mark — the report says null even though take 1 owns mark A"
+        );
+        assert_eq!(takes::load_head(&song, &draft), Some(1));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn back_snapshots_an_untaken_hand_edit_before_overwriting_it() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, song, draft, draft_livery) = routed_draft_symlinked("back-drift-preserved");
+        let stage = shellbridge::stage_dir();
+
+        write_livery(&stage, "#111111");
+        snapshot("rice.take", "stage").unwrap(); // take 1, head
+
+        // An un-taken hand edit — nothing ever called `rice take`/`rice
+        // stage` on this content, so it exists nowhere but the live stage.
+        write_livery(&stage, "#hand-edited");
+
+        let out = handle_rice_back(&inv_back(None, Some(1)));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        let data = out.data.unwrap();
+        let drifted_take = data["drifted"].as_u64().expect("the hand edit must have minted a take");
+        assert_eq!(drifted_take, 2, "the drift take hangs off the head it preserved");
+
+        // The un-taken edit is recoverable: it is exactly what take 2 holds.
+        let preserved = takes::load_take(&song, &draft, 2).unwrap();
+        assert_eq!(preserved.cause, "drift");
+        assert_eq!(preserved.parent, Some(1));
+        assert_eq!(preserved.livery["palette"]["bg"], "#hand-edited");
+
+        // And the revert itself still landed — take 1's content is now live.
+        let restored: Value = serde_json::from_str(&std::fs::read_to_string(&draft_livery).unwrap()).unwrap();
+        assert_eq!(restored["palette"]["bg"], "#111111");
+        assert_eq!(takes::load_head(&song, &draft), Some(1));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn back_mints_no_drift_take_when_the_stage_already_matches_the_head() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, song, draft, _draft_livery) = routed_draft_symlinked("back-no-drift");
+        let stage = shellbridge::stage_dir();
+
+        write_livery(&stage, "#111111");
+        snapshot("rice.take", "stage").unwrap(); // take 1, head — stage matches it exactly
+
+        let out = handle_rice_back(&inv_back(None, Some(1)));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert!(out.data.unwrap()["drifted"].is_null(), "nothing differed from the head — nothing to preserve");
+        assert_eq!(
+            takes::list_takes(&song, &draft).len(),
+            1,
+            "no phantom take minted when there was nothing to drift-capture"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn back_to_the_same_target_twice_in_a_row_mints_no_new_takes_between_calls() {
+        // Fork 8 ("a revert is not a take") proven against the state a
+        // REVERT ITSELF produces, not just against a stage nobody has
+        // touched yet. `back_mints_no_drift_take_when_the_stage_already_
+        // matches_the_head` above only exercises the latter (nothing ever
+        // ran `rice back` before the assertion); this calls `rice back`
+        // twice at the SAME target and checks the take count never grows
+        // between the two calls — the second call's drift comparison is
+        // against exactly what the first call's own write just produced.
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, song, draft, _draft_livery) = routed_draft_symlinked("back-repeat-same-target");
+        let stage = shellbridge::stage_dir();
+
+        write_livery(&stage, "#111111");
+        snapshot("rice.take", "stage").unwrap(); // take 1
+        write_livery(&stage, "#222222");
+        snapshot("rice.take", "stage").unwrap(); // take 2, head
+
+        let first = handle_rice_back(&inv_back(None, Some(1)));
+        assert_eq!(first.status, Status::Ok, "{:?}", first.data);
+        let count_after_first = takes::list_takes(&song, &draft).len();
+
+        let second = handle_rice_back(&inv_back(None, Some(1)));
+        assert_eq!(second.status, Status::Ok, "{:?}", second.data);
+        assert!(
+            second.data.as_ref().unwrap()["drifted"].is_null(),
+            "the second revert to the same target drifts nothing — the stage already IS take 1"
+        );
+        assert_eq!(
+            takes::list_takes(&song, &draft).len(),
+            count_after_first,
+            "two consecutive reverts to the same target mint zero takes between them"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn back_clears_a_stale_stage_cover_when_the_target_take_has_none() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, song, draft, _draft_livery) = routed_draft_symlinked("back-cover-clear");
+        let stage = shellbridge::stage_dir();
+
+        write_livery(&stage, "#111111");
+        let take1 = snapshot("rice.take", "stage").unwrap();
+        assert!(take1.cover.is_none());
+
+        // A cover-set lands on top and gets taken — take 2 carries a cover.
+        std::fs::write(stage.join("cover.json"), r#"{"path":"/tmp/x.png"}"#).unwrap();
+        let take2 = snapshot("rice.take", "stage").unwrap();
+        assert!(take2.cover.is_some());
+        assert!(stage.join("cover.json").is_file());
+
+        // Revert to take 1, which has no cover — the stale stage cover
+        // (still sitting there from take 2) must be cleared, not left
+        // pointing at a wallpaper take 1 never had.
+        let out = handle_rice_back(&inv_back(None, Some(1)));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert!(out.data.unwrap()["drifted"].is_null(), "stage matched head (take 2) exactly before the call");
+        assert!(!stage.join("cover.json").exists(), "target take had no cover — the stale stage cover is cleared");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn back_refuses_when_the_routing_symlink_is_missing() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let root = unique_tmp("back-routing-broken");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let song = "sonata".to_string();
+        let draft = "neon-night".to_string();
+        // Draft mode claimed, but stage/livery.json is a PLAIN file, never
+        // routed through `rice mode draft`'s symlink.
+        std::fs::write(stage.join("livery.json"), VALID_NOTES).unwrap();
+        save_mode_marker(&ModeMarker {
+            mode: RiceMode::Draft,
+            song: Some(song.clone()),
+            draft: Some(draft.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        // TWO takes, so target (1) and the pre-existing head (falls back to
+        // the max, 2) differ — this is what makes the closing head
+        // assertion discriminate. With only one take (both = 1), the
+        // fallback in `load_head` lands on 1 whether or not `save_head` ever
+        // ran, so that assertion would hold even if the routing-broken
+        // refusal secretly still moved the cursor.
+        std::fs::create_dir_all(shellbridge::draft_dir(&song, &draft).join("takes")).unwrap();
+        let seed = |n: u32, parent: Option<u32>| TakeRecord {
+            take: n,
+            parent,
+            at: "2026-08-18T00:00:00Z".to_string(),
+            session_id: None,
+            cause: "explicit".to_string(),
+            livery: serde_json::json!({ "schemaVersion": "0" }),
+            cover: None,
+        };
+        takes::save_take(&song, &draft, &seed(1, None)).unwrap();
+        takes::save_take(&song, &draft, &seed(2, Some(1))).unwrap();
+
+        let out = handle_rice_back(&inv_back(None, Some(1)));
+        assert_eq!(out.status, Status::Error);
+        assert_eq!(out.data.unwrap()["reason"], "routing-broken");
+        // Nothing written: the plain stage file is untouched and the head
+        // cursor is exactly what it was before this call (the fallback max,
+        // 2) — NOT moved to the target (1), which is what a bug that let
+        // `save_head` run despite the refusal would produce.
+        assert_eq!(
+            std::fs::read_to_string(stage.join("livery.json")).unwrap(),
+            VALID_NOTES,
+            "a routing-broken refusal writes nothing"
+        );
+        assert_eq!(
+            takes::load_head(&song, &draft),
+            Some(2),
+            "head stays at the pre-existing fallback (2), never claimed down to the target (1) by this call"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn back_with_both_take_and_mark_given_take_wins() {
+        // No sibling verb has two co-present selectors, so the reviewer
+        // ruled a silent `--take`-wins priority defensible but unpinned —
+        // this test is the pin.
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, song, draft, _draft_livery) = routed_draft_symlinked("back-both-flags-take-wins");
+        let stage = shellbridge::stage_dir();
+
+        write_livery(&stage, "#111111");
+        snapshot("rice.take", "stage").unwrap(); // take 1
+        write_livery(&stage, "#222222");
+        snapshot("rice.take", "stage").unwrap(); // take 2, head
+        mark("rice.take.mark", "A", 2).unwrap(); // A names take 2 — the OTHER selection
+
+        let out = handle_rice_back(&inv_back(Some("A"), Some(1)));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        let data = out.data.unwrap();
+        assert_eq!(data["to"], 1, "--take wins over a co-present --mark naming a different take");
+        assert!(data["mark"].is_null(), "the winning selector was --take, so mark reports null");
+        assert_eq!(takes::load_head(&song, &draft), Some(1));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn back_take_not_found_and_mark_not_found() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, _song, _draft, _draft_livery) = routed_draft_symlinked("back-not-found");
+        let stage = shellbridge::stage_dir();
+        write_livery(&stage, "#111111");
+        snapshot("rice.take", "stage").unwrap(); // only take 1 exists, no marks
+
+        let missing_take = handle_rice_back(&inv_back(None, Some(99)));
+        assert_eq!(missing_take.status, Status::Error);
+        assert_eq!(missing_take.data.unwrap()["reason"], "take-not-found");
+
+        let missing_mark = handle_rice_back(&inv_back(Some("Z"), None));
+        assert_eq!(missing_mark.status, Status::Error);
+        assert_eq!(missing_mark.data.unwrap()["reason"], "mark-not-found");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn back_invalid_take_and_mark_flags_are_rejected_before_anything_else() {
+        // Malformed-flag shape — the bare (neither flag) form is covered by
+        // `back_bare_invocation_refuses_without_reading_stdin_or_writing_anything`.
+        let bad_take = handle_rice_back(&Invocation {
+            path: vec!["rice".to_string(), "back".to_string()],
+            args: vec![],
+            flags: std::collections::BTreeMap::from([("take".to_string(), "nope".to_string())]),
+            door: aoide_protocol::Door::Cli,
+        });
+        assert_eq!(bad_take.status, Status::Usage);
+        assert_eq!(bad_take.data.unwrap()["reason"], "invalid-take");
+
+        let bad_mark = handle_rice_back(&inv_back(Some("ab"), None));
+        assert_eq!(bad_mark.status, Status::Error);
+        assert_eq!(bad_mark.data.unwrap()["reason"], "invalid-mark");
+    }
+
+    #[test]
+    fn back_bare_invocation_refuses_without_reading_stdin_or_writing_anything() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, song, draft, _draft_livery) = routed_draft_symlinked("back-bare-refuses");
+        let stage = shellbridge::stage_dir();
+        write_livery(&stage, "#111111");
+        snapshot("rice.take", "stage").unwrap();
+
+        // Neither --take nor --mark: the test harness is never a tty either
+        // way, so this exercises both "non-tty" and "this build's tty
+        // refusal" at once — the two paths are identical in this step.
+        let out = handle_rice_back(&inv_back(None, None));
+        assert_eq!(out.status, Status::Usage);
+        assert_eq!(out.data.unwrap()["reason"], "no-selection");
+        assert_eq!(takes::load_head(&song, &draft), Some(1), "the bare refusal moved nothing");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn back_refuses_outside_draft_mode() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let stage = unique_tmp("back-not-draft");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_back(&inv_back(None, Some(1)));
+        assert_eq!(out.status, Status::Error);
+        assert_eq!(out.data.unwrap()["reason"], "not-in-draft-mode");
+        let _ = std::fs::remove_dir_all(&stage);
     }
 }
