@@ -111,8 +111,16 @@ fn peer_add_and_pull_round_trip_over_real_http_between_two_loopback_instances() 
 
     // Seed a real, checkable node on the (shared, single-process) stage
     // BEFORE peer B starts serving, so B's FIRST graphSummary response
-    // carries it.
-    let seed = dispatch(&cli_invocation(&["graph", "project", "add"], &["aoide-remote", "/tmp/remote"], &[]));
+    // carries it. (The path must be a real absolute dir — `graph project
+    // add` rejects anything else now — so it lives under this test's own
+    // `root` and is removed with it.)
+    let remote = root.join("remote");
+    std::fs::create_dir_all(&remote).unwrap();
+    let seed = dispatch(&cli_invocation(
+        &["graph", "project", "add"],
+        &["aoide-remote", remote.to_str().unwrap()],
+        &[],
+    ));
     assert_eq!(seed.status, Status::Ok, "{}", seed.message);
 
     // Bind peer "B"'s A2A door to a REAL loopback port and serve it on a
@@ -162,7 +170,13 @@ fn peer_add_and_pull_round_trip_over_real_http_between_two_loopback_instances() 
     // Mutate LOCAL state AFTER the pull — the cache is a frozen snapshot of
     // what B served AT PULL TIME, not a live join, so it must NOT pick up a
     // local-only change made afterward.
-    let mutate = dispatch(&cli_invocation(&["graph", "project", "add"], &["local-only", "/tmp/local"], &[]));
+    let local = root.join("local");
+    std::fs::create_dir_all(&local).unwrap();
+    let mutate = dispatch(&cli_invocation(
+        &["graph", "project", "add"],
+        &["local-only", local.to_str().unwrap()],
+        &[],
+    ));
     assert_eq!(mutate.status, Status::Ok);
 
     // The fold: `graph view --json`'s resolved document now carries BOTH

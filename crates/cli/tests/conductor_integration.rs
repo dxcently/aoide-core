@@ -131,9 +131,13 @@ fn app_loads_recomputes_selects_and_dispatches_against_the_tempdir() {
     );
 
     // ── project add via dispatch lands on disk + in state ──
+    // (The path must be a real absolute dir — `graph project add` rejects
+    // relative/nonexistent paths now — so a subdir of the tempdir stands in.)
+    let newproj_dir = stage.join("newproj");
+    std::fs::create_dir_all(&newproj_dir).unwrap();
     app.dispatch(
         &["graph", "project", "add"],
-        &["newproj".to_string(), "/tmp/newproj".to_string()],
+        &["newproj".to_string(), newproj_dir.to_string_lossy().into_owned()],
     );
     assert!(
         app.projects.iter().any(|p| p.name == "newproj"),

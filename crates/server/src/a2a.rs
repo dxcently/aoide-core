@@ -1449,6 +1449,7 @@ mod tests {
             gated: false,
             implemented: true,
             exit_codes: (),
+            examples: &[],
             handler: fake_handler,
             available: || true,
         });
@@ -1460,6 +1461,7 @@ mod tests {
             gated: false,
             implemented: false,
             exit_codes: (),
+            examples: &[],
             handler: fake_handler,
             available: || true,
         });

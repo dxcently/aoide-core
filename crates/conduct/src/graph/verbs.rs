@@ -52,6 +52,28 @@ pub fn project_add(inv: &Invocation) -> Outcome {
             }
         },
     };
+    // Anchoring is string-prefix matching (`model.rs::cwd_under`), so a
+    // relative or nonexistent path can never anchor a session to anything —
+    // registering one is always a mistake (yesterday's `path: "intergration"`
+    // incident: accepted verbatim, the session never anchored). Reject it as
+    // a usage error with a correct example; no legitimate case is lost.
+    let p = std::path::Path::new(&path);
+    if !p.is_absolute() || !p.is_dir() {
+        let why = if !p.is_absolute() {
+            "not an absolute path"
+        } else {
+            "no such directory"
+        };
+        return Outcome::usage(
+            "graph.project.add",
+            format!(
+                "invalid project path `{path}` ({why}) — anchoring matches by absolute path prefix\n\
+                 usage: aoide graph project add <name> [<path>] [--json]\n\
+                 example: aoide graph project add {name} \"$HOME/{name}\"",
+            ),
+        )
+        .with_data(json!({ "reason": "invalid-path", "path": path }));
+    }
     let mut file: ProjectsFile = match load_stage(&projects_path()) {
         Ok(f) => f,
         Err(e) => return stage_error("graph.project.add", e),
@@ -385,9 +407,11 @@ mod tests {
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
         // Register a project. graph.json must now exist and carry the node.
+        // (The path must be a real absolute dir — `project_add` rejects
+        // anything else now — so the per-test stage dir stands in.)
         let out = project_add(&invocation(
             &["graph", "project", "add"],
-            &["aoide", "/home/k/Aoide"],
+            &["aoide", stage.to_str().unwrap()],
         ));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
 
@@ -408,6 +432,54 @@ mod tests {
         // A fresh emit would stage the very same document (idempotent).
         let (p, s, h) = load_inputs("test").unwrap();
         assert_eq!(staged, build_graph(&p.projects, &s.sessions, &h.hooks));
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn project_add_rejects_a_relative_path_as_a_usage_error() {
+        // The "intergration"-incident guard: anchoring is prefix matching, so
+        // a relative path can never anchor — refuse it (exit 2), loudly.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("reject-relative");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = project_add(&invocation(&["graph", "project", "add"], &["aoide", "intergration"]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage);
+        assert_eq!(out.render(false).1, aoide_protocol::output::exit::USAGE);
+        assert!(out.message.contains("intergration"), "the offending value is shown: {}", out.message);
+        assert!(out.message.contains("not an absolute path"), "{}", out.message);
+        // Nothing was registered.
+        let file: ProjectsFile = load_stage(&projects_path()).unwrap();
+        assert!(file.projects.is_empty());
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn project_add_rejects_a_nonexistent_absolute_path_as_a_usage_error() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("reject-nonexistent");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let bogus = stage.join("does-not-exist").to_string_lossy().into_owned();
+        let out = project_add(&invocation(&["graph", "project", "add"], &["aoide", &bogus]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage);
+        assert_eq!(out.render(false).1, aoide_protocol::output::exit::USAGE);
+        assert!(out.message.contains(&bogus), "the offending value is shown: {}", out.message);
+        assert!(out.message.contains("no such directory"), "{}", out.message);
+        let file: ProjectsFile = load_stage(&projects_path()).unwrap();
+        assert!(file.projects.is_empty());
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),

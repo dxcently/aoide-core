@@ -21,6 +21,10 @@ pub fn register(r: &mut Registry) {
         gated: false,
         implemented: true,
         handler: crate::graph::view,
+        examples: [
+            "graph view",
+            "graph view --focus session:<id>",
+        ],
     ));
     r.insert(cmd!(
         path: ["graph", "project", "add"],
@@ -33,6 +37,10 @@ pub fn register(r: &mut Registry) {
         gated: false,
         implemented: true,
         handler: crate::graph::project_add,
+        examples: [
+            "graph project add aoide ~/Aoide",
+            "graph project add aoide",
+        ],
     ));
     r.insert(cmd!(
         path: ["graph", "project", "remove"],
@@ -121,6 +129,7 @@ pub fn register(r: &mut Registry) {
         gated: false,
         implemented: true,
         handler: crate::graph::session_wrap,
+        examples: ["graph wrap --agent codex -- codex --model x"],
     ));
     r.insert(cmd!(
         path: ["graph", "send"],
@@ -134,6 +143,10 @@ pub fn register(r: &mut Registry) {
         gated: false,
         implemented: true,
         handler: crate::graph::session_send,
+        examples: [
+            "graph send --id <session-id> --submit -- yes, ship it",
+            "graph send --id <session-id> --yes -- 1",
+        ],
     ));
     r.insert(cmd!(
         path: ["graph", "permit"],
@@ -174,6 +187,10 @@ pub fn register(r: &mut Registry) {
         gated: false,
         implemented: true,
         handler: crate::reap::reap_and_announce,
+        examples: [
+            "graph reap",
+            "graph reap --announce",
+        ],
     ));
     r.insert(cmd!(
         path: ["graph", "emit"],

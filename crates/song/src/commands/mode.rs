@@ -74,6 +74,10 @@ pub fn register(r: &mut Registry) {
         gated: false,
         implemented: true,
         handler: handle_mode_stage,
+        examples: [
+            "rice mode stage moonlight",
+            "rice mode stage",
+        ],
     ));
     r.insert(cmd!(
         path: ["rice", "mode", "declarative"],
@@ -92,6 +96,7 @@ pub fn register(r: &mut Registry) {
         gated: false,
         implemented: true,
         handler: handle_mode_draft,
+        examples: ["rice mode draft neon-night"],
     ));
 }
 

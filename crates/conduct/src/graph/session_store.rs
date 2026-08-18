@@ -1245,13 +1245,18 @@ mod tests {
         let stage = unique_stage("sess-start");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
+        // The anchor root must now be a REAL absolute dir (project_add
+        // rejects anything else), so the project + session cwd live under
+        // the per-test stage dir instead of the fictional /home/k/Aoide.
+        let proj = stage.join("proj");
+        std::fs::create_dir_all(proj.join("sub")).unwrap();
         project_add(&invocation(
             &["graph", "project", "add"],
-            &["aoide", "/home/k/Aoide"],
+            &["aoide", proj.to_str().unwrap()],
         ));
         let out = session_start(&flag_invocation(
             &["graph", "session", "start"],
-            &[("id", "s1"), ("cwd", "/home/k/Aoide/sub")],
+            &[("id", "s1"), ("cwd", proj.join("sub").to_str().unwrap())],
         ));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
 

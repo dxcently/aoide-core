@@ -232,6 +232,7 @@ mod tests {
             gated: true,
             implemented: true,
             exit_codes: (),
+            examples: &[],
             handler: fake_handler,
             available: || true,
         });
@@ -243,6 +244,7 @@ mod tests {
             gated: false,
             implemented: true,
             exit_codes: (),
+            examples: &[],
             handler: fake_handler,
             available: || true,
         });

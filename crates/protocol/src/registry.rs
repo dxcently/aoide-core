@@ -60,6 +60,13 @@ pub struct Command {
     pub implemented: bool,
     #[serde(rename = "exitCodes", serialize_with = "exit_codes")]
     pub exit_codes: (),
+    /// Invocation examples shown by `<cmd> --help` (the human door only —
+    /// MCP/A2A consumers get them through `schema --json` when present).
+    /// Additive field (CONTRACTS.md §3), like `implemented` before it:
+    /// skipped when empty so a command without examples serializes
+    /// byte-identical to before this field existed.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub examples: &'static [&'static str],
     /// The handler `dispatch()` calls when `implemented` is true. Unused
     /// (never invoked) for stub commands — see `commands/stubs.rs`.
     #[serde(skip)]
@@ -165,6 +172,33 @@ impl Registry {
 /// expansions resolve identically inside THIS crate, which owns the types.
 #[macro_export]
 macro_rules! cmd {
+    // The examples-carrying arm is listed FIRST: macro arms are tried in
+    // order, so the more specific matcher must precede the general one below
+    // — a call site that passes `examples:` lands here, everything else falls
+    // through to the no-examples arm (which defaults `examples: &[]`).
+    (
+        path: [$($seg:literal),*],
+        summary: $summary:literal,
+        args: [$($arg:expr),* $(,)?],
+        flags: [$($flag:expr),* $(,)?],
+        gated: $gated:expr,
+        implemented: $impl:expr,
+        handler: $handler:expr,
+        examples: [$($ex:literal),* $(,)?] $(,)?
+    ) => {
+        $crate::registry::Command {
+            path: &[$($seg),*],
+            summary: $summary,
+            args: &[$($arg),*],
+            flags: &[$crate::registry::JSON_FLAG, $($flag),*],
+            gated: $gated,
+            implemented: $impl,
+            exit_codes: (),
+            examples: &[$($ex),*],
+            handler: $handler,
+            available: || true,
+        }
+    };
     (
         path: [$($seg:literal),*],
         summary: $summary:literal,
@@ -182,6 +216,7 @@ macro_rules! cmd {
             gated: $gated,
             implemented: $impl,
             exit_codes: (),
+            examples: &[],
             handler: $handler,
             available: || true,
         }

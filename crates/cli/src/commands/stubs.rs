@@ -30,6 +30,7 @@ pub fn register_rice_late(r: &mut Registry) {
         gated: true,
         implemented: false,
         handler: unimplemented,
+        examples: ["rice declare moonlight"],
     ));
     r.insert(cmd!(
         path: ["rice", "transpose"],

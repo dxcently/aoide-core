@@ -10,21 +10,38 @@ use aoide_protocol::output::Outcome;
 use serde_json::json;
 
 /// Positional-arg check → structured usage error (exit 2) on a miss.
+/// Names the missing positionals (not just "you're short") — this crate has
+/// no registry access, so the follow-up hint points at `--help` rather than
+/// inlining the command's usage block.
 pub(in crate::graph) fn require_args(
     inv: &Invocation,
     names: &[&str],
 ) -> Result<Vec<String>, Outcome> {
     if inv.args.len() < names.len() {
+        let missing = names[inv.args.len()..]
+            .iter()
+            .map(|n| format!("<{n}>"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let plural = if names.len() - inv.args.len() > 1 {
+            "arguments"
+        } else {
+            "argument"
+        };
         return Err(Outcome::usage(
             inv.dotted(),
             format!(
-                "usage: aoide {} {} [--json]",
+                "missing required {plural} {missing} for `aoide {}`\n\
+                 usage: aoide {} {} [--json]\n\
+                 run 'aoide {} --help' for details",
+                inv.path.join(" "),
                 inv.path.join(" "),
                 names
                     .iter()
                     .map(|n| format!("<{n}>"))
                     .collect::<Vec<_>>()
-                    .join(" ")
+                    .join(" "),
+                inv.path.join(" "),
             ),
         ));
     }
@@ -46,14 +63,19 @@ pub(in crate::graph) fn load_inputs(
 }
 
 /// A required `--flag` → structured usage error (exit 2) when absent/empty.
+/// Same "name the gap, then point at --help" shape as [`require_args`].
 pub(in crate::graph) fn require_flag(inv: &Invocation, name: &str) -> Result<String, Outcome> {
     match inv.flags.get(name).filter(|v| !v.is_empty()) {
         Some(v) => Ok(v.clone()),
         None => Err(Outcome::usage(
             inv.dotted(),
             format!(
-                "usage: aoide {} --{name} <value> [--json]",
-                inv.path.join(" ")
+                "missing required flag --{name} <value> for `aoide {}`\n\
+                 usage: aoide {} --{name} <value> [--json]\n\
+                 run 'aoide {} --help' for details",
+                inv.path.join(" "),
+                inv.path.join(" "),
+                inv.path.join(" "),
             ),
         )),
     }

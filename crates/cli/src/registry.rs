@@ -40,6 +40,30 @@ mod tests {
         }
     }
 
+    /// `examples` is additive (CONTRACTS.md §3): a command WITHOUT examples
+    /// serializes byte-identical to before the field existed — no `examples`
+    /// key at all — while one WITH examples carries it.
+    #[test]
+    fn examples_key_is_absent_unless_populated() {
+        let r = crate::commands::all();
+        let with = r
+            .commands()
+            .find(|c| c.dotted() == "graph.project.add")
+            .expect("graph project add carries examples");
+        let v = serde_json::to_value(with).unwrap();
+        assert_eq!(v["examples"][0], "graph project add aoide ~/Aoide");
+
+        let without = r
+            .commands()
+            .find(|c| c.dotted() == "graph.prune")
+            .expect("graph prune carries none");
+        let v = serde_json::to_value(without).unwrap();
+        assert!(
+            v.get("examples").is_none(),
+            "no examples → no key (byte-identical schema): {v}"
+        );
+    }
+
     #[test]
     fn command_paths_are_unique() {
         let r = crate::commands::all();
