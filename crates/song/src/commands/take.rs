@@ -63,6 +63,7 @@ use aoide_storage::fs as shellbridge;
 use aoide_storage::mode::{self, RiceMode};
 use aoide_storage::takes::{self, TakeRecord};
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub fn register(r: &mut Registry) {
     r.insert(cmd!(
@@ -73,6 +74,15 @@ pub fn register(r: &mut Registry) {
         gated: false,
         implemented: true,
         handler: handle_rice_take,
+    ));
+    r.insert(cmd!(
+        path: ["rice", "take", "list"],
+        summary: "List every take in the routed draft as a tree: number, parent, mark, cause, and the current head. Always the whole tree (fork 9 killed the partial/`--all` view — there is only one view now).",
+        args: [],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_rice_take_list,
     ));
     r.insert(cmd!(
         path: ["rice", "take", "mark"],
@@ -268,6 +278,188 @@ fn handle_rice_take(_inv: &Invocation) -> Outcome {
         }
         Err(o) => o,
     }
+}
+
+// ── `rice take list` — the tree (phase A6) ──────────────────────────────────
+
+/// Every mark letter currently naming `take` — usually zero or one, but nothing in
+/// [`aoide_storage::takes::save_marks`] forbids two letters landing on the same take, so this
+/// returns however many actually do, sorted (the map iterates by letter already, since it's a
+/// `BTreeMap`). Shared between [`render_node`] and [`handle_rice_take_list`]'s `--json` builder
+/// so the two never compute this differently.
+fn mark_letters_for(marks: &BTreeMap<String, u32>, take: u32) -> Vec<String> {
+    marks.iter().filter(|(_, v)| **v == take).map(|(k, _)| k.clone()).collect()
+}
+
+/// Depth-first ASCII rendering of the take tree's BODY — no header line (no song/draft name to
+/// print one with; the caller, [`handle_rice_take_list`], prepends that) — so this stays a
+/// **pure** function of exactly what a take store already knows, unit-testable with zero
+/// terminal and zero clock. Children are walked in ascending number order
+/// ([`aoide_storage::takes::children`], already sorted — reused, not reimplemented). A straight
+/// single-child descent draws no branch glyph at all; only an actual fork (2+ children sharing a
+/// parent) draws `├─`/`└─`, with a `│` continuation column threaded down the non-last branch —
+/// the shape `references/fleshing-out-aoide-ricing.md` §3.2's mockup draws by hand. The head
+/// take is marked `← head`; a mark letter (or letters, see [`mark_letters_for`]) is bracketed
+/// after the row. `marks` is the raw letter→take map [`aoide_storage::takes::load_marks`]
+/// returns — a stale entry naming a take absent from `takes` is simply never looked up (this
+/// walks `takes` itself outward from its roots, never `marks`' own keys), so it is skipped for
+/// free, exactly the self-healing read the advisor verdict (D6) requires, with no extra
+/// filtering code anywhere in this function.
+///
+/// No `at`-based "2h ago" fuzzing (the mockup's cosmetic choice): a relative clock reading would
+/// make this function impure and its own tests non-deterministic, which is the entire reason it
+/// takes no `now` argument. The raw ISO-8601 `at` timestamp is printed verbatim instead.
+///
+/// **Orphans are swept in, never dropped.** `aoide_storage::takes` is deliberately tolerant of
+/// partial state (`list_takes` survives a half-written record, `load_head` falls back on a stale
+/// pointer) — a `parent` naming a take number that no longer exists on disk is exactly that kind
+/// of state, and `rice take list` is the verb someone uses to FIND a take to revert to, so a real
+/// record that exists on disk must never render as nothing. The first pass walks outward from the
+/// `parent == None` roots via [`aoide_storage::takes::children`]; a second pass then sweeps every
+/// take number, ascending, that the first pass never reached and renders each as its own
+/// top-level entry, labeled `detached` — this covers both a dangling parent pointer AND a pure
+/// parent cycle with no root at all (two takes each naming the other), which the first pass can
+/// never reach either. `visited` is threaded through both passes and is what makes the sweep safe
+/// against that cycle case: [`render_node`] checks it before rendering anything, so once the
+/// cycle's entry point renders once, walking back into it a second time is a no-op instead of
+/// unbounded recursion.
+pub fn render_tree(takes: &[TakeRecord], head: Option<u32>, marks: &BTreeMap<String, u32>) -> String {
+    let mut roots: Vec<u32> = takes.iter().filter(|t| t.parent.is_none()).map(|t| t.take).collect();
+    roots.sort_unstable();
+
+    let mut visited: BTreeSet<u32> = BTreeSet::new();
+    let mut out = String::new();
+    for r in roots {
+        render_node(takes, head, marks, r, "", "", None, &mut visited, &mut out);
+    }
+
+    let mut numbers: Vec<u32> = takes.iter().map(|t| t.take).collect();
+    numbers.sort_unstable();
+    for n in numbers {
+        if visited.contains(&n) {
+            continue;
+        }
+        let note = detached_note(takes, n);
+        render_node(takes, head, marks, n, "", "", Some(&note), &mut visited, &mut out);
+    }
+    out
+}
+
+/// The label a swept-in [`render_tree`] entry carries, describing WHY it never had a real root to
+/// hang off: its own `parent` names a take absent from the store, or (the cycle case) `parent`
+/// names a take that itself, transitively, leads back here. Either way the caller only needs to
+/// know it's detached and why, not walk the ancestry again — this is a one-shot diagnostic, not
+/// part of the tree walk itself.
+fn detached_note(takes: &[TakeRecord], n: u32) -> String {
+    match takes.iter().find(|t| t.take == n).and_then(|t| t.parent) {
+        Some(p) if takes.iter().any(|t| t.take == p) => "detached (cyclic ancestry)".to_string(),
+        Some(p) => format!("detached (parent {p:04} missing)"),
+        None => "detached".to_string(),
+    }
+}
+
+/// One row plus its subtree — see [`render_tree`]'s doc for the glyph rule and the sweep/`visited`
+/// mechanism. `connector` is `""` (root, a straight single-child continuation, or a swept-in
+/// detached entry), `"├─"` (a non-last fork branch), or `"└─"` (the last fork branch); `prefix` is
+/// everything already laid down by ancestors. `detached` is `Some(note)` only for a sweep's own
+/// entry call — every recursive call this function makes for a child passes `None`, so the label
+/// marks exactly the take that had no real root, never the takes hanging off it. Returns
+/// immediately, without rendering, if `n` is already in `visited` — this is what stops the sweep
+/// from spinning forever the instant it walks into a parent cycle — or if `n` isn't actually in
+/// `takes` (defensive; every real caller only ever passes numbers [`aoide_storage::takes::children`]
+/// itself just returned, or a number [`render_tree`]'s own sweep just confirmed is present).
+fn render_node(
+    takes: &[TakeRecord],
+    head: Option<u32>,
+    marks: &BTreeMap<String, u32>,
+    n: u32,
+    prefix: &str,
+    connector: &str,
+    detached: Option<&str>,
+    visited: &mut BTreeSet<u32>,
+    out: &mut String,
+) {
+    if visited.contains(&n) {
+        return;
+    }
+    let Some(rec) = takes.iter().find(|t| t.take == n) else { return };
+    visited.insert(n);
+
+    let letters = mark_letters_for(marks, n);
+    let mark_part = if letters.is_empty() { String::new() } else { format!(" [{}]", letters.join(",")) };
+    let head_part = if head == Some(n) { " \u{2190} head" } else { "" };
+    let detached_part = detached.map(|note| format!(" {note}")).unwrap_or_default();
+
+    out.push_str(prefix);
+    out.push_str(connector);
+    out.push_str(&format!(
+        "{:04}  {}  {}{mark_part}{head_part}{detached_part}\n",
+        rec.take, rec.at, rec.cause
+    ));
+
+    let next_prefix = match connector {
+        "├─" => format!("{prefix}\u{2502} "),
+        "└─" => format!("{prefix}  "),
+        _ => prefix.to_string(),
+    };
+
+    let kids = takes::children(takes, n);
+    match kids.len() {
+        0 => {}
+        1 => render_node(takes, head, marks, kids[0], &next_prefix, "", None, visited, out),
+        _ => {
+            let last = kids.len() - 1;
+            for (i, k) in kids.iter().enumerate() {
+                let c = if i == last { "└─" } else { "├─" };
+                render_node(takes, head, marks, *k, &next_prefix, c, None, visited, out);
+            }
+        }
+    }
+}
+
+/// `rice take list [--json]` — the tree, always in full. Fork 9 decided "whole tree by default"
+/// over an ancestry-only view, which killed the plan's originally-reserved `--all` flag outright
+/// (advisor verdict D5a): there is only one view now, so no flag selects it. Refuses outside
+/// `Draft` mode via [`resolve_draft`], the same guard every other take verb opens with — takes
+/// live inside a routed draft's `takes/`, nowhere else. An empty store (`Draft` mode entered,
+/// nothing ever taken yet) is `ok` with an empty `takes` array, never an error — the `rice draft
+/// list` precedent (`draft.rs::handle_draft_list`, no drafts found is `ok` too).
+fn handle_rice_take_list(_inv: &Invocation) -> Outcome {
+    let (song, draft) = match resolve_draft("rice.take.list") {
+        Ok(v) => v,
+        Err(o) => return o,
+    };
+
+    let recs = takes::list_takes(&song, &draft);
+    let head = takes::load_head(&song, &draft);
+    let marks = takes::load_marks(&song, &draft);
+
+    let head_label = head.map(|n| format!("{n:04}")).unwrap_or_else(|| "-".to_string());
+    let mut message = format!("{} take(s) for {song}/{draft} \u{2014} head \u{2192} {head_label}", recs.len());
+    let tree = render_tree(&recs, head, &marks);
+    if !tree.is_empty() {
+        message.push_str("\n\n");
+        message.push_str(tree.trim_end());
+    }
+
+    let entries: Vec<Value> = recs
+        .iter()
+        .map(|t| {
+            let letters = mark_letters_for(&marks, t.take);
+            let mark_value = if letters.is_empty() { Value::Null } else { Value::String(letters.join(",")) };
+            json!({
+                "take": t.take,
+                "parent": t.parent,
+                "mark": mark_value,
+                "at": t.at,
+                "sessionId": t.session_id,
+                "cause": t.cause,
+            })
+        })
+        .collect();
+
+    Outcome::ok("rice.take.list", message)
+        .with_data(json!({ "song": song, "draft": draft, "head": head, "takes": entries }))
 }
 
 /// A single letter `A`-`Z` — [`handle_rice_take_mark`]'s whole validation of
@@ -713,6 +905,21 @@ mod tests {
     use aoide_protocol::output::Status;
     use aoide_storage::mode::{save_mode_marker, ModeMarker};
     use aoide_test_support::*;
+
+    /// A bare in-memory `TakeRecord` for [`render_tree`]'s own tests — those exercise a pure
+    /// function directly, off hand-built records, with no filesystem/env rig at all (unlike
+    /// every other test in this file).
+    fn rec(take: u32, parent: Option<u32>) -> TakeRecord {
+        TakeRecord {
+            take,
+            parent,
+            at: "2026-08-18T00:00:00Z".to_string(),
+            session_id: None,
+            cause: "stage".to_string(),
+            livery: serde_json::json!({}),
+            cover: None,
+        }
+    }
 
     /// Route `AOIDE_STAGE_DIR` at a fresh tmp stage and mark `mode.json` as
     /// `Draft` for `sonata`/`neon-night` — every snapshot-core test needs
@@ -1611,5 +1818,204 @@ mod tests {
         assert_eq!(out.status, Status::Error);
         assert_eq!(out.data.unwrap()["reason"], "not-in-draft-mode");
         let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    // ── `rice take list` — the tree (phase A6) ──────────────────────────
+
+    #[test]
+    fn render_tree_is_empty_for_an_empty_store() {
+        assert_eq!(render_tree(&[], None, &BTreeMap::new()), "");
+    }
+
+    #[test]
+    fn render_tree_draws_a_linear_store_with_no_branch_glyphs_marks_bracketed_head_arrowed() {
+        let takes = vec![rec(1, None), rec(2, Some(1)), rec(3, Some(2))];
+        let marks = BTreeMap::from([("A".to_string(), 1u32)]);
+
+        let out = render_tree(&takes, Some(3), &marks);
+
+        assert!(!out.contains("\u{251c}\u{2500}"), "a straight line draws no fork glyph: {out}");
+        assert!(!out.contains("\u{2514}\u{2500}"), "a straight line draws no fork glyph: {out}");
+        assert!(out.contains("[A]"), "the marked take brackets its letter: {out}");
+        assert!(out.contains("\u{2190} head"), "the head take is arrowed: {out}");
+
+        // Depth-first, ascending: 1 before 2 before 3.
+        let pos = |needle: &str| out.find(needle).unwrap_or_else(|| panic!("{needle} missing from:\n{out}"));
+        assert!(pos("0001") < pos("0002"));
+        assert!(pos("0002") < pos("0003"));
+        // The head arrow lands on take 3's own line, not anywhere else.
+        let head_line = out.lines().find(|l| l.contains("0003")).unwrap();
+        assert!(head_line.contains("\u{2190} head"));
+        assert!(!out.lines().find(|l| l.contains("0001")).unwrap().contains("\u{2190} head"));
+    }
+
+    #[test]
+    fn render_tree_draws_both_children_of_a_fork_under_the_mark_with_branch_glyphs() {
+        // 1 <- 9[A] <- 17
+        //          \- 21 <- head
+        let takes = vec![rec(1, None), rec(9, Some(1)), rec(17, Some(9)), rec(21, Some(9))];
+        let marks = BTreeMap::from([("A".to_string(), 9u32)]);
+
+        let out = render_tree(&takes, Some(21), &marks);
+
+        assert!(out.contains("\u{251c}\u{2500}"), "a fork draws the non-last branch glyph: {out}");
+        assert!(out.contains("\u{2514}\u{2500}"), "a fork draws the last branch glyph: {out}");
+        assert!(out.contains("0017"), "the first child renders: {out}");
+        assert!(out.contains("0021"), "the second child renders: {out}");
+        let mark_line = out.lines().find(|l| l.contains("0009")).unwrap();
+        assert!(mark_line.contains("[A]"), "both children hang off the marked take: {out}");
+        let head_line = out.lines().find(|l| l.contains("0021")).unwrap();
+        assert!(head_line.contains("\u{2190} head"));
+    }
+
+    #[test]
+    fn render_tree_skips_a_mark_naming_a_take_that_no_longer_exists() {
+        // Self-healing read (D6): a stale marks.json entry for a pruned/hand-removed take must
+        // never panic or otherwise surface — it is simply never looked up, because this walks
+        // `takes`, not `marks`.
+        let takes = vec![rec(1, None)];
+        let marks = BTreeMap::from([("Z".to_string(), 99u32)]);
+        let out = render_tree(&takes, Some(1), &marks);
+        assert!(!out.contains("[Z]"), "a mark naming a nonexistent take never renders: {out}");
+        assert!(out.contains("0001"));
+    }
+
+    #[test]
+    fn render_tree_renders_an_orphan_take_marked_detached_instead_of_vanishing() {
+        // Take 5's parent (2) is not in the store at all — a crash mid-prune, or a hand edit.
+        // `aoide_storage::takes` is deliberately tolerant of exactly this shape; the tree view
+        // must surface it, not silently drop a take that still exists on disk.
+        let takes = vec![rec(1, None), rec(5, Some(2))];
+        let marks = BTreeMap::new();
+
+        let out = render_tree(&takes, None, &marks);
+
+        assert!(out.contains("0001"), "the real root still renders: {out}");
+        let orphan_line = out.lines().find(|l| l.contains("0005")).unwrap_or_else(|| panic!("orphan take 5 vanished: {out}"));
+        assert!(orphan_line.contains("detached"), "the orphan is labeled, not silently a plain row: {orphan_line}");
+        assert!(orphan_line.contains("0002"), "the label names the missing parent: {orphan_line}");
+    }
+
+    #[test]
+    fn render_tree_an_orphan_that_is_also_head_still_gets_the_head_arrow() {
+        let takes = vec![rec(1, None), rec(5, Some(2))];
+        let marks = BTreeMap::new();
+
+        let out = render_tree(&takes, Some(5), &marks);
+
+        let orphan_line = out.lines().find(|l| l.contains("0005")).unwrap();
+        assert!(orphan_line.contains("detached"), "still detached: {orphan_line}");
+        assert!(orphan_line.contains("\u{2190} head"), "still arrowed as head: {orphan_line}");
+    }
+
+    #[test]
+    fn render_tree_terminates_on_a_two_node_parent_cycle_rendering_each_take_exactly_once() {
+        // 1's parent is 2, 2's parent is 1 — a hand-edited/corrupted pair with no `None`-parented
+        // root at all. Neither the roots pass nor a plain child walk can ever reach either one;
+        // only the sweep finds them, and only the `visited` guard stops it recursing forever once
+        // it does.
+        let takes = vec![rec(1, Some(2)), rec(2, Some(1))];
+        let marks = BTreeMap::new();
+
+        let out = render_tree(&takes, None, &marks);
+
+        let ones = out.lines().filter(|l| l.contains("0001")).count();
+        let twos = out.lines().filter(|l| l.contains("0002")).count();
+        assert_eq!(ones, 1, "take 1 renders exactly once, not looping: {out}");
+        assert_eq!(twos, 1, "take 2 renders exactly once, not looping: {out}");
+        assert!(out.contains("detached"), "the cycle's entry point is labeled detached: {out}");
+    }
+
+    #[test]
+    fn rice_take_list_handler_on_an_empty_store_is_ok_with_an_empty_list() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, _song, _draft) = routed_draft("take-list-empty");
+
+        let out = handle_rice_take_list(&inv(&["rice", "take", "list"], &[]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        let data = out.data.unwrap();
+        assert_eq!(data["takes"].as_array().unwrap().len(), 0);
+        assert!(data["head"].is_null());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rice_take_list_handler_refuses_outside_draft_mode() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let stage = unique_tmp("take-list-not-draft");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_take_list(&inv(&["rice", "take", "list"], &[]));
+        assert_eq!(out.status, Status::Error);
+        assert_eq!(out.data.unwrap()["reason"], "not-in-draft-mode");
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn rice_take_list_json_shape_carries_parent_and_mark_for_a_branching_store() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, song, draft) = routed_draft("take-list-json-shape");
+        std::fs::write(shellbridge::stage_dir().join("livery.json"), VALID_NOTES).unwrap();
+
+        let take1 = snapshot("rice.take", "explicit").unwrap(); // 1, no parent
+        std::fs::write(
+            shellbridge::stage_dir().join("livery.json"),
+            r##"{"schemaVersion":"0","palette":{"bg":"#222222"}}"##,
+        )
+        .unwrap();
+        let take2 = snapshot("rice.take", "explicit").unwrap(); // 2, parent 1
+        assert_eq!((take1.take, take2.take, take2.parent), (1, 2, Some(1)));
+        mark("rice.take.mark", "A", 1).unwrap();
+
+        let out = handle_rice_take_list(&inv(&["rice", "take", "list"], &[]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        let data = out.data.unwrap();
+        assert_eq!(data["song"], song);
+        assert_eq!(data["draft"], draft);
+        assert_eq!(data["head"], 2);
+
+        let entries = data["takes"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        let entry_1 = entries.iter().find(|e| e["take"] == 1).unwrap();
+        assert!(entry_1["parent"].is_null(), "the first take carries no parent");
+        assert_eq!(entry_1["mark"], "A");
+        let entry_2 = entries.iter().find(|e| e["take"] == 2).unwrap();
+        assert_eq!(entry_2["parent"], 1, "the flat array carries the parent pointer");
+        assert!(entry_2["mark"].is_null(), "an unmarked take reports a null mark, not an absent key");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rice_take_list_json_lists_an_orphan_take_too_the_builder_walks_the_flat_list_not_the_tree() {
+        // `handle_rice_take_list`'s `--json` array is built straight off `takes::list_takes`
+        // (a flat list), never off `render_tree`'s walk — so it was never exposed to the tree
+        // walk's orphan defect, but this pins that fact so it can't regress silently if the
+        // builder ever gets rewritten to reuse the tree instead.
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, song, draft) = routed_draft("take-list-json-orphan");
+
+        let seed = |n: u32, parent: Option<u32>| TakeRecord {
+            take: n,
+            parent,
+            at: "2026-08-18T00:00:00Z".to_string(),
+            session_id: None,
+            cause: "explicit".to_string(),
+            livery: serde_json::json!({}),
+            cover: None,
+        };
+        takes::save_take(&song, &draft, &seed(1, None)).unwrap();
+        takes::save_take(&song, &draft, &seed(5, Some(2))).unwrap(); // parent 2 never existed
+
+        let out = handle_rice_take_list(&inv(&["rice", "take", "list"], &[]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        let entries = out.data.unwrap()["takes"].as_array().unwrap().clone();
+        assert_eq!(entries.len(), 2, "the orphan is still listed: {entries:?}");
+        assert!(entries.iter().any(|e| e["take"] == 5), "take 5 is present even though its parent is gone");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
