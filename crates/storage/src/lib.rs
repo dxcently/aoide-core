@@ -19,6 +19,7 @@ pub mod a2a_store;
 pub mod commands;
 pub mod edits;
 pub mod fs;
+pub mod git;
 pub mod mode;
 pub mod peer_store;
 pub mod records;

@@ -14,6 +14,7 @@
 {
   lib,
   rustPlatform,
+  git,
   ...
 }:
 rustPlatform.buildRustPackage {
@@ -33,6 +34,11 @@ rustPlatform.buildRustPackage {
 
   # Walking skeleton: no live-system integration tests in the sandbox.
   doCheck = true;
+
+  # `aoide-storage::git` shells out to `git` (the project-revert plan's git
+  # seam, R2) — its own tests drive a real temp repo, so `git` must be on
+  # PATH in the sandboxed check phase.
+  nativeCheckInputs = [ git ];
 
   meta = {
     description = "Aoide CLI + daemon — an API that happens to be typeable (agent-first NixOS desktop control).";
