@@ -24,11 +24,14 @@ use crate::registry::Registry;
 /// add/list/remove/pull/status (CONTRACTS.md §7, slotted directly after the
 /// `a2a agent` group it's the same-network-federation sibling of — nothing
 /// EXISTING moves, so the historical table above it is still untouched),
-/// usage, hooks install, quickshell reload (appended newest — the Quickshell
-/// IPC hot-reload trigger, `crates/song/src/ipc.rs`; named `quickshell`, not
-/// `shell` — `shell` collided with `--agent shell`, the value `graph
-/// conduct`'s kitty wrapper uses, and broke every terminal on this desktop
-/// until caught and renamed, khoa 2026-08-15).
+/// usage, hooks install, quickshell reload (the Quickshell IPC hot-reload
+/// trigger, `crates/song/src/ipc.rs`; named `quickshell`, not `shell` —
+/// `shell` collided with `--agent shell`, the value `graph conduct`'s kitty
+/// wrapper uses, and broke every terminal on this desktop until caught and
+/// renamed, khoa 2026-08-15), screen info/shot, herald push, rice take
+/// (appended newest — the take-store's explicit snapshot verb; the byte-
+/// stable schema-order rule outweighs keeping it contiguous with the rest
+/// of the `rice` family above, advisor verdict FORK 2).
 ///
 /// `rice gen` was cut outright (khoa 2026-08-14) — a speculative
 /// prompt/wallpaper generator that was never built and had no path to being
@@ -70,6 +73,7 @@ pub fn all() -> Registry {
     aoide_song::commands::quickshell::register(&mut r); // quickshell reload — IPC hot-reload trigger
     aoide_conduct::commands::screen::register(&mut r); // screen info, screen shot — Phase 1 of the `screen` verb family (appended newest)
     aoide_conduct::commands::herald::register(&mut r); // herald push — dunst's script hook into the notification ledger (appended newest)
+    aoide_song::commands::take::register(&mut r); // rice take — explicit take-store snapshot (appended newest, byte-stable schema order; FORK 2)
 
     r
 }

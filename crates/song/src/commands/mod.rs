@@ -13,3 +13,4 @@ pub mod livery;
 pub mod mode;
 pub mod quickshell;
 pub mod rice;
+pub mod take;

@@ -140,6 +140,7 @@ mod tests {
             "rice.mode.stage",
             "rice.mode.status",
             "rice.stage",
+            "rice.take",
             "rice.transpose",
             "schema",
             "screen.diff",
