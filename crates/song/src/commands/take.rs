@@ -58,7 +58,7 @@
 
 use aoide_protocol::Invocation;
 use aoide_protocol::output::Outcome;
-use aoide_protocol::registry::{cmd, Registry};
+use aoide_protocol::registry::{arg, cmd, flag, Registry};
 use aoide_storage::fs as shellbridge;
 use aoide_storage::mode::{self, RiceMode};
 use aoide_storage::takes::{self, TakeRecord};
@@ -73,6 +73,15 @@ pub fn register(r: &mut Registry) {
         gated: false,
         implemented: true,
         handler: handle_rice_take,
+    ));
+    r.insert(cmd!(
+        path: ["rice", "take", "mark"],
+        summary: "Stamp a rehearsal-style letter (A-Z) on a take via one atomic write of takes/marks.json — never a take-record rewrite. A letter already in use MOVES to the new take (a normal correction, not an error). Defaults to the current head when --take is omitted.",
+        args: [arg!("letter", "string", true, "A single letter A-Z to stamp.")],
+        flags: [flag!("take", "int", "Take number to mark; defaults to the current head.")],
+        gated: false,
+        implemented: true,
+        handler: handle_rice_take_mark,
     ));
 }
 
@@ -243,6 +252,154 @@ fn handle_rice_take(_inv: &Invocation) -> Outcome {
                     "at": record.at,
                     "cause": record.cause,
                     "sessionId": record.session_id,
+                }))
+        }
+        Err(o) => o,
+    }
+}
+
+/// A single letter `A`-`Z` — [`handle_rice_take_mark`]'s whole validation of
+/// its positional arg. Upper-case-only and single-character, on purpose:
+/// rehearsal marks in an actual score are always capitals, and the plan's
+/// own vocabulary never speaks of a "lowercase mark" or a multi-letter one.
+/// Rejected outright rather than silently normalized (`.to_uppercase()`)
+/// so a typo (`rice take mark a`) surfaces as an error instead of quietly
+/// landing on the letter the caller didn't mean to type.
+fn valid_mark_letter(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!((chars.next(), chars.next()), (Some(c), None) if c.is_ascii_uppercase())
+}
+
+/// The unlocked mark core (locking discipline: see the module doc's
+/// "Locking discipline" section — this is this file's OTHER
+/// read-modify-write besides the snapshot cores, and gets the identical
+/// treatment). Stamping a mark is `takes::load_marks` → mutate one entry →
+/// `takes::save_marks`: a read-then-write of `takes/marks.json`, racy the
+/// same way take-number allocation is if two `rice take mark` calls (or a
+/// mark racing a prune) interleave unlocked — so it never locks itself,
+/// and [`mark`] below is the one locked entrypoint.
+///
+/// `target` is already resolved by the caller (`--take N`, parsed, or the
+/// current head) — this function's own job is only to confirm `target`
+/// names a take that actually exists (`take-not-found` if not), stamp the
+/// letter, and report whether it moved. Returns `(target, moved, previous)`
+/// where `previous` is whatever take the letter named before this call, if
+/// any — `None` for a fresh stamp, `Some(old)` for a move (`moved` is false
+/// when `previous == Some(target)`: re-stamping a letter onto the take it
+/// already names is a no-op affirmation, not a move).
+///
+/// Take files are **never** rewritten here — the whole reason marks live in
+/// `takes/marks.json` rather than a field on `TakeRecord` (advisor verdict,
+/// fork 4 / D6, recorded in the module doc): a mark stamp or move is this
+/// ONE `save_marks` call, full stop.
+pub(crate) fn mark_unlocked(cmd: &str, letter: &str, target: u32) -> Result<(u32, bool, Option<u32>), Outcome> {
+    let (song, draft) = resolve_draft(cmd)?;
+
+    if takes::load_take(&song, &draft, target).is_none() {
+        return Err(Outcome::error(cmd, format!("take {target:04} does not exist — nothing to mark"))
+            .with_data(json!({ "reason": "take-not-found", "take": target })));
+    }
+
+    let mut marks = takes::load_marks(&song, &draft);
+    let previous = marks.get(letter).copied();
+    let moved = previous.is_some_and(|p| p != target);
+    marks.insert(letter.to_string(), target);
+    takes::save_marks(&song, &draft, &marks).map_err(|e| {
+        Outcome::error(cmd, format!("failed to write marks.json: {e}"))
+            .with_data(json!({ "reason": "write-failed" }))
+    })?;
+
+    Ok((target, moved, previous))
+}
+
+/// `rice take mark`'s locked entrypoint: exactly ONE `with_stage_lock`
+/// around [`mark_unlocked`]'s whole read-mutate-write. `cmd`/`letter`/
+/// `target` pass straight through.
+pub(crate) fn mark(cmd: &str, letter: &str, target: u32) -> Result<(u32, bool, Option<u32>), Outcome> {
+    shellbridge::with_stage_lock(|| mark_unlocked(cmd, letter, target))
+}
+
+/// `rice take mark <letter> [--take N]` — the phase-A standalone verb
+/// (`references/fleshing-out-aoide-ricing.md` §5.2/§10: phase B's `rice
+/// score` `mark` step CALLS this later; it does not reimplement it, and
+/// this handler is not itself part of that state machine).
+///
+/// `--take N` names the target explicitly; omitted, it defaults to the
+/// CURRENT HEAD (`aoide_storage::takes::load_head`) — "mark where I am
+/// right now" is the common case. An empty store (no head at all, nothing
+/// ever taken) reports `take-not-found`: from the caller's point of view
+/// "no head to default to" and "the named take doesn't exist" are the same
+/// fact, so they share the one reason string rather than inventing a
+/// second for what is really the same failure.
+///
+/// Dual-entrance per the project's rule: flags/`--json` only, no prompting,
+/// no stdin read ever — the interactive picker belongs to a later step
+/// (A8, `rice back`'s bare-tty branch), never to this explicit verb.
+fn handle_rice_take_mark(inv: &Invocation) -> Outcome {
+    let letter = match inv.args.first() {
+        Some(l) => l.clone(),
+        None => {
+            return Outcome::usage(
+                "rice.take.mark",
+                "usage: aoide rice take mark <letter A-Z> [--take N] [--json]",
+            )
+            .with_data(json!({ "reason": "missing-mark" }));
+        }
+    };
+    if !valid_mark_letter(&letter) {
+        return Outcome::error(
+            "rice.take.mark",
+            format!("`{letter}` is not a valid mark: must be a single letter A-Z"),
+        )
+        .with_data(json!({ "reason": "invalid-mark", "mark": letter }));
+    }
+
+    let (song, draft) = match resolve_draft("rice.take.mark") {
+        Ok(v) => v,
+        Err(o) => return o,
+    };
+
+    let target = match inv.flags.get("take") {
+        Some(raw) => match raw.parse::<u32>() {
+            Ok(n) => n,
+            Err(_) => {
+                return Outcome::usage(
+                    "rice.take.mark",
+                    format!("`--take {raw}` is not a valid take number"),
+                )
+                .with_data(json!({ "reason": "invalid-take", "take": raw }));
+            }
+        },
+        None => match takes::load_head(&song, &draft) {
+            Some(h) => h,
+            None => {
+                return Outcome::error(
+                    "rice.take.mark",
+                    "no takes exist yet for this draft — nothing to mark (`aoide rice take` first)",
+                )
+                .with_data(json!({ "reason": "take-not-found" }));
+            }
+        },
+    };
+
+    match mark("rice.take.mark", &letter, target) {
+        Ok((take, moved, previous)) => {
+            let marks_file = takes::marks_path(&song, &draft).to_string_lossy().into_owned();
+            let message = if moved {
+                format!(
+                    "mark {letter} moved from take {:04} to take {take:04}",
+                    previous.expect("moved implies a previous take")
+                )
+            } else {
+                format!("mark {letter} stamped on take {take:04}")
+            };
+            Outcome::ok("rice.take.mark", message)
+                .changed(vec![marks_file])
+                .with_data(json!({
+                    "mark": letter,
+                    "take": take,
+                    "moved": moved,
+                    "from": previous,
                 }))
         }
         Err(o) => o,
@@ -495,5 +652,207 @@ mod tests {
         assert_eq!(out.status, Status::Error);
         assert_eq!(out.data.unwrap()["reason"], "not-in-draft-mode");
         let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    // ── `rice take mark` — the mark verb (phase A4) ─────────────────────
+    //
+    // `inv()` (aoide_test_support) has no flags support, so a `--take N`
+    // invocation is built by hand, same pattern `graph/permit.rs`'s and
+    // `rice.rs`'s own tests use for a hand-populated `Invocation`.
+
+    fn inv_with_take(letter: &str, take: u32) -> Invocation {
+        Invocation {
+            path: vec!["rice".to_string(), "take".to_string(), "mark".to_string()],
+            args: vec![letter.to_string()],
+            flags: std::collections::BTreeMap::from([("take".to_string(), take.to_string())]),
+            door: aoide_protocol::Door::Cli,
+        }
+    }
+
+    #[test]
+    fn mark_stamps_the_current_head_by_default() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, song, draft) = routed_draft("mark-head-default");
+        std::fs::write(shellbridge::stage_dir().join("livery.json"), VALID_NOTES).unwrap();
+        let first = snapshot("rice.take", "explicit").unwrap();
+        assert_eq!(first.take, 1);
+
+        let out = handle_rice_take_mark(&inv(&["rice", "take", "mark"], &["A"]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        let data = out.data.unwrap();
+        assert_eq!(data["mark"], "A");
+        assert_eq!(data["take"], 1, "no --take given, defaults to the head");
+        assert_eq!(data["moved"], false, "a fresh letter is a stamp, not a move");
+        assert!(data["from"].is_null());
+        assert!(out.changed.iter().any(|c| c.ends_with("takes/marks.json")));
+        assert_eq!(takes::load_marks(&song, &draft).get("A"), Some(&1));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mark_take_flag_targets_a_specific_take_not_the_head() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, song, draft) = routed_draft("mark-take-flag");
+        std::fs::write(shellbridge::stage_dir().join("livery.json"), VALID_NOTES).unwrap();
+        snapshot("rice.take", "explicit").unwrap(); // take 1
+        std::fs::write(
+            shellbridge::stage_dir().join("livery.json"),
+            r##"{"schemaVersion":"0","palette":{"bg":"#222222"}}"##,
+        )
+        .unwrap();
+        let second = snapshot("rice.take", "explicit").unwrap(); // take 2, now head
+        assert_eq!(second.take, 2);
+        assert_eq!(takes::load_head(&song, &draft), Some(2));
+
+        // Explicitly mark take 1, even though the head has since moved to 2.
+        let out = handle_rice_take_mark(&inv_with_take("A", 1));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert_eq!(out.data.unwrap()["take"], 1);
+        assert_eq!(takes::load_marks(&song, &draft).get("A"), Some(&1));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mark_restamping_a_letter_moves_it_take_files_stay_untouched_one_map_entry() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, song, draft) = routed_draft("mark-move");
+        std::fs::write(shellbridge::stage_dir().join("livery.json"), VALID_NOTES).unwrap();
+        let first = snapshot("rice.take", "explicit").unwrap();
+        std::fs::write(
+            shellbridge::stage_dir().join("livery.json"),
+            r##"{"schemaVersion":"0","palette":{"bg":"#222222"}}"##,
+        )
+        .unwrap();
+        let second = snapshot("rice.take", "explicit").unwrap();
+        assert_eq!((first.take, second.take), (1, 2));
+        let take_1_raw_before = std::fs::read_to_string(takes::take_path(&song, &draft, 1)).unwrap();
+        let take_2_raw_before = std::fs::read_to_string(takes::take_path(&song, &draft, 2)).unwrap();
+
+        let stamped = handle_rice_take_mark(&inv_with_take("A", 1));
+        assert_eq!(stamped.status, Status::Ok, "{:?}", stamped.data);
+
+        let moved = handle_rice_take_mark(&inv_with_take("A", 2));
+        assert_eq!(moved.status, Status::Ok, "{:?}", moved.data);
+        let data = moved.data.unwrap();
+        assert_eq!(data["moved"], true, "the letter already named take 1 — this is a move");
+        assert_eq!(data["from"], 1);
+        assert_eq!(data["take"], 2);
+
+        // Old take loses the letter, new take has it — as one map, not a
+        // per-take field: exactly one entry, naming the new take.
+        let marks = takes::load_marks(&song, &draft);
+        assert_eq!(marks.len(), 1, "moving overwrote the entry, it did not duplicate it");
+        assert_eq!(marks.get("A"), Some(&2));
+
+        // D6/fork 4: marks live OUTSIDE the take record — stamping or moving
+        // a letter must never rewrite an NNNN.json.
+        assert_eq!(
+            std::fs::read_to_string(takes::take_path(&song, &draft, 1)).unwrap(),
+            take_1_raw_before,
+            "take 1's own file is untouched by the mark ever moving off it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(takes::take_path(&song, &draft, 2)).unwrap(),
+            take_2_raw_before,
+            "take 2's own file is untouched by the mark landing on it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mark_rejects_lowercase_multichar_and_non_letter_marks() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, _song, _draft) = routed_draft("mark-invalid");
+        std::fs::write(shellbridge::stage_dir().join("livery.json"), VALID_NOTES).unwrap();
+        snapshot("rice.take", "explicit").unwrap();
+
+        for bad in ["a", "AB", "1", "", "Å"] {
+            let out = handle_rice_take_mark(&inv(&["rice", "take", "mark"], &[bad]));
+            assert_eq!(out.status, Status::Error, "`{bad}` should be rejected: {:?}", out.data);
+            assert_eq!(out.data.unwrap()["reason"], "invalid-mark", "for input `{bad}`");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mark_missing_letter_arg_is_a_usage_error() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, _song, _draft) = routed_draft("mark-missing-arg");
+
+        let out = handle_rice_take_mark(&inv(&["rice", "take", "mark"], &[]));
+        assert_eq!(out.status, Status::Usage);
+        assert_eq!(out.data.unwrap()["reason"], "missing-mark");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mark_refuses_outside_draft_mode() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let stage = unique_tmp("mark-not-draft");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_take_mark(&inv(&["rice", "take", "mark"], &["A"]));
+        assert_eq!(out.status, Status::Error);
+        assert_eq!(out.data.unwrap()["reason"], "not-in-draft-mode");
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn mark_on_a_nonexistent_take_errors_take_not_found() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, _song, _draft) = routed_draft("mark-take-missing");
+        std::fs::write(shellbridge::stage_dir().join("livery.json"), VALID_NOTES).unwrap();
+        snapshot("rice.take", "explicit").unwrap(); // only take 1 exists
+
+        let out = handle_rice_take_mark(&inv_with_take("A", 99));
+        assert_eq!(out.status, Status::Error);
+        assert_eq!(out.data.unwrap()["reason"], "take-not-found");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mark_with_no_takes_at_all_and_no_take_flag_errors_take_not_found() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, _song, _draft) = routed_draft("mark-empty-store");
+
+        // Draft mode, but nothing has ever been taken — no head to default
+        // to, which reads the same as "that take doesn't exist".
+        let out = handle_rice_take_mark(&inv(&["rice", "take", "mark"], &["A"]));
+        assert_eq!(out.status, Status::Error);
+        assert_eq!(out.data.unwrap()["reason"], "take-not-found");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mark_invalid_take_flag_is_a_usage_error() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, _song, _draft) = routed_draft("mark-take-flag-invalid");
+        std::fs::write(shellbridge::stage_dir().join("livery.json"), VALID_NOTES).unwrap();
+        snapshot("rice.take", "explicit").unwrap();
+
+        let out = handle_rice_take_mark(&Invocation {
+            path: vec!["rice".to_string(), "take".to_string(), "mark".to_string()],
+            args: vec!["A".to_string()],
+            flags: std::collections::BTreeMap::from([("take".to_string(), "not-a-number".to_string())]),
+            door: aoide_protocol::Door::Cli,
+        });
+        assert_eq!(out.status, Status::Usage);
+        assert_eq!(out.data.unwrap()["reason"], "invalid-take");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
