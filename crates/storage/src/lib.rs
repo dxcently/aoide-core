@@ -10,6 +10,10 @@
 //! same shim discipline `aoide-protocol` (Phase 2) established: every moved
 //! symbol is re-exported at its old root path via `pub use`, so no existing
 //! call site changes.
+//!
+//! `takes` (Self-Ricing Phase A) is a new addition, not a moved one: the
+//! per-draft take store backing `rice back`/`rice take` — see its module
+//! doc for the tree-of-takes model.
 
 pub mod a2a_store;
 pub mod commands;
@@ -19,6 +23,7 @@ pub mod peer_store;
 pub mod records;
 pub mod session;
 pub mod stage;
+pub mod takes;
 pub mod time;
 
 /// A crate-wide lock serialising every test that mutates process-global env
