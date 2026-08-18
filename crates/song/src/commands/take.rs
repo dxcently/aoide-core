@@ -10,7 +10,7 @@
 //! take number is a read-max/write-max+1 race exactly like the lock exists
 //! for, but the lock is documented **not re-entrant**
 //! (`aoide-storage/src/fs.rs`). If these cores locked internally, `rice
-//! back` (a later step) — which must snapshot-if-drifted, write the revert,
+//! back` — which must snapshot-if-drifted, write the revert,
 //! AND advance the head cursor as one atomic unit — would either deadlock
 //! wrapping its whole body in a second acquire, or (worse, silently) run the
 //! rest of its body unlocked if it called the cores without wrapping at all.
@@ -22,7 +22,7 @@
 //! — both call [`snapshot`] plainly, unconditionally, on every successful
 //! Draft-mode write. [`snapshot_if_drifted_unlocked`] carries NO locked
 //! counterpart at all, deliberately not reintroduced, because it has
-//! exactly ONE sanctioned caller: `rice back` (a later step), which must
+//! exactly ONE sanctioned caller: `rice back`, which must
 //! snapshot-if-drifted, write the revert, AND advance the head cursor as
 //! ONE atomic unit — the drift check has to fold into that SAME single
 //! lock, not a second acquire, so it stays `_unlocked` and `rice back`
@@ -58,6 +58,7 @@
 
 use aoide_protocol::Invocation;
 use aoide_protocol::output::Outcome;
+use aoide_protocol::pick;
 use aoide_protocol::registry::{arg, cmd, flag, Registry};
 use aoide_storage::fs as shellbridge;
 use aoide_storage::mode::{self, RiceMode};
@@ -107,7 +108,7 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["rice", "back"],
-        summary: "Revert the routed draft's live stage to an earlier take (--take N or --mark <letter>) and move the head cursor there — the NEXT write hangs off it, branching implicitly with no branch verb. Un-taken drift on the stage is snapshotted first so nothing is destroyed. Draft mode only. A bare `rice back` (neither flag) always refuses in this build — the interactive picker is a later step, not built here.",
+        summary: "Revert the routed draft's live stage to an earlier take (--take N or --mark <letter>) and move the head cursor there — the NEXT write hangs off it, branching implicitly with no branch verb. Un-taken drift on the stage is snapshotted first so nothing is destroyed. Draft mode only. A bare `rice back` (neither flag) opens a numbered picker defaulting to the head's parent when run on a real CLI tty; off a tty (an agent door, or a script) it refuses with a usage error instead — flags/--json always bypass the picker either way.",
         args: [],
         flags: [
             flag!("take", "int", "Take number to revert to."),
@@ -258,7 +259,7 @@ pub(crate) fn snapshot_if_drifted_unlocked(cmd: &str, cause: &str) -> Result<Opt
 
 /// `rice take` — the explicit snapshot verb (cause `"explicit"`). A bare
 /// mint of whatever is currently staged in the routed draft; no selection,
-/// no comparison, no revert — `rice back` (a later step) is where reverting
+/// no comparison, no revert — `rice back` is where reverting
 /// and branching actually happen. This handler's own write is not folded
 /// into anything else, so [`snapshot`]'s single lock is exactly right.
 fn handle_rice_take(_inv: &Invocation) -> Outcome {
@@ -549,8 +550,8 @@ pub(crate) fn mark(cmd: &str, letter: &str, target: u32) -> Result<(u32, bool, O
 /// second for what is really the same failure.
 ///
 /// Dual-entrance per the project's rule: flags/`--json` only, no prompting,
-/// no stdin read ever — the interactive picker belongs to a later step
-/// (A8, `rice back`'s bare-tty branch), never to this explicit verb.
+/// no stdin read ever — the interactive picker belongs to `rice back`'s
+/// bare-tty branch alone, never to this explicit verb.
 fn handle_rice_take_mark(inv: &Invocation) -> Outcome {
     let letter = match inv.args.first() {
         Some(l) => l.clone(),
@@ -1044,6 +1045,16 @@ fn back_unlocked(cmd: &str, take_flag: Option<u32>, mark_flag: Option<String>) -
 /// [`back_unlocked`]'s whole read-drift-write-advance body in exactly ONE
 /// `with_stage_lock` — see that function's own doc and the module doc's
 /// locking-discipline section.
+///
+/// The bare (neither flag) form is phase A8's dual entrance (§7, advisor
+/// verdict fork 6): [`pick::interactive`] decides whether this invocation is
+/// a real CLI tty, and only then does [`handle_rice_back_picker`] get a
+/// chance to open — every other bare invocation (an agent door, or a CLI
+/// invocation piped/redirected/run under a test harness) hits the same
+/// usage refusal this function has always returned — same `Status::Usage`,
+/// same `reason: "no-selection"`, still no stdin read and still nothing
+/// written. Only its wording moved when the picker landed, since the old
+/// wording called the picker unbuilt.
 fn handle_rice_back(inv: &Invocation) -> Outcome {
     let take_flag = match inv.flags.get("take") {
         Some(raw) => match raw.parse::<u32>() {
@@ -1069,52 +1080,141 @@ fn handle_rice_back(inv: &Invocation) -> Outcome {
         None => None,
     };
 
-    // Dual entrance (§7): a bare `rice back` on a tty is EVENTUALLY meant to
-    // open a numbered picker defaulting to the head's parent (one Enter is
-    // §5.2's one-step undo) — but that picker is a later step (A8), not this
-    // one, and half-building tty-detection with no picker on the other end
-    // of it would be worse than not building it at all. So THIS build
-    // refuses unconditionally whenever neither flag is given, tty or not,
-    // and never reads stdin either way: an agent (never a tty) and a User on
-    // a bare terminal get the IDENTICAL message pointing at the two flags
-    // that work today.
+    // Dual entrance (§7, phase A8, advisor verdict fork 6): a bare `rice
+    // back` on a real CLI tty opens the picker, head's-parent pre-selected
+    // as row 1 so §5.2's one-step undo is a single Enter. Every other bare
+    // invocation — any non-`Cli` door, or a `Cli` invocation off a tty
+    // (piped, redirected, this very test harness) — never reaches the
+    // picker at all and gets a usage refusal naming the two flags that work
+    // without a terminal. The refusal's SHAPE is unchanged from before A8
+    // (`Status::Usage`, `reason: "no-selection"`, no stdin read, nothing
+    // written); its TEXT is not, because the old text promised the picker
+    // was "a later step, not built yet" and this step is that later step.
     if take_flag.is_none() && mark_flag.is_none() {
+        if pick::interactive(inv.door) {
+            return handle_rice_back_picker();
+        }
         return Outcome::usage(
             "rice.back",
             "usage: aoide rice back --take N | --mark <letter> [--json] \
-             (a bare `rice back` will open a picker on a tty in a later step; \
-             not built yet — pass --take or --mark)",
+             (a bare `rice back` opens a numbered picker on a tty; \
+             this door is not one, so pass --take or --mark)",
         )
         .with_data(json!({ "reason": "no-selection" }));
     }
 
     match shellbridge::with_stage_lock(|| back_unlocked("rice.back", take_flag, mark_flag)) {
-        Ok(result) => {
-            let drift_note = result
-                .drifted
-                .map(|d| format!("; take {d:04} preserved the un-taken edit that was about to be overwritten"))
-                .unwrap_or_default();
-            let mark_note = result
-                .mark
-                .as_ref()
-                .map(|m| format!(" (mark {m})"))
-                .unwrap_or_default();
-            let message = format!(
-                "reverted to take {:04}{mark_note} — head now {:04}{drift_note}",
-                result.to, result.to
-            );
-            Outcome::ok("rice.back", message)
-                .changed(result.changed)
-                .with_data(json!({
-                    "from": result.from,
-                    "to": result.to,
-                    "mark": result.mark,
-                    "drifted": result.drifted,
-                    "hyprctl": result.hyprctl_status,
-                    "registry": result.registry_note,
-                }))
-        }
+        Ok(result) => render_back_outcome(result),
         Err(o) => o,
+    }
+}
+
+/// Render a completed [`BackResult`] into `rice back`'s success [`Outcome`]
+/// — shared by both entrances (the `--take`/`--mark` flags, and phase A8's
+/// tty picker below) so "take the existing A5 path" (the plan's own words
+/// for this step) means calling this ONE function from the picker's success
+/// arm too, never a second copy of the same message-building logic.
+fn render_back_outcome(result: BackResult) -> Outcome {
+    let drift_note = result
+        .drifted
+        .map(|d| format!("; take {d:04} preserved the un-taken edit that was about to be overwritten"))
+        .unwrap_or_default();
+    let mark_note = result.mark.as_ref().map(|m| format!(" (mark {m})")).unwrap_or_default();
+    let message = format!(
+        "reverted to take {:04}{mark_note} — head now {:04}{drift_note}",
+        result.to, result.to
+    );
+    Outcome::ok("rice.back", message)
+        .changed(result.changed)
+        .with_data(json!({
+            "from": result.from,
+            "to": result.to,
+            "mark": result.mark,
+            "drifted": result.drifted,
+            "hyprctl": result.hyprctl_status,
+            "registry": result.registry_note,
+        }))
+}
+
+// ── `rice back`'s tty picker (phase A8, §7 dual entrance) ──────────────────
+
+/// The row source for [`handle_rice_back_picker`]: reuse [`render_tree`]
+/// (A6) rather than re-walking the store, splitting its multi-line output
+/// back into `(take, row)` pairs so the picker can report which take number
+/// a chosen ROW actually names. Safe to parse this way because every line
+/// [`render_node`] emits starts its own take number as the first run of
+/// ASCII digits after the tree-glyph prefix (`"{:04}  {at}  {cause}..."`),
+/// and none of the glyph characters the prefix can contain (` `, `│`, `├─`,
+/// `└─`) are digits — there is nothing else on the line a digit scan could
+/// mistake for the number. Order follows [`render_tree`]'s own depth-first
+/// walk, so the picker's numbered rows read top-to-bottom exactly like
+/// `rice take list`'s tree does.
+fn take_lane_rows(recs: &[TakeRecord], head: Option<u32>, marks: &BTreeMap<String, u32>) -> Vec<(u32, String)> {
+    render_tree(recs, head, marks)
+        .lines()
+        .filter_map(|line| {
+            let start = line.find(|c: char| c.is_ascii_digit())?;
+            let digits: String = line[start..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            let take = digits.parse().ok()?;
+            Some((take, line.to_string()))
+        })
+        .collect()
+}
+
+/// Fork 6's own rule, pulled out of [`handle_rice_back_picker`] so it is
+/// testable without a tty: the picker's default row is the HEAD's PARENT —
+/// the one-step-undo row, so a bare Enter (fork 6) reverts exactly one step
+/// back — but only when that parent is actually a row in `lane`. Two cases
+/// fail safe to `None` rather than defaulting to something arbitrary, and
+/// [`pick::choose`] treats `None` as "no default; a bare Enter aborts", not
+/// as "pick row 0":
+///   - the head is a root take (`parent == None`) — there is nothing to
+///     default to.
+///   - the head's `parent` names a take absent from `takes` entirely (a
+///     dangling/hand-edited pointer — the same "detached" shape A6's
+///     [`render_tree`] already renders rather than hides): `lane` has no
+///     row for a number that was never really there, so
+///     `lane.iter().position(...)` correctly finds nothing.
+fn default_row_index(recs: &[TakeRecord], head: Option<u32>, lane: &[(u32, String)]) -> Option<usize> {
+    let head_parent = head.and_then(|h| recs.iter().find(|t| t.take == h).and_then(|t| t.parent));
+    head_parent.and_then(|p| lane.iter().position(|(n, _)| *n == p))
+}
+
+/// Bare `rice back` on a real CLI tty — reached only from
+/// [`handle_rice_back`], only once [`pick::interactive`] has already said
+/// yes. Builds the takes lane from [`take_lane_rows`], defaults the picker
+/// via [`default_row_index`] (fork 6: the one-step-undo row, so an empty
+/// Enter reverts exactly one step back), runs [`pick::choose`], and — on a
+/// selection — takes the existing `--take` path via [`render_back_outcome`].
+/// An abort (`q`, EOF, or two bad attempts) reports the same `no-selection`
+/// reason [`handle_rice_back`]'s own non-tty refusal uses, since the
+/// practical outcome is identical either way: nothing was picked, nothing
+/// was written.
+fn handle_rice_back_picker() -> Outcome {
+    let (song, draft) = match resolve_draft("rice.back") {
+        Ok(v) => v,
+        Err(o) => return o,
+    };
+
+    let recs = takes::list_takes(&song, &draft);
+    let head = takes::load_head(&song, &draft);
+    let marks = takes::load_marks(&song, &draft);
+    let lane = take_lane_rows(&recs, head, &marks);
+
+    let default_idx = default_row_index(&recs, head, &lane);
+    let rows: Vec<String> = lane.iter().map(|(_, row)| row.clone()).collect();
+
+    let prompt = format!("revert {song}/{draft} to which take?");
+    match pick::choose(&prompt, &rows, default_idx) {
+        Some(idx) => {
+            let target = lane[idx].0;
+            match shellbridge::with_stage_lock(|| back_unlocked("rice.back", Some(target), None)) {
+                Ok(result) => render_back_outcome(result),
+                Err(o) => o,
+            }
+        }
+        None => Outcome::usage("rice.back", "no take selected — aborted")
+            .with_data(json!({ "reason": "no-selection" })),
     }
 }
 
@@ -2017,13 +2117,58 @@ mod tests {
         write_livery(&stage, "#111111");
         snapshot("rice.take", "stage").unwrap();
 
-        // Neither --take nor --mark: the test harness is never a tty either
-        // way, so this exercises both "non-tty" and "this build's tty
-        // refusal" at once — the two paths are identical in this step.
+        // Snapshot the WHOLE store's observable state before the call, not
+        // just the head cursor — the plan's requirement is that the STORE
+        // is untouched, and a head-only assertion would miss a future
+        // regression that (say) wrote marks.json without moving the head.
+        let before_take_count = takes::list_takes(&song, &draft).len();
+        let before_marks = takes::load_marks(&song, &draft);
+        let livery_path = stage.join("livery.json");
+        let before_livery = std::fs::read(&livery_path).unwrap();
+        let cover_path = stage.join("cover.json");
+        let before_cover = std::fs::read(&cover_path).ok();
+
+        // Neither --take nor --mark: `pick::interactive` checks a REAL tty
+        // (`std::io::IsTerminal`), and cargo test's own stdin/stdout are a
+        // pipe/file, never a tty, so `inv.door == Cli` here still can't
+        // reach phase A8's picker branch — this exercises the exact same
+        // non-tty usage refusal it always has, verbatim.
         let out = handle_rice_back(&inv_back(None, None));
         assert_eq!(out.status, Status::Usage);
         assert_eq!(out.data.unwrap()["reason"], "no-selection");
         assert_eq!(takes::load_head(&song, &draft), Some(1), "the bare refusal moved nothing");
+        assert_eq!(takes::list_takes(&song, &draft).len(), before_take_count, "no take was minted or removed");
+        assert_eq!(takes::load_marks(&song, &draft), before_marks, "marks.json is untouched");
+        assert_eq!(std::fs::read(&livery_path).unwrap(), before_livery, "the stage livery is byte-identical");
+        assert_eq!(std::fs::read(&cover_path).ok(), before_cover, "the stage cover is byte-identical (still absent)");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A8's own assertion on the SAME non-tty behavior above: with the
+    /// picker built, a bare invocation off a tty must still refuse rather
+    /// than prompt, and must say WHY in terms of the door it actually got.
+    /// Pins the wording, so a later step cannot quietly reintroduce a
+    /// promise that the picker is unbuilt.
+    #[test]
+    fn back_bare_invocation_off_a_tty_names_the_picker_and_still_refuses() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (root, song, draft, _draft_livery) = routed_draft_symlinked("back-bare-verbatim");
+        let stage = shellbridge::stage_dir();
+        write_livery(&stage, "#111111");
+        snapshot("rice.take", "stage").unwrap();
+
+        let out = handle_rice_back(&inv_back(None, None));
+        assert_eq!(out.status, Status::Usage);
+        assert_eq!(
+            out.message,
+            "usage: aoide rice back --take N | --mark <letter> [--json] \
+             (a bare `rice back` opens a numbered picker on a tty; \
+             this door is not one, so pass --take or --mark)"
+        );
+        assert_eq!(out.data.unwrap()["reason"], "no-selection");
+        assert_eq!(takes::load_head(&song, &draft), Some(1), "writes nothing");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2086,6 +2231,64 @@ mod tests {
         assert!(mark_line.contains("[A]"), "both children hang off the marked take: {out}");
         let head_line = out.lines().find(|l| l.contains("0021")).unwrap();
         assert!(head_line.contains("\u{2190} head"));
+    }
+
+    // ── take_lane_rows: the picker's row source (phase A8) ─────────────────
+
+    #[test]
+    fn take_lane_rows_pairs_each_line_with_its_take_number_through_the_tree_glyphs() {
+        // Same fork shape as the render_tree test just above, reused so this
+        // proves the digit-scan survives real branch glyphs (`\u{251c}\u{2500}`/
+        // `\u{2514}\u{2500}`), not just a straight unbranched line.
+        // 1 <- 9[A] <- 17
+        //          \- 21 <- head
+        let takes = vec![rec(1, None), rec(9, Some(1)), rec(17, Some(9)), rec(21, Some(9))];
+        let marks = BTreeMap::from([("A".to_string(), 9u32)]);
+
+        let lane = take_lane_rows(&takes, Some(21), &marks);
+
+        let numbers: Vec<u32> = lane.iter().map(|(n, _)| *n).collect();
+        assert_eq!(numbers, vec![1, 9, 17, 21], "depth-first order, matching render_tree's own walk");
+        let (_, row_21) = lane.iter().find(|(n, _)| *n == 21).unwrap();
+        assert!(row_21.contains("\u{2190} head"), "the row text is render_tree's own line, untouched: {row_21}");
+        let (_, row_9) = lane.iter().find(|(n, _)| *n == 9).unwrap();
+        assert!(row_9.contains("[A]"));
+    }
+
+    #[test]
+    fn take_lane_rows_is_empty_for_an_empty_store() {
+        assert!(take_lane_rows(&[], None, &BTreeMap::new()).is_empty());
+    }
+
+    // ── default_row_index: fork 6's own rule, off a tty ────────────────────
+
+    #[test]
+    fn default_row_index_targets_the_heads_parent_when_present() {
+        let takes = vec![rec(1, None), rec(2, Some(1)), rec(3, Some(1))];
+        let lane = take_lane_rows(&takes, Some(3), &BTreeMap::new());
+        assert_eq!(default_row_index(&takes, Some(3), &lane), Some(0), "row 0 is take 1, the head's (3's) parent");
+    }
+
+    #[test]
+    fn default_row_index_is_none_for_a_root_head_with_no_parent() {
+        let takes = vec![rec(1, None)];
+        let lane = take_lane_rows(&takes, Some(1), &BTreeMap::new());
+        assert_eq!(
+            default_row_index(&takes, Some(1), &lane),
+            None,
+            "a root head has no parent to default to -- Enter must abort, not pick something arbitrary"
+        );
+    }
+
+    #[test]
+    fn default_row_index_is_none_when_the_heads_parent_is_not_in_the_store() {
+        // Take 9's own `parent` names 99, a take absent from `takes` entirely -- the same
+        // dangling-pointer shape A6's render_tree already renders as "detached" rather than
+        // hiding. `lane` therefore has no row for 99, and the default must fail safe to None
+        // instead of pointing at a row that does not correspond to what `parent` actually names.
+        let takes = vec![rec(1, None), rec(9, Some(99))];
+        let lane = take_lane_rows(&takes, Some(9), &BTreeMap::new());
+        assert_eq!(default_row_index(&takes, Some(9), &lane), None);
     }
 
     #[test]
