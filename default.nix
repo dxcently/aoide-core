@@ -32,6 +32,14 @@ rustPlatform.buildRustPackage {
   # upward to the root).
   buildAndTestSubdir = "crates/cli";
 
+  # ...but `buildAndTestSubdir` also SCOPES the check phase to that one crate,
+  # so without this the sandbox tested `aoide-cli` alone — about 30 of the
+  # tree's 330 tests — while every crate beneath it (storage, song, protocol,
+  # conduct, upkeep) was compiled but never exercised. A green `nix build`
+  # meant far less than it looked like. `--workspace` restores the obvious
+  # reading: the package build runs the whole suite.
+  cargoTestFlags = [ "--workspace" ];
+
   # Walking skeleton: no live-system integration tests in the sandbox.
   doCheck = true;
 
