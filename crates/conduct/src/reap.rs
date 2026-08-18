@@ -327,13 +327,26 @@ fn profile_for(rec: &SessionRecord) -> &'static AgentProfile {
 /// one is real; return the ids to RETIRE (the superseded duplicates). Pure and
 /// unit-testable: `is_recent` and `has_transcript` are injected as closures.
 ///
-/// Keeper rank (descending): a real on-disk transcript (`has_transcript` — the
-/// ground-truth "this is a live claude" signal) → carries `say` → classified
-/// `kind=="agent"` → newest `startedAt` → lexically-greatest `sessionId` (stable
-/// final tiebreak). A group of one is never touched; a group with ANY member
-/// still inside the grace (`is_recent`) is left entirely alone — a just-born pair
-/// is let settle until the real one writes its transcript, so we never drop the
-/// wrong twin at t≈0.
+/// Keeper rank (descending): newest `startedAt` → a real on-disk transcript
+/// (`has_transcript`) → carries `say` → classified `kind=="agent"` →
+/// lexically-greatest `sessionId` (stable final tiebreak). A group of one is
+/// never touched; a group with ANY member still inside the grace (`is_recent`)
+/// is left entirely alone — a just-born pair is let settle until the real one
+/// writes its transcript, so we never drop the wrong twin at t≈0.
+///
+/// `startedAt` leads, not `has_transcript`: the case this function exists for
+/// (compact/resume mints a NEW sessionId in the same window; the OLD one never
+/// gets a clean `SessionEnd`) mints the new record STRICTLY after the old one,
+/// so newest-first always keeps it. Ranking on `has_transcript` first used to
+/// pick the OLD record instead whenever the fresh session hadn't said anything
+/// yet — the transcript file doesn't exist until the first turn, while the old
+/// session's transcript (and `say`) are still sitting there from before the
+/// compact/resume. That silently reaped the LIVE session out of the roster
+/// (self-heals only once the user's next hook re-registers it) and left the
+/// stale twin standing in its place — exactly the "reap doesn't clear the
+/// ghost claude in this terminal" symptom. `has_transcript`/`say` still decide
+/// a tie: the one real scenario left for them is a same-instant registration
+/// race, where `startedAt` cannot tell the pair apart at all.
 fn superseded_agent_duplicates(
     sessions: &[SessionRecord],
     is_recent: impl Fn(&SessionRecord) -> bool,
@@ -356,10 +369,10 @@ fn superseded_agent_duplicates(
         }
         let rank = |s: &SessionRecord| {
             (
+                s.started_at.clone(),
                 has_transcript(s),
                 s.say.is_some(),
                 s.kind.as_deref() == Some("agent"),
-                s.started_at.clone(),
                 s.session_id.clone(),
             )
         };
@@ -926,8 +939,9 @@ fn reap_inner(
 
     // Also retire superseded same-window agent duplicates (a phantom re-id whose
     // pid is the terminal's, invisible to the liveness predicate above). Grace:
-    // ~60s off startedAt so a just-born pair settles; keeper = the one with a real
-    // transcript on disk (see `superseded_agent_duplicates`).
+    // ~60s off startedAt so a just-born pair settles; keeper = the newest-started
+    // one, transcript/say only tiebreaking a same-instant tie (see
+    // `superseded_agent_duplicates`).
     const DEDUP_GRACE_SECS: i64 = 60;
     let is_recent = |s: &SessionRecord| {
         aoide_storage::time::parse_iso_utc(&s.started_at)
@@ -1622,6 +1636,36 @@ mod tests {
         // just-born pair is never resolved before the real one writes a transcript).
         let all_recent = |_: &SessionRecord| true;
         assert!(superseded_agent_duplicates(&sessions, all_recent, has_tx).is_empty());
+    }
+
+    #[test]
+    fn superseded_agent_duplicates_keeps_the_newer_twin_even_transcript_less() {
+        // The compact/resume ghost this function exists for: the terminal's
+        // claude was compacted, minting a NEW sessionId in the same window
+        // while the OLD one never got a clean SessionEnd. The user hasn't said
+        // anything to the fresh session yet — no transcript, no `say` — while
+        // the stale one still carries both from before the compact. Ranking
+        // on `has_transcript` first used to keep the STALE record and reap the
+        // live one; `startedAt` must win instead, since the newer id is always
+        // the terminal's real current occupant.
+        let mut old = agent("old-session", "0xW", "2026-08-17T07:00:00Z");
+        old.kind = Some("agent".into());
+        old.say = Some("last thing I said before compacting".into());
+        let mut fresh = agent("new-session", "0xW", "2026-08-17T08:00:00Z");
+        fresh.kind = Some("agent".into());
+        // fresh has no `say` yet — matches a session that hasn't spoken.
+
+        let sessions = vec![old, fresh];
+        let none_recent = |_: &SessionRecord| false;
+        // Ground truth: only the OLD session has an on-disk transcript so far.
+        let has_tx = |s: &SessionRecord| s.session_id == "old-session";
+
+        let losers = superseded_agent_duplicates(&sessions, none_recent, has_tx);
+        assert_eq!(
+            losers,
+            vec!["old-session".to_string()],
+            "the newer, still-transcript-less session is the real occupant and must survive"
+        );
     }
 
     #[test]
