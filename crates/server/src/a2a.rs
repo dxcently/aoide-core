@@ -740,10 +740,8 @@ fn spawn_inject_prompt(id: &str, prompt: &str) {
 /// client-supplied command — see the security-model note above `SessionRef`).
 /// Detached: launched via the aoide binary's own `conduct` subcommand
 /// (`std::env::current_exe()`), `setsid`'d so it survives this handler
-/// thread, stdio nulled, and NOT waited on — it is parented to the
-/// long-lived `a2a serve` daemon (acceptable for MVP; TODO(a2a-b3+): reap
-/// finished A2A-spawned children instead of leaking zombies under a
-/// long-lived daemon).
+/// thread, stdio nulled, and reaped on a parked thread (see below) — it
+/// stays parented to the long-lived `a2a serve` daemon for its whole life.
 fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path) -> Result<Value, (i64, String)> {
     let id = format!("a2a-{}-{}", std::process::id(), unix_ts_now());
     let aoide_bin = std::env::current_exe()
@@ -779,7 +777,18 @@ fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path) -> Result<Value, (i
     }
 
     match cmd.spawn() {
-        Ok(_child) => {
+        Ok(mut child) => {
+            // `setsid()` above detaches the child into its own session so it
+            // survives this handler thread, but a new session does NOT
+            // reparent the child — this process is still its parent and
+            // still owes it a `wait()`. Skip that and the kernel keeps the
+            // exit status around forever once the child dies: a zombie
+            // entry in the process table, uncollected for as long as
+            // `a2a serve` runs. Park a thread whose only job is to collect
+            // it; nothing else here depends on when that happens.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
             // Best-effort first-turn injection — see the doc comment above.
             spawn_inject_prompt(&id, prompt);
             let _ = audit(
