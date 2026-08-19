@@ -1,6 +1,6 @@
 //! aoide-song — Aoide's ricing/design engine.
 //!
-//! `livery` is the native note engine: schema validation, `{group.key}`
+//! `livery` is the native design-token engine: schema validation, `{group.key}`
 //! deref + component fallback, and the stage/hyprctl/osc/file emitters.
 //! `live` computes the Hyprland
 //! geometry/border keyword list a staged notes document implies and
@@ -16,7 +16,7 @@ pub mod cover;
 pub mod ipc;
 pub mod live;
 pub mod livery;
-pub mod notes;
+pub mod lint;
 pub mod reap;
 pub mod widgets;
 

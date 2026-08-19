@@ -162,7 +162,7 @@ fn handle_draft_save(inv: &Invocation) -> Outcome {
                 "rice.draft.save",
                 format!("staged livery.json is not valid JSON: {e}"),
             )
-            .with_data(json!({ "reason": "invalid-json", "notes": livery_src.to_string_lossy() }));
+            .with_data(json!({ "reason": "invalid-json", "livery": livery_src.to_string_lossy() }));
         }
     };
     let song = match parsed.get("song").and_then(Value::as_str) {
@@ -217,7 +217,7 @@ pub(crate) fn fork_stage_into(song: &str, name: &str) -> Outcome {
             "rice.draft.save",
             format!("staged livery.json is not valid JSON: {e}"),
         )
-        .with_data(json!({ "reason": "invalid-json", "notes": livery_src.to_string_lossy() }));
+        .with_data(json!({ "reason": "invalid-json", "livery": livery_src.to_string_lossy() }));
     }
 
     let dir = shellbridge::draft_dir(song, name);

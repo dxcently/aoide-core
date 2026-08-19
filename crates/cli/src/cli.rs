@@ -312,7 +312,7 @@ fn group_blurb(group: &str) -> Option<&'static str> {
         "screen" => "screen capture, OCR, and pointer control",
         "a2a" => "Agent-to-Agent server and agent registry",
         "peer" => "same-network host federation",
-        "livery" => "the native note engine's verbs",
+        "livery" => "the design-token engine: resolve, lint, and emit a song's livery",
         "cover" => "cover-art staging",
         "mcp" => "the per-session stdio MCP façade",
         "hooks" => "agent-harness hook installer",

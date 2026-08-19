@@ -515,7 +515,7 @@ fn draw_status_panel(f: &mut Frame, area: Rect, app: &App) {
     ));
     lines.push(file_status(
         &stage.join("livery.json"),
-        "notes",
+        "livery",
         palette_count(app),
     ));
     lines.push(Line::from(""));

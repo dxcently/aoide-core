@@ -1,4 +1,4 @@
-//! The note-engine seam — `rice lint`'s validator.
+//! The livery-engine seam — `rice lint`'s validator.
 //!
 //! A thin wrapper over the native `livery::lint` validator, so `rice lint`
 //! validates in-process: no binary to locate, no Node on PATH. The
@@ -14,7 +14,7 @@ pub struct LintRun {
     pub errors: Vec<String>,
 }
 
-/// Run the native `livery lint` over the note file at `path`.
+/// Run the native `livery lint` over the livery file at `path`.
 ///
 /// A read failure or JSON parse failure surfaces as a lint failure carrying
 /// the Node engine's exact message shape (`cannot read {file}: {e}` /

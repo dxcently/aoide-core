@@ -1,7 +1,7 @@
-//! `livery` — the native note engine, ported into song from the standalone
+//! `livery` — the native design-token engine, ported into song from the standalone
 //! Node engine (see docs/architecture/LIVERY-MERGE.md).
 //!
-//! The engine is a pure-Rust port of the standalone Node note engine's
+//! The engine is a pure-Rust port of the standalone Node token engine's
 //! `{schema,resolve,emitters,cli}.js`, folded into song's charter ("the
 //! ricing / design engine"):
 //!

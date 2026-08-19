@@ -1,5 +1,5 @@
-//! `livery emit` / `livery resolve` / `livery lint` — the native note-engine
-//! verb group (LIVERY-MERGE.md Phase 1): the former standalone note CLI's
+//! `livery emit` / `livery resolve` / `livery lint` — the native livery-engine
+//! verb group (LIVERY-MERGE.md Phase 1): the former standalone token CLI's
 //! surface, native, inside aoide's `Invocation`/`Outcome` shell.
 //!
 //! The handlers carry the engine's raw byte output in `data["stdout"]` — the
@@ -23,10 +23,10 @@ use std::path::{Path, PathBuf};
 pub fn register(r: &mut Registry) {
     r.insert(cmd!(
         path: ["livery", "emit"],
-        summary: "Emit the fully-resolved note set through a backend: stage JSON, hyprctl keyword lines, terminal OSC sequences, or a file template ({{group.key}}).",
+        summary: "Emit the fully-resolved livery set through a backend: stage JSON, hyprctl keyword lines, terminal OSC sequences, or a file template ({{group.key}}).",
         args: [
             arg!("target", "string", true, "Emitter backend: stage, hyprctl, osc, or file."),
-            arg!("name", "string", false, "Song name or path to a note file; defaults to the staged notes."),
+            arg!("name", "string", false, "Song name or path to a livery file; defaults to the staged livery."),
         ],
         flags: [
             flag!("out", "string", "Write the emitted bytes to PATH atomically instead of stdout."),
@@ -38,8 +38,8 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["livery", "resolve"],
-        summary: "Resolve a note file to the flat, fully-resolved set (aliases deref'd, component fallbacks applied) and print it.",
-        args: [arg!("name", "string", false, "Song name or path to a note file; defaults to the staged notes.")],
+        summary: "Resolve a livery file to the flat, fully-resolved set (aliases deref'd, component fallbacks applied) and print it.",
+        args: [arg!("name", "string", false, "Song name or path to a livery file; defaults to the staged livery.")],
         flags: [],
         gated: false,
         implemented: true,
@@ -47,8 +47,8 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["livery", "lint"],
-        summary: "Validate a note file against the closed v0 schema.",
-        args: [arg!("name", "string", false, "Song name or path to a note file; defaults to the staged notes.")],
+        summary: "Validate a livery file against the closed v0 schema.",
+        args: [arg!("name", "string", false, "Song name or path to a livery file; defaults to the staged livery.")],
         flags: [],
         gated: false,
         implemented: true,
@@ -56,7 +56,7 @@ pub fn register(r: &mut Registry) {
     ));
 }
 
-/// Resolve the note file a `livery` verb should act on — the same seam as
+/// Resolve the livery file a `livery` verb should act on — the same seam as
 /// `rice lint`, but RE-IMPLEMENTED here (not reusing
 /// `resolve_rice_notes` in `commands/rice.rs`): `resolve_notes` is the
 /// `livery`-local copy with a `skip` offset for the verb's own leading
@@ -69,7 +69,7 @@ pub fn register(r: &mut Registry) {
 ///   `<song>/songbook/<name>/livery.json`.
 ///
 /// `skip` offsets past the verb's own leading positionals (`livery emit`
-/// takes `<target>` first, so its note name lives at args[1]).
+/// takes `<target>` first, so its livery name lives at args[1]).
 fn resolve_notes(inv: &Invocation, cmd: &str, skip: usize) -> Result<PathBuf, Outcome> {
     match inv.args.get(skip) {
         None => {
@@ -80,13 +80,13 @@ fn resolve_notes(inv: &Invocation, cmd: &str, skip: usize) -> Result<PathBuf, Ou
                 Err(Outcome::usage(
                     cmd,
                     format!(
-                        "no note named and no staged notes at {}; \
+                        "no livery named and no staged livery at {}; \
                          usage: aoide {cmd} [<name>|<path>] [--json]",
                         staged.display()
                     ),
                 )
                 .with_data(json!({
-                    "reason": "no-staged-notes",
+                    "reason": "no-staged-livery",
                     "expected": staged.to_string_lossy(),
                 })))
             }
@@ -103,7 +103,7 @@ fn resolve_notes(inv: &Invocation, cmd: &str, skip: usize) -> Result<PathBuf, Ou
     }
 }
 
-/// Read + parse a note file, with the Node engine's exact failure strings
+/// Read + parse a livery file, with the Node engine's exact failure strings
 /// (`cannot read {file}: {e}` / `invalid JSON in {file}: {e}`).
 fn read_notes(target: &Path, cmd: &str) -> Result<serde_json::Value, Outcome> {
     let raw = match std::fs::read_to_string(target) {
@@ -156,10 +156,10 @@ fn lint_envelope(ok: bool, errors: &[String]) -> String {
 
 /// The shared validation-failure envelope (exit 1, never 0).
 fn validation_failure(cmd: &str, target: &Path, errors: &[String]) -> Outcome {
-    Outcome::error(cmd, "note schema validation reported problems").with_data(json!({
+    Outcome::error(cmd, "livery schema validation reported problems").with_data(json!({
         "ok": false,
         "errors": errors,
-        "notes": target.to_string_lossy(),
+        "livery": target.to_string_lossy(),
         "stdout": lint_envelope(false, errors),
     }))
 }
@@ -176,10 +176,10 @@ fn handle_livery_lint(inv: &Invocation) -> Outcome {
     };
     let v = livery::lint(&notes);
     if v.ok {
-        Outcome::ok("livery.lint", "note schema validation passed").with_data(json!({
+        Outcome::ok("livery.lint", "livery schema validation passed").with_data(json!({
             "ok": true,
             "schemaVersion": livery::SCHEMA_VERSION,
-            "notes": target.to_string_lossy(),
+            "livery": target.to_string_lossy(),
             "stdout": lint_envelope(true, &[]),
         }))
     } else {
@@ -187,7 +187,7 @@ fn handle_livery_lint(inv: &Invocation) -> Outcome {
     }
 }
 
-/// `livery resolve [<name>|<path>]` — the flat, fully-resolved note set.
+/// `livery resolve [<name>|<path>]` — the flat, fully-resolved livery set.
 fn handle_livery_resolve(inv: &Invocation) -> Outcome {
     let target = match resolve_notes(inv, "livery.resolve", 0) {
         Ok(p) => p,
@@ -206,13 +206,13 @@ fn handle_livery_resolve(inv: &Invocation) -> Outcome {
             let mut stdout = livery::resolve::to_json_string(&r);
             stdout.push('\n');
             Outcome::ok("livery.resolve", "resolved").with_data(json!({
-                "notes": target.to_string_lossy(),
+                "livery": target.to_string_lossy(),
                 "stdout": stdout,
             }))
         }
         Err(e) => Outcome::error("livery.resolve", e.to_string()).with_data(json!({
             "reason": "resolve-failed",
-            "notes": target.to_string_lossy(),
+            "livery": target.to_string_lossy(),
         })),
     }
 }
@@ -249,7 +249,7 @@ fn handle_livery_emit(inv: &Invocation) -> Outcome {
         Err(e) => {
             return Outcome::error("livery.emit", e.to_string()).with_data(json!({
                 "reason": "resolve-failed",
-                "notes": notes_path.to_string_lossy(),
+                "livery": notes_path.to_string_lossy(),
             }));
         }
     };
@@ -299,14 +299,14 @@ fn handle_livery_emit(inv: &Invocation) -> Outcome {
             .with_data(json!({
                 "ok": true,
                 "wrote": out_path,
-                "notes": notes_path.to_string_lossy(),
+                "livery": notes_path.to_string_lossy(),
                 "stdout": envelope,
             }));
     }
 
     Outcome::ok("livery.emit", format!("emitted {target}")).with_data(json!({
         "target": target,
-        "notes": notes_path.to_string_lossy(),
+        "livery": notes_path.to_string_lossy(),
         "stdout": stdout,
     }))
 }

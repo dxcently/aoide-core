@@ -8,7 +8,7 @@
 use aoide_protocol::Invocation;
 use aoide_protocol::output::Outcome;
 use aoide_protocol::registry::{arg, cmd, flag, Registry};
-use crate::notes;
+use crate::lint;
 use aoide_storage::fs as shellbridge;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -76,7 +76,7 @@ pub(crate) fn resolve_rice_notes(inv: &Invocation, cmd: &str) -> Result<PathBuf,
                     ),
                 )
                 .with_data(json!({
-                    "reason": "no-staged-notes",
+                    "reason": "no-staged-livery",
                     "expected": staged.to_string_lossy(),
                 })))
             }
@@ -105,18 +105,18 @@ fn handle_rice_lint(inv: &Invocation) -> Outcome {
         Ok(p) => p,
         Err(o) => return o,
     };
-    let run = notes::run_lint(&target);
+    let run = lint::run_lint(&target);
     if run.ok {
-        Outcome::ok("rice.lint", "note schema validation passed").with_data(json!({
-            "notes": target.to_string_lossy(),
+        Outcome::ok("rice.lint", "livery schema validation passed").with_data(json!({
+            "livery": target.to_string_lossy(),
             "schemaVersion": crate::livery::SCHEMA_VERSION,
             "engine": "livery",
         }))
     } else {
         // Error status → exit 1 (never a status:error with exit 0).
-        Outcome::error("rice.lint", "note schema validation reported problems")
+        Outcome::error("rice.lint", "livery schema validation reported problems")
             .with_data(json!({
-                "notes": target.to_string_lossy(),
+                "livery": target.to_string_lossy(),
                 "errors": run.errors,
             }))
     }
@@ -350,7 +350,7 @@ pub(crate) fn handle_rice_stage(inv: &Invocation) -> Outcome {
             .with_data(json!({
                 "reason": "invalid-json",
                 "name": name,
-                "notes": notes_src.to_string_lossy(),
+                "livery": notes_src.to_string_lossy(),
             }));
         }
     };
@@ -479,7 +479,7 @@ pub(crate) fn handle_rice_stage(inv: &Invocation) -> Outcome {
     .changed(changed)
     .with_data(json!({
         "name": name,
-        "notes": notes_dst.to_string_lossy(),
+        "livery": notes_dst.to_string_lossy(),
         "cover": cover.as_ref().map(|p| p.to_string_lossy().into_owned()),
         "hyprctl": hyprctl_status,
         "widgets": widget_sync.note,
@@ -597,7 +597,7 @@ fn handle_rice_compose(inv: &Invocation) -> Outcome {
             .with_data(json!({
                 "reason": "invalid-json",
                 "from": from,
-                "notes": from_notes_path.to_string_lossy(),
+                "livery": from_notes_path.to_string_lossy(),
             }));
         }
     };
@@ -676,7 +676,7 @@ mod tests {
         assert_eq!(out.status, Status::Ok);
         assert_eq!(out.render(false).1, aoide_protocol::output::exit::OK);
         let data = out.data.unwrap();
-        let notes = data["notes"].as_str().unwrap().to_string();
+        let notes = data["livery"].as_str().unwrap().to_string();
         assert!(notes.ends_with("livery.json"), "lint targeted the staged notes: {notes}");
         assert!(notes.starts_with(stage.to_str().unwrap()));
         assert_eq!(data["schemaVersion"], "0");
@@ -699,7 +699,7 @@ mod tests {
         // `moonlight` is a NAME, not a path — it must resolve under songbook/.
         let out = handle_rice_lint(&inv(&["rice", "lint"], &["moonlight"]));
         assert_eq!(out.status, Status::Ok, "songbook notes lint natively");
-        let notes = out.data.unwrap()["notes"].as_str().unwrap().to_string();
+        let notes = out.data.unwrap()["livery"].as_str().unwrap().to_string();
         assert!(
             notes.ends_with("songbook/moonlight/livery.json"),
             "bare name resolved to the songbook song: {notes}"
@@ -718,7 +718,7 @@ mod tests {
 
         let out = handle_rice_lint(&inv(&["rice", "lint"], &[file.to_str().unwrap()]));
         assert_eq!(out.status, Status::Ok, "an existing path lints literally");
-        let notes = out.data.unwrap()["notes"].as_str().unwrap().to_string();
+        let notes = out.data.unwrap()["livery"].as_str().unwrap().to_string();
         assert_eq!(notes, file.to_string_lossy(), "an existing path is literal");
         let _ = std::fs::remove_dir_all(&root);
     }

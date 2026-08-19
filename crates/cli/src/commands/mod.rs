@@ -57,7 +57,7 @@ pub fn all() -> Registry {
     aoide_song::commands::draft::register(&mut r); // rice draft save/list/stage/drop
     aoide_song::commands::mode::register(&mut r); // rice mode status/stage/declarative
     aoide_song::commands::cover::register(&mut r); // cover set
-    aoide_song::commands::livery::register(&mut r); // livery emit, resolve, lint (the native note engine's verbs)
+    aoide_song::commands::livery::register(&mut r); // livery emit, resolve, lint (the native livery engine's verbs)
     stubs::register_rice_late(&mut r); // rice declare, transpose
     stubs::register_content(&mut r); // content register/propose/approve/ingest/query
     stubs::register_make(&mut r); // make
