@@ -351,6 +351,7 @@ mod tests {
             name: "yomi-strix".into(),
             url: "http://yomi-strix:8710/".into(),
             autogate: false,
+            token_file: None,
             added_at: "2026-08-14T00:00:00Z".into(),
         }])
         .unwrap();

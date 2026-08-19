@@ -324,6 +324,7 @@ fn handle_peer_add(inv: &Invocation) -> Outcome {
         .with_data(json!({ "reason": "invalid-name", "name": name }));
     }
     let autogate = inv.flag_present("autogate");
+    let token_file = inv.flags.get("token-file").cloned().filter(|s| !s.is_empty());
 
     let mut peers = aoide_storage::peer_store::load_peers();
     if peers.iter().any(|p| p.name == name) {
@@ -354,6 +355,7 @@ fn handle_peer_add(inv: &Invocation) -> Outcome {
         name: name.clone(),
         url: url.clone(),
         autogate,
+        token_file,
         added_at: aoide_storage::time::now_iso_utc(),
     };
     aoide_storage::peer_store::insert_peer(&mut peers, peer.clone());
@@ -561,7 +563,10 @@ pub fn register_peers(r: &mut Registry) {
             arg!("name", "string", true, "A local nickname for this peer."),
             arg!("url", "string", true, "The peer's A2A door URL (e.g. http://host:8710/)."),
         ],
-        flags: [flag!("autogate", "bool", "Trust this peer: its inbound message/send auto-delivers without the pending queue.")],
+        flags: [
+            flag!("autogate", "bool", "Trust this peer: its inbound message/send auto-delivers without the pending queue."),
+            flag!("token-file", "string", "Path to a file holding the shared secret this peer must present (Authorization: Bearer <token>) to be identified as this peer — required for --autogate to survive a proxy/tunnel, where every caller's address looks the same."),
+        ],
         gated: false,
         implemented: true,
         handler: handle_peer_add,

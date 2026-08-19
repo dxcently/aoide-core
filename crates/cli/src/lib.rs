@@ -87,10 +87,12 @@ pub fn run_cli(argv: &[String]) -> i32 {
         let (bind, port) = a2a::resolve_bind_port(&inv);
         let spawn_agent = a2a::resolve_spawn_agent(&inv);
         let peer_name = a2a::resolve_peer_name(&inv);
+        let token_file = a2a::resolve_token_file(&inv);
+        let expected_token = a2a::read_expected_token(&token_file).unwrap_or_default();
         let audit_log = dispatch::audit_log_path(&inv);
         // The registry is injected here too (same DI seam as `mcp serve
         // --stdio` above) — `a2a::serve` needs it to build the AgentCard.
-        return match a2a::serve(&bind, port, &audit_log, &spawn_agent, &peer_name, dispatch::registry()) {
+        return match a2a::serve(&bind, port, &audit_log, &spawn_agent, &peer_name, &expected_token, dispatch::registry()) {
             Ok(()) => output::exit::OK,
             Err(e) => {
                 eprintln!("aoide a2a serve: {e}");

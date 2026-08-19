@@ -42,6 +42,16 @@ pub struct Peer {
     /// unmarked/unknown sender is never autogated.
     #[serde(default)]
     pub autogate: bool,
+    /// Path to a file (on THIS instance) holding the shared secret this peer
+    /// presents as `Authorization: Bearer <token>` on an inbound
+    /// `message/send` — how the door tells WHICH registered peer is calling
+    /// once IP alone can't (CONTRACTS.md §6 amendment, 2026-08-18: behind any
+    /// reverse proxy/tunnel every caller is `127.0.0.1`, so the
+    /// [`is_autogated_peer_addr`] IP match is permanently dead there). Absent
+    /// by default — an unmarked peer authenticates by address only, exactly
+    /// as before this field existed.
+    #[serde(rename = "tokenFile", default, skip_serializing_if = "Option::is_none")]
+    pub token_file: Option<String>,
     #[serde(rename = "addedAt", default)]
     pub added_at: String,
 }
@@ -163,6 +173,58 @@ pub fn is_autogated_peer_addr(peers: &[Peer], addr: IpAddr) -> bool {
     peers.iter().filter(|p| p.autogate).any(|p| peer_url_matches_addr(&p.url, addr))
 }
 
+// ── Per-peer token identification (CONTRACTS.md §6 amendment, 2026-08-18) ───
+//
+// [`is_autogated_peer_addr`] above is the address-based match this crate
+// shipped with (§6, 2026-08-14) — still here, still checked first, still the
+// ONLY check when no peer has ever set `token_file` (so a registry with no
+// tokens configured resolves identically to before this amendment). But
+// behind any reverse proxy or tunnel, `peer_addr()` on the SERVER's end is
+// the proxy's own loopback address for every caller, so IP can no longer
+// tell two peers apart. A per-peer token is the identity signal that
+// survives a proxy: [`is_autogated_peer_token`] below is the same autogate
+// fold as [`is_autogated_peer_addr`], keyed on a presented bearer token
+// instead of a source address.
+
+/// Length-independent byte compare for a secret: unlike `==`/`eq`, the
+/// comparison loop always runs to `max(expected.len(), presented.len())`
+/// rather than returning the instant a byte (or the length) differs, so a
+/// timing side-channel can't easily be walked to recover the secret one byte
+/// at a time. Not a cryptographic constant-time primitive (no crate for
+/// that here — house "zero new deps" discipline) — just cheap insurance
+/// against the crudest form of that leak.
+pub fn token_bytes_eq(expected: &str, presented: &str) -> bool {
+    let e = expected.as_bytes();
+    let p = presented.as_bytes();
+    let len_diff = (e.len() != p.len()) as u8;
+    let max_len = e.len().max(p.len());
+    let mut diff: u8 = len_diff;
+    for i in 0..max_len {
+        diff |= e.get(i).copied().unwrap_or(0) ^ p.get(i).copied().unwrap_or(0);
+    }
+    diff == 0
+}
+
+/// Does `presented` (an inbound `Authorization: Bearer <token>` value) match
+/// an autogate-marked peer's OWN token (`Peer.token_file`, read fresh off
+/// disk — a peer's token can rotate without restarting `a2a serve`)? Mirrors
+/// [`is_autogated_peer_addr`]'s fold exactly, keyed on token identity instead
+/// of address. A peer with no `token_file` set never matches (tolerant —
+/// same "absent means uninvolved" stance as an unmatched address), and a
+/// peer whose file is missing/unreadable at match time never matches either
+/// (fails safe, never a panic/error).
+pub fn is_autogated_peer_token(peers: &[Peer], presented: &str) -> bool {
+    peers
+        .iter()
+        .filter(|p| p.autogate)
+        .filter_map(|p| p.token_file.as_deref())
+        .any(|path| {
+            std::fs::read_to_string(path)
+                .map(|raw| token_bytes_eq(raw.trim(), presented))
+                .unwrap_or(false)
+        })
+}
+
 // ── Peer cache: the last-pulled `aoide/graphSummary` response ───────────────
 
 /// One peer's cached pull result (`state/peer-cache/<name>.json`, v0).
@@ -247,6 +309,7 @@ mod tests {
             name: name.to_string(),
             url: url.to_string(),
             autogate,
+            token_file: None,
             added_at: "2026-08-14T00:00:00Z".to_string(),
         }
     }
@@ -418,5 +481,53 @@ mod tests {
 
         let never_fetched = PeerCacheEntry { fetched_at: None, ..base };
         assert!(!is_cache_fresh(&never_fetched, fetched_epoch), "no fetchedAt is never fresh");
+    }
+
+    // ── Per-peer token identification (pure compare + the fold) ─────────────
+
+    #[test]
+    fn token_bytes_eq_matches_equal_secrets_and_rejects_every_kind_of_mismatch() {
+        assert!(token_bytes_eq("s3cr3t", "s3cr3t"), "identical strings match");
+        assert!(token_bytes_eq("", ""), "two empty strings match");
+        assert!(!token_bytes_eq("s3cr3t", "s3cr3u"), "a single differing byte mismatches");
+        assert!(!token_bytes_eq("s3cr3t", "s3cr3"), "a shorter presented value mismatches");
+        assert!(!token_bytes_eq("s3cr3t", "s3cr3tt"), "a longer presented value mismatches");
+        assert!(!token_bytes_eq("s3cr3t", ""), "an empty presented value never matches a real secret");
+    }
+
+    #[test]
+    fn is_autogated_peer_token_matches_only_an_autogated_peers_own_token_file() {
+        let _g = crate::env_lock().lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("aoide-peer-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let trusted_file = dir.join("trusted.token");
+        std::fs::write(&trusted_file, "trusted-secret\n").unwrap();
+        let untrusted_file = dir.join("untrusted.token");
+        std::fs::write(&untrusted_file, "untrusted-secret\n").unwrap();
+
+        let mut trusted = fixture_peer("trusted", "http://10.0.0.5:8710/", true);
+        trusted.token_file = Some(trusted_file.to_string_lossy().into_owned());
+        // Registered, autogate-marked, but WITHOUT a token file at all — must
+        // never match any presented token (absent means uninvolved).
+        let no_token_autogate = fixture_peer("no-token", "http://10.0.0.7:8710/", true);
+        // Autogate-marked but its token file points nowhere real — a missing
+        // file fails safe (never matches), never panics.
+        let mut broken = fixture_peer("broken", "http://10.0.0.8:8710/", true);
+        broken.token_file = Some(dir.join("does-not-exist.token").to_string_lossy().into_owned());
+        // Has the SAME secret as `trusted` but is NOT autogate-marked — must
+        // never match, since only autogate-marked peers are consulted.
+        let mut untrusted = fixture_peer("untrusted", "http://10.0.0.6:8710/", false);
+        untrusted.token_file = Some(untrusted_file.to_string_lossy().into_owned());
+
+        let peers = vec![trusted, no_token_autogate, broken, untrusted];
+
+        assert!(is_autogated_peer_token(&peers, "trusted-secret"), "matches the autogate-marked peer's own token");
+        assert!(!is_autogated_peer_token(&peers, "untrusted-secret"), "an autogate-marked peer's token never matches a NON-autogated peer's secret");
+        assert!(!is_autogated_peer_token(&peers, "wrong"), "an unrecognised token matches nothing");
+        assert!(!is_autogated_peer_token(&[], "trusted-secret"), "an empty registry matches nothing");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

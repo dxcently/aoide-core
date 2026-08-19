@@ -163,6 +163,43 @@ pub fn resolve_spawn_agent(inv: &Invocation) -> String {
         .unwrap_or_default()
 }
 
+/// Resolve `aoide.a2a.tokenFile`: the path to a file holding the shared
+/// secret a caller must present (`Authorization: Bearer <token>`) to be
+/// trusted as an authenticated caller (CONTRACTS.md §6 amendment,
+/// 2026-08-18) — required before Spawn runs at all, and the switch that
+/// decouples loopback's free pass once it's set (see [`effective_origin`]).
+/// `--token-file` flag → `AOIDE_A2A_TOKEN_FILE` env (set by the `aoide-a2a`
+/// systemd unit) → default `""` (empty = no token required — today's fully
+/// open behavior, unchanged). Mirrors [`resolve_spawn_agent`]'s exact
+/// precedence shape. Only a FILE PATH ever crosses a flag/env var — the
+/// secret itself is read off disk once, at `a2a serve` launch
+/// ([`read_expected_token`]), never passed as a flag value directly (argv is
+/// world-readable via `/proc/*/cmdline`) and never logged.
+pub fn resolve_token_file(inv: &Invocation) -> String {
+    inv.flags
+        .get("token-file")
+        .cloned()
+        .or_else(|| std::env::var("AOIDE_A2A_TOKEN_FILE").ok())
+        .unwrap_or_default()
+}
+
+/// Read the expected A2A token off [`resolve_token_file`]'s resolved path.
+/// An empty path resolves to `None` outright (feature off, no disk read at
+/// all). A missing/unreadable file, or one that's empty/whitespace-only,
+/// ALSO resolves to `None` rather than a hard launch failure — MVP
+/// tolerance, matching the other `resolve_*` functions' soft-fallback
+/// stance. Trimmed once so a trailing newline from `echo >file`/an editor
+/// doesn't become part of the secret.
+pub fn read_expected_token(token_file: &str) -> Option<String> {
+    if token_file.is_empty() {
+        return None;
+    }
+    std::fs::read_to_string(token_file)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Resolve this instance's `aoide/graphSummary` `instance.name` (CONTRACTS.md
 /// §7): `--peer-name` flag → `AOIDE_A2A_PEER_NAME` env (set by the
 /// `aoide-a2a` systemd unit, mirroring `resolve_bind_port`/
@@ -237,6 +274,97 @@ fn should_deliver_now(origin: PeerOrigin, autogate_match: bool) -> bool {
         PeerOrigin::Loopback => true,
         PeerOrigin::Remote(_) => autogate_match,
         PeerOrigin::Unknown => false,
+    }
+}
+
+// ── Bearer-token authentication (CONTRACTS.md §6 amendment, 2026-08-18) ─────
+//
+// The prior amendment (2026-08-14, above) trusted `PeerOrigin::Loopback`
+// unconditionally, on the assumption that only a genuinely local caller
+// could present it. Behind any reverse proxy or tunnel (`ssh -R`, a
+// tailscale funnel, cloudflared, nginx) that assumption is false: the
+// SERVER's end of the TCP connection sees the proxy's own loopback address
+// for every caller, so `classify_origin` can no longer distinguish "the
+// operator, locally" from "anyone who can reach the proxy". A token is the
+// signal that survives a proxy hop; ORIGIN alone no longer can, once one is
+// configured.
+//
+// [`resolve_token_file`]/[`read_expected_token`] resolve the SERVER's own
+// expected token ONCE at `a2a serve` launch, exactly like `spawn_agent`. Two
+// separate things then key off it:
+//   - Whether the SPAWN arm may run at all ([`spawn_authorized`]) — the
+//     actual must-fix gap: `message/send`'s Spawn path was origin-blind
+//     entirely, gated only by `aoide.a2a.spawnAgent` being non-empty
+//     (rebuild-time only, no per-request gate whatsoever).
+//   - Whether ORIGIN still confers loopback's automatic trust for Inject
+//     ([`effective_origin`]) — once a token is configured, loopback stops
+//     being a trust signal, full stop: no separate opt-out, no
+//     `trustLoopback` bool to leave mis-set. A caller — local or not — must
+//     present the valid token to keep loopback's old free pass.
+//
+// Separately, [`aoide_storage::peer_store::is_autogated_peer_token`] restores
+// PER-PEER identification for the non-loopback autogate match (replacing the
+// now-frequently-dead address match behind a proxy) — that one is keyed on
+// each registered peer's OWN token, not this single server-wide expected
+// token, and works independently of whether this server-wide token is
+// configured at all (see `message_send` below).
+
+/// The outcome of comparing a presented `Authorization: Bearer <token>`
+/// against the server's configured expected token. Pure — no I/O; the token
+/// VALUES are already resolved by the time this runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenState {
+    /// No `Authorization: Bearer` header was presented at all.
+    Absent,
+    /// A token was presented and matches the expected token exactly.
+    Valid,
+    /// A token was presented but does not match.
+    Invalid,
+}
+
+/// Classify a presented token against the expected one. Only meaningful when
+/// a token IS configured (`expected` non-empty) — callers gate on that
+/// separately ([`resolve_token_file`]'s empty-means-off convention) rather
+/// than folding "not configured" into this enum, so `TokenState` stays a
+/// three-way fact about ONE comparison, not a second copy of the
+/// feature-on/off switch. Uses [`aoide_storage::peer_store::token_bytes_eq`]
+/// (length-independent byte compare) rather than `==` on a secret. Pure.
+fn classify_token(expected: &str, presented: Option<&str>) -> TokenState {
+    match presented {
+        None => TokenState::Absent,
+        Some(p) if aoide_storage::peer_store::token_bytes_eq(expected, p) => TokenState::Valid,
+        Some(_) => TokenState::Invalid,
+    }
+}
+
+/// Is Spawn allowed to run? When no token is configured, ALWAYS yes — the
+/// off-path is byte-identical to before this amendment (spawn's admission
+/// stays rebuild-time-only, exactly CONTRACTS.md §6's original security
+/// model). When a token IS configured, only a [`TokenState::Valid`] bearer
+/// unlocks it — an absent or wrong token is a clean `-32005` error, not a
+/// silent fallback to the old open behavior. Pure — directly testable
+/// without a socket or a spawned process.
+fn spawn_authorized(token_configured: bool, token_state: TokenState) -> bool {
+    !token_configured || token_state == TokenState::Valid
+}
+
+/// The origin [`should_deliver_now`] actually sees. When no token is
+/// configured this is the IDENTITY function — `origin` passes through
+/// unchanged, so `should_deliver_now`'s own byte-identical-when-off
+/// regression pin holds by construction, not just by inspection. When a
+/// token IS configured, an origin that did NOT present a [`TokenState::Valid`]
+/// bearer is coerced to [`PeerOrigin::Unknown`] — deliberately reusing that
+/// variant's existing "never trusted, fails safe" arm in `should_deliver_now`
+/// rather than adding a fourth origin kind, since the resulting trust
+/// decision (never auto-deliver) is exactly the same either way. This is the
+/// "loopback stops being a trust signal" coupling: there is no code path
+/// where a token is required AND loopback still auto-delivers unauthenticated
+/// — the same `token_configured` bool drives both. Pure.
+fn effective_origin(origin: PeerOrigin, token_configured: bool, token_state: TokenState) -> PeerOrigin {
+    if token_configured && token_state != TokenState::Valid {
+        PeerOrigin::Unknown
+    } else {
+        origin
     }
 }
 
@@ -689,29 +817,59 @@ fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path) -> Result<Value, (i
 }
 
 /// `message/send`: parse params, resolve [`decide_send_action`], execute.
-/// `origin` (CONTRACTS.md §6 amendment) only ever affects the Inject branch —
-/// spawn keeps its existing rebuild-time-only admission model unchanged (see
-/// the module doc comment's security model note); the ONE must-fix gap was
-/// Inject's unconditional `--yes`, not spawn's separate admission story.
+///
+/// `origin` (CONTRACTS.md §6 amendment, 2026-08-14) affects the Inject
+/// branch. `expected_token`/`presented_token` (amendment, 2026-08-18) affect
+/// BOTH branches: an empty `expected_token` (no token configured) is a pure
+/// no-op on every decision below — [`effective_origin`] is the identity
+/// function and [`spawn_authorized`] always allows — so this whole amendment
+/// is byte-identical-when-off by construction, not merely by testing.
+///
+/// - Inject's autogate match now folds TWO independent signals: the
+///   original address match ([`aoide_storage::peer_store::is_autogated_peer_addr`],
+///   dead behind any proxy) OR a per-peer token match
+///   ([`aoide_storage::peer_store::is_autogated_peer_token`], survives one) —
+///   either is sufficient, so an operator who has never set a peer
+///   `token_file` sees the exact original address-only behavior.
+/// - Inject's ORIGIN is [`effective_origin`]'d before reaching
+///   [`should_deliver_now`]: once a token is configured, an unauthenticated
+///   loopback caller no longer gets the automatic pass — see that function's
+///   doc comment for why this is one switch, not two.
+/// - Spawn gained a gate it never had at all: [`spawn_authorized`] must pass
+///   before [`do_spawn`] runs. This is the actual must-fix gap this
+///   amendment closes — Spawn was origin-blind AND token-blind before it.
 fn message_send(
     params: &Value,
     audit_log: &Path,
     spawn_agent: &str,
     origin: PeerOrigin,
+    expected_token: &str,
+    presented_token: Option<&str>,
 ) -> Result<Value, (i64, String)> {
     let (prompt, context_id, spawn_asked) = parse_message_send_params(params);
+    let token_configured = !expected_token.is_empty();
+    let token_state = classify_token(expected_token, presented_token);
     match decide_send_action(context_id.as_deref(), spawn_asked, spawn_agent, session_ref_lookup) {
         SendAction::Inject { session_id } => {
-            let autogate_match = match origin {
-                PeerOrigin::Remote(ip) => {
-                    aoide_storage::peer_store::is_autogated_peer_addr(&aoide_storage::peer_store::load_peers(), ip)
-                }
+            let peers = aoide_storage::peer_store::load_peers();
+            let ip_autogate = match origin {
+                PeerOrigin::Remote(ip) => aoide_storage::peer_store::is_autogated_peer_addr(&peers, ip),
                 PeerOrigin::Loopback | PeerOrigin::Unknown => false,
             };
-            let deliver_now = should_deliver_now(origin, autogate_match);
+            let token_autogate = presented_token
+                .map(|t| aoide_storage::peer_store::is_autogated_peer_token(&peers, t))
+                .unwrap_or(false);
+            let autogate_match = ip_autogate || token_autogate;
+            let eff_origin = effective_origin(origin, token_configured, token_state);
+            let deliver_now = should_deliver_now(eff_origin, autogate_match);
             do_inject(&session_id, &prompt, audit_log, deliver_now)
         }
-        SendAction::Spawn { agent_cmd } => do_spawn(&agent_cmd, &prompt, audit_log),
+        SendAction::Spawn { agent_cmd } => {
+            if !spawn_authorized(token_configured, token_state) {
+                return Err((-32005, "unauthorized: a valid A2A token is required".to_string()));
+            }
+            do_spawn(&agent_cmd, &prompt, audit_log)
+        }
         SendAction::Error { code, msg } => Err((code, msg)),
     }
 }
@@ -746,6 +904,12 @@ struct RequestCtx<'a> {
     origin: PeerOrigin,
     peer_name: &'a str,
     self_url: &'a str,
+    /// The server's own expected A2A token (CONTRACTS.md §6 amendment,
+    /// 2026-08-18) — empty means none configured (feature off). Resolved
+    /// once at `a2a serve` launch, same as `spawn_agent`.
+    expected_token: &'a str,
+    /// This request's `Authorization: Bearer <token>`, if any.
+    presented_token: Option<&'a str>,
 }
 
 /// Handle one parsed JSON-RPC 2.0 request `Value`, returning the response
@@ -761,7 +925,14 @@ fn handle_jsonrpc(req: &Value, ctx: &RequestCtx) -> Value {
             let task_id = params.get("id").and_then(Value::as_str).unwrap_or("");
             task_get(task_id)
         }
-        "message/send" => message_send(&params, ctx.audit_log, ctx.spawn_agent, ctx.origin),
+        "message/send" => message_send(
+            &params,
+            ctx.audit_log,
+            ctx.spawn_agent,
+            ctx.origin,
+            ctx.expected_token,
+            ctx.presented_token,
+        ),
         "aoide/graphSummary" => graph_summary(ctx.peer_name, ctx.self_url),
         "" => Err((-32600, "invalid request: missing method".to_string())),
         other => Err((-32601, format!("method not found: {other}"))),
@@ -878,6 +1049,8 @@ fn stream_task<W: Write>(
     audit_log: &Path,
     spawn_agent: &str,
     origin: PeerOrigin,
+    expected_token: &str,
+    presented_token: Option<&str>,
 ) -> std::io::Result<()> {
     let rpc: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
     let rpc_id = rpc.get("id").cloned().unwrap_or(Value::Null);
@@ -887,7 +1060,9 @@ fn stream_task<W: Write>(
     // send FIRST (inject/spawn) and streams the task it produced;
     // `tasks/resubscribe` streams an existing task by id.
     let resolved: Result<Value, (i64, String)> = match method {
-        "message/stream" => message_send(&params, audit_log, spawn_agent, origin),
+        "message/stream" => {
+            message_send(&params, audit_log, spawn_agent, origin, expected_token, presented_token)
+        }
         _ /* tasks/resubscribe */ => {
             match params.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
                 Some(id) => task_get(id),
@@ -980,6 +1155,26 @@ struct HttpRequest {
     method: String,
     path: String,
     body: Vec<u8>,
+    /// The `Authorization` header's bearer token, if present and well-formed
+    /// (CONTRACTS.md §6 amendment, 2026-08-18) — `Some(<token>)` for
+    /// `Authorization: Bearer <token>`, `None` for a missing header or any
+    /// other scheme. Every other header this door doesn't need is still read
+    /// and discarded, same as before this field existed.
+    bearer: Option<String>,
+}
+
+/// Extract the bearer token from a raw `Authorization` header VALUE (the
+/// part after `Authorization:`), case-insensitive on the `Bearer` scheme
+/// name (RFC 7235 §2.1 treats auth-scheme as case-insensitive), trimmed.
+/// `None` for any other scheme, an empty token, or a malformed header. Pure.
+fn extract_bearer(header_value: &str) -> Option<String> {
+    let rest = header_value.trim();
+    let (scheme, token) = rest.split_once(char::is_whitespace)?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_string())
 }
 
 /// A parse failure, carrying the HTTP status it should become — a plain
@@ -1071,6 +1266,7 @@ fn parse_http_request<R: BufRead>(r: &mut R, start: Instant) -> Result<HttpReque
     // this door only ever needs to understand HTTP/1.1 requests to itself.
 
     let mut content_length: usize = 0;
+    let mut bearer: Option<String> = None;
     let mut header_count: usize = 0;
     loop {
         if header_count >= MAX_HEADERS {
@@ -1086,8 +1282,11 @@ fn parse_http_request<R: BufRead>(r: &mut R, start: Instant) -> Result<HttpReque
             break; // the blank line ending the header block
         }
         if let Some((name, value)) = header_line.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("content-length") {
+            let name = name.trim();
+            if name.eq_ignore_ascii_case("content-length") {
                 content_length = value.trim().parse().unwrap_or(0);
+            } else if name.eq_ignore_ascii_case("authorization") {
+                bearer = extract_bearer(value);
             }
         }
     }
@@ -1121,7 +1320,7 @@ fn parse_http_request<R: BufRead>(r: &mut R, start: Instant) -> Result<HttpReque
         }
     }
 
-    Ok(HttpRequest { method, path, body })
+    Ok(HttpRequest { method, path, body, bearer })
 }
 
 fn status_reason(status: u16) -> &'static str {
@@ -1184,6 +1383,7 @@ fn route(
     spawn_agent: &str,
     peer_name: &str,
     origin: PeerOrigin,
+    expected_token: &str,
     registry: &Registry,
 ) -> (u16, Vec<u8>, String) {
     match req.path.as_str() {
@@ -1225,6 +1425,8 @@ fn route(
                     origin,
                     peer_name,
                     self_url: &self_url,
+                    expected_token,
+                    presented_token: req.bearer.as_deref(),
                 };
                 let resp = handle_jsonrpc_bytes(&req.body, &ctx);
                 let body = serde_json::to_vec(&resp).unwrap_or_default();
@@ -1276,6 +1478,7 @@ pub fn serve(
     audit_log: &Path,
     spawn_agent: &str,
     peer_name: &str,
+    expected_token: &str,
     registry: &'static Registry,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind((bind, port))?;
@@ -1307,11 +1510,19 @@ pub fn serve(
         let audit_log = audit_log.to_path_buf();
         let spawn_agent = spawn_agent.to_string();
         let peer_name = peer_name.to_string();
+        let expected_token = expected_token.to_string();
         std::thread::spawn(move || {
             let _guard = ConnGuard; // released on every exit path, incl. panic
-            if let Err(e) =
-                handle_connection(stream, &bind, port, &audit_log, &spawn_agent, &peer_name, registry)
-            {
+            if let Err(e) = handle_connection(
+                stream,
+                &bind,
+                port,
+                &audit_log,
+                &spawn_agent,
+                &peer_name,
+                &expected_token,
+                registry,
+            ) {
                 eprintln!("aoide a2a: connection error: {e}");
             }
         });
@@ -1329,6 +1540,7 @@ fn handle_connection(
     audit_log: &Path,
     spawn_agent: &str,
     peer_name: &str,
+    expected_token: &str,
     registry: &Registry,
 ) -> std::io::Result<()> {
     // The connection's ORIGIN (CONTRACTS.md §6 amendment, 2026-08-14): TCP
@@ -1381,11 +1593,29 @@ fn handle_connection(
             "open",
             "SSE stream open",
         );
-        return stream_task(&mut writer, &req, &method, audit_log, spawn_agent, origin);
+        return stream_task(
+            &mut writer,
+            &req,
+            &method,
+            audit_log,
+            spawn_agent,
+            origin,
+            expected_token,
+            req.bearer.as_deref(),
+        );
     }
 
-    let (status, body, audit_cmd) =
-        route(&req, bind, port, audit_log, spawn_agent, peer_name, origin, registry);
+    let (status, body, audit_cmd) = route(
+        &req,
+        bind,
+        port,
+        audit_log,
+        spawn_agent,
+        peer_name,
+        origin,
+        expected_token,
+        registry,
+    );
 
     // Security/audit (CONTRACTS.md §6): every handled request routes through
     // the single audit log, same discipline as the CLI/MCP doors. The
@@ -1434,6 +1664,8 @@ mod tests {
             origin: PeerOrigin::Loopback,
             peer_name: "aoide",
             self_url: "http://127.0.0.1:8710/",
+            expected_token: "",
+            presented_token: None,
         }
     }
 
@@ -1853,6 +2085,212 @@ mod tests {
         assert!(!should_deliver_now(PeerOrigin::Unknown, true));
     }
 
+    // ── Bearer-token authentication (CONTRACTS.md §6 amendment, 2026-08-18) ──
+    //
+    // THE REGRESSION PIN this amendment must not violate: with no token
+    // configured, every origin/autogate combination `should_deliver_now`
+    // resolves TODAY must resolve identically — the test just above this one
+    // (untouched by this amendment, still exercising the bare function) is
+    // that pin at the `should_deliver_now` level. The two tests below prove
+    // the pin holds at the INTEGRATION point too: `effective_origin` (what
+    // actually feeds `should_deliver_now` now) is the identity function when
+    // `token_configured` is false, and `spawn_authorized` always allows —
+    // so composing them in front of the untouched functions changes nothing
+    // on the off-path, by construction rather than by inspection alone.
+
+    #[test]
+    fn effective_origin_is_the_identity_function_when_no_token_is_configured() {
+        for origin in [
+            PeerOrigin::Loopback,
+            PeerOrigin::Remote("10.0.0.5".parse().unwrap()),
+            PeerOrigin::Unknown,
+        ] {
+            for token_state in [TokenState::Absent, TokenState::Invalid, TokenState::Valid] {
+                assert_eq!(
+                    effective_origin(origin, false, token_state),
+                    origin,
+                    "token_configured=false must pass {origin:?} through unchanged regardless of token_state"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn effective_origin_denies_loopback_once_a_token_is_configured_and_not_valid() {
+        // The "coupled loopback trust" amendment: once ANY token is
+        // configured, loopback keeps its old free pass ONLY with a valid
+        // bearer — an absent or wrong one is coerced to Unknown, which
+        // `should_deliver_now` already treats as never-trusted.
+        assert_eq!(
+            effective_origin(PeerOrigin::Loopback, true, TokenState::Absent),
+            PeerOrigin::Unknown
+        );
+        assert_eq!(
+            effective_origin(PeerOrigin::Loopback, true, TokenState::Invalid),
+            PeerOrigin::Unknown
+        );
+        // A VALID token restores loopback's original standing exactly.
+        assert_eq!(
+            effective_origin(PeerOrigin::Loopback, true, TokenState::Valid),
+            PeerOrigin::Loopback
+        );
+        // A remote origin without a valid token is ALSO coerced — it was
+        // already untrusted by default, but this proves the coercion isn't
+        // loopback-specific plumbing that happens to skip Remote.
+        assert_eq!(
+            effective_origin(PeerOrigin::Remote("10.0.0.5".parse().unwrap()), true, TokenState::Absent),
+            PeerOrigin::Unknown
+        );
+    }
+
+    #[test]
+    fn classify_token_is_absent_valid_or_invalid() {
+        assert_eq!(classify_token("s3cr3t", None), TokenState::Absent);
+        assert_eq!(classify_token("s3cr3t", Some("s3cr3t")), TokenState::Valid);
+        assert_eq!(classify_token("s3cr3t", Some("wrong")), TokenState::Invalid);
+        // A presented token of a DIFFERENT length than expected is still a
+        // clean Invalid, not a panic or an early-return short-circuit.
+        assert_eq!(classify_token("s3cr3t", Some("s3cr3tt")), TokenState::Invalid);
+        assert_eq!(classify_token("s3cr3t", Some("")), TokenState::Invalid);
+    }
+
+    #[test]
+    fn spawn_authorized_always_allows_when_no_token_is_configured() {
+        // THE regression pin for Spawn specifically: `spawn_agent` alone
+        // (rebuild-time admission) still fully gates it when no token is
+        // set — this amendment adds a gate, it doesn't tighten the existing
+        // one on the off-path.
+        for token_state in [TokenState::Absent, TokenState::Invalid, TokenState::Valid] {
+            assert!(spawn_authorized(false, token_state), "token_configured=false must always allow, got {token_state:?}");
+        }
+    }
+
+    #[test]
+    fn spawn_authorized_requires_a_valid_token_once_one_is_configured() {
+        assert!(!spawn_authorized(true, TokenState::Absent));
+        assert!(!spawn_authorized(true, TokenState::Invalid));
+        assert!(spawn_authorized(true, TokenState::Valid));
+    }
+
+    #[test]
+    fn extract_bearer_parses_the_authorization_header_value() {
+        assert_eq!(extract_bearer("Bearer abc123").as_deref(), Some("abc123"));
+        // The scheme name is case-insensitive (RFC 7235 §2.1); extra
+        // whitespace around the token is trimmed.
+        assert_eq!(extract_bearer("bearer   abc123  ").as_deref(), Some("abc123"));
+        assert_eq!(extract_bearer("BEARER abc123").as_deref(), Some("abc123"));
+        // Any other scheme, a missing token, or a malformed header → None.
+        assert_eq!(extract_bearer("Basic dXNlcjpwYXNz"), None);
+        assert_eq!(extract_bearer("Bearer"), None);
+        assert_eq!(extract_bearer("Bearer   "), None);
+        assert_eq!(extract_bearer(""), None);
+    }
+
+    #[test]
+    fn parse_http_request_captures_the_authorization_bearer_header() {
+        let raw = b"POST / HTTP/1.1\r\nAuthorization: Bearer my-token\r\nContent-Length: 2\r\n\r\n{}";
+        let mut r = BufReader::new(std::io::Cursor::new(&raw[..]));
+        let req = parse_http_request(&mut r, Instant::now()).unwrap();
+        assert_eq!(req.bearer.as_deref(), Some("my-token"));
+
+        // No Authorization header at all → None, same as before this field
+        // existed.
+        let raw2 = b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}";
+        let mut r2 = BufReader::new(std::io::Cursor::new(&raw2[..]));
+        let req2 = parse_http_request(&mut r2, Instant::now()).unwrap();
+        assert_eq!(req2.bearer, None);
+    }
+
+    #[test]
+    fn resolve_token_file_prefers_flag_then_env_then_defaults_empty() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_A2A_TOKEN_FILE").ok();
+
+        let mut flags = std::collections::BTreeMap::new();
+        flags.insert("token-file".to_string(), "/flag/path".to_string());
+        let inv = Invocation { path: vec![], args: vec![], flags, door: Door::Cli };
+        std::env::set_var("AOIDE_A2A_TOKEN_FILE", "/env/path");
+        assert_eq!(resolve_token_file(&inv), "/flag/path", "an explicit flag wins outright");
+
+        let inv_no_flag = Invocation {
+            path: vec![],
+            args: vec![],
+            flags: std::collections::BTreeMap::new(),
+            door: Door::Cli,
+        };
+        assert_eq!(resolve_token_file(&inv_no_flag), "/env/path", "falls back to the env var");
+
+        std::env::remove_var("AOIDE_A2A_TOKEN_FILE");
+        assert_eq!(resolve_token_file(&inv_no_flag), "", "defaults to empty (no token required)");
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_A2A_TOKEN_FILE", v),
+            None => std::env::remove_var("AOIDE_A2A_TOKEN_FILE"),
+        }
+    }
+
+    #[test]
+    fn read_expected_token_trims_and_tolerates_absence() {
+        assert_eq!(read_expected_token(""), None, "an empty path is feature-off — no disk read");
+        assert_eq!(
+            read_expected_token("/nonexistent/aoide-a2a-token-file-does-not-exist"),
+            None,
+            "an unreadable path is tolerated as unconfigured, not a hard failure"
+        );
+
+        let dir = std::env::temp_dir().join(format!("aoide-a2a-token-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token");
+        std::fs::write(&path, "  s3cr3t-value\n").unwrap();
+        assert_eq!(
+            read_expected_token(path.to_str().unwrap()),
+            Some("s3cr3t-value".to_string()),
+            "trims surrounding whitespace/newline"
+        );
+
+        std::fs::write(&path, "   \n").unwrap();
+        assert_eq!(
+            read_expected_token(path.to_str().unwrap()),
+            None,
+            "a whitespace-only file is treated as unconfigured"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn message_send_spawn_rejects_without_a_valid_token_once_one_is_configured() {
+        // No contextId → the Spawn arm — spawn_agent is non-empty so
+        // `decide_send_action` resolves to Spawn, and the NEW token gate must
+        // reject it BEFORE `do_spawn` ever runs (so this never actually
+        // spawns a process — the house rule every other error-branch test in
+        // this suite already follows).
+        let params = json!({
+            "message": { "parts": [{ "kind": "text", "text": "hi" }] }
+        });
+        let err = message_send(
+            &params,
+            Path::new("/dev/null"),
+            "claude",
+            PeerOrigin::Loopback,
+            "expected-secret",
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.0, -32005);
+
+        let err2 = message_send(
+            &params,
+            Path::new("/dev/null"),
+            "claude",
+            PeerOrigin::Loopback,
+            "expected-secret",
+            Some("wrong-secret"),
+        )
+        .unwrap_err();
+        assert_eq!(err2.0, -32005);
+    }
+
     #[test]
     fn non_loopback_message_send_is_held_pending_not_delivered() {
         let _guard = crate::env_lock().lock().unwrap();
@@ -1891,7 +2329,7 @@ mod tests {
             "message": { "parts": [{ "kind": "text", "text": "inject me" }], "contextId": id }
         });
         let remote_origin = PeerOrigin::Remote("10.0.0.9".parse().unwrap());
-        let result = message_send(&params, &audit_log, "", remote_origin);
+        let result = message_send(&params, &audit_log, "", remote_origin, "", None);
         let task = result.expect("a pending send is still an Ok Task, not a JSON-RPC error");
         assert_eq!(task["id"], id);
         assert_eq!(
@@ -1977,7 +2415,7 @@ mod tests {
         let params = serde_json::json!({
             "message": { "parts": [{ "kind": "text", "text": "hello loopback" }], "contextId": id }
         });
-        let result = message_send(&params, &audit_log, "", PeerOrigin::Loopback);
+        let result = message_send(&params, &audit_log, "", PeerOrigin::Loopback, "", None);
         let got = acc.join().unwrap();
         assert_eq!(String::from_utf8(got).unwrap(), "hello loopback\n");
 
@@ -1986,6 +2424,142 @@ mod tests {
 
         let log = std::fs::read_to_string(&audit_log).unwrap_or_default();
         assert!(log.contains("\"status\":\"delivered\""), "audited as delivered: {log}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
+    fn loopback_message_send_is_held_pending_once_a_token_is_configured_and_absent() {
+        // The actual gap this amendment closes: a proxy/tunnel makes an
+        // outside caller LOOK loopback to `peer_addr()`. Once the operator
+        // configures a token, an unauthenticated "loopback" caller must no
+        // longer get the automatic pass it used to.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            // Kept SHORT deliberately: XDG_RUNTIME_DIR is set to this root, so
+            // conduct_socket_path() hangs `/aoide/session-<id>.sock` off it and
+            // the whole thing must fit SUN_LEN (107 bytes + NUL).
+            "aoide-a2a-tok-abs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_STATE_DIR", root.join("state"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        let id = "tok-abs-tgt";
+        let socket = aoide_conduct::graph::conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        // If a delivery were WRONGLY attempted, connecting would succeed;
+        // the assertions below prove it never happens.
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![conductable_session(id, &socket)],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let audit_log = root.join("log");
+        let params = serde_json::json!({
+            "message": { "parts": [{ "kind": "text", "text": "spoofed loopback" }], "contextId": id }
+        });
+        let result = message_send(&params, &audit_log, "", PeerOrigin::Loopback, "the-real-token", None);
+        let task = result.expect("a pending send is still an Ok Task, not a JSON-RPC error");
+        assert_eq!(
+            task["status"]["state"], "submitted",
+            "held pending, not the session's unrelated state"
+        );
+        assert!(listener.accept().is_err(), "an unauthenticated 'loopback' send must never touch the socket once a token is configured");
+
+        let pending: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(stage.join("pending.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pending["pending"].as_array().unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
+    fn loopback_message_send_with_a_valid_token_still_auto_delivers() {
+        // The other half of the same coupling: presenting the CORRECT token
+        // restores exactly the original loopback behavior — this amendment
+        // narrows trust, it doesn't remove the ability to be trusted.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            // Kept SHORT deliberately — see the sibling test above for why.
+            "aoide-a2a-tok-ok-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_STATE_DIR", root.join("state"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        let id = "tok-ok-tgt";
+        let socket = aoide_conduct::graph::conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![conductable_session(id, &socket)],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+
+        let audit_log = root.join("log");
+        let params = serde_json::json!({
+            "message": { "parts": [{ "kind": "text", "text": "authenticated loopback" }], "contextId": id }
+        });
+        let result = message_send(
+            &params,
+            &audit_log,
+            "",
+            PeerOrigin::Loopback,
+            "the-real-token",
+            Some("the-real-token"),
+        );
+        let got = acc.join().unwrap();
+        assert_eq!(String::from_utf8(got).unwrap(), "authenticated loopback\n");
+        assert_eq!(result.unwrap()["id"], id);
 
         let _ = std::fs::remove_dir_all(&root);
         match saved_stage {
@@ -2023,6 +2597,7 @@ mod tests {
             name: "trusted-peer".into(),
             url: "http://10.0.0.9:8710/".into(),
             autogate: true,
+            token_file: None,
             added_at: "2026-08-14T00:00:00Z".into(),
         }])
         .unwrap();
@@ -2051,7 +2626,7 @@ mod tests {
             "message": { "parts": [{ "kind": "text", "text": "trusted send" }], "contextId": id }
         });
         let remote_origin = PeerOrigin::Remote("10.0.0.9".parse().unwrap());
-        let result = message_send(&params, &audit_log, "", remote_origin);
+        let result = message_send(&params, &audit_log, "", remote_origin, "", None);
         let got = acc.join().unwrap();
         assert_eq!(
             String::from_utf8(got).unwrap(),
@@ -2067,6 +2642,88 @@ mod tests {
                 serde_json::from_str(&std::fs::read_to_string(&pending_path).unwrap()).unwrap();
             assert!(pending["pending"].as_array().map(Vec::is_empty).unwrap_or(true));
         }
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
+    fn autogated_peer_delivers_via_a_matching_token_even_when_ip_does_not_match() {
+        // The actual replacement for the dead IP match: behind a proxy the
+        // caller's real address is unknowable, but a per-peer TOKEN survives
+        // the hop. No global A2A token is configured here at all — this is
+        // entirely the peer_store-level identification, independent of the
+        // `message_send` expected_token/presented_token plumbing.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            // Kept SHORT deliberately: XDG_RUNTIME_DIR is set to this root, so
+            // conduct_socket_path() hangs `/aoide/session-<id>.sock` off it and
+            // the whole thing must fit SUN_LEN (107 bytes + NUL). The verbose
+            // form of this name plus a verbose session id came to exactly 108.
+            "aoide-a2a-ptok-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let stage = root.join("stage");
+        let state = root.join("state");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        let token_path = root.join("peer.token");
+        std::fs::write(&token_path, "peer-secret\n").unwrap();
+        aoide_storage::peer_store::save_peers(&[aoide_storage::peer_store::Peer {
+            name: "proxied-peer".into(),
+            // A URL that resolves to an address the caller is NOT actually
+            // connecting from — proving delivery here comes from the TOKEN
+            // match, not a coincidental IP match.
+            url: "http://192.0.2.99:8710/".into(),
+            autogate: true,
+            token_file: Some(token_path.to_string_lossy().into_owned()),
+            added_at: "2026-08-18T00:00:00Z".into(),
+        }])
+        .unwrap();
+
+        let id = "ptok-target";
+        let socket = aoide_conduct::graph::conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![conductable_session(id, &socket)],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+
+        let audit_log = root.join("log");
+        let params = serde_json::json!({
+            "message": { "parts": [{ "kind": "text", "text": "token-identified send" }], "contextId": id }
+        });
+        let remote_origin = PeerOrigin::Remote("10.0.0.9".parse().unwrap());
+        let result = message_send(&params, &audit_log, "", remote_origin, "", Some("peer-secret"));
+        let got = acc.join().unwrap();
+        assert_eq!(String::from_utf8(got).unwrap(), "token-identified send\n");
+        assert!(result.is_ok());
 
         let _ = std::fs::remove_dir_all(&root);
         match saved_stage {
@@ -2343,6 +3000,7 @@ mod tests {
             method: method.into(),
             path: path.into(),
             body: body.as_bytes().to_vec(),
+            bearer: None,
         };
         assert_eq!(
             streaming_method(&mk("POST", "/", r#"{"method":"message/stream"}"#)).as_deref(),
@@ -2366,13 +3024,14 @@ mod tests {
     fn unknown_path_is_404_and_wrong_method_on_a_known_path_is_405() {
         let registry = Registry::new();
         let (status, body, _) = route(
-            &HttpRequest { method: "GET".into(), path: "/nope".into(), body: vec![] },
+            &HttpRequest { method: "GET".into(), path: "/nope".into(), body: vec![], bearer: None },
             "127.0.0.1",
             8710,
             Path::new("/dev/null"),
             "",
             "aoide",
             PeerOrigin::Loopback,
+            "",
             &registry,
         );
         assert_eq!(status, 404);
@@ -2384,6 +3043,7 @@ mod tests {
                 method: "GET".into(),
                 path: "/".into(),
                 body: vec![],
+                bearer: None,
             },
             "127.0.0.1",
             8710,
@@ -2391,6 +3051,7 @@ mod tests {
             "",
             "aoide",
             PeerOrigin::Loopback,
+            "",
             &registry,
         );
         assert_eq!(status, 405);
