@@ -63,6 +63,7 @@ use aoide_protocol::registry::{arg, cmd, flag, Registry};
 use aoide_storage::fs as shellbridge;
 use aoide_storage::mode::{self, RiceMode};
 use aoide_storage::takes::{self, TakeRecord};
+use aoide_storage::time::{now_iso_utc, parse_iso_utc};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -105,6 +106,20 @@ pub fn register(r: &mut Registry) {
         gated: false,
         implemented: true,
         handler: handle_rice_take_diff,
+    ));
+    r.insert(cmd!(
+        path: ["rice", "take", "prune"],
+        summary: "Prune takes so the store does not grow without bound: --older-than <Nd|Nh>, --keep <N>, and --all-but-marks select candidates from everything except the head and its whole ancestry, which are never selectable by any flag combination — re-checked at prune time against the live head, not just when the candidates were chosen. Given together, selector flags combine as AND (a take must satisfy every one given). Marked takes are protected unless --force; only then does their letter also leave takes/marks.json. Surviving children of a pruned take re-parent to its parent, so ancestry keeps resolving. A bare invocation (no selector) opens a multi-select picker on a real CLI tty; off a tty it prints a dry run and changes nothing.",
+        args: [],
+        flags: [
+            flag!("older-than", "string", "Prune takes older than this: `<N>d` (days) or `<N>h` (hours), e.g. `7d` or `12h`."),
+            flag!("keep", "int", "Keep only the newest N takes outside the head's ancestry (the head and its ancestry always survive on top of this); the rest become candidates."),
+            flag!("all-but-marks", "bool", "Select the whole eligible pool as candidates (the head/ancestry rail still applies; marked takes still need --force)."),
+            flag!("force", "bool", "Also include marked takes in the candidate set; their letters are dropped from takes/marks.json when pruned."),
+        ],
+        gated: false,
+        implemented: true,
+        handler: handle_rice_take_prune,
     ));
     r.insert(cmd!(
         path: ["rice", "back"],
@@ -169,7 +184,7 @@ fn read_staged_content(cmd: &str) -> Result<(Value, Option<Value>), Outcome> {
     let livery: Value = serde_json::from_str(&raw).map_err(|e| {
         Outcome::error(cmd, format!("staged livery.json is not valid JSON: {e}")).with_data(json!({
             "reason": "invalid-json",
-            "notes": livery_path.to_string_lossy(),
+            "livery": livery_path.to_string_lossy(),
         }))
     })?;
 
@@ -829,6 +844,436 @@ fn handle_rice_take_diff(inv: &Invocation) -> Outcome {
         .collect();
 
     Outcome::ok("rice.take.diff", message).with_data(json!({ "base": base, "diff": entries }))
+}
+
+// ── `rice take prune` — the pressure valve (phase A9, §7.1) ────────────────
+//
+// **Design note, since the plan leaves the exact combination un-spelled-out:**
+// every OTHER verb in this file draws a hard line between "a flag was given"
+// (act immediately, no prompt, no stdin) and "no flag was given" (the tty
+// picker, or off a tty, a refusal/report) — `rice back`'s `--take`/`--mark`
+// vs. its bare dual entrance is the precedent this mirrors exactly. Prune
+// follows the identical split: `--older-than`/`--keep`/`--all-but-marks`
+// are agent-facing and act at once once parsed; the "dry-run shape ... with
+// a confirm" the plan describes IS the bare (no selector) path — on a tty
+// the multi-select picker's own act of choosing rows *is* the confirm (the
+// same shape `rice back`'s picker already uses, no separate y/n prompt —
+// this repo has none anywhere and takes no new dependency to add one); off
+// a tty it degrades to printing the same candidate report and touching
+// nothing, per the plan's own explicit non-tty rule. When more than one
+// selector flag is given they combine as AND (a take must satisfy every
+// given criterion to be a candidate) — the conservative reading, and the
+// only one consistent with `--all-but-marks` (which selects the *whole*
+// eligible pool) composing sensibly with a narrower `--older-than`/`--keep`
+// alongside it rather than fighting it.
+
+/// Parse `--older-than <Nd|Nh>`: a positive integer immediately followed by
+/// exactly one unit letter, `d` (days) or `h` (hours) — `"7d"`, `"12h"`.
+/// Returns the threshold in seconds. Anything else (empty, no digits, a
+/// zero count, a third unit, trailing junk) is `None`, which the caller
+/// turns into a usage error rather than silently rounding or defaulting —
+/// the same "malformed flag is a usage error before anything else runs"
+/// discipline `handle_rice_back`'s own `--take`/`--mark` parsing uses.
+fn parse_older_than(raw: &str) -> Option<u64> {
+    if raw.len() < 2 {
+        return None;
+    }
+    let (digits, unit) = raw.split_at(raw.len() - 1);
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let n: u64 = digits.parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    match unit {
+        "d" => Some(n * 86400),
+        "h" => Some(n * 3600),
+        _ => None,
+    }
+}
+
+/// UTC wall-clock now as Unix epoch seconds — reuses
+/// [`aoide_storage::time::now_iso_utc`]/[`parse_iso_utc`] (the format/parse
+/// pair `aoide-storage` already exports) rather than growing a third
+/// almost-identical epoch helper in this crate for one comparison.
+fn now_epoch() -> i64 {
+    parse_iso_utc(&now_iso_utc()).unwrap_or(0)
+}
+
+/// Everything a prune decision needs, computed off one unlocked read of the
+/// store (the same read-then-decide shape [`resolve_base`]/[`take_lane_rows`]
+/// already use elsewhere in this file — nothing here writes).
+struct PrunePlan {
+    /// The head and its whole ancestry (`aoide_storage::takes::ancestry`,
+    /// walked from the head) — every one of these is excluded BEFORE any
+    /// selector runs, and no flag, including `--force`, can put one back in.
+    /// This is the never-prune-the-ground-you-are-standing-on rail.
+    protected_ancestry: BTreeSet<u32>,
+    /// The takes a selector actually picked — `--older-than`/`--keep`/
+    /// `--all-but-marks` narrowing the eligible pool (all takes minus
+    /// `protected_ancestry`), already filtered to drop a marked take unless
+    /// `force` was set. This is the real candidate set any confirm/selection
+    /// acts on.
+    candidates: Vec<TakeRecord>,
+    /// The subset withheld from `candidates` purely because it carries a
+    /// mark and `force` was not given — reported so a dry run/report can say
+    /// how many are being protected and why.
+    protected_by_mark: Vec<TakeRecord>,
+}
+
+/// Build a [`PrunePlan`] for the routed draft. `older_than`/`keep` are
+/// already-parsed selector values (`None` when their flag was absent);
+/// `all_but_marks` selects the whole eligible pool (still subject to the
+/// ancestry rail and the mark filter) — see the module banner above for why
+/// multiple given selectors combine as AND. `force` decides whether a
+/// marked take can survive into `candidates` at all.
+fn plan_prune(song: &str, draft: &str, older_than: Option<u64>, keep: Option<usize>, force: bool) -> PrunePlan {
+    let all = takes::list_takes(song, draft);
+    let head = takes::load_head(song, draft);
+    let marks = takes::load_marks(song, draft);
+    let marked: BTreeSet<u32> = marks.values().copied().collect();
+
+    let protected_ancestry: BTreeSet<u32> =
+        head.map(|h| takes::ancestry(&all, h).into_iter().collect()).unwrap_or_default();
+
+    let mut pool: Vec<TakeRecord> = all.iter().filter(|t| !protected_ancestry.contains(&t.take)).cloned().collect();
+    pool.sort_by_key(|t| t.take); // ascending — oldest first, newest last.
+
+    if let Some(n) = keep {
+        // The newest `n` (by take number — the store's own monotone mint
+        // order) survive; truncating to the front drops them from the tail,
+        // leaving the "beyond keep" pool as candidates. `n >= pool.len()`
+        // saturates to 0, a no-op truncate — nothing is a candidate then.
+        let cut = pool.len().saturating_sub(n);
+        pool.truncate(cut);
+    }
+    if let Some(threshold) = older_than {
+        let now = now_epoch();
+        pool.retain(|t| match parse_iso_utc(&t.at) {
+            Some(at) => (now - at).max(0) as u64 >= threshold,
+            None => false, // an unreadable `at` is never "old enough" — fail safe.
+        });
+    }
+
+    let (protected_by_mark, candidates): (Vec<TakeRecord>, Vec<TakeRecord>) =
+        pool.iter().cloned().partition(|t| !force && marked.contains(&t.take));
+
+    PrunePlan { protected_ancestry, candidates, protected_by_mark }
+}
+
+/// The result of an actual prune write, assembled inside the lock so nothing
+/// here re-reads state the write already changed underneath it (mirrors
+/// [`BackResult`]'s own discipline).
+struct PruneResult {
+    pruned: Vec<u32>,
+    /// `(take, old_parent, new_parent)` for every SURVIVING take the splice
+    /// actually re-parented.
+    reparented: Vec<(u32, Option<u32>, Option<u32>)>,
+    dropped_marks: Vec<String>,
+    changed: Vec<String>,
+    /// Candidates the CALLER handed in (a [`PrunePlan`] computed unlocked,
+    /// possibly seconds or minutes earlier — the tty picker blocks on human
+    /// input with no lock held in between) that turned out to be the head or
+    /// on its ancestry by the time this actually ran, and were silently
+    /// dropped rather than pruned — see [`prune_unlocked`]'s own doc for why
+    /// a stale plan can disagree with the live store here.
+    skipped_now_protected: Vec<u32>,
+}
+
+/// The unlocked prune core: given an already-decided candidate set (from a
+/// [`PrunePlan`], or hand-picked via the tty picker), splice each one out
+/// with [`aoide_storage::takes::reparent`], persist every surviving take
+/// whose `parent` the splice actually changed, delete every pruned take's
+/// own file, and rewrite `takes/marks.json` in the SAME pass to drop any
+/// letter naming a take this call just removed (advisor verdict D6 — the
+/// prune is exactly the place that knows).
+///
+/// **The head-and-ancestry rail is re-checked HERE, against a FRESH read,
+/// not trusted from `doomed`.** [`plan_prune`] computes its own
+/// `protected_ancestry` unlocked, and the caller that turns a plan into this
+/// call's `doomed` list can be arbitrarily far removed in time from this
+/// function actually running — most concretely, [`prune_picker`] sits
+/// blocked on [`pick::choose_many`] (human input, no lock held) between
+/// computing the plan and calling this. A second door can move the head in
+/// that window (e.g. another agent's `rice back --take 4` while a human is
+/// still staring at a picker that offered take 4 as a candidate), which
+/// would make a plan-time-only check breach "never prune the head or its
+/// ancestry, under ANY flag combination" — the ancestry it checked against
+/// is no longer the live one. So: `before`/`head` are read fresh right here,
+/// `protected_now` is derived from THAT read, and any element of `doomed`
+/// it contains is stripped before anything is spliced or deleted — the same
+/// fail-safe-against-a-race posture `takes::load_head`'s stale-pointer
+/// fallback and [`plan_prune`]'s unreadable-`at` skip already use elsewhere
+/// in this feature, rather than trusting a decision that may already be
+/// wrong.
+///
+/// The (now-filtered) `doomed` is folded one at a time through `reparent`,
+/// and this is order-independent by construction:
+/// [`aoide_storage::takes::reparent`] always looks up the CURRENT (possibly
+/// already-spliced) parent of the take being removed, so a take whose own
+/// parent was ALSO pruned in this same pass still lands its surviving
+/// children on the nearest ancestor that makes it through the whole pass,
+/// however `doomed` happens to be ordered.
+fn prune_unlocked(song: &str, draft: &str, doomed: &[u32]) -> Result<PruneResult, String> {
+    let before = takes::list_takes(song, draft);
+    let head = takes::load_head(song, draft);
+    let protected_now: BTreeSet<u32> = head.map(|h| takes::ancestry(&before, h).into_iter().collect()).unwrap_or_default();
+
+    let mut skipped_now_protected = Vec::new();
+    let doomed: Vec<u32> = doomed
+        .iter()
+        .copied()
+        .filter(|n| {
+            if protected_now.contains(n) {
+                skipped_now_protected.push(*n);
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    let mut after = before.clone();
+    for &n in &doomed {
+        after = takes::reparent(&after, n);
+    }
+
+    // Persist every splice: a surviving take whose `parent` differs between
+    // `before` and `after` must be rewritten so `ancestry` resolves
+    // correctly the next time anything reads it off disk, not just in this
+    // call's own memory.
+    let mut reparented = Vec::new();
+    let mut changed = Vec::new();
+    for rec in &after {
+        let old_parent = before.iter().find(|t| t.take == rec.take).and_then(|t| t.parent);
+        if old_parent != rec.parent {
+            takes::save_take(song, draft, rec).map_err(|e| format!("failed to re-parent take {}: {e}", rec.take))?;
+            changed.push(takes::take_path(song, draft, rec.take).to_string_lossy().into_owned());
+            reparented.push((rec.take, old_parent, rec.parent));
+        }
+    }
+
+    for &n in &doomed {
+        let path = takes::take_path(song, draft, n);
+        if path.is_file() {
+            std::fs::remove_file(&path).map_err(|e| format!("failed to remove take {n}: {e}"))?;
+            changed.push(path.to_string_lossy().into_owned());
+        }
+    }
+
+    let doomed_set: BTreeSet<u32> = doomed.iter().copied().collect();
+    let mut marks = takes::load_marks(song, draft);
+    let mut dropped_marks = Vec::new();
+    marks.retain(|letter, take| {
+        if doomed_set.contains(take) {
+            dropped_marks.push(letter.clone());
+            false
+        } else {
+            true
+        }
+    });
+    if !dropped_marks.is_empty() {
+        takes::save_marks(song, draft, &marks).map_err(|e| format!("failed to write marks.json: {e}"))?;
+        changed.push(takes::marks_path(song, draft).to_string_lossy().into_owned());
+    }
+
+    Ok(PruneResult { pruned: doomed, reparented, dropped_marks, changed, skipped_now_protected })
+}
+
+/// `rice take prune`'s locked entrypoint: exactly ONE `with_stage_lock`
+/// around [`prune_unlocked`]'s whole splice-persist-delete-remark body — the
+/// crate's non-reentrant lock rule (module doc's "Locking discipline"
+/// section), the same shape every other mutator in this file uses.
+fn prune(song: &str, draft: &str, doomed: &[u32]) -> Result<PruneResult, String> {
+    shellbridge::with_stage_lock(|| prune_unlocked(song, draft, doomed))
+}
+
+/// One picker row for a prune candidate — same fields as
+/// [`take_lane_rows`]'s tree rows, minus the tree glyphs (a flat candidate
+/// list has no branches to draw): number, timestamp, cause, and any mark
+/// letters (reusing [`mark_letters_for`]) so a marked-and-`--force`d
+/// candidate is still labeled as one right before the User prunes it.
+fn prune_row(rec: &TakeRecord, marks: &BTreeMap<String, u32>) -> String {
+    let letters = mark_letters_for(marks, rec.take);
+    let mark_part = if letters.is_empty() { String::new() } else { format!(" [{}]", letters.join(",")) };
+    format!("{:04}  {}  {}{mark_part}", rec.take, rec.at, rec.cause)
+}
+
+/// The dry-run report: `Status::Ok`, `changed: []`, nothing written — the
+/// shape both the non-tty bare path and an empty-selection tty path (nothing
+/// left to pick) return. `Ok`, not `Usage`: nothing was asked for that this
+/// refuses, this is the informational default the plan's own "prints the
+/// dry run and changes nothing" describes.
+fn dry_run_outcome(song: &str, draft: &str, plan: &PrunePlan) -> Outcome {
+    let numbers: Vec<u32> = plan.candidates.iter().map(|t| t.take).collect();
+    let message = if numbers.is_empty() {
+        format!(
+            "nothing prunable for {song}/{draft} right now \
+             (pass --older-than/--keep/--all-but-marks, or run on a tty for the picker)"
+        )
+    } else {
+        format!(
+            "would prune {} take(s) for {song}/{draft}: {} \
+             (dry run — pass a selector flag to act, --force to also include marked takes, \
+             or run on a tty to pick)",
+            numbers.len(),
+            numbers.iter().map(|n| format!("{n:04}")).collect::<Vec<_>>().join(", ")
+        )
+    };
+    Outcome::ok("rice.take.prune", message).with_data(json!({
+        "dryRun": true,
+        "candidates": numbers,
+        "protectedByMark": plan.protected_by_mark.iter().map(|t| t.take).collect::<Vec<_>>(),
+        "protectedAncestry": plan.protected_ancestry.iter().copied().collect::<Vec<_>>(),
+    }))
+}
+
+/// Render a completed [`PruneResult`] into `rice take prune`'s success
+/// [`Outcome`] — shared by the flag-driven path and the tty picker's success
+/// arm, mirroring how [`render_back_outcome`] is shared by `rice back`'s two
+/// entrances.
+fn render_prune_outcome(song: &str, draft: &str, result: PruneResult, plan: &PrunePlan) -> Outcome {
+    let reparent_note = if result.reparented.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; re-parented {}",
+            result.reparented.iter().map(|(t, _, _)| format!("{t:04}")).collect::<Vec<_>>().join(", ")
+        )
+    };
+    // A candidate the plan picked can still lose the race against a head
+    // move that happened between planning and this call actually running
+    // (see `prune_unlocked`'s own doc) — surfaced in the message, not just
+    // buried in `data`, since it means fewer takes went than the caller
+    // asked for.
+    let skipped_note = if result.skipped_now_protected.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; {} skipped (became the head or its ancestor before the prune ran): {}",
+            result.skipped_now_protected.len(),
+            result.skipped_now_protected.iter().map(|n| format!("{n:04}")).collect::<Vec<_>>().join(", ")
+        )
+    };
+    let message = format!(
+        "pruned {} take(s) for {song}/{draft}: {}{reparent_note}{skipped_note}",
+        result.pruned.len(),
+        result.pruned.iter().map(|n| format!("{n:04}")).collect::<Vec<_>>().join(", ")
+    );
+    Outcome::ok("rice.take.prune", message).changed(result.changed).with_data(json!({
+        "pruned": result.pruned,
+        "reparented": result.reparented.iter().map(|(t, old, new)| json!({ "take": t, "from": old, "to": new })).collect::<Vec<_>>(),
+        "droppedMarks": result.dropped_marks,
+        "protectedByMark": plan.protected_by_mark.iter().map(|t| t.take).collect::<Vec<_>>(),
+        "skippedNowProtected": result.skipped_now_protected,
+    }))
+}
+
+/// Act on a [`PrunePlan`] whose candidates were selected by a flag
+/// (`--older-than`/`--keep`/`--all-but-marks`) — executes immediately, no
+/// prompt, no stdin, exactly like every other flag-driven verb in this file.
+/// An empty candidate set is still `Ok` ("nothing to prune"), never an
+/// error — the same "idempotent no-op is success" shape
+/// [`snapshot_if_drifted_unlocked`]'s no-drift case uses.
+fn execute_prune(song: &str, draft: &str, plan: &PrunePlan) -> Outcome {
+    let doomed: Vec<u32> = plan.candidates.iter().map(|t| t.take).collect();
+    if doomed.is_empty() {
+        return Outcome::ok("rice.take.prune", format!("nothing to prune for {song}/{draft}")).with_data(json!({
+            "pruned": Vec::<u32>::new(),
+            "protectedByMark": plan.protected_by_mark.iter().map(|t| t.take).collect::<Vec<_>>(),
+        }));
+    }
+    match prune(song, draft, &doomed) {
+        Ok(result) => render_prune_outcome(song, draft, result, plan),
+        Err(e) => Outcome::error("rice.take.prune", format!("prune failed: {e}")).with_data(json!({ "reason": "write-failed" })),
+    }
+}
+
+/// Bare `rice take prune` on a real CLI tty — reached only from
+/// [`handle_rice_take_prune`], only once [`pick::interactive`] has already
+/// said yes. Rows come from `plan.candidates` (the mark filter and the
+/// ancestry rail already applied — a marked take is never even offered
+/// unless `--force` was also passed, and the head/its ancestry are never
+/// rows at all). An empty candidate pool skips the picker outright and
+/// returns the same dry-run report the non-tty path would. Choosing rows
+/// IS the confirm (see the module banner) — there is no separate y/n
+/// prompt.
+fn prune_picker(song: &str, draft: &str, plan: &PrunePlan) -> Outcome {
+    if plan.candidates.is_empty() {
+        return dry_run_outcome(song, draft, plan);
+    }
+    let marks = takes::load_marks(song, draft);
+    let rows: Vec<String> = plan.candidates.iter().map(|t| prune_row(t, &marks)).collect();
+    let prompt = format!("prune which take(s) for {song}/{draft}?");
+    match pick::choose_many(&prompt, &rows, None) {
+        Some(indices) => {
+            let doomed: Vec<u32> = indices.iter().filter_map(|&i| plan.candidates.get(i)).map(|t| t.take).collect();
+            match prune(song, draft, &doomed) {
+                Ok(result) => render_prune_outcome(song, draft, result, plan),
+                Err(e) => Outcome::error("rice.take.prune", format!("prune failed: {e}"))
+                    .with_data(json!({ "reason": "write-failed" })),
+            }
+        }
+        None => {
+            Outcome::usage("rice.take.prune", "no takes selected — aborted").with_data(json!({ "reason": "no-selection" }))
+        }
+    }
+}
+
+/// `rice take prune [--older-than <Nd|Nh>] [--keep <N>] [--all-but-marks]
+/// [--force] [--json]` — the pressure valve (phase A9, §7.1). Flags are
+/// syntax-validated first (a malformed `--older-than`/`--keep` is a usage
+/// error before the draft is even resolved, mirroring every other verb's
+/// flag-first-then-mode-check order in this file), then [`resolve_draft`]
+/// gates on Draft mode, then [`plan_prune`] computes the candidate set once.
+/// A selector flag present (`older-than`/`keep`/`all-but-marks`) acts at
+/// once via [`execute_prune`]; with none given, [`pick::interactive`] routes
+/// a real CLI tty to [`prune_picker`] and everything else (an agent door, or
+/// a `Cli` invocation off a tty) to [`dry_run_outcome`] — see the module
+/// banner for why the split lands exactly here.
+fn handle_rice_take_prune(inv: &Invocation) -> Outcome {
+    let older_than = match inv.flags.get("older-than") {
+        Some(raw) => match parse_older_than(raw) {
+            Some(secs) => Some(secs),
+            None => {
+                return Outcome::usage(
+                    "rice.take.prune",
+                    format!("`--older-than {raw}` is not valid — expected `<N>d` or `<N>h`, e.g. `7d` or `12h`"),
+                )
+                .with_data(json!({ "reason": "invalid-older-than", "olderThan": raw }));
+            }
+        },
+        None => None,
+    };
+    let keep = match inv.flags.get("keep") {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                return Outcome::usage("rice.take.prune", format!("`--keep {raw}` is not a valid count"))
+                    .with_data(json!({ "reason": "invalid-keep", "keep": raw }));
+            }
+        },
+        None => None,
+    };
+    let all_but_marks = inv.flag_present("all-but-marks");
+    let force = inv.flag_present("force");
+    let selector_given = older_than.is_some() || keep.is_some() || all_but_marks;
+
+    let (song, draft) = match resolve_draft("rice.take.prune") {
+        Ok(v) => v,
+        Err(o) => return o,
+    };
+
+    let plan = plan_prune(&song, &draft, older_than, keep, force);
+
+    if selector_given {
+        return execute_prune(&song, &draft, &plan);
+    }
+    if pick::interactive(inv.door) {
+        return prune_picker(&song, &draft, &plan);
+    }
+    dry_run_outcome(&song, &draft, &plan)
 }
 
 // ── `rice back` — the revert that lands the branch-from-any-mark ask ───────
@@ -2832,6 +3277,438 @@ mod tests {
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
         let out = handle_rice_take_diff(&inv_diff(None, None));
+        assert_eq!(out.status, Status::Error);
+        assert_eq!(out.data.unwrap()["reason"], "not-in-draft-mode");
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    // ── `rice take prune` (phase A9, §7.1) ──────────────────────────────
+
+    /// Seed one take directly (bypassing `snapshot`) so a test can control
+    /// `parent`/`at` exactly — the shape every prune test below needs to
+    /// build a tree with specific ages and branch points without minting
+    /// through the stage. Optionally stamps a mark letter onto it in the
+    /// same call.
+    fn seed(song: &str, draft: &str, take: u32, parent: Option<u32>, at: &str, mark: Option<char>) -> TakeRecord {
+        let record = TakeRecord {
+            take,
+            parent,
+            at: at.to_string(),
+            session_id: None,
+            cause: "stage".to_string(),
+            livery: serde_json::json!({}),
+            cover: None,
+        };
+        takes::save_take(song, draft, &record).unwrap();
+        if let Some(c) = mark {
+            let mut marks = takes::load_marks(song, draft);
+            marks.insert(c.to_string(), take);
+            takes::save_marks(song, draft, &marks).unwrap();
+        }
+        record
+    }
+
+    fn inv_prune(older_than: Option<&str>, keep: Option<u32>, all_but_marks: bool, force: bool) -> Invocation {
+        let mut flags = std::collections::BTreeMap::new();
+        if let Some(v) = older_than {
+            flags.insert("older-than".to_string(), v.to_string());
+        }
+        if let Some(k) = keep {
+            flags.insert("keep".to_string(), k.to_string());
+        }
+        if all_but_marks {
+            flags.insert("all-but-marks".to_string(), "true".to_string());
+        }
+        if force {
+            flags.insert("force".to_string(), "true".to_string());
+        }
+        Invocation {
+            path: vec!["rice".to_string(), "take".to_string(), "prune".to_string()],
+            args: vec![],
+            flags,
+            door: aoide_protocol::Door::Cli,
+        }
+    }
+
+    const OLD_AT: &str = "2020-01-01T00:00:00Z";
+
+    // ── parse_older_than: pure, no fs ────────────────────────────────────
+
+    #[test]
+    fn parse_older_than_accepts_days_and_hours() {
+        assert_eq!(parse_older_than("7d"), Some(7 * 86400));
+        assert_eq!(parse_older_than("12h"), Some(12 * 3600));
+        assert_eq!(parse_older_than("1d"), Some(86400));
+    }
+
+    #[test]
+    fn parse_older_than_rejects_malformed_values() {
+        assert_eq!(parse_older_than(""), None, "empty");
+        assert_eq!(parse_older_than("d"), None, "no digits");
+        assert_eq!(parse_older_than("7"), None, "no unit");
+        assert_eq!(parse_older_than("0d"), None, "a zero count");
+        assert_eq!(parse_older_than("7x"), None, "an unknown unit");
+        assert_eq!(parse_older_than("-7d"), None, "a negative count");
+    }
+
+    // ── plan_prune: the ancestry rail holds at the planning layer itself ──
+
+    #[test]
+    fn plan_prune_never_lets_the_head_or_its_ancestry_into_candidates_even_with_force() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, song, draft) = routed_draft("prune-plan-ancestry-rail");
+        seed(&song, &draft, 1, None, OLD_AT, None);
+        seed(&song, &draft, 2, Some(1), OLD_AT, None);
+        seed(&song, &draft, 3, Some(2), OLD_AT, None);
+        seed(&song, &draft, 4, Some(1), OLD_AT, None); // a branch off root 1, not on head 3's line.
+        takes::save_head(&song, &draft, 3).unwrap();
+
+        let plan = plan_prune(&song, &draft, None, None, true); // force=true changes nothing about the rail.
+        assert_eq!(plan.protected_ancestry, BTreeSet::from([1, 2, 3]));
+        let candidate_numbers: Vec<u32> = plan.candidates.iter().map(|t| t.take).collect();
+        assert_eq!(candidate_numbers, vec![4], "only the off-line branch is ever a candidate");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── the handler: dual entrance ───────────────────────────────────────
+
+    #[test]
+    fn prune_bare_non_tty_prints_the_dry_run_and_changes_nothing() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, song, draft) = routed_draft("prune-dry-run");
+        seed(&song, &draft, 1, None, OLD_AT, None);
+        seed(&song, &draft, 2, Some(1), OLD_AT, None);
+        takes::save_head(&song, &draft, 1).unwrap();
+
+        let before_count = takes::list_takes(&song, &draft).len();
+        let before_marks = takes::load_marks(&song, &draft);
+
+        // No selector flag, and cargo test's stdin/stdout are never a real
+        // tty, so `pick::interactive` reads false here exactly like
+        // `rice back`'s own bare-non-tty test relies on.
+        let out = handle_rice_take_prune(&inv_prune(None, None, false, false));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        let data = out.data.unwrap();
+        assert_eq!(data["dryRun"], true);
+        assert_eq!(data["candidates"], json!([2]));
+        assert!(out.changed.is_empty(), "a dry run changes nothing");
+        assert_eq!(takes::list_takes(&song, &draft).len(), before_count, "no take removed");
+        assert_eq!(takes::load_marks(&song, &draft), before_marks, "marks.json untouched");
+        assert!(takes::load_take(&song, &draft, 2).is_some(), "take 2 still on disk");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_never_selects_the_head_or_its_ancestry_under_force_and_all_but_marks() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, song, draft) = routed_draft("prune-force-ancestry-rail");
+        seed(&song, &draft, 1, None, OLD_AT, None);
+        seed(&song, &draft, 2, Some(1), OLD_AT, None);
+        seed(&song, &draft, 3, Some(2), OLD_AT, None); // head's line: 1 <- 2 <- 3
+        seed(&song, &draft, 4, Some(1), OLD_AT, None); // off-line branch, off root
+        seed(&song, &draft, 5, Some(2), OLD_AT, None); // off-line branch, off 2
+        takes::save_head(&song, &draft, 3).unwrap();
+
+        let out = handle_rice_take_prune(&inv_prune(None, None, true, true)); // --all-but-marks --force
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert_eq!(out.data.unwrap()["pruned"], json!([4, 5]));
+        assert_eq!(takes::load_head(&song, &draft), Some(3), "head untouched");
+        for n in [1u32, 2, 3] {
+            assert!(takes::load_take(&song, &draft, n).is_some(), "take {n} on the head's ancestry survives --force");
+        }
+        assert!(takes::load_take(&song, &draft, 4).is_none());
+        assert!(takes::load_take(&song, &draft, 5).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_keep_n_keeps_the_newest_n_eligible_takes() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, song, draft) = routed_draft("prune-keep-n");
+        seed(&song, &draft, 1, None, OLD_AT, None);
+        for n in 2u32..=6 {
+            seed(&song, &draft, n, Some(1), OLD_AT, None);
+        }
+        takes::save_head(&song, &draft, 1).unwrap();
+
+        let out = handle_rice_take_prune(&inv_prune(None, Some(2), false, false));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert_eq!(out.data.unwrap()["pruned"], json!([2, 3, 4]), "the newest 2 (5, 6) are kept");
+        assert!(takes::load_take(&song, &draft, 5).is_some());
+        assert!(takes::load_take(&song, &draft, 6).is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_keep_n_exceeding_the_take_count_prunes_nothing() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, song, draft) = routed_draft("prune-keep-exceeds");
+        seed(&song, &draft, 1, None, OLD_AT, None);
+        seed(&song, &draft, 2, Some(1), OLD_AT, None);
+        takes::save_head(&song, &draft, 1).unwrap();
+
+        let out = handle_rice_take_prune(&inv_prune(None, Some(100), false, false));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert_eq!(out.data.unwrap()["pruned"], json!([]));
+        assert!(out.changed.is_empty());
+        assert!(takes::load_take(&song, &draft, 2).is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_older_than_selects_only_takes_past_the_threshold() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, song, draft) = routed_draft("prune-older-than");
+        seed(&song, &draft, 1, None, OLD_AT, None);
+        seed(&song, &draft, 2, Some(1), OLD_AT, None); // 2020 — well past any sane threshold.
+        seed(&song, &draft, 3, Some(1), &now_iso_utc(), None); // just minted — never "old enough".
+        takes::save_head(&song, &draft, 1).unwrap();
+
+        let out = handle_rice_take_prune(&inv_prune(Some("1d"), None, false, false));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert_eq!(out.data.unwrap()["pruned"], json!([2]));
+        assert!(takes::load_take(&song, &draft, 3).is_some(), "too recent to be a candidate");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_older_than_malformed_value_is_a_usage_error_that_changes_nothing() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, song, draft) = routed_draft("prune-older-than-bad");
+        seed(&song, &draft, 1, None, OLD_AT, None);
+        seed(&song, &draft, 2, Some(1), OLD_AT, None);
+        takes::save_head(&song, &draft, 1).unwrap();
+        let before = takes::list_takes(&song, &draft).len();
+
+        let out = handle_rice_take_prune(&inv_prune(Some("nonsense"), None, false, false));
+        assert_eq!(out.status, Status::Usage);
+        assert_eq!(out.data.unwrap()["reason"], "invalid-older-than");
+        assert_eq!(takes::list_takes(&song, &draft).len(), before, "nothing was pruned");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_keep_malformed_value_is_a_usage_error() {
+        let out = handle_rice_take_prune(&Invocation {
+            path: vec!["rice".to_string(), "take".to_string(), "prune".to_string()],
+            args: vec![],
+            flags: std::collections::BTreeMap::from([("keep".to_string(), "nope".to_string())]),
+            door: aoide_protocol::Door::Cli,
+        });
+        assert_eq!(out.status, Status::Usage);
+        assert_eq!(out.data.unwrap()["reason"], "invalid-keep");
+    }
+
+    #[test]
+    fn prune_marks_survive_by_default_and_go_under_force_dropping_the_letter_from_the_map() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, song, draft) = routed_draft("prune-marks-protection");
+        seed(&song, &draft, 1, None, OLD_AT, None);
+        seed(&song, &draft, 2, Some(1), OLD_AT, Some('A'));
+        seed(&song, &draft, 3, Some(1), OLD_AT, None);
+        takes::save_head(&song, &draft, 1).unwrap();
+
+        // Without --force, the marked take (2) is protected — only 3 goes.
+        let out = handle_rice_take_prune(&inv_prune(None, None, true, false));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert_eq!(out.data.unwrap()["pruned"], json!([3]));
+        assert!(takes::load_take(&song, &draft, 2).is_some(), "marked take survives by default");
+        assert_eq!(takes::load_marks(&song, &draft).get("A"), Some(&2));
+
+        // With --force, the marked take is now a candidate too, and its
+        // letter leaves the map in the SAME pass.
+        let out = handle_rice_take_prune(&inv_prune(None, None, true, true));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert_eq!(out.data.unwrap()["pruned"], json!([2]));
+        assert!(takes::load_take(&song, &draft, 2).is_none());
+        assert!(
+            takes::load_marks(&song, &draft).get("A").is_none(),
+            "the mark's letter no longer names a deleted take"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── the prune core: splice, cascade, orphans ─────────────────────────
+
+    #[test]
+    fn prune_reparents_surviving_children_and_ancestry_still_resolves() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, song, draft) = routed_draft("prune-splice");
+        seed(&song, &draft, 1, None, OLD_AT, None);
+        seed(&song, &draft, 2, Some(1), OLD_AT, None);
+        seed(&song, &draft, 3, Some(2), OLD_AT, None);
+        seed(&song, &draft, 4, Some(2), OLD_AT, None);
+        takes::save_head(&song, &draft, 1).unwrap();
+
+        let result = prune(&song, &draft, &[2]).unwrap();
+        assert_eq!(result.pruned, vec![2]);
+        let mut reparented = result.reparented.clone();
+        reparented.sort_by_key(|(t, _, _)| *t);
+        assert_eq!(reparented, vec![(3, Some(2), Some(1)), (4, Some(2), Some(1))]);
+        assert!(takes::load_take(&song, &draft, 2).is_none());
+        assert_eq!(takes::load_take(&song, &draft, 3).unwrap().parent, Some(1));
+        assert_eq!(takes::load_take(&song, &draft, 4).unwrap().parent, Some(1));
+        assert_eq!(takes::ancestry(&takes::list_takes(&song, &draft), 3), vec![3, 1]);
+        assert_eq!(takes::ancestry(&takes::list_takes(&song, &draft), 4), vec![4, 1]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A splice target that is ITSELF pruned in the same pass — grandchildren
+    /// must land on the nearest SURVIVING ancestor, and this must hold
+    /// regardless of which order the doomed takes are folded in.
+    #[test]
+    fn prune_cascades_through_a_splice_target_that_is_also_pruned_in_the_same_pass() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+
+        for (tag, order) in [("prune-cascade-fwd", [9u32, 17]), ("prune-cascade-rev", [17, 9])] {
+            let (root, song, draft) = routed_draft(tag);
+            seed(&song, &draft, 1, None, OLD_AT, None);
+            seed(&song, &draft, 9, Some(1), OLD_AT, None);
+            seed(&song, &draft, 17, Some(9), OLD_AT, None);
+            seed(&song, &draft, 25, Some(17), OLD_AT, None);
+            takes::save_head(&song, &draft, 1).unwrap();
+
+            let result = prune(&song, &draft, &order).unwrap();
+            let mut pruned = result.pruned.clone();
+            pruned.sort_unstable();
+            assert_eq!(pruned, vec![9, 17], "order {order:?}");
+            assert_eq!(
+                takes::load_take(&song, &draft, 25).unwrap().parent,
+                Some(1),
+                "grandchild lands on the nearest surviving ancestor regardless of fold order {order:?}"
+            );
+            assert_eq!(takes::ancestry(&takes::list_takes(&song, &draft), 25), vec![25, 1]);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn prune_an_orphan_take_is_prunable_and_does_not_corrupt_the_store() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, song, draft) = routed_draft("prune-orphan");
+        seed(&song, &draft, 1, None, OLD_AT, None);
+        seed(&song, &draft, 2, Some(999), OLD_AT, None); // dangling parent — A6 established this is reachable.
+        takes::save_head(&song, &draft, 1).unwrap();
+
+        let result = prune(&song, &draft, &[2]).unwrap();
+        assert_eq!(result.pruned, vec![2]);
+        assert!(result.reparented.is_empty(), "the orphan has no children to splice");
+        assert!(takes::load_take(&song, &draft, 2).is_none());
+        let remaining = takes::list_takes(&song, &draft);
+        assert_eq!(remaining.iter().map(|t| t.take).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(takes::ancestry(&remaining, 1), vec![1], "the surviving root is untouched");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The rail's real defense-in-depth: `doomed` here plays the role of a
+    /// PLAN computed unlocked, possibly well before this actually runs (the
+    /// tty picker blocks on human input in between with no lock held — see
+    /// `prune_unlocked`'s own doc). Simulate the race directly: hand `prune`
+    /// a `doomed` list naming the CURRENT head, exactly as if another door
+    /// had moved the head there after a plan was computed but before the
+    /// human confirmed a selection that included it. The fresh re-check
+    /// inside `prune_unlocked` must strip it rather than trust the list.
+    #[test]
+    fn prune_re_checks_the_ancestry_rail_against_a_fresh_read_and_skips_a_stale_candidate() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, song, draft) = routed_draft("prune-stale-plan-race");
+        seed(&song, &draft, 1, None, OLD_AT, None);
+        seed(&song, &draft, 2, Some(1), OLD_AT, None); // now the head — as if `rice back --take 2` raced the plan.
+        seed(&song, &draft, 3, Some(1), OLD_AT, None); // a genuine, still-off-ancestry candidate.
+        takes::save_head(&song, &draft, 2).unwrap();
+
+        // A stale plan that offered both 2 and 3 as candidates before the
+        // head moved to 2 — `prune_unlocked` must not trust it verbatim.
+        let result = prune(&song, &draft, &[2, 3]).unwrap();
+        assert_eq!(result.pruned, vec![3], "the now-protected candidate never reaches the doomed set");
+        assert_eq!(result.skipped_now_protected, vec![2]);
+        assert!(takes::load_take(&song, &draft, 2).is_some(), "the take that raced into being the head survives");
+        assert_eq!(takes::load_take(&song, &draft, 2).unwrap().parent, Some(1), "and is untouched, not just un-deleted");
+        assert!(takes::load_take(&song, &draft, 3).is_none());
+        assert_eq!(takes::load_head(&song, &draft), Some(2), "the head itself is exactly where it raced to");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Same race, but the stale candidate is on the LIVE HEAD'S ANCESTRY
+    /// rather than being the head itself — the rail re-check walks the
+    /// whole ancestry fresh, not just a bare `head == n` comparison.
+    #[test]
+    fn prune_re_checks_the_whole_fresh_ancestry_not_just_the_bare_head() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, song, draft) = routed_draft("prune-stale-plan-ancestry-race");
+        seed(&song, &draft, 1, None, OLD_AT, None);
+        seed(&song, &draft, 2, Some(1), OLD_AT, None); // about to become the head's PARENT.
+        seed(&song, &draft, 3, Some(2), OLD_AT, None); // the new head.
+        takes::save_head(&song, &draft, 3).unwrap();
+
+        let result = prune(&song, &draft, &[2]).unwrap();
+        assert_eq!(result.pruned, Vec::<u32>::new());
+        assert_eq!(result.skipped_now_protected, vec![2]);
+        assert!(takes::load_take(&song, &draft, 2).is_some());
+        assert_eq!(takes::load_take(&song, &draft, 3).unwrap().parent, Some(2), "no splice ran — 2 was never touched");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `changed` must list only paths this call actually wrote or deleted —
+    /// a candidate the fresh rail re-check strips must not show up as
+    /// "changed" when nothing about it changed at all.
+    #[test]
+    fn prune_changed_never_lists_a_path_the_rail_re_check_stripped() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, song, draft) = routed_draft("prune-changed-accuracy-stale");
+        seed(&song, &draft, 1, None, OLD_AT, None);
+        seed(&song, &draft, 2, Some(1), OLD_AT, None); // races into being the head.
+        seed(&song, &draft, 3, Some(1), OLD_AT, None); // genuinely pruned.
+        takes::save_head(&song, &draft, 2).unwrap();
+
+        let result = prune(&song, &draft, &[2, 3]).unwrap();
+        let take2_path = takes::take_path(&song, &draft, 2).to_string_lossy().into_owned();
+        assert!(!result.changed.contains(&take2_path), "take 2 was skipped, not touched — must not be reported as changed");
+        assert_eq!(result.changed, vec![takes::take_path(&song, &draft, 3).to_string_lossy().into_owned()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other way `changed` could over-report: a doomed number whose file
+    /// was ALREADY gone by the time this ran (a second racing prune, or a
+    /// hand removal) — `path.is_file()` is false, nothing is removed, and
+    /// that must not be reported as a change either.
+    #[test]
+    fn prune_changed_never_lists_a_doomed_take_whose_file_was_already_gone() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let (root, song, draft) = routed_draft("prune-changed-accuracy-already-gone");
+        seed(&song, &draft, 1, None, OLD_AT, None);
+        seed(&song, &draft, 2, Some(1), OLD_AT, None);
+        takes::save_head(&song, &draft, 1).unwrap();
+        std::fs::remove_file(takes::take_path(&song, &draft, 2)).unwrap(); // simulate a concurrent removal.
+
+        let result = prune(&song, &draft, &[2]).unwrap();
+        assert!(result.changed.is_empty(), "nothing was actually removed by THIS call");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_refuses_outside_draft_mode() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let stage = unique_tmp("prune-not-draft");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_take_prune(&inv_prune(None, None, true, false));
         assert_eq!(out.status, Status::Error);
         assert_eq!(out.data.unwrap()["reason"], "not-in-draft-mode");
         let _ = std::fs::remove_dir_all(&stage);

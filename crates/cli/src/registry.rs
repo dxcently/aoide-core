@@ -145,6 +145,7 @@ mod tests {
             "rice.take.diff",
             "rice.take.list",
             "rice.take.mark",
+            "rice.take.prune",
             "rice.transpose",
             "schema",
             "screen.diff",
