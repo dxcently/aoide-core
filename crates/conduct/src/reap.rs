@@ -31,7 +31,7 @@
 //!     hooks on its own cadence is proven alive by its fresh hook `updatedAt`.
 //! And three ghosts that answer NO to every signal above and are dead anyway:
 //! a record whose evidence all predates the machine's own boot instant (see
-//! [`pre_boot_ghosts`] — the case a recycled pid shields forever), a sub-agent
+//! [`pre_boot_ghosts`] — the case a recycled pid shields forever), a dependent
 //! node whose parent has left the roster entirely (see [`orphaned_subagents`]),
 //! and the control socket a killed `conduct` left in `$XDG_RUNTIME_DIR` (see
 //! [`sweep_orphan_sockets`] — not a session record at all, but this sweep's
@@ -519,7 +519,7 @@ fn pre_boot_ghosts(
         .collect()
 }
 
-/// Sub-agent records whose parent is gone from the roster entirely. PURE —
+/// Dependent records whose parent is gone from the roster entirely. PURE —
 /// `is_recent` is injected.
 ///
 /// A `subagent` node exists only inside its parent's Task-tool call: its id is
@@ -531,11 +531,19 @@ fn pre_boot_ghosts(
 /// a parentless root node, and there it sits for its full staleness band
 /// (2h mid-turn, 72h at rest) still claiming to be working.
 ///
-/// Narrow on purpose: only a record whose parent id is EMPTY or names a
-/// session that is not in the roster AT ALL. A parent that is present but
-/// `done` is the cascade's business and is left to it. `is_recent` spares an
-/// infant, since a reap racing the hook door's own write would otherwise judge
-/// a record whose parent link is a moment away.
+/// The same blind spot swallows a HOOK-ONLY top-level agent (no pid, no
+/// windowAddress — every liveness signal blind by construction) whose host
+/// terminal's record has left the roster: the host is reaped only once its
+/// window AND its pid are both gone, so a gone parent means a dead terminal,
+/// and a dead terminal's claude is dead with it. That case is taken here too —
+/// but only on a PRESENT-but-gone parent link: an absent parent is the normal
+/// project-anchored shape for a top-level agent, never evidence of death.
+///
+/// Narrow on purpose: for sub-agents, only a record whose parent id is EMPTY
+/// or names a session that is not in the roster AT ALL. A parent that is
+/// present but `done` is the cascade's business and is left to it. `is_recent`
+/// spares an infant, since a reap racing the hook door's own write would
+/// otherwise judge a record whose parent link is a moment away.
 fn orphaned_subagents(
     sessions: &[SessionRecord],
     is_recent: impl Fn(&SessionRecord) -> bool,
@@ -544,14 +552,22 @@ fn orphaned_subagents(
     sessions
         .iter()
         .filter(|s| s.state != "done")
-        .filter(|s| s.kind.as_deref() == Some("subagent") || s.session_id.starts_with("sub:"))
         .filter(|s| !is_recent(s))
         .filter(|s| {
-            s.parent_session_id
+            let parent = s
+                .parent_session_id
                 .as_deref()
                 .map(str::trim)
-                .filter(|p| !p.is_empty())
-                .is_none_or(|p| !known.contains(p))
+                .filter(|p| !p.is_empty());
+            if s.kind.as_deref() == Some("subagent") || s.session_id.starts_with("sub:") {
+                // A sub-agent owns nothing — parentless is parentless.
+                parent.is_none_or(|p| !known.contains(p))
+            } else if is_agent_kind(s) && s.pid.is_none() && s.window_address.is_empty() {
+                // The hook-only agent: signal-blind without its host terminal.
+                parent.is_some_and(|p| !known.contains(p))
+            } else {
+                false
+            }
         })
         .map(|s| s.session_id.clone())
         .collect()
@@ -968,8 +984,9 @@ fn reap_inner(
         }
     }
 
-    // And the parentless sub-agents — nodes hanging off a Task call whose
-    // parent is no longer in the roster at all (see `orphaned_subagents`).
+    // And the parentless dependents — nodes hanging off a Task call whose
+    // parent is no longer in the roster at all, and hook-only agents whose
+    // host terminal's record has left the same way (see `orphaned_subagents`).
     // Same settle grace as the dedup above, so an infant awaiting its own
     // parent link is never judged.
     for id in orphaned_subagents(&s_file.sessions, is_recent) {
@@ -2114,6 +2131,42 @@ mod tests {
             orphaned_subagents(&[bare], |_| false),
             vec!["sub:t1".to_string()],
         );
+    }
+
+    #[test]
+    fn orphaned_hook_only_agents_follow_a_gone_host_but_never_an_absent_parent() {
+        // The live case this widened for: a hook-only claude (no pid, no
+        // window — every signal blind) whose host terminal's record was
+        // already reaped out of the roster.
+        let agent = |id: &str, parent: Option<&str>| {
+            let mut s = hook_only(id, "idle");
+            s.kind = Some("agent".into());
+            s.parent_session_id = parent.map(str::to_string);
+            s
+        };
+        let mut with_window = agent("kept-has-window", Some("host-reaped-away"));
+        with_window.window_address = "0xabc".into();
+        let mut with_pid = agent("kept-has-pid", Some("host-reaped-away"));
+        with_pid.pid = Some(123);
+        let sessions = vec![
+            hook_only("host-live", "working"),
+            agent("orphan-host-gone", Some("host-reaped-away")),
+            agent("kept-host-live", Some("host-live")),
+            // An absent/blank parent is the normal project-anchored shape —
+            // never evidence of death.
+            agent("kept-no-parent", None),
+            agent("kept-blank-parent", Some("   ")),
+            // A record with its own signal is that signal's business, not the
+            // orphan sweep's.
+            with_window,
+            with_pid,
+        ];
+
+        let got = orphaned_subagents(&sessions, |_| false);
+        assert_eq!(got, vec!["orphan-host-gone".to_string()]);
+
+        // The settle grace spares an infant here too.
+        assert!(orphaned_subagents(&sessions, |_| true).is_empty());
     }
 
     #[test]
