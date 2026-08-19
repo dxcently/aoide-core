@@ -17,7 +17,7 @@ WHAT AOIDE IS (don't conflate the two):
   * AoideOS is the DISTRIBUTION built on that core — the NixOS flake that
     ADDITIONALLY ships the Quickshell widget-making toolkit (bar, dock,
     gadgets, the DAG/conductor surfaces) and the specialized ricer (the
-    song/notes theming engine). Aoide is the engine; AoideOS is the desktop
+    song/livery theming engine). Aoide is the engine; AoideOS is the desktop
     around it. A capability that is 'Aoide' works with only a shell; one that
     is 'AoideOS' is desktop/Quickshell/rice.
 
@@ -41,7 +41,7 @@ Tier 1 — the CLI (full capability)
   manage saved variants) → `rice declare <name>` (USER gates this) → commit +
   gated rebuild.
   Replay: a committed song is host-agnostic — any host performs it by naming it
-  in nix (`aoide.song = \"<name>\";`); the notes fan-out swaps, the venue keeps
+  in nix (`aoide.song = \"<name>\";`); the livery fan-out swaps, the venue keeps
   its own instruments. `sonata` is the shipped standard.
   Graph: `aoide graph view` renders the project/session DAG (projects anchor
   sessions by cwd; spawned-by edges nest sessions); `graph project add`,
