@@ -115,6 +115,7 @@ mod tests {
             "graph.session.hook",
             "graph.session.phase",
             "graph.session.start",
+            "graph.spawn",
             "graph.view",
             "graph.wrap",
             "guide",

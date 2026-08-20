@@ -756,6 +756,10 @@ fn spawn_inject_prompt(id: &str, prompt: &str) {
 /// (`std::env::current_exe()`), `setsid`'d so it survives this handler
 /// thread, stdio nulled, and reaped on a parked thread (see below) — it
 /// stays parented to the long-lived `a2a serve` daemon for its whole life.
+/// `aoide-conduct`'s `graph spawn` (P2 of the conducted-agents plan) now
+/// generalizes exactly this detach/register/reap shape as its own verb; a
+/// later phase can have this handler ride on it instead of hand-rolling the
+/// same mechanics here.
 fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path) -> Result<Value, (i64, String)> {
     let id = format!("a2a-{}-{}", std::process::id(), unix_ts_now());
     let aoide_bin = std::env::current_exe()

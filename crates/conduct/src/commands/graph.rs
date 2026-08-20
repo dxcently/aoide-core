@@ -132,6 +132,21 @@ pub fn register(r: &mut Registry) {
         examples: ["graph wrap --agent codex -- codex --model x"],
     ));
     r.insert(cmd!(
+        path: ["graph", "spawn"],
+        summary: "Spawn ANY agent command as a DETACHED headless conducted session that outlives this call: re-execs `conduct --headless`, waits briefly for it to register its control socket, and returns. Exports AOIDE_SESSION_ID to the child same as `conduct`/`wrap`. An optional --prompt is injected through the one gated injection door (`graph send --yes --submit`) once registration succeeds; skipped (honestly reported) if it never does.",
+        args: [arg!("command", "string", true, "The wrapped command and its args — put them after `--` so the child's own flags pass through verbatim.")],
+        flags: [
+            flag!("agent", "string", "Agent name for the roster (default: the command's basename)."),
+            flag!("parent", "string", "Spawning session id — records the spawned-by edge (passed through to `conduct`)."),
+            flag!("id", "string", "Session id override (default spawn-<pid>-<unixts>)."),
+            flag!("prompt", "string", "A first turn to inject once the session registers (skipped, honestly reported, if it never does)."),
+        ],
+        gated: false,
+        implemented: true,
+        handler: crate::graph::session_spawn,
+        examples: ["graph spawn --agent codex -- codex --model x"],
+    ));
+    r.insert(cmd!(
         path: ["graph", "send"],
         summary: "Inject text into a conducted session's control socket (the one gated injection door). Held pending approval by default; --yes (or an autogate policy) delivers and auto-renames the node to a one-line form of the text — except for a bare keystroke answer (text with no letters, e.g. a permission verdict digit), which is not a task and leaves the node's name alone. Every outcome is audited.",
         args: [arg!("text", "string", true, "The text to inject — put it after `--` so its own words/flags pass through verbatim.")],

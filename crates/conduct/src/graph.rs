@@ -21,6 +21,7 @@ mod pending;
 mod permit;
 mod send;
 mod session_store;
+mod spawn;
 #[cfg(test)]
 pub(crate) mod testutil;
 mod verbs;
@@ -50,6 +51,10 @@ pub use self::pending::{pending_approve, pending_deny, pending_list};
 pub use self::permit::{answer_summons, session_permit, summons_card_id};
 pub use self::send::{session_hook, session_send};
 pub use self::session_store::{session_end, session_phase, session_start, session_wrap};
+// `graph spawn` (P2 of the conducted-agents plan): the detached sibling of
+// `conduct`/`wrap` that re-execs `conduct --headless` and returns without
+// waiting on the agent's own lifetime — see `graph/spawn.rs`'s module doc.
+pub use self::spawn::session_spawn;
 pub use self::verbs::{emit, link, project_add, project_list, project_remove, prune, view};
 pub use self::window::{focus, focus_session, focus_window, run_hypr_window_listener, FocusError};
 
