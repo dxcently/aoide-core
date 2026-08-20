@@ -37,16 +37,16 @@ pub const TAIL_BYTES: u64 = 64 * 1024;
 /// even when the raw read (and thus the stripped line count) holds more.
 pub const TAIL_LINES: usize = 400;
 
-/// The stripper's state machine. Only [`Csi`](State::Csi) and
-/// [`Osc`](State::Osc) sequences are actually parsed to their real
-/// terminator; every other escape ([`Esc`](State::Esc) landing on neither
-/// `[` nor `]`) is a one-byte-and-done heuristic, not a real parser for the
-/// dozens of other ESC-prefixed sequences a terminal understands. That is
-/// deliberate: this reader mirrors pty output, it does not emulate a
-/// terminal (see the module doc). A sequence like `ESC ( B` (select ASCII
-/// as G0) is two bytes past the ESC; the heuristic eats the `(` and returns
-/// to `Normal`, so the `B` prints as if it were ordinary text. Documented,
-/// not fixed — see `esc_non_csi_osc_leaks_its_final_byte` below.
+/// The stripper's state machine. [`Csi`](State::Csi) and [`Osc`](State::Osc)
+/// parse to their real terminator; [`EscIntermediate`](State::EscIntermediate)
+/// parses the third ECMA-48 sequence family — an intermediate byte
+/// (`0x20..=0x2F`) followed eventually by a final byte (`0x30..=0x7E`), e.g.
+/// `ESC ( B` (select ASCII as G0). That is still tokenizing by the standard's
+/// byte-class rules, not vt100 emulation — no cursor/colour semantics are
+/// interpreted, only "where does this sequence end." What is left as a
+/// one-byte-and-done heuristic is the two-byte Fp/Fs family (`ESC 7`, `ESC
+/// M`, `ESC =`, ...) — those have no intermediate byte, so "consume the one
+/// byte after ESC" is already exactly correct for them, not a shortcut.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum State {
     /// Ordinary text.
@@ -62,6 +62,10 @@ enum State {
     /// Inside OSC, just saw an `ESC`; one more byte decides whether it
     /// completes the `ESC \` terminator.
     OscEsc,
+    /// Inside a non-CSI, non-OSC escape that has an ECMA-48 intermediate
+    /// byte (`0x20..=0x2F`), e.g. the `(` of `ESC ( B` — swallowing further
+    /// intermediates until a final byte (`0x30..=0x7E`) ends it.
+    EscIntermediate,
 }
 
 /// Strip terminal escape sequences and non-`\n`/`\t`/`\r` control bytes from
@@ -101,9 +105,13 @@ fn strip_ansi(input: &str) -> String {
             }
             (State::Esc, '[') => State::Csi,
             (State::Esc, ']') => State::Osc,
-            // Any other ESC: the "one following byte" heuristic. Dropped,
-            // whatever it was — see the `State` doc for the known leak when
-            // the real sequence was longer than two bytes.
+            // ECMA-48 intermediate byte: a non-CSI/OSC escape with a real
+            // terminator to find (e.g. the `(` of `ESC ( B`) — go find it
+            // instead of guessing at one byte.
+            (State::Esc, c) if (0x20..=0x2f).contains(&(c as u32)) => State::EscIntermediate,
+            // Everything else is a two-byte Fp/Fs escape (`ESC 7`, `ESC M`,
+            // `ESC =`, ...) — no intermediate byte, so consuming this one
+            // byte and returning to Normal is exactly correct, not a guess.
             (State::Esc, _) => State::Normal,
             (State::Csi, c) if (0x40..=0x7e).contains(&(c as u32)) => State::Normal,
             (State::Csi, _) => State::Csi,
@@ -116,6 +124,10 @@ fn strip_ansi(input: &str) -> String {
             // an OSC body is itself malformed input, not worth a second
             // heuristic layered on top of the first).
             (State::OscEsc, _) => State::Osc,
+            // Stay put on further intermediates; a final byte ends the
+            // sequence and drops back to plain text.
+            (State::EscIntermediate, c) if (0x30..=0x7e).contains(&(c as u32)) => State::Normal,
+            (State::EscIntermediate, _) => State::EscIntermediate,
         };
     }
     out
@@ -125,10 +137,22 @@ fn strip_ansi(input: &str) -> String {
 ///
 /// Pipeline: lossy UTF-8 decode (raw bytes are "not necessarily valid
 /// UTF-8", CONTRACTS §4) → strip escapes/control bytes ([`strip_ansi`]) →
-/// split on `\n` → per line, keep only the text after the last `\r` (a
-/// spinner or progress bar overwrites the same line with `\r`, never `\n`;
-/// keeping everything before it would print every frame) → trim trailing
-/// whitespace. Blank lines are kept — they're honest chatter, not noise.
+/// normalize `\r\n` to `\n` → split on `\n` → per line, keep only the text
+/// after the last remaining `\r` (a spinner or progress bar overwrites the
+/// same line with `\r`, never `\n`; keeping everything before it would
+/// print every frame) → trim trailing whitespace. Blank lines are kept —
+/// they're honest chatter, not noise.
+///
+/// The `\r\n` normalization exists because real logs are not `\n`-terminated:
+/// every headless session runs its child in raw mode, and every substantial
+/// log sampled from `state/sessions/*.log` has `\r\n` count exactly equal to
+/// `\n` count (242/242, 182/182, 350/350) — CRLF line endings are the normal
+/// shape here, not an edge case. Without this step the terminating `\r` of
+/// every line reads as "the last `\r`," and the after-last-`\r` rule above
+/// keeps the empty tail past it — every line renders blank. Normalizing
+/// first removes exactly the `\r` that immediately precedes a `\n`, so a
+/// genuine mid-line spinner `\r` (never followed by `\n`) still reaches the
+/// per-line collapse untouched.
 ///
 /// `truncated` (from [`tail_file`]: did the read start mid-file?) drops the
 /// first line unconditionally. One rule, two reasons: a truncated read may
@@ -141,7 +165,7 @@ fn strip_ansi(input: &str) -> String {
 /// Finally, windows to the last `max_lines`.
 pub fn render_tail(bytes: &[u8], truncated: bool, max_lines: usize) -> Vec<String> {
     let text = String::from_utf8_lossy(bytes);
-    let stripped = strip_ansi(&text);
+    let stripped = strip_ansi(&text).replace("\r\n", "\n");
     if stripped.is_empty() {
         return Vec::new();
     }
@@ -162,13 +186,18 @@ pub fn render_tail(bytes: &[u8], truncated: bool, max_lines: usize) -> Vec<Strin
 /// Read the tail of a headless session's log file.
 ///
 /// Opens `path`, seeks to `len.saturating_sub(`[`TAIL_BYTES`]`)`, and reads
-/// to EOF — never [`std::fs::read_to_string`] or a full [`Read::read_to_end`]
-/// from byte 0. The log is append-only and unrotated (CONTRACTS §4 ~829), so
-/// whole-file reads are the one mistake that grows without bound. Any IO
-/// failure (missing file, permission, mid-read error) yields an empty tail
-/// rather than propagating — the same "missing = empty" convention
-/// `App::load_json` uses elsewhere in this crate; a headless session whose
-/// log briefly doesn't exist yet is not a crash.
+/// at most [`TAIL_BYTES`] — never [`std::fs::read_to_string`] or an
+/// unbounded [`Read::read_to_end`] from byte 0. The log is append-only and
+/// unrotated (CONTRACTS §4 ~829), so whole-file reads are the one mistake
+/// that grows without bound. The read is capped with [`Read::take`], not
+/// just seeked-past: `metadata().len()` and the read are two syscalls, and
+/// the file can grow between them (a headless session's log is being
+/// appended to live), so seeking on the stale length alone would not bound
+/// how much a since-grown file hands back. Any IO failure (missing file,
+/// permission, mid-read error) yields an empty tail rather than
+/// propagating — the same "missing = empty" convention `App::load_json`
+/// uses elsewhere in this crate; a headless session whose log briefly
+/// doesn't exist yet is not a crash.
 pub fn tail_file(path: &Path, max_lines: usize) -> Vec<String> {
     let Ok(mut file) = File::open(path) else {
         return Vec::new();
@@ -179,7 +208,7 @@ pub fn tail_file(path: &Path, max_lines: usize) -> Vec<String> {
         return Vec::new();
     }
     let mut buf = Vec::new();
-    if file.read_to_end(&mut buf).is_err() {
+    if file.take(TAIL_BYTES).read_to_end(&mut buf).is_err() {
         return Vec::new();
     }
     render_tail(&buf, start > 0, max_lines)
@@ -208,15 +237,58 @@ mod tests {
     }
 
     #[test]
-    fn esc_non_csi_osc_leaks_its_final_byte() {
+    fn esc_non_csi_osc_intermediate_sequence_leaks_nothing() {
         // ESC ( B — select ASCII as G0 — is a real, common terminal
-        // sequence (three bytes: ESC, '(', 'B'), but this stripper only
-        // truly parses CSI and OSC. The one-byte heuristic eats the ESC and
-        // the '(' and returns to Normal, so the trailing 'B' prints as
-        // ordinary text. Documented in the `State` doc as the accepted
-        // cost of not depending on a vt100 crate.
+        // sequence: ESC, then one ECMA-48 intermediate byte ('('), then a
+        // final byte ('B'). EscIntermediate tokenizes to that final byte
+        // instead of guessing at one, so nothing from the sequence prints.
         let raw = b"before\x1b(Bafter";
-        assert_eq!(render_tail(raw, false, 10), vec!["beforeBafter"]);
+        assert_eq!(render_tail(raw, false, 10), vec!["beforeafter"]);
+    }
+
+    #[test]
+    fn crlf_terminated_lines_survive_real_pty_shape() {
+        // Real pty logs (raw-mode child, sampled from state/sessions/*.log)
+        // terminate EVERY line with `\r\n`, not bare `\n` — `\r\n` count
+        // equals `\n` count exactly in every substantial sampled log
+        // (242/242, 182/182, 350/350). This is the normal shape, not an
+        // edge case, and it is deliberately mixed here with ANSI styling
+        // AND one genuine mid-line spinner `\r` (three progress frames on
+        // one line, no `\n` between them, only a trailing `\r\n` at the
+        // end) to prove the two `\r` uses don't get confused for each
+        // other.
+        let raw = [
+            b"\x1b[1;32mstatus: running\x1b[0m\r\n".as_slice(),
+            b"build output line one\r\n".as_slice(),
+            b"downloading |=   | 10%\rdownloading |==  | 50%\rdownloading |====| 100%\r\n"
+                .as_slice(),
+            b"build output line two\r\n".as_slice(),
+        ]
+        .concat();
+        let lines = render_tail(&raw, false, 10);
+        assert_eq!(
+            lines,
+            vec![
+                "status: running",
+                "build output line one",
+                "downloading |====| 100%",
+                "build output line two",
+                "",
+            ]
+        );
+        // (a) every real content line survived non-blank — the historical
+        // bug collapsed all of these to "" because the CRLF terminator read
+        // as "the last \r" on every line.
+        for line in &lines[..lines.len() - 1] {
+            assert!(!line.is_empty(), "a content line went blank: {lines:?}");
+        }
+        // (b) the spinner line still collapsed to its last frame, not all
+        // three concatenated.
+        assert_eq!(lines[2], "downloading |====| 100%");
+        // (c) no bare \r survived into any rendered line.
+        for line in &lines {
+            assert!(!line.contains('\r'), "bare \\r leaked into {line:?}");
+        }
     }
 
     #[test]
