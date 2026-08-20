@@ -1,5 +1,5 @@
 //! The ratatui view layer — top-level layout, the five panel widgets, the
-//! status bar, and the help overlay.
+//! status bar, and two overlays: help and the headless-session log tail.
 //!
 //! This replaces the hand-rolled differential renderer + the `Vec<String>`
 //! panels: ratatui owns the double buffer and the diff now, so every panel is a
@@ -27,7 +27,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListSt
 use ratatui::Frame;
 
 /// Compose the whole screen: brand header, tab strip, the active panel filling
-/// the body, and the status line — then the help overlay when open.
+/// the body, and the status line — then the help or log-tail overlay when
+/// either is open (mutually exclusive by construction — see [`crate::app`]).
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
     let rows = Layout::vertical([
@@ -45,6 +46,9 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     if app.help_open {
         draw_help(f, area, app);
+    }
+    if app.tail.is_some() {
+        draw_log_tail(f, area, app);
     }
 }
 
@@ -269,31 +273,42 @@ fn detail_lines<'a>(rows: &[DagRow], app: &App) -> Vec<Line<'a>> {
             let st = theme::state_style(&rec.state, pal);
             let merged = app.merged();
             let chain = parent_chain(&rec.session_id, &merged);
+            let mut header_spans = vec![
+                Span::raw("  "),
+                Span::styled(format!("{} ", theme::state_glyph(&rec.state)), st),
+                Span::raw(format!("{}   ", rec.session_id)),
+                Span::styled(
+                    format!(
+                        "agent {}   ",
+                        if rec.agent.is_empty() {
+                            "?"
+                        } else {
+                            &rec.agent
+                        }
+                    ),
+                    theme::dim(),
+                ),
+                Span::styled(format!("state {}", rec.state), st),
+            ];
+            // `log_path` is the CONTRACTS §4-exact headless marker
+            // (`App::cue_session`'s own branch) — a headless session has no
+            // window to report, so the header names it explicitly rather
+            // than let a stale/spawner `window_address` mislead.
+            if rec.log_path.is_some() {
+                header_spans.push(Span::styled("   headless", theme::dim()));
+            }
             let mut lines = vec![
                 rule,
-                Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(format!("{} ", theme::state_glyph(&rec.state)), st),
-                    Span::raw(format!("{}   ", rec.session_id)),
-                    Span::styled(
-                        format!(
-                            "agent {}   ",
-                            if rec.agent.is_empty() {
-                                "?"
-                            } else {
-                                &rec.agent
-                            }
-                        ),
-                        theme::dim(),
-                    ),
-                    Span::styled(format!("state {}", rec.state), st),
-                ]),
+                Line::from(header_spans),
                 Line::from(format!("  cwd     {}", rec.cwd)),
-                Line::from(format!(
-                    "  window  {}   started {}",
-                    theme::disp(&rec.window_address),
-                    theme::disp(&rec.started_at)
-                )),
+                match rec.log_path.as_deref() {
+                    Some(path) => Line::from(format!("  log     {path}")),
+                    None => Line::from(format!(
+                        "  window  {}   started {}",
+                        theme::disp(&rec.window_address),
+                        theme::disp(&rec.started_at)
+                    )),
+                },
             ];
             if let Some(model) = rec.model.as_deref().filter(|m| !m.is_empty()) {
                 lines.push(Line::from(format!("  model   {model}")));
@@ -595,6 +610,49 @@ fn palette_summary<'a>(app: &App) -> Line<'a> {
     Line::from(spans)
 }
 
+// ── Log-tail overlay ────────────────────────────────────────────────────────
+
+/// The headless-session log tail — Enter's other destination
+/// ([`crate::app::App::cue_session`]), painted the same modal way
+/// [`draw_help`] is: `Clear` the region under it, float a framed panel over
+/// the frame, centered at ~90% of the screen. A no-op when `app.tail` is
+/// `None` (the caller in [`draw`] already gates this).
+fn draw_log_tail(f: &mut Frame, area: Rect, app: &App) {
+    let Some(tail) = &app.tail else { return };
+
+    let w = (area.width as u32 * 9 / 10) as u16;
+    let h = (area.height as u32 * 9 / 10) as u16;
+    let rect = centered(w, h, area);
+
+    f.render_widget(Clear, rect);
+
+    // The subtitle is the record's honesty clause verbatim (see
+    // `crate::logtail`'s module doc): this is a stripped mirror of raw pty
+    // bytes, not a terminal — a full-screen TUI in the log reads back as its
+    // own redraw chatter.
+    let block = panel_block(&format!("{} — headless log", tail.session_id), app).title(
+        Line::from(Span::styled(
+            " stripped mirror · not a terminal ",
+            theme::dim(),
+        ))
+        .right_aligned(),
+    );
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let mut lines: Vec<Line> = vec![Line::from(tail.path.display().to_string()).style(theme::dim())];
+    if tail.lines.is_empty() {
+        lines.push(Line::from("(none yet)").style(theme::dim()));
+    } else {
+        let body_h = (inner.height as usize).saturating_sub(1).max(1);
+        let start = tail.lines.len().saturating_sub(body_h);
+        for l in &tail.lines[start..] {
+            lines.push(Line::from(l.as_str()).style(theme::dim()));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 // ── Help overlay ────────────────────────────────────────────────────────────
 
 fn draw_help(f: &mut Frame, area: Rect, app: &App) {
@@ -607,12 +665,13 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         "  DAG (the visual graph)",
         "    j / k            walk nodes (preorder)",
         "    g / G            jump to first / last node",
-        "    Enter            cue: jump to the session's window",
+        "    Enter            cue window · tail the log if headless",
         "    p / e            prune done · emit graph.json",
         "    ◆ project  ● session   ⟨tag⟩ read-only tag",
         "",
         "  SESSIONS",
-        "    Enter            cue window (or fold a group)",
+        "    Enter            cue window · tail the log if headless",
+        "    Esc / q          close the log tail (Enter also closes it)",
         "    h / l            fold / unfold the group",
         "    L                link the session under a parent",
         "    a / d            add / remove a project anchor",
@@ -806,6 +865,58 @@ mod tests {
     }
 
     #[test]
+    fn sessions_panel_detail_shows_log_path_and_headless_for_a_headless_session() {
+        let mut rec = session("s1", "/home/k/Aoide", "running", None);
+        rec.log_path = Some("/home/k/Aoide/state/sessions/s1.log".into());
+        let mut app = app_with(
+            vec![Project {
+                name: "aoide".into(),
+                path: "/home/k/Aoide".into(),
+            }],
+            vec![rec],
+        );
+        app.dag_sel = 1; // row 0 is the ◆ aoide group header; row 1 is the session
+        let out = render_panel(&app, Panel::Sessions, 100, 30);
+        assert!(
+            out.contains("log     /home/k/Aoide/state/sessions/s1.log"),
+            "log path line in the detail card: {out}"
+        );
+        assert!(
+            out.contains("headless"),
+            "dim headless marker on the header line: {out}"
+        );
+        assert!(
+            !out.contains("window "),
+            "no window line for a headless session: {out}"
+        );
+    }
+
+    #[test]
+    fn sessions_panel_detail_windowed_session_renders_unchanged() {
+        let mut app = app_with(
+            vec![Project {
+                name: "aoide".into(),
+                path: "/home/k/Aoide".into(),
+            }],
+            vec![session("s1", "/home/k/Aoide", "running", None)],
+        );
+        app.dag_sel = 1; // row 0 is the ◆ aoide group header; row 1 is the session
+        let out = render_panel(&app, Panel::Sessions, 100, 30);
+        assert!(
+            out.contains("window  0xs1   started s1"),
+            "a windowed session's detail line is byte-identical to before: {out}"
+        );
+        assert!(
+            !out.contains("headless"),
+            "no headless marker for a windowed session: {out}"
+        );
+        assert!(
+            !out.contains("log     "),
+            "no log line for a windowed session: {out}"
+        );
+    }
+
+    #[test]
     fn sessions_panel_shows_model_on_roster_row_and_detail_card_for_a_subagent() {
         let mut root = session("root", "/home/k/Aoide", "running", None);
         root.model = Some("claude-sonnet-5".into());
@@ -921,5 +1032,82 @@ mod tests {
         assert!(out.contains("aoide conductor — keys"), "overlay title present");
         assert!(out.contains("cycle panels"));
         assert!(out.contains("read-only tag"), "DAG tag legend documented");
+        assert!(
+            out.contains("tail the log if headless"),
+            "Enter's headless branch is documented: {out}"
+        );
+        assert!(
+            out.contains("close the log tail"),
+            "the log-tail overlay's close keys are documented: {out}"
+        );
+    }
+
+    /// A throwaway on-disk log the overlay tests point `App::open_tail` at —
+    /// `LogTail::mtime` is private to `app.rs`, so a real (bounded) read via
+    /// the public `App::open_tail` is the only way to populate `app.tail`
+    /// from here. The `lines` field is public, so once opened the fixture
+    /// overwrites it with canned content.
+    fn app_with_tail(session_id: &str, lines: Vec<String>, tag: &str) -> App {
+        let dir = std::env::temp_dir().join(format!(
+            "aoide-ui-tail-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.log");
+        std::fs::write(&path, "seed\n").unwrap();
+        let mut rec = session(session_id, "/tmp", "running", None);
+        rec.log_path = Some(path.to_string_lossy().into_owned());
+        let mut app = App::for_test(vec![], vec![rec.clone()], vec![]);
+        app.open_tail(&rec);
+        if let Some(t) = app.tail.as_mut() {
+            t.lines = lines;
+        }
+        app
+    }
+
+    #[test]
+    fn log_tail_overlay_stamps_title_mirror_clause_path_and_content() {
+        let app = app_with_tail("s1", vec!["line one".into(), "line two".into()], "content");
+        let backend = TestBackend::new(90, 34);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let out = dump(term.backend().buffer());
+        assert!(
+            out.contains("s1 — headless log"),
+            "overlay title names the session: {out}"
+        );
+        assert!(
+            out.contains("stripped mirror") && out.contains("not a terminal"),
+            "the honesty-clause subtitle is painted: {out}"
+        );
+        assert!(out.contains(".log"), "the log path line is painted: {out}");
+        assert!(out.contains("line two"), "tail content is painted: {out}");
+    }
+
+    #[test]
+    fn log_tail_overlay_shows_none_yet_when_lines_are_empty() {
+        let app = app_with_tail("s1", Vec::new(), "empty");
+        let backend = TestBackend::new(90, 34);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let out = dump(term.backend().buffer());
+        assert!(out.contains("(none yet)"), "empty tail says so: {out}");
+    }
+
+    #[test]
+    fn log_tail_overlay_title_survives_a_long_session_id_at_a_narrow_width() {
+        // The point of this fixture is width, not id realism: a title far
+        // longer than the frame it must be drawn into, at a width far
+        // narrower than the title text — this must not panic (saturating
+        // arithmetic throughout `draw_log_tail`/`centered`).
+        let long_id = "s".repeat(200);
+        let app = app_with_tail(&long_id, vec!["hi".into()], "long-id");
+        let backend = TestBackend::new(12, 8);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
     }
 }
