@@ -684,13 +684,28 @@ fn session_ref_lookup(id: &str) -> Option<SessionRef> {
 ///   `pending.json` and reports `delivered:false`, never touching the
 ///   socket. No pending-queue logic is reimplemented here.
 ///
+/// Build a `submitted`-state Task keyed on `session_id`/`contextId`
+/// (NOT `task_get`, which would report the SESSION's current phase — an
+/// unrelated prior turn's state — rather than "this particular message is
+/// queued"). Shared by [`do_inject`]'s held-pending arm and `message_send`'s
+/// uniform-response guard (CONTRACTS.md §6 amendment, 2026-08-20, #50) so
+/// the two "the caller gets an honest immediate `submitted` receipt, the
+/// real state shows up later via `tasks/get`/SSE" shapes cannot drift apart.
+fn submitted_task(session_id: &str) -> Value {
+    let task = Task {
+        id: session_id.to_string(),
+        context_id: session_id.to_string(),
+        status: TaskStatus { state: "submitted".to_string(), timestamp: now_iso_utc() },
+        kind: "task".to_string(),
+    };
+    serde_json::to_value(&task).expect("Task always serializes")
+}
+
 /// A delivered send returns the freshly-reloaded Task (unchanged from
-/// before). A held-pending send returns a Task in `submitted` state built
-/// directly (NOT `task_get`, which would report the SESSION's current
-/// phase — an unrelated prior turn's state — rather than "this particular
-/// message is queued") so the synchronous JSON-RPC caller gets an honest
-/// immediate response; `tasks/get`/the SSE stream reflect the real session
-/// state once/if a human approves and delivers it.
+/// before). A held-pending send returns [`submitted_task`]'s Task so the
+/// synchronous JSON-RPC caller gets an honest immediate response;
+/// `tasks/get`/the SSE stream reflect the real session state once/if a
+/// human approves and delivers it.
 fn do_inject(
     session_id: &str,
     prompt: &str,
@@ -723,13 +738,7 @@ fn do_inject(
     if delivered {
         task_get(session_id)
     } else {
-        let task = Task {
-            id: session_id.to_string(),
-            context_id: session_id.to_string(),
-            status: TaskStatus { state: "submitted".to_string(), timestamp: now_iso_utc() },
-            kind: "task".to_string(),
-        };
-        Ok(serde_json::to_value(&task).expect("Task always serializes"))
+        Ok(submitted_task(session_id))
     }
 }
 
@@ -875,6 +884,24 @@ fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path) -> Result<Value, (i
 /// - Spawn gained a gate it never had at all: [`token_authorized`] must pass
 ///   before [`do_spawn`] runs. This is the actual must-fix gap this
 ///   amendment closes — Spawn was origin-blind AND token-blind before it.
+///
+/// **Amendment (2026-08-20, #50): a context-id send answers UNIFORMLY, not
+/// with a hard gate, once a token is configured and the caller holds
+/// neither a valid one nor an autogate match.** `message/send`'s Inject arm
+/// used to run [`session_ref_lookup`] regardless of auth — an
+/// unauthenticated caller could tell a real `contextId` from a bogus one by
+/// the response shape (`-32001` vs an injected/queued Task), and a REAL id
+/// got queued into `pending.json` with no credential at all. A hard `-32005`
+/// here (mirroring Spawn) would be wrong instead: enrolled peers authenticate
+/// via their OWN per-peer token
+/// ([`aoide_storage::peer_store::is_autogated_peer_token`]), never the
+/// server-wide one, and outbound clients send no bearer whatsoever — see the
+/// grounding above. So the guard below fires only when NEITHER credential
+/// matches, and answers with the exact same synthetic `submitted` Task
+/// [`do_inject`]'s own held-pending arm returns ([`submitted_task`]) —
+/// without ever resolving whether the id names a real session, so it never
+/// reads `sessions.json` and never touches `pending.json`. Spawn (no
+/// `contextId`, or `spawn_asked`) is untouched and keeps its own `-32005`.
 fn message_send(
     params: &Value,
     audit_log: &Path,
@@ -886,17 +913,44 @@ fn message_send(
     let (prompt, context_id, spawn_asked) = parse_message_send_params(params);
     let token_configured = !expected_token.is_empty();
     let token_state = classify_token(expected_token, presented_token);
+
+    // Autogate signals hoisted ABOVE the send-action decision: the uniform-
+    // response guard below needs them BEFORE `decide_send_action` even runs,
+    // and the Inject arm further down still needs them AFTER — one
+    // `load_peers()` per `message_send` call, not two. Values and their
+    // meaning are unchanged from before this amendment; only WHEN they're
+    // computed moved.
+    let peers = aoide_storage::peer_store::load_peers();
+    let ip_autogate = match origin {
+        PeerOrigin::Remote(ip) => aoide_storage::peer_store::is_autogated_peer_addr(&peers, ip),
+        PeerOrigin::Loopback | PeerOrigin::Unknown => false,
+    };
+    let token_autogate = presented_token
+        .map(|t| aoide_storage::peer_store::is_autogated_peer_token(&peers, t))
+        .unwrap_or(false);
+    let autogate_match = ip_autogate || token_autogate;
+
+    // Uniform-response guard (see the amendment above) — mirrors
+    // `decide_send_action`'s OWN `spawn_asked`/`context_id` split exactly
+    // (`context_id.is_some() && !spawn_asked` is that function's "past this
+    // point it's a lookup, not a spawn" condition, negated the same way), so
+    // a request can never classify "spawn" for this gate and "send" for the
+    // decision or vice versa.
+    if token_configured && token_state != TokenState::Valid && !autogate_match && context_id.is_some() && !spawn_asked {
+        let id = context_id.as_deref().expect("context_id.is_some() checked above");
+        let _ = audit(
+            audit_log,
+            Door::A2a,
+            EventClass::Audit,
+            "a2a.message/send",
+            "unauthorized",
+            &format!("uniform submitted Task for context `{id}` — no valid token, no autogate match (#50)"),
+        );
+        return Ok(submitted_task(id));
+    }
+
     match decide_send_action(context_id.as_deref(), spawn_asked, spawn_agent, session_ref_lookup) {
         SendAction::Inject { session_id } => {
-            let peers = aoide_storage::peer_store::load_peers();
-            let ip_autogate = match origin {
-                PeerOrigin::Remote(ip) => aoide_storage::peer_store::is_autogated_peer_addr(&peers, ip),
-                PeerOrigin::Loopback | PeerOrigin::Unknown => false,
-            };
-            let token_autogate = presented_token
-                .map(|t| aoide_storage::peer_store::is_autogated_peer_token(&peers, t))
-                .unwrap_or(false);
-            let autogate_match = ip_autogate || token_autogate;
             let eff_origin = effective_origin(origin, token_configured, token_state);
             let deliver_now = should_deliver_now(eff_origin, autogate_match);
             do_inject(&session_id, &prompt, audit_log, deliver_now)
@@ -2829,11 +2883,18 @@ mod tests {
     }
 
     #[test]
-    fn loopback_message_send_is_held_pending_once_a_token_is_configured_and_absent() {
-        // The actual gap this amendment closes: a proxy/tunnel makes an
-        // outside caller LOOK loopback to `peer_addr()`. Once the operator
-        // configures a token, an unauthenticated "loopback" caller must no
-        // longer get the automatic pass it used to.
+    fn loopback_message_send_gets_the_uniform_answer_once_a_token_is_configured_and_absent() {
+        // The actual gap the 2026-08-19 amendment closed: a proxy/tunnel
+        // makes an outside caller LOOK loopback to `peer_addr()`. Once the
+        // operator configures a token, an unauthenticated "loopback" caller
+        // must no longer get the automatic pass it used to.
+        //
+        // Superseded by the 2026-08-20 (#50) uniform-response amendment: this
+        // scenario now hits the uniform guard BEFORE `decide_send_action`
+        // even runs, so it no longer queues into `pending.json` at all — it
+        // used to (a hold-pending Task, one queued entry); now it's a
+        // synthetic submitted Task and the queue stays untouched, closing
+        // the unauthenticated-queue-write half of #50.
         let _guard = crate::env_lock().lock().unwrap();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
@@ -2872,18 +2933,24 @@ mod tests {
             "message": { "parts": [{ "kind": "text", "text": "spoofed loopback" }], "contextId": id }
         });
         let result = message_send(&params, &audit_log, "", PeerOrigin::Loopback, "the-real-token", None);
-        let task = result.expect("a pending send is still an Ok Task, not a JSON-RPC error");
+        let task = result.expect("the uniform arm always answers Ok, never a JSON-RPC error");
         assert_eq!(
             task["status"]["state"], "submitted",
-            "held pending, not the session's unrelated state"
+            "the uniform synthetic Task, not the session's unrelated state"
         );
         assert!(listener.accept().is_err(), "an unauthenticated 'loopback' send must never touch the socket once a token is configured");
 
-        let pending: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(stage.join("pending.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(pending["pending"].as_array().unwrap().len(), 1);
+        // #50: the uniform arm never resolves the id, so it never queues —
+        // no `pending.json` entry, unlike this scenario's pre-#50 behavior.
+        let pending_path = stage.join("pending.json");
+        if pending_path.exists() {
+            let pending: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&pending_path).unwrap()).unwrap();
+            assert!(
+                pending["pending"].as_array().map(Vec::is_empty).unwrap_or(true),
+                "an unauthenticated 'loopback' send must never feed the approval queue"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&root);
         match saved_stage {
@@ -3116,6 +3183,368 @@ mod tests {
         let got = acc.join().unwrap();
         assert_eq!(String::from_utf8(got).unwrap(), "token-identified send\n");
         assert!(result.is_ok());
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    // ── Uniform-response guard, #50 (CONTRACTS.md §6 amendment, 2026-08-20) ──
+    //
+    // Once a token is configured, an unauthenticated `message/send` naming a
+    // contextId must be impossible to distinguish from the outside whether
+    // that id names a real conductable session, a known-but-not-conductable
+    // one, or nothing at all — and must never touch `pending.json`. These
+    // tests drive `message_send` directly, same house style as the
+    // non-loopback pending-gate tests above.
+
+    fn non_conductable_session(id: &str) -> SessionRecord {
+        fixture_session(id, "working", None)
+    }
+
+    #[test]
+    fn uniform_response_hides_existence_and_never_queues_when_unauthenticated() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-uniform-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_STATE_DIR", root.join("state"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        let real_id = "real-target";
+        let noncond_id = "noncond-target";
+        let bogus_id = "bogus-target"; // never written to sessions.json at all
+
+        let real_socket = aoide_conduct::graph::conduct_socket_path(real_id);
+        std::fs::create_dir_all(real_socket.parent().unwrap()).unwrap();
+        // If the guard wrongly fell through to do_inject, connecting here
+        // would succeed — proving it never happens is the point.
+        let real_listener = UnixListener::bind(&real_socket).unwrap();
+        real_listener.set_nonblocking(true).unwrap();
+
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![conductable_session(real_id, &real_socket), non_conductable_session(noncond_id)],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let audit_log = root.join("log");
+
+        // Both "no bearer at all" and "a wrong bearer" must land on the same
+        // uniform answer — this is TokenState::Absent vs TokenState::Invalid,
+        // both non-Valid.
+        for presented in [None, Some("wrong-tok")] {
+            let mut shapes = Vec::new();
+            for id in [real_id, bogus_id, noncond_id] {
+                let params = serde_json::json!({
+                    "message": { "parts": [{ "kind": "text", "text": "probe" }], "contextId": id }
+                });
+                // Loopback origin too — the uniform answer holds even for the
+                // origin that would otherwise get the automatic trust pass.
+                let result = message_send(&params, &audit_log, "", PeerOrigin::Loopback, "s3cr3t", presented);
+                let task = result.expect("uniform arm always answers Ok, never a JSON-RPC error");
+                assert_eq!(task["id"], id);
+                assert_eq!(task["contextId"], id);
+                assert_eq!(task["status"]["state"], "submitted");
+                assert_eq!(task["kind"], "task");
+                assert!(task["status"]["timestamp"].as_str().unwrap().ends_with('Z'));
+
+                let mut normalized = task.clone();
+                normalized["id"] = serde_json::Value::Null;
+                normalized["contextId"] = serde_json::Value::Null;
+                normalized["status"]["timestamp"] = serde_json::Value::Null;
+                shapes.push(normalized);
+            }
+            assert_eq!(shapes[0], shapes[1], "real vs bogus id: byte-identical shape modulo id/timestamp");
+            assert_eq!(shapes[0], shapes[2], "real vs non-conductable id: byte-identical shape modulo id/timestamp");
+        }
+
+        // Never touched the real session's control socket.
+        assert!(real_listener.accept().is_err(), "the uniform arm must never attempt delivery");
+
+        // Never wrote pending.json — no queue write for any of the three.
+        let pending_path = stage.join("pending.json");
+        if pending_path.exists() {
+            let pending: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&pending_path).unwrap()).unwrap();
+            assert!(
+                pending["pending"].as_array().map(Vec::is_empty).unwrap_or(true),
+                "unauthenticated sends must never feed the approval queue"
+            );
+        }
+
+        let log = std::fs::read_to_string(&audit_log).unwrap_or_default();
+        assert!(log.contains("\"door\":\"a2a\""), "audited through Door::A2a: {log}");
+        assert!(log.contains("\"status\":\"unauthorized\""), "audited as unauthorized: {log}");
+        assert!(log.contains("a2a.message/send"), "reuses message/send's own audit label: {log}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
+    fn uniform_response_guard_lets_a_valid_bearer_reach_the_real_decision() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-uniform-valid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_STATE_DIR", root.join("state"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        let real_id = "valid-real-target";
+        let noncond_id = "valid-noncond-target";
+        let bogus_id = "valid-bogus-target";
+
+        let real_socket = aoide_conduct::graph::conduct_socket_path(real_id);
+        std::fs::create_dir_all(real_socket.parent().unwrap()).unwrap();
+        let real_listener = UnixListener::bind(&real_socket).unwrap();
+        real_listener.set_nonblocking(true).unwrap();
+
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![conductable_session(real_id, &real_socket), non_conductable_session(noncond_id)],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let audit_log = root.join("log");
+        // Remote + no registered autogate peer, so a real send is held
+        // pending rather than delivered — same as the pre-#50 Inject arm,
+        // and it proves `do_inject` (not the uniform guard) ran: only that
+        // path writes `pending.json`.
+        let remote_origin = PeerOrigin::Remote("10.0.0.9".parse().unwrap());
+
+        let params = serde_json::json!({
+            "message": { "parts": [{ "kind": "text", "text": "authed send" }], "contextId": real_id }
+        });
+        let result = message_send(&params, &audit_log, "", remote_origin, "s3cr3t", Some("s3cr3t"));
+        let task = result.expect("a valid bearer still resolves the real Inject decision");
+        assert_eq!(task["id"], real_id);
+        assert_eq!(task["status"]["state"], "submitted");
+        assert!(real_listener.accept().is_err(), "not auto-delivered — held pending, same as before #50");
+
+        let pending: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(stage.join("pending.json")).unwrap()).unwrap();
+        let entries = pending["pending"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "a valid bearer's Inject still queues, unlike the uniform guard");
+        assert_eq!(entries[0]["sessionId"], real_id);
+
+        let bogus_params = serde_json::json!({
+            "message": { "parts": [{ "kind": "text", "text": "x" }], "contextId": bogus_id }
+        });
+        let bogus_err =
+            message_send(&bogus_params, &audit_log, "", remote_origin, "s3cr3t", Some("s3cr3t")).unwrap_err();
+        assert_eq!(bogus_err.0, -32001);
+
+        let noncond_params = serde_json::json!({
+            "message": { "parts": [{ "kind": "text", "text": "x" }], "contextId": noncond_id }
+        });
+        let noncond_err =
+            message_send(&noncond_params, &audit_log, "", remote_origin, "s3cr3t", Some("s3cr3t")).unwrap_err();
+        assert_eq!(noncond_err.0, -32004);
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
+    fn uniform_response_guard_is_a_no_op_when_no_token_is_configured() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-uniform-off-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_STATE_DIR", root.join("state"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        let real_id = "off-real-target";
+        let noncond_id = "off-noncond-target";
+        let bogus_id = "off-bogus-target";
+
+        let real_socket = aoide_conduct::graph::conduct_socket_path(real_id);
+        std::fs::create_dir_all(real_socket.parent().unwrap()).unwrap();
+        let real_listener = UnixListener::bind(&real_socket).unwrap();
+
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![conductable_session(real_id, &real_socket), non_conductable_session(noncond_id)],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = real_listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+
+        let audit_log = root.join("log");
+        // Loopback + no token configured: off-path, must auto-deliver exactly
+        // as it did before the #50 amendment.
+        let params = serde_json::json!({
+            "message": { "parts": [{ "kind": "text", "text": "off-path send" }], "contextId": real_id }
+        });
+        let result = message_send(&params, &audit_log, "", PeerOrigin::Loopback, "", None);
+        let got = acc.join().unwrap();
+        assert_eq!(String::from_utf8(got).unwrap(), "off-path send\n", "no token configured: loopback still auto-delivers");
+        assert!(result.is_ok());
+
+        let bogus_params = serde_json::json!({
+            "message": { "parts": [{ "kind": "text", "text": "x" }], "contextId": bogus_id }
+        });
+        let bogus_err = message_send(&bogus_params, &audit_log, "", PeerOrigin::Loopback, "", None).unwrap_err();
+        assert_eq!(bogus_err.0, -32001);
+
+        let noncond_params = serde_json::json!({
+            "message": { "parts": [{ "kind": "text", "text": "x" }], "contextId": noncond_id }
+        });
+        let noncond_err = message_send(&noncond_params, &audit_log, "", PeerOrigin::Loopback, "", None).unwrap_err();
+        assert_eq!(noncond_err.0, -32004);
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
+    fn uniform_response_guard_never_fires_for_a_per_peer_autogated_token() {
+        // A server-wide token IS configured (and the presented bearer does
+        // NOT match it), but the presented token DOES match an enrolled
+        // peer's own `token_file` — the exact scenario the amendment's
+        // grounding names: enrolled peers authenticate per-peer, never
+        // against the server-wide token, so the uniform guard must not
+        // swallow this send.
+        //
+        // What "not swallowed" means here is REACHING `do_inject`, not
+        // necessarily instant delivery: a non-Valid server-wide bearer still
+        // coerces `effective_origin` to `Unknown` (the pre-existing,
+        // 2026-08-19 amendment — unrelated to #50), and `should_deliver_now`
+        // never auto-delivers on `Unknown` regardless of autogate (fail-safe
+        // pin: `should_deliver_now_covers_every_origin_autogate_combination`).
+        // So this send is correctly held PENDING — the proof that autogate
+        // exempted it from the #50 guard is that it reaches the real
+        // `session_ref_lookup`/`do_inject` machinery and queues into
+        // `pending.json` at all, which the #50 guard's own synthetic path
+        // never does.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-uniform-ptok-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let stage = root.join("stage");
+        let state = root.join("state");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        let token_path = root.join("peer.token");
+        std::fs::write(&token_path, "peer-secret\n").unwrap();
+        aoide_storage::peer_store::save_peers(&[aoide_storage::peer_store::Peer {
+            name: "enrolled-peer".into(),
+            url: "http://192.0.2.99:8710/".into(),
+            autogate: true,
+            token_file: Some(token_path.to_string_lossy().into_owned()),
+            added_at: "2026-08-20T00:00:00Z".into(),
+        }])
+        .unwrap();
+
+        let id = "ptok-still-injects";
+        let socket = aoide_conduct::graph::conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        // Nonblocking + no acceptor thread: this send is held pending (see
+        // above), so a connection must never actually land here — a blocking
+        // `accept()` would hang forever waiting for a delivery that never
+        // comes, exactly the trap the ORIGINAL (wrong) version of this test
+        // fell into.
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![conductable_session(id, &socket)],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let audit_log = root.join("log");
+        let params = serde_json::json!({
+            "message": { "parts": [{ "kind": "text", "text": "per-peer authed" }], "contextId": id }
+        });
+        let remote_origin = PeerOrigin::Remote("10.0.0.9".parse().unwrap());
+        // "server-secret" is configured server-wide; "peer-secret" (what's
+        // presented) does NOT match it — only the per-peer autogate match
+        // saves this from the #50 uniform guard.
+        let result = message_send(&params, &audit_log, "", remote_origin, "server-secret", Some("peer-secret"));
+        let task = result.expect("autogate exempts this send from the #50 guard, so it's still an Ok Task");
+        assert_eq!(task["id"], id);
+        assert_eq!(task["status"]["state"], "submitted");
+        assert!(listener.accept().is_err(), "held pending, not delivered — the non-Valid server bearer still coerces Unknown");
+
+        // The proof this reached REAL Inject machinery (not the #50 guard):
+        // `pending.json` carries the queued entry, exactly like an
+        // authenticated-but-not-auto-delivered send does.
+        let pending: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(stage.join("pending.json")).unwrap()).unwrap();
+        let entries = pending["pending"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "autogate exemption reaches do_inject/session_ref_lookup, unlike the #50 guard");
+        assert_eq!(entries[0]["sessionId"], id);
 
         let _ = std::fs::remove_dir_all(&root);
         match saved_stage {
