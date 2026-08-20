@@ -186,6 +186,18 @@ struct SongbookEval {
 /// other song's stale/malformed entry) on every `rice stage` call once a
 /// runtime tree exists, regardless of whether the ACTIVE song has bodies to
 /// carry.
+///
+/// Pre-existing scope limit, not introduced here: the BODY copy is still
+/// per-STAGED-song only, `name`'s own `widgets/` tree. Once a borrow exists
+/// (W5+), editing the OWNING song's widget body and running `rice stage` on
+/// the BORROWING song does not carry that edit into
+/// `run/qml/songs/<owner>/` — only staging the owner directly does.
+/// manifest.json/registry.json stay correct regardless (whole regen, every
+/// call), so this is a live-preview body-freshness papercut, not a
+/// correctness bug, and it self-resolves on the owner's own next stage or on
+/// a rebuild. Whoever lands the first borrow should re-check whether this is
+/// still an acceptable seam or worth widening to "sync every song the
+/// active one's manifest entries resolve through."
 pub fn sync_song_widgets(name: &str) -> Result<WidgetSyncOk, WidgetSyncErr> {
     let run_qml = aoide_storage::fs::run_qml_dir();
     if !run_qml.is_dir() {
