@@ -429,6 +429,23 @@ pub fn agent_card(registry: &Registry, bind: &str, port: u16) -> Value {
     agent_card_from_commands(registry.commands(), bind, port)
 }
 
+/// The stripped AgentCard served to an unauthenticated GET once a server
+/// token is configured (CONTRACTS.md §6, 2026-08-20 amendment): just enough
+/// for a caller to identify and register the agent — `name`,
+/// `protocolVersion`, `url` — with no skills inventory, `version`, or
+/// `capabilities`. Each field is PICKED OFF the full card `Value` rather than
+/// re-derived, so the stripped shape can never drift from what
+/// [`agent_card_from_commands`] actually emits. Pure.
+fn stripped_card(full: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    for key in ["name", "protocolVersion", "url"] {
+        if let Some(v) = full.get(key) {
+            out.insert(key.to_string(), v.clone());
+        }
+    }
+    Value::Object(out)
+}
+
 // ── canonical_state → A2A TaskState mapping (CONTRACTS.md §6) ───────────────
 
 /// `canonical_state` (`aoide_conduct::graph`) → A2A `TaskState`, JSON-RPC/HTTP
@@ -1421,7 +1438,10 @@ fn method_not_allowed(method: &str, path: &str) -> (u16, Vec<u8>, String) {
 /// POST `/` whose body parses as `message/send`; `peer_name` (plus the
 /// `self_url` this function derives from `bind`/`port`, the same way
 /// [`agent_card`]'s own `url` field does) is only consulted by
-/// `aoide/graphSummary`; `registry` is only consulted by the AgentCard GET —
+/// `aoide/graphSummary`; `registry` and `expected_token` (compared against
+/// `req.bearer`, CONTRACTS.md §6 2026-08-20 amendment) are only consulted by
+/// the AgentCard GET, which strips the card down to `name`/`protocolVersion`/
+/// `url` when a token is configured and the bearer doesn't classify `Valid` —
 /// every other route is pure I/O-free routing over what's already in `req`,
 /// so it still unit-tests without a real socket, spawn, or audit-log write.
 fn route(
@@ -1438,7 +1458,19 @@ fn route(
     match req.path.as_str() {
         "/.well-known/agent-card.json" => {
             if req.method == "GET" {
-                let card = agent_card(registry, bind, port);
+                let full = agent_card(registry, bind, port);
+                let token_configured = !expected_token.is_empty();
+                let token_state = classify_token(expected_token, req.bearer.as_deref());
+                // A GET here returns a card, never JSON-RPC — no -32005 on
+                // this path (CONTRACTS.md §6, 2026-08-20 amendment): an
+                // unauthorized caller still gets 200 and a card, just the
+                // stripped one, so discovery keeps working without leaking
+                // the skills inventory/version/capabilities.
+                let card = if token_authorized(token_configured, token_state) {
+                    full
+                } else {
+                    stripped_card(&full)
+                };
                 (
                     200,
                     serde_json::to_vec(&card).unwrap_or_default(),
@@ -3417,5 +3449,158 @@ mod tests {
         assert_eq!(status, 405);
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert!(v["error"]["code"].is_i64());
+    }
+
+    // ── P4: unauthenticated AgentCard GET is stripped, not gated ────────────
+    // (CONTRACTS.md §6, 2026-08-20 amendment)
+
+    /// Off-path pin: with NO token configured, the served card is
+    /// byte-identical to the pre-amendment behavior — the FULL card,
+    /// field-for-field against `agent_card_from_commands` directly — with or
+    /// without a bearer presented (there's nothing configured to compare it
+    /// against).
+    #[test]
+    fn agent_card_get_with_no_token_configured_serves_the_full_card_unchanged() {
+        let registry = Registry::new();
+        let expected = agent_card_from_commands(registry.commands(), "127.0.0.1", 8710);
+
+        for bearer in [None, Some("anything".to_string())] {
+            let req = HttpRequest {
+                method: "GET".into(),
+                path: "/.well-known/agent-card.json".into(),
+                body: vec![],
+                bearer,
+            };
+            let (status, body, label) = route(
+                &req,
+                "127.0.0.1",
+                8710,
+                Path::new("/dev/null"),
+                "",
+                "aoide",
+                PeerOrigin::Loopback,
+                "",
+                &registry,
+            );
+            assert_eq!(status, 200);
+            assert_eq!(label, "a2a.agent-card");
+            let served: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(served, expected);
+        }
+    }
+
+    /// Token configured, no bearer presented: the served card is stripped to
+    /// EXACTLY three keys — assert the key COUNT, not just presence, so a
+    /// future field added to the full card can't silently leak through the
+    /// strip. Status stays 200 (a card GET never becomes `-32005`).
+    #[test]
+    fn agent_card_get_with_token_and_no_bearer_is_stripped_to_exactly_three_keys() {
+        let registry = Registry::new();
+        let req = HttpRequest {
+            method: "GET".into(),
+            path: "/.well-known/agent-card.json".into(),
+            body: vec![],
+            bearer: None,
+        };
+        let (status, body, label) = route(
+            &req,
+            "127.0.0.1",
+            8710,
+            Path::new("/dev/null"),
+            "",
+            "aoide",
+            PeerOrigin::Loopback,
+            "s3cr3t",
+            &registry,
+        );
+        assert_eq!(status, 200, "a card GET never becomes -32005, even unauthorized");
+        assert_eq!(label, "a2a.agent-card");
+        let served: Value = serde_json::from_slice(&body).unwrap();
+        let obj = served.as_object().expect("stripped card is still a JSON object");
+        assert_eq!(obj.len(), 3, "stripped card must carry exactly name/protocolVersion/url, got {obj:?}");
+        assert_eq!(served["name"], "aoide");
+        assert_eq!(served["protocolVersion"], "0.3.0");
+        assert_eq!(served["url"], "http://127.0.0.1:8710/");
+        assert!(!obj.contains_key("skills"), "skills inventory must not leak unauthenticated");
+        assert!(!obj.contains_key("version"), "version must not leak unauthenticated");
+        assert!(!obj.contains_key("capabilities"), "capabilities must not leak unauthenticated");
+        assert!(!obj.contains_key("defaultInputModes"));
+        assert!(!obj.contains_key("defaultOutputModes"));
+    }
+
+    /// Token configured, WRONG bearer presented: the same stripped card as
+    /// no bearer at all — `token_authorized` treats `TokenState::Invalid`
+    /// identically to `Absent`.
+    #[test]
+    fn agent_card_get_with_wrong_bearer_is_the_same_stripped_card() {
+        let registry = Registry::new();
+        let req = HttpRequest {
+            method: "GET".into(),
+            path: "/.well-known/agent-card.json".into(),
+            body: vec![],
+            bearer: Some("nope".to_string()),
+        };
+        let (status, body, _) = route(
+            &req,
+            "127.0.0.1",
+            8710,
+            Path::new("/dev/null"),
+            "",
+            "aoide",
+            PeerOrigin::Loopback,
+            "s3cr3t",
+            &registry,
+        );
+        assert_eq!(status, 200);
+        let served: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(served.as_object().unwrap().len(), 3);
+        assert_eq!(served["name"], "aoide");
+    }
+
+    /// Token configured, VALID bearer presented: the full card, unchanged.
+    #[test]
+    fn agent_card_get_with_valid_bearer_serves_the_full_card() {
+        let registry = Registry::new();
+        let expected = agent_card_from_commands(registry.commands(), "127.0.0.1", 8710);
+        let req = HttpRequest {
+            method: "GET".into(),
+            path: "/.well-known/agent-card.json".into(),
+            body: vec![],
+            bearer: Some("s3cr3t".to_string()),
+        };
+        let (status, body, _) = route(
+            &req,
+            "127.0.0.1",
+            8710,
+            Path::new("/dev/null"),
+            "",
+            "aoide",
+            PeerOrigin::Loopback,
+            "s3cr3t",
+            &registry,
+        );
+        assert_eq!(status, 200);
+        let served: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(served, expected);
+    }
+
+    /// The client's own `parse_agent_card` still accepts the stripped shape
+    /// — enrollment (`aoide a2a agent add`) survives against a
+    /// token-protected server, it just gets an empty `description` (the
+    /// known accepted consequence, CONTRACTS.md §6 2026-08-20 amendment;
+    /// closing it is #47 Phase H, not this one).
+    #[test]
+    fn parse_agent_card_accepts_the_stripped_card() {
+        let full = agent_card_from_commands(Registry::new().commands(), "127.0.0.1", 8710);
+        let stripped = stripped_card(&full);
+        let agent = aoide_client::wire::parse_agent_card(
+            &stripped,
+            "http://127.0.0.1:8710/.well-known/agent-card.json",
+            "NOW",
+        )
+        .expect("stripped card still has a name; enrollment must not fail");
+        assert_eq!(agent.name, "aoide");
+        assert_eq!(agent.url, "http://127.0.0.1:8710/");
+        assert_eq!(agent.description, "", "stripped card carries no description field to read");
     }
 }
