@@ -51,7 +51,9 @@ pub struct PendingFile {
     pub pending: Vec<PendingSend>,
 }
 
-fn pending_path() -> PathBuf {
+/// `pub(in crate::graph)`, not private: `graph/pending.rs` (the read/approve/
+/// deny surface over this queue) needs the same path record_pending writes.
+pub(in crate::graph) fn pending_path() -> PathBuf {
     stage_dir().join("pending.json")
 }
 

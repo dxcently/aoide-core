@@ -17,6 +17,7 @@ mod common;
 mod conduct;
 mod doc;
 mod model;
+mod pending;
 mod permit;
 mod send;
 mod session_store;
@@ -45,6 +46,7 @@ pub use self::model::{
     anchor_for, canonical_state, merged_sessions, HookRecord, HooksFile, Project, ProjectsFile,
     SessionRecord, SessionsFile,
 };
+pub use self::pending::{pending_approve, pending_deny, pending_list};
 pub use self::permit::{answer_summons, session_permit, summons_card_id};
 pub use self::send::{session_hook, session_send};
 pub use self::session_store::{session_end, session_phase, session_start, session_wrap};

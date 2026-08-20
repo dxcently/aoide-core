@@ -149,6 +149,36 @@ pub fn register(r: &mut Registry) {
         ],
     ));
     r.insert(cmd!(
+        path: ["graph", "pending", "list"],
+        summary: "Enumerate held `graph send` / A2A entries in song/stage/pending.json (id is the entry's position — re-list after any approve/deny, positions shift). A malformed entry (a stale hand-edited line) is listed with state `malformed` rather than failing the whole read.",
+        args: [],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: crate::graph::pending_list,
+        examples: ["graph pending list"],
+    ));
+    r.insert(cmd!(
+        path: ["graph", "pending", "approve"],
+        summary: "Approve one held pending entry: re-drive it through the one gated injection door (`graph send`, in-process, --yes) and remove it from the queue. A malformed or out-of-range id fails cleanly, leaving the entry untouched.",
+        args: [arg!("id", "string", true, "Pending entry id — its position from `graph pending list`.")],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: crate::graph::pending_approve,
+        examples: ["graph pending approve 0"],
+    ));
+    r.insert(cmd!(
+        path: ["graph", "pending", "deny"],
+        summary: "Reject one held pending entry: remove it from the queue and inject nothing. A malformed or out-of-range id fails cleanly, leaving the entry untouched.",
+        args: [arg!("id", "string", true, "Pending entry id — its position from `graph pending list`.")],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: crate::graph::pending_deny,
+        examples: ["graph pending deny 0"],
+    ));
+    r.insert(cmd!(
         path: ["graph", "permit"],
         summary: "Publish the herald's permission SUMMONS for a session blocked on a permission prompt. The card is filed into the herald ledger (stage/herald.json) and this verb RETURNS — the Quickshell herald draws it with real approve/deny buttons, and the click routes back through the shellbridge to type the verdict in. The hook door raises it automatically when a session goes `awaiting`. Only ever raised for a conductable session whose harness has verified prompt keys, and the verdict is only typed while the session is still awaiting.",
         args: [],
