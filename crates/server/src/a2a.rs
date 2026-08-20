@@ -292,7 +292,7 @@ fn should_deliver_now(origin: PeerOrigin, autogate_match: bool) -> bool {
 // [`resolve_token_file`]/[`read_expected_token`] resolve the SERVER's own
 // expected token ONCE at `a2a serve` launch, exactly like `spawn_agent`. Two
 // separate things then key off it:
-//   - Whether the SPAWN arm may run at all ([`spawn_authorized`]) — the
+//   - Whether the SPAWN arm may run at all ([`token_authorized`]) — the
 //     actual must-fix gap: `message/send`'s Spawn path was origin-blind
 //     entirely, gated only by `aoide.a2a.spawnAgent` being non-empty
 //     (rebuild-time only, no per-request gate whatsoever).
@@ -337,15 +337,29 @@ fn classify_token(expected: &str, presented: Option<&str>) -> TokenState {
     }
 }
 
-/// Is Spawn allowed to run? When no token is configured, ALWAYS yes — the
-/// off-path is byte-identical to before this amendment (spawn's admission
-/// stays rebuild-time-only, exactly CONTRACTS.md §6's original security
-/// model). When a token IS configured, only a [`TokenState::Valid`] bearer
-/// unlocks it — an absent or wrong token is a clean `-32005` error, not a
-/// silent fallback to the old open behavior. Pure — directly testable
-/// without a socket or a spawned process.
-fn spawn_authorized(token_configured: bool, token_state: TokenState) -> bool {
+/// Is a token-gated action allowed to run? When no token is configured,
+/// ALWAYS yes — the off-path is byte-identical to before the token amendment
+/// (admission stays rebuild-time-only, exactly CONTRACTS.md §6's original
+/// security model). When a token IS configured, only a [`TokenState::Valid`]
+/// bearer unlocks it — an absent or wrong token is a clean [`unauthorized`]
+/// `-32005` error, not a silent fallback to the old open behavior. Pure —
+/// directly testable without a socket or a spawned process.
+///
+/// One predicate guards two things (CONTRACTS.md §6 amendment, Phase G,
+/// 2026-08-20): the SPAWN arm of `message/send`, and the READ verbs
+/// (`tasks/get`, `aoide/graphSummary`, `tasks/resubscribe`, `message/stream`).
+/// Before Phase G the reads were ungated even with a token set — harmless on
+/// loopback, but a whole-session-graph leak the moment the door faced a
+/// network. The gate is identical for both because the question is identical:
+/// does the caller hold a valid token when one is required?
+fn token_authorized(token_configured: bool, token_state: TokenState) -> bool {
     !token_configured || token_state == TokenState::Valid
+}
+
+/// The `-32005` unauthorized error every token-gated arm returns, so the code
+/// and message never drift between the spawn gate and the read gates.
+fn unauthorized() -> (i64, String) {
+    (-32005, "unauthorized: a valid A2A token is required".to_string())
 }
 
 /// The origin [`should_deliver_now`] actually sees. When no token is
@@ -831,7 +845,7 @@ fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path) -> Result<Value, (i
 /// branch. `expected_token`/`presented_token` (amendment, 2026-08-18) affect
 /// BOTH branches: an empty `expected_token` (no token configured) is a pure
 /// no-op on every decision below — [`effective_origin`] is the identity
-/// function and [`spawn_authorized`] always allows — so this whole amendment
+/// function and [`token_authorized`] always allows — so this whole amendment
 /// is byte-identical-when-off by construction, not merely by testing.
 ///
 /// - Inject's autogate match now folds TWO independent signals: the
@@ -844,7 +858,7 @@ fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path) -> Result<Value, (i
 ///   [`should_deliver_now`]: once a token is configured, an unauthenticated
 ///   loopback caller no longer gets the automatic pass — see that function's
 ///   doc comment for why this is one switch, not two.
-/// - Spawn gained a gate it never had at all: [`spawn_authorized`] must pass
+/// - Spawn gained a gate it never had at all: [`token_authorized`] must pass
 ///   before [`do_spawn`] runs. This is the actual must-fix gap this
 ///   amendment closes — Spawn was origin-blind AND token-blind before it.
 fn message_send(
@@ -874,8 +888,8 @@ fn message_send(
             do_inject(&session_id, &prompt, audit_log, deliver_now)
         }
         SendAction::Spawn { agent_cmd } => {
-            if !spawn_authorized(token_configured, token_state) {
-                return Err((-32005, "unauthorized: a valid A2A token is required".to_string()));
+            if !token_authorized(token_configured, token_state) {
+                return Err(unauthorized());
             }
             do_spawn(&agent_cmd, &prompt, audit_log)
         }
@@ -929,7 +943,18 @@ fn handle_jsonrpc(req: &Value, ctx: &RequestCtx) -> Value {
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);
 
+    // Phase G (CONTRACTS.md §6 amendment, 2026-08-20): the read verbs are
+    // token-gated by the SAME rule as spawn. Computed once; only bites when a
+    // token is configured (off-path unchanged). `message/send` runs its own
+    // classify internally (it needs the full TokenState for effective_origin),
+    // so it is not re-gated here.
+    let read_ok = token_authorized(
+        !ctx.expected_token.is_empty(),
+        classify_token(ctx.expected_token, ctx.presented_token),
+    );
+
     let result: Result<Value, (i64, String)> = match method {
+        "tasks/get" if !read_ok => Err(unauthorized()),
         "tasks/get" => {
             let task_id = params.get("id").and_then(Value::as_str).unwrap_or("");
             task_get(task_id)
@@ -942,6 +967,7 @@ fn handle_jsonrpc(req: &Value, ctx: &RequestCtx) -> Value {
             ctx.expected_token,
             ctx.presented_token,
         ),
+        "aoide/graphSummary" if !read_ok => Err(unauthorized()),
         "aoide/graphSummary" => graph_summary(ctx.peer_name, ctx.self_url),
         "" => Err((-32600, "invalid request: missing method".to_string())),
         other => Err((-32601, format!("method not found: {other}"))),
@@ -1068,14 +1094,31 @@ fn stream_task<W: Write>(
     // Resolve the target task + its initial state. `message/stream` runs the
     // send FIRST (inject/spawn) and streams the task it produced;
     // `tasks/resubscribe` streams an existing task by id.
-    let resolved: Result<Value, (i64, String)> = match method {
-        "message/stream" => {
-            message_send(&params, audit_log, spawn_agent, origin, expected_token, presented_token)
-        }
-        _ /* tasks/resubscribe */ => {
-            match params.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-                Some(id) => task_get(id),
-                None => Err((-32001, "task not found".to_string())),
+    //
+    // Phase G (CONTRACTS.md §6 amendment, 2026-08-20): gate BOTH streaming
+    // reads by the same token rule as the one-shot verbs. When a token is
+    // configured and the caller lacks a valid one, resolution short-circuits
+    // to `unauthorized()` BEFORE `message_send` runs — so an unauthenticated
+    // `message/stream` neither injects nor spawns, it only receives the
+    // `-32005` SSE error event below. `tasks/resubscribe`'s own `task_get`
+    // would otherwise be an ungated session-state read (the SSE sibling of
+    // `tasks/get`). Off-path (no token) is byte-identical to before.
+    let stream_ok = token_authorized(
+        !expected_token.is_empty(),
+        classify_token(expected_token, presented_token),
+    );
+    let resolved: Result<Value, (i64, String)> = if !stream_ok {
+        Err(unauthorized())
+    } else {
+        match method {
+            "message/stream" => {
+                message_send(&params, audit_log, spawn_agent, origin, expected_token, presented_token)
+            }
+            _ /* tasks/resubscribe */ => {
+                match params.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    Some(id) => task_get(id),
+                    None => Err((-32001, "task not found".to_string())),
+                }
             }
         }
     };
@@ -2050,6 +2093,98 @@ mod tests {
         let _ = std::fs::remove_dir_all(&stage);
     }
 
+    /// Phase G: the read verbs (`tasks/get`, `aoide/graphSummary`) are
+    /// token-gated by the same rule as spawn. When a token IS configured, an
+    /// absent or wrong bearer is a clean `-32005` BEFORE the read runs; a
+    /// valid bearer passes through to the normal handler.
+    #[test]
+    fn read_verbs_are_token_gated_when_a_token_is_configured() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = std::env::temp_dir().join(format!(
+            "aoide-server-a2a-gate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![fixture_session("s1", "stopped", None)],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let ctx = |presented: Option<&'static str>| RequestCtx {
+            audit_log: Path::new("/dev/null"),
+            spawn_agent: "",
+            origin: PeerOrigin::Loopback,
+            peer_name: "aoide",
+            self_url: "http://127.0.0.1:8710/",
+            expected_token: "s3cr3t",
+            presented_token: presented,
+        };
+        let get = json!({ "jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": { "id": "s1" } });
+        let sum = json!({ "jsonrpc": "2.0", "id": 2, "method": "aoide/graphSummary" });
+
+        // Absent bearer — both reads denied, and denied BEFORE the read runs
+        // (a real session id still returns -32005, never its state).
+        assert_eq!(handle_jsonrpc(&get, &ctx(None))["error"]["code"], -32005);
+        assert_eq!(handle_jsonrpc(&sum, &ctx(None))["error"]["code"], -32005);
+        // Wrong bearer — same.
+        assert_eq!(handle_jsonrpc(&get, &ctx(Some("wrong")))["error"]["code"], -32005);
+        assert_eq!(handle_jsonrpc(&sum, &ctx(Some("wrong")))["error"]["code"], -32005);
+        // Valid bearer — passes the gate; tasks/get reaches its real handler
+        // and resolves the known session's state (never -32005).
+        let ok = handle_jsonrpc(&get, &ctx(Some("s3cr3t")));
+        assert_eq!(ok["result"]["status"]["state"], "completed");
+        // graphSummary with a valid bearer is past the gate too — whatever it
+        // returns, it is NOT the auth error.
+        assert_ne!(handle_jsonrpc(&sum, &ctx(Some("s3cr3t")))["error"]["code"], -32005);
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    /// Phase G off-path: with NO token configured (today's default), the read
+    /// verbs stay open exactly as before — the gate only bites when armed.
+    #[test]
+    fn read_verbs_stay_open_when_no_token_is_configured() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = std::env::temp_dir().join(format!(
+            "aoide-server-a2a-nogate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![fixture_session("s1", "stopped", None)],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": { "id": "s1" } });
+        // Empty expected_token = feature off; no bearer presented; still works.
+        let resp = handle_jsonrpc(&req, &test_ctx(Path::new("/dev/null"), ""));
+        assert_eq!(resp["result"]["status"]["state"], "completed");
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
     // ── The non-loopback pending-gate amendment (CONTRACTS.md §6, 2026-08-14) ──
     //
     // The one must-fix security gap: `do_inject` used to force `--yes`
@@ -2103,7 +2238,7 @@ mod tests {
     // that pin at the `should_deliver_now` level. The two tests below prove
     // the pin holds at the INTEGRATION point too: `effective_origin` (what
     // actually feeds `should_deliver_now` now) is the identity function when
-    // `token_configured` is false, and `spawn_authorized` always allows —
+    // `token_configured` is false, and `token_authorized` always allows —
     // so composing them in front of the untouched functions changes nothing
     // on the off-path, by construction rather than by inspection alone.
 
@@ -2164,21 +2299,21 @@ mod tests {
     }
 
     #[test]
-    fn spawn_authorized_always_allows_when_no_token_is_configured() {
-        // THE regression pin for Spawn specifically: `spawn_agent` alone
-        // (rebuild-time admission) still fully gates it when no token is
-        // set — this amendment adds a gate, it doesn't tighten the existing
-        // one on the off-path.
+    fn token_authorized_always_allows_when_no_token_is_configured() {
+        // THE regression pin: `spawn_agent` alone (rebuild-time admission)
+        // still fully gates spawn, and the read verbs stay open, when no
+        // token is set — Phase G adds a gate, it doesn't tighten the existing
+        // off-path.
         for token_state in [TokenState::Absent, TokenState::Invalid, TokenState::Valid] {
-            assert!(spawn_authorized(false, token_state), "token_configured=false must always allow, got {token_state:?}");
+            assert!(token_authorized(false, token_state), "token_configured=false must always allow, got {token_state:?}");
         }
     }
 
     #[test]
-    fn spawn_authorized_requires_a_valid_token_once_one_is_configured() {
-        assert!(!spawn_authorized(true, TokenState::Absent));
-        assert!(!spawn_authorized(true, TokenState::Invalid));
-        assert!(spawn_authorized(true, TokenState::Valid));
+    fn token_authorized_requires_a_valid_token_once_one_is_configured() {
+        assert!(!token_authorized(true, TokenState::Absent));
+        assert!(!token_authorized(true, TokenState::Invalid));
+        assert!(token_authorized(true, TokenState::Valid));
     }
 
     #[test]
