@@ -67,6 +67,10 @@ enum SendGate {
     /// The sender is the target's parent — an orchestrator freely commanding a
     /// child it spawned (the "freely orchestrated" default). No human in the loop.
     AutogateParent,
+    /// The sender and the target are SIBLINGS — same parent, and that parent is
+    /// itself still live — talking to each other without going through it. See
+    /// [`sibling_autogate_enabled`] for the User's decision and the opt-out.
+    AutogateSibling,
     /// No authorisation — held pending for approval.
     Pending,
 }
@@ -79,6 +83,7 @@ impl SendGate {
             SendGate::Yes => "yes",
             SendGate::Autogate => "autogate",
             SendGate::AutogateParent => "autogate-parent",
+            SendGate::AutogateSibling => "autogate-sibling",
             SendGate::Pending => "pending",
         }
     }
@@ -107,15 +112,53 @@ fn sender_is_parent(sender_session: Option<&str>, target_parent: Option<&str>) -
     }
 }
 
+/// The sibling-autogate rule (pure, unit-tested): the sender and the target
+/// may freely talk to each other when they are SIBLINGS — both parented under
+/// the SAME session, and that shared parent is itself still live (not
+/// `done`). A dead/absent parent, a cross-tree pair, or either side unparented
+/// stays gated. `parent_live` is resolved by the caller against the already-
+/// loaded sessions file (no I/O here).
+///
+/// Deliberately blind to whether sender == target: a self-send trivially
+/// satisfies `a == b` here too (same record, same parent field read twice),
+/// so the caller MUST refuse that case before this predicate ever runs — see
+/// the `is_self_send` guard in [`session_send`]. Folding that guard in here
+/// would hide it behind a parameter that looks like just another parent
+/// string.
+fn siblings_share_live_parent(
+    sender_parent: Option<&str>,
+    target_parent: Option<&str>,
+    parent_live: bool,
+) -> bool {
+    match (sender_parent, target_parent) {
+        (Some(a), Some(b)) => !a.is_empty() && a == b && parent_live,
+        _ => false,
+    }
+}
+
+/// The sibling-autogate switch. **The User's decision, 2026-08-20: sibling
+/// delivery is ON BY DEFAULT.** Opt out per-box with
+/// `AOIDE_CONDUCT_SIBLING_AUTOGATE` set to one of `{0,false,no}`; absent or
+/// any other value leaves it enabled. One-line flip to default-off: change the
+/// wildcard arm below from `true` to `false`.
+fn sibling_autogate_enabled() -> bool {
+    match std::env::var("AOIDE_CONDUCT_SIBLING_AUTOGATE").ok().as_deref() {
+        Some("0") | Some("false") | Some("no") => false,
+        _ => true, // one-line flip to default-off: change this arm to `false`.
+    }
+}
+
 /// Resolve the gate: `--yes`, then the global autogate switch, then the
-/// parent-of-target rule, else pending.
-fn send_gate(yes: bool, sender_is_parent: bool) -> SendGate {
+/// parent-of-target rule, then the sibling rule, else pending.
+fn send_gate(yes: bool, sender_is_parent: bool, is_sibling: bool) -> SendGate {
     if yes {
         SendGate::Yes
     } else if autogate_env() {
         SendGate::Autogate
     } else if sender_is_parent {
         SendGate::AutogateParent
+    } else if is_sibling && sibling_autogate_enabled() {
+        SendGate::AutogateSibling
     } else {
         SendGate::Pending
     }
@@ -240,10 +283,12 @@ fn audit_send(inv: &Invocation, status: &str, message: &str, text: &str) {
 /// `aoide graph send --id <id> [--submit] [--yes] -- <text …>` — the one
 /// injection door. Resolves the target's control socket from sessions.json;
 /// errors cleanly (exit 1) if the id is unknown or not conductable. Gate: WITHOUT
-/// `--yes` and no autogate, the send is recorded PENDING (atomic stage write) and
-/// NOT delivered; WITH `--yes` (or an autogate match) it connects to the socket,
-/// writes `<text>` (+ `\n` on `--submit`), auto-renames the node to a one-line
-/// form of the text (unless the text is a bare keystroke answer — see
+/// `--yes` and no autogate match, the send is recorded PENDING (atomic stage
+/// write) and NOT delivered; WITH `--yes` (or an autogate match — global env,
+/// sender-is-target's-parent, or sender-and-target-are-siblings-under-a-live-
+/// parent, see [`sibling_autogate_enabled`]) it connects to the socket, writes
+/// `<text>` (+ `\n` on `--submit`), auto-renames the node to a one-line form of
+/// the text (unless the text is a bare keystroke answer — see
 /// [`names_the_node`]), and returns delivered. Every outcome writes an audit line.
 pub fn session_send(inv: &Invocation) -> Outcome {
     let cmd = "graph.send";
@@ -286,10 +331,34 @@ pub fn session_send(inv: &Invocation) -> Outcome {
     let socket = socket.unwrap();
 
     // The gate. The sender's own session id (from the env `aoide conduct` exports)
-    // vs the target's parent decides the parent-autogate rule.
+    // vs the target's parent decides the parent-autogate rule. The sibling rule
+    // resolves the SENDER's own record from this SAME already-loaded file (no
+    // second read) to find ITS parent, and checks that parent is still live.
     let sender = std::env::var("AOIDE_SESSION_ID").ok();
     let is_parent = sender_is_parent(sender.as_deref(), target_parent.as_deref());
-    let gate = send_gate(yes, is_parent);
+    let sender_parent: Option<String> = sender
+        .as_deref()
+        .and_then(|sid| file.sessions.iter().find(|s| s.session_id == sid))
+        .and_then(|r| r.parent_session_id.clone());
+    let parent_live = target_parent
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .and_then(|p| file.sessions.iter().find(|s| s.session_id == p))
+        .map(|r| aoide_protocol::canonical_state(&r.state) != "done")
+        .unwrap_or(false);
+    // A self-send (sender id == target id) vacuously satisfies the predicate —
+    // a session is trivially its OWN sibling (same record, same parent field on
+    // both sides of the comparison) — but it is not a sibling relationship at
+    // all, it is a session talking to itself. `AOIDE_SESSION_ID` is exported
+    // into every conducted child's own env, so an unguarded predicate here
+    // would let a prompt-injected `graph send --id "$AOIDE_SESSION_ID" --submit
+    // -- <text>` self-deliver text straight back into its own input stream,
+    // bypassing approval entirely — a gate WIDENING, not a convenience. Excluded
+    // before the predicate ever runs.
+    let is_self_send = sender.as_deref() == Some(id.as_str());
+    let is_sibling = !is_self_send
+        && siblings_share_live_parent(sender_parent.as_deref(), target_parent.as_deref(), parent_live);
+    let gate = send_gate(yes, is_parent, is_sibling);
     if !gate.delivers() {
         if let Err(e) = record_pending(&id, &text, submit) {
             return stage_error(cmd, e);
@@ -1105,15 +1174,56 @@ mod tests {
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&["AOIDE_CONDUCT_AUTOGATE"]);
         std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
-        assert_eq!(send_gate(true, false), SendGate::Yes); // --yes wins outright
-        assert_eq!(send_gate(false, true), SendGate::AutogateParent);
-        assert_eq!(send_gate(false, false), SendGate::Pending);
+        assert_eq!(send_gate(true, false, false), SendGate::Yes); // --yes wins outright
+        assert_eq!(send_gate(false, true, false), SendGate::AutogateParent);
+        assert_eq!(send_gate(false, false, false), SendGate::Pending);
         assert!(SendGate::AutogateParent.delivers());
         assert_eq!(SendGate::AutogateParent.label(), "autogate-parent");
         std::env::set_var("AOIDE_CONDUCT_AUTOGATE", "1");
         // The global switch outranks the parent rule (both deliver; label differs).
-        assert_eq!(send_gate(false, true), SendGate::Autogate);
-        assert_eq!(send_gate(false, false), SendGate::Autogate);
+        assert_eq!(send_gate(false, true, false), SendGate::Autogate);
+        assert_eq!(send_gate(false, false, false), SendGate::Autogate);
+    }
+    #[test]
+    fn sibling_autogate_decision_is_exact_and_guarded() {
+        // Equal, non-empty parents, parent live → sibling autogate.
+        assert!(siblings_share_live_parent(Some("orch"), Some("orch"), true));
+        // Equal parent id, but that parent is done (or absent, parent_live=false) → not.
+        assert!(!siblings_share_live_parent(Some("orch"), Some("orch"), false));
+        // One side missing → not.
+        assert!(!siblings_share_live_parent(None, Some("orch"), true));
+        assert!(!siblings_share_live_parent(Some("orch"), None, true));
+        // Both missing → not.
+        assert!(!siblings_share_live_parent(None, None, true));
+        // Empty-string parents never match (a blank id is not a parent claim).
+        assert!(!siblings_share_live_parent(Some(""), Some(""), true));
+        // Different parents (cross-tree) → not, whatever `parent_live` says.
+        assert!(!siblings_share_live_parent(Some("orch"), Some("other"), true));
+
+        // The env opt-out: absent/anything-else → enabled; {0,false,no} → disabled.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_CONDUCT_SIBLING_AUTOGATE"]);
+        std::env::remove_var("AOIDE_CONDUCT_SIBLING_AUTOGATE");
+        assert!(sibling_autogate_enabled());
+        for off in ["0", "false", "no"] {
+            std::env::set_var("AOIDE_CONDUCT_SIBLING_AUTOGATE", off);
+            assert!(!sibling_autogate_enabled(), "{off} should disable it");
+        }
+        std::env::set_var("AOIDE_CONDUCT_SIBLING_AUTOGATE", "whatever");
+        assert!(sibling_autogate_enabled());
+
+        // The gate: --yes ▸ global env ▸ parent-of-target ▸ sibling ▸ pending.
+        let _env2 = EnvVars::save(&["AOIDE_CONDUCT_AUTOGATE"]);
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_CONDUCT_SIBLING_AUTOGATE");
+        assert_eq!(send_gate(false, false, true), SendGate::AutogateSibling);
+        assert_eq!(SendGate::AutogateSibling.label(), "autogate-sibling");
+        assert!(SendGate::AutogateSibling.delivers());
+        // Parent-of-target still outranks sibling when both are true.
+        assert_eq!(send_gate(false, true, true), SendGate::AutogateParent);
+        // The opt-out env falls the sibling arm through to pending.
+        std::env::set_var("AOIDE_CONDUCT_SIBLING_AUTOGATE", "0");
+        assert_eq!(send_gate(false, false, true), SendGate::Pending);
     }
     #[test]
     fn send_yes_delivers_and_autorenames_the_title() {
@@ -1396,6 +1506,228 @@ mod tests {
         let out = session_send(&send_invocation(&["hi"], &[("id", id)]));
         assert_eq!(out.data.as_ref().unwrap()["state"], "pending");
         assert_eq!(out.data.as_ref().unwrap()["delivered"], false);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn send_delivers_between_siblings_of_a_live_parent() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_CONDUCT_SIBLING_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+
+        let root = unique_stage("send-sibling");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE"); // no global autogate.
+        std::env::remove_var("AOIDE_CONDUCT_SIBLING_AUTOGATE"); // default: enabled.
+
+        // A live parent `orch`, and two of its children: `sib-a` (the sender,
+        // NOT conductable — it never receives) and `sib-b` (the conductable
+        // TARGET). Neither is the other's parent — only their shared, live
+        // parent makes this a sibling send.
+        do_session_start("orch", Some("claude"), Some("/w"), None, None, None, None, None, None);
+        do_session_start(
+            "sib-a", Some("claude"), Some("/w"), None, Some("orch"), None, None, None, None,
+        );
+        let target = "sib-b";
+        let socket = conduct_socket_path(target);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        do_session_start(
+            target,
+            Some("claude"),
+            Some("/w"),
+            None,
+            Some("orch"),
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+            None,
+        );
+
+        // (a) sender and target share a live parent, no --yes, no env autogate,
+        // sender is NOT the target's parent → DELIVERED, sibling label.
+        std::env::set_var("AOIDE_SESSION_ID", "sib-a");
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+        let out = session_send(&send_invocation(&["hey", "sib"], &[("id", target)]));
+        let got = acc.join().unwrap();
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(out.data.as_ref().unwrap()["delivered"], true);
+        assert_eq!(out.data.as_ref().unwrap()["gate"], "autogate-sibling");
+        assert_eq!(String::from_utf8(got).unwrap(), "hey sib");
+
+        // (b) same pair, but the opt-out env is set → held pending, not delivered.
+        std::env::set_var("AOIDE_CONDUCT_SIBLING_AUTOGATE", "0");
+        let out = session_send(&send_invocation(&["hey", "again"], &[("id", target)]));
+        assert_eq!(out.data.as_ref().unwrap()["state"], "pending");
+        assert_eq!(out.data.as_ref().unwrap()["delivered"], false);
+        std::env::remove_var("AOIDE_CONDUCT_SIBLING_AUTOGATE"); // back to enabled.
+
+        // (c) a cross-tree sender (a different parent than the target's) → pending.
+        do_session_start(
+            "cross-sender", Some("claude"), Some("/w"), None, Some("other-parent"), None, None,
+            None, None,
+        );
+        std::env::set_var("AOIDE_SESSION_ID", "cross-sender");
+        let out = session_send(&send_invocation(&["nope"], &[("id", target)]));
+        assert_eq!(out.data.as_ref().unwrap()["state"], "pending");
+        assert_eq!(out.data.as_ref().unwrap()["delivered"], false);
+
+        // (d) an orphan sender (no AOIDE_SESSION_ID at all) → pending.
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let out = session_send(&send_invocation(&["nope"], &[("id", target)]));
+        assert_eq!(out.data.as_ref().unwrap()["state"], "pending");
+        assert_eq!(out.data.as_ref().unwrap()["delivered"], false);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn send_to_self_never_autodelivers_via_the_sibling_arm() {
+        // Regression for a real gate-widening: `AOIDE_SESSION_ID` is exported
+        // into every conducted child's own env, so a prompt-injected `graph
+        // send --id "$AOIDE_SESSION_ID" --submit -- <text>` finds ITS OWN
+        // record as sender — sender_parent == target_parent trivially (same
+        // record, same field, read twice) and the shared parent is live in the
+        // normal case. Without the `is_self_send` guard this self-delivers
+        // text straight back into the session's own input stream, bypassing
+        // approval. It must queue, exactly like any other ungated send.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_CONDUCT_SIBLING_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+
+        let root = unique_stage("send-self");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_CONDUCT_SIBLING_AUTOGATE"); // default: enabled.
+
+        do_session_start("orch", Some("claude"), Some("/w"), None, None, None, None, None, None);
+        let id = "self-target";
+        let socket = conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap(); // prove nothing connects.
+        do_session_start(
+            id,
+            Some("claude"),
+            Some("/w"),
+            None,
+            Some("orch"), // a live parent — the predicate WOULD fire if unguarded.
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+            None,
+        );
+
+        // The sender IS the target — the exact shape a self-injecting prompt
+        // would produce (`--id "$AOIDE_SESSION_ID"`).
+        std::env::set_var("AOIDE_SESSION_ID", id);
+        let out = session_send(&send_invocation(&["do", "a", "thing"], &[("id", id)]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(out.data.as_ref().unwrap()["state"], "pending");
+        assert_eq!(out.data.as_ref().unwrap()["delivered"], false);
+        assert!(
+            matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "a self-send delivers nothing"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn global_autogate_env_outranks_the_sibling_label_even_when_both_apply() {
+        // Precedence lock-in: when the global switch is on AND the sibling
+        // predicate is true, the label must be the global arm's ("autogate"),
+        // never "autogate-sibling" — a future refactor that reorders the `if`
+        // chain in `send_gate` should trip this, not silently relabel deliveries.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_CONDUCT_AUTOGATE"]);
+        std::env::set_var("AOIDE_CONDUCT_AUTOGATE", "1");
+        let gate = send_gate(false, false, true);
+        assert_eq!(gate, SendGate::Autogate);
+        assert_eq!(gate.label(), "autogate");
+    }
+    #[test]
+    fn sibling_send_queues_when_the_shared_parent_record_is_done() {
+        // Integration-level: the pure predicate's `parent_live=false` arm is
+        // already unit-tested; this proves the RESOLUTION through a real
+        // SessionsFile record actually feeds it — a parent whose on-disk state
+        // is `done` must gate the sibling send, not just the bool parameter.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_CONDUCT_SIBLING_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+
+        let root = unique_stage("send-sibling-done-parent");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_CONDUCT_SIBLING_AUTOGATE"); // default: enabled.
+
+        do_session_start("orch", Some("claude"), Some("/w"), None, None, None, None, None, None);
+        do_session_start(
+            "sib-a", Some("claude"), Some("/w"), None, Some("orch"), None, None, None, None,
+        );
+        let target = "sib-b";
+        let socket = conduct_socket_path(target);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        do_session_start(
+            target,
+            Some("claude"),
+            Some("/w"),
+            None,
+            Some("orch"),
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+            None,
+        );
+        // The shared parent ends — its on-disk sessions.json record flips to
+        // `done` (sib-a/sib-b are not `kind: subagent`, so they survive intact).
+        do_session_end("orch");
+
+        std::env::set_var("AOIDE_SESSION_ID", "sib-a");
+        let out = session_send(&send_invocation(&["nope"], &[("id", target)]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(out.data.as_ref().unwrap()["state"], "pending");
+        assert_eq!(out.data.as_ref().unwrap()["delivered"], false);
+        assert!(
+            matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "a dead-parent sibling send delivers nothing"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
