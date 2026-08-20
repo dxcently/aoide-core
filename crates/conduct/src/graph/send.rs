@@ -7,7 +7,7 @@
 use super::common::{require_flag, stage_error};
 use super::doc::restage_graph;
 use super::model::{
-    load_stage, sessions_path, write_stage, SessionsFile, STAGE_GRAPH_VERSION,
+    load_stage, sessions_path, write_stage, SessionRecord, SessionsFile, STAGE_GRAPH_VERSION,
 };
 use super::session_store::{
     do_session_end, do_session_phase, do_session_phase_if, do_session_start, do_subagent_end,
@@ -256,6 +256,34 @@ fn provenance_prefix(sender: Option<&str>, text: &str) -> Option<String> {
     Some(format!("from {sender}: "))
 }
 
+/// Map a resolved+sanitized sender id to its TERSE provenance DISPLAY form —
+/// `<petname> (…<tail4>)` (petnames plan P3's grammar, minus host/role: the
+/// composer prefix stays deliberately narrower than the full `graph view`/
+/// pending-list grammar) — when `sender` resolves against `sessions` (the
+/// caller's ALREADY-LOADED roster, no second read) to a record carrying a
+/// minted petname. Falls back to `sender` unchanged for an unknown sender or
+/// a legacy/petname-less one — `sanitize_sender` already governs the string
+/// that reaches here, and this never re-sanitizes.
+///
+/// DISPLAY ONLY: [`record_pending`]'s `from`, the audit line
+/// ([`audit_send`]), and `approve --from` (`pending.rs`) all keep the raw
+/// sender id — this resolves fresh, off whatever the CURRENT roster says, at
+/// the moment of DELIVERY (not memoized into the queue at hold time, so a
+/// petname minted/changed between queueing and approval still shows right).
+fn display_sender<'a>(sender: &'a str, sessions: &[SessionRecord]) -> std::borrow::Cow<'a, str> {
+    match sessions
+        .iter()
+        .find(|s| s.session_id == sender)
+        .and_then(|s| s.petname.as_deref())
+    {
+        Some(petname) => std::borrow::Cow::Owned(format!(
+            "{petname} (…{})",
+            aoide_storage::display::short_tail(sender)
+        )),
+        None => std::borrow::Cow::Borrowed(sender),
+    }
+}
+
 /// A one-line, length-bounded form of the injected text — the auto-rename title.
 fn one_line_title(text: &str) -> String {
     let first = text.lines().next().unwrap_or("").trim();
@@ -492,7 +520,14 @@ pub fn session_send(inv: &Invocation) -> Outcome {
     if submit {
         payload.push('\n');
     }
-    if let Some(prefix) = provenance_prefix(attributed_sender.as_deref(), &text) {
+    // Display-only: the prefix names the sender by petname+tail when the
+    // ALREADY-LOADED roster (`file.sessions`) resolves one, never the raw id
+    // — `attributed_sender` itself (the raw id) is what `record_pending` and
+    // `audit_send` still see, unaffected by this mapping.
+    let prefix_sender = attributed_sender
+        .as_deref()
+        .map(|s| display_sender(s, &file.sessions));
+    if let Some(prefix) = provenance_prefix(prefix_sender.as_deref(), &text) {
         payload = format!("{prefix}{payload}");
     }
     match UnixStream::connect(&socket) {
@@ -1789,6 +1824,149 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
     #[test]
+    fn provenance_prefix_names_a_petnamed_sender_by_petname_and_tail() {
+        // Petnames plan P3: the composer prefix is TERSE — `from <petname>
+        // (…<tail4>): `, never host/role — and resolves the sender against
+        // the ALREADY-LOADED roster at delivery time, not the raw session id
+        // `resolve_sender` produced. Every session minted since P2 carries a
+        // petname automatically, so a registered sender always hits this path.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+
+        let root = unique_stage("send-provenance-petname");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+
+        let sender_id = "petname-sender";
+        std::env::remove_var("AOIDE_SESSION_ID");
+        do_session_start(sender_id, Some("claude"), Some("/w"), None, None, None, None, None, None);
+        std::env::set_var("AOIDE_SESSION_ID", sender_id);
+
+        let target = "petname-target";
+        let socket = conduct_socket_path(target);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        do_session_start(
+            target,
+            Some("claude"),
+            Some("/w"),
+            None,
+            None,
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+            None,
+        );
+
+        // Read back the petname `do_session_start` minted for the sender —
+        // pinned off the SAME storage helper the prefix build uses, not a
+        // hand-guessed literal (the mint is non-deterministic by design).
+        let sessions: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let sender_rec = sessions.sessions.iter().find(|s| s.session_id == sender_id).unwrap();
+        let petname = sender_rec.petname.clone().expect("every minted session carries a petname (P2)");
+        let expected_prefix = format!(
+            "from {petname} (…{}): ",
+            aoide_storage::display::short_tail(sender_id)
+        );
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+
+        let out = session_send(&send_invocation(
+            &["ship", "it"],
+            &[("id", target), ("submit", "true"), ("yes", "true")],
+        ));
+        let got = acc.join().unwrap();
+
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(
+            String::from_utf8(got).unwrap(),
+            format!("{expected_prefix}ship it\n"),
+            "the delivered prefix names the sender by petname+tail, not the raw session id"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn provenance_prefix_falls_back_to_the_raw_sender_id_when_unresolvable() {
+        // A sender that resolves to nothing in the current roster (never
+        // registered, or already pruned/reaped since it sent) degrades to
+        // the raw id — the same fallback a legacy/petname-less record would
+        // hit, exercised here via the far more common real-world case: an
+        // unknown sender.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+
+        let root = unique_stage("send-provenance-fallback");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::set_var("AOIDE_SESSION_ID", "ghost-sender");
+
+        let target = "fallback-target";
+        let socket = conduct_socket_path(target);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        do_session_start(
+            target,
+            Some("claude"),
+            Some("/w"),
+            None,
+            None,
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+            None,
+        );
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+
+        let out = session_send(&send_invocation(
+            &["ship", "it"],
+            &[("id", target), ("submit", "true"), ("yes", "true")],
+        ));
+        let got = acc.join().unwrap();
+
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(
+            String::from_utf8(got).unwrap(),
+            "from ghost-sender: ship it\n",
+            "an unresolvable sender falls back to the raw id, exactly as before this change"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
     fn send_without_yes_is_held_pending_not_delivered() {
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&[
@@ -1978,8 +2156,25 @@ mod tests {
         assert_eq!(out.data.as_ref().unwrap()["gate"], "autogate-sibling");
         // `AOIDE_SESSION_ID=sib-a` doubles as the gate's sender AND the
         // provenance attribution (see [`resolve_sender`]) — the delivered
-        // bytes carry the sibling's `from sib-a: ` prefix.
-        assert_eq!(String::from_utf8(got).unwrap(), "from sib-a: hey sib");
+        // bytes carry the sibling's prefix, DISPLAY-mapped to its
+        // auto-minted petname+tail (petnames plan P3; every session mints
+        // one on registration since P2, so `sib-a` — a real registered
+        // sender — always hits that path). Pulled off the roster rather
+        // than hand-guessed since the mint is non-deterministic.
+        let sessions: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let sender_petname = sessions
+            .sessions
+            .iter()
+            .find(|s| s.session_id == "sib-a")
+            .and_then(|s| s.petname.clone())
+            .expect("every minted session carries a petname (P2)");
+        assert_eq!(
+            String::from_utf8(got).unwrap(),
+            format!(
+                "from {sender_petname} (…{}): hey sib",
+                aoide_storage::display::short_tail("sib-a")
+            )
+        );
 
         // (b) same pair, but the opt-out env is set → held pending, not delivered.
         std::env::set_var("AOIDE_CONDUCT_SIBLING_AUTOGATE", "0");

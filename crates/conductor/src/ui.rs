@@ -726,10 +726,14 @@ mod tests {
 
     #[test]
     fn graph_panel_draws_nodes_edges_and_tags() {
-        let mut root = session("root", "/home/k/Aoide", "running", None);
-        root.extra
-            .insert("tags".into(), serde_json::json!(["backend"]));
-        let kid = session("kid", "/home/k/Aoide", "idle", Some("root"));
+        // Short ids/state/tag: the display-grammar label (petnames plan
+        // P3 — `<host>/<role>/<sessionId>` on a legacy/petname-less
+        // fixture) now shares the chip's CHIP_MAX budget with the state
+        // word and the tag chip, so this fixture stays lean to leave room
+        // for both on any reasonably short box hostname.
+        let mut root = session("r", "/home/k/Aoide", "idle", None);
+        root.extra.insert("tags".into(), serde_json::json!(["x"]));
+        let kid = session("k", "/home/k/Aoide", "idle", Some("r"));
         let app = app_with(
             vec![Project {
                 name: "aoide".into(),
@@ -740,15 +744,19 @@ mod tests {
         let out = render_panel(&app, Panel::Graph, 120, 30);
         assert!(out.contains("DAG"), "panel title rendered");
         assert!(out.contains("◆ aoide"), "project node drawn");
+        // Session chips render the display grammar (petnames plan P3), not
+        // the bare id — neither fixture session has a minted petname, so
+        // each degrades to `<host>/<role>/<sessionId>`.
+        let host = aoide_storage::display::local_host_name();
         assert!(
-            out.contains("● root") && out.contains("● kid"),
-            "session nodes drawn"
+            out.contains(&format!("● {host}/root/r")) && out.contains(&format!("{host}/child/k")),
+            "session nodes drawn: {out}"
         );
         assert!(
             out.contains('├') || out.contains('└') || out.contains('─'),
             "box-drawing edges present"
         );
-        assert!(out.contains("⟨backend⟩"), "read-only tag chip drawn");
+        assert!(out.contains("⟨x⟩"), "read-only tag chip drawn: {out}");
     }
 
     #[test]
@@ -830,13 +838,16 @@ mod tests {
 
     #[test]
     fn graph_panel_draws_the_model_tag_on_a_subagent_chip() {
-        let root = session("root", "/home/k/Aoide", "running", None);
-        let mut sub = session("kid", "/home/k/Aoide", "working", Some("root"));
+        // Short ids + a short state + a one-char model, so the chip's
+        // CHIP_MAX budget survives the display-grammar label (petnames
+        // plan P3 — `<host>/<role>/<sessionId>` now eats into the SAME
+        // budget the model tag used to have mostly to itself) on any
+        // reasonably short box hostname. The point is the glyph+text ride
+        // the chip at all, not exercising the truncation boundary itself.
+        let root = session("r", "/home/k/Aoide", "idle", None);
+        let mut sub = session("k", "/home/k/Aoide", "idle", Some("r"));
         sub.kind = Some("subagent".into());
-        // Short enough to survive the chip's CHIP_MAX truncation (tags/state
-        // already share that budget) — the point is the glyph+text ride the
-        // chip at all, not exercising the truncation boundary itself.
-        sub.model = Some("fable5".into());
+        sub.model = Some("m".into());
         let app = app_with(
             vec![Project {
                 name: "aoide".into(),
@@ -845,10 +856,7 @@ mod tests {
             vec![root, sub],
         );
         let out = render_panel(&app, Panel::Graph, 120, 30);
-        assert!(
-            out.contains("⟐fable5"),
-            "subagent chip carries its model tag: {out}"
-        );
+        assert!(out.contains("⟐m"), "subagent chip carries its model tag: {out}");
     }
 
     #[test]

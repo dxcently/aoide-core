@@ -29,7 +29,9 @@ use std::collections::{HashMap, HashSet};
 
 /// Per-depth band width in cells. Wide enough to read as columns (distinct from
 /// the roster's tight indentation) and to give edges a gutter to route through.
-const COL_W: usize = 28;
+/// Widened 28->36 for the display grammar's `<host>/<role>/<petname>
+/// (…<tail4>)` label (petnames plan P3) — `CHIP_MAX` (below) follows.
+const COL_W: usize = 36;
 /// Max chip width (label + state + tag chips), leaving a gutter for connectors.
 const CHIP_MAX: usize = COL_W - 4;
 
@@ -100,6 +102,21 @@ pub fn build_model(app: &App) -> Model {
     let nodes_j = doc["nodes"].as_array().unwrap_or(&empty);
     let edges_j = doc["edges"].as_array().unwrap_or(&empty);
 
+    // Which session node ids are the `to` end of a "spawned" edge — exactly
+    // `resolved_parent(...).is_some()` in `conduct`'s own terms (`build_graph`
+    // emits "spawned" only for a session with a resolved parent, "anchors"
+    // only for a parentless one) — so this is the display grammar's `role`
+    // (petnames plan P3) read straight off the edge vocabulary already on the
+    // document, no second parent walk needed.
+    let spawned_targets: HashSet<&str> = edges_j
+        .iter()
+        .filter(|e| e.get("kind").and_then(|v| v.as_str()) == Some("spawned"))
+        .filter_map(|e| e.get("to").and_then(|v| v.as_str()))
+        .collect();
+    // Resolved ONCE for this whole build — every session label in the panel
+    // shares the same host (mirrors the `graph view` tree render's rule).
+    let host = aoide_storage::display::local_host_name();
+
     // Metadata per node id, and the project ids in doc order (sorted by name).
     let mut meta: HashMap<String, Meta> = HashMap::new();
     let mut project_ids: Vec<String> = Vec::new();
@@ -136,11 +153,24 @@ pub fn build_model(app: &App) -> Model {
                 // or subagent alike) — absent for shells, so no filter on `role`
                 // is needed here.
                 let model = n.get("model").and_then(|v| v.as_str()).map(str::to_string);
+                // The display grammar (petnames plan P3): `<host>/<role>/
+                // <petname> (…<tail4>)`, degrading to `<host>/<role>/
+                // <sessionId>` for a legacy/petname-less node. `session_id`
+                // (below) stays the bare canonical id — this is the LABEL
+                // only, never what Enter/`graph focus` reads.
+                let role = if spawned_targets.contains(id.as_str()) { "child" } else { "root" };
+                let petname = n.get("petname").and_then(|v| v.as_str()).map(str::to_string);
+                let rec = aoide_storage::records::SessionRecord {
+                    session_id: sid.clone(),
+                    petname,
+                    ..Default::default()
+                };
+                let label = aoide_storage::display::session_label(&rec, &host, role);
                 meta.insert(
                     id.clone(),
                     Meta {
                         kind: NodeKind::Session,
-                        label: sid.clone(),
+                        label,
                         session_id: Some(sid),
                         state: Some(state),
                         tags,
@@ -532,9 +562,13 @@ mod tests {
         );
         let m = build_model(&app);
         // project (depth 0) → root session (depth 1) → spawned kid (depth 2).
+        // Session labels now render the display grammar (petnames plan P3),
+        // not the bare id — so lookups here go through `session_id`, the
+        // field that stays the bare canonical id (Enter/`graph focus`
+        // unaffected by the label change).
         let proj = m.nodes.iter().find(|n| n.label == "aoide").unwrap();
-        let root = m.nodes.iter().find(|n| n.label == "root").unwrap();
-        let kid = m.nodes.iter().find(|n| n.label == "kid").unwrap();
+        let root = m.nodes.iter().find(|n| n.session_id.as_deref() == Some("root")).unwrap();
+        let kid = m.nodes.iter().find(|n| n.session_id.as_deref() == Some("kid")).unwrap();
         assert_eq!(proj.depth, 0);
         assert_eq!(root.depth, 1);
         assert_eq!(kid.depth, 2);
@@ -552,7 +586,7 @@ mod tests {
         );
         let m = build_model(&app);
         assert!(m.nodes.iter().any(|n| n.kind == NodeKind::Unanchored));
-        assert!(m.nodes.iter().any(|n| n.label == "loose"));
+        assert!(m.nodes.iter().any(|n| n.session_id.as_deref() == Some("loose")));
     }
 
     #[test]
@@ -574,9 +608,9 @@ mod tests {
             Vec::new(),
         );
         let m = build_model(&app);
-        let root_n = m.nodes.iter().find(|n| n.label == "root").unwrap();
-        let kid_n = m.nodes.iter().find(|n| n.label == "kid").unwrap();
-        let term_n = m.nodes.iter().find(|n| n.label == "term").unwrap();
+        let root_n = m.nodes.iter().find(|n| n.session_id.as_deref() == Some("root")).unwrap();
+        let kid_n = m.nodes.iter().find(|n| n.session_id.as_deref() == Some("kid")).unwrap();
+        let term_n = m.nodes.iter().find(|n| n.session_id.as_deref() == Some("term")).unwrap();
         assert_eq!(root_n.model.as_deref(), Some("claude-sonnet-5"));
         assert_eq!(kid_n.model.as_deref(), Some("claude-fable-5"));
         assert_eq!(term_n.model, None);
@@ -596,7 +630,52 @@ mod tests {
             Vec::new(),
         );
         let m = build_model(&app);
-        let node = m.nodes.iter().find(|n| n.label == "t").unwrap();
+        let node = m.nodes.iter().find(|n| n.session_id.as_deref() == Some("t")).unwrap();
         assert_eq!(node.tags, vec!["backend".to_string(), "wip".to_string()]);
+    }
+
+    #[test]
+    fn session_label_renders_the_display_grammar_while_session_id_stays_bare() {
+        // Petnames plan P3: `Meta.label` (and so `Node.label`) is the
+        // grammar string — `<host>/<role>/<petname> (…<tail4>)`, legacy
+        // degrading to `<host>/<role>/<sessionId>` — but `Node::session_id`
+        // stays the bare canonical id no matter what, since Enter/`graph
+        // focus` reads that field, never the label.
+        let mut root = session("root", "/home/k/Aoide", "running", None);
+        root.petname = Some("brave-otter".into());
+        let mut kid = session("kid", "/home/k/Aoide", "working", Some("root"));
+        kid.petname = Some("calm-thorn".into());
+        // Legacy: no petname minted.
+        let legacy = session("legacy-full-id", "/home/k/Aoide", "idle", None);
+        let app = App::for_test(
+            vec![Project {
+                name: "aoide".into(),
+                path: "/home/k/Aoide".into(),
+            }],
+            vec![root, kid, legacy],
+            Vec::new(),
+        );
+        let m = build_model(&app);
+        let host = aoide_storage::display::local_host_name();
+
+        let root_n = m.nodes.iter().find(|n| n.session_id.as_deref() == Some("root")).unwrap();
+        assert_eq!(root_n.label, format!("{host}/root/brave-otter (…root)"));
+        assert_eq!(root_n.session_id.as_deref(), Some("root"), "session_id stays the bare canonical id");
+
+        let kid_n = m.nodes.iter().find(|n| n.session_id.as_deref() == Some("kid")).unwrap();
+        assert_eq!(kid_n.label, format!("{host}/child/calm-thorn (…kid)"));
+        assert_eq!(kid_n.session_id.as_deref(), Some("kid"));
+
+        let legacy_n = m
+            .nodes
+            .iter()
+            .find(|n| n.session_id.as_deref() == Some("legacy-full-id"))
+            .unwrap();
+        assert_eq!(
+            legacy_n.label,
+            format!("{host}/root/legacy-full-id"),
+            "legacy (petname-less) node degrades to host/role/full-id"
+        );
+        assert_eq!(legacy_n.session_id.as_deref(), Some("legacy-full-id"));
     }
 }

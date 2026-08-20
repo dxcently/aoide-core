@@ -40,12 +40,14 @@
 //! the entry stays exactly where it was for a human to inspect by hand.
 
 use super::common::{require_args, stage_error};
-use super::model::{load_stage, write_stage};
+use super::model::{
+    load_stage, resolved_parent, sessions_path, write_stage, SessionRecord, SessionsFile,
+};
 use super::send::pending_path;
 use aoide_protocol::output::{Outcome, Status};
 use aoide_protocol::Invocation;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 /// Is this raw `pending` array element too broken to resolve? The one field
 /// every entry [`super::send::record_pending`] ever wrote is a non-empty
@@ -90,12 +92,57 @@ fn load_pending_array() -> Result<Vec<Value>, String> {
         .unwrap_or_default())
 }
 
+/// Render a session id for the human line via the canonical display grammar
+/// (petnames plan P3): `<host>/<role>/<petname> (…<tail4>)`, degrading to
+/// `<host>/<role>/<sessionId>` for a legacy/petname-less record. When the id
+/// no longer resolves to any record in the current roster (the target was
+/// pruned/reaped since the entry was queued), falls back to the bare raw id
+/// — there is no record left to derive a role from, and a line inventing one
+/// would be a lie.
+fn grammar_label(
+    id: &str,
+    by_id: &BTreeMap<&str, &SessionRecord>,
+    ids: &HashSet<&str>,
+    host: &str,
+) -> String {
+    match by_id.get(id) {
+        Some(rec) => {
+            let role = if resolved_parent(rec, ids).is_some() { "child" } else { "root" };
+            aoide_storage::display::session_label(rec, host, role)
+        }
+        None => id.to_string(),
+    }
+}
+
+/// Render a sender id for the human line's TERSE `(from …)` tag — petname+
+/// tail only (never host/role — matches `send.rs`'s composer-prefix grammar,
+/// not the fuller tree-line one `grammar_label` above renders), falling back
+/// to the raw sender id when it does not resolve to a live petnamed record.
+fn from_label(id: &str, by_id: &BTreeMap<&str, &SessionRecord>) -> String {
+    match by_id.get(id).and_then(|r| r.petname.as_deref()) {
+        Some(petname) => format!("{petname} (…{})", aoide_storage::display::short_tail(id)),
+        None => id.to_string(),
+    }
+}
+
 /// One JSON view of a pending entry for `list`'s `data.pending`, and the text
 /// line for its human render. `from` is the sender attribution
 /// [`super::send::resolve_sender`] resolved at queue time — `None`/absent for
 /// an unattributed send AND for a LEGACY entry written before this field
 /// existed (serde default on read, see [`super::send::PendingSend`]).
-fn entry_view(index: usize, v: &Value) -> (Value, String) {
+///
+/// `by_id`/`ids`/`host` are the CURRENT session roster, loaded once by the
+/// caller ([`pending_list`]) and threaded through every entry — the JSON
+/// `sessionId`/`from` stay the entry's own canonical raw ids verbatim
+/// (machine contract unchanged); only the human LINE renders through the
+/// display grammar.
+fn entry_view(
+    index: usize,
+    v: &Value,
+    by_id: &BTreeMap<&str, &SessionRecord>,
+    ids: &HashSet<&str>,
+    host: &str,
+) -> (Value, String) {
     let malformed = is_malformed(v);
     if malformed {
         let json = json!({
@@ -130,10 +177,13 @@ fn entry_view(index: usize, v: &Value) -> (Value, String) {
         "state": "pending",
     });
     let line = format!(
-        "[{index}] {session_id} ← {}{}{} ({queued_at})",
+        "[{index}] {} ← {}{}{} ({queued_at})",
+        grammar_label(&session_id, by_id, ids, host),
         preview(&text),
         if submit { " [submit]" } else { "" },
-        from.as_deref().map(|f| format!(" (from {f})")).unwrap_or_default(),
+        from.as_deref()
+            .map(|f| format!(" (from {})", from_label(f, by_id)))
+            .unwrap_or_default(),
     );
     (json, line)
 }
@@ -146,10 +196,22 @@ pub fn pending_list(_inv: &Invocation) -> Outcome {
         Ok(a) => a,
         Err(e) => return stage_error(cmd, e),
     };
+    // The current session roster, loaded ONCE for this whole list — every
+    // entry's human line renders its target/sender through the SAME
+    // snapshot (and the SAME once-resolved host), matching the render
+    // pass's "host resolved once per render" rule in `doc.rs`.
+    let sessions: Vec<SessionRecord> = load_stage::<SessionsFile>(&sessions_path())
+        .map(|f| f.sessions)
+        .unwrap_or_default();
+    let by_id: BTreeMap<&str, &SessionRecord> =
+        sessions.iter().map(|s| (s.session_id.as_str(), s)).collect();
+    let ids: HashSet<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+    let host = aoide_storage::display::local_host_name();
+
     let mut data = Vec::with_capacity(arr.len());
     let mut lines = Vec::with_capacity(arr.len());
     for (i, v) in arr.iter().enumerate() {
-        let (j, l) = entry_view(i, v);
+        let (j, l) = entry_view(i, v, &by_id, &ids, &host);
         data.push(j);
         lines.push(l);
     }
@@ -418,6 +480,95 @@ mod tests {
         assert_eq!(arr[1]["state"], "malformed", "a bare string entry is flagged, not fatal");
         assert_eq!(arr[2]["state"], "malformed", "an object with no sessionId is unresolvable too");
         assert!(out.message.contains("3 pending"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_human_line_renders_the_display_grammar_while_the_json_stays_raw() {
+        // Petnames plan P3: `list`'s human line renders the target through
+        // the canonical grammar (host/role/petname/tail) and the sender
+        // through the terse petname+tail tag — but `data.pending[]`'s
+        // `sessionId`/`from` are the machine contract and must stay the
+        // entry's raw canonical ids, untouched.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+        let root = setup("pnd-grammar");
+
+        let sender_id = "grammar-sender";
+        do_session_start(sender_id, Some("claude"), Some("/w"), None, None, None, None, None, None);
+
+        let target = "grammar-target";
+        let socket = conduct_socket_path(target);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let _listener = UnixListener::bind(&socket).unwrap();
+        do_session_start(
+            target,
+            Some("claude"),
+            Some("/w"),
+            None,
+            None,
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+            None,
+        );
+
+        // Held pending: no --yes, no autogate.
+        std::env::set_var("AOIDE_SESSION_ID", sender_id);
+        let queued = session_send(&send_invocation(&["do", "the", "thing"], &[("id", target), ("submit", "true")]));
+        assert_eq!(queued.data.as_ref().unwrap()["state"], "pending");
+
+        // Pull the SAME petnames the mint actually chose (non-deterministic
+        // roll) rather than hand-guessing a literal.
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let target_petname = s
+            .sessions
+            .iter()
+            .find(|r| r.session_id == target)
+            .and_then(|r| r.petname.clone())
+            .expect("every minted session carries a petname (P2)");
+        let sender_petname = s
+            .sessions
+            .iter()
+            .find(|r| r.session_id == sender_id)
+            .and_then(|r| r.petname.clone())
+            .expect("every minted session carries a petname (P2)");
+        let host = aoide_storage::display::local_host_name();
+
+        let out = pending_list(&pending_invocation(&["graph", "pending", "list"], &[]));
+        assert_eq!(out.status, Status::Ok);
+        let data = out.data.unwrap();
+        let arr = data["pending"].as_array().unwrap();
+        // The JSON contract: raw canonical ids, verbatim.
+        assert_eq!(arr[0]["sessionId"], target, "JSON sessionId stays the raw canonical id");
+        assert_eq!(arr[0]["from"], sender_id, "JSON from stays the raw canonical id");
+        // The human line: full grammar for the target (a root — no parent),
+        // terse petname+tail for the sender.
+        let expected_target = format!(
+            "{host}/root/{target_petname} (…{})",
+            aoide_storage::display::short_tail(target)
+        );
+        let expected_from = format!(
+            "(from {sender_petname} (…{}))",
+            aoide_storage::display::short_tail(sender_id)
+        );
+        assert!(
+            out.message.contains(&expected_target),
+            "target renders via the display grammar: {}",
+            out.message
+        );
+        assert!(
+            out.message.contains(&expected_from),
+            "sender renders via the terse petname+tail tag: {}",
+            out.message
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

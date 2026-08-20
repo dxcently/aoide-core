@@ -254,8 +254,13 @@ pub fn render(
         }
     }
 
-    fn session_line(s: &SessionRecord, focus: Option<&str>) -> String {
+    fn session_line(s: &SessionRecord, focus: Option<&str>, host: &str, role: &str) -> String {
         let id = format!("session:{}", s.session_id);
+        // The canonical display grammar (petnames plan P3): `<host>/<role>/
+        // <petname> (…<tail4>)`, degrading to `<host>/<role>/<sessionId>`
+        // (full id) for a legacy/petname-less record — one function, every
+        // human surface.
+        let label = aoide_storage::display::session_label(s, host, role);
         // The running Claude model, when known — a compact `⟐ <model>` tag
         // (same glyph the gadget dock uses for a subagent's model text)
         // appended after cwd; omitted for shells and anything model-less.
@@ -281,7 +286,7 @@ pub fn render(
         format!(
             "{}● {}  {}  {}  {}{}{}{}",
             marker(focus, &id, &s.session_id),
-            s.session_id,
+            label,
             s.agent,
             s.state,
             s.cwd,
@@ -300,6 +305,7 @@ pub fn render(
         prefix: &str,
         focus: Option<&str>,
         visited: &mut HashSet<String>,
+        host: &str,
     ) {
         let Some(kids) = children.get(parent) else {
             return;
@@ -310,11 +316,22 @@ pub fn render(
             }
             let last = i + 1 == kids.len();
             let branch = if last { "└─ " } else { "├─ " };
-            out.push(format!("{prefix}{branch}{}", session_line(kid, focus)));
+            // Everything reached through `children` has a resolved parent by
+            // construction (that's how it landed in this map) — role is
+            // always "child" here, "root" only in the caller's own group.
+            out.push(format!(
+                "{prefix}{branch}{}",
+                session_line(kid, focus, host, "child")
+            ));
             let deeper = format!("{prefix}{}", if last { "   " } else { "│  " });
-            render_children(out, &kid.session_id, children, &deeper, focus, visited);
+            render_children(out, &kid.session_id, children, &deeper, focus, visited, host);
         }
     }
+
+    // Resolved ONCE per render call (not per node) — every line in this pass
+    // shares the same host, matching the plan's "host resolved once per
+    // render pass" rule.
+    let host = aoide_storage::display::local_host_name();
 
     let mut out: Vec<String> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
@@ -335,7 +352,12 @@ pub fn render(
             visited.insert(s.session_id.clone());
             let last = i + 1 == group.len();
             let branch = if last { "└─ " } else { "├─ " };
-            out.push(format!("{branch}{}", session_line(s, focus)));
+            // `group` is always a `roots` slice (per-project or unanchored) —
+            // role is always "root" here; children get "child" one level down.
+            out.push(format!(
+                "{branch}{}",
+                session_line(s, focus, &host, "root")
+            ));
             let deeper = if last { "   " } else { "│  " };
             render_children(
                 &mut *out,
@@ -344,6 +366,7 @@ pub fn render(
                 deeper,
                 focus,
                 &mut visited,
+                &host,
             );
         }
     };
@@ -598,19 +621,24 @@ mod tests {
             },
         ];
         // Roster `running` folds to canonical `working`; the merged hook phase and
-        // the resting states render verbatim from the one vocabulary.
-        let expected = "\
+        // the resting states render verbatim from the one vocabulary. None of
+        // these fixtures carry a minted petname, so every head degrades to
+        // `<host>/<role>/<sessionId>` — s1/s2/s4 are roots, s3 is s1's child.
+        let host = aoide_storage::display::local_host_name();
+        let expected = format!(
+            "\
 ◆ aoide  /home/k/Aoide
-└─ ● s1  claude  idle  /home/k/Aoide
-   └─ ● s3  claude  idle  /home/k/elsewhere
+└─ ● {host}/root/s1  claude  idle  /home/k/Aoide
+   └─ ● {host}/child/s3  claude  idle  /home/k/elsewhere
 ◆ nested  /home/k/Aoide/sub
-└─ ● s2  claude  working  /home/k/Aoide/sub/x
+└─ ● {host}/root/s2  claude  working  /home/k/Aoide/sub/x
 ◆ (unanchored)
-└─ ● s4  claude  idle  /tmp";
+└─ ● {host}/root/s4  claude  idle  /tmp"
+        );
         assert_eq!(render(&projects, &sessions, &hooks, None), expected);
         // The focus marker singles out one node.
         let focused = render(&projects, &sessions, &hooks, Some("session:s2"));
-        assert!(focused.contains("└─ ▶ ● s2  claude  working"));
+        assert!(focused.contains(&format!("└─ ▶ ● {host}/root/s2  claude  working")));
         // Same inputs → same render (deterministic).
         assert_eq!(render(&projects, &sessions, &hooks, None), expected);
     }
@@ -627,16 +655,17 @@ mod tests {
         let shell = session("s3", "/home/k/Aoide", "idle", "3", None);
         let sessions = vec![parent, sub, shell];
         let out = render(&projects, &sessions, &[], None);
+        let host = aoide_storage::display::local_host_name();
         assert!(
-            out.contains("● s1  claude  working  /home/k/Aoide  ⟐ claude-sonnet-5"),
+            out.contains(&format!("● {host}/root/s1  claude  working  /home/k/Aoide  ⟐ claude-sonnet-5")),
             "agent node carries its model tag: {out}"
         );
         assert!(
-            out.contains("● s2  claude  working  /home/k/Aoide  ⟐ claude-fable-5"),
+            out.contains(&format!("● {host}/child/s2  claude  working  /home/k/Aoide  ⟐ claude-fable-5")),
             "subagent node carries its own (possibly different) model tag: {out}"
         );
         assert!(
-            out.contains("● s3  claude  idle  /home/k/Aoide\n"),
+            out.contains(&format!("● {host}/root/s3  claude  idle  /home/k/Aoide\n")),
             "model-less node has no dangling tag: {out}"
         );
         assert!(!out.contains('⟐') || out.matches('⟐').count() == 2, "exactly two model tags: {out}");
@@ -1058,13 +1087,45 @@ mod tests {
         let free = session("s2", "/home/k/Aoide", "idle", "2", None);
         let sessions = vec![blocked, free];
         let out = render(&projects, &sessions, &[], None);
+        let host = aoide_storage::display::local_host_name();
         assert!(
-            out.contains("● s1  claude  awaiting  /home/k/Aoide  [sudo]"),
+            out.contains(&format!("● {host}/root/s1  claude  awaiting  /home/k/Aoide  [sudo]")),
             "sudo-blocked node carries the marker: {out}"
         );
         assert!(
-            !out.contains("s2  claude  idle  /home/k/Aoide  [sudo]"),
+            !out.contains(&format!("{host}/root/s2  claude  idle  /home/k/Aoide  [sudo]")),
             "non-blocked node carries no marker: {out}"
+        );
+    }
+    #[test]
+    fn render_session_head_uses_the_display_grammar_petnamed_and_legacy() {
+        // The canonical display grammar (petnames plan P3): a petnamed
+        // record's tree head is `<host>/<role>/<petname> (…<tail4>)`; a
+        // legacy (petname-less) record degrades to `<host>/<role>/
+        // <sessionId>` — the FULL id, never a truncated fake. Root vs child
+        // role comes from the DAG shape the tree already computes, not a
+        // stored field. Trailing glyph vocabulary (⟐/⧉/[sudo]) is untouched
+        // by this rendering change.
+        let mut root = session("sess-0000-8948", "/home/k/Aoide", "idle", "1", None);
+        root.petname = Some("brave-otter".into());
+        let mut child = session("sess-0000-1234", "/home/k/Aoide", "idle", "2", Some("sess-0000-8948"));
+        child.petname = Some("calm-thorn".into());
+        let legacy = session("sess-legacy-full-id", "/home/k/Aoide", "idle", "3", None);
+        let sessions = vec![root, child, legacy];
+
+        let out = render(&fixture_projects(), &sessions, &[], None);
+        let host = aoide_storage::display::local_host_name();
+        assert!(
+            out.contains(&format!("● {host}/root/brave-otter (…8948)  claude  idle")),
+            "petnamed root renders host/role/petname/tail: {out}"
+        );
+        assert!(
+            out.contains(&format!("● {host}/child/calm-thorn (…1234)  claude  idle")),
+            "petnamed child renders host/role/petname/tail: {out}"
+        );
+        assert!(
+            out.contains(&format!("● {host}/root/sess-legacy-full-id  claude  idle")),
+            "legacy record degrades to host/role/full-id, never a truncated fake: {out}"
         );
     }
 }
