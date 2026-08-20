@@ -699,6 +699,7 @@ mod tests {
             needs_sudo: None,
             context_ceiling: None,
             log_path: None,
+            petname: None,
             extra: Map::new(),
         }
     }
