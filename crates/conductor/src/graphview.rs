@@ -416,8 +416,23 @@ fn lay_out(model: &Model, sel: usize, pal: &crate::app::Palette) -> Vec<Vec<GCel
     grid
 }
 
+fn push_cells(buf: &mut Vec<GCell>, s: &str, style: Style) {
+    for ch in s.chars() {
+        buf.push(GCell { ch, style });
+    }
+}
+
 /// Build a node's chip as styled cells: marker, label, a short state word, and
-/// read-only tag chips — truncated to [`CHIP_MAX`].
+/// read-only tag chips — fit to [`CHIP_MAX`].
+///
+/// Send-back fix (P3 review): post-P2 every session carries a minted
+/// petname, so the display-grammar label (`<host>/<role>/<petname>
+/// (…<tail4>)`) routinely runs 30+ chars on its own — wider than the whole
+/// old bare-id chip. The SUFFIX (state, model, tag chips) is sized first and
+/// the label gets whatever budget is left, never the other way — state must
+/// survive on every row, the label is what yields. [`fit_label`] degrades
+/// the label gracefully into that budget rather than being blind-truncated
+/// by the final backstop below.
 fn chip_cells(n: &Node, selected: bool, pal: &crate::app::Palette) -> Vec<GCell> {
     let accent = theme::accent(pal).unwrap_or(Color::Cyan);
     let (marker, marker_style, label_style) = match n.kind {
@@ -432,18 +447,13 @@ fn chip_cells(n: &Node, selected: bool, pal: &crate::app::Palette) -> Vec<GCell>
         }
     };
 
-    let mut cells: Vec<GCell> = Vec::new();
-    let mut push = |s: &str, style: Style| {
-        for ch in s.chars() {
-            cells.push(GCell { ch, style });
-        }
-    };
-    push(&marker.to_string(), marker_style);
-    push(" ", label_style);
-    push(&n.label, label_style);
+    // The suffix — state, then model, then tag chips — in the SAME order
+    // and styling as always; only the sizing is new (computed before the
+    // label, so the label knows what's left).
+    let mut suffix: Vec<GCell> = Vec::new();
     if let Some(state) = &n.state {
         if !state.is_empty() {
-            push(&format!(" {state}"), theme::dim());
+            push_cells(&mut suffix, &format!(" {state}"), theme::dim());
         }
     }
     // The running Claude model, when known — same `⟐` glyph the gadget dock
@@ -451,19 +461,37 @@ fn chip_cells(n: &Node, selected: bool, pal: &crate::app::Palette) -> Vec<GCell>
     // subagent chips alike; absent for projects, unanchored, and shells.
     if let Some(model) = &n.model {
         if !model.is_empty() {
-            push(
+            push_cells(
+                &mut suffix,
                 &format!(" ⟐{model}"),
                 Style::default().fg(accent).add_modifier(Modifier::DIM),
             );
         }
     }
     for t in &n.tags {
-        push(
+        push_cells(
+            &mut suffix,
             &format!(" ⟨{t}⟩"),
             Style::default().fg(accent).add_modifier(Modifier::DIM),
         );
     }
 
+    // marker + space = 2 fixed cells; the label gets whatever's left after
+    // that and the suffix above.
+    let label_budget = CHIP_MAX.saturating_sub(2).saturating_sub(suffix.len());
+    let label = fit_label(&n.label, label_budget);
+
+    let mut cells: Vec<GCell> = Vec::new();
+    push_cells(&mut cells, &marker.to_string(), marker_style);
+    push_cells(&mut cells, " ", label_style);
+    push_cells(&mut cells, &label, label_style);
+    cells.extend(suffix);
+
+    // Backstop only now — sizing above already fits the budget in the
+    // overwhelming common case; this only bites the pathological one where
+    // the suffix ALONE exceeds CHIP_MAX-2 (label_budget saturated to 0),
+    // and even then it cuts from the END (tags, then model), never from the
+    // front where marker+state live.
     cells.truncate(CHIP_MAX);
     if selected {
         for c in &mut cells {
@@ -471,6 +499,111 @@ fn chip_cells(n: &Node, selected: bool, pal: &crate::app::Palette) -> Vec<GCell>
         }
     }
     cells
+}
+
+/// Fit a display-grammar label (`<host>/<role>/<petname> (…<tail4>)`, or the
+/// legacy `<host>/<role>/<sessionId>` with no tail bracket) into `budget`
+/// characters. The tail4 grep-back handle is the LAST thing to die — it is
+/// the only link back to the canonical id once host/role/petname are gone:
+///
+/// 1. Fits as-is → returned unchanged.
+/// 2. `<host>/<role>/` and the ` (…<tail4>)` bracket both preserved; the
+///    petname/id between them middle-elided (`hardy-…rbor`) to make room.
+/// 3. Host dropped: `<role>/<petname-truncated>… (…<tail4>)`.
+/// 4. Role dropped too: `<petname-prefix> (…<tail4>)`.
+/// 5. No room for any petname/id at all — just the tail bracket, itself
+///    front-truncated if `budget` is smaller than the bracket.
+/// 6. No tail to preserve (a legacy label, or `budget` too small for even
+///    a lone bracket char) — a blunt front-truncate of the raw label.
+fn fit_label(label: &str, budget: usize) -> String {
+    let len = label.chars().count();
+    if len <= budget {
+        return label.to_string();
+    }
+    if budget == 0 {
+        return String::new();
+    }
+
+    let (head, tail) = match label.rfind(" (…") {
+        Some(i) => (&label[..i], &label[i..]),
+        None => (label, ""),
+    };
+    let tail_len = tail.chars().count();
+    let mut segs = head.splitn(3, '/');
+    let (host, role, name) = match (segs.next(), segs.next(), segs.next()) {
+        (Some(h), Some(r), Some(nm)) => (h, r, nm),
+        _ => ("", "", head),
+    };
+
+    // Rung 1: host/role/ + middle-elided name + tail.
+    if !host.is_empty() && !role.is_empty() {
+        let fixed = host.chars().count() + 1 + role.chars().count() + 1 + tail_len;
+        if fixed < budget {
+            let name_budget = budget - fixed;
+            return format!("{host}/{role}/{}{tail}", elide_middle(name, name_budget));
+        }
+    }
+    // Rung 2: role/ + end-truncated name + tail (host dropped).
+    if !role.is_empty() {
+        let fixed = role.chars().count() + 1 + tail_len;
+        if fixed < budget {
+            let name_budget = budget - fixed;
+            return format!("{role}/{}{tail}", truncate_end(name, name_budget));
+        }
+    }
+    // Rung 3: name-prefix + tail (host AND role dropped).
+    if tail_len < budget {
+        let name_budget = budget - tail_len;
+        let prefix: String = name.chars().take(name_budget).collect();
+        return format!("{prefix}{tail}");
+    }
+    // Rung 4: the tail bracket alone — nothing else survives — itself
+    // front-truncated if even the bracket doesn't fit.
+    if tail_len > 0 {
+        return tail.chars().take(budget).collect();
+    }
+    // No tail at all (legacy label) — blunt front-truncate, the true last resort.
+    label.chars().take(budget).collect()
+}
+
+/// Middle-elide `s` into `budget` chars: `hardy-harbor` at budget 7 becomes
+/// `har…bor` — keeps BOTH ends visible (the common case has plenty of room
+/// for this; see [`fit_label`] rung 1).
+fn elide_middle(s: &str, budget: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= budget {
+        return s.to_string();
+    }
+    if budget == 0 {
+        return String::new();
+    }
+    if budget == 1 {
+        return "…".to_string();
+    }
+    let keep = budget - 1; // reserve 1 cell for the ellipsis itself.
+    let head_n = keep - keep / 2;
+    let tail_n = keep / 2;
+    let head: String = chars[..head_n].iter().collect();
+    let tail: String = chars[chars.len() - tail_n..].iter().collect();
+    format!("{head}…{tail}")
+}
+
+/// End-truncate `s` into `budget` chars with a trailing ellipsis (used once
+/// the host is already gone — see [`fit_label`] rung 2 — where showing only
+/// the FRONT of the petname/id reads more naturally than a middle elision).
+fn truncate_end(s: &str, budget: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= budget {
+        return s.to_string();
+    }
+    if budget == 0 {
+        return String::new();
+    }
+    if budget == 1 {
+        return "…".to_string();
+    }
+    let head: String = chars[..budget - 1].iter().collect();
+    format!("{head}…")
 }
 
 fn set(grid: &mut [Vec<GCell>], x: usize, y: usize, ch: char, style: Style) {
@@ -677,5 +810,84 @@ mod tests {
             "legacy (petname-less) node degrades to host/role/full-id"
         );
         assert_eq!(legacy_n.session_id.as_deref(), Some("legacy-full-id"));
+    }
+
+    #[test]
+    fn chip_cells_keeps_state_and_the_tail_visible_on_a_realistic_petnamed_row() {
+        // Send-back regression (P3 review): post-P2 every session carries a
+        // minted petname, so a REAL row's label is `<host>/<role>/<petname>
+        // (…<tail4>)` — routinely 30+ chars on a real box, wider than the
+        // whole pre-P3 chip. This fixture deliberately does NOT shrink the
+        // host, petname, or session id (unlike the layout tests above) —
+        // it drives the actual overflow path `fit_label` exists for, not a
+        // fixture engineered to dodge it.
+        let mut root = session(
+            "sess-realistically-long-canonical-id-0001",
+            "/home/k/Aoide",
+            "working",
+            None,
+        );
+        root.petname = Some("hardy-harbor".into()); // wordlist-shaped (petname.rs).
+        root.extra.insert("tags".into(), serde_json::json!(["backend"]));
+        let app = App::for_test(
+            vec![Project {
+                name: "aoide".into(),
+                path: "/home/k/Aoide".into(),
+            }],
+            vec![root],
+            Vec::new(),
+        );
+        let m = build_model(&app);
+        let node = m
+            .nodes
+            .iter()
+            .find(|n| n.session_id.as_deref() == Some("sess-realistically-long-canonical-id-0001"))
+            .unwrap();
+        // Sanity: this fixture actually exercises overflow — the full label
+        // alone is already wider than the whole chip budget.
+        assert!(
+            node.label.chars().count() > CHIP_MAX,
+            "fixture must exercise the overflow path: {} chars vs CHIP_MAX={CHIP_MAX}",
+            node.label.chars().count()
+        );
+
+        let cells = chip_cells(node, false, &app.palette);
+        let rendered: String = cells.iter().map(|c| c.ch).collect();
+
+        // (a) the acceptance bar: state survives.
+        assert!(rendered.contains("working"), "state chip survives: {rendered:?}");
+        // (b) the tail4 grep-back handle survives — the last thing to die.
+        assert!(rendered.contains(" (…"), "tail4 handle survives: {rendered:?}");
+        // (c) the row never overflows the chip's budget.
+        assert!(
+            cells.len() <= CHIP_MAX,
+            "chip must fit CHIP_MAX={CHIP_MAX}, got {} cells: {rendered:?}",
+            cells.len()
+        );
+    }
+
+    #[test]
+    fn fit_label_ladder_preserves_the_tail_longest_and_degrades_in_order() {
+        let label = "yomi-strix/child/hardy-harbor (…ab12)";
+        // Fits as-is.
+        assert_eq!(fit_label(label, 100), label);
+        // Rung 1: host/role/ + middle-elided name + tail all present.
+        let r1 = fit_label(label, 30);
+        assert!(r1.starts_with("yomi-strix/child/"), "rung 1 keeps host/role/: {r1}");
+        assert!(r1.ends_with(" (…ab12)"), "rung 1 keeps the tail: {r1}");
+        // Rung 2: budget too small for host — role/name/tail only.
+        let r2 = fit_label(label, 18);
+        assert!(!r2.contains("yomi-strix"), "rung 2 drops the host: {r2}");
+        assert!(r2.starts_with("child/"), "rung 2 keeps role/: {r2}");
+        assert!(r2.ends_with(" (…ab12)"), "rung 2 keeps the tail: {r2}");
+        // Even at a brutal budget, the tail bracket is the last thing cut.
+        let tiny = fit_label(label, 8);
+        assert!(tiny.ends_with(" (…ab12)"), "tail survives an 8-cell budget: {tiny}");
+        let tinier = fit_label(label, 5);
+        assert_eq!(tinier.chars().count(), 5);
+        assert!(
+            tinier.contains("ab12") || tinier.contains('…'),
+            "even a 5-cell budget keeps SOME fragment of the tail or an ellipsis: {tinier}"
+        );
     }
 }
