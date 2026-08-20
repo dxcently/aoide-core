@@ -178,8 +178,10 @@ pub(in crate::graph) fn summons_enabled(env_value: Option<&str>) -> bool {
 // ── The verb ────────────────────────────────────────────────────────────
 
 /// Resolve the harness profile for a session record's `agent` field, falling
-/// back to claude the way every other hook consumer does.
-fn profile_for_agent(agent: &str) -> &'static AgentProfile {
+/// back to claude the way every other hook consumer does. `pub(in
+/// crate::graph)`: `send.rs`'s delivery path reuses this SAME resolver to
+/// pick the target's submit keystroke — no second lookup of the same table.
+pub(in crate::graph) fn profile_for_agent(agent: &str) -> &'static AgentProfile {
     agent_profile(agent).unwrap_or(&CLAUDE_PROFILE)
 }
 

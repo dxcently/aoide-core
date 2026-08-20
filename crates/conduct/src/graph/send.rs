@@ -405,7 +405,10 @@ fn audit_send(inv: &Invocation, status: &str, message: &str, text: &str) {
 /// write) and NOT delivered; WITH `--yes` (or an autogate match — global env,
 /// sender-is-target's-parent, or sender-and-target-are-siblings-under-a-live-
 /// parent, see [`sibling_autogate_enabled`]) it connects to the socket, writes
-/// `<text>` (+ `\n` on `--submit`), auto-renames the node to a one-line form of
+/// `<text>` (+ the TARGET's own submit keystroke on `--submit` — `\n` for most
+/// harnesses, `\r` for kimi, resolved from the target session's agent profile
+/// at delivery time via [`super::permit::profile_for_agent`], never a fixed
+/// byte), auto-renames the node to a one-line form of
 /// the text (unless the text is a bare keystroke answer — see
 /// [`names_the_node`]), and returns delivered. A delivered payload that names
 /// the node also carries a `from <sender>: ` provenance prefix on its first
@@ -508,17 +511,22 @@ pub fn session_send(inv: &Invocation) -> Outcome {
         return out;
     }
 
-    // Deliver: connect + write the payload (+ newline on --submit, decided
-    // from the ORIGINAL text before any prefix). The provenance prefix (see
-    // [`provenance_prefix`]) is then prepended to the payload as a whole —
-    // since the prefix itself is newline-free, that lands it on the payload's
-    // first line only, never disturbing a later line or the trailing
-    // --submit newline. The title (`one_line_title`), the `names_the_node`
-    // check, and the audit `untrusted_data` below all keep reading the
-    // ORIGINAL `text`, never this prefixed payload.
+    // Deliver: connect + write the payload (+ the target's own submit
+    // keystroke on --submit, decided from the ORIGINAL text before any
+    // prefix). Resolved from `rec.agent` through the SAME profile lookup
+    // `graph permit` uses (`profile_for_agent`, promoted `pub(in
+    // crate::graph)` in permit.rs) — an unregistered/empty agent falls back
+    // to claude's `\n`, exactly as that lookup already does; no second
+    // resolver. The provenance prefix (see [`provenance_prefix`]) is then
+    // prepended to the payload as a whole — since the prefix itself is
+    // newline-free, that lands it on the payload's first line only, never
+    // disturbing a later line or the trailing submit keystroke. The title
+    // (`one_line_title`), the `names_the_node` check, and the audit
+    // `untrusted_data` below all keep reading the ORIGINAL `text`, never this
+    // prefixed payload.
     let mut payload = text.clone();
     if submit {
-        payload.push('\n');
+        payload.push_str(super::permit::profile_for_agent(&rec.agent).submit_key);
     }
     // Display-only: the prefix names the sender by petname+tail when the
     // ALREADY-LOADED roster (`file.sessions`) resolves one, never the raw id
@@ -1819,6 +1827,203 @@ mod tests {
         assert_eq!(
             delivered, "from evil sender: ship it\n",
             "the embedded newline in --from collapsed to a space, prefix stays single-line"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn send_yes_to_a_kimi_target_submits_with_carriage_return_not_newline() {
+        // Kimi's TUI submits on `\r`, not `\n` (KIMI_PROFILE::submit_key) —
+        // the delivered payload must carry exactly that byte, resolved from
+        // the TARGET's own registered agent, not a fixed `\n` at the call
+        // site.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+
+        let root = unique_stage("s-kimi");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        let id = "kimi-t";
+        let socket = conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        do_session_start(
+            id,
+            Some("kimi"),
+            Some("/w"),
+            None,
+            None,
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+            None,
+        );
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+
+        let out = session_send(&send_invocation(
+            &["hello", "world"],
+            &[("id", id), ("submit", "true"), ("yes", "true")],
+        ));
+        let got = acc.join().unwrap();
+
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let delivered = String::from_utf8(got).unwrap();
+        assert_eq!(delivered, "hello world\r");
+        assert_eq!(delivered.matches('\r').count(), 1);
+        assert_eq!(delivered.matches('\n').count(), 0, "no newline for a kimi target");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn send_yes_to_an_unregistered_agent_defaults_to_newline_submit() {
+        // An unregistered ("shell") or empty agent string falls back to the
+        // claude profile's `\n` — the same fallback `profile_for_agent`
+        // already applies for `graph permit`.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+
+        for (tag, agent) in [("sh", Some("shell")), ("mt", Some(""))] {
+            let root = unique_stage(&format!("s-unk-{tag}"));
+            let stage = root.join("stage");
+            std::fs::create_dir_all(&stage).unwrap();
+            std::env::set_var("AOIDE_STAGE_DIR", &stage);
+            std::env::set_var("XDG_RUNTIME_DIR", &root);
+            std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+            std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+            std::env::remove_var("AOIDE_SESSION_ID");
+
+            let id = "unk-t";
+            let socket = conduct_socket_path(id);
+            std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+            let listener = UnixListener::bind(&socket).unwrap();
+            do_session_start(
+                id,
+                agent,
+                Some("/w"),
+                None,
+                None,
+                Some(true),
+                Some(socket.to_str().unwrap()),
+                None,
+                None,
+            );
+
+            let acc = std::thread::spawn(move || {
+                let (mut conn, _) = listener.accept().unwrap();
+                use std::io::Read as _;
+                let mut buf = Vec::new();
+                let _ = conn.read_to_end(&mut buf);
+                buf
+            });
+
+            let out = session_send(&send_invocation(
+                &["hello", "world"],
+                &[("id", id), ("submit", "true"), ("yes", "true")],
+            ));
+            let got = acc.join().unwrap();
+
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+            assert_eq!(
+                String::from_utf8(got).unwrap(),
+                "hello world\n",
+                "agent {tag:?} defaults to the claude fallback's newline submit"
+            );
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+    #[test]
+    fn a_from_flag_with_an_embedded_carriage_return_never_smuggles_an_extra_submitted_line_for_a_kimi_target(
+    ) {
+        // Twin of `a_from_flag_with_an_embedded_newline_never_smuggles_an_
+        // extra_submitted_line`, against a kimi target: `sanitize_sender`
+        // already collapses an embedded `\r` in `--from` to a space, and the
+        // ONE `\r` in the delivered payload must be the trailing submit
+        // keystroke — never one smuggled in early by an unsanitized sender.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+
+        let root = unique_stage("s-kimi-cr");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        let id = "kimi-cr-t";
+        let socket = conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        do_session_start(
+            id,
+            Some("kimi"),
+            Some("/w"),
+            None,
+            None,
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+            None,
+        );
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+
+        let out = session_send(&send_invocation(
+            &["ship", "it"],
+            &[("id", id), ("submit", "true"), ("yes", "true"), ("from", "evil\rsender")],
+        ));
+        let got = acc.join().unwrap();
+
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let delivered = String::from_utf8(got).unwrap();
+        assert_eq!(
+            delivered.matches('\r').count(),
+            1,
+            "exactly one \\r (the trailing kimi submit), never an early-smuggled one: {delivered:?}"
+        );
+        assert!(delivered.ends_with('\r'), "the one \\r sits at the very end: {delivered:?}");
+        assert_eq!(
+            delivered, "from evil sender: ship it\r",
+            "the embedded \\r in --from collapsed to a space, prefix stays single-line"
         );
 
         let _ = std::fs::remove_dir_all(&root);

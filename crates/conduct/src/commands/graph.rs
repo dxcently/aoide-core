@@ -152,7 +152,7 @@ pub fn register(r: &mut Registry) {
         args: [arg!("text", "string", true, "The text to inject — put it after `--` so its own words/flags pass through verbatim.")],
         flags: [
             flag!("id", "string", "Target session id (required); its socket is resolved from sessions.json."),
-            flag!("submit", "bool", "Append a newline so the agent submits the line (Enter)."),
+            flag!("submit", "bool", "Append the target harness's own submit keystroke (Enter for most agents, \\r for kimi — resolved from the target session's agent profile at delivery time)."),
             flag!("yes", "bool", "Authorise delivery now (else the send is held pending approval)."),
             flag!("from", "string", "Sender attribution override for the delivered provenance prefix (default: AOIDE_SESSION_ID). ATTRIBUTION ONLY, not authentication — unauthenticated and as spoofable as the env var it defaults from."),
         ],

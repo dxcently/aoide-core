@@ -129,6 +129,14 @@ pub struct AgentProfile {
     /// on a live screen — in which case `graph permit` refuses to raise a
     /// summons at all rather than typing a guess into someone's session.
     pub permission_keys: Option<PermissionKeys>,
+    /// The keystroke that SUBMITS a composed line in this harness's own
+    /// input — what `graph send --submit` appends to the payload after the
+    /// text, resolved per-target from the DELIVERED session's own agent
+    /// profile (never a fixed byte at the call site). Every registered
+    /// profile names one; there is no absent case, only the unregistered-
+    /// agent fallback to claude's `\n` every other profile lookup already
+    /// takes.
+    pub submit_key: &'static str,
     /// Normalize a raw hook payload onto the canonical field names the hook
     /// door reads (`user_prompt`, `tool_use_id`, `agent_type`, …), in place,
     /// before `map_hook` runs. Identity for a harness whose payloads already
@@ -620,6 +628,9 @@ pub static CLAUDE_PROFILE: AgentProfile = AgentProfile {
         approve: "1",
         deny: "3",
     }),
+    // Claude Code's composer submits on Enter, same as any ordinary line
+    // editor.
+    submit_key: "\n",
     normalize_payload: claude_normalize_payload,
     model_ceiling: crate::model::context_ceiling_for_model,
     transcript: TranscriptSpec {
@@ -993,6 +1004,10 @@ pub static KIMI_PROFILE: AgentProfile = AgentProfile {
     // guessed hotkey into a session. Its `PermissionRequest` hook still
     // drives the roster's `awaiting` face.
     permission_keys: None,
+    // Kimi's TUI submits a composed line on `\r`, NOT `\n` — read off the
+    // live screen (Conductor-Channel.md's `graph send` entry): against a
+    // kimi target, a plain `\n` types the line without submitting it.
+    submit_key: "\r",
     normalize_payload: kimi_normalize_payload,
     model_ceiling: kimi_context_ceiling,
     transcript: TranscriptSpec {
@@ -1289,6 +1304,8 @@ pub static PI_PROFILE: AgentProfile = AgentProfile {
     // pi's permissions are invisible to the extension API (see above), so
     // there is no prompt for a summons to answer.
     permission_keys: None,
+    // pi's extension is a claude-shaped input surface; Enter submits.
+    submit_key: "\n",
     normalize_payload: normalize_identity,
     model_ceiling: crate::model::context_ceiling_for_model,
     transcript: TranscriptSpec {
@@ -1337,6 +1354,16 @@ mod tests {
         assert!(agent_profile("nope").is_none());
         assert!(agent_profile("").is_none());
         assert_eq!(known_agents(), &["claude", "kimi", "pi"]);
+    }
+
+    #[test]
+    fn submit_key_is_pinned_per_profile() {
+        // claude and pi submit on Enter; kimi's TUI submits on `\r` (ground-
+        // truthed on a live screen, see Conductor-Channel.md's `graph send`
+        // entry) — a wrong byte here types the line without submitting it.
+        assert_eq!(CLAUDE_PROFILE.submit_key, "\n");
+        assert_eq!(KIMI_PROFILE.submit_key, "\r");
+        assert_eq!(PI_PROFILE.submit_key, "\n");
     }
 
     #[test]
