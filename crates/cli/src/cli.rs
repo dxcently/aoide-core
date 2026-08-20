@@ -293,12 +293,30 @@ fn signature(c: &registry::Command) -> String {
     sig
 }
 
-/// Heuristic: is this token part of a command path (so a preceding `--flag`
-/// should be treated as a bare boolean rather than consuming it)?
-fn is_command_token(tok: &str, _prior: &[String]) -> bool {
-    dispatch::registry()
-        .commands()
-        .any(|c| c.path.first() == Some(&tok))
+/// Is this token part of a command path (so a preceding `--flag` should be
+/// treated as a bare boolean rather than consuming it)?
+///
+/// Flag-position-aware (khoa, 2026-08-20): `prior` is the positionals already
+/// collected by the time the parser reaches this token — i.e. how much of a
+/// command path has been built so far, interleaved with whatever flags came
+/// before it. A token only continues a command path if some REGISTERED path
+/// agrees with `prior` exactly up to `prior.len()` and has `tok` as its very
+/// next segment. This is a strict refinement of the old "does `tok` match
+/// ANY command's first segment" check, which ignored position entirely: a
+/// value like `a2a` (a real group's first segment) or `shell` collided with
+/// `--agent a2a` / `--agent shell` no matter where in argv it sat, because
+/// nothing about the check depended on what came before it. Requiring `tok`
+/// to be the exact next segment of a path that already agrees with `prior`
+/// means a flag's value can never be mistaken for a command token unless the
+/// invocation is ACTUALLY still mid-way through spelling out a longer
+/// command path — which a flag's value never is, by construction (a flag
+/// always trails the command path it belongs to, never sits inside it).
+fn is_command_token(tok: &str, prior: &[String]) -> bool {
+    dispatch::registry().commands().any(|c| {
+        c.path.len() > prior.len()
+            && c.path[..prior.len()].iter().zip(prior).all(|(a, b)| *a == b)
+            && c.path[prior.len()] == tok
+    })
 }
 
 /// One-line blurbs for the KNOWN command groups, keyed by first path
@@ -486,15 +504,16 @@ mod tests {
     // command named `shell` briefly existed (the Quickshell IPC reload
     // trigger), colliding with `--agent shell`, the value `graph
     // conduct`/kitty's shell wrapper have used for a long time. The command
-    // was renamed to `quickshell` to end THIS collision, but `is_command_token`
-    // itself is still collision-prone by construction — it does not consider
-    // that the token immediately follows a flag expecting a value. This test
-    // guards the specific incident (a bare `shell` value must be consumed by
-    // `--agent`, not treated as a subcommand); it does NOT guard the general
-    // class — a *future* command whose first segment matches some agent name
-    // in use can reintroduce the same failure mode. `_prior` on
-    // `is_command_token` is unused today; making it flag-position-aware would
-    // close the general case, flagged here rather than rushed.
+    // was renamed to `quickshell` to end THIS collision, but at the time
+    // `is_command_token` itself was still collision-prone by construction —
+    // it did not consider that the token immediately follows a flag
+    // expecting a value. This test guards the specific incident (a bare
+    // `shell` value must be consumed by `--agent`, not treated as a
+    // subcommand). The general class it warned about above DID recur (every
+    // `a2a message/send` spawn, `--agent a2a` colliding with the `a2a`
+    // group — see `do_spawn` in server/src/a2a.rs) and `is_command_token` is
+    // now flag-position-aware using `prior`; see the tests directly below
+    // this one for the general-case coverage.
     #[test]
     fn agent_value_shell_is_consumed_as_a_flag_value_not_treated_as_a_command() {
         let (inv, _) = parse(
@@ -504,6 +523,74 @@ mod tests {
         .unwrap();
         assert_eq!(inv.flags.get("agent").map(String::as_str), Some("shell"));
         assert_eq!(inv.args, vec!["bash", "-c", "true"]);
+    }
+
+    // The general class the comment above flagged (khoa, 2026-08-20): every
+    // `a2a message/send` spawn was silently failing. `do_spawn`
+    // (server/src/a2a.rs) execs the aoide binary itself with
+    // `["conduct", "--agent", "a2a", "--id", <id>, "--", <agent command>]` —
+    // `"a2a"` is a registered command GROUP (`a2a.serve`, `a2a.agent.*`), so
+    // the old position-blind `is_command_token` treated it as the start of a
+    // new subcommand, leaving `--agent` a bare boolean and pushing `"a2a"`
+    // onto `positionals` instead. That corrupted the whole downstream parse:
+    // `conduct`'s `command` arg ended up trying to exec the literal program
+    // `"a2a"`, which doesn't exist — spawn dies, but `a2a serve` had already
+    // returned `{"status":"submitted"}` to the client and logged `ok`, so the
+    // failure was invisible outside a process list. This is the exact argv
+    // `do_spawn` builds; it must parse into a real `conduct` invocation.
+    #[test]
+    fn agent_value_a2a_is_consumed_as_a_flag_value_not_treated_as_a_command() {
+        let (inv, _) = parse(
+            &argv(&["conduct", "--agent", "a2a", "--id", "X", "--", "claude", "-p"]),
+            Door::Cli,
+        )
+        .unwrap();
+        assert_eq!(inv.path, vec!["conduct"]);
+        assert_eq!(inv.flags.get("agent").map(String::as_str), Some("a2a"));
+        assert_eq!(inv.flags.get("id").map(String::as_str), Some("X"));
+        assert_eq!(inv.args, vec!["claude", "-p"]);
+    }
+
+    // The collision is with ANY registered group's first segment, not just
+    // `a2a` — `is_command_token` used to fire on `graph`, `peer`, `rice`,
+    // `screen`, ... every top-level group name, whenever it happened to be a
+    // flag's value. Two more, to prove the fix is general rather than an
+    // `a2a`-shaped patch.
+    #[test]
+    fn agent_value_colliding_with_other_registered_groups_is_still_consumed_as_a_value() {
+        for group in ["graph", "peer", "rice"] {
+            let (inv, _) = parse(
+                &argv(&["conduct", "--agent", group, "--id", "Y", "--", "true"]),
+                Door::Cli,
+            )
+            .unwrap_or_else(|e| panic!("`--agent {group}` failed to parse: {}", e.message));
+            assert_eq!(
+                inv.flags.get("agent").map(String::as_str),
+                Some(group),
+                "--agent {group} must be consumed as the flag's value"
+            );
+            assert_eq!(inv.args, vec!["true"]);
+        }
+    }
+
+    // The bug wasn't special to `--agent` — ANY flag whose value happens to
+    // collide with a registered group's first segment is corrupted the same
+    // way. `--id graph` on `conduct` (a completely different flag, on the
+    // same command) must consume `graph` as its value, not treat it as the
+    // start of a new command path.
+    #[test]
+    fn a_non_agent_flags_value_colliding_with_a_group_name_is_still_consumed() {
+        let (inv, _) = parse(
+            &argv(&[
+                "conduct", "--id", "graph", "--agent", "codex", "--", "claude", "-p",
+            ]),
+            Door::Cli,
+        )
+        .unwrap();
+        assert_eq!(inv.path, vec!["conduct"]);
+        assert_eq!(inv.flags.get("id").map(String::as_str), Some("graph"));
+        assert_eq!(inv.flags.get("agent").map(String::as_str), Some("codex"));
+        assert_eq!(inv.args, vec!["claude", "-p"]);
     }
 
     // No CLI-internal aliases (khoa, 2026-08-14): each command has exactly one
