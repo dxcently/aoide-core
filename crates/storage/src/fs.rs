@@ -67,6 +67,18 @@ pub fn captures_dir() -> std::path::PathBuf {
     state_dir().join("captures")
 }
 
+/// Headless-conduct transcripts: `~/Aoide/state/sessions/` (one
+/// `<sessionId>.log` per headless `aoide conduct` session — the pty-master
+/// mirror `logPath` on the session record points into).
+///
+/// Under [`state_dir`], not [`stage_dir`] — same reasoning as
+/// [`captures_dir`]: a session's transcript is a durable artifact that
+/// outlives one invocation, never song-scoped, never reset by a `rice
+/// mode`/stage-reseed the way live rehearsal state is.
+pub fn session_logs_dir() -> std::path::PathBuf {
+    state_dir().join("sessions")
+}
+
 /// Saved pointer position: `~/Aoide/state/pointer-pos.json` (`aoide screen
 /// point save`/`restore`, Phase 2 of the `screen` verb family).
 ///

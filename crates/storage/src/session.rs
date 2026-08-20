@@ -94,6 +94,9 @@ pub fn upsert_session(
             context_tokens: None,
             context_ceiling: None,
             needs_sudo: None,
+            // Stamped later by `set_session_log_path`, only for a headless
+            // `aoide conduct` session; every other fresh record starts without one.
+            log_path: None,
             extra: Map::new(),
         });
         true

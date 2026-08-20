@@ -320,6 +320,33 @@ pub(in crate::graph) fn ensure_session_ceiling(id: &str, ceiling: u64) {
     });
 }
 
+/// Stamp a headless `aoide conduct` session's `logPath` — the absolute path of
+/// its pty-master transcript (`state/sessions/<id>.log`). A locked
+/// read-modify-write like [`ensure_session_ceiling`]: change-only (a second
+/// identical call is a no-op that never re-stages), and a silent no-op for an
+/// unknown id — conduct calls this right after `do_session_start`, so the id
+/// is always fresh, but the discipline matches every other stage writer here.
+pub(in crate::graph) fn set_session_log_path(id: &str, path: &str) {
+    with_stage_lock(|| {
+        let mut file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        if let Some(s) = file
+            .sessions
+            .iter_mut()
+            .find(|s| s.session_id == id && s.log_path.as_deref() != Some(path))
+        {
+            s.log_path = Some(path.to_string());
+            if file.schema_version.is_empty() {
+                file.schema_version = STAGE_GRAPH_VERSION.to_string();
+            }
+            let _ = write_stage(&sessions_path(), &file);
+            let _ = restage_graph();
+        }
+    });
+}
+
 /// Best-effort: refresh a session's transcript-derived fields at a hook boundary —
 /// its `say` (the agent's latest words) and, set-once, its `title` (the session
 /// NAME, from `custom-title`). Change-only; never touches state/activity/pid;
@@ -1341,6 +1368,45 @@ mod tests {
         assert!(out.changed.is_empty(), "unknown id → no change");
         // No session file was written (nothing to end).
         assert!(!sessions_path().exists());
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+    #[test]
+    fn set_session_log_path_is_change_only_and_noops_on_an_unknown_id() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("sess-log-path");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        session_start(&flag_invocation(&["graph", "session", "start"], &[("id", "s")]));
+
+        set_session_log_path("s", "/home/khoa/Aoide/state/sessions/s.log");
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(
+            s.sessions.iter().find(|x| x.session_id == "s").unwrap().log_path.as_deref(),
+            Some("/home/khoa/Aoide/state/sessions/s.log")
+        );
+        let mtime_after_first = std::fs::metadata(sessions_path()).unwrap().modified().unwrap();
+
+        // A second call with the SAME path is change-only: no rewrite, so the
+        // file's mtime does not advance.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        set_session_log_path("s", "/home/khoa/Aoide/state/sessions/s.log");
+        let mtime_after_second = std::fs::metadata(sessions_path()).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_after_first, mtime_after_second,
+            "an identical logPath must not rewrite the stage file"
+        );
+
+        // An unknown id is a safe no-op (never panics, never inserts a record).
+        set_session_log_path("ghost", "/nope.log");
+        let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(s2.sessions.len(), 1);
+        assert!(!s2.sessions.iter().any(|x| x.session_id == "ghost"));
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),

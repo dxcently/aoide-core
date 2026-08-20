@@ -9,11 +9,11 @@ use super::doc::restage_graph;
 use super::model::{
     canonical_state, load_stage, sessions_path, write_stage, SessionsFile, STAGE_GRAPH_VERSION,
 };
-use super::session_store::{do_session_end, do_session_start};
+use super::session_store::{do_session_end, do_session_start, set_session_log_path};
 use super::window::discover_window_address;
 use aoide_protocol::Invocation;
 use aoide_protocol::output::Outcome;
-use aoide_storage::fs::with_stage_lock;
+use aoide_storage::fs::{session_logs_dir, with_stage_lock};
 use serde_json::json;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
@@ -235,6 +235,40 @@ fn write_all_fd(fd: RawFd, mut data: &[u8]) {
             break;
         }
         data = &data[n as usize..];
+    }
+}
+
+/// Where the pty-master's output goes: the real stdout (interactive conduct,
+/// unchanged) or an append-only session-log file (headless conduct — no
+/// controlling tty to write to). `Stdout` is the ENTIRE interactive path
+/// today, byte-identical; `Log` is new for headless mode.
+enum OutputSink {
+    Stdout,
+    Log(std::fs::File),
+}
+impl OutputSink {
+    /// Mirror `bytes` to the sink. The `Stdout` arm is exactly today's
+    /// `write_all_fd(stdout_fd, …)` call. The `Log` arm appends (retrying a
+    /// short write, same as `write_all_fd`'s own retry loop) and, on a write
+    /// error, DEGRADES rather than killing the session — mirroring
+    /// `write_all_fd` itself, which just stops mirroring on an unrecoverable
+    /// write error instead of tearing down the conducted child.
+    fn write(&mut self, bytes: &[u8]) {
+        match self {
+            OutputSink::Stdout => write_all_fd(libc::STDOUT_FILENO, bytes),
+            OutputSink::Log(f) => {
+                use std::io::Write as _;
+                let mut data = bytes;
+                while !data.is_empty() {
+                    match f.write(data) {
+                        Ok(0) => break,
+                        Ok(n) => data = &data[n..],
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -541,13 +575,16 @@ fn conduct_multiplex(
     child: &mut std::process::Child,
     id: &str,
     is_shell: bool,
+    read_stdin: bool,
+    sink: &mut OutputSink,
 ) -> i32 {
     use std::sync::atomic::Ordering;
     let stdin_fd = libc::STDIN_FILENO;
-    let stdout_fd = libc::STDOUT_FILENO;
     let listener_fd = listener.map(|l| l.as_raw_fd());
     let mut conns: Vec<RawFd> = Vec::new();
-    let mut stdin_eof = false;
+    // Headless: no controlling tty to read from — never push the stdin
+    // pollfd, and start already-EOF so the loop never touches it.
+    let mut stdin_eof = !read_stdin;
     let mut buf = [0u8; 8192];
 
     // Live cwd/command tick for a conducted SHELL. A `tail -f` (or any quiet TUI)
@@ -626,7 +663,7 @@ fn conduct_multiplex(
                 if is_shell && scan_for_sudo_prompt(&buf[..n]) {
                     sudo_prompt_seen_at = Some(std::time::Instant::now());
                 }
-                write_all_fd(stdout_fd, &buf[..n]);
+                sink.write(&buf[..n]);
             } else {
                 break;
             }
@@ -635,7 +672,7 @@ fn conduct_multiplex(
             let n =
                 unsafe { libc::read(master, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if n > 0 {
-                write_all_fd(stdout_fd, &buf[..n as usize]);
+                sink.write(&buf[..n as usize]);
             }
             break;
         }
@@ -751,8 +788,18 @@ pub fn session_conduct(inv: &Invocation) -> Outcome {
         .map(|p| p.to_string_lossy().into_owned());
     let socket_path = conduct_socket_path(&id);
 
-    // Seed the pty with the real tty's geometry so a TUI opens correctly sized.
-    let ws = tty_winsize(libc::STDIN_FILENO);
+    // Seed the pty with the real tty's geometry so a TUI opens correctly
+    // sized. A headless conduct usually has NO controlling tty (spawned by
+    // another process), which would hand openpty a NULL winsize and leave the
+    // pty at 0 rows x 0 cols — a geometry full-screen TUIs misrender against
+    // or refuse outright. Fall back to a conventional 80x24 there; the
+    // interactive no-tty case keeps its historical None so nothing changes.
+    let headless = inv.flag_present("headless");
+    let ws = tty_winsize(libc::STDIN_FILENO).or(if headless {
+        Some(libc::winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 })
+    } else {
+        None
+    });
 
     // Spawn FIRST: a failed exec must register no session (parity with `wrap`).
     let (mut child, master) = match spawn_on_pty(&program, &inv.args[1..], &id, ws) {
@@ -801,19 +848,56 @@ pub fn session_conduct(inv: &Invocation) -> Outcome {
         Some(std::process::id()),
     );
 
-    // Raw-mode the real tty + arm resize passthrough. The TtyRaw guard restores
-    // the terminal on EVERY path below — normal return and unwind alike.
-    install_winch_handler();
-    let mut tty = TtyRaw::enter(libc::STDIN_FILENO);
-    if let Some(ws) = ws {
-        set_winsize(master_fd, &ws);
+    // `--headless`: no controlling tty at all — the pty's output goes to a
+    // per-session log file instead of stdout, and the multiplexer never reads
+    // stdin (there is nothing to read it from). Everything else about conduct
+    // (registration, injection socket, exit mirroring) is identical. (The
+    // flag itself is read above, where the pty winsize fallback needs it.)
+    let mut sink = OutputSink::Stdout;
+    if headless {
+        let _ = std::fs::create_dir_all(session_logs_dir());
+        let log_path = session_logs_dir().join(format!("{id}.log"));
+        match std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            Ok(f) => {
+                set_session_log_path(&id, &log_path.to_string_lossy());
+                sink = OutputSink::Log(f);
+            }
+            // A log file that can't be opened (e.g. an unwritable state dir) must
+            // not kill the session — degrade to stdout, same posture as the
+            // socket-bind best-effort above.
+            Err(_) => {}
+        }
     }
 
-    let exit_code =
-        conduct_multiplex(master_fd, listener.as_ref(), &mut child, &id, agent == "shell");
+    // Raw-mode the real tty + arm resize passthrough (interactive only — a
+    // headless session has no controlling tty to raw-mode or resize). The
+    // TtyRaw guard restores the terminal on EVERY path below — normal return
+    // and unwind alike.
+    let mut tty = if headless {
+        None
+    } else {
+        install_winch_handler();
+        let t = TtyRaw::enter(libc::STDIN_FILENO);
+        if let Some(ws) = ws {
+            set_winsize(master_fd, &ws);
+        }
+        Some(t)
+    };
+
+    let exit_code = conduct_multiplex(
+        master_fd,
+        listener.as_ref(),
+        &mut child,
+        &id,
+        agent == "shell",
+        !headless,
+        &mut sink,
+    );
 
     // Restore tty, unlink socket, resolve the session — whatever happened.
-    tty.restore();
+    if let Some(t) = tty.as_mut() {
+        t.restore();
+    }
     let _ = std::fs::remove_file(&socket_path);
     let _ = do_session_end(&id);
 
@@ -845,6 +929,22 @@ mod tests {
     use crate::graph::session_store::upsert_session;
     use crate::graph::testutil::*;
 
+    #[test]
+    fn output_sink_log_appends_bytes_and_they_read_back() {
+        let dir = unique_stage("output-sink-log");
+        let path = dir.join("s.log");
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let mut sink = OutputSink::Log(f);
+        sink.write(b"hello ");
+        sink.write(b"world\n");
+        let got = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(got, "hello world\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn friendly_editor_command_shows_editor_and_file_by_basename() {
         // A plain file argument, editor resolved to a full store path.
@@ -1155,6 +1255,36 @@ mod tests {
         let rec = s.sessions.iter().find(|r| r.session_id == "conduct-fail").unwrap();
         assert_eq!(rec.state, "done");
         assert_eq!(rec.agent, "sevens");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn conduct_headless_mirrors_pty_output_to_the_log_and_stamps_log_path() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR"]);
+
+        let root = unique_stage("conduct-headless");
+        let stage = root.join("stage");
+        let state = root.join("state");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+
+        let out = session_conduct(&conduct_invocation(
+            &["sh", "-c", "echo mark-headless"],
+            &[("id", "conduct-headless"), ("headless", "true")],
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(out.data.as_ref().unwrap()["exitCode"], 0);
+
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let rec = s.sessions.iter().find(|r| r.session_id == "conduct-headless").unwrap();
+        assert_eq!(rec.state, "done");
+        let log_path = rec.log_path.clone().expect("headless conduct stamps logPath");
+        assert!(log_path.ends_with("conduct-headless.log"));
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert!(logged.contains("mark-headless"), "log contents: {logged:?}");
 
         let _ = std::fs::remove_dir_all(&root);
     }

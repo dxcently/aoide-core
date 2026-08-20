@@ -50,6 +50,7 @@ pub(crate) fn session(
         context_tokens: None,
         context_ceiling: None,
         needs_sudo: None,
+        log_path: None,
         extra: Map::new(),
     }
 }

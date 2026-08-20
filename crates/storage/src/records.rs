@@ -160,6 +160,14 @@ pub struct SessionRecord {
     /// agent's.
     #[serde(rename = "needsSudo", default, skip_serializing_if = "Option::is_none")]
     pub needs_sudo: Option<bool>,
+    /// Absolute path to the pty-master transcript of a HEADLESS `aoide conduct`
+    /// session (`state/sessions/<sessionId>.log`, CONTRACTS.md §4) — raw bytes,
+    /// append-only, unrotated. Stamped right after `do_session_start` by
+    /// `set_session_log_path`, once the log file is open. Additive/v0-safe:
+    /// absent on a legacy record and on every INTERACTIVE session (conduct
+    /// never sets it when a real controlling tty is attached).
+    #[serde(rename = "logPath", default, skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -330,5 +338,37 @@ mod tests {
         assert!(back.get("parentSessionId").is_none());
         // A record with no pid serialises WITHOUT the key (additive/v0-safe).
         assert!(back.get("pid").is_none());
+    }
+    #[test]
+    fn session_record_log_path_round_trips_and_stays_absent_when_unset() {
+        // serde: `logPath` serialises as a string when set, and is skipped
+        // (skip_serializing_if) when None — additive/v0-safe on the wire,
+        // matching the `needsSudo`/`workspace` fields' contract above.
+        let mut rec = SessionRecord {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        rec.log_path = Some("/home/khoa/Aoide/state/sessions/s.log".to_string());
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(
+            json.contains("\"logPath\":\"/home/khoa/Aoide/state/sessions/s.log\""),
+            "serialised: {json}"
+        );
+        let back: SessionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.log_path, rec.log_path);
+
+        // A record with no logPath omits the key entirely (no null noise) and
+        // a legacy record with no `logPath` field parses to None — a record
+        // WITHOUT the key serialises byte-identical to before this field
+        // existed.
+        let bare = SessionRecord {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        let bare_json = serde_json::to_string(&bare).unwrap();
+        assert!(!bare_json.contains("logPath"), "serialised: {bare_json}");
+        let legacy: SessionRecord =
+            serde_json::from_str(r#"{ "sessionId": "s", "windowAddress": "0x1" }"#).unwrap();
+        assert_eq!(legacy.log_path, None);
     }
 }

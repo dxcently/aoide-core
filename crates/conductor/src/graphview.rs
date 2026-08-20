@@ -511,6 +511,7 @@ mod tests {
             context_tokens: None,
             needs_sudo: None,
             context_ceiling: None,
+            log_path: None,
             extra: Map::new(),
         }
     }
