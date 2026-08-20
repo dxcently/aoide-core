@@ -11,6 +11,7 @@
 //! (`do_session_start/end/phase/phase_if`, …) stay in root — they move in
 //! Phase 3b.
 
+use crate::petname;
 use crate::records::{HookRecord, SessionRecord};
 use aoide_protocol::agents::CLAUDE_PROFILE;
 use serde_json::Map;
@@ -69,6 +70,12 @@ pub fn upsert_session(
         // is likewise preserved.
         false
     } else {
+        // Minted once, here, against the live in-hand vec (a done record's
+        // name is free per `mint_for`'s liveness rule) — the UPDATE arm
+        // above never touches `petname`: a re-start/resume must not rename
+        // a session mid-flight, and a legacy `None` record is never
+        // backfilled on later touches.
+        let petname = petname::mint_for(sessions);
         sessions.push(SessionRecord {
             session_id: id.to_string(),
             agent: agent.unwrap_or(CLAUDE_PROFILE.name).to_string(),
@@ -97,10 +104,7 @@ pub fn upsert_session(
             // Stamped later by `set_session_log_path`, only for a headless
             // `aoide conduct` session; every other fresh record starts without one.
             log_path: None,
-            // Compile-only for now: the petname mint wires into this INSERT
-            // arm in P2 of the petnames plan, under the stage lock with the
-            // live sessions vec already in hand. P1 only adds the field.
-            petname: None,
+            petname: Some(petname),
             extra: Map::new(),
         });
         true
@@ -131,5 +135,95 @@ pub fn upsert_hook(hooks: &mut Vec<HookRecord>, id: &str, phase: &str, now: &str
             updated_at: now.to_string(),
             extra: Map::new(),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upsert_session_insert_arm_mints_a_petname() {
+        let mut sessions: Vec<SessionRecord> = Vec::new();
+        assert!(upsert_session(
+            &mut sessions, "s1", None, Some("/w"), None, None, None, None, None, None,
+            "2026-01-01T00:00:00Z"
+        ));
+        assert!(sessions[0].petname.is_some(), "a fresh insert must mint a petname");
+    }
+
+    #[test]
+    fn upsert_session_update_arm_never_touches_petname() {
+        let mut sessions: Vec<SessionRecord> = Vec::new();
+        upsert_session(
+            &mut sessions, "s1", None, Some("/w"), None, None, None, None, None, None,
+            "2026-01-01T00:00:00Z"
+        );
+        let minted = sessions[0].petname.clone();
+        // Serialize before and after the re-start (update arm) with a
+        // fully-populated set of fields, so any accidental re-mint or
+        // clear shows up as a byte difference in the petname key alone.
+        let before = serde_json::to_string(&sessions[0]).unwrap();
+        assert!(!upsert_session(
+            &mut sessions,
+            "s1",
+            Some("melete"),
+            Some("/w2"),
+            Some("0xabc"),
+            Some("parent"),
+            Some(true),
+            Some("/run/user/1000/aoide/session-s1.sock"),
+            Some("do the thing"),
+            Some(123),
+            "2026-02-02T00:00:00Z"
+        ));
+        assert_eq!(sessions[0].petname, minted, "the update arm re-minted or cleared petname");
+        let after = serde_json::to_string(&sessions[0]).unwrap();
+        let petname_key = format!("\"petname\":\"{}\"", minted.unwrap());
+        assert!(before.contains(&petname_key), "before: {before}");
+        assert!(after.contains(&petname_key), "the serialized petname changed across an update: {after}");
+    }
+
+    #[test]
+    fn upsert_session_two_fresh_inserts_mint_different_petnames() {
+        let mut sessions: Vec<SessionRecord> = Vec::new();
+        upsert_session(
+            &mut sessions, "s1", None, Some("/w"), None, None, None, None, None, None,
+            "2026-01-01T00:00:00Z"
+        );
+        upsert_session(
+            &mut sessions, "s2", None, Some("/w"), None, None, None, None, None, None,
+            "2026-01-01T00:00:01Z"
+        );
+        assert_ne!(
+            sessions[0].petname, sessions[1].petname,
+            "two live records must never share a minted petname"
+        );
+    }
+
+    #[test]
+    fn upsert_session_update_arm_never_backfills_a_legacy_none_petname() {
+        let mut sessions: Vec<SessionRecord> = vec![SessionRecord {
+            session_id: "legacy".into(),
+            agent: "claude".into(),
+            state: "idle".into(),
+            started_at: "2025-01-01T00:00:00Z".into(),
+            petname: None,
+            ..Default::default()
+        }];
+        assert!(!upsert_session(
+            &mut sessions,
+            "legacy",
+            Some("melete"),
+            Some("/w2"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "2026-02-02T00:00:00Z"
+        ));
+        assert_eq!(sessions[0].petname, None, "a legacy None petname must never be backfilled");
     }
 }

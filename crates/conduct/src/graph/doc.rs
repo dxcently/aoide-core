@@ -78,6 +78,13 @@ pub fn build_graph(
         if let Some(k) = &s.kind {
             node["role"] = json!(k);
         }
+        // The minted `adjective-noun` display handle (petnames plan) — rides
+        // onto the node only when present, so a legacy/petname-less record
+        // stays byte-for-byte as before. Display-only: `session_id` above
+        // stays the canonical key.
+        if let Some(pn) = &s.petname {
+            node["petname"] = json!(pn);
+        }
         // The agent's latest words (transcript tail), when it has spoken.
         if let Some(say) = &s.say {
             node["say"] = json!(say);
@@ -750,6 +757,29 @@ mod tests {
         let node_b = nodes.iter().find(|n| n["id"] == "session:b").unwrap();
         assert_eq!(node_a["model"], json!("claude-fable-5"));
         assert!(node_b.get("model").is_none());
+    }
+    #[test]
+    fn graph_node_carries_petname_only_when_known() {
+        // Mirrors the model test above: `petname` rides onto a session node
+        // only when the record has one minted, so a legacy/petname-less
+        // record round-trips byte-for-byte.
+        let with_petname = SessionRecord {
+            session_id: "a".into(),
+            window_address: "0xaaa".into(),
+            petname: Some("brave-otter".into()),
+            ..Default::default()
+        };
+        let without_petname = SessionRecord {
+            session_id: "b".into(),
+            window_address: "0xbbb".into(),
+            ..Default::default()
+        };
+        let doc = build_graph(&[], &[with_petname, without_petname], &[]);
+        let nodes = doc["nodes"].as_array().unwrap();
+        let node_a = nodes.iter().find(|n| n["id"] == "session:a").unwrap();
+        let node_b = nodes.iter().find(|n| n["id"] == "session:b").unwrap();
+        assert_eq!(node_a["petname"], json!("brave-otter"));
+        assert!(node_b.get("petname").is_none());
     }
     #[test]
     fn graph_node_carries_context_tokens_only_when_known() {

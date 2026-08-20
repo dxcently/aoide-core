@@ -814,6 +814,7 @@ pub(crate) fn reconcile_untracked_terminals(
                 changed = true;
             }
         } else {
+            let petname = aoide_storage::petname::mint_for(&sessions);
             sessions.push(SessionRecord {
                 session_id: sid,
                 agent: "shell".to_string(),
@@ -824,6 +825,7 @@ pub(crate) fn reconcile_untracked_terminals(
                 title: want_title,
                 pid: want_pid,
                 workspace: w.workspace,
+                petname: Some(petname),
                 ..Default::default()
             });
             changed = true;
@@ -1133,6 +1135,21 @@ mod tests {
         assert!(changed3);
         assert_eq!(third.len(), 1);
         assert_eq!(third[0].cwd, "/other");
+    }
+    #[test]
+    fn reconcile_untracked_terminals_mints_petname_and_never_rewrites_a_named_record() {
+        // A NEW synthetic terminal gets a minted petname on creation…
+        let (first, changed1) =
+            reconcile_untracked_terminals(vec![], &[term_win("0xAABB", "kitty", "/home/khoa")]);
+        assert!(changed1);
+        assert!(first[0].petname.is_some(), "a freshly synthesized win: record must mint a petname");
+
+        // …and a re-scan of the SAME window (already named) must not touch it:
+        // no re-mint, and the changed flag stays false (no rewrite churn).
+        let (second, changed2) =
+            reconcile_untracked_terminals(first.clone(), &[term_win("0xAABB", "kitty", "/home/khoa")]);
+        assert!(!changed2, "re-scanning an already-named record must not flip changed");
+        assert_eq!(second[0].petname, first[0].petname, "an existing petname must never be re-minted");
     }
     #[test]
     fn focus_address_matching_is_prefix_and_case_tolerant() {

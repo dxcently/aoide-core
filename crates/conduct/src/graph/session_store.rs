@@ -600,6 +600,7 @@ pub(in crate::graph) fn do_subagent_spawn(
             // landed). Do nothing rather than create a duplicate/misparented one.
             return;
         } else {
+            let petname = aoide_storage::petname::mint_for(&file.sessions);
             file.sessions.push(SessionRecord {
                 session_id: sub_id.to_string(),
                 agent: if agent_type.is_empty() {
@@ -616,6 +617,7 @@ pub(in crate::graph) fn do_subagent_spawn(
                     Some(name.to_string())
                 },
                 kind: Some("subagent".to_string()),
+                petname: Some(petname),
                 ..Default::default()
             });
         }
@@ -1009,6 +1011,27 @@ mod tests {
     // lean on session-lifecycle fixtures/helpers this module owns).
     use crate::reap::{effective_live_addresses, is_session_dead, reap};
 
+    #[test]
+    fn do_subagent_spawn_mints_a_petname_on_create() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("subagent-spawn-petname");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        do_subagent_spawn("sub:t1", "owner", "Task name", "explore", true);
+
+        let s: SessionsFile =
+            serde_json::from_str(&std::fs::read_to_string(stage.join("sessions.json")).unwrap())
+                .unwrap();
+        let rec = s.sessions.iter().find(|r| r.session_id == "sub:t1").unwrap();
+        assert!(rec.petname.is_some(), "a freshly created subagent node must mint a petname");
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
     #[test]
     fn wrap_registers_resolves_and_mirrors_the_child() {
         let _guard = crate::env_lock().lock().unwrap();

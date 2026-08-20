@@ -203,30 +203,23 @@ pub fn read_expected_token(token_file: &str) -> Option<String> {
 /// Resolve this instance's `aoide/graphSummary` `instance.name` (CONTRACTS.md
 /// §7): `--peer-name` flag → `AOIDE_A2A_PEER_NAME` env (set by the
 /// `aoide-a2a` systemd unit, mirroring `resolve_bind_port`/
-/// `resolve_spawn_agent`'s precedence) → the OS hostname (`libc::gethostname`
-/// — this crate already carries `libc`, so no new dependency) → the literal
-/// `"aoide"` if even that fails. Resolved once at `a2a serve` launch, same as
-/// bind/port/spawn-agent.
+/// `resolve_spawn_agent`'s precedence) → the OS hostname → the literal
+/// `"aoide"` if even that fails. The env/hostname tail is
+/// `aoide_storage::display::local_host_name` (petnames plan, P2): storage
+/// has no `Invocation` to read the flag off, so this crate still resolves
+/// the flag itself and only delegates the rest. Resolved once at `a2a serve`
+/// launch, same as bind/port/spawn-agent.
 pub fn resolve_peer_name(inv: &Invocation) -> String {
+    // The env/hostname tail (env var -> OS hostname -> "aoide") is delegated
+    // to `aoide_storage::display::local_host_name` — the storage crate's copy
+    // is byte-identical (conduct/conductor renderers need the same fallback
+    // chain and cannot depend on this crate), so this resolves it once
+    // instead of keeping a second copy in sync. The `--peer-name` flag stays
+    // here: storage has no `Invocation` to read a flag off.
     inv.flags
         .get("peer-name")
         .cloned()
-        .or_else(|| std::env::var("AOIDE_A2A_PEER_NAME").ok().filter(|s| !s.is_empty()))
-        .or_else(os_hostname)
-        .unwrap_or_else(|| "aoide".to_string())
-}
-
-/// The OS hostname via `libc::gethostname`, or `None` on any failure
-/// (truncated/non-UTF8/errno) — best-effort, never a panic.
-fn os_hostname() -> Option<String> {
-    let mut buf = vec![0u8; 256];
-    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
-    if rc != 0 {
-        return None;
-    }
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    let s = String::from_utf8_lossy(&buf[..end]).trim().to_string();
-    (!s.is_empty()).then_some(s)
+        .unwrap_or_else(aoide_storage::display::local_host_name)
 }
 
 // ── Where a `message/send`/`message/stream` connection originated ───────────
