@@ -14,14 +14,21 @@
 //! `takes` (Self-Ricing Phase A) is a new addition, not a moved one: the
 //! per-draft take store backing `rice back`/`rice take` — see its module
 //! doc for the tree-of-takes model.
+//!
+//! `petname` and `display` (petnames plan, P1) are likewise new: the
+//! `adjective-noun` wordlist + mint, and the render-time-only
+//! `<host>/<role>/<petname> (…<tail4>)` grammar — both pure, both agnostic
+//! of any call site (nothing outside this crate wires them yet).
 
 pub mod a2a_store;
 pub mod commands;
+pub mod display;
 pub mod edits;
 pub mod fs;
 pub mod git;
 pub mod mode;
 pub mod peer_store;
+pub mod petname;
 pub mod records;
 pub mod session;
 pub mod stage;

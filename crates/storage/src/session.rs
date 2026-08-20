@@ -97,6 +97,10 @@ pub fn upsert_session(
             // Stamped later by `set_session_log_path`, only for a headless
             // `aoide conduct` session; every other fresh record starts without one.
             log_path: None,
+            // Compile-only for now: the petname mint wires into this INSERT
+            // arm in P2 of the petnames plan, under the stage lock with the
+            // live sessions vec already in hand. P1 only adds the field.
+            petname: None,
             extra: Map::new(),
         });
         true

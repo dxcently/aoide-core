@@ -168,6 +168,16 @@ pub struct SessionRecord {
     /// never sets it when a real controlling tty is attached).
     #[serde(rename = "logPath", default, skip_serializing_if = "Option::is_none")]
     pub log_path: Option<String>,
+    /// A human-readable `adjective-noun` DISPLAY handle, minted once (see
+    /// `petname::mint_for`) — never a lookup key and never encoding machine
+    /// or role (those are derived at render time, `display::session_label`).
+    /// `sessionId` stays the sole canonical identity everywhere: JSON
+    /// payloads, sockets, CONTRACTS keys, `Node::session_id`. Additive/
+    /// v0-safe: absent on a legacy record and never backfilled onto one —
+    /// same "field this version doesn't know about round-trips, an absent
+    /// one stays absent" discipline as `logPath` above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub petname: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -370,5 +380,34 @@ mod tests {
         let legacy: SessionRecord =
             serde_json::from_str(r#"{ "sessionId": "s", "windowAddress": "0x1" }"#).unwrap();
         assert_eq!(legacy.log_path, None);
+    }
+    #[test]
+    fn session_record_petname_round_trips_and_stays_absent_when_unset() {
+        // serde: `petname` serialises as a string when set, and is skipped
+        // (skip_serializing_if) when None — additive/v0-safe on the wire,
+        // matching the `logPath`/`needsSudo`/`workspace` fields' contract
+        // above.
+        let mut rec = SessionRecord {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        rec.petname = Some("brave-otter".to_string());
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("\"petname\":\"brave-otter\""), "serialised: {json}");
+        let back: SessionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.petname, rec.petname);
+
+        // A record with no petname omits the key entirely (no null noise) and
+        // a legacy record with no `petname` field parses to None — never
+        // backfilled just by round-tripping.
+        let bare = SessionRecord {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        let bare_json = serde_json::to_string(&bare).unwrap();
+        assert!(!bare_json.contains("petname"), "serialised: {bare_json}");
+        let legacy: SessionRecord =
+            serde_json::from_str(r#"{ "sessionId": "s", "windowAddress": "0x1" }"#).unwrap();
+        assert_eq!(legacy.petname, None);
     }
 }
