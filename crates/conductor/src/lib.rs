@@ -49,6 +49,7 @@
 pub mod app;
 pub mod commands;
 pub mod graphview;
+pub mod logtail;
 pub mod theme;
 pub mod ui;
 
