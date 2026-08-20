@@ -95,6 +95,30 @@ pub struct RegistrySyncOk {
     pub note: String,
 }
 
+/// Test-only input seam: when set, [`eval_songbook`] reads its `{
+/// manifest, registry }` payload from the JSON FILE at this path instead of
+/// shelling out to `nix eval`. Exists so the widgets-sync-MECHANICS tests
+/// (body copy, manifest whole-regen/shape-healing, registry idempotency —
+/// `commands/rice.rs`'s `mod tests`) can run inside the `aoide` package
+/// derivation's sandboxed `checkPhase`, which has `HOME=/homeless-shelter`,
+/// no flake checkout, no network, and no usable `nix` binary. Those tests
+/// exercise THIS crate's regeneration/write logic, not the real
+/// `lib/songbook.nix` generator's output shape, so a fixture is a strictly
+/// better input for them: hermetic, and no longer coupled to the committed
+/// songbook's current slot counts. Tests that deliberately assert the REAL
+/// generator's field shapes for the real committed songs still call a real
+/// `nix eval` and stay `#[ignore]`d for the sandbox (matching
+/// `crates/cli/tests/peer_connectivity.rs`'s precedent for the same
+/// sandbox constraint).
+///
+/// Opt-in only, read once per call, and validated exactly like the real `nix
+/// eval` payload below (never a default/empty value on missing/malformed
+/// input) — this is an alternate SOURCE for the same validated shape, not a
+/// fallback that lets a broken/missing `nix` proceed quietly. A deployed
+/// system that never sets this variable is byte-for-byte the pre-existing
+/// code path.
+pub(crate) const SONGBOOK_EVAL_FIXTURE_VAR: &str = "AOIDE_SONGBOOK_EVAL_FIXTURE";
+
 /// One `nix eval --json` shell-out against the `songbookManifest` flake
 /// output (`flake.nix`), which wraps `lib/songbook.nix` — the SAME function
 /// `modules/facets/quickshell/default.nix`'s `quickshellConfig` derivation
@@ -114,7 +138,20 @@ pub struct RegistrySyncOk {
 /// incomplete output) returns `Err` with nix's own message where available
 /// — never a default/empty value, which a caller could mistake for "the
 /// songbook is genuinely empty" and write out.
+///
+/// [`SONGBOOK_EVAL_FIXTURE_VAR`] short-circuits this whole shell-out for
+/// tests — see that constant's own doc.
 fn eval_songbook() -> Result<SongbookEval, WidgetSyncErr> {
+    if let Ok(path) = std::env::var(SONGBOOK_EVAL_FIXTURE_VAR) {
+        let bytes = std::fs::read(&path).map_err(|e| WidgetSyncErr {
+            error: format!(
+                "failed to read {SONGBOOK_EVAL_FIXTURE_VAR} fixture at {path}: {e}"
+            ),
+            target: path.clone(),
+        })?;
+        return parse_songbook_eval(&bytes, &path);
+    }
+
     let flake_root = aoide_storage::fs::flake_root();
     let flake_ref = format!("{}#songbookManifest", flake_root.to_string_lossy());
 
@@ -140,9 +177,18 @@ fn eval_songbook() -> Result<SongbookEval, WidgetSyncErr> {
         });
     }
 
-    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|e| WidgetSyncErr {
-        error: format!("nix eval produced output that isn't valid JSON: {e}"),
-        target: flake_ref.clone(),
+    parse_songbook_eval(&output.stdout, &flake_ref)
+}
+
+/// Shared validation for [`eval_songbook`]'s payload, whichever of the two
+/// sources above produced it: must be `{ manifest, registry }` with both
+/// fields objects — never a default/empty value on partial/garbled input,
+/// which a caller could mistake for "the songbook is genuinely empty" and
+/// write out.
+fn parse_songbook_eval(bytes: &[u8], target: &str) -> Result<SongbookEval, WidgetSyncErr> {
+    let parsed: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| WidgetSyncErr {
+        error: format!("songbook eval output isn't valid JSON: {e}"),
+        target: target.to_string(),
     })?;
 
     let manifest = parsed
@@ -150,18 +196,18 @@ fn eval_songbook() -> Result<SongbookEval, WidgetSyncErr> {
         .filter(|v| v.is_object())
         .cloned()
         .ok_or_else(|| WidgetSyncErr {
-            error: "nix eval output has no `manifest` object — refusing to write a malformed manifest.json"
+            error: "songbook eval output has no `manifest` object — refusing to write a malformed manifest.json"
                 .to_string(),
-            target: flake_ref.clone(),
+            target: target.to_string(),
         })?;
     let registry = parsed
         .get("registry")
         .filter(|v| v.is_object())
         .cloned()
         .ok_or_else(|| WidgetSyncErr {
-            error: "nix eval output has no `registry` object — refusing to write a malformed registry.json"
+            error: "songbook eval output has no `registry` object — refusing to write a malformed registry.json"
                 .to_string(),
-            target: flake_ref,
+            target: target.to_string(),
         })?;
 
     Ok(SongbookEval { manifest, registry })

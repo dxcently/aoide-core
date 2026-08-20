@@ -1171,10 +1171,25 @@ mod tests {
         (root, stage, run_qml)
     }
 
+    /// Writes a `{ manifest, registry }` payload to a fixture file under
+    /// `root` and points `crate::widgets`'s test-only input seam
+    /// (`AOIDE_SONGBOOK_EVAL_FIXTURE`) at it, so `eval_songbook` reads THIS
+    /// instead of shelling out to a real `nix eval` — the mechanism the
+    /// widgets-sync-MECHANICS tests below need (they exercise this crate's
+    /// regeneration/write logic, not the real songbook generator's output).
+    /// Callers must include `crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR` in
+    /// their own `EnvSaver::capture` list so it's unset again after the
+    /// test, same discipline as `AOIDE_STAGE_DIR`.
+    fn set_songbook_eval_fixture(root: &std::path::Path, json: &str) {
+        let path = root.join("songbook-eval-fixture.json");
+        std::fs::write(&path, json).unwrap();
+        std::env::set_var(crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR, &path);
+    }
+
     #[test]
     fn stage_syncs_an_edited_widget_body_into_the_runtime_tree() {
         let _g = aoide_test_support::env_lock().lock().unwrap();
-        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR]);
         let (root, stage, run_qml) = widget_sync_tmp("stage-widget-edit");
         let song = root.join("aoide").join("song").join("songbook").join("moonlight");
         std::fs::create_dir_all(song.join("widgets")).unwrap();
@@ -1184,6 +1199,7 @@ mod tests {
         std::fs::create_dir_all(&runtime_song_dir).unwrap();
         std::fs::write(runtime_song_dir.join("bar.qml"), "// stale bar body\n").unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        set_songbook_eval_fixture(&root, r#"{"manifest":{},"registry":{}}"#);
 
         let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
         assert_eq!(out.status, Status::Ok, "{:?}", out.data);
@@ -1204,7 +1220,7 @@ mod tests {
     #[test]
     fn stage_leaves_an_unchanged_widget_body_untouched() {
         let _g = aoide_test_support::env_lock().lock().unwrap();
-        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR]);
         let (root, stage, run_qml) = widget_sync_tmp("stage-widget-unchanged");
         let song = root.join("aoide").join("song").join("songbook").join("moonlight");
         std::fs::create_dir_all(song.join("widgets")).unwrap();
@@ -1215,6 +1231,7 @@ mod tests {
         std::fs::create_dir_all(&runtime_song_dir).unwrap();
         std::fs::write(runtime_song_dir.join("bar.qml"), body).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        set_songbook_eval_fixture(&root, r#"{"manifest":{},"registry":{}}"#);
 
         let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
         assert_eq!(out.status, Status::Ok, "{:?}", out.data);
@@ -1230,13 +1247,15 @@ mod tests {
     // C4/W3: `manifest.json`/`registry.json` regeneration shells out to `nix
     // eval` against the REAL committed songbook
     // (`aoide_storage::fs::flake_root`, deliberately decoupled from
-    // `AOIDE_STAGE_DIR` — see that function's doc) rather than scanning
-    // whatever this test's scratch songbook fabricates. So these tests
-    // ground their manifest/registry assertions in the actual committed
-    // songs (sonata/fugue/etude/nocturne — 14/2/1/1 slots), captured once
-    // here so a future songbook edit has one place to update:
-    const SONATA_SLOT_COUNT: usize = 14;
-    const FUGUE_SLOT_COUNT: usize = 2;
+    // `AOIDE_STAGE_DIR` — see that function's doc), which the nix package
+    // build's sandboxed `checkPhase` cannot run (no flake checkout, no
+    // network, no usable `nix`). Tests that only exercise THIS crate's
+    // regeneration/write MECHANICS (not the real generator's own output
+    // shape) go through `set_songbook_eval_fixture` instead — hermetic, and
+    // no longer coupled to the committed songbook's current slot counts.
+    // `stage_regenerates_the_registry_from_the_real_songbook_across_widget_kinds`
+    // deliberately keeps asserting the REAL generator's output and stays
+    // `#[ignore]`d for the sandbox instead.
 
     /// Every manifest entry is `{ "<slot>": { "owner": "...", "file":
     /// "..." } }` — never a bare list. This is the shape assertion the
@@ -1269,11 +1288,15 @@ mod tests {
         // owner-map shaped) — staging `sonata` must still produce a
         // manifest where BOTH `sonata` (rewritten from list → owner-map)
         // AND `fugue` (regenerated fresh, not merely preserved) come out
-        // correctly shaped, because whole-file regeneration from nix can't
-        // reproduce the old bug's failure mode: every song's entry, staged
-        // or not, comes from the same eval every time.
+        // correctly shaped, because whole-file regeneration from the eval
+        // source can't reproduce the old bug's failure mode: every song's
+        // entry, staged or not, comes from the same eval every time. The
+        // eval source itself is a fixture (`set_songbook_eval_fixture`), not
+        // a real `nix eval` of the committed songbook: this test is about
+        // THIS crate's whole-file-regeneration behaviour, which a fixture
+        // proves just as well and hermetically.
         let _g = aoide_test_support::env_lock().lock().unwrap();
-        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR]);
         let (root, stage, run_qml) = widget_sync_tmp("stage-manifest-heal");
         let song = root.join("aoide").join("song").join("songbook").join("sonata");
         std::fs::create_dir_all(song.join("widgets")).unwrap();
@@ -1287,6 +1310,20 @@ mod tests {
         )
         .unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        // The fixture's own eval output: sonata now owner-map shaped with
+        // 3 slots, fugue owner-map shaped with 2 — deliberately different
+        // counts from the stale file above, and from each other, so the
+        // assertions below can't pass by accident.
+        set_songbook_eval_fixture(
+            &root,
+            r#"{"manifest":{
+                "sonata":{"bar":{"owner":"sonata","file":"bar.qml"},
+                          "calendar":{"owner":"sonata","file":"calendar.qml"},
+                          "clock":{"owner":"sonata","file":"clock.qml"}},
+                "fugue":{"bar":{"owner":"fugue","file":"bar.qml"},
+                         "herald":{"owner":"fugue","file":"herald.qml"}}
+            },"registry":{}}"#,
+        );
 
         let out = handle_rice_stage(&inv(&["rice", "stage"], &["sonata"]));
         assert_eq!(out.status, Status::Ok, "{:?}", out.data);
@@ -1300,15 +1337,15 @@ mod tests {
         let sonata = manifest["sonata"].as_object().unwrap();
         assert_eq!(
             sonata.len(),
-            SONATA_SLOT_COUNT,
-            "sonata healed from list-shape into the real owner map: {sonata:?}"
+            3,
+            "sonata healed from list-shape into the fixture's owner map: {sonata:?}"
         );
         assert_eq!(sonata["bar"], json!({"owner": "sonata", "file": "bar.qml"}));
 
         let fugue = manifest["fugue"].as_object().unwrap();
         assert_eq!(
             fugue.len(),
-            FUGUE_SLOT_COUNT,
+            2,
             "fugue is present and owner-map shaped though sonata was staged, not fugue: {fugue:?}"
         );
         assert_eq!(fugue["bar"], json!({"owner": "fugue", "file": "bar.qml"}));
@@ -1341,23 +1378,27 @@ mod tests {
     #[test]
     fn stage_skips_widget_sync_when_song_has_no_widgets_dir() {
         let _g = aoide_test_support::env_lock().lock().unwrap();
-        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR]);
         let (root, stage, run_qml) = widget_sync_tmp("stage-widget-no-widgets-dir");
         let song = root.join("aoide").join("song").join("songbook").join("moonlight");
         std::fs::create_dir_all(&song).unwrap();
         std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
         std::fs::create_dir_all(&run_qml).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        // "moonlight" isn't in the fixture at all (mirrors it not being a
+        // real committed song); "fugue" is present with an empty widget-type
+        // registry entry (mirrors a real committed song that declares no
+        // widget types).
+        set_songbook_eval_fixture(&root, r#"{"manifest":{},"registry":{"fugue":{}}}"#);
 
         let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
         assert_eq!(out.status, Status::Ok, "{:?}", out.data);
         // livery.json is staged; manifest.json AND registry.json are BOTH
-        // (re)generated whole from the real committed songbook (C4) — a
-        // runtime tree exists, so both regenerate unconditionally,
-        // regardless of whether the ACTIVE song ("moonlight", fake, not a
-        // real committed song) has a local widgets/ dir. No widget BODIES
-        // are copied though: no LOCAL widgets/ dir → no per-song run/qml
-        // songs/moonlight/ dir.
+        // (re)generated whole from the songbook eval (C4) — a runtime tree
+        // exists, so both regenerate unconditionally, regardless of whether
+        // the ACTIVE song ("moonlight", fake, not in the fixture) has a
+        // local widgets/ dir. No widget BODIES are copied though: no LOCAL
+        // widgets/ dir → no per-song run/qml songs/moonlight/ dir.
         assert_eq!(
             out.changed.len(),
             3,
@@ -1379,12 +1420,14 @@ mod tests {
         assert_eq!(
             registry["fugue"],
             json!({}),
-            "fugue is a real committed song that declares no widget types → {{}}"
+            "fugue is present in the fixture with no widget types → {{}}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
+    #[ignore = "real `nix eval` of the committed songbook — no flake checkout/network/`nix` in \
+                the nix package build's sandboxed checkPhase; run with --ignored"]
     fn stage_regenerates_the_registry_from_the_real_songbook_across_widget_kinds() {
         // C4/W3: `registry.json` no longer reads THIS song's local
         // `livery.json` at all — it comes entirely from nix's eval of the
@@ -1438,19 +1481,22 @@ mod tests {
     #[test]
     fn stage_leaves_the_registry_untouched_when_already_current() {
         // Idempotency: stage the SAME song twice with nothing changed in
-        // between. The first call writes real content (whatever nix's eval
-        // of the committed songbook currently produces — not hand-typed
-        // here, since C4 means this test cannot predict it without running
-        // the same eval); the second call must report no registry.json
-        // write at all.
+        // between. The first call writes the fixture's content; the second
+        // call must report no registry.json write at all. Content doesn't
+        // matter here — only that it's stable across the two calls, so an
+        // arbitrary fixture stands in for the real songbook eval.
         let _g = aoide_test_support::env_lock().lock().unwrap();
-        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR]);
         let (root, stage, run_qml) = widget_sync_tmp("stage-registry-unchanged");
         let song = root.join("aoide").join("song").join("songbook").join("fugue");
         std::fs::create_dir_all(&song).unwrap();
         std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
         std::fs::create_dir_all(&run_qml).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        set_songbook_eval_fixture(
+            &root,
+            r#"{"manifest":{},"registry":{"fugue":{"bar":{"kind":"dock","order":0}}}}"#,
+        );
 
         let first = handle_rice_stage(&inv(&["rice", "stage"], &["fugue"]));
         assert_eq!(first.status, Status::Ok, "{:?}", first.data);
@@ -1499,7 +1545,7 @@ mod tests {
     #[test]
     fn stage_entry_with_no_name_syncs_the_current_songs_widgets() {
         let _g = aoide_test_support::env_lock().lock().unwrap();
-        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR]);
         let (root, stage, run_qml) = widget_sync_tmp("stage-entry-widget-bare");
         let song = root.join("aoide").join("song").join("songbook").join("moonlight");
         std::fs::create_dir_all(song.join("widgets")).unwrap();
@@ -1517,6 +1563,7 @@ mod tests {
         )
         .unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        set_songbook_eval_fixture(&root, r#"{"manifest":{},"registry":{}}"#);
 
         aoide_storage::mode::save_mode_marker(&aoide_storage::mode::ModeMarker {
             mode: aoide_storage::mode::RiceMode::Staging,
@@ -1537,7 +1584,7 @@ mod tests {
     #[test]
     fn stage_copies_helper_and_asset_files_not_just_slots() {
         let _g = aoide_test_support::env_lock().lock().unwrap();
-        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR]);
         let (root, stage, run_qml) = widget_sync_tmp("stage-widget-helpers");
         let song = root.join("aoide").join("song").join("songbook").join("moonlight");
         std::fs::create_dir_all(song.join("widgets").join("assets")).unwrap();
@@ -1551,6 +1598,7 @@ mod tests {
         std::fs::write(song.join("widgets").join("assets").join("logo.txt"), "logo data").unwrap();
         std::fs::create_dir_all(&run_qml).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        set_songbook_eval_fixture(&root, r#"{"manifest":{},"registry":{}}"#);
 
         let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
         assert_eq!(out.status, Status::Ok, "{:?}", out.data);
