@@ -170,6 +170,18 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
 
+    // The log-tail overlay is the same modal shape: swallow everything until
+    // dismissed. Enter joins Esc/`q` here (unlike help's `?`) since Enter is
+    // what opened it — closing on the same key that opens it is the least
+    // surprising round trip.
+    if app.tail.is_some() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => app.close_tail(),
+            _ => {}
+        }
+        return false;
+    }
+
     // If a panel has an inline input open (e.g. projects "add"), it consumes
     // text/enter/esc itself — don't let global keys steal them.
     if app.input_active() {
@@ -190,4 +202,127 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         _ => app.handle_key(key),
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aoide_conduct::graph::SessionRecord;
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aoide-conductor-lib-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A headless session fixture: `log_path` stamped, the marker
+    /// `App::cue_session` branches on.
+    fn headless_session(path: &std::path::Path) -> SessionRecord {
+        SessionRecord {
+            session_id: "s1".into(),
+            agent: "claude".into(),
+            window_address: String::new(),
+            cwd: "/tmp".into(),
+            state: "running".into(),
+            started_at: "s1".into(),
+            parent_session_id: None,
+            conductable: None,
+            socket: None,
+            title: None,
+            pid: None,
+            workspace: None,
+            activity: None,
+            kind: None,
+            say: None,
+            tool: None,
+            model: None,
+            context_tokens: None,
+            needs_sudo: None,
+            context_ceiling: None,
+            log_path: Some(path.to_string_lossy().into_owned()),
+            petname: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::from(code)
+    }
+
+    /// The tail overlay is the same modal shape as `help_open` (block right
+    /// after it, ~lib.rs:172): Esc, `q`, and Enter (the key that opened it)
+    /// all close it, and none of them fall through to quit.
+    #[test]
+    fn the_tail_overlay_closes_on_esc_q_or_enter() {
+        let dir = tmp_dir("close-keys");
+        let log = dir.join("s1.log");
+        std::fs::write(&log, "hi\n").unwrap();
+        let rec = headless_session(&log);
+
+        for close_key in [KeyCode::Esc, KeyCode::Char('q'), KeyCode::Enter] {
+            let mut app = App::for_test(Vec::new(), vec![rec.clone()], Vec::new());
+            app.open_tail(&rec);
+            assert!(app.tail.is_some());
+
+            let quit = handle_key(&mut app, key(close_key));
+
+            assert!(!quit, "closing the tail must not quit the conductor");
+            assert!(app.tail.is_none(), "{close_key:?} must close the tail");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every other key is swallowed outright — it must neither close the
+    /// overlay nor leak through to the global keymap (panel switches, quit).
+    #[test]
+    fn an_unrelated_key_is_swallowed_while_the_tail_is_open() {
+        let dir = tmp_dir("swallow");
+        let log = dir.join("s1.log");
+        std::fs::write(&log, "hi\n").unwrap();
+        let rec = headless_session(&log);
+
+        let mut app = App::for_test(Vec::new(), vec![rec.clone()], Vec::new());
+        app.open_tail(&rec);
+        let panel_before = app.panel;
+
+        let quit = handle_key(&mut app, key(KeyCode::Char('j')));
+
+        assert!(!quit);
+        assert!(app.tail.is_some(), "an unrelated key must not close the tail");
+        assert_eq!(
+            app.panel, panel_before,
+            "global keys must not leak through the modal"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ctrl-C's "always quits" rule (checked before either modal block) must
+    /// still win while the tail overlay is open.
+    #[test]
+    fn ctrl_c_still_quits_with_the_tail_open() {
+        let dir = tmp_dir("ctrl-c");
+        let log = dir.join("s1.log");
+        std::fs::write(&log, "hi\n").unwrap();
+        let rec = headless_session(&log);
+
+        let mut app = App::for_test(Vec::new(), vec![rec.clone()], Vec::new());
+        app.open_tail(&rec);
+
+        let mut ev = key(KeyCode::Char('c'));
+        ev.modifiers = KeyModifiers::CONTROL;
+        let quit = handle_key(&mut app, ev);
+
+        assert!(quit, "Ctrl-C must quit even mid-overlay");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

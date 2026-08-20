@@ -19,6 +19,7 @@
 //! terminal-watcher: sessions that appear between ticks are marked fresh for a
 //! few beats ([`FRESH_TICKS`]) so the eye catches a new arrival.
 
+use crate::logtail;
 use aoide_conduct::graph::{self, HooksFile, ProjectsFile, SessionRecord, SessionsFile};
 use aoide_protocol::output::{Outcome, Status};
 use aoide_protocol::Door;
@@ -137,6 +138,10 @@ pub enum DagRow {
 }
 
 /// mtimes of the stage files we poll, so a tick reloads only what changed.
+/// Stage-files-only: the log tail's own mtime lives on [`LogTail`] itself,
+/// gated separately in [`App::poll_refresh`] — a tail is a file read, not a
+/// stage file, and it doesn't exist for most of an App's life (`None` while
+/// closed).
 #[derive(Debug, Clone, Default)]
 struct StageMtimes {
     sessions: Option<SystemTime>,
@@ -146,10 +151,30 @@ struct StageMtimes {
     audit: Option<SystemTime>,
 }
 
+/// The open headless-log-tail overlay's state: which session, which file, the
+/// last [`logtail::render_tail`]ed lines, and the file's mtime at that last
+/// read (the gate [`App::poll_refresh`] checks before re-reading). Plays the
+/// same "one Option, `None` == closed" modal role [`App::help_open`] plays,
+/// just with a richer payload than a bare bool.
+#[derive(Debug, Clone)]
+pub struct LogTail {
+    pub session_id: String,
+    pub path: PathBuf,
+    pub lines: Vec<String>,
+    mtime: Option<SystemTime>,
+}
+
 /// The whole conductor state.
 pub struct App {
     pub panel: Panel,
     pub help_open: bool,
+    /// The open headless-log-tail overlay, or `None` (closed) — the same
+    /// modal role [`help_open`](Self::help_open) plays, richer payload. Enter
+    /// on a session whose record carries `log_path` opens this instead of
+    /// dispatching `graph focus` ([`App::cue_session`]); lib.rs's
+    /// `handle_key` swallows keys while it is `Some` the same way it does for
+    /// the help overlay.
+    pub tail: Option<LogTail>,
     /// Selected node in the DAG (Graph) panel (indexes the preorder node list
     /// [`crate::graphview::node_order`] the layout walks).
     pub graph_sel: usize,
@@ -211,6 +236,7 @@ impl App {
         App {
             panel: Panel::Graph,
             help_open: false,
+            tail: None,
             graph_sel: 0,
             dag_sel: 0,
             proj_sel: 0,
@@ -388,6 +414,20 @@ impl App {
         }
 
         self.mtimes = cur;
+
+        // The log tail (if open) re-reads on its OWN mtime gate, never
+        // folded into `StageMtimes` — it isn't a stage file, and most ticks
+        // it's `None` so this is a single field check, not a read. `logtail`
+        // does the actual (bounded, <=64KB) IO; poll_refresh just decides
+        // whether that's due.
+        if let Some(t) = &mut self.tail {
+            let m = Self::mtime(&t.path);
+            if m != t.mtime {
+                t.lines = logtail::tail_file(&t.path, logtail::TAIL_LINES);
+                t.mtime = m;
+                changed = true;
+            }
+        }
 
         // Age the fresh marks one beat; a mark that expires needs a repaint to
         // shed its highlight. (Decrement before detection so a session arriving
@@ -579,6 +619,52 @@ impl App {
         }
     }
 
+    // ── Enter's destination: a window to cue, or a log to tail ──────────────
+
+    /// THE branch every Enter site shares (roster row, graph node): a
+    /// headless session — `log_path` stamped, the CONTRACTS §4-exact marker
+    /// only `conduct --headless` sets — has no window to focus, so Enter
+    /// opens its log tail instead. Deliberately never looks at
+    /// `window_address`: a spawner's window can be stamped there even for a
+    /// headless child (false positive), and a pre-backfill interactive
+    /// session can lack one (false negative) — `log_path` is the one field
+    /// that means what we need. The windowed and neither-field cases are
+    /// UNCHANGED: `graph focus` dispatches exactly as before, including the
+    /// no-window-address status error when neither is set.
+    fn cue_session(&mut self, rec: &SessionRecord) {
+        if rec.log_path.is_some() {
+            self.open_tail(rec);
+        } else {
+            let id = rec.session_id.clone();
+            self.dispatch(&["graph", "focus"], &[id]);
+        }
+    }
+
+    /// Open the tail overlay for `rec`'s log, reading it immediately — Enter
+    /// must paint content on the keypress itself, not wait for the next
+    /// ~500ms tick. A no-op when `rec` has no `log_path` (defensive:
+    /// [`Self::cue_session`] is the only caller and has already checked).
+    pub fn open_tail(&mut self, rec: &SessionRecord) {
+        let Some(path) = rec.log_path.as_ref() else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        let lines = logtail::tail_file(&path, logtail::TAIL_LINES);
+        let mtime = Self::mtime(&path);
+        self.tail = Some(LogTail {
+            session_id: rec.session_id.clone(),
+            path,
+            lines,
+            mtime,
+        });
+    }
+
+    /// Close the tail overlay. Called from lib.rs's modal-swallow block (Esc
+    /// / `q` / Enter while the overlay is open).
+    pub fn close_tail(&mut self) {
+        self.tail = None;
+    }
+
     // ── Key handling for the active panel / inline input ────────────────────
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -616,8 +702,14 @@ impl App {
             }
             KeyCode::Enter => {
                 if let Some(node) = nodes.get(self.graph_sel) {
-                    if let Some(id) = &node.session_id {
-                        self.dispatch(&["graph", "focus"], std::slice::from_ref(id));
+                    if let Some(id) = node.session_id.clone() {
+                        // Node → record via `merged()` (the same lookup the
+                        // roster's rows are built from) — no graphview
+                        // change, `cue_session` is the one branch.
+                        let rec = self.merged().into_iter().find(|m| m.session_id == id);
+                        if let Some(rec) = rec {
+                            self.cue_session(&rec);
+                        }
                     }
                 }
             }
@@ -638,14 +730,13 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => {
                 self.dag_sel = self.dag_sel.saturating_sub(1);
             }
-            // Enter: on a session, cue it — dispatch `graph focus` right now
+            // Enter: on a session, cue it — a window to focus right now
             // (jump latency is the whole multiplexer story; Hyprland windows
-            // are our panes). On a group header, toggle the fold.
+            // are our panes) or, for a headless session, its log tail
+            // (`cue_session` is the one branch). On a group header, toggle
+            // the fold.
             KeyCode::Enter => match rows.get(self.dag_sel) {
-                Some(DagRow::Session { rec, .. }) => {
-                    let id = rec.session_id.clone();
-                    self.dispatch(&["graph", "focus"], &[id]);
-                }
+                Some(DagRow::Session { rec, .. }) => self.cue_session(rec),
                 Some(DagRow::Group { name, .. }) => self.toggle_fold(name.clone()),
                 None => {}
             },
@@ -1025,5 +1116,220 @@ mod tests {
     fn white_and_black_extremes() {
         assert_eq!(rgb_to_ansi256(255, 255, 255), 231); // top of the cube (white)
         assert_eq!(rgb_to_ansi256(0, 0, 0), 16); // bottom of the cube (black)
+    }
+
+    // ── Enter's branch: log tail vs. `graph focus` ──────────────────────────
+
+    use serde_json::Map;
+    use std::sync::Mutex;
+
+    /// A unique scratch dir per call (pid + nanos), mirroring
+    /// `stage_notes_path_is_unconditionally_livery_json` above.
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aoide-conductor-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A minimal `SessionRecord` fixture — same shape as `ui.rs`'s test
+    /// helper of the same name.
+    fn session(id: &str, cwd: &str, state: &str, parent: Option<&str>) -> SessionRecord {
+        SessionRecord {
+            session_id: id.into(),
+            agent: "claude".into(),
+            window_address: format!("0x{id}"),
+            cwd: cwd.into(),
+            state: state.into(),
+            started_at: id.into(),
+            parent_session_id: parent.map(str::to_string),
+            conductable: None,
+            socket: None,
+            title: None,
+            pid: None,
+            workspace: None,
+            activity: None,
+            kind: None,
+            say: None,
+            tool: None,
+            model: None,
+            context_tokens: None,
+            needs_sudo: None,
+            context_ceiling: None,
+            log_path: None,
+            petname: None,
+            extra: Map::new(),
+        }
+    }
+
+    /// Serialises the tests below that touch `AOIDE_STAGE_DIR`/
+    /// `AOIDE_AUDIT_LOG` — process-global env, so parallel `cargo test`
+    /// threads within this crate must not race on it. `aoide_storage` has an
+    /// equivalent lock but it's `pub(crate)` there, unreachable from this
+    /// crate — this is this crate's own copy of the same guard.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Point `AOIDE_STAGE_DIR`/`AOIDE_AUDIT_LOG` at a fresh empty tempdir for
+    /// the duration of `f`, restoring whatever was set before. Any test that
+    /// calls `App::dispatch` or `App::poll_refresh` needs this — both read
+    /// the real stage dir otherwise, and on this machine that's the live
+    /// `~/Aoide/song/stage`, not a fixture.
+    fn with_isolated_stage<R>(f: impl FnOnce() -> R) -> R {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tmp_dir("stage-isolated");
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_audit = std::env::var("AOIDE_AUDIT_LOG").ok();
+        std::env::set_var("AOIDE_STAGE_DIR", &dir);
+        std::env::set_var("AOIDE_AUDIT_LOG", dir.join("audit.log"));
+
+        let result = f();
+
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        match saved_audit {
+            Some(v) => std::env::set_var("AOIDE_AUDIT_LOG", v),
+            None => std::env::remove_var("AOIDE_AUDIT_LOG"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
+
+    #[test]
+    fn enter_on_a_headless_roster_row_opens_the_tail_and_dispatches_nothing() {
+        let dir = tmp_dir("tail-headless");
+        let log = dir.join("s1.log");
+        std::fs::write(&log, "hello\n").unwrap();
+
+        let mut rec = session("s1", "/tmp", "running", None);
+        rec.log_path = Some(log.to_string_lossy().into_owned());
+        let mut app = App::for_test(Vec::new(), vec![rec], Vec::new());
+        app.panel = Panel::Sessions;
+        app.dag_sel = 1; // row 0 is the `(unanchored)` group header
+
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+
+        let tail = app.tail.as_ref().expect("tail opened on headless Enter");
+        assert_eq!(tail.session_id, "s1");
+        assert_eq!(tail.lines, vec!["hello".to_string(), String::new()]);
+        assert!(
+            app.last_outcome.is_none(),
+            "headless Enter must not dispatch graph focus"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enter_on_a_windowed_roster_row_still_dispatches_graph_focus() {
+        with_isolated_stage(|| {
+            // No `log_path` — only `window_address` (set by the `session`
+            // fixture) — so this is the unchanged branch.
+            let rec = session("s1", "/tmp", "running", None);
+            let mut app = App::for_test(Vec::new(), vec![rec], Vec::new());
+            app.panel = Panel::Sessions;
+            app.dag_sel = 1;
+
+            app.handle_key(KeyEvent::from(KeyCode::Enter));
+
+            assert!(app.tail.is_none(), "a windowed session never opens a tail");
+            assert!(
+                app.last_outcome.is_some(),
+                "windowed Enter still dispatches graph focus"
+            );
+        });
+    }
+
+    #[test]
+    fn enter_on_a_graph_node_whose_session_is_headless_opens_the_same_tail() {
+        let dir = tmp_dir("tail-graphnode");
+        let log = dir.join("s1.log");
+        std::fs::write(&log, "hello\n").unwrap();
+
+        let mut rec = session("s1", "/tmp", "running", None);
+        rec.log_path = Some(log.to_string_lossy().into_owned());
+        let mut app = App::for_test(Vec::new(), vec![rec], Vec::new());
+        app.panel = Panel::Graph;
+        app.graph_sel = 1; // node 0 is the synthetic `(unanchored)` root
+
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+
+        let tail = app.tail.as_ref().expect("tail opened from the graph panel");
+        assert_eq!(tail.session_id, "s1");
+        assert_eq!(tail.lines, vec!["hello".to_string(), String::new()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn close_tail_clears_the_overlay() {
+        let dir = tmp_dir("tail-close");
+        let log = dir.join("s1.log");
+        std::fs::write(&log, "hi\n").unwrap();
+        let mut rec = session("s1", "/tmp", "running", None);
+        rec.log_path = Some(log.to_string_lossy().into_owned());
+
+        let mut app = App::for_test(Vec::new(), vec![rec.clone()], Vec::new());
+        app.open_tail(&rec);
+        assert!(app.tail.is_some());
+
+        app.close_tail();
+        assert!(app.tail.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_tail_on_a_missing_log_file_opens_empty_without_panicking() {
+        let mut rec = session("s1", "/tmp", "running", None);
+        rec.log_path = Some("/nonexistent/aoide-conductor-test/does-not-exist.log".to_string());
+        let mut app = App::for_test(Vec::new(), vec![rec.clone()], Vec::new());
+
+        app.open_tail(&rec); // must not panic
+
+        let tail = app.tail.as_ref().expect("tail still opens on a missing file");
+        assert!(
+            tail.lines.is_empty(),
+            "P1's tail_file returns empty on a missing file"
+        );
+    }
+
+    #[test]
+    fn poll_refresh_does_not_reread_the_tail_when_its_mtime_is_unchanged() {
+        with_isolated_stage(|| {
+            let dir = tmp_dir("tail-poll");
+            let log = dir.join("s1.log");
+            std::fs::write(&log, "one\n").unwrap();
+            let mut rec = session("s1", "/tmp", "running", None);
+            rec.log_path = Some(log.to_string_lossy().into_owned());
+
+            let mut app = App::for_test(Vec::new(), vec![rec.clone()], Vec::new());
+            app.open_tail(&rec);
+            let after_open = app.tail.as_ref().unwrap().mtime;
+
+            // No write to the file between ticks: the mtime-gate condition
+            // (`m != t.mtime`) sees the same value both times, so the
+            // `changed = true` inside it — the only place `poll_refresh`
+            // marks a repaint for the tail — never fires. The isolated
+            // stage dir holds no other files, so nothing else can trip
+            // `changed` either: `false` here is proof the gate held.
+            let changed = app.poll_refresh();
+
+            assert!(!changed, "an unchanged tail mtime must not report a repaint");
+            assert_eq!(app.tail.as_ref().unwrap().mtime, after_open);
+            assert_eq!(
+                app.tail.as_ref().unwrap().lines,
+                vec!["one".to_string(), String::new()]
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 }
