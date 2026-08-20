@@ -2140,9 +2140,15 @@ mod tests {
         // and resolves the known session's state (never -32005).
         let ok = handle_jsonrpc(&get, &ctx(Some("s3cr3t")));
         assert_eq!(ok["result"]["status"]["state"], "completed");
-        // graphSummary with a valid bearer is past the gate too — whatever it
-        // returns, it is NOT the auth error.
-        assert_ne!(handle_jsonrpc(&sum, &ctx(Some("s3cr3t")))["error"]["code"], -32005);
+        // graphSummary with a valid bearer is past the gate too — and it
+        // must be a REAL read, not just "any non-auth response" (a bare
+        // `assert_ne!` here would still pass if the read arm silently broke
+        // and started returning some other error): the wrapped graph
+        // document and the instance envelope both come through.
+        let sum_ok = handle_jsonrpc(&sum, &ctx(Some("s3cr3t")));
+        assert_eq!(sum_ok["result"]["schemaVersion"], "0");
+        assert_eq!(sum_ok["result"]["instance"]["name"], "aoide");
+        assert!(sum_ok["result"]["graph"]["nodes"].is_array());
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
@@ -2177,6 +2183,219 @@ mod tests {
         // Empty expected_token = feature off; no bearer presented; still works.
         let resp = handle_jsonrpc(&req, &test_ctx(Path::new("/dev/null"), ""));
         assert_eq!(resp["result"]["status"]["state"], "completed");
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    /// Pull the JSON payload out of the FIRST `data: <json>\n\n` SSE frame in
+    /// `stream_task`'s written output (`sse_event`'s exact format). Every
+    /// `stream_task` test below writes at most one event before returning
+    /// (a denial closes immediately; a terminal initial state closes on its
+    /// first tick), so "first" is also "only" in practice.
+    fn first_sse_data_json(out: &[u8]) -> Value {
+        let text = String::from_utf8_lossy(out);
+        let frame = text.split("data: ").nth(1).expect("at least one SSE data event was written");
+        let line = frame.split('\n').next().unwrap();
+        serde_json::from_str(line).expect("SSE data line is valid JSON")
+    }
+
+    /// Phase G, SSE half: `tasks/resubscribe` is gated by the SAME rule as
+    /// the one-shot `tasks/get` — proven here at the `stream_task` level
+    /// (not just `handle_jsonrpc`), driving the function with a real
+    /// `Vec<u8>` writer exactly as `handle_connection` would. A REAL staged
+    /// session id is used so a passing gate would leak real state; instead
+    /// the SSE headers open (the socket contract doesn't change) and the
+    /// stream's one and only event is the `-32005` denial — the session's
+    /// state is never read.
+    #[test]
+    fn stream_task_tasks_resubscribe_denies_before_reading_a_real_session_when_a_token_is_configured() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = std::env::temp_dir().join(format!(
+            "aoide-server-a2a-sse-gate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![fixture_session("s1", "working", None)],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tasks/resubscribe", "params": { "id": "s1" }
+        }))
+        .unwrap();
+        let req = HttpRequest { method: "POST".to_string(), path: "/".to_string(), body, bearer: None };
+
+        let mut out: Vec<u8> = Vec::new();
+        let result = stream_task(
+            &mut out,
+            &req,
+            "tasks/resubscribe",
+            Path::new("/dev/null"),
+            "",
+            PeerOrigin::Loopback,
+            "s3cr3t",
+            None,
+        );
+        assert!(result.is_ok(), "a denied stream still returns Ok — it closed cleanly, not by erroring out");
+
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("text/event-stream"), "SSE headers are written before the gate is even consulted: {text}");
+        let event = first_sse_data_json(&out);
+        assert_eq!(event["error"]["code"], -32005);
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    /// Phase G, SSE half: `message/stream` is gated BEFORE `message_send`
+    /// runs, so an unauthenticated caller can neither inject into nor spawn
+    /// off an existing session through the streaming path. The
+    /// security-load-bearing assertion isn't the `-32005` alone (a broken
+    /// gate that still happened to error out some OTHER way would pass
+    /// that) — it's that `message_send` never ran at ALL: a conductable
+    /// session's control socket is stood in with a real `UnixListener` (a
+    /// wrongly-attempted Inject would connect to it) AND the pending-queue
+    /// file (`do_inject`'s fallback when delivery isn't immediate) never
+    /// gets created, proving `do_inject`/`session_send` were never reached
+    /// rather than merely "delivery was skipped".
+    #[test]
+    fn stream_task_message_stream_denies_before_message_send_runs_when_a_token_is_configured() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-sse-msend-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_STATE_DIR", root.join("state"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        let id = "sse-tgt";
+        let socket = aoide_conduct::graph::conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        // If message_send WRONGLY ran (the gate failed to short-circuit
+        // before it), a successful Inject would connect here.
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![conductable_session(id, &socket)],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "message/stream",
+            "params": { "message": { "parts": [{ "kind": "text", "text": "hi" }], "contextId": id } }
+        }))
+        .unwrap();
+        let req = HttpRequest { method: "POST".to_string(), path: "/".to_string(), body, bearer: None };
+
+        let audit_log = root.join("log");
+        let mut out: Vec<u8> = Vec::new();
+        let result = stream_task(
+            &mut out,
+            &req,
+            "message/stream",
+            &audit_log,
+            "",
+            PeerOrigin::Loopback,
+            "s3cr3t",
+            None,
+        );
+        assert!(result.is_ok());
+
+        let event = first_sse_data_json(&out);
+        assert_eq!(event["error"]["code"], -32005);
+
+        assert!(
+            !stage.join("pending.json").exists(),
+            "message_send must never run once the SSE gate denies — a held-pending send would still \
+             have written pending.json, so its absence proves do_inject was never reached at all"
+        );
+        assert!(
+            listener.accept().is_err(),
+            "the conducted session's socket must never be touched by a denied message/stream"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    /// Phase G off-path, SSE half: with NO token configured, `stream_task`
+    /// is byte-identical to before — `tasks/resubscribe` reaches the real
+    /// session and streams its actual terminal state, proving the gate
+    /// doesn't bite when off (not just that it returns SOME non-error
+    /// event). The fixture session's canonical state ("stopped" ->
+    /// "completed", `a2a_task_state`) is already terminal, so
+    /// `stream_task`'s loop emits the final event on its very first tick
+    /// and returns — no `STREAM_POLL` sleep, nowhere near `MAX_STREAM`.
+    #[test]
+    fn stream_task_tasks_resubscribe_reaches_the_real_terminal_state_when_no_token_is_configured() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = std::env::temp_dir().join(format!(
+            "aoide-server-a2a-sse-nogate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![fixture_session("s1", "stopped", None)],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0", "id": 9, "method": "tasks/resubscribe", "params": { "id": "s1" }
+        }))
+        .unwrap();
+        let req = HttpRequest { method: "POST".to_string(), path: "/".to_string(), body, bearer: None };
+
+        let mut out: Vec<u8> = Vec::new();
+        let result = stream_task(
+            &mut out,
+            &req,
+            "tasks/resubscribe",
+            Path::new("/dev/null"),
+            "",
+            PeerOrigin::Loopback,
+            "",
+            None,
+        );
+        assert!(result.is_ok());
+
+        let event = first_sse_data_json(&out);
+        assert_eq!(event["result"]["status"]["state"], "completed");
+        assert_eq!(event["result"]["final"], true, "the terminal state closes the stream on its first tick");
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
