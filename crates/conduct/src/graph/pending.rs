@@ -25,8 +25,9 @@
 //! for.
 //!
 //! Addressing: `pending.json`'s `PendingSend` carries no id of its own (only
-//! `sessionId`/`text`/`submit`/`queuedAt` — see [`super::send::PendingSend`]),
-//! so `list`'s `id` is the entry's POSITION in the array. Positions shift the
+//! `sessionId`/`text`/`submit`/`queuedAt`/`from` — see
+//! [`super::send::PendingSend`]), so `list`'s `id` is the entry's POSITION in
+//! the array. Positions shift the
 //! moment any entry resolves, so `approve`/`deny` always re-read the file
 //! fresh under the lock rather than trusting a stale list; a caller scripting
 //! multiple resolutions in one breath should re-list between them.
@@ -90,7 +91,10 @@ fn load_pending_array() -> Result<Vec<Value>, String> {
 }
 
 /// One JSON view of a pending entry for `list`'s `data.pending`, and the text
-/// line for its human render.
+/// line for its human render. `from` is the sender attribution
+/// [`super::send::resolve_sender`] resolved at queue time — `None`/absent for
+/// an unattributed send AND for a LEGACY entry written before this field
+/// existed (serde default on read, see [`super::send::PendingSend`]).
 fn entry_view(index: usize, v: &Value) -> (Value, String) {
     let malformed = is_malformed(v);
     if malformed {
@@ -100,6 +104,7 @@ fn entry_view(index: usize, v: &Value) -> (Value, String) {
             "text": v.to_string(),
             "submit": false,
             "queuedAt": "",
+            "from": Value::Null,
             "state": "malformed",
         });
         let line = format!("[{index}] <malformed entry — cannot resolve; edit song/stage/pending.json by hand>");
@@ -110,18 +115,25 @@ fn entry_view(index: usize, v: &Value) -> (Value, String) {
     let text = o.get("text").and_then(Value::as_str).unwrap_or("").to_string();
     let submit = o.get("submit").and_then(Value::as_bool).unwrap_or(false);
     let queued_at = o.get("queuedAt").and_then(Value::as_str).unwrap_or("").to_string();
+    let from = o
+        .get("from")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     let json = json!({
         "id": index.to_string(),
         "sessionId": session_id,
         "text": text,
         "submit": submit,
         "queuedAt": queued_at,
+        "from": from,
         "state": "pending",
     });
     let line = format!(
-        "[{index}] {session_id} ← {}{} ({queued_at})",
+        "[{index}] {session_id} ← {}{}{} ({queued_at})",
         preview(&text),
         if submit { " [submit]" } else { "" },
+        from.as_deref().map(|f| format!(" (from {f})")).unwrap_or_default(),
     );
     (json, line)
 }
@@ -241,6 +253,11 @@ pub fn pending_approve(inv: &Invocation) -> Outcome {
     let session_id = o.get("sessionId").and_then(Value::as_str).unwrap_or("").to_string();
     let text = o.get("text").and_then(Value::as_str).unwrap_or("").to_string();
     let submit = o.get("submit").and_then(Value::as_bool).unwrap_or(false);
+    let from = o
+        .get("from")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 
     let mut flags = BTreeMap::new();
     flags.insert("id".to_string(), session_id.clone());
@@ -248,6 +265,16 @@ pub fn pending_approve(inv: &Invocation) -> Outcome {
     if submit {
         flags.insert("submit".to_string(), "true".to_string());
     }
+    // Carry the ORIGINAL entry's attribution through as `--from` — ALWAYS,
+    // even when the entry had none. `resolve_sender`'s tri-state rule makes
+    // this the only correct move: a PRESENT `--from` (the entry's sender, or
+    // `""` when it had none) is used as-is and the env is never consulted;
+    // an ABSENT `--from` would instead fall through to the approver's own
+    // live `AOIDE_SESSION_ID` (an orchestrating conducted session always has
+    // one) and misattribute an anonymously-queued send to whoever happened
+    // to approve it. `--from ""` keeps that entry anonymous through
+    // delivery, exactly as it was queued.
+    flags.insert("from".to_string(), from.clone().unwrap_or_default());
     if let Some(log) = inv.flags.get("audit-log") {
         flags.insert("audit-log".to_string(), log.clone());
     }
@@ -332,6 +359,7 @@ mod tests {
     use super::*;
     use crate::graph::conduct::conduct_socket_path;
     use crate::graph::model::{sessions_path, SessionsFile};
+    use crate::graph::send::session_send;
     use crate::graph::session_store::do_session_start;
     use crate::graph::testutil::*;
     use std::os::unix::net::UnixListener;
@@ -353,13 +381,21 @@ mod tests {
         std::env::set_var("XDG_RUNTIME_DIR", &root);
         std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
         std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        // Tests running under a REAL conducted session (this one included)
+        // inherit a real AOIDE_SESSION_ID from the ambient environment; now
+        // that `pending_approve`'s re-drive resolves sender attribution, an
+        // unguarded env would leak that ambient id into `list`/`approve`
+        // assertions. Callers that need a specific sender set it themselves
+        // AFTER `setup` and must include "AOIDE_SESSION_ID" in their own
+        // `EnvVars::save` so it is restored.
+        std::env::remove_var("AOIDE_SESSION_ID");
         root
     }
 
     #[test]
     fn list_reads_real_and_malformed_entries_without_dying() {
         let _guard = crate::env_lock().lock().unwrap();
-        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG", "AOIDE_CONDUCT_AUTOGATE"]);
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG", "AOIDE_CONDUCT_AUTOGATE", "AOIDE_SESSION_ID"]);
         let root = setup("pnd-ls");
 
         std::fs::write(
@@ -394,6 +430,7 @@ mod tests {
             "XDG_RUNTIME_DIR",
             "AOIDE_AUDIT_LOG",
             "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
         ]);
         let root = setup("pnd-ap");
 
@@ -446,6 +483,202 @@ mod tests {
     }
 
     #[test]
+    fn pending_round_trip_keeps_the_original_queuer_as_sender_through_approve() {
+        // Queue under sender A, approve under sender B → the delivered bytes
+        // must name A (the original queuer), never B (the approver) — the
+        // whole point of carrying `from` through the queue.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+        let root = setup("pnd-rt");
+
+        let id = "rt-target";
+        let socket = conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        do_session_start(
+            id,
+            Some("claude"),
+            Some("/w"),
+            None,
+            None,
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+            None,
+        );
+
+        // Queue under sender A (no --yes, no autogate → held pending).
+        std::env::set_var("AOIDE_SESSION_ID", "sender-a");
+        let queued = session_send(&send_invocation(&["do", "the", "thing"], &[("id", id), ("submit", "true")]));
+        assert_eq!(queued.data.as_ref().unwrap()["state"], "pending");
+
+        // `from` is visible in `list` BEFORE approve.
+        let listed = pending_list(&pending_invocation(&["graph", "pending", "list"], &[]));
+        let arr = listed.data.unwrap()["pending"].as_array().unwrap().clone();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["from"], "sender-a", "the queuer is visible before approval");
+
+        // Approve under a DIFFERENT sender B.
+        std::env::set_var("AOIDE_SESSION_ID", "sender-b");
+        listener.set_nonblocking(false).unwrap();
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+        let approved = pending_approve(&pending_invocation(&["graph", "pending", "approve"], &["0"]));
+        let got = acc.join().unwrap();
+        assert_eq!(approved.status, Status::Ok, "msg: {}", approved.message);
+        assert_eq!(
+            String::from_utf8(got).unwrap(),
+            "from sender-a: do the thing\n",
+            "the delivered bytes name the ORIGINAL queuer, not the approver"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn approving_an_anonymously_queued_entry_never_wears_the_approvers_name() {
+        // Regression: an entry queued with NO sender (env cleared at queue
+        // time) must NOT inherit the approver's own live AOIDE_SESSION_ID —
+        // an orchestrating conducted session always has one, so an unguarded
+        // re-drive would silently misattribute an anonymous send to whoever
+        // happened to approve it.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+        let root = setup("pnd-anon");
+
+        let id = "anon-target";
+        let socket = conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        do_session_start(
+            id,
+            Some("claude"),
+            Some("/w"),
+            None,
+            None,
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+            None,
+        );
+
+        // Queue with NO sender at all (env cleared — `setup` already does
+        // this, reasserted here for clarity).
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let queued = session_send(&send_invocation(&["do", "the", "thing"], &[("id", id), ("submit", "true")]));
+        assert_eq!(queued.data.as_ref().unwrap()["state"], "pending");
+
+        let listed = pending_list(&pending_invocation(&["graph", "pending", "list"], &[]));
+        let arr = listed.data.unwrap()["pending"].as_array().unwrap().clone();
+        assert_eq!(arr[0]["from"], Value::Null, "queued with no attribution");
+
+        // Approve under a REAL, non-empty sender.
+        std::env::set_var("AOIDE_SESSION_ID", "approver-x");
+        listener.set_nonblocking(false).unwrap();
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+        let approved = pending_approve(&pending_invocation(&["graph", "pending", "approve"], &["0"]));
+        let got = acc.join().unwrap();
+        assert_eq!(approved.status, Status::Ok, "msg: {}", approved.message);
+        assert_eq!(
+            String::from_utf8(got).unwrap(),
+            "do the thing\n",
+            "no prefix at all — the approver's own session id must never leak in"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_legacy_pending_entry_with_no_from_field_still_lists_and_approves_cleanly() {
+        // An entry written before this field existed (serde default on read)
+        // must not fail to list or approve.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+        std::env::remove_var("AOIDE_SESSION_ID"); // no ambient attribution — legacy path only.
+        let root = setup("pnd-legacy");
+
+        let id = "legacy-target";
+        let socket = conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        do_session_start(
+            id,
+            Some("claude"),
+            Some("/w"),
+            None,
+            None,
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+            None,
+        );
+
+        // Hand-written, NO `from` key at all — exactly the pre-P6 shape.
+        std::fs::write(
+            pending_path(),
+            format!(
+                r#"{{"schemaVersion":"0","pending":[{{"sessionId":"{id}","text":"legacy send","submit":false,"queuedAt":"2026-08-13T14:01:10Z"}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        let listed = pending_list(&pending_invocation(&["graph", "pending", "list"], &[]));
+        assert_eq!(listed.status, Status::Ok);
+        let arr = listed.data.unwrap()["pending"].as_array().unwrap().clone();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["from"], Value::Null, "no attribution on a legacy entry");
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+        let approved = pending_approve(&pending_invocation(&["graph", "pending", "approve"], &["0"]));
+        let got = acc.join().unwrap();
+        assert_eq!(approved.status, Status::Ok, "msg: {}", approved.message);
+        assert_eq!(
+            String::from_utf8(got).unwrap(),
+            "legacy send",
+            "no provenance prefix for a legacy entry with no sender to attribute"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn deny_removes_without_touching_the_socket() {
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&[
@@ -453,6 +686,7 @@ mod tests {
             "XDG_RUNTIME_DIR",
             "AOIDE_AUDIT_LOG",
             "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
         ]);
         let root = setup("pnd-dn");
 
@@ -504,7 +738,7 @@ mod tests {
     #[test]
     fn approve_and_deny_on_a_malformed_or_missing_id_fail_cleanly() {
         let _guard = crate::env_lock().lock().unwrap();
-        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG", "AOIDE_CONDUCT_AUTOGATE"]);
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG", "AOIDE_CONDUCT_AUTOGATE", "AOIDE_SESSION_ID"]);
         let root = setup("pnd-mf");
 
         std::fs::write(

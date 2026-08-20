@@ -154,6 +154,7 @@ pub fn register(r: &mut Registry) {
             flag!("id", "string", "Target session id (required); its socket is resolved from sessions.json."),
             flag!("submit", "bool", "Append a newline so the agent submits the line (Enter)."),
             flag!("yes", "bool", "Authorise delivery now (else the send is held pending approval)."),
+            flag!("from", "string", "Sender attribution override for the delivered provenance prefix (default: AOIDE_SESSION_ID). ATTRIBUTION ONLY, not authentication — unauthenticated and as spoofable as the env var it defaults from."),
         ],
         gated: false,
         implemented: true,

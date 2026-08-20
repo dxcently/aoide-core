@@ -40,6 +40,13 @@ pub struct PendingSend {
     pub submit: bool,
     #[serde(rename = "queuedAt", default)]
     pub queued_at: String,
+    /// The sender attribution [`resolve_sender`] resolved at queue time (see
+    /// its doc — attribution, not security). `skip_serializing_if` keeps an
+    /// unattributed entry's JSON byte-identical to before this field existed;
+    /// `default` on read means a LEGACY entry written before this field
+    /// existed deserializes with `from: None`, not a parse failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
 }
 
 /// `pending.json` container.
@@ -174,6 +181,81 @@ fn names_the_node(text: &str) -> bool {
     text.chars().any(char::is_alphabetic)
 }
 
+/// Sanitize a resolved sender string for use in the single-line provenance
+/// prefix: every `\n`/`\r` collapses to a single space. Both `--from` (raw
+/// argv) and `AOIDE_SESSION_ID` (raw env) may legally contain a newline —
+/// neither the shell nor the OS forbids it — but the prefix built from this
+/// value is a promise to the delivery path: exactly one line, ever. An
+/// unsanitized sender would smuggle an extra `\n` into the payload ahead of
+/// the real text, submitting a bogus half-line into the target's TUI before
+/// the actual message arrives — exactly the corruption [`provenance_prefix`]
+/// exists to prevent.
+fn sanitize_sender(raw: &str) -> String {
+    raw.replace(['\n', '\r'], " ")
+}
+
+/// The sender attribution for THIS invocation — a TRI-STATE read of `--from`,
+/// falling back to `AOIDE_SESSION_ID` only when `--from` is ABSENT:
+///
+/// - `--from` **absent** → fall back to the `AOIDE_SESSION_ID` env (the
+///   conducting session's own id, exported by `conduct`/`wrap`/`spawn` into
+///   every child's env); an empty/unset env is `None` (no attribution).
+/// - `--from` **present and non-empty** → that sender, sanitized (see
+///   [`sanitize_sender`]) — the env is never consulted.
+/// - `--from` **present but empty** (`--from ""`) → explicit "no
+///   attribution": `None`, and the env fallback is deliberately SKIPPED. This
+///   is the case [`super::pending::pending_approve`] relies on: it always
+///   sets `--from` on its re-drive (the original entry's sender when `Some`,
+///   `""` when the entry carried none), so an anonymously-queued send stays
+///   anonymous through approval instead of silently inheriting the
+///   approver's own live `AOIDE_SESSION_ID`.
+///
+/// **ATTRIBUTION, NOT SECURITY.** Neither source is proof of identity: `--from`
+/// is a plain CLI flag any same-user process can set to whatever string it
+/// likes, and `AOIDE_SESSION_ID` is an ordinary env var any same-user process
+/// can export before calling `graph send` — both are trivially spoofable by
+/// anyone who can already run `aoide` as this user. This exists so a
+/// receiving agent and the audit log can see who CLAIMS to have sent a
+/// message, not to gate delivery on that claim (the gate in [`send_gate`] is
+/// unaffected by this). The wider door is the control socket itself: whoever
+/// can write to it can already impersonate the target's own keystrokes with
+/// no attribution at all — this label is strictly additive information, never
+/// a trust boundary.
+fn resolve_sender(inv: &Invocation) -> Option<String> {
+    match inv.flags.get("from") {
+        Some(f) if f.is_empty() => None, // explicit anonymous — env fallback skipped.
+        Some(f) => Some(sanitize_sender(f)),
+        None => std::env::var("AOIDE_SESSION_ID")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| sanitize_sender(&s)),
+    }
+}
+
+/// A single-line sender-provenance prefix (`from <sender>: `) for a delivered
+/// payload, or `None` when there is nothing to attribute or `text` isn't a
+/// real message. `None` when `sender` is `None`, or when `!names_the_node
+/// (text)` — [`names_the_node`]'s "does this carry a letter" check is exactly
+/// the right test here too: a bare keystroke/verdict payload (`graph
+/// permit`'s digit, `3\n`) is not an authored message, it's an answer typed
+/// into a prompt, and prefixing it would corrupt the exact bytes the target's
+/// TUI is waiting to read as a keystroke.
+///
+/// The returned string carries NO embedded newline — the caller prepends it
+/// directly to the front of the payload, which (since the prefix itself is
+/// newline-free) lands it on the payload's first line only; an injected
+/// newline here would submit a half-line into a TUI composer ahead of the
+/// real text. This relies on `sender` already being sanitized (every caller
+/// goes through [`resolve_sender`], which does exactly that) — this function
+/// does not re-sanitize.
+fn provenance_prefix(sender: Option<&str>, text: &str) -> Option<String> {
+    let sender = sender?;
+    if !names_the_node(text) {
+        return None;
+    }
+    Some(format!("from {sender}: "))
+}
+
 /// A one-line, length-bounded form of the injected text — the auto-rename title.
 fn one_line_title(text: &str) -> String {
     let first = text.lines().next().unwrap_or("").trim();
@@ -187,7 +269,7 @@ fn one_line_title(text: &str) -> String {
     }
 }
 
-fn record_pending(id: &str, text: &str, submit: bool) -> Result<(), String> {
+fn record_pending(id: &str, text: &str, submit: bool, from: Option<&str>) -> Result<(), String> {
     with_stage_lock(|| {
         let mut file: PendingFile = load_stage(&pending_path())?;
         file.schema_version = STAGE_GRAPH_VERSION.to_string();
@@ -196,6 +278,7 @@ fn record_pending(id: &str, text: &str, submit: bool) -> Result<(), String> {
             text: text.to_string(),
             submit,
             queued_at: now_iso_utc(),
+            from: from.map(str::to_string),
         });
         write_stage(&pending_path(), &file)
     })
@@ -259,13 +342,20 @@ fn set_session_name_if_unset(id: &str, name: &str) {
 
 /// One audit line per send outcome, through aoided's audit path. The injected
 /// text rides as `untrusted_data` (never the message) — forwarded agent-bound
-/// text is data, never re-interpreted as a command (the house rule).
+/// text is data, never re-interpreted as a command (the house rule). The
+/// resolved [`resolve_sender`] attribution (when present) is folded into the
+/// audit MESSAGE — never into `untrusted_data`, which stays exactly the
+/// injected text — so the audit trail names who claimed to send it.
 fn audit_send(inv: &Invocation, status: &str, message: &str, text: &str) {
     let log = inv
         .flags
         .get("audit-log")
         .map(PathBuf::from)
         .unwrap_or_else(aoide_protocol::default_audit_log);
+    let message = match resolve_sender(inv) {
+        Some(sender) => format!("{message} (from {sender})"),
+        None => message.to_string(),
+    };
     let _ = aoide_protocol::append_audit(
         &log,
         &aoide_protocol::AuditRecord {
@@ -274,7 +364,7 @@ fn audit_send(inv: &Invocation, status: &str, message: &str, text: &str) {
             class: aoide_protocol::EventClass::Audit,
             command: "graph.send".to_string(),
             status: status.to_string(),
-            message: message.to_string(),
+            message,
             untrusted_data: Some(text.to_string()),
         },
     );
@@ -289,7 +379,12 @@ fn audit_send(inv: &Invocation, status: &str, message: &str, text: &str) {
 /// parent, see [`sibling_autogate_enabled`]) it connects to the socket, writes
 /// `<text>` (+ `\n` on `--submit`), auto-renames the node to a one-line form of
 /// the text (unless the text is a bare keystroke answer — see
-/// [`names_the_node`]), and returns delivered. Every outcome writes an audit line.
+/// [`names_the_node`]), and returns delivered. A delivered payload that names
+/// the node also carries a `from <sender>: ` provenance prefix on its first
+/// line when a sender resolves (see [`resolve_sender`] / [`provenance_prefix`]
+/// — attribution, not authentication); the title, the keystroke check, and
+/// the audit `untrusted_data` all still see the unprefixed text. Every
+/// outcome writes an audit line, the sender folded into its message.
 pub fn session_send(inv: &Invocation) -> Outcome {
     let cmd = "graph.send";
     let id = match require_flag(inv, "id") {
@@ -359,8 +454,14 @@ pub fn session_send(inv: &Invocation) -> Outcome {
     let is_sibling = !is_self_send
         && siblings_share_live_parent(sender_parent.as_deref(), target_parent.as_deref(), parent_live);
     let gate = send_gate(yes, is_parent, is_sibling);
+    // The provenance attribution — `--from` or `AOIDE_SESSION_ID` (see
+    // [`resolve_sender`]) — is resolved once here, from the ORIGINAL
+    // invocation, and reused for both the pending record and (below) the
+    // delivered payload's prefix, so a queued-then-approved send still names
+    // whoever queued it, not whoever approved it.
+    let attributed_sender = resolve_sender(inv);
     if !gate.delivers() {
-        if let Err(e) = record_pending(&id, &text, submit) {
+        if let Err(e) = record_pending(&id, &text, submit, attributed_sender.as_deref()) {
             return stage_error(cmd, e);
         }
         let out = Outcome::ok(
@@ -379,10 +480,20 @@ pub fn session_send(inv: &Invocation) -> Outcome {
         return out;
     }
 
-    // Deliver: connect + write the payload (+ newline on --submit).
+    // Deliver: connect + write the payload (+ newline on --submit, decided
+    // from the ORIGINAL text before any prefix). The provenance prefix (see
+    // [`provenance_prefix`]) is then prepended to the payload as a whole —
+    // since the prefix itself is newline-free, that lands it on the payload's
+    // first line only, never disturbing a later line or the trailing
+    // --submit newline. The title (`one_line_title`), the `names_the_node`
+    // check, and the audit `untrusted_data` below all keep reading the
+    // ORIGINAL `text`, never this prefixed payload.
     let mut payload = text.clone();
     if submit {
         payload.push('\n');
+    }
+    if let Some(prefix) = provenance_prefix(attributed_sender.as_deref(), &text) {
+        payload = format!("{prefix}{payload}");
     }
     match UnixStream::connect(&socket) {
         Ok(mut stream) => {
@@ -1233,6 +1344,7 @@ mod tests {
             "XDG_RUNTIME_DIR",
             "AOIDE_AUDIT_LOG",
             "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
         ]);
 
         let root = unique_stage("send-yes");
@@ -1242,6 +1354,11 @@ mod tests {
         std::env::set_var("XDG_RUNTIME_DIR", &root);
         std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
         std::env::remove_var("AOIDE_CONDUCT_AUTOGATE"); // no standing autogate.
+        // No sender attribution in scope here — a real ambient AOIDE_SESSION_ID
+        // (this test may itself be running inside a conducted session) would
+        // otherwise leak a provenance prefix into the plain-delivery assertion
+        // below.
+        std::env::remove_var("AOIDE_SESSION_ID");
 
         let id = "send-target";
         let socket = conduct_socket_path(id);
@@ -1317,6 +1434,7 @@ mod tests {
             "XDG_RUNTIME_DIR",
             "AOIDE_AUDIT_LOG",
             "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
         ]);
 
         let root = unique_stage("send-key");
@@ -1326,6 +1444,11 @@ mod tests {
         std::env::set_var("XDG_RUNTIME_DIR", &root);
         std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
         std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        // No sender attribution in scope — this test is about the
+        // names_the_node/title distinction, not provenance; guard against a
+        // real ambient AOIDE_SESSION_ID leaking a prefix into the steer's
+        // plain-text delivery assertion below.
+        std::env::remove_var("AOIDE_SESSION_ID");
 
         let id = "key-t";
         let socket = conduct_socket_path(id);
@@ -1379,6 +1502,288 @@ mod tests {
             s.sessions.iter().find(|r| r.session_id == id).unwrap().title.as_deref(),
             Some("fix the reaper"),
             "the steer's name survived the verdict keystroke"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn provenance_prefix_table() {
+        // No sender → no prefix, whatever the text.
+        assert_eq!(provenance_prefix(None, "hello world"), None);
+        // A keystroke/verdict payload (no letters) is never prefixed, even
+        // with a sender resolved — this is the regression that matters most:
+        // `graph permit`'s bare digit must reach the socket byte-identical.
+        assert_eq!(provenance_prefix(Some("orch"), "1"), None);
+        assert_eq!(provenance_prefix(Some("orch"), "3\n"), None);
+        assert_eq!(provenance_prefix(Some("orch"), "  2  "), None);
+        assert_eq!(provenance_prefix(Some("orch"), ""), None);
+        // Normal text with a sender → prefixed, single line, no trailing
+        // newline of its own.
+        assert_eq!(
+            provenance_prefix(Some("orch"), "fix the auth test"),
+            Some("from orch: ".to_string())
+        );
+        // Multi-line text: the prefix itself never grows a newline (the
+        // caller prepends it to the whole payload, landing it on line one
+        // only — proven end-to-end by the delivery test below).
+        let p = provenance_prefix(Some("orch"), "line one\nline two").unwrap();
+        assert!(!p.contains('\n'), "the prefix itself carries no newline: {p:?}");
+        assert_eq!(p, "from orch: ");
+    }
+    #[test]
+    fn resolve_sender_is_tri_state_absent_present_or_explicitly_anonymous() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_SESSION_ID"]);
+
+        // Neither source present → None.
+        std::env::remove_var("AOIDE_SESSION_ID");
+        assert_eq!(resolve_sender(&send_invocation(&["hi"], &[("id", "x")])), None);
+
+        // `--from` ABSENT → falls through to the env.
+        std::env::set_var("AOIDE_SESSION_ID", "env-sid");
+        assert_eq!(
+            resolve_sender(&send_invocation(&["hi"], &[("id", "x")])),
+            Some("env-sid".to_string())
+        );
+
+        // `--from` PRESENT and non-empty wins over the env — env never consulted.
+        assert_eq!(
+            resolve_sender(&send_invocation(&["hi"], &[("id", "x"), ("from", "flag-sid")])),
+            Some("flag-sid".to_string())
+        );
+
+        // `--from` PRESENT but EMPTY is explicit "no attribution" — the env
+        // fallback is SKIPPED (not consulted), even though it's set to a real
+        // sender. This is the case `pending_approve` relies on to keep an
+        // anonymously-queued entry anonymous through approval (see
+        // `graph::pending::tests::pending_round_trip_...`).
+        assert_eq!(resolve_sender(&send_invocation(&["hi"], &[("id", "x"), ("from", "")])), None);
+
+        // An empty env with `--from` ABSENT → None too.
+        std::env::set_var("AOIDE_SESSION_ID", "");
+        assert_eq!(resolve_sender(&send_invocation(&["hi"], &[("id", "x")])), None);
+    }
+    #[test]
+    fn resolve_sender_sanitizes_embedded_newlines_from_either_source() {
+        // `--from` and `AOIDE_SESSION_ID` are both raw argv/env data — a
+        // newline is legal in either — but the provenance prefix built from
+        // this value crosses into a TUI's input stream, where an unsanitized
+        // newline would submit a bogus extra line ahead of the real text.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_SESSION_ID"]);
+
+        std::env::remove_var("AOIDE_SESSION_ID");
+        assert_eq!(
+            resolve_sender(&send_invocation(&["hi"], &[("id", "x"), ("from", "evil\nsender")])),
+            Some("evil sender".to_string())
+        );
+        assert_eq!(
+            resolve_sender(&send_invocation(&["hi"], &[("id", "x"), ("from", "cr\rlf\r\nboth")])),
+            Some("cr lf  both".to_string())
+        );
+
+        std::env::set_var("AOIDE_SESSION_ID", "env\nsender");
+        assert_eq!(
+            resolve_sender(&send_invocation(&["hi"], &[("id", "x")])),
+            Some("env sender".to_string())
+        );
+    }
+    #[test]
+    fn delivered_payload_carries_the_provenance_prefix_but_the_title_does_not() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+
+        let root = unique_stage("send-provenance");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::set_var("AOIDE_SESSION_ID", "the-sender");
+
+        let id = "prov-target";
+        let socket = conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        do_session_start(
+            id,
+            Some("claude"),
+            Some("/w"),
+            None,
+            None,
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+            None,
+        );
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+
+        let out = session_send(&send_invocation(
+            &["fix", "the", "reaper"],
+            &[("id", id), ("submit", "true"), ("yes", "true")],
+        ));
+        let got = acc.join().unwrap();
+
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(
+            String::from_utf8(got).unwrap(),
+            "from the-sender: fix the reaper\n",
+            "the delivered bytes carry the provenance prefix"
+        );
+
+        // The auto-rename title is the UNPREFIXED text — the sender label
+        // must never leak into the node's name.
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(
+            s.sessions.iter().find(|r| r.session_id == id).unwrap().title.as_deref(),
+            Some("fix the reaper"),
+            "the title carries no provenance prefix"
+        );
+        assert_eq!(out.data.as_ref().unwrap()["title"], "fix the reaper");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn a_permit_shaped_keystroke_is_delivered_with_no_prefix_even_with_a_sender() {
+        // The regression that matters most: `graph permit`'s bare-digit
+        // verdict (or a hand-typed answer of the same shape) must reach the
+        // socket as EXACTLY the digit + newline — a provenance prefix here
+        // would corrupt the keystroke the target's TUI is waiting to read.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+
+        let root = unique_stage("send-permit-shaped");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::set_var("AOIDE_SESSION_ID", "the-approver");
+
+        let id = "permit-shaped-target";
+        let socket = conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        do_session_start(
+            id,
+            Some("claude"),
+            Some("/w"),
+            None,
+            None,
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+            None,
+        );
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+
+        let out = session_send(&send_invocation(
+            &["2"],
+            &[("id", id), ("submit", "true"), ("yes", "true")],
+        ));
+        let got = acc.join().unwrap();
+
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(
+            String::from_utf8(got).unwrap(),
+            "2\n",
+            "a permit-shaped keystroke delivers with NO provenance prefix"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn a_from_flag_with_an_embedded_newline_never_smuggles_an_extra_submitted_line() {
+        // Regression: `--from` is raw argv — a newline is legal in it — but an
+        // unsanitized sender would inject a second, EARLY-SUBMITTED line into
+        // the target's TUI ahead of the real text. The delivered bytes must
+        // carry EXACTLY the one newline `--submit` asked for.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+
+        let root = unique_stage("send-from-newline");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        let id = "from-newline-target";
+        let socket = conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        do_session_start(
+            id,
+            Some("claude"),
+            Some("/w"),
+            None,
+            None,
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+            None,
+        );
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+
+        let out = session_send(&send_invocation(
+            &["ship", "it"],
+            &[("id", id), ("submit", "true"), ("yes", "true"), ("from", "evil\nsender")],
+        ));
+        let got = acc.join().unwrap();
+
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let delivered = String::from_utf8(got).unwrap();
+        assert_eq!(
+            delivered.matches('\n').count(),
+            1,
+            "exactly one newline (the --submit one), never an early-submitted line: {delivered:?}"
+        );
+        assert_eq!(
+            delivered, "from evil sender: ship it\n",
+            "the embedded newline in --from collapsed to a space, prefix stays single-line"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1499,7 +1904,9 @@ mod tests {
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["delivered"], true);
         assert_eq!(out.data.as_ref().unwrap()["gate"], "autogate-parent");
-        assert_eq!(String::from_utf8(got).unwrap(), "go\n");
+        // The gate's sender (`AOIDE_SESSION_ID=orch`) doubles as the
+        // provenance attribution — the delivered bytes carry the prefix.
+        assert_eq!(String::from_utf8(got).unwrap(), "from orch: go\n");
 
         // An UNRELATED sender (different session) to the same child stays pending.
         std::env::set_var("AOIDE_SESSION_ID", "stranger");
@@ -1569,7 +1976,10 @@ mod tests {
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["delivered"], true);
         assert_eq!(out.data.as_ref().unwrap()["gate"], "autogate-sibling");
-        assert_eq!(String::from_utf8(got).unwrap(), "hey sib");
+        // `AOIDE_SESSION_ID=sib-a` doubles as the gate's sender AND the
+        // provenance attribution (see [`resolve_sender`]) — the delivered
+        // bytes carry the sibling's `from sib-a: ` prefix.
+        assert_eq!(String::from_utf8(got).unwrap(), "from sib-a: hey sib");
 
         // (b) same pair, but the opt-out env is set → held pending, not delivered.
         std::env::set_var("AOIDE_CONDUCT_SIBLING_AUTOGATE", "0");

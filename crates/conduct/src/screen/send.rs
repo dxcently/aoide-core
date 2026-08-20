@@ -614,7 +614,17 @@ mod tests {
         // `graph::send`'s own `send_yes_delivers_and_autorenames_the_title`
         // — a local test fixture, NEVER a real live agent session.
         let _guard = crate::env_lock().lock().unwrap();
-        let _env = aoide_test_support::EnvSaver::capture(&["AOIDE_STAGE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
+        let _env = aoide_test_support::EnvSaver::capture(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_SESSION_ID",
+        ]);
+        // No sender attribution in scope here — a real ambient AOIDE_SESSION_ID
+        // (P6 provenance, `graph/send.rs::resolve_sender`) would otherwise
+        // prefix the delivered bytes and break the plain `starts_with`
+        // assertion below.
+        std::env::remove_var("AOIDE_SESSION_ID");
 
         let root = aoide_test_support::unique_tmp("screen-send-yes");
         let stage = root.join("stage");
