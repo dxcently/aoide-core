@@ -135,6 +135,34 @@ pub fn repo_root() -> std::path::PathBuf {
         .unwrap_or(song)
 }
 
+/// The Aoide FLAKE root: the git checkout `nix eval` shells out against
+/// (`crate::widgets`'s songbook manifest/registry regeneration, C4/W3).
+///
+/// Deliberately NOT derived from [`stage_dir`]/[`repo_root`] the way every
+/// other path in this file is: those are relocatable per-test so a scratch
+/// tmp dir can stand in for `~/Aoide`'s RUNTIME trees (`song/stage`,
+/// `run/qml`) without a real flake anywhere in sight. The committed
+/// songbook `nix eval` reads (`song/songbook/`, `lib/song.nix`,
+/// `flake.nix`) is not a runtime tree — it is the one git checkout on disk,
+/// so relocating it per-test would mean fabricating a working flake (with
+/// its own `flake.lock`) in every test that touches `rice stage`, for no
+/// reason: on the DEFAULT layout `flake_root` and `repo_root` already
+/// coincide (both resolve to `~/Aoide`), so this only diverges from
+/// `repo_root` under an `$AOIDE_STAGE_DIR` test override — exactly the case
+/// where a real flake should NOT be expected to exist at the relocated
+/// path. `$AOIDE_FLAKE_ROOT` (absolute-path-wins, same precedence as every
+/// other override here) exists for the one caller that DOES want to point
+/// at a different flake checkout — a fixture flake, or a second clone.
+pub fn flake_root() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("AOIDE_FLAKE_ROOT") {
+        let p = std::path::PathBuf::from(&dir);
+        if p.is_absolute() {
+            return p;
+        }
+    }
+    aoide_protocol::aoide_home().join("Aoide")
+}
+
 /// The committed-song directory: `<song>/songbook/<name>/`.
 ///
 /// Shares [`song_dir`]'s `AOIDE_STAGE_DIR`-relative resolution, so a test that
@@ -574,6 +602,42 @@ mod tests {
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
             None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+    }
+
+    #[test]
+    fn flake_root_ignores_the_stage_dir_override_and_honors_its_own() {
+        // `flake_root` is deliberately NOT `AOIDE_STAGE_DIR`-relative (unlike
+        // every other path above) — see its own doc for why: the committed
+        // git checkout `nix eval` reads doesn't move just because a test
+        // relocated the runtime trees.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_flake = std::env::var("AOIDE_FLAKE_ROOT").ok();
+
+        std::env::set_var("AOIDE_STAGE_DIR", "/tmp/aoide-flake-root-test/song/stage");
+        std::env::remove_var("AOIDE_FLAKE_ROOT");
+        assert!(
+            !flake_root().starts_with("/tmp/aoide-flake-root-test"),
+            "an AOIDE_STAGE_DIR relocation must not move flake_root: {:?}",
+            flake_root()
+        );
+        assert!(flake_root().ends_with("Aoide"));
+
+        std::env::set_var("AOIDE_FLAKE_ROOT", "/tmp/aoide-flake-root-test/fixture-flake");
+        assert_eq!(
+            flake_root(),
+            std::path::PathBuf::from("/tmp/aoide-flake-root-test/fixture-flake"),
+            "an explicit AOIDE_FLAKE_ROOT wins outright"
+        );
+
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        match saved_flake {
+            Some(v) => std::env::set_var("AOIDE_FLAKE_ROOT", v),
+            None => std::env::remove_var("AOIDE_FLAKE_ROOT"),
         }
     }
 

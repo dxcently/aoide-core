@@ -432,14 +432,16 @@ pub(crate) fn handle_rice_stage(inv: &Invocation) -> Outcome {
             .with_data(json!({ "reason": "widget-sync-failed", "target": e.target }));
         }
     };
-    let widget_sync_changed = !widget_sync.changed.is_empty();
+    let widget_sync_changed = widget_sync.bodies_changed;
     changed.extend(widget_sync.changed);
 
-    // Widget-TYPE registry (Phase 3): the runtime hot-sync counterpart to
-    // Phase 2's build-time registry.json walk — rewrites this song's entry
-    // from its current livery.json `.widgets` key. Same call site, same
-    // trigger (unconditional on `rice stage`/`preview`), same fatal-on-IO
-    // posture as the widget-body sync just above.
+    // Widget-TYPE registry (Phase 3, C4/W3): the runtime hot-sync
+    // counterpart to the build-time registry.json walk — regenerates
+    // registry.json WHOLE from the committed songbook (`nix eval`, same
+    // generator the widget-body sync above just called for manifest.json),
+    // then reads THIS song's entry back out of the fresh result. Same call
+    // site, same trigger (unconditional on `rice stage`/`preview`), same
+    // fatal-on-IO posture as the widget-body sync just above.
     let registry_sync = match crate::widgets::sync_song_registry(&name) {
         Ok(sync) => sync,
         Err(e) => {
@@ -1225,37 +1227,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // C4/W3: `manifest.json`/`registry.json` regeneration shells out to `nix
+    // eval` against the REAL committed songbook
+    // (`aoide_storage::fs::flake_root`, deliberately decoupled from
+    // `AOIDE_STAGE_DIR` — see that function's doc) rather than scanning
+    // whatever this test's scratch songbook fabricates. So these tests
+    // ground their manifest/registry assertions in the actual committed
+    // songs (sonata/fugue/etude/nocturne — 14/2/1/1 slots), captured once
+    // here so a future songbook edit has one place to update:
+    const SONATA_SLOT_COUNT: usize = 14;
+    const FUGUE_SLOT_COUNT: usize = 2;
+
+    /// Every manifest entry is `{ "<slot>": { "owner": "...", "file":
+    /// "..." } }` — never a bare list. This is the shape assertion the
+    /// pre-C4 stale test never made (it only ever checked ONE song's
+    /// shape), which is how the list-shape regression stayed hidden.
+    fn assert_every_entry_is_owner_map_shaped(manifest: &Value) {
+        let obj = manifest.as_object().expect("manifest.json is an object");
+        for (song, entry) in obj {
+            let slots = entry
+                .as_object()
+                .unwrap_or_else(|| panic!("{song}'s manifest entry is list-shaped, not owner-map: {entry:?}"));
+            for (slot, record) in slots {
+                assert!(
+                    record.get("owner").and_then(Value::as_str).is_some(),
+                    "{song}/{slot} has no string `owner`: {record:?}"
+                );
+                assert!(
+                    record.get("file").and_then(Value::as_str).is_some(),
+                    "{song}/{slot} has no string `file`: {record:?}"
+                );
+            }
+        }
+    }
+
     #[test]
-    fn stage_regenerates_the_manifest_for_a_newly_present_slot() {
+    fn stage_regenerates_the_manifest_and_heals_every_songs_shape_not_just_the_staged_one() {
+        // The regression this whole commit exists for: a prior stray write
+        // (the pre-C4 hazard) left `sonata` in the OLD bare-list shape.
+        // `fugue` is untouched by the bug in this fixture (already
+        // owner-map shaped) — staging `sonata` must still produce a
+        // manifest where BOTH `sonata` (rewritten from list → owner-map)
+        // AND `fugue` (regenerated fresh, not merely preserved) come out
+        // correctly shaped, because whole-file regeneration from nix can't
+        // reproduce the old bug's failure mode: every song's entry, staged
+        // or not, comes from the same eval every time.
         let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
-        let (root, stage, run_qml) = widget_sync_tmp("stage-widget-manifest");
-        let song = root.join("aoide").join("song").join("songbook").join("moonlight");
+        let (root, stage, run_qml) = widget_sync_tmp("stage-manifest-heal");
+        let song = root.join("aoide").join("song").join("songbook").join("sonata");
         std::fs::create_dir_all(song.join("widgets")).unwrap();
         std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
         std::fs::write(song.join("widgets").join("bar.qml"), "// bar\n").unwrap();
-        std::fs::write(song.join("widgets").join("calendar.qml"), "// calendar\n").unwrap();
         let songs_dir = run_qml.join("songs");
         std::fs::create_dir_all(&songs_dir).unwrap();
         std::fs::write(
             songs_dir.join("manifest.json"),
-            r#"{"moonlight":["bar"],"dusk":["clock"]}"#,
+            r#"{"sonata":["bar","calendar"],"fugue":{"bar":{"owner":"fugue","file":"bar.qml"},"herald":{"owner":"fugue","file":"herald.qml"}}}"#,
         )
         .unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
-        let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["sonata"]));
         assert_eq!(out.status, Status::Ok, "{:?}", out.data);
         let manifest: Value = serde_json::from_str(
             &std::fs::read_to_string(songs_dir.join("manifest.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(manifest["moonlight"], json!(["bar", "calendar"]));
+
+        assert_every_entry_is_owner_map_shaped(&manifest);
+
+        let sonata = manifest["sonata"].as_object().unwrap();
         assert_eq!(
-            manifest["dusk"],
-            json!(["clock"]),
-            "another song's manifest entry survives the rewrite untouched"
+            sonata.len(),
+            SONATA_SLOT_COUNT,
+            "sonata healed from list-shape into the real owner map: {sonata:?}"
         );
+        assert_eq!(sonata["bar"], json!({"owner": "sonata", "file": "bar.qml"}));
+
+        let fugue = manifest["fugue"].as_object().unwrap();
+        assert_eq!(
+            fugue.len(),
+            FUGUE_SLOT_COUNT,
+            "fugue is present and owner-map shaped though sonata was staged, not fugue: {fugue:?}"
+        );
+        assert_eq!(fugue["bar"], json!({"owner": "fugue", "file": "bar.qml"}));
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1294,151 +1351,121 @@ mod tests {
 
         let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
         assert_eq!(out.status, Status::Ok, "{:?}", out.data);
-        // livery.json is staged and registry.json is (re)synced — a widget
-        // TYPE declaration lives in livery.json, not the widgets/ dir, so
-        // the registry sync runs independently of it (Phase 3). No widget
-        // BODIES are copied though: no widgets/ dir → no per-song run/qml
+        // livery.json is staged; manifest.json AND registry.json are BOTH
+        // (re)generated whole from the real committed songbook (C4) — a
+        // runtime tree exists, so both regenerate unconditionally,
+        // regardless of whether the ACTIVE song ("moonlight", fake, not a
+        // real committed song) has a local widgets/ dir. No widget BODIES
+        // are copied though: no LOCAL widgets/ dir → no per-song run/qml
         // songs/moonlight/ dir.
         assert_eq!(
             out.changed.len(),
-            2,
-            "no widgets/ dir → no bodies synced, but registry.json still is: {:?}",
+            3,
+            "no widgets/ dir → no bodies synced, but manifest.json + registry.json still are: {:?}",
             out.changed
         );
         assert!(out.changed.iter().any(|c| c.ends_with("stage/livery.json")));
+        assert!(out.changed.iter().any(|c| c.ends_with("run/qml/songs/manifest.json")));
         assert!(out.changed.iter().any(|c| c.ends_with("run/qml/songs/registry.json")));
         assert!(!run_qml.join("songs").join("moonlight").exists());
         let registry: Value = serde_json::from_str(
             &std::fs::read_to_string(run_qml.join("songs").join("registry.json")).unwrap(),
         )
         .unwrap();
+        assert!(
+            registry.get("moonlight").is_none(),
+            "moonlight isn't a real committed song, so it has no registry entry at all: {registry:?}"
+        );
         assert_eq!(
-            registry["moonlight"],
+            registry["fugue"],
             json!({}),
-            "VALID_NOTES carries no .widgets key → registry entry is {{}}"
+            "fugue is a real committed song that declares no widget types → {{}}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn stage_syncs_a_widget_type_declaration_into_the_registry() {
+    fn stage_regenerates_the_registry_from_the_real_songbook_across_widget_kinds() {
+        // C4/W3: `registry.json` no longer reads THIS song's local
+        // `livery.json` at all — it comes entirely from nix's eval of the
+        // committed songbook, same as `manifest.json`. So this test doesn't
+        // author a fixture `.widgets` block; it stages an arbitrary real
+        // song and checks that every OTHER real song's registry entry
+        // — across both widget kinds the schema carries — comes out
+        // correct: etude's `demo` (surface, with namespace/shortcut/blur)
+        // and nocturne's `vigil` (dock, with `order`).
         let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
-        let (root, stage, run_qml) = widget_sync_tmp("stage-registry-declare");
-        let song = root.join("aoide").join("song").join("songbook").join("moonlight");
-        std::fs::create_dir_all(song.join("widgets")).unwrap();
-        let notes = r##"{ "schemaVersion":"0",
-            "palette": {"bg":"#0b1021","fg":"#c8d3f5","accent":"#82aaff","urgent":"#ff757f"},
-            "widgets": { "grimoire": { "kind": "surface", "layer": "top" } } }"##;
-        std::fs::write(song.join("livery.json"), notes).unwrap();
-        std::fs::write(song.join("widgets").join("grimoire.qml"), "// grimoire\n").unwrap();
+        let (root, stage, run_qml) = widget_sync_tmp("stage-registry-real-kinds");
+        let song = root.join("aoide").join("song").join("songbook").join("etude");
+        std::fs::create_dir_all(&song).unwrap();
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
         std::fs::create_dir_all(&run_qml).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
-        let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["etude"]));
         assert_eq!(out.status, Status::Ok, "{:?}", out.data);
-        let registry: Value = serde_json::from_str(
-            &std::fs::read_to_string(run_qml.join("songs").join("registry.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            registry["moonlight"],
-            json!({ "grimoire": { "kind": "surface", "layer": "top" } })
-        );
         assert!(
             out.changed.iter().any(|c| c.ends_with("run/qml/songs/registry.json")),
             "registry.json write is reported changed: {:?}",
             out.changed
         );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn stage_syncs_a_dock_kind_widget_declaration_with_order_into_the_registry() {
-        // Phase 9 v2 expansion: `sync_song_registry` passes `.widgets`
-        // through verbatim with no per-field inspection, so a `dock`-kind
-        // entry carrying an `order` field should round-trip unchanged —
-        // same as any other widgets shape (confirms no code change needed
-        // here for the new kind).
-        let _g = aoide_test_support::env_lock().lock().unwrap();
-        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
-        let (root, stage, run_qml) = widget_sync_tmp("stage-registry-dock-order");
-        let song = root.join("aoide").join("song").join("songbook").join("moonlight");
-        std::fs::create_dir_all(song.join("widgets")).unwrap();
-        let notes = r##"{ "schemaVersion":"0",
-            "palette": {"bg":"#0b1021","fg":"#c8d3f5","accent":"#82aaff","urgent":"#ff757f"},
-            "widgets": { "usage": { "kind": "dock", "order": 2 } } }"##;
-        std::fs::write(song.join("livery.json"), notes).unwrap();
-        std::fs::write(song.join("widgets").join("usage.qml"), "// usage\n").unwrap();
-        std::fs::create_dir_all(&run_qml).unwrap();
-        std::env::set_var("AOIDE_STAGE_DIR", &stage);
-
-        let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
-        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
         let registry: Value = serde_json::from_str(
             &std::fs::read_to_string(run_qml.join("songs").join("registry.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(
-            registry["moonlight"],
-            json!({ "usage": { "kind": "dock", "order": 2 } }),
-            "a dock-kind entry with `order` round-trips through sync_song_registry unchanged"
+            registry["etude"],
+            json!({ "demo": {
+                "kind": "surface",
+                "namespace": "aoide-etude-demo",
+                "layer": "overlay",
+                "shortcut": "aoide:etude-demo",
+                "blur": true,
+            } }),
+            "surface-kind entry, full field set: {registry:?}"
         );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn stage_regenerates_the_registry_preserving_other_songs() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
-        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
-        let (root, stage, run_qml) = widget_sync_tmp("stage-registry-preserve");
-        let song = root.join("aoide").join("song").join("songbook").join("moonlight");
-        std::fs::create_dir_all(&song).unwrap();
-        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
-        let songs_dir = run_qml.join("songs");
-        std::fs::create_dir_all(&songs_dir).unwrap();
-        std::fs::write(
-            songs_dir.join("registry.json"),
-            r#"{"dusk":{"clock":{"kind":"surface"}}}"#,
-        )
-        .unwrap();
-        std::env::set_var("AOIDE_STAGE_DIR", &stage);
-
-        let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
-        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
-        let registry: Value =
-            serde_json::from_str(&std::fs::read_to_string(songs_dir.join("registry.json")).unwrap())
-                .unwrap();
-        assert_eq!(registry["moonlight"], json!({}), "no .widgets key → {{}}");
         assert_eq!(
-            registry["dusk"],
-            json!({"clock":{"kind":"surface"}}),
-            "another song's registry entry survives the rewrite untouched"
+            registry["nocturne"],
+            json!({ "vigil": { "kind": "dock", "order": 0 } }),
+            "dock-kind entry with `order`: {registry:?}"
         );
+        assert_eq!(registry["fugue"], json!({}), "fugue declares no widget types: {registry:?}");
+        assert_eq!(out.data.as_ref().unwrap()["registry"], "synced `etude`'s widget-type registry entry");
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn stage_leaves_the_registry_untouched_when_already_current() {
+        // Idempotency: stage the SAME song twice with nothing changed in
+        // between. The first call writes real content (whatever nix's eval
+        // of the committed songbook currently produces — not hand-typed
+        // here, since C4 means this test cannot predict it without running
+        // the same eval); the second call must report no registry.json
+        // write at all.
         let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, stage, run_qml) = widget_sync_tmp("stage-registry-unchanged");
-        let song = root.join("aoide").join("song").join("songbook").join("moonlight");
+        let song = root.join("aoide").join("song").join("songbook").join("fugue");
         std::fs::create_dir_all(&song).unwrap();
         std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
-        let songs_dir = run_qml.join("songs");
-        std::fs::create_dir_all(&songs_dir).unwrap();
-        // Already current — byte-identical to what the sync would write.
-        let body = serde_json::to_string_pretty(&json!({"moonlight": {}})).unwrap() + "\n";
-        std::fs::write(songs_dir.join("registry.json"), &body).unwrap();
+        std::fs::create_dir_all(&run_qml).unwrap();
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
-        let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
-        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        let first = handle_rice_stage(&inv(&["rice", "stage"], &["fugue"]));
+        assert_eq!(first.status, Status::Ok, "{:?}", first.data);
         assert!(
-            !out.changed.iter().any(|c| c.ends_with("run/qml/songs/registry.json")),
-            "a byte-identical registry entry must not be reported as changed: {:?}",
-            out.changed
+            first.changed.iter().any(|c| c.ends_with("run/qml/songs/registry.json")),
+            "the first stage call writes registry.json: {:?}",
+            first.changed
+        );
+
+        let second = handle_rice_stage(&inv(&["rice", "stage"], &["fugue"]));
+        assert_eq!(second.status, Status::Ok, "{:?}", second.data);
+        assert!(
+            !second.changed.iter().any(|c| c.ends_with("run/qml/songs/registry.json")),
+            "a byte-identical second regeneration must not be reported as changed: {:?}",
+            second.changed
         );
         let _ = std::fs::remove_dir_all(&root);
     }

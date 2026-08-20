@@ -4,23 +4,42 @@
 //! `song/stage/livery.json`; this module carries a song's widget QML
 //! BODIES (`song/songbook/<song>/widgets/*.qml`) into the live runtime tree
 //! (`run/qml/songs/<song>/`) too, so Quickshell's own file-watcher picks up
-//! an edit to an EXISTING widget file live, no rebuild needed. A brand-new
-//! widget file still needs a service restart to be discovered
-//! (`manifest.json` is read once at startup) — a known, unchanged
-//! limitation this module does not attempt to fix.
+//! an edit to an EXISTING widget file live, no rebuild needed. `manifest.json`
+//! is a hot-reloaded `FileView` on the QML side (`StagingEngine.qml`), not
+//! read once at startup — a brand-new slot still needs THIS module's own
+//! manifest regeneration (below) to appear in it, but no service restart.
+//!
+//! **C4/W3 (the manifest/registry generator, unified):** `manifest.json` and
+//! `registry.json` are no longer derived by scanning THIS song's own
+//! `widgets/` directory and patching one entry. A scan cannot answer "who
+//! owns this slot" once a composition borrows another song's widget body —
+//! only `composeSong` (`lib/song.nix`, run inside `lib/songbook.nix`)
+//! resolves ownership, and it runs in the nix evaluator, nowhere else. So
+//! both files are regenerated WHOLE, for every committed song at once, by
+//! shelling out to `nix eval --json` against the `songbookManifest` flake
+//! output (`flake.nix`) — the exact same generator
+//! `modules/facets/quickshell/default.nix`'s `quickshellConfig` derivation
+//! calls at build time. One generator, two callers: [`eval_songbook`] is
+//! that shell-out, invoked once from the manifest path
+//! ([`sync_song_widgets`]) and once from the registry path
+//! ([`sync_song_registry`]) — see each function's own doc.
+//!
+//! This also fixes a real, silent hazard the old per-entry writer left
+//! behind: it preserved every OTHER song's entry verbatim on each write, so
+//! a manifest.json written by nix (owner-map shape) that this module then
+//! patched would leave every UNTOUCHED song's entry in owner-map shape but
+//! silently rewrite the STAGED song's own entry back to the old bare-list
+//! shape — a shape `StagingEngine.qml`'s `has()` cannot look up, so every
+//! widget for that one song would render nothing, no error anywhere.
+//! Whole-file regeneration from nix can't reproduce that failure mode: every
+//! song's entry, staged or not, comes from the same eval every time.
 //!
 //! Mirrors the nix build's own per-song widget carry
 //! (`modules/facets/quickshell/default.nix`'s `quickshellConfig`
-//! derivation) as closely as possible: the WHOLE `widgets/` tree is copied
-//! unfiltered (helper components, asset subdirs, `.gitkeep`, everything),
-//! while the manifest only ever lists top-level lowercase-kebab `.qml`
-//! files as slots.
-//!
-//! **Phase 3 addition:** [`sync_song_registry`] carries the declared
-//! widget-TYPE registry (CONTRACTS.md §5; `aoide.arrangement.widgets`) the
-//! same way — a song's `livery.json` `.widgets` key into that song's
-//! `run/qml/songs/registry.json` entry, mirroring the same nix
-//! derivation's build-time `registry.json` walk (Phase 2).
+//! derivation) as closely as possible for the BODY copy: the WHOLE
+//! `widgets/` tree is copied unfiltered (helper components, asset subdirs,
+//! `.gitkeep`, everything), while the manifest only ever lists top-level
+//! lowercase-kebab `.qml` files as slots.
 
 use std::path::Path;
 
@@ -29,15 +48,33 @@ use std::path::Path;
 pub struct WidgetSyncOk {
     /// `run/qml`-rooted files actually (re)written, absolute paths.
     pub changed: Vec<String>,
-    /// This song's manifested slot names, sorted.
+    /// This song's LOCAL slot names, sorted — a scan of the widgets/ dir
+    /// just copied (never the just-regenerated manifest.json): informational
+    /// only, for the `Outcome`'s own `data.slots`/message, independent of
+    /// what nix's committed-tree eval says this song owns. A song being
+    /// staged from an uncommitted/relocated songbook (tests; a brand-new
+    /// song not yet `git add`ed) can carry local widget files nix's eval of
+    /// the real committed tree has never seen — this field still reports
+    /// them; `manifest.json` itself does not until nix does.
     pub slots: Vec<String>,
+    /// Whether any widget BODY file (not `manifest.json`) was (re)written —
+    /// the trigger `rice stage`'s caller uses to decide whether a
+    /// Quickshell IPC reload is worth it (dynamically
+    /// `Qt.createComponent`-loaded widget bodies have no file watcher;
+    /// `manifest.json` does, via `StagingEngine.qml`'s own `FileView`, so a
+    /// manifest-only regeneration needs no IPC nudge).
+    pub bodies_changed: bool,
     /// Human summary for the caller's `Outcome` message/data.
     pub note: String,
 }
 
-/// A widget sync failure — an IO error partway through the copy or the
-/// manifest rewrite. Fatal to the caller: a torn widgets/manifest write is
-/// worse than refusing the whole `rice stage` call.
+/// A widget sync failure — an IO error partway through the copy, or the
+/// `nix eval` shell-out failing/producing something unusable. Fatal to the
+/// caller in both cases: a torn widgets copy is worse than refusing the
+/// call, and a manifest/registry write built on a NIX EVAL FAILURE is
+/// exactly the silently-wrong-file class this module exists to prevent —
+/// better to leave the last-good file in place and surface nix's own
+/// message than guess.
 pub struct WidgetSyncErr {
     pub error: String,
     pub target: String,
@@ -50,49 +87,136 @@ pub struct RegistrySyncOk {
     /// entries (`registry.json`'s own path), same shape as
     /// [`WidgetSyncOk::changed`].
     pub changed: Vec<String>,
-    /// This song's synced `.widgets` value (`{}` when absent/malformed).
+    /// This song's freshly-regenerated registry entry (`{}` when the
+    /// committed tree declares nothing for it), straight from
+    /// [`eval_songbook`]'s output — never the pre-regeneration file.
     pub widgets: serde_json::Value,
     /// Human summary for the caller's `Outcome` message/data.
     pub note: String,
 }
 
-/// Sync `<song>/songbook/<name>/widgets/` into `run/qml/songs/<name>/` and
-/// regenerate that song's `manifest.json` entry — the live-desktop half of
-/// `rice stage`.
+/// One `nix eval --json` shell-out against the `songbookManifest` flake
+/// output (`flake.nix`), which wraps `lib/songbook.nix` — the SAME function
+/// `modules/facets/quickshell/default.nix`'s `quickshellConfig` derivation
+/// calls at build time. Evaluates against
+/// [`aoide_storage::fs::flake_root`] (the git checkout, not the relocatable
+/// stage/runtime trees — see that function's doc), so the result reflects
+/// the COMMITTED songbook (an untracked file needs `git add` before nix's
+/// git-tree source sees it at all; an already-tracked file's uncommitted
+/// edit is visible without a commit).
 ///
-/// Clean-skips (`Ok`, empty `changed`) when the song has no `widgets/` dir,
-/// or when no `run/qml` runtime tree is deployed at all (no
-/// `nixos-rebuild switch` yet) — neither is an error, just nothing to sync.
-pub fn sync_song_widgets(name: &str) -> Result<WidgetSyncOk, WidgetSyncErr> {
-    let src = aoide_storage::fs::songbook_dir(name).join("widgets");
-    if !src.is_dir() {
-        return Ok(WidgetSyncOk {
-            changed: vec![],
-            slots: vec![],
-            note: format!("no widgets/ dir for `{name}`; runtime widgets left untouched"),
+/// `--no-eval-cache`: this runs in `rice stage`'s hot path, where a widget
+/// edit made moments ago must be reflected immediately — never served from
+/// a cache keyed on a state that's since changed.
+///
+/// Returns the WHOLE `{ manifest, registry }` payload; callers pick the
+/// half they need. On any failure (nix missing, eval error, unparseable or
+/// incomplete output) returns `Err` with nix's own message where available
+/// — never a default/empty value, which a caller could mistake for "the
+/// songbook is genuinely empty" and write out.
+fn eval_songbook() -> Result<SongbookEval, WidgetSyncErr> {
+    let flake_root = aoide_storage::fs::flake_root();
+    let flake_ref = format!("{}#songbookManifest", flake_root.to_string_lossy());
+
+    let output = std::process::Command::new("nix")
+        .args(["eval", "--json", "--no-eval-cache", &flake_ref])
+        .output()
+        .map_err(|e| WidgetSyncErr {
+            error: format!(
+                "failed to run `nix eval` (is `nix` on PATH?): {e}"
+            ),
+            target: flake_ref.clone(),
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(WidgetSyncErr {
+            error: format!(
+                "nix eval failed regenerating the songbook manifest/registry — \
+                 manifest.json/registry.json left untouched:\n{}",
+                stderr.trim()
+            ),
+            target: flake_ref,
         });
     }
 
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|e| WidgetSyncErr {
+        error: format!("nix eval produced output that isn't valid JSON: {e}"),
+        target: flake_ref.clone(),
+    })?;
+
+    let manifest = parsed
+        .get("manifest")
+        .filter(|v| v.is_object())
+        .cloned()
+        .ok_or_else(|| WidgetSyncErr {
+            error: "nix eval output has no `manifest` object — refusing to write a malformed manifest.json"
+                .to_string(),
+            target: flake_ref.clone(),
+        })?;
+    let registry = parsed
+        .get("registry")
+        .filter(|v| v.is_object())
+        .cloned()
+        .ok_or_else(|| WidgetSyncErr {
+            error: "nix eval output has no `registry` object — refusing to write a malformed registry.json"
+                .to_string(),
+            target: flake_ref,
+        })?;
+
+    Ok(SongbookEval { manifest, registry })
+}
+
+/// [`eval_songbook`]'s parsed result — the whole committed songbook's
+/// manifest and registry, keyed by song name.
+struct SongbookEval {
+    manifest: serde_json::Value,
+    registry: serde_json::Value,
+}
+
+/// Sync `<song>/songbook/<name>/widgets/` into `run/qml/songs/<name>/` and
+/// regenerate `manifest.json` WHOLE (every committed song, via
+/// [`eval_songbook`]) — the live-desktop half of `rice stage`.
+///
+/// Clean-skips (`Ok`, empty `changed`) only when no `run/qml` runtime tree
+/// is deployed at all (no `nixos-rebuild switch` yet) — there is nowhere to
+/// write. Unlike the pre-C4 version, a MISSING `widgets/` dir for `name`
+/// does NOT skip the manifest regeneration: the manifest is a whole-songbook
+/// artifact, not a per-song one, so it stays current (and self-heals any
+/// other song's stale/malformed entry) on every `rice stage` call once a
+/// runtime tree exists, regardless of whether the ACTIVE song has bodies to
+/// carry.
+pub fn sync_song_widgets(name: &str) -> Result<WidgetSyncOk, WidgetSyncErr> {
     let run_qml = aoide_storage::fs::run_qml_dir();
     if !run_qml.is_dir() {
         return Ok(WidgetSyncOk {
             changed: vec![],
             slots: vec![],
+            bodies_changed: false,
             note: "no run/qml runtime tree deployed; widgets not synced".into(),
         });
     }
 
-    let dst = run_qml.join("songs").join(name);
+    let src = aoide_storage::fs::songbook_dir(name).join("widgets");
     let mut changed: Vec<String> = Vec::new();
-    copy_tree_atomic(&src, &dst, &mut changed)?;
-    let slots = sync_manifest_entry(name, &src, &run_qml, &mut changed)?;
+    let local_slots = if src.is_dir() {
+        let dst = run_qml.join("songs").join(name);
+        copy_tree_atomic(&src, &dst, &mut changed)?;
+        scan_slot_names(&src)?
+    } else {
+        Vec::new()
+    };
+    let body_file_count = changed.len();
+    let bodies_changed = body_file_count > 0;
 
-    let note = if changed.is_empty() {
+    regenerate_manifest(&run_qml, &mut changed)?;
+
+    let note = if !bodies_changed {
         "widget bodies already current".to_string()
     } else {
-        format!("synced {} widget file(s) into run/qml/songs/{name}", changed.len())
+        format!("synced {body_file_count} widget file(s) into run/qml/songs/{name}")
     };
-    Ok(WidgetSyncOk { changed, slots, note })
+    Ok(WidgetSyncOk { changed, slots: local_slots, bodies_changed, note })
 }
 
 /// Recursively copy `src` into `dst`, unfiltered — every file and subdir,
@@ -145,20 +269,12 @@ fn copy_tree_atomic(
     Ok(())
 }
 
-/// Recompute `name`'s slot list from `src`'s top-level entries and rewrite
-/// `run_qml/songs/manifest.json`'s entry for it, preserving every other
-/// song's entry untouched. Returns the computed slot list.
-///
-/// A file qualifies as a slot iff it is a FILE (not a dir), its name is not
-/// `.gitkeep`, it ends with `.qml`, and its first byte is ascii-lowercase or
-/// an ascii digit — the same lowercase-kebab-vs-uppercase-helper rule
-/// `modules/facets/quickshell/default.nix`'s manifest generation uses.
-fn sync_manifest_entry(
-    name: &str,
-    src: &Path,
-    run_qml: &Path,
-    changed: &mut Vec<String>,
-) -> Result<Vec<String>, WidgetSyncErr> {
+/// `name`'s top-level slot files in `src` — informational only (see
+/// [`WidgetSyncOk::slots`]'s doc), same rule
+/// `modules/facets/quickshell/default.nix`'s manifest generation uses: a
+/// FILE (not a dir), not `.gitkeep`, ending `.qml`, first byte
+/// ascii-lowercase or an ascii digit.
+fn scan_slot_names(src: &Path) -> Result<Vec<String>, WidgetSyncErr> {
     let entries = std::fs::read_dir(src).map_err(|e| WidgetSyncErr {
         error: e.to_string(),
         target: src.to_string_lossy().into_owned(),
@@ -196,49 +312,34 @@ fn sync_manifest_entry(
     }
     slots.sort();
     slots.dedup();
+    Ok(slots)
+}
 
+/// Regenerate `run_qml/songs/manifest.json` WHOLE from [`eval_songbook`] —
+/// every committed song's owner-map entry, replacing the file outright
+/// (preserve-nothing: the eval is total, so a stale or malformed entry for
+/// ANY song, not just the one being staged, self-heals on every call).
+fn regenerate_manifest(run_qml: &Path, changed: &mut Vec<String>) -> Result<(), WidgetSyncErr> {
+    let eval = eval_songbook()?;
     let manifest_path = run_qml.join("songs").join("manifest.json");
+    let body = serde_json::to_string_pretty(&eval.manifest).unwrap_or_default() + "\n";
     let existing = std::fs::read_to_string(&manifest_path).ok();
-    let mut manifest: serde_json::Value = existing
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({}));
-    manifest
-        .as_object_mut()
-        .expect("normalized to an object above")
-        .insert(name.to_string(), serde_json::json!(slots));
-
-    let body = serde_json::to_string_pretty(&manifest).unwrap_or_default() + "\n";
-    let differs = existing.as_deref() != Some(body.as_str());
-    if differs {
+    if existing.as_deref() != Some(body.as_str()) {
         aoide_storage::fs::atomic_write(&manifest_path, &body).map_err(|e| WidgetSyncErr {
             error: e.to_string(),
             target: manifest_path.to_string_lossy().into_owned(),
         })?;
         changed.push(manifest_path.to_string_lossy().into_owned());
     }
-
-    Ok(slots)
+    Ok(())
 }
 
-/// Rewrite `<name>`'s entry in `run/qml/songs/registry.json` from that
-/// song's CURRENT committed `livery.json` `.widgets` key (CONTRACTS.md §5;
-/// `aoide.arrangement.widgets`) — the RUNTIME hot-sync counterpart to Phase
-/// 2's BUILD-TIME walk (`modules/facets/quickshell/default.nix`'s
-/// `quickshellConfig` derivation, which generates the same file for every
-/// song at build time). Keeps ONE song's entry current after a live edit to
-/// its `livery.json`, no rebuild needed — same preserve-other-songs-entries
-/// + atomic-write pattern [`sync_manifest_entry`] already uses for
-/// `manifest.json`.
-///
-/// Tolerant of a song with no `livery.json` at all, or one with no
-/// `.widgets` key (or a malformed one) — all read as `{}`, mirroring the
-/// build-time walk's own `.widgets // {}` (never an error, never a skipped
-/// song). Independent of whether the song has a `widgets/` dir: `.widgets`
-/// is a sibling field of `livery.json`, not physically tied to widget QML
-/// bodies, exactly as the build-time walk treats it (every committed song
-/// gets an entry there regardless of its `widgets/*.qml` files).
+/// Regenerate `run/qml/songs/registry.json` WHOLE from [`eval_songbook`] —
+/// the second call site of the one generator (see the module doc's "one
+/// generator, invoked twice"). Same preserve-nothing posture as
+/// [`regenerate_manifest`]: every committed song's registry entry comes
+/// from THIS eval, every time, so a stale entry for any song self-heals
+/// regardless of which song is being staged.
 ///
 /// Clean-skips (`Ok`, empty `changed`) when no `run/qml` runtime tree is
 /// deployed at all — mirrors [`sync_song_widgets`]'s own not-yet-switched
@@ -253,27 +354,10 @@ pub fn sync_song_registry(name: &str) -> Result<RegistrySyncOk, WidgetSyncErr> {
         });
     }
 
-    let notes_path = aoide_storage::fs::songbook_notes(name);
-    let widgets = std::fs::read_to_string(&notes_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v.get("widgets").cloned())
-        .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({}));
-
+    let eval = eval_songbook()?;
     let registry_path = run_qml.join("songs").join("registry.json");
+    let body = serde_json::to_string_pretty(&eval.registry).unwrap_or_default() + "\n";
     let existing = std::fs::read_to_string(&registry_path).ok();
-    let mut registry: serde_json::Value = existing
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({}));
-    registry
-        .as_object_mut()
-        .expect("normalized to an object above")
-        .insert(name.to_string(), widgets.clone());
-
-    let body = serde_json::to_string_pretty(&registry).unwrap_or_default() + "\n";
     let differs = existing.as_deref() != Some(body.as_str());
     let mut changed: Vec<String> = Vec::new();
     if differs {
@@ -283,6 +367,8 @@ pub fn sync_song_registry(name: &str) -> Result<RegistrySyncOk, WidgetSyncErr> {
         })?;
         changed.push(registry_path.to_string_lossy().into_owned());
     }
+
+    let widgets = eval.registry.get(name).cloned().unwrap_or_else(|| serde_json::json!({}));
 
     let note = if differs {
         format!("synced `{name}`'s widget-type registry entry")
