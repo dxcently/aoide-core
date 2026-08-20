@@ -302,7 +302,10 @@ fn detail_lines<'a>(rows: &[DagRow], app: &App) -> Vec<Line<'a>> {
                 Line::from(header_spans),
                 Line::from(format!("  cwd     {}", rec.cwd)),
                 match rec.log_path.as_deref() {
-                    Some(path) => Line::from(format!("  log     {path}")),
+                    Some(path) => Line::from(format!(
+                        "  log     {path}   started {}",
+                        theme::disp(&rec.started_at)
+                    )),
                     None => Line::from(format!(
                         "  window  {}   started {}",
                         theme::disp(&rec.window_address),
@@ -666,6 +669,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         "    j / k            walk nodes (preorder)",
         "    g / G            jump to first / last node",
         "    Enter            cue window · tail the log if headless",
+        "    Esc / q          close the log tail (Enter also closes it)",
         "    p / e            prune done · emit graph.json",
         "    ◆ project  ● session   ⟨tag⟩ read-only tag",
         "",
@@ -878,8 +882,8 @@ mod tests {
         app.dag_sel = 1; // row 0 is the ◆ aoide group header; row 1 is the session
         let out = render_panel(&app, Panel::Sessions, 100, 30);
         assert!(
-            out.contains("log     /home/k/Aoide/state/sessions/s1.log"),
-            "log path line in the detail card: {out}"
+            out.contains("log     /home/k/Aoide/state/sessions/s1.log   started s1"),
+            "log path line keeps started alongside the path: {out}"
         );
         assert!(
             out.contains("headless"),
