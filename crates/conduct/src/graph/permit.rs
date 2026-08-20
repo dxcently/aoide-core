@@ -603,15 +603,20 @@ mod tests {
     }
 
     #[test]
-    fn only_claude_carries_verified_permission_keys_today() {
+    fn claude_and_kimi_carry_verified_permission_keys_pi_does_not() {
         let claude = profile_for_agent("claude");
         let keys = claude.permission_keys.as_ref().expect("claude's prompt was read live");
         assert_eq!(keys.approve, "1");
         assert_eq!(keys.deny, "3");
         // Not option 2 — a summons approves THIS request, not the session.
         assert_ne!(keys.approve, "2");
-        // The unverified harnesses refuse rather than guess.
-        assert!(profile_for_agent("kimi").permission_keys.is_none());
+        // Kimi's prompt was read live too (2026-08-20 probe) — same shape.
+        let kimi = profile_for_agent("kimi");
+        let kimi_keys = kimi.permission_keys.as_ref().expect("kimi's prompt was read live");
+        assert_eq!(kimi_keys.approve, "1");
+        assert_eq!(kimi_keys.deny, "3");
+        assert_ne!(kimi_keys.approve, "2");
+        // pi's prompt has never been read live — it still refuses to guess.
         assert!(profile_for_agent("pi").permission_keys.is_none());
         // An unknown agent string falls back to claude, as everywhere else.
         assert_eq!(profile_for_agent("mystery").name, "claude");

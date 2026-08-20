@@ -999,11 +999,20 @@ pub static KIMI_PROFILE: AgentProfile = AgentProfile {
     // Kimi's dispatch tool IS `Agent` — confirmed in captured 0.31.1 hook
     // payloads (`tool_name:"Agent"`); this harness has no `Task` alias.
     subagent_tools: &["Agent"],
-    // Kimi's own permission prompt shape has never been read on a live
-    // screen, so the herald summons stays off for it rather than typing a
-    // guessed hotkey into a session. Its `PermissionRequest` hook still
-    // drives the roster's `awaiting` face.
-    permission_keys: None,
+    // Read off the live prompt (2026-08-20 probe, headless conducted kimi,
+    // pty log at a real shell-permission prompt): "▶ Run this command? / ...
+    // / ▶ 1. Approve once / 2. Approve for this session / 3. Reject /
+    // 4. Reject with feedback / ↑/↓ select · 1/2/3/4 choose · ↵ confirm".
+    // Injecting the single byte "1" (no trailing \r) fired approval
+    // immediately and the command executed — the digit alone chooses AND
+    // confirms, no trailing submit byte needed (same as claude's digits).
+    // Option 2 is deliberately NOT the approve key — it is the
+    // session-wide allow-all, and a summons approves THIS request only.
+    // Option 4 is reject-with-feedback, not the bare deny.
+    permission_keys: Some(PermissionKeys {
+        approve: "1",
+        deny: "3",
+    }),
     // Kimi's TUI submits a composed line on `\r`, NOT `\n` — read off the
     // live screen (Conductor-Channel.md's `graph send` entry): against a
     // kimi target, a plain `\n` types the line without submitting it.
