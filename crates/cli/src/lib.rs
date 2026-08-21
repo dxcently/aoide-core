@@ -31,164 +31,138 @@ use daemon::Door;
 
 /// Run the `aoide` CLI trunk. Returns the process exit code.
 ///
-/// `argv` excludes the program name. Special-cases: `mcp serve --stdio` starts
-/// the MCP server; `guide` prints the onboarding text; everything else routes
-/// through the single dispatcher (so the audit log + gate apply uniformly).
+/// `argv` excludes the program name. The parse/dispatch/render skeleton lives
+/// in `aoide_protocol::door::run` (Phase 3 restructure,
+/// docs/architecture/PACKAGE-LAYOUT.md) so a second binary (lyra, P-A4) can
+/// drive the same loop against its own registry without duplicating it; this
+/// crate supplies its own six special-cased verbs via the `special` hook —
+/// `mcp serve --stdio` and `a2a serve` start servers, `conductor` hands off
+/// to the interactive terminal loop, `guide`/`schema`/`livery` bypass the
+/// generic `Outcome` envelope — everything else routes through the single
+/// dispatcher (so the audit log + gate apply uniformly).
 pub fn run_cli(argv: &[String]) -> i32 {
-    // Determine `--json` up front for uniform rendering of parse errors too.
-    let (inv, json) = match cli::parse(argv, Door::Cli) {
-        Ok(v) => v,
-        Err(o) => {
-            let json = wants_json(argv);
-            let (body, code) = o.render(json);
-            if code == output::exit::OK {
-                // Informational (a `--help`/`-h` usage block): to stdout, exit 0.
-                // Text mode prints the raw usage; `--json` still emits the
-                // envelope so a tool reading `--help --json` gets structure.
-                if json {
-                    println!("{body}");
-                } else {
-                    println!("{}", o.message);
+    protocol::door::run(argv, Door::Cli, dispatch::registry(), dispatch::dispatch, |inv, json| {
+        // `mcp serve --stdio` is a long-running server, not a one-shot dispatch.
+        // The registry + dispatcher are injected here (the DI seam
+        // `aoide-server`'s module doc comment explains — `aoide-server` cannot
+        // reach the crate-global, fully-assembled `dispatch::registry()` itself).
+        if inv.path == ["mcp", "serve"] && inv.flag_present("stdio") {
+            return Some(match mcp::serve_stdio(dispatch::registry(), dispatch::dispatch) {
+                Ok(()) => output::exit::OK,
+                Err(e) => {
+                    eprintln!("aoide mcp serve: {e}");
+                    output::exit::ERROR
                 }
+            });
+        }
+
+        // `a2a serve` is a long-running server, launched at the entry point
+        // exactly like `mcp serve --stdio` and `conductor`: dispatch FIRST (so
+        // the single audit log records the launch, and a non-Cli door — e.g. an
+        // MCP `tools/call` for `a2a.serve` — gets the "run this from a terminal"
+        // outcome via `handle_a2a_serve` instead of blocking that door), then
+        // block in the accept loop.
+        if inv.path == ["a2a", "serve"] {
+            let launch = dispatch::dispatch(inv);
+            if launch.status != output::Status::Ok {
+                let (body, code) = launch.render(json);
+                eprintln!("{body}");
+                return Some(code);
+            }
+            let (bind, port) = a2a::resolve_bind_port(inv);
+            let spawn_agent = a2a::resolve_spawn_agent(inv);
+            let peer_name = a2a::resolve_peer_name(inv);
+            let token_file = a2a::resolve_token_file(inv);
+            let expected_token = a2a::read_expected_token(&token_file).unwrap_or_default();
+            let audit_log = dispatch::audit_log_path(inv);
+            // The registry is injected here too (same DI seam as `mcp serve
+            // --stdio` above) — `a2a::serve` needs it to build the AgentCard.
+            return Some(match a2a::serve(&bind, port, &audit_log, &spawn_agent, &peer_name, &expected_token, dispatch::registry()) {
+                Ok(()) => output::exit::OK,
+                Err(e) => {
+                    eprintln!("aoide a2a serve: {e}");
+                    output::exit::ERROR
+                }
+            });
+        }
+
+        // `conductor` is an interactive loop, resolved at the entry point exactly
+        // like `mcp serve --stdio` — mode resolution happens here; everything
+        // below the door is frontend-agnostic. We dispatch FIRST (so the single
+        // audit log records the launch — the very record the LOG panel then
+        // tails), then hand control to the terminal loop. The loop installs a
+        // panic hook + a Drop guard that restore the terminal (leave the
+        // alternate screen, disable raw mode) on ANY exit path, so a panic can
+        // never leave a wedged tty.
+        if inv.path == ["conductor"] {
+            let launch = dispatch::dispatch(inv);
+            if launch.status != output::Status::Ok {
+                let (body, code) = launch.render(json);
+                eprintln!("{body}");
+                return Some(code);
+            }
+            return Some(match conductor::run(dispatch::dispatch) {
+                Ok(()) => output::exit::OK,
+                Err(e) => {
+                    eprintln!("aoide conductor: {e}");
+                    output::exit::ERROR
+                }
+            });
+        }
+
+        // `guide` in text mode prints the full onboarding rather than a summary.
+        if inv.path == ["guide"] && !json {
+            print!("{}", guide::GUIDE);
+            return Some(output::exit::OK);
+        }
+
+        // `schema --json` emits the raw contract document at top level (CONTRACTS
+        // §3), NOT wrapped in the generic outcome envelope — it is the source of
+        // truth the MCP tool list and external tooling parse directly.
+        if inv.path == ["schema"] {
+            // Still record the read through the single audit log for parity.
+            let _ = daemon::audit(
+                &daemon::default_audit_log(),
+                Door::Cli,
+                daemon::EventClass::Audit,
+                "schema",
+                "ok",
+                "emitted schema",
+            );
+            let doc = dispatch::registry().schema();
+            let body = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into());
+            println!("{body}");
+            return Some(output::exit::OK);
+        }
+
+        // `livery emit` / `livery resolve` / `livery lint` print the engine's raw
+        // byte output in text mode (the livery CLI contract: terminal consumers
+        // pipe the OSC stream / hyprctl lines / resolve JSON straight out), NOT
+        // the outcome envelope — same posture as `schema` above. The handler
+        // carries the exact bytes in `data["stdout"]`; errors render normally
+        // (envelope to stderr, exit 1). `--json` keeps the structured envelope.
+        if inv.path.len() == 2 && inv.path[0] == "livery" && !json {
+            let outcome = dispatch::dispatch(inv);
+            if outcome.status == output::Status::Ok {
+                if let Some(stdout) = outcome
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("stdout"))
+                    .and_then(|s| s.as_str())
+                {
+                    print!("{stdout}");
+                    return Some(output::exit::OK);
+                }
+            }
+            let (body, code) = outcome.render(false);
+            if code == output::exit::OK {
+                println!("{body}");
             } else {
                 eprintln!("{body}");
             }
-            return code;
+            return Some(code);
         }
-    };
 
-    // `mcp serve --stdio` is a long-running server, not a one-shot dispatch.
-    // The registry + dispatcher are injected here (the DI seam
-    // `aoide-server`'s module doc comment explains — `aoide-server` cannot
-    // reach the crate-global, fully-assembled `dispatch::registry()` itself).
-    if inv.path == ["mcp", "serve"] && inv.flag_present("stdio") {
-        return match mcp::serve_stdio(dispatch::registry(), dispatch::dispatch) {
-            Ok(()) => output::exit::OK,
-            Err(e) => {
-                eprintln!("aoide mcp serve: {e}");
-                output::exit::ERROR
-            }
-        };
-    }
-
-    // `a2a serve` is a long-running server, launched at the entry point
-    // exactly like `mcp serve --stdio` and `conductor`: dispatch FIRST (so
-    // the single audit log records the launch, and a non-Cli door — e.g. an
-    // MCP `tools/call` for `a2a.serve` — gets the "run this from a terminal"
-    // outcome via `handle_a2a_serve` instead of blocking that door), then
-    // block in the accept loop.
-    if inv.path == ["a2a", "serve"] {
-        let launch = dispatch::dispatch(&inv);
-        if launch.status != output::Status::Ok {
-            let (body, code) = launch.render(json);
-            eprintln!("{body}");
-            return code;
-        }
-        let (bind, port) = a2a::resolve_bind_port(&inv);
-        let spawn_agent = a2a::resolve_spawn_agent(&inv);
-        let peer_name = a2a::resolve_peer_name(&inv);
-        let token_file = a2a::resolve_token_file(&inv);
-        let expected_token = a2a::read_expected_token(&token_file).unwrap_or_default();
-        let audit_log = dispatch::audit_log_path(&inv);
-        // The registry is injected here too (same DI seam as `mcp serve
-        // --stdio` above) — `a2a::serve` needs it to build the AgentCard.
-        return match a2a::serve(&bind, port, &audit_log, &spawn_agent, &peer_name, &expected_token, dispatch::registry()) {
-            Ok(()) => output::exit::OK,
-            Err(e) => {
-                eprintln!("aoide a2a serve: {e}");
-                output::exit::ERROR
-            }
-        };
-    }
-
-    // `conductor` is an interactive loop, resolved at the entry point exactly
-    // like `mcp serve --stdio` — mode resolution happens here; everything
-    // below the door is frontend-agnostic. We dispatch FIRST (so the single
-    // audit log records the launch — the very record the LOG panel then
-    // tails), then hand control to the terminal loop. The loop installs a
-    // panic hook + a Drop guard that restore the terminal (leave the
-    // alternate screen, disable raw mode) on ANY exit path, so a panic can
-    // never leave a wedged tty.
-    if inv.path == ["conductor"] {
-        let launch = dispatch::dispatch(&inv);
-        if launch.status != output::Status::Ok {
-            let (body, code) = launch.render(json);
-            eprintln!("{body}");
-            return code;
-        }
-        return match conductor::run(dispatch::dispatch) {
-            Ok(()) => output::exit::OK,
-            Err(e) => {
-                eprintln!("aoide conductor: {e}");
-                output::exit::ERROR
-            }
-        };
-    }
-
-    // `guide` in text mode prints the full onboarding rather than a summary.
-    if inv.path == ["guide"] && !json {
-        print!("{}", guide::GUIDE);
-        return output::exit::OK;
-    }
-
-    // `schema --json` emits the raw contract document at top level (CONTRACTS
-    // §3), NOT wrapped in the generic outcome envelope — it is the source of
-    // truth the MCP tool list and external tooling parse directly.
-    if inv.path == ["schema"] {
-        // Still record the read through the single audit log for parity.
-        let _ = daemon::audit(
-            &daemon::default_audit_log(),
-            Door::Cli,
-            daemon::EventClass::Audit,
-            "schema",
-            "ok",
-            "emitted schema",
-        );
-        let doc = dispatch::registry().schema();
-        let body = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into());
-        println!("{body}");
-        return output::exit::OK;
-    }
-
-    // `livery emit` / `livery resolve` / `livery lint` print the engine's raw
-    // byte output in text mode (the livery CLI contract: terminal consumers
-    // pipe the OSC stream / hyprctl lines / resolve JSON straight out), NOT
-    // the outcome envelope — same posture as `schema` above. The handler
-    // carries the exact bytes in `data["stdout"]`; errors render normally
-    // (envelope to stderr, exit 1). `--json` keeps the structured envelope.
-    if inv.path.len() == 2 && inv.path[0] == "livery" && !json {
-        let outcome = dispatch::dispatch(&inv);
-        if outcome.status == output::Status::Ok {
-            if let Some(stdout) = outcome
-                .data
-                .as_ref()
-                .and_then(|d| d.get("stdout"))
-                .and_then(|s| s.as_str())
-            {
-                print!("{stdout}");
-                return output::exit::OK;
-            }
-        }
-        let (body, code) = outcome.render(false);
-        if code == output::exit::OK {
-            println!("{body}");
-        } else {
-            eprintln!("{body}");
-        }
-        return code;
-    }
-
-    let outcome = dispatch::dispatch(&inv);
-    let (body, code) = outcome.render(json);
-    if code == output::exit::OK {
-        println!("{body}");
-    } else {
-        eprintln!("{body}");
-    }
-    code
-}
-
-/// Did argv contain `--json` anywhere? (used before full parse for errors).
-fn wants_json(argv: &[String]) -> bool {
-    argv.iter().any(|a| a == "--json" || a == "--json=true")
+        None
+    })
 }
