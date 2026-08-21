@@ -74,7 +74,7 @@ pub fn all() -> Registry {
     aoide_storage::commands::register(&mut r); // usage — local token/cost rollup (CONTRACTS.md §4)
     aoide_conduct::commands::hooks::register(&mut r); // hooks install — the hook-installer verb (appended newest)
     aoide_song::commands::quickshell::register(&mut r); // quickshell reload — IPC hot-reload trigger
-    aoide_conduct::commands::screen::register(&mut r); // screen info, screen shot — Phase 1 of the `screen` verb family (appended newest)
+    aoide_screen::commands::register(&mut r); // screen info, screen shot — Phase 1 of the `screen` verb family (own crate since P-A1)
     aoide_conduct::commands::herald::register(&mut r); // herald push — dunst's script hook into the notification ledger (appended newest)
     aoide_song::commands::take::register(&mut r); // rice take — explicit take-store snapshot (byte-stable schema order; FORK 2)
     aoide_upkeep::commands::register(&mut r); // soundcheck — mechanical-integrity WORKING-tree sweep, report-only (appended newest)

@@ -34,7 +34,7 @@
 //! function here takes a caller-supplied path/repo/sha and does exactly the
 //! one git operation its name says.
 //!
-//! **Tool-missing shape mirrors `aoide_conduct::screen::ocr`'s tesseract
+//! **Tool-missing shape mirrors `aoide_screen::ocr`'s tesseract
 //! handling** (the house precedent this plan cites for the tenth/eleventh
 //! external binary, plan §1.4): a spawn failure (`git` not on `PATH`) and a
 //! nonzero exit (git ran and refused) are DISTINCT failure shapes, both

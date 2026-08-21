@@ -76,4 +76,10 @@ pub(crate) use self::model::{hooks_path, STAGE_GRAPH_VERSION};
 pub(crate) use self::session_store::{
     refresh_subagent_says, refresh_transcript_fields, upsert_hook,
 };
-pub(crate) use self::window::{hyprctl_clients, normalize_addr};
+pub(crate) use self::window::hyprctl_clients;
+/// Widened from `pub(crate)` to `pub` at P-A1 of the binary-split
+/// workstream: `aoide-screen` (moved out of this crate) needs the same
+/// `0x`/case-tolerant window-address comparison its own session-targeted
+/// verbs (`screen shot --session`, `screen point --from-shot`, …) already
+/// relied on when they lived here.
+pub use self::window::normalize_addr;

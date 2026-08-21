@@ -37,6 +37,7 @@ dependencies = [
  "aoide-conduct",
  "aoide-conductor",
  "aoide-protocol",
+ "aoide-screen",
  "aoide-server",
  "aoide-song",
  "aoide-storage",
@@ -66,12 +67,9 @@ dependencies = [
  "aoide-protocol",
  "aoide-storage",
  "aoide-test-support",
- "image",
  "libc",
  "serde",
  "serde_json",
- "wayland-client",
- "wayland-protocols-wlr",
 ]
 
 [[package]]
@@ -93,6 +91,23 @@ version = "0.0.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "aoide-screen"
+version = "0.0.0"
+dependencies = [
+ "aoide-client",
+ "aoide-conduct",
+ "aoide-protocol",
+ "aoide-storage",
+ "aoide-test-support",
+ "image",
+ "libc",
+ "serde",
+ "serde_json",
+ "wayland-client",
+ "wayland-protocols-wlr",
 ]
 
 [[package]]

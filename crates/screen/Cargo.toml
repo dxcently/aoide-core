@@ -1,0 +1,42 @@
+[package]
+name = "aoide-screen"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+description = "Aoide screen verb family: read-only desktop readout, capture, pointer synthesis, OCR, act-verification diff, and send-to-agent — extracted from aoide-conduct (P-A1 of the binary-split workstream)."
+
+[lib]
+name = "aoide_screen"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+aoide-protocol = { workspace = true }
+aoide-storage = { workspace = true }
+# `screen::capture`/`point`'s session/window resolution reaches into
+# conduct's session graph (`SessionRecord`, `SessionsFile`, `load_stage`,
+# `write_stage`, `sessions_path`, `normalize_addr`); `screen::send`'s
+# `--session` path calls `aoide_conduct::graph::session_send` directly (a
+# same-process function call, never a subprocess shell-out) so it inherits
+# that verb's own hold/gate/audit behavior for free.
+aoide-conduct = { workspace = true }
+# `screen send --agent` calls `aoide_client::commands::handle_agent_send`
+# directly — the same JSON-RPC `message/send` driver `aoide a2a agent send`
+# uses (moved here verbatim from conduct's own former edge; see
+# `send.rs`'s module header for the full story).
+aoide-client = { workspace = true }
+libc = { workspace = true }
+# `screen::synth`'s pointer-synthesis backend (Phase A of the
+# pointer-emulation workstream) — see the workspace manifest's own comment on
+# why default features (pure-Rust, no system libwayland link).
+wayland-client = { workspace = true }
+wayland-protocols-wlr = { workspace = true }
+# `screen::diff`'s decode boundary (Phase E) — see the workspace manifest's
+# own comment on why png+jpeg-only.
+image = { workspace = true }
+
+[dev-dependencies]
+# `send.rs`'s tests share the workspace rig (scratch dirs, EnvSaver,
+# `env_lock`) — dev-only edge.
+aoide-test-support = { workspace = true }

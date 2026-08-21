@@ -21,7 +21,12 @@ use std::path::PathBuf;
 /// leading `0x` stripped. The stored `windowAddress` and hyprctl's reported
 /// addresses can disagree on case and on a present/absent `0x` prefix
 /// (hyprctl reports e.g. `0x55…`); this makes the match tolerant of both.
-pub(crate) fn normalize_addr(addr: &str) -> String {
+///
+/// Widened from `pub(crate)` to `pub` at P-A1 of the binary-split
+/// workstream: `aoide-screen` (moved out of this crate) needs the same
+/// address comparison for its session-targeted verbs (`screen shot
+/// --session`, `screen point --from-shot`, …).
+pub fn normalize_addr(addr: &str) -> String {
     let a = addr.trim();
     let a = a
         .strip_prefix("0x")

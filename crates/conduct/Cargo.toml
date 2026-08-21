@@ -14,21 +14,18 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 aoide-protocol = { workspace = true }
 aoide-storage = { workspace = true }
-# Phase 5 (`screen send --agent`): reuses `client::commands::handle_agent_send`
-# directly rather than reinventing an A2A driver here. Bends the charter
-# table's "conduct/client are independent leaves under cli" a little — see
-# `screen/send.rs`'s module header for why this edge exists and doesn't cycle
-# (client has no dependency back on conduct).
+# Originally added Phase 5 for `screen send --agent`'s reuse of
+# `client::commands::handle_agent_send` — that tenant moved out with
+# `screen` at P-A1 of the binary-split workstream (now `aoide-screen`'s own
+# edge, see its Cargo.toml). The edge STAYS regardless: it's deliberately
+# retained for the upcoming `who` presence verb (messaging workstream C2,
+# `aoide who`/`graph send --to`), which needs client's peer-pull transport
+# from inside this crate. Bends the charter table's "conduct/client are
+# independent leaves under cli" a little either way — see the messaging
+# workstream plan for why this edge doesn't cycle (client has no dependency
+# back on conduct).
 aoide-client = { workspace = true }
 libc = { workspace = true }
-# `screen::synth`'s pointer-synthesis backend (Phase A of the
-# pointer-emulation workstream) — see the workspace manifest's own comment on
-# why default features (pure-Rust, no system libwayland link).
-wayland-client = { workspace = true }
-wayland-protocols-wlr = { workspace = true }
-# `screen::diff`'s decode boundary (Phase E) — see the workspace manifest's
-# own comment on why png+jpeg-only.
-image = { workspace = true }
 
 [dev-dependencies]
 # The commands/hooks tests share the workspace rig (scratch dirs, EnvSaver,
