@@ -27,7 +27,7 @@ use daemon::Door;
 /// `conductor` — those are core identity, never lyra's (plan P-A4: "NO a2a
 /// serve, NO conductor").
 pub fn run_lyra(argv: &[String]) -> i32 {
-    aoide_protocol::door::run(argv, Door::Cli, dispatch::registry(), dispatch::dispatch, |inv, json| {
+    aoide_protocol::door::run(argv, Door::Cli, "lyra", dispatch::registry(), dispatch::dispatch, |inv, json| {
         // `mcp serve --stdio` is a long-running server, not a one-shot
         // dispatch. The registry + dispatcher are injected here (the DI
         // seam `aoide-server`'s module doc comment explains) — LYRA's own

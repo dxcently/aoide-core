@@ -24,7 +24,6 @@ pub use aoide_conduct as conduct;
 pub use aoide_conductor as conductor;
 pub use aoide_protocol as protocol;
 pub use aoide_server as server;
-pub use aoide_song as song;
 pub use aoide_storage as storage;
 
 use daemon::Door;
@@ -35,13 +34,15 @@ use daemon::Door;
 /// in `aoide_protocol::door::run` (Phase 3 restructure,
 /// docs/architecture/PACKAGE-LAYOUT.md) so a second binary (lyra, P-A4) can
 /// drive the same loop against its own registry without duplicating it; this
-/// crate supplies its own six special-cased verbs via the `special` hook —
+/// crate supplies its own five special-cased verbs via the `special` hook —
 /// `mcp serve --stdio` and `a2a serve` start servers, `conductor` hands off
-/// to the interactive terminal loop, `guide`/`schema`/`livery` bypass the
-/// generic `Outcome` envelope — everything else routes through the single
-/// dispatcher (so the audit log + gate apply uniformly).
+/// to the interactive terminal loop, `guide`/`schema` bypass the generic
+/// `Outcome` envelope — everything else routes through the single dispatcher
+/// (so the audit log + gate apply uniformly). `livery` was the sixth special
+/// case; it moved to lyra with the rest of the graphical bundle at P-A5 —
+/// core no longer parses `livery.*` at all.
 pub fn run_cli(argv: &[String]) -> i32 {
-    protocol::door::run(argv, Door::Cli, dispatch::registry(), dispatch::dispatch, |inv, json| {
+    protocol::door::run(argv, Door::Cli, "aoide", dispatch::registry(), dispatch::dispatch, |inv, json| {
         // `mcp serve --stdio` is a long-running server, not a one-shot dispatch.
         // The registry + dispatcher are injected here (the DI seam
         // `aoide-server`'s module doc comment explains — `aoide-server` cannot
@@ -133,34 +134,6 @@ pub fn run_cli(argv: &[String]) -> i32 {
             let body = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into());
             println!("{body}");
             return Some(output::exit::OK);
-        }
-
-        // `livery emit` / `livery resolve` / `livery lint` print the engine's raw
-        // byte output in text mode (the livery CLI contract: terminal consumers
-        // pipe the OSC stream / hyprctl lines / resolve JSON straight out), NOT
-        // the outcome envelope — same posture as `schema` above. The handler
-        // carries the exact bytes in `data["stdout"]`; errors render normally
-        // (envelope to stderr, exit 1). `--json` keeps the structured envelope.
-        if inv.path.len() == 2 && inv.path[0] == "livery" && !json {
-            let outcome = dispatch::dispatch(inv);
-            if outcome.status == output::Status::Ok {
-                if let Some(stdout) = outcome
-                    .data
-                    .as_ref()
-                    .and_then(|d| d.get("stdout"))
-                    .and_then(|s| s.as_str())
-                {
-                    print!("{stdout}");
-                    return Some(output::exit::OK);
-                }
-            }
-            let (body, code) = outcome.render(false);
-            if code == output::exit::OK {
-                println!("{body}");
-            } else {
-                eprintln!("{body}");
-            }
-            return Some(code);
         }
 
         None

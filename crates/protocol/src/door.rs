@@ -37,9 +37,14 @@ fn known_paths(registry: &Registry) -> Vec<Vec<String>> {
 
 /// Parse argv (excluding the program name) into an [`Invocation`].
 ///
+/// `bin_name` is the invoking binary's name (`"aoide"` for core, `"lyra"`
+/// for the graphical binary, P-A5 of the binary-split workstream) — every
+/// usage/help/did-you-mean string below names it instead of a hardcoded
+/// `"aoide"`, so lyra's own usage errors say `lyra`, not `aoide`.
+///
 /// Returns `Err(Outcome)` for a usage error (`--help`, unknown command) so the
 /// caller can render it as JSON or text uniformly.
-pub fn parse(argv: &[String], door: Door, registry: &Registry) -> Result<(Invocation, bool), Outcome> {
+pub fn parse(argv: &[String], door: Door, bin_name: &str, registry: &Registry) -> Result<(Invocation, bool), Outcome> {
     // First split off flags anywhere; positionals keep order.
     let mut positionals: Vec<String> = Vec::new();
     let mut flags: BTreeMap<String, String> = BTreeMap::new();
@@ -94,9 +99,9 @@ pub fn parse(argv: &[String], door: Door, registry: &Registry) -> Result<(Invoca
         // `aoide --help` (no command) → the root usage at exit 0; bare `aoide`
         // is still the usage error (exit 2).
         return if help {
-            Err(help_outcome("aoide", usage_root(registry).message))
+            Err(help_outcome(bin_name, usage_root(registry, bin_name).message))
         } else {
-            Err(usage_root(registry))
+            Err(usage_root(registry, bin_name))
         };
     }
 
@@ -113,15 +118,15 @@ pub fn parse(argv: &[String], door: Door, registry: &Registry) -> Result<(Invoca
             // A `--help` on a partial/unknown path still surfaces the command
             // list rather than a bare "unknown command".
             if help {
-                return Err(help_outcome(&positionals.join("."), usage_root(registry).message));
+                return Err(help_outcome(&positionals.join("."), usage_root(registry, bin_name).message));
             }
-            return Err(unknown_command_outcome(&positionals, registry));
+            return Err(unknown_command_outcome(&positionals, registry, bin_name));
         }
     };
 
     // `--help`/`-h` on a known subcommand → that subcommand's usage (exit 0).
     if help {
-        return Err(help_outcome(&path.join("."), command_usage(&path, registry)));
+        return Err(help_outcome(&path.join("."), command_usage(&path, registry, bin_name)));
     }
 
     // Reject an unrecognised flag by name (exit 2) — never silently swallow it.
@@ -129,9 +134,9 @@ pub fn parse(argv: &[String], door: Door, registry: &Registry) -> Result<(Invoca
         return Err(Outcome::usage(
             path.join("."),
             format!(
-                "unrecognized flag `--{bad}` for `aoide {}`\n{}",
+                "unrecognized flag `--{bad}` for `{bin_name} {}`\n{}",
                 path.join(" "),
-                command_usage(&path, registry)
+                command_usage(&path, registry, bin_name)
             ),
         ));
     }
@@ -163,7 +168,7 @@ fn command_for<'a>(path: &[String], registry: &'a Registry) -> Option<&'a Comman
 ///   edit distance (`graph vie` → `graph view`).
 ///
 /// Either way the message ends with the `aoide --help` pointer.
-fn unknown_command_outcome(positionals: &[String], registry: &Registry) -> Outcome {
+fn unknown_command_outcome(positionals: &[String], registry: &Registry, bin_name: &str) -> Outcome {
     let sub: Vec<&Command> = registry
         .commands()
         .filter(|c| {
@@ -190,14 +195,14 @@ fn unknown_command_outcome(positionals: &[String], registry: &Registry) -> Outco
         if !suggestions.is_empty() {
             m.push_str("\n\ndid you mean:");
             for s in suggestions {
-                m.push_str(&format!("\n  aoide {s}"));
+                m.push_str(&format!("\n  {bin_name} {s}"));
             }
         }
         m
     };
     Outcome::usage(
         positionals.join("."),
-        format!("{message}\n\nrun 'aoide --help' for the full command list"),
+        format!("{message}\n\nrun '{bin_name} --help' for the full command list"),
     )
 }
 
@@ -264,12 +269,12 @@ fn help_outcome(cmd: &str, message: String) -> Outcome {
 
 /// The per-subcommand usage block printed for `--help`/`-h`, built from the
 /// registry so it can never drift from the real arg/flag set.
-fn command_usage(path: &[String], registry: &Registry) -> String {
+fn command_usage(path: &[String], registry: &Registry, bin_name: &str) -> String {
     let Some(c) = command_for(path, registry) else {
-        return usage_root(registry).message;
+        return usage_root(registry, bin_name).message;
     };
     let mut s = format!(
-        "usage: aoide {}{} [--json]\n\n{}",
+        "usage: {bin_name} {}{} [--json]\n\n{}",
         path.join(" "),
         signature(c),
         c.summary
@@ -288,7 +293,7 @@ fn command_usage(path: &[String], registry: &Registry) -> String {
     if !c.examples.is_empty() {
         s.push_str("\n\nexamples:");
         for ex in c.examples {
-            s.push_str(&format!("\n  aoide {ex}"));
+            s.push_str(&format!("\n  {bin_name} {ex}"));
         }
     }
     s
@@ -382,7 +387,7 @@ fn command_line(c: &Command, width: usize) -> String {
     format!("  {lhs:<width$}  {}", short_desc(c.summary))
 }
 
-fn usage_root(registry: &Registry) -> Outcome {
+fn usage_root(registry: &Registry, bin_name: &str) -> Outcome {
     // Group by first path segment, preserving registration order inside each
     // group (the registry's own order is load-bearing — registry.rs module
     // docs). Group order is first-appearance order: no sorting, so a newly
@@ -401,7 +406,7 @@ fn usage_root(registry: &Registry) -> Outcome {
         .max()
         .unwrap_or(0);
 
-    let mut s = String::from("usage: aoide <command> [args] [--json]\n\ncommands:");
+    let mut s = format!("usage: {bin_name} <command> [args] [--json]\n\ncommands:");
     for (group, cmds) in &groups {
         s.push('\n');
         if let Some(blurb) = group_blurb(group) {
@@ -416,11 +421,11 @@ fn usage_root(registry: &Registry) -> Outcome {
     }
     // Drop the trailing newline of the last group before the footer.
     s.pop();
-    s.push_str(
-        "\n\nRun 'aoide <command> --help' for args, flags, and examples. \
-         'aoide guide' prints the tier map.",
-    );
-    Outcome::usage("aoide", s)
+    s.push_str(&format!(
+        "\n\nRun '{bin_name} <command> --help' for args, flags, and examples. \
+         '{bin_name} guide' prints the tier map."
+    ));
+    Outcome::usage(bin_name, s)
 }
 
 /// Exit code for a usage error surfaced during parsing.
@@ -443,11 +448,12 @@ fn wants_json(argv: &[String]) -> bool {
 pub fn run(
     argv: &[String],
     door: Door,
+    bin_name: &str,
     registry: &Registry,
     dispatch: fn(&Invocation) -> Outcome,
     special: impl FnOnce(&Invocation, bool) -> Option<i32>,
 ) -> i32 {
-    let (inv, json) = match parse(argv, door, registry) {
+    let (inv, json) = match parse(argv, door, bin_name, registry) {
         Ok(v) => v,
         Err(o) => {
             let json = wants_json(argv);
@@ -534,7 +540,7 @@ mod tests {
     #[test]
     fn help_flag_prints_subcommand_usage_at_exit_zero() {
         let reg = test_registry();
-        let err = parse(&argv(&["graph", "view", "--help"]), Door::Cli, &reg).unwrap_err();
+        let err = parse(&argv(&["graph", "view", "--help"]), Door::Cli, "aoide", &reg).unwrap_err();
         assert_eq!(err.status, Status::Ok, "--help is informational, exit 0");
         assert_eq!(err.render(false).1, exit::OK);
         assert!(err.message.contains("usage: aoide graph view"));
@@ -544,7 +550,7 @@ mod tests {
     #[test]
     fn unknown_flag_is_a_usage_error_naming_the_offender() {
         let reg = test_registry();
-        let err = parse(&argv(&["graph", "view", "--bogus"]), Door::Cli, &reg).unwrap_err();
+        let err = parse(&argv(&["graph", "view", "--bogus"]), Door::Cli, "aoide", &reg).unwrap_err();
         assert_eq!(err.status, Status::Usage, "unknown flag → exit 2");
         assert_eq!(err.render(false).1, exit::USAGE);
         assert!(err.message.contains("--bogus"));
@@ -553,7 +559,7 @@ mod tests {
     #[test]
     fn known_flags_still_parse() {
         let reg = test_registry();
-        let (inv, _) = parse(&argv(&["graph", "view", "--focus", "session:x"]), Door::Cli, &reg).unwrap();
+        let (inv, _) = parse(&argv(&["graph", "view", "--focus", "session:x"]), Door::Cli, "aoide", &reg).unwrap();
         assert_eq!(inv.path, vec!["graph", "view"]);
         assert_eq!(inv.flags.get("focus").map(String::as_str), Some("session:x"));
     }
@@ -561,23 +567,45 @@ mod tests {
     #[test]
     fn a_typo_gets_a_did_you_mean_suggestion() {
         let reg = test_registry();
-        let err = parse(&argv(&["graph", "vie"]), Door::Cli, &reg).unwrap_err();
+        let err = parse(&argv(&["graph", "vie"]), Door::Cli, "aoide", &reg).unwrap_err();
         assert_eq!(err.status, Status::Usage);
         assert!(err.message.contains("unknown command: `graph vie`"));
         assert!(err.message.contains("did you mean:\n  aoide graph view"));
     }
 
+    /// `bin_name` is not cosmetic: a second binary (lyra, P-A5) must see its
+    /// own name in every usage/help/did-you-mean string, never `aoide`'s.
+    #[test]
+    fn bin_name_names_the_invoking_binary_everywhere() {
+        let reg = test_registry();
+
+        let root = parse(&argv(&[]), Door::Cli, "lyra", &reg).unwrap_err();
+        assert!(root.message.contains("usage: lyra <command>"), "{}", root.message);
+        assert!(!root.message.contains("aoide"), "{}", root.message);
+
+        let sub = parse(&argv(&["graph", "view", "--help"]), Door::Cli, "lyra", &reg).unwrap_err();
+        assert!(sub.message.contains("usage: lyra graph view"), "{}", sub.message);
+
+        let unknown = parse(&argv(&["graph", "vie"]), Door::Cli, "lyra", &reg).unwrap_err();
+        assert!(
+            unknown.message.contains("did you mean:\n  lyra graph view"),
+            "{}",
+            unknown.message
+        );
+        assert!(unknown.message.contains("run 'lyra --help'"), "{}", unknown.message);
+    }
+
     #[test]
     fn run_falls_through_to_dispatch_when_special_declines() {
         let reg = test_registry();
-        let code = run(&argv(&["graph", "view"]), Door::Cli, &reg, noop, |_inv, _json| None);
+        let code = run(&argv(&["graph", "view"]), Door::Cli, "aoide", &reg, noop, |_inv, _json| None);
         assert_eq!(code, exit::OK);
     }
 
     #[test]
     fn run_short_circuits_when_special_claims_the_invocation() {
         let reg = test_registry();
-        let code = run(&argv(&["graph", "view"]), Door::Cli, &reg, noop, |_inv, _json| Some(exit::NOT_IMPLEMENTED));
+        let code = run(&argv(&["graph", "view"]), Door::Cli, "aoide", &reg, noop, |_inv, _json| Some(exit::NOT_IMPLEMENTED));
         assert_eq!(code, exit::NOT_IMPLEMENTED);
     }
 

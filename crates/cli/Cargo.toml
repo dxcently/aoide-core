@@ -33,11 +33,14 @@ aoide-storage = { workspace = true }
 aoide-conduct = { workspace = true }
 aoide-client = { workspace = true }
 aoide-server = { workspace = true }
-aoide-song = { workspace = true }
-# `aoide screen` — the screen verb family, its own crate since P-A1 of the
-# binary-split workstream (extracted out of `aoide-conduct`; the sole home
-# of this workspace's wayland-client/wayland-protocols-wlr/image deps).
-aoide-screen = { workspace = true }
+# `aoide-song`/`aoide-screen` (the rice/livery engine and the screen verb
+# family) moved out of core's dependency list at P-A5 of the binary-split
+# workstream — the graphical bundle they back now lives ONLY in `crates/lyra`
+# (docs/architecture/PACKAGE-LAYOUT.md, CONTRACTS.md §3). Core is
+# nix-independent; song/screen carry lyra's nix-eval and heavy
+# wayland-client/wayland-protocols-wlr/image deps, which must never reach
+# this crate's dependency tree again (the P-A5 `cargo tree -p aoide-cli`
+# gate).
 # `aoide conductor` — the interactive terminal frontend, its own crate
 # (Phase 6b restructure, docs/architecture/PACKAGE-LAYOUT.md).
 aoide-conductor = { workspace = true }

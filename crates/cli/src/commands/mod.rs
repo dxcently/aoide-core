@@ -16,56 +16,34 @@ mod stubs;
 use crate::registry::Registry;
 
 /// Build the full command registry, in the historical `schema --json` order:
-/// guide, schema, rice lint/stage/compose, rice draft
-/// save/list/drop, rice mode status/stage/declarative/draft, cover set, rice
-/// declare/transpose(stub), content(stub x5), make(stub), update(stub),
-/// onboard(stub), mcp serve, daemon, shellbridge, graph(x15) + conduct,
-/// adapter melete, conductor, a2a serve + agent add/list/remove, peer
-/// add/list/remove/pull/status (CONTRACTS.md §7, slotted directly after the
-/// `a2a agent` group it's the same-network-federation sibling of — nothing
-/// EXISTING moves, so the historical table above it is still untouched),
-/// usage, hooks install, quickshell reload (the Quickshell IPC hot-reload
-/// trigger, `crates/song/src/ipc.rs`; named `quickshell`, not `shell` —
-/// `shell` collided with `--agent shell`, the value `graph conduct`'s kitty
-/// wrapper uses, and broke every terminal on this desktop until caught and
-/// renamed, khoa 2026-08-15), screen info/shot, herald push, rice take
-/// (the take-store's explicit snapshot verb; the byte-stable schema-order
-/// rule outweighs keeping it contiguous with the rest of the `rice` family
-/// above, advisor verdict FORK 2), soundcheck (appended newest — the
-/// mechanical-integrity verb's WORKING-tree half, `aoide-upkeep`;
-/// report-only, forever — see its own module doc for the finding format
-/// and why the COMMITTED-tree half lives in `nix flake check` instead).
+/// guide, schema, content(stub x5), make(stub), update(stub), onboard(stub),
+/// mcp serve, daemon, graph(x15) + conduct, adapter melete, conductor, a2a
+/// serve + agent add/list/remove, peer add/list/remove/pull/status
+/// (CONTRACTS.md §7, slotted directly after the `a2a agent` group it's the
+/// same-network-federation sibling of — nothing EXISTING moves, so the
+/// historical table above it is still untouched), usage, hooks install,
+/// soundcheck (appended newest — the mechanical-integrity verb's
+/// WORKING-tree half, `aoide-upkeep`; report-only, forever — see its own
+/// module doc for the finding format and why the COMMITTED-tree half lives
+/// in `nix flake check` instead).
 ///
-/// `rice gen` was cut outright (khoa 2026-08-14) — a speculative
-/// prompt/wallpaper generator that was never built and had no path to being
-/// built without a design nobody had; `rice compose` (scaffold) → `rice
-/// mode stage` (go live) → `rice mode draft` (route into a saved
-/// iteration) → `rice declare` (commit) is the real loop.
-///
-/// `draft::register`/`mode::register` sit directly after `rice::register`
-/// (rather than off on their own) so the whole `rice` family —
-/// `lint`/`stage`/`compose`/`draft *`/`mode *` — stays contiguous in
-/// `schema --json`'s command order, even though each is its own module (the
-/// draft feature; see `crates/song/src/commands/draft.rs`; the mode-toggle
-/// feature, now three-way (`staging`/`declarative`/`draft`) with `rice mode
-/// draft`'s symlink routing; see `crates/storage/src/mode.rs`).
+/// P-A5 (binary-split workstream) removed the 11 register lines for the
+/// graphical bundle — rice/draft/mode/cover/livery/rice-late-stubs/
+/// shellbridge/quickshell/screen/herald/take — from this list; those 39
+/// command paths now live ONLY in `crates/lyra/src/commands/mod.rs::all()`
+/// (docs/architecture/PACKAGE-LAYOUT.md, CONTRACTS.md §3). Core's golden
+/// went 87 -> 48 in the same commit; nothing else in this list moved or
+/// reordered.
 pub fn all() -> Registry {
     let mut r = Registry::new();
 
     meta::register(&mut r); // guide, schema
-    aoide_song::commands::rice::register(&mut r); // rice lint, stage, compose
-    aoide_song::commands::draft::register(&mut r); // rice draft save/list/stage/drop
-    aoide_song::commands::mode::register(&mut r); // rice mode status/stage/declarative
-    aoide_song::commands::cover::register(&mut r); // cover set
-    aoide_song::commands::livery::register(&mut r); // livery emit, resolve, lint (the native livery engine's verbs)
-    stubs::register_rice_late(&mut r); // rice declare, transpose
     stubs::register_content(&mut r); // content register/propose/approve/ingest/query
     stubs::register_make(&mut r); // make
     stubs::register_update(&mut r); // update
     stubs::register_onboard(&mut r); // onboard
     infra::register_mcp(&mut r); // mcp serve (root-coupled: reads this assembled registry)
     aoide_server::commands::register_infra(&mut r); // daemon
-    aoide_conduct::commands::shellbridge::register(&mut r); // shellbridge (own module since P-A2)
     aoide_conduct::commands::graph::register(&mut r); // graph x15 + conduct
     aoide_client::commands::register_post_graph(&mut r); // adapter melete
     aoide_conductor::commands::register(&mut r); // conductor
@@ -74,10 +52,6 @@ pub fn all() -> Registry {
     aoide_client::commands::register_peers(&mut r); // peer add/list/remove/pull/status — same-network federation (CONTRACTS.md §7, appended newest)
     aoide_storage::commands::register(&mut r); // usage — local token/cost rollup (CONTRACTS.md §4)
     aoide_conduct::commands::hooks::register(&mut r); // hooks install — the hook-installer verb (appended newest)
-    aoide_song::commands::quickshell::register(&mut r); // quickshell reload — IPC hot-reload trigger
-    aoide_screen::commands::register(&mut r); // screen info, screen shot — Phase 1 of the `screen` verb family (own crate since P-A1)
-    aoide_conduct::commands::herald::register(&mut r); // herald push — dunst's script hook into the notification ledger (appended newest)
-    aoide_song::commands::take::register(&mut r); // rice take — explicit take-store snapshot (byte-stable schema order; FORK 2)
     aoide_upkeep::commands::register(&mut r); // soundcheck — mechanical-integrity WORKING-tree sweep, report-only (appended newest)
 
     r

@@ -13,9 +13,11 @@
 //! unknown-command usage error — then appends to the single audit log and
 //! applies the gate tail uniformly. Every command's actual behavior lives in
 //! its DOMAIN crate's `commands` module (`aoide_conduct::commands`,
-//! `aoide_song::commands`, … — Phase 9 restructure,
+//! `aoide_storage::commands`, … — Phase 9 restructure,
 //! docs/architecture/PACKAGE-LAYOUT.md), assembled here by
-//! `commands/mod.rs::all()`.
+//! `commands/mod.rs::all()`. (`aoide_song::commands`/`aoide_screen::commands`
+//! are the same pattern one door over — they assemble into `lyra`'s
+//! registry, not this crate's, since P-A5.)
 //!
 //! `Invocation` moved to `aoide-protocol` (Phase 2 restructure,
 //! docs/architecture/PACKAGE-LAYOUT.md) — it's the type that broke the cycle
@@ -112,12 +114,14 @@ mod tests {
 
     #[test]
     fn not_implemented_command_carries_the_stub_envelope_and_gate() {
-        // `rice declare` is gated + not implemented.
-        let out = dispatch(&inv(&["rice", "declare"], &["dusk"]));
+        // `rice declare` (the gated+not-implemented example this test used to
+        // exercise) moved to lyra at P-A5. `content approve` is core's own
+        // gated + not-implemented stub — same shape, still here.
+        let out = dispatch(&inv(&["content", "approve"], &["/tmp/dusk"]));
         assert_eq!(out.status, Status::NotImplemented);
         assert_eq!(out.render(false).1, crate::output::exit::NOT_IMPLEMENTED);
-        assert!(out.gated, "rice.declare is a gated command");
-        assert_eq!(out.data.unwrap()["args"][0], "dusk");
+        assert!(out.gated, "content.approve is a gated command");
+        assert_eq!(out.data.unwrap()["args"][0], "/tmp/dusk");
     }
 
     #[test]

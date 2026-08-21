@@ -6,8 +6,11 @@
 //!
 //! Split into several small `register_*` functions (rather than one) because
 //! the historical `schema --json` command order interleaves these stubs
-//! between the implemented `rice`/`graph` groups — `commands/mod.rs::all()`
-//! calls each at the point that reproduces that order exactly.
+//! between the implemented groups — `commands/mod.rs::all()` calls each at
+//! the point that reproduces that order exactly. `rice declare`/`rice
+//! transpose` used to be a fifth `register_*` here; that stub pair moved to
+//! `crates/lyra/src/commands/stubs.rs` at P-A5 along with the rest of the
+//! rice family — core no longer registers any `rice.*` path.
 
 use crate::dispatch::Invocation;
 use crate::output::Outcome;
@@ -17,33 +20,6 @@ use crate::registry::{arg, cmd, flag, Registry};
 /// for any command with `implemented: false`, without calling `handler`.
 fn unimplemented(_inv: &Invocation) -> Outcome {
     unreachable!("dispatch() never calls the handler of a not-implemented command")
-}
-
-/// `rice declare` / `rice transpose` — sit after `cover set` in the historical
-/// order.
-pub fn register_rice_late(r: &mut Registry) {
-    r.insert(cmd!(
-        path: ["rice", "declare"],
-        summary: "Commit a staged rice into declarative state and propose the gated rebuild (user gates this).",
-        args: [arg!("name", "string", true, "Rice/song name to declare.")],
-        flags: [],
-        gated: true,
-        implemented: false,
-        handler: unimplemented,
-        examples: ["rice declare moonlight"],
-    ));
-    r.insert(cmd!(
-        path: ["rice", "transpose"],
-        summary: "Replay a song in another key (palette) from the song's songbook/<song>/palette/.",
-        args: [
-            arg!("rice", "string", true, "Source song name."),
-            arg!("palette", "string", true, "Key/palette name to transpose into."),
-        ],
-        flags: [],
-        gated: false,
-        implemented: false,
-        handler: unimplemented,
-    ));
 }
 
 /// `content register|propose|approve|ingest|query` (concepts/Content-Pipeline).

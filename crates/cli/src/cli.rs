@@ -15,7 +15,7 @@ use crate::output::Outcome;
 /// Returns `Err(Outcome)` for a usage error (`--help`, unknown command) so the
 /// caller can render it as JSON or text uniformly.
 pub fn parse(argv: &[String], door: Door) -> Result<(Invocation, bool), Outcome> {
-    aoide_protocol::door::parse(argv, door, dispatch::registry())
+    aoide_protocol::door::parse(argv, door, "aoide", dispatch::registry())
 }
 
 /// Exit code for a usage error surfaced during parsing.
@@ -45,9 +45,13 @@ mod tests {
 
     #[test]
     fn short_dash_h_is_also_help() {
-        let err = parse(&argv(&["rice", "lint", "-h"]), Door::Cli).unwrap_err();
+        // `rice lint` moved to lyra at P-A5 — core no longer parses it;
+        // `content approve` is a stub that stayed in core and still exists
+        // for this same assertion (arg-parsing/usage don't care whether a
+        // command is implemented).
+        let err = parse(&argv(&["content", "approve", "-h"]), Door::Cli).unwrap_err();
         assert_eq!(err.status, Status::Ok);
-        assert!(err.message.contains("usage: aoide rice lint"));
+        assert!(err.message.contains("usage: aoide content approve"));
     }
 
     #[test]

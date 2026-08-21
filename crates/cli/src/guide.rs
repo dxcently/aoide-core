@@ -12,14 +12,19 @@ WHAT AOIDE IS (don't conflate the two):
     freely orchestrated for any task. Any agent with a shell is fully capable,
     no MCP required. Every terminal is a CONDUCTABLE, TRACKED session by
     default, so a central agent can speak into any other running session
-    (see 'Conducting' below). This core runs anywhere there is a shell —
-    portable, headless-capable, agent-first.
-  * AoideOS is the DISTRIBUTION built on that core — the NixOS flake that
-    ADDITIONALLY ships the Quickshell widget-making toolkit (bar, dock,
-    gadgets, the DAG/conductor surfaces) and the specialized ricer (the
-    song/livery theming engine). Aoide is the engine; AoideOS is the desktop
-    around it. A capability that is 'Aoide' works with only a shell; one that
-    is 'AoideOS' is desktop/Quickshell/rice.
+    (see 'Conducting' below). This binary (`aoide`/`aoided`) is nix-
+    independent — cargo build, run on any Linux, no nix shell-outs —
+    portable, headless-capable, agent-first. Conducting/orchestration is
+    Aoide's identity.
+  * `lyra` is the PAINTED SURFACE — a separate binary owning everything that
+    draws: the self-ricing loop (song/livery theming), screen capture/
+    pointer/OCR, the herald notification ledger, shellbridge, and the
+    Quickshell IPC reload trigger. Painting is lyra's identity; `lyra guide`
+    orients within its own command tree. AoideOS is the NixOS DISTRIBUTION
+    that ships both binaries plus the Quickshell widget-making toolkit (bar,
+    dock, gadgets, the DAG/conductor surfaces) rendering what `aoide` writes
+    and lyra paints. A capability reachable with only a shell is 'Aoide';
+    one that draws is 'lyra'/'AoideOS'.
 
 Orient through four tiers, in order.
 
@@ -34,12 +39,13 @@ Tier 1 — the CLI (full capability)
   - All operations are idempotent and report exactly what changed.
   - `aoide schema --json` is the machine-readable backstop at any tier — the
     MCP tool list generates from it.
-  Rice loop (headline): `aoide rice compose <name> [--from <song>]` scaffolds
-  a song → `rice mode stage <name>` unlocks + stages it live → edit the
-  song's files → `rice lint` validates → `rice draft save <draft-name>`
-  saves the iteration (not yet declared; `rice draft list`/`stage`/`drop`
-  manage saved variants) → `rice declare <name>` (USER gates this) → commit +
-  gated rebuild.
+  Rice loop lives in `lyra`, not core: `lyra rice compose <name>
+  [--from <song>]` scaffolds a song → `lyra rice mode stage <name>` unlocks +
+  stages it live → edit the song's files → `lyra rice lint` validates →
+  `lyra rice draft save <draft-name>` saves the iteration (not yet declared;
+  `lyra rice draft list`/`stage`/`drop` manage saved variants) → `lyra rice
+  declare <name>` (USER gates this) → commit + gated rebuild. Full surface:
+  `lyra guide`.
   Replay: a committed song is host-agnostic — any host performs it by naming it
   in nix (`aoide.song = \"<name>\";`); the livery fan-out swaps, the venue keeps
   its own instruments. `sonata` is the shipped standard.
