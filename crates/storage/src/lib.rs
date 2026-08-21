@@ -19,8 +19,16 @@
 //! `adjective-noun` wordlist + mint, and the render-time-only
 //! `<host>/<role>/<petname> (…<tail4>)` grammar — both pure, both agnostic
 //! of any call site (nothing outside this crate wires them yet).
+//!
+//! `addr` (messaging/presence plan, P-C1) is the newest addition: a pure
+//! resolver that inverts `display::session_label` — a human types what the
+//! label showed, `addr::resolve` works back to a session id or a deferred
+//! remote query. Zero I/O, agnostic of any call site, same as `petname`/
+//! `display` — C2 (`aoide who`) and C3 (`graph send --to`) are the planned
+//! callers, not present yet.
 
 pub mod a2a_store;
+pub mod addr;
 pub mod commands;
 pub mod display;
 pub mod edits;

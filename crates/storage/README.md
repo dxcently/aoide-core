@@ -19,6 +19,11 @@ cache (CONTRACTS.md §7). File-first by decision — no embedded database yet
 - `takes` — the per-draft take store behind `rice back`/`rice take`.
 - `petname`/`display` — the adjective-noun petname mint and its
   render-time-only display grammar.
+- `addr` — the pure address resolver (messaging/presence plan, P-C1),
+  inverting `display::session_label`'s grammar to turn a typed query back
+  into a local session id or a deferred `peer/<rest>` remote query. Zero
+  I/O, agnostic of any call site — planned callers are `aoide who` (C2) and
+  `graph send --to` (C3), neither wired in yet.
 - `commands` — this crate's one CLI verb, `usage` (local token/cost rollup).
 
 ## What it consumes
