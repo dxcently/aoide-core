@@ -13,6 +13,9 @@
 #   * Also installs `lyra` (P-A7 of the binary-split workstream) — the
 #     graphical/rice binary from `crates/lyra`, sharing this one derivation
 #     rather than a second package (see the `cargoBuildFlags` comment below).
+#     As of P-A8, `lyra` ships in this derivation's separate `rice` output
+#     (`pkgs.aoide.rice`) — droppable from a headless closure that only ever
+#     references `pkgs.aoide` (the `out` output: `aoide` + `aoided`).
 #   * cargo deps vendored via `cargoLock.lockFile` so the build is pure/offline.
 {
   lib,
@@ -25,6 +28,17 @@ rustPlatform.buildRustPackage {
   version = "0.0.0";
 
   src = lib.cleanSource ./.;
+
+  # P-A8 of the binary-split workstream: `lyra` moves off $out into its own
+  # `rice` output, so a config that never enables the paint half (headless
+  # boxes — sakaki and any future doors-only host) can install `pkgs.aoide`
+  # (aoide + aoided only) without `pkgs.aoide.rice` ever entering its closure.
+  # `out` stays first so plain `pkgs.aoide`/`${pkgs.aoide}` keeps resolving to
+  # the core pair, unchanged for every existing caller.
+  outputs = [
+    "out"
+    "rice"
+  ];
 
   cargoLock.lockFile = ./Cargo.lock;
 
@@ -53,11 +67,27 @@ rustPlatform.buildRustPackage {
   # the repo root before the `pushd`, so `lyra`'s binary lands in the exact
   # same `target/<triple>/release/` directory nixpkgs' `cargoInstallHook`
   # already sweeps for executables — no `postInstall` copy needed (rung (a)
-  # of the plan's ladder, first form; verified live via `ls result/bin`).
+  # of the plan's ladder, first form; verified live via `ls result/bin`). All
+  # three still install to $out at this point; P-A8's `postFixup` below is
+  # what relocates `lyra` alone into `$rice`.
   cargoBuildFlags = [ "--workspace" ];
 
   # Walking skeleton: no live-system integration tests in the sandbox.
   doCheck = true;
+
+  # P-A8: relocate `lyra` into the `rice` output. `cargoInstallHook` (like
+  # every nixpkgs install hook) installs to $out regardless of the declared
+  # `outputs` list, so all three binaries land in $out/bin first; this runs
+  # in `postFixup` (the documented moveToOutput call site — nixpkgs manual
+  # §"multiple-output packages") so it happens AFTER stripping/patchelf have
+  # already run against the file at its $out path, then simply relocates the
+  # finished artifact. `moveToOutput` is provided unconditionally by the
+  # `multiple-outputs.sh` setup hook baked into stdenv — no extra input
+  # needed. No `dev`/`doc` split declared here, so there is no
+  # dev-output-interference hazard to work around.
+  postFixup = ''
+    moveToOutput bin/lyra "$rice"
+  '';
 
   # `aoide-storage::git` shells out to `git` (the project-revert plan's git
   # seam, R2) — its own tests drive a real temp repo, so `git` must be on
