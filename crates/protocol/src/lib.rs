@@ -1,5 +1,6 @@
 pub mod agents;
 pub mod audit;
+pub mod bin;
 pub mod door;
 pub mod invocation;
 pub mod model;

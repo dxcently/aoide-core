@@ -272,9 +272,12 @@ fn rice_mode_toggle_target(current: RiceMode) -> &'static str {
 /// necessary — to know synchronously whether the switch actually succeeded
 /// before deciding whether to fire a notification.
 ///
-/// Re-execs THIS SAME running binary (`std::env::current_exe()`, the same
-/// self-re-exec idiom `server/src/a2a.rs`'s `do_spawn` uses — never a bare
-/// `"aoide"` relying on PATH) as `rice mode <target> --json`.
+/// Execs the SIBLING `lyra` binary (`daemon::bin::rice_bin()`, protocol's
+/// sibling resolver — never a bare `"aoide"`, and never `current_exe()`:
+/// `rice mode` lives in lyra, not this running binary, since P-A5 moved it
+/// out of core) as `rice mode <target> --json`. This call is NOT inside
+/// `with_stage_lock` — see `protocol::bin`'s module doc for why that would
+/// matter if it ever were.
 ///
 /// The two toggle directions are deliberately asymmetric about which song
 /// they act on. `stage` (declarative/draft → staging) passes no song arg —
@@ -328,8 +331,7 @@ fn dispatch_rice_mode_toggle() -> Result<String, String> {
     let default_song =
         rice_mode_toggle_default_song(target, std::env::var("AOIDE_DEFAULT_SONG").ok().as_deref());
 
-    let exe = std::env::current_exe().map_err(|e| format!("resolving the aoide binary: {e}"))?;
-    let mut command = std::process::Command::new(&exe);
+    let mut command = std::process::Command::new(daemon::bin::rice_bin());
     command.args(["rice", "mode", target]);
     if let Some(song) = &default_song {
         command.arg(song);
@@ -337,12 +339,12 @@ fn dispatch_rice_mode_toggle() -> Result<String, String> {
     command.arg("--json");
     let output = command
         .output()
-        .map_err(|e| format!("spawning `aoide rice mode {target}`: {e}"))?;
+        .map_err(|e| format!("spawning `lyra rice mode {target}`: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
-            "`aoide rice mode {target}` exited {}: {}",
+            "`lyra rice mode {target}` exited {}: {}",
             output.status,
             stderr.trim()
         ));
@@ -421,10 +423,12 @@ fn classify_usage_refresh(exited_ok: bool, stdout: &str, stderr: &str) -> Result
     }
 }
 
-/// Dispatch ONE usage refresh: re-exec THIS running binary as `aoide usage
-/// --json` (the same `std::env::current_exe()` self-re-exec idiom as
-/// [`dispatch_rice_mode_toggle`], never a bare `"aoide"` off PATH) and audit
-/// the outcome, judged on its real output via [`classify_usage_refresh`].
+/// Dispatch ONE usage refresh: exec the core `aoide` binary
+/// (`daemon::bin::core_bin()`, protocol's sibling resolver — never a bare
+/// `"aoide"` relying on PATH alone) as `aoide usage --json` and audit the
+/// outcome, judged on its real output via [`classify_usage_refresh`]. This
+/// call is NOT inside `with_stage_lock` — see `protocol::bin`'s module doc
+/// for why that would matter if it ever were.
 ///
 /// Runs on a DETACHED thread. Unlike the rice-mode toggle (a fast local switch,
 /// safe to `.output()` inline), `aoide usage`'s live fetch is `curl --max-time
@@ -439,21 +443,10 @@ fn classify_usage_refresh(exited_ok: bool, stdout: &str, stderr: &str) -> Result
 /// never panicked or propagated.
 fn dispatch_usage_refresh() {
     std::thread::spawn(|| {
-        let exe = match std::env::current_exe() {
-            Ok(e) => e,
-            Err(e) => {
-                let _ = daemon::audit(
-                    &daemon::default_audit_log(),
-                    daemon::Door::Daemon,
-                    daemon::EventClass::Audit,
-                    "shellbridge",
-                    "usage-refresh-failed",
-                    &format!("resolving the aoide binary: {e}"),
-                );
-                return;
-            }
-        };
-        let result = match std::process::Command::new(&exe).args(["usage", "--json"]).output() {
+        let result = match std::process::Command::new(daemon::bin::core_bin())
+            .args(["usage", "--json"])
+            .output()
+        {
             Ok(out) => classify_usage_refresh(
                 out.status.success(),
                 &String::from_utf8_lossy(&out.stdout),
@@ -516,15 +509,16 @@ fn classify_recheck(exited_ok: bool, stdout: &str, stderr: &str) -> Result<Strin
     }
 }
 
-/// Dispatch ONE session recheck: re-exec THIS running binary as `aoide graph
-/// reap --announce --json` — the liveness/rehook sweep (reap dead sessions,
-/// decay `stopped` → `idle`, prune orphaned hook records, refresh every live
-/// agent's transcript fields) the ~12s `aoide-graph-reap.timer` runs
-/// periodically — so the Terminals/Conductor `[ reap ]` control triggers it NOW
-/// instead of waiting up to a full timer period. Same
-/// `std::env::current_exe()` self-re-exec idiom as
-/// [`dispatch_rice_mode_toggle`]/[`dispatch_usage_refresh`], never a bare
-/// `"aoide"` off PATH.
+/// Dispatch ONE session recheck: exec the core `aoide` binary
+/// (`daemon::bin::core_bin()`, protocol's sibling resolver — never a bare
+/// `"aoide"` relying on PATH alone) as `aoide graph reap --announce --json`
+/// — the liveness/rehook sweep (reap dead sessions, decay `stopped` →
+/// `idle`, prune orphaned hook records, refresh every live agent's
+/// transcript fields) the ~12s `aoide-graph-reap.timer` runs periodically —
+/// so the Terminals/Conductor `[ reap ]` control triggers it NOW instead of
+/// waiting up to a full timer period. This call is NOT inside
+/// `with_stage_lock` — see `protocol::bin`'s module doc for why that would
+/// matter if it ever were.
 ///
 /// `--announce` is what makes the click ANSWER: the toast is unconditional here,
 /// where a human pressed something, while the timer's own sweeps stay silent
@@ -544,21 +538,7 @@ fn classify_recheck(exited_ok: bool, stdout: &str, stderr: &str) -> Result<Strin
 /// classify error is audited, never panicked or propagated.
 fn dispatch_recheck_sessions() {
     std::thread::spawn(|| {
-        let exe = match std::env::current_exe() {
-            Ok(e) => e,
-            Err(e) => {
-                let _ = daemon::audit(
-                    &daemon::default_audit_log(),
-                    daemon::Door::Daemon,
-                    daemon::EventClass::Audit,
-                    "shellbridge",
-                    "recheck-failed",
-                    &format!("resolving the aoide binary: {e}"),
-                );
-                return;
-            }
-        };
-        let result = match std::process::Command::new(&exe)
+        let result = match std::process::Command::new(daemon::bin::core_bin())
             .args(["graph", "reap", "--announce", "--json"])
             .output()
         {
