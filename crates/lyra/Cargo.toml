@@ -1,0 +1,37 @@
+[package]
+name = "aoide-lyra"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+description = "Aoide's graphical/rice binary: the self-ricing loop, screen capture/pointer/OCR, the herald ledger, the shellbridge stage bridge, and the Quickshell IPC trigger — split out of the `aoide` core binary (P-A4 of the binary-split workstream, docs/architecture/PACKAGE-LAYOUT.md)."
+
+# The second app crate (P-A4): its own composition root, same shape as
+# `aoide-cli` — assembles its own Registry from the domain crates its bundle
+# needs and runs it through the shared `aoide_protocol::door::{parse,run}`
+# loop (P-A3) with its own `special` hook. Core `aoide`/`aoided` are
+# UNTOUCHED by this crate's existence (A5 removes the graphical paths from
+# core; this phase only adds lyra alongside it).
+[[bin]]
+name = "lyra"
+path = "src/bin/lyra.rs"
+
+[lib]
+name = "aoide_lyra"
+path = "src/lib.rs"
+
+[dependencies]
+serde_json = { workspace = true }
+aoide-protocol = { workspace = true }
+# rice/draft/mode/cover/livery/quickshell/take — the whole `rice` family.
+aoide-song = { workspace = true }
+# shellbridge, herald — registration only (the socket-loop/ledger
+# implementations stay in `aoide-conduct`; see those modules' own doc
+# comments, P-A2).
+aoide-conduct = { workspace = true }
+# screen info/shot/point/ocr/diff/send — the whole `screen` verb family
+# (P-A1).
+aoide-screen = { workspace = true }
+# `mcp serve --stdio`'s real server loop (`aoide_server::mcp::serve_stdio`)
+# — the same DI-seam consumer `aoide-cli` is, reading LYRA's own assembled
+# registry + dispatcher rather than core's.
+aoide-server = { workspace = true }

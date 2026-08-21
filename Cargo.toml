@@ -3,7 +3,7 @@
 # lives at `crates/cli`, single-charter crates under `crates/*`.
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/storage", "crates/conduct", "crates/client", "crates/server", "crates/song", "crates/conductor", "crates/test-support", "crates/cli", "crates/upkeep", "crates/screen"]
+members = ["crates/protocol", "crates/storage", "crates/conduct", "crates/client", "crates/server", "crates/song", "crates/conductor", "crates/test-support", "crates/cli", "crates/upkeep", "crates/screen", "crates/lyra"]
 
 # ONE version source for the whole workspace (the monorepo standard): every
 # crate inherits via `{ workspace = true }` — no per-manifest version repeats.
@@ -58,6 +58,11 @@ aoide-upkeep = { path = "crates/upkeep" }
 # the sole home of this workspace's wayland-client/wayland-protocols-wlr/
 # image dependencies (see those entries above for the technical rationale).
 aoide-screen = { path = "crates/screen" }
+# `lyra` — the graphical/rice binary (P-A4 of the binary-split workstream):
+# its own composition root over the rice/screen/shellbridge/herald bundle,
+# assembled from the SAME domain crates `aoide-cli` already depends on
+# (`aoide-song`, `aoide-conduct`, `aoide-screen`) — nothing here is a copy.
+aoide-lyra = { path = "crates/lyra" }
 
 [profile.release]
 opt-level = "s"
