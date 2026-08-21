@@ -1,5 +1,5 @@
-//! The server domain's CLI verbs: `a2a serve`'s door-hint handler, `daemon`
-//! (the aoided skeleton), and `shellbridge` (the stage bridge process).
+//! The server domain's CLI verbs: `a2a serve`'s door-hint handler and
+//! `daemon` (the aoided skeleton).
 //!
 //! Moved from the root package's `src/commands/a2a.rs` + the server half of
 //! `src/commands/infra.rs` (Phase 9 restructure,
@@ -9,6 +9,12 @@
 //! [`register_a2a_serve`] directly before
 //! `aoide_client::commands::register_agents`, so `schema --json` order never
 //! shifts.
+//!
+//! `shellbridge` moved out at P-A2 of the binary-split workstream
+//! (docs/architecture/PACKAGE-LAYOUT.md): it belongs with the graphical
+//! binary (`lyra`), not core, so its registration now lives in
+//! `aoide_conduct::commands::shellbridge` — `commands::all()` calls it
+//! directly after [`register_infra`] so the assembled order is unchanged.
 //!
 //! `a2a serve` itself is a long-running blocking server, so the root
 //! package's `run_cli` special-cases its launch exactly like
@@ -50,13 +56,9 @@ fn handle_daemon(inv: &Invocation) -> Outcome {
     Outcome::ok("daemon", "aoided skeleton self-check complete").with_data(status)
 }
 
-fn handle_shellbridge(_inv: &Invocation) -> Outcome {
-    let status = aoide_conduct::shellbridge::run();
-    Outcome::ok("shellbridge", "shellbridge skeleton self-check complete").with_data(status)
-}
-
-/// `daemon` + `shellbridge`, registered directly after the root package's
-/// own `mcp serve` entry (the historical pre-`graph` order).
+/// `daemon`, registered directly after the root package's own `mcp serve`
+/// entry (the historical pre-`graph` order; `shellbridge` used to register
+/// here too — see the module doc for where it moved).
 pub fn register_infra(r: &mut Registry) {
     r.insert(cmd!(
         path: ["daemon"],
@@ -66,15 +68,6 @@ pub fn register_infra(r: &mut Registry) {
         gated: false,
         implemented: true,
         handler: handle_daemon,
-    ));
-    r.insert(cmd!(
-        path: ["shellbridge"],
-        summary: "Run the shellbridge process: publish session/hook state to song/stage/ atomically.",
-        args: [],
-        flags: [flag!("run", "bool", "Run the long-lived shellbridge process.")],
-        gated: false,
-        implemented: true,
-        handler: handle_shellbridge,
     ));
 }
 

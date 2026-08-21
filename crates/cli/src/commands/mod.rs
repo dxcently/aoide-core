@@ -64,7 +64,8 @@ pub fn all() -> Registry {
     stubs::register_update(&mut r); // update
     stubs::register_onboard(&mut r); // onboard
     infra::register_mcp(&mut r); // mcp serve (root-coupled: reads this assembled registry)
-    aoide_server::commands::register_infra(&mut r); // daemon, shellbridge
+    aoide_server::commands::register_infra(&mut r); // daemon
+    aoide_conduct::commands::shellbridge::register(&mut r); // shellbridge (own module since P-A2)
     aoide_conduct::commands::graph::register(&mut r); // graph x15 + conduct
     aoide_client::commands::register_post_graph(&mut r); // adapter melete
     aoide_conductor::commands::register(&mut r); // conductor
