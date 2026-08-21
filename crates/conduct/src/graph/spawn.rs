@@ -193,11 +193,30 @@ pub fn session_spawn(inv: &Invocation) -> Outcome {
     let registered = wait_for(&socket_path, REGISTRATION_BUDGET);
 
     let (socket, log_path) = if registered {
-        load_stage::<SessionsFile>(&sessions_path())
-            .ok()
-            .and_then(|f| f.sessions.into_iter().find(|s| s.session_id == id))
-            .map(|r| (r.socket, r.log_path))
-            .unwrap_or((None, None))
+        // The child binds its control socket before its second record write
+        // stamps logPath (at log open) — a one-shot read here can land in
+        // that gap on a slow builder and report a registered session with a
+        // null logPath. Poll for the stamped record on the same budget;
+        // whatever the record holds at deadline is the honest answer.
+        let deadline = Instant::now() + REGISTRATION_BUDGET;
+        let mut found = (None, None);
+        loop {
+            if let Some(r) = load_stage::<SessionsFile>(&sessions_path())
+                .ok()
+                .and_then(|f| f.sessions.into_iter().find(|s| s.session_id == id))
+            {
+                let stamped = r.log_path.is_some();
+                found = (r.socket, r.log_path);
+                if stamped {
+                    break;
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(REGISTRATION_POLL);
+        }
+        found
     } else {
         (None, None)
     };
