@@ -6,7 +6,8 @@
   building/sending, agent registration, the melete adapter. The serve/listen
   half lives in `aoide-server` and must never migrate here.
 - **The `conduct → client` edge is load-bearing, not a smell.** `conduct`'s
-  presence projection (`who`) needs this crate's peer-pull transport. Don't
+  presence projection (`who`, planned — workstream C2, not yet implemented)
+  needs this crate's peer-pull transport. Don't
   "heal" it by inverting the dependency or duplicating the transport in
   `conduct` — see `docs/architecture/PACKAGE-LAYOUT.md`'s "Verified facts"
   note on this exact edge.

@@ -23,7 +23,8 @@ cache persist through `storage`).
 
 `conduct`, `screen`, `server` (dev-dependency only, for one round-trip
 test), and `cli` depend on it. **The `conduct → client` edge is intentional,
-not technical debt**: `conduct`'s `who` (peer presence) needs client's
+not technical debt**: `conduct`'s planned `who` presence verb (workstream
+C2, not yet implemented) needs client's
 peer-pull transport — the edge stays even though the original reason
 (`screen/send.rs`) moved out to the `screen` crate at P-A1
 (`docs/architecture/PACKAGE-LAYOUT.md`, "Verified facts").

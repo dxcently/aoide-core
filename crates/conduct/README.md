@@ -20,8 +20,9 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
 
 ## What it consumes
 
-`aoide-protocol`, `aoide-storage`, `aoide-client` (for `who`'s peer-pull
-transport — see `client`'s own README for why that edge stays).
+`aoide-protocol`, `aoide-storage`, `aoide-client` (for the planned `who`
+presence verb's peer-pull transport — workstream C2, not yet implemented;
+see `client`'s own README for why that edge stays).
 
 ## How it composes
 
