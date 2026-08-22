@@ -20,13 +20,28 @@
 //! already-in-flight resolve.
 //!
 //! **Ids are a small monotonic counter, not a UUID** — short and
-//! human-typeable (`secrets approve 3 --totp 123456`), the same shape
+//! human-typeable (`secrets approve 3f2a-3 --totp 123456`), the same shape
 //! `aoide_conduct::graph::pending`'s own list-position ids favor for the
 //! same reason. Unlike that module's ids (a `pending.json` array position,
 //! reused the moment an earlier entry resolves), this counter never
 //! repeats for the lifetime of one broker process — there is no persisted
 //! array to re-index, so a monotonic counter is both simpler and never
 //! ambiguous.
+//!
+//! **Ids carry a 4-hex-char per-process NONCE prefix (`<nonce>-<n>`, P-N2c
+//! FIX 4) — never a bare number.** The counter restarts at 1 on every
+//! broker restart; without a nonce, an id an operator is still holding
+//! from BEFORE a restart (typed into a terminal, or just slow to act)
+//! could silently `approve`/`dismiss` a totally DIFFERENT ask that
+//! happened to land on the same bare number after the restart. The nonce
+//! ([`random_nonce`], 2 bytes off `/dev/urandom` — the same zero-new-deps
+//! precedent `enroll::generate_secret` already holds) is generated ONCE
+//! per [`ParkRegistry`] (one per broker process lifetime, `broker::serve`'s
+//! own doc), so a stale id from a previous process almost never carries
+//! the current process's nonce and is correctly refused as unknown
+//! ([`ParkRegistry::peek`]/[`ParkRegistry::take`] parse the id against
+//! THIS registry's own nonce, module doc's own boundary) — the existing
+//! "unknown pending id" error, not a new error shape.
 //!
 //! **Poisoned-lock handling**: this is the first PRODUCTION (non-test)
 //! shared-mutex state anywhere in the `aoide` crate tree (grep the other
@@ -39,6 +54,7 @@
 //! the shared park registry.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Mutex;
@@ -74,6 +90,54 @@ pub fn park_timeout() -> Duration {
         }
     }
     Duration::from_secs(DEFAULT_PARK_TIMEOUT_SECS)
+}
+
+/// Env override for the registry-wide max PARKED asks at once (P-N2c FIX
+/// 3b — a deploy-blocker hardening, not a normal-path limit): every parked
+/// connection holds one `handle_conn` thread open for up to the full park
+/// timeout, so an unbounded queue of them is an unbounded thread count.
+pub const PARK_CAP_ENV: &str = "AOIDE_SECRETS_PARK_CAP";
+
+/// The default park cap: 32 concurrently parked asks (task requirement).
+/// Same tolerant-fallback shape as [`park_timeout`] — a blank/unparsable
+/// env value falls back here rather than erroring the broker.
+pub const DEFAULT_PARK_CAP: usize = 32;
+
+/// Resolve the registry-wide park cap: [`PARK_CAP_ENV`] when set to a valid
+/// positive integer, else [`DEFAULT_PARK_CAP`]. Read once per park attempt,
+/// same "no re-derivation, no daemon restart needed" shape [`park_timeout`]
+/// already holds.
+pub fn park_cap() -> usize {
+    if let Ok(v) = std::env::var(PARK_CAP_ENV) {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            if let Ok(cap) = trimmed.parse::<usize>() {
+                if cap > 0 {
+                    return cap;
+                }
+            }
+        }
+    }
+    DEFAULT_PARK_CAP
+}
+
+/// A 4-hex-char per-process nonce, prefixed onto every id [`ParkRegistry`]
+/// hands out (module doc, P-N2c FIX 4) — 2 bytes off `/dev/urandom` (the
+/// same zero-new-deps precedent `enroll::generate_secret` already holds;
+/// never blocks on Linux once the kernel's CSPRNG is seeded, same
+/// justification that function's own doc gives), formatted lowercase hex.
+/// Falls back to a fixed `"0000"` on any read failure rather than
+/// panicking the broker over a syscall going sideways (`enroll::
+/// local_hostname`'s own "never block startup on this" precedent) — this
+/// nonce only needs to usually DIFFER across restarts, not resist a
+/// determined attacker, so a degraded-but-non-fatal fallback is
+/// acceptable, unlike the TOTP secret itself.
+fn random_nonce() -> String {
+    let mut buf = [0u8; 2];
+    match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)) {
+        Ok(()) => format!("{:02x}{:02x}", buf[0], buf[1]),
+        Err(_) => "0000".to_string(),
+    }
 }
 
 /// What completes a parked ask — sent exactly once, by whichever of
@@ -121,17 +185,26 @@ impl ParkedAsk {
 /// The shared registry every connection-handling thread reaches through an
 /// `Arc` (`broker::serve`'s one instance, cloned per spawned thread). Ids
 /// are internally `u64` (the monotonic counter, module doc) and only ever
-/// formatted to/parsed from decimal text at this type's own boundary — a
-/// caller (the wire, the CLI) never sees anything but the string form.
-#[derive(Default)]
+/// formatted to/parsed from `<nonce>-<n>` text at this type's own boundary
+/// (`format_id`/`parse_id`) — a caller (the wire, the CLI) never sees
+/// anything but the string form.
 pub struct ParkRegistry {
     inner: Mutex<BTreeMap<u64, ParkedAsk>>,
     counter: AtomicU64,
+    /// This registry's own per-process nonce (module doc, FIX 4) — fixed
+    /// for the registry's whole lifetime, generated once in [`Self::new`].
+    nonce: String,
+}
+
+impl Default for ParkRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ParkRegistry {
     pub fn new() -> Self {
-        Self::default()
+        Self { inner: Mutex::new(BTreeMap::new()), counter: AtomicU64::new(0), nonce: random_nonce() }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, ParkedAsk>> {
@@ -139,17 +212,57 @@ impl ParkRegistry {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn format_id(&self, n: u64) -> String {
+        format!("{}-{n}", self.nonce)
+    }
+
+    /// Parse a wire/CLI id string back into this registry's own internal
+    /// key — the id must carry THIS registry's exact nonce prefix (module
+    /// doc, FIX 4); anything else (malformed, a bare number, a DIFFERENT
+    /// process's nonce from before a restart) is `None`, which every
+    /// caller below already treats as "unknown pending id" — no new error
+    /// shape needed for the stale-id case.
+    fn parse_id(&self, id: &str) -> Option<u64> {
+        id.trim().strip_prefix(self.nonce.as_str())?.strip_prefix('-')?.parse().ok()
+    }
+
     /// Register a new parked ask and return its id plus the receiving half
     /// of its completion channel — the caller ([`broker::handle_resolve`])
-    /// blocks on the receiver via [`wait_for_outcome`].
+    /// blocks on the receiver via [`wait_for_outcome`]. Uncapped — the
+    /// registry-wide limit lives in [`Self::park_if_room`], which this
+    /// delegates to with an effectively-unbounded cap; every existing
+    /// caller (tests, and any future one with no cap concern) keeps this
+    /// simpler unconditional signature.
     pub fn park(&self, secret: &str, consumer: &str, requested_at: u64) -> (String, mpsc::Receiver<ParkOutcome>) {
+        self.park_if_room(secret, consumer, requested_at, usize::MAX)
+            .expect("an unbounded park (cap = usize::MAX) must never refuse")
+    }
+
+    /// [`Self::park`]'s cap-aware sibling (P-N2c FIX 3b) — `broker::
+    /// handle_resolve` is the one production call site, passing
+    /// [`park_cap`]'s resolved limit. Checks-then-inserts under the SAME
+    /// lock acquisition (never a separate `len()` check followed by a
+    /// second locked insert) so two threads racing the last open slot can
+    /// never both succeed and overrun the cap by one. Returns `None` when
+    /// the registry is already at `cap` — the caller falls back to the
+    /// immediate pre-park refusal (the `wait:false` text) rather than
+    /// growing the queue further.
+    pub fn park_if_room(
+        &self,
+        secret: &str,
+        consumer: &str,
+        requested_at: u64,
+        cap: usize,
+    ) -> Option<(String, mpsc::Receiver<ParkOutcome>)> {
         let (tx, rx) = mpsc::channel();
-        let id = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
-        self.lock().insert(
-            id,
-            ParkedAsk { secret: secret.to_string(), consumer: consumer.to_string(), requested_at, tx },
-        );
-        (id.to_string(), rx)
+        let mut guard = self.lock();
+        if guard.len() >= cap {
+            return None;
+        }
+        let n = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
+        guard.insert(n, ParkedAsk { secret: secret.to_string(), consumer: consumer.to_string(), requested_at, tx });
+        drop(guard);
+        Some((self.format_id(n), rx))
     }
 
     /// Look up an ask's `(secret, consumer)` WITHOUT removing it — the
@@ -158,7 +271,7 @@ impl ParkRegistry {
     /// ever taken off the registry, so an INVALID code leaves the ask
     /// exactly where it was (task requirement: "ask STAYS parked").
     pub fn peek(&self, id: &str) -> Option<(String, String)> {
-        let n: u64 = id.trim().parse().ok()?;
+        let n = self.parse_id(id)?;
         self.lock().get(&n).map(|a| (a.secret.clone(), a.consumer.clone()))
     }
 
@@ -168,7 +281,7 @@ impl ParkRegistry {
     /// a `None` means someone else (a timeout, a concurrent
     /// approve/dismiss) already claimed it first.
     pub fn take(&self, id: &str) -> Option<ParkedAsk> {
-        let n: u64 = id.trim().parse().ok()?;
+        let n = self.parse_id(id)?;
         self.lock().remove(&n)
     }
 
@@ -180,20 +293,22 @@ impl ParkRegistry {
     /// approve/dismiss already got there first and this call must instead
     /// wait for the message already in flight).
     fn remove_only(&self, id: &str) -> bool {
-        match id.trim().parse::<u64>() {
-            Ok(n) => self.lock().remove(&n).is_some(),
-            Err(_) => false,
+        match self.parse_id(id) {
+            Some(n) => self.lock().remove(&n).is_some(),
+            None => false,
         }
     }
 
     /// Every parked ask's `(id, secret, consumer, requested_at)` — never a
     /// value, never a channel handle (`secrets pending`'s whole reply).
-    /// Ordered by id (insertion order, since ids are monotonic) via
-    /// `BTreeMap`'s own iteration order.
+    /// Ordered by the internal counter (insertion order, since it's
+    /// monotonic) via `BTreeMap`'s own iteration order — the nonce prefix
+    /// is constant across every entry in one registry, so formatting it
+    /// on afterward never disturbs that order.
     pub fn list(&self) -> Vec<(String, String, String, u64)> {
         self.lock()
             .iter()
-            .map(|(id, ask)| (id.to_string(), ask.secret.clone(), ask.consumer.clone(), ask.requested_at))
+            .map(|(id, ask)| (self.format_id(*id), ask.secret.clone(), ask.consumer.clone(), ask.requested_at))
             .collect()
     }
 }
@@ -223,9 +338,18 @@ pub enum WaitResult {
 /// taken the entry (and is about to send, or already sent, on the channel)
 /// microseconds before this function's own deadline fired — in that case
 /// this function falls through to a plain blocking `rx.recv()`, which is
-/// guaranteed to return promptly because the entry is provably gone and
-/// its taker is provably mid-send (never left dangling, since
+/// EXPECTED to return promptly, since the entry is provably gone and its
+/// taker is committed to eventually sending (never left dangling, since
 /// [`ParkedAsk::send`] is the only way to consume a taken [`ParkedAsk`]).
+/// **This is an assumption, not a proof, and it can be wrong: the taker on
+/// the `approve` path runs a backend shell-out (`broker::
+/// fetch_secret_value`) BETWEEN `take` and `send`** — a hung/slow backend
+/// command means this `recv()` blocks for as long as that shell-out does,
+/// not "promptly." `dismiss`'s taker sends immediately after `take` with
+/// no I/O in between, so this gap is `approve`-specific and already
+/// narrow (the race window itself is microseconds); it is a known,
+/// deferred gap (this crate's `AGENTS.md`), not something this function
+/// can fix on its own — a backend timeout would have to exist first.
 pub fn wait_for_outcome(registry: &ParkRegistry, id: &str, rx: mpsc::Receiver<ParkOutcome>, timeout: Duration) -> WaitResult {
     match rx.recv_timeout(timeout) {
         Ok(ParkOutcome::Approved(v)) => WaitResult::Approved(v),
@@ -263,10 +387,14 @@ mod tests {
     fn park_then_list_shows_the_ask_with_no_value_anywhere() {
         let reg = ParkRegistry::new();
         let (id, _rx) = reg.park("db-prod", "m", 1_700_000_000);
-        assert_eq!(id, "1");
+        // Ids carry a per-process nonce prefix (`<nonce>-<n>`, FIX 4) — not
+        // a bare number — so this asserts the SHAPE (a `-` splitting a
+        // non-empty nonce from the counter) rather than a literal "1".
+        assert!(id.ends_with("-1"), "expected a `<nonce>-1` shaped id, got {id:?}");
+        assert!(id.len() > "-1".len(), "the nonce half must be non-empty: {id:?}");
         let list = reg.list();
         assert_eq!(list.len(), 1);
-        assert_eq!(list[0], ("1".to_string(), "db-prod".to_string(), "m".to_string(), 1_700_000_000));
+        assert_eq!(list[0], (id, "db-prod".to_string(), "m".to_string(), 1_700_000_000));
     }
 
     #[test]
@@ -274,13 +402,52 @@ mod tests {
         let reg = ParkRegistry::new();
         let (id1, _rx1) = reg.park("a", "m", 1);
         let (id2, _rx2) = reg.park("b", "m", 2);
-        assert_eq!(id1, "1");
-        assert_eq!(id2, "2");
+        assert!(id1.ends_with("-1"), "{id1:?}");
+        assert!(id2.ends_with("-2"), "{id2:?}");
+        // Same registry -> same nonce prefix on every id it hands out.
+        let nonce1 = id1.strip_suffix("-1").unwrap();
+        let nonce2 = id2.strip_suffix("-2").unwrap();
+        assert_eq!(nonce1, nonce2, "one registry must use ONE nonce for its whole lifetime");
         // Taking id1 does not free it up for reuse — the counter never
         // rewinds.
         reg.take(&id1);
         let (id3, _rx3) = reg.park("c", "m", 3);
-        assert_eq!(id3, "3");
+        assert!(id3.ends_with("-3"), "{id3:?}");
+    }
+
+    /// A held id carrying a DIFFERENT nonce (e.g. from before a broker
+    /// restart) but the SAME numeric suffix must be refused exactly like
+    /// any other unknown id, never accidentally matched against the wrong
+    /// ask (FIX 4's whole point) — deterministic (flips one hex digit of
+    /// the real nonce), not a coin-flip collision test.
+    #[test]
+    fn a_foreign_or_stale_nonce_prefix_is_unknown_never_misrouted() {
+        let reg = ParkRegistry::new();
+        let (id, _rx) = reg.park("secret-a", "m", 1);
+        let (real_nonce, suffix) = id.rsplit_once('-').unwrap();
+        let mut chars: Vec<char> = real_nonce.chars().collect();
+        chars[0] = if chars[0] == '0' { '1' } else { '0' };
+        let foreign_id = format!("{}-{suffix}", chars.into_iter().collect::<String>());
+        assert_ne!(foreign_id, id);
+        assert!(reg.peek(&foreign_id).is_none(), "a foreign-nonce id must never resolve, even with the right suffix");
+        assert!(reg.take(&foreign_id).is_none());
+        // The genuine id still works.
+        assert!(reg.peek(&id).is_some());
+    }
+
+    #[test]
+    fn park_if_room_refuses_beyond_the_cap_and_admits_again_after_a_take() {
+        let reg = ParkRegistry::new();
+        assert!(reg.park_if_room("a", "m", 1, 2).is_some());
+        assert!(reg.park_if_room("b", "m", 2, 2).is_some());
+        assert!(reg.park_if_room("c", "m", 3, 2).is_none(), "a third park must refuse at cap 2");
+        assert_eq!(reg.list().len(), 2);
+
+        // Freeing one slot (a take, as approve/dismiss/timeout would do)
+        // lets the next park through again.
+        let first_id = reg.list().into_iter().next().unwrap().0;
+        reg.take(&first_id);
+        assert!(reg.park_if_room("d", "m", 4, 2).is_some());
     }
 
     #[test]

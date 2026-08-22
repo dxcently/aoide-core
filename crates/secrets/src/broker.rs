@@ -322,9 +322,36 @@ pub fn serve(secrets_home: &Path, socket_path: &Path) -> std::io::Result<()> {
             Ok(stream) => {
                 let home = home.clone();
                 let parked = Arc::clone(&parked);
-                std::thread::spawn(move || handle_conn(&home, stream, &parked));
+                // FIX 3a (P-N2c, deploy blocker): `std::thread::spawn`
+                // PANICS if the OS refuses to create a thread (e.g. the
+                // process is already at its thread/fd limit) — that panic
+                // would unwind straight out of this accept loop, killing
+                // `serve` itself, which systemd would then restart into
+                // the SAME resource exhaustion until `StartLimitBurst`
+                // gives up and the unit goes `failed` PERMANENTLY. Use the
+                // fallible `Builder::spawn` and, on `Err`, drop just this
+                // one connection (log + `continue`) — the broker keeps
+                // accepting everyone else, same "one connection's failure
+                // never touches another's" discipline this module doc
+                // already holds for every other per-connection failure.
+                if let Err(e) =
+                    std::thread::Builder::new().spawn(move || handle_conn(&home, stream, &parked))
+                {
+                    eprintln!("[aoide/secrets] could not spawn a connection thread (dropping this connection): {e}");
+                }
             }
-            Err(e) => eprintln!("[aoide/secrets] accept error (continuing): {e}"),
+            Err(e) => {
+                eprintln!("[aoide/secrets] accept error (continuing): {e}");
+                // FIX 3c: a short backoff before retrying — without it, an
+                // fd-exhaustion condition (EMFILE) that keeps `accept(2)`
+                // failing immediately turns this loop into a tight busy
+                // spin, burning a full CPU core while making the
+                // exhaustion strictly worse (this loop's own fds count
+                // against the same limit). 250ms is short enough that a
+                // transient, immediately-recovering error costs nothing a
+                // human would notice, and long enough to stop the spin.
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
         }
     }
     Ok(())
@@ -354,28 +381,43 @@ fn handle_conn(secrets_home: &Path, stream: UnixStream, parked: &ParkRegistry) {
         if line.trim().is_empty() {
             continue;
         }
-        let reply = handle_line(secrets_home, &line, parked);
-        let mut out = reply.to_string();
-        out.push('\n');
-        if writer.write_all(out.as_bytes()).is_err() {
+        let reply = handle_line(secrets_home, &line, parked, &mut writer);
+        if write_json_line(&mut writer, &reply).is_err() {
             break;
         }
     }
 }
 
+/// Write ONE JSON value as a newline-terminated wire line — the ONE place
+/// this crate formats a reply/interim line for the socket (module doc's
+/// framing contract), shared by [`handle_conn`]'s own final-reply write and
+/// [`handle_resolve`]'s interim-line write (P-N2c) so both stay byte-for-
+/// byte the same shape.
+fn write_json_line(writer: &mut impl Write, value: &Value) -> std::io::Result<()> {
+    let mut out = value.to_string();
+    out.push('\n');
+    writer.write_all(out.as_bytes())
+}
+
 /// Parse and dispatch ONE wire line. Pure with respect to the wire framing
 /// (all I/O — policy load, backend fetch, audit, parking — happens inside
-/// the individual `handle_*` functions); malformed JSON or an unknown `op`
-/// always gets a reply line, never a silently dropped connection (unlike
-/// shellbridge's fire-and-forget commands, a secrets client is BLOCKED
-/// waiting on this reply).
-fn handle_line(secrets_home: &Path, line: &str, parked: &ParkRegistry) -> Value {
+/// the individual `handle_*` functions) EXCEPT for `interim_out`
+/// (P-N2c): [`handle_resolve`] is the only handler that ever writes through
+/// it, to send the interim `{"interim":true,"parked":true,...}` line the
+/// INSTANT an ask parks (module doc's "framing contract" — the whole reason
+/// this parameter exists: without it, `secrets exec` hangs for up to the
+/// full park timeout with zero indication whether it parked or the broker
+/// wedged). Every other handler ignores it entirely. Malformed JSON or an
+/// unknown `op` always gets a FINAL reply line, never a silently dropped
+/// connection (unlike shellbridge's fire-and-forget commands, a secrets
+/// client is BLOCKED waiting on this reply).
+fn handle_line(secrets_home: &Path, line: &str, parked: &ParkRegistry, interim_out: &mut impl Write) -> Value {
     let req: Value = match serde_json::from_str(line.trim()) {
         Ok(v) => v,
         Err(_) => return json!({"ok": false, "error": "malformed request: not valid JSON"}),
     };
     match req.get("op").and_then(Value::as_str) {
-        Some("resolve") => handle_resolve(secrets_home, &req, parked),
+        Some("resolve") => handle_resolve(secrets_home, &req, parked, interim_out),
         Some("put") => handle_put(secrets_home, &req),
         Some("pending") => handle_pending(parked),
         Some("approve") => handle_approve(secrets_home, parked, &req),
@@ -390,8 +432,14 @@ fn handle_line(secrets_home: &Path, line: &str, parked: &ParkRegistry) -> Value 
 /// The new branch is [`GateOutcome::NeedsTotp`]: `wait` (default `true`,
 /// module doc) parks the connection via [`ParkRegistry::park`]/
 /// [`crate::park::wait_for_outcome`]; `wait:false` restores the pre-P-N2
-/// immediate refusal.
-fn handle_resolve(secrets_home: &Path, req: &Value, parked: &ParkRegistry) -> Value {
+/// immediate refusal. **P-N2c:** the instant a park is registered, an
+/// INTERIM line (`{"interim":true,"parked":true,"id":...,"timeoutSecs":...}`)
+/// writes down `interim_out` BEFORE this function blocks on
+/// `wait_for_outcome` — a write failure here (the caller already hung up)
+/// is swallowed, not propagated: the park proceeds regardless, since a
+/// gone caller learning its own id is moot but the ask itself is still a
+/// legitimate parked state an operator could dismiss.
+fn handle_resolve(secrets_home: &Path, req: &Value, parked: &ParkRegistry, interim_out: &mut impl Write) -> Value {
     let secret = req.get("secret").and_then(Value::as_str).unwrap_or("").to_string();
     let consumer = req.get("consumer").and_then(Value::as_str).unwrap_or("").to_string();
     let argv0 = req.get("argv0").and_then(Value::as_str).map(str::to_string);
@@ -419,9 +467,30 @@ fn handle_resolve(secrets_home: &Path, req: &Value, parked: &ParkRegistry) -> Va
                 audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), false, Some(&reason));
                 return json!({"ok": false, "error": reason});
             }
-            let (id, rx) = parked.park(&secret, &consumer, now_unix);
+            let cap = crate::park::park_cap();
+            let Some((id, rx)) = parked.park_if_room(&secret, &consumer, now_unix, cap) else {
+                // FIX 3b: at the registry-wide cap — the SAME immediate
+                // refusal `wait:false` gives, plus a hint naming the
+                // cap/knob, rather than growing an unbounded thread queue
+                // (module doc's "read-modify-write... never block" is
+                // about connections, not about this being unbounded).
+                let reason = format!(
+                    "requireTotp is set but no totp code was provided, and the pending-ask queue is full \
+                     ({cap} parked already — {} to raise it); retry with an inline `--totp <code>`, or once \
+                     an operator clears a pending ask",
+                    crate::park::PARK_CAP_ENV
+                );
+                audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), false, Some(&reason));
+                return json!({"ok": false, "error": reason});
+            };
             audit_park(secrets_home, &id, &secret, &consumer);
             let timeout = crate::park::park_timeout();
+            // P-N2c FIX 1: announce the park BEFORE blocking — a write
+            // failure here (the caller already hung up) is swallowed, not
+            // propagated (this function's own doc): the ask stays
+            // legitimately parked either way.
+            let interim = json!({"interim": true, "parked": true, "id": id, "timeoutSecs": timeout.as_secs()});
+            let _ = write_json_line(interim_out, &interim);
             match crate::park::wait_for_outcome(parked, &id, rx, timeout) {
                 WaitResult::Approved(value) => {
                     audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), true, None);
@@ -432,8 +501,10 @@ fn handle_resolve(secrets_home: &Path, req: &Value, parked: &ParkRegistry) -> Va
                     json!({"ok": false, "error": reason})
                 }
                 WaitResult::Dismissed => {
-                    let reason =
-                        "the pending TOTP ask was dismissed by an operator before a code was provided".to_string();
+                    // FIX small-honesty: no actor claim — ANY group member
+                    // holding a valid socket connection can dismiss, not
+                    // necessarily "an operator" in any privileged sense.
+                    let reason = "the pending TOTP ask was dismissed before a code was provided".to_string();
                     audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), false, Some(&reason));
                     json!({"ok": false, "error": reason})
                 }
@@ -478,29 +549,60 @@ fn handle_pending(parked: &ParkRegistry) -> Value {
     json!({"ok": true, "pending": pending})
 }
 
-/// `approve <id> --totp <code>` (P-N2): validate the code with the SAME
-/// [`verify_totp_gate`] a fast-path `resolve` uses (same RFC 6238 verify,
-/// same single-use replay ledger — the code is consumed identically either
-/// way), then fetch the value fresh and release it down the ORIGINAL
-/// parked connection. This function's OWN reply to the approver never
-/// carries the value — only `{"ok":true}` or a value-free `{"ok":false,
-/// "error":...}`.
+/// Re-run the `exists` + `consumer authorized` half of the policy gate
+/// against the ask's STORED consumer, immediately before a value is ever
+/// fetched for release (P-N2c FIX 2 — reviewer-confirmed gap). Before this
+/// fix, [`handle_approve`] jumped straight from a validated code to
+/// [`fetch_secret_value`], never re-checking authorization — a `secrets
+/// revoke`/`secrets rm` issued WHILE an ask sat parked did NOT stop the
+/// eventual release (up to the full park timeout's worth of revocation
+/// lag), and the same gap would have silently bypassed a future `remote`
+/// gate the moment one exists. Mirrors [`resolve_gate`]'s own
+/// exists/authorized checks exactly (identical error strings, so a caller
+/// sees the same wording whether the fast path or the parked path denied
+/// it) but never touches TOTP — the code has already validated by the
+/// time this runs.
+fn authorize_release(secrets_home: &Path, secret: &str, consumer: &str) -> Result<(), String> {
+    let policies = crate::store::load_policies(secrets_home)
+        .map_err(|e| crate::home::describe_home_file_error(secrets_home, &crate::store::policy_path(secrets_home), &e))?;
+    let policy = policies.iter().find(|p| p.name == secret).ok_or_else(|| "secret not found".to_string())?;
+    let authorized = policy.consumers.is_empty() || policy.consumers.iter().any(|c| c == consumer);
+    if !authorized {
+        return Err("consumer not authorized for this secret".to_string());
+    }
+    Ok(())
+}
+
+/// `approve <id> --totp <code>` (P-N2, re-gated P-N2c): validate the code
+/// with the SAME [`verify_totp_gate`] a fast-path `resolve` uses (same RFC
+/// 6238 verify, same single-use replay ledger — the code is consumed
+/// identically either way), re-run [`authorize_release`] against the ask's
+/// STORED consumer, then fetch the value fresh and release it down the
+/// ORIGINAL parked connection. This function's OWN reply to the approver
+/// never carries the value — only `{"ok":true}` or a value-free
+/// `{"ok":false,"error":...}`.
 ///
 /// **Two-step lookup, deliberately** (module doc): [`ParkRegistry::peek`]
 /// first (read-only) so an INVALID/expired/already-used/missing code
 /// leaves the ask exactly where it was — [`ParkRegistry::take`] only
 /// happens AFTER a code has already validated (and been consumed by the
 /// replay ledger), at which point the ask must be resolved one way or
-/// another (approved, or — the rare case where the value can no longer be
-/// fetched, e.g. the policy was removed while parked — denied); it can
-/// never be left parked past that point, since the code that would be
-/// needed to try again has already been spent.
+/// another (approved, or denied — a policy removed/revoked while parked,
+/// module doc on [`authorize_release`], or the rare case where the value
+/// can no longer be fetched at all); it can never be left parked past that
+/// point, since the code that would be needed to try again has already
+/// been spent. **The code is burned either way, honestly documented**: a
+/// revoked-but-still-parked ask still consumes the approver's code even
+/// though the release is then denied — the code validated the APPROVER'S
+/// identity/possession, which is a real event regardless of what the
+/// re-gate decides next; it is not un-spent just because authorization
+/// changed underneath it a moment later.
 fn handle_approve(secrets_home: &Path, parked: &ParkRegistry, req: &Value) -> Value {
     let id = req.get("id").and_then(Value::as_str).unwrap_or("").to_string();
     if id.is_empty() {
         return json!({"ok": false, "error": "malformed request: `id` is required"});
     }
-    let Some((secret, _consumer)) = parked.peek(&id) else {
+    let Some((secret, consumer)) = parked.peek(&id) else {
         let reason = format!("unknown pending id `{id}`");
         audit_approve(secrets_home, &id, None, false, &reason);
         return json!({"ok": false, "error": reason});
@@ -529,6 +631,16 @@ fn handle_approve(secrets_home: &Path, parked: &ParkRegistry, req: &Value) -> Va
         audit_approve(secrets_home, &id, Some(&secret), false, &reason);
         return json!({"ok": false, "error": reason});
     };
+
+    // FIX 2: re-gate authorization against the ask's STORED consumer
+    // BEFORE ever fetching a value — a revocation while parked must stop
+    // the release, not just a future one.
+    if let Err(e) = authorize_release(secrets_home, &secret, &consumer) {
+        ask.send(ParkOutcome::Denied(e.clone()));
+        audit_approve(secrets_home, &id, Some(&secret), false, &e);
+        return json!({"ok": false, "error": e});
+    }
+
     match fetch_secret_value(secrets_home, &secret) {
         Ok(value) => {
             ask.send(ParkOutcome::Approved(value));
@@ -1414,7 +1526,7 @@ mod tests {
     #[test]
     fn malformed_json_gets_a_reply_not_a_dropped_connection() {
         let home = tmp_home("malformed");
-        let reply = handle_line(&home, "not json at all", &ParkRegistry::new());
+        let reply = handle_line(&home, "not json at all", &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("not valid JSON"));
         std::fs::remove_dir_all(&home).ok();
@@ -1423,7 +1535,7 @@ mod tests {
     #[test]
     fn missing_op_is_a_clear_error() {
         let home = tmp_home("missingop");
-        let reply = handle_line(&home, r#"{"secret":"t","consumer":"m"}"#, &ParkRegistry::new());
+        let reply = handle_line(&home, r#"{"secret":"t","consumer":"m"}"#, &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("missing `op`"));
         std::fs::remove_dir_all(&home).ok();
@@ -1432,7 +1544,7 @@ mod tests {
     #[test]
     fn unknown_op_is_a_clear_error() {
         let home = tmp_home("unknownop");
-        let reply = handle_line(&home, r#"{"op":"explode"}"#, &ParkRegistry::new());
+        let reply = handle_line(&home, r#"{"op":"explode"}"#, &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("unknown op"));
         std::fs::remove_dir_all(&home).ok();
@@ -1441,7 +1553,7 @@ mod tests {
     #[test]
     fn resolve_with_missing_fields_is_malformed() {
         let home = tmp_home("missingfields");
-        let reply = handle_line(&home, r#"{"op":"resolve","secret":"t"}"#, &ParkRegistry::new());
+        let reply = handle_line(&home, r#"{"op":"resolve","secret":"t"}"#, &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("required"));
         std::fs::remove_dir_all(&home).ok();
@@ -1462,7 +1574,7 @@ mod tests {
 
         let p = Policy::new("t", "scratch", "stored-value");
         seed(&home, &[p]);
-        let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &ParkRegistry::new());
+        let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(reply["ok"], true);
         assert_eq!(reply["value"], "stored-value");
 
@@ -1493,7 +1605,7 @@ mod tests {
         });
         std::fs::write(crate::backend::backends_path(&home), serde_json::to_vec(&backends).unwrap()).unwrap();
 
-        let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &ParkRegistry::new());
+        let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(reply["ok"], false);
         let wire_error = reply["error"].as_str().unwrap();
         assert!(!wire_error.contains("SENTINEL"), "wire reply leaked stderr: {wire_error}");
@@ -1636,20 +1748,20 @@ mod tests {
         seed_with_set(&home, &[p], &format!("cat {}", out.display()), &format!("cat > {}", out.display()));
 
         // 1. Empty -> stores, `replaced` is false.
-        let first = handle_line(&home, r#"{"op":"put","secret":"t","value":"first-value"}"#, &ParkRegistry::new());
+        let first = handle_line(&home, r#"{"op":"put","secret":"t","value":"first-value"}"#, &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(first["ok"], true, "{first}");
         assert_eq!(first["replaced"], false, "{first}");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "first-value");
 
         // 2. Existing, no `overwrite` -> the distinct `exists` refusal, and
         //    the stored value is UNCHANGED.
-        let second = handle_line(&home, r#"{"op":"put","secret":"t","value":"attempted-overwrite"}"#, &ParkRegistry::new());
+        let second = handle_line(&home, r#"{"op":"put","secret":"t","value":"attempted-overwrite"}"#, &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(second["ok"], false, "{second}");
         assert_eq!(second["exists"], true, "the refusal must be machine-readable via `exists`, not error prose: {second}");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "first-value", "a refused put must never touch the store");
 
         // 3. Existing, `overwrite: true` -> replaced, `replaced` is true.
-        let third = handle_line(&home, r#"{"op":"put","secret":"t","value":"second-value","overwrite":true}"#, &ParkRegistry::new());
+        let third = handle_line(&home, r#"{"op":"put","secret":"t","value":"second-value","overwrite":true}"#, &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(third["ok"], true, "{third}");
         assert_eq!(third["replaced"], true, "{third}");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "second-value");
@@ -1669,8 +1781,8 @@ mod tests {
         seed_with_set(&home, &[p], &format!("cat {}", out.display()), &format!("cat > {}", out.display()));
         std::fs::write(&out, "original-value").unwrap();
 
-        let with_false = handle_line(&home, r#"{"op":"put","secret":"t","value":"x","overwrite":false}"#, &ParkRegistry::new());
-        let without_field = handle_line(&home, r#"{"op":"put","secret":"t","value":"x"}"#, &ParkRegistry::new());
+        let with_false = handle_line(&home, r#"{"op":"put","secret":"t","value":"x","overwrite":false}"#, &ParkRegistry::new(), &mut Vec::new());
+        let without_field = handle_line(&home, r#"{"op":"put","secret":"t","value":"x"}"#, &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(with_false, without_field, "an explicit `overwrite:false` and an absent field must match byte-for-byte");
         assert_eq!(with_false["exists"], true, "{with_false}");
         std::fs::remove_dir_all(&home).ok();
@@ -1687,7 +1799,7 @@ mod tests {
         let p = Policy::new("t", "scratch", "k");
         seed_with_set(&home, &[p], &format!("cat {}", out.display()), &format!("cat > {}", out.display()));
 
-        let reply = handle_line(&home, r#"{"op":"put","secret":"t","value":"stored-value"}"#, &ParkRegistry::new());
+        let reply = handle_line(&home, r#"{"op":"put","secret":"t","value":"stored-value"}"#, &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(reply["ok"], true);
         assert!(reply.get("value").is_none(), "put's reply must never carry a value: {reply}");
         assert_eq!(reply["replaced"], false, "the store starts empty — this is a new store, not a replace: {reply}");
@@ -1703,7 +1815,7 @@ mod tests {
     #[test]
     fn put_with_a_missing_secret_field_is_malformed() {
         let home = tmp_home("put-missingfields");
-        let reply = handle_line(&home, r#"{"op":"put","value":"x"}"#, &ParkRegistry::new());
+        let reply = handle_line(&home, r#"{"op":"put","value":"x"}"#, &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("required"));
         std::fs::remove_dir_all(&home).ok();
@@ -1723,7 +1835,7 @@ mod tests {
 
         // ── failure 1: no policy at all for this secret ────────────────
         seed(&home, &[]);
-        let reply = handle_line(&home, &format!(r#"{{"op":"put","secret":"nope","value":"{SENTINEL}"}}"#), &ParkRegistry::new());
+        let reply = handle_line(&home, &format!(r#"{{"op":"put","secret":"nope","value":"{SENTINEL}"}}"#), &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(reply["ok"], false);
         assert!(!reply.to_string().contains(SENTINEL), "wire reply leaked the sentinel: {reply}");
 
@@ -1735,7 +1847,7 @@ mod tests {
         let p = Policy::new("t", "scratch", "k");
         seed(&home, &[p]); // `seed`'s fixture backend is get-only.
         let reply =
-            handle_line(&home, &format!(r#"{{"op":"put","secret":"t","value":"{SENTINEL}","overwrite":true}}"#), &ParkRegistry::new());
+            handle_line(&home, &format!(r#"{{"op":"put","secret":"t","value":"{SENTINEL}","overwrite":true}}"#), &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(reply["ok"], false);
         assert!(!reply.to_string().contains(SENTINEL), "wire reply leaked the sentinel: {reply}");
 
@@ -1799,7 +1911,7 @@ mod tests {
         let parked = ParkRegistry::new();
 
         with_redirected_audit_log(&home, || {
-            let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m","wait":false}"#, &parked);
+            let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m","wait":false}"#, &parked, &mut Vec::new());
             assert_eq!(reply["ok"], false);
             assert_eq!(
                 reply["error"], "requireTotp is set but no totp code was provided",
@@ -1827,7 +1939,7 @@ mod tests {
         with_redirected_audit_log(&home, || {
             let resolved = std::thread::scope(|scope| {
                 let resolve_handle =
-                    scope.spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked));
+                    scope.spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
 
                 let mut id = None;
                 for _ in 0..200 {
@@ -1844,7 +1956,7 @@ mod tests {
 
                 let code = code_for_now(&secret, unix_now());
                 let approve_req = format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#);
-                let approve_reply = handle_line(&home, &approve_req, &parked);
+                let approve_reply = handle_line(&home, &approve_req, &parked, &mut Vec::new());
                 assert_eq!(approve_reply["ok"], true, "{approve_reply}");
                 assert!(
                     approve_reply.get("value").is_none(),
@@ -1874,7 +1986,7 @@ mod tests {
         with_redirected_audit_log(&home, || {
             std::thread::scope(|scope| {
                 let resolve_handle =
-                    scope.spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked));
+                    scope.spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
 
                 let mut id = None;
                 for _ in 0..200 {
@@ -1886,13 +1998,197 @@ mod tests {
                 }
                 let id = id.expect("the resolve did not park in time");
 
-                let dismiss_reply = handle_line(&home, &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked);
+                let dismiss_reply = handle_line(&home, &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new());
                 assert_eq!(dismiss_reply["ok"], true, "{dismiss_reply}");
 
                 let resolved = resolve_handle.join().unwrap();
                 assert_eq!(resolved["ok"], false);
                 assert!(resolved["error"].as_str().unwrap().to_lowercase().contains("dismissed"), "{resolved}");
             });
+        });
+        assert!(parked.list().is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// P-N2c FIX 2, the reviewer-confirmed authorization gap: a `secrets
+    /// revoke` issued WHILE an ask sits parked must stop the eventual
+    /// release, not just the next one. Parks a resolve, edits
+    /// `policy.json` DIRECTLY (the same write `commands::
+    /// handle_secrets_revoke` would perform) to drop "m" from the
+    /// secret's `consumers[]` while the ask is still parked, then
+    /// approves with a genuinely VALID code — both the approver and the
+    /// original parked caller must see the denial, and the ask must be
+    /// gone from the registry afterward (never left dangling parked).
+    #[test]
+    fn park_then_revoke_the_consumer_then_approve_denies_the_parked_caller() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("park-revoke-then-approve");
+        let mut p = Policy::new("t", "scratch", "stored-value");
+        p.consumers = vec!["m".to_string()];
+        let secret = seed_enrolled(&home, p);
+        let parked = ParkRegistry::new();
+
+        with_redirected_audit_log(&home, || {
+            std::thread::scope(|scope| {
+                let resolve_handle =
+                    scope.spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
+
+                let mut id = None;
+                for _ in 0..200 {
+                    if let Some((pid, ..)) = parked.list().into_iter().next() {
+                        id = Some(pid);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let id = id.expect("the resolve did not park in time");
+
+                // The revocation: "m" is no longer listed (a non-empty
+                // list WITHOUT "m" — an empty list would mean "any
+                // consumer," the opposite of what a revoke means).
+                let mut revoked = Policy::new("t", "scratch", "stored-value");
+                revoked.require_totp = true;
+                revoked.consumers = vec!["someone-else".to_string()];
+                crate::store::save_policies(&home, &[revoked]).unwrap();
+
+                let code = code_for_now(&secret, unix_now());
+                let approve_reply =
+                    handle_line(&home, &format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#), &parked, &mut Vec::new());
+                assert_eq!(approve_reply["ok"], false, "{approve_reply}");
+                assert_eq!(approve_reply["error"], "consumer not authorized for this secret", "{approve_reply}");
+                assert!(
+                    approve_reply.get("value").is_none(),
+                    "a denied approve must never carry a value: {approve_reply}"
+                );
+
+                let resolved = resolve_handle.join().unwrap();
+                assert_eq!(resolved["ok"], false, "{resolved}");
+                assert_eq!(
+                    resolved["error"], "consumer not authorized for this secret",
+                    "the ORIGINAL parked caller must see the SAME re-gate denial: {resolved}"
+                );
+            });
+        });
+        assert!(parked.list().is_empty(), "a denied-on-re-gate ask must be gone, never left dangling parked");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// P-N2c FIX 3b: at the registry-wide park cap, a codeless resolve
+    /// gets the SAME immediate refusal `wait:false` would (never a park),
+    /// with a hint naming the cap and its env knob — the queue never grows
+    /// past `AOIDE_SECRETS_PARK_CAP`.
+    #[test]
+    fn a_codeless_resolve_at_the_park_cap_is_refused_immediately_and_never_parks() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_cap = std::env::var(crate::park::PARK_CAP_ENV).ok();
+        std::env::set_var(crate::park::PARK_CAP_ENV, "1");
+
+        let home = tmp_home("park-cap");
+        let p = Policy::new("t", "scratch", "stored-value");
+        seed_enrolled(&home, p);
+        let parked = ParkRegistry::new();
+
+        with_redirected_audit_log(&home, || {
+            std::thread::scope(|scope| {
+                // Fills the ONE slot the cap allows.
+                let first_handle =
+                    scope.spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
+                let mut id = None;
+                for _ in 0..200 {
+                    if let Some((pid, ..)) = parked.list().into_iter().next() {
+                        id = Some(pid);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let id = id.expect("the first resolve did not park in time");
+                assert_eq!(parked.list().len(), 1);
+
+                // A SECOND codeless resolve, at cap 1, must be refused
+                // immediately — same connection thread, so this call
+                // itself must NOT block.
+                let second_reply =
+                    handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
+                assert_eq!(second_reply["ok"], false, "{second_reply}");
+                let err = second_reply["error"].as_str().unwrap();
+                assert!(err.contains("queue is full"), "{err}");
+                assert!(err.contains(crate::park::PARK_CAP_ENV), "must name the knob: {err}");
+                assert_eq!(parked.list().len(), 1, "the cap refusal must never grow the queue");
+
+                // Clean up the still-parked first ask so its thread returns.
+                let dismissed = handle_line(&home, &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new());
+                assert_eq!(dismissed["ok"], true, "{dismissed}");
+                let _ = first_handle.join().unwrap();
+            });
+        });
+
+        match saved_cap {
+            Some(v) => std::env::set_var(crate::park::PARK_CAP_ENV, v),
+            None => std::env::remove_var(crate::park::PARK_CAP_ENV),
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// P-N2c FIX 1, over a REAL connection (`UnixStream::pair`, not a
+    /// direct `handle_line` call): a parking resolve must put TWO lines on
+    /// the wire — the interim `{"interim":true,"parked":true,...}` line
+    /// first, then (once dismissed here, to keep the test fast) the final
+    /// reply — proving `handle_conn`'s own write path, not just
+    /// `handle_resolve`'s return value, honors the "zero-or-more interim,
+    /// exactly one final" framing (module doc; `CONTRACTS.md`).
+    #[test]
+    fn park_over_a_real_connection_writes_the_interim_line_then_the_final_reply() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("park-interim-two-lines");
+        let p = Policy::new("t", "scratch", "stored-value");
+        seed_enrolled(&home, p);
+        let parked = Arc::new(ParkRegistry::new());
+
+        with_redirected_audit_log(&home, || {
+            let (client_end, server_end) = UnixStream::pair().expect("socketpair");
+            let home_for_conn = home.clone();
+            let parked_for_conn = Arc::clone(&parked);
+            let conn_handle =
+                std::thread::spawn(move || handle_conn(&home_for_conn, server_end, &parked_for_conn));
+
+            let mut writer = client_end.try_clone().expect("clone client end");
+            writer
+                .write_all(b"{\"op\":\"resolve\",\"secret\":\"t\",\"consumer\":\"m\"}\n")
+                .unwrap();
+            let mut reader = BufReader::new(client_end);
+
+            // Line 1: the interim park announcement.
+            let mut line1 = String::new();
+            reader.read_line(&mut line1).expect("reading the interim line");
+            let interim: Value = serde_json::from_str(line1.trim()).expect("interim line must be JSON");
+            assert_eq!(interim["interim"], true, "{interim}");
+            assert_eq!(interim["parked"], true, "{interim}");
+            let id = interim["id"].as_str().expect("interim carries the ask id").to_string();
+            assert!(interim["timeoutSecs"].as_u64().is_some(), "{interim}");
+
+            // Resolve it so the connection's second (final) line arrives
+            // without waiting out the real timeout.
+            let dismissed = handle_line(&home, &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new());
+            assert_eq!(dismissed["ok"], true, "{dismissed}");
+
+            // Line 2: the final reply — exactly one, and it is NOT interim.
+            let mut line2 = String::new();
+            reader.read_line(&mut line2).expect("reading the final reply line");
+            let final_reply: Value = serde_json::from_str(line2.trim()).expect("final line must be JSON");
+            assert!(
+                final_reply.get("interim").is_none(),
+                "the second line must be the FINAL reply, not another interim: {final_reply}"
+            );
+            assert_eq!(final_reply["ok"], false, "{final_reply}");
+            assert!(final_reply["error"].as_str().unwrap().to_lowercase().contains("dismissed"), "{final_reply}");
+
+            // `handle_conn`'s read loop blocks on the NEXT line until EOF —
+            // drop the client side FIRST so the server sees the connection
+            // close and `handle_conn` returns; otherwise this join hangs
+            // forever (both ends alive, neither expecting more data).
+            drop(reader);
+            drop(writer);
+            conn_handle.join().unwrap();
         });
         assert!(parked.list().is_empty());
         std::fs::remove_dir_all(&home).ok();
@@ -1912,7 +2208,7 @@ mod tests {
         with_redirected_audit_log(&home, || {
             std::thread::scope(|scope| {
                 let resolve_handle =
-                    scope.spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked));
+                    scope.spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
 
                 let mut id = None;
                 for _ in 0..200 {
@@ -1925,13 +2221,13 @@ mod tests {
                 let id = id.expect("the resolve did not park in time");
 
                 // A wrong code: denied, but the ask must still be there.
-                let wrong = handle_line(&home, &format!(r#"{{"op":"approve","id":"{id}","totp":"000000"}}"#), &parked);
+                let wrong = handle_line(&home, &format!(r#"{{"op":"approve","id":"{id}","totp":"000000"}}"#), &parked, &mut Vec::new());
                 assert_eq!(wrong["ok"], false, "{wrong}");
                 assert_eq!(parked.list().len(), 1, "an invalid code must leave the ask parked");
 
                 // The REAL correct code now completes it.
                 let code = code_for_now(&secret, unix_now());
-                let right = handle_line(&home, &format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#), &parked);
+                let right = handle_line(&home, &format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#), &parked, &mut Vec::new());
                 assert_eq!(right["ok"], true, "{right}");
 
                 let resolved = resolve_handle.join().unwrap();
@@ -1948,7 +2244,7 @@ mod tests {
         let home = tmp_home("approve-unknown");
         let parked = ParkRegistry::new();
         with_redirected_audit_log(&home, || {
-            let reply = handle_line(&home, r#"{"op":"approve","id":"9","totp":"123456"}"#, &parked);
+            let reply = handle_line(&home, r#"{"op":"approve","id":"9","totp":"123456"}"#, &parked, &mut Vec::new());
             assert_eq!(reply["ok"], false);
             assert!(reply["error"].as_str().unwrap().contains("unknown pending id `9`"), "{reply}");
         });
@@ -1961,7 +2257,7 @@ mod tests {
         let home = tmp_home("dismiss-unknown");
         let parked = ParkRegistry::new();
         with_redirected_audit_log(&home, || {
-            let reply = handle_line(&home, r#"{"op":"dismiss","id":"9"}"#, &parked);
+            let reply = handle_line(&home, r#"{"op":"dismiss","id":"9"}"#, &parked, &mut Vec::new());
             assert_eq!(reply["ok"], false);
             assert!(reply["error"].as_str().unwrap().contains("unknown pending id `9`"), "{reply}");
         });
@@ -1978,7 +2274,7 @@ mod tests {
         let (id, _rx) = parked.park("t", "m", NOW);
 
         with_redirected_audit_log(&home, || {
-            let reply = handle_line(&home, &format!(r#"{{"op":"approve","id":"{id}"}}"#), &parked);
+            let reply = handle_line(&home, &format!(r#"{{"op":"approve","id":"{id}"}}"#), &parked, &mut Vec::new());
             assert_eq!(reply["ok"], false);
             assert!(reply["error"].as_str().unwrap().contains("`totp` is required"), "{reply}");
         });
@@ -1995,12 +2291,12 @@ mod tests {
         let home = tmp_home("pending-list");
         let parked = ParkRegistry::new();
 
-        let empty = handle_line(&home, r#"{"op":"pending"}"#, &parked);
+        let empty = handle_line(&home, r#"{"op":"pending"}"#, &parked, &mut Vec::new());
         assert_eq!(empty["ok"], true);
         assert_eq!(empty["pending"].as_array().unwrap().len(), 0);
 
         let (id, _rx) = parked.park("db-prod", "m", 1_700_000_123);
-        let listed = handle_line(&home, r#"{"op":"pending"}"#, &parked);
+        let listed = handle_line(&home, r#"{"op":"pending"}"#, &parked, &mut Vec::new());
         let arr = listed["pending"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["id"], id);
@@ -2028,6 +2324,7 @@ mod tests {
                 &home,
                 &format!(r#"{{"op":"resolve","secret":"t","consumer":"m","totp":"{code}"}}"#),
                 &parked,
+                &mut Vec::new(),
             );
             assert_eq!(reply["ok"], true, "{reply}");
             assert_eq!(reply["value"], "stored-value");
@@ -2051,7 +2348,7 @@ mod tests {
         let parked = ParkRegistry::new();
 
         with_redirected_audit_log(&home, || {
-            let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked);
+            let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
             assert_eq!(reply["ok"], false);
             let err = reply["error"].as_str().unwrap();
             assert!(err.contains("timed out after 1s"), "{err}");
@@ -2094,7 +2391,7 @@ mod tests {
         with_redirected_audit_log(&home, || {
             std::thread::scope(|scope| {
                 let resolve_handle = scope
-                    .spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"locked","consumer":"m"}"#, &parked));
+                    .spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"locked","consumer":"m"}"#, &parked, &mut Vec::new()));
 
                 let mut parked_yet = false;
                 for _ in 0..200 {
@@ -2108,14 +2405,14 @@ mod tests {
 
                 // An unrelated resolve, on the SAME registry, completes
                 // immediately — proving the parked ask never blocked it.
-                let free_reply = handle_line(&home, r#"{"op":"resolve","secret":"open","consumer":"m"}"#, &parked);
+                let free_reply = handle_line(&home, r#"{"op":"resolve","secret":"open","consumer":"m"}"#, &parked, &mut Vec::new());
                 assert_eq!(free_reply["ok"], true, "{free_reply}");
                 assert_eq!(free_reply["value"], "open-value");
 
                 // Clean up: dismiss the still-parked ask so the spawned
                 // thread returns and this test doesn't leak a blocked one.
                 let (id, ..) = parked.list().into_iter().next().unwrap();
-                let dismissed = handle_line(&home, &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked);
+                let dismissed = handle_line(&home, &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new());
                 assert_eq!(dismissed["ok"], true, "{dismissed}");
                 let resolved = resolve_handle.join().unwrap();
                 assert_eq!(resolved["ok"], false);

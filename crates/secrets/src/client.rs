@@ -189,8 +189,10 @@ pub fn parse_exec_args(inv: &Invocation) -> Result<ExecArgs, String> {
     Ok(ExecArgs { consumer, secret, var, totp, cmd })
 }
 
-/// Connect to `socket_path`, send ONE `resolve` request, read ONE reply
-/// line, and return the value or a value-free error message.
+/// Connect to `socket_path`, send ONE `resolve` request, read the wire's
+/// FINAL reply line ([`read_final_reply`] — zero or more interim lines may
+/// come first, P-N2c FIX 1), and return the value or a value-free error
+/// message.
 pub fn resolve(
     socket_path: &Path,
     secret: &str,
@@ -220,15 +222,7 @@ pub fn resolve(
         .map_err(|e| format!("writing to the secrets broker: {e}"))?;
 
     let mut reader = BufReader::new(stream);
-    let mut reply_line = String::new();
-    reader
-        .read_line(&mut reply_line)
-        .map_err(|e| format!("reading from the secrets broker: {e}"))?;
-    if reply_line.trim().is_empty() {
-        return Err("the secrets broker closed the connection with no reply".to_string());
-    }
-    let reply: Value = serde_json::from_str(reply_line.trim())
-        .map_err(|e| format!("the secrets broker sent an unparseable reply: {e}"))?;
+    let reply = read_final_reply(&mut reader)?;
 
     if reply.get("ok").and_then(Value::as_bool) == Some(true) {
         reply
@@ -242,6 +236,52 @@ pub fn resolve(
             .and_then(Value::as_str)
             .unwrap_or("the secrets broker denied the request")
             .to_string())
+    }
+}
+
+/// Read wire lines until the FINAL (non-interim) reply — the framing
+/// contract P-N2c FIX 1 establishes (`CONTRACTS.md`'s Transport paragraph,
+/// `broker.rs`'s module doc): "one request line -> zero or more interim
+/// lines (`"interim":true`) -> exactly one final reply line." Every
+/// interim line is surfaced via [`announce_interim`] (STDERR only, never
+/// stdout — stdout stays clean for scripting) and then discarded; the
+/// first line WITHOUT `"interim":true` is the final reply this function
+/// returns. Only [`resolve`] can ever receive an interim line today (the
+/// only op that parks) — kept as its own function rather than inlined so a
+/// future op gaining interim lines reuses this loop instead of
+/// re-deriving it.
+fn read_final_reply(reader: &mut impl BufRead) -> Result<Value, String> {
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).map_err(|e| format!("reading from the secrets broker: {e}"))?;
+        if line.trim().is_empty() {
+            return Err("the secrets broker closed the connection with no reply".to_string());
+        }
+        let value: Value = serde_json::from_str(line.trim())
+            .map_err(|e| format!("the secrets broker sent an unparseable reply: {e}"))?;
+        if value.get("interim").and_then(Value::as_bool) == Some(true) {
+            announce_interim(&value);
+            continue;
+        }
+        return Ok(value);
+    }
+}
+
+/// Surface ONE interim line to the human at the terminal — STDERR only,
+/// never stdout (module doc's own discipline). Today the only interim
+/// shape the broker ever sends is a park announcement
+/// (`{"interim":true,"parked":true,"id":...,"timeoutSecs":...}`) — this
+/// only prints for THAT shape; an interim line with a different shape (a
+/// future mode) is still safely consumed by [`read_final_reply`]'s loop
+/// even when this function has nothing to say about it yet.
+fn announce_interim(value: &Value) {
+    if value.get("parked").and_then(Value::as_bool) == Some(true) {
+        let id = value.get("id").and_then(Value::as_str).unwrap_or("?");
+        let timeout_secs = value.get("timeoutSecs").and_then(Value::as_u64).unwrap_or(0);
+        eprintln!(
+            "parked as ask {id} — complete with: aoide secrets approve {id} --totp <code>  (or dismiss {id}); \
+             times out in {timeout_secs}s"
+        );
     }
 }
 
@@ -947,6 +987,60 @@ mod tests {
         drop(broker_thread);
         std::fs::remove_file(&socket_path).ok();
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── P-N2c FIX 1: interim-line framing (`read_final_reply`) ──────────
+
+    #[test]
+    fn read_final_reply_skips_interim_lines_and_returns_the_first_real_one() {
+        let wire = "{\"interim\":true,\"parked\":true,\"id\":\"ab12-1\",\"timeoutSecs\":300}\n\
+                    {\"ok\":true,\"value\":\"the-value\"}\n";
+        let mut reader = std::io::Cursor::new(wire.as_bytes());
+        let reply = read_final_reply(&mut reader).unwrap();
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["value"], "the-value");
+    }
+
+    #[test]
+    fn read_final_reply_with_no_interim_line_behaves_exactly_as_before() {
+        // Old-broker compat: a reply with zero interim lines (every op
+        // besides a parking `resolve`) must round-trip byte-identically.
+        let wire = "{\"ok\":false,\"error\":\"secret not found\"}\n";
+        let mut reader = std::io::Cursor::new(wire.as_bytes());
+        let reply = read_final_reply(&mut reader).unwrap();
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["error"], "secret not found");
+    }
+
+    #[test]
+    fn read_final_reply_skips_multiple_interim_lines() {
+        let wire = "{\"interim\":true,\"parked\":true,\"id\":\"1\",\"timeoutSecs\":1}\n\
+                    {\"interim\":true,\"parked\":true,\"id\":\"1\",\"timeoutSecs\":1}\n\
+                    {\"ok\":false,\"error\":\"timed out\"}\n";
+        let mut reader = std::io::Cursor::new(wire.as_bytes());
+        let reply = read_final_reply(&mut reader).unwrap();
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["error"], "timed out");
+    }
+
+    #[test]
+    fn read_final_reply_on_a_connection_that_closes_after_only_interim_lines_is_a_clear_error() {
+        let wire = "{\"interim\":true,\"parked\":true,\"id\":\"1\",\"timeoutSecs\":1}\n";
+        let mut reader = std::io::Cursor::new(wire.as_bytes());
+        let err = read_final_reply(&mut reader).unwrap_err();
+        assert!(err.contains("closed the connection"), "{err}");
+    }
+
+    #[test]
+    fn resolve_against_a_dead_socket_never_reaches_the_interim_loop_at_all() {
+        // Sanity: a dead-socket connect error still short-circuits before
+        // `read_final_reply` is ever called — same shape as the existing
+        // `resolve_against_a_dead_socket_is_a_connect_error` test, kept
+        // here as a reminder that FIX 1's new loop sits strictly AFTER the
+        // connect step, never wrapping it.
+        let dead = Path::new("/tmp/aoide-secrets-nonexistent-interim-test.sock");
+        let err = resolve(dead, "t", "m", None, None).unwrap_err();
+        assert!(err.contains("connecting"), "{err}");
     }
 
     #[test]

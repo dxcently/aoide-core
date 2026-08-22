@@ -198,10 +198,21 @@ afterward — even on a read error). A piped/redirected stdin
 BYTE-IDENTICAL to before: `client::stdin_is_tty` is false in that case and
 `run_put` falls straight through the old `read_to_string` path.
 
-## The wire (unix socket, JSON-lines, one request per line, one reply)
+## The wire (unix socket, JSON-lines, one request line, zero-or-more interim, one final reply)
+
+**Framing (P-N2c, FIX 1):** write ONE request line; read zero or more
+INTERIM lines (`"interim":true`) followed by exactly one FINAL reply line
+(no `interim` field, or `interim` absent/false). Today the only interim
+line is `resolve`'s park announcement below — a future op/mode extends the
+wire with a new interim shape or a new `op`, never by widening `wait` (see
+below) into something richer.
 
 ```
 -> {"op":"resolve","secret":"<name>","consumer":"<consumer>","totp":"<code>"?,"argv0":"<cmd>"?,"wait":<bool>?}
+<- {"interim":true,"parked":true,"id":"<id>","timeoutSecs":<N>}   (INTERIM,
+                                                      only when this resolve
+                                                      parks — P-N2c FIX 1;
+                                                      never on the fast path)
 <- {"ok":true,"value":"<value>"}                    (granted — immediately,
                                                       or after a park completes)
 <- {"ok":false,"error":"<value-free message>"}      (denied/error/timeout/dismissed)
@@ -236,6 +247,14 @@ BYTE-IDENTICAL to before: `client::stdin_is_tty` is false in that case and
                                                        refusal)
 <- {"ok":false,"error":"unknown pending id `<id>`"}
 ```
+
+`client::resolve` (`secrets exec`/`secrets get`) consumes any interim line
+itself and never surfaces it on stdout — a park prints ONE line to STDERR
+instead: `parked as ask <id> — complete with: aoide secrets approve <id>
+--totp <code>  (or dismiss <id>); times out in <N>s`, so an interactive
+caller learns its own ask id immediately rather than watching a silent hang
+that is indistinguishable from a wedged broker for up to
+`AOIDE_SECRETS_PARK_TIMEOUT` seconds.
 
 `totp`/`argv0`/`wait` are optional on `resolve` (`wait` defaults to `true`
 — see "Parking a TOTP resolve" below); `put` has neither, but gained
@@ -284,15 +303,22 @@ agent  -> aoide secrets exec --as m --secret db-prod -- psql        (no --totp)
              — no value is ever fetched, stored, or held anywhere yet
 
 operator -> aoide secrets pending                          (a SEPARATE connection)
-         <- [{"id":"3","secret":"db-prod","consumer":"m","requestedAt":...}]
-         -> aoide secrets approve 3 --totp 123456           (a THIRD connection)
+         <- [{"id":"3f2a-3","secret":"db-prod","consumer":"m","requestedAt":...}]
+         -> aoide secrets approve 3f2a-3 --totp 123456       (a THIRD connection)
          -> broker: verify_totp_gate("123456") — SAME RFC 6238 verify +
             replay ledger an inline `--totp` code uses
-            -> valid: fetch the value fresh through the backend, send it
-               down the ORIGINAL (first) connection's own channel
+            -> valid: re-run the FULL authorization gate (exists + consumer
+               authorized, P-N2c FIX 2, see below) against the ask's STORED
+               consumer BEFORE fetching — then fetch fresh through the
+               backend, send it down the ORIGINAL (first) connection's own
+               channel
             -> invalid/expired/used: the ask STAYS parked, ledger UNBURNED
                — approve replies {"ok":false,"error":...} to the operator,
                the agent's connection keeps waiting
+            -> valid code but the re-gate now denies (revoked mid-park):
+               BOTH the operator's approve reply and the agent's original
+               resolve reply get the SAME denial; the ask is removed either
+               way, never left dangling
 
        <- the agent's ORIGINAL resolve call finally returns
           {"ok":true,"value":"<value>"} — approve's own reply never
@@ -346,6 +372,54 @@ grant (breaking single-use), and two concurrent `overwrite:false` puts
 could both pass the existence probe before either stored. Both follow the
 SAME poisoned-lock-recovery convention `ParkRegistry`'s lock set. See
 "Invariants held" below for the full three-lock inventory.
+
+**`approve` re-gates authorization at release time (P-N2c, FIX 2).** Before
+this fix, `handle_approve` discarded the ask's stored consumer and
+`fetch_secret_value` loaded policy only far enough to find the
+backend/key — so a `secrets revoke` issued WHILE an ask sat parked did
+nothing to stop that ask's release (up to `AOIDE_SECRETS_PARK_TIMEOUT`
+seconds of revocation-hole), and the same gap would silently have bypassed
+the `remote` gate once a network door exists. The fix (`broker::
+authorize_release`) re-runs the SAME exists + consumers-authorization check
+`resolve` itself uses, against the ask's ORIGINAL stored consumer, AFTER
+the TOTP code validates but BEFORE any value is fetched. **Honesty note:**
+the code is consumed from the replay ledger regardless of which way the
+re-gate comes out — a burned code on a denied release is the deliberate
+trade (a reusable code on a denial path is worse), documented here so it is
+never mistaken for a bug.
+
+**Ids are nonce-prefixed, not a bare counter (P-N2c, FIX 4).** An id has
+the shape `<4-hex-nonce>-<counter>` (`ParkRegistry::new` reads 2 bytes from
+`/dev/urandom` once per broker process start; the counter still increments
+per-ask, unreused, within that process). A bare restart-then-reuse counter
+could let a held id silently approve a DIFFERENT ask after a broker
+restart — the nonce makes a stale id from a previous process simply
+unknown (the same `"unknown pending id"` error a never-existed id gets)
+rather than accidentally routable to a same-numbered ask under a new
+process.
+
+**A registry-wide park cap bounds memory (P-N2c, FIX 3b),** default 32,
+`AOIDE_SECRETS_PARK_CAP` env override — `park::park_cap()`, same
+tolerant-fallback shape as `park_timeout()`. Beyond the cap, a codeless
+`resolve` gets the immediate `wait:false`-shaped refusal (never a park),
+naming the cap and its env knob. `ParkRegistry::park_if_room` checks
+`len() >= cap` and inserts under the SAME lock acquisition — never two
+separate lock calls — so two racing threads can never jointly overrun the
+cap by one (the same TOCTOU discipline `put_lock`/`replay_ledger_lock`
+already hold).
+
+**The broker survives thread-creation failure and fd exhaustion (P-N2c,
+FIX 3a/3c) instead of dying permanently.** `serve`'s accept loop used to
+call `std::thread::spawn`, which PANICS if the OS refuses to create a
+thread — that panic unwinds `serve()` itself, killing the broker process;
+under a systemd unit with `StartLimitBurst`, enough of these in a row marks
+the unit permanently failed with no further restart attempts, a crash that
+never repairs itself. The loop now uses the fallible `std::thread::Builder
+::new().spawn(...)`: on `Err`, it `eprintln!`s and drops that ONE
+connection, leaving the broker itself untouched. The accept loop's `Err`
+arm (typically `EMFILE`, too many open files) also gained a ~250ms sleep
+before retrying — without it, a broker at the fd ceiling busy-spins the
+accept loop at 100% CPU instead of waiting out the transient exhaustion.
 
 ## The automation gate (`secrets automate`, P-N1)
 
@@ -724,17 +798,31 @@ Pure logic (P-V1, unchanged):
   added P-N1) and `valid_secret_name`. `totp_required(policy, consumer)`
   (P-N1) is the ONE decision point behind "is a TOTP code required for
   this resolve" — see "The automation gate" below.
-- `park` (P-N2) — `ParkRegistry` (the in-memory parked-ask registry,
-  `Mutex<BTreeMap<id, ParkedAsk>>` + an `AtomicU64` monotonic id counter,
-  never reused within one broker process's lifetime), `park_timeout`
+- `park` (P-N2, id scheme + cap P-N2c) — `ParkRegistry` (the in-memory
+  parked-ask registry, `Mutex<BTreeMap<id, ParkedAsk>>` + an `AtomicU64`
+  monotonic per-process counter, never reused within one broker process's
+  lifetime, PLUS a `nonce: String` — 2 random bytes from `/dev/urandom`
+  read once in `ParkRegistry::new`), `park_timeout`
   (`AOIDE_SECRETS_PARK_TIMEOUT` env override, default 300s — no
-  config-file knob exists in the secrets home for this, env-only), and
-  `wait_for_outcome` (the completion/timeout race, `mpsc::Receiver::
-  recv_timeout` plus a re-check against the registry to close the race
-  where a timeout and a late approval land at nearly the same instant —
-  see its own module doc). Never stores or touches a value — a `ParkedAsk`
-  carries only `secret`/`consumer`/`requestedAt` and a private send-once
-  channel.
+  config-file knob exists in the secrets home for this, env-only),
+  `park_cap`/`PARK_CAP_ENV`/`DEFAULT_PARK_CAP` (P-N2c FIX 3b:
+  `AOIDE_SECRETS_PARK_CAP` env override, default 32, same tolerant-fallback
+  shape as `park_timeout`), and `wait_for_outcome` (the completion/timeout
+  race, `mpsc::Receiver::recv_timeout` plus a re-check against the registry
+  to close the race where a timeout and a late approval land at nearly the
+  same instant — see its own module doc, softened P-N2c to state the
+  backend-shell-out assumption rather than claim it "provably" holds).
+  Never stores or touches a value — a `ParkedAsk` carries only
+  `secret`/`consumer`/`requestedAt` and a private send-once channel.
+  `format_id`/`parse_id` (P-N2c FIX 4) are the ONE place an id is built or
+  read — every public method (`park`/`park_if_room`/`peek`/`take`/
+  `remove_only`/`list`) routes an id through them, so `<nonce>-<counter>`
+  is never assembled or parsed twice. `park` still exists (delegates to
+  `park_if_room(..., usize::MAX)`, which cannot refuse); `park_if_room` is
+  the cap-aware entry point `handle_resolve` actually calls, checking
+  `len() >= cap` and inserting under the SAME lock acquisition (no
+  separate check-then-insert) so two racing parks can never jointly
+  overrun the cap by one.
 
 Daemon/socket/CLI (P-V2, extended P-V3):
 
@@ -809,15 +897,26 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   file to `0660`; see "Deployment" above) followed by the accept loop
   (`aoide secrets serve`'s body — **thread-per-connection as of P-N2**,
   changed from a single-threaded serial loop so a parked connection never
-  stalls anyone queued behind it, see "Parking a TOTP resolve" above), the
-  policy gate (`resolve_gate`, plus `verify_totp_gate` for a `requireTotp`
+  stalls anyone queued behind it, see "Parking a TOTP resolve" above; P-N2c
+  FIX 3a/3c hardened it further — `std::thread::Builder::new().spawn(...)`
+  instead of the panic-on-failure `std::thread::spawn`, so a refused thread
+  drops only that ONE connection (`eprintln!` + continue) rather than
+  unwinding `serve()` and killing the broker process; the `Err` arm also
+  gained a ~250ms sleep before retrying, so fd exhaustion (`EMFILE`) backs
+  off instead of busy-spinning the accept loop at 100% CPU), the policy
+  gate (`resolve_gate`, plus `verify_totp_gate` for a `requireTotp`
   policy — P-V3; P-N2 changed `resolve_gate`'s return into a `GateOutcome`
   enum — `Granted`/`Denied`/`NeedsTotp` — so its callers can tell "denied"
   and "park candidate" apart, where the old signature only had a
   `Result`), and BOTH audit writes (the broker's own `audit.log` in
   secrets home + the mirrored aoide log via `EventClass::Secret`) — see
   its module doc for the full wire contract and the "broker-side only"
-  audit discipline. `put_gate` (P-V4c, extended P-67) returns a
+  audit discipline. `write_json_line` (P-N2c) is the ONE place this crate
+  formats a wire line — shared by `handle_conn`'s final-reply write and
+  `handle_resolve`'s new interim-line write, so both stay byte-for-byte
+  the same shape; `handle_line` now takes a trailing `interim_out: &mut
+  impl Write` that only `handle_resolve` ever writes through (module doc).
+  `put_gate` (P-V4c, extended P-67) returns a
   `PutOutcome` (`Granted { replaced }` / `DeniedExists` / `Denied(reason)`)
   rather than a plain `Result` — `handle_put` maps that onto the wire's
   `replaced`/`exists` fields, and `audit_put` carries the same `replaced`
@@ -827,10 +926,24 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   three new op handlers — `handle_approve` peeks the ask (read-only) BEFORE
   validating a code, so an invalid code never removes it, and only `take`s
   it once a code has already validated and been consumed by the replay
-  ledger; `audit_park`/`audit_approve`/`audit_dismiss` are the matching
+  ledger; P-N2c FIX 2 added `authorize_release` (re-runs exists +
+  consumers-authorization against the ask's STORED consumer, AFTER the code
+  validates/burns but BEFORE any fetch — a revoked-mid-park consumer denies
+  both the approver's reply and the original parked caller's reply, and the
+  ask is removed either way) — `handle_approve` calls it right after
+  `take`. `audit_park`/`audit_approve`/`audit_dismiss` are the matching
   name-only audit functions, same two-destination shape as `audit_resolve`/
-  `audit_put`.
-- `client` — `resolve` (one round trip over the socket), `parse_exec_args`
+  `audit_put`; the dismissed-caller message no longer claims "by an
+  operator" (P-N2c honesty fix — any group member reaching the socket can
+  dismiss).
+- `client` — `resolve` (one round trip over the socket, now via
+  `read_final_reply` — P-N2c FIX 1: loops reading lines, consuming and
+  `announce_interim`-ing any `"interim":true` line, returning the first
+  non-interim line as the reply; `announce_interim` is what prints the
+  `parked as ask <id> — complete with: ...` line to STDERR, never stdout,
+  and only for the `"parked":true` interim shape — a future interim shape
+  a caller doesn't recognize is silently consumed, never surfaced or
+  fatal), `parse_exec_args`
   (pure `Invocation` parsing), `run_exec` (the full `secrets exec` flow: the
   entry point for `aoide-cli`'s `special` hook); `put` (P-V4c, one `put`
   round trip over the socket, mirrors `resolve`'s shape; P-67: takes an

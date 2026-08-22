@@ -267,6 +267,78 @@
   own justification independent of this one wire escape hatch — don't
   wire one up "since the field already exists" without a caller that
   actually needs it from a terminal.
+- **The wire's framing contract is "one request line -> zero or more
+  INTERIM lines -> exactly one FINAL reply line" (P-N2c, FIX 1) — not
+  "one request, one reply."** An interim line is any line whose object
+  carries `"interim":true`; `broker::write_json_line` is the ONE place
+  this crate formats a wire line, shared by `handle_conn`'s final-reply
+  write and `handle_resolve`'s interim-line write, so a change to the line
+  shape can't drift between the two call sites. `client::read_final_reply`
+  is the ONE place a reply is read back — it loops, consuming and
+  surfacing (`announce_interim`) any interim line, returning only the
+  first non-interim line. Don't add a second ad hoc `read_line`+parse
+  anywhere in `client.rs`; a new caller of the wire routes through
+  `read_final_reply` even if it never expects an interim line today. A
+  future mode/op extends the wire with a NEW interim shape or op, never by
+  widening `resolve`'s `wait` field (still a plain bool) into something
+  richer — `wait` is closed on purpose (invariant below, unchanged from
+  P-N2).
+- **`approve` MUST re-run the full authorization gate against the ask's
+  STORED consumer, immediately before fetching — never trust a code alone
+  (P-N2c, FIX 2, hard constraint).** Before this fix, `handle_approve`
+  validated only the TOTP code and then fetched by backend/key, so a
+  `secrets revoke`/policy edit issued WHILE an ask sat parked did nothing
+  to stop that ask's eventual release — and the same gap would have
+  silently bypassed the `remote` gate (invariant above) the day a network
+  door exists. `broker::authorize_release` re-runs the SAME exists +
+  consumers-authorization check `resolve_gate` itself uses; `handle_approve`
+  calls it AFTER the code validates (so it is consumed from the replay
+  ledger either way — deliberate, see the doc comment) and BEFORE any
+  value is fetched. A revoked/removed consumer at that point denies BOTH
+  the approver's own reply and the original parked caller's `resolve`
+  reply with the identical error, and the ask is removed from the registry
+  either way. Don't move a future release-time check to run only against
+  the ask's ORIGINAL policy snapshot "since that's what was approved" — the
+  whole point is to re-read `policy.json` fresh at release time, the same
+  way `resolve`'s own fast path always has.
+- **Park ids are nonce-prefixed (`<4-hex-nonce>-<counter>`), never a bare
+  counter across a broker restart (P-N2c, FIX 4).** `park::ParkRegistry`
+  reads 2 random bytes from `/dev/urandom` once per process start
+  (`park::random_nonce`) and prefixes every id it mints that process with
+  it; the counter still increments per-ask, unreused, within that process.
+  `park::format_id`/`park::parse_id` are the ONE place an id is built or
+  parsed — every public `ParkRegistry` method routes through them. This
+  exists so a held id from a PREVIOUS broker process can never silently
+  address a DIFFERENT ask after a restart (the counter alone restarts at
+  1); an id whose nonce doesn't match the CURRENT process is simply
+  unknown, the same `"unknown pending id"` error a never-existed id gets.
+  Don't reach for `.parse::<u64>()` on a raw id anywhere outside `park.rs`;
+  every caller (broker, client, tests) treats an id as an opaque string.
+- **A registry-wide park cap bounds memory (P-N2c, FIX 3b),** default 32,
+  `AOIDE_SECRETS_PARK_CAP` env override — `park::park_cap()`/
+  `park::PARK_CAP_ENV`/`park::DEFAULT_PARK_CAP`, same tolerant-fallback
+  shape as `park_timeout()`. `ParkRegistry::park_if_room` is the cap-aware
+  entry point (`park` still exists, delegating to `park_if_room(...,
+  usize::MAX)`, which cannot refuse) — it checks `len() >= cap` and inserts
+  under the SAME lock acquisition, never two separate lock calls, so two
+  racing parks can never jointly overrun the cap by one (the same TOCTOU
+  discipline the `put_lock`/`replay_ledger_lock` invariant above already
+  holds). Beyond the cap, `handle_resolve` returns the SAME immediate
+  refusal `wait:false` produces, naming the cap and its env knob. Don't
+  make the cap check a separate `len()` call followed by a separate
+  `insert` — that reintroduces exactly the TOCTOU this fix exists to close.
+- **A connection thread that fails to spawn must drop ONE connection,
+  never crash the broker (P-N2c, FIX 3a/3c, hard constraint).** `serve`'s
+  accept loop uses the FALLIBLE `std::thread::Builder::new().spawn(...)`,
+  never the panicking `std::thread::spawn` — a refused OS thread creation
+  (fd/thread-table exhaustion) `eprintln!`s and continues the loop, rather
+  than unwinding `serve()` and killing the whole broker process (which,
+  under a systemd unit with `StartLimitBurst`, permanently fails the unit
+  with no further restart — the exact crash-to-permanent-outage shape this
+  fix exists to close). The accept loop's `Err` arm (typically `EMFILE`)
+  also sleeps ~250ms before retrying rather than busy-spinning. Don't
+  revert to `std::thread::spawn` "since it's simpler" — the fallibility is
+  the entire point.
 - **`home::secrets_home`/`socket::socket_path` are THE resolution — nothing
   else re-derives a secrets-home or socket path.** `broker::serve`/
   `client::resolve`/`client::run_exec` all take the resolved `&Path` as a
@@ -464,6 +536,33 @@
   reads `secrets pending`/calls `secrets approve`/`secrets dismiss` the
   SAME way an operator's terminal does — this phase is explicitly the
   substrate for that, not a preview of it; no UI code lives in this crate.
+- **P-N2c (this commit) — four judge-pass fixes on the P-N2 park/approve/
+  dismiss lifecycle, all landed together:** the interim-line framing +
+  STDERR park announcement (FIX 1, invariant above), `approve`'s release-
+  time re-gate against the ask's stored consumer (FIX 2, invariant above,
+  hard constraint), the fallible `Builder::spawn` + accept-loop backoff +
+  registry-wide park cap (FIX 3a/3b/3c, invariants above), and
+  nonce-prefixed ids (FIX 4, invariant above). Two small honesty fixes rode
+  the same commit: the dismissed-caller message no longer claims "by an
+  operator" (any group member reaching the socket can dismiss, not only an
+  operator), and `park::wait_for_outcome`'s doc comment no longer claims
+  its lost-race `recv()` is "provably prompt" — a hung backend shell-out
+  breaks that promise (see the KNOWN GAP note immediately below), so the
+  comment now states the assumption instead of overclaiming it.
+
+**KNOWN GAP, deferred, not fixed by P-N2c:** backend `get`/`set` shell-outs
+(`backend::fetch_value`/`store_value`) have NO timeout — a wedged backend
+command blocks its calling thread indefinitely. On the `put` path this
+means `broker::put_lock` (the invariant above) is held across that
+unbounded shell-out, so a single hung `set` template serializes every OTHER
+`put` on this broker behind it for as long as the hang lasts (the
+`resolve`/`approve` path has no equivalent lock held across its own
+backend call, so a hung `get` only blocks that one connection's thread).
+This is a documented, deferred gap, not a P-N2c fix — a future phase adding
+a shell-out timeout (or narrowing `put_lock`'s critical section to exclude
+the backend call, which would need its own TOCTOU analysis) closes it; a
+new `put`-path change must not casually widen `put_lock`'s critical
+section further without accounting for this already-known cost.
 
 ## Docs update required in the same commit
 
