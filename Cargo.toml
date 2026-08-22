@@ -3,7 +3,7 @@
 # lives at `crates/cli`, single-charter crates under `crates/*`.
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/storage", "crates/conduct", "crates/client", "crates/server", "crates/song", "crates/conductor", "crates/test-support", "crates/cli", "crates/upkeep", "crates/screen", "crates/lyra"]
+members = ["crates/protocol", "crates/storage", "crates/conduct", "crates/client", "crates/server", "crates/song", "crates/conductor", "crates/test-support", "crates/cli", "crates/upkeep", "crates/screen", "crates/lyra", "crates/vault"]
 
 # ONE version source for the whole workspace (the monorepo standard): every
 # crate inherits via `{ workspace = true }` — no per-manifest version repeats.
@@ -63,6 +63,13 @@ aoide-screen = { path = "crates/screen" }
 # assembled from the SAME domain crates `aoide-cli` already depends on
 # (`aoide-song`, `aoide-conduct`, `aoide-screen`) — nothing here is a copy.
 aoide-lyra = { path = "crates/lyra" }
+# `aoide-vault` — Workstream VAULT's pure-logic slice (P-V1): TOTP, policy
+# types, replay ledger, otpauth:// URI construction. NOTHING depends on
+# this crate yet — `aoide-cli` does NOT gain the dependency until P-V2
+# wires the broker daemon + `vault exec`/`vault serve` around this logic;
+# it is a workspace member on its own, not yet part of any app crate's
+# bundle. Do not add it to `cli`'s dependencies as part of a P-V1 change.
+aoide-vault = { path = "crates/vault" }
 
 [profile.release]
 opt-level = "s"

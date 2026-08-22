@@ -173,6 +173,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aoide-vault"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "approx"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
