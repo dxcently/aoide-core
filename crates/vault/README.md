@@ -204,8 +204,10 @@ sudo -u aoide-vault env \
   aoide vault serve
 ```
 
-A minimal systemd unit for the above (the exact shape the nix module also
-generates, spelled out by hand for a non-nix box):
+A minimal systemd unit for the above (same topology as the nix module's
+generated unit, trimmed for a non-nix box — the module additionally sets
+`StateDirectory=` and hardening directives like `NoNewPrivileges`/
+`ProtectSystem`; the `install -d` step above covers the state dir here):
 
 ```ini
 # /etc/systemd/system/aoide-vault-serve.service

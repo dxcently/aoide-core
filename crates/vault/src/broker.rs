@@ -57,12 +57,17 @@
 //! the backend fetch and the `{"ok":true,"value":...}` line write.
 //!
 //! **The socket is chmod'd to `0660` immediately after bind** (P-V4,
-//! deployment). `UnixListener::bind` alone honors the process umask
-//! (typically `0755`), which leaves the socket file WORLD-connectable —
+//! deployment). `UnixListener::bind` alone honors the process umask, so
+//! the socket's mode is whatever the ambient umask happens to yield —
+//! under the common `022` that's `0755`, which (since `connect(2)` on an
+//! `AF_UNIX` socket requires WRITE permission) is actually unreachable for
+//! the intended access GROUP, while under a loose umask (`002`/`000`, a
+//! hand-run non-nix box) it drifts toward group- or world-connectable —
 //! and the wire's `consumer` field is SELF-ASSERTED (this module's own
-//! doc, above), so on a multi-user box a world-connectable socket means
-//! any local user, not just the vault's intended group, could resolve any
-//! standing-grant secret. `0660` (owner + group rw, no other bits) is the
+//! doc, above), so an over-open socket means any local user could resolve
+//! any standing-grant secret. The explicit chmod replaces that
+//! umask-dependent lottery with the one deliberate mode either way.
+//! `0660` (owner + group rw, no other bits) is the
 //! DESIGN, not a tightened-as-far-as-possible default: the socket is
 //! deliberately GROUP-connectable, not owner-only, because the whole point
 //! is that ordinary operator-uid agents (members of the access group) can
