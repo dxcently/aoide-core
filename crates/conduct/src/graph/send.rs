@@ -799,6 +799,22 @@ fn peer_session_label(peer: &str, session_id: &str, petname: Option<&str>, role:
     aoide_storage::display::session_label(&rec, peer, role)
 }
 
+/// Which of `--submit`/`--yes` the caller actually passed on THIS
+/// invocation — both are accepted-but-unused for a `--to` remote send (see
+/// [`deliver_remote`]'s doc), so this is purely for surfacing that fact back
+/// to the caller, never for a gating decision. Order matches flag
+/// declaration order in `commands/graph.rs`.
+fn ignored_remote_flags(inv: &Invocation) -> Vec<&'static str> {
+    let mut flags = Vec::new();
+    if inv.flag_present("submit") {
+        flags.push("submit");
+    }
+    if inv.flag_present("yes") {
+        flags.push("yes");
+    }
+    flags
+}
+
 /// Deliver `text` to ONE remote session on `peer`, resolved from `query`
 /// against `peer`'s CACHED graph (`state/peer-cache/<peer>.json`) — a live
 /// pull is deliberately NOT performed here (the plan's own call: the cache
@@ -817,8 +833,12 @@ fn peer_session_label(peer: &str, session_id: &str, petname: Option<&str>, role:
 /// lives: it decides deliver-now vs. hold-pending off ITS OWN peer-trust
 /// config (`should_deliver_now`/autogate — CONTRACTS.md §6), unconditionally
 /// forcing `submit=true` on its side regardless of what this caller's
-/// `--submit` flag says. So `--submit`/`--yes` are silently accepted but
-/// unused here — there is nothing on this side left for them to gate.
+/// `--submit` flag says. So `--submit`/`--yes` are ACCEPTED but UNUSED
+/// here — there is nothing on this side left for them to gate — and NOT
+/// silently: [`ignored_remote_flags`] collects whichever of them was
+/// actually passed and both delivery-attempt arms below fold a note into
+/// the returned `Outcome` (`message` + `data.ignoredFlags`) so a caller who
+/// habitually passes them sees they did nothing, rather than guessing.
 ///
 /// No title auto-rename, no local provenance prefix: both are operations on
 /// OUR OWN `sessions.json` graph node — a remote peer's graph is a
@@ -828,6 +848,21 @@ fn peer_session_label(peer: &str, session_id: &str, petname: Option<&str>, role:
 fn deliver_remote(inv: &Invocation, peer: &aoide_storage::peer_store::Peer, query: &str) -> Outcome {
     let cmd = "graph.send";
     let text = inv.args.join(" ");
+    // `--submit`/`--yes` are accepted-but-unused for a remote send (see this
+    // function's own doc) — a caller who habitually passes them gets no
+    // hint they did nothing unless the Outcome says so. Collected once,
+    // folded into BOTH arms of the delivery attempt below (success and
+    // failure): the flags were equally inert either way, not just on a
+    // success.
+    let ignored = ignored_remote_flags(inv);
+    let ignored_note = if ignored.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " (--{} ignored — gating a remote send is the receiving peer's job)",
+            ignored.join(", --")
+        )
+    };
 
     let cache = aoide_storage::peer_store::load_peer_cache(&peer.name);
     let Some(graph) = cache.and_then(|c| c.graph) else {
@@ -855,7 +890,7 @@ fn deliver_remote(inv: &Invocation, peer: &aoide_storage::peer_store::Peer, quer
                 Ok(response) => {
                     let out = Outcome::ok(
                         cmd,
-                        format!("delivered to `{remote_id}` on peer `{}`", peer.name),
+                        format!("delivered to `{remote_id}` on peer `{}`{ignored_note}", peer.name),
                     )
                     .changed(vec![format!("sent to {}/{remote_id}", peer.name)])
                     .with_data(json!({
@@ -863,6 +898,7 @@ fn deliver_remote(inv: &Invocation, peer: &aoide_storage::peer_store::Peer, quer
                         "remoteSessionId": remote_id,
                         "delivered": true,
                         "response": response,
+                        "ignoredFlags": ignored,
                     }));
                     audit_send(inv, "delivered", &out.message, &text);
                     out
@@ -870,10 +906,11 @@ fn deliver_remote(inv: &Invocation, peer: &aoide_storage::peer_store::Peer, quer
                 Err(e) => {
                     let out = Outcome::error(
                         cmd,
-                        format!("delivering to `{remote_id}` on peer `{}`: {e}", peer.name),
+                        format!("delivering to `{remote_id}` on peer `{}`: {e}{ignored_note}", peer.name),
                     )
                     .with_data(json!({
                         "reason": "peer-send-failed", "peer": peer.name, "remoteSessionId": remote_id,
+                        "ignoredFlags": ignored,
                     }));
                     audit_send(inv, "error", &out.message, &text);
                     out
@@ -3157,6 +3194,53 @@ mod tests {
     }
 
     #[test]
+    fn to_unknown_target_not_found_with_no_hint_when_it_matches_no_known_peer_either() {
+        // The plain branch of `Resolution::NotFound`: `target` names neither
+        // a local session nor a known peer at all (no registered peers, and
+        // not slash-shaped), so the "did you mean `peer/<rest>`?" hint must
+        // NOT fire — a bare, unrecognized token gets the plain message.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_AUDIT_LOG"]);
+
+        let root = unique_stage("to-plain-notfound");
+        let stage = root.join("stage");
+        let state = root.join("state");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        // No peers registered at all, no local sessions either.
+
+        let out = session_send(&send_invocation(&["hi"], &[("to", "ghost-target"), ("yes", "true")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
+        assert_eq!(out.data.as_ref().unwrap()["reason"], "not-found");
+        assert_eq!(out.message, "no session matches `ghost-target`", "msg: {}", out.message);
+        assert!(!out.message.contains("did you mean"), "msg: {}", out.message);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ignored_remote_flags_table() {
+        // Pure — the flags a caller passed on a `--to` invocation, in
+        // declaration order, with neither/one/both present.
+        assert_eq!(ignored_remote_flags(&send_invocation(&["hi"], &[])), Vec::<&str>::new());
+        assert_eq!(
+            ignored_remote_flags(&send_invocation(&["hi"], &[("submit", "true")])),
+            vec!["submit"]
+        );
+        assert_eq!(
+            ignored_remote_flags(&send_invocation(&["hi"], &[("yes", "true")])),
+            vec!["yes"]
+        );
+        assert_eq!(
+            ignored_remote_flags(&send_invocation(&["hi"], &[("submit", "true"), ("yes", "true")])),
+            vec!["submit", "yes"]
+        );
+    }
+
+    #[test]
     fn to_remote_with_no_cache_points_at_peer_pull() {
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_AUDIT_LOG"]);
@@ -3212,9 +3296,12 @@ mod tests {
         ))
         .unwrap();
 
+        // `--submit`/`--yes` both passed too — accepted-but-unused for a
+        // remote send; the Outcome must say so rather than leaving a caller
+        // who habitually passes them guessing (review nit).
         let out = session_send(&send_invocation(
             &["hi", "there"],
-            &[("to", "yomi-strix/misty-comet"), ("yes", "true")],
+            &[("to", "yomi-strix/misty-comet"), ("yes", "true"), ("submit", "true")],
         ));
         assert_eq!(
             out.status,
@@ -3224,6 +3311,14 @@ mod tests {
         );
         assert_eq!(out.data.as_ref().unwrap()["reason"], "peer-send-failed");
         assert_eq!(out.data.as_ref().unwrap()["remoteSessionId"], "sess-remote-1");
+        assert_eq!(
+            out.data.as_ref().unwrap()["ignoredFlags"],
+            json!(["submit", "yes"]),
+        );
+        assert!(
+            out.message.contains("--submit, --yes ignored"),
+            "msg: {}", out.message
+        );
 
         let log = std::fs::read_to_string(root.join("log")).unwrap_or_default();
         assert!(log.contains("graph.send"), "audit line written even on a failed remote delivery: {log}");
