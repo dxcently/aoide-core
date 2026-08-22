@@ -287,6 +287,18 @@ fn no_dispatch(_: &Invocation) -> Outcome {
     Outcome::usage("conductor", "dispatch not wired for this App")
 }
 
+/// The bracketed status tag shared by the global status line
+/// ([`App::status_message`]) and the ROSTER pane's fetch status
+/// ([`App::roster_status`]) — one mapping, not two (P-C4 review nit).
+fn status_tag(status: Status) -> &'static str {
+    match status {
+        Status::Ok => "ok",
+        Status::Error => "err",
+        Status::Usage => "usage",
+        Status::NotImplemented => "n/i",
+    }
+}
+
 impl App {
     fn empty() -> Self {
         App {
@@ -650,9 +662,20 @@ impl App {
     }
 
     /// A one-line fetch status for the pane header: probing, freshly
-    /// fetched, or never fetched yet.
+    /// fetched, never fetched yet, or — when `who` itself came back
+    /// non-`Ok` — that error, in the same `[tag] command: message` shape
+    /// [`App::status_message`] uses for the global status line (house
+    /// style; P-C4 review nit). Without this branch a failed fetch would
+    /// render as a bare "fetched Ns ago" over an empty roster, silently
+    /// indistinguishable from "this box and every peer really have zero
+    /// sessions."
     pub fn roster_status(&self) -> String {
         let probing = self.roster_rx.is_some();
+        if let Some(o) = self.roster.outcome.as_ref().filter(|o| o.status != Status::Ok) {
+            let first = o.message.lines().next().unwrap_or("");
+            let suffix = if probing { " · probing…" } else { "" };
+            return format!("[{}] {}: {first}{suffix}", status_tag(o.status), o.command);
+        }
         match (self.roster.fetched_at, probing) {
             (None, true) => "probing…".to_string(),
             (None, false) => "not yet fetched — press r".to_string(),
@@ -826,15 +849,9 @@ impl App {
     pub fn status_message(&self) -> String {
         match &self.last_outcome {
             Some(o) => {
-                let tag = match o.status {
-                    Status::Ok => "ok",
-                    Status::Error => "err",
-                    Status::Usage => "usage",
-                    Status::NotImplemented => "n/i",
-                };
                 // Collapse the message to its first line for the one-row bar.
                 let first = o.message.lines().next().unwrap_or("");
-                format!("[{tag}] {}: {first}", o.command)
+                format!("[{}] {}: {first}", status_tag(o.status), o.command)
             }
             None => "ready".to_string(),
         }
@@ -1764,5 +1781,22 @@ mod tests {
         assert_eq!(nodes[1].fetched_at.as_deref(), Some("2026-08-20T23:00:00Z"));
 
         assert!(app.roster_status().starts_with("fetched "), "{}", app.roster_status());
+    }
+
+    #[test]
+    fn roster_status_surfaces_a_non_ok_outcome_instead_of_hiding_it() {
+        let mut app = App::for_test(Vec::new(), Vec::new(), Vec::new());
+        app.roster.outcome = Some(Outcome::error("who", "stage read failed: permission denied"));
+        app.roster.fetched_at = Some(Instant::now());
+
+        let status = app.roster_status();
+        assert!(
+            status.starts_with("[err] who: stage read failed"),
+            "the error message surfaces in the pane, not a bare age: {status}"
+        );
+        assert!(
+            app.roster_nodes().is_empty(),
+            "an error Outcome carries no `data`, so no rows — the status line is the only signal"
+        );
     }
 }

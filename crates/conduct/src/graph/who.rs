@@ -294,7 +294,14 @@ fn apply_filter(filter: &str, host: &str, nodes: Vec<NodeView>, locals: &[Sessio
     }
 }
 
-fn glyph(presence: &str) -> &'static str {
+/// Node-level presence glyph — `online`/`unreachable`/`never-pulled` (this
+/// module's doc, "Presence model"). Widened to `pub` (re-exported at
+/// `graph.rs` alongside [`who`]) for a second consumer: the conductor's
+/// ROSTER panel (messaging/presence plan, P-C4) paints the exact same three
+/// glyphs over this same `presence` string and must not redraw its own copy
+/// of this map — reuse it instead of forking it (crate `AGENTS.md`'s "no
+/// cross-crate copying").
+pub fn glyph(presence: &str) -> &'static str {
     match presence {
         "online" => "●",
         "unreachable" => "◐",

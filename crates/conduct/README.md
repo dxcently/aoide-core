@@ -29,7 +29,10 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   presence over this box's own sessions plus every registered peer,
   probed in parallel on each invocation (messaging workstream C2). A
   PROJECTION, never a store — it never writes `state/peer-cache/`;
-  `build_graph`'s own fold (`doc.rs`) owns that file.
+  `build_graph`'s own fold (`doc.rs`) owns that file. `glyph` (the
+  online/unreachable/never-pulled node-presence map) is `pub`, re-exported
+  at `graph::glyph` — the conductor's ROSTER panel (P-C4) is its second
+  consumer, reusing it rather than redrawing its own copy.
 
 ## What it consumes
 

@@ -1,4 +1,4 @@
-//! The ratatui view layer — top-level layout, the five panel widgets, the
+//! The ratatui view layer — top-level layout, the six panel widgets, the
 //! status bar, and two overlays: help and the headless-session log tail.
 //!
 //! This replaces the hand-rolled differential renderer + the `Vec<String>`
@@ -10,11 +10,15 @@
 //! SGR. Panels stay pure over `&App`, so a `TestBackend` can render any of them
 //! headless and assert on the buffer (see the tests below).
 //!
-//! Two of the five panels are the expansion this port carries: `DAG` (the
+//! Two of the six panels are the expansion this port carries: `DAG` (the
 //! visual graph, drawn by [`crate::graphview`]) and `SESSIONS` (the
 //! terminal roster, now split into a scrolling list + a live detail card with a
 //! focus affordance). The other three — PROJECTS, LOG, STATUS — are ports of the
-//! originals.
+//! originals. `ROSTER` (messaging/presence plan, P-C4) is a later, distinct
+//! addition — read-only presence over this box plus every registered peer,
+//! sourced from a throttled, backgrounded `who` dispatch (`app`'s "ROSTER"
+//! section covers the threading; this file only paints what `App::roster_nodes`
+//! hands it).
 
 use crate::app::{App, DagRow, Panel};
 use crate::graphview;
@@ -620,13 +624,14 @@ fn palette_summary<'a>(app: &App) -> Line<'a> {
 // Read-only (messaging/presence plan, P-C4): rows come straight from the
 // cached `who --json` `Outcome` (`App::roster_nodes` — a reshape, never a
 // re-derivation), local box first then peers in `who`'s own order. Node
-// glyphs (`●`/`◐`/`○`) MATCH `who`'s own Unicode-roster vocabulary
-// (`conduct/src/graph/who.rs`'s private `glyph` helper — independently
-// drawn here since that helper isn't public); session glyphs are the
-// conductor's existing musical-note set
-// (`theme::state_glyph`) applied to `who`'s canonical `state` string —
-// the SAME mapping the SESSIONS panel paints, since `who` classifies
-// sessions off the identical vocabulary.
+// glyphs (`●`/`◐`/`○`) call `aoide_conduct::graph::glyph` DIRECTLY — `who`
+// widened it to `pub` for exactly this (P-C4 review nits; no forked copy
+// here); session glyphs are the conductor's existing musical-note set
+// (`theme::state_glyph`) applied to `who`'s canonical `state` string — the
+// SAME mapping the SESSIONS panel paints, since `who` classifies sessions
+// off the identical vocabulary. Staleness wording ("last seen") is also
+// `who`'s own — `render_nodes` in `who.rs` says it first; this pane matches
+// rather than inventing "as of".
 
 fn draw_roster(f: &mut Frame, area: Rect, app: &App) {
     let nodes = app.roster_nodes();
@@ -659,10 +664,10 @@ fn draw_roster(f: &mut Frame, area: Rect, app: &App) {
     let pal = &app.palette;
     let mut lines: Vec<Line> = Vec::new();
     for n in &nodes {
-        let glyph = roster_node_glyph(&n.presence);
+        let glyph = graph::glyph(&n.presence);
         let head = match n.presence.as_str() {
             "unreachable" => format!(
-                "{glyph} {} — unreachable (as of {})",
+                "{glyph} {} — unreachable (last seen {})",
                 n.name,
                 n.fetched_at.as_deref().unwrap_or("unknown")
             ),
@@ -690,17 +695,6 @@ fn draw_roster(f: &mut Frame, area: Rect, app: &App) {
         }
     }
     f.render_widget(Paragraph::new(lines), parts[2]);
-}
-
-/// Node-level presence glyph — matches `who`'s own Unicode-roster
-/// vocabulary (`conduct/src/graph/who.rs`'s private `glyph` helper).
-fn roster_node_glyph(presence: &str) -> &'static str {
-    match presence {
-        "online" => "●",
-        "unreachable" => "◐",
-        "never-pulled" => "○",
-        _ => "?",
-    }
 }
 
 // ── Log-tail overlay ────────────────────────────────────────────────────────
@@ -1285,7 +1279,7 @@ mod tests {
             "local node: online glyph + (this host): {out}"
         );
         assert!(
-            out.contains("◐ yomi-strix — unreachable (as of 2026-08-20T23:00:00Z)"),
+            out.contains("◐ yomi-strix — unreachable (last seen 2026-08-20T23:00:00Z)"),
             "peer node: unreachable glyph + staleness stamp: {out}"
         );
         assert!(
