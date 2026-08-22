@@ -811,7 +811,18 @@ fn draw_log_tail(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
-    let mut lines: Vec<Line> = vec![Line::from(tail.path.display().to_string()).style(theme::dim())];
+    // The path line reuses `theme::shorten_cwd`'s "last two components" rule
+    // (the same one the SESSIONS panel's cwd row already applies) rather than
+    // painting the raw absolute path unbounded: `Paragraph` has no wrap here,
+    // so an unshortened path longer than the overlay's inner width is
+    // silently clipped by the terminal buffer with no ellipsis — on a deep
+    // `$TMPDIR`/state-dir tree that clip can land BEFORE the `.log`
+    // extension, so the line stops looking like a log path at all. Shortened
+    // display is deterministic (bounded by component count, not by whatever
+    // ancestor directories the path happens to have) and still names the
+    // exact file — only the invariant this overlay actually promises.
+    let shown_path = theme::shorten_cwd(&tail.path.display().to_string());
+    let mut lines: Vec<Line> = vec![Line::from(shown_path).style(theme::dim())];
     if tail.lines.is_empty() {
         lines.push(Line::from("(none yet)").style(theme::dim()));
     } else {
@@ -1228,7 +1239,15 @@ mod tests {
     /// from here. The `lines` field is public, so once opened the fixture
     /// overwrites it with canned content.
     fn app_with_tail(session_id: &str, lines: Vec<String>, tag: &str) -> App {
-        let dir = std::env::temp_dir().join(format!(
+        app_with_tail_under(std::env::temp_dir(), session_id, lines, tag)
+    }
+
+    /// [`app_with_tail`], parameterised on the base directory the fixture's
+    /// log file nests under — lets a test pin a DETERMINISTIC path depth
+    /// (task #59's regression test, below) rather than relying on however
+    /// deep the ambient `$TMPDIR` happens to be on whatever machine runs it.
+    fn app_with_tail_under(base: std::path::PathBuf, session_id: &str, lines: Vec<String>, tag: &str) -> App {
+        let dir = base.join(format!(
             "aoide-ui-tail-test-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -1289,6 +1308,36 @@ mod tests {
         let backend = TestBackend::new(12, 8);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, &app)).unwrap();
+    }
+
+    #[test]
+    fn log_tail_overlay_path_line_survives_a_deep_ancestor_tree() {
+        // Regression pin (task #59): `draw_log_tail` used to paint
+        // `tail.path.display()` UNBOUNDED with no wrap, so the terminal
+        // buffer silently clipped the line at the overlay's inner width —
+        // on a deep enough ancestor tree that clip landed BEFORE the
+        // `.log` extension, so this exact assertion in the sibling test
+        // above passed or failed purely on how deep the ambient `$TMPDIR`
+        // happened to be that run (settled diagnosis: "TMPDIR
+        // PATH-LENGTH-SENSITIVE"). The fix shortens the painted path to
+        // its last two components (`theme::shorten_cwd`, the same rule
+        // SESSIONS already applies to a cwd), which is bounded by
+        // component count rather than by ancestor depth. This test pins
+        // that fix with a deliberately deep, DETERMINISTIC prefix — two
+        // 60-character directory names — so the deep-tree case is
+        // exercised every run, not only on whichever machine happens to
+        // hand out a long temp path.
+        let deep_base = std::env::temp_dir().join("a".repeat(60)).join("b".repeat(60));
+        let app = app_with_tail_under(deep_base.clone(), "s1", vec!["hi".into()], "deep");
+        let backend = TestBackend::new(90, 34);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let out = dump(term.backend().buffer());
+        assert!(
+            out.contains(".log"),
+            "the log path line survives a deep ancestor tree: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&deep_base);
     }
 
     // ── ROSTER panel (P-C4): fixed `who --json` fixture -> render ───────────
