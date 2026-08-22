@@ -408,11 +408,16 @@ secrets add must run as the broker user (uid 999, the owner of /var/lib/aoide-se
 
 This is the fix for the incident above: root COULD always write
 `policy.json` regardless of ownership, which is exactly what silently
-reowned it. The guard has one deliberate exception — a secrets home that
-doesn't exist yet is never refused (nothing has decided who the broker
-user is until the first admin verb creates it), so a first-run `sudo -u
-aoide-secrets aoide secrets add …` on a fresh host still works exactly as
-documented below.
+reowned it. **A secrets home that doesn't exist yet still refuses root**
+(found on review, P-V4f follow-up): `store::save_policies`/`store::
+save_totp_secret` both create the home directory on their first write, so
+an unguarded root caller would have just moved the same bricking bug
+earlier — creating a fresh `policy.json`/`totp.secret` owned `root:root`
+instead of reowning an existing one. Only a NON-root uid may bootstrap a
+missing home (there is genuinely nothing to compare it against yet), so a
+first-run `sudo -u aoide-secrets aoide secrets add …` on a fresh host
+still works exactly as documented below — a bare `sudo` on that same fresh
+host does not.
 
 These pick up the code's own placeholder default
 (`/var/lib/aoide-secrets`, `home.rs`) with no extra flags as long as it
@@ -444,9 +449,13 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   write locks the file to `0600` after writing — `create_dir_all` alone
   honors the process umask, which would otherwise leave the secrets home
   world-searchable. `effective_uid`/`admin_identity_error`/
-  `admin_identity_check` (P-V4f) are the admin-identity guard: the pure
-  decision, unit-tested on injected uids, and its live wiring to a real
-  stat + a real `geteuid(2)` — see `AGENTS.md`'s matching invariant and
+  `admin_identity_error_for_missing_home`/`admin_identity_check` (P-V4f)
+  are the admin-identity guard: two pure decisions — one for an existing
+  home (owner vs. euid), one for a home that doesn't exist yet (root
+  refused, any other uid passes, since a write would `create_dir_all` it) —
+  both unit-tested on injected uids, and `admin_identity_check`'s live
+  wiring to a real stat + a real `geteuid(2)` dispatching between them —
+  see `AGENTS.md`'s matching invariant and
   "Admin verbs" above.
 - `socket` — `socket_path()`: `$AOIDE_SECRETS_SOCKET` env override, else the
   canonical deployed path `/run/aoide-secrets/secrets.sock` (P-V4d — the

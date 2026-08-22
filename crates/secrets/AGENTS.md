@@ -132,13 +132,22 @@
   cover). Root is explicitly a REFUSED case, not a bypass: root can always
   write regardless of file ownership, which is the exact mechanism that
   corrupted `policy.json` in the field. **A not-yet-existing secrets home
-  is NOT refused** — `admin_identity_check` returns `None` when the stat
-  fails, deliberately: nothing has decided who the broker user is until
-  the first admin verb creates the home directory, so there is nothing yet
-  to compare the caller's uid against (`home.rs`'s module doc has the full
-  reasoning). Don't add a second, differently-worded identity check
-  elsewhere in this crate; this is the one gate, and a new admin verb that
-  touches `policy.json`/`totp.secret` calls it the same way.
+  is not an unconditional pass either** (P-V4f follow-up, found on review:
+  `store::save_policies`/`store::save_totp_secret` both `create_dir_all`
+  the home on first write, so an unguarded root caller hitting a missing
+  home would CREATE it `root:root` — the identical bricking symptom,
+  just at creation time instead of a reown) — `home::
+  admin_identity_error_for_missing_home(euid, home, verb)` is that case's
+  own PURE decision (root refused, any other uid passes), and
+  `admin_identity_check` falls to it whenever the stat fails, rather than
+  passing unconditionally. A non-root uid still creates its own fresh home
+  freely (the dev/test tempdir flow, or an explicit `sudo -u aoide-secrets`
+  first run per the deployment doc) — only root bootstrapping a missing
+  home is refused. Don't add a second, differently-worded identity check
+  elsewhere in this crate; these two pure functions plus
+  `admin_identity_check`'s dispatch between them are the one gate, and a
+  new admin verb that touches `policy.json`/`totp.secret` calls it the
+  same way.
 - **`home::secrets_home`/`socket::socket_path` are THE resolution — nothing
   else re-derives a secrets-home or socket path.** `broker::serve`/
   `client::resolve`/`client::run_exec` all take the resolved `&Path` as a

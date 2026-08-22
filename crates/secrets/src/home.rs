@@ -35,14 +35,20 @@
 //!
 //! **This module also owns the admin-verb identity guard** (the
 //! yomi-strix incident, 2026-08-22): [`admin_identity_error`] is the pure
-//! decision (injected `euid`/`home_owner`, unit-testable without a real
-//! stat or a real process uid), [`admin_identity_check`] wires it to a
-//! real [`effective_uid`] and a real `std::fs::metadata(home)` — a
-//! not-yet-existing home returns `None` (no refusal) rather than inventing
-//! an owner nobody has decided yet; see that function's own doc. Every
-//! admin verb that reads/writes `policy.json`/`totp.secret` calls this
-//! BEFORE any such read-modify-write — `commands.rs`'s `require_admin_identity`
-//! for the policy-CRUD quintet, `enroll::run` directly for the one other
+//! decision for an EXISTING home (injected `euid`/`home_owner`,
+//! unit-testable without a real stat or a real process uid);
+//! [`admin_identity_error_for_missing_home`] is its sibling for a home
+//! that does not exist YET — a stat failure is not license to proceed,
+//! since `store::save_policies`/`store::save_totp_secret` both
+//! `create_dir_all` the home on first write, so an unguarded root caller
+//! would CREATE it owned `root:root` (the identical bricking symptom as
+//! the yomi-strix incident, just at creation time instead of a reown;
+//! found on review, P-V4f follow-up). [`admin_identity_check`] wires both
+//! to a real [`effective_uid`] and a real `std::fs::metadata(home)` — see
+//! that function's own doc. Every admin verb that reads/writes
+//! `policy.json`/`totp.secret` calls this BEFORE any such
+//! read-modify-write — `commands.rs`'s `require_admin_identity` for the
+//! policy-CRUD quintet, `enroll::run` directly for the one other
 //! broker-home write outside `commands.rs`'s own dispatch.
 
 use std::io;
@@ -116,23 +122,54 @@ pub fn admin_identity_error(euid: u32, home_owner: u32, home: &Path, verb: &str)
     ))
 }
 
-/// Live wiring for [`admin_identity_error`]: stats `home` for its owning
-/// uid and compares it against this process's real [`effective_uid`].
+/// The admin-identity guard's decision when `home` does NOT exist yet
+/// (PURE, injected `euid` — the missing-home sibling of
+/// [`admin_identity_error`]). A stat failure is NOT license to proceed:
+/// `store::save_policies`/`store::save_totp_secret` both `create_dir_all`
+/// the home on their very first write, so a root caller hitting a missing
+/// home would CREATE `policy.json`/`totp.secret` owned `root:root` — the
+/// identical bricking symptom as the yomi-strix incident, just at
+/// creation time instead of a reown (found on review, P-V4f follow-up,
+/// 2026-08-22).
 ///
-/// **Returns `None` (no refusal) when `home` does not exist yet, or its
-/// owner can't be read at all** — deliberate, not an oversight: on a
-/// brand-new deployment nothing has decided who the broker user is until
-/// the FIRST admin verb creates the home directory, so there is nothing
-/// yet to compare the caller's uid against. Per the deployment doc's own
-/// admin-verb section, that first invocation is expected to already be
-/// `sudo -u aoide-secrets ...`; a caller who skips that on a fresh host
-/// still only ends up owning a freshly created home (a narrower failure
-/// than the incident this guard exists for — an EXISTING, correctly-owned
-/// home getting silently reowned by root). This function never invents an
-/// owner Linux didn't actually report.
+/// `None` for any non-root `euid`: a non-root uid bootstrapping its own
+/// fresh home (the dev/test tempdir flow, or an explicit `sudo -u
+/// aoide-secrets` first run per the deployment doc) is the expected shape
+/// and stays allowed. `Some(message)` for `euid == 0` — root must never
+/// be the one to create the secrets home, full stop; first-time
+/// provisioning belongs to the broker's own systemd unit
+/// (`StateDirectory=`) or an explicit `sudo -u aoide-secrets` invocation.
+pub fn admin_identity_error_for_missing_home(euid: u32, home: &Path, verb: &str) -> Option<String> {
+    if euid != 0 {
+        return None;
+    }
+    Some(format!(
+        "secrets {verb} must run as the broker user, not root — {} does not exist yet, and root creating it \
+         would leave policy.json/totp.secret owned root:root, bricking the broker before it even starts. \
+         First-time provisioning belongs to the broker's own service (systemd's StateDirectory) or an explicit \
+         `sudo -u aoide-secrets` run. Run: sudo -u aoide-secrets aoide secrets {verb} ...",
+        home.display()
+    ))
+}
+
+/// Live wiring for [`admin_identity_error`]/[`admin_identity_error_for_missing_home`]:
+/// stats `home` for its owning uid and compares it against this process's
+/// real [`effective_uid`].
+///
+/// When `home` exists, [`admin_identity_error`] decides (euid vs. the
+/// real owner). **When it does not exist yet — or its owner can't be
+/// stat'd at all — this falls to [`admin_identity_error_for_missing_home`]
+/// rather than passing unconditionally**: nothing has decided who the
+/// broker user is until the FIRST admin verb creates the home directory,
+/// but `store::save_policies`/`store::save_totp_secret` both
+/// `create_dir_all` it on that first write, so root reaching this point
+/// would CREATE a root-owned home — refused for that reason alone, a
+/// non-root uid still passes through to create it itself.
 pub fn admin_identity_check(home: &Path, verb: &str) -> Option<String> {
-    let owner = std::fs::metadata(home).ok()?.uid();
-    admin_identity_error(effective_uid(), owner, home, verb)
+    match std::fs::metadata(home) {
+        Ok(meta) => admin_identity_error(effective_uid(), meta.uid(), home, verb),
+        Err(_) => admin_identity_error_for_missing_home(effective_uid(), home, verb),
+    }
 }
 
 #[cfg(test)]
@@ -238,17 +275,53 @@ mod tests {
         assert!(!msg.to_lowercase().contains("plain `sudo`"), "{msg}");
     }
 
+    // ── admin_identity_error_for_missing_home (pure — injected euid) ───────
+    //
+    // The reviewed gap: a stat failure alone used to pass unconditionally,
+    // but `store::save_policies`/`store::save_totp_secret` `create_dir_all`
+    // the home on first write, so a root caller hitting a missing home
+    // would CREATE it root-owned — the same bricking symptom as an
+    // existing-home reown, just at creation time.
+
+    #[test]
+    fn admin_identity_error_for_missing_home_refuses_root() {
+        let msg = admin_identity_error_for_missing_home(0, Path::new("/var/lib/aoide-secrets"), "add").unwrap();
+        assert!(msg.contains("secrets add"), "{msg}");
+        assert!(msg.contains("/var/lib/aoide-secrets"), "{msg}");
+        assert!(msg.to_lowercase().contains("root"), "{msg}");
+        assert!(msg.contains("sudo -u aoide-secrets aoide secrets add"), "{msg}");
+    }
+
+    #[test]
+    fn admin_identity_error_for_missing_home_passes_a_non_root_uid() {
+        assert_eq!(
+            admin_identity_error_for_missing_home(1000, Path::new("/var/lib/aoide-secrets"), "add"),
+            None
+        );
+        assert_eq!(
+            admin_identity_error_for_missing_home(1, Path::new("/var/lib/aoide-secrets"), "enroll"),
+            None
+        );
+    }
+
     // ── admin_identity_check (real stat + real effective_uid) ──────────────
 
     #[test]
-    fn admin_identity_check_is_none_when_the_home_does_not_exist_yet() {
+    fn admin_identity_check_on_a_missing_home_matches_the_missing_home_rule() {
         let dir = std::env::temp_dir().join(format!(
             "aoide-secrets-home-identity-missing-{}-{}",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         assert!(!dir.exists());
-        assert_eq!(admin_identity_check(&dir, "add"), None);
+        // Defensive either way (this suite never actually runs as root),
+        // but this keeps the assertion honest rather than assuming a
+        // non-root test runner.
+        let expected = admin_identity_error_for_missing_home(effective_uid(), &dir, "add");
+        assert_eq!(admin_identity_check(&dir, "add"), expected);
+        if effective_uid() != 0 {
+            assert_eq!(admin_identity_check(&dir, "add"), None, "non-root creating a fresh home must still be allowed");
+        }
     }
 
     #[test]
