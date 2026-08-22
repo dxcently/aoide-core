@@ -85,9 +85,14 @@ aoide-lyra = { path = "crates/lyra" }
 # new verb, binary stays nix-independent); the built-in `file` backend +
 # the write half, `secrets put` (P-V4c — golden +1); `secrets set-totp`,
 # `secrets enroll --show`, and a tty-hidden-input prompt for `secrets put`
-# (P-V4e — golden +1, only `set-totp` is a new path). `aoide-cli` depends
-# on this crate as of P-V2 (`secrets serve`/`exec`/`add`/`rm`/`grant`/
-# `revoke`/`enroll`/`put`/`set-totp` register into its `Registry`).
+# (P-V4e — golden +1, only `set-totp` is a new path); the per-secret
+# automation gate (`Policy::automation`, relaxes requireTotp for LISTED
+# consumers only) and the `remote` reachability flag (no behavior change
+# yet — lands ahead of any non-local entry point), plus `secrets automate`
+# (on/off/grant/revoke) and `secrets expose` (on/off) (P-N1 — golden +2).
+# `aoide-cli` depends on this crate as of P-V2 (`secrets serve`/`exec`/
+# `add`/`rm`/`grant`/`revoke`/`enroll`/`put`/`set-totp`/`automate`/
+# `expose` register into its `Registry`).
 aoide-secrets = { path = "crates/secrets" }
 
 [profile.release]

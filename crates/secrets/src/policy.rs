@@ -39,8 +39,29 @@ pub fn valid_secret_name(name: &str) -> bool {
     charset_ok && ends_ok && no_double_hyphen
 }
 
-/// One secret's access policy — the plan's SECRETS §Policy shape verbatim:
-/// `{name, backend, key, requireTotp, consumers[], sharedWith[]}`.
+/// A secret's automation gate (P-N1). OPEN (`enabled: true`) lets the
+/// consumers LISTED here resolve WITHOUT a fresh TOTP code, even when the
+/// policy's own `requireTotp` is set; every other caller is still gated
+/// normally. CLOSED (`enabled: false`, the default — and what an existing
+/// `policy.json` predating this field loads as) changes nothing:
+/// `requireTotp` applies to everyone, exactly as before this field
+/// existed. See [`totp_required`] for the one decision point this gate
+/// feeds into.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Automation {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Consumer names matched EXACTLY (same validation as a policy's own
+    /// `consumers[]` — `commands::handle_secrets_automate` checks
+    /// [`valid_secret_name`] before a `grant` lands one here).
+    #[serde(default)]
+    pub consumers: Vec<String>,
+}
+
+/// One secret's access policy — the plan's SECRETS §Policy shape, extended
+/// at P-N1: `{name, backend, key, requireTotp, consumers[], sharedWith[],
+/// automation, remote}`.
 ///
 /// **Invariant this type must never grow**: no field here may ever hold
 /// the secret's VALUE. This struct derives `Serialize` and rides through
@@ -64,7 +85,8 @@ pub struct Policy {
     /// template substitutes).
     pub key: String,
     /// Whether release requires a fresh TOTP code (vs. a standing grant
-    /// check only).
+    /// check only) — the BASELINE [`totp_required`] narrows via
+    /// `automation`, never widens.
     #[serde(default)]
     pub require_totp: bool,
     /// Consumer names allowed to resolve this secret. Empty means "any
@@ -78,11 +100,29 @@ pub struct Policy {
     /// change when sharing lands; empty until then.
     #[serde(default)]
     pub shared_with: Vec<String>,
+    /// The automation gate (P-N1, see [`Automation`]). Optional-with-
+    /// default on load: an existing `policy.json` predating this field
+    /// carries neither key and loads as `{enabled: false, consumers: []}`
+    /// — automation disabled, empty — identical behavior to before this
+    /// field existed.
+    #[serde(default)]
+    pub automation: Automation,
+    /// Remote-reachability (P-N1): whether this secret may ever be
+    /// released over a NON-LOCAL entry point (mesh replication, a future
+    /// network door). Defaults to `false` on both a fresh policy and an
+    /// existing `policy.json` that predates this field. **NO behavior
+    /// change today** — there is no non-local entry point yet — but this
+    /// is a crate invariant (`AGENTS.md`): every non-local entry point
+    /// added later MUST refuse a secret whose `remote` is `false` before
+    /// ever touching its backend.
+    #[serde(default)]
+    pub remote: bool,
 }
 
 impl Policy {
-    /// Construct a policy with no consumers/sharing restrictions and
-    /// `requireTotp` off — the caller narrows from here.
+    /// Construct a policy with no consumers/sharing restrictions,
+    /// `requireTotp` off, automation closed, and `remote` off — the
+    /// caller narrows from here.
     pub fn new(name: impl Into<String>, backend: impl Into<String>, key: impl Into<String>) -> Self {
         Policy {
             name: name.into(),
@@ -91,8 +131,33 @@ impl Policy {
             require_totp: false,
             consumers: Vec::new(),
             shared_with: Vec::new(),
+            automation: Automation::default(),
+            remote: false,
         }
     }
+}
+
+/// Whether a `resolve` on behalf of `consumer` must present a TOTP code,
+/// given `policy` — the ONE decision point [`crate::broker::resolve_gate`]
+/// routes through (P-N1). `requireTotp` is the baseline; the automation
+/// gate can only ever RELAX it, never tighten it: `requireTotp: false`
+/// always returns `false`, automation or not. When `requireTotp` is
+/// `true`, a code is still required UNLESS automation is OPEN
+/// (`automation.enabled`) AND `consumer` is one of the names LISTED in
+/// `automation.consumers` (exact match) — every other caller (automation
+/// closed, or open but this consumer isn't listed) is gated exactly as
+/// before this field existed.
+///
+/// Deliberately a single, narrowly-named pure function rather than
+/// inlined into `resolve_gate`: a follow-up phase (P-N2, not built here)
+/// turns a no-code `true` result into a PARK instead of a flat refusal,
+/// and this is the one place that phase changes.
+pub fn totp_required(policy: &Policy, consumer: &str) -> bool {
+    if !policy.require_totp {
+        return false;
+    }
+    let automation_open = policy.automation.enabled && policy.automation.consumers.iter().any(|c| c == consumer);
+    !automation_open
 }
 
 #[cfg(test)]
@@ -163,6 +228,75 @@ mod tests {
         assert!(!policy.require_totp);
         assert!(policy.consumers.is_empty());
         assert!(policy.shared_with.is_empty());
+        assert!(!policy.automation.enabled);
+        assert!(policy.automation.consumers.is_empty());
+        assert!(!policy.remote);
+    }
+
+    // ── automation / remote (P-N1) ──────────────────────────────────────
+
+    /// The exact live shape: an OLD `policy.json` written before P-N1
+    /// carries neither `automation` nor `remote` at all — must load
+    /// cleanly, treated as automation disabled/empty and remote false.
+    #[test]
+    fn old_shape_json_with_no_automation_or_remote_key_loads_as_closed() {
+        let json = r#"{"name":"t","backend":"pass","key":"k","requireTotp":true,"consumers":["m"],"sharedWith":[]}"#;
+        let policy: Policy = serde_json::from_str(json).unwrap();
+        assert!(policy.require_totp);
+        assert!(!policy.automation.enabled);
+        assert!(policy.automation.consumers.is_empty());
+        assert!(!policy.remote);
+    }
+
+    #[test]
+    fn new_shape_json_round_trips_automation_and_remote() {
+        let mut policy = Policy::new("db-prod", "pass", "prod/db");
+        policy.require_totp = true;
+        policy.automation.enabled = true;
+        policy.automation.consumers.push("m".into());
+        policy.remote = true;
+
+        let json = serde_json::to_value(&policy).unwrap();
+        assert_eq!(json["automation"]["enabled"], true);
+        assert_eq!(json["automation"]["consumers"][0], "m");
+        assert_eq!(json["remote"], true);
+
+        let back: Policy = serde_json::from_value(json).unwrap();
+        assert_eq!(back, policy);
+    }
+
+    /// The four combinations the phase brief calls out by name:
+    /// `requireTotp` x automation-open-and-listed.
+    #[test]
+    fn totp_required_covers_the_four_combinations() {
+        let mut open_and_listed = Policy::new("t", "b", "k");
+        open_and_listed.require_totp = true;
+        open_and_listed.automation.enabled = true;
+        open_and_listed.automation.consumers = vec!["m".into()];
+
+        let closed = {
+            let mut p = Policy::new("t", "b", "k");
+            p.require_totp = true; // automation stays default-closed
+            p
+        };
+
+        let require_totp_off_but_automation_open = {
+            let mut p = Policy::new("t", "b", "k");
+            p.require_totp = false;
+            p.automation.enabled = true;
+            p.automation.consumers = vec!["m".into()];
+            p
+        };
+
+        // requireTotp true, automation open, consumer LISTED -> not required.
+        assert!(!totp_required(&open_and_listed, "m"));
+        // requireTotp true, automation open, consumer NOT listed -> still required.
+        assert!(totp_required(&open_and_listed, "someone-else"));
+        // requireTotp true, automation closed -> required regardless of consumer.
+        assert!(totp_required(&closed, "m"));
+        assert!(totp_required(&closed, "anyone"));
+        // requireTotp false -> never required, even with automation open+listed.
+        assert!(!totp_required(&require_totp_off_but_automation_open, "m"));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! `aoide secrets` — the secrets broker's CLI surface (Workstream SECRETS,
-//! P-V2, P-V3, P-V4c, P-V4e). Registers NINE verbs:
+//! P-V2, P-V3, P-V4c, P-V4e, P-N1). Registers ELEVEN verbs:
 //!
 //! - `serve` — the long-running broker, special-cased at the entry point
 //!   exactly like `a2a serve`/`conductor` (`cli`'s `run_cli`): this
@@ -71,9 +71,32 @@
 //!   Same `require_cli` gate as the rest of the admin surface; unknown name
 //!   is a clean error; re-setting the same state is idempotent and reports
 //!   "unchanged" honestly (house rule: report exactly what changed) rather
-//!   than calling `.changed(...)` on a no-op write. Appended LAST in
-//!   `register()` (golden discipline — `pkgs/aoide/crates/AGENTS.md`:
-//!   append, never reorder), golden 60 -> 61.
+//!   than calling `.changed(...)` on a no-op write. Appended newest in
+//!   `register()` before P-N1 (golden discipline — `pkgs/aoide/crates/
+//!   AGENTS.md`: append, never reorder), golden 60 -> 61.
+//! - `automate` (P-N1) — `secrets automate <name> on|off` flips the
+//!   policy's new `automation.enabled` bit; `secrets automate <name>
+//!   grant|revoke <consumer>` edits `automation.consumers` (the consumer
+//!   name checked with the SAME [`valid_secret_name`] validation as every
+//!   other name in this crate). Same `require_cli` + `require_admin_identity`
+//!   gate as the rest of the admin surface; idempotent both ways — flipping
+//!   to the state it already has, or granting/revoking a consumer already
+//!   in/out of the list, reports "unchanged" and writes nothing (house rule
+//!   2, `set-totp`'s own precedent). See `crate::policy::Automation`/
+//!   `totp_required` for what this field actually gates:
+//!   `broker::resolve_gate` skips the TOTP check ONLY for a consumer LISTED
+//!   here while `enabled` is `true` — every other caller is unaffected.
+//! - `expose` (P-N1) — `secrets expose <name> on|off` flips the policy's
+//!   new `remote` bit. Same admin gate, same idempotency discipline as
+//!   `automate`/`set-totp`. **NO behavior change today** — no non-local
+//!   entry point exists yet — this verb only lets an operator PRE-DECLARE a
+//!   secret as remote-reachable ahead of one landing; see
+//!   `crate::policy::Policy::remote`'s own doc and this crate's `AGENTS.md`
+//!   for the invariant a future non-local door must hold.
+//!
+//! `automate`/`expose` are appended LAST in `register()` (golden discipline
+//! — `pkgs/aoide/crates/AGENTS.md`: append, never reorder), golden
+//! 61 -> 63.
 //!
 //! `add`/`rm`/`grant`/`revoke`/`enroll` run AS THE SECRETS USER in deployment
 //! (`sudo -u aoide-secrets ...`, wrapped by the nix module at P-V4), but the
@@ -86,10 +109,10 @@
 //! `set` backend template, over the socket (`crate::broker::handle_put`'s
 //! module doc).
 //!
-//! **`add`/`rm`/`grant`/`revoke`/`set-totp` also carry the admin-identity
-//! guard** ([`require_admin_identity`], `home::admin_identity_check`'s
+//! **`add`/`rm`/`grant`/`revoke`/`set-totp`/`automate`/`expose` also carry
+//! the admin-identity guard** ([`require_admin_identity`], `home::admin_identity_check`'s
 //! module doc — the yomi-strix incident, 2026-08-22): called right after
-//! [`require_cli`] in every one of those five handlers, BEFORE
+//! [`require_cli`] in every one of those seven handlers, BEFORE
 //! `store::load_policies`/`store::save_policies` ever runs, it refuses the
 //! call outright when this process's effective uid doesn't own the
 //! secrets home — plain `sudo` (root, euid 0) is explicitly one of the
@@ -228,6 +251,38 @@ pub fn register(r: &mut Registry) {
         implemented: true,
         handler: handle_secrets_set_totp,
         examples: ["secrets set-totp db-prod on", "secrets set-totp db-prod off"],
+    ));
+    r.insert(cmd!(
+        path: ["secrets", "automate"],
+        summary: "Manage an EXISTING secret's automation gate. `on`/`off` flips whether the LISTED consumers resolve without a TOTP code (every other caller stays gated by requireTotp as before); `grant`/`revoke <consumer>` edits which consumers are listed. Idempotent: re-setting a state, or granting/revoking a consumer already in/out of the list, reports \"unchanged\" and writes nothing.",
+        args: [
+            arg!("name", "string", true, "The secret's nickname — must already have a policy (`secrets add` first)."),
+            arg!("action", "string", true, "`on` | `off` | `grant` | `revoke`."),
+            arg!("consumer", "string", false, "Consumer name — required for `grant`/`revoke`, ignored for `on`/`off`.")
+        ],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_secrets_automate,
+        examples: [
+            "secrets automate db-prod on",
+            "secrets automate db-prod grant m",
+            "secrets automate db-prod revoke m",
+            "secrets automate db-prod off"
+        ],
+    ));
+    r.insert(cmd!(
+        path: ["secrets", "expose"],
+        summary: "Flip an EXISTING secret's remote-reachability bit on or off. No behavior change today — no non-local entry point exists yet — but every non-local path added later (mesh replication, a network door) must refuse a secret whose remote bit is off. Idempotent: re-setting the same state reports \"unchanged\" and writes nothing.",
+        args: [
+            arg!("name", "string", true, "The secret's nickname — must already have a policy (`secrets add` first)."),
+            arg!("state", "string", true, "`on` or `off`.")
+        ],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_secrets_expose,
+        examples: ["secrets expose db-prod on", "secrets expose db-prod off"],
     ));
 }
 
@@ -551,6 +606,142 @@ fn handle_secrets_set_totp(inv: &Invocation) -> Outcome {
     Outcome::ok(cmd, format!("secret `{name}` requireTotp set to `{state}`")).changed(vec![format!("policy:{name}")])
 }
 
+/// `secrets automate <name> on|off | grant|revoke <consumer>` (P-N1) — the
+/// admin verb behind `crate::policy::Policy::automation`. Same
+/// `require_cli` + `require_admin_identity` gate, same idempotency
+/// discipline as `set-totp` above: a state already in place, or a
+/// consumer already granted/revoked, reports "unchanged" and never
+/// rewrites `policy.json`. `grant`/`revoke`'s `<consumer>` is checked with
+/// the SAME [`valid_secret_name`] validation this crate already holds
+/// every other name to — a malformed consumer name is a usage error, not
+/// a silently-accepted string.
+fn handle_secrets_automate(inv: &Invocation) -> Outcome {
+    let cmd = "secrets.automate";
+    const USAGE: &str = "usage: secrets automate <name> on|off | secrets automate <name> grant|revoke <consumer>";
+    if let Some(hint) = require_cli(inv, cmd) {
+        return hint;
+    }
+    if let Some(hint) = require_admin_identity(cmd, "automate") {
+        return hint;
+    }
+    let Some(name) = inv.args.first().cloned() else {
+        return Outcome::usage(cmd, format!("secrets automate: missing <name> — {USAGE}"));
+    };
+    let Some(action) = inv.args.get(1).cloned() else {
+        return Outcome::usage(cmd, format!("secrets automate: missing on|off|grant|revoke — {USAGE}"));
+    };
+
+    let home = home::secrets_home();
+    let mut policies = match store::load_policies(&home) {
+        Ok(p) => p,
+        Err(e) => return policy_io_error(cmd, &home, e),
+    };
+    let Some(policy) = policies.iter_mut().find(|p| p.name == name) else {
+        return Outcome::error(cmd, format!("no policy for secret `{name}`"));
+    };
+
+    let outcome = match action.as_str() {
+        "on" | "off" => {
+            let want = action == "on";
+            if policy.automation.enabled == want {
+                Outcome::ok(cmd, format!("secret `{name}` automation already `{action}` — unchanged"))
+            } else {
+                policy.automation.enabled = want;
+                Outcome::ok(cmd, format!("secret `{name}` automation set to `{action}`"))
+                    .changed(vec![format!("policy:{name}")])
+            }
+        }
+        "grant" | "revoke" => {
+            let Some(consumer) = inv.args.get(2).cloned() else {
+                return Outcome::usage(cmd, format!("secrets automate {name} {action}: missing <consumer> — {USAGE}"));
+            };
+            if !valid_secret_name(&consumer) {
+                return Outcome::usage(
+                    cmd,
+                    format!(
+                        "invalid consumer name `{consumer}` (must be lowercase [a-z0-9-], no leading/trailing/doubled \
+                         hyphen) — {USAGE}"
+                    ),
+                );
+            }
+            let already_listed = policy.automation.consumers.iter().any(|c| c == &consumer);
+            if action == "grant" {
+                if already_listed {
+                    Outcome::ok(cmd, format!("secret `{name}` automation already lists consumer `{consumer}` — unchanged"))
+                } else {
+                    policy.automation.consumers.push(consumer.clone());
+                    Outcome::ok(cmd, format!("secret `{name}` automation now lists consumer `{consumer}`"))
+                        .changed(vec![format!("policy:{name}")])
+                }
+            } else if already_listed {
+                policy.automation.consumers.retain(|c| c != &consumer);
+                Outcome::ok(cmd, format!("secret `{name}` automation no longer lists consumer `{consumer}`"))
+                    .changed(vec![format!("policy:{name}")])
+            } else {
+                Outcome::ok(cmd, format!("secret `{name}` automation does not list consumer `{consumer}` — unchanged"))
+            }
+        }
+        _ => {
+            return Outcome::usage(
+                cmd,
+                format!("secrets automate expects on|off|grant|revoke, got `{action}` — {USAGE}"),
+            )
+        }
+    };
+
+    if outcome.changed.is_empty() {
+        return outcome;
+    }
+    if let Err(e) = store::save_policies(&home, &policies) {
+        return policy_io_error(cmd, &home, e);
+    }
+    outcome
+}
+
+/// `secrets expose <name> on|off` (P-N1) — flips `crate::policy::
+/// Policy::remote`. Same shape as `handle_secrets_set_totp` exactly:
+/// same admin gate, same idempotent "unchanged" reporting.
+fn handle_secrets_expose(inv: &Invocation) -> Outcome {
+    let cmd = "secrets.expose";
+    const USAGE: &str = "usage: secrets expose <name> on|off";
+    if let Some(hint) = require_cli(inv, cmd) {
+        return hint;
+    }
+    if let Some(hint) = require_admin_identity(cmd, "expose") {
+        return hint;
+    }
+    let Some(name) = inv.args.first().cloned() else {
+        return Outcome::usage(cmd, format!("secrets expose: missing <name> — {USAGE}"));
+    };
+    let Some(state) = inv.args.get(1).cloned() else {
+        return Outcome::usage(cmd, format!("secrets expose: missing on|off — {USAGE}"));
+    };
+    let want = match state.as_str() {
+        "on" => true,
+        "off" => false,
+        _ => return Outcome::usage(cmd, format!("secrets expose expects `on` or `off`, got `{state}` — {USAGE}")),
+    };
+
+    let home = home::secrets_home();
+    let mut policies = match store::load_policies(&home) {
+        Ok(p) => p,
+        Err(e) => return policy_io_error(cmd, &home, e),
+    };
+    let Some(policy) = policies.iter_mut().find(|p| p.name == name) else {
+        return Outcome::error(cmd, format!("no policy for secret `{name}`"));
+    };
+
+    if policy.remote == want {
+        return Outcome::ok(cmd, format!("secret `{name}` remote already `{state}` — unchanged"));
+    }
+    policy.remote = want;
+
+    if let Err(e) = store::save_policies(&home, &policies) {
+        return policy_io_error(cmd, &home, e);
+    }
+    Outcome::ok(cmd, format!("secret `{name}` remote set to `{state}`")).changed(vec![format!("policy:{name}")])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,6 +797,8 @@ mod tests {
                 "secrets.enroll",
                 "secrets.put",
                 "secrets.set-totp",
+                "secrets.automate",
+                "secrets.expose",
             ]
         );
         for c in r.commands() {
@@ -1020,5 +1213,264 @@ mod tests {
 
         let force_only = inv(Door::Cli, &["secrets", "enroll"], &[], &[("force", "true")]);
         assert_eq!(handle_secrets_enroll(&force_only).status, Status::Ok);
+    }
+
+    // ── automate (P-N1) ──────────────────────────────────────────────────
+
+    #[test]
+    fn automate_on_off_flips_automation_enabled_and_persists_reload_proves() {
+        with_secrets_home("automate-on-off", |home| {
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "pass"), ("key", "x")]);
+            assert_eq!(handle_secrets_add(&add).status, Status::Ok);
+            assert!(!store::load_policies(home).unwrap()[0].automation.enabled);
+
+            let on = inv(Door::Cli, &["secrets", "automate"], &["t", "on"], &[]);
+            let out = handle_secrets_automate(&on);
+            assert_eq!(out.status, Status::Ok, "{out:?}");
+            assert!(!out.changed.is_empty());
+            assert!(store::load_policies(home).unwrap()[0].automation.enabled);
+
+            let off = inv(Door::Cli, &["secrets", "automate"], &["t", "off"], &[]);
+            assert_eq!(handle_secrets_automate(&off).status, Status::Ok);
+            assert!(!store::load_policies(home).unwrap()[0].automation.enabled);
+        });
+    }
+
+    #[test]
+    fn automate_on_re_set_is_a_reported_no_op() {
+        with_secrets_home("automate-idempotent", |home| {
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "pass"), ("key", "x")]);
+            handle_secrets_add(&add);
+            let on = inv(Door::Cli, &["secrets", "automate"], &["t", "on"], &[]);
+            handle_secrets_automate(&on);
+            let bytes_before = std::fs::read(store::policy_path(home)).unwrap();
+
+            let out = handle_secrets_automate(&on);
+            assert_eq!(out.status, Status::Ok, "{out:?}");
+            assert!(out.changed.is_empty(), "a no-op automate on|off must report nothing changed");
+            assert!(out.message.contains("unchanged"), "{}", out.message);
+
+            let bytes_after = std::fs::read(store::policy_path(home)).unwrap();
+            assert_eq!(bytes_before, bytes_after, "a no-op automate must not even rewrite policy.json");
+        });
+    }
+
+    #[test]
+    fn automate_grant_then_revoke_round_trips_automation_consumers() {
+        with_secrets_home("automate-grant-revoke", |home| {
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "pass"), ("key", "x")]);
+            handle_secrets_add(&add);
+
+            let grant = inv(Door::Cli, &["secrets", "automate"], &["t", "grant", "m"], &[]);
+            let out = handle_secrets_automate(&grant);
+            assert_eq!(out.status, Status::Ok, "{out:?}");
+            assert!(!out.changed.is_empty());
+            assert_eq!(store::load_policies(home).unwrap()[0].automation.consumers, vec!["m".to_string()]);
+
+            let revoke = inv(Door::Cli, &["secrets", "automate"], &["t", "revoke", "m"], &[]);
+            assert_eq!(handle_secrets_automate(&revoke).status, Status::Ok);
+            assert!(store::load_policies(home).unwrap()[0].automation.consumers.is_empty());
+        });
+    }
+
+    #[test]
+    fn automate_grant_on_an_already_listed_consumer_is_a_reported_no_op() {
+        with_secrets_home("automate-grant-idempotent", |home| {
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "pass"), ("key", "x")]);
+            handle_secrets_add(&add);
+            let grant = inv(Door::Cli, &["secrets", "automate"], &["t", "grant", "m"], &[]);
+            handle_secrets_automate(&grant);
+            let bytes_before = std::fs::read(store::policy_path(home)).unwrap();
+
+            let out = handle_secrets_automate(&grant);
+            assert_eq!(out.status, Status::Ok, "{out:?}");
+            assert!(out.changed.is_empty(), "granting an already-listed consumer must report nothing changed");
+            assert!(out.message.contains("unchanged"), "{}", out.message);
+
+            let bytes_after = std::fs::read(store::policy_path(home)).unwrap();
+            assert_eq!(bytes_before, bytes_after);
+        });
+    }
+
+    #[test]
+    fn automate_revoke_on_an_absent_consumer_is_a_reported_no_op() {
+        with_secrets_home("automate-revoke-idempotent", |home| {
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "pass"), ("key", "x")]);
+            handle_secrets_add(&add);
+            let bytes_before = std::fs::read(store::policy_path(home)).unwrap();
+
+            let revoke = inv(Door::Cli, &["secrets", "automate"], &["t", "revoke", "m"], &[]);
+            let out = handle_secrets_automate(&revoke);
+            assert_eq!(out.status, Status::Ok, "{out:?}");
+            assert!(out.changed.is_empty(), "revoking an absent consumer must report nothing changed");
+            assert!(out.message.contains("unchanged"), "{}", out.message);
+
+            let bytes_after = std::fs::read(store::policy_path(home)).unwrap();
+            assert_eq!(bytes_before, bytes_after);
+        });
+    }
+
+    #[test]
+    fn automate_grant_rejects_an_invalid_consumer_name() {
+        with_secrets_home("automate-grant-badname", |home| {
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "pass"), ("key", "x")]);
+            handle_secrets_add(&add);
+            let grant = inv(Door::Cli, &["secrets", "automate"], &["t", "grant", "Bad--Name"], &[]);
+            assert_eq!(handle_secrets_automate(&grant).status, Status::Usage);
+            assert!(store::load_policies(home).unwrap()[0].automation.consumers.is_empty());
+        });
+    }
+
+    #[test]
+    fn automate_rejects_an_action_that_is_not_on_off_grant_or_revoke() {
+        with_secrets_home("automate-badaction", |_home| {
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "pass"), ("key", "x")]);
+            handle_secrets_add(&add);
+            let bogus = inv(Door::Cli, &["secrets", "automate"], &["t", "maybe"], &[]);
+            assert_eq!(handle_secrets_automate(&bogus).status, Status::Usage);
+        });
+    }
+
+    #[test]
+    fn automate_grant_without_a_consumer_is_a_usage_error() {
+        with_secrets_home("automate-grant-noconsumer", |_home| {
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "pass"), ("key", "x")]);
+            handle_secrets_add(&add);
+            let grant = inv(Door::Cli, &["secrets", "automate"], &["t", "grant"], &[]);
+            assert_eq!(handle_secrets_automate(&grant).status, Status::Usage);
+        });
+    }
+
+    #[test]
+    fn automate_on_an_unknown_secret_is_a_clean_error() {
+        with_secrets_home("automate-unknown", |_home| {
+            let on = inv(Door::Cli, &["secrets", "automate"], &["nope", "on"], &[]);
+            assert_eq!(handle_secrets_automate(&on).status, Status::Error);
+        });
+    }
+
+    #[test]
+    fn automate_is_cli_only_a_non_cli_door_never_mutates_policy_json() {
+        with_secrets_home("automate-door-gate", |home| {
+            let seed = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "pass"), ("key", "x")]);
+            assert_eq!(handle_secrets_add(&seed).status, Status::Ok);
+            let before = std::fs::read(store::policy_path(home)).unwrap();
+
+            for door in [Door::Mcp, Door::A2a, Door::Daemon] {
+                let on = inv(door, &["secrets", "automate"], &["t", "on"], &[]);
+                assert_eq!(handle_secrets_automate(&on).status, Status::Usage, "automate over {door:?}");
+            }
+
+            let after = std::fs::read(store::policy_path(home)).unwrap();
+            assert_eq!(before, after, "policy.json mutated by a gated automate");
+        });
+    }
+
+    // ── expose (P-N1) ────────────────────────────────────────────────────
+
+    #[test]
+    fn expose_on_off_flips_remote_and_persists_reload_proves() {
+        with_secrets_home("expose-on-off", |home| {
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "pass"), ("key", "x")]);
+            assert_eq!(handle_secrets_add(&add).status, Status::Ok);
+            assert!(!store::load_policies(home).unwrap()[0].remote);
+
+            let on = inv(Door::Cli, &["secrets", "expose"], &["t", "on"], &[]);
+            let out = handle_secrets_expose(&on);
+            assert_eq!(out.status, Status::Ok, "{out:?}");
+            assert!(!out.changed.is_empty());
+            assert!(store::load_policies(home).unwrap()[0].remote);
+
+            let off = inv(Door::Cli, &["secrets", "expose"], &["t", "off"], &[]);
+            assert_eq!(handle_secrets_expose(&off).status, Status::Ok);
+            assert!(!store::load_policies(home).unwrap()[0].remote);
+        });
+    }
+
+    #[test]
+    fn expose_re_setting_the_same_state_is_a_reported_no_op() {
+        with_secrets_home("expose-idempotent", |home| {
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "pass"), ("key", "x")]);
+            handle_secrets_add(&add);
+            let bytes_before = std::fs::read(store::policy_path(home)).unwrap();
+
+            let off = inv(Door::Cli, &["secrets", "expose"], &["t", "off"], &[]);
+            let out = handle_secrets_expose(&off);
+            assert_eq!(out.status, Status::Ok, "{out:?}");
+            assert!(out.changed.is_empty(), "a no-op expose must report nothing changed");
+            assert!(out.message.contains("unchanged"), "{}", out.message);
+
+            let bytes_after = std::fs::read(store::policy_path(home)).unwrap();
+            assert_eq!(bytes_before, bytes_after, "a no-op expose must not even rewrite policy.json");
+        });
+    }
+
+    #[test]
+    fn expose_on_an_unknown_secret_is_a_clean_error() {
+        with_secrets_home("expose-unknown", |_home| {
+            let on = inv(Door::Cli, &["secrets", "expose"], &["nope", "on"], &[]);
+            assert_eq!(handle_secrets_expose(&on).status, Status::Error);
+        });
+    }
+
+    #[test]
+    fn expose_rejects_a_state_that_is_not_on_or_off() {
+        with_secrets_home("expose-badstate", |home| {
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "pass"), ("key", "x")]);
+            handle_secrets_add(&add);
+            let bogus = inv(Door::Cli, &["secrets", "expose"], &["t", "maybe"], &[]);
+            assert_eq!(handle_secrets_expose(&bogus).status, Status::Usage);
+            assert!(!store::load_policies(home).unwrap()[0].remote);
+        });
+    }
+
+    #[test]
+    fn expose_is_cli_only_a_non_cli_door_never_mutates_policy_json() {
+        with_secrets_home("expose-door-gate", |home| {
+            let seed = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "pass"), ("key", "x")]);
+            assert_eq!(handle_secrets_add(&seed).status, Status::Ok);
+            let before = std::fs::read(store::policy_path(home)).unwrap();
+
+            for door in [Door::Mcp, Door::A2a, Door::Daemon] {
+                let on = inv(door, &["secrets", "expose"], &["t", "on"], &[]);
+                assert_eq!(handle_secrets_expose(&on).status, Status::Usage, "expose over {door:?}");
+            }
+
+            let after = std::fs::read(store::policy_path(home)).unwrap();
+            assert_eq!(before, after, "policy.json mutated by a gated expose");
+        });
+    }
+
+    /// The euid guard applies to the new verbs (task requirement): `/` is
+    /// stat-able on every Linux host and, on any non-root test runner, is
+    /// owned by a DIFFERENT uid than this process's own euid — a real
+    /// mismatch, not an injected one, proving `require_admin_identity` is
+    /// actually wired into both new handlers, not merely present in
+    /// `home.rs`'s own pure unit tests. Skipped under a root test runner
+    /// (root would own `/` too, so the mismatch this test depends on
+    /// wouldn't exist).
+    #[test]
+    fn automate_and_expose_refuse_a_mismatched_euid_before_touching_policy_json() {
+        if home::effective_uid() == 0 {
+            return;
+        }
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_SECRETS_HOME").ok();
+        std::env::set_var("AOIDE_SECRETS_HOME", "/");
+
+        let automate = inv(Door::Cli, &["secrets", "automate"], &["t", "on"], &[]);
+        let out = handle_secrets_automate(&automate);
+        assert_eq!(out.status, Status::Error, "{out:?}");
+        assert!(out.message.contains("must run as the broker user"), "{}", out.message);
+
+        let expose = inv(Door::Cli, &["secrets", "expose"], &["t", "on"], &[]);
+        let out = handle_secrets_expose(&expose);
+        assert_eq!(out.status, Status::Error, "{out:?}");
+        assert!(out.message.contains("must run as the broker user"), "{}", out.message);
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_SECRETS_HOME", v),
+            None => std::env::remove_var("AOIDE_SECRETS_HOME"),
+        }
     }
 }

@@ -164,6 +164,37 @@
   `admin_identity_check`'s dispatch between them are the one gate, and a
   new admin verb that touches `policy.json`/`totp.secret` calls it the
   same way.
+- **The automation gate can only ever RELAX `requireTotp`, never tighten
+  it** (P-N1). `policy::totp_required(policy, consumer)` is the ONE
+  decision point `broker::resolve_gate` routes through — it is `requireTotp
+  AND NOT (automation.enabled AND consumer IS IN automation.consumers)`.
+  `requireTotp: false` returns `false` from `totp_required` in every
+  combination; automation has no ability to IMPOSE a TOTP requirement a
+  policy doesn't already carry, only to name specific consumers who skip
+  one it does. Don't inline `policy.require_totp` back into `resolve_gate`
+  "for clarity" — `totp_required` is the one place a later phase (P-N2:
+  turning a no-code `true` result into a PARK instead of a flat refusal)
+  changes, and every call site must route through it.
+- **`automation.consumers` is checked against the SAME self-asserted
+  `consumer` wire field `resolve`'s `consumers[]` already is** (P-N1,
+  honesty note mirroring the `ReplayLedger` ruling above, for the
+  identical reason). Nothing authenticates the wire's `consumer` field, so
+  an automation-open secret is effectively code-free for any local socket
+  caller claiming a listed name, until authenticated session identity
+  exists (#63-adjacent, not planned). Don't treat `automation` as adding
+  any cryptographic boundary beyond what `consumers[]` already has — it's
+  a courtesy label on the same self-asserted field, not a stronger one.
+- **`Policy::remote` (P-N1) gates NOTHING today — that is deliberate, not
+  a gap.** No non-local entry point onto this broker exists yet. This is
+  a forward-looking crate invariant, written down now while the field is
+  new: **every non-local entry point added later (mesh replication, a
+  network door, any future doorway a value could leave this host through)
+  MUST refuse a secret whose `remote` is `false` before ever touching its
+  backend.** Don't add a mesh/network resolve path that skips this check
+  "because it's not implemented as a gate yet" — the field existing with
+  no reader yet is exactly what this note exists to close before it
+  becomes a live gap the way the automation-consumer self-assertion note
+  above already is.
 - **`home::secrets_home`/`socket::socket_path` are THE resolution — nothing
   else re-derives a secrets-home or socket path.** `broker::serve`/
   `client::resolve`/`client::run_exec` all take the resolved `&Path` as a
@@ -324,6 +355,22 @@
   split living in that op's own client function — not a generic
   "confirm before mutation" middleware, since each op's own gate already
   knows its own state.
+- **Two per-secret policy gates + their admin verbs landed at P-N1.**
+  `Policy` gained `automation: {enabled, consumers[]}` and `remote: bool`,
+  both `#[serde(default)]` so an existing `policy.json` predating this
+  phase loads cleanly as automation-disabled/empty and `remote: false` —
+  see `policy.rs`'s round-trip tests for both the old and new shape.
+  `policy::totp_required(policy, consumer)` is the new single decision
+  point (invariant above) `broker::resolve_gate` calls instead of reading
+  `policy.require_totp` directly. `secrets automate <name> on|off|grant|
+  revoke` and `secrets expose <name> on|off` are plain handlers
+  (`commands::handle_secrets_automate`/`handle_secrets_expose`) — same
+  `require_cli` + `require_admin_identity` gate, same idempotent
+  "unchanged" reporting as `set-totp`, appended LAST in `register()`
+  (golden 61 -> 63). A future P-N2 phase turns a `totp_required` `true`
+  result with no code into a PARK instead of a flat refusal — that phase
+  changes `totp_required`'s callers, not its own signature or the
+  automation/remote fields themselves.
 
 ## Docs update required in the same commit
 

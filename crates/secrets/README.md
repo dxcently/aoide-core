@@ -50,6 +50,18 @@ wire, and `secrets put` gained a `--force` flag that sets it — on a tty
 without `--force`, the refusal becomes a `y/N` confirmation instead of a
 hard stop. See "The write flow" below for the full flow and
 `CONTRACTS.md`'s "Secrets wire" subsection for the wire-compat notes.
+**P-N1 (this commit) adds two per-secret policy gates and their admin
+verbs**: `automation` (`{enabled, consumers[]}`) lets an operator name
+consumers that resolve a `requireTotp`-gated secret WITHOUT a code —
+`secrets automate <name> on|off|grant|revoke` — while every other caller
+stays gated exactly as before (see "The automation gate" below,
+`policy::totp_required` for the exact decision, and its honesty caveat:
+the consumers it lists are checked against the SAME self-asserted
+`consumer` wire field every other gate in this crate already trusts, or
+doesn't); `remote` (default `false`) is a per-secret reachability flag
+with NO behavior change yet — `secrets expose <name> on|off` — that every
+future non-local entry point onto this broker must check before releasing
+a value (see "Remote reachability" below).
 
 `secrets enroll` generates a fresh 20-byte secret from `/dev/urandom`,
 persists it (`store::save_totp_secret`, `0600`), and prints its
@@ -224,6 +236,61 @@ group-membership trust model, the `consumer`-self-assertion honesty note)
 for a reader who never opens this crate's Rust; THIS section is the
 canonical copy — a wire change lands here (and in `broker.rs`'s module
 doc) first, `CONTRACTS.md` follows in the same commit.
+
+## The automation gate (`secrets automate`, P-N1)
+
+A policy's `automation` field (`{enabled: bool, consumers: [name, ...]}`,
+absent on an existing `policy.json` loads as `{enabled: false, consumers:
+[]}` — identical behavior to before this field existed) lets an operator
+name specific consumers that resolve `requireTotp`-gated secrets WITHOUT a
+fresh code, while every other caller stays gated exactly as before. It can
+only ever RELAX `requireTotp`, never tighten it: a policy with
+`requireTotp: false` is unaffected by `automation` in every combination.
+
+`policy::totp_required(policy, consumer)` is the ONE decision point
+`broker::resolve_gate` routes through (replacing what used to be a bare
+`if policy.require_totp`) — the gate order is now:
+
+```
+exists -> consumer authorized (unchanged) -> totp_required(policy, consumer) -> fetch
+```
+
+where `totp_required` is `requireTotp AND NOT (automation.enabled AND
+consumer IS IN automation.consumers)`. Consumer names in
+`automation.consumers` are matched EXACTLY, the same validation
+([`policy::valid_secret_name`]) as every other name this crate holds —
+`secrets automate <name> grant <consumer>` checks it before the name ever
+lands in `policy.json`.
+
+`secrets automate <name> on|off` flips `automation.enabled`;
+`secrets automate <name> grant|revoke <consumer>` edits
+`automation.consumers` — both idempotent (`set-totp`'s own precedent):
+re-flipping the same state, or granting/revoking a consumer already
+in/out of the list, reports "unchanged" and writes nothing.
+
+**Honesty note (mirrors the replay-ledger ruling below, for the identical
+reason):** the wire's `consumer` field is SELF-ASSERTED — nothing
+authenticates it (this crate's `AGENTS.md`, `CONTRACTS.md`'s "Secrets
+wire" honesty note). `automation.consumers` is checked against that SAME
+self-asserted field, so an automation-open secret is effectively
+CODE-FREE for any local socket caller claiming a listed consumer name,
+until authenticated session identity exists (#63-adjacent, not planned
+here). Automation is a courtesy label on top of the real boundary (socket
+group membership), not a cryptographic one, exactly like `consumers[]`
+itself — don't reach for `automation` as a way to "still be safe without
+TOTP" against a hostile co-tenant of the same socket group; it isn't.
+
+## Remote reachability (`secrets expose`, P-N1)
+
+`policy.json` also carries a `remote` boolean (default `false`; absent on
+an existing file loads as `false`). **NO behavior change today** — there
+is no non-local entry point onto this broker yet (no mesh replication, no
+network door) — this field exists so an operator can PRE-DECLARE which
+secrets are meant to ever leave this host, ahead of one landing. It is a
+crate invariant (`AGENTS.md`): every non-local entry point added later
+MUST refuse a secret whose `remote` is `false` before ever touching its
+backend. `secrets expose <name> on|off` flips it, same idempotency
+discipline as `set-totp`/`automate`.
 
 ## TOTP enrollment (`secrets enroll`, P-V3)
 
@@ -435,21 +502,39 @@ which one provisioned the parent directory.
 
 ### Admin verbs
 
-`secrets add|rm|grant|revoke|enroll|set-totp` mutate `policy.json`/
-`totp.secret` under the secrets home, so they run AS the secrets user — no
-sudo rule is shipped (nix module or not); the raw form:
+`secrets add|rm|grant|revoke|enroll|set-totp|automate|expose` mutate
+`policy.json`/`totp.secret` under the secrets home, so they run AS the
+secrets user — no sudo rule is shipped (nix module or not); the raw form:
 
 ```sh
 sudo -u aoide-secrets aoide secrets enroll
 sudo -u aoide-secrets aoide secrets add <name> --backend <backend> --key <key>
 sudo -u aoide-secrets aoide secrets grant <name> <consumer>
 sudo -u aoide-secrets aoide secrets set-totp <name> on
+sudo -u aoide-secrets aoide secrets automate <name> on
+sudo -u aoide-secrets aoide secrets automate <name> grant <consumer>
+sudo -u aoide-secrets aoide secrets expose <name> on
 ```
 
 `secrets set-totp <name> on|off` (P-V4e) flips an EXISTING policy's
 `requireTotp` bit directly, in place of hand-editing `policy.json` with a
 `jq` one-liner — the gap this verb exists to close. Idempotent: re-setting
 the state a policy already has reports "unchanged" and writes nothing.
+
+`secrets automate <name> on|off` (P-N1) flips the policy's `automation.
+enabled` bit; `secrets automate <name> grant|revoke <consumer>` edits
+`automation.consumers` (checked with the same [`valid_secret_name`]
+validation as every other name in this crate). Both are idempotent the
+same way `set-totp` is — a state already in place, or a consumer already
+granted/revoked, reports "unchanged" and never rewrites `policy.json`. See
+"The automation gate" below for what this field actually does at resolve
+time, and its honesty caveat.
+
+`secrets expose <name> on|off` (P-N1) flips the policy's `remote` bit —
+same idempotency discipline as `set-totp`/`automate`. **No behavior
+change today**: no non-local entry point onto this broker exists yet, so
+`remote` currently gates nothing — see "Remote reachability" below for
+the invariant it exists to enforce once one lands.
 
 **Running any of these as the wrong user is refused outright, before the
 verb ever touches `policy.json`/`totp.secret` (P-V4f).** A mismatched
@@ -525,7 +610,10 @@ Pure logic (P-V1, unchanged):
   consumer dimension (see its own module doc for the ruling). Consulted by
   `broker::verify_totp_gate` (P-V3) and persisted via `store`.
 - `policy` — `Policy` (per-secret `{name, backend, key, requireTotp,
-  consumers[], sharedWith[]}`) and `valid_secret_name`.
+  consumers[], sharedWith[], automation, remote}`, `automation`/`remote`
+  added P-N1) and `valid_secret_name`. `totp_required(policy, consumer)`
+  (P-N1) is the ONE decision point behind "is a TOTP code required for
+  this resolve" — see "The automation gate" below.
 
 Daemon/socket/CLI (P-V2, extended P-V3):
 
@@ -628,22 +716,25 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   real socket. `non_tty_exists_message` (P-67) is the pure message builder
   behind the non-interactive "refuses and teaches `--force`" path — testable
   without faking a tty.
-- `commands` — `register(&mut Registry)`: NINE verbs, ALL CLI-only.
+- `commands` — `register(&mut Registry)`: ELEVEN verbs, ALL CLI-only.
   `serve`/`exec`/`enroll` are door-hint handlers (the real work happens in
   `cli`'s `special` hook, same pattern as `a2a serve`/`conductor`); `add`/
-  `rm`/`grant`/`revoke`/`set-totp` are policy-CRUD handlers gated the same
-  way (`require_cli`) — a non-CLI door (MCP/A2A/Daemon) gets the door-hint
-  `Outcome` before `policy.json`/`totp.secret` is ever touched, closing off
-  a self-escalation path (`secrets grant <secret> <itself>`, or a hostile
-  re-enrollment, from an already-connected agent). Those same five also
-  call `require_admin_identity` (P-V4f) right after `require_cli` — the
-  wrong effective uid gets refused before the file is ever touched too, see
-  "Admin verbs" above. `put` (P-V4c) is gated
+  `rm`/`grant`/`revoke`/`set-totp`/`automate`/`expose` are policy-CRUD
+  handlers gated the same way (`require_cli`) — a non-CLI door (MCP/A2A/
+  Daemon) gets the door-hint `Outcome` before `policy.json`/`totp.secret` is
+  ever touched, closing off a self-escalation path (`secrets grant <secret>
+  <itself>`, or a hostile re-enrollment, from an already-connected agent).
+  Those same seven also call `require_admin_identity` (P-V4f) right after
+  `require_cli` — the wrong effective uid gets refused before the file is
+  ever touched too, see "Admin verbs" above. `put` (P-V4c) is gated
   the SAME way (`require_cli`) but is NOT special-cased like `exec`/
   `enroll` — see `commands.rs`'s own module doc for why its wire reply
   carrying no value at all makes that unnecessary. `set-totp` (P-V4e)
-  follows `put`'s shape too — a plain handler, no wire, no value, appended
-  newest.
+  follows `put`'s shape too — a plain handler, no wire, no value. `automate`/
+  `expose` (P-N1) follow the SAME shape as `set-totp` — plain handlers, no
+  wire op of their own (both only edit `policy.json`, the same file
+  `resolve`/`put` already read), same idempotent "unchanged" reporting —
+  appended newest, LAST in `register()`.
 
 ## What it consumes
 
@@ -666,8 +757,9 @@ mod.rs::all()` calls `aoide_secrets::commands::register`, appended newest;
 `crates/cli/src/lib.rs`'s `special` hook wires `secrets serve`/`secrets exec`/
 `secrets enroll` — P-V4e's `--show` rides the SAME `secrets enroll` arm, no
 second one — `secrets put`, P-V4c, deliberately does NOT join that hook,
-see `commands.rs`'s module doc; neither does `secrets set-totp`, P-V4e, for
-the same reason `put` doesn't — a plain handler, no value on the wire). The workspace `Cargo.toml`
+see `commands.rs`'s module doc; neither does `secrets set-totp`, P-V4e, nor
+`secrets automate`/`secrets expose`, P-N1, for the same reason `put`
+doesn't — plain handlers, no value on the wire). The workspace `Cargo.toml`
 comment on the `aoide-secrets` member is kept current with the verb set in
 the same commit as any change.
 

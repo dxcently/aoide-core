@@ -68,6 +68,17 @@
 //! same as every other backend call in this module, the value never
 //! leaves this process.
 //!
+//! **The automation gate (P-N1) can only ever RELAX `requireTotp`, never
+//! tighten it.** [`resolve_gate`]'s TOTP branch is gated by
+//! `crate::policy::totp_required(policy, consumer)`, not `policy.
+//! require_totp` directly — that function's own doc has the full decision
+//! table; the short version is: a policy's automation is OPEN
+//! (`automation.enabled`) and `consumer` is one of the names LISTED in
+//! `automation.consumers` skips the code entirely for THAT consumer, every
+//! other caller (automation closed, or open but unlisted) is gated exactly
+//! as before this field existed. Gate order is otherwise unchanged: exists
+//! -> consumers-authorization -> `totp_required` -> fetch.
+//!
 //! **`requireTotp` is wired live (P-V3).** [`resolve_gate`] rejects it
 //! outright ONLY when no `secrets enroll` has ever run on this host
 //! (`crate::store::load_totp_secret` returns `None`) — a clear "no TOTP
@@ -381,7 +392,7 @@ fn resolve_gate(
     if !authorized {
         return (false, Err("consumer not authorized for this secret".to_string()));
     }
-    if policy.require_totp {
+    if crate::policy::totp_required(policy, consumer) {
         if let Err(e) = verify_totp_gate(secrets_home, totp, now_unix) {
             return (false, Err(e));
         }
@@ -822,6 +833,65 @@ mod tests {
         assert!(!granted, "the same code must be denied the second time (replay)");
         assert!(!marker.exists(), "backend ran on a replay denial");
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── automation gate (P-N1) ──────────────────────────────────────────
+
+    /// The end-to-end proof `crate::policy::totp_required`'s own unit
+    /// tests can't give alone: a `requireTotp` policy whose automation is
+    /// OPEN and lists the calling consumer resolves through the REAL
+    /// broker gate with no `totp` field on the wire at all.
+    #[test]
+    fn automation_open_and_listed_consumer_resolves_without_a_totp_code() {
+        let home = tmp_home("automation-open");
+        let mut p = Policy::new("t", "scratch", "stored-value");
+        p.require_totp = true;
+        p.automation.enabled = true;
+        p.automation.consumers = vec!["m".to_string()];
+        // No `secrets enroll` on this host at all — proves the code path
+        // never even reaches `verify_totp_gate` (which would deny with "no
+        // TOTP enrollment" otherwise).
+        seed(&home, &[p]);
+
+        let (granted, result) = resolve_gate(&home, "t", "m", None, NOW);
+        assert!(granted, "{result:?}");
+        assert_eq!(result.unwrap(), "stored-value");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The same policy, an UNLISTED consumer — still gated, exactly as
+    /// before this field existed (no enrollment on this host, so the
+    /// denial is the "no TOTP enrollment" one).
+    #[test]
+    fn automation_open_but_unlisted_consumer_is_still_gated() {
+        let home = tmp_home("automation-unlisted");
+        let mut p = Policy::new("t", "scratch", "stored-value");
+        p.require_totp = true;
+        p.automation.enabled = true;
+        p.automation.consumers = vec!["m".to_string()];
+        seed(&home, &[p]);
+
+        let (granted, result) = resolve_gate(&home, "t", "someone-else", None, NOW);
+        assert!(!granted);
+        assert!(result.unwrap_err().contains("no TOTP enrollment"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Automation CLOSED (the default) — the exact same policy shape minus
+    /// `enabled`, still fully gated for the consumer that would have been
+    /// listed had it been open.
+    #[test]
+    fn automation_disabled_is_gated_exactly_like_before_this_field_existed() {
+        let home = tmp_home("automation-closed");
+        let mut p = Policy::new("t", "scratch", "stored-value");
+        p.require_totp = true;
+        p.automation.consumers = vec!["m".to_string()]; // listed, but NOT enabled
+        seed(&home, &[p]);
+
+        let (granted, result) = resolve_gate(&home, "t", "m", None, NOW);
+        assert!(!granted);
+        assert!(result.unwrap_err().contains("no TOTP enrollment"));
         std::fs::remove_dir_all(&home).ok();
     }
 
