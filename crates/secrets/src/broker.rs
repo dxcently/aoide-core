@@ -23,6 +23,27 @@
 //! [`crate::park::ParkRegistry`] recovers from a poisoned lock rather than
 //! propagating a panic across threads.
 //!
+//! **Thread-per-connection also exposed two read-modify-write sections that
+//! the old serial accept loop used to serialize FOR FREE, just by never
+//! running two connections' code at the same time (P-N2 review fix, this
+//! commit).** [`verify_totp_gate`]'s replay-ledger load -> record -> prune
+//! -> save, and [`put_gate`]'s existence-probe -> store, are each now
+//! wrapped in their own process-wide [`std::sync::Mutex<()>`]
+//! ([`replay_ledger_lock`], [`put_lock`]) held across the FULL critical
+//! section — without it, two threads racing the SAME valid TOTP code could
+//! both load the ledger before either saved, each `record()` against a
+//! private copy, and both succeed (one code redeeming a secret TWICE,
+//! breaking the single-use guarantee); symmetrically, two concurrent
+//! `overwrite:false` puts could both pass the existence probe before either
+//! stored. Both locks recover from a poisoned lock the SAME way
+//! [`crate::park::ParkRegistry`]'s does (`park.rs`'s own module doc is the
+//! precedent this follows) — `.lock().unwrap_or_else(|e| e.into_inner())`,
+//! never a bare `.unwrap()`, so a panic inside one connection's thread can
+//! never wedge every other connection's TOTP verification or put. Neither
+//! lock introduces caching — the ledger and the backend's own stored value
+//! are still read fresh from disk every time; the lock only serializes the
+//! section, it never remembers what it read.
+//!
 //! Wire (`resolve`/`put`/`pending`/`approve`/`dismiss`):
 //! ```text
 //! -> {"op":"resolve","secret":"<name>","consumer":"<consumer>","totp":"<code>"?,"argv0":"<cmd>"?,"wait":<bool>?}
@@ -604,10 +625,26 @@ fn handle_put(secrets_home: &Path, req: &Value) -> Value {
 /// value; `Granted { replaced }` distinguishes a first-ever store from an
 /// overwrite so the audit line and the client's own success message can
 /// say which happened.
+#[derive(Debug)]
 enum PutOutcome {
     Granted { replaced: bool },
     DeniedExists,
     Denied(String),
+}
+
+/// Serializes `put_gate`'s existence-probe -> store critical section (P-N2
+/// review fix, this commit) — see the module doc's "read-modify-write
+/// sections" paragraph for why thread-per-connection made this necessary
+/// (it was implicitly serialized for free under the old single-threaded
+/// accept loop) and `park::ParkRegistry`'s own module doc for the
+/// poisoned-lock-recovery precedent this follows. A SEPARATE lock from
+/// [`replay_ledger_lock`] — `put` and `resolve`/`approve` guard different
+/// files (a backend's own stored value vs. `totp-replay.json`), so there is
+/// no reason for a slow put to block an unrelated TOTP verification or vice
+/// versa.
+fn put_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
 }
 
 /// The `put` policy gate + existence probe + backend store, in one place —
@@ -618,7 +655,13 @@ enum PutOutcome {
 /// invoked on either. **P-67:** when `overwrite` is false and
 /// `crate::backend::has_value` reports an existing value, the backend's
 /// `set` template is never invoked either — the existence probe (a `get`
-/// template run) is the only backend call on that path.
+/// template run) is the only backend call on that path. **P-N2 review
+/// fix:** the probe and the store are held under [`put_lock`] for the
+/// FULL critical section — two `overwrite:false` puts racing on separate
+/// connections must never both pass the probe before either stores (the
+/// same newly-exposed TOCTOU shape [`verify_totp_gate`]'s replay ledger
+/// had, module doc). The probe itself still reads the backend fresh every
+/// time — the lock serializes, it never caches.
 fn put_gate(secrets_home: &Path, secret: &str, value: &str, overwrite: bool) -> PutOutcome {
     let policies = match crate::store::load_policies(secrets_home) {
         Ok(p) => p,
@@ -633,6 +676,8 @@ fn put_gate(secrets_home: &Path, secret: &str, value: &str, overwrite: bool) -> 
     let Some(policy) = policies.iter().find(|p| p.name == secret) else {
         return PutOutcome::Denied("secret not found".to_string());
     };
+
+    let _guard = put_lock().lock().unwrap_or_else(|e| e.into_inner());
     let already_has_value = crate::backend::has_value(secrets_home, &policy.backend, &policy.key);
     if already_has_value && !overwrite {
         return PutOutcome::DeniedExists;
@@ -718,6 +763,27 @@ fn resolve_gate(secrets_home: &Path, secret: &str, consumer: &str, totp: Option<
     }
 }
 
+/// Serializes [`verify_totp_gate`]'s ENTIRE replay-ledger load -> record ->
+/// prune -> save critical section (P-N2 review fix, this commit — a
+/// CONFIRMED race, reproduced by a two-thread test iterated ~20x before
+/// this lock existed). See the module doc's "read-modify-write sections"
+/// paragraph: the old single-threaded accept loop serialized this for
+/// free just by never running two connections' code at once; P-N2's move
+/// to thread-per-connection removed that, so without an explicit lock two
+/// threads racing the SAME valid code could each load the ledger before
+/// either saved, each `record()` a private copy, and both succeed — one
+/// code redeeming a `requireTotp` secret TWICE. Recovers from a poisoned
+/// lock the same way [`crate::park::ParkRegistry`]'s own lock does
+/// (`park.rs`'s module doc is the precedent) — a panic inside one
+/// connection's thread must never wedge every other connection's TOTP
+/// verification. The ledger is still loaded fresh from disk on every call
+/// (this crate's "NO CACHE, EVER" invariant, `AGENTS.md`) — this lock only
+/// serializes the section, it never remembers what it read.
+fn replay_ledger_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
+}
+
 /// The `requireTotp` half of [`resolve_gate`]. No enrollment on this host
 /// -> unresolvable (unchanged wording from before P-V3). Enrolled -> a
 /// fresh `±1`-window code, single-use per TIMESTEP via the persisted
@@ -725,7 +791,9 @@ fn resolve_gate(secrets_home: &Path, secret: &str, consumer: &str, totp: Option<
 /// on timestep alone, never consumer). Every error string here is
 /// value-free AND code-free by construction: the caller-typed `totp`
 /// string is untrusted input (module doc) and is never interpolated into
-/// any returned message, only parsed/compared.
+/// any returned message, only parsed/compared. **P-N2 review fix:** the
+/// ledger's load/record/prune/save is held under [`replay_ledger_lock`]
+/// for its full extent — see that function's own doc.
 fn verify_totp_gate(secrets_home: &Path, totp: Option<&str>, now_unix: u64) -> Result<(), String> {
     let secret = match crate::store::load_totp_secret(secrets_home) {
         Ok(Some(s)) => s,
@@ -744,6 +812,7 @@ fn verify_totp_gate(secrets_home: &Path, totp: Option<&str>, now_unix: u64) -> R
         return Err("totp code invalid or expired".to_string());
     };
 
+    let _guard = replay_ledger_lock().lock().unwrap_or_else(|e| e.into_inner());
     let mut ledger = match crate::store::load_replay_ledger(secrets_home) {
         Ok(l) => l,
         Err(e) => return Err(format!("totp-replay.json: {e}")),
@@ -2053,5 +2122,120 @@ mod tests {
             });
         });
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── P-N2 review fix: the replay-ledger and put critical sections ────
+    //
+    // Thread-per-connection removed the implicit serialization the old
+    // serial accept loop gave these two read-modify-write sections for
+    // free (module doc's "read-modify-write sections" paragraph). Both
+    // tests below reproduce the exact race the reviewer found — two
+    // threads racing the SAME resource with a `Barrier` to align their
+    // start as tightly as possible — iterated so a single lucky
+    // (unlucky) interleaving can't hide a regression.
+
+    /// The CRITICAL fix: two threads calling `resolve_gate` concurrently
+    /// with the SAME valid TOTP code against a SHARED secrets home must
+    /// grant exactly once, never twice. Before `replay_ledger_lock`
+    /// existed, this reproduced a double-grant on roughly 5/20 iterations
+    /// (reviewer's own repro rate) — iterated 20x here so a regression
+    /// can't slip through on a lucky run.
+    #[test]
+    fn concurrent_resolve_with_the_same_code_never_grants_twice() {
+        for i in 0..20 {
+            let home = tmp_home(&format!("race-resolve-{i}"));
+            let mut p = Policy::new("t", "scratch", "stored-value");
+            p.consumers = vec!["m".to_string()];
+            let secret = seed_enrolled(&home, p);
+            let code = code_for_now(&secret, NOW);
+
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+            let home_a = home.clone();
+            let code_a = code.clone();
+            let barrier_a = barrier.clone();
+            let a = std::thread::spawn(move || {
+                barrier_a.wait();
+                resolve_gate(&home_a, "t", "m", Some(&code_a), NOW)
+            });
+
+            let home_b = home.clone();
+            let code_b = code.clone();
+            let barrier_b = barrier.clone();
+            let b = std::thread::spawn(move || {
+                barrier_b.wait();
+                resolve_gate(&home_b, "t", "m", Some(&code_b), NOW)
+            });
+
+            let ra = a.join().unwrap();
+            let rb = b.join().unwrap();
+            let grants = [&ra, &rb].into_iter().filter(|o| matches!(o, GateOutcome::Granted(_))).count();
+            assert_eq!(
+                grants, 1,
+                "iteration {i}: exactly one of two concurrent resolves sharing a valid code must grant, got {grants}"
+            );
+
+            std::fs::remove_dir_all(&home).ok();
+        }
+    }
+
+    /// The SECONDARY fix, same TOCTOU shape: two threads calling
+    /// `put_gate` concurrently with `overwrite:false` against a SECRET
+    /// THAT DOES NOT YET HAVE A VALUE must store exactly once — the other
+    /// must see the value the first one stored and refuse with
+    /// `DeniedExists`, never silently clobber it.
+    #[test]
+    fn concurrent_overwrite_false_puts_store_exactly_once() {
+        for i in 0..20 {
+            let home = tmp_home(&format!("race-put-{i}"));
+            seed(&home, &[Policy::new("t", "scratch-write", "irrelevant")]);
+            // `put_gate` needs a `set` template too — `seed`'s own
+            // `scratch` backend only has `get`, so this test writes its
+            // own backend entry with both.
+            let store_path = home.join("store-file");
+            // No `|| true` on the `get` template — `has_value` (module
+            // doc) is exactly `fetch_value(...).is_ok()`, so the probe
+            // must genuinely FAIL (non-zero exit) while the file doesn't
+            // exist yet, for the "no value yet, race the first store"
+            // shape this test needs.
+            std::fs::write(
+                crate::backend::backends_path(&home),
+                serde_json::to_vec(&serde_json::json!({
+                    "scratch-write": {
+                        "get": format!("cat {}", store_path.display()),
+                        "set": format!("cat > {}", store_path.display())
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+            let home_a = home.clone();
+            let barrier_a = barrier.clone();
+            let a = std::thread::spawn(move || {
+                barrier_a.wait();
+                put_gate(&home_a, "t", "value-a", false)
+            });
+
+            let home_b = home.clone();
+            let barrier_b = barrier.clone();
+            let b = std::thread::spawn(move || {
+                barrier_b.wait();
+                put_gate(&home_b, "t", "value-b", false)
+            });
+
+            let ra = a.join().unwrap();
+            let rb = b.join().unwrap();
+            let stores = [&ra, &rb].into_iter().filter(|o| matches!(o, PutOutcome::Granted { .. })).count();
+            assert_eq!(
+                stores, 1,
+                "iteration {i}: exactly one of two concurrent overwrite:false puts must store, got {stores}: \
+                 a={ra:?} b={rb:?}"
+            );
+
+            std::fs::remove_dir_all(&home).ok();
+        }
     }
 }

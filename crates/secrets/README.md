@@ -334,6 +334,19 @@ thread, and every other connection (an unrelated `resolve`, a `put`, a
 parked. `AGENTS.md`'s own invariant list has the poisoned-lock convention
 this introduced (the crate's first production, non-test, lock).
 
+**Review fix, same commit as the fix below in git history: two
+read-modify-write sections the serial accept loop used to serialize for
+free needed an EXPLICIT lock once connections stopped running one at a
+time.** `verify_totp_gate`'s replay-ledger load→record→prune→save, and
+`put_gate`'s existence-probe→store, are each now held under their own
+process-wide `Mutex<()>` (`broker::replay_ledger_lock`/`broker::put_lock`)
+for the full critical section — without it, two threads racing the SAME
+valid TOTP code could both load the ledger before either saved and both
+grant (breaking single-use), and two concurrent `overwrite:false` puts
+could both pass the existence probe before either stored. Both follow the
+SAME poisoned-lock-recovery convention `ParkRegistry`'s lock set. See
+"Invariants held" below for the full three-lock inventory.
+
 ## The automation gate (`secrets automate`, P-N1)
 
 A policy's `automation` field (`{enabled: bool, consumers: [name, ...]}`,
@@ -948,11 +961,23 @@ the same commit as any change.
   channel — `approve` fetches fresh through the backend only AFTER a code
   has already validated, and sends it straight down that channel; nothing
   in `park`/`broker` ever holds a value across the wait.
-- **The `ParkRegistry`'s `Mutex` recovers from a poisoned lock rather than
-  propagating the panic** (P-N2 — the first PRODUCTION, non-test, lock
-  anywhere in this crate tree; every earlier `Mutex`/`RwLock` use was
-  test-only env serialization). `.lock().unwrap_or_else(|e| e.into_inner())`
-  everywhere the registry is touched — a panic inside one connection's own
-  thread must never poison every OTHER connection's ability to park/list/
-  approve/dismiss, matching this crate's existing "one connection's failure
-  never touches another's" discipline (`broker.rs`'s own module doc).
+- **Three production, non-test locks exist in this crate tree, all
+  poisoned-lock-recovering** (`.lock().unwrap_or_else(|e| e.into_inner())`,
+  never a bare `.unwrap()`): `park::ParkRegistry`'s internal `Mutex` was
+  the first (P-N2 — every earlier `Mutex`/`RwLock` use was test-only env
+  serialization); thread-per-connection then exposed two more
+  read-modify-write sections the old serial accept loop used to serialize
+  implicitly, just by never running two connections' code at once — a
+  reviewer-confirmed race (empirically reproduced, ~5/20 iterations
+  double-granting the same TOTP code before the fix). `broker::
+  replay_ledger_lock` now guards `verify_totp_gate`'s full
+  load→record→prune→save of the replay ledger, and `broker::put_lock`
+  guards `put_gate`'s full existence-probe→store — two SEPARATE locks,
+  since `put` and `resolve`/`approve` guard different files and there is
+  no reason for one to block the other. A panic inside one connection's
+  own thread must never poison every OTHER connection's ability to
+  park/list/approve/dismiss/resolve/put, matching this crate's existing
+  "one connection's failure never touches another's" discipline
+  (`broker.rs`'s own module doc). Neither new lock caches anything — both
+  sections still read fresh from disk on every call, same "NO CACHE,
+  EVER" invariant as always; the lock only serializes the section.
