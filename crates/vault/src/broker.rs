@@ -55,27 +55,59 @@
 //! client sent one) + granted/denied + a value-free reason — NEVER the
 //! value, which exists only as this module's own local `String` between
 //! the backend fetch and the `{"ok":true,"value":...}` line write.
+//!
+//! **The socket is chmod'd to `0660` immediately after bind** (P-V4,
+//! deployment). `UnixListener::bind` alone honors the process umask
+//! (typically `0755`), which leaves the socket file WORLD-connectable —
+//! and the wire's `consumer` field is SELF-ASSERTED (this module's own
+//! doc, above), so on a multi-user box a world-connectable socket means
+//! any local user, not just the vault's intended group, could resolve any
+//! standing-grant secret. `0660` (owner + group rw, no other bits) is the
+//! DESIGN, not a tightened-as-far-as-possible default: the socket is
+//! deliberately GROUP-connectable, not owner-only, because the whole point
+//! is that ordinary operator-uid agents (members of the access group) can
+//! reach it. [`bind_socket`] sets only the MODE bits (`0o660` literal, the
+//! group-connectable design point — contrast [`crate::home::secure_file`]'s
+//! `0o600`, which is the wrong mode HERE on purpose). Group OWNERSHIP —
+//! making the socket's gid the real `aoide-vault-access` group — is
+//! deployment's job, not this crate's: P-V4's nix module sets the
+//! `aoide-vault-serve` unit's `Group=aoide-vault-access`, so every file the
+//! broker process creates (including this socket) inherits that gid from
+//! the process's own primary/effective group. This module only ever touches
+//! the mode bits.
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
-/// Bind `socket_path` and serve `resolve` requests forever. Creates
-/// `vault_home` if absent and locks it down to `0700` (bounce-fix item 3,
-/// P-V2 review — `create_dir_all` alone honors the process umask, which
-/// would leave `policy.json`/`backends.json` world-readable); removes a
-/// stale socket file first (single-owner path per host, same precedent as
-/// `shellbridge::run`). Only returns on a bind/permission failure — a
-/// running broker never returns `Ok`.
-pub fn serve(vault_home: &Path, socket_path: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(vault_home)?;
-    crate::home::secure_dir(vault_home)?;
+/// Bind `socket_path`: create its parent dir if absent, remove a stale
+/// socket file first (single-owner path per host, same precedent as
+/// `shellbridge::run`), bind, then chmod the socket file to `0660`
+/// (module doc — group-connectable is the DESIGN, group OWNERSHIP is
+/// deployment's job). Split out of [`serve`] so a test can exercise the
+/// bind-and-secure step directly without entering the forever-loop accept
+/// body.
+fn bind_socket(socket_path: &Path) -> std::io::Result<UnixListener> {
     if let Some(parent) = socket_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660))?;
+    Ok(listener)
+}
+
+/// Bind `socket_path` and serve `resolve` requests forever. Creates
+/// `vault_home` if absent and locks it down to `0700` (bounce-fix item 3,
+/// P-V2 review — `create_dir_all` alone honors the process umask, which
+/// would leave `policy.json`/`backends.json` world-readable). Only returns
+/// on a bind/permission failure — a running broker never returns `Ok`.
+pub fn serve(vault_home: &Path, socket_path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(vault_home)?;
+    crate::home::secure_dir(vault_home)?;
+    let listener = bind_socket(socket_path)?;
 
     let home = vault_home.to_path_buf();
     for conn in listener.incoming() {
@@ -548,6 +580,19 @@ mod tests {
         assert!(!granted, "the same code must be denied the second time (replay)");
         assert!(!marker.exists(), "backend ran on a replay denial");
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── socket permissions (P-V4) ───────────────────────────────────────
+
+    #[test]
+    fn bind_socket_chmods_the_socket_file_to_0660() {
+        let home = tmp_home("sockmode");
+        let socket_path = home.join("vault.sock");
+        let listener = bind_socket(&socket_path).unwrap();
+        let mode = std::fs::metadata(&socket_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o660, "vault socket must be group-connectable (0660), got {mode:o}");
+        drop(listener);
         std::fs::remove_dir_all(&home).ok();
     }
 

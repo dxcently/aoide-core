@@ -101,9 +101,17 @@
   `broker::verify_totp_gate` wires `totp::verify`/`replay::ReplayLedger`
   into `resolve_gate`'s `requireTotp` branch, and `store::
   load_replay_ledger`/`save_replay_ledger` give the ledger its vault-home
-  file. Deployment hardening (P-V4: the real `/var/lib/aoide-vault` path,
-  a real `aoide-vault` system user) is the only piece still ahead —
-  nothing about verification itself is left to wire.
+  file.
+- **Deployment LANDED at P-V4** — `broker::bind_socket` chmods the socket
+  to `0660` on bind (group-connectable is the DESIGN; group OWNERSHIP is
+  `modules/nucleus/vault.nix`'s job via the service's `Group=`, never this
+  crate's — see `broker.rs`'s module doc and this file's own invariant
+  below). The real `/var/lib/aoide-vault` path and a real `aoide-vault`
+  system user are provisioned by that nix module (nix-dependent by design
+  — root `AGENTS.md`'s HARD CONSTRAINT carves out systemd packaging) or by
+  the non-nix `useradd`/`groupadd` path in `README.md`'s "Deployment"
+  section (any init, or none — the broker binary itself never gained a nix
+  dependency). Only P-V5 (mesh pairing, gated on #51) is still ahead.
 - **Backend adapter DOC PRESETS** (`pass`/`gopass`/`bw`/`sops`) landed at
   P-V3 in `README.md`'s "Backend presets" section — `backend.rs` itself is
   unchanged (it never gained backend-specific knowledge, by design). QR-

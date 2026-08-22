@@ -66,9 +66,12 @@ aoide-lyra = { path = "crates/lyra" }
 # `aoide-vault` — Workstream VAULT's secrets broker: TOTP, policy types,
 # replay ledger, otpauth:// URI construction (P-V1); the unix-socket
 # broker daemon, the client `vault exec`, and the admin CLI verbs (P-V2);
-# `vault enroll` + the live requireTotp gate + backend-preset docs (P-V3).
-# `aoide-cli` depends on this crate as of P-V2 (`vault serve`/`exec`/
-# `add`/`rm`/`grant`/`revoke`/`enroll` register into its `Registry`).
+# `vault enroll` + the live requireTotp gate + backend-preset docs (P-V3);
+# the socket chmod'd 0660 on bind, deployed via modules/nucleus/vault.nix
+# or the non-nix install path (P-V4 — no new verb, binary stays
+# nix-independent). `aoide-cli` depends on this crate as of P-V2
+# (`vault serve`/`exec`/`add`/`rm`/`grant`/`revoke`/`enroll` register into
+# its `Registry`).
 aoide-vault = { path = "crates/vault" }
 
 [profile.release]
