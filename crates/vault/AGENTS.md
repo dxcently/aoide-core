@@ -10,6 +10,13 @@
   type added to this crate must be checked against this line before it
   lands. A value belongs in a client-process env var and nowhere else
   (README's release-to-client flow).
+- **`ReplayLedger` keys on timestep ALONE, never on consumer** (ruling,
+  Fable, 2026-08-22, P-V1 review escalation — plan file's VAULT §Policy
+  section). The resolve wire's `consumer` field is self-asserted; a
+  per-consumer ledger would let one typed code redeem once per invented
+  label. Don't reintroduce a consumer dimension to `replay::ReplayLedger`
+  without authenticated consumer identity landing first (#51-adjacent,
+  not planned).
 - **Clock-as-parameter, everywhere.** Every function in `totp`/`replay`
   takes `unix_time`/`timestep`/cutoff as an explicit argument. Nothing in
   `src/` calls `SystemTime::now()` — grep for it before merging a change

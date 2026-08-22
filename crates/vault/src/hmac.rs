@@ -76,4 +76,17 @@ mod tests {
         let mac = hmac_sha1(&key, data);
         assert_eq!(hex(&mac), "aa4ae5e15272d00e95705637ce8a3b55ed402112");
     }
+
+    // Key-exactly-64-bytes boundary (P-V1 review nit): `key.len() >
+    // BLOCK_LEN` is a strict `>`, so a 64-byte key takes the zero-pad
+    // (else) branch, not the hash-the-key-down branch — this is the one
+    // length where that boundary condition is actually exercised.
+    // Independently verified against `openssl dgst -mac HMAC`.
+    #[test]
+    fn key_exactly_block_size_takes_the_zero_pad_branch() {
+        let key = [0xccu8; BLOCK_LEN];
+        assert_eq!(key.len(), BLOCK_LEN);
+        let mac = hmac_sha1(&key, b"boundary key test message");
+        assert_eq!(hex(&mac), "0301feda67b20f871fae1d5bbfef8f929ca5fdcf");
+    }
 }

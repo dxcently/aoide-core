@@ -45,9 +45,13 @@ agent  -> aoide vault exec --as <consumer> --secret <name>[:VAR] [--totp NNNNNN]
   padding-tolerant on decode.
 - `uri` — `otpauth://` enrollment URI construction (Google Authenticator
   key-uri format), for V3's `vault enroll`.
-- `replay` — `ReplayLedger`: the single-use-per-`(consumer, timestep)`
-  structure that stops a captured TOTP code from being replayed within its
-  validity window. Pure struct + serde; no clock reads.
+- `replay` — `ReplayLedger`: the single-use-per-TIMESTEP structure that
+  stops a captured TOTP code from being replayed within its validity
+  window. Keyed by timestep ALONE, never by consumer — the resolve wire's
+  `consumer` field is self-asserted, so scoping single-use to it would
+  let one typed code redeem once per invented label (ruling recorded in
+  `replay.rs`'s module doc and the plan's VAULT §Policy section). Pure
+  struct + serde; no clock reads.
 - `policy` — `Policy` (per-secret `{name, backend, key, requireTotp,
   consumers[], sharedWith[]}`) and `valid_secret_name` (stricter than
   `aoide_storage::peer_store::valid_peer_name` — see the module doc).

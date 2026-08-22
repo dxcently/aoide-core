@@ -125,4 +125,25 @@ mod tests {
             "da39a3ee5e6b4b0d3255bfef95601890afd80709"
         );
     }
+
+    // Padding-spill boundary cases (P-V1 review nit): the padding step
+    // appends 0x80 then zeros until `len % 64 == 56`. A message of
+    // length 55 hits that mark with the 0x80 byte alone (padding stays
+    // inside the message's own last block); 56, 63, and 64 all overshoot
+    // it, forcing an entire extra 64-byte block of padding + the
+    // bit-length suffix. All four inputs are `n` repetitions of `a`,
+    // digests independently verified against `sha1sum`.
+    #[test]
+    fn boundary_lengths_around_the_padding_spill_match_sha1sum() {
+        let cases: &[(usize, &str)] = &[
+            (55, "c1c8bbdc22796e28c0e15163d20899b65621d65a"),
+            (56, "c2db330f6083854c99d4b5bfb6e8f29f201be699"),
+            (63, "03f09f5b158a7a8cdad920bddc29b81c18a551f5"),
+            (64, "0098ba824b5c16427bd7a1122a5a442a25ec644d"),
+        ];
+        for &(len, expected) in cases {
+            let msg = vec![b'a'; len];
+            assert_eq!(hex(&sha1(&msg)), expected, "length {len}");
+        }
+    }
 }

@@ -138,4 +138,28 @@ mod tests {
         let secret = b"12345678901234567890";
         assert_eq!(verify(secret, 0, 1111111111, DEFAULT_WINDOW), None);
     }
+
+    // T=0 boundary (P-V1 review nit): `unix_time = 0` puts `center` at
+    // timestep 0, and a `±1` window scan reaches `step = -1` before
+    // `step = 0`/`step = 1`. `verify` must not underflow computing that
+    // negative step (it works in `i64`, guarding `step < 0` before ever
+    // casting back to `u64`) — the T-1 side has nothing to match, T=0
+    // and T+1 are both reachable and correctly identified.
+    #[test]
+    fn verify_at_the_unix_epoch_does_not_underflow_and_checks_t0_and_t1() {
+        let secret = b"12345678901234567890";
+
+        let code_t0 = totp6(secret, 0);
+        assert_eq!(verify(secret, code_t0, 0, DEFAULT_WINDOW), Some(0));
+
+        let code_t1 = totp6(secret, STEP_SECONDS);
+        assert_eq!(verify(secret, code_t1, 0, DEFAULT_WINDOW), Some(1));
+
+        // No timestep -1 exists to match against — confirm a code that
+        // is neither T0's nor T1's is rejected rather than panicking.
+        let bogus = (code_t0 + 1) % 1_000_000;
+        if bogus != code_t1 {
+            assert_eq!(verify(secret, bogus, 0, DEFAULT_WINDOW), None);
+        }
+    }
 }
