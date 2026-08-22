@@ -112,6 +112,33 @@
   earn their own named module, it does not disappear. `enroll` itself
   never writes a secrets-home FILE directly — that stays `store`'s job
   (`enroll::run` calls `store::save_totp_secret`/`save_replay_ledger`).
+- **Every admin verb that reads/writes `policy.json`/`totp.secret` refuses
+  the wrong effective uid BEFORE touching the file, never after** (P-V4f,
+  the yomi-strix incident, 2026-08-22: plain `sudo aoide secrets add …`
+  ran as euid 0, succeeded, and silently reowned `policy.json` to
+  `root:root`, bricking the broker and every later admin verb — including
+  the correctly-spelled `sudo -u aoide-secrets` retry — until a manual
+  `chown`). `home::admin_identity_error(euid, home_owner, home, verb)` is
+  the PURE decision (unit-tested on injected uids: matching, root-vs-owner,
+  an arbitrary mismatch); `home::admin_identity_check(home, verb)` wires it
+  to a real `std::fs::metadata(home)` stat and a real `home::effective_uid`
+  (`libc::geteuid`, zero new deps — `libc` is already this crate's
+  dependency). `commands::require_admin_identity` calls it right after
+  `require_cli` in `add`/`rm`/`grant`/`revoke`/`set-totp`;
+  `enroll::run` calls it directly (its real work happens from `cli`'s
+  `special` hook, outside `commands.rs`'s own dispatch) — `enroll::show`
+  does NOT carry it (read-only, nothing to corrupt), and neither does
+  `put`/`exec` (socket-side operator verbs the guard was never meant to
+  cover). Root is explicitly a REFUSED case, not a bypass: root can always
+  write regardless of file ownership, which is the exact mechanism that
+  corrupted `policy.json` in the field. **A not-yet-existing secrets home
+  is NOT refused** — `admin_identity_check` returns `None` when the stat
+  fails, deliberately: nothing has decided who the broker user is until
+  the first admin verb creates the home directory, so there is nothing yet
+  to compare the caller's uid against (`home.rs`'s module doc has the full
+  reasoning). Don't add a second, differently-worded identity check
+  elsewhere in this crate; this is the one gate, and a new admin verb that
+  touches `policy.json`/`totp.secret` calls it the same way.
 - **`home::secrets_home`/`socket::socket_path` are THE resolution — nothing
   else re-derives a secrets-home or socket path.** `broker::serve`/
   `client::resolve`/`client::run_exec` all take the resolved `&Path` as a
@@ -183,6 +210,12 @@
 - **Secrets pairing / mesh replica sharing** (P-V5, gated on #51) is a new
   module beside `broker`, not a growth of `broker`'s own resolve path —
   see the plan's "Mesh sharing" section for the separate loopback channel.
+- **The admin-identity guard LANDED at P-V4f** — see the invariant above
+  for the shape; the next admin verb that touches `policy.json`/
+  `totp.secret` calls `commands::require_admin_identity` (or, if its real
+  work lives outside `commands.rs`'s own dispatch the way `enroll::run`'s
+  does, `home::admin_identity_check` directly) right after its `require_cli`
+  gate, before any read-modify-write.
 - **Two live UX gaps closed at P-V4e** — `secrets set-totp <name> on|off`
   (`commands::handle_secrets_set_totp`) flips an existing policy's
   `require_totp` bit through `store::load_policies`/`save_policies`, the

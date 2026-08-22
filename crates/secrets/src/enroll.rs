@@ -135,7 +135,20 @@ fn print_enrollment(secret: &[u8]) {
 /// never through an `Outcome`/JSON envelope (module doc) — and a QR code
 /// too when `qrencode` is reachable ([`render_qr`]'s feature-detect; its
 /// absence is a one-line hint, never an error).
+///
+/// Carries the SAME admin-identity guard as `commands::require_admin_identity`
+/// (`home::admin_identity_check`'s module doc — the yomi-strix incident,
+/// 2026-08-22): checked FIRST, before even the existing-enrollment read,
+/// because `run`'s actual work happens from `cli`'s `special` hook rather
+/// than through `commands::handle_secrets_enroll`'s own dispatch, so this
+/// is the one place in the write path that can enforce it. [`show`] does
+/// NOT carry this guard — it rotates nothing, so a wrong-uid caller has
+/// nothing to corrupt, only an ordinary permission error to hit on the
+/// read.
 pub fn run(secrets_home: &Path, force: bool) -> Result<(), String> {
+    if let Some(msg) = crate::home::admin_identity_check(secrets_home, "enroll") {
+        return Err(msg);
+    }
     match crate::store::load_totp_secret(secrets_home) {
         Ok(Some(_)) if !force => {
             return Err(

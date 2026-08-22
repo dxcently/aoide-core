@@ -71,6 +71,23 @@
 //! it never touches this crate's own storage directly, only the broker's
 //! `set` backend template, over the socket (`crate::broker::handle_put`'s
 //! module doc).
+//!
+//! **`add`/`rm`/`grant`/`revoke`/`set-totp` also carry the admin-identity
+//! guard** ([`require_admin_identity`], `home::admin_identity_check`'s
+//! module doc — the yomi-strix incident, 2026-08-22): called right after
+//! [`require_cli`] in every one of those five handlers, BEFORE
+//! `store::load_policies`/`store::save_policies` ever runs, it refuses the
+//! call outright when this process's effective uid doesn't own the
+//! secrets home — plain `sudo` (root, euid 0) is explicitly one of the
+//! refused cases, not a bypass, because root CAN write regardless of
+//! ownership, which is exactly what silently reowned `policy.json` to
+//! `root:root` and bricked the broker (and every later admin verb,
+//! including the correctly-spelled `sudo -u aoide-secrets` retry) in the
+//! field. `enroll`'s own write path (`enroll::run`) carries the same guard
+//! directly, since its actual work happens in `cli`'s `special` hook, not
+//! here — `enroll::show` (read-only, rotates nothing) does NOT carry it,
+//! and neither does `put`/`exec`: those are the socket-side operator verbs
+//! this guard was never meant to cover (`home.rs`'s module doc).
 
 use crate::home;
 use crate::policy::{valid_secret_name, Policy};
@@ -258,9 +275,28 @@ fn require_cli(inv: &Invocation, cmd: &str) -> Option<Outcome> {
     }
 }
 
+/// The yomi-strix incident's guard (2026-08-22, this crate's `AGENTS.md`/
+/// `home.rs`'s module doc): refuses an admin verb BEFORE it ever calls
+/// `store::load_policies`/`store::save_policies` when this process's
+/// effective uid isn't the secrets home's owning uid — `plain sudo`
+/// (euid 0) is explicitly wrong, not a free pass, because root CAN write
+/// regardless of ownership, which is exactly what silently reowned
+/// `policy.json` to `root:root` and bricked the broker (and every
+/// subsequent admin verb, including the correctly-spelled `sudo -u
+/// aoide-secrets` retry) in the field. Called immediately after
+/// [`require_cli`] in every handler below. `verb` is the bare verb word
+/// (`"add"`, not `"secrets.add"`) — it lands in the corrective `sudo -u
+/// aoide-secrets aoide secrets <verb> ...` spelling the refusal teaches.
+fn require_admin_identity(cmd: &str, verb: &str) -> Option<Outcome> {
+    home::admin_identity_check(&home::secrets_home(), verb).map(|msg| Outcome::error(cmd, msg))
+}
+
 fn handle_secrets_add(inv: &Invocation) -> Outcome {
     let cmd = "secrets.add";
     if let Some(hint) = require_cli(inv, cmd) {
+        return hint;
+    }
+    if let Some(hint) = require_admin_identity(cmd, "add") {
         return hint;
     }
     let Some(name) = inv.args.first().cloned() else {
@@ -305,6 +341,9 @@ fn handle_secrets_rm(inv: &Invocation) -> Outcome {
     if let Some(hint) = require_cli(inv, cmd) {
         return hint;
     }
+    if let Some(hint) = require_admin_identity(cmd, "rm") {
+        return hint;
+    }
     let Some(name) = inv.args.first().cloned() else {
         return Outcome::usage(cmd, "usage: secrets rm <name>");
     };
@@ -327,9 +366,20 @@ fn handle_secrets_rm(inv: &Invocation) -> Outcome {
 }
 
 /// Shared shape behind `grant`/`revoke`: both take `<name> <consumer>` and
-/// differ only in what they do to the `consumers[]` list.
-fn edit_consumer(inv: &Invocation, cmd: &str, usage: &str, edit: impl FnOnce(&mut Vec<String>, &str)) -> Outcome {
+/// differ only in what they do to the `consumers[]` list. `verb` names the
+/// bare word (`"grant"`/`"revoke"`) for [`require_admin_identity`]'s
+/// corrective spelling.
+fn edit_consumer(
+    inv: &Invocation,
+    cmd: &str,
+    verb: &str,
+    usage: &str,
+    edit: impl FnOnce(&mut Vec<String>, &str),
+) -> Outcome {
     if let Some(hint) = require_cli(inv, cmd) {
+        return hint;
+    }
+    if let Some(hint) = require_admin_identity(cmd, verb) {
         return hint;
     }
     let Some(name) = inv.args.first().cloned() else {
@@ -356,17 +406,29 @@ fn edit_consumer(inv: &Invocation, cmd: &str, usage: &str, edit: impl FnOnce(&mu
 }
 
 fn handle_secrets_grant(inv: &Invocation) -> Outcome {
-    edit_consumer(inv, "secrets.grant", "usage: secrets grant <name> <consumer>", |consumers, consumer| {
-        if !consumers.iter().any(|c| c == consumer) {
-            consumers.push(consumer.to_string());
-        }
-    })
+    edit_consumer(
+        inv,
+        "secrets.grant",
+        "grant",
+        "usage: secrets grant <name> <consumer>",
+        |consumers, consumer| {
+            if !consumers.iter().any(|c| c == consumer) {
+                consumers.push(consumer.to_string());
+            }
+        },
+    )
 }
 
 fn handle_secrets_revoke(inv: &Invocation) -> Outcome {
-    edit_consumer(inv, "secrets.revoke", "usage: secrets revoke <name> <consumer>", |consumers, consumer| {
-        consumers.retain(|c| c != consumer);
-    })
+    edit_consumer(
+        inv,
+        "secrets.revoke",
+        "revoke",
+        "usage: secrets revoke <name> <consumer>",
+        |consumers, consumer| {
+            consumers.retain(|c| c != consumer);
+        },
+    )
 }
 
 /// `secrets put <name>` (P-V4c) — CLI-only via the SAME [`require_cli`]
@@ -406,6 +468,9 @@ fn handle_secrets_put(inv: &Invocation) -> Outcome {
 fn handle_secrets_set_totp(inv: &Invocation) -> Outcome {
     let cmd = "secrets.set-totp";
     if let Some(hint) = require_cli(inv, cmd) {
+        return hint;
+    }
+    if let Some(hint) = require_admin_identity(cmd, "set-totp") {
         return hint;
     }
     let Some(name) = inv.args.first().cloned() else {

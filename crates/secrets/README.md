@@ -33,7 +33,15 @@ flips an EXISTING policy's `requireTotp` bit directly — no more hand-editing
 rotating anything (`--force` still rotates; the two flags are mutually
 exclusive). `secrets put` also now prompts on stderr with input hidden when
 stdin is a terminal, instead of requiring a pipe — a piped/redirected stdin
-is unchanged.
+is unchanged. **P-V4f (this commit) fixes a THIRD live deployment bug**
+(yomi-strix, 2026-08-22): `sudo aoide secrets add …` (plain sudo — euid 0)
+used to succeed and silently reown `policy.json` to `root:root`, bricking
+the broker and every later admin verb (including the correctly-spelled
+`sudo -u aoide-secrets` retry) until a manual `chown`. Every admin verb
+that touches `policy.json`/`totp.secret` now refuses outright when the
+process's effective uid doesn't own the secrets home, before it ever reads
+or writes that file — see "Admin verbs" below and `AGENTS.md`'s matching
+invariant for the exact shape.
 
 `secrets enroll` generates a fresh 20-byte secret from `/dev/urandom`,
 persists it (`store::save_totp_secret`, `0600`), and prints its
@@ -387,6 +395,25 @@ sudo -u aoide-secrets aoide secrets set-totp <name> on
 `jq` one-liner — the gap this verb exists to close. Idempotent: re-setting
 the state a policy already has reports "unchanged" and writes nothing.
 
+**Running any of these as the wrong user is refused outright, before the
+verb ever touches `policy.json`/`totp.secret` (P-V4f).** A mismatched
+effective uid — root included, from a plain `sudo` — gets a message
+naming the actual home path, the actual owning uid, and the corrective
+spelling, e.g.:
+
+```
+$ sudo aoide secrets add db-prod --backend file --key db-prod
+secrets add must run as the broker user (uid 999, the owner of /var/lib/aoide-secrets) — this process is running as root (uid 0) — plain `sudo` runs as root, and root CAN write here regardless of file ownership, which is exactly what silently corrupts it. Run: sudo -u aoide-secrets aoide secrets add ...
+```
+
+This is the fix for the incident above: root COULD always write
+`policy.json` regardless of ownership, which is exactly what silently
+reowned it. The guard has one deliberate exception — a secrets home that
+doesn't exist yet is never refused (nothing has decided who the broker
+user is until the first admin verb creates it), so a first-run `sudo -u
+aoide-secrets aoide secrets add …` on a fresh host still works exactly as
+documented below.
+
 These pick up the code's own placeholder default
 (`/var/lib/aoide-secrets`, `home.rs`) with no extra flags as long as it
 matches the deployed path above — `sudo -u aoide-secrets` does not carry the
@@ -416,7 +443,11 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   crate is immediately followed by `secure_dir`, and every secrets-home file
   write locks the file to `0600` after writing — `create_dir_all` alone
   honors the process umask, which would otherwise leave the secrets home
-  world-searchable.
+  world-searchable. `effective_uid`/`admin_identity_error`/
+  `admin_identity_check` (P-V4f) are the admin-identity guard: the pure
+  decision, unit-tested on injected uids, and its live wiring to a real
+  stat + a real `geteuid(2)` — see `AGENTS.md`'s matching invariant and
+  "Admin verbs" above.
 - `socket` — `socket_path()`: `$AOIDE_SECRETS_SOCKET` env override, else the
   canonical deployed path `/run/aoide-secrets/secrets.sock` (P-V4d — the
   first live deployment, yomi-strix, found the earlier secrets-home-relative
@@ -481,7 +512,10 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   way (`require_cli`) — a non-CLI door (MCP/A2A/Daemon) gets the door-hint
   `Outcome` before `policy.json`/`totp.secret` is ever touched, closing off
   a self-escalation path (`secrets grant <secret> <itself>`, or a hostile
-  re-enrollment, from an already-connected agent). `put` (P-V4c) is gated
+  re-enrollment, from an already-connected agent). Those same five also
+  call `require_admin_identity` (P-V4f) right after `require_cli` — the
+  wrong effective uid gets refused before the file is ever touched too, see
+  "Admin verbs" above. `put` (P-V4c) is gated
   the SAME way (`require_cli`) but is NOT special-cased like `exec`/
   `enroll` — see `commands.rs`'s own module doc for why its wire reply
   carrying no value at all makes that unnecessary. `set-totp` (P-V4e)
