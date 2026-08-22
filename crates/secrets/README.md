@@ -16,7 +16,12 @@ live, plus the backend-preset docs below. P-V4 was deployment:
 template mechanism — see "Backend presets" below), a `{home}` template
 placeholder to make that possible, and the write half — an optional
 per-backend `set` template plus the new `secrets put <name>` verb (see
-"The write flow" below). The socket wire is now also documented in
+"The write flow" below). **P-V4d fixed two deployment bugs the first live
+host (yomi-strix) surfaced**: the socket default now resolves to the real
+`/run/aoide-secrets/secrets.sock` with no env needed (`socket.rs`'s module
+doc), and the broker's own systemd unit gained a `PATH` (`bash`+`coreutils`)
+so its `sh -c` backend templates can actually spawn (see "Deployment"
+below). The socket wire is now also documented in
 `CONTRACTS.md`'s "Secrets wire" subsection as a first-class,
 directly-speakable API for non-agent consumers (services, models) — this
 file stays the canonical source, `CONTRACTS.md` restates it for a reader
@@ -255,7 +260,19 @@ forever, so this is right from day one, no oneshot detour; anchored to
 `aoide.secrets.members` (default `[]`) is the list of user names added to
 `aoide-secrets-access` — enable alone grants nobody access until a host names
 its operator here. No sudo rule is shipped; admin verbs run as the secrets
-user by hand (below).
+user by hand (below). The service's `path` also carries `bash`+`coreutils`
+(sh/cat/mkdir/install for the built-in `file` backend's own templates — a
+systemd unit's default `PATH` carries no `sh`, so an un-hardened unit can
+bind the socket fine and still fail every resolve with "spawning backend
+`file`: No such file or directory", found live on the first deployment) and
+`environment.systemPackages` gains `qrencode` (so `secrets enroll`'s QR
+render succeeds — the first live enrollment attempt found it absent).
+**A regular agent-side consumer (`secrets exec`/`secrets put`) needs NO env
+set at all on a deployed host** as of P-V4d: `socket::socket_path()`'s own
+default now equals the module's `AOIDE_SECRETS_SOCKET` value, so a bare
+shell finds the right socket with zero exports. Only the admin verbs below
+still need an explicit `sudo -u aoide-secrets` invocation (sudo does not
+carry the caller's env).
 
 ### Any other init (or none) — the non-nix install path
 
@@ -358,12 +375,15 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   write locks the file to `0600` after writing — `create_dir_all` alone
   honors the process umask, which would otherwise leave the secrets home
   world-searchable.
-- `socket` — `socket_path()`: `$AOIDE_SECRETS_SOCKET` env override, else
-  `secrets_home().join("secrets.sock")` (deliberately NOT `/run/...` yet — see
-  the module doc for why, and the SUN_LEN caution for any caller building
-  a socket path by hand). P-V4's deployment sets `AOIDE_SECRETS_SOCKET`
-  explicitly to `/run/aoide-secrets/secrets.sock`; this function's own default
-  never changes.
+- `socket` — `socket_path()`: `$AOIDE_SECRETS_SOCKET` env override, else the
+  canonical deployed path `/run/aoide-secrets/secrets.sock` (P-V4d — the
+  first live deployment, yomi-strix, found the earlier secrets-home-relative
+  default sent an env-less client shell, e.g. a bare `aoide secrets exec`, to
+  the wrong path; see the module doc and this file's "Deployment" section
+  for the full story, and the SUN_LEN caution for any caller building a
+  socket path by hand). P-V4's nix module still sets `AOIDE_SECRETS_SOCKET`
+  explicitly on the unit — belt-and-suspenders, not load-bearing anymore —
+  and the value MUST equal this function's own default.
 - `backend` — `Backends`/`Backend` (`backends.json`'s shape: a map of
   named backend -> a `get` template and an OPTIONAL `set` template, P-V4c)
   and `fetch_value`/`store_value`, which substitute the policy's `key` and

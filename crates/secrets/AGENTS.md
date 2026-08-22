@@ -145,6 +145,20 @@
   the non-nix `useradd`/`groupadd` path in `README.md`'s "Deployment"
   section (any init, or none — the broker binary itself never gained a nix
   dependency). Only P-V5 (mesh pairing, gated on #51) is still ahead.
+- **P-V4d fixed two bugs the first live deployment (yomi-strix) found that
+  the sandboxed gates could not see.** `socket::socket_path()`'s default is
+  now the fixed `/run/aoide-secrets/secrets.sock` (never derived from
+  `home::secrets_home()` — see `socket.rs`'s module doc), so an env-less
+  client shell (`aoide secrets exec`/`put` run by hand) resolves the real
+  deployed socket with no export needed. `modules/nucleus/secrets.nix`'s
+  service gained `path = [ pkgs.bash pkgs.coreutils ]` (a systemd unit's
+  default `PATH` carries no `sh`, and every backend template — including
+  the built-in `file` backend's own `get`/`set` — runs via `sh -c`) and
+  `environment.systemPackages` gained `pkgs.qrencode` (the first live
+  `secrets enroll` found it missing from the operator's own shell). Don't
+  reintroduce a secrets-home-relative socket default; the whole point of
+  P-V4d was that the client and the service must agree on the socket path
+  without per-shell env.
 - **Backend adapter DOC PRESETS** (`pass`/`gopass`/`bw`/`sops`) landed at
   P-V3 in `README.md`'s "Backend presets" section — `backend.rs` itself is
   unchanged (it never gained backend-specific knowledge, by design). QR-

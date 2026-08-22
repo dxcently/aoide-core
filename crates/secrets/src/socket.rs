@@ -1,37 +1,43 @@
 //! The secrets broker's socket path: `$AOIDE_SECRETS_SOCKET` env override,
-//! else a default UNDER the secrets home (`secrets.sock`) — deliberately NOT
-//! `/run/aoide-secrets/secrets.sock` yet. That path requires a provisioned,
-//! typically root-owned `/run/aoide-secrets/` directory this phase never
-//! creates (P-V4's tmpfiles rule does). Defaulting under
-//! [`crate::home::secrets_home`] means `secrets serve`/`secrets exec` work out
-//! of the box against any writable `AOIDE_SECRETS_HOME` — a tempdir in
-//! tests, a dev directory by hand — with no privileged path to provision
-//! first. P-V4's nix module sets `AOIDE_SECRETS_SOCKET=/run/aoide-secrets/
-//! secrets.sock` explicitly on the systemd units, which is what actually
-//! moves the deployed socket there; this module's own default never
-//! changes.
+//! else the canonical deployed path `/run/aoide-secrets/secrets.sock`
+//! (P-V4d, corrected from an earlier secrets-home-relative default after
+//! the first live deployment, yomi-strix, found the mismatch: a plain
+//! client shell with no env set — `aoide secrets put/exec` run by hand —
+//! resolved the OLD default to `<secrets_home>/secrets.sock`
+//! (`/var/lib/aoide-secrets/secrets.sock`) while the deployed socket sits at
+//! `/run/aoide-secrets/secrets.sock`, so every such client got `Permission
+//! denied`/`No such file or directory` on the wrong path unless the operator
+//! exported `AOIDE_SECRETS_SOCKET` by hand every session). Hardcoding `/run`
+//! as the default — rather than deriving it from [`crate::home::secrets_home`]
+//! — is deliberate: the client and the service must agree on the socket
+//! location WITHOUT per-shell env, and `/run` is what P-V4's nix module (and
+//! the non-nix install doc) has always provisioned as the real deployed
+//! socket. A host that hasn't run that provisioning yet (a tempdir in tests,
+//! a dev box by hand) sets `AOIDE_SECRETS_SOCKET` explicitly — same as it
+//! always had to for `AOIDE_SECRETS_HOME` before `/var/lib/aoide-secrets`
+//! existed.
 //!
 //! **SUN_LEN hazard** (every caller, this crate's own tests included): a
 //! unix socket path is capped at ~108 bytes on Linux
-//! (`sockaddr_un.sun_path`). A secrets home nested under a long sandboxed
-//! tempdir can overflow that before the `secrets.sock` suffix is even
-//! added. A caller that needs a GUARANTEED-short path (this crate's own
-//! end-to-end test, `tests/e2e.rs`) passes `AOIDE_SECRETS_SOCKET` — or, for
-//! a direct `broker::serve`/`client::resolve` call, an explicit
-//! `/tmp`-direct path — rather than relying on this derived default.
+//! (`sockaddr_un.sun_path`). A caller that needs a GUARANTEED-short path
+//! (this crate's own end-to-end test, `tests/e2e.rs`) passes
+//! `AOIDE_SECRETS_SOCKET` — or, for a direct `broker::serve`/
+//! `client::resolve` call, an explicit `/tmp`-direct path — rather than
+//! relying on this default, which is now a fixed absolute path independent
+//! of any tempdir nesting.
 
 use std::path::PathBuf;
 
 /// Resolve the broker's socket path: `$AOIDE_SECRETS_SOCKET` when set to a
-/// non-blank value, else `secrets_home().join("secrets.sock")` (see module
-/// doc for why that's the default rather than `/run/...`).
+/// non-blank value, else the canonical deployed path
+/// `/run/aoide-secrets/secrets.sock` (see module doc — P-V4d).
 pub fn socket_path() -> PathBuf {
     if let Ok(p) = std::env::var("AOIDE_SECRETS_SOCKET") {
         if !p.trim().is_empty() {
             return PathBuf::from(p);
         }
     }
-    crate::home::secrets_home().join("secrets.sock")
+    PathBuf::from("/run/aoide-secrets/secrets.sock")
 }
 
 #[cfg(test)]
@@ -51,13 +57,16 @@ mod tests {
     }
 
     #[test]
-    fn default_lives_under_the_secrets_home() {
+    fn default_is_the_canonical_run_path_regardless_of_secrets_home() {
+        // P-V4d: the default no longer derives from AOIDE_SECRETS_HOME — a
+        // client shell with only AOIDE_SECRETS_HOME set (never
+        // AOIDE_SECRETS_SOCKET) must still resolve the real deployed socket.
         let _guard = crate::env_lock().lock().unwrap();
         let saved_sock = std::env::var("AOIDE_SECRETS_SOCKET").ok();
         let saved_home = std::env::var("AOIDE_SECRETS_HOME").ok();
         std::env::remove_var("AOIDE_SECRETS_SOCKET");
         std::env::set_var("AOIDE_SECRETS_HOME", "/tmp/av-test-home");
-        assert_eq!(socket_path(), PathBuf::from("/tmp/av-test-home/secrets.sock"));
+        assert_eq!(socket_path(), PathBuf::from("/run/aoide-secrets/secrets.sock"));
         match saved_sock {
             Some(v) => std::env::set_var("AOIDE_SECRETS_SOCKET", v),
             None => std::env::remove_var("AOIDE_SECRETS_SOCKET"),
@@ -69,13 +78,13 @@ mod tests {
     }
 
     #[test]
-    fn blank_env_value_falls_back_to_the_derived_default() {
+    fn blank_env_value_falls_back_to_the_canonical_default() {
         let _guard = crate::env_lock().lock().unwrap();
         let saved_sock = std::env::var("AOIDE_SECRETS_SOCKET").ok();
         let saved_home = std::env::var("AOIDE_SECRETS_HOME").ok();
         std::env::set_var("AOIDE_SECRETS_SOCKET", "  ");
         std::env::set_var("AOIDE_SECRETS_HOME", "/tmp/av-test-home2");
-        assert_eq!(socket_path(), PathBuf::from("/tmp/av-test-home2/secrets.sock"));
+        assert_eq!(socket_path(), PathBuf::from("/run/aoide-secrets/secrets.sock"));
         match saved_sock {
             Some(v) => std::env::set_var("AOIDE_SECRETS_SOCKET", v),
             None => std::env::remove_var("AOIDE_SECRETS_SOCKET"),
