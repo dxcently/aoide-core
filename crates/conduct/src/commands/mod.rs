@@ -1,5 +1,6 @@
-//! The conduct domain's CLI verbs: the `graph *`/`conduct` registrations and
-//! the `hooks install` hook-installer verb.
+//! The conduct domain's CLI verbs: the `graph *`/`conduct` registrations,
+//! the `hooks install` hook-installer verb, and `who` (live presence,
+//! messaging/presence plan P-C2, appended newest).
 //!
 //! Moved from the root package's `src/commands/{graph,hooks}.rs` (Phase 9
 //! restructure, docs/architecture/PACKAGE-LAYOUT.md): a domain's CLI verbs
@@ -11,3 +12,4 @@ pub mod graph;
 pub mod herald;
 pub mod hooks;
 pub mod shellbridge;
+pub mod who;

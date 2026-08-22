@@ -17,13 +17,12 @@ aoide-storage = { workspace = true }
 # Originally added Phase 5 for `screen send --agent`'s reuse of
 # `client::commands::handle_agent_send` — that tenant moved out with
 # `screen` at P-A1 of the binary-split workstream (now `aoide-screen`'s own
-# edge, see its Cargo.toml). The edge STAYS regardless: it's deliberately
-# retained for the upcoming `who` presence verb (messaging workstream C2,
-# `aoide who`/`graph send --to`), which needs client's peer-pull transport
-# from inside this crate. Bends the charter table's "conduct/client are
-# independent leaves under cli" a little either way — see the messaging
-# workstream plan for why this edge doesn't cycle (client has no dependency
-# back on conduct).
+# edge, see its Cargo.toml). The edge STAYS regardless: the tenant is now
+# `who` (messaging workstream C2, landed) — `commands::who::handle` calls
+# `aoide_client::commands::pull_peer_live` for its live per-peer probe.
+# Bends the charter table's "conduct/client are independent leaves under
+# cli" a little either way — see the messaging workstream plan for why this
+# edge doesn't cycle (client has no dependency back on conduct).
 aoide-client = { workspace = true }
 libc = { workspace = true }
 

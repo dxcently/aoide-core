@@ -25,6 +25,7 @@ mod spawn;
 #[cfg(test)]
 pub(crate) mod testutil;
 mod verbs;
+mod who;
 mod window;
 
 // Public API: reached at `crate::graph::*` from WITHIN this crate (used by
@@ -56,6 +57,10 @@ pub use self::session_store::{session_end, session_phase, session_start, session
 // waiting on the agent's own lifetime — see `graph/spawn.rs`'s module doc.
 pub use self::spawn::session_spawn;
 pub use self::verbs::{emit, link, project_add, project_list, project_remove, prune, view};
+// `aoide who` (messaging/presence plan, P-C2): live presence over this
+// box's own sessions plus every registered peer — see `graph/who.rs`'s
+// module doc for the probe/filter design.
+pub use self::who::who;
 pub use self::window::{focus, focus_session, focus_window, run_hypr_window_listener, FocusError};
 
 // Storage/time passthroughs root's `a2a.rs` / `commands/{a2a,usage}.rs` still

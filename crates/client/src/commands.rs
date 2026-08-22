@@ -35,8 +35,23 @@ use std::process::Stdio;
 /// the url/body may ride in argv freely — this reuses usage.rs's parsing, not
 /// its token-hiding.
 fn run_curl(extra: &[&str], stdin_body: Option<&str>) -> Result<(u16, String), String> {
+    run_curl_with_timeout(15, extra, stdin_body)
+}
+
+/// `run_curl`'s parameterised core: same transport, an explicit `--max-time`
+/// instead of the hardcoded `15`. Split out for `pull_peer_live` (`who`'s
+/// presence probe, workstream C2) which needs a much shorter per-peer bound
+/// (~2s) than every other curl call site here — those all keep calling
+/// [`run_curl`] unchanged, so this refactor is a pure internal split, not a
+/// behavior change for `peer pull`/`a2a agent add`/etc.
+fn run_curl_with_timeout(
+    timeout_secs: u64,
+    extra: &[&str],
+    stdin_body: Option<&str>,
+) -> Result<(u16, String), String> {
     let mut cmd = std::process::Command::new("curl");
-    cmd.args(["-sS", "--max-time", "15", "-w", "\n%{http_code}"]);
+    let timeout = timeout_secs.to_string();
+    cmd.args(["-sS", "--max-time", &timeout, "-w", "\n%{http_code}"]);
     cmd.args(extra);
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     cmd.stdin(if stdin_body.is_some() { Stdio::piped() } else { Stdio::null() });
@@ -490,6 +505,36 @@ fn pull_one_peer(peer: &aoide_storage::peer_store::Peer) -> Value {
             json!({ "name": peer.name, "ok": false, "error": e })
         }
     }
+}
+
+/// Pull ONE peer's `aoide/graphSummary` LIVE, with an explicit per-call
+/// `timeout_secs`, WITHOUT writing `state/peer-cache/<name>.json` — the
+/// read-only sibling of [`pull_one_peer`] (which persists on every
+/// outcome). `aoide who`'s presence probe (conduct crate, workstream C2)
+/// is the reason this exists: it reuses this exact curl transport (never
+/// reimplements HTTP — see the crate's `Cargo.toml` for why the
+/// `conduct → client` edge stays) but must never treat a presence query as
+/// a cache-refreshing side effect. `build_graph`'s fold (`aoide-conduct`)
+/// is the ONLY writer of that cache; `who` only ever READS it, as the
+/// fallback for a peer this call fails to reach. Returns just the peer's
+/// resolved `graph` document (`{nodes, edges}`) — `who` has no use for the
+/// envelope's `instance` field `pull_one_peer` also captures.
+pub fn pull_peer_live(peer: &aoide_storage::peer_store::Peer, timeout_secs: u64) -> Result<Value, String> {
+    let body = crate::peer::build_graph_summary_request();
+    let body_str = serde_json::to_string(&body).unwrap_or_default();
+    let (code, resp_body) = run_curl_with_timeout(
+        timeout_secs,
+        &["-X", "POST", "-H", "Content-Type: application/json", "--data-binary", "@-", "--", &peer.url],
+        Some(&body_str),
+    )?;
+    if code != 200 {
+        return Err(format!("HTTP {code}"));
+    }
+    let resp: Value =
+        serde_json::from_str(&resp_body).map_err(|e| format!("unparseable response: {e}"))?;
+    let now = aoide_storage::time::now_iso_utc();
+    let entry = crate::peer::parse_graph_summary_response(&resp, &peer.name, &now)?;
+    Ok(entry.graph.unwrap_or_else(|| json!({ "nodes": [], "edges": [] })))
 }
 
 /// `peer pull [<name>]` — pull `aoide/graphSummary` from one (or, with no

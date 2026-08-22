@@ -12,7 +12,9 @@ never the inbound/serve half (that's `aoide-server`).
   agnostic of any one downstream agent's shape).
 - `peer` — peer-federation client half (CONTRACTS.md §7).
 - `commands` — this crate's CLI verbs: `a2a agent add/list/remove/send`,
-  `adapter melete`.
+  `peer add/list/remove/pull/status`, `adapter melete`; also exposes
+  `pull_peer_live` (not a verb itself — the `conduct → client` edge's one
+  crossing point, `who`'s live per-peer probe).
 
 ## What it consumes
 
@@ -23,8 +25,8 @@ cache persist through `storage`).
 
 `conduct`, `screen`, `server` (dev-dependency only, for one round-trip
 test), and `cli` depend on it. **The `conduct → client` edge is intentional,
-not technical debt**: `conduct`'s planned `who` presence verb (workstream
-C2, not yet implemented) needs client's
-peer-pull transport — the edge stays even though the original reason
+not technical debt**: `conduct`'s `who` presence verb (workstream C2,
+landed) calls this crate's `commands::pull_peer_live` for its live
+per-peer probe — the edge stays even though the original reason
 (`screen/send.rs`) moved out to the `screen` crate at P-A1
 (`docs/architecture/PACKAGE-LAYOUT.md`, "Verified facts").

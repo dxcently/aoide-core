@@ -16,13 +16,19 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   moved to `lyra` at P-A2, but both stay resident here (see charter smudge
   below).
 - `commands` — this crate's CLI verbs: `graph *` (15 paths), `conduct`,
-  `hooks install`.
+  `hooks install`, `who`.
+- `who` — `aoide who [filter] [--json] [--all]` (`graph/who.rs`): live
+  presence over this box's own sessions plus every registered peer,
+  probed in parallel on each invocation (messaging workstream C2). A
+  PROJECTION, never a store — it never writes `state/peer-cache/`;
+  `build_graph`'s own fold (`doc.rs`) owns that file.
 
 ## What it consumes
 
-`aoide-protocol`, `aoide-storage`, `aoide-client` (for the planned `who`
-presence verb's peer-pull transport — workstream C2, not yet implemented;
-see `client`'s own README for why that edge stays).
+`aoide-protocol`, `aoide-storage`, `aoide-client` (`who`'s live per-peer
+probe calls `aoide_client::commands::pull_peer_live` — the peer-pull
+transport `peer pull` itself uses, workstream C2; see `client`'s own
+README for why that edge stays).
 
 ## How it composes
 

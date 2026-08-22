@@ -6,11 +6,11 @@
   building/sending, agent registration, the melete adapter. The serve/listen
   half lives in `aoide-server` and must never migrate here.
 - **The `conduct → client` edge is load-bearing, not a smell.** `conduct`'s
-  presence projection (`who`, planned — workstream C2, not yet implemented)
-  needs this crate's peer-pull transport. Don't
-  "heal" it by inverting the dependency or duplicating the transport in
-  `conduct` — see `docs/architecture/PACKAGE-LAYOUT.md`'s "Verified facts"
-  note on this exact edge.
+  presence projection (`who`, workstream C2, landed) calls this crate's
+  `commands::pull_peer_live` for its live per-peer probe. Don't "heal" it
+  by inverting the dependency or duplicating the transport in `conduct` —
+  see `docs/architecture/PACKAGE-LAYOUT.md`'s "Verified facts" note on this
+  exact edge.
 - **`build_message_send_body` hardcodes `context_id: None` today.** A caller
   adding cross-host context threading extends the function's parameters
   rather than working around it — the server side already routes a

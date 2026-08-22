@@ -17,6 +17,12 @@
   without checking that dependency first.
 - **A killed terminal never self-reports `done`.** `reap` is the only
   sanctioned sweep of dead sessions; don't add a second liveness mechanism.
+- **`who` is a projection, never a store.** It must never write
+  `state/peer-cache/<name>.json` — `build_graph`'s own fold (`doc.rs`) is
+  the ONLY writer of that cache. `who`'s live probe reads straight off the
+  network via `aoide_client::commands::pull_peer_live` and falls back to
+  the cache (read-only) for an unreachable peer; don't "helpfully" have a
+  successful live probe refresh the cache as a side effect.
 
 ## Extension points
 

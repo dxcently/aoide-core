@@ -22,10 +22,11 @@ use crate::registry::Registry;
 /// (CONTRACTS.md §7, slotted directly after the `a2a agent` group it's the
 /// same-network-federation sibling of — nothing EXISTING moves, so the
 /// historical table above it is still untouched), usage, hooks install,
-/// soundcheck (appended newest — the mechanical-integrity verb's
-/// WORKING-tree half, `aoide-upkeep`; report-only, forever — see its own
-/// module doc for the finding format and why the COMMITTED-tree half lives
-/// in `nix flake check` instead).
+/// soundcheck (the mechanical-integrity verb's WORKING-tree half,
+/// `aoide-upkeep`; report-only, forever — see its own module doc for the
+/// finding format and why the COMMITTED-tree half lives in `nix flake
+/// check` instead), who (appended newest — live presence over sessions +
+/// registered peers, messaging workstream C2).
 ///
 /// P-A5 (binary-split workstream) removed the 11 register lines for the
 /// graphical bundle — rice/draft/mode/cover/livery/rice-late-stubs/
@@ -51,8 +52,9 @@ pub fn all() -> Registry {
     aoide_client::commands::register_agents(&mut r); // a2a agent add/list/remove/send (CONTRACTS.md §6)
     aoide_client::commands::register_peers(&mut r); // peer add/list/remove/pull/status — same-network federation (CONTRACTS.md §7, appended newest)
     aoide_storage::commands::register(&mut r); // usage — local token/cost rollup (CONTRACTS.md §4)
-    aoide_conduct::commands::hooks::register(&mut r); // hooks install — the hook-installer verb (appended newest)
-    aoide_upkeep::commands::register(&mut r); // soundcheck — mechanical-integrity WORKING-tree sweep, report-only (appended newest)
+    aoide_conduct::commands::hooks::register(&mut r); // hooks install — the hook-installer verb
+    aoide_upkeep::commands::register(&mut r); // soundcheck — mechanical-integrity WORKING-tree sweep, report-only
+    aoide_conduct::commands::who::register(&mut r); // who — live presence over sessions + registered peers (messaging workstream C2, appended newest)
 
     r
 }

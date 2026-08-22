@@ -131,6 +131,7 @@ mod tests {
             "soundcheck",
             "update",
             "usage",
+            "who",
         ];
         expected.sort();
 
