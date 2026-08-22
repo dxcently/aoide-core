@@ -92,7 +92,16 @@ pub fn parse_agent_card(
 /// Mirrors the inbound shape the server's `parse_message_send_params`
 /// (`src/a2a.rs`) reads. Pure — the caller generates `message_id`, so the
 /// body stays deterministic in tests.
-pub fn build_message_send_body(text: &str, message_id: &str) -> Value {
+///
+/// `context_id` threads a target session id for a PEER send (messaging plan
+/// P-C3: `graph send --to <peer>/<query>` resolves a remote sessionId and
+/// hands it here so the receiving peer's `message_send` Inject arm can find
+/// it — see `crates/server/src/a2a.rs::decide_send_action`). Every OTHER
+/// caller (today: `a2a agent send`, driving an unrelated registered A2A
+/// agent that has no notion of an aoide sessionId) passes `None`, which
+/// reproduces the old hardcoded-`None` body byte-for-byte — this parameter
+/// is additive, nothing else about the wire shape changed.
+pub fn build_message_send_body(text: &str, message_id: &str, context_id: Option<&str>) -> Value {
     let params = MessageSendParams {
         message: Message {
             role: "user".to_string(),
@@ -102,7 +111,7 @@ pub fn build_message_send_body(text: &str, message_id: &str) -> Value {
                 extra: Default::default(),
             }],
             message_id: Some(message_id.to_string()),
-            context_id: None,
+            context_id: context_id.map(str::to_string),
             metadata: None,
         },
     };
@@ -190,16 +199,25 @@ mod tests {
 
     #[test]
     fn build_message_send_body_matches_the_jsonrpc_shape() {
-        let body = build_message_send_body("hello there", "mid-123");
+        let body = build_message_send_body("hello there", "mid-123", None);
         assert_eq!(body["jsonrpc"], "2.0");
         assert_eq!(body["id"], 1);
         assert_eq!(body["method"], "message/send");
         let msg = &body["params"]["message"];
         assert_eq!(msg["role"], "user");
         assert_eq!(msg["messageId"], "mid-123");
+        assert!(msg.get("contextId").is_none(), "None stays absent, not null-present");
         let parts = msg["parts"].as_array().unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0]["kind"], "text");
         assert_eq!(parts[0]["text"], "hello there");
+    }
+
+    #[test]
+    fn build_message_send_body_threads_a_context_id_when_given() {
+        // P-C3: a peer-targeted send carries the resolved remote sessionId
+        // as `contextId` so the receiving peer's Inject arm can find it.
+        let body = build_message_send_body("hello there", "mid-123", Some("sess-9"));
+        assert_eq!(body["params"]["message"]["contextId"], "sess-9");
     }
 }

@@ -3,11 +3,22 @@
 //! sub-agent verbs. The one place untrusted agent-bound text and untrusted
 //! hook JSON both land, so every outcome is audited and a hook payload never
 //! propagates as anything but data.
+//!
+//! `graph send` has two ways to name a target (messaging plan P-C3):
+//! `--id <id>` (the original, unchanged) or `--to <target>` (resolved via
+//! `aoide_storage::addr::resolve`, mutually exclusive with `--id` — see
+//! [`session_send`]). A LOCAL `--to` match re-drives the exact `--id` path
+//! (`deliver_local`); a REMOTE match (`peer/<query>`, resolved against that
+//! peer's CACHED graph — never a live pull) delivers over A2A
+//! `message/send` instead (`deliver_remote`) and runs no LOCAL gate at all,
+//! since the receiving peer's own `message_send` Inject arm is where that
+//! gate actually lives — see `deliver_remote`'s doc comment.
 
 use super::common::{require_flag, stage_error};
 use super::doc::restage_graph;
 use super::model::{
-    load_stage, sessions_path, write_stage, SessionRecord, SessionsFile, STAGE_GRAPH_VERSION,
+    load_stage, resolved_parent, sessions_path, write_stage, SessionRecord, SessionsFile,
+    STAGE_GRAPH_VERSION,
 };
 use super::session_store::{
     do_session_end, do_session_phase, do_session_phase_if, do_session_start, do_subagent_end,
@@ -18,9 +29,11 @@ use super::window::{discover_window, ensure_session_window};
 use aoide_protocol::agents::{agent_profile, known_agents, AgentProfile, HookClass, CLAUDE_PROFILE};
 use aoide_protocol::Invocation;
 use aoide_protocol::output::Outcome;
+use aoide_storage::addr::{self, LocalCandidate, Resolution};
 use aoide_storage::fs::{stage_dir, with_stage_lock};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::os::unix::net::UnixStream;
 #[cfg(test)]
 use std::os::unix::net::UnixListener;
@@ -398,26 +411,65 @@ fn audit_send(inv: &Invocation, status: &str, message: &str, text: &str) {
     );
 }
 
-/// `aoide graph send --id <id> [--submit] [--yes] -- <text …>` — the one
-/// injection door. Resolves the target's control socket from sessions.json;
-/// errors cleanly (exit 1) if the id is unknown or not conductable. Gate: WITHOUT
-/// `--yes` and no autogate match, the send is recorded PENDING (atomic stage
-/// write) and NOT delivered; WITH `--yes` (or an autogate match — global env,
-/// sender-is-target's-parent, or sender-and-target-are-siblings-under-a-live-
-/// parent, see [`sibling_autogate_enabled`]) it connects to the socket, writes
-/// `<text>` (+ the TARGET's own submit keystroke on `--submit` — `\n` for most
+/// `aoide graph send (--id <id> | --to <target>) [--submit] [--yes] -- <text
+/// …>` — the one injection door, with two ways to name the target (messaging
+/// plan P-C3 added `--to`; mutually exclusive with `--id`, checked before
+/// either resolves).
+///
+/// **`--id <id>`** resolves the target's control socket from sessions.json
+/// directly; errors cleanly (exit 1) if the id is unknown or not conductable.
+/// Gate: WITHOUT `--yes` and no autogate match, the send is recorded PENDING
+/// (atomic stage write) and NOT delivered; WITH `--yes` (or an autogate
+/// match — global env, sender-is-target's-parent, or
+/// sender-and-target-are-siblings-under-a-live-parent, see
+/// [`sibling_autogate_enabled`]) it connects to the socket, writes `<text>`
+/// (+ the TARGET's own submit keystroke on `--submit` — `\n` for most
 /// harnesses, `\r` for kimi, resolved from the target session's agent profile
 /// at delivery time via [`super::permit::profile_for_agent`], never a fixed
-/// byte), auto-renames the node to a one-line form of
-/// the text (unless the text is a bare keystroke answer — see
-/// [`names_the_node`]), and returns delivered. A delivered payload that names
-/// the node also carries a `from <sender>: ` provenance prefix on its first
-/// line when a sender resolves (see [`resolve_sender`] / [`provenance_prefix`]
-/// — attribution, not authentication); the title, the keystroke check, and
-/// the audit `untrusted_data` all still see the unprefixed text. Every
-/// outcome writes an audit line, the sender folded into its message.
+/// byte), auto-renames the node to a one-line form of the text (unless the
+/// text is a bare keystroke answer — see [`names_the_node`]), and returns
+/// delivered. A delivered payload that names the node also carries a `from
+/// <sender>: ` provenance prefix on its first line when a sender resolves
+/// (see [`resolve_sender`] / [`provenance_prefix`] — attribution, not
+/// authentication); the title, the keystroke check, and the audit
+/// `untrusted_data` all still see the unprefixed text. Every outcome writes
+/// an audit line, the sender folded into its message.
+///
+/// **`--to <target>`** resolves `target` via [`aoide_storage::addr::resolve`]
+/// against this box's current local sessions + registered peers (see
+/// [`session_send_to`]):
+/// - a LOCAL match re-drives the exact `--id` path above, unchanged (same
+///   gate, pending queue, provenance, audit) — `--to brave-otter` behaves
+///   identically to `--id <that session's id>`.
+/// - a REMOTE match (`peer/<query>`) delivers over A2A `message/send`
+///   instead of a local socket write — see [`session_send_to`]'s doc for the
+///   full remote gating discussion (short version: **remote gating is the
+///   RECEIVING peer's job**, done inside its own `message_send` Inject arm;
+///   this door's `--yes`/pending/autogate machinery above is a LOCAL-socket
+///   concept and does not apply to a remote delivery, which always attempts
+///   the network send — exactly like the existing `a2a agent send`/`peer
+///   pull` verbs already do unconditionally).
+///
+/// With NEITHER flag, this is a usage error (same as before `--to` existed —
+/// `require_flag` below is untouched).
 pub fn session_send(inv: &Invocation) -> Outcome {
     let cmd = "graph.send";
+    let to = inv
+        .flags
+        .get("to")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let id_present = inv.flags.get("id").map(|s| !s.trim().is_empty()).unwrap_or(false);
+    if to.is_some() && id_present {
+        return Outcome::usage(
+            cmd,
+            "usage: aoide graph send (--id <id> | --to <target>) [--submit] [--yes] -- <text …> \
+             — --id and --to are mutually exclusive",
+        );
+    }
+    if let Some(target) = to {
+        return session_send_to(inv, &target);
+    }
     let id = match require_flag(inv, "id") {
         Ok(v) => v,
         Err(o) => return o,
@@ -428,6 +480,18 @@ pub fn session_send(inv: &Invocation) -> Outcome {
             "usage: aoide graph send --id <id> [--submit] [--yes] -- <text …>",
         );
     }
+    deliver_local(inv, &id)
+}
+
+/// The exact body `--id` has always run, factored out so [`session_send_to`]'s
+/// LOCAL resolution branch re-drives it unmodified rather than reimplementing
+/// any piece of the gate/pending/provenance/audit path — the phase's SACRED
+/// invariant. `id` is re-owned into a `String` immediately so every line
+/// below is byte-identical to the pre-P-C3 function body (no `&id`/`id`
+/// reference-vs-owned churn to review).
+fn deliver_local(inv: &Invocation, id: &str) -> Outcome {
+    let cmd = "graph.send";
+    let id = id.to_string();
     let text = inv.args.join(" ");
     let submit = inv.flag_present("submit");
     let yes = inv.flag_present("yes");
@@ -587,6 +651,289 @@ pub fn session_send(inv: &Invocation) -> Outcome {
         }));
     audit_send(inv, "delivered", &out.message, &text);
     out
+}
+
+// ── `--to <target>`: local-or-remote resolution (messaging plan P-C3) ───────
+
+/// `--to <target>` resolution: turns `target` into either a LOCAL session id
+/// (re-drives [`deliver_local`] unchanged — same gate/pending/provenance/
+/// audit) or a REMOTE peer+session (delivered over A2A `message/send`, see
+/// [`deliver_remote`]). Ambiguity is always a hard error at every tier —
+/// send is a delivering action, never narrows or guesses (mirrors
+/// `aoide_storage::addr`'s own "ambiguity is an error, never first-match"
+/// rule in its home context, restated here for send specifically).
+fn session_send_to(inv: &Invocation, target: &str) -> Outcome {
+    let cmd = "graph.send";
+    if inv.args.is_empty() {
+        return Outcome::usage(
+            cmd,
+            "usage: aoide graph send --to <target> [--submit] [--yes] -- <text …>",
+        );
+    }
+    let text = inv.args.join(" ");
+
+    let file: SessionsFile = match load_stage(&sessions_path()) {
+        Ok(f) => f,
+        Err(e) => return stage_error(cmd, e),
+    };
+    let host = aoide_storage::display::local_host_name();
+    let ids: HashSet<&str> = file.sessions.iter().map(|s| s.session_id.as_str()).collect();
+    let candidates: Vec<LocalCandidate<'_>> = file
+        .sessions
+        .iter()
+        .map(|s| {
+            let role = if resolved_parent(s, &ids).is_some() { "child" } else { "root" };
+            LocalCandidate { session_id: &s.session_id, petname: s.petname.as_deref(), role }
+        })
+        .collect();
+    let peers = aoide_storage::peer_store::load_peers();
+    let peer_names: Vec<&str> = peers.iter().map(|p| p.name.as_str()).collect();
+
+    match addr::resolve(target, &host, &candidates, &peer_names) {
+        Resolution::Local(id) => deliver_local(inv, &id),
+        Resolution::Remote { peer, query } => match peers.iter().find(|p| p.name == peer) {
+            Some(p) => deliver_remote(inv, p, &query),
+            // `addr::resolve` only ever names a peer it was HANDED in
+            // `peer_names` above (built from this SAME `peers` slice), so a
+            // miss here is unreachable in practice — a defensive clean error
+            // rather than an unwrap/panic.
+            None => {
+                let out = Outcome::error(cmd, format!("peer `{peer}` vanished mid-resolution"))
+                    .with_data(json!({ "reason": "peer-not-found", "peer": peer }));
+                audit_send(inv, "error", &out.message, &text);
+                out
+            }
+        },
+        Resolution::Ambiguous(ids) => {
+            let out = Outcome::error(
+                cmd,
+                format!(
+                    "`{target}` is ambiguous — {} local session(s) match: {}",
+                    ids.len(),
+                    ids.join(", ")
+                ),
+            )
+            .with_data(json!({ "reason": "ambiguous", "target": target, "candidates": ids }));
+            audit_send(inv, "error", &out.message, &text);
+            out
+        }
+        Resolution::NotFound => {
+            // addr.rs's documented "bare known-peer-name" decision: a
+            // slash-free token that names a registered peer but matches no
+            // local session is `NotFound`, not `Remote` (there is no
+            // `<rest>` to defer without a slash) — hint the `peer/<rest>`
+            // form the user probably meant instead of leaving them guessing.
+            let hint = if !target.contains('/') && peer_names.contains(&target) {
+                format!(
+                    " (`{target}` names a known peer, not a local session — did you mean `{target}/<session>`?)"
+                )
+            } else {
+                String::new()
+            };
+            let out = Outcome::error(cmd, format!("no session matches `{target}`{hint}"))
+                .with_data(json!({ "reason": "not-found", "target": target }));
+            audit_send(inv, "error", &out.message, &text);
+            out
+        }
+    }
+}
+
+/// Extract every `kind:"session"` node from a peer's CACHED graph document
+/// as (sessionId, petname, role) triples — role derived from the SAME
+/// document's own `spawned` edges. A `send`-local twin of
+/// `who.rs::sessions_from_graph`'s extraction: not reused directly, since
+/// that function returns `who`'s own display-only `SessionView`, a shape
+/// this door has no use for — this needs only what [`LocalCandidate`] and an
+/// error-message label need.
+fn peer_cached_sessions(graph: &Value) -> Vec<(String, Option<String>, &'static str)> {
+    let empty: Vec<Value> = Vec::new();
+    let nodes = graph.get("nodes").and_then(Value::as_array).unwrap_or(&empty);
+    let edges = graph.get("edges").and_then(Value::as_array).unwrap_or(&empty);
+    nodes
+        .iter()
+        .filter(|n| n["kind"] == "session")
+        .map(|n| {
+            let full_id = n["id"].as_str().unwrap_or("");
+            let session_id = full_id.strip_prefix("session:").unwrap_or(full_id).to_string();
+            let role = if edges.iter().any(|e| e["kind"] == "spawned" && e["to"] == full_id) {
+                "child"
+            } else {
+                "root"
+            };
+            let petname = n["petname"].as_str().map(String::from);
+            (session_id, petname, role)
+        })
+        .collect()
+}
+
+/// Resolve `query` (the remainder after `peer/` — see `aoide_storage::addr`'s
+/// tier-5 doc) against `peer`'s cached session set. Tries `query` AS TYPED
+/// first — this covers the common, DOCUMENTED case (`addr.rs`'s own module
+/// doc example: `Remote { peer: "yomi-strix", query: "brave-otter" }`, a
+/// bare petname) via tiers 1–3 (exact remote id, id tail4, bare petname) —
+/// and only on a miss retries the RECONSTRUCTED `<peer>/<query>` form, so a
+/// `role/petname` remainder (what tier 5 stripped the host segment OFF of —
+/// `addr.rs`'s "multi-segment rest… passes it through verbatim" test case)
+/// still resolves via tier 4 against the peer's own name standing in as
+/// `host`. `peers: &[]` on BOTH attempts: a remote-of-remote is not a shape
+/// this phase resolves, so tier 5 can never fire here — see
+/// [`deliver_remote`]'s `Resolution::Remote` arm.
+fn resolve_remote_query(peer: &str, query: &str, candidates: &[LocalCandidate<'_>]) -> Resolution {
+    match addr::resolve(query, peer, candidates, &[]) {
+        Resolution::NotFound => addr::resolve(&format!("{peer}/{query}"), peer, candidates, &[]),
+        other => other,
+    }
+}
+
+/// A peer session's display label for an error message — mirrors
+/// `who.rs::sessions_from_graph`'s label construction
+/// (`display::session_label` with the peer's own name standing in as
+/// `host`), so an ambiguous/not-found `--to` error names candidates the same
+/// way `aoide who` would already be showing them.
+fn peer_session_label(peer: &str, session_id: &str, petname: Option<&str>, role: &str) -> String {
+    let rec = aoide_storage::records::SessionRecord {
+        session_id: session_id.to_string(),
+        petname: petname.map(String::from),
+        ..Default::default()
+    };
+    aoide_storage::display::session_label(&rec, peer, role)
+}
+
+/// Deliver `text` to ONE remote session on `peer`, resolved from `query`
+/// against `peer`'s CACHED graph (`state/peer-cache/<peer>.json`) — a live
+/// pull is deliberately NOT performed here (the plan's own call: the cache
+/// is the addressing source for `send`; `who` is the probe verb). No cache
+/// at all (peer never pulled) is a clean error pointing at `peer pull`,
+/// never a silent auto-pull — a send should be predictable, not trigger a
+/// network fetch the user didn't ask for.
+///
+/// **GATING**: unlike [`deliver_local`], this function runs NO gate at all —
+/// `--yes`/pending/autogate (`send_gate`, `record_pending`) are a
+/// LOCAL-SOCKET concept: they decide whether THIS process writes to a
+/// socket it owns. A remote send is always ATTEMPTED over the network,
+/// exactly like `a2a agent send`/`peer pull` already do unconditionally.
+/// The RECEIVING peer's own `message_send` Inject arm
+/// (`aoide-server::a2a::message_send` → `do_inject`) is where the real gate
+/// lives: it decides deliver-now vs. hold-pending off ITS OWN peer-trust
+/// config (`should_deliver_now`/autogate — CONTRACTS.md §6), unconditionally
+/// forcing `submit=true` on its side regardless of what this caller's
+/// `--submit` flag says. So `--submit`/`--yes` are silently accepted but
+/// unused here — there is nothing on this side left for them to gate.
+///
+/// No title auto-rename, no local provenance prefix: both are operations on
+/// OUR OWN `sessions.json` graph node — a remote peer's graph is a
+/// projection this box doesn't own (`who.rs`'s own invariant, restated here
+/// for the same reason). Authenticated cross-host provenance is #51's
+/// scope, not this phase's (messaging plan, "Verified facts").
+fn deliver_remote(inv: &Invocation, peer: &aoide_storage::peer_store::Peer, query: &str) -> Outcome {
+    let cmd = "graph.send";
+    let text = inv.args.join(" ");
+
+    let cache = aoide_storage::peer_store::load_peer_cache(&peer.name);
+    let Some(graph) = cache.and_then(|c| c.graph) else {
+        let out = Outcome::error(
+            cmd,
+            format!(
+                "peer `{}` has no cached graph — run `aoide peer pull {}` first",
+                peer.name, peer.name
+            ),
+        )
+        .with_data(json!({ "reason": "peer-never-pulled", "peer": peer.name }));
+        audit_send(inv, "error", &out.message, &text);
+        return out;
+    };
+
+    let sess = peer_cached_sessions(&graph);
+    let candidates: Vec<LocalCandidate<'_>> = sess
+        .iter()
+        .map(|(id, pet, role)| LocalCandidate { session_id: id, petname: pet.as_deref(), role })
+        .collect();
+
+    match resolve_remote_query(&peer.name, query, &candidates) {
+        Resolution::Local(remote_id) => {
+            match aoide_client::commands::send_message_to_peer(peer, &text, &remote_id) {
+                Ok(response) => {
+                    let out = Outcome::ok(
+                        cmd,
+                        format!("delivered to `{remote_id}` on peer `{}`", peer.name),
+                    )
+                    .changed(vec![format!("sent to {}/{remote_id}", peer.name)])
+                    .with_data(json!({
+                        "peer": peer.name,
+                        "remoteSessionId": remote_id,
+                        "delivered": true,
+                        "response": response,
+                    }));
+                    audit_send(inv, "delivered", &out.message, &text);
+                    out
+                }
+                Err(e) => {
+                    let out = Outcome::error(
+                        cmd,
+                        format!("delivering to `{remote_id}` on peer `{}`: {e}", peer.name),
+                    )
+                    .with_data(json!({
+                        "reason": "peer-send-failed", "peer": peer.name, "remoteSessionId": remote_id,
+                    }));
+                    audit_send(inv, "error", &out.message, &text);
+                    out
+                }
+            }
+        }
+        Resolution::Ambiguous(ids) => {
+            let labels: Vec<String> = ids
+                .iter()
+                .filter_map(|id| {
+                    sess.iter().find(|(sid, _, _)| sid == id).map(|(sid, pet, role)| {
+                        peer_session_label(&peer.name, sid, pet.as_deref(), role)
+                    })
+                })
+                .collect();
+            let out = Outcome::error(
+                cmd,
+                format!(
+                    "`{query}` is ambiguous on peer `{}` — {} session(s) match: {}",
+                    peer.name,
+                    ids.len(),
+                    labels.join(", ")
+                ),
+            )
+            .with_data(json!({ "reason": "ambiguous", "peer": peer.name, "query": query, "candidates": ids }));
+            audit_send(inv, "error", &out.message, &text);
+            out
+        }
+        Resolution::NotFound => {
+            let labels: Vec<String> = sess
+                .iter()
+                .map(|(id, pet, role)| peer_session_label(&peer.name, id, pet.as_deref(), role))
+                .collect();
+            let hint = if labels.is_empty() {
+                format!(" (peer `{}` has no cached sessions)", peer.name)
+            } else {
+                format!(" — available on `{}`: {}", peer.name, labels.join(", "))
+            };
+            let out = Outcome::error(
+                cmd,
+                format!("no session on peer `{}` matches `{query}`{hint}", peer.name),
+            )
+            .with_data(json!({ "reason": "not-found", "peer": peer.name, "query": query }));
+            audit_send(inv, "error", &out.message, &text);
+            out
+        }
+        Resolution::Remote { .. } => {
+            // Unreachable: `resolve_remote_query` always passes `peers: &[]`
+            // to `addr::resolve`, so tier 5 (the only source of `Remote`)
+            // never fires. A clean error, not a panic/unwrap, in case that
+            // invariant ever drifts.
+            let out = Outcome::error(
+                cmd,
+                format!("`{query}` resolved to a nested peer reference, which is not supported"),
+            )
+            .with_data(json!({ "reason": "nested-remote-unsupported", "peer": peer.name, "query": query }));
+            audit_send(inv, "error", &out.message, &text);
+            out
+        }
+    }
 }
 
 /// A Task sub-agent to create: its node id (`sub:<tool_use_id>`), a human name
@@ -2565,6 +2912,393 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    // ── `--to` resolution (messaging plan P-C3) ───────────────────────────
+
+    fn test_peer(name: &str, url: &str) -> aoide_storage::peer_store::Peer {
+        aoide_storage::peer_store::Peer {
+            name: name.to_string(),
+            url: url.to_string(),
+            autogate: false,
+            token_file: None,
+            added_at: "2026-08-21T00:00:00Z".to_string(),
+        }
+    }
+
+    fn test_cache(name: &str, graph: Value) -> aoide_storage::peer_store::PeerCacheEntry {
+        aoide_storage::peer_store::PeerCacheEntry {
+            schema_version: "0".to_string(),
+            name: name.to_string(),
+            instance: None,
+            graph: Some(graph),
+            fetched_at: Some("2026-08-21T00:00:00Z".to_string()),
+            stale: false,
+            last_error: None,
+        }
+    }
+
+    /// `(sessionId, petname, role)` triples → a minimal cached-graph
+    /// document `peer_cached_sessions` can extract back out of — a `role:
+    /// "child"` entry gets a synthetic `spawned` edge so the role-derivation
+    /// half of the extraction is exercised too, mirroring `who.rs`'s own
+    /// `peer_graph` test fixture.
+    fn peer_graph_json(sessions: &[(&str, Option<&str>, &str)]) -> Value {
+        let nodes: Vec<Value> = sessions
+            .iter()
+            .map(|(id, petname, _role)| {
+                let mut n = json!({
+                    "id": format!("session:{id}"), "kind": "session",
+                    "state": "working", "cwd": "/x", "agent": "claude",
+                });
+                if let Some(p) = petname {
+                    n["petname"] = json!(p);
+                }
+                n
+            })
+            .collect();
+        let edges: Vec<Value> = sessions
+            .iter()
+            .filter(|(_, _, role)| *role == "child")
+            .map(|(id, _, _)| json!({ "from": "session:parent", "to": format!("session:{id}"), "kind": "spawned" }))
+            .collect();
+        json!({ "schemaVersion": "0", "nodes": nodes, "edges": edges })
+    }
+
+    #[test]
+    fn resolve_remote_query_table() {
+        // Pure, no I/O — mirrors `aoide_storage::addr`'s own table-driven
+        // style, scoped to what this function adds on top of `addr::resolve`
+        // itself: trying `query` exactly as typed first (tiers 1-3), and
+        // only on a miss retrying the reconstructed `<peer>/<query>` form
+        // (tier 4, the `role/petname` remainder tier 5 stripped the host off
+        // of).
+        struct Case {
+            name: &'static str,
+            query: &'static str,
+            candidates: Vec<(&'static str, Option<&'static str>, &'static str)>,
+            expected: Resolution,
+        }
+        let peer = "yomi-strix";
+        let cases = vec![
+            Case {
+                name: "exact remote id, tried as typed",
+                query: "sess-aaaa-1111",
+                candidates: vec![("sess-aaaa-1111", Some("brave-otter"), "root")],
+                expected: Resolution::Local("sess-aaaa-1111".into()),
+            },
+            Case {
+                name: "id tail4, tried as typed",
+                query: "1111",
+                candidates: vec![("sess-aaaa-1111", Some("brave-otter"), "root")],
+                expected: Resolution::Local("sess-aaaa-1111".into()),
+            },
+            Case {
+                name: "bare petname, tried as typed (the documented common case)",
+                query: "brave-otter",
+                candidates: vec![("sess-aaaa-1111", Some("brave-otter"), "root")],
+                expected: Resolution::Local("sess-aaaa-1111".into()),
+            },
+            Case {
+                name: "role/petname compound falls back to the reconstructed <peer>/<query> form",
+                query: "root/brave-otter",
+                candidates: vec![("sess-aaaa-1111", Some("brave-otter"), "root")],
+                expected: Resolution::Local("sess-aaaa-1111".into()),
+            },
+            Case {
+                name: "petname collision on the peer's own cache is ambiguous",
+                query: "brave-otter",
+                candidates: vec![
+                    ("sess-aaaa-1111", Some("brave-otter"), "root"),
+                    ("sess-bbbb-2222", Some("brave-otter"), "child"),
+                ],
+                expected: Resolution::Ambiguous(vec!["sess-aaaa-1111".into(), "sess-bbbb-2222".into()]),
+            },
+            Case {
+                name: "no match in either attempt",
+                query: "ghost-name",
+                candidates: vec![("sess-aaaa-1111", Some("brave-otter"), "root")],
+                expected: Resolution::NotFound,
+            },
+        ];
+        for c in cases {
+            let candidates: Vec<LocalCandidate<'_>> = c
+                .candidates
+                .iter()
+                .map(|(id, pet, role)| LocalCandidate { session_id: id, petname: *pet, role })
+                .collect();
+            let got = resolve_remote_query(peer, c.query, &candidates);
+            assert_eq!(got, c.expected, "case failed: {}", c.name);
+        }
+    }
+
+    #[test]
+    fn to_and_id_together_is_a_usage_error() {
+        let out = session_send(&send_invocation(&["hi"], &[("id", "x"), ("to", "y"), ("yes", "true")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage);
+        assert!(out.message.contains("mutually exclusive"), "msg: {}", out.message);
+    }
+
+    #[test]
+    fn to_local_petname_redrives_the_exact_id_path() {
+        // Same assertions `send_yes_delivers_and_autorenames_the_title` makes
+        // for `--id`, driven through `--to` instead — proving resolution
+        // funnels into `deliver_local` unmodified, not a parallel
+        // reimplementation of the gate/delivery/rename path.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+
+        let root = unique_stage("to-local");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        let id = "to-target";
+        let socket = conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        do_session_start(
+            id, Some("claude"), Some("/w"), None, None, Some(true), Some(socket.to_str().unwrap()), None, None,
+        );
+        // Mint a petname directly on the stage record — the send path
+        // resolves against whatever `sessions.json` says, not through the
+        // real minting machinery (not this phase's concern).
+        {
+            let mut f: SessionsFile = load_stage(&sessions_path()).unwrap();
+            f.sessions.iter_mut().find(|s| s.session_id == id).unwrap().petname =
+                Some("brave-otter".to_string());
+            write_stage(&sessions_path(), &f).unwrap();
+        }
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+
+        let out = session_send(&send_invocation(
+            &["hello", "world"],
+            &[("to", "brave-otter"), ("submit", "true"), ("yes", "true")],
+        ));
+        let got = acc.join().unwrap();
+
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(out.data.as_ref().unwrap()["delivered"], true);
+        assert_eq!(out.data.as_ref().unwrap()["id"], id);
+        assert_eq!(String::from_utf8(got).unwrap(), "hello world\n");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn to_local_ambiguous_petname_is_a_hard_error_never_first_match() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_AUDIT_LOG"]);
+
+        let root = unique_stage("to-ambiguous");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+
+        let mut a = session("dup-a", "/x", "working", "1", None);
+        a.petname = Some("brave-otter".to_string());
+        let mut b = session("dup-b", "/x", "idle", "2", None);
+        b.petname = Some("brave-otter".to_string());
+        let sf = SessionsFile { schema_version: "0".to_string(), sessions: vec![a, b] };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let out = session_send(&send_invocation(&["hi"], &[("to", "brave-otter"), ("yes", "true")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
+        assert_eq!(out.data.as_ref().unwrap()["reason"], "ambiguous");
+        assert_eq!(out.data.as_ref().unwrap()["candidates"].as_array().unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn to_unknown_bare_peer_name_hints_the_slash_form() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_AUDIT_LOG"]);
+
+        let root = unique_stage("to-bare-peer");
+        let stage = root.join("stage");
+        let state = root.join("state");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+
+        aoide_storage::peer_store::save_peers(&[test_peer("yomi-strix", "http://127.0.0.1:9/")]).unwrap();
+
+        // A slash-free query naming a KNOWN peer but no local session is
+        // `NotFound` (`addr.rs`'s documented bare-known-peer-name decision,
+        // never a whole-peer `Remote`) — the error should hint the
+        // `peer/<rest>` form instead of leaving the user guessing.
+        let out = session_send(&send_invocation(&["hi"], &[("to", "yomi-strix"), ("yes", "true")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
+        assert_eq!(out.data.as_ref().unwrap()["reason"], "not-found");
+        assert!(out.message.contains("did you mean"), "msg: {}", out.message);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn to_remote_with_no_cache_points_at_peer_pull() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_AUDIT_LOG"]);
+
+        let root = unique_stage("to-remote-no-cache");
+        let stage = root.join("stage");
+        let state = root.join("state");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+
+        aoide_storage::peer_store::save_peers(&[test_peer("yomi-strix", "http://127.0.0.1:9/")]).unwrap();
+
+        // Peer registered but NEVER pulled — no `state/peer-cache/…` file at
+        // all. Never an auto-pull: a clean error pointing at `peer pull`.
+        let out = session_send(&send_invocation(
+            &["hi"],
+            &[("to", "yomi-strix/brave-otter"), ("yes", "true")],
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
+        assert_eq!(out.data.as_ref().unwrap()["reason"], "peer-never-pulled");
+        assert!(out.message.contains("peer pull"), "msg: {}", out.message);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn to_remote_resolves_against_the_cache_and_attempts_delivery() {
+        // No mock HTTP server: `peer.url` names a closed loopback port so
+        // the underlying curl POST fails FAST and deterministically. This
+        // proves resolution reached exactly ONE remote session and the door
+        // actually attempted the network delivery (the part THIS phase
+        // owns) — not that the delivery succeeds, which is `aoide-client`'s
+        // own transport, untouched here beyond threading `context_id`.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_AUDIT_LOG"]);
+
+        let root = unique_stage("to-remote-deliver");
+        let stage = root.join("stage");
+        let state = root.join("state");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+
+        aoide_storage::peer_store::save_peers(&[test_peer("yomi-strix", "http://127.0.0.1:9/")]).unwrap();
+        aoide_storage::peer_store::save_peer_cache(&test_cache(
+            "yomi-strix",
+            peer_graph_json(&[("sess-remote-1", Some("misty-comet"), "root")]),
+        ))
+        .unwrap();
+
+        let out = session_send(&send_invocation(
+            &["hi", "there"],
+            &[("to", "yomi-strix/misty-comet"), ("yes", "true")],
+        ));
+        assert_eq!(
+            out.status,
+            aoide_protocol::output::Status::Error,
+            "the closed loopback port refuses the POST: {}",
+            out.message
+        );
+        assert_eq!(out.data.as_ref().unwrap()["reason"], "peer-send-failed");
+        assert_eq!(out.data.as_ref().unwrap()["remoteSessionId"], "sess-remote-1");
+
+        let log = std::fs::read_to_string(root.join("log")).unwrap_or_default();
+        assert!(log.contains("graph.send"), "audit line written even on a failed remote delivery: {log}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn to_remote_ambiguous_in_the_cache_lists_peer_session_labels() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_AUDIT_LOG"]);
+
+        let root = unique_stage("to-remote-ambiguous");
+        let stage = root.join("stage");
+        let state = root.join("state");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+
+        aoide_storage::peer_store::save_peers(&[test_peer("yomi-strix", "http://127.0.0.1:9/")]).unwrap();
+        aoide_storage::peer_store::save_peer_cache(&test_cache(
+            "yomi-strix",
+            peer_graph_json(&[
+                ("sess-remote-1", Some("misty-comet"), "root"),
+                ("sess-remote-2", Some("misty-comet"), "child"),
+            ]),
+        ))
+        .unwrap();
+
+        let out = session_send(&send_invocation(
+            &["hi"],
+            &[("to", "yomi-strix/misty-comet"), ("yes", "true")],
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
+        assert_eq!(out.data.as_ref().unwrap()["reason"], "ambiguous");
+        assert_eq!(out.data.as_ref().unwrap()["candidates"].as_array().unwrap().len(), 2);
+        assert!(out.message.contains("misty-comet"), "msg: {}", out.message);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn to_remote_not_found_in_the_cache_lists_available_sessions() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_AUDIT_LOG"]);
+
+        let root = unique_stage("to-remote-notfound");
+        let stage = root.join("stage");
+        let state = root.join("state");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+
+        aoide_storage::peer_store::save_peers(&[test_peer("yomi-strix", "http://127.0.0.1:9/")]).unwrap();
+        aoide_storage::peer_store::save_peer_cache(&test_cache(
+            "yomi-strix",
+            peer_graph_json(&[("sess-remote-1", Some("misty-comet"), "root")]),
+        ))
+        .unwrap();
+
+        let out = session_send(&send_invocation(
+            &["hi"],
+            &[("to", "yomi-strix/ghost-name"), ("yes", "true")],
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
+        assert_eq!(out.data.as_ref().unwrap()["reason"], "not-found");
+        assert!(out.message.contains("misty-comet"), "msg: {}", out.message);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn hook_event_mapping_covers_the_lifecycle_and_ignores_the_rest() {
         let start = map_hook(

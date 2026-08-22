@@ -2055,7 +2055,7 @@ mod tests {
     /// production code never lets `aoide-server` reach `aoide-client`.
     #[test]
     fn build_message_send_body_round_trips_through_the_inbound_parser() {
-        let body = aoide_client::wire::build_message_send_body("hello there", "mid-123");
+        let body = aoide_client::wire::build_message_send_body("hello there", "mid-123", None);
         let (prompt, ctx, spawn) = parse_message_send_params(&body["params"]);
         assert_eq!(prompt, "hello there");
         assert_eq!(ctx, None);

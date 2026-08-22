@@ -12,9 +12,12 @@ never the inbound/serve half (that's `aoide-server`).
   agnostic of any one downstream agent's shape).
 - `peer` — peer-federation client half (CONTRACTS.md §7).
 - `commands` — this crate's CLI verbs: `a2a agent add/list/remove/send`,
-  `peer add/list/remove/pull/status`, `adapter melete`; also exposes
-  `pull_peer_live` (not a verb itself — the `conduct → client` edge's one
-  crossing point, `who`'s live per-peer probe).
+  `peer add/list/remove/pull/status`, `adapter melete`; also exposes two
+  non-verb functions that are the `conduct → client` edge's crossing
+  points: `pull_peer_live` (`who`'s live per-peer probe, read-only) and
+  `send_message_to_peer` (`graph send --to <peer>/<query>`'s delivery,
+  workstream C3 — POSTs `message/send` with an explicit `contextId` naming
+  the resolved remote session).
 
 ## What it consumes
 
@@ -27,6 +30,8 @@ cache persist through `storage`).
 test), and `cli` depend on it. **The `conduct → client` edge is intentional,
 not technical debt**: `conduct`'s `who` presence verb (workstream C2,
 landed) calls this crate's `commands::pull_peer_live` for its live
-per-peer probe — the edge stays even though the original reason
-(`screen/send.rs`) moved out to the `screen` crate at P-A1
-(`docs/architecture/PACKAGE-LAYOUT.md`, "Verified facts").
+per-peer probe, and `graph send --to`'s remote branch (workstream C3,
+landed) calls `commands::send_message_to_peer` to deliver — the edge stays
+even though the original reason (`screen/send.rs`) moved out to the
+`screen` crate at P-A1 (`docs/architecture/PACKAGE-LAYOUT.md`, "Verified
+facts").

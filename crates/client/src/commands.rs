@@ -248,7 +248,10 @@ pub fn handle_agent_send(inv: &Invocation) -> Outcome {
         }
     };
     let message_id = gen_message_id();
-    let body = crate::wire::build_message_send_body(&message, &message_id);
+    // `context_id: None` — this drives an unrelated registered A2A agent,
+    // which has no notion of an aoide sessionId (that's `send_message_to_peer`
+    // below, P-C3's peer-targeted path).
+    let body = crate::wire::build_message_send_body(&message, &message_id, None);
     let body_str = serde_json::to_string(&body).unwrap_or_default();
     let (code, resp) = match run_curl(
         &[
@@ -535,6 +538,62 @@ pub fn pull_peer_live(peer: &aoide_storage::peer_store::Peer, timeout_secs: u64)
     let now = aoide_storage::time::now_iso_utc();
     let entry = crate::peer::parse_graph_summary_response(&resp, &peer.name, &now)?;
     Ok(entry.graph.unwrap_or_else(|| json!({ "nodes": [], "edges": [] })))
+}
+
+/// POST a `message/send` to a PEER (not a registered A2A agent — see
+/// [`handle_agent_send`]) with an explicit `contextId` naming the REMOTE
+/// session to inject into. `graph send --to <peer>/<query>` (`aoide-conduct`,
+/// workstream C3) resolves `query` against the peer's cached graph to that
+/// one remote sessionId, then drives THIS function — the transport lives
+/// here (not duplicated in `conduct`) for the same reason [`pull_peer_live`]
+/// does, see the crate's `Cargo.toml`/`AGENTS.md` on the `conduct → client`
+/// edge.
+///
+/// Same `run_curl` transport and 15s timeout every other `message/send`
+/// call site in this file uses (`handle_agent_send`) — this is a real
+/// delivery, not `who`'s short-timeout presence probe, so it does NOT reuse
+/// [`pull_peer_live`]'s tighter bound. Returns the parsed JSON-RPC response
+/// on a 200 with no `error` member; any transport/HTTP/JSON-RPC failure is
+/// `Err` with a plain message the caller (`aoide-conduct`) can surface and
+/// audit directly — mirrors [`pull_peer_live`]'s `Result`-not-`Outcome`
+/// shape so the caller builds its own `Outcome`/audit line, never this one.
+pub fn send_message_to_peer(
+    peer: &aoide_storage::peer_store::Peer,
+    text: &str,
+    context_id: &str,
+) -> Result<Value, String> {
+    let message_id = gen_message_id();
+    let body = crate::wire::build_message_send_body(text, &message_id, Some(context_id));
+    let body_str = serde_json::to_string(&body).unwrap_or_default();
+    let (code, resp) = run_curl(
+        &[
+            "-X",
+            "POST",
+            "-H",
+            "Content-Type: application/json",
+            "--data-binary",
+            "@-",
+            "--",
+            &peer.url,
+        ],
+        Some(&body_str),
+    )?;
+    if code != 200 {
+        return Err(format!("HTTP {code}"));
+    }
+    let parsed: Value =
+        serde_json::from_str(&resp).map_err(|e| format!("unparseable response: {e}"))?;
+    // A JSON-RPC error still returns HTTP 200 (same discipline as
+    // `handle_agent_send`'s own check) — surface it as an `Err`, not a
+    // silently-`Ok`'d error envelope.
+    if let Some(err) = parsed.get("error") {
+        let detail = err
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("(no message)");
+        return Err(format!("peer returned an error: {detail}"));
+    }
+    Ok(parsed)
 }
 
 /// `peer pull [<name>]` — pull `aoide/graphSummary` from one (or, with no

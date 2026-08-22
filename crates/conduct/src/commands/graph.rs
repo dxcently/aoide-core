@@ -148,13 +148,14 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["graph", "send"],
-        summary: "Inject text into a conducted session's control socket (the one gated injection door). Held pending approval by default; --yes (or an autogate policy) delivers and auto-renames the node to a one-line form of the text — except for a bare keystroke answer (text with no letters, e.g. a permission verdict digit), which is not a task and leaves the node's name alone. Siblings (sharing a live parent) autogate each other by default too — opt out with AOIDE_CONDUCT_SIBLING_AUTOGATE={0,false,no}. Every outcome is audited.",
+        summary: "Inject text into a conducted session's control socket (the one gated injection door). Held pending approval by default; --yes (or an autogate policy) delivers and auto-renames the node to a one-line form of the text — except for a bare keystroke answer (text with no letters, e.g. a permission verdict digit), which is not a task and leaves the node's name alone. Siblings (sharing a live parent) autogate each other by default too — opt out with AOIDE_CONDUCT_SIBLING_AUTOGATE={0,false,no}. Every outcome is audited. --to resolves a name (local id/tail4/petname, or peer/<query> for a remote session over A2A) instead of a raw --id; mutually exclusive with --id — a remote send is always attempted (the receiving peer gates its own delivery) and never queues locally.",
         args: [arg!("text", "string", true, "The text to inject — put it after `--` so its own words/flags pass through verbatim.")],
         flags: [
-            flag!("id", "string", "Target session id (required); its socket is resolved from sessions.json."),
-            flag!("submit", "bool", "Append the target harness's own submit keystroke (Enter for most agents, \\r for kimi — resolved from the target session's agent profile at delivery time)."),
-            flag!("yes", "bool", "Authorise delivery now (else the send is held pending approval)."),
+            flag!("id", "string", "Target session id (required unless --to is given); its socket is resolved from sessions.json."),
+            flag!("submit", "bool", "Append the target harness's own submit keystroke (Enter for most agents, \\r for kimi — resolved from the target session's agent profile at delivery time). No-op for a --to remote send (the receiving peer always submits its own way)."),
+            flag!("yes", "bool", "Authorise delivery now (else the send is held pending approval). No-op for a --to remote send — the receiving peer gates its own delivery."),
             flag!("from", "string", "Sender attribution override for the delivered provenance prefix (default: AOIDE_SESSION_ID). ATTRIBUTION ONLY, not authentication — unauthenticated and as spoofable as the env var it defaults from."),
+            flag!("to", "string", "Target by name instead of --id: a local session id/tail4/petname/host-role-petname line, or peer/<query> to resolve against a registered peer's CACHED graph and deliver over A2A message/send. Mutually exclusive with --id."),
         ],
         gated: false,
         implemented: true,
@@ -162,6 +163,8 @@ pub fn register(r: &mut Registry) {
         examples: [
             "graph send --id <session-id> --submit -- yes, ship it",
             "graph send --id <session-id> --yes -- 1",
+            "graph send --to brave-otter --yes --submit -- status?",
+            "graph send --to yomi-strix/brave-otter -- ping",
         ],
     ));
     r.insert(cmd!(
