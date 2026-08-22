@@ -1,16 +1,33 @@
 //! The broker daemon (`aoide secrets serve`): a unix-socket JSON-lines
 //! server, ONE request per line, ONE reply per line — the shellbridge
 //! precedent (`aoide_conduct::shellbridge`, read and matched deliberately
-//! per the phase brief): a single-threaded accept loop, a `serve`/
-//! `handle_conn` split, every failure contained (a malformed line, an
-//! unknown op, or a dropped connection ends only that line/connection —
-//! never the service).
+//! per the phase brief) for everything EXCEPT the connection model itself.
 //!
-//! Wire (`resolve` and `put`, P-V4c):
+//! **Connection model: thread-per-connection (P-N2, this commit — CHANGED
+//! from a single-threaded serial accept loop).** Before this phase,
+//! [`serve`]'s `for conn in listener.incoming()` called [`handle_conn`]
+//! INLINE, so one slow/blocked connection stalled every other client
+//! queued behind it on `accept(2)`. That was safe only because nothing here
+//! ever blocked for long. P-N2 breaks that: a TOTP-gated `resolve` with no
+//! code now PARKS (see below) and can legitimately hold its connection open
+//! for the FULL park timeout (default 300s, [`crate::park::park_timeout`]).
+//! [`serve`] now spawns ONE THREAD PER CONNECTION
+//! (`std::thread::spawn(move || handle_conn(...))`), so a parked connection
+//! blocks only its own thread — the accept loop keeps admitting new
+//! connections, and an unrelated `resolve`/`put`/`pending` on a different
+//! connection completes normally while another sits parked. Every failure
+//! is still contained per-connection (a malformed line, an unknown op, a
+//! dropped connection, even a panic inside one `handle_conn` thread ends
+//! only that one connection — never the service, never another connection's
+//! own thread); see `park.rs`'s module doc for why the shared
+//! [`crate::park::ParkRegistry`] recovers from a poisoned lock rather than
+//! propagating a panic across threads.
+//!
+//! Wire (`resolve`/`put`/`pending`/`approve`/`dismiss`):
 //! ```text
-//! -> {"op":"resolve","secret":"<name>","consumer":"<consumer>","totp":"<code>"?,"argv0":"<cmd>"?}
-//! <- {"ok":true,"value":"<value>"}                    (granted)
-//! <- {"ok":false,"error":"<value-free message>"}      (denied/error)
+//! -> {"op":"resolve","secret":"<name>","consumer":"<consumer>","totp":"<code>"?,"argv0":"<cmd>"?,"wait":<bool>?}
+//! <- {"ok":true,"value":"<value>"}                    (granted — immediately, or after a park completes)
+//! <- {"ok":false,"error":"<value-free message>"}      (denied/error/timeout/dismissed)
 //!
 //! -> {"op":"put","secret":"<name>","value":"<value>","overwrite":<bool>?}
 //! <- {"ok":true,"replaced":<bool>}                    (stored — `replaced`
@@ -23,21 +40,92 @@
 //!                                                       the secret ALREADY
 //!                                                       has a stored value)
 //! <- {"ok":false,"error":"<value-free message>"}      (denied/error)
+//!
+//! -> {"op":"pending"}
+//! <- {"ok":true,"pending":[{"id":"<id>","secret":"<name>","consumer":"<consumer>","requestedAt":<unix-seconds>},...]}
+//!
+//! -> {"op":"approve","id":"<id>","totp":"<code>"}
+//! <- {"ok":true}                                      (code valid — the
+//!                                                       VALUE releases down
+//!                                                       the ORIGINAL parked
+//!                                                       connection, never
+//!                                                       in this reply)
+//! <- {"ok":false,"error":"<value-free message>"}      (unknown id / invalid
+//!                                                       or missing code —
+//!                                                       the ask STAYS
+//!                                                       parked on an
+//!                                                       invalid/missing
+//!                                                       code)
+//!
+//! -> {"op":"dismiss","id":"<id>"}
+//! <- {"ok":true}                                       (the parked caller
+//!                                                       gets a clean
+//!                                                       "dismissed" refusal)
+//! <- {"ok":false,"error":"unknown pending id `<id>`"}
 //! ```
-//! `totp`/`argv0` are optional on `resolve`; `overwrite` is optional on
-//! `put` — ABSENT MEANS `false` (P-67, wire compatibility: an old client
+//! `totp`/`argv0`/`wait` are optional on `resolve`; `overwrite` is optional
+//! on `put` — ABSENT MEANS `false` (P-67, wire compatibility: an old client
 //! sending no `overwrite` field still gets the tightened "exists" refusal
 //! from a new broker on a second `put`, which is the deliberate behavior
 //! change this feature makes — see `client.rs`'s module doc for the full
-//! wire-compat note). `consumer` is SELF-ASSERTED
+//! wire-compat note). `wait` (P-N2) ABSENT MEANS `true` — a resolve that
+//! would otherwise park now DOES park by default; `wait:false` restores the
+//! pre-P-N2 immediate `"...no totp code was provided"` refusal, for machine
+//! callers that structurally cannot type a code and would rather fail fast
+//! (documented in `CONTRACTS.md`'s "Secrets wire" subsection — wire-only,
+//! no CLI flag). `consumer` is SELF-ASSERTED
 //! (the plan's V1 ruling, `crate::replay`'s module doc): the policy's
 //! `consumers[]` list is the real gate, not caller identity. This repo-wide
-//! machine-consumer contract (both ops, every error string, the
+//! machine-consumer contract (every op, every error string, the
 //! group-membership trust model) is ALSO documented in `CONTRACTS.md`'s
 //! "Secrets home" section — services (verba voluntia, Melete-side models)
 //! are meant to speak this wire directly, no LLM in the loop; `secrets
-//! exec`/`secrets put` are convenience wrappers over the same two ops, not
-//! the only door onto them.
+//! exec`/`secrets put`/`secrets pending`/`secrets approve`/`secrets
+//! dismiss` are convenience wrappers over the same ops, not the only door
+//! onto them.
+//!
+//! **Parking a TOTP-gated resolve (P-N2, this commit).** Today (before this
+//! phase) a `resolve` for a `requireTotp`-gated secret with no code was an
+//! ordinary denial. Now: [`resolve_gate`] returns [`GateOutcome::NeedsTotp`]
+//! for that exact case (enrollment exists, code absent/empty, a code WOULD
+//! be checked if present) — [`handle_resolve`] registers a
+//! [`crate::park::ParkedAsk`] in the shared [`crate::park::ParkRegistry`]
+//! and blocks THIS connection's own thread on [`crate::park::
+//! wait_for_outcome`] until one of three things happens:
+//! - `secrets approve <id> --totp <code>` ([`handle_approve`]) validates
+//!   the code with the SAME [`verify_totp_gate`] a fast-path `resolve`
+//!   would use (same RFC 6238 verify, same single-use-per-timestep replay
+//!   ledger — a code is consumed identically either way), fetches the value
+//!   fresh (`fetch_secret_value`, NEVER cached from park time — the value
+//!   is never stored anywhere before this moment, `park.rs`'s module doc),
+//!   and sends it down the channel to the parked connection — `approve`'s
+//!   OWN reply to the approver never carries the value, only `{"ok":true}`.
+//!   An INVALID/expired/already-used/missing code leaves the ask exactly
+//!   where it was (`ParkRegistry::peek`, never `take`, on that path) — the
+//!   operator can retry.
+//! - `secrets dismiss <id>` ([`handle_dismiss`]) resolves the ask with no
+//!   code at all — the parked connection gets a clean "dismissed" refusal.
+//! - [`crate::park::park_timeout`] elapses first (default 300s,
+//!   `AOIDE_SECRETS_PARK_TIMEOUT` to change it) — the parked connection gets
+//!   a refusal naming the timeout, the knob, and both completion paths
+//!   (inline `--totp` on a fresh resolve, or `secrets approve`); the ask is
+//!   removed.
+//!
+//! Audit gains three new event kinds alongside the unchanged `secrets.
+//! resolve`/`secrets.put` ones (module doc's audit section, below): a
+//! `secrets.resolve` "parked" line at park time
+//! ([`audit_park`]), a `secrets.approve` line per approve attempt
+//! ([`audit_approve`]), and a `secrets.dismiss` line per dismiss attempt
+//! ([`audit_dismiss`]) — all name-only, same discipline as every other
+//! audit line in this module. The ask's EVENTUAL grant/deny (approved,
+//! dismissed, or timed out) still fires the pre-existing [`audit_resolve`]
+//! exactly as an immediate resolve always has — parking only inserts a
+//! wait in the middle, it does not change what gets audited at the end.
+//!
+//! **An automation-open listed consumer NEVER parks** — `resolve_gate`'s
+//! `totp_required` check (P-N1) already routes those straight to
+//! [`GateOutcome::Granted`]/`Denied`, before the no-code/park branch is
+//! ever reached; nothing about this phase changes that.
 //!
 //! **`put` carries NO `consumer` field and is never gated by
 //! `requireTotp`** (P-V4c, deliberate): `secrets put` is CLI-only
@@ -99,13 +187,13 @@
 //! a restart re-reads the same file.
 //!
 //! `resolve_gate`'s clock is a PARAMETER (`now_unix`), not a `SystemTime::
-//! now()` call inside it — [`handle_resolve`] is the one place in this
-//! module that reads the real clock (`aoide_protocol::audit::now_secs()`)
-//! and hands it in, so `resolve_gate`/`verify_totp_gate` stay exactly as
-//! deterministically testable as `crate::totp`/`crate::replay` themselves
-//! (this crate's `AGENTS.md`, "clock-as-parameter, everywhere" — the
-//! broker is where the real-clock wrapper is allowed to live, and this is
-//! that one wrapper).
+//! now()` call inside it — [`handle_resolve`] and [`handle_approve`] (P-N2)
+//! are the two places in this module that read the real clock
+//! (`aoide_protocol::audit::now_secs()`) and hand it in, so `resolve_gate`/
+//! `verify_totp_gate` stay exactly as deterministically testable as
+//! `crate::totp`/`crate::replay` themselves (this crate's `AGENTS.md`,
+//! "clock-as-parameter, everywhere" — the broker is where the real-clock
+//! wrapper is allowed to live, and these are those two wrappers).
 //!
 //! **Audit, broker-side only** (this crate's `AGENTS.md`): every resolve
 //! attempt is logged HERE — never by the client, which only ever learns
@@ -117,7 +205,11 @@
 //! `EventClass::Secret`. Both carry secret name + consumer + argv0 (if the
 //! client sent one) + granted/denied + a value-free reason — NEVER the
 //! value, which exists only as this module's own local `String` between
-//! the backend fetch and the `{"ok":true,"value":...}` line write.
+//! the backend fetch and the `{"ok":true,"value":...}` line write (or, on a
+//! park, between `fetch_secret_value`'s return inside [`handle_approve`]
+//! and the `ParkOutcome::Approved` send — still never persisted, `park.rs`'s
+//! module doc). [`audit_park`]/[`audit_approve`]/[`audit_dismiss`] (P-N2)
+//! follow the identical two-destination, name-only shape.
 //!
 //! **The socket is chmod'd to `0660` immediately after bind** (P-V4,
 //! deployment). `UnixListener::bind` alone honors the process umask, so
@@ -144,11 +236,13 @@
 //! the process's own primary/effective group. This module only ever touches
 //! the mode bits.
 
+use crate::park::{ParkOutcome, ParkRegistry, WaitResult};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Bind `socket_path`: create its parent dir if absent, remove a stale
 /// socket file first (single-owner path per host, same precedent as
@@ -167,15 +261,16 @@ fn bind_socket(socket_path: &Path) -> std::io::Result<UnixListener> {
     Ok(listener)
 }
 
-/// Bind `socket_path` and serve `resolve`/`put` requests forever. Creates
-/// `secrets_home` if absent and locks it down to `0700` (bounce-fix item 3,
-/// P-V2 review — `create_dir_all` alone honors the process umask, which
-/// would leave `policy.json`/`backends.json` world-readable). **Seeds
-/// `backends.json` with the built-in `file` backend when absent** (P-V4c,
-/// `crate::backend::seed_default_backends`) — this is the ONE seeding site
-/// (decision recorded here, not duplicated at `secrets add`/`secrets put`):
-/// `serve` is the single long-running process that ever actually resolves
-/// a backend name against a `get`/`set` template (both the CLI's `secrets
+/// Bind `socket_path` and serve `resolve`/`put`/`pending`/`approve`/
+/// `dismiss` requests forever. Creates `secrets_home` if absent and locks
+/// it down to `0700` (bounce-fix item 3, P-V2 review — `create_dir_all`
+/// alone honors the process umask, which would leave `policy.json`/
+/// `backends.json` world-readable). **Seeds `backends.json` with the
+/// built-in `file` backend when absent** (P-V4c, `crate::backend::
+/// seed_default_backends`) — this is the ONE seeding site (decision
+/// recorded here, not duplicated at `secrets add`/`secrets put`): `serve`
+/// is the single long-running process that ever actually resolves a
+/// backend name against a `get`/`set` template (both the CLI's `secrets
 /// exec` and the new `secrets put` reach a backend only by round-tripping
 /// through THIS process over the socket), so seeding here guarantees every
 /// such attempt sees a `backends.json` on disk without a second seed call
@@ -184,6 +279,13 @@ fn bind_socket(socket_path: &Path) -> std::io::Result<UnixListener> {
 /// ever uses non-`file` backends) is still a perfectly servable broker.
 /// Only returns on a bind/permission failure — a running broker never
 /// returns `Ok`.
+///
+/// **ONE [`ParkRegistry`] for the whole broker's lifetime** (P-N2),
+/// wrapped in an `Arc` and cloned into every spawned connection thread
+/// (module doc's thread-per-connection change) — every connection must
+/// share the SAME registry, since an `approve`/`dismiss`/`pending` arriving
+/// on one connection has to see (and resolve) an ask parked by a totally
+/// different connection.
 pub fn serve(secrets_home: &Path, socket_path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(secrets_home)?;
     crate::home::secure_dir(secrets_home)?;
@@ -193,19 +295,28 @@ pub fn serve(secrets_home: &Path, socket_path: &Path) -> std::io::Result<()> {
     let listener = bind_socket(socket_path)?;
 
     let home = secrets_home.to_path_buf();
+    let parked = Arc::new(ParkRegistry::new());
     for conn in listener.incoming() {
         match conn {
-            Ok(stream) => handle_conn(&home, stream),
+            Ok(stream) => {
+                let home = home.clone();
+                let parked = Arc::clone(&parked);
+                std::thread::spawn(move || handle_conn(&home, stream, &parked));
+            }
             Err(e) => eprintln!("[aoide/secrets] accept error (continuing): {e}"),
         }
     }
     Ok(())
 }
 
-/// Handle ONE client connection: read newline-delimited JSON requests and
-/// reply to each. A read error (dropped connection) ends only this
-/// connection; nothing here can unwind into `serve`'s accept loop.
-fn handle_conn(secrets_home: &Path, stream: UnixStream) {
+/// Handle ONE client connection, on its OWN thread (module doc, P-N2): read
+/// newline-delimited JSON requests and reply to each. A read error (dropped
+/// connection) ends only this connection; nothing here can unwind into
+/// `serve`'s accept loop OR into any other connection's own thread. A
+/// `resolve` that parks (`handle_resolve`) blocks THIS thread only, for as
+/// long as `crate::park::park_timeout()` allows — every other connection's
+/// `handle_conn` thread is unaffected.
+fn handle_conn(secrets_home: &Path, stream: UnixStream, parked: &ParkRegistry) {
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
         Err(e) => {
@@ -222,7 +333,7 @@ fn handle_conn(secrets_home: &Path, stream: UnixStream) {
         if line.trim().is_empty() {
             continue;
         }
-        let reply = handle_line(secrets_home, &line);
+        let reply = handle_line(secrets_home, &line, parked);
         let mut out = reply.to_string();
         out.push('\n');
         if writer.write_all(out.as_bytes()).is_err() {
@@ -232,42 +343,218 @@ fn handle_conn(secrets_home: &Path, stream: UnixStream) {
 }
 
 /// Parse and dispatch ONE wire line. Pure with respect to the wire framing
-/// (all I/O — policy load, backend fetch, audit — happens inside
-/// [`handle_resolve`]/[`resolve_gate`]); malformed JSON or an unknown `op`
+/// (all I/O — policy load, backend fetch, audit, parking — happens inside
+/// the individual `handle_*` functions); malformed JSON or an unknown `op`
 /// always gets a reply line, never a silently dropped connection (unlike
 /// shellbridge's fire-and-forget commands, a secrets client is BLOCKED
 /// waiting on this reply).
-fn handle_line(secrets_home: &Path, line: &str) -> Value {
+fn handle_line(secrets_home: &Path, line: &str, parked: &ParkRegistry) -> Value {
     let req: Value = match serde_json::from_str(line.trim()) {
         Ok(v) => v,
         Err(_) => return json!({"ok": false, "error": "malformed request: not valid JSON"}),
     };
     match req.get("op").and_then(Value::as_str) {
-        Some("resolve") => handle_resolve(secrets_home, &req),
+        Some("resolve") => handle_resolve(secrets_home, &req, parked),
         Some("put") => handle_put(secrets_home, &req),
+        Some("pending") => handle_pending(parked),
+        Some("approve") => handle_approve(secrets_home, parked, &req),
+        Some("dismiss") => handle_dismiss(secrets_home, parked, &req),
         Some(other) => json!({"ok": false, "error": format!("unknown op `{other}`")}),
         None => json!({"ok": false, "error": "malformed request: missing `op`"}),
     }
 }
 
-fn handle_resolve(secrets_home: &Path, req: &Value) -> Value {
+/// `resolve` — the fast path is UNCHANGED (module doc): a code present, or
+/// no TOTP gate at all, resolves/denies immediately exactly as before P-N2.
+/// The new branch is [`GateOutcome::NeedsTotp`]: `wait` (default `true`,
+/// module doc) parks the connection via [`ParkRegistry::park`]/
+/// [`crate::park::wait_for_outcome`]; `wait:false` restores the pre-P-N2
+/// immediate refusal.
+fn handle_resolve(secrets_home: &Path, req: &Value, parked: &ParkRegistry) -> Value {
     let secret = req.get("secret").and_then(Value::as_str).unwrap_or("").to_string();
     let consumer = req.get("consumer").and_then(Value::as_str).unwrap_or("").to_string();
     let argv0 = req.get("argv0").and_then(Value::as_str).map(str::to_string);
     let totp = req.get("totp").and_then(Value::as_str).map(str::to_string);
+    let wait = req.get("wait").and_then(Value::as_bool).unwrap_or(true);
 
     if secret.is_empty() || consumer.is_empty() {
         return json!({"ok": false, "error": "malformed request: `secret` and `consumer` are required"});
     }
 
-    // The one real-clock read in this module — see module doc.
+    // The one real-clock read in this function — see module doc.
     let now_unix = aoide_protocol::audit::now_secs();
-    let (granted, result) = resolve_gate(secrets_home, &secret, &consumer, totp.as_deref(), now_unix);
-    audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), granted, result.as_ref().err());
+    match resolve_gate(secrets_home, &secret, &consumer, totp.as_deref(), now_unix) {
+        GateOutcome::Granted(value) => {
+            audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), true, None);
+            json!({"ok": true, "value": value})
+        }
+        GateOutcome::Denied(reason) => {
+            audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), false, Some(&reason));
+            json!({"ok": false, "error": reason})
+        }
+        GateOutcome::NeedsTotp => {
+            if !wait {
+                let reason = "requireTotp is set but no totp code was provided".to_string();
+                audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), false, Some(&reason));
+                return json!({"ok": false, "error": reason});
+            }
+            let (id, rx) = parked.park(&secret, &consumer, now_unix);
+            audit_park(secrets_home, &id, &secret, &consumer);
+            let timeout = crate::park::park_timeout();
+            match crate::park::wait_for_outcome(parked, &id, rx, timeout) {
+                WaitResult::Approved(value) => {
+                    audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), true, None);
+                    json!({"ok": true, "value": value})
+                }
+                WaitResult::Denied(reason) => {
+                    audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), false, Some(&reason));
+                    json!({"ok": false, "error": reason})
+                }
+                WaitResult::Dismissed => {
+                    let reason =
+                        "the pending TOTP ask was dismissed by an operator before a code was provided".to_string();
+                    audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), false, Some(&reason));
+                    json!({"ok": false, "error": reason})
+                }
+                WaitResult::TimedOut => {
+                    let reason = park_timeout_message(&secret, timeout.as_secs());
+                    audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), false, Some(&reason));
+                    json!({"ok": false, "error": reason})
+                }
+            }
+        }
+    }
+}
 
-    match result {
-        Ok(value) => json!({"ok": true, "value": value}),
-        Err(reason) => json!({"ok": false, "error": reason}),
+/// The timeout refusal's exact wording — a pure function so it's testable
+/// without actually waiting out a real timeout (task requirement: name the
+/// timeout, the knob, and BOTH completion paths). Deliberately does NOT
+/// name the now-removed ask's id: by the time this fires the id is already
+/// gone from the registry, and `secrets approve <that-id>` would just get
+/// "unknown pending id" — a stale id would mislead, not help.
+fn park_timeout_message(secret: &str, timeout_secs: u64) -> String {
+    format!(
+        "the pending TOTP ask for `{secret}` timed out after {timeout_secs}s ({} to change the default) — \
+         resolve again with an inline `--totp <code>`, or approve the next ask before it expires with \
+         `aoide secrets approve <id> --totp <code>`",
+        crate::park::PARK_TIMEOUT_ENV
+    )
+}
+
+/// `pending` (P-N2) — list every parked ask. Never carries a value (module
+/// doc); never errors (an empty queue is `{"ok":true,"pending":[]}`, same
+/// tolerant shape `graph pending list` already holds). Not audited — a mere
+/// read of in-memory state, same precedent `graph pending list` sets (that
+/// command doesn't audit either).
+fn handle_pending(parked: &ParkRegistry) -> Value {
+    let pending: Vec<Value> = parked
+        .list()
+        .into_iter()
+        .map(|(id, secret, consumer, requested_at)| {
+            json!({"id": id, "secret": secret, "consumer": consumer, "requestedAt": requested_at})
+        })
+        .collect();
+    json!({"ok": true, "pending": pending})
+}
+
+/// `approve <id> --totp <code>` (P-N2): validate the code with the SAME
+/// [`verify_totp_gate`] a fast-path `resolve` uses (same RFC 6238 verify,
+/// same single-use replay ledger — the code is consumed identically either
+/// way), then fetch the value fresh and release it down the ORIGINAL
+/// parked connection. This function's OWN reply to the approver never
+/// carries the value — only `{"ok":true}` or a value-free `{"ok":false,
+/// "error":...}`.
+///
+/// **Two-step lookup, deliberately** (module doc): [`ParkRegistry::peek`]
+/// first (read-only) so an INVALID/expired/already-used/missing code
+/// leaves the ask exactly where it was — [`ParkRegistry::take`] only
+/// happens AFTER a code has already validated (and been consumed by the
+/// replay ledger), at which point the ask must be resolved one way or
+/// another (approved, or — the rare case where the value can no longer be
+/// fetched, e.g. the policy was removed while parked — denied); it can
+/// never be left parked past that point, since the code that would be
+/// needed to try again has already been spent.
+fn handle_approve(secrets_home: &Path, parked: &ParkRegistry, req: &Value) -> Value {
+    let id = req.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+    if id.is_empty() {
+        return json!({"ok": false, "error": "malformed request: `id` is required"});
+    }
+    let Some((secret, _consumer)) = parked.peek(&id) else {
+        let reason = format!("unknown pending id `{id}`");
+        audit_approve(secrets_home, &id, None, false, &reason);
+        return json!({"ok": false, "error": reason});
+    };
+
+    let totp = req.get("totp").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    let Some(code) = totp else {
+        let reason = "malformed request: `totp` is required".to_string();
+        audit_approve(secrets_home, &id, Some(&secret), false, &reason);
+        return json!({"ok": false, "error": reason});
+    };
+
+    // The one real-clock read in this function — see module doc.
+    let now_unix = aoide_protocol::audit::now_secs();
+    if let Err(e) = verify_totp_gate(secrets_home, Some(code), now_unix) {
+        // Invalid/expired/already-used code: the ask STAYS parked (task
+        // requirement) — never `take`n on this path.
+        audit_approve(secrets_home, &id, Some(&secret), false, &e);
+        return json!({"ok": false, "error": e});
+    }
+
+    // The code is now valid AND consumed — the ask must resolve one way or
+    // another from here, never stay parked.
+    let Some(ask) = parked.take(&id) else {
+        let reason = format!("pending ask `{id}` no longer exists (it may have timed out or been dismissed)");
+        audit_approve(secrets_home, &id, Some(&secret), false, &reason);
+        return json!({"ok": false, "error": reason});
+    };
+    match fetch_secret_value(secrets_home, &secret) {
+        Ok(value) => {
+            ask.send(ParkOutcome::Approved(value));
+            audit_approve(secrets_home, &id, Some(&secret), true, "");
+            json!({"ok": true})
+        }
+        Err(e) => {
+            ask.send(ParkOutcome::Denied(e.clone()));
+            audit_approve(secrets_home, &id, Some(&secret), false, &e);
+            json!({"ok": false, "error": e})
+        }
+    }
+}
+
+/// Fetch `secret`'s value fresh through its policy's backend — the SAME
+/// lookup [`resolve_gate`]'s own granted path performs, reused here rather
+/// than duplicated (task requirement: "NEVER store or park a value; the
+/// fetch happens only after successful completion"). Never called before a
+/// code has already validated.
+fn fetch_secret_value(secrets_home: &Path, secret: &str) -> Result<String, String> {
+    let policies = crate::store::load_policies(secrets_home)
+        .map_err(|e| crate::home::describe_home_file_error(secrets_home, &crate::store::policy_path(secrets_home), &e))?;
+    let policy = policies.iter().find(|p| p.name == secret).ok_or_else(|| "secret not found".to_string())?;
+    crate::backend::fetch_value(secrets_home, &policy.backend, &policy.key)
+}
+
+/// `dismiss <id>` (P-N2): resolve a parked ask with no code at all — the
+/// parked connection gets a clean "dismissed" refusal, the dismisser gets
+/// `{"ok":true}`. An unknown id is a taught error naming it explicitly
+/// (task requirement).
+fn handle_dismiss(secrets_home: &Path, parked: &ParkRegistry, req: &Value) -> Value {
+    let id = req.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+    if id.is_empty() {
+        return json!({"ok": false, "error": "malformed request: `id` is required"});
+    }
+    match parked.take(&id) {
+        Some(ask) => {
+            let secret = ask.secret.clone();
+            ask.send(ParkOutcome::Dismissed);
+            audit_dismiss(secrets_home, &id, &secret, true, None);
+            json!({"ok": true})
+        }
+        None => {
+            let reason = format!("unknown pending id `{id}`");
+            audit_dismiss(secrets_home, &id, "", false, Some(&reason));
+            json!({"ok": false, "error": reason})
+        }
     }
 }
 
@@ -362,44 +649,72 @@ fn put_gate(secrets_home: &Path, secret: &str, value: &str, overwrite: bool) -> 
 /// [`verify_totp_gate`] just recorded. Pure bound, no clock read.
 const REPLAY_RETENTION_STEPS: u64 = 4; // ~2 minutes at the 30s step
 
-/// The policy gate + backend fetch, in one place. `granted` is carried
-/// alongside the `Result` (rather than inferred from `is_ok()` at the call
-/// site) so the caller's audit call reads as one obviously-correct pairing
-/// rather than a second derivation of the same fact. `now_unix` is the
+/// [`resolve_gate`]'s three-way decision (P-N2, widened from the old
+/// `(bool, Result<String, String>)` pair specifically to carry the new
+/// PARK-candidate case — `policy.rs`'s own `totp_required` doc anticipated
+/// exactly this change: "a follow-up phase (P-N2) turns a no-code `true`
+/// result into a PARK instead of a flat refusal, and this is the one place
+/// that phase changes"). `NeedsTotp` is returned ONLY when a code would
+/// otherwise be checked (enrollment exists) and none was given — when no
+/// enrollment exists at all, this is still an immediate [`GateOutcome::
+/// Denied`] (module doc: parking would be pointless, since nobody could
+/// ever complete an approve without an enrolled secret).
+enum GateOutcome {
+    Granted(String),
+    Denied(String),
+    NeedsTotp,
+}
+
+/// The policy gate + backend fetch, in one place. `now_unix` is the
 /// caller's clock read (module doc's clock-as-parameter discipline) — this
 /// function and everything it calls stay deterministic given the same
-/// inputs.
-fn resolve_gate(
-    secrets_home: &Path,
-    secret: &str,
-    consumer: &str,
-    totp: Option<&str>,
-    now_unix: u64,
-) -> (bool, Result<String, String>) {
+/// inputs. `totp` is treated as absent when blank/whitespace-only, same as
+/// an outright missing field (task requirement: "no (or empty) totp
+/// field").
+fn resolve_gate(secrets_home: &Path, secret: &str, consumer: &str, totp: Option<&str>, now_unix: u64) -> GateOutcome {
     let policies = match crate::store::load_policies(secrets_home) {
         Ok(p) => p,
         Err(e) => {
-            return (
-                false,
-                Err(crate::home::describe_home_file_error(secrets_home, &crate::store::policy_path(secrets_home), &e)),
-            )
+            return GateOutcome::Denied(crate::home::describe_home_file_error(
+                secrets_home,
+                &crate::store::policy_path(secrets_home),
+                &e,
+            ))
         }
     };
     let Some(policy) = policies.iter().find(|p| p.name == secret) else {
-        return (false, Err("secret not found".to_string()));
+        return GateOutcome::Denied("secret not found".to_string());
     };
     let authorized = policy.consumers.is_empty() || policy.consumers.iter().any(|c| c == consumer);
     if !authorized {
-        return (false, Err("consumer not authorized for this secret".to_string()));
+        return GateOutcome::Denied("consumer not authorized for this secret".to_string());
     }
     if crate::policy::totp_required(policy, consumer) {
-        if let Err(e) = verify_totp_gate(secrets_home, totp, now_unix) {
-            return (false, Err(e));
+        let code = totp.map(str::trim).filter(|s| !s.is_empty());
+        match code {
+            None => {
+                // No code — either a park candidate (enrollment exists, a
+                // code WOULD be checked if present) or, when nothing has
+                // ever enrolled this host, the same immediate refusal
+                // `verify_totp_gate` has always given for that case.
+                return match crate::store::load_totp_secret(secrets_home) {
+                    Ok(Some(_)) => GateOutcome::NeedsTotp,
+                    Ok(None) => GateOutcome::Denied(
+                        "requireTotp is set but no TOTP enrollment exists on this host yet".to_string(),
+                    ),
+                    Err(e) => GateOutcome::Denied(format!("totp.secret: {e}")),
+                };
+            }
+            Some(code) => {
+                if let Err(e) = verify_totp_gate(secrets_home, Some(code), now_unix) {
+                    return GateOutcome::Denied(e);
+                }
+            }
         }
     }
     match crate::backend::fetch_value(secrets_home, &policy.backend, &policy.key) {
-        Ok(value) => (true, Ok(value)),
-        Err(e) => (false, Err(e)),
+        Ok(value) => GateOutcome::Granted(value),
+        Err(e) => GateOutcome::Denied(e),
     }
 }
 
@@ -533,6 +848,100 @@ fn audit_put(secrets_home: &Path, secret: &str, granted: bool, reason: Option<&S
     );
 }
 
+/// Write BOTH audit lines for one `resolve` that PARKED (P-N2) — fired
+/// once, at park time, from [`handle_resolve`]. The ask's EVENTUAL
+/// grant/deny (approved, dismissed, or timed out) still fires
+/// [`audit_resolve`] separately, exactly as an immediate resolve always
+/// has (module doc) — this is an ADDITIONAL line marking the park itself,
+/// not a replacement for that one. Name-only, same discipline as every
+/// other audit call in this module — carries the ask's `id` so the two
+/// lines (park, then eventual resolution) can be correlated by a human
+/// reading `audit.log`, never a code or value.
+fn audit_park(secrets_home: &Path, id: &str, secret: &str, consumer: &str) {
+    let record = json!({
+        "ts": aoide_protocol::audit::now_secs(),
+        "op": "park",
+        "id": id,
+        "secret": secret,
+        "consumer": consumer,
+    });
+    if let Err(e) = append_own_log(secrets_home, &record) {
+        eprintln!("[aoide/secrets] could not write the secrets audit log: {e}");
+    }
+    let message = format!("secret `{secret}` for consumer `{consumer}`: parked (id `{id}`, awaiting a TOTP code)");
+    let _ = aoide_protocol::audit(
+        &aoide_protocol::default_audit_log(),
+        aoide_protocol::Door::Daemon,
+        aoide_protocol::EventClass::Secret,
+        "secrets.resolve",
+        "parked",
+        &message,
+    );
+}
+
+/// Write BOTH audit lines for one `approve` attempt (P-N2) — the
+/// APPROVER's own side of the interaction, distinct from [`audit_resolve`]'s
+/// eventual line on the PARKED caller's side. `secret` is `None` only for
+/// an unknown id (nothing to name). Never carries the typed code (untrusted
+/// input, module doc) or the released value.
+fn audit_approve(secrets_home: &Path, id: &str, secret: Option<&str>, granted: bool, reason: &str) {
+    let record = json!({
+        "ts": aoide_protocol::audit::now_secs(),
+        "op": "approve",
+        "id": id,
+        "secret": secret,
+        "granted": granted,
+        "reason": if reason.is_empty() { Value::Null } else { Value::String(reason.to_string()) },
+    });
+    if let Err(e) = append_own_log(secrets_home, &record) {
+        eprintln!("[aoide/secrets] could not write the secrets audit log: {e}");
+    }
+    let status = if granted { "granted" } else { "denied" };
+    let message = match secret {
+        Some(s) if !reason.is_empty() => format!("approve `{id}` for secret `{s}`: {status} ({reason})"),
+        Some(s) => format!("approve `{id}` for secret `{s}`: {status}"),
+        None => format!("approve `{id}`: {status} ({reason})"),
+    };
+    let _ = aoide_protocol::audit(
+        &aoide_protocol::default_audit_log(),
+        aoide_protocol::Door::Daemon,
+        aoide_protocol::EventClass::Secret,
+        "secrets.approve",
+        status,
+        &message,
+    );
+}
+
+/// Write BOTH audit lines for one `dismiss` attempt (P-N2) — mirrors
+/// [`audit_approve`]'s shape. `secret` is `""` only for an unknown id.
+fn audit_dismiss(secrets_home: &Path, id: &str, secret: &str, granted: bool, reason: Option<&str>) {
+    let record = json!({
+        "ts": aoide_protocol::audit::now_secs(),
+        "op": "dismiss",
+        "id": id,
+        "secret": if secret.is_empty() { Value::Null } else { Value::String(secret.to_string()) },
+        "granted": granted,
+        "reason": reason,
+    });
+    if let Err(e) = append_own_log(secrets_home, &record) {
+        eprintln!("[aoide/secrets] could not write the secrets audit log: {e}");
+    }
+    let status = if granted { "dismissed" } else { "denied" };
+    let message = match reason {
+        Some(r) => format!("dismiss `{id}`: {status} ({r})"),
+        None if !secret.is_empty() => format!("dismiss `{id}` for secret `{secret}`: {status}"),
+        None => format!("dismiss `{id}`: {status}"),
+    };
+    let _ = aoide_protocol::audit(
+        &aoide_protocol::default_audit_log(),
+        aoide_protocol::Door::Daemon,
+        aoide_protocol::EventClass::Secret,
+        "secrets.dismiss",
+        status,
+        &message,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,11 +970,28 @@ mod tests {
     /// timing — deterministic, never `SystemTime::now()`.
     const NOW: u64 = 1_700_000_000;
 
+    /// Unpacks [`GateOutcome`] into the PRE-P-N2 `(granted, Result<value,
+    /// error>)` tuple shape most of this suite's existing assertions were
+    /// written against — same precedent [`put_outcome_as_result`] already
+    /// sets for [`PutOutcome`]. `NeedsTotp` collapses to a placeholder
+    /// `Err` here (its own distinct shape — the whole point of P-N2 — is
+    /// exercised directly via `matches!(outcome, GateOutcome::NeedsTotp)`
+    /// by the tests that actually need to tell it apart from an ordinary
+    /// denial; every OTHER test in this suite predates P-N2 and never
+    /// exercises a policy shape that can produce `NeedsTotp` at all).
+    fn gate_outcome_as_result(outcome: GateOutcome) -> (bool, Result<String, String>) {
+        match outcome {
+            GateOutcome::Granted(v) => (true, Ok(v)),
+            GateOutcome::Denied(e) => (false, Err(e)),
+            GateOutcome::NeedsTotp => (false, Err("needs a totp code (would park)".to_string())),
+        }
+    }
+
     #[test]
     fn unknown_secret_is_denied_with_a_clear_reason() {
         let home = tmp_home("unknown");
         seed(&home, &[]);
-        let (granted, result) = resolve_gate(&home, "nope", "m", None, NOW);
+        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "nope", "m", None, NOW));
         assert!(!granted);
         assert_eq!(result.unwrap_err(), "secret not found");
         std::fs::remove_dir_all(&home).ok();
@@ -592,7 +1018,7 @@ mod tests {
         let path = crate::store::policy_path(&home);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        let (resolve_granted, resolve_result) = resolve_gate(&home, "t", "m", None, NOW);
+        let (resolve_granted, resolve_result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", None, NOW));
         let (put_granted, put_result) = put_outcome_as_result(put_gate(&home, "t", "irrelevant", false));
 
         // Restore before any assertion could early-return and leave the
@@ -618,7 +1044,7 @@ mod tests {
         let mut p = Policy::new("t", "scratch", "stored-value");
         p.consumers = vec!["m".to_string()];
         seed(&home, &[p]);
-        let (granted, result) = resolve_gate(&home, "t", "someone-else", None, NOW);
+        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "someone-else", None, NOW));
         assert!(!granted);
         assert!(result.unwrap_err().contains("not authorized"));
         std::fs::remove_dir_all(&home).ok();
@@ -629,7 +1055,7 @@ mod tests {
         let home = tmp_home("anyconsumer");
         let p = Policy::new("t", "scratch", "stored-value");
         seed(&home, &[p]);
-        let (granted, result) = resolve_gate(&home, "t", "whoever", None, NOW);
+        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "whoever", None, NOW));
         assert!(granted);
         assert_eq!(result.unwrap(), "stored-value");
         std::fs::remove_dir_all(&home).ok();
@@ -642,7 +1068,7 @@ mod tests {
         p.require_totp = true;
         seed(&home, &[p]);
         // No `totp.secret` written — nothing has enrolled this host yet.
-        let (granted, result) = resolve_gate(&home, "t", "m", Some("123456"), NOW);
+        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some("123456"), NOW));
         assert!(!granted);
         assert!(result.unwrap_err().contains("no TOTP enrollment"));
         std::fs::remove_dir_all(&home).ok();
@@ -654,7 +1080,7 @@ mod tests {
         let mut p = Policy::new("t", "scratch", "stored-value");
         p.consumers = vec!["m".to_string()];
         seed(&home, &[p]);
-        let (granted, result) = resolve_gate(&home, "t", "m", None, NOW);
+        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", None, NOW));
         assert!(granted);
         assert_eq!(result.unwrap(), "stored-value");
         std::fs::remove_dir_all(&home).ok();
@@ -691,21 +1117,25 @@ mod tests {
         let secret = seed_enrolled(&home, p);
         let code = code_for_now(&secret, NOW);
 
-        let (granted, result) = resolve_gate(&home, "t", "m", Some(&code), NOW);
+        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some(&code), NOW));
         assert!(granted, "{result:?}");
         assert_eq!(result.unwrap(), "stored-value");
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// P-N2: enrolled + `requireTotp` + no code no longer means an
+    /// immediate denial — it's now the PARK candidate (`GateOutcome::
+    /// NeedsTotp`); `broker::handle_resolve` is what turns that into an
+    /// actual park (or, with `wait:false`, this exact old denial string —
+    /// see the wire-level `wait_false_...` test below for that half).
     #[test]
-    fn enrolled_with_no_code_is_denied() {
+    fn enrolled_with_no_code_needs_totp_a_park_candidate_not_an_immediate_denial() {
         let home = tmp_home("totp-missingcode");
         let p = Policy::new("t", "scratch", "stored-value");
         seed_enrolled(&home, p);
 
-        let (granted, result) = resolve_gate(&home, "t", "m", None, NOW);
-        assert!(!granted);
-        assert!(result.unwrap_err().contains("no totp code"));
+        let outcome = resolve_gate(&home, "t", "m", None, NOW);
+        assert!(matches!(outcome, GateOutcome::NeedsTotp), "expected NeedsTotp");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -719,7 +1149,7 @@ mod tests {
         let wrong_num: u32 = (correct.parse::<u32>().unwrap() + 1) % 1_000_000;
         let wrong = crate::totp::format6(wrong_num);
 
-        let (granted, result) = resolve_gate(&home, "t", "m", Some(&wrong), NOW);
+        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some(&wrong), NOW));
         assert!(!granted);
         assert!(result.unwrap_err().contains("invalid or expired"));
         std::fs::remove_dir_all(&home).ok();
@@ -731,7 +1161,7 @@ mod tests {
         let p = Policy::new("t", "scratch", "stored-value");
         seed_enrolled(&home, p);
 
-        let (granted, result) = resolve_gate(&home, "t", "m", Some("not-a-number"), NOW);
+        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some("not-a-number"), NOW));
         assert!(!granted);
         assert!(result.unwrap_err().contains("malformed"));
         std::fs::remove_dir_all(&home).ok();
@@ -748,7 +1178,7 @@ mod tests {
         let secret = seed_enrolled(&home, p);
         let code = code_for_now(&secret, NOW);
 
-        let (first_granted, first_result) = resolve_gate(&home, "t", "m", Some(&code), NOW);
+        let (first_granted, first_result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some(&code), NOW));
         assert!(first_granted, "{first_result:?}");
 
         // A second, DIFFERENT claimed consumer doesn't matter — the ledger
@@ -756,7 +1186,7 @@ mod tests {
         // resolve wire's `consumer` field is self-asserted, so a
         // per-consumer ledger would let one typed code redeem once per
         // invented label).
-        let (second_granted, second_result) = resolve_gate(&home, "t", "someone-else-entirely", Some(&code), NOW);
+        let (second_granted, second_result) = gate_outcome_as_result(resolve_gate(&home, "t", "someone-else-entirely", Some(&code), NOW));
         assert!(!second_granted);
         assert!(second_result.unwrap_err().contains("already used"));
         std::fs::remove_dir_all(&home).ok();
@@ -775,7 +1205,7 @@ mod tests {
         let secret = seed_enrolled(&home, p);
         let code = code_for_now(&secret, NOW);
 
-        let (granted, _) = resolve_gate(&home, "t", "m", Some(&code), NOW);
+        let (granted, _) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some(&code), NOW));
         assert!(granted);
 
         // Nothing here reuses any in-process state from the call above —
@@ -784,7 +1214,7 @@ mod tests {
         let step = crate::totp::timestep(NOW);
         assert!(ledger_after_restart.is_used(step), "the ledger file must have the spent timestep");
 
-        let (granted_again, result_again) = resolve_gate(&home, "t", "m", Some(&code), NOW);
+        let (granted_again, result_again) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some(&code), NOW));
         assert!(!granted_again);
         assert!(result_again.unwrap_err().contains("already used"));
         std::fs::remove_dir_all(&home).ok();
@@ -814,22 +1244,24 @@ mod tests {
         let wrong_num: u32 = (code.parse::<u32>().unwrap() + 1) % 1_000_000;
         let wrong = crate::totp::format6(wrong_num);
 
-        // No code, wrong code, replay (after one legitimate grant) — every
-        // denial must leave the marker untouched.
-        let (granted, _) = resolve_gate(&home, "t", "m", None, NOW);
-        assert!(!granted);
-        assert!(!marker.exists(), "backend ran on a missing-code denial");
+        // No code (now a PARK candidate, P-N2 — never an immediate denial,
+        // but still must never touch the backend), wrong code, replay
+        // (after one legitimate grant) — every one of these must leave the
+        // marker untouched.
+        let outcome = resolve_gate(&home, "t", "m", None, NOW);
+        assert!(matches!(outcome, GateOutcome::NeedsTotp), "expected NeedsTotp");
+        assert!(!marker.exists(), "backend ran on a needs-totp (would-park) case");
 
-        let (granted, _) = resolve_gate(&home, "t", "m", Some(&wrong), NOW);
+        let (granted, _) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some(&wrong), NOW));
         assert!(!granted);
         assert!(!marker.exists(), "backend ran on a wrong-code denial");
 
-        let (granted, _) = resolve_gate(&home, "t", "m", Some(&code), NOW);
+        let (granted, _) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some(&code), NOW));
         assert!(granted, "the legitimate code should be granted (and now the marker DOES exist)");
         assert!(marker.exists(), "positive control: the backend must run on a granted resolve");
         std::fs::remove_file(&marker).unwrap();
 
-        let (granted, _) = resolve_gate(&home, "t", "m", Some(&code), NOW);
+        let (granted, _) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some(&code), NOW));
         assert!(!granted, "the same code must be denied the second time (replay)");
         assert!(!marker.exists(), "backend ran on a replay denial");
 
@@ -854,7 +1286,7 @@ mod tests {
         // TOTP enrollment" otherwise).
         seed(&home, &[p]);
 
-        let (granted, result) = resolve_gate(&home, "t", "m", None, NOW);
+        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", None, NOW));
         assert!(granted, "{result:?}");
         assert_eq!(result.unwrap(), "stored-value");
         std::fs::remove_dir_all(&home).ok();
@@ -872,7 +1304,7 @@ mod tests {
         p.automation.consumers = vec!["m".to_string()];
         seed(&home, &[p]);
 
-        let (granted, result) = resolve_gate(&home, "t", "someone-else", None, NOW);
+        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "someone-else", None, NOW));
         assert!(!granted);
         assert!(result.unwrap_err().contains("no TOTP enrollment"));
         std::fs::remove_dir_all(&home).ok();
@@ -889,7 +1321,7 @@ mod tests {
         p.automation.consumers = vec!["m".to_string()]; // listed, but NOT enabled
         seed(&home, &[p]);
 
-        let (granted, result) = resolve_gate(&home, "t", "m", None, NOW);
+        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", None, NOW));
         assert!(!granted);
         assert!(result.unwrap_err().contains("no TOTP enrollment"));
         std::fs::remove_dir_all(&home).ok();
@@ -913,7 +1345,7 @@ mod tests {
     #[test]
     fn malformed_json_gets_a_reply_not_a_dropped_connection() {
         let home = tmp_home("malformed");
-        let reply = handle_line(&home, "not json at all");
+        let reply = handle_line(&home, "not json at all", &ParkRegistry::new());
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("not valid JSON"));
         std::fs::remove_dir_all(&home).ok();
@@ -922,7 +1354,7 @@ mod tests {
     #[test]
     fn missing_op_is_a_clear_error() {
         let home = tmp_home("missingop");
-        let reply = handle_line(&home, r#"{"secret":"t","consumer":"m"}"#);
+        let reply = handle_line(&home, r#"{"secret":"t","consumer":"m"}"#, &ParkRegistry::new());
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("missing `op`"));
         std::fs::remove_dir_all(&home).ok();
@@ -931,7 +1363,7 @@ mod tests {
     #[test]
     fn unknown_op_is_a_clear_error() {
         let home = tmp_home("unknownop");
-        let reply = handle_line(&home, r#"{"op":"explode"}"#);
+        let reply = handle_line(&home, r#"{"op":"explode"}"#, &ParkRegistry::new());
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("unknown op"));
         std::fs::remove_dir_all(&home).ok();
@@ -940,7 +1372,7 @@ mod tests {
     #[test]
     fn resolve_with_missing_fields_is_malformed() {
         let home = tmp_home("missingfields");
-        let reply = handle_line(&home, r#"{"op":"resolve","secret":"t"}"#);
+        let reply = handle_line(&home, r#"{"op":"resolve","secret":"t"}"#, &ParkRegistry::new());
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("required"));
         std::fs::remove_dir_all(&home).ok();
@@ -961,7 +1393,7 @@ mod tests {
 
         let p = Policy::new("t", "scratch", "stored-value");
         seed(&home, &[p]);
-        let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#);
+        let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &ParkRegistry::new());
         assert_eq!(reply["ok"], true);
         assert_eq!(reply["value"], "stored-value");
 
@@ -992,7 +1424,7 @@ mod tests {
         });
         std::fs::write(crate::backend::backends_path(&home), serde_json::to_vec(&backends).unwrap()).unwrap();
 
-        let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#);
+        let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &ParkRegistry::new());
         assert_eq!(reply["ok"], false);
         let wire_error = reply["error"].as_str().unwrap();
         assert!(!wire_error.contains("SENTINEL"), "wire reply leaked stderr: {wire_error}");
@@ -1135,20 +1567,20 @@ mod tests {
         seed_with_set(&home, &[p], &format!("cat {}", out.display()), &format!("cat > {}", out.display()));
 
         // 1. Empty -> stores, `replaced` is false.
-        let first = handle_line(&home, r#"{"op":"put","secret":"t","value":"first-value"}"#);
+        let first = handle_line(&home, r#"{"op":"put","secret":"t","value":"first-value"}"#, &ParkRegistry::new());
         assert_eq!(first["ok"], true, "{first}");
         assert_eq!(first["replaced"], false, "{first}");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "first-value");
 
         // 2. Existing, no `overwrite` -> the distinct `exists` refusal, and
         //    the stored value is UNCHANGED.
-        let second = handle_line(&home, r#"{"op":"put","secret":"t","value":"attempted-overwrite"}"#);
+        let second = handle_line(&home, r#"{"op":"put","secret":"t","value":"attempted-overwrite"}"#, &ParkRegistry::new());
         assert_eq!(second["ok"], false, "{second}");
         assert_eq!(second["exists"], true, "the refusal must be machine-readable via `exists`, not error prose: {second}");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "first-value", "a refused put must never touch the store");
 
         // 3. Existing, `overwrite: true` -> replaced, `replaced` is true.
-        let third = handle_line(&home, r#"{"op":"put","secret":"t","value":"second-value","overwrite":true}"#);
+        let third = handle_line(&home, r#"{"op":"put","secret":"t","value":"second-value","overwrite":true}"#, &ParkRegistry::new());
         assert_eq!(third["ok"], true, "{third}");
         assert_eq!(third["replaced"], true, "{third}");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "second-value");
@@ -1168,8 +1600,8 @@ mod tests {
         seed_with_set(&home, &[p], &format!("cat {}", out.display()), &format!("cat > {}", out.display()));
         std::fs::write(&out, "original-value").unwrap();
 
-        let with_false = handle_line(&home, r#"{"op":"put","secret":"t","value":"x","overwrite":false}"#);
-        let without_field = handle_line(&home, r#"{"op":"put","secret":"t","value":"x"}"#);
+        let with_false = handle_line(&home, r#"{"op":"put","secret":"t","value":"x","overwrite":false}"#, &ParkRegistry::new());
+        let without_field = handle_line(&home, r#"{"op":"put","secret":"t","value":"x"}"#, &ParkRegistry::new());
         assert_eq!(with_false, without_field, "an explicit `overwrite:false` and an absent field must match byte-for-byte");
         assert_eq!(with_false["exists"], true, "{with_false}");
         std::fs::remove_dir_all(&home).ok();
@@ -1186,7 +1618,7 @@ mod tests {
         let p = Policy::new("t", "scratch", "k");
         seed_with_set(&home, &[p], &format!("cat {}", out.display()), &format!("cat > {}", out.display()));
 
-        let reply = handle_line(&home, r#"{"op":"put","secret":"t","value":"stored-value"}"#);
+        let reply = handle_line(&home, r#"{"op":"put","secret":"t","value":"stored-value"}"#, &ParkRegistry::new());
         assert_eq!(reply["ok"], true);
         assert!(reply.get("value").is_none(), "put's reply must never carry a value: {reply}");
         assert_eq!(reply["replaced"], false, "the store starts empty — this is a new store, not a replace: {reply}");
@@ -1202,7 +1634,7 @@ mod tests {
     #[test]
     fn put_with_a_missing_secret_field_is_malformed() {
         let home = tmp_home("put-missingfields");
-        let reply = handle_line(&home, r#"{"op":"put","value":"x"}"#);
+        let reply = handle_line(&home, r#"{"op":"put","value":"x"}"#, &ParkRegistry::new());
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("required"));
         std::fs::remove_dir_all(&home).ok();
@@ -1222,7 +1654,7 @@ mod tests {
 
         // ── failure 1: no policy at all for this secret ────────────────
         seed(&home, &[]);
-        let reply = handle_line(&home, &format!(r#"{{"op":"put","secret":"nope","value":"{SENTINEL}"}}"#));
+        let reply = handle_line(&home, &format!(r#"{{"op":"put","secret":"nope","value":"{SENTINEL}"}}"#), &ParkRegistry::new());
         assert_eq!(reply["ok"], false);
         assert!(!reply.to_string().contains(SENTINEL), "wire reply leaked the sentinel: {reply}");
 
@@ -1234,7 +1666,7 @@ mod tests {
         let p = Policy::new("t", "scratch", "k");
         seed(&home, &[p]); // `seed`'s fixture backend is get-only.
         let reply =
-            handle_line(&home, &format!(r#"{{"op":"put","secret":"t","value":"{SENTINEL}","overwrite":true}}"#));
+            handle_line(&home, &format!(r#"{{"op":"put","secret":"t","value":"{SENTINEL}","overwrite":true}}"#), &ParkRegistry::new());
         assert_eq!(reply["ok"], false);
         assert!(!reply.to_string().contains(SENTINEL), "wire reply leaked the sentinel: {reply}");
 
@@ -1252,4 +1684,374 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    // ── parking (P-N2) ───────────────────────────────────────────────────
+    //
+    // `handle_resolve` now BLOCKS the calling thread when a resolve parks,
+    // so every test below that exercises a genuine park spawns it on its
+    // own thread (`std::thread::scope`, no `'static` bound needed) and
+    // completes the ask from the main thread against the SAME
+    // `ParkRegistry` — this proves the actual blocking/wakeup mechanism,
+    // not just the pure `GateOutcome::NeedsTotp` decision the tests above
+    // already cover. Every test that calls `handle_line` for `resolve`/
+    // `approve`/`dismiss` triggers this module's own audit calls
+    // (`audit_park`/`audit_resolve`/`audit_approve`/`audit_dismiss`), which
+    // write to `AOIDE_AUDIT_LOG` — same discipline the pre-P-N2 tests above
+    // already hold individually (`crate::env_lock()` + a redirected path,
+    // never the real `~/Aoide/log`).
+
+    fn unix_now() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+    }
+
+    /// Redirect `AOIDE_AUDIT_LOG` into `home`'s own tempdir for the
+    /// duration of `f`, restoring it after — the shared helper every
+    /// `handle_line`-driven test below wraps its body in. Caller still
+    /// holds `crate::env_lock()` for the whole test (the SAME lock guards
+    /// `AOIDE_SECRETS_PARK_TIMEOUT` where a test also touches that).
+    fn with_redirected_audit_log<T>(home: &Path, f: impl FnOnce() -> T) -> T {
+        let saved = std::env::var("AOIDE_AUDIT_LOG").ok();
+        std::env::set_var("AOIDE_AUDIT_LOG", home.join("mirrored-aoide-log"));
+        let result = f();
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_AUDIT_LOG", v),
+            None => std::env::remove_var("AOIDE_AUDIT_LOG"),
+        }
+        result
+    }
+
+    /// `wait:false` restores the pre-P-N2 immediate refusal (task
+    /// requirement) — no thread, no blocking, no ask ever created.
+    #[test]
+    fn resolve_with_wait_false_gets_the_old_immediate_refusal_and_never_parks() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("wait-false");
+        let p = Policy::new("t", "scratch", "stored-value");
+        seed_enrolled(&home, p);
+        let parked = ParkRegistry::new();
+
+        with_redirected_audit_log(&home, || {
+            let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m","wait":false}"#, &parked);
+            assert_eq!(reply["ok"], false);
+            assert_eq!(
+                reply["error"], "requireTotp is set but no totp code was provided",
+                "wait:false must reproduce the EXACT pre-P-N2 refusal string: {reply}"
+            );
+        });
+        assert!(parked.list().is_empty(), "wait:false must never create a parked ask");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The deliverable's own end-to-end proof at the wire level: a
+    /// `resolve` with no code PARKS (default `wait`), `secrets pending`
+    /// sees it, `secrets approve <id> --totp <code>` releases the value
+    /// down the ORIGINAL parked connection's own reply (never the
+    /// approver's), and the approver's own reply carries no value at all.
+    #[test]
+    fn park_then_approve_releases_the_value_to_the_original_caller_only() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("park-approve");
+        let mut p = Policy::new("t", "scratch", "stored-value");
+        p.consumers = vec!["m".to_string()];
+        let secret = seed_enrolled(&home, p);
+        let parked = ParkRegistry::new();
+
+        with_redirected_audit_log(&home, || {
+            let resolved = std::thread::scope(|scope| {
+                let resolve_handle =
+                    scope.spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked));
+
+                let mut id = None;
+                for _ in 0..200 {
+                    let list = parked.list();
+                    if let Some((pid, secret, consumer, _)) = list.into_iter().next() {
+                        assert_eq!(secret, "t");
+                        assert_eq!(consumer, "m");
+                        id = Some(pid);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let id = id.expect("the resolve did not park in time");
+
+                let code = code_for_now(&secret, unix_now());
+                let approve_req = format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#);
+                let approve_reply = handle_line(&home, &approve_req, &parked);
+                assert_eq!(approve_reply["ok"], true, "{approve_reply}");
+                assert!(
+                    approve_reply.get("value").is_none(),
+                    "the approver's own reply must never carry the value: {approve_reply}"
+                );
+
+                resolve_handle.join().unwrap()
+            });
+
+            assert_eq!(resolved["ok"], true, "{resolved}");
+            assert_eq!(resolved["value"], "stored-value");
+        });
+        assert!(parked.list().is_empty(), "the ask must be gone once resolved");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// `secrets dismiss <id>` — the parked caller gets a clean refusal, the
+    /// dismisser gets `{"ok":true}`.
+    #[test]
+    fn park_then_dismiss_refuses_the_parked_caller_cleanly() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("park-dismiss");
+        let p = Policy::new("t", "scratch", "stored-value");
+        seed_enrolled(&home, p);
+        let parked = ParkRegistry::new();
+
+        with_redirected_audit_log(&home, || {
+            std::thread::scope(|scope| {
+                let resolve_handle =
+                    scope.spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked));
+
+                let mut id = None;
+                for _ in 0..200 {
+                    if let Some((pid, ..)) = parked.list().into_iter().next() {
+                        id = Some(pid);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let id = id.expect("the resolve did not park in time");
+
+                let dismiss_reply = handle_line(&home, &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked);
+                assert_eq!(dismiss_reply["ok"], true, "{dismiss_reply}");
+
+                let resolved = resolve_handle.join().unwrap();
+                assert_eq!(resolved["ok"], false);
+                assert!(resolved["error"].as_str().unwrap().to_lowercase().contains("dismissed"), "{resolved}");
+            });
+        });
+        assert!(parked.list().is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Task requirement: an invalid code leaves the ask PARKED (never
+    /// removed) and never burns the replay ledger — proven by a wrong code
+    /// first, then the CORRECT code still working afterward on the SAME ask.
+    #[test]
+    fn approve_with_an_invalid_code_leaves_the_ask_parked_and_the_ledger_unburned() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("park-invalidcode");
+        let p = Policy::new("t", "scratch", "stored-value");
+        let secret = seed_enrolled(&home, p);
+        let parked = ParkRegistry::new();
+
+        with_redirected_audit_log(&home, || {
+            std::thread::scope(|scope| {
+                let resolve_handle =
+                    scope.spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked));
+
+                let mut id = None;
+                for _ in 0..200 {
+                    if let Some((pid, ..)) = parked.list().into_iter().next() {
+                        id = Some(pid);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let id = id.expect("the resolve did not park in time");
+
+                // A wrong code: denied, but the ask must still be there.
+                let wrong = handle_line(&home, &format!(r#"{{"op":"approve","id":"{id}","totp":"000000"}}"#), &parked);
+                assert_eq!(wrong["ok"], false, "{wrong}");
+                assert_eq!(parked.list().len(), 1, "an invalid code must leave the ask parked");
+
+                // The REAL correct code now completes it.
+                let code = code_for_now(&secret, unix_now());
+                let right = handle_line(&home, &format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#), &parked);
+                assert_eq!(right["ok"], true, "{right}");
+
+                let resolved = resolve_handle.join().unwrap();
+                assert_eq!(resolved["ok"], true, "{resolved}");
+                assert_eq!(resolved["value"], "stored-value");
+            });
+        });
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn approve_on_an_unknown_id_is_a_taught_error() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("approve-unknown");
+        let parked = ParkRegistry::new();
+        with_redirected_audit_log(&home, || {
+            let reply = handle_line(&home, r#"{"op":"approve","id":"9","totp":"123456"}"#, &parked);
+            assert_eq!(reply["ok"], false);
+            assert!(reply["error"].as_str().unwrap().contains("unknown pending id `9`"), "{reply}");
+        });
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn dismiss_on_an_unknown_id_is_a_taught_error() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("dismiss-unknown");
+        let parked = ParkRegistry::new();
+        with_redirected_audit_log(&home, || {
+            let reply = handle_line(&home, r#"{"op":"dismiss","id":"9"}"#, &parked);
+            assert_eq!(reply["ok"], false);
+            assert!(reply["error"].as_str().unwrap().contains("unknown pending id `9`"), "{reply}");
+        });
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn approve_missing_totp_is_a_malformed_request_and_leaves_the_ask_parked() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("approve-missingtotp");
+        let p = Policy::new("t", "scratch", "stored-value");
+        seed_enrolled(&home, p);
+        let parked = ParkRegistry::new();
+        let (id, _rx) = parked.park("t", "m", NOW);
+
+        with_redirected_audit_log(&home, || {
+            let reply = handle_line(&home, &format!(r#"{{"op":"approve","id":"{id}"}}"#), &parked);
+            assert_eq!(reply["ok"], false);
+            assert!(reply["error"].as_str().unwrap().contains("`totp` is required"), "{reply}");
+        });
+        assert_eq!(parked.list().len(), 1, "a missing code must leave the ask parked");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// `secrets pending` never carries a value, whether the queue is empty
+    /// or has an ask in it. Not audited (no `handle_line` audit call on
+    /// this op, matching `graph pending list`'s own precedent), so no
+    /// redirection needed.
+    #[test]
+    fn pending_list_never_contains_a_value() {
+        let home = tmp_home("pending-list");
+        let parked = ParkRegistry::new();
+
+        let empty = handle_line(&home, r#"{"op":"pending"}"#, &parked);
+        assert_eq!(empty["ok"], true);
+        assert_eq!(empty["pending"].as_array().unwrap().len(), 0);
+
+        let (id, _rx) = parked.park("db-prod", "m", 1_700_000_123);
+        let listed = handle_line(&home, r#"{"op":"pending"}"#, &parked);
+        let arr = listed["pending"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], id);
+        assert_eq!(arr[0]["secret"], "db-prod");
+        assert_eq!(arr[0]["consumer"], "m");
+        assert_eq!(arr[0]["requestedAt"], 1_700_000_123);
+        assert!(!listed.to_string().to_lowercase().contains("value"), "{listed}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Task requirement: a resolve WITH a code is completely unchanged by
+    /// this whole phase — the fast path never touches `ParkRegistry` at all.
+    #[test]
+    fn resolve_with_a_code_never_parks_the_fast_path_is_unchanged() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("fastpath-unchanged");
+        let mut p = Policy::new("t", "scratch", "stored-value");
+        p.consumers = vec!["m".to_string()];
+        let secret = seed_enrolled(&home, p);
+        let parked = ParkRegistry::new();
+        let code = code_for_now(&secret, unix_now());
+
+        with_redirected_audit_log(&home, || {
+            let reply = handle_line(
+                &home,
+                &format!(r#"{{"op":"resolve","secret":"t","consumer":"m","totp":"{code}"}}"#),
+                &parked,
+            );
+            assert_eq!(reply["ok"], true, "{reply}");
+            assert_eq!(reply["value"], "stored-value");
+        });
+        assert!(parked.list().is_empty(), "a resolve WITH a code must never touch the park registry");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The timeout path, with a tiny configured timeout (never the real
+    /// 300s default) — names the timeout/knob/both completion paths (task
+    /// requirement) and removes the ask.
+    #[test]
+    fn park_times_out_and_names_the_knob_and_both_completion_paths() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_timeout = std::env::var(crate::park::PARK_TIMEOUT_ENV).ok();
+        std::env::set_var(crate::park::PARK_TIMEOUT_ENV, "1");
+
+        let home = tmp_home("park-timeout");
+        let p = Policy::new("t", "scratch", "stored-value");
+        seed_enrolled(&home, p);
+        let parked = ParkRegistry::new();
+
+        with_redirected_audit_log(&home, || {
+            let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked);
+            assert_eq!(reply["ok"], false);
+            let err = reply["error"].as_str().unwrap();
+            assert!(err.contains("timed out after 1s"), "{err}");
+            assert!(err.contains(crate::park::PARK_TIMEOUT_ENV), "must name the knob: {err}");
+            assert!(err.contains("--totp"), "must name the inline completion path: {err}");
+            assert!(err.contains("secrets approve"), "must name the approve completion path: {err}");
+        });
+        assert!(parked.list().is_empty(), "a timed-out ask must be removed");
+
+        match saved_timeout {
+            Some(v) => std::env::set_var(crate::park::PARK_TIMEOUT_ENV, v),
+            None => std::env::remove_var(crate::park::PARK_TIMEOUT_ENV),
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Concurrency, at the connection-thread level (task's hard
+    /// constraint): while one `resolve` sits parked (blocking ITS thread),
+    /// an UNRELATED `resolve` on a totally separate call completes
+    /// normally against the SAME `ParkRegistry` — proving nothing about
+    /// parking serializes unrelated work. (The full accept-loop-level
+    /// proof — a real second SOCKET connection completing while another is
+    /// parked — lives in `tests/e2e.rs`, which exercises the real
+    /// `broker::serve` thread-per-connection accept loop this unit test
+    /// can't reach.)
+    #[test]
+    fn an_unrelated_resolve_completes_while_another_is_parked() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("park-concurrency");
+        let mut gated = Policy::new("locked", "scratch", "locked-value");
+        gated.consumers = vec!["m".to_string()];
+        gated.require_totp = true;
+        let mut free = Policy::new("open", "scratch", "open-value");
+        free.consumers = vec!["m".to_string()];
+        seed(&home, &[gated, free]);
+        let totp_secret = b"a-twenty-byte-totp-s".to_vec();
+        crate::store::save_totp_secret(&home, &totp_secret).unwrap();
+        let parked = ParkRegistry::new();
+
+        with_redirected_audit_log(&home, || {
+            std::thread::scope(|scope| {
+                let resolve_handle = scope
+                    .spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"locked","consumer":"m"}"#, &parked));
+
+                let mut parked_yet = false;
+                for _ in 0..200 {
+                    if !parked.list().is_empty() {
+                        parked_yet = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                assert!(parked_yet, "the gated resolve did not park in time");
+
+                // An unrelated resolve, on the SAME registry, completes
+                // immediately — proving the parked ask never blocked it.
+                let free_reply = handle_line(&home, r#"{"op":"resolve","secret":"open","consumer":"m"}"#, &parked);
+                assert_eq!(free_reply["ok"], true, "{free_reply}");
+                assert_eq!(free_reply["value"], "open-value");
+
+                // Clean up: dismiss the still-parked ask so the spawned
+                // thread returns and this test doesn't leak a blocked one.
+                let (id, ..) = parked.list().into_iter().next().unwrap();
+                let dismissed = handle_line(&home, &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked);
+                assert_eq!(dismissed["ok"], true, "{dismissed}");
+                let resolved = resolve_handle.join().unwrap();
+                assert_eq!(resolved["ok"], false);
+            });
+        });
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

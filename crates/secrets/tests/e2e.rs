@@ -357,6 +357,173 @@ fn end_to_end_requiretotp_resolve_grants_then_denies_replay_through_the_socket()
     std::fs::remove_file(&socket_path).ok();
 }
 
+/// P-N2, real socket: a `resolve` with no code PARKS, `secrets pending`
+/// (a SEPARATE connection) sees it, and `secrets approve` (a THIRD
+/// connection) releases the value down the ORIGINAL parked connection's own
+/// read — proving the release crosses real connection boundaries, not just
+/// an in-process `ParkRegistry` shared directly (`broker.rs`'s own unit
+/// tests already cover that half; this is the "real socketpair/test
+/// socket" half the phase brief calls for explicitly).
+#[test]
+fn park_then_approve_over_the_real_socket_releases_the_value_to_the_original_caller() {
+    let _guard = audit_env_lock().lock().unwrap();
+    let secrets_home = short_tmp("parkhome");
+    std::fs::create_dir_all(&secrets_home).unwrap();
+    let socket_path = PathBuf::from(format!("{}.sock", short_tmp("parksock").display()));
+    let aoide_log = secrets_home.join("mirrored-aoide-log");
+    std::env::set_var("AOIDE_AUDIT_LOG", &aoide_log);
+
+    let mut policy = Policy::new("locked", "file", "locked-key");
+    policy.consumers = vec!["m".to_string()];
+    policy.require_totp = true;
+    store::save_policies(&secrets_home, &[policy]).unwrap();
+    let totp_secret = b"a-twenty-byte-totp-s".to_vec();
+    store::save_totp_secret(&secrets_home, &totp_secret).unwrap();
+
+    let home_for_thread = secrets_home.clone();
+    let sock_for_thread = socket_path.clone();
+    let broker_thread = std::thread::spawn(move || {
+        let _ = broker::serve(&home_for_thread, &sock_for_thread);
+    });
+    let mut connected = false;
+    for _ in 0..50 {
+        if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+            connected = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(connected, "broker did not bind {} in time", socket_path.display());
+
+    // Seed the value through the seeded `file` backend — a REAL `put` over
+    // its own connection, same as every other e2e test here.
+    assert_eq!(client::put(&socket_path, "locked", "the-real-value", false).unwrap(), false);
+
+    // `resolve` with no code — a new connection, blocked on its own read
+    // until `approve` completes it. Runs on its own thread since it BLOCKS.
+    let sock_for_resolve = socket_path.clone();
+    let resolve_thread = std::thread::spawn(move || client::resolve(&sock_for_resolve, "locked", "m", None, None));
+
+    // `secrets pending` — a SEPARATE connection — must see the ask within a
+    // bounded number of short polls.
+    let mut ask = None;
+    for _ in 0..200 {
+        let list = client::pending(&socket_path).unwrap();
+        if let Some(a) = list.into_iter().next() {
+            ask = Some(a);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let ask = ask.expect("the resolve did not park in time over the real socket");
+    assert_eq!(ask.secret, "locked");
+    assert_eq!(ask.consumer, "m");
+
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let step = aoide_secrets::totp::timestep(now);
+    let code = aoide_secrets::totp::format6(aoide_secrets::totp::hotp(&totp_secret, step, aoide_secrets::totp::DIGITS));
+
+    // `secrets approve` — a THIRD connection. Its own reply carries no
+    // value at all.
+    client::approve(&socket_path, &ask.id, &code).unwrap();
+
+    // The value arrives down the ORIGINAL (first) connection's own read.
+    assert_eq!(resolve_thread.join().unwrap(), Ok("the-real-value".to_string()));
+    assert_eq!(client::pending(&socket_path).unwrap(), Vec::new());
+
+    let own_log = std::fs::read_to_string(secrets_home.join("audit.log")).unwrap();
+    assert!(!own_log.contains("the-real-value"), "the broker's own audit log leaked the value:\n{own_log}");
+    assert!(!own_log.contains(&code), "the broker's own audit log leaked the totp code:\n{own_log}");
+    assert!(own_log.contains("\"op\":\"approve\""), "{own_log}");
+
+    drop(broker_thread);
+    std::env::remove_var("AOIDE_AUDIT_LOG");
+    std::fs::remove_dir_all(&secrets_home).ok();
+    std::fs::remove_file(&socket_path).ok();
+}
+
+/// The concurrency hard constraint, proven at the ACCEPT-LOOP level (not
+/// merely against one shared in-process `ParkRegistry`, which is all
+/// `broker.rs`'s own unit tests can reach): while a `resolve` sits parked
+/// on one real connection, a brand-new, totally unrelated connection opened
+/// AFTER the park is confirmed must be accepted and served immediately —
+/// proving the broker's accept loop never blocks on a parked connection.
+/// Bounded by a short deadline so a regression back to a serial accept loop
+/// fails this test instead of hanging the suite.
+#[test]
+fn a_second_connection_is_accepted_and_served_while_the_first_sits_parked() {
+    let _guard = audit_env_lock().lock().unwrap();
+    let secrets_home = short_tmp("concurrenthome");
+    std::fs::create_dir_all(&secrets_home).unwrap();
+    let socket_path = PathBuf::from(format!("{}.sock", short_tmp("concurrentsock").display()));
+    let aoide_log = secrets_home.join("mirrored-aoide-log");
+    std::env::set_var("AOIDE_AUDIT_LOG", &aoide_log);
+
+    let mut gated = Policy::new("locked", "file", "locked-key");
+    gated.consumers = vec!["m".to_string()];
+    gated.require_totp = true;
+    let mut free = Policy::new("open", "file", "open-key");
+    free.consumers = vec!["m".to_string()];
+    store::save_policies(&secrets_home, &[gated, free]).unwrap();
+    let totp_secret = b"a-twenty-byte-totp-s".to_vec();
+    store::save_totp_secret(&secrets_home, &totp_secret).unwrap();
+
+    let home_for_thread = secrets_home.clone();
+    let sock_for_thread = socket_path.clone();
+    let broker_thread = std::thread::spawn(move || {
+        let _ = broker::serve(&home_for_thread, &sock_for_thread);
+    });
+    let mut connected = false;
+    for _ in 0..50 {
+        if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+            connected = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(connected, "broker did not bind {} in time", socket_path.display());
+
+    assert_eq!(client::put(&socket_path, "open", "open-value", false).unwrap(), false);
+
+    // Park a resolve on its own connection/thread — it will sit blocked
+    // until this test dismisses it below.
+    let sock_for_resolve = socket_path.clone();
+    let resolve_thread = std::thread::spawn(move || client::resolve(&sock_for_resolve, "locked", "m", None, None));
+
+    let mut ask = None;
+    for _ in 0..200 {
+        let list = client::pending(&socket_path).unwrap();
+        if let Some(a) = list.into_iter().next() {
+            ask = Some(a);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let ask = ask.expect("the resolve did not park in time");
+
+    // Now that the first connection is confirmed parked, a completely
+    // unrelated NEW connection must complete promptly — a serial accept
+    // loop would hang here until the parked one closes.
+    let start = std::time::Instant::now();
+    let value = client::resolve(&socket_path, "open", "m", None, None).unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(value, "open-value");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "an unrelated resolve on a fresh connection took {elapsed:?} while another was parked \
+         — the accept loop is blocking on the parked connection"
+    );
+
+    // Clean up: dismiss the still-parked ask so the spawned thread returns.
+    client::dismiss(&socket_path, &ask.id).unwrap();
+    assert_eq!(resolve_thread.join().unwrap().unwrap_err().to_lowercase().contains("dismissed"), true);
+
+    drop(broker_thread);
+    std::env::remove_var("AOIDE_AUDIT_LOG");
+    std::fs::remove_dir_all(&secrets_home).ok();
+    std::fs::remove_file(&socket_path).ok();
+}
+
 /// `home::secrets_home`'s env-override half, proven ONE more time at the
 /// integration-test level (unit tests already cover it inside the crate)
 /// — cheap, and this file is the only integration-test binary that could

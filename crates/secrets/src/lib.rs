@@ -64,6 +64,26 @@
 //! non_tty_exists_message`]). A put with no stored value yet is unaffected
 //! — no prompt, no warning, same as before this feature.
 //!
+//! **P-N1 (this commit) adds the automation/remote policy fields** — see
+//! `README.md`'s "The automation gate"/"Remote reachability" sections;
+//! [`policy::totp_required`] is the one decision point a `requireTotp`
+//! check now routes through.
+//!
+//! **P-N2 (this commit) parks a TOTP-gated `resolve` with no code instead
+//! of refusing it outright.** [`park::ParkRegistry`] holds every in-flight
+//! ask; [`broker::handle_resolve`] blocks the REQUESTING connection's own
+//! thread on it (which is why [`broker::serve`]'s accept loop moved to
+//! thread-per-connection this phase — a parked connection must never block
+//! the broker from admitting anyone else) until an operator completes the
+//! ask over a SEPARATE connection (`secrets approve <id> --totp <code>` /
+//! `secrets dismiss <id>`, new wire ops [`broker`]'s module doc documents)
+//! or [`park::park_timeout`] elapses. A resolve WITH a code is completely
+//! unchanged (the fast path); the wire's optional `wait:false` field
+//! restores the pre-P-N2 immediate refusal for machine callers that can't
+//! type a code. See `park.rs`'s own module doc for the value-never-parked
+//! invariant and the timeout/completion race, and `README.md`'s "Parking a
+//! TOTP resolve" section for the full lifecycle.
+//!
 //! See `README.md` for the wire shape and the release-to-client flow, and
 //! `AGENTS.md` for the invariants a change here must hold — most
 //! importantly: a secret's VALUE never appears on a `Serialize`/
@@ -80,6 +100,7 @@ pub mod commands;
 pub mod enroll;
 pub mod hmac;
 pub mod home;
+pub mod park;
 pub mod policy;
 pub mod replay;
 pub mod sha1;

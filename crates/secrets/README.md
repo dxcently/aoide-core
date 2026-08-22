@@ -61,7 +61,17 @@ the consumers it lists are checked against the SAME self-asserted
 doesn't); `remote` (default `false`) is a per-secret reachability flag
 with NO behavior change yet — `secrets expose <name> on|off` — that every
 future non-local entry point onto this broker must check before releasing
-a value (see "Remote reachability" below).
+a value (see "Remote reachability" below). **P-N2 (this commit) parks a
+`requireTotp` resolve with no code instead of refusing it outright**: the
+requesting connection now WAITS (default 300s, `AOIDE_SECRETS_PARK_TIMEOUT`
+to change it) while the ask is completed from a SEPARATE connection —
+`secrets pending`/`secrets approve <id> --totp <code>`/`secrets dismiss
+<id>` — or the timeout elapses. This is what moved [`broker::serve`] from
+a single-threaded serial accept loop to thread-per-connection (a parked
+connection must never stall every other client behind it on `accept(2)`) —
+see "Parking a TOTP resolve" below for the full lifecycle. A resolve WITH
+a code is completely unchanged; the wire's new `wait:false` field restores
+the pre-P-N2 immediate refusal for a caller that can't type a code.
 
 `secrets enroll` generates a fresh 20-byte secret from `/dev/urandom`,
 persists it (`store::save_totp_secret`, `0600`), and prints its
@@ -191,9 +201,10 @@ BYTE-IDENTICAL to before: `client::stdin_is_tty` is false in that case and
 ## The wire (unix socket, JSON-lines, one request per line, one reply)
 
 ```
--> {"op":"resolve","secret":"<name>","consumer":"<consumer>","totp":"<code>"?,"argv0":"<cmd>"?}
-<- {"ok":true,"value":"<value>"}                    (granted)
-<- {"ok":false,"error":"<value-free message>"}      (denied/error)
+-> {"op":"resolve","secret":"<name>","consumer":"<consumer>","totp":"<code>"?,"argv0":"<cmd>"?,"wait":<bool>?}
+<- {"ok":true,"value":"<value>"}                    (granted — immediately,
+                                                      or after a park completes)
+<- {"ok":false,"error":"<value-free message>"}      (denied/error/timeout/dismissed)
 
 -> {"op":"put","secret":"<name>","value":"<value>","overwrite":<bool>?}
 <- {"ok":true,"replaced":<bool>}                    (stored — `replaced`
@@ -206,9 +217,28 @@ BYTE-IDENTICAL to before: `client::stdin_is_tty` is false in that case and
                                                       `overwrite` was
                                                       false/absent)
 <- {"ok":false,"error":"<value-free message>"}      (denied/error)
+
+-> {"op":"pending"}
+<- {"ok":true,"pending":[{"id":"<id>","secret":"<name>","consumer":"<consumer>","requestedAt":<unix-seconds>},...]}
+
+-> {"op":"approve","id":"<id>","totp":"<code>"}
+<- {"ok":true}                                      (code valid — the VALUE
+                                                      releases down the
+                                                      ORIGINAL parked
+                                                      connection, never here)
+<- {"ok":false,"error":"<value-free message>"}      (unknown id / invalid or
+                                                      missing code — the ask
+                                                      STAYS parked either way)
+
+-> {"op":"dismiss","id":"<id>"}
+<- {"ok":true}                                       (the parked caller gets
+                                                       a clean "dismissed"
+                                                       refusal)
+<- {"ok":false,"error":"unknown pending id `<id>`"}
 ```
 
-`totp`/`argv0` are optional on `resolve`; `put` has neither, but gained
+`totp`/`argv0`/`wait` are optional on `resolve` (`wait` defaults to `true`
+— see "Parking a TOTP resolve" below); `put` has neither, but gained
 `overwrite` at P-67 (also optional — absent means `false`, same shape as
 `resolve`'s own optional fields). `consumer` is SELF-ASSERTED (the V1
 ruling `replay.rs` carries): the policy's `consumers[]` list is the real
@@ -236,6 +266,73 @@ group-membership trust model, the `consumer`-self-assertion honesty note)
 for a reader who never opens this crate's Rust; THIS section is the
 canonical copy — a wire change lands here (and in `broker.rs`'s module
 doc) first, `CONTRACTS.md` follows in the same commit.
+
+## Parking a TOTP resolve (P-N2)
+
+Before this phase, `resolve` on a `requireTotp` secret with no code was an
+immediate refusal — the caller had exactly the 30-second window of one TOTP
+code to notice the prompt, switch to an authenticator, and retry, or lose
+the race. P-N2 replaces that with a PARK: the ask waits, held open on its
+own connection, until an operator completes it or a timeout elapses.
+
+```
+agent  -> aoide secrets exec --as m --secret db-prod -- psql        (no --totp)
+       -> client connects, sends {op:"resolve", secret:"db-prod", consumer:"m"}
+       -> broker: totp_required(policy, "m") is true, no code on the wire
+          -> registers {id, secret:"db-prod", consumer:"m", requestedAt}
+             in the in-memory ParkRegistry, THIS connection's thread blocks
+             — no value is ever fetched, stored, or held anywhere yet
+
+operator -> aoide secrets pending                          (a SEPARATE connection)
+         <- [{"id":"3","secret":"db-prod","consumer":"m","requestedAt":...}]
+         -> aoide secrets approve 3 --totp 123456           (a THIRD connection)
+         -> broker: verify_totp_gate("123456") — SAME RFC 6238 verify +
+            replay ledger an inline `--totp` code uses
+            -> valid: fetch the value fresh through the backend, send it
+               down the ORIGINAL (first) connection's own channel
+            -> invalid/expired/used: the ask STAYS parked, ledger UNBURNED
+               — approve replies {"ok":false,"error":...} to the operator,
+               the agent's connection keeps waiting
+
+       <- the agent's ORIGINAL resolve call finally returns
+          {"ok":true,"value":"<value>"} — approve's own reply never
+          carried it
+```
+
+**The value never exists anywhere until the ask resolves.** Parking stores
+only `{id, secret name, consumer, requestedAt}` — never a value, never a
+partial fetch — the SAME "never store or park a value" invariant every
+other verb in this crate holds (`AGENTS.md`). `approve` fetches fresh,
+through the backend, only after a code has already validated, then sends
+it down the channel the original `resolve` call is blocked reading —
+`approve`'s own wire reply to the operator carries no `value` field at all.
+
+**Three ways out**, all removing the ask from the registry:
+- `secrets approve <id> --totp <code>` — a valid code releases the value to
+  the original caller; an invalid one leaves the ask parked, unburned.
+- `secrets dismiss <id>` — the original caller gets a clean "dismissed"
+  refusal, no code needed.
+- Timeout (default 300s, `AOIDE_SECRETS_PARK_TIMEOUT` env override) — the
+  original caller's refusal names the timeout, the env knob, AND both
+  completion paths (`secrets approve`/an inline `--totp` retry), since a
+  stale id at that point would only mislead (`broker::park_timeout_message`).
+
+**`wait:false` is the wire-only escape hatch** for a caller that has no way
+to ever supply a code and would rather fail fast than tie up a connection
+for up to 5 minutes — no CLI flag exists for it (this section's own
+"first-class API" framing), only a direct socket speaker can send it.
+Absent/`true` (the default) parks; `false` reproduces the EXACT pre-P-N2
+refusal string, byte for byte.
+
+**Concurrency — the accept loop never blocks on a parked connection.**
+Before P-N2, [`broker::serve`]'s accept loop called `handle_conn` INLINE,
+serially — safe only because nothing ever blocked for long. A park can
+legitimately hold a connection open for the full timeout, so `serve` now
+spawns one thread PER connection; a parked connection blocks only its own
+thread, and every other connection (an unrelated `resolve`, a `put`, a
+`pending` poll) is admitted and served normally the entire time one sits
+parked. `AGENTS.md`'s own invariant list has the poisoned-lock convention
+this introduced (the crate's first production, non-test, lock).
 
 ## The automation gate (`secrets automate`, P-N1)
 
@@ -614,6 +711,17 @@ Pure logic (P-V1, unchanged):
   added P-N1) and `valid_secret_name`. `totp_required(policy, consumer)`
   (P-N1) is the ONE decision point behind "is a TOTP code required for
   this resolve" — see "The automation gate" below.
+- `park` (P-N2) — `ParkRegistry` (the in-memory parked-ask registry,
+  `Mutex<BTreeMap<id, ParkedAsk>>` + an `AtomicU64` monotonic id counter,
+  never reused within one broker process's lifetime), `park_timeout`
+  (`AOIDE_SECRETS_PARK_TIMEOUT` env override, default 300s — no
+  config-file knob exists in the secrets home for this, env-only), and
+  `wait_for_outcome` (the completion/timeout race, `mpsc::Receiver::
+  recv_timeout` plus a re-check against the registry to close the race
+  where a timeout and a late approval land at nearly the same instant —
+  see its own module doc). Never stores or touches a value — a `ParkedAsk`
+  carries only `secret`/`consumer`/`requestedAt` and a private send-once
+  channel.
 
 Daemon/socket/CLI (P-V2, extended P-V3):
 
@@ -686,17 +794,29 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   `special` hook, same role `client::run_exec` plays for `secrets exec`).
 - `broker` — `serve`: `bind_socket` (P-V4 — binds, then chmods the socket
   file to `0660`; see "Deployment" above) followed by the accept loop
-  (`aoide secrets serve`'s body), the policy gate (`resolve_gate`, plus
-  `verify_totp_gate` for a `requireTotp` policy — P-V3), and BOTH audit
-  writes (the broker's own `audit.log` in secrets home + the mirrored aoide log
-  via `EventClass::Secret`) — see its module doc for the full wire
-  contract and the "broker-side only" audit discipline. `put_gate` (P-V4c,
-  extended P-67) returns a `PutOutcome` (`Granted { replaced }` /
-  `DeniedExists` / `Denied(reason)`) rather than a plain
-  `Result` — `handle_put` maps that onto the wire's `replaced`/`exists`
-  fields, and `audit_put` carries the same `replaced` distinction into
-  both audit logs (names only, never the value) — see "The write flow"
-  (README) and this module's own doc for the full P-67 shape.
+  (`aoide secrets serve`'s body — **thread-per-connection as of P-N2**,
+  changed from a single-threaded serial loop so a parked connection never
+  stalls anyone queued behind it, see "Parking a TOTP resolve" above), the
+  policy gate (`resolve_gate`, plus `verify_totp_gate` for a `requireTotp`
+  policy — P-V3; P-N2 changed `resolve_gate`'s return into a `GateOutcome`
+  enum — `Granted`/`Denied`/`NeedsTotp` — so its callers can tell "denied"
+  and "park candidate" apart, where the old signature only had a
+  `Result`), and BOTH audit writes (the broker's own `audit.log` in
+  secrets home + the mirrored aoide log via `EventClass::Secret`) — see
+  its module doc for the full wire contract and the "broker-side only"
+  audit discipline. `put_gate` (P-V4c, extended P-67) returns a
+  `PutOutcome` (`Granted { replaced }` / `DeniedExists` / `Denied(reason)`)
+  rather than a plain `Result` — `handle_put` maps that onto the wire's
+  `replaced`/`exists` fields, and `audit_put` carries the same `replaced`
+  distinction into both audit logs (names only, never the value) — see
+  "The write flow" (README) and this module's own doc for the full P-67
+  shape. `handle_pending`/`handle_approve`/`handle_dismiss` (P-N2) are the
+  three new op handlers — `handle_approve` peeks the ask (read-only) BEFORE
+  validating a code, so an invalid code never removes it, and only `take`s
+  it once a code has already validated and been consumed by the replay
+  ledger; `audit_park`/`audit_approve`/`audit_dismiss` are the matching
+  name-only audit functions, same two-destination shape as `audit_resolve`/
+  `audit_put`.
 - `client` — `resolve` (one round trip over the socket), `parse_exec_args`
   (pure `Invocation` parsing), `run_exec` (the full `secrets exec` flow: the
   entry point for `aoide-cli`'s `special` hook); `put` (P-V4c, one `put`
@@ -715,8 +835,13 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   route through — pure given an injected `io::Error`, unit-tested without a
   real socket. `non_tty_exists_message` (P-67) is the pure message builder
   behind the non-interactive "refuses and teaches `--force`" path — testable
-  without faking a tty.
-- `commands` — `register(&mut Registry)`: ELEVEN verbs, ALL CLI-only.
+  without faking a tty. `pending`/`approve`/`dismiss` (P-N2) are one-shot
+  socket round trips mirroring `resolve`/`put`'s own shape — `PendingAsk`
+  (id/secret/consumer/requestedAt, no value field at all) is `pending`'s
+  return type; `approve`/`dismiss` return `Result<(), String>` — neither
+  arm of either can carry a value, since the wire replies they read never
+  have one.
+- `commands` — `register(&mut Registry)`: FOURTEEN verbs, ALL CLI-only.
   `serve`/`exec`/`enroll` are door-hint handlers (the real work happens in
   `cli`'s `special` hook, same pattern as `a2a serve`/`conductor`); `add`/
   `rm`/`grant`/`revoke`/`set-totp`/`automate`/`expose` are policy-CRUD
@@ -733,8 +858,12 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   follows `put`'s shape too — a plain handler, no wire, no value. `automate`/
   `expose` (P-N1) follow the SAME shape as `set-totp` — plain handlers, no
   wire op of their own (both only edit `policy.json`, the same file
-  `resolve`/`put` already read), same idempotent "unchanged" reporting —
-  appended newest, LAST in `register()`.
+  `resolve`/`put` already read), same idempotent "unchanged" reporting.
+  `pending`/`approve`/`dismiss` (P-N2, appended newest, LAST in
+  `register()`) are `require_cli`-only like `put` — deliberately NOT
+  `require_admin_identity`-gated, since they never touch `policy.json`,
+  only the broker's in-memory `ParkRegistry` over the socket, the same
+  operator-side-but-not-admin-side distinction `put`/`exec` already draw.
 
 ## What it consumes
 
@@ -758,8 +887,9 @@ mod.rs::all()` calls `aoide_secrets::commands::register`, appended newest;
 `secrets enroll` — P-V4e's `--show` rides the SAME `secrets enroll` arm, no
 second one — `secrets put`, P-V4c, deliberately does NOT join that hook,
 see `commands.rs`'s module doc; neither does `secrets set-totp`, P-V4e, nor
-`secrets automate`/`secrets expose`, P-N1, for the same reason `put`
-doesn't — plain handlers, no value on the wire). The workspace `Cargo.toml`
+`secrets automate`/`secrets expose`, P-N1, nor `secrets pending`/`secrets
+approve`/`secrets dismiss`, P-N2, for the same reason `put` doesn't — plain
+handlers, no value on the wire). The workspace `Cargo.toml`
 comment on the `aoide-secrets` member is kept current with the verb set in
 the same commit as any change.
 
@@ -812,3 +942,17 @@ the same commit as any change.
 - **Per-backend environment is INLINE IN THE TEMPLATE** (P-V4c, "Backend
   presets" above) — `sh -c` IS the environment mechanism; there is no
   structured `env` map anywhere in `Backend`'s shape, and none is planned.
+- **A parked ask never stores or touches a value** (P-N2, same "NO CACHE,
+  EVER" spirit as above, restated for the registry this phase adds): a
+  `ParkedAsk` holds only `secret`/`consumer`/`requestedAt` and a private
+  channel — `approve` fetches fresh through the backend only AFTER a code
+  has already validated, and sends it straight down that channel; nothing
+  in `park`/`broker` ever holds a value across the wait.
+- **The `ParkRegistry`'s `Mutex` recovers from a poisoned lock rather than
+  propagating the panic** (P-N2 — the first PRODUCTION, non-test, lock
+  anywhere in this crate tree; every earlier `Mutex`/`RwLock` use was
+  test-only env serialization). `.lock().unwrap_or_else(|e| e.into_inner())`
+  everywhere the registry is touched — a panic inside one connection's own
+  thread must never poison every OTHER connection's ability to park/list/
+  approve/dismiss, matching this crate's existing "one connection's failure
+  never touches another's" discipline (`broker.rs`'s own module doc).

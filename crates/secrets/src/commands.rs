@@ -1,5 +1,5 @@
 //! `aoide secrets` — the secrets broker's CLI surface (Workstream SECRETS,
-//! P-V2, P-V3, P-V4c, P-V4e, P-N1). Registers ELEVEN verbs:
+//! P-V2, P-V3, P-V4c, P-V4e, P-N1, P-N2). Registers FOURTEEN verbs:
 //!
 //! - `serve` — the long-running broker, special-cased at the entry point
 //!   exactly like `a2a serve`/`conductor` (`cli`'s `run_cli`): this
@@ -93,10 +93,21 @@
 //!   secret as remote-reachable ahead of one landing; see
 //!   `crate::policy::Policy::remote`'s own doc and this crate's `AGENTS.md`
 //!   for the invariant a future non-local door must hold.
+//! - `pending`/`approve`/`dismiss` (P-N2) — the parked-resolve completion
+//!   surface: [`handle_secrets_pending`] lists every in-flight ask ([`crate::
+//!   client::pending`], value-free by construction); [`handle_secrets_approve`]
+//!   validates a TOTP code and releases the value down the ORIGINAL parked
+//!   connection ([`crate::client::approve`] — its own reply never carries
+//!   the value, `broker::handle_approve`'s doc); [`handle_secrets_dismiss`]
+//!   refuses a parked ask outright ([`crate::client::dismiss`]). All three
+//!   are **operator-side over the socket, same as `put`/`exec`** — CLI-only
+//!   via [`require_cli`], but deliberately NOT gated by
+//!   [`require_admin_identity`]: they never touch `policy.json`, only the
+//!   broker's in-memory [`crate::park::ParkRegistry`] over the wire.
 //!
-//! `automate`/`expose` are appended LAST in `register()` (golden discipline
-//! — `pkgs/aoide/crates/AGENTS.md`: append, never reorder), golden
-//! 61 -> 63.
+//! `automate`/`expose` are appended in `register()` (golden discipline —
+//! `pkgs/aoide/crates/AGENTS.md`: append, never reorder), golden 61 -> 63;
+//! `pending`/`approve`/`dismiss` (P-N2) are appended last, golden 63 -> 66.
 //!
 //! `add`/`rm`/`grant`/`revoke`/`enroll` run AS THE SECRETS USER in deployment
 //! (`sudo -u aoide-secrets ...`, wrapped by the nix module at P-V4), but the
@@ -283,6 +294,36 @@ pub fn register(r: &mut Registry) {
         implemented: true,
         handler: handle_secrets_expose,
         examples: ["secrets expose db-prod on", "secrets expose db-prod off"],
+    ));
+    r.insert(cmd!(
+        path: ["secrets", "pending"],
+        summary: "List every parked TOTP-gated resolve waiting on a code (id, secret, consumer, requestedAt) — never a value. Operator-side over the socket, same as put/exec: CLI-only, but NOT an admin/euid verb (it only reads in-memory broker state, no policy.json write).",
+        args: [],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_secrets_pending,
+        examples: ["secrets pending"],
+    ));
+    r.insert(cmd!(
+        path: ["secrets", "approve"],
+        summary: "Complete a parked resolve with a TOTP code, releasing the value down the ORIGINAL requesting connection (never into this command's own reply). Invalid/expired code: the ask stays parked and the replay ledger is unburned.",
+        args: [arg!("id", "string", true, "The parked ask's id, from `secrets pending`.")],
+        flags: [flag!("totp", "string", "The TOTP code to validate against this host's enrollment.")],
+        gated: false,
+        implemented: true,
+        handler: handle_secrets_approve,
+        examples: ["secrets approve 3 --totp 123456"],
+    ));
+    r.insert(cmd!(
+        path: ["secrets", "dismiss"],
+        summary: "Refuse a parked resolve outright — the original requesting connection gets a clean \"dismissed\" refusal, no code needed.",
+        args: [arg!("id", "string", true, "The parked ask's id, from `secrets pending`.")],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_secrets_dismiss,
+        examples: ["secrets dismiss 3"],
     ));
 }
 
@@ -742,6 +783,82 @@ fn handle_secrets_expose(inv: &Invocation) -> Outcome {
     Outcome::ok(cmd, format!("secret `{name}` remote set to `{state}`")).changed(vec![format!("policy:{name}")])
 }
 
+/// `secrets pending` (P-N2) — CLI-only via the SAME [`require_cli`] gate as
+/// `put`/`exec`, but deliberately **NOT** [`require_admin_identity`]: this
+/// is the operator-side socket surface (task requirement — "like put/exec,
+/// NOT admin/euid verbs"), reading in-memory broker state over the socket
+/// rather than `policy.json`, so the euid-ownership guard that protects
+/// `policy.json` writes doesn't apply here. The list `crate::client::
+/// pending` returns is value-free by construction (`PendingAsk` has no
+/// value field at all); this handler only re-shapes it into JSON, adding
+/// nothing.
+fn handle_secrets_pending(inv: &Invocation) -> Outcome {
+    let cmd = "secrets.pending";
+    if let Some(hint) = require_cli(inv, cmd) {
+        return hint;
+    }
+    match crate::client::pending(&crate::socket::socket_path()) {
+        Ok(asks) => {
+            let data: Vec<serde_json::Value> = asks
+                .iter()
+                .map(|a| {
+                    json!({
+                        "id": a.id,
+                        "secret": a.secret,
+                        "consumer": a.consumer,
+                        "requestedAt": a.requested_at,
+                    })
+                })
+                .collect();
+            Outcome::ok(cmd, format!("{} pending ask(s)", asks.len())).with_data(json!({ "pending": data }))
+        }
+        Err(e) => Outcome::error(cmd, e),
+    }
+}
+
+/// `secrets approve <id> --totp <code>` (P-N2) — same operator-side gate as
+/// `secrets pending` above (CLI-only, no admin-identity check). Delegates
+/// straight to `crate::client::approve`, whose `Result<(), String>` carries
+/// no value on either arm (the wire's own `approve` reply never has one —
+/// `broker::handle_approve`'s own doc: the value goes down the ORIGINAL
+/// parked connection, never this reply).
+fn handle_secrets_approve(inv: &Invocation) -> Outcome {
+    let cmd = "secrets.approve";
+    const USAGE: &str = "usage: secrets approve <id> --totp <code>";
+    if let Some(hint) = require_cli(inv, cmd) {
+        return hint;
+    }
+    let Some(id) = inv.args.first().cloned() else {
+        return Outcome::usage(cmd, format!("secrets approve: missing <id> — {USAGE}"));
+    };
+    let Some(totp) = inv.flags.get("totp").cloned() else {
+        return Outcome::usage(cmd, format!("secrets approve: missing --totp <code> — {USAGE}"));
+    };
+    match crate::client::approve(&crate::socket::socket_path(), &id, &totp) {
+        Ok(()) => Outcome::ok(cmd, format!("approved pending ask `{id}`")).changed(vec![format!("pending:{id}")]),
+        Err(e) => Outcome::error(cmd, e),
+    }
+}
+
+/// `secrets dismiss <id>` (P-N2) — same operator-side gate as `secrets
+/// pending`/`secrets approve` above. The parked caller gets a clean
+/// "dismissed" refusal on its own connection; this reply only confirms the
+/// dismissal happened, no value ever exists on this path at all.
+fn handle_secrets_dismiss(inv: &Invocation) -> Outcome {
+    let cmd = "secrets.dismiss";
+    const USAGE: &str = "usage: secrets dismiss <id>";
+    if let Some(hint) = require_cli(inv, cmd) {
+        return hint;
+    }
+    let Some(id) = inv.args.first().cloned() else {
+        return Outcome::usage(cmd, format!("secrets dismiss: missing <id> — {USAGE}"));
+    };
+    match crate::client::dismiss(&crate::socket::socket_path(), &id) {
+        Ok(()) => Outcome::ok(cmd, format!("dismissed pending ask `{id}`")).changed(vec![format!("pending:{id}")]),
+        Err(e) => Outcome::error(cmd, e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -799,6 +916,9 @@ mod tests {
                 "secrets.set-totp",
                 "secrets.automate",
                 "secrets.expose",
+                "secrets.pending",
+                "secrets.approve",
+                "secrets.dismiss",
             ]
         );
         for c in r.commands() {

@@ -89,10 +89,16 @@ aoide-lyra = { path = "crates/lyra" }
 # automation gate (`Policy::automation`, relaxes requireTotp for LISTED
 # consumers only) and the `remote` reachability flag (no behavior change
 # yet — lands ahead of any non-local entry point), plus `secrets automate`
-# (on/off/grant/revoke) and `secrets expose` (on/off) (P-N1 — golden +2).
+# (on/off/grant/revoke) and `secrets expose` (on/off) (P-N1 — golden +2);
+# a TOTP-gated `resolve` with no code now PARKS (holds the connection,
+# releases the value once completed) instead of refusing outright — the
+# broker moved from a serial accept loop to thread-per-connection so a
+# parked connection never blocks another, and `secrets pending`/`secrets
+# approve`/`secrets dismiss` complete or refuse a parked ask over the
+# socket, operator-side like put/exec (P-N2 — golden +3).
 # `aoide-cli` depends on this crate as of P-V2 (`secrets serve`/`exec`/
 # `add`/`rm`/`grant`/`revoke`/`enroll`/`put`/`set-totp`/`automate`/
-# `expose` register into its `Registry`).
+# `expose`/`pending`/`approve`/`dismiss` register into its `Registry`).
 aoide-secrets = { path = "crates/secrets" }
 
 [profile.release]

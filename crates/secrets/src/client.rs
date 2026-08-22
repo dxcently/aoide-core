@@ -316,6 +316,135 @@ pub fn put(socket_path: &Path, secret: &str, value: &str, overwrite: bool) -> Re
     }
 }
 
+/// One parked ask, as `secrets pending` lists it — id/secret/consumer/
+/// requestedAt ONLY, never a value (mirrors the wire's own `pending` reply
+/// shape, `broker.rs`'s module doc's wire table).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAsk {
+    pub id: String,
+    pub secret: String,
+    pub consumer: String,
+    pub requested_at: u64,
+}
+
+/// Connect to `socket_path`, send ONE `pending` request, read ONE reply
+/// line, and return every parked ask — value-free by construction (the
+/// wire's `pending` reply never carries one; this simply reads the fields
+/// that ARE there).
+pub fn pending(socket_path: &Path) -> Result<Vec<PendingAsk>, String> {
+    let mut stream = UnixStream::connect(socket_path)
+        .map_err(|e| describe_connect_error(socket_path, &e, "aoide secrets pending"))?;
+
+    let line = json!({ "op": "pending" }).to_string() + "\n";
+    stream.write_all(line.as_bytes()).map_err(|e| format!("writing to the secrets broker: {e}"))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut reply_line = String::new();
+    reader.read_line(&mut reply_line).map_err(|e| format!("reading from the secrets broker: {e}"))?;
+    if reply_line.trim().is_empty() {
+        return Err("the secrets broker closed the connection with no reply".to_string());
+    }
+    let reply: Value = serde_json::from_str(reply_line.trim())
+        .map_err(|e| format!("the secrets broker sent an unparseable reply: {e}"))?;
+
+    if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(reply
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("the secrets broker denied the request")
+            .to_string());
+    }
+    let asks = reply
+        .get("pending")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "the secrets broker's reply had no `pending` array".to_string())?;
+    asks.iter()
+        .map(|a| {
+            Ok(PendingAsk {
+                id: a.get("id").and_then(Value::as_str).ok_or("a pending entry had no `id`")?.to_string(),
+                secret: a
+                    .get("secret")
+                    .and_then(Value::as_str)
+                    .ok_or("a pending entry had no `secret`")?
+                    .to_string(),
+                consumer: a
+                    .get("consumer")
+                    .and_then(Value::as_str)
+                    .ok_or("a pending entry had no `consumer`")?
+                    .to_string(),
+                requested_at: a
+                    .get("requestedAt")
+                    .and_then(Value::as_u64)
+                    .ok_or("a pending entry had no `requestedAt`")?,
+            })
+        })
+        .collect::<Result<Vec<_>, &str>>()
+        .map_err(str::to_string)
+}
+
+/// Connect to `socket_path`, send ONE `approve` request carrying `id` and
+/// `totp`, read ONE reply line. Success is `{"ok":true}` only — never a
+/// value (the value went down the ORIGINAL parked connection, broker-side;
+/// this function's own reply can't carry it because the wire reply it reads
+/// never has one, `handle_approve`'s own doc). An invalid/expired code, or
+/// an unknown id, comes back as a value-free `Err`.
+pub fn approve(socket_path: &Path, id: &str, totp: &str) -> Result<(), String> {
+    let mut stream = UnixStream::connect(socket_path)
+        .map_err(|e| describe_connect_error(socket_path, &e, &format!("aoide secrets approve {id} --totp ...")))?;
+
+    let line = json!({ "op": "approve", "id": id, "totp": totp }).to_string() + "\n";
+    stream.write_all(line.as_bytes()).map_err(|e| format!("writing to the secrets broker: {e}"))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut reply_line = String::new();
+    reader.read_line(&mut reply_line).map_err(|e| format!("reading from the secrets broker: {e}"))?;
+    if reply_line.trim().is_empty() {
+        return Err("the secrets broker closed the connection with no reply".to_string());
+    }
+    let reply: Value = serde_json::from_str(reply_line.trim())
+        .map_err(|e| format!("the secrets broker sent an unparseable reply: {e}"))?;
+
+    if reply.get("ok").and_then(Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        Err(reply
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("the secrets broker denied the request")
+            .to_string())
+    }
+}
+
+/// Connect to `socket_path`, send ONE `dismiss` request carrying `id`, read
+/// ONE reply line. An unknown id is a taught error (`handle_dismiss`'s own
+/// doc), value-free either way.
+pub fn dismiss(socket_path: &Path, id: &str) -> Result<(), String> {
+    let mut stream = UnixStream::connect(socket_path)
+        .map_err(|e| describe_connect_error(socket_path, &e, &format!("aoide secrets dismiss {id}")))?;
+
+    let line = json!({ "op": "dismiss", "id": id }).to_string() + "\n";
+    stream.write_all(line.as_bytes()).map_err(|e| format!("writing to the secrets broker: {e}"))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut reply_line = String::new();
+    reader.read_line(&mut reply_line).map_err(|e| format!("reading from the secrets broker: {e}"))?;
+    if reply_line.trim().is_empty() {
+        return Err("the secrets broker closed the connection with no reply".to_string());
+    }
+    let reply: Value = serde_json::from_str(reply_line.trim())
+        .map_err(|e| format!("the secrets broker sent an unparseable reply: {e}"))?;
+
+    if reply.get("ok").and_then(Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        Err(reply
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("the secrets broker denied the request")
+            .to_string())
+    }
+}
+
 /// Is stdin a terminal? `libc::isatty` on fd 0 — the branch point between
 /// the historical pipe path and P-V4e's hidden-input prompt (module doc).
 fn stdin_is_tty() -> bool {
@@ -714,6 +843,106 @@ mod tests {
 
         // Third put, overwrite: true -> `replaced: true`.
         assert_eq!(put(&socket_path, "t", "second-value", true), Ok(true));
+
+        drop(broker_thread);
+        std::fs::remove_file(&socket_path).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── P-N2: pending/approve/dismiss ───────────────────────────────────
+
+    #[test]
+    fn pending_against_a_dead_socket_is_a_connect_error() {
+        let dead = Path::new("/tmp/aoide-secrets-nonexistent-pending-test.sock");
+        let err = pending(dead).unwrap_err();
+        assert!(err.contains("connecting"), "{err}");
+    }
+
+    #[test]
+    fn approve_against_a_dead_socket_is_a_connect_error() {
+        let dead = Path::new("/tmp/aoide-secrets-nonexistent-approve-test.sock");
+        let err = approve(dead, "1", "123456").unwrap_err();
+        assert!(err.contains("connecting"), "{err}");
+    }
+
+    #[test]
+    fn dismiss_against_a_dead_socket_is_a_connect_error() {
+        let dead = Path::new("/tmp/aoide-secrets-nonexistent-dismiss-test.sock");
+        let err = dismiss(dead, "1").unwrap_err();
+        assert!(err.contains("connecting"), "{err}");
+    }
+
+    /// A real broker + socket round trip through the client wrappers
+    /// themselves: `resolve` parks (no code given), `pending` sees the ask
+    /// with no value anywhere in it, `approve` releases the value down the
+    /// ORIGINAL `resolve` call — never into `approve`'s own `Ok(())` — and
+    /// once approved the ask is gone from `pending` again. Same real-broker
+    /// shape as `put_reports_exists_then_replaced_true_through_a_real_broker`
+    /// (a single `serve` call for the whole test, dropped-not-joined, same
+    /// pattern that test already establishes).
+    #[test]
+    fn pending_approve_round_trips_through_a_real_broker_and_releases_to_the_original_caller() {
+        let home = std::env::temp_dir().join(format!(
+            "aoide-secrets-client-park-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let mut p = crate::policy::Policy::new("t", "file", "k");
+        p.require_totp = true;
+        crate::store::save_policies(&home, &[p]).unwrap();
+        let totp_secret = b"a-twenty-byte-totp-s".to_vec();
+        crate::store::save_totp_secret(&home, &totp_secret).unwrap();
+
+        let socket_path = std::path::PathBuf::from(format!(
+            "/tmp/aoide-secrets-client-park-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+
+        let home_for_thread = home.clone();
+        let sock_for_thread = socket_path.clone();
+        let broker_thread = std::thread::spawn(move || {
+            let _ = crate::broker::serve(&home_for_thread, &sock_for_thread);
+        });
+        let mut connected = false;
+        for _ in 0..50 {
+            if UnixStream::connect(&socket_path).is_ok() {
+                connected = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(connected, "broker did not bind {} in time", socket_path.display());
+
+        // `put` a value first (no TOTP gate on `put`, module doc), so the
+        // parked `resolve` below has something real to release.
+        assert_eq!(put(&socket_path, "t", "the-real-value", false), Ok(false));
+        assert_eq!(pending(&socket_path).unwrap(), Vec::new());
+
+        let sock_for_resolve = socket_path.clone();
+        let resolve_thread = std::thread::spawn(move || resolve(&sock_for_resolve, "t", "m", None, None));
+
+        let mut ask = None;
+        for _ in 0..200 {
+            let list = pending(&socket_path).unwrap();
+            if let Some(a) = list.into_iter().next() {
+                ask = Some(a);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let ask = ask.expect("the resolve did not park in time");
+        assert_eq!(ask.secret, "t");
+        assert_eq!(ask.consumer, "m");
+
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let step = crate::totp::timestep(now);
+        let code = crate::totp::format6(crate::totp::hotp(&totp_secret, step, crate::totp::DIGITS));
+        approve(&socket_path, &ask.id, &code).unwrap();
+
+        assert_eq!(resolve_thread.join().unwrap(), Ok("the-real-value".to_string()));
+        assert_eq!(pending(&socket_path).unwrap(), Vec::new());
 
         drop(broker_thread);
         std::fs::remove_file(&socket_path).ok();

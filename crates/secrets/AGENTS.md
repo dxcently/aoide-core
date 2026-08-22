@@ -172,9 +172,9 @@
   combination; automation has no ability to IMPOSE a TOTP requirement a
   policy doesn't already carry, only to name specific consumers who skip
   one it does. Don't inline `policy.require_totp` back into `resolve_gate`
-  "for clarity" — `totp_required` is the one place a later phase (P-N2:
-  turning a no-code `true` result into a PARK instead of a flat refusal)
-  changes, and every call site must route through it.
+  "for clarity" — `totp_required` stayed the ONE call site P-N2's parking
+  change routed through (`GateOutcome::NeedsTotp`, invariant below) rather
+  than a second ad hoc check growing beside it.
 - **`automation.consumers` is checked against the SAME self-asserted
   `consumer` wire field `resolve`'s `consumers[]` already is** (P-N1,
   honesty note mirroring the `ReplayLedger` ruling above, for the
@@ -195,6 +195,60 @@
   no reader yet is exactly what this note exists to close before it
   becomes a live gap the way the automation-consumer self-assertion note
   above already is.
+- **A parked ask never stores or touches a value — the same "never store a
+  value" rule above, extended to the registry P-N2 adds.** `park::
+  ParkedAsk` carries only `secret`/`consumer`/`requested_at` and a private
+  send-once channel; `broker::handle_approve` fetches the value fresh
+  through the backend ONLY after a code has already validated
+  (`verify_totp_gate`, the SAME function an inline `resolve` code uses),
+  and sends it straight down that channel — never holding it in the
+  registry, never in `approve`'s own wire reply back to the operator.
+  Don't add a "cache the value once fetched, in case the connection reads
+  slowly" optimization to `ParkedAsk` — the value must exist ONLY inside
+  the one send/receive handoff, same as everywhere else in this crate.
+- **The `ParkRegistry`'s lock recovers from a poisoned lock rather than
+  propagating the panic — the FIRST production (non-test) lock in this
+  crate tree, and the convention any future one follows.** Every earlier
+  `Mutex`/`RwLock` in this crate was test-only env serialization
+  (`env_lock()`); `park::ParkRegistry`'s internal `Mutex` is the first one
+  live code touches. Every access goes through `.lock().unwrap_or_else(|e|
+  e.into_inner())`, never a bare `.lock().unwrap()` — a panic inside one
+  connection's own thread (P-N2's thread-per-connection model, below) must
+  never poison every OTHER connection's ability to park/list/approve/
+  dismiss, matching this crate's own "one connection's failure is
+  contained to that connection" discipline (`broker.rs`'s module doc). A
+  future production lock elsewhere in this crate follows the SAME recovery
+  pattern, not a bare `.unwrap()`.
+- **`serve`'s accept loop is thread-per-connection, and must never block on
+  a parked one (P-N2, hard constraint).** Before this phase the loop called
+  `handle_conn` INLINE, serially — safe only because nothing ever blocked
+  for long. A parked `resolve` can legitimately hold its connection open
+  for the full timeout (default 300s), so `serve` now does
+  `std::thread::spawn(move || handle_conn(...))` per accepted connection,
+  sharing one `Arc<park::ParkRegistry>`. Don't reintroduce an inline
+  `handle_conn` call in the accept loop, and don't add a SECOND kind of
+  long-lived wait anywhere in `handle_conn` that isn't routed through
+  `park::wait_for_outcome`'s own timeout/completion race — a second
+  ad hoc blocking point would need this same accept-loop guarantee
+  re-proven from scratch.
+- **`resolve_gate` returns a `GateOutcome` (`Granted`/`Denied`/
+  `NeedsTotp`), not a bare `Result` (P-N2 — replaced the old
+  `(bool, Result<String,String>)` tuple).** `NeedsTotp` is the park
+  candidate: `totp_required` is true, an enrollment exists, but no/empty
+  code rode the wire — every OTHER `requireTotp`-true-with-no-enrollment
+  case is still an immediate `Denied` (unchanged wording), never a park,
+  since there is nothing an operator could approve against. Don't collapse
+  `NeedsTotp` back into `Denied` "since both come from the same missing-
+  code condition" — `handle_resolve` is the ONE call site that branches on
+  which variant it got, and that branch is the entire mechanism that turns
+  a no-code resolve into a park instead of a refusal.
+- **`wait:false` is wire-only — no CLI flag exists, and none should be
+  added casually (P-N2).** It exists for a machine caller with no way to
+  ever supply a code (this crate's own `README.md`, "Parking a TOTP
+  resolve"). Adding a `--no-wait`/`--wait=false` CLI flag would need its
+  own justification independent of this one wire escape hatch — don't
+  wire one up "since the field already exists" without a caller that
+  actually needs it from a terminal.
 - **`home::secrets_home`/`socket::socket_path` are THE resolution — nothing
   else re-derives a secrets-home or socket path.** `broker::serve`/
   `client::resolve`/`client::run_exec` all take the resolved `&Path` as a
@@ -367,10 +421,31 @@
   (`commands::handle_secrets_automate`/`handle_secrets_expose`) — same
   `require_cli` + `require_admin_identity` gate, same idempotent
   "unchanged" reporting as `set-totp`, appended LAST in `register()`
-  (golden 61 -> 63). A future P-N2 phase turns a `totp_required` `true`
-  result with no code into a PARK instead of a flat refusal — that phase
-  changes `totp_required`'s callers, not its own signature or the
-  automation/remote fields themselves.
+  (golden 61 -> 63).
+- **A `totp_required` `true` result with no code PARKS instead of refusing
+  outright, landed at P-N2 (golden 63 -> 66).** `broker::resolve_gate`
+  returns `GateOutcome::NeedsTotp` (invariant above) instead of an
+  immediate denial when a code is required, enrolled, but absent/empty on
+  the wire; `handle_resolve` registers the ask in `park::ParkRegistry` and
+  blocks the CONNECTION'S OWN THREAD on `park::wait_for_outcome`, which is
+  why `serve`'s accept loop moved to thread-per-connection this phase
+  (invariant above — a hard constraint, not a style choice). Three new
+  CLI-only, `require_cli`-but-NOT-`require_admin_identity` verbs complete
+  or refuse a parked ask over the socket, same operator-side-not-admin-side
+  shape `put`/`exec` already draw: `secrets pending` (lists asks, never a
+  value), `secrets approve <id> --totp <code>` (validates with the SAME
+  `verify_totp_gate` an inline code uses, fetches fresh, releases down the
+  ORIGINAL connection — an invalid code leaves the ask parked, ledger
+  unburned), `secrets dismiss <id>` (clean refusal to the original caller,
+  no code needed). `resolve` gained one optional wire field, `wait`
+  (default `true`) — `wait:false` is the wire-only (no CLI flag) escape
+  hatch back to the pre-P-N2 immediate refusal. Timeout is
+  `AOIDE_SECRETS_PARK_TIMEOUT` (default 300s, env-only — no config-file
+  knob exists in this crate for numeric settings, and none was invented for
+  this). A future phase adding a code-entry UI (a popup, a notification)
+  reads `secrets pending`/calls `secrets approve`/`secrets dismiss` the
+  SAME way an operator's terminal does — this phase is explicitly the
+  substrate for that, not a preview of it; no UI code lives in this crate.
 
 ## Docs update required in the same commit
 
@@ -381,7 +456,7 @@
   `crates/cli/README.md`'s golden-path count when the verb set changes.
 - `CONTRACTS.md §3` (the core schema's command count) and its "Secrets
   wire" subsection (§4, the machine-consumer contract — P-V4c) when the
-  wire shape (either op) or file layout changes; that subsection restates
+  wire shape (any op) or file layout changes; that subsection restates
   this crate's own wire docs (`README.md`'s "The wire", `broker.rs`'s
   module doc) for a reader who never opens this crate's Rust — update the
   crate docs FIRST, `CONTRACTS.md` follows in the same commit.
