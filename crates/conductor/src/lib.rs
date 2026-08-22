@@ -25,16 +25,19 @@
 //!   * [`graphview`] lays out and draws the visual DAG; [`theme`] carries the
 //!     palette → `Style`, the glyph vocabulary, and the small pure formatters.
 //!
-//! The six panels: DAG (the visual graph), SESSIONS (the terminal roster),
+//! The seven panels: DAG (the visual graph), SESSIONS (the terminal roster),
 //! PROJECTS, LOG, STATUS, ROSTER (presence — this box plus every registered
-//! peer, messaging/presence plan P-C4). The event stream is still the audit
-//! log (the LOG panel tails it); live state is still stage-file mtimes,
-//! polled each tick (~500 ms via the crossterm poll timeout). There is no
-//! watcher, no async runtime — one thread, one loop for everything except
-//! ROSTER's own dispatch: `who` performs LIVE network probes, so its
-//! throttled (~15s) fetch runs on its own background `std::thread` and
-//! reports back over a channel the tick polls without blocking (see
-//! `app`'s "ROSTER" section) — the one deliberate exception to "one thread".
+//! peer, messaging/presence plan P-C4; selection + compose P-C5), PENDING
+//! (held `graph send`/A2A entries, approve/deny, P-C5). The event stream is
+//! still the audit log (the LOG panel tails it); live state is still
+//! stage-file mtimes, polled each tick (~500 ms via the crossterm poll
+//! timeout). There is no watcher, no async runtime — one thread, one loop
+//! for everything except ROSTER's own dispatch: `who` performs LIVE network
+//! probes, so its throttled (~15s) fetch runs on its own background
+//! `std::thread` and reports back over a channel the tick polls without
+//! blocking (see `app`'s "ROSTER" section) — the one deliberate exception to
+//! "one thread". PENDING's `graph pending list` is a local file read, so it
+//! refreshes synchronously on the tick instead (`app`'s "PENDING" section).
 //!
 //! Terminal restoration is belt-and-braces: [`TermGuard`]'s `Drop` leaves the
 //! alternate screen and disables raw mode, and a panic hook does the same before
@@ -48,7 +51,7 @@
 //! ```sh
 //! export AOIDE_STAGE_DIR=$(mktemp -d) AOIDE_AUDIT_LOG=$AOIDE_STAGE_DIR/log
 //! pkgs/aoide/tests/fixtures/seed.sh "$AOIDE_STAGE_DIR"
-//! aoide conductor  # 1-6/Tab switch panels, j/k select, ? help, q quit
+//! aoide conductor  # 1-7/Tab switch panels, j/k select, ? help, q quit
 //! ```
 
 pub mod app;
@@ -205,6 +208,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('4') => app.select_panel(Panel::Log),
         KeyCode::Char('5') => app.select_panel(Panel::Status),
         KeyCode::Char('6') => app.select_panel(Panel::Roster),
+        KeyCode::Char('7') => app.select_panel(Panel::Pending),
         _ => app.handle_key(key),
     }
     false

@@ -1,15 +1,17 @@
 # aoide-conductor
 
 `aoide conductor` — the interactive terminal frontend over the trunk: a
-ratatui/crossterm TUI with six panels (DAG, SESSIONS, PROJECTS, LOG,
-STATUS, ROSTER). Core, never `lyra` — pure Rust, no system-closure weight,
-and conducting orchestration is Aoide's core identity (root `AGENTS.md`).
+ratatui/crossterm TUI with seven panels (DAG, SESSIONS, PROJECTS, LOG,
+STATUS, ROSTER, PENDING). Core, never `lyra` — pure Rust, no system-closure
+weight, and conducting orchestration is Aoide's core identity (root
+`AGENTS.md`).
 
 ## Named seams (what it exposes)
 
 - `app::App` — live state (projects/sessions/hooks from the stage tree),
   audit tail, panel/node selection, the last dispatched `Outcome`, the
-  ROSTER panel's throttled `who` cache. Draws nothing.
+  ROSTER panel's throttled `who` cache, the PENDING panel's `graph pending
+  list` cache. Draws nothing.
 - `ui` — pure `draw(frame, area, &App)` view functions per panel, testable
   with a `TestBackend`.
 - `graphview` — DAG layout + drawing.
@@ -17,18 +19,20 @@ and conducting orchestration is Aoide's core identity (root `AGENTS.md`).
 - `logtail` — the log-tail overlay for headless-session detail.
 - `commands` — this crate's one CLI verb, `conductor`.
 
-## ROSTER: presence over this box + every registered peer (P-C4)
+## ROSTER: presence over this box + every registered peer (P-C4; selection + compose P-C5)
 
-Read-only. Rows are `who --json`'s `Outcome.data`, dispatched through the
-same injected `DispatchFn` as every other action — never re-derived —
-parsed into `App::roster_nodes()` (local box first, then peers, exactly
-`who`'s own order). Node glyphs (`●`/`◐`/`○` — online/unreachable/
-never-pulled) match `who`'s own Unicode-roster vocabulary
-(`conduct/src/graph/who.rs`'s private `glyph` helper — same three glyphs,
-independently drawn here since that helper isn't public); session glyphs
-reuse the conductor's existing musical-note set
-(`theme::state_glyph`) since `who` classifies sessions off the identical
-state vocabulary the SESSIONS panel already reads.
+Rows are `who --json`'s `Outcome.data`, dispatched through the same
+injected `DispatchFn` as every other action — never re-derived — parsed
+into `App::roster_nodes()` (local box first, then peers, exactly `who`'s
+own order), then flattened into `App::roster_flat_rows()` for selection
+(one `Vec` is the single source of truth for both render and key handling,
+the same shape `App::dag_rows()` uses over the DAG). Node glyphs
+(`●`/`◐`/`○` — online/unreachable/never-pulled) match `who`'s own
+Unicode-roster vocabulary (`conduct/src/graph/who.rs`'s private `glyph`
+helper — same three glyphs, independently drawn here since that helper
+isn't public); session glyphs reuse the conductor's existing musical-note
+set (`theme::state_glyph`) since `who` classifies sessions off the
+identical state vocabulary the SESSIONS panel already reads.
 
 `who` performs a LIVE network probe of every registered peer (~2s/peer,
 parallel) on every invocation, so this pane throttles: it re-dispatches at
@@ -41,6 +45,34 @@ the one dispatch in this crate that does not go through the synchronous
 `App::dispatch` (which every mutating action uses), because `who` never
 mutates anything and its live probes would otherwise freeze the tick loop
 for the probe's duration.
+
+`j`/`k` walk the flattened rows; `s` on a selected SESSION row (P-C5) opens
+the existing inline `Input` line editor, pre-labeled with that row's own
+display-grammar label, and on submit dispatches `graph send --to <target>
+--yes -- <text>` through `App::dispatch_with_flags` — the same single
+dispatch seam, just with flags. `--yes` is a documented no-op for a REMOTE
+target (`conduct/src/graph/send.rs::deliver_remote` folds that note
+straight into the `Outcome` message, so `App::status_message` surfaces it
+same as any other dispatch, no special-casing needed here).
+
+## PENDING: held `graph send` / A2A entries, approve/deny (P-C5)
+
+Rows are `graph pending list --json`'s `Outcome.data`, dispatched through
+the same injected `DispatchFn`, parsed into `App::pending_rows()` — never
+re-derived: the malformed-entry detection and display-grammar rendering
+stay in `conduct::graph::pending`. Unlike ROSTER's `who`, `graph pending
+list` is a local file read (no network), so there is no throttle and no
+background thread: `App::refresh_pending` runs synchronously, called from
+`reload_all` (which fires after every dispatch) and from the tick loop
+while the pane is visible.
+
+`j`/`k` walk the rows; `a`/`d` approve/deny the selected one. **The
+invariant**: `graph pending list`'s `id` is the entry's ARRAY POSITION, not
+a stable id (`conduct/src/graph/pending.rs`'s module doc) — resolving one
+entry shifts every id after it. `App::dispatch` already re-lists via
+`reload_all` -> `refresh_pending` synchronously before the next paint, so a
+second a/d keypress in the same visit always resolves the row actually on
+screen, never a stale index.
 
 ## What it consumes
 

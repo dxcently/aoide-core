@@ -10,15 +10,19 @@
 //! SGR. Panels stay pure over `&App`, so a `TestBackend` can render any of them
 //! headless and assert on the buffer (see the tests below).
 //!
-//! Two of the six panels are the expansion this port carries: `DAG` (the
+//! Two of the seven panels are the expansion this port carries: `DAG` (the
 //! visual graph, drawn by [`crate::graphview`]) and `SESSIONS` (the
 //! terminal roster, now split into a scrolling list + a live detail card with a
 //! focus affordance). The other three — PROJECTS, LOG, STATUS — are ports of the
-//! originals. `ROSTER` (messaging/presence plan, P-C4) is a later, distinct
-//! addition — read-only presence over this box plus every registered peer,
-//! sourced from a throttled, backgrounded `who` dispatch (`app`'s "ROSTER"
-//! section covers the threading; this file only paints what `App::roster_nodes`
-//! hands it).
+//! originals. `ROSTER` (messaging/presence plan, P-C4; selection + compose
+//! added P-C5) and `PENDING` (P-C5) are later, distinct additions. ROSTER is
+//! presence over this box plus every registered peer, sourced from a
+//! throttled, backgrounded `who` dispatch (`app`'s "ROSTER" section covers
+//! the threading; this file only paints what `App::roster_flat_rows` hands
+//! it) — plus, since P-C5, selection and an `s`-to-compose affordance.
+//! PENDING is held `graph send`/A2A entries from `graph pending list`, a
+//! synchronous local read (`app`'s "PENDING" section) with `a`/`d`
+//! approve/deny.
 
 use crate::app::{App, DagRow, Panel};
 use crate::graphview;
@@ -116,7 +120,10 @@ fn keymap_hint(panel: Panel) -> &'static str {
         Panel::Projects => "j/k select · a add · d remove · Tab panel · ? help · q quit",
         Panel::Log => "Tab panel · ? help · q quit",
         Panel::Status => "Tab panel · ? help · q quit",
-        Panel::Roster => "r refresh (auto ~15s while open) · Tab panel · ? help · q quit",
+        Panel::Roster => {
+            "j/k select · s compose · r refresh (auto ~15s while open) · Tab panel · ? help · q quit"
+        }
+        Panel::Pending => "j/k select · a approve · d deny · Tab panel · ? help · q quit",
     }
 }
 
@@ -154,6 +161,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &App) {
         Panel::Log => draw_log(f, inner, app),
         Panel::Status => draw_status_panel(f, inner, app),
         Panel::Roster => draw_roster(f, inner, app),
+        Panel::Pending => draw_pending(f, inner, app),
     }
 }
 
@@ -634,7 +642,7 @@ fn palette_summary<'a>(app: &App) -> Line<'a> {
 // rather than inventing "as of".
 
 fn draw_roster(f: &mut Frame, area: Rect, app: &App) {
-    let nodes = app.roster_nodes();
+    let rows = app.roster_flat_rows();
 
     let parts = Layout::vertical([
         Constraint::Length(1), // glyph legend
@@ -652,7 +660,7 @@ fn draw_roster(f: &mut Frame, area: Rect, app: &App) {
     let status = Line::from(format!(" {}", app.roster_status())).style(theme::dim());
     f.render_widget(Paragraph::new(status), parts[1]);
 
-    if nodes.is_empty() {
+    if rows.is_empty() {
         let lines = vec![
             Line::from(""),
             Line::from("   no roster data yet — press r to fetch.").style(theme::dim()),
@@ -661,40 +669,116 @@ fn draw_roster(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    // A stateful list (P-C5 adds selection to C4's read-only pane) — same
+    // shape [`draw_sessions`] uses over the DAG's flattened rows.
     let pal = &app.palette;
-    let mut lines: Vec<Line> = Vec::new();
-    for n in &nodes {
-        let glyph = graph::glyph(&n.presence);
-        let head = match n.presence.as_str() {
-            "unreachable" => format!(
-                "{glyph} {} — unreachable (last seen {})",
-                n.name,
-                n.fetched_at.as_deref().unwrap_or("unknown")
-            ),
-            "never-pulled" => format!("{glyph} {} — never pulled", n.name),
-            _ if n.is_local => format!("{glyph} {} (this host)", n.name),
-            _ => format!("{glyph} {}", n.name),
-        };
-        lines.push(Line::from(Span::styled(
-            head,
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-        for (i, s) in n.sessions.iter().enumerate() {
-            let branch = if i + 1 == n.sessions.len() { "└─ " } else { "├─ " };
+    let accent = theme::accent(pal);
+    let items: Vec<ListItem> = rows.iter().map(|r| roster_row_item(r, pal)).collect();
+    let mut hl = Style::default().add_modifier(Modifier::REVERSED);
+    if let Some(c) = accent {
+        hl = hl.fg(c);
+    }
+    let list = List::new(items).highlight_style(hl);
+    let mut state = ListState::default();
+    state.select(Some(app.roster_sel.min(rows.len().saturating_sub(1))));
+    f.render_stateful_widget(list, parts[2], &mut state);
+}
+
+fn roster_row_item<'a>(row: &crate::app::RosterRow, pal: &crate::app::Palette) -> ListItem<'a> {
+    match row {
+        crate::app::RosterRow::NodeHeader { name, is_local, presence, fetched_at } => {
+            let glyph = graph::glyph(presence);
+            let head = match presence.as_str() {
+                "unreachable" => format!(
+                    "{glyph} {} — unreachable (last seen {})",
+                    name,
+                    fetched_at.as_deref().unwrap_or("unknown")
+                ),
+                "never-pulled" => format!("{glyph} {} — never pulled", name),
+                _ if *is_local => format!("{glyph} {} (this host)", name),
+                _ => format!("{glyph} {}", name),
+            };
+            ListItem::new(Line::from(Span::styled(
+                head,
+                Style::default().add_modifier(Modifier::BOLD),
+            )))
+        }
+        crate::app::RosterRow::Session { session: s, is_last } => {
+            let branch = if *is_last { "└─ " } else { "├─ " };
             let st = theme::state_style(&s.state, pal);
             let sg = theme::state_glyph(&s.state);
-            lines.push(Line::from(vec![
+            ListItem::new(Line::from(vec![
                 Span::raw(format!("  {branch}")),
                 Span::styled(format!("{sg} "), st),
                 Span::raw(format!("{}  ", s.label)),
                 Span::styled(s.state.clone(), st),
-            ]));
+            ]))
         }
-        if n.sessions.is_empty() && n.presence != "never-pulled" {
-            lines.push(Line::from("     (no sessions)").style(theme::dim()));
+        crate::app::RosterRow::Empty => {
+            ListItem::new(Line::from("     (no sessions)").style(theme::dim()))
         }
     }
-    f.render_widget(Paragraph::new(lines), parts[2]);
+}
+
+// ── [6] PENDING ──────────────────────────────────────────────────────────
+
+/// Held `graph send` / A2A entries (messaging/presence plan, P-C5) — rows
+/// from `graph pending list --json`, dispatched through the same injected
+/// `DispatchFn` as every other pane, never re-derived. `a`/`d` approve/deny
+/// the selected row; `id` in each row is an ARRAY POSITION, not a stable id
+/// (`conduct/src/graph/pending.rs`'s module doc), so [`App`] always re-lists
+/// immediately after a resolve — this view never trusts a row across one.
+fn draw_pending(f: &mut Frame, area: Rect, app: &App) {
+    let rows = app.pending_rows();
+
+    let parts = Layout::vertical([
+        Constraint::Length(1), // fetch status
+        Constraint::Min(3),    // pending list
+    ])
+    .split(area);
+
+    let status = Line::from(format!(" {}", app.pending_status())).style(theme::dim());
+    f.render_widget(Paragraph::new(status), parts[0]);
+
+    if rows.is_empty() {
+        let lines = vec![
+            Line::from(""),
+            Line::from("   nothing held — song/stage/pending.json is empty.").style(theme::dim()),
+        ];
+        f.render_widget(Paragraph::new(lines), parts[1]);
+        return;
+    }
+
+    let accent = theme::accent(&app.palette);
+    let items: Vec<ListItem> = rows.iter().map(pending_row_item).collect();
+    let mut hl = Style::default().add_modifier(Modifier::REVERSED);
+    if let Some(c) = accent {
+        hl = hl.fg(c);
+    }
+    let list = List::new(items).highlight_style(hl);
+    let mut state = ListState::default();
+    state.select(Some(app.pending_sel.min(rows.len().saturating_sub(1))));
+    f.render_stateful_widget(list, parts[1], &mut state);
+}
+
+fn pending_row_item<'a>(row: &crate::app::PendingRow) -> ListItem<'a> {
+    let marker = if row.state == "malformed" { "⚠ " } else { "" };
+    let from = row
+        .from
+        .as_deref()
+        .map(|f| format!(" (from {f})"))
+        .unwrap_or_default();
+    let submit = if row.submit { " [submit]" } else { "" };
+    let line = format!(
+        "[{}] {marker}{} ← {}{submit}{from}  ({})",
+        row.id, row.session_id, row.text, row.queued_at
+    );
+    let style = if row.state == "malformed" {
+        theme::dim()
+    } else {
+        Style::default()
+    };
+    ListItem::new(Line::from(Span::styled(line, style)))
 }
 
 // ── Log-tail overlay ────────────────────────────────────────────────────────
@@ -746,7 +830,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     let help: &[&str] = &[
         "",
         "  Tab / Shift-Tab   cycle panels",
-        "  1 2 3 4 5 6       DAG / SESSIONS / PROJECTS / LOG / STATUS / ROSTER",
+        "  1 2 3 4 5 6 7     DAG / SESSIONS / PROJECTS / LOG / STATUS / ROSTER / PENDING",
         "  j / k  ↓ / ↑      move selection",
         "",
         "  DAG (the visual graph)",
@@ -768,8 +852,13 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         "",
         "  PROJECTS: a add · d remove",
         "",
-        "  ROSTER (read-only): r forces a refresh; auto-probes every ~15s",
-        "    while the pane is open. ● online  ◐ unreachable  ○ never-pulled",
+        "  ROSTER: j/k select · s compose (send to the selected session)",
+        "    r forces a refresh; auto-probes every ~15s while the pane is",
+        "    open. ● online  ◐ unreachable  ○ never-pulled",
+        "",
+        "  PENDING: j/k select · a approve · d deny — held graph send/A2A",
+        "    entries; resolving always re-lists (ids are positions, not",
+        "    stable — they shift the moment any entry resolves)",
         "",
         "  ?                 toggle this help      q / Ctrl-C  quit",
         "  Every cue runs through the one door; the audit log records it.",
@@ -1316,6 +1405,69 @@ mod tests {
         assert!(
             out.contains("not yet fetched") && out.contains("press r"),
             "an empty cache tells the human how to get data: {out}"
+        );
+    }
+
+    // ── PENDING panel (P-C5) ─────────────────────────────────────────────
+
+    fn pending_fixture() -> aoide_protocol::output::Outcome {
+        let data = serde_json::json!({
+            "pending": [
+                {
+                    "id": "0", "sessionId": "s0", "text": "do the thing", "submit": true,
+                    "queuedAt": "2026-08-21T00:00:00Z", "from": "sakaki/root/brave-otter (…snd)",
+                    "state": "pending",
+                },
+                {
+                    "id": "1", "sessionId": "s1", "text": "status?", "submit": false,
+                    "queuedAt": "2026-08-21T00:05:00Z", "from": serde_json::Value::Null,
+                    "state": "pending",
+                },
+            ],
+        });
+        aoide_protocol::output::Outcome::ok("graph.pending.list", "2 pending").with_data(data)
+    }
+
+    #[test]
+    fn pending_panel_renders_rows_with_selection_highlight() {
+        let mut a = App::for_test(vec![], vec![], vec![]);
+        a.panel = Panel::Pending;
+        a.pending = Some(pending_fixture());
+        a.pending_sel = 1;
+
+        let backend = TestBackend::new(100, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &a)).unwrap();
+        let out = dump(term.backend().buffer());
+
+        assert!(out.contains("PENDING"), "panel title: {out}");
+        assert!(
+            out.contains("[0] s0 ← do the thing [submit] (from sakaki/root/brave-otter (…snd))"),
+            "first entry, full grammar: {out}"
+        );
+        assert!(
+            out.contains("[1] s1 ← status?"),
+            "second (selected) entry, no `from` tag since it queued anonymous: {out}"
+        );
+    }
+
+    #[test]
+    fn pending_panel_shows_the_empty_hint_when_the_queue_is_empty() {
+        let mut a = App::for_test(vec![], vec![], vec![]);
+        a.panel = Panel::Pending;
+        a.pending = Some(
+            aoide_protocol::output::Outcome::ok("graph.pending.list", "0 pending")
+                .with_data(serde_json::json!({ "pending": [] })),
+        );
+
+        let backend = TestBackend::new(80, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &a)).unwrap();
+        let out = dump(term.backend().buffer());
+
+        assert!(
+            out.contains("nothing held"),
+            "an empty queue tells the human, not a bare blank pane: {out}"
         );
     }
 }

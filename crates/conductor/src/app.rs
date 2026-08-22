@@ -31,14 +31,14 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Instant, SystemTime};
 
-/// The six panels, in Tab / 1-6 order. `Graph` is the visual DAG (the new hero
+/// The seven panels, in Tab / 1-7 order. `Graph` is the visual DAG (the new hero
 /// view — nodes/edges laid out and drawn); `Sessions` is the collapsible roster
 /// (the terminal-sessions view, keyed off [`App::dag_rows`]). The two are
 /// deliberately distinct lenses on the same data: `Graph` shows the *shape* of
 /// the DAG, `Sessions` the *state* of each terminal. `Roster` (messaging/
-/// presence plan, P-C4) is a distinct, later addition — appended last so the
-/// existing 1-5 keys never shift (registry append-only discipline,
-/// `pkgs/aoide/crates/AGENTS.md`).
+/// presence plan, P-C4) and `Pending` (P-C5) are later additions — each
+/// appended last so no earlier key ever shifts (registry append-only
+/// discipline, `pkgs/aoide/crates/AGENTS.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
     Graph,
@@ -47,16 +47,18 @@ pub enum Panel {
     Log,
     Status,
     Roster,
+    Pending,
 }
 
 impl Panel {
-    pub const ALL: [Panel; 6] = [
+    pub const ALL: [Panel; 7] = [
         Panel::Graph,
         Panel::Sessions,
         Panel::Projects,
         Panel::Log,
         Panel::Status,
         Panel::Roster,
+        Panel::Pending,
     ];
     pub fn title(self) -> &'static str {
         match self {
@@ -66,6 +68,7 @@ impl Panel {
             Panel::Log => "LOG",
             Panel::Status => "STATUS",
             Panel::Roster => "ROSTER",
+            Panel::Pending => "PENDING",
         }
     }
     pub fn index(self) -> usize {
@@ -114,6 +117,13 @@ pub enum InputKind {
     /// Link the named child session under the parent the prompt collects.
     Link {
         child: String,
+    },
+    /// Compose a message to `target` (messaging/presence plan, P-C5) — opened
+    /// by `s` on a selected ROSTER session row, pre-labeled with the row's own
+    /// display-grammar label. Submitting dispatches `graph send --to <target>
+    /// --yes -- <text>` ([`App::handle_input_key`]'s `Enter` arm).
+    Compose {
+        target: String,
     },
 }
 
@@ -213,6 +223,44 @@ pub struct RosterCache {
     fetched_at: Option<Instant>,
 }
 
+/// One flattened, selectable ROSTER row (P-C5 adds selection to C4's
+/// read-only pane) — a node header, one of its sessions, or the cosmetic
+/// "(no sessions)" filler a node with an empty session list renders. Mirrors
+/// [`DagRow`]'s "one Vec is the single source of truth for both render and
+/// key handling" shape, over `who`'s node/session tree instead of the DAG.
+/// `is_last` on `Session` is the tree-branch glyph's own lookahead
+/// (`└─`/`├─`), precomputed here so the render side never re-derives it.
+#[derive(Debug, Clone)]
+pub enum RosterRow {
+    NodeHeader {
+        name: String,
+        is_local: bool,
+        presence: String,
+        fetched_at: Option<String>,
+    },
+    Session {
+        session: RosterSession,
+        is_last: bool,
+    },
+    Empty,
+}
+
+/// One row of the PENDING panel — reshaped straight from `graph pending
+/// list --json`'s `data.pending[]` (`conduct/src/graph/pending.rs::entry_view`),
+/// never re-derived: `id` is the entry's ARRAY POSITION, not a stable id (see
+/// that module's doc) — `App`'s a/d handlers must always re-list immediately
+/// after a resolve rather than trusting a row built before it.
+#[derive(Debug, Clone, Default)]
+pub struct PendingRow {
+    pub id: String,
+    pub session_id: String,
+    pub text: String,
+    pub submit: bool,
+    pub queued_at: String,
+    pub from: Option<String>,
+    pub state: String,
+}
+
 /// The whole conductor state.
 pub struct App {
     pub panel: Panel,
@@ -264,6 +312,15 @@ pub struct App {
     /// [`App::drain_roster`]. See the module doc's "Roster: throttled,
     /// backgrounded dispatch" for why this exists at all.
     roster_rx: Option<mpsc::Receiver<Outcome>>,
+    /// Selected row in the ROSTER panel (indexes [`App::roster_flat_rows`]).
+    pub roster_sel: usize,
+    /// The PENDING panel's cache — last `graph pending list` [`Outcome`]. No
+    /// throttle metadata (unlike [`RosterCache`]): a local file read refreshes
+    /// synchronously on the same cadence every other local pane uses (see
+    /// [`App::refresh_pending`]).
+    pub pending: Option<Outcome>,
+    /// Selected row in the PENDING panel (indexes [`App::pending_rows`]).
+    pub pending_sel: usize,
 }
 
 /// How many audit lines the LOG panel keeps in memory.
@@ -323,6 +380,9 @@ impl App {
             dispatch_fn: no_dispatch,
             roster: RosterCache::default(),
             roster_rx: None,
+            roster_sel: 0,
+            pending: None,
+            pending_sel: 0,
         }
     }
 
@@ -393,6 +453,12 @@ impl App {
         self.hooks = h.hooks;
         self.palette = load_palette(&stage_notes_path(&dir));
         self.reload_log();
+        // A local read through the dispatcher (P-C5) — `reload_all` runs
+        // synchronously right after every mutating `App::dispatch`, so this
+        // is what makes "re-list after every pending resolve" true: by the
+        // time `handle_key`'s a/d handler returns, `self.pending` already
+        // reflects the post-resolve queue, positions and all.
+        self.refresh_pending();
 
         self.mtimes = StageMtimes {
             sessions: Self::mtime(&dir.join("sessions.json")),
@@ -533,6 +599,12 @@ impl App {
             changed = true;
         }
 
+        // PENDING: same "independent of the stage-mtime watch" reasoning as
+        // ROSTER above, minus the throttle — see the "PENDING" section.
+        if self.poll_pending() {
+            changed = true;
+        }
+
         changed
     }
 
@@ -661,6 +733,31 @@ impl App {
             .collect()
     }
 
+    /// [`App::roster_nodes`] flattened into one selectable `Vec` (P-C5 adds
+    /// selection to C4's read-only pane) — the same "one row model for
+    /// render + keys" shape [`App::dag_rows`] already uses over the DAG,
+    /// here over `who`'s node/session tree. `roster_sel` indexes this, never
+    /// `roster_nodes()`'s nested shape directly.
+    pub fn roster_flat_rows(&self) -> Vec<RosterRow> {
+        let mut rows = Vec::new();
+        for n in self.roster_nodes() {
+            rows.push(RosterRow::NodeHeader {
+                name: n.name,
+                is_local: n.is_local,
+                presence: n.presence.clone(),
+                fetched_at: n.fetched_at,
+            });
+            let len = n.sessions.len();
+            if len == 0 && n.presence != "never-pulled" {
+                rows.push(RosterRow::Empty);
+            }
+            for (i, s) in n.sessions.into_iter().enumerate() {
+                rows.push(RosterRow::Session { session: s, is_last: i + 1 == len });
+            }
+        }
+        rows
+    }
+
     /// A one-line fetch status for the pane header: probing, freshly
     /// fetched, never fetched yet, or — when `who` itself came back
     /// non-`Ok` — that error, in the same `[tag] command: message` shape
@@ -681,6 +778,86 @@ impl App {
             (None, false) => "not yet fetched — press r".to_string(),
             (Some(t), true) => format!("probing… (last fetched {}s ago)", t.elapsed().as_secs()),
             (Some(t), false) => format!("fetched {}s ago", t.elapsed().as_secs()),
+        }
+    }
+
+    // ── PENDING: `graph pending list` through the dispatcher (P-C5) ─────────
+    //
+    // Unlike ROSTER's `who`, `graph pending list` is a local file read (no
+    // network) — refreshing it costs one JSON parse of `song/stage/pending.json`,
+    // not a ~2s-per-peer probe. So there is no throttle window and no
+    // background thread here: [`App::refresh_pending`] runs synchronously,
+    // called from `reload_all` (which fires after every dispatch — this is
+    // what makes "re-list after every resolve" true) and from
+    // [`App::poll_pending`] every tick while the pane is visible.
+
+    /// Refresh `self.pending` via the injected dispatcher — `graph pending
+    /// list`'s malformed-entry detection and display-grammar rendering stay
+    /// in `conduct::graph::pending` (`crates/AGENTS.md`'s "no cross-crate
+    /// copying"); this only reshapes the JSON it already computed.
+    fn refresh_pending(&mut self) {
+        let inv = Invocation {
+            path: vec!["graph".to_string(), "pending".to_string(), "list".to_string()],
+            args: Vec::new(),
+            flags: BTreeMap::from([("json".to_string(), "true".to_string())]),
+            door: Door::Cli,
+        };
+        self.pending = Some((self.dispatch_fn)(&inv));
+    }
+
+    /// Tick-driven pending refresh: only while the pane is the VISIBLE panel
+    /// (a tick it isn't showing never bothers). Always reports a repaint
+    /// while visible — cheap enough that, unlike ROSTER, there is no
+    /// staleness gate to check first.
+    fn poll_pending(&mut self) -> bool {
+        if self.panel == Panel::Pending {
+            self.refresh_pending();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The PENDING panel's rows, parsed from the cached `graph pending list`
+    /// [`Outcome`] (never re-derived). `id` is each entry's ARRAY POSITION —
+    /// see [`PendingRow`]'s doc — so a caller must re-fetch (which
+    /// [`App::dispatch`] already does via `reload_all`) before trusting a
+    /// row built from a previous fetch.
+    pub fn pending_rows(&self) -> Vec<PendingRow> {
+        let Some(data) = self.pending.as_ref().and_then(|o| o.data.as_ref()) else {
+            return Vec::new();
+        };
+        let arr = data
+            .get("pending")
+            .and_then(|v| v.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or(&[]);
+        arr.iter()
+            .map(|v| PendingRow {
+                id: v["id"].as_str().unwrap_or("").to_string(),
+                session_id: v["sessionId"].as_str().unwrap_or("").to_string(),
+                text: v["text"].as_str().unwrap_or("").to_string(),
+                submit: v["submit"].as_bool().unwrap_or(false),
+                queued_at: v["queuedAt"].as_str().unwrap_or("").to_string(),
+                from: v["from"].as_str().map(String::from),
+                state: v["state"].as_str().unwrap_or("pending").to_string(),
+            })
+            .collect()
+    }
+
+    /// A one-line status for the pane header — mirrors [`App::roster_status`]'s
+    /// non-`Ok` surfacing (P-C4 review nit, same rule here): a failed
+    /// `graph pending list` (a corrupt `pending.json` file, not a malformed
+    /// individual entry — that lists fine with `state: "malformed"`) must not
+    /// silently render as an empty, all-clear queue.
+    pub fn pending_status(&self) -> String {
+        match self.pending.as_ref() {
+            Some(o) if o.status != Status::Ok => {
+                let first = o.message.lines().next().unwrap_or("");
+                format!("[{}] {}: {first}", status_tag(o.status), o.command)
+            }
+            Some(o) => o.message.lines().next().unwrap_or("").to_string(),
+            None => "not yet fetched".to_string(),
         }
     }
 
@@ -797,6 +974,14 @@ impl App {
         if self.graph_sel >= n_nodes.max(1) {
             self.graph_sel = n_nodes.saturating_sub(1);
         }
+        let n_roster = self.roster_flat_rows().len();
+        if self.roster_sel >= n_roster.max(1) {
+            self.roster_sel = n_roster.saturating_sub(1);
+        }
+        let n_pending = self.pending_rows().len();
+        if self.pending_sel >= n_pending.max(1) {
+            self.pending_sel = n_pending.saturating_sub(1);
+        }
     }
 
     // ── Panel switching ─────────────────────────────────────────────────────
@@ -804,11 +989,16 @@ impl App {
     /// Switch panels. Landing on ROSTER with a stale (or never-fetched)
     /// cache fires one immediate background fetch rather than waiting for
     /// the next ~500ms tick — the pane should not open to a blank "not yet
-    /// fetched" that then sits idle for up to 15s.
+    /// fetched" that then sits idle for up to 15s. Landing on PENDING fires
+    /// an immediate SYNCHRONOUS refresh instead (it's a local read, no
+    /// background thread needed — see the "PENDING" section).
     pub fn select_panel(&mut self, p: Panel) {
         self.panel = p;
         if p == Panel::Roster && self.roster_stale() {
             self.spawn_roster_fetch();
+        }
+        if p == Panel::Pending {
+            self.refresh_pending();
         }
     }
     pub fn next_panel(&mut self) {
@@ -832,10 +1022,18 @@ impl App {
     /// mutates anything — and it fires on the keypress itself, not on the next
     /// tick, so a cue (Enter → `graph focus` → hyprctl) lands instantly.
     pub fn dispatch(&mut self, path: &[&str], args: &[String]) {
+        self.dispatch_with_flags(path, args, BTreeMap::new());
+    }
+
+    /// Like [`App::dispatch`] but with flags — the compose flow (P-C5) needs
+    /// `--to`/`--yes` on `graph send`, which plain positional args can't
+    /// carry. Kept as a separate method rather than widening `dispatch`'s
+    /// signature so the six existing flag-less call sites stay untouched.
+    pub fn dispatch_with_flags(&mut self, path: &[&str], args: &[String], flags: BTreeMap<String, String>) {
         let inv = Invocation {
             path: path.iter().map(|s| s.to_string()).collect(),
             args: args.to_vec(),
-            flags: BTreeMap::new(),
+            flags,
             door: Door::Cli,
         };
         let outcome = (self.dispatch_fn)(&inv);
@@ -915,18 +1113,98 @@ impl App {
             Panel::Sessions => self.handle_dag_key(key),
             Panel::Projects => self.handle_projects_key(key),
             Panel::Roster => self.handle_roster_key(key),
+            Panel::Pending => self.handle_pending_key(key),
             Panel::Log | Panel::Status => {} // read-only panels
         }
     }
 
-    /// Keys for the ROSTER panel — read-only (messaging/presence plan
-    /// P-C4): the one action is `r`, a manual refresh that FORCES a fetch
-    /// regardless of the throttle window (unlike the tick-driven path,
-    /// which only fires past [`ROSTER_THROTTLE`]). Still a no-op while a
-    /// fetch is already in flight — [`App::spawn_roster_fetch`]'s own guard.
+    /// Keys for the ROSTER panel (messaging/presence plan P-C4; selection +
+    /// compose added P-C5): `r` forces a fetch regardless of the throttle
+    /// window (unlike the tick-driven path, which only fires past
+    /// [`ROSTER_THROTTLE`]) — a no-op while a fetch is already in flight
+    /// ([`App::spawn_roster_fetch`]'s own guard). `j`/`k` walk
+    /// [`App::roster_flat_rows`], the same flattened-row selection style
+    /// [`App::handle_dag_key`] uses over the DAG. `s` opens the compose
+    /// prompt on the selected session row ([`App::open_compose`]).
     fn handle_roster_key(&mut self, key: KeyEvent) {
-        if key.code == KeyCode::Char('r') {
-            self.spawn_roster_fetch();
+        match key.code {
+            KeyCode::Char('r') => self.spawn_roster_fetch(),
+            KeyCode::Char('j') | KeyCode::Down => {
+                let n = self.roster_flat_rows().len();
+                if n > 0 && self.roster_sel + 1 < n {
+                    self.roster_sel += 1;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.roster_sel = self.roster_sel.saturating_sub(1);
+            }
+            KeyCode::Char('s') => self.open_compose(),
+            _ => {}
+        }
+    }
+
+    /// `s` on a selected ROSTER session row opens the compose prompt
+    /// ([`InputKind::Compose`]), pre-labeled with the row's own
+    /// display-grammar label — the exact string `who` already computed and
+    /// the exact string `graph send --to <target>` resolves back to a
+    /// session (petname, tail4, host/role/petname — whatever `who` rendered).
+    /// A no-op on a node-header or empty-node row: there is no session to
+    /// address, and the frontend never invents one.
+    fn open_compose(&mut self) {
+        let rows = self.roster_flat_rows();
+        if let Some(RosterRow::Session { session, .. }) = rows.get(self.roster_sel) {
+            let target = session.label.clone();
+            self.input = Some(Input {
+                label: format!("send to {target}"),
+                buffer: String::new(),
+                step: 0,
+                collected: Vec::new(),
+                kind: InputKind::Compose { target },
+            });
+        }
+    }
+
+    /// Keys for the PENDING panel (P-C5): `j`/`k` walk [`App::pending_rows`];
+    /// `a`/`d` approve/deny the selected row. `Invocation.args` carries the
+    /// entry's `id` — its ARRAY POSITION, not a stable id
+    /// (`conduct/src/graph/pending.rs`'s module doc) — so [`App::dispatch`]'s
+    /// `reload_all` -> `refresh_pending` re-list, which runs synchronously
+    /// before the next paint, is not an optimization: it is what keeps a
+    /// second a/d keypress in the same visit from resolving whatever now
+    /// sits at a STALE selected index instead of the row on screen.
+    fn handle_pending_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                let n = self.pending_rows().len();
+                if n > 0 && self.pending_sel + 1 < n {
+                    self.pending_sel += 1;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.pending_sel = self.pending_sel.saturating_sub(1);
+            }
+            KeyCode::Char('a') => self.resolve_pending("approve"),
+            KeyCode::Char('d') => self.resolve_pending("deny"),
+            _ => {}
+        }
+    }
+
+    /// Approve or deny the selected PENDING row, then clamp the cursor —
+    /// `dispatch` has already re-listed by the time this returns (see
+    /// [`App::handle_pending_key`]'s doc), so a shrunk queue never leaves
+    /// `pending_sel` pointing past the end. A no-op on an empty list
+    /// (nothing selected to resolve) rather than a panic; the door itself
+    /// (not this frontend) is what rejects a malformed entry.
+    fn resolve_pending(&mut self, verb: &'static str) {
+        let rows = self.pending_rows();
+        let Some(row) = rows.get(self.pending_sel) else {
+            return;
+        };
+        let id = row.id.clone();
+        self.dispatch(&["graph", "pending", verb], &[id]);
+        let n = self.pending_rows().len();
+        if self.pending_sel >= n.max(1) {
+            self.pending_sel = n.saturating_sub(1);
         }
     }
 
@@ -1146,6 +1424,27 @@ impl App {
                     // The dispatcher owns the guardrails (cycle check,
                     // missing-child) — we just hand it the edge.
                     self.dispatch(&["graph", "link"], &[child, parent]);
+                }
+                InputKind::Compose { target } => {
+                    let text = input.buffer.trim().to_string();
+                    if text.is_empty() {
+                        self.input = Some(input); // stay until a message is given
+                        return;
+                    }
+                    // `args: vec![text]` round-trips the exact text through
+                    // `session_send`'s own `inv.args.join(" ")`, whitespace
+                    // and all — the same one-element-vec pattern
+                    // `pending_approve`'s in-process re-drive uses
+                    // (`conduct/src/graph/pending.rs`). `--yes` is a
+                    // documented no-op for a REMOTE target (the receiving
+                    // peer gates its own delivery); `deliver_remote` folds
+                    // that note straight into the Outcome message, so
+                    // `status_message` surfaces it same as any other
+                    // dispatch — no special-casing needed here.
+                    let mut flags = BTreeMap::new();
+                    flags.insert("to".to_string(), target);
+                    flags.insert("yes".to_string(), "true".to_string());
+                    self.dispatch_with_flags(&["graph", "send"], &[text], flags);
                 }
             },
             _ => {
@@ -1591,7 +1890,7 @@ mod tests {
     // the real `App::poll_refresh`/`select_panel`/`handle_key` call sites
     // rather than a lower-level decision helper.
 
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -1798,5 +2097,283 @@ mod tests {
             app.roster_nodes().is_empty(),
             "an error Outcome carries no `data`, so no rows — the status line is the only signal"
         );
+    }
+
+    // ── ROSTER: selection mechanics (P-C5) ───────────────────────────────
+
+    #[test]
+    fn roster_selection_walks_flat_rows_and_clamps_at_both_ends() {
+        let mut app = App::for_test(Vec::new(), Vec::new(), Vec::new());
+        app.panel = Panel::Roster;
+        app.roster.outcome = Some(who_fixture_two_nodes());
+        // sakaki (header) + s1 (session) + yomi-strix (header) + s2 (session) = 4 rows.
+        assert_eq!(app.roster_flat_rows().len(), 4);
+
+        assert_eq!(app.roster_sel, 0);
+        app.handle_key(KeyEvent::from(KeyCode::Char('j')));
+        assert_eq!(app.roster_sel, 1);
+        for _ in 0..10 {
+            app.handle_key(KeyEvent::from(KeyCode::Char('j')));
+        }
+        assert_eq!(app.roster_sel, 3, "j never walks past the last row");
+
+        for _ in 0..10 {
+            app.handle_key(KeyEvent::from(KeyCode::Char('k')));
+        }
+        assert_eq!(app.roster_sel, 0, "k never walks before the first row");
+    }
+
+    fn who_fixture_two_nodes() -> Outcome {
+        let data = json!({
+            "host": "sakaki",
+            "generatedAt": "t",
+            "nodes": [
+                {
+                    "name": "sakaki", "isLocal": true, "presence": "online",
+                    "fetchedAt": null, "error": null,
+                    "sessions": [
+                        {"sessionId": "s1", "label": "sakaki/root/brave-otter (…s1)", "petname": "brave-otter",
+                         "agent": "claude", "state": "working", "presence": "online", "cwd": "/x"},
+                    ],
+                },
+                {
+                    "name": "yomi-strix", "isLocal": false, "presence": "online",
+                    "fetchedAt": "t", "error": null,
+                    "sessions": [
+                        {"sessionId": "s2", "label": "yomi-strix/root/misty-comet (…s2)", "petname": "misty-comet",
+                         "agent": "claude", "state": "idle", "presence": "online", "cwd": "/y"},
+                    ],
+                },
+            ],
+        });
+        Outcome::ok("who", "2 node(s), 2 session(s)").with_data(data)
+    }
+
+    // ── Compose: `s` on a ROSTER session row (P-C5) ──────────────────────
+
+    static COMPOSE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static COMPOSE_CALLS: Mutex<Vec<(Vec<String>, Vec<String>, BTreeMap<String, String>)>> =
+        Mutex::new(Vec::new());
+
+    fn recording_compose_dispatch(inv: &Invocation) -> Outcome {
+        COMPOSE_CALLS
+            .lock()
+            .unwrap()
+            .push((inv.path.clone(), inv.args.clone(), inv.flags.clone()));
+        Outcome::ok("graph.send", "delivered")
+    }
+
+    #[test]
+    fn compose_builds_the_exact_expected_invocation() {
+        let _g = COMPOSE_TEST_LOCK.lock().unwrap();
+        COMPOSE_CALLS.lock().unwrap().clear();
+
+        with_isolated_stage(|| {
+            let mut app = App::for_test_with_dispatch(recording_compose_dispatch);
+            app.panel = Panel::Roster;
+            app.roster.outcome = Some(who_fixture_two_nodes());
+            app.roster_sel = 1; // the s1 session row (index 1: header, session, header, session)
+
+            app.handle_key(KeyEvent::from(KeyCode::Char('s')));
+            let input = app.input.as_ref().expect("`s` on a session row opens compose");
+            assert_eq!(input.label, "send to sakaki/root/brave-otter (…s1)");
+            assert_eq!(
+                input.kind,
+                InputKind::Compose { target: "sakaki/root/brave-otter (…s1)".to_string() }
+            );
+
+            for c in "hi".chars() {
+                app.handle_key(KeyEvent::from(KeyCode::Char(c)));
+            }
+            app.handle_key(KeyEvent::from(KeyCode::Enter));
+
+            assert!(app.input.is_none(), "submit closes the prompt");
+            let calls = COMPOSE_CALLS.lock().unwrap();
+            let send_call = calls
+                .iter()
+                .find(|(path, ..)| path == &vec!["graph".to_string(), "send".to_string()])
+                .expect("a graph send dispatch was recorded");
+            assert_eq!(send_call.1, vec!["hi".to_string()], "text rides as a single positional arg");
+            let mut expected_flags = BTreeMap::new();
+            expected_flags.insert("to".to_string(), "sakaki/root/brave-otter (…s1)".to_string());
+            expected_flags.insert("yes".to_string(), "true".to_string());
+            assert_eq!(send_call.2, expected_flags);
+        });
+    }
+
+    #[test]
+    fn s_on_a_node_header_row_is_a_no_op() {
+        let mut app = App::for_test_with_dispatch(recording_compose_dispatch);
+        app.panel = Panel::Roster;
+        app.roster.outcome = Some(who_fixture_two_nodes());
+        app.roster_sel = 0; // the sakaki header row, not a session
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('s')));
+
+        assert!(app.input.is_none(), "no session under the cursor — nothing to compose to");
+    }
+
+    // ── PENDING: verb spellings, id-as-position, re-list mechanics (P-C5) ─
+
+    static PENDING_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static PENDING_CALLS: Mutex<Vec<(String, Vec<String>)>> = Mutex::new(Vec::new());
+    static PENDING_QUEUE: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new()); // (sessionId, text)
+
+    /// A fake `graph pending list|approve|deny` over `PENDING_QUEUE` — proves
+    /// the dispatch-order and re-list mechanics without touching real stage
+    /// files. `list` renders whatever is currently in the queue (so a
+    /// caller's own re-list after approve/deny sees the shrunk array,
+    /// positions and all — mirroring the real door's behaviour exactly).
+    fn recording_pending_dispatch(inv: &Invocation) -> Outcome {
+        let path = inv.path.join(".");
+        PENDING_CALLS.lock().unwrap().push((path.clone(), inv.args.clone()));
+        match path.as_str() {
+            "graph.pending.list" => {
+                let q = PENDING_QUEUE.lock().unwrap();
+                let pending: Vec<Value> = q
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (sid, text))| {
+                        json!({
+                            "id": i.to_string(), "sessionId": sid, "text": text, "submit": false,
+                            "queuedAt": "t", "from": Value::Null, "state": "pending",
+                        })
+                    })
+                    .collect();
+                let n = pending.len();
+                Outcome::ok("graph.pending.list", format!("{n} pending"))
+                    .with_data(json!({ "pending": pending }))
+            }
+            "graph.pending.approve" | "graph.pending.deny" => {
+                let idx: usize = inv.args[0].parse().unwrap_or(usize::MAX);
+                let mut q = PENDING_QUEUE.lock().unwrap();
+                if idx < q.len() {
+                    let (sid, _) = q.remove(idx);
+                    Outcome::ok(path.clone(), format!("resolved {sid}"))
+                } else {
+                    Outcome::error(path.clone(), format!("no pending entry at index {idx}"))
+                }
+            }
+            other => Outcome::usage("test", format!("unexpected path {other}")),
+        }
+    }
+
+    #[test]
+    fn approve_dispatches_pending_approve_then_relists_and_positions_shift() {
+        let _g = PENDING_TEST_LOCK.lock().unwrap();
+        PENDING_CALLS.lock().unwrap().clear();
+        *PENDING_QUEUE.lock().unwrap() =
+            vec![("s0".into(), "a".into()), ("s1".into(), "b".into()), ("s2".into(), "c".into())];
+
+        with_isolated_stage(|| {
+            let mut app = App::for_test_with_dispatch(recording_pending_dispatch);
+            app.select_panel(Panel::Pending); // immediate synchronous fetch — no tick needed
+            assert_eq!(app.pending_rows().len(), 3);
+            app.pending_sel = 0; // s0, the entry at position 0
+
+            app.handle_key(KeyEvent::from(KeyCode::Char('a'))); // approve
+
+            let calls = PENDING_CALLS.lock().unwrap();
+            let last_two = &calls[calls.len() - 2..];
+            assert_eq!(last_two[0], ("graph.pending.approve".to_string(), vec!["0".to_string()]));
+            assert_eq!(last_two[1], ("graph.pending.list".to_string(), Vec::<String>::new()));
+            drop(calls);
+
+            // Positions shifted: s1 (was index 1) is now at index 0.
+            let rows = app.pending_rows();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].session_id, "s1");
+            assert_eq!(rows[1].session_id, "s2");
+        });
+    }
+
+    #[test]
+    fn deny_dispatches_pending_deny_then_relists() {
+        let _g = PENDING_TEST_LOCK.lock().unwrap();
+        PENDING_CALLS.lock().unwrap().clear();
+        *PENDING_QUEUE.lock().unwrap() = vec![("s0".into(), "a".into()), ("s1".into(), "b".into())];
+
+        with_isolated_stage(|| {
+            let mut app = App::for_test_with_dispatch(recording_pending_dispatch);
+            app.select_panel(Panel::Pending);
+            app.pending_sel = 0;
+
+            app.handle_key(KeyEvent::from(KeyCode::Char('d'))); // deny
+
+            let calls = PENDING_CALLS.lock().unwrap();
+            let last_two = &calls[calls.len() - 2..];
+            assert_eq!(last_two[0], ("graph.pending.deny".to_string(), vec!["0".to_string()]));
+            assert_eq!(last_two[1], ("graph.pending.list".to_string(), Vec::<String>::new()));
+            drop(calls);
+
+            let rows = app.pending_rows();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].session_id, "s1");
+        });
+    }
+
+    #[test]
+    fn a_second_approve_after_the_first_resolves_the_row_now_at_the_cursor_not_a_stale_one() {
+        // The invariant the module doc states as a constraint: without the
+        // re-list, a second a/d in the same visit would resolve whatever
+        // WAS at the selected index before the first resolve, not what's
+        // there now. Three entries, approve twice at index 0: must take s0
+        // then s1 (never s0 twice, never skip to s2).
+        let _g = PENDING_TEST_LOCK.lock().unwrap();
+        PENDING_CALLS.lock().unwrap().clear();
+        *PENDING_QUEUE.lock().unwrap() =
+            vec![("s0".into(), "a".into()), ("s1".into(), "b".into()), ("s2".into(), "c".into())];
+
+        with_isolated_stage(|| {
+            let mut app = App::for_test_with_dispatch(recording_pending_dispatch);
+            app.select_panel(Panel::Pending);
+            app.pending_sel = 0;
+
+            app.handle_key(KeyEvent::from(KeyCode::Char('a')));
+            app.handle_key(KeyEvent::from(KeyCode::Char('a')));
+
+            let rows = app.pending_rows();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].session_id, "s2", "s0 then s1 were taken — never a stale re-resolve");
+        });
+    }
+
+    #[test]
+    fn resolve_on_an_empty_pending_list_does_not_panic() {
+        let _g = PENDING_TEST_LOCK.lock().unwrap();
+        PENDING_CALLS.lock().unwrap().clear();
+        *PENDING_QUEUE.lock().unwrap() = Vec::new();
+
+        let mut app = App::for_test_with_dispatch(recording_pending_dispatch);
+        app.select_panel(Panel::Pending);
+        assert!(app.pending_rows().is_empty());
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('a'))); // must not panic
+        app.handle_key(KeyEvent::from(KeyCode::Char('d'))); // must not panic
+
+        assert!(app.pending_rows().is_empty());
+        // Neither key dispatched an approve/deny — nothing was selected.
+        let calls = PENDING_CALLS.lock().unwrap();
+        assert!(calls.iter().all(|(p, _)| p == "graph.pending.list"));
+    }
+
+    #[test]
+    fn pending_selection_walks_rows_and_clamps() {
+        let _g = PENDING_TEST_LOCK.lock().unwrap();
+        PENDING_CALLS.lock().unwrap().clear();
+        *PENDING_QUEUE.lock().unwrap() = vec![("s0".into(), "a".into()), ("s1".into(), "b".into())];
+
+        let mut app = App::for_test_with_dispatch(recording_pending_dispatch);
+        app.select_panel(Panel::Pending);
+
+        assert_eq!(app.pending_sel, 0);
+        app.handle_key(KeyEvent::from(KeyCode::Char('j')));
+        assert_eq!(app.pending_sel, 1);
+        app.handle_key(KeyEvent::from(KeyCode::Char('j')));
+        assert_eq!(app.pending_sel, 1, "j never walks past the last row");
+        app.handle_key(KeyEvent::from(KeyCode::Char('k')));
+        assert_eq!(app.pending_sel, 0);
+        app.handle_key(KeyEvent::from(KeyCode::Char('k')));
+        assert_eq!(app.pending_sel, 0, "k never walks before the first row");
     }
 }
