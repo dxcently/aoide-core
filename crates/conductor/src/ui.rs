@@ -1423,9 +1423,17 @@ mod tests {
                     "queuedAt": "2026-08-21T00:05:00Z", "from": serde_json::Value::Null,
                     "state": "pending",
                 },
+                {
+                    // The `is_malformed` shape `conduct/src/graph/pending.rs::entry_view`
+                    // renders for a stale hand-edited entry: `sessionId`/`queuedAt` empty,
+                    // `text` carrying the raw dumped value, `state: "malformed"`.
+                    "id": "2", "sessionId": "", "text": "<malformed entry>", "submit": false,
+                    "queuedAt": "", "from": serde_json::Value::Null,
+                    "state": "malformed",
+                },
             ],
         });
-        aoide_protocol::output::Outcome::ok("graph.pending.list", "2 pending").with_data(data)
+        aoide_protocol::output::Outcome::ok("graph.pending.list", "3 pending").with_data(data)
     }
 
     #[test]
@@ -1448,6 +1456,10 @@ mod tests {
         assert!(
             out.contains("[1] s1 ← status?"),
             "second (selected) entry, no `from` tag since it queued anonymous: {out}"
+        );
+        assert!(
+            out.contains("[2] ⚠") && out.contains("<malformed entry>"),
+            "a malformed entry renders its warning marker, not silently: {out}"
         );
     }
 

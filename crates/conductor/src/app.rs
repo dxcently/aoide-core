@@ -688,6 +688,17 @@ impl App {
     /// showing never starts a probe.
     fn poll_roster(&mut self) -> bool {
         let mut changed = self.drain_roster();
+        if changed {
+            // A landed fetch can SHRINK the roster (a peer went unreachable,
+            // a session ended) — `roster_sel` was clamped against the OLD
+            // row count. `reload_all`/`poll_refresh`'s stage-mtime path
+            // clamps after every reload, but a background `who` completing
+            // is the one mutation that bypasses both (review nit): without
+            // this, render's `.min()` would visibly highlight the last row
+            // while `open_compose`'s raw `.get(self.roster_sel)` silently
+            // no-ops `s` against a row that no longer exists at that index.
+            self.clamp_selection();
+        }
         if self.panel == Panel::Roster && self.roster_stale() {
             self.spawn_roster_fetch();
             changed = true; // a fresh "probing…" status is itself a repaint
@@ -2121,6 +2132,54 @@ mod tests {
             app.handle_key(KeyEvent::from(KeyCode::Char('k')));
         }
         assert_eq!(app.roster_sel, 0, "k never walks before the first row");
+    }
+
+    #[test]
+    fn a_landed_background_fetch_that_shrinks_the_roster_clamps_selection_so_compose_never_silently_no_ops(
+    ) {
+        // Review nit: `drain_roster`/`poll_roster` (the background `who`
+        // fetch completing) is the one mutation that bypassed
+        // `clamp_selection` — `reload_all` and `poll_refresh`'s
+        // stage-mtime-gated block both call it, this path didn't. Start on
+        // the LAST row of a 4-row roster, land a fetch that shrinks to 2
+        // rows, and prove both that the cursor is clamped AND that `s`
+        // then composes against the row actually on screen (index 1, s1) —
+        // not silently no-op against the stale pre-shrink index 3, which is
+        // exactly the bug: render's `.min()` would still highlight row 1
+        // while `open_compose`'s raw `.get(3)` found nothing.
+        let mut app = App::for_test(Vec::new(), Vec::new(), Vec::new());
+        app.panel = Panel::Roster;
+        app.roster.outcome = Some(who_fixture_two_nodes());
+        app.roster_sel = 3; // yomi-strix/s2 — about to vanish in the shrink
+
+        // Populate the exact channel `spawn_roster_fetch` uses, as if a
+        // background fetch just landed — deterministic, no thread race.
+        let (tx, rx) = mpsc::channel();
+        let shrunk = Outcome::ok("who", "1 node(s), 1 session(s)").with_data(json!({
+            "host": "sakaki", "generatedAt": "t",
+            "nodes": [
+                {
+                    "name": "sakaki", "isLocal": true, "presence": "online",
+                    "fetchedAt": null, "error": null,
+                    "sessions": [
+                        {"sessionId": "s1", "label": "sakaki/root/brave-otter (…s1)", "petname": "brave-otter",
+                         "agent": "claude", "state": "working", "presence": "online", "cwd": "/x"},
+                    ],
+                },
+            ],
+        }));
+        tx.send(shrunk).unwrap();
+        app.roster_rx = Some(rx);
+
+        let changed = app.poll_roster();
+
+        assert!(changed, "a landed fetch is a repaint");
+        assert_eq!(app.roster_flat_rows().len(), 2, "header + the one remaining session");
+        assert_eq!(app.roster_sel, 1, "clamped onto the new last row, not left at the stale index 3");
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('s')));
+        let input = app.input.as_ref().expect("`s` composes against the row actually on screen");
+        assert_eq!(input.label, "send to sakaki/root/brave-otter (…s1)");
     }
 
     fn who_fixture_two_nodes() -> Outcome {
