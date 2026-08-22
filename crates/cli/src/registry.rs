@@ -135,6 +135,7 @@ mod tests {
             "update",
             "usage",
             "vault.add",
+            "vault.enroll",
             "vault.exec",
             "vault.grant",
             "vault.revoke",

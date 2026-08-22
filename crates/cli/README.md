@@ -14,8 +14,8 @@ correspondence").
 - `cli`/`dispatch` — argv parsing and the dispatcher, over
   `aoide_protocol::door::run`'s shared skeleton with core's own `special`
   hook (`mcp serve --stdio`, `a2a serve`, `vault serve`, `vault exec`,
-  `conductor`, `guide`/`schema` raw output).
-- `registry` — the golden command-path snapshot test (58 paths).
+  `vault enroll`, `conductor`, `guide`/`schema` raw output).
+- `registry` — the golden command-path snapshot test (59 paths).
 - `guide` — `aoide guide`, the onboarding tier map.
 - `commands` — the three root-coupled groups that must read the ASSEMBLED
   registry: `meta` (guide/schema), `stubs` (not-yet-implemented
@@ -34,7 +34,7 @@ depends on it.
 
 ## How it composes
 
-58 command paths (core's headless-capable, agent-orchestration surface: the
+59 command paths (core's headless-capable, agent-orchestration surface: the
 project/session graph, A2A, peers, presence, the daemon, usage, hooks, the
 message inbox, the vault secrets broker). Never depends on
 `aoide-song`/`aoide-screen` — painting is `lyra`'s bundle, assembled the

@@ -25,14 +25,16 @@
   Don't set `untrusted_data` on a Secret-classed `AuditRecord` expecting it
   to ride through; it won't, and the strip is the safety net, not the
   design.
-- **`requireTotp` is UNRESOLVABLE this phase, not a downgrade to a
-  standing grant.** `broker::resolve_gate` rejects a `requireTotp: true`
-  policy outright, regardless of whether a `totp` code rode the request.
-  Do not wire `totp::verify`/`replay::ReplayLedger` into the gate before
-  `vault enroll` (P-V3/P-V4) lands an actual enrolled secret to verify a
-  code against — there is no honest way to test a "granted via TOTP"
-  branch before then, and a fake-verified branch is worse than an honest
-  rejection.
+- **`requireTotp` is UNRESOLVABLE only when no enrollment exists on this
+  host, never a silent downgrade to a standing grant in either
+  direction.** `broker::resolve_gate`/`verify_totp_gate` (P-V3): no
+  `totp.secret` -> reject outright, same wording as before P-V3;
+  enrolled -> verify the wire's `totp` code (`totp::verify`, `±1` window)
+  and consume the matched timestep in the persisted
+  `replay::ReplayLedger` — a missing/wrong/already-used code is an
+  ordinary denial, the backend never runs. Don't let a `requireTotp`
+  policy fall back to treating itself as a standing grant just because an
+  enrollment exists; the code (or its absence) is what decides.
 - **`ReplayLedger` keys on timestep ALONE, never on consumer** (ruling,
   Fable, 2026-08-22, P-V1 review escalation — plan file's VAULT §Policy
   section). The resolve wire's `consumer` field is self-asserted; a
@@ -66,14 +68,17 @@
   run). Don't "consolidate" the two without re-deriving why vault secret
   names are held to a tighter bar (they name on-disk backend-store paths
   under a privileged uid; a peer name only names a JSON cache file).
-- **I/O is confined to five named modules: `broker`, `client`, `store`,
-  `backend`, and each module's own `#[cfg(test)]` block.** `sha1`/`hmac`/
-  `totp`/`base32`/`uri`/`replay`/`policy` stay pure — no `SystemTime::
-  now()`, no socket, no `exec`, no reads/writes of vault home in any of
-  them. This is the P-V2 narrowing of the old P-V1 rule ("nothing in this
-  crate performs I/O" — true then because there were no I/O modules yet);
-  the boundary moved from "this whole crate" to "these five modules," it
-  did not disappear.
+- **I/O is confined to six named modules: `broker`, `client`, `store`,
+  `backend`, `enroll` (P-V3), and each module's own `#[cfg(test)]` block.**
+  `sha1`/`hmac`/`totp`/`base32`/`uri`/`replay`/`policy` stay pure — no
+  `SystemTime::now()`, no socket, no `exec`, no reads/writes of vault home
+  in any of them. This is the P-V2 narrowing of the old P-V1 rule ("nothing
+  in this crate performs I/O" — true then because there were no I/O
+  modules yet), widened once more at P-V3 for `enroll`'s `/dev/urandom`/
+  `gethostname`/`qrencode` calls; the boundary moves as new I/O concerns
+  earn their own named module, it does not disappear. `enroll` itself
+  never writes a vault-home FILE directly — that stays `store`'s job
+  (`enroll::run` calls `store::save_totp_secret`/`save_replay_ledger`).
 - **`home::vault_home`/`socket::socket_path` are THE resolution — nothing
   else re-derives a vault-home or socket path.** `broker::serve`/
   `client::resolve`/`client::run_exec` all take the resolved `&Path` as a
@@ -92,17 +97,18 @@
   fixed by RFC 6238's default and this vault's whole TOTP surface) would
   get its own module beside `sha1`/`hmac`, same zero-dependency rule, same
   RFC-vector-as-test-suite discipline.
-- **`vault enroll` + real TOTP verification** (P-V3/P-V4) wires
-  `totp::verify`/`replay::ReplayLedger` into `broker::resolve_gate`'s
-  `requireTotp` branch (currently an outright rejection — see the
-  invariant above) and adds ledger persistence to `store` (there is none
-  yet; nothing exercises the ledger's file I/O this phase because nothing
-  can honestly reach the granted branch).
-- **Backend adapter DOC PRESETS** (`pass`/`gopass`/`bw`/`sops` — P-V3)
-  consume `backend`'s template mechanism as-is; QR-code rendering for
-  `vault enroll`'s URI (`uri`/`base32`, already present) is a new leaf
-  dependency scoped to that phase only (`qrencode` shell-out per the plan,
-  not a new Rust dep).
+- **`vault enroll` + real TOTP verification LANDED at P-V3** —
+  `broker::verify_totp_gate` wires `totp::verify`/`replay::ReplayLedger`
+  into `resolve_gate`'s `requireTotp` branch, and `store::
+  load_replay_ledger`/`save_replay_ledger` give the ledger its vault-home
+  file. Deployment hardening (P-V4: the real `/var/lib/aoide-vault` path,
+  a real `aoide-vault` system user) is the only piece still ahead —
+  nothing about verification itself is left to wire.
+- **Backend adapter DOC PRESETS** (`pass`/`gopass`/`bw`/`sops`) landed at
+  P-V3 in `README.md`'s "Backend presets" section — `backend.rs` itself is
+  unchanged (it never gained backend-specific knowledge, by design). QR-
+  code rendering for `vault enroll`'s URI lives in `enroll::render_qr`
+  (`qrencode` shell-out, feature-detected, not a Cargo dependency).
 - **Vault pairing / mesh replica sharing** (P-V5, gated on #51) is a new
   module beside `broker`, not a growth of `broker`'s own resolve path —
   see the plan's "Mesh sharing" section for the separate loopback channel.

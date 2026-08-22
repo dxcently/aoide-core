@@ -39,7 +39,9 @@ use daemon::Door;
 /// `mcp serve --stdio`, `a2a serve`, and `vault serve` start servers,
 /// `vault exec` resolves a secret and execs a command with it injected as an
 /// env var (`Stdio::inherit` throughout — the value can never cross the
-/// generic `Outcome` envelope, Workstream VAULT P-V2), `conductor` hands off
+/// generic `Outcome` envelope, Workstream VAULT P-V2), `vault enroll` prints
+/// a fresh TOTP secret's `otpauth://` URI + base32 form directly to stdout
+/// for the same reason (Workstream VAULT P-V3), `conductor` hands off
 /// to the interactive terminal loop, `guide`/`schema` bypass the generic
 /// `Outcome` envelope — everything else routes through the single dispatcher
 /// (so the audit log + gate apply uniformly). `livery` was an earlier special
@@ -157,6 +159,32 @@ pub fn run_cli(argv: &[String]) -> i32 {
                 return Some(code);
             }
             return Some(vault::client::run_exec(inv, &vault::socket::socket_path()));
+        }
+
+        // `vault enroll` (P-V3) is special-cased the SAME way as `vault
+        // exec`, for the same reason: the printed `otpauth://` URI + base32
+        // secret must never ride the generic `Outcome` envelope (this
+        // crate's `AGENTS.md`). Dispatch first (audits the launch attempt
+        // and gives every non-Cli door the clean "run it from a terminal"
+        // outcome via `handle_vault_enroll`, touching no vault-home file),
+        // then hand off to `aoide_vault::enroll::run`, which does the real
+        // work — generate/persist/print — and prints the secret directly
+        // to stdout.
+        if inv.path == ["vault", "enroll"] {
+            let launch = dispatch::dispatch(inv);
+            if launch.status != output::Status::Ok {
+                let (body, code) = launch.render(json);
+                eprintln!("{body}");
+                return Some(code);
+            }
+            let force = inv.flag_present("force");
+            return Some(match vault::enroll::run(&vault::home::vault_home(), force) {
+                Ok(()) => output::exit::OK,
+                Err(e) => {
+                    eprintln!("aoide vault enroll: {e}");
+                    output::exit::ERROR
+                }
+            });
         }
 
         // `guide` in text mode prints the full onboarding rather than a summary.

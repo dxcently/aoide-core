@@ -6,7 +6,7 @@
 //! unknown op, or a dropped connection ends only that line/connection —
 //! never the service).
 //!
-//! Wire (V2 — `resolve` is the only op):
+//! Wire (`resolve` is the only op):
 //! ```text
 //! -> {"op":"resolve","secret":"<name>","consumer":"<consumer>","totp":"<code>"?,"argv0":"<cmd>"?}
 //! <- {"ok":true,"value":"<value>"}                    (granted)
@@ -16,13 +16,33 @@
 //! V1 ruling, `crate::replay`'s module doc): the policy's `consumers[]`
 //! list is the real gate, not caller identity.
 //!
-//! **STANDING GRANTS ONLY this phase.** A policy with `requireTotp: true`
-//! is UNRESOLVABLE — rejected outright with a clear "no TOTP enrollment on
-//! this host yet" error, regardless of whether a `totp` code rode the
-//! request. `crate::totp::verify` + `crate::replay::ReplayLedger` stay
-//! unwired until `vault enroll` lands (P-V3/P-V4) — there is no enrolled
-//! secret to verify a code AGAINST yet, so wiring verification now would
-//! be dead code with no honest way to exercise its granted branch.
+//! **`requireTotp` is wired live (P-V3).** [`resolve_gate`] rejects it
+//! outright ONLY when no `vault enroll` has ever run on this host
+//! (`crate::store::load_totp_secret` returns `None`) — a clear "no TOTP
+//! enrollment" error, same wording as before P-V3. Once enrolled, a
+//! `requireTotp` policy verifies the wire's `totp` code against the
+//! enrolled secret (`crate::totp::verify`, `±1`-timestep window) and
+//! consumes the matched timestep in a [`crate::replay::ReplayLedger`]
+//! persisted via `crate::store::load_replay_ledger`/`save_replay_ledger`
+//! (this crate's `AGENTS.md` ruling: keyed on timestep ALONE, never
+//! consumer) — a missing/wrong/already-used code is a denial, exactly
+//! like every other gate failure below: the backend never runs, both
+//! audit lines fire with a value-free (and CODE-free — the typed code is
+//! untrusted input, never echoed) reason. The ledger is reloaded fresh
+//! from disk on every TOTP-gated attempt rather than cached across
+//! connections (no in-memory broker state at all, matching how policies
+//! are already handled) — which is also what makes "a broker restart must
+//! not resurrect a spent code" true for free: the very next resolve after
+//! a restart re-reads the same file.
+//!
+//! `resolve_gate`'s clock is a PARAMETER (`now_unix`), not a `SystemTime::
+//! now()` call inside it — [`handle_resolve`] is the one place in this
+//! module that reads the real clock (`aoide_protocol::audit::now_secs()`)
+//! and hands it in, so `resolve_gate`/`verify_totp_gate` stay exactly as
+//! deterministically testable as `crate::totp`/`crate::replay` themselves
+//! (this crate's `AGENTS.md`, "clock-as-parameter, everywhere" — the
+//! broker is where the real-clock wrapper is allowed to live, and this is
+//! that one wrapper).
 //!
 //! **Audit, broker-side only** (this crate's `AGENTS.md`): every resolve
 //! attempt is logged HERE — never by the client, which only ever learns
@@ -118,15 +138,15 @@ fn handle_resolve(vault_home: &Path, req: &Value) -> Value {
     let secret = req.get("secret").and_then(Value::as_str).unwrap_or("").to_string();
     let consumer = req.get("consumer").and_then(Value::as_str).unwrap_or("").to_string();
     let argv0 = req.get("argv0").and_then(Value::as_str).map(str::to_string);
-    // Accepted on the wire, parsed only so the shape doesn't shift before
-    // P-V3/P-V4 wire it — see the module doc: never consulted this phase.
-    let _totp = req.get("totp").and_then(Value::as_str);
+    let totp = req.get("totp").and_then(Value::as_str).map(str::to_string);
 
     if secret.is_empty() || consumer.is_empty() {
         return json!({"ok": false, "error": "malformed request: `secret` and `consumer` are required"});
     }
 
-    let (granted, result) = resolve_gate(vault_home, &secret, &consumer);
+    // The one real-clock read in this module — see module doc.
+    let now_unix = aoide_protocol::audit::now_secs();
+    let (granted, result) = resolve_gate(vault_home, &secret, &consumer, totp.as_deref(), now_unix);
     audit_resolve(vault_home, &secret, &consumer, argv0.as_deref(), granted, result.as_ref().err());
 
     match result {
@@ -135,11 +155,26 @@ fn handle_resolve(vault_home: &Path, req: &Value) -> Value {
     }
 }
 
+/// Timesteps kept in the replay ledger beyond the oldest one a `±1`-window
+/// `totp::verify` could still match — a generous buffer (not a tight `±1`)
+/// so a slightly-delayed save can never prune the very timestep
+/// [`verify_totp_gate`] just recorded. Pure bound, no clock read.
+const REPLAY_RETENTION_STEPS: u64 = 4; // ~2 minutes at the 30s step
+
 /// The policy gate + backend fetch, in one place. `granted` is carried
 /// alongside the `Result` (rather than inferred from `is_ok()` at the call
 /// site) so the caller's audit call reads as one obviously-correct pairing
-/// rather than a second derivation of the same fact.
-fn resolve_gate(vault_home: &Path, secret: &str, consumer: &str) -> (bool, Result<String, String>) {
+/// rather than a second derivation of the same fact. `now_unix` is the
+/// caller's clock read (module doc's clock-as-parameter discipline) — this
+/// function and everything it calls stay deterministic given the same
+/// inputs.
+fn resolve_gate(
+    vault_home: &Path,
+    secret: &str,
+    consumer: &str,
+    totp: Option<&str>,
+    now_unix: u64,
+) -> (bool, Result<String, String>) {
     let policies = match crate::store::load_policies(vault_home) {
         Ok(p) => p,
         Err(e) => return (false, Err(format!("policy.json: {e}"))),
@@ -152,16 +187,54 @@ fn resolve_gate(vault_home: &Path, secret: &str, consumer: &str) -> (bool, Resul
         return (false, Err("consumer not authorized for this secret".to_string()));
     }
     if policy.require_totp {
-        return (
-            false,
-            Err("requireTotp is set but no TOTP enrollment exists on this host yet (P-V2: standing grants only)"
-                .to_string()),
-        );
+        if let Err(e) = verify_totp_gate(vault_home, totp, now_unix) {
+            return (false, Err(e));
+        }
     }
     match crate::backend::fetch_value(vault_home, &policy.backend, &policy.key) {
         Ok(value) => (true, Ok(value)),
         Err(e) => (false, Err(e)),
     }
+}
+
+/// The `requireTotp` half of [`resolve_gate`]. No enrollment on this host
+/// -> unresolvable (unchanged wording from before P-V3). Enrolled -> a
+/// fresh `±1`-window code, single-use per TIMESTEP via the persisted
+/// [`crate::replay::ReplayLedger`] (this crate's `AGENTS.md` ruling: keyed
+/// on timestep alone, never consumer). Every error string here is
+/// value-free AND code-free by construction: the caller-typed `totp`
+/// string is untrusted input (module doc) and is never interpolated into
+/// any returned message, only parsed/compared.
+fn verify_totp_gate(vault_home: &Path, totp: Option<&str>, now_unix: u64) -> Result<(), String> {
+    let secret = match crate::store::load_totp_secret(vault_home) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Err("requireTotp is set but no TOTP enrollment exists on this host yet".to_string())
+        }
+        Err(e) => return Err(format!("totp.secret: {e}")),
+    };
+    let Some(code_str) = totp else {
+        return Err("requireTotp is set but no totp code was provided".to_string());
+    };
+    let Ok(code) = code_str.trim().parse::<u32>() else {
+        return Err("malformed totp code".to_string());
+    };
+    let Some(step) = crate::totp::verify(&secret, code, now_unix, crate::totp::DEFAULT_WINDOW) else {
+        return Err("totp code invalid or expired".to_string());
+    };
+
+    let mut ledger = match crate::store::load_replay_ledger(vault_home) {
+        Ok(l) => l,
+        Err(e) => return Err(format!("totp-replay.json: {e}")),
+    };
+    if !ledger.record(step) {
+        return Err("totp code already used".to_string());
+    }
+    ledger.prune_before(crate::totp::timestep(now_unix).saturating_sub(REPLAY_RETENTION_STEPS));
+    if let Err(e) = crate::store::save_replay_ledger(vault_home, &ledger) {
+        return Err(format!("writing totp-replay.json: {e}"));
+    }
+    Ok(())
 }
 
 fn own_audit_log_path(vault_home: &Path) -> PathBuf {
@@ -240,11 +313,15 @@ mod tests {
         std::fs::write(crate::backend::backends_path(home), serde_json::to_vec(&backends).unwrap()).unwrap();
     }
 
+    /// A fixed "now" for every test that doesn't specifically exercise TOTP
+    /// timing — deterministic, never `SystemTime::now()`.
+    const NOW: u64 = 1_700_000_000;
+
     #[test]
     fn unknown_secret_is_denied_with_a_clear_reason() {
         let home = tmp_home("unknown");
         seed(&home, &[]);
-        let (granted, result) = resolve_gate(&home, "nope", "m");
+        let (granted, result) = resolve_gate(&home, "nope", "m", None, NOW);
         assert!(!granted);
         assert_eq!(result.unwrap_err(), "secret not found");
         std::fs::remove_dir_all(&home).ok();
@@ -256,7 +333,7 @@ mod tests {
         let mut p = Policy::new("t", "scratch", "stored-value");
         p.consumers = vec!["m".to_string()];
         seed(&home, &[p]);
-        let (granted, result) = resolve_gate(&home, "t", "someone-else");
+        let (granted, result) = resolve_gate(&home, "t", "someone-else", None, NOW);
         assert!(!granted);
         assert!(result.unwrap_err().contains("not authorized"));
         std::fs::remove_dir_all(&home).ok();
@@ -267,19 +344,20 @@ mod tests {
         let home = tmp_home("anyconsumer");
         let p = Policy::new("t", "scratch", "stored-value");
         seed(&home, &[p]);
-        let (granted, result) = resolve_gate(&home, "t", "whoever");
+        let (granted, result) = resolve_gate(&home, "t", "whoever", None, NOW);
         assert!(granted);
         assert_eq!(result.unwrap(), "stored-value");
         std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
-    fn require_totp_is_unresolvable_this_phase_no_matter_what() {
-        let home = tmp_home("totp");
+    fn require_totp_is_unresolvable_with_no_enrollment_on_this_host() {
+        let home = tmp_home("totp-noenroll");
         let mut p = Policy::new("t", "scratch", "stored-value");
         p.require_totp = true;
         seed(&home, &[p]);
-        let (granted, result) = resolve_gate(&home, "t", "m");
+        // No `totp.secret` written — nothing has enrolled this host yet.
+        let (granted, result) = resolve_gate(&home, "t", "m", Some("123456"), NOW);
         assert!(!granted);
         assert!(result.unwrap_err().contains("no TOTP enrollment"));
         std::fs::remove_dir_all(&home).ok();
@@ -291,9 +369,185 @@ mod tests {
         let mut p = Policy::new("t", "scratch", "stored-value");
         p.consumers = vec!["m".to_string()];
         seed(&home, &[p]);
-        let (granted, result) = resolve_gate(&home, "t", "m");
+        let (granted, result) = resolve_gate(&home, "t", "m", None, NOW);
         assert!(granted);
         assert_eq!(result.unwrap(), "stored-value");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── requireTotp, enrolled (P-V3) ────────────────────────────────────
+
+    /// Seeds an enrollment (`totp.secret`) alongside the usual policy/
+    /// backend fixture. Returns the raw secret bytes so a test can derive
+    /// a code from them via `crate::totp` directly.
+    fn seed_enrolled(home: &Path, mut p: Policy) -> Vec<u8> {
+        p.require_totp = true;
+        seed(home, &[p]);
+        let secret = b"a-twenty-byte-totp-s".to_vec();
+        assert_eq!(secret.len(), 20);
+        crate::store::save_totp_secret(home, &secret).unwrap();
+        secret
+    }
+
+    /// Time-sensitivity discipline (phase brief): derive the TIMESTEP
+    /// first, then the code for exactly that step — never `totp6(secret,
+    /// now)` against a live clock, which could straddle a boundary between
+    /// computing the code and the assertion running.
+    fn code_for_now(secret: &[u8], now: u64) -> String {
+        let step = crate::totp::timestep(now);
+        crate::totp::format6(crate::totp::hotp(secret, step, crate::totp::DIGITS))
+    }
+
+    #[test]
+    fn enrolled_and_correct_code_is_granted_and_runs_the_backend() {
+        let home = tmp_home("totp-granted");
+        let mut p = Policy::new("t", "scratch", "stored-value");
+        p.consumers = vec!["m".to_string()];
+        let secret = seed_enrolled(&home, p);
+        let code = code_for_now(&secret, NOW);
+
+        let (granted, result) = resolve_gate(&home, "t", "m", Some(&code), NOW);
+        assert!(granted, "{result:?}");
+        assert_eq!(result.unwrap(), "stored-value");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn enrolled_with_no_code_is_denied() {
+        let home = tmp_home("totp-missingcode");
+        let p = Policy::new("t", "scratch", "stored-value");
+        seed_enrolled(&home, p);
+
+        let (granted, result) = resolve_gate(&home, "t", "m", None, NOW);
+        assert!(!granted);
+        assert!(result.unwrap_err().contains("no totp code"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn enrolled_with_the_wrong_code_is_denied() {
+        let home = tmp_home("totp-wrongcode");
+        let p = Policy::new("t", "scratch", "stored-value");
+        let secret = seed_enrolled(&home, p);
+        let correct = code_for_now(&secret, NOW);
+        // Any 6-digit code that isn't the correct one.
+        let wrong_num: u32 = (correct.parse::<u32>().unwrap() + 1) % 1_000_000;
+        let wrong = crate::totp::format6(wrong_num);
+
+        let (granted, result) = resolve_gate(&home, "t", "m", Some(&wrong), NOW);
+        assert!(!granted);
+        assert!(result.unwrap_err().contains("invalid or expired"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn a_malformed_totp_code_is_denied_without_panicking() {
+        let home = tmp_home("totp-malformed");
+        let p = Policy::new("t", "scratch", "stored-value");
+        seed_enrolled(&home, p);
+
+        let (granted, result) = resolve_gate(&home, "t", "m", Some("not-a-number"), NOW);
+        assert!(!granted);
+        assert!(result.unwrap_err().contains("malformed"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn the_same_code_used_twice_is_denied_the_second_time_replay() {
+        let home = tmp_home("totp-replay");
+        // Empty consumers list = any consumer — so BOTH calls clear the
+        // authorization check, isolating the replay/ledger behavior this
+        // test is actually about (a consumer mismatch would deny the
+        // second call for the WRONG reason).
+        let p = Policy::new("t", "scratch", "stored-value");
+        let secret = seed_enrolled(&home, p);
+        let code = code_for_now(&secret, NOW);
+
+        let (first_granted, first_result) = resolve_gate(&home, "t", "m", Some(&code), NOW);
+        assert!(first_granted, "{first_result:?}");
+
+        // A second, DIFFERENT claimed consumer doesn't matter — the ledger
+        // keys on timestep alone (this crate's AGENTS.md ruling: the
+        // resolve wire's `consumer` field is self-asserted, so a
+        // per-consumer ledger would let one typed code redeem once per
+        // invented label).
+        let (second_granted, second_result) = resolve_gate(&home, "t", "someone-else-entirely", Some(&code), NOW);
+        assert!(!second_granted);
+        assert!(second_result.unwrap_err().contains("already used"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The ledger persistence requirement, exercised directly against
+    /// `resolve_gate`: a SEPARATE call — standing in for "after a broker
+    /// restart", since `resolve_gate` never caches the ledger in memory —
+    /// still refuses the timestep an earlier call consumed, because the
+    /// only state connecting the two calls is the file on disk.
+    #[test]
+    fn a_spent_code_stays_spent_across_a_simulated_broker_restart() {
+        let home = tmp_home("totp-restart");
+        let mut p = Policy::new("t", "scratch", "stored-value");
+        p.consumers = vec!["m".to_string()];
+        let secret = seed_enrolled(&home, p);
+        let code = code_for_now(&secret, NOW);
+
+        let (granted, _) = resolve_gate(&home, "t", "m", Some(&code), NOW);
+        assert!(granted);
+
+        // Nothing here reuses any in-process state from the call above —
+        // this is exactly what a fresh broker process would do.
+        let ledger_after_restart = crate::store::load_replay_ledger(&home).unwrap();
+        let step = crate::totp::timestep(NOW);
+        assert!(ledger_after_restart.is_used(step), "the ledger file must have the spent timestep");
+
+        let (granted_again, result_again) = resolve_gate(&home, "t", "m", Some(&code), NOW);
+        assert!(!granted_again);
+        assert!(result_again.unwrap_err().contains("already used"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Every TOTP denial path must short-circuit BEFORE the backend ever
+    /// runs — same "positive control" discipline as `tests/e2e.rs`'s
+    /// backend-invoked marker.
+    #[test]
+    fn totp_denial_paths_never_invoke_the_backend() {
+        let home = tmp_home("totp-marker");
+        let marker = home.join("backend-invoked-marker");
+        let mut p = Policy::new("t", "scratch", "stored-value");
+        p.require_totp = true;
+        p.consumers = vec!["m".to_string()];
+        seed(&home, &[p]);
+        let secret = b"a-twenty-byte-totp-s".to_vec();
+        crate::store::save_totp_secret(&home, &secret).unwrap();
+        // Overwrite the fixture backend so it touches a marker before
+        // producing output — same technique as `tests/e2e.rs`.
+        let backends = serde_json::json!({
+            "scratch": { "get": format!("touch {} && printf %s {{name}}", marker.display()) }
+        });
+        std::fs::write(crate::backend::backends_path(&home), serde_json::to_vec(&backends).unwrap()).unwrap();
+
+        let code = code_for_now(&secret, NOW);
+        let wrong_num: u32 = (code.parse::<u32>().unwrap() + 1) % 1_000_000;
+        let wrong = crate::totp::format6(wrong_num);
+
+        // No code, wrong code, replay (after one legitimate grant) — every
+        // denial must leave the marker untouched.
+        let (granted, _) = resolve_gate(&home, "t", "m", None, NOW);
+        assert!(!granted);
+        assert!(!marker.exists(), "backend ran on a missing-code denial");
+
+        let (granted, _) = resolve_gate(&home, "t", "m", Some(&wrong), NOW);
+        assert!(!granted);
+        assert!(!marker.exists(), "backend ran on a wrong-code denial");
+
+        let (granted, _) = resolve_gate(&home, "t", "m", Some(&code), NOW);
+        assert!(granted, "the legitimate code should be granted (and now the marker DOES exist)");
+        assert!(marker.exists(), "positive control: the backend must run on a granted resolve");
+        std::fs::remove_file(&marker).unwrap();
+
+        let (granted, _) = resolve_gate(&home, "t", "m", Some(&code), NOW);
+        assert!(!granted, "the same code must be denied the second time (replay)");
+        assert!(!marker.exists(), "backend ran on a replay denial");
+
         std::fs::remove_dir_all(&home).ok();
     }
 

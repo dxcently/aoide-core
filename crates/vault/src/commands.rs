@@ -1,5 +1,5 @@
 //! `aoide vault` — the secrets broker's CLI surface (Workstream VAULT,
-//! P-V2). Registers SIX verbs:
+//! P-V2, P-V3). Registers SEVEN verbs:
 //!
 //! - `serve` — the long-running broker, special-cased at the entry point
 //!   exactly like `a2a serve`/`conductor` (`cli`'s `run_cli`): this
@@ -10,21 +10,25 @@
 //!   inherited stdio and an injected env var — see `crate::client`'s
 //!   module doc for why that can never go through the generic `Outcome`
 //!   envelope (a value would have to ride through it).
+//! - `enroll` (P-V3) — CLI-only, special-cased the SAME way as `serve`/
+//!   `exec`, for the same reason `exec` is: the printed `otpauth://` URI +
+//!   base32 secret must never ride the `Outcome` envelope (this crate's
+//!   `AGENTS.md`). [`handle_vault_enroll`] only gates the door and records
+//!   the launch; the actual secret generation/persistence/printing is
+//!   `crate::enroll::run`, called from `cli`'s `special` hook.
 //! - `add`/`rm`/`grant`/`revoke` — the policy-CRUD admin quartet. Not
 //!   special-cased (they only read/write `policy.json`, no socket, no
 //!   value, ever, so they still run through the ordinary dispatch + audit
 //!   path like any other command), but **CLI-only, door-gated the SAME way
-//!   as `serve`/`exec`** (bounce-fix item 2, P-V2 review — [`require_cli`]):
-//!   an earlier revision left them reachable over MCP/A2A/Daemon doors,
-//!   which would let any agent already talking to aoide `vault grant
-//!   <secret> <itself>` and self-escalate. The gate returns the door-hint
-//!   `Outcome` and returns BEFORE any `store::load_policies`/
+//!   as `serve`/`exec`/`enroll`** (bounce-fix item 2, P-V2 review —
+//!   [`require_cli`]): an earlier revision left them reachable over MCP/
+//!   A2A/Daemon doors, which would let any agent already talking to aoide
+//!   `vault grant <secret> <itself>` and self-escalate. The gate returns
+//!   the door-hint `Outcome` and returns BEFORE any `store::load_policies`/
 //!   `store::save_policies` call, so a non-CLI invocation never mutates
-//!   `policy.json`. `vault enroll` — the fifth admin verb the plan lists —
-//!   is P-V3's; TOTP enrollment doesn't exist yet, so there is nothing for
-//!   it to write.
+//!   `policy.json`.
 //!
-//! `add`/`rm`/`grant`/`revoke` run AS THE VAULT USER in deployment
+//! `add`/`rm`/`grant`/`revoke`/`enroll` run AS THE VAULT USER in deployment
 //! (`sudo -u aoide-vault ...`, wrapped by the nix module at P-V4), but the
 //! code itself is uid-agnostic — it only reads/writes whatever
 //! `home::vault_home()` resolves to, same as every other function here.
@@ -116,6 +120,18 @@ pub fn register(r: &mut Registry) {
         handler: handle_vault_revoke,
         examples: ["vault revoke db-prod m"],
     ));
+    r.insert(cmd!(
+        path: ["vault", "enroll"],
+        summary: "Enroll this host for TOTP: generate a fresh secret and print its otpauth:// URI + base32 form (plus a QR code when `qrencode` is on PATH). ONE enrollment per host — pass --force to regenerate (old codes stop working immediately). CLI-only: the secret is printed directly to stdout, never through this envelope.",
+        args: [],
+        flags: [
+            flag!("force", "bool", "Regenerate the secret even if one is already enrolled on this host. Invalidates every previously issued code.")
+        ],
+        gated: false,
+        implemented: true,
+        handler: handle_vault_enroll,
+        examples: ["vault enroll", "vault enroll --force"],
+    ));
 }
 
 /// See `crate::broker`'s module doc for the accept loop this launch record
@@ -143,6 +159,23 @@ fn handle_vault_exec(inv: &Invocation) -> Outcome {
             "vault exec spawns a child with inherited stdio; run it from a CLI terminal (not over this door)",
         ),
     }
+}
+
+/// See `crate::enroll`'s module doc for the secret-generation/persistence/
+/// printing flow this hands off to (in the owning app crate's `special`
+/// hook, not here — same split as `handle_vault_serve`/`handle_vault_exec`
+/// above). This handler itself does no vault-home I/O: it only gates the
+/// door (reusing [`require_cli`], same as the CRUD quartet below) and
+/// returns a plain confirmation `Outcome` with no secret content — the
+/// `vaultHome` field mirrors `handle_vault_serve`'s own `with_data`.
+fn handle_vault_enroll(inv: &Invocation) -> Outcome {
+    let cmd = "vault.enroll";
+    if let Some(hint) = require_cli(inv, cmd) {
+        return hint;
+    }
+    Outcome::ok(cmd, "enrolling TOTP on this host").with_data(json!({
+        "vaultHome": home::vault_home().to_string_lossy(),
+    }))
 }
 
 /// Shared door gate for the admin quartet (`add`/`rm`/`grant`/`revoke`):
@@ -317,7 +350,15 @@ mod tests {
         let paths: Vec<String> = r.commands().map(|c| c.dotted()).collect();
         assert_eq!(
             paths,
-            vec!["vault.serve", "vault.exec", "vault.add", "vault.rm", "vault.grant", "vault.revoke"]
+            vec![
+                "vault.serve",
+                "vault.exec",
+                "vault.add",
+                "vault.rm",
+                "vault.grant",
+                "vault.revoke",
+                "vault.enroll",
+            ]
         );
         for c in r.commands() {
             assert!(c.flags.iter().any(|f| f.name == "json"), "{} missing --json", c.dotted());
@@ -325,16 +366,20 @@ mod tests {
     }
 
     #[test]
-    fn serve_and_exec_are_cli_only_elsewhere_a_door_hint() {
+    fn serve_exec_and_enroll_are_cli_only_elsewhere_a_door_hint() {
         let serve = inv(Door::Mcp, &["vault", "serve"], &[], &[]);
         assert_eq!(handle_vault_serve(&serve).status, Status::Usage);
         let exec = inv(Door::A2a, &["vault", "exec"], &[], &[]);
         assert_eq!(handle_vault_exec(&exec).status, Status::Usage);
+        let enroll = inv(Door::Daemon, &["vault", "enroll"], &[], &[]);
+        assert_eq!(handle_vault_enroll(&enroll).status, Status::Usage);
 
         let serve_cli = inv(Door::Cli, &["vault", "serve"], &[], &[]);
         assert_eq!(handle_vault_serve(&serve_cli).status, Status::Ok);
         let exec_cli = inv(Door::Cli, &["vault", "exec"], &[], &[]);
         assert_eq!(handle_vault_exec(&exec_cli).status, Status::Ok);
+        let enroll_cli = inv(Door::Cli, &["vault", "enroll"], &[], &[]);
+        assert_eq!(handle_vault_enroll(&enroll_cli).status, Status::Ok);
     }
 
     #[test]

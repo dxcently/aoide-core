@@ -1,18 +1,27 @@
 //! `aoide-vault`: Aoide's secrets broker (Workstream VAULT). P-V1 landed
 //! the pure logic — hand-rolled RFC 2104/3174/6238 TOTP, RFC 4648 base32,
 //! `otpauth://` URI construction, the single-use replay ledger, and
-//! policy-store types. **P-V2 (this commit) adds the broker daemon, the
-//! unix-socket wire, and the client + admin CLI verbs**: `aoide vault
-//! serve`/`exec`/`add`/`rm`/`grant`/`revoke`, now registered into
-//! `aoide-cli`'s `Registry` via [`commands::register`] — `aoide-cli` has
-//! depended on this crate since this commit (the workspace `Cargo.toml`
-//! comment that used to say otherwise is updated in the same commit).
+//! policy-store types. P-V2 added the broker daemon, the unix-socket wire,
+//! and the client + admin CLI verbs: `aoide vault serve`/`exec`/`add`/`rm`/
+//! `grant`/`revoke`, registered into `aoide-cli`'s `Registry` via
+//! [`commands::register`] — `aoide-cli` has depended on this crate since
+//! P-V2.
 //!
-//! **STANDING GRANTS ONLY this phase.** TOTP verification stays unwired
-//! until `vault enroll` lands (P-V3/P-V4) — there is no enrolled secret to
-//! verify a code against yet. A policy with `requireTotp: true` is simply
-//! UNRESOLVABLE for now: `broker`'s resolve gate rejects it outright with
-//! a clear message, never silently falling back to a standing grant.
+//! **P-V3 (this commit) lands `vault enroll` and wires `requireTotp` live**:
+//! [`enroll::run`] generates a fresh secret, persists it via
+//! [`store::save_totp_secret`], and prints its `otpauth://` URI + base32
+//! form (plus a QR code when `qrencode` is on `PATH`) — see `enroll`'s
+//! module doc for why the printing happens there rather than in
+//! `commands::handle_vault_enroll`'s `Outcome`. `broker::resolve_gate` now
+//! verifies a `requireTotp` policy's code against the host's enrolled
+//! secret (`totp::verify`, `±1` window) and consumes the matched timestep
+//! in a [`replay::ReplayLedger`] persisted via [`store::load_replay_ledger`]/
+//! [`store::save_replay_ledger`] — a policy with `requireTotp: true` is
+//! UNRESOLVABLE only when NO enrollment exists on this host yet; once
+//! enrolled, a missing/wrong/replayed code is a denial, never a silent
+//! standing-grant fallback. `backend`'s `pass`/`gopass`/`bw`/`sops` DOC
+//! PRESETS live in `README.md`'s "Backend presets" section (P-V3), not in
+//! this module — `backend` itself is unchanged.
 //!
 //! See `README.md` for the wire shape and the release-to-client flow, and
 //! `AGENTS.md` for the invariants a change here must hold — most
@@ -26,6 +35,7 @@ pub mod base32;
 pub mod broker;
 pub mod client;
 pub mod commands;
+pub mod enroll;
 pub mod hmac;
 pub mod home;
 pub mod policy;

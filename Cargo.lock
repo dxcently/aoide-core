@@ -178,6 +178,7 @@ name = "aoide-vault"
 version = "0.0.0"
 dependencies = [
  "aoide-protocol",
+ "libc",
  "serde",
  "serde_json",
 ]
