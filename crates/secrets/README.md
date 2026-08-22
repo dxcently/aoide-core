@@ -426,16 +426,22 @@ caller's `AOIDE_SECRETS_HOME`/`AOIDE_SECRETS_SOCKET` env by default, so set
 them explicitly on the invocation if a host's paths ever diverge from the
 default.
 
-**A `policy.json`/`totp.secret` this euid cannot READ, even though the
-admin-identity guard above passed, is the POISONED-FILE case** (the User's
-live UX complaint this section answers, 2026-08-22): the guard proves this
-process's euid owns the secrets HOME directory, but an individual file
-inside it can still be owned by a stale uid from a historical plain-`sudo`
-run that predates the guard. `home::describe_home_file_error` is the ONE
-seam every admin-verb load/save call site (`commands.rs`'s CRUD quintet,
-`enroll::run`/`enroll::show`) routes a `PermissionDenied` `io::Error`
-through, rather than the bare `format!("policy.json: {e}")` this crate used
-to return — it names the file, shows the owning uid mismatch when a stat is
+**A `policy.json`/`totp.secret`/`backends.json` this euid cannot READ, even
+though the admin-identity guard above passed, is the POISONED-FILE case**
+(the User's live UX complaint this section answers, 2026-08-22): the guard
+proves this process's euid owns the secrets HOME directory, but an
+individual file inside it can still be owned by a stale uid from a
+historical plain-`sudo` run that predates the guard. `home::
+describe_home_file_error` is the ONE seam EVERY `policy.json`/
+`totp.secret`/`totp-replay.json`/`backends.json` load/save call site in
+this crate routes a `PermissionDenied` `io::Error` through — not only the
+admin CRUD verbs (`commands.rs`'s CRUD quintet via its `policy_io_error`
+wrapper, `enroll::run`/`enroll::show`), but also the broker's own
+AGENT-facing gates (`broker::resolve_gate`/`put_gate`, reached by `secrets
+exec`/`put` — the primary agent-facing path, and the exact one the User
+hit live) and `backend::load_backends` — rather than the bare
+`format!("policy.json: {e}")` this crate used to return at each of those
+sites. It names the file, shows the owning uid mismatch when a stat is
 cheap, and teaches `sudo chown --reference=<home> <file>` (matches the
 file's ownership to the secrets home's own without this crate ever
 resolving a username, since it only ever learns uids — `effective_uid`'s

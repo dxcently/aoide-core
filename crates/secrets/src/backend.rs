@@ -104,7 +104,8 @@ pub fn backends_path(secrets_home: &Path) -> std::path::PathBuf {
 
 fn load_backends(secrets_home: &Path) -> Result<Backends, String> {
     let path = backends_path(secrets_home);
-    let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let bytes = std::fs::read(&path)
+        .map_err(|e| crate::home::describe_home_file_error(secrets_home, &path, &e))?;
     serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 

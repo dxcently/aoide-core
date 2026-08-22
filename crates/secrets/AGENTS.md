@@ -243,17 +243,24 @@
   called from the SAME special-hook arm behind a flag, never a new path.
 - **Denials name the cause and teach the fix, P-V4g (this commit).**
   `home::describe_home_file_error(home, file, &io_err)` is the ONE seam
-  every admin-verb `policy.json`/`totp.secret`/`totp-replay.json` load/save
-  call site routes a `PermissionDenied` through (`commands.rs`'s CRUD
-  quintet via its local `policy_io_error` wrapper, `enroll::run`/
-  `enroll::show` directly) — the poisoned-file case: the admin-identity
-  guard already proved this process's euid owns the secrets HOME
-  directory, but an individual file inside it can still be owned by a
-  stale uid from before that guard existed, and a bare `format!("policy.
-  json: {e}")` gave zero indication why. It teaches `sudo chown
-  --reference=<home> <file>` rather than a literal `chown aoide-secrets:
-  ...` — this crate only ever learns uids, never a username, and
-  `--reference` sidesteps needing one. `client::describe_connect_error`
+  EVERY `policy.json`/`totp.secret`/`totp-replay.json`/`backends.json`
+  load/save call site in this crate routes a `PermissionDenied` through —
+  not only the admin CRUD verbs (`commands.rs`'s CRUD quintet via its
+  local `policy_io_error` wrapper, `enroll::run`/`enroll::show` directly),
+  but also the broker's own AGENT-facing gates (`broker::resolve_gate`/
+  `put_gate`, reached by `secrets exec`/`put` — the primary agent-facing
+  path, and the one the User actually hit live) and `backend::
+  load_backends` — the poisoned-file case: the admin-identity guard
+  already proved this process's euid owns the secrets HOME directory, but
+  an individual file inside it can still be owned by a stale uid from
+  before that guard existed, and a bare `format!("policy.json: {e}")` gave
+  zero indication why at ANY of those sites, not only the admin ones. It
+  teaches `sudo chown --reference=<home> <file>` rather than a literal
+  `chown aoide-secrets: ...` — this crate only ever learns uids, never a
+  username, and `--reference` sidesteps needing one. Don't add a NEW
+  policy.json/backends.json-adjacent read/write path that skips this seam
+  "because it's not an admin verb" — the broker gap this note replaces was
+  exactly that mistake. `client::describe_connect_error`
   is the client-side sibling: `resolve`/`put`'s `UnixStream::connect`
   failure maps `PermissionDenied` to "this session isn't in
   `aoide-secrets-access` yet" (teaching BOTH `sg aoide-secrets-access -c

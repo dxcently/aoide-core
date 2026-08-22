@@ -265,7 +265,12 @@ fn handle_put(secrets_home: &Path, req: &Value) -> Value {
 fn put_gate(secrets_home: &Path, secret: &str, value: &str) -> (bool, Result<(), String>) {
     let policies = match crate::store::load_policies(secrets_home) {
         Ok(p) => p,
-        Err(e) => return (false, Err(format!("policy.json: {e}"))),
+        Err(e) => {
+            return (
+                false,
+                Err(crate::home::describe_home_file_error(secrets_home, &crate::store::policy_path(secrets_home), &e)),
+            )
+        }
     };
     let Some(policy) = policies.iter().find(|p| p.name == secret) else {
         return (false, Err("secret not found".to_string()));
@@ -298,7 +303,12 @@ fn resolve_gate(
 ) -> (bool, Result<String, String>) {
     let policies = match crate::store::load_policies(secrets_home) {
         Ok(p) => p,
-        Err(e) => return (false, Err(format!("policy.json: {e}"))),
+        Err(e) => {
+            return (
+                false,
+                Err(crate::home::describe_home_file_error(secrets_home, &crate::store::policy_path(secrets_home), &e)),
+            )
+        }
     };
     let Some(policy) = policies.iter().find(|p| p.name == secret) else {
         return (false, Err("secret not found".to_string()));
@@ -477,6 +487,47 @@ mod tests {
         let (granted, result) = resolve_gate(&home, "nope", "m", None, NOW);
         assert!(!granted);
         assert_eq!(result.unwrap_err(), "secret not found");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The wire-level counterpart to `commands.rs`'s
+    /// `a_policy_json_this_euid_cannot_read_gets_the_chown_reference_hint`:
+    /// `secrets exec`/`put` are the primary AGENT-facing path, and a
+    /// poisoned `policy.json` reaches them through `resolve_gate`/
+    /// `put_gate`, not the admin CRUD quintet — this is the exact incident
+    /// this whole feature answers, so both gates must teach the fix, not
+    /// just `commands.rs`'s `add`/`rm`/`grant`/`revoke`/`set-totp`. Skipped
+    /// under a root test runner (root reads `0000` files fine, so the
+    /// denial this test depends on wouldn't happen).
+    #[test]
+    fn an_unreadable_policy_json_teaches_the_chown_reference_fix_on_both_gates() {
+        if crate::home::effective_uid() == 0 {
+            return;
+        }
+        let home = tmp_home("unreadable-policy");
+        seed(&home, &[Policy::new("t", "scratch", "k")]);
+
+        use std::os::unix::fs::PermissionsExt;
+        let path = crate::store::policy_path(&home);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let (resolve_granted, resolve_result) = resolve_gate(&home, "t", "m", None, NOW);
+        let (put_granted, put_result) = put_gate(&home, "t", "irrelevant");
+
+        // Restore before any assertion could early-return and leave the
+        // tempdir's cleanup unable to remove an unreadable file.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(!resolve_granted);
+        let resolve_err = resolve_result.unwrap_err();
+        assert!(resolve_err.to_lowercase().contains("permission denied"), "{resolve_err}");
+        assert!(resolve_err.contains("chown --reference="), "{resolve_err}");
+        assert!(resolve_err.contains(&path.display().to_string()), "{resolve_err}");
+
+        assert!(!put_granted);
+        let put_err = put_result.unwrap_err();
+        assert!(put_err.contains("chown --reference="), "{put_err}");
+
         std::fs::remove_dir_all(&home).ok();
     }
 
