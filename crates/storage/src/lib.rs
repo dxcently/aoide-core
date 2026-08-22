@@ -26,6 +26,10 @@
 //! remote query. Zero I/O, agnostic of any call site, same as `petname`/
 //! `display` — C2 (`aoide who`) and C3 (`graph send --to`) are the planned
 //! callers, not present yet.
+//!
+//! `inbox` (messaging plan, P-C6) is the newest: the durable per-host
+//! message store (`state/inbox.json`) both delivery seams file into — see
+//! its own module doc for the one-writer-covers-both-seams reasoning.
 
 pub mod a2a_store;
 pub mod addr;
@@ -34,6 +38,7 @@ pub mod display;
 pub mod edits;
 pub mod fs;
 pub mod git;
+pub mod inbox;
 pub mod mode;
 pub mod peer_store;
 pub mod petname;

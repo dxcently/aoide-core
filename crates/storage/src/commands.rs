@@ -1,22 +1,32 @@
-//! `aoide usage` — the offline half of the usage widget (CONTRACTS.md §2/§4,
-//! `state/usage.json` v0): a LOCAL token/cost rollup computed straight off
-//! Claude Code's own on-disk transcripts (`~/.claude/projects/**/*.jsonl`),
-//! same read pattern `graph/session_store.rs`'s `transcript_context_tokens`
-//! uses for the context-window meter. No network, no credentials — this
-//! machine's transcripts only.
+//! This crate's own CLI verbs. Two groups today:
 //!
-//! The `live` block IS now wired to a real fetch ([`fetch_live_usage`]): it
-//! reads the consumer OAuth token from `~/.claude/.credentials.json` and calls
-//! Claude Code's own (unofficial, ToS-gray) `/api/oauth/usage` endpoint via
-//! curl, with the token kept out of argv and off disk (the curl config is
-//! piped over stdin, `--config -`, so the token never touches a file). ANY
-//! failure degrades to `live.ok:false` + a **tokenless** reason, so readers
-//! (the widget) must still tolerate `live.ok == false`. The token is never
-//! logged, printed, or embedded in an error string or the written state file.
+//! - `aoide usage` — the offline half of the usage widget (CONTRACTS.md
+//!   §2/§4, `state/usage.json` v0): a LOCAL token/cost rollup computed
+//!   straight off Claude Code's own on-disk transcripts
+//!   (`~/.claude/projects/**/*.jsonl`), same read pattern
+//!   `graph/session_store.rs`'s `transcript_context_tokens` uses for the
+//!   context-window meter. No network, no credentials — this machine's
+//!   transcripts only.
+//!
+//!   The `live` block IS now wired to a real fetch ([`fetch_live_usage`]): it
+//!   reads the consumer OAuth token from `~/.claude/.credentials.json` and calls
+//!   Claude Code's own (unofficial, ToS-gray) `/api/oauth/usage` endpoint via
+//!   curl, with the token kept out of argv and off disk (the curl config is
+//!   piped over stdin, `--config -`, so the token never touches a file). ANY
+//!   failure degrades to `live.ok:false` + a **tokenless** reason, so readers
+//!   (the widget) must still tolerate `live.ok == false`. The token is never
+//!   logged, printed, or embedded in an error string or the written state file.
+//!
+//! - `aoide inbox list|read|clear` — the CLI surface over [`crate::inbox`]
+//!   (messaging plan P-C6, `state/inbox.json`). The store itself (cap,
+//!   atomic writes, id semantics) lives in `inbox.rs`; this file only
+//!   parses invocations, renders human/`--json` output, and reports
+//!   `changed`/errors — the same split `usage` already keeps between its
+//!   pure/IO core (above) and its handler.
 
 use aoide_protocol::Invocation;
 use aoide_protocol::output::Outcome;
-use aoide_protocol::registry::{cmd, Registry};
+use aoide_protocol::registry::{arg, cmd, flag, Registry};
 use crate::fs as shellbridge;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -601,6 +611,162 @@ fn handle_usage(_inv: &Invocation) -> Outcome {
     .with_data(body)
 }
 
+// ── `aoide inbox list|read|clear` (messaging plan P-C6) ─────────────────────
+
+/// `aoide inbox list|read|clear` verbs, appended newest into `cli`'s
+/// `commands::all()` — see that assembly's own module doc for why this
+/// lives in `storage` (inbox is state; storage owns the store, the way
+/// `usage` already does above).
+pub fn register_inbox(r: &mut Registry) {
+    r.insert(cmd!(
+        path: ["inbox", "list"],
+        summary: "List this host's message inbox (state/inbox.json) — unread entries by default, every entry with --all. id is the entry's position in the stored array.",
+        args: [],
+        flags: [flag!("all", "bool", "Include already-read entries too.")],
+        gated: false,
+        implemented: true,
+        handler: handle_inbox_list,
+        examples: ["inbox list", "inbox list --all"],
+    ));
+    r.insert(cmd!(
+        path: ["inbox", "read"],
+        summary: "Mark one inbox entry read by its `inbox list` position. Marking does not remove the entry or shift other positions.",
+        args: [arg!("n", "string", true, "The entry's position, as shown by `inbox list`.")],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_inbox_read,
+        examples: ["inbox read 0"],
+    ));
+    r.insert(cmd!(
+        path: ["inbox", "clear"],
+        summary: "Empty the message inbox. Unconditional — matches graph.prune's precedent (no --yes, no gate): the verb name is the whole blast radius, nothing selective to confirm.",
+        args: [],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_inbox_clear,
+        examples: ["inbox clear"],
+    ));
+}
+
+/// A one-line, length-bounded preview of an inbox entry's text — mirrors
+/// `pending.rs`'s own `preview` (not shared: that one is private to a
+/// different crate).
+fn inbox_preview(text: &str) -> String {
+    let first = text.lines().next().unwrap_or("").trim();
+    const MAX: usize = 60;
+    if first.chars().count() > MAX {
+        let mut t: String = first.chars().take(MAX - 1).collect();
+        t.push('…');
+        t
+    } else {
+        first.to_string()
+    }
+}
+
+/// `aoide inbox list [--json] [--all]` — enumerate `state/inbox.json`:
+/// unread entries only by default, every entry (read or not) with `--all`.
+/// `id` in each JSON row (and the human `[n]` prefix) is the entry's
+/// position in the FULL stored array — see [`crate::inbox::mark_read`]'s
+/// doc for how that id stays stable across `inbox read` calls, unlike
+/// `pending list`'s shifting positions. Never errors on an empty or
+/// missing inbox.
+fn handle_inbox_list(inv: &Invocation) -> Outcome {
+    let cmd = "inbox.list";
+    let file = match crate::inbox::load() {
+        Ok(f) => f,
+        Err(e) => return Outcome::error(cmd, format!("state/inbox.json: {e}")),
+    };
+    let all = inv.flag_present("all");
+    let mut data = Vec::new();
+    let mut lines = Vec::new();
+    for (i, e) in file.entries.iter().enumerate() {
+        if !all && e.read {
+            continue;
+        }
+        let from = if e.from.is_empty() { "(anonymous)" } else { e.from.as_str() };
+        lines.push(format!(
+            "[{i}] {} ← {} (from {from}, {}){}",
+            e.target,
+            inbox_preview(&e.text),
+            e.received_at,
+            if e.read { " [read]" } else { "" }
+        ));
+        // The JSON row is the entry verbatim (raw `from`, possibly ""), plus
+        // its position — the human line above is where the placeholder lives.
+        let mut v = serde_json::to_value(e).unwrap_or_default();
+        if let Some(o) = v.as_object_mut() {
+            o.insert("id".to_string(), json!(i.to_string()));
+        }
+        data.push(v);
+    }
+    let n = data.len();
+    let body = if n == 0 {
+        if all { "state/inbox.json is empty".to_string() } else { "no unread messages (pass --all to include read ones)".to_string() }
+    } else {
+        lines.join("\n")
+    };
+    Outcome::ok(cmd, format!("{n} {}\n{body}", if all { "shown" } else { "unread" }))
+        .with_data(json!({ "entries": data }))
+}
+
+/// `aoide inbox read <n> [--json]` — mark one entry read by its `inbox
+/// list` position.
+fn handle_inbox_read(inv: &Invocation) -> Outcome {
+    let cmd = "inbox.read";
+    let raw = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(s) => s,
+        None => {
+            return Outcome::usage(
+                cmd,
+                "usage: aoide inbox read <n> — n is the position shown by `aoide inbox list`",
+            )
+        }
+    };
+    let index: usize = match raw.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            return Outcome::usage(
+                cmd,
+                format!(
+                    "`{raw}` is not an inbox id — ids are the position shown by `aoide inbox list` (e.g. 0)"
+                ),
+            )
+            .with_data(json!({ "reason": "bad-id", "id": raw }));
+        }
+    };
+    match crate::inbox::mark_read(index) {
+        Ok(entry) => {
+            let from = if entry.from.is_empty() { "(anonymous)" } else { entry.from.as_str() };
+            let mut v = serde_json::to_value(&entry).unwrap_or_default();
+            if let Some(o) = v.as_object_mut() {
+                o.insert("id".to_string(), json!(index.to_string()));
+            }
+            Outcome::ok(
+                cmd,
+                format!("inbox entry {index} marked read (from {from}, target `{}`)", entry.target),
+            )
+            .changed(vec![format!("inbox[{index}]: marked read")])
+            .with_data(v)
+        }
+        Err(e) => Outcome::error(cmd, e)
+            .with_data(json!({ "reason": "inbox-entry-not-found", "id": index.to_string() })),
+    }
+}
+
+/// `aoide inbox clear [--json]` — empty the inbox. Unconditional (see the
+/// `register_inbox` cmd! summary for the gating precedent this matches).
+fn handle_inbox_clear(_inv: &Invocation) -> Outcome {
+    let cmd = "inbox.clear";
+    match crate::inbox::clear() {
+        Ok(n) => Outcome::ok(cmd, format!("inbox cleared ({n} entr{} dropped)", if n == 1 { "y" } else { "ies" }))
+            .changed(vec![format!("state/inbox.json: {n} entries cleared")])
+            .with_data(json!({ "cleared": n })),
+        Err(e) => Outcome::error(cmd, format!("state/inbox.json: {e}")),
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
@@ -939,5 +1105,133 @@ mod tests {
             sanitize_header_value("claude-code/1.2.3\n\"evil\\"),
             "claude-code/1.2.3evil"
         );
+    }
+
+    // ── `aoide inbox list|read|clear` ───────────────────────────────────────
+
+    fn inbox_env(dir: &Path) {
+        std::env::set_var("AOIDE_STATE_DIR", dir);
+    }
+
+    fn inv_with_flag(path: &[&str], args: &[&str], flag: &str) -> aoide_protocol::Invocation {
+        let mut i = inv(path, args);
+        i.flags.insert(flag.to_string(), String::new());
+        i
+    }
+
+    #[test]
+    fn inbox_list_hides_read_entries_by_default_and_shows_them_with_all() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STATE_DIR"]);
+        let root = unique_tmp("inbox-list");
+        inbox_env(&root);
+
+        crate::inbox::receive("alice", "sess-1", "hi", None).unwrap();
+        crate::inbox::receive("bob", "sess-1", "yo", None).unwrap();
+        crate::inbox::mark_read(0).unwrap();
+
+        let out = handle_inbox_list(&inv(&["inbox", "list"], &[]));
+        assert_eq!(out.status, Status::Ok);
+        let data = out.data.unwrap();
+        let arr = data["entries"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "only the unread entry shows by default");
+        assert_eq!(arr[0]["id"], "1");
+        assert_eq!(arr[0]["from"], "bob");
+
+        let out = handle_inbox_list(&inv_with_flag(&["inbox", "list"], &[], "all"));
+        let data = out.data.unwrap();
+        let arr = data["entries"].as_array().unwrap();
+        assert_eq!(arr.len(), 2, "--all shows the read entry too");
+        assert_eq!(arr[0]["id"], "0");
+        assert_eq!(arr[0]["read"], true);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn inbox_list_on_an_empty_inbox_is_a_clean_ok_no_op() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STATE_DIR"]);
+        let root = unique_tmp("inbox-list-empty");
+        inbox_env(&root);
+
+        let out = handle_inbox_list(&inv(&["inbox", "list"], &[]));
+        assert_eq!(out.status, Status::Ok);
+        assert_eq!(out.data.unwrap()["entries"].as_array().unwrap().len(), 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn inbox_read_marks_by_position_and_reports_the_entry() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STATE_DIR"]);
+        let root = unique_tmp("inbox-read");
+        inbox_env(&root);
+
+        crate::inbox::receive("alice", "sess-1", "hi", None).unwrap();
+
+        let out = handle_inbox_read(&inv(&["inbox", "read"], &["0"]));
+        assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
+        let data = out.data.unwrap();
+        assert_eq!(data["id"], "0");
+        assert_eq!(data["read"], true);
+        assert_eq!(data["from"], "alice");
+
+        // The entry is now read, not removed — a second `list` (default,
+        // unread-only) shows nothing; `--all` still shows it.
+        let listed = handle_inbox_list(&inv(&["inbox", "list"], &[]));
+        assert_eq!(listed.data.unwrap()["entries"].as_array().unwrap().len(), 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn inbox_read_on_a_bad_or_missing_id_fails_cleanly() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STATE_DIR"]);
+        let root = unique_tmp("inbox-read-bad");
+        inbox_env(&root);
+
+        let out = handle_inbox_read(&inv(&["inbox", "read"], &["not-a-number"]));
+        assert_eq!(out.status, Status::Usage);
+
+        let out = handle_inbox_read(&inv(&["inbox", "read"], &[]));
+        assert_eq!(out.status, Status::Usage);
+
+        let out = handle_inbox_read(&inv(&["inbox", "read"], &["9"]));
+        assert_eq!(out.status, Status::Error, "out-of-range is a clean error, not a panic");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn inbox_clear_empties_and_reports_the_count() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STATE_DIR"]);
+        let root = unique_tmp("inbox-clear");
+        inbox_env(&root);
+
+        crate::inbox::receive("alice", "sess-1", "hi", None).unwrap();
+        crate::inbox::receive("bob", "sess-1", "yo", None).unwrap();
+
+        let out = handle_inbox_clear(&inv(&["inbox", "clear"], &[]));
+        assert_eq!(out.status, Status::Ok);
+        assert_eq!(out.data.unwrap()["cleared"], 2);
+
+        let listed = handle_inbox_list(&inv_with_flag(&["inbox", "list"], &[], "all"));
+        assert_eq!(listed.data.unwrap()["entries"].as_array().unwrap().len(), 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn register_inbox_wires_all_three_verbs() {
+        let mut r = Registry::new();
+        register_inbox(&mut r);
+        let paths: Vec<String> = r.commands().map(|c| c.dotted()).collect();
+        assert!(paths.contains(&"inbox.list".to_string()));
+        assert!(paths.contains(&"inbox.read".to_string()));
+        assert!(paths.contains(&"inbox.clear".to_string()));
     }
 }

@@ -623,6 +623,37 @@ fn deliver_local(inv: &Invocation, id: &str) -> Outcome {
         }
     }
 
+    // File this delivered message into the durable per-host inbox
+    // (messaging plan P-C6, `state/inbox.json`) — this is the ONE seam that
+    // covers every route a message takes to land here: a direct `--id`
+    // send, a `--to <local target>` (re-drives this exact function), a
+    // `pending approve` re-drive, AND the A2A server's `do_inject`
+    // (`crates/server/src/a2a.rs`) — `do_inject` builds a `graph send --id`
+    // invocation and calls `session_send` too, which for a same-box
+    // `contextId` can only ever reach THIS branch (it never sets `--to`).
+    // See `aoide_storage::inbox`'s module doc for the full reasoning and
+    // why `do_inject` does not file a second entry of its own.
+    //
+    // `from` is `attributed_sender` — the SAME resolved sender the audit
+    // line and the provenance prefix above already computed, empty string
+    // for an anonymous/unresolved sender (never `None` — the inbox's `from`
+    // is a plain `String`, not optional). `text` is the ORIGINAL message,
+    // not `payload` (which carries the provenance prefix and/or submit
+    // keystroke actually written to the socket).
+    //
+    // Best-effort by design: an inbox write failing must never turn an
+    // ALREADY-DELIVERED message into a reported failure — any error is
+    // folded into `changed` below, the returned status stays `Ok`.
+    let inbox_note = match aoide_storage::inbox::receive(
+        attributed_sender.as_deref().unwrap_or(""),
+        &id,
+        &text,
+        None,
+    ) {
+        Ok(()) => None,
+        Err(e) => Some(format!("(inbox filing failed: {e})")),
+    };
+
     // Auto-rename the node to a one-line form of the delivered task — unless
     // the text is a keystroke answer rather than a task (see [`names_the_node`]).
     let renamed = names_the_node(&text);
@@ -632,6 +663,9 @@ fn deliver_local(inv: &Invocation, id: &str) -> Outcome {
         String::new()
     };
     let mut changed = vec![format!("injected {} byte(s) into {id}", payload.len())];
+    if let Some(note) = inbox_note {
+        changed.push(note);
+    }
     if renamed {
         match set_session_title(&id, &title) {
             Ok(()) => changed.push(format!("session {id}: title → {title}")),
@@ -1840,6 +1874,121 @@ mod tests {
             log.contains("graph.send") && log.contains("delivered"),
             "audit log carries the delivered send: {log}"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn a_delivered_local_send_is_filed_into_the_inbox() {
+        // Messaging plan P-C6: `deliver_local`'s success path is the one
+        // seam that files a delivered message into `state/inbox.json` — see
+        // `aoide_storage::inbox`'s module doc for why the A2A door's
+        // `do_inject` does not need (and must not add) a second append.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_STATE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+
+        let root = unique_stage("send-inbox");
+        let stage = root.join("stage");
+        let state = root.join("state");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::set_var("AOIDE_SESSION_ID", "orchestrator-1");
+
+        let id = "send-inbox-target";
+        let socket = conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        do_session_start(
+            id,
+            Some("claude"),
+            Some("/w"),
+            None,
+            None,
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+            None,
+        );
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+        let out = session_send(&send_invocation(&["do", "the", "thing"], &[("id", id), ("yes", "true")]));
+        let _ = acc.join().unwrap();
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+
+        let file = aoide_storage::inbox::load().unwrap();
+        assert_eq!(file.entries.len(), 1, "one delivered message, one inbox entry");
+        let e = &file.entries[0];
+        assert_eq!(e.from, "orchestrator-1");
+        assert_eq!(e.target, id);
+        assert_eq!(e.text, "do the thing", "the RAW text, not the prefixed wire payload");
+        assert!(!e.read);
+        assert!(e.context.is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn a_send_left_pending_is_not_filed_into_the_inbox_until_approved() {
+        // Only a SUCCESSFUL delivery files — a held-pending send must not
+        // appear in the inbox at all yet.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_STATE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+
+        let root = unique_stage("send-inbox-pending");
+        let stage = root.join("stage");
+        let state = root.join("state");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        let id = "send-inbox-pending-target";
+        let socket = conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let _listener = UnixListener::bind(&socket).unwrap();
+        do_session_start(
+            id,
+            Some("claude"),
+            Some("/w"),
+            None,
+            None,
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+            None,
+        );
+
+        // No --yes, no autogate → held pending, never touches the socket.
+        let out = session_send(&send_invocation(&["do", "the", "thing"], &[("id", id)]));
+        assert_eq!(out.data.as_ref().unwrap()["state"], "pending");
+
+        let file = aoide_storage::inbox::load().unwrap();
+        assert!(file.entries.is_empty(), "a pending (undelivered) send never reaches the inbox");
 
         let _ = std::fs::remove_dir_all(&root);
     }

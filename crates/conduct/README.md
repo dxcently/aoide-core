@@ -17,7 +17,12 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   peer's CACHED graph, never a live pull) delivers over A2A `message/send`
   instead, gated entirely on the RECEIVING peer's side (this door's own
   `--yes`/pending/autogate machinery is a local-socket concept and does not
-  apply to a remote delivery).
+  apply to a remote delivery). `send::deliver_local`'s success path is also
+  the ONE seam that files a delivered message into `aoide_storage::inbox`
+  (messaging plan P-C6, `state/inbox.json`) — every route that lands a
+  message locally (direct `--id`, `--to` local, `pending approve`'s
+  re-drive, AND `aoide-server`'s A2A `do_inject`, which reaches this same
+  function through `session_send`) is covered by that one call.
 - `reap` — liveness reaping (`aoide graph reap`), sweeping sessions a
   `SIGKILL`'d terminal could never mark `done`.
 - `shellbridge`, `herald` — files only; their CLI verbs (registry lines)

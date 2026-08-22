@@ -23,6 +23,14 @@
   network via `aoide_client::commands::pull_peer_live` and falls back to
   the cache (read-only) for an unreachable peer; don't "helpfully" have a
   successful live probe refresh the cache as a side effect.
+- **`send::deliver_local`'s success path is the ONLY inbox-filing call in
+  the tree.** Every consumer that ultimately writes into a target session's
+  socket (`graph send --id`, `--to` resolving local, `pending approve`'s
+  re-drive, `aoide-server`'s A2A `do_inject`) reaches it through
+  `session_send`. Do NOT add a second `aoide_storage::inbox::receive` call
+  anywhere else — a2a's `do_inject` in particular reaches this exact
+  function too, so a second call there would double-file every A2A message
+  (see `aoide_storage::inbox`'s module doc for the full reasoning).
 
 ## Extension points
 

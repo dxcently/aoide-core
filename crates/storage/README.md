@@ -24,7 +24,18 @@ cache (CONTRACTS.md §7). File-first by decision — no embedded database yet
   into a local session id or a deferred `peer/<rest>` remote query. Zero
   I/O, agnostic of any call site — planned callers are `aoide who` (C2) and
   `graph send --to` (C3), neither wired in yet.
-- `commands` — this crate's one CLI verb, `usage` (local token/cost rollup).
+- `inbox` — the durable per-host message store (messaging plan P-C6,
+  `state/inbox.json`, CONTRACTS.md §4): every message that lands in a local
+  session, filed by `conduct`'s `deliver_local` success path — the ONE
+  writer that covers a direct `graph send`, a `--to` local resolve, a
+  `pending approve` re-drive, AND the A2A server's `do_inject` (which
+  reaches `deliver_local` through the same `session_send` door). Capped at
+  200, oldest-drop, atomic writes (`herald::LEDGER_CAP`'s fold-and-cap
+  precedent). `context` is an opaque `serde_json::Value` passthrough
+  reserved for a future Mneme (memory-manager) integration — v0 never reads
+  it.
+- `commands` — this crate's CLI verbs: `usage` (local token/cost rollup) and
+  `inbox list|read|clear` (the store above's CLI surface).
 
 ## What it consumes
 

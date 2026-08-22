@@ -25,8 +25,9 @@ use crate::registry::Registry;
 /// soundcheck (the mechanical-integrity verb's WORKING-tree half,
 /// `aoide-upkeep`; report-only, forever — see its own module doc for the
 /// finding format and why the COMMITTED-tree half lives in `nix flake
-/// check` instead), who (appended newest — live presence over sessions +
-/// registered peers, messaging workstream C2).
+/// check` instead), who (live presence over sessions + registered peers,
+/// messaging workstream C2), inbox list/read/clear (appended newest — the
+/// durable per-host message store, messaging workstream C6).
 ///
 /// P-A5 (binary-split workstream) removed the 11 register lines for the
 /// graphical bundle — rice/draft/mode/cover/livery/rice-late-stubs/
@@ -54,7 +55,8 @@ pub fn all() -> Registry {
     aoide_storage::commands::register(&mut r); // usage — local token/cost rollup (CONTRACTS.md §4)
     aoide_conduct::commands::hooks::register(&mut r); // hooks install — the hook-installer verb
     aoide_upkeep::commands::register(&mut r); // soundcheck — mechanical-integrity WORKING-tree sweep, report-only
-    aoide_conduct::commands::who::register(&mut r); // who — live presence over sessions + registered peers (messaging workstream C2, appended newest)
+    aoide_conduct::commands::who::register(&mut r); // who — live presence over sessions + registered peers (messaging workstream C2)
+    aoide_storage::commands::register_inbox(&mut r); // inbox list/read/clear — durable per-host message store (messaging workstream C6, appended newest)
 
     r
 }

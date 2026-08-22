@@ -706,6 +706,17 @@ fn submitted_task(session_id: &str) -> Value {
 /// synchronous JSON-RPC caller gets an honest immediate response;
 /// `tasks/get`/the SSE stream reflect the real session state once/if a
 /// human approves and delivers it.
+/// **Messaging plan P-C6, `state/inbox.json`**: this function files NO inbox
+/// entry of its own. It builds a `graph send --id` [`Invocation`] and calls
+/// [`session_send`] just like `graph send` itself does — and since this
+/// invocation never carries a `--to` flag, `session_send` can only ever
+/// reach its LOCAL branch (`deliver_local`), which is the one place a
+/// delivered message gets filed (`aoide_conduct::graph::send::deliver_local`
+/// — see `aoide_storage::inbox`'s module doc). So a remote peer's message
+/// lands in the inbox through the exact same call `do_inject` already makes
+/// below; adding a second append here would double-file every A2A-delivered
+/// message. See `a_successfully_delivered_message_send_files_into_the_inbox`
+/// below for the end-to-end proof.
 fn do_inject(
     session_id: &str,
     prompt: &str,
@@ -2870,6 +2881,74 @@ mod tests {
 
         let log = std::fs::read_to_string(&audit_log).unwrap_or_default();
         assert!(log.contains("\"status\":\"delivered\""), "audited as delivered: {log}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
+    fn a_successfully_delivered_message_send_files_into_the_inbox() {
+        // Messaging plan P-C6: `do_inject` files no entry of its own (see its
+        // doc comment) — this proves the SHARED seam actually fires for an
+        // A2A-delivered message, end to end through `message_send`.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-inbox-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_STATE_DIR", root.join("state"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        let id = "inbox-a2a-target";
+        let socket = aoide_conduct::graph::conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![conductable_session(id, &socket)],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+
+        let audit_log = root.join("log");
+        let params = serde_json::json!({
+            "message": { "parts": [{ "kind": "text", "text": "hello from a peer" }], "contextId": id }
+        });
+        let result = message_send(&params, &audit_log, "", PeerOrigin::Loopback, "", None);
+        let _ = acc.join().unwrap();
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let file = aoide_storage::inbox::load().unwrap();
+        assert_eq!(file.entries.len(), 1, "one delivered A2A message, one inbox entry — not two");
+        assert_eq!(file.entries[0].target, id);
+        assert_eq!(file.entries[0].text, "hello from a peer");
+        // The a2a door has no caller identity to offer today (#51's scope) —
+        // `do_inject`'s Invocation never sets `--from`, and this test process
+        // has no AOIDE_SESSION_ID either, so the honest attribution is empty.
+        assert_eq!(file.entries[0].from, "");
 
         let _ = std::fs::remove_dir_all(&root);
         match saved_stage {

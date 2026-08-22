@@ -10,7 +10,12 @@ the inbound half of the two-door contract (the outbound half is
 - `daemon` — the `aoided` policy skeleton and `run` entry point.
 - `mcp` — `serve_stdio`, the MCP stdio server.
 - `a2a` — the serve half of A2A (JSON-RPC/HTTP/SSE); the client half stays
-  in `aoide-client`.
+  in `aoide-client`. `do_inject` (`message/send`'s Inject arm) delivers
+  through `aoide_conduct::graph::session_send` — the same door `graph send`
+  uses — which is also where a delivered message gets filed into
+  `aoide_storage::inbox` (messaging plan P-C6): `do_inject` itself files no
+  entry of its own, since its Invocation can only ever reach
+  `session_send`'s LOCAL branch (see `do_inject`'s doc comment).
 - `commands` — this crate's CLI verbs: `daemon`, `shellbridge` (registration
   only — the files stay in `conduct`), `a2a serve`.
 

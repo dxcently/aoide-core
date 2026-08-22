@@ -634,6 +634,73 @@ mod tests {
     }
 
     #[test]
+    fn approving_a_pending_entry_files_it_into_the_inbox_via_the_shared_delivery_seam() {
+        // Messaging plan P-C6: the inbox append lives ONLY in `deliver_local`
+        // (send.rs) — `pending_approve`'s re-drive goes through the SAME
+        // `session_send` door, so a previously-held entry lands in the
+        // inbox naturally the moment it is actually delivered, never at
+        // queue time.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_STATE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+        let root = setup("pnd-inbox");
+        let state = root.join("state");
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+
+        let id = "inbox-approve-target";
+        let socket = conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        do_session_start(
+            id,
+            Some("claude"),
+            Some("/w"),
+            None,
+            None,
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+            None,
+        );
+
+        std::fs::write(
+            pending_path(),
+            format!(
+                r#"{{"schemaVersion":"0","pending":[{{"sessionId":"{id}","text":"hello inbox","submit":true,"queuedAt":"2026-08-13T14:01:10Z","from":"queuer-a"}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        // Nothing in the inbox yet — the entry is only PENDING.
+        assert!(aoide_storage::inbox::load().unwrap().entries.is_empty());
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+        let out = pending_approve(&pending_invocation(&["graph", "pending", "approve"], &["0"]));
+        let _ = acc.join().unwrap();
+        assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
+
+        let file = aoide_storage::inbox::load().unwrap();
+        assert_eq!(file.entries.len(), 1, "approval's re-drive filed the message");
+        assert_eq!(file.entries[0].from, "queuer-a", "the ORIGINAL queuer, not the approver");
+        assert_eq!(file.entries[0].target, id);
+        assert_eq!(file.entries[0].text, "hello inbox");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn pending_round_trip_keeps_the_original_queuer_as_sender_through_approve() {
         // Queue under sender A, approve under sender B → the delivered bytes
         // must name A (the original queuer), never B (the approver) — the

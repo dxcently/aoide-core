@@ -18,9 +18,9 @@
 
 - **A new durable record shape** adds a type to `records` and a read/write
   pair to `fs`/`stage`; existing consumers never touch raw file paths for it.
-- **A new CLI verb** (this crate has one today, `usage`) adds a
-  `cmd!`/`register` entry in `commands.rs`, wired into the owning app
-  crate's `commands::all()`.
+- **A new CLI verb** (this crate has two groups today, `usage` and `inbox
+  list|read|clear`) adds a `cmd!`/`register` entry in `commands.rs`, wired
+  into the owning app crate's `commands::all()`.
 
 ## Docs update required in the same commit
 
