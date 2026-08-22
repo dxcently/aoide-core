@@ -18,6 +18,16 @@
 //! itself stays `store`'s job ([`store::save_totp_secret`]/
 //! [`store::save_replay_ledger`]) — this module never writes a secrets-home
 //! file directly.
+//!
+//! **[`show`] (P-V4e) is `run`'s read-only sibling**: `secrets enroll
+//! --show` reprints an EXISTING enrollment's URI/base32/QR through the
+//! same [`print_enrollment`] tail `run` uses, but calls neither
+//! `generate_secret` nor `store::save_totp_secret`/`save_replay_ledger` —
+//! there is nothing in it that could rotate anything. `commands::
+//! handle_secrets_enroll` rejects `--force`+`--show` together as a usage
+//! error before either reaches `cli`'s `special` hook, which dispatches to
+//! `run` or `show` from the SAME `["secrets", "enroll"]` arm (no second
+//! arm — see that hook's own comment).
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -84,6 +94,35 @@ pub fn render_qr(uri: &str) -> Option<String> {
     String::from_utf8(output.stdout).ok()
 }
 
+/// The `(otpauth:// URI, base32 secret)` pair `run`/`show` both print — a
+/// pure formatting split-out (module doc's I/O-boundary widening note),
+/// so a test can assert on the exact text either path would print without
+/// capturing this process's real stdout (there is no precedent for that in
+/// this crate's tests, and OS-level stdout capture is fragile across
+/// `cargo test`'s parallel test threads).
+fn enrollment_text(secret: &[u8]) -> (String, String) {
+    let hostname = local_hostname();
+    let uri = crate::uri::totp_uri(&hostname, "aoide-secrets", secret);
+    let secret_b32 = crate::base32::encode(secret);
+    (uri, secret_b32)
+}
+
+/// Print an enrollment's URI + base32 + QR (or the qrencode-absent hint) —
+/// the shared tail of `run` and [`show`]: identical output shape, whether
+/// the secret behind it is freshly generated or an existing one being
+/// reprinted.
+fn print_enrollment(secret: &[u8]) {
+    let (uri, secret_b32) = enrollment_text(secret);
+    println!("{uri}");
+    println!("secret (base32): {secret_b32}");
+    match render_qr(&uri) {
+        Some(qr) => println!("{qr}"),
+        None => println!(
+            "(qrencode not found on PATH — scan the URI above by hand, or install qrencode for a QR code)"
+        ),
+    }
+}
+
 /// The full `secrets enroll` flow. ONE enrollment per host: an existing
 /// `totp.secret` is left untouched unless `force` is set, in which case
 /// the OLD secret AND its replay ledger are both replaced — a stale
@@ -115,21 +154,30 @@ pub fn run(secrets_home: &Path, force: bool) -> Result<(), String> {
     crate::store::save_replay_ledger(secrets_home, &crate::replay::ReplayLedger::new())
         .map_err(|e| format!("resetting the replay ledger: {e}"))?;
 
-    let hostname = local_hostname();
-    let uri = crate::uri::totp_uri(&hostname, "aoide-secrets", &secret);
-    let secret_b32 = crate::base32::encode(&secret);
-
-    println!("{uri}");
-    println!("secret (base32): {secret_b32}");
-    match render_qr(&uri) {
-        Some(qr) => println!("{qr}"),
-        None => println!(
-            "(qrencode not found on PATH — scan the URI above by hand, or install qrencode for a QR code)"
-        ),
-    }
+    print_enrollment(&secret);
     if force {
         println!("re-enrolled: the previous secret and every consumed code are now invalid.");
     }
+    Ok(())
+}
+
+/// `secrets enroll --show` (P-V4e): reprint the EXISTING enrollment's URI +
+/// base32 + QR through the exact same [`print_enrollment`] path `run`
+/// uses, WITHOUT generating, persisting, or touching anything — no
+/// `store::save_totp_secret`/`save_replay_ledger` call anywhere in this
+/// function, by construction (there is nothing here for it to call). Errors
+/// cleanly when no enrollment exists yet rather than silently enrolling one
+/// — that would be exactly the surprise rotation `--show` exists to let a
+/// caller avoid.
+pub fn show(secrets_home: &Path) -> Result<(), String> {
+    let secret = match crate::store::load_totp_secret(secrets_home) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Err("no TOTP enrollment on this host yet — run `secrets enroll` first".to_string())
+        }
+        Err(e) => return Err(format!("checking existing enrollment: {e}")),
+    };
+    print_enrollment(&secret);
     Ok(())
 }
 
@@ -258,6 +306,38 @@ mod tests {
             crate::store::load_replay_ledger(&home).unwrap().is_empty(),
             "--force must reset the replay ledger too — a stale spent timestep must not survive re-enrollment"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── show (P-V4e) ─────────────────────────────────────────────────────
+
+    #[test]
+    fn show_reprints_the_seeded_secrets_uri_and_rotates_nothing() {
+        let home = tmp_home("show");
+        run(&home, false).unwrap();
+        let secret_path = crate::store::totp_secret_path(&home);
+        let bytes_before = std::fs::read(&secret_path).unwrap();
+        let seeded = crate::store::load_totp_secret(&home).unwrap().unwrap();
+
+        show(&home).unwrap();
+
+        // Byte-identical, not merely value-equal — `show` must not even
+        // rewrite the file (mtime/formatting included).
+        let bytes_after = std::fs::read(&secret_path).unwrap();
+        assert_eq!(bytes_before, bytes_after, "show must not touch totp.secret at all");
+        let after = crate::store::load_totp_secret(&home).unwrap().unwrap();
+        assert_eq!(seeded, after, "show must never rotate the secret");
+
+        // Same secret in, same URI/base32 text out.
+        assert_eq!(enrollment_text(&seeded), enrollment_text(&after));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn show_without_an_existing_enrollment_errors_cleanly() {
+        let home = tmp_home("show-none");
+        let err = show(&home).unwrap_err();
+        assert!(err.contains("no TOTP enrollment"), "{err}");
         std::fs::remove_dir_all(&home).ok();
     }
 }

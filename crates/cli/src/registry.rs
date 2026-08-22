@@ -142,6 +142,7 @@ mod tests {
             "secrets.revoke",
             "secrets.rm",
             "secrets.serve",
+            "secrets.set-totp",
             "who",
         ];
         expected.sort();

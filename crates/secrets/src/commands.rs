@@ -1,5 +1,5 @@
 //! `aoide secrets` — the secrets broker's CLI surface (Workstream SECRETS,
-//! P-V2, P-V3, P-V4c). Registers EIGHT verbs:
+//! P-V2, P-V3, P-V4c, P-V4e). Registers NINE verbs:
 //!
 //! - `serve` — the long-running broker, special-cased at the entry point
 //!   exactly like `a2a serve`/`conductor` (`cli`'s `run_cli`): this
@@ -10,12 +10,17 @@
 //!   inherited stdio and an injected env var — see `crate::client`'s
 //!   module doc for why that can never go through the generic `Outcome`
 //!   envelope (a value would have to ride through it).
-//! - `enroll` (P-V3) — CLI-only, special-cased the SAME way as `serve`/
-//!   `exec`, for the same reason `exec` is: the printed `otpauth://` URI +
-//!   base32 secret must never ride the `Outcome` envelope (this crate's
-//!   `AGENTS.md`). [`handle_secrets_enroll`] only gates the door and records
-//!   the launch; the actual secret generation/persistence/printing is
-//!   `crate::enroll::run`, called from `cli`'s `special` hook.
+//! - `enroll` (P-V3, `--show` added P-V4e) — CLI-only, special-cased the
+//!   SAME way as `serve`/`exec`, for the same reason `exec` is: the printed
+//!   `otpauth://` URI + base32 secret must never ride the `Outcome`
+//!   envelope (this crate's `AGENTS.md`). [`handle_secrets_enroll`] only
+//!   gates the door, rejects the `--force`/`--show` combination (a usage
+//!   error — the two ask for opposite things: rotate vs. never touch), and
+//!   records the launch; the actual secret generation/persistence/printing
+//!   (`--force`/bare) or read-only reprint (`--show`) is `crate::enroll::
+//!   run`/`crate::enroll::show`, dispatched from `cli`'s `special` hook —
+//!   the SAME `if inv.path == ["secrets", "enroll"]` arm as before, not a
+//!   second one (see that module's doc).
 //! - `add`/`rm`/`grant`/`revoke` — the policy-CRUD admin quartet. Not
 //!   special-cased (they only read/write `policy.json`, no socket, no
 //!   value, ever, so they still run through the ordinary dispatch + audit
@@ -26,7 +31,10 @@
 //!   `secrets grant <secret> <itself>` and self-escalate. The gate returns
 //!   the door-hint `Outcome` and returns BEFORE any `store::load_policies`/
 //!   `store::save_policies` call, so a non-CLI invocation never mutates
-//!   `policy.json`.
+//!   `policy.json`. `add`'s `--require-totp` flag (present since P-V2, live
+//!   since P-V3's TOTP wiring) births the policy already gated — a secret
+//!   never has to pass through an unrequired window before someone remembers
+//!   to lock it down.
 //! - `put` (P-V4c) — the write half: `secrets put <name>` reads the value
 //!   from STDIN (never argv) and forwards it to the broker's `put` op over
 //!   the socket. **NOT special-cased**, unlike `serve`/`exec`/`enroll`:
@@ -39,9 +47,19 @@
 //!   and its own success/failure message is name-only
 //!   (`format!("put secret \`{name}\`")`) — so nothing about its return
 //!   path ever needs to bypass the generic `Outcome` envelope the way a
-//!   FETCHED value (`exec`) or a PRINTED secret (`enroll`) would. Appended
-//!   LAST in `register()` (golden discipline — `pkgs/aoide/crates/
-//!   AGENTS.md`: append, never reorder), golden 59 -> 60.
+//!   FETCHED value (`exec`) or a PRINTED secret (`enroll`) would. **P-V4e:**
+//!   when stdin is a terminal, `crate::client::run_put` now prompts on
+//!   STDERR and reads the value with terminal echo disabled instead of
+//!   requiring a pipe — see that module's doc; a piped/redirected stdin is
+//!   byte-identical to before.
+//! - `set-totp` (P-V4e) — `secrets set-totp <name> on|off`: flips an
+//!   EXISTING policy's `requireTotp` bit without hand-editing `policy.json`.
+//!   Same `require_cli` gate as the rest of the admin surface; unknown name
+//!   is a clean error; re-setting the same state is idempotent and reports
+//!   "unchanged" honestly (house rule: report exactly what changed) rather
+//!   than calling `.changed(...)` on a no-op write. Appended LAST in
+//!   `register()` (golden discipline — `pkgs/aoide/crates/AGENTS.md`:
+//!   append, never reorder), golden 60 -> 61.
 //!
 //! `add`/`rm`/`grant`/`revoke`/`enroll` run AS THE SECRETS USER in deployment
 //! (`sudo -u aoide-secrets ...`, wrapped by the nix module at P-V4), but the
@@ -94,7 +112,7 @@ pub fn register(r: &mut Registry) {
         flags: [
             flag!("backend", "string", "The named backend (backends.json) that fetches this secret's value."),
             flag!("key", "string", "The backend-specific key/identifier substituted into that backend's fetch-command template."),
-            flag!("require-totp", "bool", "Require a fresh TOTP code to resolve (P-V2: makes this secret unresolvable until enrollment lands at P-V4)."),
+            flag!("require-totp", "bool", "Require a fresh TOTP code to resolve — the policy is born gated. Unresolvable until this host has run `secrets enroll`; once enrolled, verified live against the enrolled TOTP secret on every resolve (`secrets set-totp` flips this later without re-adding)."),
             flag!("consumers", "string", "Comma-separated consumer names allowed to resolve this secret (empty/omitted = any consumer).")
         ],
         gated: false,
@@ -140,25 +158,39 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["secrets", "enroll"],
-        summary: "Enroll this host for TOTP: generate a fresh secret and print its otpauth:// URI + base32 form (plus a QR code when `qrencode` is on PATH). ONE enrollment per host — pass --force to regenerate (old codes stop working immediately). CLI-only: the secret is printed directly to stdout, never through this envelope.",
+        summary: "Enroll this host for TOTP: generate a fresh secret and print its otpauth:// URI + base32 form (plus a QR code when `qrencode` is on PATH). ONE enrollment per host — pass --force to regenerate (old codes stop working immediately), or --show to reprint the EXISTING enrollment's URI/QR without rotating anything. --force and --show are mutually exclusive. CLI-only: the secret is printed directly to stdout, never through this envelope.",
         args: [],
         flags: [
-            flag!("force", "bool", "Regenerate the secret even if one is already enrolled on this host. Invalidates every previously issued code.")
+            flag!("force", "bool", "Regenerate the secret even if one is already enrolled on this host. Invalidates every previously issued code."),
+            flag!("show", "bool", "Reprint the existing enrollment's otpauth:// URI + base32 + QR without generating or rotating anything. Errors if no enrollment exists yet.")
         ],
         gated: false,
         implemented: true,
         handler: handle_secrets_enroll,
-        examples: ["secrets enroll", "secrets enroll --force"],
+        examples: ["secrets enroll", "secrets enroll --force", "secrets enroll --show"],
     ));
     r.insert(cmd!(
         path: ["secrets", "put"],
-        summary: "Store a value for an EXISTING secret's policy, read from stdin (never argv). CLI-only — no TOTP, since put is admin-side, not agent-facing. The named policy's backend must carry a `set` template (the built-in `file` backend has one by default).",
+        summary: "Store a value for an EXISTING secret's policy, read from stdin (never argv) — prompts on stderr with input hidden when stdin is a terminal, reads piped bytes byte-identically otherwise. CLI-only — no TOTP, since put is admin-side, not agent-facing. The named policy's backend must carry a `set` template (the built-in `file` backend has one by default).",
         args: [arg!("name", "string", true, "The secret's nickname — must already have a policy (`secrets add` first).")],
         flags: [],
         gated: false,
         implemented: true,
         handler: handle_secrets_put,
-        examples: ["printf %s hunter2 | aoide secrets put db-prod"],
+        examples: ["printf %s hunter2 | aoide secrets put db-prod", "aoide secrets put db-prod"],
+    ));
+    r.insert(cmd!(
+        path: ["secrets", "set-totp"],
+        summary: "Flip an EXISTING secret's requireTotp bit on or off, without hand-editing policy.json. Idempotent: re-setting the same state reports \"unchanged\" and writes nothing.",
+        args: [
+            arg!("name", "string", true, "The secret's nickname — must already have a policy (`secrets add` first)."),
+            arg!("state", "string", true, "`on` or `off`.")
+        ],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_secrets_set_totp,
+        examples: ["secrets set-totp db-prod on", "secrets set-totp db-prod off"],
     ));
 }
 
@@ -201,7 +233,11 @@ fn handle_secrets_enroll(inv: &Invocation) -> Outcome {
     if let Some(hint) = require_cli(inv, cmd) {
         return hint;
     }
-    Outcome::ok(cmd, "enrolling TOTP on this host").with_data(json!({
+    if inv.flag_present("force") && inv.flag_present("show") {
+        return Outcome::usage(cmd, "secrets enroll: --force and --show are mutually exclusive");
+    }
+    let message = if inv.flag_present("show") { "reprinting enrollment" } else { "enrolling TOTP on this host" };
+    Outcome::ok(cmd, message).with_data(json!({
         "secretsHome": home::secrets_home().to_string_lossy(),
     }))
 }
@@ -359,6 +395,51 @@ fn handle_secrets_put(inv: &Invocation) -> Outcome {
     }
 }
 
+/// `secrets set-totp <name> on|off` — the direct replacement for the
+/// hand-edited `jq` one-liner against `policy.json` this verb exists to
+/// retire. Same `require_cli` gate as the rest of the admin surface; an
+/// unknown secret name is a clean [`Outcome::error`], never a silent
+/// no-op. Idempotent (house rule 2 — "report exactly what changed"):
+/// re-setting the state a policy already has writes NOTHING and reports
+/// "unchanged" rather than calling `.changed(...)` on a write that never
+/// happened.
+fn handle_secrets_set_totp(inv: &Invocation) -> Outcome {
+    let cmd = "secrets.set-totp";
+    if let Some(hint) = require_cli(inv, cmd) {
+        return hint;
+    }
+    let Some(name) = inv.args.first().cloned() else {
+        return Outcome::usage(cmd, "usage: secrets set-totp <name> on|off");
+    };
+    let Some(state) = inv.args.get(1).cloned() else {
+        return Outcome::usage(cmd, "usage: secrets set-totp <name> on|off");
+    };
+    let want = match state.as_str() {
+        "on" => true,
+        "off" => false,
+        _ => return Outcome::usage(cmd, format!("secrets set-totp expects `on` or `off`, got `{state}`")),
+    };
+
+    let home = home::secrets_home();
+    let mut policies = match store::load_policies(&home) {
+        Ok(p) => p,
+        Err(e) => return Outcome::error(cmd, format!("policy.json: {e}")),
+    };
+    let Some(policy) = policies.iter_mut().find(|p| p.name == name) else {
+        return Outcome::error(cmd, format!("no policy for secret `{name}`"));
+    };
+
+    if policy.require_totp == want {
+        return Outcome::ok(cmd, format!("secret `{name}` requireTotp already `{state}` — unchanged"));
+    }
+    policy.require_totp = want;
+
+    if let Err(e) = store::save_policies(&home, &policies) {
+        return Outcome::error(cmd, format!("writing policy.json: {e}"));
+    }
+    Outcome::ok(cmd, format!("secret `{name}` requireTotp set to `{state}`")).changed(vec![format!("policy:{name}")])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,6 +494,7 @@ mod tests {
                 "secrets.revoke",
                 "secrets.enroll",
                 "secrets.put",
+                "secrets.set-totp",
             ]
         );
         for c in r.commands() {
@@ -611,5 +693,182 @@ mod tests {
             let put = inv(Door::Cli, &["secrets", "put"], &["Bad--Name"], &[]);
             assert_eq!(handle_secrets_put(&put).status, Status::Usage);
         });
+    }
+
+    // ── set-totp ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn set_totp_flips_on_and_persists_reload_proves() {
+        with_secrets_home("set-totp-on", |home| {
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "pass"), ("key", "x")]);
+            assert_eq!(handle_secrets_add(&add).status, Status::Ok);
+            assert!(!store::load_policies(home).unwrap()[0].require_totp);
+
+            let on = inv(Door::Cli, &["secrets", "set-totp"], &["t", "on"], &[]);
+            let out = handle_secrets_set_totp(&on);
+            assert_eq!(out.status, Status::Ok, "{out:?}");
+            assert!(!out.changed.is_empty());
+
+            // Reload proves the write actually landed on disk, not just in
+            // the in-memory `Vec` this call happened to mutate.
+            assert!(store::load_policies(home).unwrap()[0].require_totp);
+        });
+    }
+
+    #[test]
+    fn set_totp_on_off_on_round_trips() {
+        with_secrets_home("set-totp-roundtrip", |home| {
+            let add = inv(
+                Door::Cli,
+                &["secrets", "add"],
+                &["t"],
+                &[("backend", "pass"), ("key", "x"), ("require-totp", "true")],
+            );
+            handle_secrets_add(&add);
+            assert!(store::load_policies(home).unwrap()[0].require_totp);
+
+            let off = inv(Door::Cli, &["secrets", "set-totp"], &["t", "off"], &[]);
+            assert_eq!(handle_secrets_set_totp(&off).status, Status::Ok);
+            assert!(!store::load_policies(home).unwrap()[0].require_totp);
+
+            let on = inv(Door::Cli, &["secrets", "set-totp"], &["t", "on"], &[]);
+            assert_eq!(handle_secrets_set_totp(&on).status, Status::Ok);
+            assert!(store::load_policies(home).unwrap()[0].require_totp);
+
+            let off_again = inv(Door::Cli, &["secrets", "set-totp"], &["t", "off"], &[]);
+            assert_eq!(handle_secrets_set_totp(&off_again).status, Status::Ok);
+            assert!(!store::load_policies(home).unwrap()[0].require_totp);
+        });
+    }
+
+    /// Idempotency (house rule: report exactly what changed) — re-setting
+    /// the state a policy already has must report "unchanged" AND must not
+    /// even rewrite `policy.json` (proven byte-identical, not merely
+    /// value-equal, so a re-touch of the file's mtime/formatting would also
+    /// be caught).
+    #[test]
+    fn set_totp_re_setting_the_same_state_is_a_reported_no_op() {
+        with_secrets_home("set-totp-idempotent", |home| {
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "pass"), ("key", "x")]);
+            handle_secrets_add(&add);
+            let bytes_before = std::fs::read(store::policy_path(home)).unwrap();
+
+            let off = inv(Door::Cli, &["secrets", "set-totp"], &["t", "off"], &[]);
+            let out = handle_secrets_set_totp(&off);
+            assert_eq!(out.status, Status::Ok, "{out:?}");
+            assert!(out.changed.is_empty(), "a no-op set-totp must report nothing changed");
+            assert!(out.message.contains("unchanged"), "{}", out.message);
+
+            let bytes_after = std::fs::read(store::policy_path(home)).unwrap();
+            assert_eq!(bytes_before, bytes_after, "a no-op set-totp must not even rewrite policy.json");
+        });
+    }
+
+    #[test]
+    fn set_totp_on_an_unknown_secret_is_a_clean_error() {
+        with_secrets_home("set-totp-unknown", |_home| {
+            let set = inv(Door::Cli, &["secrets", "set-totp"], &["nope", "on"], &[]);
+            let out = handle_secrets_set_totp(&set);
+            assert_eq!(out.status, Status::Error);
+            assert!(out.message.contains("no policy"), "{}", out.message);
+        });
+    }
+
+    #[test]
+    fn set_totp_rejects_a_state_that_is_not_on_or_off() {
+        with_secrets_home("set-totp-badstate", |home| {
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "pass"), ("key", "x")]);
+            handle_secrets_add(&add);
+            let bogus = inv(Door::Cli, &["secrets", "set-totp"], &["t", "maybe"], &[]);
+            assert_eq!(handle_secrets_set_totp(&bogus).status, Status::Usage);
+            // A rejected state must not touch the file either.
+            assert!(!store::load_policies(home).unwrap()[0].require_totp);
+        });
+    }
+
+    /// Same CLI-only discipline as the rest of the admin surface (module
+    /// doc), proven the same way as `admin_quartet_is_cli_only_...`:
+    /// `policy.json` byte-identical after every gated attempt over every
+    /// non-CLI door.
+    #[test]
+    fn set_totp_is_cli_only_a_non_cli_door_never_mutates_policy_json() {
+        with_secrets_home("set-totp-door-gate", |home| {
+            let seed = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "pass"), ("key", "x")]);
+            assert_eq!(handle_secrets_add(&seed).status, Status::Ok);
+            let before = std::fs::read(store::policy_path(home)).unwrap();
+
+            for door in [Door::Mcp, Door::A2a, Door::Daemon] {
+                let set = inv(door, &["secrets", "set-totp"], &["t", "on"], &[]);
+                assert_eq!(handle_secrets_set_totp(&set).status, Status::Usage, "set-totp over {door:?}");
+            }
+
+            let after = std::fs::read(store::policy_path(home)).unwrap();
+            assert_eq!(before, after, "policy.json mutated by a gated set-totp");
+        });
+    }
+
+    /// The deliverable's own end-to-end proof: `add --require-totp` births
+    /// a policy that is genuinely unresolvable without a code, not merely
+    /// one whose `require_totp` field happens to read `true` on disk — a
+    /// REAL broker + socket round trip, the same shape as `tests/e2e.rs`'s
+    /// own requireTotp coverage, but seeded through the actual CLI handler
+    /// under test here rather than a hand-built `Policy`.
+    #[test]
+    fn require_totp_on_add_births_a_gated_policy_denied_without_a_code() {
+        with_secrets_home("require-totp-add-e2e", |home| {
+            let add = inv(
+                Door::Cli,
+                &["secrets", "add"],
+                &["locked"],
+                &[("backend", "pass"), ("key", "x"), ("require-totp", "true")],
+            );
+            assert_eq!(handle_secrets_add(&add).status, Status::Ok);
+            assert!(store::load_policies(home).unwrap()[0].require_totp);
+
+            // A short /tmp-direct socket path — sockaddr_un's ~108-byte
+            // sun_path can overflow under a nested tempdir (the same SUN_LEN
+            // caution `tests/e2e.rs`'s own `short_tmp` documents).
+            let socket_path = std::path::PathBuf::from(format!(
+                "/tmp/aoide-secrets-cmd-totp-{}-{}.sock",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            ));
+
+            let home_for_thread = home.to_path_buf();
+            let sock_for_thread = socket_path.clone();
+            let broker_thread = std::thread::spawn(move || {
+                let _ = crate::broker::serve(&home_for_thread, &sock_for_thread);
+            });
+
+            let mut connected = false;
+            for _ in 0..50 {
+                if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+                    connected = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(connected, "broker did not bind {} in time", socket_path.display());
+
+            let err = crate::client::resolve(&socket_path, "locked", "m", None, None).unwrap_err();
+            assert!(err.contains("no TOTP enrollment"), "{err}");
+
+            drop(broker_thread);
+            std::fs::remove_file(&socket_path).ok();
+        });
+    }
+
+    // ── enroll --show / --force conflict ────────────────────────────────
+
+    #[test]
+    fn enroll_show_and_force_together_is_a_usage_error() {
+        let both = inv(Door::Cli, &["secrets", "enroll"], &[], &[("force", "true"), ("show", "true")]);
+        assert_eq!(handle_secrets_enroll(&both).status, Status::Usage);
+
+        let show_only = inv(Door::Cli, &["secrets", "enroll"], &[], &[("show", "true")]);
+        assert_eq!(handle_secrets_enroll(&show_only).status, Status::Ok);
+
+        let force_only = inv(Door::Cli, &["secrets", "enroll"], &[], &[("force", "true")]);
+        assert_eq!(handle_secrets_enroll(&force_only).status, Status::Ok);
     }
 }

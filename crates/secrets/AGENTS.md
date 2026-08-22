@@ -183,6 +183,33 @@
 - **Secrets pairing / mesh replica sharing** (P-V5, gated on #51) is a new
   module beside `broker`, not a growth of `broker`'s own resolve path —
   see the plan's "Mesh sharing" section for the separate loopback channel.
+- **Two live UX gaps closed at P-V4e** — `secrets set-totp <name> on|off`
+  (`commands::handle_secrets_set_totp`) flips an existing policy's
+  `require_totp` bit through `store::load_policies`/`save_policies`, the
+  same round trip `add`/`grant`/`revoke` already use; it is the replacement
+  for hand-editing `policy.json` with a `jq` one-liner as the secrets user.
+  `secrets enroll --show` (`enroll::show`) reprints an EXISTING
+  enrollment's URI/base32/QR through the SAME `enroll::print_enrollment`
+  tail `run` uses, calling neither `generate_secret` nor `store::
+  save_totp_secret`/`save_replay_ledger` — there is nothing in it that
+  could rotate anything. `commands::handle_secrets_enroll` rejects
+  `--force`+`--show` together as a usage error; `cli`'s `special` hook
+  dispatches to `run` or `show` from the SAME `["secrets", "enroll"]` arm,
+  never a second one. A new read-only reprint of some OTHER already-
+  persisted secret-adjacent state (not TOTP) follows this same shape: a
+  sibling function beside the mutating one, sharing its rendering tail,
+  called from the SAME special-hook arm behind a flag, never a new path.
+- **`secrets put`'s stdin intake grew a tty branch at P-V4e**
+  (`client::stdin_is_tty`/`client::read_hidden_line`) — when stdin is a
+  terminal, `run_put` prompts on stderr and reads with echo disabled
+  (raw `libc::termios`, restored unconditionally, even on a read error)
+  instead of requiring a pipe. A piped/redirected stdin is BYTE-IDENTICAL
+  to before — `run_put`'s non-tty branch is the original `read_to_string`
+  call, untouched. Don't let the tty branch's prompt or trim logic leak
+  into the pipe branch "for consistency"; they are deliberately two
+  separate code paths with different contracts (a script's piped bytes
+  are the value verbatim; a human's typed line loses exactly one trailing
+  newline, `client::strip_one_trailing_newline`).
 
 ## Docs update required in the same commit
 

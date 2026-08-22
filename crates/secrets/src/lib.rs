@@ -39,6 +39,15 @@
 //! `CONTRACTS.md`'s "Secrets wire" subsection as a first-class,
 //! directly-speakable API for non-agent consumers.
 //!
+//! **P-V4e (this commit) closes two live UX gaps**: [`commands::
+//! handle_secrets_set_totp`] (`secrets set-totp <name> on|off`) flips an
+//! existing policy's `requireTotp` bit directly, replacing a hand-edited
+//! `jq` one-liner against `policy.json`; [`enroll::show`] (`secrets enroll
+//! --show`) reprints an EXISTING enrollment's URI/base32/QR without
+//! rotating anything, mutually exclusive with `--force`; and
+//! [`client::run_put`] now prompts on stderr with echo disabled when
+//! stdin is a terminal (a piped/redirected stdin is unchanged).
+//!
 //! See `README.md` for the wire shape and the release-to-client flow, and
 //! `AGENTS.md` for the invariants a change here must hold — most
 //! importantly: a secret's VALUE never appears on a `Serialize`/

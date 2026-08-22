@@ -31,6 +31,22 @@
 //! to bypass the generic `Outcome` envelope or return a spawned child's
 //! own exit code (`commands.rs`'s own module doc justifies this choice
 //! next to `serve`/`exec`/`enroll`'s).
+//!
+//! **P-V4e: `run_put` prompts and hides input when stdin is a terminal.**
+//! A piped/redirected stdin (`printf %s hunter2 | aoide secrets put t`,
+//! the historical shape, and every existing test/script) is BYTE-IDENTICAL
+//! to before — [`stdin_is_tty`] is false in that case and `run_put` falls
+//! straight through to the old `read_to_string` path, untouched. Only when
+//! stdin IS a terminal ([`stdin_is_tty`] true — `libc::isatty` on fd 0,
+//! already a dependency via `enroll::local_hostname`'s `gethostname`, no
+//! new crate) does [`read_hidden_line`] take over: it prints a prompt to
+//! STDERR (never stdout — stdout stays clean for scripting), clears
+//! `ECHO` on stdin's `termios` for the read, and restores the ORIGINAL
+//! termios afterward unconditionally — even on a read error — so a killed
+//! read can never leave the caller's shell echo-less. [`strip_one_trailing_newline`]
+//! is split out as its own pure function (module doc's "small seam"): the
+//! termios dance itself is not exercised by `cargo test` (this process's
+//! own stdin is never a tty in CI), but the trim logic it feeds is.
 
 use aoide_protocol::Invocation;
 use serde_json::{json, Value};
@@ -181,17 +197,79 @@ pub fn put(socket_path: &Path, secret: &str, value: &str) -> Result<(), String> 
     }
 }
 
+/// Is stdin a terminal? `libc::isatty` on fd 0 — the branch point between
+/// the historical pipe path and P-V4e's hidden-input prompt (module doc).
+fn stdin_is_tty() -> bool {
+    unsafe { libc::isatty(0) != 0 }
+}
+
+/// Strip exactly ONE trailing `\n`, never a blanket `.trim_end()` (same
+/// "exactly one, not a blanket trim" discipline `backend::fetch_value`'s
+/// module doc already holds for a backend's stdout) — a hidden-input read
+/// carries the newline the user's Enter key produced; this removes that
+/// one character and nothing else a pasted value might legitimately end
+/// with. Pure and total, so it is the "small seam" the tty path's own
+/// termios dance is tested through, per this module's own doc.
+fn strip_one_trailing_newline(mut s: String) -> String {
+    if s.ends_with('\n') {
+        s.pop();
+    }
+    s
+}
+
+/// Read one line from stdin with terminal echo disabled — the tty half of
+/// [`run_put`]'s prompt (module doc). Restores the ORIGINAL termios
+/// unconditionally before returning, on the success path AND the error
+/// path alike, so a read that fails partway can never leave the caller's
+/// terminal echo-less. Prints the prompt AND the post-read newline to
+/// STDERR (never stdout, module doc) — the newline exists because the
+/// user's own Enter never reached the terminal with echo off, so without
+/// it the next line printed would glue onto the hidden input's line.
+fn read_hidden_line(prompt: &str) -> Result<String, String> {
+    use std::io::{BufRead, Write};
+    eprint!("{prompt}");
+    let _ = std::io::stderr().flush();
+
+    let mut term: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(0, &mut term) } != 0 {
+        return Err("reading terminal attributes: tcgetattr failed".to_string());
+    }
+    let original = term;
+    term.c_lflag &= !libc::ECHO;
+    if unsafe { libc::tcsetattr(0, libc::TCSANOW, &term) } != 0 {
+        return Err("disabling terminal echo: tcsetattr failed".to_string());
+    }
+
+    let mut line = String::new();
+    let read_result = std::io::stdin().lock().read_line(&mut line);
+
+    // Always restore, even on a read error — never leave the terminal
+    // echo-less (module doc).
+    unsafe { libc::tcsetattr(0, libc::TCSANOW, &original) };
+    eprintln!();
+
+    read_result.map_err(|e| format!("reading value from stdin: {e}"))?;
+    Ok(strip_one_trailing_newline(line))
+}
+
 /// The full `secrets put <name>` client flow: read the value from THIS
-/// process's own stdin (stdin-only intake, module doc), then [`put`] it
-/// over `socket_path`. The value exists only as this function's own local
-/// `String`, from the stdin read to the `put()` call — never returned,
-/// never logged, never touching argv.
+/// process's own stdin (stdin-only intake, module doc) — prompting with
+/// echo hidden when stdin is a terminal (P-V4e), reading straight through
+/// unchanged when it's piped/redirected (the historical shape) — then
+/// [`put`] it over `socket_path`. The value exists only as this function's
+/// own local `String`, from the stdin read to the `put()` call — never
+/// returned, never logged, never touching argv.
 pub fn run_put(secret: &str, socket_path: &Path) -> Result<(), String> {
-    use std::io::Read;
-    let mut value = String::new();
-    std::io::stdin()
-        .read_to_string(&mut value)
-        .map_err(|e| format!("reading value from stdin: {e}"))?;
+    let value = if stdin_is_tty() {
+        read_hidden_line(&format!("value for `{secret}` (input hidden): "))?
+    } else {
+        use std::io::Read;
+        let mut value = String::new();
+        std::io::stdin()
+            .read_to_string(&mut value)
+            .map_err(|e| format!("reading value from stdin: {e}"))?;
+        value
+    };
     put(socket_path, secret, &value)
 }
 
@@ -334,5 +412,35 @@ mod tests {
         let dead = Path::new("/tmp/aoide-secrets-nonexistent-put-test.sock");
         let err = put(dead, "t", "irrelevant").unwrap_err();
         assert!(err.contains("connecting"), "{err}");
+    }
+
+    // ── P-V4e: `secrets put`'s tty prompt ───────────────────────────────
+    //
+    // The termios dance itself (`read_hidden_line`) is not exercised here —
+    // `cargo test`'s own stdin is never a tty — so these cover exactly the
+    // "small seam" the module doc calls out: the pure trim logic, and that
+    // `stdin_is_tty` reads false (so `run_put` takes the untouched pipe
+    // path) under this process's own non-tty stdin, same as every existing
+    // `run_put`-adjacent test already implicitly relies on.
+
+    #[test]
+    fn strip_one_trailing_newline_removes_exactly_one() {
+        assert_eq!(strip_one_trailing_newline("hunter2\n".to_string()), "hunter2");
+        assert_eq!(strip_one_trailing_newline("hunter2\n\n".to_string()), "hunter2\n");
+        assert_eq!(strip_one_trailing_newline("hunter2".to_string()), "hunter2");
+        assert_eq!(strip_one_trailing_newline(String::new()), "");
+        // Trailing spaces in a pasted value are NOT eaten — only the one
+        // newline the Enter key produced, never a blanket `.trim_end()`.
+        assert_eq!(strip_one_trailing_newline("hunter2  \n".to_string()), "hunter2  ");
+    }
+
+    #[test]
+    fn stdin_is_tty_is_false_under_cargo_test() {
+        // `cargo test` never runs with a tty on fd 0 — this is the same
+        // guarantee `run_put`'s existing pipe-path callers already lean on
+        // implicitly; asserted directly so a sandboxing change that somehow
+        // attaches a tty would fail loudly here instead of silently
+        // changing `run_put`'s behavior under every other test.
+        assert!(!stdin_is_tty());
     }
 }

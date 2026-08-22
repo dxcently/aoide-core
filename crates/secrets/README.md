@@ -25,7 +25,15 @@ below). The socket wire is now also documented in
 `CONTRACTS.md`'s "Secrets wire" subsection as a first-class,
 directly-speakable API for non-agent consumers (services, models) — this
 file stays the canonical source, `CONTRACTS.md` restates it for a reader
-who never opens this crate's Rust.
+who never opens this crate's Rust. **P-V4e (this commit) closes two live
+UX gaps the deployed broker surfaced**: `secrets set-totp <name> on|off`
+flips an EXISTING policy's `requireTotp` bit directly — no more hand-editing
+`policy.json` with a `jq` one-liner as the broker user — and `secrets enroll
+--show` reprints the CURRENT enrollment's `otpauth://` URI/base32/QR without
+rotating anything (`--force` still rotates; the two flags are mutually
+exclusive). `secrets put` also now prompts on stderr with input hidden when
+stdin is a terminal, instead of requiring a pipe — a piped/redirected stdin
+is unchanged.
 
 `secrets enroll` generates a fresh 20-byte secret from `/dev/urandom`,
 persists it (`store::save_totp_secret`, `0600`), and prints its
@@ -76,6 +84,8 @@ a value flows CLIENT-to-broker, never released back:
 ```
 operator/service -> aoide secrets put <name>   (value read from STDIN, never argv)
                   -> client (caller uid) connects, sends {op:"put", secret, value}
+                     (stdin is a terminal -> prompt on stderr, echo hidden;
+                     stdin is piped/redirected -> read straight through, unchanged)
                   -> broker (secrets uid): policy gate (secret has a policy —
                      `put` NEVER auto-creates one, `secrets add` owns that —
                      and its backend has a `set` template) -> pipes `value`
@@ -96,6 +106,23 @@ value exists ONLY as a local `String` in `client::run_put`, from the
 stdin read to the `put()` call that pipes it into the wire request — never
 an `Outcome`, never either audit line (both are written broker-side,
 name-only, exactly like `resolve`'s — see `broker`'s module doc).
+
+**Stdin intake, P-V4e**: `aoide secrets put <name>` with no pipe now
+prompts —
+
+```
+$ aoide secrets put db-prod
+value for `db-prod` (input hidden):
+put secret `db-prod`
+```
+
+— the prompt and the post-input newline print to STDERR (stdout stays
+clean for scripting), and the terminal's echo is disabled for the read
+(`client::read_hidden_line`, raw `libc::termios`, restored unconditionally
+afterward — even on a read error). A piped/redirected stdin
+(`printf %s hunter2 | aoide secrets put db-prod`, the original shape) is
+BYTE-IDENTICAL to before: `client::stdin_is_tty` is false in that case and
+`run_put` falls straight through the old `read_to_string` path.
 
 ## The wire (unix socket, JSON-lines, one request per line, one reply)
 
@@ -160,6 +187,15 @@ secret (base32): <base32>
   independent of which secret produced the code that consumed one, so a
   stale "already used" entry from before a re-enrollment must never shadow
   a legitimate fresh code from the new secret.
+- `secrets enroll --show` (P-V4e) reprints the EXISTING enrollment's URI +
+  base32 + QR through the exact same render path, WITHOUT generating or
+  rotating anything — `enroll::show` never calls `store::save_totp_secret`/
+  `save_replay_ledger`. Errors cleanly ("no TOTP enrollment on this host
+  yet…") when nothing is enrolled, rather than silently enrolling one.
+  `--force` and `--show` are mutually exclusive (`commands::
+  handle_secrets_enroll` rejects the combination as a usage error before
+  either reaches `cli`'s `special` hook) — one asks to rotate, the other
+  promises not to.
 - The URI + base32 secret print DIRECTLY to stdout, never through the
   `Outcome` envelope (this crate's `AGENTS.md`) — `commands::
   handle_secrets_enroll` only gates the door (CLI-only, same `require_cli`
@@ -335,15 +371,21 @@ which one provisioned the parent directory.
 
 ### Admin verbs
 
-`secrets add|rm|grant|revoke|enroll` mutate `policy.json`/`totp.secret` under
-the secrets home, so they run AS the secrets user — no sudo rule is shipped
-(nix module or not); the raw form:
+`secrets add|rm|grant|revoke|enroll|set-totp` mutate `policy.json`/
+`totp.secret` under the secrets home, so they run AS the secrets user — no
+sudo rule is shipped (nix module or not); the raw form:
 
 ```sh
 sudo -u aoide-secrets aoide secrets enroll
 sudo -u aoide-secrets aoide secrets add <name> --backend <backend> --key <key>
 sudo -u aoide-secrets aoide secrets grant <name> <consumer>
+sudo -u aoide-secrets aoide secrets set-totp <name> on
 ```
+
+`secrets set-totp <name> on|off` (P-V4e) flips an EXISTING policy's
+`requireTotp` bit directly, in place of hand-editing `policy.json` with a
+`jq` one-liner — the gap this verb exists to close. Idempotent: re-setting
+the state a policy already has reports "unchanged" and writes nothing.
 
 These pick up the code's own placeholder default
 (`/var/lib/aoide-secrets`, `home.rs`) with no extra flags as long as it
@@ -432,24 +474,28 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   (P-V4c, reads the value from THIS process's own stdin then calls `put` —
   the full `secrets put` flow, but a PLAIN function called from
   `commands::handle_secrets_put`, not a `cli`-crate `special`-hook case).
-- `commands` — `register(&mut Registry)`: EIGHT verbs, ALL CLI-only.
+- `commands` — `register(&mut Registry)`: NINE verbs, ALL CLI-only.
   `serve`/`exec`/`enroll` are door-hint handlers (the real work happens in
   `cli`'s `special` hook, same pattern as `a2a serve`/`conductor`); `add`/
-  `rm`/`grant`/`revoke` are policy-CRUD handlers gated the same way
-  (`require_cli`) — a non-CLI door (MCP/A2A/Daemon) gets the door-hint
+  `rm`/`grant`/`revoke`/`set-totp` are policy-CRUD handlers gated the same
+  way (`require_cli`) — a non-CLI door (MCP/A2A/Daemon) gets the door-hint
   `Outcome` before `policy.json`/`totp.secret` is ever touched, closing off
   a self-escalation path (`secrets grant <secret> <itself>`, or a hostile
   re-enrollment, from an already-connected agent). `put` (P-V4c) is gated
   the SAME way (`require_cli`) but is NOT special-cased like `exec`/
   `enroll` — see `commands.rs`'s own module doc for why its wire reply
-  carrying no value at all makes that unnecessary.
+  carrying no value at all makes that unnecessary. `set-totp` (P-V4e)
+  follows `put`'s shape too — a plain handler, no wire, no value, appended
+  newest.
 
 ## What it consumes
 
 `aoide-protocol` (`Registry`/`Invocation`/`Outcome`/`Door`/`EventClass`/the
 audit helpers/the `cmd!`/`arg!`/`flag!` macros), `serde`/`serde_json`,
 `libc` (P-V3, new — `enroll::local_hostname`'s `gethostname(2)`, already a
-workspace dependency via `aoide-storage`, so nothing new in the lockfile).
+workspace dependency via `aoide-storage`, so nothing new in the lockfile;
+P-V4e reuses the same dependency for `client::stdin_is_tty`'s `isatty(2)`
+and `client::read_hidden_line`'s `tcgetattr`/`tcsetattr` — no new crate).
 **Still zero ALGORITHMIC dependencies** — no `sha1`/`hmac`/`totp-lite`/
 `data-encoding` crate anywhere in this tree (this crate's `AGENTS.md`); the
 broker socket, the backend shell-out, the exec spawn, and `/dev/urandom`
@@ -461,8 +507,10 @@ read are all plain `std`. `qrencode` is a runtime `PATH` shell-out
 `aoide-cli` depends on this crate as of P-V2 (`crates/cli/src/commands/
 mod.rs::all()` calls `aoide_secrets::commands::register`, appended newest;
 `crates/cli/src/lib.rs`'s `special` hook wires `secrets serve`/`secrets exec`/
-`secrets enroll`, P-V3 — `secrets put`, P-V4c, deliberately does NOT join
-that hook, see `commands.rs`'s module doc). The workspace `Cargo.toml`
+`secrets enroll` — P-V4e's `--show` rides the SAME `secrets enroll` arm, no
+second one — `secrets put`, P-V4c, deliberately does NOT join that hook,
+see `commands.rs`'s module doc; neither does `secrets set-totp`, P-V4e, for
+the same reason `put` doesn't — a plain handler, no value on the wire). The workspace `Cargo.toml`
 comment on the `aoide-secrets` member is kept current with the verb set in
 the same commit as any change.
 

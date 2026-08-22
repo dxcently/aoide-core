@@ -41,7 +41,9 @@ use daemon::Door;
 /// env var (`Stdio::inherit` throughout — the value can never cross the
 /// generic `Outcome` envelope, Workstream SECRETS P-V2), `secrets enroll` prints
 /// a fresh TOTP secret's `otpauth://` URI + base32 form directly to stdout
-/// for the same reason (Workstream SECRETS P-V3), `conductor` hands off
+/// for the same reason (Workstream SECRETS P-V3) — or, with `--show`
+/// (Workstream SECRETS P-V4e), reprints the EXISTING enrollment's URI/base32
+/// without generating a new one — `conductor` hands off
 /// to the interactive terminal loop, `guide`/`schema` bypass the generic
 /// `Outcome` envelope — everything else routes through the single dispatcher
 /// (so the audit log + gate apply uniformly). `livery` was an earlier special
@@ -172,9 +174,14 @@ pub fn run_cli(argv: &[String]) -> i32 {
         // crate's `AGENTS.md`). Dispatch first (audits the launch attempt
         // and gives every non-Cli door the clean "run it from a terminal"
         // outcome via `handle_secrets_enroll`, touching no secrets-home file),
-        // then hand off to `aoide_secrets::enroll::run`, which does the real
-        // work — generate/persist/print — and prints the secret directly
-        // to stdout.
+        // then hand off to `aoide_secrets::enroll::run` (generate/persist/
+        // print) or, P-V4e, `aoide_secrets::enroll::show` (reprint the
+        // EXISTING enrollment, no rotation) when `--show` is present —
+        // `handle_secrets_enroll` already rejected `--force`+`--show`
+        // together as a usage error, so `launch.status != Ok` covers that
+        // case before either branch below runs. Both print the secret
+        // directly to stdout; this stays the SAME `["secrets", "enroll"]`
+        // arm rather than a second one for `--show`.
         if inv.path == ["secrets", "enroll"] {
             let launch = dispatch::dispatch(inv);
             if launch.status != output::Status::Ok {
@@ -182,8 +189,12 @@ pub fn run_cli(argv: &[String]) -> i32 {
                 eprintln!("{body}");
                 return Some(code);
             }
-            let force = inv.flag_present("force");
-            return Some(match secrets::enroll::run(&secrets::home::secrets_home(), force) {
+            let result = if inv.flag_present("show") {
+                secrets::enroll::show(&secrets::home::secrets_home())
+            } else {
+                secrets::enroll::run(&secrets::home::secrets_home(), inv.flag_present("force"))
+            };
+            return Some(match result {
                 Ok(()) => output::exit::OK,
                 Err(e) => {
                     eprintln!("aoide secrets enroll: {e}");

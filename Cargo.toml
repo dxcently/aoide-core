@@ -83,9 +83,11 @@ aoide-lyra = { path = "crates/lyra" }
 # backend-preset docs (P-V3); the socket chmod'd 0660 on bind, deployed
 # via modules/nucleus/secrets.nix or the non-nix install path (P-V4 — no
 # new verb, binary stays nix-independent); the built-in `file` backend +
-# the write half, `secrets put` (P-V4c — golden +1). `aoide-cli` depends
+# the write half, `secrets put` (P-V4c — golden +1); `secrets set-totp`,
+# `secrets enroll --show`, and a tty-hidden-input prompt for `secrets put`
+# (P-V4e — golden +1, only `set-totp` is a new path). `aoide-cli` depends
 # on this crate as of P-V2 (`secrets serve`/`exec`/`add`/`rm`/`grant`/
-# `revoke`/`enroll`/`put` register into its `Registry`).
+# `revoke`/`enroll`/`put`/`set-totp` register into its `Registry`).
 aoide-secrets = { path = "crates/secrets" }
 
 [profile.release]
