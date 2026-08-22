@@ -291,8 +291,17 @@ fn require_admin_identity(cmd: &str, verb: &str) -> Option<Outcome> {
     home::admin_identity_check(&home::secrets_home(), verb).map(|msg| Outcome::error(cmd, msg))
 }
 
+/// Enrich a `policy.json` I/O error via [`home::describe_home_file_error`]
+/// — the ONE seam every admin-verb load/save call site below routes
+/// through, so the poisoned-file diagnosis (this crate's `AGENTS.md`) is
+/// written once, not copied at each of the CRUD quintet's eight call sites.
+fn policy_io_error(cmd: &str, home: &std::path::Path, err: std::io::Error) -> Outcome {
+    Outcome::error(cmd, home::describe_home_file_error(home, &store::policy_path(home), &err))
+}
+
 fn handle_secrets_add(inv: &Invocation) -> Outcome {
     let cmd = "secrets.add";
+    const USAGE: &str = "usage: secrets add <name> --backend <backend> --key <key>";
     if let Some(hint) = require_cli(inv, cmd) {
         return hint;
     }
@@ -300,22 +309,28 @@ fn handle_secrets_add(inv: &Invocation) -> Outcome {
         return hint;
     }
     let Some(name) = inv.args.first().cloned() else {
-        return Outcome::usage(cmd, "usage: secrets add <name> --backend <backend> --key <key>");
+        return Outcome::usage(cmd, USAGE);
     };
     if !valid_secret_name(&name) {
-        return Outcome::usage(cmd, format!("invalid secret name `{name}`"));
+        return Outcome::usage(
+            cmd,
+            format!(
+                "invalid secret name `{name}` (must be lowercase [a-z0-9-], no leading/trailing/doubled \
+                 hyphen) — {USAGE}"
+            ),
+        );
     }
     let Some(backend) = inv.flags.get("backend").cloned() else {
-        return Outcome::usage(cmd, "secrets add requires --backend <backend>");
+        return Outcome::usage(cmd, format!("secrets add: missing --backend <backend> — {USAGE}"));
     };
     let Some(key) = inv.flags.get("key").cloned() else {
-        return Outcome::usage(cmd, "secrets add requires --key <key>");
+        return Outcome::usage(cmd, format!("secrets add: missing --key <key> — {USAGE}"));
     };
 
     let home = home::secrets_home();
     let mut policies = match store::load_policies(&home) {
         Ok(p) => p,
-        Err(e) => return Outcome::error(cmd, format!("policy.json: {e}")),
+        Err(e) => return policy_io_error(cmd, &home, e),
     };
     if policies.iter().any(|p| p.name == name) {
         return Outcome::error(cmd, format!("secret `{name}` already has a policy — use `secrets rm` first"));
@@ -331,13 +346,14 @@ fn handle_secrets_add(inv: &Invocation) -> Outcome {
     policies.push(policy);
 
     if let Err(e) = store::save_policies(&home, &policies) {
-        return Outcome::error(cmd, format!("writing policy.json: {e}"));
+        return policy_io_error(cmd, &home, e);
     }
     Outcome::ok(cmd, format!("added secret `{name}`")).changed(vec![format!("policy:{name}")])
 }
 
 fn handle_secrets_rm(inv: &Invocation) -> Outcome {
     let cmd = "secrets.rm";
+    const USAGE: &str = "usage: secrets rm <name>";
     if let Some(hint) = require_cli(inv, cmd) {
         return hint;
     }
@@ -345,13 +361,13 @@ fn handle_secrets_rm(inv: &Invocation) -> Outcome {
         return hint;
     }
     let Some(name) = inv.args.first().cloned() else {
-        return Outcome::usage(cmd, "usage: secrets rm <name>");
+        return Outcome::usage(cmd, USAGE);
     };
 
     let home = home::secrets_home();
     let mut policies = match store::load_policies(&home) {
         Ok(p) => p,
-        Err(e) => return Outcome::error(cmd, format!("policy.json: {e}")),
+        Err(e) => return policy_io_error(cmd, &home, e),
     };
     let before = policies.len();
     policies.retain(|p| p.name != name);
@@ -360,7 +376,7 @@ fn handle_secrets_rm(inv: &Invocation) -> Outcome {
     }
 
     if let Err(e) = store::save_policies(&home, &policies) {
-        return Outcome::error(cmd, format!("writing policy.json: {e}"));
+        return policy_io_error(cmd, &home, e);
     }
     Outcome::ok(cmd, format!("removed secret `{name}`")).changed(vec![format!("policy:{name}")])
 }
@@ -383,16 +399,16 @@ fn edit_consumer(
         return hint;
     }
     let Some(name) = inv.args.first().cloned() else {
-        return Outcome::usage(cmd, usage);
+        return Outcome::usage(cmd, format!("secrets {verb}: missing <name> — {usage}"));
     };
     let Some(consumer) = inv.args.get(1).cloned() else {
-        return Outcome::usage(cmd, usage);
+        return Outcome::usage(cmd, format!("secrets {verb}: missing <consumer> — {usage}"));
     };
 
     let home = home::secrets_home();
     let mut policies = match store::load_policies(&home) {
         Ok(p) => p,
-        Err(e) => return Outcome::error(cmd, format!("policy.json: {e}")),
+        Err(e) => return policy_io_error(cmd, &home, e),
     };
     let Some(policy) = policies.iter_mut().find(|p| p.name == name) else {
         return Outcome::error(cmd, format!("no policy for secret `{name}`"));
@@ -400,7 +416,7 @@ fn edit_consumer(
     edit(&mut policy.consumers, &consumer);
 
     if let Err(e) = store::save_policies(&home, &policies) {
-        return Outcome::error(cmd, format!("writing policy.json: {e}"));
+        return policy_io_error(cmd, &home, e);
     }
     Outcome::ok(cmd, format!("updated consumers for secret `{name}`")).changed(vec![format!("policy:{name}")])
 }
@@ -442,14 +458,21 @@ fn handle_secrets_revoke(inv: &Invocation) -> Outcome {
 /// accident.
 fn handle_secrets_put(inv: &Invocation) -> Outcome {
     let cmd = "secrets.put";
+    const USAGE: &str = "usage: secrets put <name> (value read from stdin)";
     if let Some(hint) = require_cli(inv, cmd) {
         return hint;
     }
     let Some(name) = inv.args.first().cloned() else {
-        return Outcome::usage(cmd, "usage: secrets put <name> (value read from stdin)");
+        return Outcome::usage(cmd, USAGE);
     };
     if !valid_secret_name(&name) {
-        return Outcome::usage(cmd, format!("invalid secret name `{name}`"));
+        return Outcome::usage(
+            cmd,
+            format!(
+                "invalid secret name `{name}` (must be lowercase [a-z0-9-], no leading/trailing/doubled \
+                 hyphen) — {USAGE}"
+            ),
+        );
     }
     match crate::client::run_put(&name, &crate::socket::socket_path()) {
         Ok(()) => Outcome::ok(cmd, format!("put secret `{name}`")),
@@ -467,6 +490,7 @@ fn handle_secrets_put(inv: &Invocation) -> Outcome {
 /// happened.
 fn handle_secrets_set_totp(inv: &Invocation) -> Outcome {
     let cmd = "secrets.set-totp";
+    const USAGE: &str = "usage: secrets set-totp <name> on|off";
     if let Some(hint) = require_cli(inv, cmd) {
         return hint;
     }
@@ -474,21 +498,21 @@ fn handle_secrets_set_totp(inv: &Invocation) -> Outcome {
         return hint;
     }
     let Some(name) = inv.args.first().cloned() else {
-        return Outcome::usage(cmd, "usage: secrets set-totp <name> on|off");
+        return Outcome::usage(cmd, format!("secrets set-totp: missing <name> — {USAGE}"));
     };
     let Some(state) = inv.args.get(1).cloned() else {
-        return Outcome::usage(cmd, "usage: secrets set-totp <name> on|off");
+        return Outcome::usage(cmd, format!("secrets set-totp: missing on|off — {USAGE}"));
     };
     let want = match state.as_str() {
         "on" => true,
         "off" => false,
-        _ => return Outcome::usage(cmd, format!("secrets set-totp expects `on` or `off`, got `{state}`")),
+        _ => return Outcome::usage(cmd, format!("secrets set-totp expects `on` or `off`, got `{state}` — {USAGE}")),
     };
 
     let home = home::secrets_home();
     let mut policies = match store::load_policies(&home) {
         Ok(p) => p,
-        Err(e) => return Outcome::error(cmd, format!("policy.json: {e}")),
+        Err(e) => return policy_io_error(cmd, &home, e),
     };
     let Some(policy) = policies.iter_mut().find(|p| p.name == name) else {
         return Outcome::error(cmd, format!("no policy for secret `{name}`"));
@@ -500,7 +524,7 @@ fn handle_secrets_set_totp(inv: &Invocation) -> Outcome {
     policy.require_totp = want;
 
     if let Err(e) = store::save_policies(&home, &policies) {
-        return Outcome::error(cmd, format!("writing policy.json: {e}"));
+        return policy_io_error(cmd, &home, e);
     }
     Outcome::ok(cmd, format!("secret `{name}` requireTotp set to `{state}`")).changed(vec![format!("policy:{name}")])
 }
@@ -920,6 +944,45 @@ mod tests {
 
             drop(broker_thread);
             std::fs::remove_file(&socket_path).ok();
+        });
+    }
+
+    // ── policy.json I/O errors get the poisoned-file diagnosis ─────────────
+
+    /// End-to-end proof that `policy_io_error` is actually wired into the
+    /// admin quintet's call sites, not merely unit-tested in isolation on
+    /// `home.rs`'s side: a `policy.json` this process's own euid cannot
+    /// read (mode `0000`, still owned by the SAME euid that owns the
+    /// secrets home — the euid guard passes, exactly the "even though the
+    /// euid guard passed" case the task describes) must surface the
+    /// `chown --reference=` hint through the real `Outcome`, not the old
+    /// bare `format!("policy.json: {e}")`. Skipped under a root test
+    /// runner (root reads `0000` files fine, so the denial this test
+    /// depends on wouldn't happen).
+    #[test]
+    fn a_policy_json_this_euid_cannot_read_gets_the_chown_reference_hint() {
+        if home::effective_uid() == 0 {
+            return;
+        }
+        with_secrets_home("poisoned", |home| {
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "pass"), ("key", "x")]);
+            assert_eq!(handle_secrets_add(&add).status, Status::Ok);
+
+            use std::os::unix::fs::PermissionsExt;
+            let path = store::policy_path(home);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+            let rm = inv(Door::Cli, &["secrets", "rm"], &["t"], &[]);
+            let out = handle_secrets_rm(&rm);
+
+            // Restore before any assertion could early-return and leave the
+            // tempdir's cleanup unable to remove an unreadable file.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+            assert_eq!(out.status, Status::Error, "{out:?}");
+            assert!(out.message.to_lowercase().contains("permission denied"), "{}", out.message);
+            assert!(out.message.contains("chown --reference="), "{}", out.message);
+            assert!(out.message.contains(&path.display().to_string()), "{}", out.message);
         });
     }
 

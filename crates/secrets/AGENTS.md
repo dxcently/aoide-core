@@ -241,6 +241,33 @@
   persisted secret-adjacent state (not TOTP) follows this same shape: a
   sibling function beside the mutating one, sharing its rendering tail,
   called from the SAME special-hook arm behind a flag, never a new path.
+- **Denials name the cause and teach the fix, P-V4g (this commit).**
+  `home::describe_home_file_error(home, file, &io_err)` is the ONE seam
+  every admin-verb `policy.json`/`totp.secret`/`totp-replay.json` load/save
+  call site routes a `PermissionDenied` through (`commands.rs`'s CRUD
+  quintet via its local `policy_io_error` wrapper, `enroll::run`/
+  `enroll::show` directly) — the poisoned-file case: the admin-identity
+  guard already proved this process's euid owns the secrets HOME
+  directory, but an individual file inside it can still be owned by a
+  stale uid from before that guard existed, and a bare `format!("policy.
+  json: {e}")` gave zero indication why. It teaches `sudo chown
+  --reference=<home> <file>` rather than a literal `chown aoide-secrets:
+  ...` — this crate only ever learns uids, never a username, and
+  `--reference` sidesteps needing one. `client::describe_connect_error`
+  is the client-side sibling: `resolve`/`put`'s `UnixStream::connect`
+  failure maps `PermissionDenied` to "this session isn't in
+  `aoide-secrets-access` yet" (teaching BOTH `sg aoide-secrets-access -c
+  '<cmd>'` and a fresh login — group membership is login-scoped) and
+  `NotFound`/`ConnectionRefused` to "the broker isn't running" (teaching
+  `systemctl status aoide-secrets-serve` and the `AOIDE_SECRETS_SOCKET`
+  override). Both functions are PURE given an injected `io::Error` — no
+  real stat/socket needed to unit-test them — and every OTHER
+  `io::ErrorKind` rides through unenriched, exactly as before this commit;
+  don't widen either match arm to a kind it hasn't been proven to mean.
+  Client-side messages only — neither function self-invokes `sudo`/`sg`,
+  and neither prompts interactively; they only print what to run. A new
+  admin-verb file or a new client socket op reuses these two functions
+  rather than hand-rolling a third diagnosis.
 - **`secrets put`'s stdin intake grew a tty branch at P-V4e**
   (`client::stdin_is_tty`/`client::read_hidden_line`) — when stdin is a
   terminal, `run_put` prompts on stderr and reads with echo disabled

@@ -426,6 +426,33 @@ caller's `AOIDE_SECRETS_HOME`/`AOIDE_SECRETS_SOCKET` env by default, so set
 them explicitly on the invocation if a host's paths ever diverge from the
 default.
 
+**A `policy.json`/`totp.secret` this euid cannot READ, even though the
+admin-identity guard above passed, is the POISONED-FILE case** (the User's
+live UX complaint this section answers, 2026-08-22): the guard proves this
+process's euid owns the secrets HOME directory, but an individual file
+inside it can still be owned by a stale uid from a historical plain-`sudo`
+run that predates the guard. `home::describe_home_file_error` is the ONE
+seam every admin-verb load/save call site (`commands.rs`'s CRUD quintet,
+`enroll::run`/`enroll::show`) routes a `PermissionDenied` `io::Error`
+through, rather than the bare `format!("policy.json: {e}")` this crate used
+to return — it names the file, shows the owning uid mismatch when a stat is
+cheap, and teaches `sudo chown --reference=<home> <file>` (matches the
+file's ownership to the secrets home's own without this crate ever
+resolving a username, since it only ever learns uids — `effective_uid`'s
+whole reason for existing).
+
+**A `put`/`exec` socket-connect failure gets the same treatment on the
+client side.** `client::describe_connect_error` maps `UnixStream::connect`'s
+`io::Error` into the two live UX gaps the User hit: `PermissionDenied`
+means this login session isn't in the `aoide-secrets-access` group yet
+(membership is login-scoped — the fix is `sg aoide-secrets-access -c
+'<command>'` in the current session, or a fresh login); `NotFound`/
+`ConnectionRefused` means nothing is listening at the resolved socket path
+at all — the fix is `systemctl status aoide-secrets-serve`, or setting
+`AOIDE_SECRETS_SOCKET` if this host's socket lives somewhere else. Both
+`client::resolve`/`client::put` route their connect failure through this
+one function rather than each hand-rolling the diagnosis.
+
 ## Named seams (what it exposes)
 
 Pure logic (P-V1, unchanged):
@@ -456,7 +483,10 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   both unit-tested on injected uids, and `admin_identity_check`'s live
   wiring to a real stat + a real `geteuid(2)` dispatching between them —
   see `AGENTS.md`'s matching invariant and
-  "Admin verbs" above.
+  "Admin verbs" above. `describe_home_file_error` (this section's
+  "POISONED-FILE case" above) is the sibling diagnosis for a FILE-level
+  `PermissionDenied` the guard's own directory-level check can't catch —
+  pure given an injected `io::Error`, unit-tested the same way.
 - `socket` — `socket_path()`: `$AOIDE_SECRETS_SOCKET` env override, else the
   canonical deployed path `/run/aoide-secrets/secrets.sock` (P-V4d — the
   first live deployment, yomi-strix, found the earlier secrets-home-relative
@@ -514,6 +544,10 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   (P-V4c, reads the value from THIS process's own stdin then calls `put` —
   the full `secrets put` flow, but a PLAIN function called from
   `commands::handle_secrets_put`, not a `cli`-crate `special`-hook case).
+  `describe_connect_error` (this section's "socket-connect failure" case
+  above) is the shared connect-error diagnosis both `resolve` and `put`
+  route through — pure given an injected `io::Error`, unit-tested without a
+  real socket.
 - `commands` — `register(&mut Registry)`: NINE verbs, ALL CLI-only.
   `serve`/`exec`/`enroll` are door-hint handlers (the real work happens in
   `cli`'s `special` hook, same pattern as `a2a serve`/`conductor`); `add`/

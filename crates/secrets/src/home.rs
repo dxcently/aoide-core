@@ -172,6 +172,59 @@ pub fn admin_identity_check(home: &Path, verb: &str) -> Option<String> {
     }
 }
 
+/// Enrich a secrets-home FILE's I/O error into an actionable message — the
+/// POISONED-FILE case (this crate's `AGENTS.md`): [`admin_identity_check`]
+/// above already proves this process's euid owns the secrets HOME
+/// directory before an admin verb ever reads/writes a file inside it, but
+/// an individual file (`policy.json`, `totp.secret`, `totp-replay.json`)
+/// can still be owned by a stale uid from a historical plain-`sudo` run
+/// that predates that guard — the exact "policy.json: Permission denied
+/// (os error 13)" the User hit live, with zero indication of WHY. Reached
+/// from every admin-verb load/save seam (`commands.rs`'s CRUD quintet,
+/// `enroll::run`/`enroll::show`'s totp.secret/replay-ledger calls) so this
+/// diagnosis lives in exactly ONE place rather than a copy at each of the
+/// half-dozen call sites that used to just `format!("policy.json: {e}")`.
+///
+/// Only [`io::ErrorKind::PermissionDenied`] gets the rich treatment — every
+/// other kind (a missing file already reads as an empty policy list
+/// upstream in `store::load_policies`; a corrupt JSON body is a data
+/// problem, not an ownership one) rides through with just the file path
+/// prefixed, same shape as before this function existed. The repair spells
+/// `chown --reference=<home>` rather than a literal `chown aoide-secrets:
+/// aoide-secrets-access <file>` — this crate never learns a broker
+/// username, only uids (`effective_uid`'s whole reason for existing), and
+/// `--reference` matches the file's ownership to the secrets home's own
+/// without this crate ever resolving one.
+pub fn describe_home_file_error(home: &Path, file: &Path, err: &io::Error) -> String {
+    if err.kind() != io::ErrorKind::PermissionDenied {
+        return format!("{}: {err}", file.display());
+    }
+    let home_owner = std::fs::metadata(home).ok().map(|m| m.uid());
+    let file_owner = std::fs::metadata(file).ok().map(|m| m.uid());
+    let owner_note = match (home_owner, file_owner) {
+        (Some(h), Some(f)) if h != f => format!(
+            " — {} is owned by uid {f}, but the secrets home ({}) is owned by uid {h}; this looks \
+             like a file poisoned by a historical plain `sudo` run from before the admin-identity \
+             guard existed",
+            file.display(),
+            home.display()
+        ),
+        (Some(h), Some(_)) => format!(
+            " — {} and the secrets home are both owned by uid {h}, but this process still cannot \
+             write it (check its permission bits)",
+            file.display()
+        ),
+        _ => String::new(),
+    };
+    format!(
+        "{}: permission denied{owner_note}. Fix: sudo chown --reference={} {} (matches its ownership \
+         to the secrets home's owner — the broker user)",
+        file.display(),
+        home.display(),
+        file.display()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +383,49 @@ mod tests {
         // process's own euid — the ordinary single-user dev/CI shape.
         let dir = tmp_dir("identity-owned");
         assert_eq!(admin_identity_check(&dir, "add"), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── describe_home_file_error (the poisoned-file diagnosis) ─────────────
+
+    #[test]
+    fn non_permission_denied_errors_pass_through_with_just_the_path_prefixed() {
+        let home = Path::new("/var/lib/aoide-secrets");
+        let file = Path::new("/var/lib/aoide-secrets/policy.json");
+        let err = io::Error::new(io::ErrorKind::InvalidData, "not valid json");
+        let msg = describe_home_file_error(home, file, &err);
+        assert_eq!(msg, format!("{}: {err}", file.display()));
+        assert!(!msg.contains("chown"), "{msg}");
+    }
+
+    #[test]
+    fn permission_denied_on_a_pair_that_cannot_be_stat_ed_still_teaches_the_chown_reference_fix() {
+        // Neither path exists, so both metadata() calls fail — this is the
+        // "cheap where possible" fallback: no owner-mismatch clause, but
+        // still the actionable repair.
+        let home = Path::new("/nonexistent-aoide-secrets-home-for-test");
+        let file = home.join("policy.json");
+        let err = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        let msg = describe_home_file_error(home, &file, &err);
+        assert!(msg.contains(&file.display().to_string()), "{msg}");
+        assert!(msg.contains("permission denied"), "{msg}");
+        assert!(msg.contains(&format!("chown --reference={}", home.display())), "{msg}");
+        assert!(!msg.contains("is owned by uid"), "{msg}");
+    }
+
+    #[test]
+    fn permission_denied_with_a_stat_able_pair_names_the_shared_owning_uid() {
+        // Both this process's own tempdir and a file inside it are owned by
+        // the SAME uid (this test process's own euid) — exercises the
+        // "owners match but still denied" branch without needing a second
+        // real uid, which a non-root test runner can't fabricate.
+        let dir = tmp_dir("describe-same-owner");
+        let file = dir.join("policy.json");
+        std::fs::write(&file, b"[]").unwrap();
+        let err = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        let msg = describe_home_file_error(&dir, &file, &err);
+        assert!(msg.contains("both owned by uid"), "{msg}");
+        assert!(msg.contains(&format!("chown --reference={}", dir.display())), "{msg}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

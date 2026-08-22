@@ -158,14 +158,23 @@ pub fn run(secrets_home: &Path, force: bool) -> Result<(), String> {
             );
         }
         Ok(_) => {}
-        Err(e) => return Err(format!("checking existing enrollment: {e}")),
+        Err(e) => {
+            return Err(crate::home::describe_home_file_error(
+                secrets_home,
+                &crate::store::totp_secret_path(secrets_home),
+                &e,
+            ))
+        }
     }
 
     let secret = generate_secret().map_err(|e| format!("generating a secret: {e}"))?;
-    crate::store::save_totp_secret(secrets_home, &secret).map_err(|e| format!("writing totp.secret: {e}"))?;
+    crate::store::save_totp_secret(secrets_home, &secret).map_err(|e| {
+        crate::home::describe_home_file_error(secrets_home, &crate::store::totp_secret_path(secrets_home), &e)
+    })?;
     // Re-enrollment resets the ledger too — see module/function doc.
-    crate::store::save_replay_ledger(secrets_home, &crate::replay::ReplayLedger::new())
-        .map_err(|e| format!("resetting the replay ledger: {e}"))?;
+    crate::store::save_replay_ledger(secrets_home, &crate::replay::ReplayLedger::new()).map_err(|e| {
+        crate::home::describe_home_file_error(secrets_home, &crate::store::replay_ledger_path(secrets_home), &e)
+    })?;
 
     print_enrollment(&secret);
     if force {
@@ -188,7 +197,13 @@ pub fn show(secrets_home: &Path) -> Result<(), String> {
         Ok(None) => {
             return Err("no TOTP enrollment on this host yet — run `secrets enroll` first".to_string())
         }
-        Err(e) => return Err(format!("checking existing enrollment: {e}")),
+        Err(e) => {
+            return Err(crate::home::describe_home_file_error(
+                secrets_home,
+                &crate::store::totp_secret_path(secrets_home),
+                &e,
+            ))
+        }
     };
     print_enrollment(&secret);
     Ok(())

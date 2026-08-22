@@ -50,10 +50,54 @@
 
 use aoide_protocol::Invocation;
 use serde_json::{json, Value};
+use std::io;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Stdio;
+
+/// Map a `UnixStream::connect` failure against the broker socket into an
+/// actionable message — pure (an injected [`io::Error`], no real socket),
+/// so this is fully unit-tested without a live broker. This IS the exact
+/// wall the User hit live (this task's own report): a bare "Permission
+/// denied (os error 13)" with zero indication of what to do about it.
+///
+/// [`io::ErrorKind::PermissionDenied`]: the caller's own login session
+/// isn't in the broker's `aoide-secrets-access` group yet — group
+/// membership is login-scoped (`README.md`'s "Deployment" section), so a
+/// `usermod -aG`/nix-module rebuild done from *this* shell never applies
+/// until either a fresh login or an `sg` re-exec picks it up. Both fixes
+/// are taught, since either genuinely works and which is more convenient
+/// depends on the caller.
+///
+/// [`io::ErrorKind::NotFound`]/[`io::ErrorKind::ConnectionRefused`]: nothing
+/// is listening at `socket_path` at all — the broker isn't running, or the
+/// resolved path doesn't match the deployed one (`socket.rs`'s module doc:
+/// `AOIDE_SECRETS_SOCKET`, or its `/run/aoide-secrets/secrets.sock`
+/// default).
+///
+/// Every other `io::ErrorKind` (a transient `EMFILE`, an unreadable
+/// destination directory, ...) rides through with just the socket path
+/// prefixed — unchanged from before this function existed — rather than
+/// guessing at a fix this function has no evidence for.
+fn describe_connect_error(socket_path: &Path, err: &io::Error, reinvoke: &str) -> String {
+    match err.kind() {
+        io::ErrorKind::PermissionDenied => format!(
+            "connecting to the secrets broker at {}: permission denied — this session isn't in the \
+             `aoide-secrets-access` group yet (group membership is login-scoped: joining the group \
+             doesn't apply to an already-open shell). Fix: run `sg aoide-secrets-access -c '{reinvoke}'` \
+             in THIS session, or log out and back in so a fresh session picks up the group.",
+            socket_path.display()
+        ),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => format!(
+            "connecting to the secrets broker at {}: {err} — the broker doesn't look like it's running \
+             (or the socket path is wrong). Check `systemctl status aoide-secrets-serve`, or set \
+             AOIDE_SECRETS_SOCKET if this host's broker socket lives somewhere else.",
+            socket_path.display()
+        ),
+        _ => format!("connecting to the secrets broker at {}: {err}", socket_path.display()),
+    }
+}
 
 /// Parsed `secrets exec` arguments — pure, no I/O, fully unit-testable
 /// without a running broker.
@@ -78,17 +122,22 @@ pub fn default_var_name(secret: &str) -> String {
 /// the wrapped command + its args — `aoide_protocol::door::parse` already
 /// treats a bare `--` as ending flag parsing, so everything after it
 /// arrives here verbatim as positionals (that module's own doc).
+/// `secrets exec`'s own usage line — printed alongside every specific
+/// missing/malformed-argument message below, never a generic usage dump on
+/// its own (task: name WHICH flag is wrong AND show this verb's usage).
+pub const EXEC_USAGE: &str = "usage: secrets exec --as <consumer> --secret <name>[:VAR] [--totp NNNNNN] -- <cmd>";
+
 pub fn parse_exec_args(inv: &Invocation) -> Result<ExecArgs, String> {
     let consumer = inv
         .flags
         .get("as")
         .cloned()
-        .ok_or_else(|| "secrets exec requires --as <consumer>".to_string())?;
+        .ok_or_else(|| format!("secrets exec: missing --as <consumer> — {EXEC_USAGE}"))?;
     let secret_flag = inv
         .flags
         .get("secret")
         .cloned()
-        .ok_or_else(|| "secrets exec requires --secret <name>[:VAR]".to_string())?;
+        .ok_or_else(|| format!("secrets exec: missing --secret <name>[:VAR] — {EXEC_USAGE}"))?;
     let (secret, var) = match secret_flag.split_once(':') {
         Some((n, v)) if !v.is_empty() => (n.to_string(), v.to_string()),
         _ => {
@@ -98,12 +147,15 @@ pub fn parse_exec_args(inv: &Invocation) -> Result<ExecArgs, String> {
         }
     };
     if !crate::policy::valid_secret_name(&secret) {
-        return Err(format!("invalid secret name `{secret}`"));
+        return Err(format!(
+            "invalid secret name `{secret}` (must be lowercase [a-z0-9-], no leading/trailing/doubled \
+             hyphen) — {EXEC_USAGE}"
+        ));
     }
     let totp = inv.flags.get("totp").cloned();
     let cmd = inv.args.clone();
     if cmd.is_empty() {
-        return Err("secrets exec requires a command after `--`".to_string());
+        return Err(format!("secrets exec: missing a command after `--` — {EXEC_USAGE}"));
     }
     Ok(ExecArgs { consumer, secret, var, totp, cmd })
 }
@@ -117,8 +169,13 @@ pub fn resolve(
     totp: Option<&str>,
     argv0: Option<&str>,
 ) -> Result<String, String> {
-    let mut stream = UnixStream::connect(socket_path)
-        .map_err(|e| format!("connecting to the secrets broker at {}: {e}", socket_path.display()))?;
+    let mut stream = UnixStream::connect(socket_path).map_err(|e| {
+        describe_connect_error(
+            socket_path,
+            &e,
+            &format!("aoide secrets exec --as {consumer} --secret {secret} -- ..."),
+        )
+    })?;
 
     let mut req = json!({ "op": "resolve", "secret": secret, "consumer": consumer });
     if let Some(t) = totp {
@@ -166,7 +223,7 @@ pub fn resolve(
 /// so there is nothing here for a caller to extract.
 pub fn put(socket_path: &Path, secret: &str, value: &str) -> Result<(), String> {
     let mut stream = UnixStream::connect(socket_path)
-        .map_err(|e| format!("connecting to the secrets broker at {}: {e}", socket_path.display()))?;
+        .map_err(|e| describe_connect_error(socket_path, &e, &format!("aoide secrets put {secret}")))?;
 
     let req = json!({ "op": "put", "secret": secret, "value": value });
     let mut line = req.to_string();
@@ -398,6 +455,48 @@ mod tests {
     fn invalid_secret_name_is_rejected() {
         let i = inv(&[("as", "m"), ("secret", "Bad Name")], &["cmd"]);
         assert!(parse_exec_args(&i).unwrap_err().contains("invalid secret name"));
+    }
+
+    // ── describe_connect_error (pure — injected io::Error, no real socket) ──
+
+    #[test]
+    fn permission_denied_teaches_both_the_sg_and_relogin_fixes() {
+        let socket = Path::new("/run/aoide-secrets/secrets.sock");
+        let err = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        let msg = describe_connect_error(socket, &err, "aoide secrets put db-prod");
+        assert!(msg.contains(&socket.display().to_string()), "{msg}");
+        assert!(msg.contains("aoide-secrets-access"), "{msg}");
+        assert!(msg.contains("sg aoide-secrets-access -c 'aoide secrets put db-prod'"), "{msg}");
+        assert!(msg.to_lowercase().contains("log out"), "{msg}");
+    }
+
+    #[test]
+    fn not_found_teaches_checking_the_broker_service() {
+        let socket = Path::new("/run/aoide-secrets/secrets.sock");
+        let err = io::Error::new(io::ErrorKind::NotFound, "no such file or directory");
+        let msg = describe_connect_error(socket, &err, "aoide secrets exec --as m --secret t -- true");
+        assert!(msg.contains(&socket.display().to_string()), "{msg}");
+        assert!(msg.contains("systemctl status aoide-secrets-serve"), "{msg}");
+        assert!(msg.contains("AOIDE_SECRETS_SOCKET"), "{msg}");
+    }
+
+    #[test]
+    fn connection_refused_gets_the_same_not_running_hint_as_not_found() {
+        let socket = Path::new("/run/aoide-secrets/secrets.sock");
+        let err = io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused");
+        let msg = describe_connect_error(socket, &err, "aoide secrets put t");
+        assert!(msg.contains("systemctl status aoide-secrets-serve"), "{msg}");
+    }
+
+    #[test]
+    fn an_unrelated_error_kind_rides_through_unenriched() {
+        let socket = Path::new("/run/aoide-secrets/secrets.sock");
+        let err = io::Error::new(io::ErrorKind::TimedOut, "timed out");
+        let msg = describe_connect_error(socket, &err, "aoide secrets put t");
+        assert!(msg.contains(&socket.display().to_string()), "{msg}");
+        assert!(msg.contains("timed out"), "{msg}");
+        assert!(!msg.contains("aoide-secrets-access"), "{msg}");
+        assert!(!msg.contains("systemctl"), "{msg}");
     }
 
     #[test]
