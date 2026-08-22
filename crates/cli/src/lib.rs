@@ -46,7 +46,12 @@ use daemon::Door;
 /// `Outcome` envelope — everything else routes through the single dispatcher
 /// (so the audit log + gate apply uniformly). `livery` was an earlier special
 /// case; it moved to lyra with the rest of the graphical bundle at P-A5 —
-/// core no longer parses `livery.*` at all.
+/// core no longer parses `livery.*` at all. `secrets put` (Workstream
+/// SECRETS P-V4c) is deliberately NOT special-cased here — its wire reply
+/// carries no value, so it runs as an ordinary registered handler
+/// (`aoide_secrets::commands::handle_secrets_put`) that reads stdin and
+/// talks to the broker itself; see that crate's `commands` module doc for
+/// why its shape differs from `exec`/`enroll`.
 pub fn run_cli(argv: &[String]) -> i32 {
     protocol::door::run(argv, Door::Cli, "aoide", dispatch::registry(), dispatch::dispatch, |inv, json| {
         // `mcp serve --stdio` is a long-running server, not a one-shot dispatch.

@@ -35,6 +35,39 @@
   ordinary denial, the backend never runs. Don't let a `requireTotp`
   policy fall back to treating itself as a standing grant just because an
   enrollment exists; the code (or its absence) is what decides.
+- **`put` (P-V4c) is NEVER gated by `requireTotp`, and carries no
+  `consumer` field at all.** `broker::put_gate` is a SEPARATE function from
+  `resolve_gate` — it never calls `verify_totp_gate`, on ANY policy,
+  `requireTotp` or not. This is deliberate, not an oversight: `secrets put`
+  is CLI-only/admin-side (`commands::handle_secrets_put`'s `require_cli`
+  gate), never agent-facing, so there is no separate consumer identity to
+  authorize and no code check to run — see `broker.rs`'s module doc for the
+  full reasoning. Don't add a TOTP or consumer check to `put_gate` "for
+  symmetry with resolve"; the two ops have different threat models on
+  purpose.
+- **NO CACHE, EVER.** A secret's value exists ONLY between a `get`/`set`
+  template's own invocation and the wire write that immediately follows —
+  nothing in `broker`/`client`/`backend` may hold a value across requests,
+  in memory or on disk, for any reason. `resolve` runs the backend fresh on
+  EVERY call so revocation is immediate; don't introduce a warm cache, a
+  TTL, or a "remember the last resolve for this secret" optimization —
+  that would make revocation lag behind `secrets rm`/backend rotation,
+  which is exactly the property this crate exists to hold.
+- **ONE VALUE PER SECRET is the contract, not an implementation detail.**
+  `policy::Policy` models exactly one backend-fetched value per policy
+  entry; a credential with multiple fields is multiple named secrets, each
+  its own policy with its own `consumers[]`/`requireTotp` (the `sops`
+  preset's per-field JSONPath `key`, README's "Backend presets", already
+  shows this). Don't add a multi-field resolve/put op, and don't let a
+  single `Policy` grow a second value-bearing field "for convenience" —
+  per-field grants and per-field TOTP are the whole point of keeping
+  secrets one-per-policy.
+- **Per-backend environment is INLINE IN THE TEMPLATE — no structured
+  `env` map on `Backend`, ever.** A backend needing `BW_SESSION` or similar
+  sets it as part of its own `sh -c` template text. Don't add an `env:
+  BTreeMap<String,String>` field to `backend::Backend` "to avoid repeating
+  the var in every template" — the whole adapter surface is deliberately
+  ONE string per direction (`get`, `set`).
 - **`ReplayLedger` keys on timestep ALONE, never on consumer** (ruling,
   Fable, 2026-08-22, P-V1 review escalation — plan file's SECRETS §Policy
   section). The resolve wire's `consumer` field is self-asserted; a
@@ -117,6 +150,22 @@
   unchanged (it never gained backend-specific knowledge, by design). QR-
   code rendering for `secrets enroll`'s URI lives in `enroll::render_qr`
   (`qrencode` shell-out, feature-detected, not a Cargo dependency).
+- **The built-in `file` backend + the write half LANDED at P-V4c** —
+  `backend::Backend` gained an optional `set` template and the `{home}`
+  placeholder (`backend::expand_template`, a single left-to-right scan —
+  never a sequential two-pass `.replace()`, module doc); `backend::
+  seed_default_backends` seeds `backends.json` with `file` when absent,
+  called once from `broker::serve`'s startup (the one seeding site, that
+  function's own doc); `broker::handle_put`/`put_gate`/`audit_put` are the
+  broker-side `put` op (policy-exists + backend-has-`set` gate only, no
+  `requireTotp`, no `consumer`); `client::put`/`run_put` and `commands::
+  handle_secrets_put` are the client-side flow, registered as a PLAIN
+  handler (not a `special`-hook case — `commands.rs`'s own module doc
+  explains why `exec`/`enroll` needed that escape and `put` doesn't). A
+  NEW backend preset with its own `set` template follows the exact same
+  table-row shape "Backend presets" already documents — no code changes
+  needed for one, `file` was the one exception because it ships SEEDED,
+  not merely documented.
 - **Secrets pairing / mesh replica sharing** (P-V5, gated on #51) is a new
   module beside `broker`, not a growth of `broker`'s own resolve path —
   see the plan's "Mesh sharing" section for the separate loopback channel.
@@ -128,5 +177,11 @@
   order, golden discipline, per-crate tests) — not restated here.
 - The workspace `Cargo.toml`'s `aoide-secrets` member comment and
   `crates/cli/README.md`'s golden-path count when the verb set changes.
-- `CONTRACTS.md §3` (the core schema's command count) and its secrets-home
-  pointer note when the wire shape or file layout changes.
+- `CONTRACTS.md §3` (the core schema's command count) and its "Secrets
+  wire" subsection (§4, the machine-consumer contract — P-V4c) when the
+  wire shape (either op) or file layout changes; that subsection restates
+  this crate's own wire docs (`README.md`'s "The wire", `broker.rs`'s
+  module doc) for a reader who never opens this crate's Rust — update the
+  crate docs FIRST, `CONTRACTS.md` follows in the same commit.
+- `lib/vmTest.nix`'s `cmd_count` tripwire and its nearby count-history
+  comment when the verb set changes (same commit as the golden snapshot).

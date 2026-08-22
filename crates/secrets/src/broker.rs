@@ -6,15 +6,39 @@
 //! unknown op, or a dropped connection ends only that line/connection —
 //! never the service).
 //!
-//! Wire (`resolve` is the only op):
+//! Wire (`resolve` and `put`, P-V4c):
 //! ```text
 //! -> {"op":"resolve","secret":"<name>","consumer":"<consumer>","totp":"<code>"?,"argv0":"<cmd>"?}
 //! <- {"ok":true,"value":"<value>"}                    (granted)
 //! <- {"ok":false,"error":"<value-free message>"}      (denied/error)
+//!
+//! -> {"op":"put","secret":"<name>","value":"<value>"}
+//! <- {"ok":true}                                       (stored)
+//! <- {"ok":false,"error":"<value-free message>"}      (denied/error)
 //! ```
-//! `totp`/`argv0` are optional. `consumer` is SELF-ASSERTED (the plan's
-//! V1 ruling, `crate::replay`'s module doc): the policy's `consumers[]`
-//! list is the real gate, not caller identity.
+//! `totp`/`argv0` are optional on `resolve`. `consumer` is SELF-ASSERTED
+//! (the plan's V1 ruling, `crate::replay`'s module doc): the policy's
+//! `consumers[]` list is the real gate, not caller identity. This repo-wide
+//! machine-consumer contract (both ops, every error string, the
+//! group-membership trust model) is ALSO documented in `CONTRACTS.md`'s
+//! "Secrets home" section — services (verba voluntia, Melete-side models)
+//! are meant to speak this wire directly, no LLM in the loop; `secrets
+//! exec`/`secrets put` are convenience wrappers over the same two ops, not
+//! the only door onto them.
+//!
+//! **`put` carries NO `consumer` field and is never gated by
+//! `requireTotp`** (P-V4c, deliberate): `secrets put` is CLI-only
+//! (`commands::handle_secrets_put`'s `require_cli` gate) and, in
+//! deployment, runs AS THE SECRETS UID's own operator (`sudo -u
+//! aoide-secrets aoide secrets put …`, same admin-verb precedent as
+//! `add`/`grant` — README's "Admin verbs" section) — there is no separate
+//! "consumer" identity to authorize the way `resolve`'s agent-facing
+//! callers need, and a code check would be gating the secrets uid against
+//! itself. [`put_gate`] therefore checks ONLY that a policy exists for the
+//! named secret (`put` never auto-creates one — `secrets add` owns policy
+//! creation, same as before P-V4c) and that its backend has a `set`
+//! template; it never touches `policy.require_totp` or `verify_totp_gate`
+//! at all.
 //!
 //! **`requireTotp` is wired live (P-V3).** [`resolve_gate`] rejects it
 //! outright ONLY when no `secrets enroll` has ever run on this host
@@ -104,14 +128,29 @@ fn bind_socket(socket_path: &Path) -> std::io::Result<UnixListener> {
     Ok(listener)
 }
 
-/// Bind `socket_path` and serve `resolve` requests forever. Creates
+/// Bind `socket_path` and serve `resolve`/`put` requests forever. Creates
 /// `secrets_home` if absent and locks it down to `0700` (bounce-fix item 3,
 /// P-V2 review — `create_dir_all` alone honors the process umask, which
-/// would leave `policy.json`/`backends.json` world-readable). Only returns
-/// on a bind/permission failure — a running broker never returns `Ok`.
+/// would leave `policy.json`/`backends.json` world-readable). **Seeds
+/// `backends.json` with the built-in `file` backend when absent** (P-V4c,
+/// `crate::backend::seed_default_backends`) — this is the ONE seeding site
+/// (decision recorded here, not duplicated at `secrets add`/`secrets put`):
+/// `serve` is the single long-running process that ever actually resolves
+/// a backend name against a `get`/`set` template (both the CLI's `secrets
+/// exec` and the new `secrets put` reach a backend only by round-tripping
+/// through THIS process over the socket), so seeding here guarantees every
+/// such attempt sees a `backends.json` on disk without a second seed call
+/// anywhere else. A seeding failure is logged and NON-fatal — an existing
+/// or hand-authored `backends.json` (or none at all, for a host that only
+/// ever uses non-`file` backends) is still a perfectly servable broker.
+/// Only returns on a bind/permission failure — a running broker never
+/// returns `Ok`.
 pub fn serve(secrets_home: &Path, socket_path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(secrets_home)?;
     crate::home::secure_dir(secrets_home)?;
+    if let Err(e) = crate::backend::seed_default_backends(secrets_home) {
+        eprintln!("[aoide/secrets] could not seed the default `file` backend into backends.json: {e}");
+    }
     let listener = bind_socket(socket_path)?;
 
     let home = secrets_home.to_path_buf();
@@ -166,6 +205,7 @@ fn handle_line(secrets_home: &Path, line: &str) -> Value {
     };
     match req.get("op").and_then(Value::as_str) {
         Some("resolve") => handle_resolve(secrets_home, &req),
+        Some("put") => handle_put(secrets_home, &req),
         Some(other) => json!({"ok": false, "error": format!("unknown op `{other}`")}),
         None => json!({"ok": false, "error": "malformed request: missing `op`"}),
     }
@@ -189,6 +229,50 @@ fn handle_resolve(secrets_home: &Path, req: &Value) -> Value {
     match result {
         Ok(value) => json!({"ok": true, "value": value}),
         Err(reason) => json!({"ok": false, "error": reason}),
+    }
+}
+
+/// `put` (P-V4c): stores `value` through the named secret's backend `set`
+/// template. No `consumer` field on this op, no TOTP gate — see module doc
+/// for why (CLI-only, admin-side). The value exists here ONLY as this
+/// function's own local read of `req`'s `value` field, handed straight to
+/// [`put_gate`]/`crate::backend::store_value`; it never lands anywhere
+/// else in this function (not the returned `Value`, not either audit line
+/// — [`audit_put`] is name-only by construction, same as `audit_resolve`).
+fn handle_put(secrets_home: &Path, req: &Value) -> Value {
+    let secret = req.get("secret").and_then(Value::as_str).unwrap_or("").to_string();
+    let value = req.get("value").and_then(Value::as_str).unwrap_or("").to_string();
+
+    if secret.is_empty() {
+        return json!({"ok": false, "error": "malformed request: `secret` is required"});
+    }
+
+    let (granted, result) = put_gate(secrets_home, &secret, &value);
+    audit_put(secrets_home, &secret, granted, result.as_ref().err());
+
+    match result {
+        Ok(()) => json!({"ok": true}),
+        Err(reason) => json!({"ok": false, "error": reason}),
+    }
+}
+
+/// The `put` policy gate + backend store, in one place — mirrors
+/// [`resolve_gate`]'s shape (`granted` carried alongside the `Result`, same
+/// reasoning). `put` never auto-creates a policy (`secrets add` owns policy
+/// creation, module doc) and never checks `requireTotp` (module doc): a
+/// missing policy or a backend with no `set` template are both ordinary,
+/// value-free denials — the backend is never invoked on either.
+fn put_gate(secrets_home: &Path, secret: &str, value: &str) -> (bool, Result<(), String>) {
+    let policies = match crate::store::load_policies(secrets_home) {
+        Ok(p) => p,
+        Err(e) => return (false, Err(format!("policy.json: {e}"))),
+    };
+    let Some(policy) = policies.iter().find(|p| p.name == secret) else {
+        return (false, Err("secret not found".to_string()));
+    };
+    match crate::backend::store_value(secrets_home, &policy.backend, &policy.key, value) {
+        Ok(()) => (true, Ok(())),
+        Err(e) => (false, Err(e)),
     }
 }
 
@@ -321,6 +405,38 @@ fn audit_resolve(
         aoide_protocol::Door::Daemon,
         aoide_protocol::EventClass::Secret,
         "secrets.resolve",
+        status,
+        &message,
+    );
+}
+
+/// Write BOTH audit lines for one `put` attempt — the `put` mirror of
+/// [`audit_resolve`], same two destinations (the broker's own `audit.log`
+/// + the mirrored `EventClass::Secret` aoide-log line), same name-only
+/// discipline. No `consumer`/`argv0` fields — `put`'s wire request carries
+/// neither (module doc).
+fn audit_put(secrets_home: &Path, secret: &str, granted: bool, reason: Option<&String>) {
+    let record = json!({
+        "ts": aoide_protocol::audit::now_secs(),
+        "op": "put",
+        "secret": secret,
+        "granted": granted,
+        "reason": reason,
+    });
+    if let Err(e) = append_own_log(secrets_home, &record) {
+        eprintln!("[aoide/secrets] could not write the secrets audit log: {e}");
+    }
+
+    let status = if granted { "granted" } else { "denied" };
+    let message = match reason {
+        Some(r) => format!("put `{secret}`: {status} ({r})"),
+        None => format!("put `{secret}`: {status}"),
+    };
+    let _ = aoide_protocol::audit(
+        &aoide_protocol::default_audit_log(),
+        aoide_protocol::Door::Daemon,
+        aoide_protocol::EventClass::Secret,
+        "secrets.put",
         status,
         &message,
     );
@@ -702,4 +818,136 @@ mod tests {
         }
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // ── `put` (P-V4c) ────────────────────────────────────────────────────
+
+    fn seed_with_set(home: &Path, policies: &[Policy], get: &str, set: &str) {
+        crate::store::save_policies(home, policies).unwrap();
+        let backends = serde_json::json!({ "scratch": { "get": get, "set": set } });
+        std::fs::write(crate::backend::backends_path(home), serde_json::to_vec(&backends).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn put_on_an_unknown_secret_is_denied_and_never_invokes_a_backend() {
+        let home = tmp_home("put-unknown");
+        seed(&home, &[]);
+        let (granted, result) = put_gate(&home, "nope", "irrelevant");
+        assert!(!granted);
+        assert_eq!(result.unwrap_err(), "secret not found");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn put_on_a_backend_with_no_set_template_is_a_clean_error() {
+        let home = tmp_home("put-noset");
+        let p = Policy::new("t", "scratch", "k");
+        seed(&home, &[p]); // `seed`'s fixture backend has only `get`.
+        let (granted, result) = put_gate(&home, "t", "irrelevant");
+        assert!(!granted);
+        assert!(result.unwrap_err().contains("no `set` template"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn a_granted_put_writes_through_the_named_backends_set_template() {
+        let home = tmp_home("put-granted");
+        let out = home.join("out.txt");
+        let p = Policy::new("t", "scratch", "k");
+        seed_with_set(&home, &[p], &format!("cat {}", out.display()), &format!("cat > {}", out.display()));
+
+        let (granted, result) = put_gate(&home, "t", "the-stored-value");
+        assert!(granted, "{result:?}");
+        assert!(result.is_ok());
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "the-stored-value");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// `put` never checks `requireTotp` — even a policy with it set is
+    /// storable without any code at all (module doc: put is CLI-only/
+    /// admin-side, not agent-facing).
+    #[test]
+    fn put_ignores_require_totp_entirely() {
+        let home = tmp_home("put-ignorestotp");
+        let out = home.join("out.txt");
+        let mut p = Policy::new("t", "scratch", "k");
+        p.require_totp = true;
+        seed_with_set(&home, &[p], &format!("cat {}", out.display()), &format!("cat > {}", out.display()));
+
+        let (granted, result) = put_gate(&home, "t", "value-with-no-totp-anywhere");
+        assert!(granted, "{result:?}");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "value-with-no-totp-anywhere");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn a_full_put_line_round_trips_through_handle_line_with_no_value_in_the_reply() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_AUDIT_LOG").ok();
+        let home = tmp_home("put-fullline");
+        std::env::set_var("AOIDE_AUDIT_LOG", home.join("mirrored-aoide-log"));
+
+        let out = home.join("out.txt");
+        let p = Policy::new("t", "scratch", "k");
+        seed_with_set(&home, &[p], &format!("cat {}", out.display()), &format!("cat > {}", out.display()));
+
+        let reply = handle_line(&home, r#"{"op":"put","secret":"t","value":"stored-value"}"#);
+        assert_eq!(reply["ok"], true);
+        assert!(reply.get("value").is_none(), "put's reply must never carry a value: {reply}");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "stored-value");
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_AUDIT_LOG", v),
+            None => std::env::remove_var("AOIDE_AUDIT_LOG"),
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn put_with_a_missing_secret_field_is_malformed() {
+        let home = tmp_home("put-missingfields");
+        let reply = handle_line(&home, r#"{"op":"put","value":"x"}"#);
+        assert_eq!(reply["ok"], false);
+        assert!(reply["error"].as_str().unwrap().contains("required"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The sentinel test (P-V4c phase brief): a put of a sentinel value,
+    /// forced through BOTH failure paths (missing policy, missing `set`
+    /// template), must leave the sentinel out of the wire reply AND both
+    /// audit logs on every single attempt.
+    #[test]
+    fn put_sentinel_value_never_leaks_on_missing_policy_or_missing_set_template() {
+        const SENTINEL: &str = "SENTINEL-PUT-VALUE-XYZ";
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_AUDIT_LOG").ok();
+        let home = tmp_home("put-sentinel");
+        std::env::set_var("AOIDE_AUDIT_LOG", home.join("mirrored-aoide-log"));
+
+        // ── failure 1: no policy at all for this secret ────────────────
+        seed(&home, &[]);
+        let reply = handle_line(&home, &format!(r#"{{"op":"put","secret":"nope","value":"{SENTINEL}"}}"#));
+        assert_eq!(reply["ok"], false);
+        assert!(!reply.to_string().contains(SENTINEL), "wire reply leaked the sentinel: {reply}");
+
+        // ── failure 2: policy exists, but its backend has no `set` ─────
+        let p = Policy::new("t", "scratch", "k");
+        seed(&home, &[p]); // `seed`'s fixture backend is get-only.
+        let reply = handle_line(&home, &format!(r#"{{"op":"put","secret":"t","value":"{SENTINEL}"}}"#));
+        assert_eq!(reply["ok"], false);
+        assert!(!reply.to_string().contains(SENTINEL), "wire reply leaked the sentinel: {reply}");
+
+        let own_log = std::fs::read_to_string(own_audit_log_path(&home)).unwrap();
+        assert!(!own_log.contains(SENTINEL), "the broker's own audit.log leaked the sentinel:\n{own_log}");
+        assert!(own_log.contains("\"op\":\"put\""), "{own_log}");
+
+        let mirrored_log = std::fs::read_to_string(home.join("mirrored-aoide-log")).unwrap();
+        assert!(!mirrored_log.contains(SENTINEL), "mirrored aoide audit log leaked the sentinel:\n{mirrored_log}");
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_AUDIT_LOG", v),
+            None => std::env::remove_var("AOIDE_AUDIT_LOG"),
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
 }

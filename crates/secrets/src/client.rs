@@ -17,6 +17,20 @@
 //! field for it to land on (this crate's `AGENTS.md` invariant) — a
 //! `serde_json::Value` read at the use site, not a named reusable type, is
 //! the shape that honors it.
+//!
+//! **`put` (P-V4c, `secrets put <name>`) is the write-side mirror, and
+//! flows the OTHER direction**: [`run_put`] reads the value from THIS
+//! process's own stdin (stdin-only intake — never argv, never a `--value`
+//! flag) into a local `String`, hands it straight to [`put`], which builds
+//! the wire request with `serde_json::json!` at the point of use (same
+//! rule as `resolve`'s request — never a `#[derive(Serialize)]` struct)
+//! and sends it. `put`'s reply carries no value at all (just `{"ok":true}`
+//! or `{"ok":false,"error":...}`), so unlike `exec`, `secrets put` is a
+//! PLAIN registered handler (`commands::handle_secrets_put`), not a
+//! `cli`-crate `special`-hook case: nothing about its control flow needs
+//! to bypass the generic `Outcome` envelope or return a spawned child's
+//! own exit code (`commands.rs`'s own module doc justifies this choice
+//! next to `serve`/`exec`/`enroll`'s).
 
 use aoide_protocol::Invocation;
 use serde_json::{json, Value};
@@ -127,6 +141,58 @@ pub fn resolve(
             .unwrap_or("the secrets broker denied the request")
             .to_string())
     }
+}
+
+/// Connect to `socket_path`, send ONE `put` request carrying `value`, read
+/// ONE reply line, and return `Ok(())` on a stored value or a value-free
+/// `Err` otherwise. Mirrors [`resolve`]'s one-shot socket shape; unlike
+/// `resolve`'s reply, `put`'s never carries a value back — only ok/error —
+/// so there is nothing here for a caller to extract.
+pub fn put(socket_path: &Path, secret: &str, value: &str) -> Result<(), String> {
+    let mut stream = UnixStream::connect(socket_path)
+        .map_err(|e| format!("connecting to the secrets broker at {}: {e}", socket_path.display()))?;
+
+    let req = json!({ "op": "put", "secret": secret, "value": value });
+    let mut line = req.to_string();
+    line.push('\n');
+    stream
+        .write_all(line.as_bytes())
+        .map_err(|e| format!("writing to the secrets broker: {e}"))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut reply_line = String::new();
+    reader
+        .read_line(&mut reply_line)
+        .map_err(|e| format!("reading from the secrets broker: {e}"))?;
+    if reply_line.trim().is_empty() {
+        return Err("the secrets broker closed the connection with no reply".to_string());
+    }
+    let reply: Value = serde_json::from_str(reply_line.trim())
+        .map_err(|e| format!("the secrets broker sent an unparseable reply: {e}"))?;
+
+    if reply.get("ok").and_then(Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        Err(reply
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("the secrets broker denied the request")
+            .to_string())
+    }
+}
+
+/// The full `secrets put <name>` client flow: read the value from THIS
+/// process's own stdin (stdin-only intake, module doc), then [`put`] it
+/// over `socket_path`. The value exists only as this function's own local
+/// `String`, from the stdin read to the `put()` call — never returned,
+/// never logged, never touching argv.
+pub fn run_put(secret: &str, socket_path: &Path) -> Result<(), String> {
+    use std::io::Read;
+    let mut value = String::new();
+    std::io::stdin()
+        .read_to_string(&mut value)
+        .map_err(|e| format!("reading value from stdin: {e}"))?;
+    put(socket_path, secret, &value)
 }
 
 /// Spawn `cmd`, `var`=`value` injected, `Stdio::inherit()` throughout
@@ -260,6 +326,13 @@ mod tests {
     fn resolve_against_a_dead_socket_is_a_connect_error() {
         let dead = Path::new("/tmp/aoide-secrets-nonexistent-test.sock");
         let err = resolve(dead, "t", "m", None, None).unwrap_err();
+        assert!(err.contains("connecting"), "{err}");
+    }
+
+    #[test]
+    fn put_against_a_dead_socket_is_a_connect_error() {
+        let dead = Path::new("/tmp/aoide-secrets-nonexistent-put-test.sock");
+        let err = put(dead, "t", "irrelevant").unwrap_err();
         assert!(err.contains("connecting"), "{err}");
     }
 }

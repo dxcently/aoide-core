@@ -23,12 +23,29 @@
 //! PRESETS live in `README.md`'s "Backend presets" section (P-V3), not in
 //! this module — `backend` itself is unchanged.
 //!
+//! **P-V4c (this commit) is the backend build-out**: a built-in `file`
+//! backend (plain `0600` files under the secrets home, [`backend::
+//! seed_default_backends`] seeds it into a fresh `backends.json`) and a
+//! `{home}` template placeholder that makes it possible
+//! ([`backend::expand_template`]), an optional per-backend `set` template
+//! ([`backend::store_value`]), and the write half: a new `secrets put
+//! <name>` verb ([`commands::handle_secrets_put`], [`client::put`]/
+//! [`client::run_put`], [`broker::handle_put`]/[`broker::put_gate`]/
+//! [`broker::audit_put`]) that reads a value from stdin and stores it
+//! through the named secret's backend — never gated by `requireTotp`, no
+//! `consumer` field on the wire (`put` is CLI-only/admin-side, never
+//! agent-facing; `broker`'s module doc has the full reasoning). The
+//! socket wire (`resolve` + `put`) is now ALSO documented in
+//! `CONTRACTS.md`'s "Secrets wire" subsection as a first-class,
+//! directly-speakable API for non-agent consumers.
+//!
 //! See `README.md` for the wire shape and the release-to-client flow, and
 //! `AGENTS.md` for the invariants a change here must hold — most
 //! importantly: a secret's VALUE never appears on a `Serialize`/
 //! `Deserialize` type anywhere in this crate ([`policy::Policy`] is still
-//! the only derived-`Serialize` type that touches the wire; the resolve
-//! reply is hand-built `serde_json::Value`, never a struct).
+//! the only derived-`Serialize` type that touches the wire; both the
+//! resolve reply and the put reply are hand-built `serde_json::Value`,
+//! never a struct); NO CACHE EVER; and ONE VALUE PER SECRET.
 
 pub mod backend;
 pub mod base32;

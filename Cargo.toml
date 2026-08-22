@@ -70,9 +70,10 @@ aoide-lyra = { path = "crates/lyra" }
 # verbs (P-V2); `secrets enroll` + the live requireTotp gate +
 # backend-preset docs (P-V3); the socket chmod'd 0660 on bind, deployed
 # via modules/nucleus/secrets.nix or the non-nix install path (P-V4 — no
-# new verb, binary stays nix-independent). `aoide-cli` depends on this
-# crate as of P-V2 (`secrets serve`/`exec`/`add`/`rm`/`grant`/`revoke`/
-# `enroll` register into its `Registry`).
+# new verb, binary stays nix-independent); the built-in `file` backend +
+# the write half, `secrets put` (P-V4c — golden +1). `aoide-cli` depends
+# on this crate as of P-V2 (`secrets serve`/`exec`/`add`/`rm`/`grant`/
+# `revoke`/`enroll`/`put` register into its `Registry`).
 aoide-secrets = { path = "crates/secrets" }
 
 [profile.release]

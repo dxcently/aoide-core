@@ -138,6 +138,7 @@ mod tests {
             "secrets.enroll",
             "secrets.exec",
             "secrets.grant",
+            "secrets.put",
             "secrets.revoke",
             "secrets.rm",
             "secrets.serve",

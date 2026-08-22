@@ -7,10 +7,20 @@ P-V1 landed the pure logic; P-V2 added the broker
 daemon, the unix-socket wire, and the client + admin CLI verbs — `aoide
 secrets serve`/`exec`/`add`/`rm`/`grant`/`revoke`, registered into
 `aoide-cli`'s `Registry`. P-V3 added `secrets enroll` and wired `requireTotp`
-live, plus the backend-preset docs below. **P-V4 (this commit) is
-deployment**: `broker::bind_socket` chmods the socket to `0660` on bind,
-and the "Deployment" section below covers both the nix module
-(`modules/nucleus/secrets.nix`) and the non-nix install path.
+live, plus the backend-preset docs below. P-V4 was deployment:
+`broker::bind_socket` chmods the socket to `0660` on bind, and the
+"Deployment" section below covers both the nix module
+(`modules/nucleus/secrets.nix`) and the non-nix install path. **P-V4c
+(this commit) is the backend build-out**: a built-in `file` backend
+(plain `0600` files under the secrets home, expressed entirely through the
+template mechanism — see "Backend presets" below), a `{home}` template
+placeholder to make that possible, and the write half — an optional
+per-backend `set` template plus the new `secrets put <name>` verb (see
+"The write flow" below). The socket wire is now also documented in
+`CONTRACTS.md`'s "Secrets wire" subsection as a first-class,
+directly-speakable API for non-agent consumers (services, models) — this
+file stays the canonical source, `CONTRACTS.md` restates it for a reader
+who never opens this crate's Rust.
 
 `secrets enroll` generates a fresh 20-byte secret from `/dev/urandom`,
 persists it (`store::save_totp_secret`, `0600`), and prints its
@@ -53,24 +63,71 @@ Release-to-client is honest, not a leak: a same-uid agent with a valid
 code/grant could always read the value once released; the grant/code IS
 the gate, not the transport.
 
+## The write flow (`secrets put`, P-V4c)
+
+The write-side mirror of the flow above, and it goes the OTHER direction —
+a value flows CLIENT-to-broker, never released back:
+
+```
+operator/service -> aoide secrets put <name>   (value read from STDIN, never argv)
+                  -> client (caller uid) connects, sends {op:"put", secret, value}
+                  -> broker (secrets uid): policy gate (secret has a policy —
+                     `put` NEVER auto-creates one, `secrets add` owns that —
+                     and its backend has a `set` template) -> pipes `value`
+                     to the template's OWN stdin, runs it AS SECRETS UID
+                  -> client learns granted/denied from the reply; there is
+                     no value in it either way
+```
+
+`put` carries NO `consumer` field and is NEVER gated by `requireTotp`
+(deliberate): `secrets put` is CLI-only (`commands::handle_secrets_put`'s
+`require_cli` gate, same as the policy-admin quartet) and, in deployment,
+runs as the secrets uid's own operator (`sudo -u aoide-secrets aoide
+secrets put …`, same admin-verb precedent as `add`/`grant` — "Admin verbs"
+below) — there is no separate agent-facing "consumer" identity to
+authorize, and gating the secrets uid's own operator behind a TOTP code it
+would also have to hold is pointless ceremony, not defense in depth. The
+value exists ONLY as a local `String` in `client::run_put`, from the
+stdin read to the `put()` call that pipes it into the wire request — never
+an `Outcome`, never either audit line (both are written broker-side,
+name-only, exactly like `resolve`'s — see `broker`'s module doc).
+
 ## The wire (unix socket, JSON-lines, one request per line, one reply)
 
 ```
 -> {"op":"resolve","secret":"<name>","consumer":"<consumer>","totp":"<code>"?,"argv0":"<cmd>"?}
 <- {"ok":true,"value":"<value>"}                    (granted)
 <- {"ok":false,"error":"<value-free message>"}      (denied/error)
+
+-> {"op":"put","secret":"<name>","value":"<value>"}
+<- {"ok":true}                                      (stored)
+<- {"ok":false,"error":"<value-free message>"}      (denied/error)
 ```
 
-`totp`/`argv0` are optional. `consumer` is SELF-ASSERTED (the V1 ruling
-`replay.rs` carries): the policy's `consumers[]` list is the real gate,
-never caller identity. `argv0` (the wrapped command's own argv[0], sent by
-`secrets exec`) exists purely so the broker's audit lines can name it — the
-broker never runs it. `totp` is consulted ONLY when the resolved policy has
-`requireTotp: true` (`broker::verify_totp_gate`) — on a policy without it,
-`totp` rides the wire unread, same as before P-V3.
+`totp`/`argv0` are optional on `resolve`; `put` has neither. `consumer` is
+SELF-ASSERTED (the V1 ruling `replay.rs` carries): the policy's
+`consumers[]` list is the real gate, never caller identity. `argv0` (the
+wrapped command's own argv[0], sent by `secrets exec`) exists purely so the
+broker's audit lines can name it — the broker never runs it. `totp` is
+consulted ONLY when the resolved policy has `requireTotp: true`
+(`broker::verify_totp_gate`) — on a policy without it, or on a `put`
+(never checked at all), `totp` rides the wire unread if present, same as
+before P-V3.
 
-The reply is hand-built `serde_json::Value` (`serde_json::json!`), never a
-`#[derive(Serialize)]` struct — see "Invariants held" below.
+Both replies are hand-built `serde_json::Value` (`serde_json::json!`),
+never a `#[derive(Serialize)]` struct — see "Invariants held" below.
+
+**This wire is a FIRST-CLASS API (P-V4c), not merely `secrets exec`/
+`secrets put`'s private implementation detail.** A service (verba
+voluntia, an aoide-side Melete model) is meant to connect the socket and
+speak these two ops DIRECTLY — no LLM, no `aoide` binary in the loop —
+exactly the way `secrets exec`/`secrets put` do internally.
+`CONTRACTS.md`'s "Secrets wire" subsection restates this same contract
+(transport, both request/reply shapes, every error string, the
+group-membership trust model, the `consumer`-self-assertion honesty note)
+for a reader who never opens this crate's Rust; THIS section is the
+canonical copy — a wire change lands here (and in `broker.rs`'s module
+doc) first, `CONTRACTS.md` follows in the same commit.
 
 ## TOTP enrollment (`secrets enroll`, P-V3)
 
@@ -113,32 +170,54 @@ secret (base32): <base32>
 
 ## Backend presets
 
-`backend.rs`'s `Backends`/`fetch_value` (Named seams, below) know nothing
-about any specific secret manager — `backends.json` is a map of named
-backend -> ONE `get` command template, and the policy's `key` is
-substituted into that template's `{name}` placeholder. These four presets
-are DOCUMENTATION, not code — copy the shape that matches your backend
-into `backends.json`:
+`backend.rs`'s `Backends`/`fetch_value`/`store_value` (Named seams, below)
+know nothing about any specific secret manager — `backends.json` is a map
+of named backend -> a `get` command template (and, P-V4c, an OPTIONAL
+`set` template that makes the backend WRITABLE), and the policy's `key` is
+substituted into that template's `{name}` placeholder. A template may also
+use `{home}` (P-V4c), substituted with `secrets_home` itself, quoted the
+SAME way as `{name}`. These presets are DOCUMENTATION, not code — copy the
+shape that matches your backend into `backends.json` — with ONE exception:
 
-| Backend  | `get` template            | Notes                                            |
-|----------|----------------------------|--------------------------------------------------|
-| `pass`   | `pass show {name}`         | `key` is the pass-store entry path (`prod/db`).  |
-| `gopass` | `gopass show -o {name}`    | `-o` prints the password line only, no metadata. |
-| `bw`     | `bw get password {name}`   | `key` is the Bitwarden item's name or id; needs a prior `bw unlock`/`BW_SESSION` in the broker's own environment (secrets-uid-owned, per the ownership-trap note below). |
-| `sops`   | `sops -d --extract {name} secrets.yaml` | `key` is the FULL `--extract` JSONPath argument sops expects, e.g. `["password"]` — the brackets+quotes are part of the `key` VALUE (so `backend::shell_single_quote` escapes them along with everything else), not written into the template. The `secrets.yaml` path is fixed in the template, not templated — a second sops file needs its own named backend entry, and the secrets uid needs the sops decryption key (age/GPG/KMS) set up, per the ownership note below. |
+| Backend  | `get` template            | `set` template | Notes                                            |
+|----------|----------------------------|-----------------|--------------------------------------------------|
+| `file` **(built-in, P-V4c)** | `cat {home}/store/{name}` | `mkdir -p -m 0700 {home}/store && install -m 0600 /dev/stdin {home}/store/{name}` | The ONE exception — SEEDED automatically into a fresh `backends.json` (below), not merely documented here. Plain `0600` files under `<secrets_home>/store/`, expressed entirely through the template mechanism (house rule 7 — no special-cased Rust reads or writes this backend's bytes). |
+| `pass`   | `pass show {name}`         | — | `key` is the pass-store entry path (`prod/db`).  |
+| `gopass` | `gopass show -o {name}`    | — | `-o` prints the password line only, no metadata. |
+| `bw`     | `bw get password {name}`   | — | `key` is the Bitwarden item's name or id; needs a prior `bw unlock`/`BW_SESSION` in the broker's own environment (secrets-uid-owned, per the ownership-trap note below). |
+| `sops`   | `sops -d --extract {name} secrets.yaml` | — | `key` is the FULL `--extract` JSONPath argument sops expects, e.g. `["password"]` — the brackets+quotes are part of the `key` VALUE (so `backend::shell_single_quote` escapes them along with everything else), not written into the template. The `secrets.yaml` path is fixed in the template, not templated — a second sops file needs its own named backend entry, and the secrets uid needs the sops decryption key (age/GPG/KMS) set up, per the ownership note below. |
 
-**Never pre-quote `{name}`** — `backend.rs`'s module doc: the substituted
-`key` is already shell-single-quote-escaped
-(`backend::shell_single_quote`) before it lands in the template, so
-`pass show {name}` is correct and `pass show "{name}"` would double-quote
-and break. Every template above follows that rule.
+**`backends.json` is SEEDED with the `file` backend when absent** — the
+ONE seeding site is `broker::serve`'s startup (decision recorded in
+`broker.rs`'s module doc): the broker is the single long-running process
+that ever actually resolves a backend name against a template, so seeding
+there guarantees every `resolve`/`put` sees a `backends.json` on disk
+without a second seed call at `secrets add`/`secrets put`. **An EXISTING
+`backends.json` is never touched** — seeding only ever writes the file
+when it is entirely absent.
 
-Each backend process runs AS THE BROKER'S OWN UID (`backend.rs`'s module
-doc), which is what solves the backing-store ownership trap structurally:
-the `pass` GPG key, the `bw` session, the `sops` age/GPG key all live
-under the secrets uid, never the calling agent's — a template above is only
-as safe as the secrets uid's own access to that backend being scoped
-correctly (documentation and deployment concern, P-V4, not this crate's).
+**Never pre-quote `{name}`/`{home}`** — `backend.rs`'s module doc: both
+substitutions are already shell-single-quote-escaped
+(`backend::shell_single_quote`) before they land in the template, so
+`pass show {name}` / `cat {home}/store/{name}` are correct and
+`pass show "{name}"` would double-quote and break. Every template above
+follows that rule.
+
+Each backend process (`get` AND `set`) runs AS THE BROKER'S OWN UID
+(`backend.rs`'s module doc), which is what solves the backing-store
+ownership trap structurally: the `pass` GPG key, the `bw` session, the
+`sops` age/GPG key, and the built-in `file` backend's own `store/`
+directory all live under the secrets uid, never the calling agent's — a
+template above is only as safe as the secrets uid's own access to that
+backend being scoped correctly (documentation and deployment concern, P-V4,
+not this crate's).
+
+**Per-backend environment is INLINE IN THE TEMPLATE, never a structured
+env map** (P-V4c invariant): a backend needing `BW_SESSION` or similar
+sets it as part of the `sh -c` command text itself (`BW_SESSION=... bw get
+password {name}`) — `backends.json` has no separate `env` field for this
+crate to parse, validate, or leak through, and never will; the whole
+adapter surface is ONE string per direction (`get`, `set`), by design.
 
 ## Deployment (P-V4)
 
@@ -286,17 +365,27 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   explicitly to `/run/aoide-secrets/secrets.sock`; this function's own default
   never changes.
 - `backend` — `Backends`/`Backend` (`backends.json`'s shape: a map of
-  named backend -> ONE fetch-command template) and `fetch_value`, which
-  substitutes the policy's `key`, SHELL-SINGLE-QUOTE-ESCAPED (never a raw
-  `.replace()` — a key with whitespace or an embedded `'` must not be able
-  to break the command or escape its argument boundary), into the
-  template's `{name}` placeholder, runs it via `sh -c`, and trims exactly
-  one trailing newline from stdout. On a failing backend, the returned
-  `Err` carries ONLY the exit status — the command's full stderr is
-  `eprintln!`'d to the broker's own stderr and never returned, since the
-  `Err` string rides the wire reply and both audit lines' `reason` field.
-  `pass`/`gopass`/`bw`/`sops` are DOC PRESETS ("Backend presets" above),
-  not code — this module has no knowledge of any specific backend.
+  named backend -> a `get` template and an OPTIONAL `set` template, P-V4c)
+  and `fetch_value`/`store_value`, which substitute the policy's `key` and
+  (P-V4c) `secrets_home` itself (`{home}`), both SHELL-SINGLE-QUOTE-ESCAPED
+  (never a raw `.replace()` — a key/home with whitespace or an embedded `'`
+  must not be able to break the command or escape its argument boundary)
+  via `expand_template`'s single left-to-right scan (module doc — never a
+  sequential two-pass replace, which could re-scan already-substituted text
+  for the other placeholder). `fetch_value` runs the `get` template via
+  `sh -c` and trims exactly one trailing newline from stdout; `store_value`
+  (P-V4c) runs the `set` template the same way with `value` piped to ITS
+  OWN stdin (never argv) and discards its stdout. On a failing backend
+  (either direction), the returned `Err` carries ONLY the exit status — the
+  command's full stderr is `eprintln!`'d to the broker's own stderr and
+  never returned, since the `Err` string rides the wire reply and both
+  audit lines' `reason` field. Also `seed_default_backends` (P-V4c): writes
+  the built-in `file` backend into `backends.json` when absent, never when
+  one already exists — see "Backend presets" above for the seeding-site
+  decision. `pass`/`gopass`/`bw`/`sops` are DOC PRESETS ("Backend presets"
+  above), not code — this module has no knowledge of any specific backend;
+  `file` is the one backend that ships as SEEDED DATA rather than mere
+  documentation, still through the same template mechanism.
 - `store` — secrets-home file persistence, all write-temp-then-rename +
   `home::secure_dir`/`secure_file`: `load_policies`/`save_policies`
   (`policy.json`, P-V2); `load_totp_secret`/`save_totp_secret`
@@ -318,15 +407,22 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   contract and the "broker-side only" audit discipline.
 - `client` — `resolve` (one round trip over the socket), `parse_exec_args`
   (pure `Invocation` parsing), `run_exec` (the full `secrets exec` flow: the
-  entry point for `aoide-cli`'s `special` hook).
-- `commands` — `register(&mut Registry)`: SEVEN verbs, ALL CLI-only.
+  entry point for `aoide-cli`'s `special` hook); `put` (P-V4c, one `put`
+  round trip over the socket, mirrors `resolve`'s shape) and `run_put`
+  (P-V4c, reads the value from THIS process's own stdin then calls `put` —
+  the full `secrets put` flow, but a PLAIN function called from
+  `commands::handle_secrets_put`, not a `cli`-crate `special`-hook case).
+- `commands` — `register(&mut Registry)`: EIGHT verbs, ALL CLI-only.
   `serve`/`exec`/`enroll` are door-hint handlers (the real work happens in
   `cli`'s `special` hook, same pattern as `a2a serve`/`conductor`); `add`/
   `rm`/`grant`/`revoke` are policy-CRUD handlers gated the same way
   (`require_cli`) — a non-CLI door (MCP/A2A/Daemon) gets the door-hint
   `Outcome` before `policy.json`/`totp.secret` is ever touched, closing off
   a self-escalation path (`secrets grant <secret> <itself>`, or a hostile
-  re-enrollment, from an already-connected agent).
+  re-enrollment, from an already-connected agent). `put` (P-V4c) is gated
+  the SAME way (`require_cli`) but is NOT special-cased like `exec`/
+  `enroll` — see `commands.rs`'s own module doc for why its wire reply
+  carrying no value at all makes that unnecessary.
 
 ## What it consumes
 
@@ -345,9 +441,10 @@ read are all plain `std`. `qrencode` is a runtime `PATH` shell-out
 `aoide-cli` depends on this crate as of P-V2 (`crates/cli/src/commands/
 mod.rs::all()` calls `aoide_secrets::commands::register`, appended newest;
 `crates/cli/src/lib.rs`'s `special` hook wires `secrets serve`/`secrets exec`/
-`secrets enroll`, P-V3). The workspace `Cargo.toml` comment on the
-`aoide-secrets` member is kept current with the verb set in the same commit
-as any change.
+`secrets enroll`, P-V3 — `secrets put`, P-V4c, deliberately does NOT join
+that hook, see `commands.rs`'s module doc). The workspace `Cargo.toml`
+comment on the `aoide-secrets` member is kept current with the verb set in
+the same commit as any change.
 
 ## Invariants held (see `AGENTS.md` for the full list)
 
@@ -369,3 +466,32 @@ as any change.
   exists on this host yet; once enrolled, a missing/wrong/replayed code is
   an ordinary denial, never a silent standing-grant fallback in either
   direction.
+- **NO CACHE, EVER** (P-V4c, written down as a crate invariant): a
+  secret's value exists ONLY between a `get`/`set` template's own
+  invocation and the wire write that follows it — nothing in `broker`/
+  `client`/`backend` holds a value across requests, in memory or on disk,
+  for any reason (not a warm cache, not a TTL, not a "the last resolve for
+  this secret"). `resolve` runs the backend fresh on EVERY call, so
+  revocation (removing a consumer, `secrets rm`, rotating the backing
+  value) is immediate — the very next resolve sees it, never a stale
+  cached answer. This is also why `policy.json`/`totp-replay.json` are
+  reloaded fresh from disk on every gated attempt rather than held in the
+  broker process (`store`'s module doc) — the same "no cached state"
+  discipline, restated here as the crate-wide rule it actually is.
+- **ONE VALUE PER SECRET** (P-V4c, written down as the contract
+  `policy::Policy`'s shape already implies): a "secret" in this crate's
+  vocabulary is exactly one policy entry — one `{name, backend, key,
+  requireTotp, consumers[], sharedWith[]}` — pointing at exactly one
+  backend-fetched value. A credential with multiple fields (a
+  username+password pair, a multi-key JSON blob) is modeled as MULTIPLE
+  named secrets, each its own policy with its own `consumers[]`/
+  `requireTotp`, never one policy resolving to a multi-field structure —
+  the `sops` preset's JSONPath `key` (`["password"]`, "Backend presets"
+  above) already shows this shape: a second field of the same
+  `secrets.yaml` gets its OWN backend entry, `["username"]`, not a second
+  key inside one resolve. There is no multi-field resolve op on the wire,
+  and none is planned — per-field grants and per-field TOTP are the whole
+  point.
+- **Per-backend environment is INLINE IN THE TEMPLATE** (P-V4c, "Backend
+  presets" above) — `sh -c` IS the environment mechanism; there is no
+  structured `env` map anywhere in `Backend`'s shape, and none is planned.

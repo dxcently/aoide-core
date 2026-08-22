@@ -1,5 +1,5 @@
 //! `aoide secrets` — the secrets broker's CLI surface (Workstream SECRETS,
-//! P-V2, P-V3). Registers SEVEN verbs:
+//! P-V2, P-V3, P-V4c). Registers EIGHT verbs:
 //!
 //! - `serve` — the long-running broker, special-cased at the entry point
 //!   exactly like `a2a serve`/`conductor` (`cli`'s `run_cli`): this
@@ -27,6 +27,21 @@
 //!   the door-hint `Outcome` and returns BEFORE any `store::load_policies`/
 //!   `store::save_policies` call, so a non-CLI invocation never mutates
 //!   `policy.json`.
+//! - `put` (P-V4c) — the write half: `secrets put <name>` reads the value
+//!   from STDIN (never argv) and forwards it to the broker's `put` op over
+//!   the socket. **NOT special-cased**, unlike `serve`/`exec`/`enroll`:
+//!   [`handle_secrets_put`] is a PLAIN handler — CLI-only via the SAME
+//!   [`require_cli`] gate as the admin quartet (an agent putting values is
+//!   exactly what the design forbids), then it delegates the stdin-read +
+//!   socket round trip to `crate::client::run_put`. This differs from
+//!   `exec`/`enroll` in the one way that matters: `put`'s wire reply
+//!   carries NO value at all (`{"ok":true}` or `{"ok":false,"error":...}`),
+//!   and its own success/failure message is name-only
+//!   (`format!("put secret \`{name}\`")`) — so nothing about its return
+//!   path ever needs to bypass the generic `Outcome` envelope the way a
+//!   FETCHED value (`exec`) or a PRINTED secret (`enroll`) would. Appended
+//!   LAST in `register()` (golden discipline — `pkgs/aoide/crates/
+//!   AGENTS.md`: append, never reorder), golden 59 -> 60.
 //!
 //! `add`/`rm`/`grant`/`revoke`/`enroll` run AS THE SECRETS USER in deployment
 //! (`sudo -u aoide-secrets ...`, wrapped by the nix module at P-V4), but the
@@ -34,7 +49,10 @@
 //! `home::secrets_home()` resolves to, same as every other function here.
 //! `add` reads NO value at any point: the secrets broker never stores one, only a
 //! policy (backend name + key) pointing at where a value can be fetched
-//! from later.
+//! from later. `put` is the one verb here whose stdin DOES carry a value —
+//! it never touches this crate's own storage directly, only the broker's
+//! `set` backend template, over the socket (`crate::broker::handle_put`'s
+//! module doc).
 
 use crate::home;
 use crate::policy::{valid_secret_name, Policy};
@@ -131,6 +149,16 @@ pub fn register(r: &mut Registry) {
         implemented: true,
         handler: handle_secrets_enroll,
         examples: ["secrets enroll", "secrets enroll --force"],
+    ));
+    r.insert(cmd!(
+        path: ["secrets", "put"],
+        summary: "Store a value for an EXISTING secret's policy, read from stdin (never argv). CLI-only — no TOTP, since put is admin-side, not agent-facing. The named policy's backend must carry a `set` template (the built-in `file` backend has one by default).",
+        args: [arg!("name", "string", true, "The secret's nickname — must already have a policy (`secrets add` first).")],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_secrets_put,
+        examples: ["printf %s hunter2 | aoide secrets put db-prod"],
     ));
 }
 
@@ -305,6 +333,32 @@ fn handle_secrets_revoke(inv: &Invocation) -> Outcome {
     })
 }
 
+/// `secrets put <name>` (P-V4c) — CLI-only via the SAME [`require_cli`]
+/// gate as the admin quartet (module doc: an agent putting values is
+/// exactly what the design forbids), then a PLAIN delegation to
+/// `crate::client::run_put`, which reads the value from stdin and does the
+/// socket round trip. The returned [`Outcome`]'s message is name-only —
+/// `crate::client::run_put`'s `Result<(), String>` carries no value on
+/// either arm (put's own wire reply never has one either), so there is
+/// nothing here that could put the value on this envelope even by
+/// accident.
+fn handle_secrets_put(inv: &Invocation) -> Outcome {
+    let cmd = "secrets.put";
+    if let Some(hint) = require_cli(inv, cmd) {
+        return hint;
+    }
+    let Some(name) = inv.args.first().cloned() else {
+        return Outcome::usage(cmd, "usage: secrets put <name> (value read from stdin)");
+    };
+    if !valid_secret_name(&name) {
+        return Outcome::usage(cmd, format!("invalid secret name `{name}`"));
+    }
+    match crate::client::run_put(&name, &crate::socket::socket_path()) {
+        Ok(()) => Outcome::ok(cmd, format!("put secret `{name}`")),
+        Err(e) => Outcome::error(cmd, e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,6 +412,7 @@ mod tests {
                 "secrets.grant",
                 "secrets.revoke",
                 "secrets.enroll",
+                "secrets.put",
             ]
         );
         for c in r.commands() {
@@ -509,6 +564,52 @@ mod tests {
 
                 assert_eq!(store::load_policies(home).unwrap(), before, "policy.json mutated over {door:?}");
             }
+        });
+    }
+
+    /// `put` (P-V4c) holds the SAME CLI-only discipline as the admin
+    /// quartet, proven the same way — `policy.json` byte-identical AND the
+    /// backend's on-disk store dir untouched (a gated `put` must never even
+    /// REACH `client::run_put`, so it can neither read stdin nor write
+    /// through a backend's `set` template).
+    #[test]
+    fn put_is_cli_only_a_non_cli_door_never_mutates_policy_json_or_the_store_dir() {
+        with_secrets_home("put-door-gate", |home| {
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "file"), ("key", "k")]);
+            assert_eq!(handle_secrets_add(&add).status, Status::Ok);
+            let policies_before = store::load_policies(home).unwrap();
+
+            // A store dir with a pre-existing file, standing in for "a
+            // secret already written by an earlier, legitimate put" — a
+            // gated attempt must leave it byte-identical.
+            let store_dir = home.join("store");
+            std::fs::create_dir_all(&store_dir).unwrap();
+            std::fs::write(store_dir.join("k"), b"pre-existing-content").unwrap();
+            let store_before = std::fs::read(store_dir.join("k")).unwrap();
+
+            for door in [Door::Mcp, Door::A2a, Door::Daemon] {
+                let put = inv(door, &["secrets", "put"], &["t"], &[]);
+                assert_eq!(handle_secrets_put(&put).status, Status::Usage, "put over {door:?}");
+            }
+
+            assert_eq!(store::load_policies(home).unwrap(), policies_before, "policy.json mutated by a gated put");
+            assert_eq!(std::fs::read(store_dir.join("k")).unwrap(), store_before, "store dir mutated by a gated put");
+        });
+    }
+
+    #[test]
+    fn put_requires_a_secret_name() {
+        with_secrets_home("put-noname", |_home| {
+            let put = inv(Door::Cli, &["secrets", "put"], &[], &[]);
+            assert_eq!(handle_secrets_put(&put).status, Status::Usage);
+        });
+    }
+
+    #[test]
+    fn put_rejects_an_invalid_secret_name() {
+        with_secrets_home("put-badname", |_home| {
+            let put = inv(Door::Cli, &["secrets", "put"], &["Bad--Name"], &[]);
+            assert_eq!(handle_secrets_put(&put).status, Status::Usage);
         });
     }
 }
