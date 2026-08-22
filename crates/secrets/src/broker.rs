@@ -453,8 +453,20 @@ fn handle_resolve(secrets_home: &Path, req: &Value, parked: &ParkRegistry, inter
     // The one real-clock read in this function — see module doc.
     let now_unix = aoide_protocol::audit::now_secs();
     match resolve_gate(secrets_home, &secret, &consumer, totp.as_deref(), now_unix) {
-        GateOutcome::Granted(value) => {
+        GateOutcome::Granted { value, totp_free } => {
             audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), true, None);
+            // P-N3: notify only the TOTP-free grant (`requireTotp:false`, or
+            // an automation-skip) — a resolve that validated its own inline
+            // `--totp` code needs no desktop notice, the caller just typed
+            // it themselves. Fired AFTER `audit_resolve` (no lock held by
+            // either call) — see `emit_notify`'s own doc.
+            if totp_free {
+                emit_notify(
+                    secrets_home,
+                    "released",
+                    json!({"event": "released", "secret": secret, "consumer": consumer}),
+                );
+            }
             json!({"ok": true, "value": value})
         }
         GateOutcome::Denied(reason) => {
@@ -485,6 +497,20 @@ fn handle_resolve(secrets_home: &Path, req: &Value, parked: &ParkRegistry, inter
             };
             audit_park(secrets_home, &id, &secret, &consumer);
             let timeout = crate::park::park_timeout();
+            // P-N3: the popup's future trigger — fired once per park, right
+            // alongside `audit_park`, no lock held (`park_if_room` already
+            // returned).
+            emit_notify(
+                secrets_home,
+                "parked",
+                json!({
+                    "event": "parked",
+                    "id": id,
+                    "secret": secret,
+                    "consumer": consumer,
+                    "timeoutSecs": timeout.as_secs(),
+                }),
+            );
             // P-N2c FIX 1: announce the park BEFORE blocking — a write
             // failure here (the caller already hung up) is swallowed, not
             // propagated (this function's own doc): the ask stays
@@ -511,6 +537,11 @@ fn handle_resolve(secrets_home: &Path, req: &Value, parked: &ParkRegistry, inter
                 WaitResult::TimedOut => {
                     let reason = park_timeout_message(&secret, timeout.as_secs());
                     audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), false, Some(&reason));
+                    emit_notify(
+                        secrets_home,
+                        "expired",
+                        json!({"event": "expired", "id": id, "secret": secret, "consumer": consumer}),
+                    );
                     json!({"ok": false, "error": reason})
                 }
             }
@@ -645,6 +676,15 @@ fn handle_approve(secrets_home: &Path, parked: &ParkRegistry, req: &Value) -> Va
         Ok(value) => {
             ask.send(ParkOutcome::Approved(value));
             audit_approve(secrets_home, &id, Some(&secret), true, "");
+            // P-N3: fired once, on the approver's own side — the ORIGINAL
+            // parked caller's `resolve` return (`WaitResult::Approved` in
+            // `handle_resolve`) does not fire a second one for the same
+            // lifecycle event.
+            emit_notify(
+                secrets_home,
+                "completed",
+                json!({"event": "completed", "id": id, "secret": secret, "consumer": consumer}),
+            );
             json!({"ok": true})
         }
         Err(e) => {
@@ -679,8 +719,14 @@ fn handle_dismiss(secrets_home: &Path, parked: &ParkRegistry, req: &Value) -> Va
     match parked.take(&id) {
         Some(ask) => {
             let secret = ask.secret.clone();
+            let consumer = ask.consumer.clone();
             ask.send(ParkOutcome::Dismissed);
             audit_dismiss(secrets_home, &id, &secret, true, None);
+            emit_notify(
+                secrets_home,
+                "dismissed",
+                json!({"event": "dismissed", "id": id, "secret": secret, "consumer": consumer}),
+            );
             json!({"ok": true})
         }
         None => {
@@ -817,7 +863,14 @@ const REPLAY_RETENTION_STEPS: u64 = 4; // ~2 minutes at the 30s step
 /// Denied`] (module doc: parking would be pointless, since nobody could
 /// ever complete an approve without an enrolled secret).
 enum GateOutcome {
-    Granted(String),
+    /// `totp_free` (P-N3) is `true` exactly when [`crate::policy::
+    /// totp_required`] said no code was ever needed for this resolve
+    /// (`requireTotp:false`, or an automation-skip) — the ONE case
+    /// [`handle_resolve`] fires a `released` notify event for. A resolve
+    /// that DID validate an inline `--totp` code also reaches this variant
+    /// (the fast path is otherwise unchanged, module doc) but with
+    /// `totp_free: false`, so it is never mistaken for the TOTP-free case.
+    Granted { value: String, totp_free: bool },
     Denied(String),
     NeedsTotp,
 }
@@ -846,7 +899,12 @@ fn resolve_gate(secrets_home: &Path, secret: &str, consumer: &str, totp: Option<
     if !authorized {
         return GateOutcome::Denied("consumer not authorized for this secret".to_string());
     }
-    if crate::policy::totp_required(policy, consumer) {
+    // P-N3: recorded once, up front, so the eventual `Granted` variant can
+    // say honestly whether a code was ever checked — `totp_required` itself
+    // is already the ONE decision point (`AGENTS.md`), this just carries its
+    // answer forward to the grant.
+    let totp_free = !crate::policy::totp_required(policy, consumer);
+    if !totp_free {
         let code = totp.map(str::trim).filter(|s| !s.is_empty());
         match code {
             None => {
@@ -870,7 +928,7 @@ fn resolve_gate(secrets_home: &Path, secret: &str, consumer: &str, totp: Option<
         }
     }
     match crate::backend::fetch_value(secrets_home, &policy.backend, &policy.key) {
-        Ok(value) => GateOutcome::Granted(value),
+        Ok(value) => GateOutcome::Granted { value, totp_free },
         Err(e) => GateOutcome::Denied(e),
     }
 }
@@ -1123,6 +1181,55 @@ fn audit_dismiss(secrets_home: &Path, id: &str, secret: &str, granted: bool, rea
     );
 }
 
+/// Emit one broker EVENT (P-N3, not to be confused with the `audit_*`
+/// functions above): the five notable outcomes — `released`, `parked`,
+/// `completed`, `dismissed`, `expired` — a future desktop popup needs to
+/// hear about. `payload` is the EXACT name-only JSON shape that future
+/// consumer reads (`{"event": "<kind>", "secret", "consumer", "id"?,
+/// "timeoutSecs"?}` — never a value, same discipline every other record in
+/// this module already holds).
+///
+/// Two destinations, the SAME two the `audit_*` functions above already
+/// write to: the broker's own structured `audit.log`
+/// (`append_own_log`/`own_audit_log_path`, so `tail -f
+/// <secrets_home>/audit.log` shows the raw event JSON verbatim) and the
+/// mirrored aoide log (`EventClass::Secret`, command `secrets.notify`,
+/// status = `kind` — `tail -f ~/Aoide/log | grep secrets.notify` is the
+/// cross-host-readable half). See `README.md`'s "Broker notifications"
+/// section for the full pickup-point note (no adapter exists yet — this
+/// emission IS the substrate a popup phase reads from, same framing P-N2's
+/// park lifecycle used for `secrets pending`/`approve`/`dismiss`).
+///
+/// **Best-effort, always** (task requirement): a notification must never
+/// fail or block the resolve it rides alongside. Both writes are
+/// `eprintln!`/swallowed exactly like every `audit_*` function's own `if
+/// let Err(e) = ...` above — never a `?`, never a panic.
+///
+/// **MUST be called with no crate lock held** (`AGENTS.md`'s three-lock
+/// inventory — `replay_ledger_lock`, `put_lock`, `ParkRegistry`'s own
+/// internal `Mutex`). Every call site above already satisfies this: each
+/// one fires after the park-registry call that produced its `id`/`ask` has
+/// already returned (that call's own internal lock is acquired and released
+/// entirely inside `ParkRegistry`'s own methods), and after
+/// `verify_totp_gate`'s `replay_ledger_lock` guard (a block-scoped
+/// `_guard`) has already gone out of scope. A future call site follows the
+/// same rule: emit only once every lock this event's own outcome depended
+/// on has already been released.
+fn emit_notify(secrets_home: &Path, kind: &str, payload: Value) {
+    if let Err(e) = append_own_log(secrets_home, &payload) {
+        eprintln!("[aoide/secrets] could not write the secrets notify log: {e}");
+    }
+    let message = payload.to_string();
+    let _ = aoide_protocol::audit(
+        &aoide_protocol::default_audit_log(),
+        aoide_protocol::Door::Daemon,
+        aoide_protocol::EventClass::Secret,
+        "secrets.notify",
+        kind,
+        &message,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1162,7 +1269,7 @@ mod tests {
     /// exercises a policy shape that can produce `NeedsTotp` at all).
     fn gate_outcome_as_result(outcome: GateOutcome) -> (bool, Result<String, String>) {
         match outcome {
-            GateOutcome::Granted(v) => (true, Ok(v)),
+            GateOutcome::Granted { value, .. } => (true, Ok(value)),
             GateOutcome::Denied(e) => (false, Err(e)),
             GateOutcome::NeedsTotp => (false, Err("needs a totp code (would park)".to_string())),
         }
@@ -2466,7 +2573,7 @@ mod tests {
 
             let ra = a.join().unwrap();
             let rb = b.join().unwrap();
-            let grants = [&ra, &rb].into_iter().filter(|o| matches!(o, GateOutcome::Granted(_))).count();
+            let grants = [&ra, &rb].into_iter().filter(|o| matches!(o, GateOutcome::Granted { .. })).count();
             assert_eq!(
                 grants, 1,
                 "iteration {i}: exactly one of two concurrent resolves sharing a valid code must grant, got {grants}"
@@ -2534,5 +2641,414 @@ mod tests {
 
             std::fs::remove_dir_all(&home).ok();
         }
+    }
+
+    // ── broker event notifications (P-N3) ────────────────────────────────
+    //
+    // Every notable broker event fires a NAME-ONLY line into the SAME two
+    // destinations every `audit_*` function above already writes to: the
+    // broker's own structured `audit.log` (read back via
+    // [`own_log_lines`]) and the mirrored aoide log (`with_redirected_
+    // audit_log`, the same fixture every P-N2 park test above already
+    // uses). No dedup/throttle, deliberately (User decision, this phase,
+    // `README.md`'s "Broker notifications" section): every TOTP-free
+    // release notifies, every single time.
+
+    /// Read the broker's own `audit.log` back as parsed JSON lines — every
+    /// `emit_notify` call lands here via the SAME `append_own_log` every
+    /// `audit_*` function already writes through.
+    fn own_log_lines(home: &Path) -> Vec<Value> {
+        std::fs::read_to_string(own_audit_log_path(home))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// The mirrored aoide-log's own lines, same shape.
+    fn mirrored_log_lines(home: &Path) -> Vec<Value> {
+        std::fs::read_to_string(home.join("mirrored-aoide-log"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// The one line in `lines` whose `"event"` field equals `event` — the
+    /// own `audit.log`'s notify shape (`emit_notify`'s `payload`, written
+    /// verbatim). Panics with the whole log on a miss, so a failure shows
+    /// what WAS written rather than just "not found".
+    fn find_notify_event<'a>(lines: &'a [Value], event: &str) -> &'a Value {
+        lines
+            .iter()
+            .find(|l| l.get("event").and_then(Value::as_str) == Some(event))
+            .unwrap_or_else(|| panic!("no `{event}` notify event in: {lines:?}"))
+    }
+
+    /// The mirrored aoide-log's OWN shape (`AuditRecord`): the event kind
+    /// rides as `status`, alongside `command: "secrets.notify"` — there is
+    /// no `event` field here at all (that shape is `emit_notify`'s
+    /// `payload`, embedded whole as this record's `message` string).
+    fn find_mirrored_notify<'a>(lines: &'a [Value], kind: &str) -> &'a Value {
+        lines
+            .iter()
+            .find(|l| l.get("command").and_then(Value::as_str) == Some("secrets.notify") && l.get("status").and_then(Value::as_str) == Some(kind))
+            .unwrap_or_else(|| panic!("no mirrored `secrets.notify`/`{kind}` line in: {lines:?}"))
+    }
+
+    /// `released` (task's exact shape: `{event, secret, consumer}`, no
+    /// `id`) fires on an ordinary `requireTotp:false` resolve — the
+    /// baseline TOTP-free case.
+    #[test]
+    fn released_fires_on_a_requiretotp_false_resolve() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("notify-released-free");
+        let mut p = Policy::new("t", "scratch", "stored-value");
+        p.consumers = vec!["m".to_string()];
+        seed(&home, &[p]);
+        let parked = ParkRegistry::new();
+
+        with_redirected_audit_log(&home, || {
+            let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
+            assert_eq!(reply["ok"], true, "{reply}");
+        });
+
+        let own_lines = own_log_lines(&home);
+        let ev = find_notify_event(&own_lines, "released");
+        assert_eq!(ev["secret"], "t");
+        assert_eq!(ev["consumer"], "m");
+        assert!(ev.get("id").is_none(), "`released` carries no `id`: {ev}");
+        assert!(!ev.to_string().contains("stored-value"), "the notify event leaked the value: {ev}");
+
+        let mirrored_lines = mirrored_log_lines(&home);
+        let mirrored = find_mirrored_notify(&mirrored_lines, "released");
+        assert!(!mirrored.to_string().contains("stored-value"), "{mirrored}");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The OTHER TOTP-free path (P-N1's automation-skip, not a bare
+    /// `requireTotp:false` policy) also fires `released` — the task's own
+    /// wording ("automation-skip or requireTotp=false") names both.
+    #[test]
+    fn released_fires_on_an_automation_skip_resolve() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("notify-released-automation");
+        let mut p = Policy::new("t", "scratch", "stored-value");
+        p.consumers = vec!["m".to_string()];
+        p.require_totp = true;
+        p.automation.enabled = true;
+        p.automation.consumers = vec!["m".to_string()];
+        // No enrollment on this host at all — proves the grant came from
+        // the automation skip, never a code check.
+        seed(&home, &[p]);
+        let parked = ParkRegistry::new();
+
+        with_redirected_audit_log(&home, || {
+            let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
+            assert_eq!(reply["ok"], true, "{reply}");
+        });
+
+        let own_lines = own_log_lines(&home);
+        let ev = find_notify_event(&own_lines, "released");
+        assert_eq!(ev["secret"], "t");
+        assert_eq!(ev["consumer"], "m");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The negative space that proves the `totp_free` distinction is real:
+    /// a resolve that validates its OWN inline `--totp` code is granted
+    /// exactly as before, but must NEVER fire `released` — the caller just
+    /// typed the code themselves, there is nothing for a desktop popup to
+    /// tell them.
+    #[test]
+    fn released_does_not_fire_when_an_inline_totp_code_is_used() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("notify-no-release-on-code");
+        let mut p = Policy::new("t", "scratch", "stored-value");
+        p.consumers = vec!["m".to_string()];
+        let secret = seed_enrolled(&home, p);
+        let parked = ParkRegistry::new();
+        let code = code_for_now(&secret, unix_now());
+
+        with_redirected_audit_log(&home, || {
+            let reply = handle_line(
+                &home,
+                &format!(r#"{{"op":"resolve","secret":"t","consumer":"m","totp":"{code}"}}"#),
+                &parked,
+                &mut Vec::new(),
+            );
+            assert_eq!(reply["ok"], true, "{reply}");
+        });
+
+        let lines = own_log_lines(&home);
+        assert!(
+            lines.iter().all(|l| l.get("event").and_then(Value::as_str) != Some("released")),
+            "a code-verified resolve must never fire `released`: {lines:?}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// `parked` (task's exact shape: `{event, id, secret, consumer,
+    /// timeoutSecs}`) — the popup's future trigger, fired once per park.
+    #[test]
+    fn parked_fires_with_the_id_and_timeout_when_a_resolve_parks() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("notify-parked");
+        let p = Policy::new("t", "scratch", "stored-value");
+        seed_enrolled(&home, p);
+        let parked = ParkRegistry::new();
+
+        with_redirected_audit_log(&home, || {
+            std::thread::scope(|scope| {
+                let resolve_handle =
+                    scope.spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
+
+                let mut id = None;
+                for _ in 0..200 {
+                    if let Some((pid, ..)) = parked.list().into_iter().next() {
+                        id = Some(pid);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let id = id.expect("the ask did not park in time");
+
+                let own_lines = own_log_lines(&home);
+                let ev = find_notify_event(&own_lines, "parked");
+                assert_eq!(ev["id"], id);
+                assert_eq!(ev["secret"], "t");
+                assert_eq!(ev["consumer"], "m");
+                assert!(ev["timeoutSecs"].as_u64().is_some(), "{ev}");
+
+                // Clean up: dismiss so the spawned thread returns.
+                let dismissed = handle_line(&home, &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new());
+                assert_eq!(dismissed["ok"], true, "{dismissed}");
+                resolve_handle.join().unwrap();
+            });
+        });
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// `completed` (task's exact shape: `{event, id, secret, consumer}`)
+    /// fires once, on the APPROVER's own side, when a parked ask releases.
+    #[test]
+    fn completed_fires_on_a_successful_approve() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("notify-completed");
+        let mut p = Policy::new("t", "scratch", "stored-value");
+        p.consumers = vec!["m".to_string()];
+        let secret = seed_enrolled(&home, p);
+        let parked = ParkRegistry::new();
+
+        with_redirected_audit_log(&home, || {
+            std::thread::scope(|scope| {
+                let resolve_handle =
+                    scope.spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
+
+                let mut id = None;
+                for _ in 0..200 {
+                    if let Some((pid, ..)) = parked.list().into_iter().next() {
+                        id = Some(pid);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let id = id.expect("the ask did not park in time");
+                let code = code_for_now(&secret, unix_now());
+
+                let approved =
+                    handle_line(&home, &format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#), &parked, &mut Vec::new());
+                assert_eq!(approved["ok"], true, "{approved}");
+
+                let own_lines = own_log_lines(&home);
+                let ev = find_notify_event(&own_lines, "completed");
+                assert_eq!(ev["id"], id);
+                assert_eq!(ev["secret"], "t");
+                assert_eq!(ev["consumer"], "m");
+                assert!(!ev.to_string().contains("stored-value"), "{ev}");
+
+                let resolved = resolve_handle.join().unwrap();
+                assert_eq!(resolved["ok"], true, "{resolved}");
+            });
+        });
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// `dismissed` (task's exact shape: `{event, id, secret, consumer}`)
+    /// fires when an operator dismisses a parked ask.
+    #[test]
+    fn dismissed_fires_on_a_dismiss() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("notify-dismissed");
+        let p = Policy::new("t", "scratch", "stored-value");
+        seed_enrolled(&home, p);
+        let parked = ParkRegistry::new();
+
+        with_redirected_audit_log(&home, || {
+            std::thread::scope(|scope| {
+                let resolve_handle =
+                    scope.spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
+
+                let mut id = None;
+                for _ in 0..200 {
+                    if let Some((pid, ..)) = parked.list().into_iter().next() {
+                        id = Some(pid);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let id = id.expect("the ask did not park in time");
+
+                let dismissed = handle_line(&home, &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new());
+                assert_eq!(dismissed["ok"], true, "{dismissed}");
+
+                let own_lines = own_log_lines(&home);
+                let ev = find_notify_event(&own_lines, "dismissed");
+                assert_eq!(ev["id"], id);
+                assert_eq!(ev["secret"], "t");
+                assert_eq!(ev["consumer"], "m");
+
+                let resolved = resolve_handle.join().unwrap();
+                assert_eq!(resolved["ok"], false);
+            });
+        });
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// `expired` (task's exact shape: `{event, id, secret, consumer}`)
+    /// fires on the ORIGINAL caller's own side when a park times out with
+    /// no answer — same tiny-timeout fixture `park_times_out_and_names_
+    /// the_knob_and_both_completion_paths` above already uses.
+    #[test]
+    fn expired_fires_on_a_park_timeout() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_timeout = std::env::var(crate::park::PARK_TIMEOUT_ENV).ok();
+        std::env::set_var(crate::park::PARK_TIMEOUT_ENV, "1");
+
+        let home = tmp_home("notify-expired");
+        let p = Policy::new("t", "scratch", "stored-value");
+        seed_enrolled(&home, p);
+        let parked = ParkRegistry::new();
+
+        with_redirected_audit_log(&home, || {
+            let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
+            assert_eq!(reply["ok"], false, "{reply}");
+        });
+
+        let own_lines = own_log_lines(&home);
+        let ev = find_notify_event(&own_lines, "expired");
+        assert_eq!(ev["secret"], "t");
+        assert_eq!(ev["consumer"], "m");
+        assert!(ev.get("id").and_then(Value::as_str).is_some(), "{ev}");
+
+        match saved_timeout {
+            Some(v) => std::env::set_var(crate::park::PARK_TIMEOUT_ENV, v),
+            None => std::env::remove_var(crate::park::PARK_TIMEOUT_ENV),
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The sentinel test (mirrors `put_sentinel_value_never_leaks_on_
+    /// missing_policy_or_missing_set_template` above): a full
+    /// park→approve→release lifecycle with a sentinel value must never let
+    /// that value reach either notify destination, on any of the three
+    /// events it touches (`parked`, `completed`, and the wire reply
+    /// itself).
+    #[test]
+    fn notify_never_carries_a_value_across_the_full_lifecycle() {
+        const SENTINEL: &str = "SENTINEL-NOTIFY-VALUE-XYZ";
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("notify-no-value-leak");
+        let mut p = Policy::new("t", "scratch", SENTINEL);
+        p.consumers = vec!["m".to_string()];
+        let secret = seed_enrolled(&home, p);
+        let parked = ParkRegistry::new();
+
+        with_redirected_audit_log(&home, || {
+            std::thread::scope(|scope| {
+                let resolve_handle =
+                    scope.spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
+
+                let mut id = None;
+                for _ in 0..200 {
+                    if let Some((pid, ..)) = parked.list().into_iter().next() {
+                        id = Some(pid);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let id = id.expect("the ask did not park in time");
+                let code = code_for_now(&secret, unix_now());
+                let approved =
+                    handle_line(&home, &format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#), &parked, &mut Vec::new());
+                assert_eq!(approved["ok"], true, "{approved}");
+                assert!(!approved.to_string().contains(SENTINEL), "the approve reply leaked the value: {approved}");
+
+                let resolved = resolve_handle.join().unwrap();
+                assert_eq!(resolved["value"], SENTINEL, "the ORIGINAL caller still gets the real value");
+            });
+        });
+
+        let own_log = std::fs::read_to_string(own_audit_log_path(&home)).unwrap();
+        assert!(!own_log.contains(SENTINEL), "the broker's own audit.log leaked the sentinel via a notify line:\n{own_log}");
+        let mirrored_log = std::fs::read_to_string(home.join("mirrored-aoide-log")).unwrap();
+        assert!(!mirrored_log.contains(SENTINEL), "the mirrored aoide log leaked the sentinel via a notify line:\n{mirrored_log}");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Best-effort proof (task requirement): a resolve still succeeds when
+    /// BOTH notify destinations are unavailable — the own `audit.log` file
+    /// is read-only (root ignores file permissions, so this skips under a
+    /// root test runner, same precedent `an_unreadable_policy_json_
+    /// teaches_the_chown_reference_fix_on_both_gates` sets) and the
+    /// mirrored aoide log points at a path no process could ever create
+    /// (a parent component is a plain FILE, not a directory).
+    #[test]
+    fn resolve_still_succeeds_when_the_notify_sink_is_unavailable() {
+        if crate::home::effective_uid() == 0 {
+            return;
+        }
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("notify-sink-unavailable");
+        let mut p = Policy::new("t", "scratch", "stored-value");
+        p.consumers = vec!["m".to_string()];
+        seed(&home, &[p]);
+
+        // Pre-create the broker's own audit.log, then strip write
+        // permission — `append_own_log`'s `OpenOptions::append` must fail.
+        let own_log = own_audit_log_path(&home);
+        std::fs::write(&own_log, "").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&own_log, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+        // A mirrored-log path that can never be created: a regular FILE
+        // stands in for what would need to be a directory component.
+        let blocker_file = home.join("blocker-file");
+        std::fs::write(&blocker_file, "not a directory").unwrap();
+        let unreachable_mirror = blocker_file.join("log");
+
+        let saved = std::env::var("AOIDE_AUDIT_LOG").ok();
+        std::env::set_var("AOIDE_AUDIT_LOG", &unreachable_mirror);
+
+        let parked = ParkRegistry::new();
+        let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_AUDIT_LOG", v),
+            None => std::env::remove_var("AOIDE_AUDIT_LOG"),
+        }
+        // Restore write permission before cleanup can remove the tempdir.
+        std::fs::set_permissions(&own_log, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert_eq!(reply["ok"], true, "a resolve must succeed even when BOTH notify sinks are unreachable: {reply}");
+        assert_eq!(reply["value"], "stored-value");
+
+        std::fs::remove_dir_all(&home).ok();
     }
 }

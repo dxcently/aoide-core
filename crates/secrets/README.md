@@ -72,6 +72,14 @@ connection must never stall every other client behind it on `accept(2)`) —
 see "Parking a TOTP resolve" below for the full lifecycle. A resolve WITH
 a code is completely unchanged; the wire's new `wait:false` field restores
 the pre-P-N2 immediate refusal for a caller that can't type a code.
+**P-N3 (this commit) fires a NAME-ONLY notification on every notable broker
+event** — `released` (a TOTP-free grant: `requireTotp:false`, or an
+automation-skip), `parked`, `completed` (a successful `approve`),
+`dismissed`, and `expired` (a park timing out) — so the desktop can surface
+secret activity, and so a future popup has the park lifecycle's own
+`released`/`parked`/`completed`/`dismissed`/`expired` signal to key off of.
+See "Broker notifications" below for the exact shapes, the mechanism this
+phase chose (and the one it didn't), and the no-dedup decision.
 
 `secrets enroll` generates a fresh 20-byte secret from `/dev/urandom`,
 persists it (`store::save_totp_secret`, `0600`), and prints its
@@ -475,6 +483,98 @@ crate invariant (`AGENTS.md`): every non-local entry point added later
 MUST refuse a secret whose `remote` is `false` before ever touching its
 backend. `secrets expose <name> on|off` flips it, same idempotency
 discipline as `set-totp`/`automate`.
+
+## Broker notifications (P-N3)
+
+Every notable broker event fires a NAME-ONLY notification, so a desktop can
+surface secret activity — and so a future popup phase (the code-entry UI
+P-N2's own doc already named as this substrate's eventual consumer) has a
+signal to key off of, not just `secrets pending`'s poll. Five events, the
+task's own exact shapes:
+
+```
+released:  {"event":"released", "secret", "consumer"}            — a TOTP-free grant
+parked:    {"event":"parked", "id", "secret", "consumer", "timeoutSecs"}
+completed: {"event":"completed", "id", "secret", "consumer"}      — a successful approve
+dismissed: {"event":"dismissed", "id", "secret", "consumer"}
+expired:   {"event":"expired", "id", "secret", "consumer"}        — a park that timed out
+```
+
+`released` fires ONLY on a TOTP-free grant — `requireTotp:false`, or an
+automation-skip (P-N1's `automation.enabled` + a listed consumer) — never on
+a resolve that validated its own inline `--totp` code: the caller just typed
+the code themselves, there is nothing for a desktop popup to tell them.
+`GateOutcome::Granted`'s `totp_free` field (`broker.rs`) is the ONE place
+this distinction is recorded, right where `resolve_gate` already decides
+`totp_required` — see `broker.rs`'s own doc on that variant.
+
+**No dedup, no throttle — deliberate (User decision, this phase).** Every
+TOTP-free resolve fires its own `released` line, even a hundred calls in a
+tight loop from the same consumer. Revisit only with real spam evidence from
+a live deployment (the same "wait for the field to complain" discipline this
+crate's other UX fixes — P-V4d/e/f/g — were all born from); no rate limit,
+window, or "same secret+consumer within N seconds" collapsing is planned
+ahead of that evidence.
+
+**Mechanism chosen, and the one this phase did NOT take.** `conduct/src/
+graph/permit.rs` (a DIFFERENT crate, `aoide-conduct`) publishes its own
+desktop summons through `crate::herald::publish` → `crate::shellbridge::
+send_line` — a unix-socket call into the shellbridge daemon that owns
+`song/stage/herald.json`, the file the Quickshell herald widget actually
+draws from. That seam was the first one this phase checked, and it is NOT
+reachable from here: `aoide-secrets`'s own `Cargo.toml` depends on nothing
+but `aoide-protocol`/`libc`/`serde`/`serde_json` — no `aoide-storage`, no
+`aoide-conduct` — and `herald`/`shellbridge` both live in `aoide-conduct`
+(a "charter smudge" its own `AGENTS.md` names explicitly). Reaching them
+would mean a NEW `aoide-secrets` → `aoide-conduct` dependency edge, which
+this phase's brief ruled out (`pkgs/aoide/crates/AGENTS.md`'s "no
+cross-crate copying" — the fix for a missing seam is widening what's
+already `pub`, not duplicating logic in, and reaching an unrelated crate is
+worse than either); it would also be a step backward across the aoide/AoideOS
+boundary from the root `AGENTS.md` (house rule 7's "delete every `.qml`"
+test): the shellbridge socket only exists while a desktop session's bridge
+daemon is running, but this broker is meant to run headless, as a system
+service, with no desktop present at all (`socket::socket_path`'s own
+`/run/aoide-secrets/secrets.sock`, entirely independent of `$XDG_RUNTIME_DIR/
+aoide/shellbridge.sock`).
+
+No adapter on the `aoide-conduct`/`lyra` side currently tails the mirrored
+aoide log (`~/Aoide/log`) and republishes anything from it into `herald`
+either — `aoide-client`'s adapter skeleton (`crates/client/src/adapter.rs`)
+subscribes to `EventClass::{Audit,Gate,Rice,Content,Notification}` but has
+no `Secret` case at all, and no other crate in this workspace tails that
+file live. So this phase lands EMISSION ONLY, into the SAME two
+destinations every `audit_*` function in `broker.rs` already writes to
+(`broker.rs`'s own module doc, "Two destinations"): the broker's own
+structured `<secrets_home>/audit.log` (`emit_notify`'s `payload`, written
+verbatim by `append_own_log` — `tail -f <secrets_home>/audit.log` shows the
+five event shapes above exactly as written) and the mirrored aoide log
+(`EventClass::Secret`, `command: "secrets.notify"`, `status` = the event
+kind, `message` = the same payload JSON stringified — `tail -f ~/Aoide/log |
+grep secrets.notify` is the cross-host-readable half). Both writes are
+best-effort: a notification must never fail or block the resolve/approve/
+dismiss it rides alongside, so both `append_own_log` and `aoide_protocol::
+audit`'s own errors are `eprintln!`d and swallowed, the SAME posture every
+`audit_*` function already holds.
+
+**The popup phase's pickup point** (documented here, per this phase's own
+brief, since no adapter exists yet to wire it into): a future code-entry
+popup tails `<secrets_home>/audit.log` (or the mirrored `~/Aoide/log`,
+filtering `command == "secrets.notify"`) the same way `secrets pending`
+already polls the in-memory `ParkRegistry` — a `parked` line is the exact
+trigger `secrets pending`'s own poll would eventually see, just pushed
+instead of pulled. Building that tail/adapter is explicitly OUT of this
+phase's scope (no QML, no new lyra/conduct code landed here) — this
+emission is the substrate, the same relationship P-N2's park/approve/
+dismiss lifecycle already has to that same future UI.
+
+`emit_notify` (`broker.rs`) is the ONE function that builds and writes a
+notify line — every call site (`handle_resolve`'s `Granted`/`NeedsTotp`/
+`WaitResult::TimedOut` arms, `handle_approve`'s success arm,
+`handle_dismiss`'s found arm) calls it only AFTER the crate lock its own
+outcome depended on has already been released (`park::ParkRegistry`'s
+internal `Mutex`, or `broker::replay_ledger_lock`) — see `emit_notify`'s own
+doc comment for the exact "no lock held" accounting at each site.
 
 ## TOTP enrollment (`secrets enroll`, P-V3)
 
@@ -935,7 +1035,14 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   name-only audit functions, same two-destination shape as `audit_resolve`/
   `audit_put`; the dismissed-caller message no longer claims "by an
   operator" (P-N2c honesty fix — any group member reaching the socket can
-  dismiss).
+  dismiss). `emit_notify` (P-N3) is the one function every notify call site
+  routes through — see "Broker notifications" above for the exact shapes
+  and the two destinations it writes (the SAME `append_own_log`/
+  `aoide_protocol::audit` primitives every `audit_*` function already
+  uses); `GateOutcome::Granted` grew a `totp_free: bool` field (set once, in
+  `resolve_gate`, from the SAME `totp_required` call that already gated the
+  `if`) so `handle_resolve` can tell a TOTP-free grant apart from a
+  code-verified one without a second policy load.
 - `client` — `resolve` (one round trip over the socket, now via
   `read_final_reply` — P-N2c FIX 1: loops reading lines, consuming and
   `announce_interim`-ing any `"interim":true` line, returning the first

@@ -350,6 +350,46 @@
   convenience" — that would silently reintroduce the env-mutation
   test-serialization problem `home`/`socket`'s OWN unit tests already
   need `env_lock` for.
+- **`emit_notify` is called ONLY after every lock its outcome depended on
+  has already been released (P-N3, hard constraint).** No notification I/O
+  happens while holding `park::ParkRegistry`'s internal `Mutex` or
+  `broker::replay_ledger_lock` — every call site (`handle_resolve`'s
+  `Granted`/`NeedsTotp`-park/`WaitResult::TimedOut` arms, `handle_approve`'s
+  success arm, `handle_dismiss`'s found arm) fires only after the
+  `ParkRegistry` method or `verify_totp_gate` call that produced its
+  id/ask/grant has already returned (their own internal locks are
+  acquire-then-release entirely inside those functions, never held across
+  the return). Don't add a notify call inside a `_guard = ...lock()...`
+  scope; a future call site follows the same rule.
+- **`released` fires ONLY on a TOTP-free grant, never on a code-verified
+  one (P-N3).** `GateOutcome::Granted`'s `totp_free: bool` field is the ONE
+  place this is decided — set once in `resolve_gate` from the SAME
+  `totp_required` call that already gated the `if` (never a second policy
+  load to re-derive it). A resolve that validated its own inline `--totp`
+  code is granted exactly as before but must never notify — the caller
+  already knows, they just typed the code. Don't collapse `totp_free`
+  back out of `GateOutcome::Granted` "since both grant the same way" — it
+  is the only signal `handle_resolve` has to tell the two apart.
+- **No dedup or throttle on any notify event, deliberately (P-N3, User
+  decision).** Every TOTP-free resolve fires its own `released` line, even
+  a tight loop from the same consumer. Don't add a rate limit, a time
+  window, or a "same secret+consumer within N seconds" collapse ahead of
+  real spam evidence from a live deployment — the same "wait for the field
+  to complain" discipline P-V4d/e/f/g were each born from.
+- **`aoide-secrets` depends on nothing that could reach the desktop herald
+  (P-N3, and stays that way).** `conduct/src/graph/permit.rs`'s summons
+  publishes through `crate::herald::publish`/`crate::shellbridge::send_line`
+  — both live in `aoide-conduct`, a DIFFERENT crate this crate's own
+  `Cargo.toml` does not and must not depend on (`aoide-secrets` depends on
+  `aoide-protocol`/`libc`/`serde`/`serde_json` only). Don't add an
+  `aoide-conduct` (or `aoide-storage`, or `aoide-client`) dependency to
+  reach `herald` "since permit.rs already has the seam" — that crate's own
+  shellbridge socket only exists while a desktop session's bridge daemon is
+  running, and this broker is meant to run headless as a system service
+  with no desktop present at all. A future popup phase reads this crate's
+  own emission (`README.md`'s "Broker notifications", the pickup-point
+  note) from the OUTSIDE — a new adapter in `aoide-conduct`/`lyra`, never a
+  new dependency edge pointing the other way.
 
 ## Extension points
 
@@ -549,6 +589,19 @@
   its lost-race `recv()` is "provably prompt" — a hung backend shell-out
   breaks that promise (see the KNOWN GAP note immediately below), so the
   comment now states the assumption instead of overclaiming it.
+- **Broker event notifications LANDED at P-N3.** `emit_notify` (`broker.rs`)
+  fires a name-only line for five events (`released`/`parked`/`completed`/
+  `dismissed`/`expired`) into the SAME two destinations every `audit_*`
+  function already writes to — see `README.md`'s "Broker notifications" for
+  the exact shapes and the mechanism reasoning (the `herald`-publish seam
+  `conduct/src/graph/permit.rs` uses was checked FIRST and ruled out: it
+  lives in `aoide-conduct`, a dependency this crate must not gain — invariant
+  above). No adapter tails either destination yet, so this phase is
+  emission-only, the identical "substrate now, UI later" relationship P-N2's
+  own park/approve/dismiss lifecycle already has to a future popup (P-N2's
+  own extension-point note above). The next phase that builds that
+  tail/adapter lives in `aoide-conduct`/`lyra`, reading FROM this crate's
+  logs — never a new edge pointing the other way.
 
 **KNOWN GAP, deferred, not fixed by P-N2c:** backend `get`/`set` shell-outs
 (`backend::fetch_value`/`store_value`) have NO timeout — a wedged backend
