@@ -41,6 +41,7 @@ dependencies = [
  "aoide-storage",
  "aoide-test-support",
  "aoide-upkeep",
+ "aoide-vault",
  "crossterm",
  "ratatui",
  "serde",
@@ -176,6 +177,7 @@ dependencies = [
 name = "aoide-vault"
 version = "0.0.0"
 dependencies = [
+ "aoide-protocol",
  "serde",
  "serde_json",
 ]

@@ -46,6 +46,11 @@ aoide-server = { workspace = true }
 aoide-conductor = { workspace = true }
 # `aoide soundcheck` — the mechanical-integrity verb (working-tree half).
 aoide-upkeep = { workspace = true }
+# `aoide vault` — the secrets broker's CLI surface (Workstream VAULT,
+# P-V2): `serve`/`exec`/`add`/`rm`/`grant`/`revoke`. New at P-V2 — the
+# workspace `Cargo.toml` comment on `aoide-vault` used to say nothing
+# depended on it; that's this commit.
+aoide-vault = { workspace = true }
 
 [dev-dependencies]
 # `tests/conductor_integration.rs` drives the conductor's app/ui layer

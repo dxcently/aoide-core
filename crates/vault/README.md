@@ -1,72 +1,131 @@
 # aoide-vault
 
-The pure-logic first slice of Aoide's secrets broker (Workstream VAULT,
+Aoide's secrets broker (Workstream VAULT,
 `~/.claude/plans/functional-singing-boole.md`'s "Workstream VAULT — Fable
-architecture" section). **This crate is not the broker yet** — no daemon, no
-unix socket, no CLI verbs, nothing registered in any `Registry`. It is the
-math and the types the broker will be built out of, landed first so V2 has
-an RFC-vector-tested foundation to wire a socket around instead of
-inventing TOTP under daemon-development time pressure.
+architecture" section). P-V1 landed the pure logic; **P-V2 (this commit)
+adds the broker daemon, the unix-socket wire, and the client + admin CLI
+verbs** — `aoide vault serve`/`exec`/`add`/`rm`/`grant`/`revoke`, now
+registered into `aoide-cli`'s `Registry`.
 
-## What this crate will be (planned, not present)
+**STANDING GRANTS ONLY this phase.** TOTP enrollment (`vault enroll`)
+doesn't exist yet, so any policy with `requireTotp: true` is simply
+UNRESOLVABLE — the broker rejects it outright with "no TOTP enrollment on
+this host yet", never silently falling back to a standing grant.
+`vault enroll` and real verification arrive at P-V3/P-V4.
 
-The eventual broker (`aoide vault serve`) runs as its own uid
-(`aoide-vault`), holding a vault home (`/var/lib/aoide-vault`: policy file,
-TOTP secret, replay ledger, vault audit log, backend stores) that the
-operator's own uid never touches directly. The socket
-(`/run/aoide-vault/vault.sock`, group `aoide-vault-access`) is the only
-door. **Pathways, not destinations**: nothing here ever holds a secret's
-*value* — a client resolves a secret by name over the socket, the broker
-release the value directly to that client process, which injects it as an
-env var and execs the real command (`Stdio::inherit`, never argv, never any
-audit/Outcome/JSON line). This crate owns the piece of that flow that has
-no daemon or socket dependency at all: proving a TOTP code is valid, and
-the types the policy/replay state will serialize as.
+## The release-to-client flow (the plan's one subtle decision)
 
-### Release-to-client flow (V2, summarized — not implemented here)
+The broker must NOT exec the agent's command: it runs as the vault uid
+(wrong cwd/env, and the child would inherit vault privileges). Instead:
 
 ```
 agent  -> aoide vault exec --as <consumer> --secret <name>[:VAR] [--totp NNNNNN] -- <cmd>
-       -> client (agent uid) connects, sends {op:"resolve", secret, consumer, totp?}
-       -> broker (vault uid): policy gate -> totp::verify + replay::ReplayLedger
-          (this crate) -> fetch via backend template AS VAULT UID -> release
-          value over the socket
-       -> client injects env var, Stdio::inherit, execs, returns exit code
+       -> client (agent uid) connects, sends {op:"resolve", secret, consumer, totp?, argv0?}
+       -> broker (vault uid): policy gate (name exists, consumer authorized,
+          requireTotp -> reject this phase) -> fetch via the backend
+          template AS VAULT UID -> release the value over the socket
+       -> client injects the value as an env var, Stdio::inherit()
+          throughout, execs, returns the CHILD's own exit code
 ```
+
+The value exists ONLY in the client process's env, from `client::resolve`'s
+return to the `.env(...)` call — never argv, never an `Outcome`/JSON
+envelope, never either audit log (both audit lines are written **broker-
+side**, before the value is ever released — see `broker`'s module doc).
+Release-to-client is honest, not a leak: a same-uid agent with a valid
+code/grant could always read the value once released; the grant/code IS
+the gate, not the transport.
+
+## The wire (unix socket, JSON-lines, one request per line, one reply)
+
+```
+-> {"op":"resolve","secret":"<name>","consumer":"<consumer>","totp":"<code>"?,"argv0":"<cmd>"?}
+<- {"ok":true,"value":"<value>"}                    (granted)
+<- {"ok":false,"error":"<value-free message>"}      (denied/error)
+```
+
+`totp`/`argv0` are optional. `consumer` is SELF-ASSERTED (the V1 ruling
+`replay.rs` carries): the policy's `consumers[]` list is the real gate,
+never caller identity. `argv0` (the wrapped command's own argv[0], sent by
+`vault exec`) exists purely so the broker's audit lines can name it — the
+broker never runs it.
+
+The reply is hand-built `serde_json::Value` (`serde_json::json!`), never a
+`#[derive(Serialize)]` struct — see "Invariants held" below.
 
 ## Named seams (what it exposes)
 
-- `sha1` — RFC 3174 / FIPS 180-1 SHA-1, hand-rolled.
-- `hmac` — RFC 2104 HMAC, specialized to SHA-1, built on `sha1`.
-- `totp` — RFC 6238 TOTP over RFC 4226 HOTP truncation, built on `hmac`;
-  clock-as-parameter throughout (`unix_time` is always a caller-supplied
-  argument, never read from the system clock).
-- `base32` — RFC 4648 §6 base32, encode/decode, unpadded by convention but
-  padding-tolerant on decode.
-- `uri` — `otpauth://` enrollment URI construction (Google Authenticator
-  key-uri format), for V3's `vault enroll`.
-- `replay` — `ReplayLedger`: the single-use-per-TIMESTEP structure that
-  stops a captured TOTP code from being replayed within its validity
-  window. Keyed by timestep ALONE, never by consumer — the resolve wire's
-  `consumer` field is self-asserted, so scoping single-use to it would
-  let one typed code redeem once per invented label (ruling recorded in
-  `replay.rs`'s module doc and the plan's VAULT §Policy section). Pure
-  struct + serde; no clock reads.
+Pure logic (P-V1, unchanged):
+
+- `sha1`/`hmac`/`totp`/`base32`/`uri` — the hand-rolled RFC 2104/3174/4226/
+  6238/4648 stack behind TOTP and `otpauth://` URIs.
+- `replay` — `ReplayLedger`, single-use-per-TIMESTEP, keyed WITHOUT a
+  consumer dimension (see its own module doc for the ruling). Not yet
+  consulted anywhere — verification is unwired until P-V3/P-V4.
 - `policy` — `Policy` (per-secret `{name, backend, key, requireTotp,
-  consumers[], sharedWith[]}`) and `valid_secret_name` (stricter than
-  `aoide_storage::peer_store::valid_peer_name` — see the module doc).
+  consumers[], sharedWith[]}`) and `valid_secret_name`.
+
+Daemon/socket/CLI (P-V2, new):
+
+- `home` — `vault_home()`: `$AOIDE_VAULT_HOME` env override, else the
+  placeholder default `/var/lib/aoide-vault` (P-V4 is what actually
+  provisions that path — see the module doc).
+- `socket` — `socket_path()`: `$AOIDE_VAULT_SOCKET` env override, else
+  `vault_home().join("vault.sock")` (deliberately NOT `/run/...` yet — see
+  the module doc for why, and the SUN_LEN caution for any caller building
+  a socket path by hand).
+- `backend` — `Backends`/`Backend` (`backends.json`'s shape: a map of
+  named backend -> ONE fetch-command template) and `fetch_value`, which
+  substitutes the policy's `key` into the template's `{name}` placeholder,
+  runs it via `sh -c`, and trims exactly one trailing newline from stdout.
+  `pass`/`gopass`/`bw`/`sops` are DOC PRESETS (P-V3), not code — this
+  module has no knowledge of any specific backend.
+- `store` — `load_policies`/`save_policies`: `policy.json` persistence
+  (write-temp-then-rename), the only file I/O `policy::Policy` gains at
+  P-V2.
+- `broker` — `serve`: the accept loop (`aoide vault serve`'s body), the
+  policy gate (`resolve_gate`), and BOTH audit writes (vault's own
+  `audit.log` in vault home + the mirrored aoide log via
+  `EventClass::Secret`) — see its module doc for the full wire contract
+  and the "broker-side only" audit discipline.
+- `client` — `resolve` (one round trip over the socket), `parse_exec_args`
+  (pure `Invocation` parsing), `run_exec` (the full `vault exec` flow: the
+  entry point for `aoide-cli`'s `special` hook).
+- `commands` — `register(&mut Registry)`: the six verbs. `serve`/`exec`
+  are CLI-only door-hint handlers (the real work happens in `cli`'s
+  `special` hook, same pattern as `a2a serve`/`conductor`); `add`/`rm`/
+  `grant`/`revoke` are plain policy-CRUD handlers.
 
 ## What it consumes
 
-`serde`/`serde_json` only. **Zero algorithmic dependencies** — no `sha1`,
-`hmac`, `totp-lite`, or `data-encoding` crate anywhere in this tree; the
-plan mandates hand-rolling the hash stack, and the RFC test vectors are
-what stand in for trusting a library.
+`aoide-protocol` (new at P-V2 — `Registry`/`Invocation`/`Outcome`/`Door`/
+`EventClass`/the audit helpers/the `cmd!`/`arg!`/`flag!` macros), `serde`/
+`serde_json`. **Still zero ALGORITHMIC dependencies** — no `sha1`/`hmac`/
+`totp-lite`/`data-encoding` crate anywhere in this tree (this crate's
+`AGENTS.md`); the broker socket, the backend shell-out, and the exec spawn
+are all plain `std`.
 
 ## How it composes
 
-Nothing depends on this crate yet. It joins the workspace `[workspace]
-members` (`pkgs/aoide/Cargo.toml`) at P-V1 with a comment explaining that
-`aoide-cli` does NOT gain the dependency until P-V2 wires the broker
-daemon and `vault exec` client verb around this logic — check that
-comment before adding a consumer prematurely.
+`aoide-cli` depends on this crate as of P-V2 (`crates/cli/src/commands/
+mod.rs::all()` calls `aoide_vault::commands::register`, appended newest;
+`crates/cli/src/lib.rs`'s `special` hook wires `vault serve`/`vault exec`).
+The workspace `Cargo.toml` comment on the `aoide-vault` member — which used
+to say nothing depended on it — is updated in this same commit.
+
+## Invariants held (see `AGENTS.md` for the full list)
+
+- A secret's VALUE never appears on a `#[derive(Serialize)]`/`Deserialize`
+  type anywhere in this crate. `policy::Policy` is still the only such
+  type that touches the wire, and it has no value field. The resolve
+  reply is hand-built `serde_json::Value`; `client::resolve` reads the
+  value straight out of that `Value` into a local `String`.
+- Audit happens BROKER-SIDE ONLY, on every resolve attempt (granted or
+  denied) — never by the client, which only ever learns granted/denied
+  from the wire reply.
+- `EventClass::Secret` (the mirror to the aoide audit log) structurally
+  forbids `untrusted_data` — enforced in `aoide_protocol::audit::
+  append_audit`, not only by convention at the call site.
+- TOTP verification (`totp::verify` + `replay::ReplayLedger`) stays
+  UNWIRED this phase — a `requireTotp` policy is unresolvable, not
+  silently downgraded to a standing grant.

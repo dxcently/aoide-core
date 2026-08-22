@@ -25,6 +25,7 @@ pub use aoide_conductor as conductor;
 pub use aoide_protocol as protocol;
 pub use aoide_server as server;
 pub use aoide_storage as storage;
+pub use aoide_vault as vault;
 
 use daemon::Door;
 
@@ -34,11 +35,14 @@ use daemon::Door;
 /// in `aoide_protocol::door::run` (Phase 3 restructure,
 /// docs/architecture/PACKAGE-LAYOUT.md) so a second binary (lyra, P-A4) can
 /// drive the same loop against its own registry without duplicating it; this
-/// crate supplies its own five special-cased verbs via the `special` hook —
-/// `mcp serve --stdio` and `a2a serve` start servers, `conductor` hands off
+/// crate supplies its own special-cased verbs via the `special` hook —
+/// `mcp serve --stdio`, `a2a serve`, and `vault serve` start servers,
+/// `vault exec` resolves a secret and execs a command with it injected as an
+/// env var (`Stdio::inherit` throughout — the value can never cross the
+/// generic `Outcome` envelope, Workstream VAULT P-V2), `conductor` hands off
 /// to the interactive terminal loop, `guide`/`schema` bypass the generic
 /// `Outcome` envelope — everything else routes through the single dispatcher
-/// (so the audit log + gate apply uniformly). `livery` was the sixth special
+/// (so the audit log + gate apply uniformly). `livery` was an earlier special
 /// case; it moved to lyra with the rest of the graphical bundle at P-A5 —
 /// core no longer parses `livery.*` at all.
 pub fn run_cli(argv: &[String]) -> i32 {
@@ -109,6 +113,50 @@ pub fn run_cli(argv: &[String]) -> i32 {
                     output::exit::ERROR
                 }
             });
+        }
+
+        // `vault serve` is a long-running broker, launched at the entry point
+        // exactly like `a2a serve`/`conductor`/`mcp serve --stdio`: dispatch
+        // FIRST (records the launch through the single audit log, and gives a
+        // non-Cli door — e.g. an MCP `tools/call` for `vault.serve` — the
+        // "run this from a terminal" outcome via `handle_vault_serve` instead
+        // of blocking that door), then block in the broker's accept loop
+        // (`aoide_vault::broker::serve`).
+        if inv.path == ["vault", "serve"] {
+            let launch = dispatch::dispatch(inv);
+            if launch.status != output::Status::Ok {
+                let (body, code) = launch.render(json);
+                eprintln!("{body}");
+                return Some(code);
+            }
+            return Some(
+                match vault::broker::serve(&vault::home::vault_home(), &vault::socket::socket_path()) {
+                    Ok(()) => output::exit::OK,
+                    Err(e) => {
+                        eprintln!("aoide vault serve: {e}");
+                        output::exit::ERROR
+                    }
+                },
+            );
+        }
+
+        // `vault exec` is CLI-only, special-cased the same way: dispatch
+        // FIRST (audits the launch attempt and gives every non-Cli door a
+        // clean "run this from a terminal" outcome via `handle_vault_exec`),
+        // then hand off to `aoide_vault::client::run_exec` — the resolved
+        // value is injected as an env var and the wrapped command is exec'd
+        // with `Stdio::inherit()` throughout, so its exit code (not any of
+        // aoide's own exit-code vocabulary) is what this returns. The value
+        // itself never touches this function, this crate, or any Outcome —
+        // see `aoide_vault::client`'s module doc.
+        if inv.path == ["vault", "exec"] {
+            let launch = dispatch::dispatch(inv);
+            if launch.status != output::Status::Ok {
+                let (body, code) = launch.render(json);
+                eprintln!("{body}");
+                return Some(code);
+            }
+            return Some(vault::client::run_exec(inv, &vault::socket::socket_path()));
         }
 
         // `guide` in text mode prints the full onboarding rather than a summary.

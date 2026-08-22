@@ -134,6 +134,12 @@ mod tests {
             "soundcheck",
             "update",
             "usage",
+            "vault.add",
+            "vault.exec",
+            "vault.grant",
+            "vault.revoke",
+            "vault.rm",
+            "vault.serve",
             "who",
         ];
         expected.sort();

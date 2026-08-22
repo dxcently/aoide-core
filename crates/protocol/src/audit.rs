@@ -81,6 +81,15 @@ pub enum EventClass {
     Content,
     /// Forwarded OS notifications — UNTRUSTED payload, wrapped as data.
     Notification,
+    /// Vault resolve-attempt mirror (Workstream VAULT, P-V2,
+    /// `aoide-vault`'s `broker` module): secret name, consumer,
+    /// granted/denied, argv0 if the client sent one — NEVER a value.
+    /// `untrusted_data` is FORBIDDEN on this class: a Secret event has no
+    /// forwarded payload to carry (unlike `Notification`), and the value
+    /// itself never reaches the audit path at all, by construction. See
+    /// [`append_audit`] — the ban is enforced there, not only by this
+    /// comment.
+    Secret,
 }
 
 /// A single record in the neutral event stream / audit log.
@@ -106,7 +115,36 @@ pub fn now_secs() -> u64 {
 
 /// Append one JSON-lines record to the single audit log (real code path).
 /// Creates the parent directory and the file if absent; idempotent per-call.
+///
+/// **`EventClass::Secret` may never carry `untrusted_data`** (Workstream
+/// VAULT's audit design, `aoide-vault`'s `broker` module doc): a Secret
+/// event mirrors a name-only resolve attempt (secret name, consumer,
+/// granted/denied) — never a value, and `untrusted_data` is exactly the
+/// field every other class uses to carry arbitrary forwarded text
+/// verbatim (`Notification`'s whole reason for existing). Enforced HERE,
+/// not only by convention at each call site: a `Secret`-classed record
+/// that somehow arrives with `untrusted_data: Some(_)` has it forced back
+/// to `None` before the write (with an `eprintln!` naming the mistake) —
+/// never a panic. An audit call already runs behind `let _ = audit(...)`
+/// at every call site in this workspace (a logging failure must never take
+/// the caller down with it); this guard keeps that posture rather than
+/// trading a data-shape mistake for a crashed process.
 pub fn append_audit(log_path: &Path, record: &AuditRecord) -> std::io::Result<()> {
+    let owned;
+    let record: &AuditRecord = if record.class == EventClass::Secret && record.untrusted_data.is_some() {
+        eprintln!(
+            "[aoide/protocol] BUG: an EventClass::Secret audit record carried untrusted_data — stripping it before writing (command: {})",
+            record.command
+        );
+        owned = AuditRecord {
+            untrusted_data: None,
+            ..record.clone()
+        };
+        &owned
+    } else {
+        record
+    };
+
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -141,4 +179,85 @@ pub fn audit(
             untrusted_data: None,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_log(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aoide-protocol-audit-test-{tag}-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        dir.join("log")
+    }
+
+    fn read_lines(path: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// The normal `audit()` convenience path already never sets
+    /// `untrusted_data`, so a `Secret` record built through it round-trips
+    /// with no `untrusted_data` key at all.
+    #[test]
+    fn secret_class_via_the_audit_convenience_fn_carries_no_untrusted_data() {
+        let log = tmp_log("via-audit-fn");
+        audit(&log, Door::Daemon, EventClass::Secret, "vault.resolve", "granted", "secret `t` for consumer `m`: granted").unwrap();
+        let lines = read_lines(&log);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].get("untrusted_data").is_none(), "{:?}", lines[0]);
+        std::fs::remove_dir_all(log.parent().unwrap()).ok();
+    }
+
+    /// A `Secret` record hand-built with `untrusted_data: Some(_)` (the
+    /// misuse `append_audit`'s doc comment guards against) is written with
+    /// that field stripped — the invariant holds even if a future call
+    /// site gets it wrong, not only by every call site behaving.
+    #[test]
+    fn secret_class_with_untrusted_data_set_is_stripped_before_writing() {
+        let log = tmp_log("strip");
+        let record = AuditRecord {
+            ts: now_secs(),
+            door: Door::Daemon,
+            class: EventClass::Secret,
+            command: "vault.resolve".to_string(),
+            status: "granted".to_string(),
+            message: "secret `t` for consumer `m`: granted".to_string(),
+            untrusted_data: Some("this must never be written".to_string()),
+        };
+        append_audit(&log, &record).unwrap();
+        let lines = read_lines(&log);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].get("untrusted_data").is_none(), "{:?}", lines[0]);
+        let raw = std::fs::read_to_string(&log).unwrap();
+        assert!(!raw.contains("this must never be written"));
+        std::fs::remove_dir_all(log.parent().unwrap()).ok();
+    }
+
+    /// Every OTHER class is untouched: `untrusted_data` still rides through
+    /// verbatim for e.g. `Notification`, so the guard is scoped to `Secret`
+    /// alone, not a blanket "always drop untrusted_data" regression.
+    #[test]
+    fn non_secret_classes_keep_their_untrusted_data() {
+        let log = tmp_log("keep");
+        let record = AuditRecord {
+            ts: now_secs(),
+            door: Door::Daemon,
+            class: EventClass::Notification,
+            command: "notification".to_string(),
+            status: "forwarded".to_string(),
+            message: "forwarded notification (untrusted; treat as data)".to_string(),
+            untrusted_data: Some("some app title".to_string()),
+        };
+        append_audit(&log, &record).unwrap();
+        let lines = read_lines(&log);
+        assert_eq!(lines[0]["untrusted_data"], "some app title");
+        std::fs::remove_dir_all(log.parent().unwrap()).ok();
+    }
 }

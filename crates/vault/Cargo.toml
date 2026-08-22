@@ -3,17 +3,21 @@ name = "aoide-vault"
 version = "0.0.0"
 edition = "2021"
 license = "MIT"
-description = "Aoide's secrets broker, pure-logic half (Workstream VAULT, P-V1): hand-rolled RFC 2104/3174/6238 TOTP, otpauth:// URI construction, RFC 4648 base32, the single-use replay ledger, and policy-store types. No daemon, no socket, no CLI verbs — nothing in the workspace depends on this crate yet (the broker/client/registration land at P-V2/P-V3)."
+description = "Aoide's secrets broker (Workstream VAULT): hand-rolled RFC 2104/3174/6238 TOTP, otpauth:// URI construction, RFC 4648 base32, the single-use replay ledger, and policy-store types (P-V1); the unix-socket broker daemon, the client `vault exec`, and the admin CLI verbs (P-V2). `aoide-cli` depends on this crate as of P-V2."
 
 [lib]
 name = "aoide_vault"
 path = "src/lib.rs"
 
 [dependencies]
-# serde/serde_json only — the TOTP stack itself (hmac/sha1/totp/base32/uri)
-# is the plan-mandated ZERO-dependency half (no `sha1`/`hmac`/`totp-lite`/
-# `data-encoding` crate anywhere in this tree); serde is for the policy/
-# replay-ledger (de)serialization contract only, same as every other
-# record-shape crate in this workspace.
+# `aoide-protocol` (P-V2, new): Registry/Invocation/Outcome/Door/EventClass
+# and the audit helpers `broker`/`commands` build on. Everything else stays
+# the P-V1 ZERO-algorithmic-dependency half (no `sha1`/`hmac`/`totp-lite`/
+# `data-encoding` crate anywhere in this tree — hand-rolled on purpose,
+# see `AGENTS.md`); serde is for the policy/replay-ledger/backend-config
+# (de)serialization contract, same as every other record-shape crate in
+# this workspace. No new deps beyond aoide-protocol at P-V2: the broker
+# socket, the backend shell-out, and the exec spawn are all plain `std`.
+aoide-protocol = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

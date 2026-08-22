@@ -16,6 +16,12 @@ other crate in this workspace sits above.
   returns.
 - `audit` — `append_audit`/`audit`/`Door`/`EventClass`/`audit_log_path`, the
   one audit log both doors write through (root `AGENTS.md` house rule 6).
+  `EventClass::Secret` (Workstream VAULT, P-V2) is the vault broker's
+  name-only mirror (secret name, consumer, granted/denied — never a
+  value); `append_audit` structurally forbids `untrusted_data` on that one
+  class, stripping it (with an `eprintln!`, never a panic — an audit call
+  must never take its caller down) rather than trusting every call site to
+  never set it.
 - `door` — the hand-rolled parse → dispatch → render run loop (`run`),
   parameterized by a `special` hook so each binary's one-shot exceptions
   (`mcp serve --stdio`, `a2a serve`, `conductor`, `guide`/`schema` raw

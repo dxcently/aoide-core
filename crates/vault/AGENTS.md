@@ -3,13 +3,36 @@
 ## Invariants
 
 - **A secret's VALUE never appears on a `Serialize`/`Deserialize` type in
-  this crate — write this rule now, before it's tested by anything.**
-  `policy::Policy` is the only wire-shaped type here at P-V1 and it holds
-  no value; the rule exists for V2, where a resolve response and audit
-  entries get added under time pressure. Any new `#[derive(Serialize)]`
-  type added to this crate must be checked against this line before it
-  lands. A value belongs in a client-process env var and nowhere else
-  (README's release-to-client flow).
+  this crate.** `policy::Policy` is still the only such type, and it holds
+  no value. P-V2's resolve response and both audit lines are the exact
+  place this rule was written down FOR: `broker::handle_resolve` and
+  `broker::audit_resolve` build `serde_json::Value`s directly (via the
+  `json!` macro) at the point of use, never a named struct with a `value`
+  field — check any new `#[derive(Serialize)]` type added to this crate
+  against this line before it lands. A value belongs in a client-process
+  env var and nowhere else (README's release-to-client flow); `client::
+  resolve` extracts it straight out of the reply's `serde_json::Value`
+  into a local `String`, never a struct field.
+- **Audit happens BROKER-SIDE ONLY** (`broker::audit_resolve`), on every
+  resolve attempt, granted or denied. The CLIENT (`client.rs`) never calls
+  `aoide_protocol::audit` itself — it only ever learns granted/denied from
+  the wire reply. Don't add a second audit call on the client side "for
+  completeness"; it would double-log every resolve and the client doesn't
+  have the policy-gate reasoning to log honestly anyway.
+- **`EventClass::Secret` (the mirrored aoide-log event) forbids
+  `untrusted_data`** — enforced in `aoide_protocol::audit::append_audit`
+  itself (strips it, `eprintln!`s), not only by this crate's discipline.
+  Don't set `untrusted_data` on a Secret-classed `AuditRecord` expecting it
+  to ride through; it won't, and the strip is the safety net, not the
+  design.
+- **`requireTotp` is UNRESOLVABLE this phase, not a downgrade to a
+  standing grant.** `broker::resolve_gate` rejects a `requireTotp: true`
+  policy outright, regardless of whether a `totp` code rode the request.
+  Do not wire `totp::verify`/`replay::ReplayLedger` into the gate before
+  `vault enroll` (P-V3/P-V4) lands an actual enrolled secret to verify a
+  code against — there is no honest way to test a "granted via TOTP"
+  branch before then, and a fake-verified branch is worse than an honest
+  rejection.
 - **`ReplayLedger` keys on timestep ALONE, never on consumer** (ruling,
   Fable, 2026-08-22, P-V1 review escalation — plan file's VAULT §Policy
   section). The resolve wire's `consumer` field is self-asserted; a
@@ -43,11 +66,25 @@
   run). Don't "consolidate" the two without re-deriving why vault secret
   names are held to a tighter bar (they name on-disk backend-store paths
   under a privileged uid; a peer name only names a JSON cache file).
-- **Nothing in this crate performs I/O outside its own test module.** No
-  daemon, no socket, no `exec`, no reads/writes of vault home — those are
-  V2. A test's tempdir file write (`replay.rs`/`policy.rs`) proves a
-  serialization contract, it is not this crate quietly growing an fs
-  dependency.
+- **I/O is confined to five named modules: `broker`, `client`, `store`,
+  `backend`, and each module's own `#[cfg(test)]` block.** `sha1`/`hmac`/
+  `totp`/`base32`/`uri`/`replay`/`policy` stay pure — no `SystemTime::
+  now()`, no socket, no `exec`, no reads/writes of vault home in any of
+  them. This is the P-V2 narrowing of the old P-V1 rule ("nothing in this
+  crate performs I/O" — true then because there were no I/O modules yet);
+  the boundary moved from "this whole crate" to "these five modules," it
+  did not disappear.
+- **`home::vault_home`/`socket::socket_path` are THE resolution — nothing
+  else re-derives a vault-home or socket path.** `broker::serve`/
+  `client::resolve`/`client::run_exec` all take the resolved `&Path` as a
+  PARAMETER rather than calling `home`/`socket` internally — this is
+  deliberate (keeps them testable against an explicit tempdir/short
+  socket path with no env-var mutation) and matches how `cli`'s `special`
+  hook calls them: it resolves `home`/`socket` once and passes the result
+  in. Don't have `broker`/`client` read the env directly "for
+  convenience" — that would silently reintroduce the env-mutation
+  test-serialization problem `home`/`socket`'s OWN unit tests already
+  need `env_lock` for.
 
 ## Extension points
 
@@ -55,20 +92,27 @@
   fixed by RFC 6238's default and this vault's whole TOTP surface) would
   get its own module beside `sha1`/`hmac`, same zero-dependency rule, same
   RFC-vector-as-test-suite discipline.
-- **The broker daemon, socket wire, and `vault exec`/`vault serve` verbs**
-  (V2) land in a `commands`/`server` module added to this crate (or a
-  sibling — TBD at V2 planning), consuming `totp`/`replay`/`policy` as a
-  library rather than duplicating any of their logic.
-- **Backend adapter templates and `vault enroll` UX** (V3) consume `uri`
-  and `base32` as-is; QR-code rendering is a new leaf dependency scoped to
-  that phase only (`qrencode` shell-out per the plan, not a new Rust dep).
+- **`vault enroll` + real TOTP verification** (P-V3/P-V4) wires
+  `totp::verify`/`replay::ReplayLedger` into `broker::resolve_gate`'s
+  `requireTotp` branch (currently an outright rejection — see the
+  invariant above) and adds ledger persistence to `store` (there is none
+  yet; nothing exercises the ledger's file I/O this phase because nothing
+  can honestly reach the granted branch).
+- **Backend adapter DOC PRESETS** (`pass`/`gopass`/`bw`/`sops` — P-V3)
+  consume `backend`'s template mechanism as-is; QR-code rendering for
+  `vault enroll`'s URI (`uri`/`base32`, already present) is a new leaf
+  dependency scoped to that phase only (`qrencode` shell-out per the plan,
+  not a new Rust dep).
+- **Vault pairing / mesh replica sharing** (P-V5, gated on #51) is a new
+  module beside `broker`, not a growth of `broker`'s own resolve path —
+  see the plan's "Mesh sharing" section for the separate loopback channel.
 
 ## Docs update required in the same commit
 
 - This `README.md` when a new module, wire shape, or dependency is added.
 - `pkgs/aoide/crates/AGENTS.md` for cross-crate invariants (registry
-  order, golden discipline, per-crate tests) — not restated here, and none
-  of them apply yet since this crate registers nothing.
-- The workspace `Cargo.toml`'s `aoide-vault` member comment, if/when a
-  consumer (`aoide-cli`, at P-V2) is added — it currently states plainly
-  that nothing depends on this crate.
+  order, golden discipline, per-crate tests) — not restated here.
+- The workspace `Cargo.toml`'s `aoide-vault` member comment and
+  `crates/cli/README.md`'s golden-path count when the verb set changes.
+- `CONTRACTS.md §3` (the core schema's command count) and its vault-home
+  pointer note when the wire shape or file layout changes.
