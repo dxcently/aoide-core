@@ -81,6 +81,15 @@ secret activity, and so a future popup has the park lifecycle's own
 See "Broker notifications" below for the exact shapes, the mechanism this
 phase chose (and the one it didn't), and the no-dedup decision.
 
+**`secrets watch` (this commit, tracker #71 Part 1) is the terminal
+completion surface P-N2's own doc named as its eventual consumer**: a
+foreground, line-mode verb that tail-follows the mirrored log, narrates
+every P-N3 event, and — on a terminal — prompts inline for a parked ask
+(approve with a hidden code, dismiss, or ignore). `--json` emits one event
+object per line, the pickup point a future graphical popup (tracker #71
+Part 2) subscribes to instead of re-tailing the log itself. See "Watching
+events" below for the full mechanism.
+
 `secrets enroll` generates a fresh 20-byte secret from `/dev/urandom`,
 persists it (`store::save_totp_secret`, `0600`), and prints its
 `otpauth://` URI + base32 form to stdout (plus a QR code when `qrencode`
@@ -557,16 +566,16 @@ dismiss it rides alongside, so both `append_own_log` and `aoide_protocol::
 audit`'s own errors are `eprintln!`d and swallowed, the SAME posture every
 `audit_*` function already holds.
 
-**The popup phase's pickup point** (documented here, per this phase's own
-brief, since no adapter exists yet to wire it into): a future code-entry
-popup tails `<secrets_home>/audit.log` (or the mirrored `~/Aoide/log`,
-filtering `command == "secrets.notify"`) the same way `secrets pending`
-already polls the in-memory `ParkRegistry` — a `parked` line is the exact
-trigger `secrets pending`'s own poll would eventually see, just pushed
-instead of pulled. Building that tail/adapter is explicitly OUT of this
-phase's scope (no QML, no new lyra/conduct code landed here) — this
-emission is the substrate, the same relationship P-N2's park/approve/
-dismiss lifecycle already has to that same future UI.
+**The popup phase's pickup point is `aoide secrets watch --json` (landed
+this commit, tracker #71 Part 1)** — see "Watching events" below. It tails
+the mirrored `~/Aoide/log`, filtering `command == "secrets.notify"`, the
+same way `secrets pending` already polls the in-memory `ParkRegistry` — a
+`parked` line is the exact trigger `secrets pending`'s own poll would
+eventually see, just pushed instead of pulled. A future GRAPHICAL popup (a
+`lyra`/desktop consumer, tracker #71 Part 2) reads `secrets watch --json`'s
+stdout stream directly rather than re-deriving this tail itself — this
+emission plus `watch`'s own tail/reconcile loop are the substrate, the same
+relationship P-N2's park/approve/dismiss lifecycle already has to that UI.
 
 `emit_notify` (`broker.rs`) is the ONE function that builds and writes a
 notify line — every call site (`handle_resolve`'s `Granted`/`NeedsTotp`/
@@ -575,6 +584,100 @@ notify line — every call site (`handle_resolve`'s `Granted`/`NeedsTotp`/
 outcome depended on has already been released (`park::ParkRegistry`'s
 internal `Mutex`, or `broker::replay_ledger_lock`) — see `emit_notify`'s own
 doc comment for the exact "no lock held" accounting at each site.
+
+## Watching events (`secrets watch`, tracker #71 Part 1, this commit)
+
+`aoide secrets watch` is a foreground, line-mode terminal surface — the
+"delete every `.qml`" proof for the code-entry-popup design (root
+`AGENTS.md` house rule 7): the whole capability is reachable with nothing
+but a shell. It tail-follows the mirrored `~/Aoide/log` from EOF
+(`crate::watch::Follower` — delta reads only, `stat(2)` once a second, never
+re-reads the file from the start; the log is tens of MB and unrotated on a
+live rig, and every agent tool call appends a `graph.session.hook` line, so
+it churns constantly), parses only `class:"secret", command:"secrets.notify"`
+lines as a TRIGGER, and narrates every one of the five broker events
+(`released`/`parked`/`completed`/`dismissed`/`expired`, "Broker
+notifications" above). `client::pending` remains the AUTHORITY — the tail
+never is — so `crate::watch::Queue::reconcile` runs once at startup (so a
+watcher started AFTER an ask parked still sees it) and again on every event
+plus a 30s safety tick (so a missed line, a completion from another
+terminal, or a broker restart all still converge on the truth). An ask
+`reconcile` discovers with no matching `parked` line has no `timeoutSecs` to
+go on — the wire's `pending` reply never carries one — so its countdown is
+`park::park_timeout()` used as an ESTIMATE, marked with a `~` prefix in the
+prompt so the operator knows it's a guess.
+
+```
+$ aoide secrets watch
+watching secret events — ^C to leave (parked asks stay parked)
+
+  19:04:11  released    aws-ci → melete   (no code required)
+  19:06:02  parked      db-prod → claude   ask 3f2a-3   times out in 5m00s
+
+┌ ask 3f2a-3 ─ db-prod ← claude ─ asked 19:06:02 ─ 4m41s left
+│ [a] approve (enter code)   [d] dismiss the ask   [i] ignore (stays parked)
+└ > a
+  code for `db-prod` (input hidden): ······
+  ✓ approved 3f2a-3 — value released to the waiting caller
+```
+
+**On a terminal** (`client::stdin_is_tty`, and `--json` absent), each
+parked ask prompts inline, one at a time, FIFO by `requestedAt` (the ask
+closest to expiry prompts first) — a second ask arriving mid-prompt is
+narrated immediately and counted as "queued", never double-prompted (a code
+typed into the wrong ask would be spent for nothing). The three keys are
+read as a LINE (`a⏎`), never raw single-key — no cbreak/raw mode, no
+terminal-state restoration risk, works over ssh and with a piped stdin:
+- `[a]` opens a hidden-input code prompt (`client::read_hidden_line`,
+  reused VERBATIM — the code goes straight to `client::approve`, NEVER
+  argv) — a wrong code narrates `the ask is STILL PARKED, nothing was
+  spent` and re-opens the same prompt (no retry cap; the park's own
+  timeout is the bound).
+- `[d]` calls `client::dismiss` — the ask is GONE, the waiting caller gets
+  a clean refusal.
+- `[i]` ignores the ask FOR THIS SESSION ONLY — it stays parked,
+  completable from any terminal, and still narrates when it completes or
+  expires (never a blindfold).
+
+**Near-expiry lockout: 10 seconds** (`crate::watch::LOCKOUT_SECS`),
+enforced twice — a code prompt refuses to OPEN below the threshold, and the
+remaining time is re-checked again AFTER the code is read but BEFORE
+`client::approve` is called, so a code typed right at the boundary is
+discarded unspent rather than raced against the broker's own unbounded
+backend shell-out (the crate's documented KNOWN GAP, `AGENTS.md`).
+
+**Non-tty stdin, or `--json`: narration only, no prompts, ever** — `aoide
+secrets watch | tee` and a systemd unit both behave. `--json` emits one
+JSON object per line, flushed per line — the seam a future graphical popup
+(tracker #71 Part 2, `lyra`-side, no new dependency edge into this crate)
+subscribes to instead of re-tailing the log itself:
+
+```
+$ aoide secrets watch --json
+{"event":"parked","id":"3f2a-3","secret":"db-prod","consumer":"claude","timeoutSecs":300,"requestedAt":1787441132,"expiresAt":1787441432,"ts":1787441132}
+{"event":"completed","id":"3f2a-3","secret":"db-prod","consumer":"claude","ts":1787441159}
+{"event":"released","secret":"aws-ci","consumer":"melete","ts":1787441171}
+```
+
+`released`/`completed`/`dismissed`/`expired` carry no `id`-adjacent extras
+beyond what "Broker notifications" already documents, plus the top-level
+`ts` every line carries (the mirrored log's own `AuditRecord.ts`); `parked`
+additionally carries `requestedAt`/`expiresAt` (`ts` and `ts + timeoutSecs`)
+so a subscriber never has to compute a deadline from a wall-clock delta
+itself. **Never in this shape, ever: a secret value** — same rule as every
+other wire/log shape in this crate.
+
+`aoide secrets watch` is CLI-only (`require_cli`, same door gate as
+`pending`/`approve`/`dismiss`) but NOT an admin/euid verb — it touches no
+`policy.json`, only the mirrored log (read-only) and the broker's in-memory
+registry over the existing socket ops. Socket errors while reconciling
+(the broker not running, or restarting) print the taught connect error
+(`client::describe_connect_error`) and the watcher keeps tailing the log
+regardless — the broker may come back. Clean exit on Ctrl-C (a SIGINT
+handler sets a flag the tail loop notices within its next 1s poll) or on
+stdin EOF during a prompt; either way, the parting line names how many asks
+are still parked: `left the watcher — N ask(s) still parked; complete with
+aoide secrets approve <id> --totp <code>`.
 
 ## TOTP enrollment (`secrets enroll`, P-V3)
 

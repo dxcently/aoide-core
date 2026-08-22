@@ -43,7 +43,11 @@ use daemon::Door;
 /// a fresh TOTP secret's `otpauth://` URI + base32 form directly to stdout
 /// for the same reason (Workstream SECRETS P-V3) — or, with `--show`
 /// (Workstream SECRETS P-V4e), reprints the EXISTING enrollment's URI/base32
-/// without generating a new one — `conductor` hands off
+/// without generating a new one — `secrets watch` (Workstream SECRETS,
+/// tracker #71) is special-cased the same way: a foreground, line-mode
+/// broker-event narrator/prompt loop (`aoide_secrets::watch::run`) that
+/// blocks until Ctrl-C, never through the generic `Outcome` envelope —
+/// `conductor` hands off
 /// to the interactive terminal loop, `guide`/`schema` bypass the generic
 /// `Outcome` envelope — everything else routes through the single dispatcher
 /// (so the audit log + gate apply uniformly). `livery` was an earlier special
@@ -201,6 +205,26 @@ pub fn run_cli(argv: &[String]) -> i32 {
                     output::exit::ERROR
                 }
             });
+        }
+
+        // `secrets watch` (Workstream SECRETS, tracker #71 Part 1) is a
+        // foreground, line-mode watcher — special-cased the SAME way as
+        // `secrets serve`/`exec`/`enroll`: dispatch FIRST (audits the launch
+        // attempt and gives every non-Cli door the clean "run this from a
+        // terminal" outcome via `handle_secrets_watch`), then hand off to
+        // `aoide_secrets::watch::run`, which blocks until Ctrl-C. `socket`/
+        // `audit_log` are resolved ONCE here and passed in (this crate's own
+        // "resolve once, pass as a parameter" discipline, same as `secrets
+        // exec`/`enroll` above) — `watch::run` never re-derives either.
+        if inv.path == ["secrets", "watch"] {
+            let launch = dispatch::dispatch(inv);
+            if launch.status != output::Status::Ok {
+                let (body, code) = launch.render(json);
+                eprintln!("{body}");
+                return Some(code);
+            }
+            let audit_log = dispatch::audit_log_path(inv);
+            return Some(secrets::watch::run(&secrets::socket::socket_path(), &audit_log, json));
         }
 
         // `guide` in text mode prints the full onboarding rather than a summary.

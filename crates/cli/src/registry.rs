@@ -148,6 +148,7 @@ mod tests {
             "secrets.rm",
             "secrets.serve",
             "secrets.set-totp",
+            "secrets.watch",
             "who",
         ];
         expected.sort();

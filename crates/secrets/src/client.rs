@@ -487,7 +487,12 @@ pub fn dismiss(socket_path: &Path, id: &str) -> Result<(), String> {
 
 /// Is stdin a terminal? `libc::isatty` on fd 0 — the branch point between
 /// the historical pipe path and P-V4e's hidden-input prompt (module doc).
-fn stdin_is_tty() -> bool {
+/// `pub(crate)` since `watch.rs` (this crate's line-mode broker-event
+/// surface) needs the SAME tty branch point to decide narration-only vs.
+/// prompting — widened per `pkgs/aoide/crates/AGENTS.md`'s "no cross-crate
+/// copying" rule, applied in-crate: reach into the existing seam, never
+/// fork a second `isatty` call site.
+pub(crate) fn stdin_is_tty() -> bool {
     unsafe { libc::isatty(0) != 0 }
 }
 
@@ -513,7 +518,12 @@ fn strip_one_trailing_newline(mut s: String) -> String {
 /// STDERR (never stdout, module doc) — the newline exists because the
 /// user's own Enter never reached the terminal with echo off, so without
 /// it the next line printed would glue onto the hidden input's line.
-fn read_hidden_line(prompt: &str) -> Result<String, String> {
+///
+/// `pub(crate)`: `watch.rs`'s approve prompt reuses this VERBATIM for its
+/// own hidden TOTP-code read (the design's own requirement — the code must
+/// never touch argv, and this is the one place in the crate that already
+/// gets the termios dance right).
+pub(crate) fn read_hidden_line(prompt: &str) -> Result<String, String> {
     use std::io::{BufRead, Write};
     eprint!("{prompt}");
     let _ = std::io::stderr().flush();

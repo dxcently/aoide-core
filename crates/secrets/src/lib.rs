@@ -84,6 +84,21 @@
 //! invariant and the timeout/completion race, and `README.md`'s "Parking a
 //! TOTP resolve" section for the full lifecycle.
 //!
+//! **`secrets watch` (this commit, tracker #71 Part 1) is a foreground,
+//! line-mode terminal surface** that tail-follows the mirrored aoide log
+//! ([`watch::Follower`], delta-reads only, never re-reads from the start),
+//! narrates every broker event ([`watch::parse_notify_line`]/[`watch::
+//! Event`]), and — when stdin is a terminal and `--json` is absent —
+//! prompts inline for each parked ask: approve with a hidden TOTP code
+//! (reusing [`client::read_hidden_line`] verbatim, so the code never
+//! touches argv), dismiss it outright, or ignore it (stays parked for any
+//! other terminal). `client::pending` remains the AUTHORITY — the tail is
+//! only a trigger, reconciled ([`watch::Queue::reconcile`]) on every event
+//! and a 30s safety tick. `--json` emits one event object per line, the
+//! seam a future graphical popup phase (Part 2 of the same design doc)
+//! subscribes to instead of re-tailing the log itself — see `watch`'s own
+//! module doc and `README.md`'s "Watching events" section.
+//!
 //! See `README.md` for the wire shape and the release-to-client flow, and
 //! `AGENTS.md` for the invariants a change here must hold — most
 //! importantly: a secret's VALUE never appears on a `Serialize`/
@@ -108,6 +123,7 @@ pub mod socket;
 pub mod store;
 pub mod totp;
 pub mod uri;
+pub mod watch;
 
 /// A crate-wide lock serialising every test that mutates process-global
 /// env (`AOIDE_SECRETS_HOME`, `AOIDE_SECRETS_SOCKET`, `AOIDE_AUDIT_LOG`) —

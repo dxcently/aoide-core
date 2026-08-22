@@ -1,5 +1,5 @@
 //! `aoide secrets` — the secrets broker's CLI surface (Workstream SECRETS,
-//! P-V2, P-V3, P-V4c, P-V4e, P-N1, P-N2). Registers FOURTEEN verbs:
+//! P-V2, P-V3, P-V4c, P-V4e, P-N1, P-N2, P-N3). Registers FIFTEEN verbs:
 //!
 //! - `serve` — the long-running broker, special-cased at the entry point
 //!   exactly like `a2a serve`/`conductor` (`cli`'s `run_cli`): this
@@ -107,7 +107,16 @@
 //!
 //! `automate`/`expose` are appended in `register()` (golden discipline —
 //! `pkgs/aoide/crates/AGENTS.md`: append, never reorder), golden 61 -> 63;
-//! `pending`/`approve`/`dismiss` (P-N2) are appended last, golden 63 -> 66.
+//! `pending`/`approve`/`dismiss` (P-N2) are appended last, golden 63 -> 66;
+//! `watch` (this commit, tracker #71 Part 1 — the terminal completion
+//! surface for a parked ask) is appended newest, golden 66 -> 67.
+//! - `watch` — a foreground, line-mode broker-event narrator + prompt
+//!   surface (`crate::watch`'s own module doc has the full mechanism).
+//!   [`handle_secrets_watch`] only gates the door (CLI-only, same
+//!   [`require_cli`] as `pending`/`approve`/`dismiss` — no admin-identity
+//!   check, same reasoning) and records the launch; the blocking loop
+//!   itself (`crate::watch::run`) is special-cased from `cli`'s `special`
+//!   hook the SAME way `serve`/`exec`/`enroll` already are.
 //!
 //! `add`/`rm`/`grant`/`revoke`/`enroll` run AS THE SECRETS USER in deployment
 //! (`sudo -u aoide-secrets ...`, wrapped by the nix module at P-V4), but the
@@ -324,6 +333,16 @@ pub fn register(r: &mut Registry) {
         implemented: true,
         handler: handle_secrets_dismiss,
         examples: ["secrets dismiss 3"],
+    ));
+    r.insert(cmd!(
+        path: ["secrets", "watch"],
+        summary: "Foreground, line-mode watcher: tail-follows the mirrored aoide log and narrates every broker event (released/parked/completed/dismissed/expired). On a terminal, also prompts inline for each parked ask — [a]pprove with a hidden TOTP code, [d]ismiss, or [i]gnore (stays parked). --json emits one event object per line instead, narration-only, the seam a future popup helper subscribes to. CLI-only, operator-side (same door gate as pending/approve/dismiss) — blocks until Ctrl-C.",
+        args: [],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_secrets_watch,
+        examples: ["secrets watch", "secrets watch --json"],
     ));
 }
 
@@ -859,6 +878,23 @@ fn handle_secrets_dismiss(inv: &Invocation) -> Outcome {
     }
 }
 
+/// `secrets watch` (this commit) — special-cased the SAME way as `serve`/
+/// `exec`/`enroll`: this handler only gates the door (CLI-only, same
+/// [`require_cli`] as `pending`/`approve`/`dismiss` — NOT
+/// [`require_admin_identity`], since watch touches no `policy.json` either,
+/// only the mirrored log and the broker's in-memory registry over the
+/// socket) and records the launch through the single audit log; the actual
+/// foreground loop (`crate::watch::run`) is dispatched from `cli`'s
+/// `special` hook, blocking forever until Ctrl-C — see that crate's `run_cli`
+/// doc comment and `crate::watch`'s own module doc.
+fn handle_secrets_watch(inv: &Invocation) -> Outcome {
+    let cmd = "secrets.watch";
+    if let Some(hint) = require_cli(inv, cmd) {
+        return hint;
+    }
+    Outcome::ok(cmd, "watching secret events")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -919,6 +955,7 @@ mod tests {
                 "secrets.pending",
                 "secrets.approve",
                 "secrets.dismiss",
+                "secrets.watch",
             ]
         );
         for c in r.commands() {
@@ -941,6 +978,18 @@ mod tests {
         assert_eq!(handle_secrets_exec(&exec_cli).status, Status::Ok);
         let enroll_cli = inv(Door::Cli, &["secrets", "enroll"], &[], &[]);
         assert_eq!(handle_secrets_enroll(&enroll_cli).status, Status::Ok);
+    }
+
+    /// `watch` (this commit) is special-cased the same way — CLI-only, same
+    /// door-hint shape, no admin-identity check (it touches no
+    /// `policy.json`, only the socket-side operator surface `pending`/
+    /// `approve`/`dismiss` already draw).
+    #[test]
+    fn watch_is_cli_only_elsewhere_a_door_hint() {
+        let watch = inv(Door::Mcp, &["secrets", "watch"], &[], &[]);
+        assert_eq!(handle_secrets_watch(&watch).status, Status::Usage);
+        let watch_cli = inv(Door::Cli, &["secrets", "watch"], &[], &[]);
+        assert_eq!(handle_secrets_watch(&watch_cli).status, Status::Ok);
     }
 
     #[test]

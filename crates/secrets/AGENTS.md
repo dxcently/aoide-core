@@ -117,17 +117,47 @@
   run). Don't "consolidate" the two without re-deriving why secrets secret
   names are held to a tighter bar (they name on-disk backend-store paths
   under a privileged uid; a peer name only names a JSON cache file).
-- **I/O is confined to six named modules: `broker`, `client`, `store`,
-  `backend`, `enroll` (P-V3), and each module's own `#[cfg(test)]` block.**
-  `sha1`/`hmac`/`totp`/`base32`/`uri`/`replay`/`policy` stay pure — no
-  `SystemTime::now()`, no socket, no `exec`, no reads/writes of secrets home
-  in any of them. This is the P-V2 narrowing of the old P-V1 rule ("nothing
-  in this crate performs I/O" — true then because there were no I/O
-  modules yet), widened once more at P-V3 for `enroll`'s `/dev/urandom`/
-  `gethostname`/`qrencode` calls; the boundary moves as new I/O concerns
-  earn their own named module, it does not disappear. `enroll` itself
-  never writes a secrets-home FILE directly — that stays `store`'s job
-  (`enroll::run` calls `store::save_totp_secret`/`save_replay_ledger`).
+- **I/O is confined to seven named modules: `broker`, `client`, `store`,
+  `backend`, `enroll` (P-V3), `watch` (tracker #71 Part 1), and each
+  module's own `#[cfg(test)]` block.** `sha1`/`hmac`/`totp`/`base32`/`uri`/
+  `replay`/`policy` stay pure — no `SystemTime::now()`, no socket, no
+  `exec`, no reads/writes of secrets home in any of them. This is the P-V2
+  narrowing of the old P-V1 rule ("nothing in this crate performs I/O" —
+  true then because there were no I/O modules yet), widened once more at
+  P-V3 for `enroll`'s `/dev/urandom`/`gethostname`/`qrencode` calls, and
+  again for `watch`'s log-tail (`File`/`stat`), socket calls
+  (`client::pending`/`approve`/`dismiss`, reused, never duplicated), and
+  `SIGINT` handling (`libc::signal`) — the boundary moves as new I/O
+  concerns earn their own named module, it does not disappear. `enroll`
+  itself never writes a secrets-home FILE directly — that stays `store`'s
+  job (`enroll::run` calls `store::save_totp_secret`/`save_replay_ledger`).
+  `watch` itself never writes a secrets-home file OR `policy.json` at all
+  — it only reads the mirrored aoide log (never the broker's own
+  `audit.log`, which is `0700` broker-uid and unreadable from the operator
+  side anyway) and speaks the SAME three socket ops `pending`/`approve`/
+  `dismiss` already expose, never a new wire op.
+- **`watch`'s pure fold (`Event`/`Queue`/`pick_next`/`code_prompt_allowed`)
+  holds the SAME clock-as-parameter discipline this crate's `totp`/`replay`
+  modules already hold** (invariant above), extended here for the identical
+  testability reason: `Queue::apply`/`Queue::reconcile` take an event/
+  `Vec<PendingAsk>` and never call `SystemTime::now()` internally — every
+  timestamp they fold in (`ts` from the mirrored log's own `AuditRecord`,
+  `requestedAt` from `client::pending`'s reply) arrives as a parameter. Only
+  `watch::run`'s own outer loop (and its private `unix_now()`) touches the
+  real clock, the same "thin wrapper reads the real clock, never the pure
+  functions" split `broker.rs`'s own P-N2 tests already establish. Don't
+  add a `SystemTime::now()` call inside `Event`/`Queue`/`pick_next`/
+  `code_prompt_allowed`/`narrate_event`/`event_to_json` — grep for it
+  before merging a change to `watch.rs`'s pure half.
+- **`watch`'s tail is a TRIGGER; `client::pending` is the AUTHORITY** — the
+  SAME rule P-N2's own README section states for `secrets pending`'s poll,
+  extended to this surface: `Queue::reconcile` runs once at `watch::run`
+  startup (so a watcher started AFTER an ask parked still converges) and
+  again on every parsed event plus a 30s safety tick. Don't let a future
+  event kind become load-bearing on its own without a reconcile behind it
+  — the mirrored log can miss a line (a truncation between polls, a
+  process restart) in a way the broker's own in-memory `ParkRegistry`
+  cannot.
 - **Every admin verb that reads/writes `policy.json`/`totp.secret` refuses
   the wrong effective uid BEFORE touching the file, never after** (P-V4f,
   the yomi-strix incident, 2026-08-22: plain `sudo aoide secrets add …`
@@ -602,6 +632,21 @@
   own extension-point note above). The next phase that builds that
   tail/adapter lives in `aoide-conduct`/`lyra`, reading FROM this crate's
   logs — never a new edge pointing the other way.
+- **The tail/adapter P-N3 left for a future phase LANDED at tracker #71
+  Part 1, IN THIS crate, not `aoide-conduct`/`lyra`** — `watch.rs` (the
+  seventh I/O module, invariant above) tail-follows the SAME mirrored log
+  P-N3 writes to and narrates its five events, plus prompts inline for a
+  parked ask when stdin is a terminal. This does NOT contradict the P-N3
+  note above ("never a new edge pointing the other way"): `watch` adds NO
+  new dependency edge — it lives inside `aoide-secrets` itself and reaches
+  `client::pending`/`approve`/`dismiss` the same way `commands.rs` already
+  does, never a socket into `aoide-conduct`/`herald`. A GRAPHICAL popup
+  (tracker #71 Part 2) is still the `aoide-conduct`/`lyra`-side consumer
+  P-N3 anticipated — it reads `secrets watch --json`'s stdout stream
+  rather than re-deriving this tail, so THAT future edge still only ever
+  points the one sanctioned direction (into this crate's output, never a
+  new dependency onto `herald`/`shellbridge`). See `README.md`'s "Watching
+  events" section for the full mechanism.
 
 **KNOWN GAP, deferred, not fixed by P-N2c:** backend `get`/`set` shell-outs
 (`backend::fetch_value`/`store_value`) have NO timeout — a wedged backend
