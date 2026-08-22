@@ -3,29 +3,48 @@
 //! got there — is filed here, so a headless agent joining late (or a human
 //! checking in) can read what arrived while nobody was watching.
 //!
-//! **The single writer is [`receive`], called from exactly ONE call site**:
-//! `aoide_conduct::graph::send::deliver_local`'s success path — the one
-//! place a message actually lands in a target's pty (CONTRACTS.md §4). That
-//! single site covers every route a message takes to get there: a direct
-//! `graph send --id`, a `graph send --to <local target>` (re-drives
-//! `deliver_local` unchanged), `graph pending approve`'s re-drive (same
-//! door, in-process), AND the A2A server's `do_inject`
-//! (`crates/server/src/a2a.rs`) — `do_inject` builds a `graph send --id`
-//! [`aoide_protocol::Invocation`] and calls
-//! `aoide_conduct::graph::session_send` directly, which for a same-box
-//! `contextId` always resolves to `deliver_local` too (there is no `--to`
-//! flag in that Invocation, so the local branch is the ONLY branch it can
-//! take). So a remote peer's message and a local agent's `graph send` both
-//! end up filed by the exact same call, exactly the "one queue, two
-//! writers... no second implementation" precedent `pending.json` already
-//! set (CONTRACTS.md §4's `pending.json` section) — except here it is
-//! ONE writer, not two, because the a2a door never bypasses `session_send`.
-//! Filing a SECOND entry from inside `do_inject` itself would double-count
-//! every A2A-delivered message; don't add one.
+//! **[`receive`] is called from exactly TWO sites — every OTHER call in the
+//! tree reaches one of these two, never adds a third:**
+//!
+//! 1. `aoide_conduct::graph::send::deliver_local`'s success path — the
+//!    place a message lands in an ALREADY-REGISTERED session's pty
+//!    (CONTRACTS.md §4). Covers a direct `graph send --id`, a `graph send
+//!    --to <local target>` (re-drives `deliver_local` unchanged), `graph
+//!    pending approve`'s re-drive (same door, in-process), AND the A2A
+//!    server's `do_inject` (`crates/server/src/a2a.rs`) — `do_inject`
+//!    builds a `graph send --id` [`aoide_protocol::Invocation`] and calls
+//!    `aoide_conduct::graph::session_send` directly, which for a same-box
+//!    `contextId` always resolves to `deliver_local` too (there is no
+//!    `--to` flag in that Invocation, so the local branch is the ONLY
+//!    branch it can take). `do_inject` files no entry of its own — adding
+//!    one would double-count every message it delivers into an existing
+//!    session.
+//! 2. `aoide-server`'s `spawn_inject_prompt` (`crates/server/src/a2a.rs`) —
+//!    the FIRST turn of a brand-new A2A-spawned session (`do_spawn`, fired
+//!    whenever an incoming `message/send` carries no `contextId` or asks to
+//!    spawn). This one does NOT go through `session_send`/`deliver_local`:
+//!    the target `SessionRecord` doesn't exist in `sessions.json` yet at
+//!    the moment the prompt is typed — it is written by the SPAWNED CHILD
+//!    ITSELF once its own `aoide conduct` process starts up, which is a
+//!    race `spawn_inject_prompt`'s own connect-and-retry loop exists to
+//!    survive in the first place. Going through the session registry here
+//!    would just trade the socket race for a registration race, so this
+//!    site talks to the raw socket directly and files its own inbox entry
+//!    right after the write, best-effort, same tolerance as the rest of
+//!    that function (a write error is already swallowed there).
+//!
+//! Together these cover "one queue, two writers... no second
+//! implementation" the same way `pending.json` already established
+//! (CONTRACTS.md §4's `pending.json` section) — except doubled here: TWO
+//! genuinely distinct filing sites, not because two doors both write, but
+//! because one door (A2A) has two genuinely different delivery mechanics
+//! (an existing session's socket vs. a session that doesn't have a
+//! registry entry yet).
 //!
 //! `deliver_remote` (an OUTBOUND `--to peer/<x>` send to another box) never
 //! calls [`receive`] — there is nothing to file on THIS host: the message
-//! lands in the REMOTE peer's OWN inbox, via that peer's own `do_inject`.
+//! lands in the REMOTE peer's OWN inbox, via whichever of that peer's own
+//! two sites actually delivers it.
 //!
 //! **Cap + oldest-drop**: [`INBOX_CAP`] mirrors `herald.rs`'s `LEDGER_CAP`
 //! precedent exactly (fold-and-cap, oldest entries fall off the front) —

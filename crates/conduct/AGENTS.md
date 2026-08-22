@@ -23,14 +23,20 @@
   network via `aoide_client::commands::pull_peer_live` and falls back to
   the cache (read-only) for an unreachable peer; don't "helpfully" have a
   successful live probe refresh the cache as a side effect.
-- **`send::deliver_local`'s success path is the ONLY inbox-filing call in
-  the tree.** Every consumer that ultimately writes into a target session's
-  socket (`graph send --id`, `--to` resolving local, `pending approve`'s
-  re-drive, `aoide-server`'s A2A `do_inject`) reaches it through
-  `session_send`. Do NOT add a second `aoide_storage::inbox::receive` call
-  anywhere else — a2a's `do_inject` in particular reaches this exact
-  function too, so a second call there would double-file every A2A message
-  (see `aoide_storage::inbox`'s module doc for the full reasoning).
+- **`send::deliver_local`'s success path is ONE of exactly TWO inbox-filing
+  calls in the whole tree — never a third.** Every consumer that delivers
+  into an ALREADY-REGISTERED session's socket (`graph send --id`, `--to`
+  resolving local, `pending approve`'s re-drive, `aoide-server`'s A2A
+  `do_inject`) reaches it through `session_send`; do NOT add a second
+  `aoide_storage::inbox::receive` call for any of those — `do_inject` in
+  particular reaches this exact function too, so a call there would
+  double-file every A2A message delivered into an existing session. The
+  OTHER filing call lives OUTSIDE this crate, in `aoide-server`'s
+  `spawn_inject_prompt` (`a2a.rs`) — a brand-new A2A-spawned session's first
+  turn is typed before that session has a `SessionRecord` at all, so it
+  can never reach `deliver_local`/`session_send` and has to file itself
+  (see `aoide_storage::inbox`'s module doc for the full two-writer
+  reasoning).
 
 ## Extension points
 

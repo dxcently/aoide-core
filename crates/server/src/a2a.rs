@@ -710,13 +710,17 @@ fn submitted_task(session_id: &str) -> Value {
 /// entry of its own. It builds a `graph send --id` [`Invocation`] and calls
 /// [`session_send`] just like `graph send` itself does — and since this
 /// invocation never carries a `--to` flag, `session_send` can only ever
-/// reach its LOCAL branch (`deliver_local`), which is the one place a
-/// delivered message gets filed (`aoide_conduct::graph::send::deliver_local`
-/// — see `aoide_storage::inbox`'s module doc). So a remote peer's message
-/// lands in the inbox through the exact same call `do_inject` already makes
-/// below; adding a second append here would double-file every A2A-delivered
-/// message. See `a_successfully_delivered_message_send_files_into_the_inbox`
-/// below for the end-to-end proof.
+/// reach its LOCAL branch (`deliver_local`), which is one of the two places
+/// a delivered message gets filed (`aoide_conduct::graph::send::deliver_local`
+/// — see `aoide_storage::inbox`'s module doc, and [`spawn_inject_prompt`]
+/// for the OTHER site: a brand-new spawned session's first turn, which
+/// cannot go through `deliver_local` at all — this function only ever
+/// injects into an ALREADY-REGISTERED session). So a remote peer's message
+/// into an existing session lands in the inbox through the exact same call
+/// `do_inject` already makes below; adding a second append here would
+/// double-file every A2A-delivered message. See
+/// `a_successfully_delivered_message_send_files_into_the_inbox` below for
+/// the end-to-end proof.
 fn do_inject(
     session_id: &str,
     prompt: &str,
@@ -762,6 +766,27 @@ fn do_inject(
 /// exists and is `conductable`, just without its opening turn typed in — a
 /// client can always follow up with a plain `graph send`/another
 /// `message/send`.
+///
+/// **Deliberately a RAW socket write, not `session_send`/`deliver_local`.**
+/// `session_send` requires a `SessionRecord` already present in
+/// `sessions.json` with `conductable:true` and a socket path — and that
+/// record is written by the SPAWNED CHILD ITSELF, once its own `aoide
+/// conduct` process starts up and registers. At the moment `do_spawn` wants
+/// to type the opening turn, that registration may not have happened yet —
+/// exactly the race this function's own retry loop exists to survive (the
+/// socket file itself may not even exist). Routing through the session
+/// registry here would just trade the socket race for a registration race,
+/// so this stays on the raw socket path it already computed.
+///
+/// **Messaging plan P-C6, `state/inbox.json`**: because of the above, this
+/// is the SECOND (and last) inbox-filing site in the tree, alongside
+/// `deliver_local`'s (see `aoide_storage::inbox`'s module doc) — a spawned
+/// session's first turn can never reach `deliver_local`, so it has to file
+/// itself. `from` is empty: the a2a door has no caller identity to offer
+/// today (#51's scope), same reasoning [`do_inject`]'s callers rely on.
+/// Best-effort, same tolerance as the rest of this function — a write error
+/// above is already swallowed (the retry loop only confirms a bound socket,
+/// never delivery), so a failed inbox write is no less tolerated.
 fn spawn_inject_prompt(id: &str, prompt: &str) {
     if prompt.is_empty() {
         return;
@@ -773,6 +798,7 @@ fn spawn_inject_prompt(id: &str, prompt: &str) {
             if let Ok(mut s) = UnixStream::connect(&socket) {
                 let _ = s.write_all(payload.as_bytes());
                 let _ = s.flush();
+                let _ = aoide_storage::inbox::receive("", id, prompt, None);
                 return;
             }
         }
@@ -2955,6 +2981,102 @@ mod tests {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
             None => std::env::remove_var("AOIDE_STAGE_DIR"),
         }
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
+    fn spawn_inject_prompts_success_branch_files_the_opening_turn_into_the_inbox() {
+        // Messaging plan P-C6, the bounce-fix hole: `message/send` with NO
+        // contextId (or `spawn_asked`) resolves to `SendAction::Spawn` and
+        // `do_spawn` — a brand-new session's FIRST turn is typed by
+        // `spawn_inject_prompt`, the SECOND (and last) inbox-filing site
+        // alongside `deliver_local`'s (see its own doc comment for why it
+        // can't reach `deliver_local`).
+        //
+        // This drives `spawn_inject_prompt` directly rather than through
+        // `message_send`/`do_spawn`: `do_spawn` launches the configured
+        // agent via `std::env::current_exe()`, which inside `cargo test` IS
+        // THE TEST BINARY ITSELF — invoking it with `conduct --agent a2a
+        // --id … -- …` would hand those words to the test harness as
+        // positional filter args and actually re-run (a subset of) this
+        // suite as a detached child process, never bind the real socket,
+        // and time out this test's 3s retry budget for nothing. No test in
+        // this file exercises `do_spawn`'s OS-level spawn for that reason
+        // (there is no `AOIDE_A2A_BIN`-style override seam for it) —
+        // `spawn_inject_prompt` is the exact function the new inbox-filing
+        // code lives in, and driving it directly against a stand-in
+        // listener is the same boundary `aoide_conduct::graph::conduct`'s
+        // own PTY-injection test already uses for the underlying
+        // socket-write mechanism (see `spawn_inject_prompt`'s doc comment).
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_runtime = std::env::var("XDG_RUNTIME_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-spawninject-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_STATE_DIR", root.join("state"));
+
+        let id = "spawn-inject-target";
+        let socket = aoide_conduct::graph::conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+
+        spawn_inject_prompt(id, "hello new session");
+        let got = acc.join().unwrap();
+        assert_eq!(String::from_utf8(got).unwrap(), "hello new session\n", "--submit's newline, same as do_spawn's payload");
+
+        let file = aoide_storage::inbox::load().unwrap();
+        assert_eq!(file.entries.len(), 1, "the spawned session's opening turn is filed exactly once");
+        assert_eq!(file.entries[0].target, id);
+        assert_eq!(file.entries[0].text, "hello new session");
+        assert_eq!(file.entries[0].from, "", "no caller identity to offer — #51's scope");
+        assert!(!file.entries[0].read);
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+        match saved_runtime {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+    }
+
+    #[test]
+    fn spawn_inject_prompt_on_an_empty_prompt_files_nothing() {
+        // The existing early return (`if prompt.is_empty() { return; }`) —
+        // an empty prompt never connects at all, so it must not file an
+        // inbox entry either.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-spawninject-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("AOIDE_STATE_DIR", root.join("state"));
+
+        spawn_inject_prompt("whatever-id", "");
+        assert!(aoide_storage::inbox::load().unwrap().entries.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
         match saved_state {
             Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
             None => std::env::remove_var("AOIDE_STATE_DIR"),
