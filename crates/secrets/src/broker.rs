@@ -12,11 +12,24 @@
 //! <- {"ok":true,"value":"<value>"}                    (granted)
 //! <- {"ok":false,"error":"<value-free message>"}      (denied/error)
 //!
-//! -> {"op":"put","secret":"<name>","value":"<value>"}
-//! <- {"ok":true}                                       (stored)
+//! -> {"op":"put","secret":"<name>","value":"<value>","overwrite":<bool>?}
+//! <- {"ok":true,"replaced":<bool>}                    (stored — `replaced`
+//!                                                       tells whether a
+//!                                                       previous value was
+//!                                                       clobbered)
+//! <- {"ok":false,"exists":true,"error":"<message>"}   (P-67: refused —
+//!                                                       `overwrite` was
+//!                                                       false/absent and
+//!                                                       the secret ALREADY
+//!                                                       has a stored value)
 //! <- {"ok":false,"error":"<value-free message>"}      (denied/error)
 //! ```
-//! `totp`/`argv0` are optional on `resolve`. `consumer` is SELF-ASSERTED
+//! `totp`/`argv0` are optional on `resolve`; `overwrite` is optional on
+//! `put` — ABSENT MEANS `false` (P-67, wire compatibility: an old client
+//! sending no `overwrite` field still gets the tightened "exists" refusal
+//! from a new broker on a second `put`, which is the deliberate behavior
+//! change this feature makes — see `client.rs`'s module doc for the full
+//! wire-compat note). `consumer` is SELF-ASSERTED
 //! (the plan's V1 ruling, `crate::replay`'s module doc): the policy's
 //! `consumers[]` list is the real gate, not caller identity. This repo-wide
 //! machine-consumer contract (both ops, every error string, the
@@ -39,6 +52,21 @@
 //! creation, same as before P-V4c) and that its backend has a `set`
 //! template; it never touches `policy.require_totp` or `verify_totp_gate`
 //! at all.
+//!
+//! **P-67 ("warn before overwrite"): `put_gate` also probes existence
+//! BEFORE storing.** When the wire's `overwrite` field is false/absent AND
+//! `crate::backend::has_value` reports the secret already has a value, the
+//! gate refuses with the DISTINCT `{"exists":true}` reply above — a
+//! machine-readable flag, never a string a caller would have to pattern-
+//! match out of `error`'s prose — and the backend's `set` template never
+//! runs. The existence probe happens BROKER-SIDE only: the client never
+//! fetches a value to check this (that would violate the release-to-client
+//! discipline for an op that isn't even `resolve`), and a client-side file
+//! peek is impossible anyway — the client doesn't run as the secrets uid.
+//! `has_value` is just `fetch_value(...).is_ok()` (`backend.rs`'s own
+//! doc) — running the `get` template broker-side is fine here because,
+//! same as every other backend call in this module, the value never
+//! leaves this process.
 //!
 //! **`requireTotp` is wired live (P-V3).** [`resolve_gate`] rejects it
 //! outright ONLY when no `secrets enroll` has ever run on this host
@@ -239,45 +267,81 @@ fn handle_resolve(secrets_home: &Path, req: &Value) -> Value {
 /// [`put_gate`]/`crate::backend::store_value`; it never lands anywhere
 /// else in this function (not the returned `Value`, not either audit line
 /// — [`audit_put`] is name-only by construction, same as `audit_resolve`).
+///
+/// **P-67:** also reads `overwrite` (absent/false when missing — wire
+/// compat, module doc). [`put_gate`]'s [`PutOutcome`] maps onto three wire
+/// shapes: `Granted { replaced }` -> `{"ok":true,"replaced":replaced}`;
+/// `DeniedExists` -> `{"ok":false,"exists":true,"error":...}` (the
+/// machine-readable refusal); `Denied(reason)` -> the ordinary
+/// `{"ok":false,"error":reason}`, unchanged from before this feature.
 fn handle_put(secrets_home: &Path, req: &Value) -> Value {
     let secret = req.get("secret").and_then(Value::as_str).unwrap_or("").to_string();
     let value = req.get("value").and_then(Value::as_str).unwrap_or("").to_string();
+    let overwrite = req.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
 
     if secret.is_empty() {
         return json!({"ok": false, "error": "malformed request: `secret` is required"});
     }
 
-    let (granted, result) = put_gate(secrets_home, &secret, &value);
-    audit_put(secrets_home, &secret, granted, result.as_ref().err());
-
-    match result {
-        Ok(()) => json!({"ok": true}),
-        Err(reason) => json!({"ok": false, "error": reason}),
-    }
+    let outcome = put_gate(secrets_home, &secret, &value, overwrite);
+    let (granted, reply, reason, replaced) = match &outcome {
+        PutOutcome::Granted { replaced } => {
+            (true, json!({"ok": true, "replaced": replaced}), None, Some(*replaced))
+        }
+        PutOutcome::DeniedExists => {
+            let msg = format!("secret `{secret}` already has a stored value");
+            (false, json!({"ok": false, "error": msg, "exists": true}), Some(msg), None)
+        }
+        PutOutcome::Denied(reason) => (false, json!({"ok": false, "error": reason}), Some(reason.clone()), None),
+    };
+    audit_put(secrets_home, &secret, granted, reason.as_ref(), replaced);
+    reply
 }
 
-/// The `put` policy gate + backend store, in one place — mirrors
-/// [`resolve_gate`]'s shape (`granted` carried alongside the `Result`, same
-/// reasoning). `put` never auto-creates a policy (`secrets add` owns policy
-/// creation, module doc) and never checks `requireTotp` (module doc): a
-/// missing policy or a backend with no `set` template are both ordinary,
-/// value-free denials — the backend is never invoked on either.
-fn put_gate(secrets_home: &Path, secret: &str, value: &str) -> (bool, Result<(), String>) {
+/// Outcome of the `put` policy gate + existence probe + backend store
+/// (P-67, "warn before overwrite"): `Denied` is the pre-existing shape
+/// (policy/backend problems, unchanged); `DeniedExists` is the NEW
+/// machine-readable refusal — `overwrite` was false and
+/// `crate::backend::has_value` found the secret already has a stored
+/// value; `Granted { replaced }` distinguishes a first-ever store from an
+/// overwrite so the audit line and the client's own success message can
+/// say which happened.
+enum PutOutcome {
+    Granted { replaced: bool },
+    DeniedExists,
+    Denied(String),
+}
+
+/// The `put` policy gate + existence probe + backend store, in one place —
+/// mirrors [`resolve_gate`]'s shape. `put` never auto-creates a policy
+/// (`secrets add` owns policy creation, module doc) and never checks
+/// `requireTotp` (module doc): a missing policy or a backend with no `set`
+/// template are both ordinary, value-free denials — the backend is never
+/// invoked on either. **P-67:** when `overwrite` is false and
+/// `crate::backend::has_value` reports an existing value, the backend's
+/// `set` template is never invoked either — the existence probe (a `get`
+/// template run) is the only backend call on that path.
+fn put_gate(secrets_home: &Path, secret: &str, value: &str, overwrite: bool) -> PutOutcome {
     let policies = match crate::store::load_policies(secrets_home) {
         Ok(p) => p,
         Err(e) => {
-            return (
-                false,
-                Err(crate::home::describe_home_file_error(secrets_home, &crate::store::policy_path(secrets_home), &e)),
-            )
+            return PutOutcome::Denied(crate::home::describe_home_file_error(
+                secrets_home,
+                &crate::store::policy_path(secrets_home),
+                &e,
+            ))
         }
     };
     let Some(policy) = policies.iter().find(|p| p.name == secret) else {
-        return (false, Err("secret not found".to_string()));
+        return PutOutcome::Denied("secret not found".to_string());
     };
+    let already_has_value = crate::backend::has_value(secrets_home, &policy.backend, &policy.key);
+    if already_has_value && !overwrite {
+        return PutOutcome::DeniedExists;
+    }
     match crate::backend::store_value(secrets_home, &policy.backend, &policy.key, value) {
-        Ok(()) => (true, Ok(())),
-        Err(e) => (false, Err(e)),
+        Ok(()) => PutOutcome::Granted { replaced: already_has_value },
+        Err(e) => PutOutcome::Denied(e),
     }
 }
 
@@ -424,23 +488,29 @@ fn audit_resolve(
 /// [`audit_resolve`], same two destinations (the broker's own `audit.log`
 /// + the mirrored `EventClass::Secret` aoide-log line), same name-only
 /// discipline. No `consumer`/`argv0` fields — `put`'s wire request carries
-/// neither (module doc).
-fn audit_put(secrets_home: &Path, secret: &str, granted: bool, reason: Option<&String>) {
+/// neither (module doc). `replaced` (P-67) is `Some(bool)` only on a
+/// GRANTED put — names only, never a value, same as everything else this
+/// function writes — so the audit trail can say "replaced" vs "stored new"
+/// without re-deriving it from the reason string.
+fn audit_put(secrets_home: &Path, secret: &str, granted: bool, reason: Option<&String>, replaced: Option<bool>) {
     let record = json!({
         "ts": aoide_protocol::audit::now_secs(),
         "op": "put",
         "secret": secret,
         "granted": granted,
         "reason": reason,
+        "replaced": replaced,
     });
     if let Err(e) = append_own_log(secrets_home, &record) {
         eprintln!("[aoide/secrets] could not write the secrets audit log: {e}");
     }
 
     let status = if granted { "granted" } else { "denied" };
-    let message = match reason {
-        Some(r) => format!("put `{secret}`: {status} ({r})"),
-        None => format!("put `{secret}`: {status}"),
+    let message = match (reason, replaced) {
+        (Some(r), _) => format!("put `{secret}`: {status} ({r})"),
+        (None, Some(true)) => format!("put `{secret}`: {status} (replaced existing value)"),
+        (None, Some(false)) => format!("put `{secret}`: {status} (stored new value)"),
+        (None, None) => format!("put `{secret}`: {status}"),
     };
     let _ = aoide_protocol::audit(
         &aoide_protocol::default_audit_log(),
@@ -512,7 +582,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
 
         let (resolve_granted, resolve_result) = resolve_gate(&home, "t", "m", None, NOW);
-        let (put_granted, put_result) = put_gate(&home, "t", "irrelevant");
+        let (put_granted, put_result) = put_outcome_as_result(put_gate(&home, "t", "irrelevant", false));
 
         // Restore before any assertion could early-return and leave the
         // tempdir's cleanup unable to remove an unreadable file.
@@ -878,11 +948,24 @@ mod tests {
         std::fs::write(crate::backend::backends_path(home), serde_json::to_vec(&backends).unwrap()).unwrap();
     }
 
+    /// Unpacks [`PutOutcome`] into the pre-P-67 `(granted, Result<replaced,
+    /// error>)` tuple shape most of this suite's existing assertions were
+    /// written against — keeps those readable without a `match` at every
+    /// call site. `DeniedExists` collapses to a plain `Err` here (its own
+    /// distinct shape is exercised directly by the P-67 tests below).
+    fn put_outcome_as_result(outcome: PutOutcome) -> (bool, Result<bool, String>) {
+        match outcome {
+            PutOutcome::Granted { replaced } => (true, Ok(replaced)),
+            PutOutcome::DeniedExists => (false, Err("secret already has a stored value".to_string())),
+            PutOutcome::Denied(reason) => (false, Err(reason)),
+        }
+    }
+
     #[test]
     fn put_on_an_unknown_secret_is_denied_and_never_invokes_a_backend() {
         let home = tmp_home("put-unknown");
         seed(&home, &[]);
-        let (granted, result) = put_gate(&home, "nope", "irrelevant");
+        let (granted, result) = put_outcome_as_result(put_gate(&home, "nope", "irrelevant", false));
         assert!(!granted);
         assert_eq!(result.unwrap_err(), "secret not found");
         std::fs::remove_dir_all(&home).ok();
@@ -893,7 +976,12 @@ mod tests {
         let home = tmp_home("put-noset");
         let p = Policy::new("t", "scratch", "k");
         seed(&home, &[p]); // `seed`'s fixture backend has only `get`.
-        let (granted, result) = put_gate(&home, "t", "irrelevant");
+        // `overwrite: true` — `seed`'s fixture `get` (`printf %s {name}`)
+        // always succeeds, so an `overwrite: false` attempt would hit the
+        // NEW `DeniedExists` path first; forcing `overwrite` here is what
+        // keeps this test actually exercising the missing-`set`-template
+        // error, same as before P-67.
+        let (granted, result) = put_outcome_as_result(put_gate(&home, "t", "irrelevant", true));
         assert!(!granted);
         assert!(result.unwrap_err().contains("no `set` template"));
         std::fs::remove_dir_all(&home).ok();
@@ -906,9 +994,9 @@ mod tests {
         let p = Policy::new("t", "scratch", "k");
         seed_with_set(&home, &[p], &format!("cat {}", out.display()), &format!("cat > {}", out.display()));
 
-        let (granted, result) = put_gate(&home, "t", "the-stored-value");
+        let (granted, result) = put_outcome_as_result(put_gate(&home, "t", "the-stored-value", false));
         assert!(granted, "{result:?}");
-        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), false, "the store dir starts empty — this is a NEW store, not a replace");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "the-stored-value");
         std::fs::remove_dir_all(&home).ok();
     }
@@ -924,9 +1012,96 @@ mod tests {
         p.require_totp = true;
         seed_with_set(&home, &[p], &format!("cat {}", out.display()), &format!("cat > {}", out.display()));
 
-        let (granted, result) = put_gate(&home, "t", "value-with-no-totp-anywhere");
+        let (granted, result) = put_outcome_as_result(put_gate(&home, "t", "value-with-no-totp-anywhere", false));
         assert!(granted, "{result:?}");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "value-with-no-totp-anywhere");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── overwrite (P-67, "warn before overwrite") ───────────────────────
+
+    #[test]
+    fn put_gate_on_an_existing_value_without_overwrite_is_a_distinct_exists_denial_and_leaves_the_value_unchanged() {
+        let home = tmp_home("put-exists-denied");
+        let out = home.join("out.txt");
+        let p = Policy::new("t", "scratch", "k");
+        seed_with_set(&home, &[p], &format!("cat {}", out.display()), &format!("cat > {}", out.display()));
+
+        // Store a first value directly (bypassing the gate) so the probe
+        // has something to find.
+        std::fs::write(&out, "original-value").unwrap();
+
+        let outcome = put_gate(&home, "t", "attempted-overwrite", false);
+        assert!(matches!(outcome, PutOutcome::DeniedExists), "expected DeniedExists, got a different outcome");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "original-value", "a denied put must never touch the store");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn put_gate_with_overwrite_true_replaces_an_existing_value() {
+        let home = tmp_home("put-overwrite-granted");
+        let out = home.join("out.txt");
+        let p = Policy::new("t", "scratch", "k");
+        seed_with_set(&home, &[p], &format!("cat {}", out.display()), &format!("cat > {}", out.display()));
+        std::fs::write(&out, "original-value").unwrap();
+
+        let (granted, result) = put_outcome_as_result(put_gate(&home, "t", "new-value", true));
+        assert!(granted, "{result:?}");
+        assert_eq!(result.unwrap(), true, "an existing value was overwritten — `replaced` must be true");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "new-value");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The wire-level version of the two tests above, through `handle_line`
+    /// — this is the deliverable's own end-to-end proof: a first `put`
+    /// stores; a second `put` (no `overwrite`) is refused with the
+    /// `exists` flag and leaves the stored value untouched; a third `put`
+    /// with `overwrite:true` replaces it.
+    #[test]
+    fn a_full_put_overwrite_cycle_round_trips_through_handle_line() {
+        let home = tmp_home("put-overwrite-wire");
+        let out = home.join("out.txt");
+        let p = Policy::new("t", "scratch", "k");
+        seed_with_set(&home, &[p], &format!("cat {}", out.display()), &format!("cat > {}", out.display()));
+
+        // 1. Empty -> stores, `replaced` is false.
+        let first = handle_line(&home, r#"{"op":"put","secret":"t","value":"first-value"}"#);
+        assert_eq!(first["ok"], true, "{first}");
+        assert_eq!(first["replaced"], false, "{first}");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "first-value");
+
+        // 2. Existing, no `overwrite` -> the distinct `exists` refusal, and
+        //    the stored value is UNCHANGED.
+        let second = handle_line(&home, r#"{"op":"put","secret":"t","value":"attempted-overwrite"}"#);
+        assert_eq!(second["ok"], false, "{second}");
+        assert_eq!(second["exists"], true, "the refusal must be machine-readable via `exists`, not error prose: {second}");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "first-value", "a refused put must never touch the store");
+
+        // 3. Existing, `overwrite: true` -> replaced, `replaced` is true.
+        let third = handle_line(&home, r#"{"op":"put","secret":"t","value":"second-value","overwrite":true}"#);
+        assert_eq!(third["ok"], true, "{third}");
+        assert_eq!(third["replaced"], true, "{third}");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "second-value");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Wire compatibility (task requirement): an absent `overwrite` field
+    /// is read exactly like `overwrite: false` — an old client's request
+    /// line, sent against a new broker, still gets the tightened refusal on
+    /// a second `put`.
+    #[test]
+    fn an_absent_overwrite_field_behaves_exactly_like_false() {
+        let home = tmp_home("put-overwrite-absent");
+        let out = home.join("out.txt");
+        let p = Policy::new("t", "scratch", "k");
+        seed_with_set(&home, &[p], &format!("cat {}", out.display()), &format!("cat > {}", out.display()));
+        std::fs::write(&out, "original-value").unwrap();
+
+        let with_false = handle_line(&home, r#"{"op":"put","secret":"t","value":"x","overwrite":false}"#);
+        let without_field = handle_line(&home, r#"{"op":"put","secret":"t","value":"x"}"#);
+        assert_eq!(with_false, without_field, "an explicit `overwrite:false` and an absent field must match byte-for-byte");
+        assert_eq!(with_false["exists"], true, "{with_false}");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -944,6 +1119,7 @@ mod tests {
         let reply = handle_line(&home, r#"{"op":"put","secret":"t","value":"stored-value"}"#);
         assert_eq!(reply["ok"], true);
         assert!(reply.get("value").is_none(), "put's reply must never carry a value: {reply}");
+        assert_eq!(reply["replaced"], false, "the store starts empty — this is a new store, not a replace: {reply}");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "stored-value");
 
         match saved {
@@ -981,9 +1157,14 @@ mod tests {
         assert!(!reply.to_string().contains(SENTINEL), "wire reply leaked the sentinel: {reply}");
 
         // ── failure 2: policy exists, but its backend has no `set` ─────
+        // `overwrite: true` forces past the NEW existence-probe path
+        // (`seed`'s fixture `get` always succeeds) so this still exercises
+        // the missing-`set`-template denial specifically, same as before
+        // P-67.
         let p = Policy::new("t", "scratch", "k");
         seed(&home, &[p]); // `seed`'s fixture backend is get-only.
-        let reply = handle_line(&home, &format!(r#"{{"op":"put","secret":"t","value":"{SENTINEL}"}}"#));
+        let reply =
+            handle_line(&home, &format!(r#"{{"op":"put","secret":"t","value":"{SENTINEL}","overwrite":true}}"#));
         assert_eq!(reply["ok"], false);
         assert!(!reply.to_string().contains(SENTINEL), "wire reply leaked the sentinel: {reply}");
 

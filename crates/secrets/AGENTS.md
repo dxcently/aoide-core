@@ -45,6 +45,22 @@
   full reasoning. Don't add a TOTP or consumer check to `put_gate` "for
   symmetry with resolve"; the two ops have different threat models on
   purpose.
+- **The "does this secret already have a value" check is BROKER-SIDE ONLY,
+  never the client's** (P-67, "warn before overwrite" — the User's own
+  live complaint: `put` silently overwrote). `broker::has_value`-backed
+  `put_gate` probes existence by running the SAME `get` template `resolve`
+  would; the CLIENT never fetches a value to find out (that would be a
+  `resolve`-shaped leak on an op that isn't `resolve`) and a client-side
+  file peek would break the uid boundary outright (the client doesn't run
+  as the secrets uid — it can't see the backing store at all). Don't add a
+  client-side existence check "to save a round trip"; the whole point is
+  that only the broker is allowed to know.
+- **The `put` overwrite refusal is a MACHINE-READABLE flag
+  (`"exists":true`), never inferred from `error` text** (P-67). Don't add a
+  new `put` denial reason whose message text a caller (or this crate's own
+  `client::put`) would need to string-match to distinguish "already has a
+  value" from every other kind of denial — a new distinct case gets its
+  own flag field the same way, not a string convention.
 - **NO CACHE, EVER.** A secret's value exists ONLY between a `get`/`set`
   template's own invocation and the wire write that immediately follows —
   nothing in `broker`/`client`/`backend` may hold a value across requests,
@@ -286,6 +302,28 @@
   separate code paths with different contracts (a script's piped bytes
   are the value verbatim; a human's typed line loses exactly one trailing
   newline, `client::strip_one_trailing_newline`).
+- **`secrets put` warns and confirms before an overwrite, P-67 (this
+  commit).** The wire's `put` op gained an optional `overwrite` bool
+  (absent means `false`); `broker::put_gate` probes existence via
+  `backend::has_value` (just `fetch_value(...).is_ok()` — no new
+  per-backend primitive) and refuses with the distinct `{"exists":true}`
+  reply when `overwrite` is false and a value already exists, never
+  touching the backend's `set` template on that path. `client::put` now
+  returns `Result<bool, PutError>` (`bool` = `replaced`,
+  `PutError::Exists` = the wire's flag, `PutError::Other` = everything
+  else); `client::run_put` takes a `force` bool (the CLI's new `--force`
+  flag) that rides as `overwrite` on the FIRST attempt, and on a tty
+  `PutError::Exists` refusal, prompts `y/N` and retries with the SAME
+  in-memory value + `overwrite:true` on yes — a non-tty stdin gets
+  `client::non_tty_exists_message` (a pure function) instead, since there
+  is no one to confirm with. `broker::audit_put` carries the same
+  `replaced` distinction into both audit logs, names only. A future op
+  that could similarly clobber existing state follows this same shape: a
+  broker-side existence/state probe, a machine-readable flag on the
+  refusal (never string-matched prose), and the client-side confirm/force
+  split living in that op's own client function — not a generic
+  "confirm before mutation" middleware, since each op's own gate already
+  knows its own state.
 
 ## Docs update required in the same commit
 

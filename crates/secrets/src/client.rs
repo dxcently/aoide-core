@@ -47,6 +47,35 @@
 //! is split out as its own pure function (module doc's "small seam"): the
 //! termios dance itself is not exercised by `cargo test` (this process's
 //! own stdin is never a tty in CI), but the trim logic it feeds is.
+//!
+//! **P-67: `run_put` warns and confirms before an overwrite.** The
+//! existence check is BROKER-SIDE — the client never fetches a value to
+//! find out (that would be a `resolve`-shaped leak on an op that isn't
+//! `resolve`, and a client-side file peek is impossible anyway, since the
+//! client never runs as the secrets uid). [`put`] now takes an `overwrite`
+//! bool and reports whether the broker's reply carries the distinct
+//! `{"exists":true}` refusal via [`PutError::Exists`] — never inferred by
+//! matching the `error` string's prose. `run_put`'s flow:
+//! - The value is read from stdin EXACTLY as before (tty-hidden or piped),
+//!   held in a local `String`, and the first `put` attempt sends
+//!   `overwrite: force` (the new `--force` flag, `commands::
+//!   handle_secrets_put`) — `--force` therefore skips the confirmation on
+//!   BOTH a tty and a pipe, storing on the first round trip either way.
+//! - A [`PutError::Exists`] refusal (only reachable when `force` was
+//!   false) branches on [`stdin_is_tty`] a SECOND time: on a tty, it
+//!   prints a `y/N` confirmation prompt (unhidden — a yes/no answer isn't
+//!   sensitive) to stderr and reads one line; `y`/`yes` (case-insensitive)
+//!   re-sends the SAME in-memory value with `overwrite: true` (the caller
+//!   is never asked to retype it), anything else — including EOF, `read_line`
+//!   returning `Ok(0)` — aborts with an "unchanged" message. On a non-tty
+//!   stdin, there is no one to ask, so it refuses outright and teaches the
+//!   `--force` spelling ([`non_tty_exists_message`], a plain pure function
+//!   so this refusal is testable without faking a tty — module doc's own
+//!   "pure-testable" requirement).
+//! - The value NEVER touches argv, a log line, or a cache at any point in
+//!   this flow — it exists only as `run_put`'s own local `String`, exactly
+//!   as before this feature, just potentially handed to [`put`] TWICE
+//!   instead of once.
 
 use aoide_protocol::Invocation;
 use serde_json::{json, Value};
@@ -216,41 +245,74 @@ pub fn resolve(
     }
 }
 
-/// Connect to `socket_path`, send ONE `put` request carrying `value`, read
-/// ONE reply line, and return `Ok(())` on a stored value or a value-free
-/// `Err` otherwise. Mirrors [`resolve`]'s one-shot socket shape; unlike
-/// `resolve`'s reply, `put`'s never carries a value back — only ok/error —
-/// so there is nothing here for a caller to extract.
-pub fn put(socket_path: &Path, secret: &str, value: &str) -> Result<(), String> {
-    let mut stream = UnixStream::connect(socket_path)
-        .map_err(|e| describe_connect_error(socket_path, &e, &format!("aoide secrets put {secret}")))?;
+/// A [`put`] failure, distinguishing the P-67 "already has a stored value"
+/// refusal from every other error — via the wire's `exists` FLAG, never by
+/// matching text out of the `error` string (the task's own requirement:
+/// "distinguishable WITHOUT string-matching prose").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PutError {
+    /// `overwrite` was false/absent and the secret already has a stored
+    /// value (the broker's `{"ok":false,"exists":true,...}` reply).
+    Exists,
+    /// Every other denial/error — connect failures, "secret not found", a
+    /// backend problem, ... — value-free, same as before this feature.
+    Other(String),
+}
 
-    let req = json!({ "op": "put", "secret": secret, "value": value });
+impl std::fmt::Display for PutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PutError::Exists => write!(f, "secret already has a stored value"),
+            PutError::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+/// Connect to `socket_path`, send ONE `put` request carrying `value` and
+/// `overwrite`, read ONE reply line, and return whether an existing value
+/// was REPLACED (`true`) or this was a first-ever store (`false`) — or a
+/// [`PutError`] otherwise. Mirrors [`resolve`]'s one-shot socket shape;
+/// `overwrite` only rides the wire when `true` (absent means false — wire
+/// compat, `broker.rs`'s module doc), same discipline `resolve`'s optional
+/// `totp`/`argv0` fields already hold.
+pub fn put(socket_path: &Path, secret: &str, value: &str, overwrite: bool) -> Result<bool, PutError> {
+    let mut stream = UnixStream::connect(socket_path).map_err(|e| {
+        PutError::Other(describe_connect_error(socket_path, &e, &format!("aoide secrets put {secret}")))
+    })?;
+
+    let mut req = json!({ "op": "put", "secret": secret, "value": value });
+    if overwrite {
+        req["overwrite"] = Value::Bool(true);
+    }
     let mut line = req.to_string();
     line.push('\n');
     stream
         .write_all(line.as_bytes())
-        .map_err(|e| format!("writing to the secrets broker: {e}"))?;
+        .map_err(|e| PutError::Other(format!("writing to the secrets broker: {e}")))?;
 
     let mut reader = BufReader::new(stream);
     let mut reply_line = String::new();
     reader
         .read_line(&mut reply_line)
-        .map_err(|e| format!("reading from the secrets broker: {e}"))?;
+        .map_err(|e| PutError::Other(format!("reading from the secrets broker: {e}")))?;
     if reply_line.trim().is_empty() {
-        return Err("the secrets broker closed the connection with no reply".to_string());
+        return Err(PutError::Other("the secrets broker closed the connection with no reply".to_string()));
     }
     let reply: Value = serde_json::from_str(reply_line.trim())
-        .map_err(|e| format!("the secrets broker sent an unparseable reply: {e}"))?;
+        .map_err(|e| PutError::Other(format!("the secrets broker sent an unparseable reply: {e}")))?;
 
     if reply.get("ok").and_then(Value::as_bool) == Some(true) {
-        Ok(())
+        Ok(reply.get("replaced").and_then(Value::as_bool).unwrap_or(false))
+    } else if reply.get("exists").and_then(Value::as_bool) == Some(true) {
+        Err(PutError::Exists)
     } else {
-        Err(reply
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("the secrets broker denied the request")
-            .to_string())
+        Err(PutError::Other(
+            reply
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("the secrets broker denied the request")
+                .to_string(),
+        ))
     }
 }
 
@@ -309,14 +371,50 @@ fn read_hidden_line(prompt: &str) -> Result<String, String> {
     Ok(strip_one_trailing_newline(line))
 }
 
+/// The non-tty "exists" refusal message (P-67) — a plain pure function so
+/// it's testable without faking a tty (module doc). Teaches the exact
+/// `--force` spelling: there is no one to ask for a `y/N` confirmation
+/// when stdin is a pipe, so this refuses outright rather than guessing.
+fn non_tty_exists_message(secret: &str) -> String {
+    format!(
+        "secret `{secret}` already has a stored value — refusing to overwrite it from a non-interactive \
+         stdin without confirmation. Re-run with --force to overwrite: printf %s <value> | aoide secrets put \
+         {secret} --force"
+    )
+}
+
+/// Prompt `y/N` on stderr and read ONE line from stdin, unhidden (a yes/no
+/// answer isn't sensitive, unlike the value itself). `true` only for
+/// `y`/`yes` (case-insensitive, surrounding whitespace trimmed); EOF
+/// (`read_line` returning `Ok(0)`) and every other input default to `false`
+/// — the task's own "default No" requirement.
+fn confirm_overwrite(secret: &str) -> Result<bool, String> {
+    eprint!("secret `{secret}` already has a stored value — overwrite? [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    let read = std::io::stdin().lock().read_line(&mut line).map_err(|e| format!("reading confirmation from stdin: {e}"))?;
+    Ok(read > 0 && matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
 /// The full `secrets put <name>` client flow: read the value from THIS
 /// process's own stdin (stdin-only intake, module doc) — prompting with
 /// echo hidden when stdin is a terminal (P-V4e), reading straight through
 /// unchanged when it's piped/redirected (the historical shape) — then
 /// [`put`] it over `socket_path`. The value exists only as this function's
-/// own local `String`, from the stdin read to the `put()` call — never
+/// own local `String`, from the stdin read to the `put()` call(s) — never
 /// returned, never logged, never touching argv.
-pub fn run_put(secret: &str, socket_path: &Path) -> Result<(), String> {
+///
+/// **P-67:** `force` (the CLI's `--force` flag) rides as `overwrite` on the
+/// FIRST attempt — a forced put always succeeds in one round trip, tty or
+/// not. Only when `force` is false and the broker refuses with
+/// [`PutError::Exists`] does this branch on [`stdin_is_tty`] a second time:
+/// a tty gets [`confirm_overwrite`]'s `y/N` prompt and, on yes, a SECOND
+/// `put` with the SAME value and `overwrite: true` — the caller is never
+/// asked to retype it; a non-tty stdin gets [`non_tty_exists_message`] and
+/// aborts. Returns the human-facing success message ("stored" vs.
+/// "replaced", so the CLI's own `Outcome` can say which happened) or a
+/// value-free error string.
+pub fn run_put(secret: &str, socket_path: &Path, force: bool) -> Result<String, String> {
     let value = if stdin_is_tty() {
         read_hidden_line(&format!("value for `{secret}` (input hidden): "))?
     } else {
@@ -327,7 +425,28 @@ pub fn run_put(secret: &str, socket_path: &Path) -> Result<(), String> {
             .map_err(|e| format!("reading value from stdin: {e}"))?;
         value
     };
-    put(socket_path, secret, &value)
+
+    match put(socket_path, secret, &value, force) {
+        Ok(true) => Ok(format!("replaced secret `{secret}`'s stored value")),
+        Ok(false) => Ok(format!("stored secret `{secret}`")),
+        Err(PutError::Other(e)) => Err(e),
+        Err(PutError::Exists) => {
+            if !stdin_is_tty() {
+                return Err(non_tty_exists_message(secret));
+            }
+            if !confirm_overwrite(secret)? {
+                return Err(format!("secret `{secret}` left unchanged"));
+            }
+            match put(socket_path, secret, &value, true) {
+                Ok(true) => Ok(format!("replaced secret `{secret}`'s stored value")),
+                Ok(false) => Ok(format!("stored secret `{secret}`")),
+                Err(PutError::Other(e)) => Err(e),
+                Err(PutError::Exists) => {
+                    Err(format!("secret `{secret}`: the broker refused the confirmed overwrite unexpectedly"))
+                }
+            }
+        }
+    }
 }
 
 /// Spawn `cmd`, `var`=`value` injected, `Stdio::inherit()` throughout
@@ -509,8 +628,9 @@ mod tests {
     #[test]
     fn put_against_a_dead_socket_is_a_connect_error() {
         let dead = Path::new("/tmp/aoide-secrets-nonexistent-put-test.sock");
-        let err = put(dead, "t", "irrelevant").unwrap_err();
-        assert!(err.contains("connecting"), "{err}");
+        let err = put(dead, "t", "irrelevant", false).unwrap_err();
+        assert!(matches!(err, PutError::Other(_)), "{err}");
+        assert!(err.to_string().contains("connecting"), "{err}");
     }
 
     // ── P-V4e: `secrets put`'s tty prompt ───────────────────────────────
@@ -531,6 +651,73 @@ mod tests {
         // Trailing spaces in a pasted value are NOT eaten — only the one
         // newline the Enter key produced, never a blanket `.trim_end()`.
         assert_eq!(strip_one_trailing_newline("hunter2  \n".to_string()), "hunter2  ");
+    }
+
+    // ── P-67: warn-before-overwrite ─────────────────────────────────────
+
+    #[test]
+    fn non_tty_exists_message_teaches_the_force_spelling() {
+        let msg = non_tty_exists_message("db-prod");
+        assert!(msg.contains("already has a stored value"), "{msg}");
+        assert!(msg.contains("--force"), "{msg}");
+        assert!(
+            msg.contains("printf %s <value> | aoide secrets put db-prod --force"),
+            "must spell out the exact fix: {msg}"
+        );
+    }
+
+    /// End-to-end proof that [`put`] surfaces the wire's `exists` flag as
+    /// [`PutError::Exists`] (never inferred by matching `error` prose) and
+    /// that `overwrite: true` reports `replaced: true` back — a REAL
+    /// broker + socket round trip, same shape as `commands.rs`'s own
+    /// `require_totp_on_add_births_a_gated_policy_denied_without_a_code`.
+    #[test]
+    fn put_reports_exists_then_replaced_true_through_a_real_broker() {
+        let home = std::env::temp_dir().join(format!(
+            "aoide-secrets-client-put-overwrite-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        crate::store::save_policies(&home, &[crate::policy::Policy::new("t", "file", "k")]).unwrap();
+
+        // A short /tmp-direct socket path — sockaddr_un's ~108-byte
+        // sun_path can overflow under a nested tempdir (same SUN_LEN
+        // caution `tests/e2e.rs`/`commands.rs`'s own TOTP e2e test document).
+        let socket_path = std::path::PathBuf::from(format!(
+            "/tmp/aoide-secrets-client-put-overwrite-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+
+        let home_for_thread = home.clone();
+        let sock_for_thread = socket_path.clone();
+        let broker_thread = std::thread::spawn(move || {
+            let _ = crate::broker::serve(&home_for_thread, &sock_for_thread);
+        });
+
+        let mut connected = false;
+        for _ in 0..50 {
+            if UnixStream::connect(&socket_path).is_ok() {
+                connected = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(connected, "broker did not bind {} in time", socket_path.display());
+
+        // First put: no stored value yet -> `replaced: false`.
+        assert_eq!(put(&socket_path, "t", "first-value", false), Ok(false));
+
+        // Second put, no overwrite: the DISTINCT exists refusal.
+        assert_eq!(put(&socket_path, "t", "attempted-overwrite", false), Err(PutError::Exists));
+
+        // Third put, overwrite: true -> `replaced: true`.
+        assert_eq!(put(&socket_path, "t", "second-value", true), Ok(true));
+
+        drop(broker_thread);
+        std::fs::remove_file(&socket_path).ok();
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

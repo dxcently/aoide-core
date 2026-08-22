@@ -42,16 +42,30 @@
 //!   [`require_cli`] gate as the admin quartet (an agent putting values is
 //!   exactly what the design forbids), then it delegates the stdin-read +
 //!   socket round trip to `crate::client::run_put`. This differs from
-//!   `exec`/`enroll` in the one way that matters: `put`'s wire reply
-//!   carries NO value at all (`{"ok":true}` or `{"ok":false,"error":...}`),
-//!   and its own success/failure message is name-only
-//!   (`format!("put secret \`{name}\`")`) — so nothing about its return
-//!   path ever needs to bypass the generic `Outcome` envelope the way a
-//!   FETCHED value (`exec`) or a PRINTED secret (`enroll`) would. **P-V4e:**
-//!   when stdin is a terminal, `crate::client::run_put` now prompts on
-//!   STDERR and reads the value with terminal echo disabled instead of
-//!   requiring a pipe — see that module's doc; a piped/redirected stdin is
-//!   byte-identical to before.
+//!   `exec`/`enroll` in the one way that matters: `put`'s wire reply never
+//!   carries a value (`{"ok":true,"replaced":bool}` or
+//!   `{"ok":false,"error":...}` — P-67 below adds the `replaced`/`exists`
+//!   fields, still no value either way), and its own success/failure
+//!   message is name-only — so nothing about its return path ever needs to
+//!   bypass the generic `Outcome` envelope the way a FETCHED value (`exec`)
+//!   or a PRINTED secret (`enroll`) would. **P-V4e:** when stdin is a
+//!   terminal, `crate::client::run_put` now prompts on STDERR and reads the
+//!   value with terminal echo disabled instead of requiring a pipe — see
+//!   that module's doc; a piped/redirected stdin is byte-identical to
+//!   before. **P-67 ("warn before overwrite", this commit):** `put` gained
+//!   a `--force` flag. Without it, overwriting a secret that already has a
+//!   stored value is refused by the broker (`crate::broker::put_gate`'s
+//!   `DeniedExists`); on a tty, `crate::client::run_put` turns that refusal
+//!   into a `y/N` confirmation and, on yes, re-sends the SAME in-memory
+//!   value with `overwrite: true` — the caller never retypes it. On a
+//!   piped stdin there is no one to confirm with, so the refusal teaches
+//!   `--force` instead. `--force` skips the confirmation entirely (works
+//!   on a tty too) by sending `overwrite: true` on the very first attempt.
+//!   [`handle_secrets_put`]'s own job barely changes: it reads the new
+//!   `force` flag and passes it through to `run_put`, and reports the
+//!   message `run_put` returns ("stored" vs. "replaced") instead of a
+//!   fixed string, so the human (and the audit trail, via `broker::
+//!   audit_put`'s new `replaced` field) sees which one happened.
 //! - `set-totp` (P-V4e) — `secrets set-totp <name> on|off`: flips an
 //!   EXISTING policy's `requireTotp` bit without hand-editing `policy.json`.
 //!   Same `require_cli` gate as the rest of the admin surface; unknown name
@@ -188,13 +202,19 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["secrets", "put"],
-        summary: "Store a value for an EXISTING secret's policy, read from stdin (never argv) — prompts on stderr with input hidden when stdin is a terminal, reads piped bytes byte-identically otherwise. CLI-only — no TOTP, since put is admin-side, not agent-facing. The named policy's backend must carry a `set` template (the built-in `file` backend has one by default).",
+        summary: "Store a value for an EXISTING secret's policy, read from stdin (never argv) — prompts on stderr with input hidden when stdin is a terminal, reads piped bytes byte-identically otherwise. Warns and asks [y/N] before overwriting a secret that already has a stored value on a tty; a piped/non-interactive attempt to overwrite is refused and told to pass --force. CLI-only — no TOTP, since put is admin-side, not agent-facing. The named policy's backend must carry a `set` template (the built-in `file` backend has one by default).",
         args: [arg!("name", "string", true, "The secret's nickname — must already have a policy (`secrets add` first).")],
-        flags: [],
+        flags: [
+            flag!("force", "bool", "Store the value even if the secret already has one, skipping the overwrite confirmation. Required to overwrite from a piped/non-interactive stdin (no one to confirm with there).")
+        ],
         gated: false,
         implemented: true,
         handler: handle_secrets_put,
-        examples: ["printf %s hunter2 | aoide secrets put db-prod", "aoide secrets put db-prod"],
+        examples: [
+            "printf %s hunter2 | aoide secrets put db-prod",
+            "aoide secrets put db-prod",
+            "printf %s hunter2 | aoide secrets put db-prod --force"
+        ],
     ));
     r.insert(cmd!(
         path: ["secrets", "set-totp"],
@@ -447,18 +467,19 @@ fn handle_secrets_revoke(inv: &Invocation) -> Outcome {
     )
 }
 
-/// `secrets put <name>` (P-V4c) — CLI-only via the SAME [`require_cli`]
-/// gate as the admin quartet (module doc: an agent putting values is
-/// exactly what the design forbids), then a PLAIN delegation to
-/// `crate::client::run_put`, which reads the value from stdin and does the
-/// socket round trip. The returned [`Outcome`]'s message is name-only —
-/// `crate::client::run_put`'s `Result<(), String>` carries no value on
-/// either arm (put's own wire reply never has one either), so there is
-/// nothing here that could put the value on this envelope even by
-/// accident.
+/// `secrets put <name>` (P-V4c, `--force` P-67) — CLI-only via the SAME
+/// [`require_cli`] gate as the admin quartet (module doc: an agent putting
+/// values is exactly what the design forbids), then a PLAIN delegation to
+/// `crate::client::run_put`, which reads the value from stdin, warns +
+/// confirms before an overwrite (module doc), and does the socket round
+/// trip(s). The returned [`Outcome`]'s message is exactly what `run_put`
+/// reports ("stored" vs. "replaced" on success) — `crate::client::
+/// run_put`'s `Result<String, String>` carries no VALUE on either arm
+/// (put's own wire reply never has one either), so there is nothing here
+/// that could put the secret's value on this envelope even by accident.
 fn handle_secrets_put(inv: &Invocation) -> Outcome {
     let cmd = "secrets.put";
-    const USAGE: &str = "usage: secrets put <name> (value read from stdin)";
+    const USAGE: &str = "usage: secrets put <name> [--force] (value read from stdin)";
     if let Some(hint) = require_cli(inv, cmd) {
         return hint;
     }
@@ -474,8 +495,9 @@ fn handle_secrets_put(inv: &Invocation) -> Outcome {
             ),
         );
     }
-    match crate::client::run_put(&name, &crate::socket::socket_path()) {
-        Ok(()) => Outcome::ok(cmd, format!("put secret `{name}`")),
+    let force = inv.flag_present("force");
+    match crate::client::run_put(&name, &crate::socket::socket_path(), force) {
+        Ok(message) => Outcome::ok(cmd, message),
         Err(e) => Outcome::error(cmd, e),
     }
 }

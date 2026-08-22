@@ -48,6 +48,22 @@
 //! [`client::run_put`] now prompts on stderr with echo disabled when
 //! stdin is a terminal (a piped/redirected stdin is unchanged).
 //!
+//! **P-67 (this commit) makes `secrets put` warn and confirm before an
+//! overwrite.** The wire's `put` op gains an optional `overwrite` bool
+//! (absent means `false`); [`broker::put_gate`] probes existence via
+//! [`backend::has_value`] and refuses with a distinct `{"exists":true}`
+//! reply rather than silently clobbering a secret that already has a
+//! stored value — the existence check is BROKER-SIDE ONLY, since the
+//! client must never fetch a value to find out, and a client-side file
+//! peek would break the uid boundary outright. [`commands::
+//! handle_secrets_put`] gained a `--force` flag; [`client::run_put`] sends
+//! it as `overwrite` on the first attempt, and on an `exists` refusal
+//! ([`client::PutError::Exists`]) prompts `y/N` on a tty (retrying with
+//! the SAME in-memory value + `overwrite:true` on yes) or refuses outright
+//! and teaches `--force` on a non-tty stdin ([`client::
+//! non_tty_exists_message`]). A put with no stored value yet is unaffected
+//! — no prompt, no warning, same as before this feature.
+//!
 //! See `README.md` for the wire shape and the release-to-client flow, and
 //! `AGENTS.md` for the invariants a change here must hold — most
 //! importantly: a secret's VALUE never appears on a `Serialize`/

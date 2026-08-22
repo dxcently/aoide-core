@@ -228,7 +228,7 @@ fn put_then_get_round_trips_through_the_real_socket_with_the_seeded_file_backend
     assert!(connected, "broker did not bind {} in time", socket_path.display());
 
     // ── put ──────────────────────────────────────────────────────────
-    client::put(&socket_path, "filed", "sentinel-put-value").unwrap();
+    assert_eq!(client::put(&socket_path, "filed", "sentinel-put-value", false).unwrap(), false);
 
     // The seeded `file` backend's contract: 0600 file under a 0700 store
     // dir, named after the POLICY's `key` (not the secret's own name).
@@ -247,8 +247,13 @@ fn put_then_get_round_trips_through_the_real_socket_with_the_seeded_file_backend
     let value = client::resolve(&socket_path, "filed", "m", None, None).unwrap();
     assert_eq!(value, "sentinel-put-value");
 
-    // ── overwrite: a second put replaces the value wholesale ───────────
-    client::put(&socket_path, "filed", "second-value").unwrap();
+    // ── a bare second put (no `overwrite`) is the P-67 exists refusal ──
+    let denied = client::put(&socket_path, "filed", "attempted-overwrite", false).unwrap_err();
+    assert_eq!(denied, client::PutError::Exists);
+    assert_eq!(read_to_string(&stored_file), "sentinel-put-value", "a refused put must never touch the store");
+
+    // ── overwrite: true replaces the value wholesale ────────────────────
+    assert_eq!(client::put(&socket_path, "filed", "second-value", true).unwrap(), true);
     assert_eq!(client::resolve(&socket_path, "filed", "m", None, None).unwrap(), "second-value");
 
     // ── neither audit log ever carries the value ────────────────────────

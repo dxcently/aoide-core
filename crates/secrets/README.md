@@ -41,7 +41,15 @@ the broker and every later admin verb (including the correctly-spelled
 that touches `policy.json`/`totp.secret` now refuses outright when the
 process's effective uid doesn't own the secrets home, before it ever reads
 or writes that file — see "Admin verbs" below and `AGENTS.md`'s matching
-invariant for the exact shape.
+invariant for the exact shape. **P-67 (this commit) closes the live UX gap
+the User hit next**: `secrets put` used to silently overwrite an existing
+value. `put`'s wire op gained an optional `overwrite` field (P-V4c's `put`,
+extended, not a new op); the broker now refuses an overwrite attempt with a
+machine-readable `{"exists":true}` reply unless `overwrite:true` rides the
+wire, and `secrets put` gained a `--force` flag that sets it — on a tty
+without `--force`, the refusal becomes a `y/N` confirmation instead of a
+hard stop. See "The write flow" below for the full flow and
+`CONTRACTS.md`'s "Secrets wire" subsection for the wire-compat notes.
 
 `secrets enroll` generates a fresh 20-byte secret from `/dev/urandom`,
 persists it (`store::save_totp_secret`, `0600`), and prints its
@@ -84,23 +92,59 @@ Release-to-client is honest, not a leak: a same-uid agent with a valid
 code/grant could always read the value once released; the grant/code IS
 the gate, not the transport.
 
-## The write flow (`secrets put`, P-V4c)
+## The write flow (`secrets put`, P-V4c; warn-before-overwrite, P-67)
 
 The write-side mirror of the flow above, and it goes the OTHER direction —
 a value flows CLIENT-to-broker, never released back:
 
 ```
-operator/service -> aoide secrets put <name>   (value read from STDIN, never argv)
-                  -> client (caller uid) connects, sends {op:"put", secret, value}
+operator/service -> aoide secrets put <name> [--force]   (value read from STDIN, never argv)
+                  -> client (caller uid) connects, sends
+                     {op:"put", secret, value, overwrite:<bool>?}
                      (stdin is a terminal -> prompt on stderr, echo hidden;
                      stdin is piped/redirected -> read straight through, unchanged)
                   -> broker (secrets uid): policy gate (secret has a policy —
-                     `put` NEVER auto-creates one, `secrets add` owns that —
-                     and its backend has a `set` template) -> pipes `value`
-                     to the template's OWN stdin, runs it AS SECRETS UID
-                  -> client learns granted/denied from the reply; there is
+                     `put` NEVER auto-creates one, `secrets add` owns that)
+                     -> IF overwrite is false/absent AND the secret already
+                     has a stored value (probed via the backend's OWN `get`
+                     template, broker-side only) -> refuse with the distinct
+                     {"exists":true} reply, backend never touched
+                     -> ELSE (no existing value, or overwrite:true): backend
+                     has a `set` template -> pipes `value` to the template's
+                     OWN stdin, runs it AS SECRETS UID
+                  -> client learns granted/denied (and, on success, whether
+                     it REPLACED an existing value) from the reply; there is
                      no value in it either way
 ```
+
+**Warn before overwrite (P-67)** — the User's own complaint: `put`
+overwrote a secret with an existing value silently. The existence check is
+BROKER-SIDE, never the client's: the client must never fetch the value to
+find out (that would be a `resolve`-shaped leak on an op that isn't
+`resolve`), and a client-side file peek is structurally impossible anyway —
+the client doesn't run as the secrets uid, so it can't see the backing
+store. `crate::backend::has_value` is the probe: it just runs the SAME
+`get` template `resolve` would and treats success as "has a value" — every
+`get` template's contract already IS "exit 0 with the value on stdout when
+it exists, non-zero otherwise" ("Backend presets" below), so there is no
+new per-backend primitive and no special-casing of the built-in `file`
+backend.
+
+On a tty, `client::run_put` turns the broker's `exists` refusal into a
+`y/N` confirmation (`secret \`<name>\` already has a stored value —
+overwrite? [y/N]`, default No, read from the SAME stdin the value came
+from) — a yes re-sends the value ALREADY held in memory with
+`overwrite:true`, never asking the caller to retype it; a no or EOF aborts
+with an "unchanged" message. On a piped/non-interactive stdin there is no
+one to ask, so the refusal teaches the fix instead:
+`printf %s <value> | aoide secrets put <name> --force`. `secrets put
+<name> --force` sends `overwrite:true` on the very FIRST attempt, skipping
+the confirmation on a tty too. A `put` on a secret with no stored value is
+unaffected either way — no prompt, no warning, same as before this
+feature. The success message says which happened ("stored" a new value vs.
+"replaced" an existing one), and `broker::audit_put`'s `replaced` field
+carries the same distinction into both audit logs (names only, never the
+value).
 
 `put` carries NO `consumer` field and is NEVER gated by `requireTotp`
 (deliberate): `secrets put` is CLI-only (`commands::handle_secrets_put`'s
@@ -139,20 +183,32 @@ BYTE-IDENTICAL to before: `client::stdin_is_tty` is false in that case and
 <- {"ok":true,"value":"<value>"}                    (granted)
 <- {"ok":false,"error":"<value-free message>"}      (denied/error)
 
--> {"op":"put","secret":"<name>","value":"<value>"}
-<- {"ok":true}                                      (stored)
+-> {"op":"put","secret":"<name>","value":"<value>","overwrite":<bool>?}
+<- {"ok":true,"replaced":<bool>}                    (stored — `replaced`
+                                                      says whether an
+                                                      existing value was
+                                                      clobbered, P-67)
+<- {"ok":false,"exists":true,"error":"<message>"}   (P-67: refused — the
+                                                      secret already has a
+                                                      stored value and
+                                                      `overwrite` was
+                                                      false/absent)
 <- {"ok":false,"error":"<value-free message>"}      (denied/error)
 ```
 
-`totp`/`argv0` are optional on `resolve`; `put` has neither. `consumer` is
-SELF-ASSERTED (the V1 ruling `replay.rs` carries): the policy's
-`consumers[]` list is the real gate, never caller identity. `argv0` (the
-wrapped command's own argv[0], sent by `secrets exec`) exists purely so the
-broker's audit lines can name it — the broker never runs it. `totp` is
-consulted ONLY when the resolved policy has `requireTotp: true`
-(`broker::verify_totp_gate`) — on a policy without it, or on a `put`
-(never checked at all), `totp` rides the wire unread if present, same as
-before P-V3.
+`totp`/`argv0` are optional on `resolve`; `put` has neither, but gained
+`overwrite` at P-67 (also optional — absent means `false`, same shape as
+`resolve`'s own optional fields). `consumer` is SELF-ASSERTED (the V1
+ruling `replay.rs` carries): the policy's `consumers[]` list is the real
+gate, never caller identity. `argv0` (the wrapped command's own argv[0],
+sent by `secrets exec`) exists purely so the broker's audit lines can name
+it — the broker never runs it. `totp` is consulted ONLY when the resolved
+policy has `requireTotp: true` (`broker::verify_totp_gate`) — on a policy
+without it, or on a `put` (never checked at all), `totp` rides the wire
+unread if present, same as before P-V3. The `exists` flag on a denied
+`put` is what a consumer of this wire checks — never string-matching the
+`error` text — to tell "already has a value" apart from every other
+denial.
 
 Both replies are hand-built `serde_json::Value` (`serde_json::json!`),
 never a `#[derive(Serialize)]` struct — see "Invariants held" below.
@@ -523,7 +579,11 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   decision. `pass`/`gopass`/`bw`/`sops` are DOC PRESETS ("Backend presets"
   above), not code — this module has no knowledge of any specific backend;
   `file` is the one backend that ships as SEEDED DATA rather than mere
-  documentation, still through the same template mechanism.
+  documentation, still through the same template mechanism. `has_value`
+  (P-67) is the existence probe behind "warn before overwrite" — just
+  `fetch_value(...).is_ok()`, since a `get` template's own contract already
+  IS "exit 0 with the value on stdout when it exists" for every backend
+  above; no new per-backend primitive, no special-casing of `file`.
 - `store` — secrets-home file persistence, all write-temp-then-rename +
   `home::secure_dir`/`secure_file`: `load_policies`/`save_policies`
   (`policy.json`, P-V2); `load_totp_secret`/`save_totp_secret`
@@ -542,18 +602,32 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   `verify_totp_gate` for a `requireTotp` policy — P-V3), and BOTH audit
   writes (the broker's own `audit.log` in secrets home + the mirrored aoide log
   via `EventClass::Secret`) — see its module doc for the full wire
-  contract and the "broker-side only" audit discipline.
+  contract and the "broker-side only" audit discipline. `put_gate` (P-V4c,
+  extended P-67) returns a `PutOutcome` (`Granted { replaced }` /
+  `DeniedExists` / `Denied(reason)`) rather than a plain
+  `Result` — `handle_put` maps that onto the wire's `replaced`/`exists`
+  fields, and `audit_put` carries the same `replaced` distinction into
+  both audit logs (names only, never the value) — see "The write flow"
+  (README) and this module's own doc for the full P-67 shape.
 - `client` — `resolve` (one round trip over the socket), `parse_exec_args`
   (pure `Invocation` parsing), `run_exec` (the full `secrets exec` flow: the
   entry point for `aoide-cli`'s `special` hook); `put` (P-V4c, one `put`
-  round trip over the socket, mirrors `resolve`'s shape) and `run_put`
-  (P-V4c, reads the value from THIS process's own stdin then calls `put` —
-  the full `secrets put` flow, but a PLAIN function called from
-  `commands::handle_secrets_put`, not a `cli`-crate `special`-hook case).
+  round trip over the socket, mirrors `resolve`'s shape; P-67: takes an
+  `overwrite` bool, returns `Result<bool, PutError>` where the `bool` is
+  `replaced` and `PutError::Exists` is the wire's distinct `{"exists":true}`
+  refusal, never inferred from `error` prose) and `run_put` (P-V4c, reads
+  the value from THIS process's own stdin then calls `put` — the full
+  `secrets put` flow, but a PLAIN function called from
+  `commands::handle_secrets_put`, not a `cli`-crate `special`-hook case;
+  P-67: takes a `force` bool — the CLI's `--force` — and, on a tty
+  `PutError::Exists` refusal, prompts `y/N` and retries with
+  `overwrite:true` on yes, never asking the caller to retype the value).
   `describe_connect_error` (this section's "socket-connect failure" case
   above) is the shared connect-error diagnosis both `resolve` and `put`
   route through — pure given an injected `io::Error`, unit-tested without a
-  real socket.
+  real socket. `non_tty_exists_message` (P-67) is the pure message builder
+  behind the non-interactive "refuses and teaches `--force`" path — testable
+  without faking a tty.
 - `commands` — `register(&mut Registry)`: NINE verbs, ALL CLI-only.
   `serve`/`exec`/`enroll` are door-hint handlers (the real work happens in
   `cli`'s `special` hook, same pattern as `a2a serve`/`conductor`); `add`/

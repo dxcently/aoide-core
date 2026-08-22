@@ -75,6 +75,14 @@
 //! (the `set` template's stdout, if any, is discarded — a `set` template
 //! has nothing useful to report back over the wire, unlike `get`'s stdout
 //! which IS the value).
+//!
+//! [`has_value`] (P-67, "warn before overwrite") is the broker-side
+//! existence probe `broker::put_gate` uses to decide whether an
+//! `overwrite:false` `put` should be refused: it just runs the `get`
+//! template and reports success/failure, since that IS every backend's
+//! existence contract already (`README.md`'s "Backend presets" table) —
+//! no new per-backend primitive, no special-casing of the built-in `file`
+//! backend.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -204,6 +212,28 @@ pub fn fetch_value(secrets_home: &Path, backend_name: &str, key: &str) -> Result
         stdout.pop();
     }
     String::from_utf8(stdout).map_err(|_| format!("backend `{backend_name}` produced non-UTF-8 output"))
+}
+
+/// Cheap-as-possible existence probe for a secret's STORED value (P-67,
+/// "warn before overwrite" — `secrets put` warns+confirms before clobbering
+/// an existing value, and the broker-side check backing that lives here):
+/// runs the SAME `get` template [`fetch_value`] would and treats success as
+/// "has a value", any failure (a missing file, an unknown backend, a spawn
+/// error, a non-zero exit, ...) as "no stored value yet". This is exactly
+/// the contract every `get` template in this crate's "Backend presets"
+/// table already commits to — `cat`, `pass show`, `gopass show -o`, `bw get
+/// password`, `sops -d --extract` all exit non-zero on a missing entry and
+/// zero with the value on stdout otherwise — so there is no separate
+/// "does it exist" primitive to add per backend, and no special-casing of
+/// the built-in `file` backend either (house rule 7: no special-cased Rust
+/// reads this backend's bytes — [`Backend`]'s shape carries only `get`/
+/// `set` templates, nothing else this function could probe more cheaply
+/// against). A backend that is merely misconfigured (unknown name, a
+/// spawn failure) also reads as "no stored value" here — harmless, since
+/// [`store_value`] re-checks the same policy/backend on the write that
+/// follows and surfaces the real error there if the caller proceeds.
+pub fn has_value(secrets_home: &Path, backend_name: &str, key: &str) -> bool {
+    fetch_value(secrets_home, backend_name, key).is_ok()
 }
 
 /// Resolve `backend_name`'s `set` template against `key`/`secrets_home`, run
@@ -462,6 +492,42 @@ mod tests {
         let home = tmp_home("literaltoken");
         write_backends(&home, "printf %s {name}");
         assert_eq!(fetch_value(&home, "scratch", "weird{home}key").unwrap(), "weird{home}key");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── has_value (P-67, "warn before overwrite") ───────────────────────
+
+    #[test]
+    fn has_value_is_true_when_the_get_template_succeeds() {
+        let home = tmp_home("hasvalue-true");
+        write_backends(&home, "printf %s {name}");
+        assert!(has_value(&home, "scratch", "stored-value"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn has_value_is_false_when_the_get_template_fails() {
+        let home = tmp_home("hasvalue-false");
+        write_backends(&home, "false");
+        assert!(!has_value(&home, "scratch", "x"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn has_value_is_false_on_an_unknown_backend() {
+        let home = tmp_home("hasvalue-unknown");
+        write_backends(&home, "printf %s {name}");
+        assert!(!has_value(&home, "nope", "x"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn the_seeded_file_backend_reports_no_value_until_one_is_stored() {
+        let home = tmp_home("hasvalue-file");
+        seed_default_backends(&home).unwrap();
+        assert!(!has_value(&home, "file", "my-secret-key"), "a fresh file backend must report no stored value");
+        store_value(&home, "file", "my-secret-key", "the-stored-value").unwrap();
+        assert!(has_value(&home, "file", "my-secret-key"), "after a store, has_value must report true");
         std::fs::remove_dir_all(&home).ok();
     }
 
