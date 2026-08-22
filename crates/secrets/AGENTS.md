@@ -1,4 +1,4 @@
-# AGENTS.md — aoide-vault
+# AGENTS.md — aoide-secrets
 
 ## Invariants
 
@@ -36,7 +36,7 @@
   policy fall back to treating itself as a standing grant just because an
   enrollment exists; the code (or its absence) is what decides.
 - **`ReplayLedger` keys on timestep ALONE, never on consumer** (ruling,
-  Fable, 2026-08-22, P-V1 review escalation — plan file's VAULT §Policy
+  Fable, 2026-08-22, P-V1 review escalation — plan file's SECRETS §Policy
   section). The resolve wire's `consumer` field is self-asserted; a
   per-consumer ledger would let one typed code redeem once per invented
   label. Don't reintroduce a consumer dimension to `replay::ReplayLedger`
@@ -52,7 +52,7 @@
   on purpose (plan mandate) — do not reach for a `sha1`/`hmac`/`totp-lite`/
   `data-encoding` crate to "simplify" this later; the RFC test vectors are
   the contract that makes the hand-rolled version trustworthy, and the
-  whole point is that the vault doesn't carry a supply-chain dependency
+  whole point is that the secrets broker doesn't carry a supply-chain dependency
   for something ~150 lines of tested Rust does directly. `serde`/
   `serde_json` are the only exception (record-shape (de)serialization, not
   cryptography).
@@ -65,22 +65,22 @@
   `aoide_storage::peer_store::valid_peer_name`**, and this crate does NOT
   depend on `aoide-storage` to reuse the looser one — see `policy.rs`'s
   module doc for the exact delta (no leading/trailing hyphen, no `--`
-  run). Don't "consolidate" the two without re-deriving why vault secret
+  run). Don't "consolidate" the two without re-deriving why secrets secret
   names are held to a tighter bar (they name on-disk backend-store paths
   under a privileged uid; a peer name only names a JSON cache file).
 - **I/O is confined to six named modules: `broker`, `client`, `store`,
   `backend`, `enroll` (P-V3), and each module's own `#[cfg(test)]` block.**
   `sha1`/`hmac`/`totp`/`base32`/`uri`/`replay`/`policy` stay pure — no
-  `SystemTime::now()`, no socket, no `exec`, no reads/writes of vault home
+  `SystemTime::now()`, no socket, no `exec`, no reads/writes of secrets home
   in any of them. This is the P-V2 narrowing of the old P-V1 rule ("nothing
   in this crate performs I/O" — true then because there were no I/O
   modules yet), widened once more at P-V3 for `enroll`'s `/dev/urandom`/
   `gethostname`/`qrencode` calls; the boundary moves as new I/O concerns
   earn their own named module, it does not disappear. `enroll` itself
-  never writes a vault-home FILE directly — that stays `store`'s job
+  never writes a secrets-home FILE directly — that stays `store`'s job
   (`enroll::run` calls `store::save_totp_secret`/`save_replay_ledger`).
-- **`home::vault_home`/`socket::socket_path` are THE resolution — nothing
-  else re-derives a vault-home or socket path.** `broker::serve`/
+- **`home::secrets_home`/`socket::socket_path` are THE resolution — nothing
+  else re-derives a secrets-home or socket path.** `broker::serve`/
   `client::resolve`/`client::run_exec` all take the resolved `&Path` as a
   PARAMETER rather than calling `home`/`socket` internally — this is
   deliberate (keeps them testable against an explicit tempdir/short
@@ -94,19 +94,19 @@
 ## Extension points
 
 - **A new hash/HMAC primitive** (this crate has none planned — SHA-1 is
-  fixed by RFC 6238's default and this vault's whole TOTP surface) would
+  fixed by RFC 6238's default and this crate's whole TOTP surface) would
   get its own module beside `sha1`/`hmac`, same zero-dependency rule, same
   RFC-vector-as-test-suite discipline.
-- **`vault enroll` + real TOTP verification LANDED at P-V3** —
+- **`secrets enroll` + real TOTP verification LANDED at P-V3** —
   `broker::verify_totp_gate` wires `totp::verify`/`replay::ReplayLedger`
   into `resolve_gate`'s `requireTotp` branch, and `store::
-  load_replay_ledger`/`save_replay_ledger` give the ledger its vault-home
+  load_replay_ledger`/`save_replay_ledger` give the ledger its secrets-home
   file.
 - **Deployment LANDED at P-V4** — `broker::bind_socket` chmods the socket
   to `0660` on bind (group-connectable is the DESIGN; group OWNERSHIP is
-  `modules/nucleus/vault.nix`'s job via the service's `Group=`, never this
+  `modules/nucleus/secrets.nix`'s job via the service's `Group=`, never this
   crate's — see `broker.rs`'s module doc and this file's own invariant
-  below). The real `/var/lib/aoide-vault` path and a real `aoide-vault`
+  below). The real `/var/lib/aoide-secrets` path and a real `aoide-secrets`
   system user are provisioned by that nix module (nix-dependent by design
   — root `AGENTS.md`'s HARD CONSTRAINT carves out systemd packaging) or by
   the non-nix `useradd`/`groupadd` path in `README.md`'s "Deployment"
@@ -115,9 +115,9 @@
 - **Backend adapter DOC PRESETS** (`pass`/`gopass`/`bw`/`sops`) landed at
   P-V3 in `README.md`'s "Backend presets" section — `backend.rs` itself is
   unchanged (it never gained backend-specific knowledge, by design). QR-
-  code rendering for `vault enroll`'s URI lives in `enroll::render_qr`
+  code rendering for `secrets enroll`'s URI lives in `enroll::render_qr`
   (`qrencode` shell-out, feature-detected, not a Cargo dependency).
-- **Vault pairing / mesh replica sharing** (P-V5, gated on #51) is a new
+- **Secrets pairing / mesh replica sharing** (P-V5, gated on #51) is a new
   module beside `broker`, not a growth of `broker`'s own resolve path —
   see the plan's "Mesh sharing" section for the separate loopback channel.
 
@@ -126,7 +126,7 @@
 - This `README.md` when a new module, wire shape, or dependency is added.
 - `pkgs/aoide/crates/AGENTS.md` for cross-crate invariants (registry
   order, golden discipline, per-crate tests) — not restated here.
-- The workspace `Cargo.toml`'s `aoide-vault` member comment and
+- The workspace `Cargo.toml`'s `aoide-secrets` member comment and
   `crates/cli/README.md`'s golden-path count when the verb set changes.
-- `CONTRACTS.md §3` (the core schema's command count) and its vault-home
+- `CONTRACTS.md §3` (the core schema's command count) and its secrets-home
   pointer note when the wire shape or file layout changes.

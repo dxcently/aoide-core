@@ -1,8 +1,8 @@
-//! `vault enroll`: the full TOTP-enrollment flow (P-V3), called from
+//! `secrets enroll`: the full TOTP-enrollment flow (P-V3), called from
 //! `aoide-cli`'s `special` hook exactly the way `broker::serve`/
 //! `client::run_exec` already are (`aoide-protocol`'s own `AGENTS.md`:
 //! "`door::run`'s `special` hook is the only sanctioned one-shot escape"
-//! from the generic `Outcome` envelope) — `commands::handle_vault_enroll`
+//! from the generic `Outcome` envelope) — `commands::handle_secrets_enroll`
 //! only gates the door and records the launch, [`run`] does everything
 //! else, including printing the secret DIRECTLY to stdout. That split
 //! exists for the same reason `serve`/`exec` are split the way they are:
@@ -14,9 +14,9 @@
 //! (`/dev/urandom`), the local hostname (`libc::gethostname`, same
 //! precedent as `aoide_storage::display::local_host_name` — see
 //! `Cargo.toml`'s comment for why this crate repeats rather than depends
-//! on it), and the `qrencode` shell-out. Vault-home file persistence
+//! on it), and the `qrencode` shell-out. Secrets-home file persistence
 //! itself stays `store`'s job ([`store::save_totp_secret`]/
-//! [`store::save_replay_ledger`]) — this module never writes a vault-home
+//! [`store::save_replay_ledger`]) — this module never writes a secrets-home
 //! file directly.
 
 use std::io::{Read, Write};
@@ -84,7 +84,7 @@ pub fn render_qr(uri: &str) -> Option<String> {
     String::from_utf8(output.stdout).ok()
 }
 
-/// The full `vault enroll` flow. ONE enrollment per host: an existing
+/// The full `secrets enroll` flow. ONE enrollment per host: an existing
 /// `totp.secret` is left untouched unless `force` is set, in which case
 /// the OLD secret AND its replay ledger are both replaced — a stale
 /// "already used" timestep from before a re-enrollment must never shadow
@@ -96,8 +96,8 @@ pub fn render_qr(uri: &str) -> Option<String> {
 /// never through an `Outcome`/JSON envelope (module doc) — and a QR code
 /// too when `qrencode` is reachable ([`render_qr`]'s feature-detect; its
 /// absence is a one-line hint, never an error).
-pub fn run(vault_home: &Path, force: bool) -> Result<(), String> {
-    match crate::store::load_totp_secret(vault_home) {
+pub fn run(secrets_home: &Path, force: bool) -> Result<(), String> {
+    match crate::store::load_totp_secret(secrets_home) {
         Ok(Some(_)) if !force => {
             return Err(
                 "TOTP is already enrolled on this host — pass --force to regenerate \
@@ -110,13 +110,13 @@ pub fn run(vault_home: &Path, force: bool) -> Result<(), String> {
     }
 
     let secret = generate_secret().map_err(|e| format!("generating a secret: {e}"))?;
-    crate::store::save_totp_secret(vault_home, &secret).map_err(|e| format!("writing totp.secret: {e}"))?;
+    crate::store::save_totp_secret(secrets_home, &secret).map_err(|e| format!("writing totp.secret: {e}"))?;
     // Re-enrollment resets the ledger too — see module/function doc.
-    crate::store::save_replay_ledger(vault_home, &crate::replay::ReplayLedger::new())
+    crate::store::save_replay_ledger(secrets_home, &crate::replay::ReplayLedger::new())
         .map_err(|e| format!("resetting the replay ledger: {e}"))?;
 
     let hostname = local_hostname();
-    let uri = crate::uri::totp_uri(&hostname, "aoide-vault", &secret);
+    let uri = crate::uri::totp_uri(&hostname, "aoide-secrets", &secret);
     let secret_b32 = crate::base32::encode(&secret);
 
     println!("{uri}");
@@ -164,7 +164,7 @@ mod tests {
     fn render_qr_returns_none_when_qrencode_is_absent_from_path() {
         let _guard = crate::env_lock().lock().unwrap();
         let saved_path = std::env::var("PATH").ok();
-        std::env::set_var("PATH", "/nonexistent-dir-for-aoide-vault-test");
+        std::env::set_var("PATH", "/nonexistent-dir-for-aoide-secrets-test");
         assert_eq!(render_qr("otpauth://totp/x"), None);
         match saved_path {
             Some(p) => std::env::set_var("PATH", p),
@@ -181,7 +181,7 @@ mod tests {
     fn render_qr_returns_the_shim_output_when_qrencode_is_present() {
         let _guard = crate::env_lock().lock().unwrap();
         let dir = std::env::temp_dir().join(format!(
-            "aoide-vault-enroll-test-qrshim-{}-{}",
+            "aoide-secrets-enroll-test-qrshim-{}-{}",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
@@ -210,7 +210,7 @@ mod tests {
 
     fn tmp_home(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "aoide-vault-enroll-run-test-{tag}-{}-{}",
+            "aoide-secrets-enroll-run-test-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));

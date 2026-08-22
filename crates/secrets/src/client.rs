@@ -1,7 +1,7 @@
-//! The `vault exec` client — RELEASE TO CLIENT, the plan's one subtle
+//! The `secrets exec` client — RELEASE TO CLIENT, the plan's one subtle
 //! decision (this crate's README's "Release-to-client flow"). The broker
-//! never execs the agent's command: it runs as the vault uid (wrong cwd/
-//! env, and the child would inherit vault privileges). Instead THIS
+//! never execs the agent's command: it runs as the secrets uid (wrong cwd/
+//! env, and the child would inherit secrets privileges). Instead THIS
 //! process — running as the CALLING uid — resolves the secret over the
 //! socket, then execs the wrapped command itself, `Stdio::inherit()`
 //! throughout.
@@ -25,7 +25,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Stdio;
 
-/// Parsed `vault exec` arguments — pure, no I/O, fully unit-testable
+/// Parsed `secrets exec` arguments — pure, no I/O, fully unit-testable
 /// without a running broker.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecArgs {
@@ -43,7 +43,7 @@ pub fn default_var_name(secret: &str) -> String {
     secret.to_uppercase().replace('-', "_")
 }
 
-/// Parse `aoide vault exec --as <consumer> --secret <name>[:VAR] [--totp N]
+/// Parse `aoide secrets exec --as <consumer> --secret <name>[:VAR] [--totp N]
 /// -- <cmd>` out of an already-parsed [`Invocation`]. `inv.args` is exactly
 /// the wrapped command + its args — `aoide_protocol::door::parse` already
 /// treats a bare `--` as ending flag parsing, so everything after it
@@ -53,12 +53,12 @@ pub fn parse_exec_args(inv: &Invocation) -> Result<ExecArgs, String> {
         .flags
         .get("as")
         .cloned()
-        .ok_or_else(|| "vault exec requires --as <consumer>".to_string())?;
+        .ok_or_else(|| "secrets exec requires --as <consumer>".to_string())?;
     let secret_flag = inv
         .flags
         .get("secret")
         .cloned()
-        .ok_or_else(|| "vault exec requires --secret <name>[:VAR]".to_string())?;
+        .ok_or_else(|| "secrets exec requires --secret <name>[:VAR]".to_string())?;
     let (secret, var) = match secret_flag.split_once(':') {
         Some((n, v)) if !v.is_empty() => (n.to_string(), v.to_string()),
         _ => {
@@ -73,7 +73,7 @@ pub fn parse_exec_args(inv: &Invocation) -> Result<ExecArgs, String> {
     let totp = inv.flags.get("totp").cloned();
     let cmd = inv.args.clone();
     if cmd.is_empty() {
-        return Err("vault exec requires a command after `--`".to_string());
+        return Err("secrets exec requires a command after `--`".to_string());
     }
     Ok(ExecArgs { consumer, secret, var, totp, cmd })
 }
@@ -88,7 +88,7 @@ pub fn resolve(
     argv0: Option<&str>,
 ) -> Result<String, String> {
     let mut stream = UnixStream::connect(socket_path)
-        .map_err(|e| format!("connecting to the vault broker at {}: {e}", socket_path.display()))?;
+        .map_err(|e| format!("connecting to the secrets broker at {}: {e}", socket_path.display()))?;
 
     let mut req = json!({ "op": "resolve", "secret": secret, "consumer": consumer });
     if let Some(t) = totp {
@@ -101,30 +101,30 @@ pub fn resolve(
     line.push('\n');
     stream
         .write_all(line.as_bytes())
-        .map_err(|e| format!("writing to the vault broker: {e}"))?;
+        .map_err(|e| format!("writing to the secrets broker: {e}"))?;
 
     let mut reader = BufReader::new(stream);
     let mut reply_line = String::new();
     reader
         .read_line(&mut reply_line)
-        .map_err(|e| format!("reading from the vault broker: {e}"))?;
+        .map_err(|e| format!("reading from the secrets broker: {e}"))?;
     if reply_line.trim().is_empty() {
-        return Err("the vault broker closed the connection with no reply".to_string());
+        return Err("the secrets broker closed the connection with no reply".to_string());
     }
     let reply: Value = serde_json::from_str(reply_line.trim())
-        .map_err(|e| format!("the vault broker sent an unparseable reply: {e}"))?;
+        .map_err(|e| format!("the secrets broker sent an unparseable reply: {e}"))?;
 
     if reply.get("ok").and_then(Value::as_bool) == Some(true) {
         reply
             .get("value")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .ok_or_else(|| "the vault broker's reply had no `value`".to_string())
+            .ok_or_else(|| "the secrets broker's reply had no `value`".to_string())
     } else {
         Err(reply
             .get("error")
             .and_then(Value::as_str)
-            .unwrap_or("the vault broker denied the request")
+            .unwrap_or("the secrets broker denied the request")
             .to_string())
     }
 }
@@ -146,7 +146,7 @@ fn spawn_with_secret(cmd: &[String], var: &str, value: &str) -> Result<i32, Stri
     Ok(status.code().unwrap_or(1))
 }
 
-/// The full `vault exec` client flow — parse, resolve over `socket_path`,
+/// The full `secrets exec` client flow — parse, resolve over `socket_path`,
 /// spawn with the value injected. Returns the process exit code to hand
 /// back from `main`: `2` (usage) for a bad invocation, `1` (error) for a
 /// denied resolve or a spawn failure, else the CHILD's own exit code.
@@ -154,7 +154,7 @@ pub fn run_exec(inv: &Invocation, socket_path: &Path) -> i32 {
     let args = match parse_exec_args(inv) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("aoide vault exec: {e}");
+            eprintln!("aoide secrets exec: {e}");
             return 2;
         }
     };
@@ -167,14 +167,14 @@ pub fn run_exec(inv: &Invocation, socket_path: &Path) -> i32 {
     ) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("aoide vault exec: {e}");
+            eprintln!("aoide secrets exec: {e}");
             return 1;
         }
     };
     match spawn_with_secret(&args.cmd, &args.var, &value) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("aoide vault exec: {e}");
+            eprintln!("aoide secrets exec: {e}");
             1
         }
     }
@@ -192,7 +192,7 @@ mod tests {
             flag_map.insert(k.to_string(), v.to_string());
         }
         Invocation {
-            path: vec!["vault".to_string(), "exec".to_string()],
+            path: vec!["secrets".to_string(), "exec".to_string()],
             args: args.iter().map(|s| s.to_string()).collect(),
             flags: flag_map,
             door: Door::Cli,
@@ -258,7 +258,7 @@ mod tests {
 
     #[test]
     fn resolve_against_a_dead_socket_is_a_connect_error() {
-        let dead = Path::new("/tmp/aoide-vault-nonexistent-test.sock");
+        let dead = Path::new("/tmp/aoide-secrets-nonexistent-test.sock");
         let err = resolve(dead, "t", "m", None, None).unwrap_err();
         assert!(err.contains("connecting"), "{err}");
     }

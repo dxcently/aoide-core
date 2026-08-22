@@ -4,7 +4,7 @@
 //! the same code accepted twice is rejected the second time, no matter
 //! what consumer name rides either request.
 //!
-//! RULING (Fable, 2026-08-22, P-V1 review escalation — plan file's VAULT
+//! RULING (Fable, 2026-08-22, P-V1 review escalation — plan file's SECRETS
 //! §Policy section carries the same text): the resolve wire's `consumer`
 //! field is SELF-ASSERTED — a label the calling agent picks, not an
 //! authenticated identity. A per-consumer ledger would let one
@@ -18,7 +18,7 @@
 //! function here takes the timestep/cutoff as a parameter the caller
 //! derived (typically from `totp::timestep(now)`); nothing in this
 //! module reads `SystemTime::now()`. V2's broker wraps this with the
-//! real clock and owns persisting it to vault home.
+//! real clock and owns persisting it to secrets home.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn serde_round_trip_survives_a_real_file_in_a_tempdir() {
         let dir = std::env::temp_dir().join(format!(
-            "aoide-vault-replay-test-{}-{}",
+            "aoide-secrets-replay-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

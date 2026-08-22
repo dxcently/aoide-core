@@ -37,11 +37,11 @@ dependencies = [
  "aoide-conduct",
  "aoide-conductor",
  "aoide-protocol",
+ "aoide-secrets",
  "aoide-server",
  "aoide-storage",
  "aoide-test-support",
  "aoide-upkeep",
- "aoide-vault",
  "crossterm",
  "ratatui",
  "serde",
@@ -122,6 +122,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aoide-secrets"
+version = "0.0.0"
+dependencies = [
+ "aoide-protocol",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "aoide-server"
 version = "0.0.0"
 dependencies = [
@@ -169,16 +179,6 @@ dependencies = [
  "aoide-protocol",
  "aoide-storage",
  "aoide-test-support",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "aoide-vault"
-version = "0.0.0"
-dependencies = [
- "aoide-protocol",
- "libc",
  "serde",
  "serde_json",
 ]

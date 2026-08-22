@@ -1,5 +1,5 @@
 //! `otpauth://` enrollment URI construction — pure string building for
-//! V3's `vault enroll`. Follows the de-facto Google Authenticator
+//! V3's `secrets enroll`. Follows the de-facto Google Authenticator
 //! key-uri format (no RFC of its own; the format every TOTP app
 //! interoperates on): `otpauth://totp/<issuer>:<label>?secret=<base32>&
 //! issuer=<issuer>&algorithm=SHA1&digits=6&period=30`.
@@ -23,7 +23,7 @@ fn percent_encode(s: &str) -> String {
 
 /// Build an `otpauth://totp/...` enrollment URI. `label` identifies the
 /// account/consumer shown in the authenticator app; `issuer` is the
-/// vault's identity (e.g. `aoide-vault@<host>`); `secret` is the raw
+/// the broker's identity (e.g. `aoide-secrets@<host>`); `secret` is the raw
 /// TOTP key (base32-encoded here — callers never pre-encode it). Fixed
 /// at this crate's RFC 6238 parameters: SHA1, 6 digits,
 /// [`crate::totp::STEP_SECONDS`].
@@ -44,21 +44,21 @@ mod tests {
     #[test]
     fn builds_the_expected_uri_shape() {
         let secret = b"12345678901234567890";
-        let uri = totp_uri("m", "aoide-vault", secret);
+        let uri = totp_uri("m", "aoide-secrets", secret);
         let expected_b32 = crate::base32::encode(secret);
         assert_eq!(
             uri,
             format!(
-                "otpauth://totp/aoide-vault:m?secret={expected_b32}&issuer=aoide-vault&algorithm=SHA1&digits=6&period=30"
+                "otpauth://totp/aoide-secrets:m?secret={expected_b32}&issuer=aoide-secrets&algorithm=SHA1&digits=6&period=30"
             )
         );
     }
 
     #[test]
     fn percent_encodes_reserved_characters_in_label_and_issuer() {
-        let uri = totp_uri("m consumer", "aoide vault: sakaki", b"x");
+        let uri = totp_uri("m consumer", "aoide secrets: sakaki", b"x");
         assert!(uri.contains("m%20consumer"));
-        assert!(uri.contains("aoide%20vault%3A%20sakaki"));
+        assert!(uri.contains("aoide%20secrets%3A%20sakaki"));
         // secret and query keys stay unescaped.
         assert!(uri.contains("secret="));
         assert!(uri.contains("&algorithm=SHA1&digits=6&period=30"));
@@ -67,7 +67,7 @@ mod tests {
     #[test]
     fn secret_round_trips_through_base32_in_the_uri() {
         let secret = b"a-real-looking-secret!!";
-        let uri = totp_uri("m", "aoide-vault", secret);
+        let uri = totp_uri("m", "aoide-secrets", secret);
         let encoded = crate::base32::encode(secret);
         assert!(uri.contains(&format!("secret={encoded}")));
         assert_eq!(crate::base32::decode(&encoded).unwrap(), secret);

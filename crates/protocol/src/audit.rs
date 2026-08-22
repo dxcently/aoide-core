@@ -81,8 +81,8 @@ pub enum EventClass {
     Content,
     /// Forwarded OS notifications — UNTRUSTED payload, wrapped as data.
     Notification,
-    /// Vault resolve-attempt mirror (Workstream VAULT, P-V2,
-    /// `aoide-vault`'s `broker` module): secret name, consumer,
+    /// Secrets-broker resolve-attempt mirror (Workstream SECRETS, P-V2,
+    /// `aoide-secrets`'s `broker` module): secret name, consumer,
     /// granted/denied, argv0 if the client sent one — NEVER a value.
     /// `untrusted_data` is FORBIDDEN on this class: a Secret event has no
     /// forwarded payload to carry (unlike `Notification`), and the value
@@ -117,7 +117,7 @@ pub fn now_secs() -> u64 {
 /// Creates the parent directory and the file if absent; idempotent per-call.
 ///
 /// **`EventClass::Secret` may never carry `untrusted_data`** (Workstream
-/// VAULT's audit design, `aoide-vault`'s `broker` module doc): a Secret
+/// SECRETS's audit design, `aoide-secrets`'s `broker` module doc): a Secret
 /// event mirrors a name-only resolve attempt (secret name, consumer,
 /// granted/denied) — never a value, and `untrusted_data` is exactly the
 /// field every other class uses to carry arbitrary forwarded text
@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn secret_class_via_the_audit_convenience_fn_carries_no_untrusted_data() {
         let log = tmp_log("via-audit-fn");
-        audit(&log, Door::Daemon, EventClass::Secret, "vault.resolve", "granted", "secret `t` for consumer `m`: granted").unwrap();
+        audit(&log, Door::Daemon, EventClass::Secret, "secrets.resolve", "granted", "secret `t` for consumer `m`: granted").unwrap();
         let lines = read_lines(&log);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].get("untrusted_data").is_none(), "{:?}", lines[0]);
@@ -226,7 +226,7 @@ mod tests {
             ts: now_secs(),
             door: Door::Daemon,
             class: EventClass::Secret,
-            command: "vault.resolve".to_string(),
+            command: "secrets.resolve".to_string(),
             status: "granted".to_string(),
             message: "secret `t` for consumer `m`: granted".to_string(),
             untrusted_data: Some("this must never be written".to_string()),

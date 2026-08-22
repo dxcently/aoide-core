@@ -16,7 +16,7 @@ other crate in this workspace sits above.
   returns.
 - `audit` — `append_audit`/`audit`/`Door`/`EventClass`/`audit_log_path`, the
   one audit log both doors write through (root `AGENTS.md` house rule 6).
-  `EventClass::Secret` (Workstream VAULT, P-V2) is the vault broker's
+  `EventClass::Secret` (Workstream SECRETS, P-V2) is the secrets broker's
   name-only mirror (secret name, consumer, granted/denied — never a
   value); `append_audit` structurally forbids `untrusted_data` on that one
   class, stripping it (with an `eprintln!`, never a panic — an audit call

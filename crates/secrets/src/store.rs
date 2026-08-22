@@ -3,16 +3,16 @@
 //! daemon reads/writes `state/policy.json` yet"). A tiny hand-rolled
 //! atomic write (temp file + rename), not a dependency on
 //! `aoide-storage::fs::atomic_write` — this crate stays off `aoide-storage`
-//! on purpose (`policy.rs`'s own module doc: vault doesn't reach into
+//! on purpose (`policy.rs`'s own module doc: this crate doesn't reach into
 //! storage even for a smaller win, reusing `valid_peer_name`; the same
 //! standoffishness applies here — atomic rename is ~5 lines to hand-roll
 //! and saves a cross-crate dependency for a one-file concern).
 //!
-//! **P-V3 adds two more vault-home files, same write-temp-then-rename +
+//! **P-V3 adds two more secrets-home files, same write-temp-then-rename +
 //! `home::secure_dir`/`secure_file` discipline:**
 //! - `totp.secret` ([`totp_secret_path`]/[`load_totp_secret`]/
 //!   [`save_totp_secret`]): the enrolled TOTP secret, RAW BYTES (not
-//!   base32-text) — `vault enroll` prints the human-facing base32/URI form
+//!   base32-text) — `secrets enroll` prints the human-facing base32/URI form
 //!   itself ([`crate::enroll::run`]), so there is no reason to also encode
 //!   the file this crate reads back; storing raw bytes means no decode
 //!   step on load. A missing file reads as `Ok(None)` (`load_policies`'s
@@ -25,7 +25,7 @@
 //!   empty ledger (same shape as `load_policies`); `broker::resolve_gate`
 //!   loads it fresh, records+prunes, and saves it back on every TOTP-gated
 //!   resolve attempt (no in-memory ledger cached across connections — the
-//!   same "no caching, `vault_home` is the resolution" discipline
+//!   same "no caching, `secrets_home` is the resolution" discipline
 //!   `load_policies`/`save_policies` already hold, and the simplest way to
 //!   honor "persist across a restart": the next resolve after a restart
 //!   just re-reads the same file, no special-cased reload path needed).
@@ -35,20 +35,20 @@ use crate::replay::ReplayLedger;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// `<vault_home>/policy.json` — every policy read/write in this crate goes
+/// `<secrets_home>/policy.json` — every policy read/write in this crate goes
 /// through here, never a hand-built path elsewhere.
-pub fn policy_path(vault_home: &Path) -> PathBuf {
-    vault_home.join("policy.json")
+pub fn policy_path(secrets_home: &Path) -> PathBuf {
+    secrets_home.join("policy.json")
 }
 
 /// Load every registered secret's policy. A MISSING file reads as an empty
-/// list — the first `vault add` on a fresh vault home creates the file;
-/// there is nothing wrong with a vault that has never had a secret
+/// list — the first `secrets add` on a fresh secrets home creates the file;
+/// there is nothing wrong with a secrets store that has never had a secret
 /// registered. A present-but-corrupt file IS an error (never silently
 /// treated as empty — that would make a bad write look like "no policies",
 /// hiding real damage).
-pub fn load_policies(vault_home: &Path) -> io::Result<Vec<Policy>> {
-    let path = policy_path(vault_home);
+pub fn load_policies(secrets_home: &Path) -> io::Result<Vec<Policy>> {
+    let path = policy_path(secrets_home);
     match std::fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display()))),
@@ -65,14 +65,14 @@ pub fn load_policies(vault_home: &Path) -> io::Result<Vec<Policy>> {
 ///
 /// Locks down permissions at BOTH levels (bounce-fix item 3, P-V2 review):
 /// `create_dir_all` alone honors the process umask (0755/0644 by default),
-/// which would leave the vault home world-searchable and `policy.json`
+/// which would leave the secrets home world-searchable and `policy.json`
 /// world-readable. `home::secure_dir`/`home::secure_file` fix that
 /// immediately after each creation/write — errors propagate rather than
 /// silently persisting policy data into an insecure directory.
-pub fn save_policies(vault_home: &Path, policies: &[Policy]) -> io::Result<()> {
-    std::fs::create_dir_all(vault_home)?;
-    crate::home::secure_dir(vault_home)?;
-    let path = policy_path(vault_home);
+pub fn save_policies(secrets_home: &Path, policies: &[Policy]) -> io::Result<()> {
+    std::fs::create_dir_all(secrets_home)?;
+    crate::home::secure_dir(secrets_home)?;
+    let path = policy_path(secrets_home);
     let tmp = path.with_extension("json.tmp");
     let bytes =
         serde_json::to_vec_pretty(policies).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -81,10 +81,10 @@ pub fn save_policies(vault_home: &Path, policies: &[Policy]) -> io::Result<()> {
     std::fs::rename(&tmp, &path)
 }
 
-/// `<vault_home>/totp.secret` — see module doc for why raw bytes, not
+/// `<secrets_home>/totp.secret` — see module doc for why raw bytes, not
 /// base32 text.
-pub fn totp_secret_path(vault_home: &Path) -> PathBuf {
-    vault_home.join("totp.secret")
+pub fn totp_secret_path(secrets_home: &Path) -> PathBuf {
+    secrets_home.join("totp.secret")
 }
 
 /// `None` when no enrollment exists yet — `broker::resolve_gate`'s "no TOTP
@@ -93,8 +93,8 @@ pub fn totp_secret_path(vault_home: &Path) -> PathBuf {
 /// truncated/corrupt write into an ordinary rejection message instead of
 /// surfacing the damage (same discipline as `load_policies`'s corrupt-file
 /// case).
-pub fn load_totp_secret(vault_home: &Path) -> io::Result<Option<Vec<u8>>> {
-    match std::fs::read(totp_secret_path(vault_home)) {
+pub fn load_totp_secret(secrets_home: &Path) -> io::Result<Option<Vec<u8>>> {
+    match std::fs::read(totp_secret_path(secrets_home)) {
         Ok(bytes) if bytes.is_empty() => {
             Err(io::Error::new(io::ErrorKind::InvalidData, "totp.secret exists but is empty"))
         }
@@ -109,26 +109,26 @@ pub fn load_totp_secret(vault_home: &Path) -> io::Result<Option<Vec<u8>>> {
 /// caller ([`crate::enroll::run`]) is what enforces "one enrollment per
 /// host unless `--force`"; this function itself has no opinion on whether
 /// overwriting is allowed.
-pub fn save_totp_secret(vault_home: &Path, secret: &[u8]) -> io::Result<()> {
-    std::fs::create_dir_all(vault_home)?;
-    crate::home::secure_dir(vault_home)?;
-    let path = totp_secret_path(vault_home);
+pub fn save_totp_secret(secrets_home: &Path, secret: &[u8]) -> io::Result<()> {
+    std::fs::create_dir_all(secrets_home)?;
+    crate::home::secure_dir(secrets_home)?;
+    let path = totp_secret_path(secrets_home);
     let tmp = path.with_extension("secret.tmp");
     std::fs::write(&tmp, secret)?;
     crate::home::secure_file(&tmp)?;
     std::fs::rename(&tmp, &path)
 }
 
-/// `<vault_home>/totp-replay.json`.
-pub fn replay_ledger_path(vault_home: &Path) -> PathBuf {
-    vault_home.join("totp-replay.json")
+/// `<secrets_home>/totp-replay.json`.
+pub fn replay_ledger_path(secrets_home: &Path) -> PathBuf {
+    secrets_home.join("totp-replay.json")
 }
 
 /// Missing file = a fresh, empty ledger (module doc); corrupt = an error
 /// (never silently emptied — a torn/corrupt ledger read as empty would
 /// resurrect every timestep it had recorded as spent).
-pub fn load_replay_ledger(vault_home: &Path) -> io::Result<ReplayLedger> {
-    match std::fs::read(replay_ledger_path(vault_home)) {
+pub fn load_replay_ledger(secrets_home: &Path) -> io::Result<ReplayLedger> {
+    match std::fs::read(replay_ledger_path(secrets_home)) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("totp-replay.json: {e}"))),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(ReplayLedger::new()),
@@ -138,10 +138,10 @@ pub fn load_replay_ledger(vault_home: &Path) -> io::Result<ReplayLedger> {
 
 /// Write-temp-then-rename + lock to `0600`, same discipline as
 /// [`save_policies`] — a reader mid-resolve never sees a torn ledger file.
-pub fn save_replay_ledger(vault_home: &Path, ledger: &ReplayLedger) -> io::Result<()> {
-    std::fs::create_dir_all(vault_home)?;
-    crate::home::secure_dir(vault_home)?;
-    let path = replay_ledger_path(vault_home);
+pub fn save_replay_ledger(secrets_home: &Path, ledger: &ReplayLedger) -> io::Result<()> {
+    std::fs::create_dir_all(secrets_home)?;
+    crate::home::secure_dir(secrets_home)?;
+    let path = replay_ledger_path(secrets_home);
     let tmp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec(ledger).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     std::fs::write(&tmp, &bytes)?;
@@ -155,7 +155,7 @@ mod tests {
 
     fn tmp_home(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "aoide-vault-store-test-{tag}-{}-{}",
+            "aoide-secrets-store-test-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -204,7 +204,7 @@ mod tests {
     }
 
     /// Bounce-fix item 3 (P-V2 review): `save_policies` must leave BOTH the
-    /// vault home directory and `policy.json` locked down, not at whatever
+    /// secrets home directory and `policy.json` locked down, not at whatever
     /// the process umask happens to be.
     #[test]
     fn save_policies_locks_down_the_home_dir_and_the_file() {
@@ -213,7 +213,7 @@ mod tests {
         save_policies(&home, &[Policy::new("t", "pass", "x")]).unwrap();
 
         let dir_mode = std::fs::metadata(&home).unwrap().permissions().mode() & 0o777;
-        assert_eq!(dir_mode, 0o700, "vault home must be 0700, got {dir_mode:o}");
+        assert_eq!(dir_mode, 0o700, "secrets home must be 0700, got {dir_mode:o}");
 
         let file_mode = std::fs::metadata(policy_path(&home)).unwrap().permissions().mode() & 0o777;
         assert_eq!(file_mode, 0o600, "policy.json must be 0600, got {file_mode:o}");

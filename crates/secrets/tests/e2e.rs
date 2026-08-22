@@ -1,5 +1,5 @@
 //! End-to-end broker + client round-trip (P-V2 gate, the phase brief's
-//! item 6): a scratch vault home, a fake backend (`printf`, no real
+//! item 6): a scratch secrets home, a fake backend (`printf`, no real
 //! `pass`/`gpg`), a policy granting one consumer, a broker bound to a
 //! SHORT `/tmp`-direct socket path (the SUN_LEN hazard is real in this
 //! sandbox — a nested tempdir can overflow `sockaddr_un`'s ~108-byte
@@ -7,8 +7,8 @@
 //! that resolves the secret into a spawned child's real env.
 //!
 //! Also proves: the three denied paths (unknown secret, wrong consumer,
-//! `requireTotp` with no enrollment), that BOTH audit logs (vault's own
-//! `audit.log` in vault home, and the mirrored aoide log via
+//! `requireTotp` with no enrollment), that BOTH audit logs (the broker's own
+//! `audit.log` in secrets home, and the mirrored aoide log via
 //! `EventClass::Secret`) are value-free, and that the granted line's audit
 //! carries `"granted":true` without the value ever appearing anywhere in
 //! either file.
@@ -24,7 +24,7 @@
 //! positive control on the mechanism itself.
 //!
 //! **Why the child writes to a file instead of the test reading its
-//! stdout**: `aoide_vault::client::run_exec` uses `Stdio::inherit()`
+//! stdout**: `aoide_secrets::client::run_exec` uses `Stdio::inherit()`
 //! throughout, by design (this crate's `AGENTS.md` — aoide never holds a
 //! wrapped command's bytes). That means the child's stdout goes to
 //! WHATEVER this test process's own stdout is, which `cargo test` doesn't
@@ -35,7 +35,7 @@
 //! identically regardless of what `run_exec` set the inherited fd to. This
 //! exercises the real, unmodified `run_exec`/`Stdio::inherit()` path.
 
-use aoide_vault::{backend, broker, client, home, policy::Policy, store};
+use aoide_secrets::{backend, broker, client, home, policy::Policy, store};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -59,20 +59,20 @@ fn read_to_string(path: &Path) -> String {
 
 #[test]
 fn end_to_end_resolve_denies_and_grants_env_round_trip() {
-    let vault_home = short_tmp("home");
-    std::fs::create_dir_all(&vault_home).unwrap();
+    let secrets_home = short_tmp("home");
+    std::fs::create_dir_all(&secrets_home).unwrap();
     let socket_path = PathBuf::from(format!("{}.sock", short_tmp("sock").display()));
     // The mirrored aoide audit log — its own tempfile, so this test never
     // touches the real `~/Aoide/log`.
-    let aoide_log = vault_home.join("mirrored-aoide-log");
+    let aoide_log = secrets_home.join("mirrored-aoide-log");
     std::env::set_var("AOIDE_AUDIT_LOG", &aoide_log);
 
-    // ── seed the vault home ─────────────────────────────────────────────
+    // ── seed the secrets home ─────────────────────────────────────────────
     // `touch`es a marker before its `printf` — proves whether the backend
     // was actually run, not just what the resolve returned (module doc).
-    let marker_path = vault_home.join("backend-invoked-marker");
+    let marker_path = secrets_home.join("backend-invoked-marker");
     std::fs::write(
-        backend::backends_path(&vault_home),
+        backend::backends_path(&secrets_home),
         serde_json::to_vec(&serde_json::json!({
             "scratch": { "get": format!("touch {} && printf %s {{name}}", marker_path.display()) }
         }))
@@ -84,10 +84,10 @@ fn end_to_end_resolve_denies_and_grants_env_round_trip() {
     granted_policy.consumers = vec!["m".to_string()];
     let mut totp_policy = Policy::new("locked", "scratch", "irrelevant");
     totp_policy.require_totp = true;
-    store::save_policies(&vault_home, &[granted_policy, totp_policy]).unwrap();
+    store::save_policies(&secrets_home, &[granted_policy, totp_policy]).unwrap();
 
     // ── spin up the broker ──────────────────────────────────────────────
-    let home_for_thread = vault_home.clone();
+    let home_for_thread = secrets_home.clone();
     let sock_for_thread = socket_path.clone();
     let broker_thread = std::thread::spawn(move || {
         let _ = broker::serve(&home_for_thread, &sock_for_thread);
@@ -127,9 +127,9 @@ fn end_to_end_resolve_denies_and_grants_env_round_trip() {
 
     // ── granted: the value round-trips into a REAL child's env, through
     //    the unmodified `run_exec`/Stdio::inherit() production path ─────
-    let out_file = vault_home.join("child-env-output");
+    let out_file = secrets_home.join("child-env-output");
     let inv = aoide_protocol::Invocation {
-        path: vec!["vault".to_string(), "exec".to_string()],
+        path: vec!["secrets".to_string(), "exec".to_string()],
         args: vec![
             "sh".to_string(),
             "-c".to_string(),
@@ -148,8 +148,8 @@ fn end_to_end_resolve_denies_and_grants_env_round_trip() {
     assert_eq!(read_to_string(&out_file).trim_end(), "stored-value");
 
     // ── both audit logs are value-free, and the granted line says so ───
-    let own_log = std::fs::read_to_string(vault_home.join("audit.log")).unwrap();
-    assert!(!own_log.contains("stored-value"), "vault's own audit log leaked the value:\n{own_log}");
+    let own_log = std::fs::read_to_string(secrets_home.join("audit.log")).unwrap();
+    assert!(!own_log.contains("stored-value"), "the broker's own audit log leaked the value:\n{own_log}");
     assert!(own_log.contains("\"granted\":true"), "{own_log}");
     assert!(own_log.contains("\"granted\":false"), "{own_log}");
     assert!(own_log.contains("\"secret\":\"t\""), "{own_log}");
@@ -171,20 +171,20 @@ fn end_to_end_resolve_denies_and_grants_env_round_trip() {
     // ── cleanup ──────────────────────────────────────────────────────────
     drop(broker_thread); // the process exiting tears the thread down; serve() never returns cleanly
     std::env::remove_var("AOIDE_AUDIT_LOG");
-    std::fs::remove_dir_all(&vault_home).ok();
+    std::fs::remove_dir_all(&secrets_home).ok();
     std::fs::remove_file(&socket_path).ok();
 }
 
-/// `home::vault_home`'s env-override half, proven ONE more time at the
+/// `home::secrets_home`'s env-override half, proven ONE more time at the
 /// integration-test level (unit tests already cover it inside the crate)
 /// — cheap, and this file is the only integration-test binary that could
-/// plausibly also want to exercise it against a real `vault add` flow
+/// plausibly also want to exercise it against a real `secrets add` flow
 /// later. Does not touch the shared crate-internal `env_lock` (a separate
 /// OS process from the lib's own unit tests, so no race is possible).
 #[test]
-fn vault_home_resolves_through_the_env_override() {
+fn secrets_home_resolves_through_the_env_override() {
     let dir = short_tmp("home-override");
-    std::env::set_var("AOIDE_VAULT_HOME", &dir);
-    assert_eq!(home::vault_home(), dir);
-    std::env::remove_var("AOIDE_VAULT_HOME");
+    std::env::set_var("AOIDE_SECRETS_HOME", &dir);
+    assert_eq!(home::secrets_home(), dir);
+    std::env::remove_var("AOIDE_SECRETS_HOME");
 }

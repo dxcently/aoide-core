@@ -13,8 +13,8 @@ correspondence").
 - `bin/{aoide,aoided}` — the two binary entry points.
 - `cli`/`dispatch` — argv parsing and the dispatcher, over
   `aoide_protocol::door::run`'s shared skeleton with core's own `special`
-  hook (`mcp serve --stdio`, `a2a serve`, `vault serve`, `vault exec`,
-  `vault enroll`, `conductor`, `guide`/`schema` raw output).
+  hook (`mcp serve --stdio`, `a2a serve`, `secrets serve`, `secrets exec`,
+  `secrets enroll`, `conductor`, `guide`/`schema` raw output).
 - `registry` — the golden command-path snapshot test (59 paths).
 - `guide` — `aoide guide`, the onboarding tier map.
 - `commands` — the three root-coupled groups that must read the ASSEMBLED
@@ -28,7 +28,7 @@ correspondence").
 ## What it consumes
 
 `aoide-protocol`, `aoide-storage`, `aoide-conduct`, `aoide-client`,
-`aoide-server`, `aoide-conductor`, `aoide-upkeep`, `aoide-vault` (new at
+`aoide-server`, `aoide-conductor`, `aoide-upkeep`, `aoide-secrets` (new at
 P-V2). The DAG sink for core: depends on everything core needs, nothing
 depends on it.
 
@@ -36,6 +36,6 @@ depends on it.
 
 59 command paths (core's headless-capable, agent-orchestration surface: the
 project/session graph, A2A, peers, presence, the daemon, usage, hooks, the
-message inbox, the vault secrets broker). Never depends on
+message inbox, the secrets broker). Never depends on
 `aoide-song`/`aoide-screen` — painting is `lyra`'s bundle, assembled the
 same way against the same domain crates' `commands` modules.

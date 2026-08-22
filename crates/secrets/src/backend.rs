@@ -1,7 +1,7 @@
-//! Backend adapter: named fetch-command templates in vault home's
-//! `backends.json`, run AS THE BROKER'S OWN UID (`crates/vault`'s README —
+//! Backend adapter: named fetch-command templates in secrets home's
+//! `backends.json`, run AS THE BROKER'S OWN UID (`crates/secrets`'s README —
 //! this is what solves the backing-store ownership trap structurally: the
-//! `pass` GPG key / `bw` session / `sops` key stays owned by the vault
+//! `pass` GPG key / `bw` session / `sops` key stays owned by the secrets
 //! uid, never the caller's). One backend = one command template
 //! (`get = "pass show {name}"`); `{name}` is substituted with the secret
 //! POLICY's own `key` field — not the backend's name — so `pass show
@@ -33,7 +33,7 @@
 //! `Err` this function returns rides three places that must stay
 //! value-free — the wire's `{ok:false,error}` reply, `client::run_exec`'s
 //! `eprintln!` into the CALLING AGENT's own stderr, and the `reason` field
-//! of BOTH audit lines (vault's own `audit.log` and the mirrored
+//! of BOTH audit lines (the broker's own `audit.log` and the mirrored
 //! `EventClass::Secret` aoide-log line). [`fetch_value`]'s `Err` on a
 //! failed command therefore carries ONLY the exit status; the full stderr
 //! is `eprintln!`'d here, into the BROKER's own stderr, and nowhere else.
@@ -58,13 +58,13 @@ pub struct Backend {
 #[serde(transparent)]
 pub struct Backends(pub BTreeMap<String, Backend>);
 
-/// `<vault_home>/backends.json`.
-pub fn backends_path(vault_home: &Path) -> std::path::PathBuf {
-    vault_home.join("backends.json")
+/// `<secrets_home>/backends.json`.
+pub fn backends_path(secrets_home: &Path) -> std::path::PathBuf {
+    secrets_home.join("backends.json")
 }
 
-fn load_backends(vault_home: &Path) -> Result<Backends, String> {
-    let path = backends_path(vault_home);
+fn load_backends(secrets_home: &Path) -> Result<Backends, String> {
+    let path = backends_path(secrets_home);
     let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -96,8 +96,8 @@ fn shell_single_quote(s: &str) -> String {
 /// one. A failed command's stderr is `eprintln!`'d to the BROKER's own
 /// stderr (module doc) and never appears in the returned `Err` — only the
 /// exit status does.
-pub fn fetch_value(vault_home: &Path, backend_name: &str, key: &str) -> Result<String, String> {
-    let backends = load_backends(vault_home)?;
+pub fn fetch_value(secrets_home: &Path, backend_name: &str, key: &str) -> Result<String, String> {
+    let backends = load_backends(secrets_home)?;
     let backend = backends
         .0
         .get(backend_name)
@@ -115,7 +115,7 @@ pub fn fetch_value(vault_home: &Path, backend_name: &str, key: &str) -> Result<S
         // the calling agent's own stderr via `client::run_exec`, and both
         // audit lines' `reason` field otherwise).
         eprintln!(
-            "[aoide/vault] backend `{backend_name}` exited {}: {}",
+            "[aoide/secrets] backend `{backend_name}` exited {}: {}",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         );
@@ -135,7 +135,7 @@ mod tests {
 
     fn tmp_home(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "aoide-vault-backend-test-{tag}-{}-{}",
+            "aoide-secrets-backend-test-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

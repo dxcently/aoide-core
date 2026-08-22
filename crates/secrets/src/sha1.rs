@@ -1,5 +1,5 @@
 //! RFC 3174 / FIPS 180-1 SHA-1 — hand-rolled, zero dependencies (plan
-//! mandate for the vault TOTP stack: no `sha1` crate anywhere in this
+//! mandate for the secrets TOTP stack: no `sha1` crate anywhere in this
 //! tree). Only consumer is [`crate::hmac::hmac_sha1`]; this module has no
 //! reason to exist outside that role, and stops at correctness — no
 //! streaming/incremental API.

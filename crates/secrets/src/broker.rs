@@ -1,4 +1,4 @@
-//! The broker daemon (`aoide vault serve`): a unix-socket JSON-lines
+//! The broker daemon (`aoide secrets serve`): a unix-socket JSON-lines
 //! server, ONE request per line, ONE reply per line — the shellbridge
 //! precedent (`aoide_conduct::shellbridge`, read and matched deliberately
 //! per the phase brief): a single-threaded accept loop, a `serve`/
@@ -17,7 +17,7 @@
 //! list is the real gate, not caller identity.
 //!
 //! **`requireTotp` is wired live (P-V3).** [`resolve_gate`] rejects it
-//! outright ONLY when no `vault enroll` has ever run on this host
+//! outright ONLY when no `secrets enroll` has ever run on this host
 //! (`crate::store::load_totp_secret` returns `None`) — a clear "no TOTP
 //! enrollment" error, same wording as before P-V3. Once enrolled, a
 //! `requireTotp` policy verifies the wire's `totp` code against the
@@ -46,8 +46,8 @@
 //!
 //! **Audit, broker-side only** (this crate's `AGENTS.md`): every resolve
 //! attempt is logged HERE — never by the client, which only ever learns
-//! granted/denied from the wire reply — to TWO places: vault's own
-//! append-only log in vault home (`audit.log`, hand-built
+//! granted/denied from the wire reply — to TWO places: the broker's own
+//! append-only log in secrets home (`audit.log`, hand-built
 //! `serde_json::Value` via the `json!` macro, never a named
 //! `#[derive(Serialize)]` struct with a reusable field a value could land
 //! on) and the mirrored aoide audit log via `aoide_protocol::audit` with
@@ -74,9 +74,9 @@
 //! reach it. [`bind_socket`] sets only the MODE bits (`0o660` literal, the
 //! group-connectable design point — contrast [`crate::home::secure_file`]'s
 //! `0o600`, which is the wrong mode HERE on purpose). Group OWNERSHIP —
-//! making the socket's gid the real `aoide-vault-access` group — is
+//! making the socket's gid the real `aoide-secrets-access` group — is
 //! deployment's job, not this crate's: P-V4's nix module sets the
-//! `aoide-vault-serve` unit's `Group=aoide-vault-access`, so every file the
+//! `aoide-secrets-serve` unit's `Group=aoide-secrets-access`, so every file the
 //! broker process creates (including this socket) inherits that gid from
 //! the process's own primary/effective group. This module only ever touches
 //! the mode bits.
@@ -105,20 +105,20 @@ fn bind_socket(socket_path: &Path) -> std::io::Result<UnixListener> {
 }
 
 /// Bind `socket_path` and serve `resolve` requests forever. Creates
-/// `vault_home` if absent and locks it down to `0700` (bounce-fix item 3,
+/// `secrets_home` if absent and locks it down to `0700` (bounce-fix item 3,
 /// P-V2 review — `create_dir_all` alone honors the process umask, which
 /// would leave `policy.json`/`backends.json` world-readable). Only returns
 /// on a bind/permission failure — a running broker never returns `Ok`.
-pub fn serve(vault_home: &Path, socket_path: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(vault_home)?;
-    crate::home::secure_dir(vault_home)?;
+pub fn serve(secrets_home: &Path, socket_path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(secrets_home)?;
+    crate::home::secure_dir(secrets_home)?;
     let listener = bind_socket(socket_path)?;
 
-    let home = vault_home.to_path_buf();
+    let home = secrets_home.to_path_buf();
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => handle_conn(&home, stream),
-            Err(e) => eprintln!("[aoide/vault] accept error (continuing): {e}"),
+            Err(e) => eprintln!("[aoide/secrets] accept error (continuing): {e}"),
         }
     }
     Ok(())
@@ -127,11 +127,11 @@ pub fn serve(vault_home: &Path, socket_path: &Path) -> std::io::Result<()> {
 /// Handle ONE client connection: read newline-delimited JSON requests and
 /// reply to each. A read error (dropped connection) ends only this
 /// connection; nothing here can unwind into `serve`'s accept loop.
-fn handle_conn(vault_home: &Path, stream: UnixStream) {
+fn handle_conn(secrets_home: &Path, stream: UnixStream) {
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("[aoide/vault] could not clone connection: {e}");
+            eprintln!("[aoide/secrets] could not clone connection: {e}");
             return;
         }
     };
@@ -144,7 +144,7 @@ fn handle_conn(vault_home: &Path, stream: UnixStream) {
         if line.trim().is_empty() {
             continue;
         }
-        let reply = handle_line(vault_home, &line);
+        let reply = handle_line(secrets_home, &line);
         let mut out = reply.to_string();
         out.push('\n');
         if writer.write_all(out.as_bytes()).is_err() {
@@ -157,21 +157,21 @@ fn handle_conn(vault_home: &Path, stream: UnixStream) {
 /// (all I/O — policy load, backend fetch, audit — happens inside
 /// [`handle_resolve`]/[`resolve_gate`]); malformed JSON or an unknown `op`
 /// always gets a reply line, never a silently dropped connection (unlike
-/// shellbridge's fire-and-forget commands, a vault client is BLOCKED
+/// shellbridge's fire-and-forget commands, a secrets client is BLOCKED
 /// waiting on this reply).
-fn handle_line(vault_home: &Path, line: &str) -> Value {
+fn handle_line(secrets_home: &Path, line: &str) -> Value {
     let req: Value = match serde_json::from_str(line.trim()) {
         Ok(v) => v,
         Err(_) => return json!({"ok": false, "error": "malformed request: not valid JSON"}),
     };
     match req.get("op").and_then(Value::as_str) {
-        Some("resolve") => handle_resolve(vault_home, &req),
+        Some("resolve") => handle_resolve(secrets_home, &req),
         Some(other) => json!({"ok": false, "error": format!("unknown op `{other}`")}),
         None => json!({"ok": false, "error": "malformed request: missing `op`"}),
     }
 }
 
-fn handle_resolve(vault_home: &Path, req: &Value) -> Value {
+fn handle_resolve(secrets_home: &Path, req: &Value) -> Value {
     let secret = req.get("secret").and_then(Value::as_str).unwrap_or("").to_string();
     let consumer = req.get("consumer").and_then(Value::as_str).unwrap_or("").to_string();
     let argv0 = req.get("argv0").and_then(Value::as_str).map(str::to_string);
@@ -183,8 +183,8 @@ fn handle_resolve(vault_home: &Path, req: &Value) -> Value {
 
     // The one real-clock read in this module — see module doc.
     let now_unix = aoide_protocol::audit::now_secs();
-    let (granted, result) = resolve_gate(vault_home, &secret, &consumer, totp.as_deref(), now_unix);
-    audit_resolve(vault_home, &secret, &consumer, argv0.as_deref(), granted, result.as_ref().err());
+    let (granted, result) = resolve_gate(secrets_home, &secret, &consumer, totp.as_deref(), now_unix);
+    audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), granted, result.as_ref().err());
 
     match result {
         Ok(value) => json!({"ok": true, "value": value}),
@@ -206,13 +206,13 @@ const REPLAY_RETENTION_STEPS: u64 = 4; // ~2 minutes at the 30s step
 /// function and everything it calls stay deterministic given the same
 /// inputs.
 fn resolve_gate(
-    vault_home: &Path,
+    secrets_home: &Path,
     secret: &str,
     consumer: &str,
     totp: Option<&str>,
     now_unix: u64,
 ) -> (bool, Result<String, String>) {
-    let policies = match crate::store::load_policies(vault_home) {
+    let policies = match crate::store::load_policies(secrets_home) {
         Ok(p) => p,
         Err(e) => return (false, Err(format!("policy.json: {e}"))),
     };
@@ -224,11 +224,11 @@ fn resolve_gate(
         return (false, Err("consumer not authorized for this secret".to_string()));
     }
     if policy.require_totp {
-        if let Err(e) = verify_totp_gate(vault_home, totp, now_unix) {
+        if let Err(e) = verify_totp_gate(secrets_home, totp, now_unix) {
             return (false, Err(e));
         }
     }
-    match crate::backend::fetch_value(vault_home, &policy.backend, &policy.key) {
+    match crate::backend::fetch_value(secrets_home, &policy.backend, &policy.key) {
         Ok(value) => (true, Ok(value)),
         Err(e) => (false, Err(e)),
     }
@@ -242,8 +242,8 @@ fn resolve_gate(
 /// value-free AND code-free by construction: the caller-typed `totp`
 /// string is untrusted input (module doc) and is never interpolated into
 /// any returned message, only parsed/compared.
-fn verify_totp_gate(vault_home: &Path, totp: Option<&str>, now_unix: u64) -> Result<(), String> {
-    let secret = match crate::store::load_totp_secret(vault_home) {
+fn verify_totp_gate(secrets_home: &Path, totp: Option<&str>, now_unix: u64) -> Result<(), String> {
+    let secret = match crate::store::load_totp_secret(secrets_home) {
         Ok(Some(s)) => s,
         Ok(None) => {
             return Err("requireTotp is set but no TOTP enrollment exists on this host yet".to_string())
@@ -260,7 +260,7 @@ fn verify_totp_gate(vault_home: &Path, totp: Option<&str>, now_unix: u64) -> Res
         return Err("totp code invalid or expired".to_string());
     };
 
-    let mut ledger = match crate::store::load_replay_ledger(vault_home) {
+    let mut ledger = match crate::store::load_replay_ledger(secrets_home) {
         Ok(l) => l,
         Err(e) => return Err(format!("totp-replay.json: {e}")),
     };
@@ -268,18 +268,18 @@ fn verify_totp_gate(vault_home: &Path, totp: Option<&str>, now_unix: u64) -> Res
         return Err("totp code already used".to_string());
     }
     ledger.prune_before(crate::totp::timestep(now_unix).saturating_sub(REPLAY_RETENTION_STEPS));
-    if let Err(e) = crate::store::save_replay_ledger(vault_home, &ledger) {
+    if let Err(e) = crate::store::save_replay_ledger(secrets_home, &ledger) {
         return Err(format!("writing totp-replay.json: {e}"));
     }
     Ok(())
 }
 
-fn own_audit_log_path(vault_home: &Path) -> PathBuf {
-    vault_home.join("audit.log")
+fn own_audit_log_path(secrets_home: &Path) -> PathBuf {
+    secrets_home.join("audit.log")
 }
 
-fn append_own_log(vault_home: &Path, record: &Value) -> std::io::Result<()> {
-    let path = own_audit_log_path(vault_home);
+fn append_own_log(secrets_home: &Path, record: &Value) -> std::io::Result<()> {
+    let path = own_audit_log_path(secrets_home);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -292,7 +292,7 @@ fn append_own_log(vault_home: &Path, record: &Value) -> std::io::Result<()> {
 /// Write BOTH audit lines for one resolve attempt (module doc). Name-only,
 /// by construction: nothing passed here is ever the secret's value.
 fn audit_resolve(
-    vault_home: &Path,
+    secrets_home: &Path,
     secret: &str,
     consumer: &str,
     argv0: Option<&str>,
@@ -307,8 +307,8 @@ fn audit_resolve(
         "granted": granted,
         "reason": reason,
     });
-    if let Err(e) = append_own_log(vault_home, &record) {
-        eprintln!("[aoide/vault] could not write the vault audit log: {e}");
+    if let Err(e) = append_own_log(secrets_home, &record) {
+        eprintln!("[aoide/secrets] could not write the secrets audit log: {e}");
     }
 
     let status = if granted { "granted" } else { "denied" };
@@ -320,7 +320,7 @@ fn audit_resolve(
         &aoide_protocol::default_audit_log(),
         aoide_protocol::Door::Daemon,
         aoide_protocol::EventClass::Secret,
-        "vault.resolve",
+        "secrets.resolve",
         status,
         &message,
     );
@@ -333,7 +333,7 @@ mod tests {
 
     fn tmp_home(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "aoide-vault-broker-test-{tag}-{}-{}",
+            "aoide-secrets-broker-test-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -593,10 +593,10 @@ mod tests {
     #[test]
     fn bind_socket_chmods_the_socket_file_to_0660() {
         let home = tmp_home("sockmode");
-        let socket_path = home.join("vault.sock");
+        let socket_path = home.join("secrets.sock");
         let listener = bind_socket(&socket_path).unwrap();
         let mode = std::fs::metadata(&socket_path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o660, "vault socket must be group-connectable (0660), got {mode:o}");
+        assert_eq!(mode, 0o660, "secrets socket must be group-connectable (0660), got {mode:o}");
         drop(listener);
         std::fs::remove_dir_all(&home).ok();
     }
@@ -645,7 +645,7 @@ mod tests {
         // MIRRORED aoide audit log too, via `aoide_protocol::
         // default_audit_log()` — redirect it into this test's own tempdir
         // (`env_lock`, restored after) so the test never touches the real
-        // `~/Aoide/log`. The vault's OWN `audit.log` lives under `home`
+        // `~/Aoide/log`. The broker's OWN `audit.log` lives under `home`
         // regardless, no redirection needed for that half.
         let _guard = crate::env_lock().lock().unwrap();
         let saved = std::env::var("AOIDE_AUDIT_LOG").ok();
@@ -691,7 +691,7 @@ mod tests {
         assert!(!wire_error.contains("SENTINEL"), "wire reply leaked stderr: {wire_error}");
 
         let own_log = std::fs::read_to_string(own_audit_log_path(&home)).unwrap();
-        assert!(!own_log.contains("SENTINEL"), "vault's own audit.log leaked stderr: {own_log}");
+        assert!(!own_log.contains("SENTINEL"), "the broker's own audit.log leaked stderr: {own_log}");
 
         let mirrored_log = std::fs::read_to_string(home.join("mirrored-aoide-log")).unwrap();
         assert!(!mirrored_log.contains("SENTINEL"), "mirrored aoide audit log leaked stderr: {mirrored_log}");

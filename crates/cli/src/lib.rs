@@ -25,7 +25,7 @@ pub use aoide_conductor as conductor;
 pub use aoide_protocol as protocol;
 pub use aoide_server as server;
 pub use aoide_storage as storage;
-pub use aoide_vault as vault;
+pub use aoide_secrets as secrets;
 
 use daemon::Door;
 
@@ -36,12 +36,12 @@ use daemon::Door;
 /// docs/architecture/PACKAGE-LAYOUT.md) so a second binary (lyra, P-A4) can
 /// drive the same loop against its own registry without duplicating it; this
 /// crate supplies its own special-cased verbs via the `special` hook —
-/// `mcp serve --stdio`, `a2a serve`, and `vault serve` start servers,
-/// `vault exec` resolves a secret and execs a command with it injected as an
+/// `mcp serve --stdio`, `a2a serve`, and `secrets serve` start servers,
+/// `secrets exec` resolves a secret and execs a command with it injected as an
 /// env var (`Stdio::inherit` throughout — the value can never cross the
-/// generic `Outcome` envelope, Workstream VAULT P-V2), `vault enroll` prints
+/// generic `Outcome` envelope, Workstream SECRETS P-V2), `secrets enroll` prints
 /// a fresh TOTP secret's `otpauth://` URI + base32 form directly to stdout
-/// for the same reason (Workstream VAULT P-V3), `conductor` hands off
+/// for the same reason (Workstream SECRETS P-V3), `conductor` hands off
 /// to the interactive terminal loop, `guide`/`schema` bypass the generic
 /// `Outcome` envelope — everything else routes through the single dispatcher
 /// (so the audit log + gate apply uniformly). `livery` was an earlier special
@@ -117,14 +117,14 @@ pub fn run_cli(argv: &[String]) -> i32 {
             });
         }
 
-        // `vault serve` is a long-running broker, launched at the entry point
+        // `secrets serve` is a long-running broker, launched at the entry point
         // exactly like `a2a serve`/`conductor`/`mcp serve --stdio`: dispatch
         // FIRST (records the launch through the single audit log, and gives a
-        // non-Cli door — e.g. an MCP `tools/call` for `vault.serve` — the
-        // "run this from a terminal" outcome via `handle_vault_serve` instead
+        // non-Cli door — e.g. an MCP `tools/call` for `secrets.serve` — the
+        // "run this from a terminal" outcome via `handle_secrets_serve` instead
         // of blocking that door), then block in the broker's accept loop
-        // (`aoide_vault::broker::serve`).
-        if inv.path == ["vault", "serve"] {
+        // (`aoide_secrets::broker::serve`).
+        if inv.path == ["secrets", "serve"] {
             let launch = dispatch::dispatch(inv);
             if launch.status != output::Status::Ok {
                 let (body, code) = launch.render(json);
@@ -132,45 +132,45 @@ pub fn run_cli(argv: &[String]) -> i32 {
                 return Some(code);
             }
             return Some(
-                match vault::broker::serve(&vault::home::vault_home(), &vault::socket::socket_path()) {
+                match secrets::broker::serve(&secrets::home::secrets_home(), &secrets::socket::socket_path()) {
                     Ok(()) => output::exit::OK,
                     Err(e) => {
-                        eprintln!("aoide vault serve: {e}");
+                        eprintln!("aoide secrets serve: {e}");
                         output::exit::ERROR
                     }
                 },
             );
         }
 
-        // `vault exec` is CLI-only, special-cased the same way: dispatch
+        // `secrets exec` is CLI-only, special-cased the same way: dispatch
         // FIRST (audits the launch attempt and gives every non-Cli door a
-        // clean "run this from a terminal" outcome via `handle_vault_exec`),
-        // then hand off to `aoide_vault::client::run_exec` — the resolved
+        // clean "run this from a terminal" outcome via `handle_secrets_exec`),
+        // then hand off to `aoide_secrets::client::run_exec` — the resolved
         // value is injected as an env var and the wrapped command is exec'd
         // with `Stdio::inherit()` throughout, so its exit code (not any of
         // aoide's own exit-code vocabulary) is what this returns. The value
         // itself never touches this function, this crate, or any Outcome —
-        // see `aoide_vault::client`'s module doc.
-        if inv.path == ["vault", "exec"] {
+        // see `aoide_secrets::client`'s module doc.
+        if inv.path == ["secrets", "exec"] {
             let launch = dispatch::dispatch(inv);
             if launch.status != output::Status::Ok {
                 let (body, code) = launch.render(json);
                 eprintln!("{body}");
                 return Some(code);
             }
-            return Some(vault::client::run_exec(inv, &vault::socket::socket_path()));
+            return Some(secrets::client::run_exec(inv, &secrets::socket::socket_path()));
         }
 
-        // `vault enroll` (P-V3) is special-cased the SAME way as `vault
+        // `secrets enroll` (P-V3) is special-cased the SAME way as `secrets
         // exec`, for the same reason: the printed `otpauth://` URI + base32
         // secret must never ride the generic `Outcome` envelope (this
         // crate's `AGENTS.md`). Dispatch first (audits the launch attempt
         // and gives every non-Cli door the clean "run it from a terminal"
-        // outcome via `handle_vault_enroll`, touching no vault-home file),
-        // then hand off to `aoide_vault::enroll::run`, which does the real
+        // outcome via `handle_secrets_enroll`, touching no secrets-home file),
+        // then hand off to `aoide_secrets::enroll::run`, which does the real
         // work — generate/persist/print — and prints the secret directly
         // to stdout.
-        if inv.path == ["vault", "enroll"] {
+        if inv.path == ["secrets", "enroll"] {
             let launch = dispatch::dispatch(inv);
             if launch.status != output::Status::Ok {
                 let (body, code) = launch.render(json);
@@ -178,10 +178,10 @@ pub fn run_cli(argv: &[String]) -> i32 {
                 return Some(code);
             }
             let force = inv.flag_present("force");
-            return Some(match vault::enroll::run(&vault::home::vault_home(), force) {
+            return Some(match secrets::enroll::run(&secrets::home::secrets_home(), force) {
                 Ok(()) => output::exit::OK,
                 Err(e) => {
-                    eprintln!("aoide vault enroll: {e}");
+                    eprintln!("aoide secrets enroll: {e}");
                     output::exit::ERROR
                 }
             });

@@ -1,4 +1,4 @@
-//! Vault policy store types: per-secret access policy, round-trip
+//! Secrets policy store types: per-secret access policy, round-trip
 //! serializable. Type surface only at P-V1 — no daemon reads/writes
 //! `state/policy.json` yet (the broker lands at V2); this module is
 //! where V2's (de)serialization contract already lives so the wire
@@ -12,11 +12,11 @@
 //! (`[a-z0-9-]`) — [`valid_secret_name`] additionally forbids a leading
 //! or trailing hyphen and any run of consecutive hyphens, where
 //! `valid_peer_name` allows both. The superseded workstream-B design
-//! (`P-B2`) is dead; only this naming decision survives into vault.
+//! (`P-B2`) is dead; only this naming decision survives into aoide-secrets.
 
 use serde::{Deserialize, Serialize};
 
-/// A vault-secret nickname: `[a-z0-9]` for the first and last character,
+/// A secret's nickname: `[a-z0-9]` for the first and last character,
 /// `[a-z0-9-]` in between, and no `--` run anywhere. Rejects empty
 /// strings. Joined into on-disk paths by later phases (V2's backend
 /// stores) the same way a peer name is — this is the traversal guard for
@@ -39,7 +39,7 @@ pub fn valid_secret_name(name: &str) -> bool {
     charset_ok && ends_ok && no_double_hyphen
 }
 
-/// One secret's access policy — the plan's VAULT §Policy shape verbatim:
+/// One secret's access policy — the plan's SECRETS §Policy shape verbatim:
 /// `{name, backend, key, requireTotp, consumers[], sharedWith[]}`.
 ///
 /// **Invariant this type must never grow**: no field here may ever hold
@@ -73,7 +73,7 @@ pub struct Policy {
     /// here since this type doesn't depend on that crate).
     #[serde(default)]
     pub consumers: Vec<String>,
-    /// Host names this secret is shared to (Workstream VAULT's mesh
+    /// Host names this secret is shared to (Workstream SECRETS's mesh
     /// phase, P-V5) — present in the type now so the wire shape doesn't
     /// change when sharing lands; empty until then.
     #[serde(default)]
@@ -102,7 +102,7 @@ mod tests {
     #[test]
     fn valid_secret_name_accepts_the_expected_shape() {
         assert!(valid_secret_name("a"));
-        assert!(valid_secret_name("aoide-vault"));
+        assert!(valid_secret_name("aoide-secrets"));
         assert!(valid_secret_name("a1-2b"));
         assert!(valid_secret_name("token9"));
     }
@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn round_trip_survives_a_real_file_in_a_tempdir() {
         let dir = std::env::temp_dir().join(format!(
-            "aoide-vault-policy-test-{}-{}",
+            "aoide-secrets-policy-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

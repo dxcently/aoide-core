@@ -27,8 +27,8 @@ use crate::registry::Registry;
 /// finding format and why the COMMITTED-tree half lives in `nix flake
 /// check` instead), who (live presence over sessions + registered peers,
 /// messaging workstream C2), inbox list/read/clear (appended newest — the
-/// durable per-host message store, messaging workstream C6), vault
-/// serve/exec/add/rm/grant/revoke (appended newest — Workstream VAULT's
+/// durable per-host message store, messaging workstream C6), secrets
+/// serve/exec/add/rm/grant/revoke (appended newest — Workstream SECRETS's
 /// broker daemon + client + admin CLI surface, P-V2).
 ///
 /// P-A5 (binary-split workstream) removed the 11 register lines for the
@@ -59,7 +59,7 @@ pub fn all() -> Registry {
     aoide_upkeep::commands::register(&mut r); // soundcheck — mechanical-integrity WORKING-tree sweep, report-only
     aoide_conduct::commands::who::register(&mut r); // who — live presence over sessions + registered peers (messaging workstream C2)
     aoide_storage::commands::register_inbox(&mut r); // inbox list/read/clear — durable per-host message store (messaging workstream C6, appended newest)
-    aoide_vault::commands::register(&mut r); // vault serve/exec/add/rm/grant/revoke — the secrets broker (Workstream VAULT P-V2, appended newest)
+    aoide_secrets::commands::register(&mut r); // secrets serve/exec/add/rm/grant/revoke — the secrets broker (Workstream SECRETS P-V2, appended newest)
 
     r
 }
