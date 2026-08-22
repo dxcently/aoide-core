@@ -2405,7 +2405,7 @@ mod tests {
         let _g = aoide_test_support::env_lock().lock().unwrap();
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
-        let (root, song, draft, _draft_livery) = routed_draft_symlinked("back-cover-clear");
+        let (root, _song, _draft, _draft_livery) = routed_draft_symlinked("back-cover-clear");
         let stage = shellbridge::stage_dir();
 
         write_livery(&stage, "#111111");
