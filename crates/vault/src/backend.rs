@@ -8,12 +8,35 @@
 //! {name}` + a policy `key: "prod/db"` runs `pass show prod/db`. See
 //! [`fetch_value`].
 //!
+//! **The substituted `key` is single-quote shell-escaped, never a raw
+//! string replace** (bounce-fix item 4, P-V2 review): a legitimate key
+//! containing whitespace or an apostrophe (`"Work Email/gmail"`, `"it's a
+//! secret"`) would otherwise break the command or, worse, let a key value
+//! reopen the shell's argument boundary. [`shell_single_quote`] wraps the
+//! value in `'...'`, escaping any embedded `'` as `'\''` (close-quote,
+//! escaped literal quote, reopen-quote — the standard POSIX-shell
+//! technique). A template's own `{name}` placeholder must NOT be
+//! pre-quoted (`pass show {name}`, never `pass show "{name}"`) — the
+//! substituted text already carries its own quoting.
+//!
 //! Shell-invoked (`sh -c "<substituted template>"`), stdout captured, and
 //! EXACTLY ONE trailing `\n` trimmed if present: a well-behaved backend
 //! emitting `value\n` round-trips to `value`, while a backend emitting
 //! `value` with no trailing newline is untouched. Never a blanket
 //! `.trim_end()` — that would also eat trailing whitespace that could be
 //! part of the actual secret.
+//!
+//! **A failed backend's stderr is BROKER-EPRINTLN-ONLY, never returned**
+//! (bounce-fix item 1, P-V2 review — the headline defect): a backend's own
+//! stderr can be verbose or interactive-prompt-shaped (`pass`/`gpg`
+//! failure prompts have been known to quote entry content back), and the
+//! `Err` this function returns rides three places that must stay
+//! value-free — the wire's `{ok:false,error}` reply, `client::run_exec`'s
+//! `eprintln!` into the CALLING AGENT's own stderr, and the `reason` field
+//! of BOTH audit lines (vault's own `audit.log` and the mirrored
+//! `EventClass::Secret` aoide-log line). [`fetch_value`]'s `Err` on a
+//! failed command therefore carries ONLY the exit status; the full stderr
+//! is `eprintln!`'d here, into the BROKER's own stderr, and nowhere else.
 //!
 //! pass/gopass/bw/sops are DOC PRESETS (P-V3), not code — this module has
 //! no knowledge of any specific backend, only the template mechanism
@@ -46,21 +69,40 @@ fn load_backends(vault_home: &Path) -> Result<Backends, String> {
     serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Single-quote shell-escape `s`: wrap in `'...'`, escaping any embedded
+/// `'` as `'\''` (close the quote, emit an escaped literal quote, reopen
+/// the quote — the standard POSIX technique). The result is always safe
+/// to splice into an `sh -c` command line as ONE argument, regardless of
+/// what `s` contains (whitespace, quotes, `$`, backticks, `;` — none of
+/// it is interpreted once single-quoted).
+fn shell_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// Resolve `backend_name`'s template against `key`, run it, and return
 /// stdout with exactly one trailing newline trimmed. Errors are precise
 /// but VALUE-FREE by construction: nothing here ever touches the secret's
 /// value except the `Ok` return itself, so an `Err` path can never leak
-/// one (a backend's stderr — its OWN tool's error text, e.g. `pass show:
-/// not in the password store` — is not the secret's value, and is safe to
-/// surface the same way `conduct::shellbridge`'s `classify_*` helpers
-/// already do for other subprocess failures).
+/// one. A failed command's stderr is `eprintln!`'d to the BROKER's own
+/// stderr (module doc) and never appears in the returned `Err` — only the
+/// exit status does.
 pub fn fetch_value(vault_home: &Path, backend_name: &str, key: &str) -> Result<String, String> {
     let backends = load_backends(vault_home)?;
     let backend = backends
         .0
         .get(backend_name)
         .ok_or_else(|| format!("unknown backend `{backend_name}`"))?;
-    let command = backend.get.replace("{name}", key);
+    let command = backend.get.replace("{name}", &shell_single_quote(key));
 
     let output = std::process::Command::new("sh")
         .arg("-c")
@@ -68,12 +110,16 @@ pub fn fetch_value(vault_home: &Path, backend_name: &str, key: &str) -> Result<S
         .output()
         .map_err(|e| format!("spawning backend `{backend_name}`: {e}"))?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "backend `{backend_name}` exited {}: {}",
+        // Full stderr goes ONLY here, to the broker's own stderr — never
+        // into the returned `Err` (module doc: it rides the wire reply,
+        // the calling agent's own stderr via `client::run_exec`, and both
+        // audit lines' `reason` field otherwise).
+        eprintln!(
+            "[aoide/vault] backend `{backend_name}` exited {}: {}",
             output.status,
-            stderr.trim()
-        ));
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return Err(format!("backend `{backend_name}` exited {}", output.status));
     }
 
     let mut stdout = output.stdout;
@@ -162,5 +208,42 @@ mod tests {
         let home = tmp_home("missingfile");
         assert!(fetch_value(&home, "scratch", "x").is_err());
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── bounce-fix item 1: backend stderr never rides the returned Err ──
+
+    #[test]
+    fn a_failing_backends_stderr_never_appears_in_the_returned_error() {
+        let home = tmp_home("stderrleak");
+        write_backends(&home, "printf 'SENTINEL-STDERR-XYZ' 1>&2; exit 1");
+        let err = fetch_value(&home, "scratch", "x").unwrap_err();
+        assert!(!err.contains("SENTINEL"), "stderr leaked into the returned error: {err}");
+        assert!(err.contains("exited"), "error should still name the exit status: {err}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── bounce-fix item 4: the key is shell-escaped, not raw-substituted ─
+
+    #[test]
+    fn key_with_a_space_round_trips_through_shell_quoting() {
+        let home = tmp_home("space");
+        write_backends(&home, "printf %s {name}");
+        assert_eq!(fetch_value(&home, "scratch", "Work Email/gmail").unwrap(), "Work Email/gmail");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn key_with_an_embedded_single_quote_round_trips_through_shell_quoting() {
+        let home = tmp_home("quote");
+        write_backends(&home, "printf %s {name}");
+        assert_eq!(fetch_value(&home, "scratch", "it's a secret").unwrap(), "it's a secret");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_every_embedded_quote() {
+        assert_eq!(shell_single_quote("plain"), "'plain'");
+        assert_eq!(shell_single_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_single_quote("''"), "''\\'''\\'''");
     }
 }

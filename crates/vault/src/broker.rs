@@ -42,11 +42,15 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
 /// Bind `socket_path` and serve `resolve` requests forever. Creates
-/// `vault_home` if absent; removes a stale socket file first (single-owner
-/// path per host, same precedent as `shellbridge::run`). Only returns on a
-/// bind failure — a running broker never returns `Ok`.
+/// `vault_home` if absent and locks it down to `0700` (bounce-fix item 3,
+/// P-V2 review — `create_dir_all` alone honors the process umask, which
+/// would leave `policy.json`/`backends.json` world-readable); removes a
+/// stale socket file first (single-owner path per host, same precedent as
+/// `shellbridge::run`). Only returns on a bind/permission failure — a
+/// running broker never returns `Ok`.
 pub fn serve(vault_home: &Path, socket_path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(vault_home)?;
+    crate::home::secure_dir(vault_home)?;
     if let Some(parent) = socket_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -349,6 +353,44 @@ mod tests {
         let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#);
         assert_eq!(reply["ok"], true);
         assert_eq!(reply["value"], "stored-value");
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_AUDIT_LOG", v),
+            None => std::env::remove_var("AOIDE_AUDIT_LOG"),
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Bounce-fix item 1 (P-V2 review), full path: a backend that dumps a
+    /// sentinel to stderr and fails must not leak that sentinel through
+    /// EITHER audit line OR the wire reply — `backend::fetch_value` already
+    /// proves the `Err` string is clean in isolation; this proves the
+    /// guarantee survives all the way through `handle_line` ->
+    /// `audit_resolve`'s `reason` field on both logs.
+    #[test]
+    fn a_backend_stderr_sentinel_never_reaches_the_wire_reply_or_either_audit_log() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_AUDIT_LOG").ok();
+        let home = tmp_home("stderrleak");
+        std::env::set_var("AOIDE_AUDIT_LOG", home.join("mirrored-aoide-log"));
+
+        let p = Policy::new("t", "scratch", "stored-value");
+        crate::store::save_policies(&home, &[p]).unwrap();
+        let backends = serde_json::json!({
+            "scratch": { "get": "printf 'SENTINEL-STDERR-XYZ' 1>&2; exit 1" }
+        });
+        std::fs::write(crate::backend::backends_path(&home), serde_json::to_vec(&backends).unwrap()).unwrap();
+
+        let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#);
+        assert_eq!(reply["ok"], false);
+        let wire_error = reply["error"].as_str().unwrap();
+        assert!(!wire_error.contains("SENTINEL"), "wire reply leaked stderr: {wire_error}");
+
+        let own_log = std::fs::read_to_string(own_audit_log_path(&home)).unwrap();
+        assert!(!own_log.contains("SENTINEL"), "vault's own audit.log leaked stderr: {own_log}");
+
+        let mirrored_log = std::fs::read_to_string(home.join("mirrored-aoide-log")).unwrap();
+        assert!(!mirrored_log.contains("SENTINEL"), "mirrored aoide audit log leaked stderr: {mirrored_log}");
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_AUDIT_LOG", v),

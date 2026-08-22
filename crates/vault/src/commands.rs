@@ -10,12 +10,19 @@
 //!   inherited stdio and an injected env var — see `crate::client`'s
 //!   module doc for why that can never go through the generic `Outcome`
 //!   envelope (a value would have to ride through it).
-//! - `add`/`rm`/`grant`/`revoke` — the policy-CRUD admin quartet. Plain
-//!   handlers, NOT special-cased: they only read/write `policy.json`, no
-//!   socket, no value, ever, so they run through the ordinary dispatch +
-//!   audit path like any other command. `vault enroll` — the fifth admin
-//!   verb the plan lists — is P-V3's; TOTP enrollment doesn't exist yet,
-//!   so there is nothing for it to write.
+//! - `add`/`rm`/`grant`/`revoke` — the policy-CRUD admin quartet. Not
+//!   special-cased (they only read/write `policy.json`, no socket, no
+//!   value, ever, so they still run through the ordinary dispatch + audit
+//!   path like any other command), but **CLI-only, door-gated the SAME way
+//!   as `serve`/`exec`** (bounce-fix item 2, P-V2 review — [`require_cli`]):
+//!   an earlier revision left them reachable over MCP/A2A/Daemon doors,
+//!   which would let any agent already talking to aoide `vault grant
+//!   <secret> <itself>` and self-escalate. The gate returns the door-hint
+//!   `Outcome` and returns BEFORE any `store::load_policies`/
+//!   `store::save_policies` call, so a non-CLI invocation never mutates
+//!   `policy.json`. `vault enroll` — the fifth admin verb the plan lists —
+//!   is P-V3's; TOTP enrollment doesn't exist yet, so there is nothing for
+//!   it to write.
 //!
 //! `add`/`rm`/`grant`/`revoke` run AS THE VAULT USER in deployment
 //! (`sudo -u aoide-vault ...`, wrapped by the nix module at P-V4), but the
@@ -138,8 +145,27 @@ fn handle_vault_exec(inv: &Invocation) -> Outcome {
     }
 }
 
+/// Shared door gate for the admin quartet (`add`/`rm`/`grant`/`revoke`):
+/// CLI-only, same shape as `handle_vault_serve`/`handle_vault_exec`'s own
+/// door check (bounce-fix item 2, P-V2 review). Returns `Some(hint)` on any
+/// non-`Cli` door — the caller must return it immediately, before touching
+/// `store::load_policies`/`store::save_policies`, so a gated call never
+/// mutates `policy.json`.
+fn require_cli(inv: &Invocation, cmd: &str) -> Option<Outcome> {
+    match inv.door {
+        Door::Cli => None,
+        _ => Some(Outcome::usage(
+            cmd,
+            "vault policy admin verbs (add/rm/grant/revoke) are CLI-only; run this from a terminal (not over this door)",
+        )),
+    }
+}
+
 fn handle_vault_add(inv: &Invocation) -> Outcome {
     let cmd = "vault.add";
+    if let Some(hint) = require_cli(inv, cmd) {
+        return hint;
+    }
     let Some(name) = inv.args.first().cloned() else {
         return Outcome::usage(cmd, "usage: vault add <name> --backend <backend> --key <key>");
     };
@@ -179,6 +205,9 @@ fn handle_vault_add(inv: &Invocation) -> Outcome {
 
 fn handle_vault_rm(inv: &Invocation) -> Outcome {
     let cmd = "vault.rm";
+    if let Some(hint) = require_cli(inv, cmd) {
+        return hint;
+    }
     let Some(name) = inv.args.first().cloned() else {
         return Outcome::usage(cmd, "usage: vault rm <name>");
     };
@@ -203,6 +232,9 @@ fn handle_vault_rm(inv: &Invocation) -> Outcome {
 /// Shared shape behind `grant`/`revoke`: both take `<name> <consumer>` and
 /// differ only in what they do to the `consumers[]` list.
 fn edit_consumer(inv: &Invocation, cmd: &str, usage: &str, edit: impl FnOnce(&mut Vec<String>, &str)) -> Outcome {
+    if let Some(hint) = require_cli(inv, cmd) {
+        return hint;
+    }
     let Some(name) = inv.args.first().cloned() else {
         return Outcome::usage(cmd, usage);
     };
@@ -401,6 +433,37 @@ mod tests {
         with_vault_home("grant-unknown", |_home| {
             let grant = inv(Door::Cli, &["vault", "grant"], &["nope", "m"], &[]);
             assert_eq!(handle_vault_grant(&grant).status, Status::Error);
+        });
+    }
+
+    /// Bounce-fix item 2 (P-V2 review): the admin quartet is CLI-only. A
+    /// non-CLI door must get the door-hint AND must never mutate
+    /// `policy.json` — proven here by seeding one existing policy first and
+    /// asserting the on-disk list is byte-identical after every gated call
+    /// (add would append, rm/grant/revoke would rewrite; none of them may
+    /// run at all).
+    #[test]
+    fn admin_quartet_is_cli_only_a_non_cli_door_never_mutates_policy_json() {
+        with_vault_home("door-gate", |home| {
+            let seed = inv(Door::Cli, &["vault", "add"], &["t"], &[("backend", "pass"), ("key", "x")]);
+            assert_eq!(handle_vault_add(&seed).status, Status::Ok);
+            let before = store::load_policies(home).unwrap();
+
+            for door in [Door::Mcp, Door::A2a, Door::Daemon] {
+                let add = inv(door, &["vault", "add"], &["other"], &[("backend", "pass"), ("key", "y")]);
+                assert_eq!(handle_vault_add(&add).status, Status::Usage, "add over {door:?}");
+
+                let rm = inv(door, &["vault", "rm"], &["t"], &[]);
+                assert_eq!(handle_vault_rm(&rm).status, Status::Usage, "rm over {door:?}");
+
+                let grant = inv(door, &["vault", "grant"], &["t", "m"], &[]);
+                assert_eq!(handle_vault_grant(&grant).status, Status::Usage, "grant over {door:?}");
+
+                let revoke = inv(door, &["vault", "revoke"], &["t", "m"], &[]);
+                assert_eq!(handle_vault_revoke(&revoke).status, Status::Usage, "revoke over {door:?}");
+
+                assert_eq!(store::load_policies(home).unwrap(), before, "policy.json mutated over {door:?}");
+            }
         });
     }
 }

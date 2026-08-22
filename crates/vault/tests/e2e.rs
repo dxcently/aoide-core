@@ -13,6 +13,16 @@
 //! carries `"granted":true` without the value ever appearing anywhere in
 //! either file.
 //!
+//! **Denial marker check** (bounce-fix item 5, P-V2 review): the earlier
+//! revision of this test only checked the returned error STRING for each
+//! denied path, never whether the backend was actually invoked — a broker
+//! bug that ran the backend anyway and then discarded the value would have
+//! passed silently. The scratch backend's template now `touch`es a marker
+//! file before its `printf`; each denial asserts the marker is ABSENT
+//! afterward, proving `resolve_gate` short-circuits BEFORE ever touching
+//! the backend, and the granted path asserts the marker IS present as a
+//! positive control on the mechanism itself.
+//!
 //! **Why the child writes to a file instead of the test reading its
 //! stdout**: `aoide_vault::client::run_exec` uses `Stdio::inherit()`
 //! throughout, by design (this crate's `AGENTS.md` — aoide never holds a
@@ -58,9 +68,15 @@ fn end_to_end_resolve_denies_and_grants_env_round_trip() {
     std::env::set_var("AOIDE_AUDIT_LOG", &aoide_log);
 
     // ── seed the vault home ─────────────────────────────────────────────
+    // `touch`es a marker before its `printf` — proves whether the backend
+    // was actually run, not just what the resolve returned (module doc).
+    let marker_path = vault_home.join("backend-invoked-marker");
     std::fs::write(
         backend::backends_path(&vault_home),
-        serde_json::to_vec(&serde_json::json!({ "scratch": { "get": "printf %s {name}" } })).unwrap(),
+        serde_json::to_vec(&serde_json::json!({
+            "scratch": { "get": format!("touch {} && printf %s {{name}}", marker_path.display()) }
+        }))
+        .unwrap(),
     )
     .unwrap();
 
@@ -92,18 +108,22 @@ fn end_to_end_resolve_denies_and_grants_env_round_trip() {
     // ── denied: unknown secret ──────────────────────────────────────────
     let err = client::resolve(&socket_path, "nope", "m", None, None).unwrap_err();
     assert_eq!(err, "secret not found");
+    assert!(!marker_path.exists(), "backend was invoked for a denied (unknown secret) resolve");
 
     // ── denied: consumer not in the policy's list ───────────────────────
     let err = client::resolve(&socket_path, "t", "someone-else", None, None).unwrap_err();
     assert!(err.contains("not authorized"), "{err}");
+    assert!(!marker_path.exists(), "backend was invoked for a denied (wrong consumer) resolve");
 
     // ── denied: requireTotp with no enrollment on this host ────────────
     let err = client::resolve(&socket_path, "locked", "m", Some("123456"), None).unwrap_err();
     assert!(err.contains("no TOTP enrollment"), "{err}");
+    assert!(!marker_path.exists(), "backend was invoked for a denied (requireTotp) resolve");
 
     // ── granted: resolve() round-trips the value directly ──────────────
     let value = client::resolve(&socket_path, "t", "m", None, Some("printenv")).unwrap();
     assert_eq!(value, "stored-value");
+    assert!(marker_path.exists(), "positive control: the backend must run on a granted resolve");
 
     // ── granted: the value round-trips into a REAL child's env, through
     //    the unmodified `run_exec`/Stdio::inherit() production path ─────

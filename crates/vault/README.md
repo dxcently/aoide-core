@@ -69,15 +69,26 @@ Daemon/socket/CLI (P-V2, new):
 
 - `home` — `vault_home()`: `$AOIDE_VAULT_HOME` env override, else the
   placeholder default `/var/lib/aoide-vault` (P-V4 is what actually
-  provisions that path — see the module doc).
+  provisions that path — see the module doc). Also `secure_dir`/
+  `secure_file` (`0700`/`0600`): every `create_dir_all(vault_home)` in this
+  crate (`broker::serve`, `store::save_policies`) is immediately followed
+  by `secure_dir`, and `store::save_policies` locks `policy.json` down to
+  `0600` after writing it — `create_dir_all` alone honors the process
+  umask, which would otherwise leave the vault home world-searchable.
 - `socket` — `socket_path()`: `$AOIDE_VAULT_SOCKET` env override, else
   `vault_home().join("vault.sock")` (deliberately NOT `/run/...` yet — see
   the module doc for why, and the SUN_LEN caution for any caller building
   a socket path by hand).
 - `backend` — `Backends`/`Backend` (`backends.json`'s shape: a map of
   named backend -> ONE fetch-command template) and `fetch_value`, which
-  substitutes the policy's `key` into the template's `{name}` placeholder,
-  runs it via `sh -c`, and trims exactly one trailing newline from stdout.
+  substitutes the policy's `key`, SHELL-SINGLE-QUOTE-ESCAPED (never a raw
+  `.replace()` — a key with whitespace or an embedded `'` must not be able
+  to break the command or escape its argument boundary), into the
+  template's `{name}` placeholder, runs it via `sh -c`, and trims exactly
+  one trailing newline from stdout. On a failing backend, the returned
+  `Err` carries ONLY the exit status — the command's full stderr is
+  `eprintln!`'d to the broker's own stderr and never returned, since the
+  `Err` string rides the wire reply and both audit lines' `reason` field.
   `pass`/`gopass`/`bw`/`sops` are DOC PRESETS (P-V3), not code — this
   module has no knowledge of any specific backend.
 - `store` — `load_policies`/`save_policies`: `policy.json` persistence
@@ -91,10 +102,13 @@ Daemon/socket/CLI (P-V2, new):
 - `client` — `resolve` (one round trip over the socket), `parse_exec_args`
   (pure `Invocation` parsing), `run_exec` (the full `vault exec` flow: the
   entry point for `aoide-cli`'s `special` hook).
-- `commands` — `register(&mut Registry)`: the six verbs. `serve`/`exec`
-  are CLI-only door-hint handlers (the real work happens in `cli`'s
+- `commands` — `register(&mut Registry)`: the six verbs, ALL CLI-only.
+  `serve`/`exec` are door-hint handlers (the real work happens in `cli`'s
   `special` hook, same pattern as `a2a serve`/`conductor`); `add`/`rm`/
-  `grant`/`revoke` are plain policy-CRUD handlers.
+  `grant`/`revoke` are policy-CRUD handlers gated the same way (`require_
+  cli`) — a non-CLI door (MCP/A2A/Daemon) gets the door-hint `Outcome`
+  before `policy.json` is ever touched, closing off a self-escalation path
+  (`vault grant <secret> <itself>` from an already-connected agent).
 
 ## What it consumes
 
