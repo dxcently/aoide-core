@@ -1,6 +1,6 @@
 [package]
 name = "aoide-conduct"
-version = "0.0.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 description = "Aoide session core: PTY multiplexer, session DAG, hook plumbing, liveness reaping."

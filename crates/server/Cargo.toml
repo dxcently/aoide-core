@@ -1,6 +1,6 @@
 [package]
 name = "aoide-server"
-version = "0.0.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 description = "Aoide's door serve-loops: the A2A JSON-RPC/HTTP server, the MCP stdio server, and the aoided policy skeleton. Untrusted input stops here."

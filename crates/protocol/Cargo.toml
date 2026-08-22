@@ -1,6 +1,6 @@
 [package]
 name = "aoide-protocol"
-version = "0.0.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 description = "Aoide's one-schema-N-doors contract: registry, Outcome envelope, Door + audit, canonical_state."

@@ -1,6 +1,6 @@
 [package]
 name = "aoide-conductor"
-version = "0.0.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 description = "Aoide's interactive terminal frontend: the session-DAG conductor TUI (ratatui/crossterm). A frontend over the one dispatcher -- never a second implementation."

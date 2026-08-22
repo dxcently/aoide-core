@@ -1,6 +1,6 @@
 [package]
 name = "aoide-upkeep"
-version = "0.0.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 description = "Aoide mechanical integrity: `aoide soundcheck`, a report-only sweep of the WORKING tree (repo-root slop, orphaned tracked/ignored files, build clutter) — the working-tree half of the mechanical-integrity design; `nix flake check`'s own checks own the COMMITTED half."

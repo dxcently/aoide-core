@@ -1,6 +1,6 @@
 [package]
 name = "aoide-screen"
-version = "0.0.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 description = "Aoide screen verb family: read-only desktop readout, capture, pointer synthesis, OCR, act-verification diff, and send-to-agent — extracted from aoide-conduct (P-A1 of the binary-split workstream)."

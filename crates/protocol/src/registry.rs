@@ -20,7 +20,13 @@ use serde::Serialize;
 
 /// Contract versions (CONTRACTS.md "Versioning").
 pub const SCHEMA_VERSION: &str = "0";
-pub const AOIDE_VERSION: &str = "0.0.0";
+/// The Aoide RELEASE version (prebeta `0.0.X`, root README.md's
+/// "Versioning" section) — derives from THIS crate's own Cargo.toml, which
+/// itself inherits `pkgs/aoide/Cargo.toml`'s `[workspace.package].version`
+/// (versioning start, 2026-08-22). Never a second hardcoded literal: a
+/// release bump is one edit to the workspace manifest, not a search for
+/// every place this string was repeated.
+pub const AOIDE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Stage-file format version (CONTRACTS.md §4).
 pub const STAGE_NOTES_VERSION: &str = "0";
 

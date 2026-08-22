@@ -1,6 +1,6 @@
 [package]
 name = "aoide-client"
-version = "0.0.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 description = "Aoide outbound: the A2A client (agent add/list/remove/send), wire builders/parsers, and the melete neutral-event adapter."

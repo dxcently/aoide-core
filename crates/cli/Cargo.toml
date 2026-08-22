@@ -1,6 +1,6 @@
 [package]
 name = "aoide-cli"
-version = "0.0.0"
+version.workspace = true
 edition = "2021"
 description = "Aoide CLI + daemon — an API that happens to be typeable."
 license = "MIT"

@@ -1,6 +1,6 @@
 [package]
 name = "aoide-test-support"
-version = "0.0.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 description = "Aoide shared test scaffolding: scratch dirs, EnvSaver, fixture note payloads, the process-wide env lock. Dev-dependency only — never a production edge."

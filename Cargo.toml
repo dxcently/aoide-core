@@ -5,6 +5,18 @@
 resolver = "2"
 members = ["crates/protocol", "crates/storage", "crates/conduct", "crates/client", "crates/server", "crates/song", "crates/conductor", "crates/test-support", "crates/cli", "crates/upkeep", "crates/screen", "crates/lyra", "crates/secrets"]
 
+# The one release-version source for the whole workspace (versioning start,
+# 2026-08-22 — User-directed: prebeta is 0.0.X, the patch bumps only at a
+# User-directed release point, see the root README.md's "Versioning"
+# section). Every crate's own `[package]` inherits via `version.workspace =
+# true` rather than repeating the literal — a bump is ONE edit here, not
+# thirteen. `aoide_protocol::registry::AOIDE_VERSION` (the schema/MCP/A2A
+# runtime-readable version) derives from THIS crate's own manifest version
+# via `env!("CARGO_PKG_VERSION")`, so it can never drift from what's
+# declared here.
+[workspace.package]
+version = "0.0.1"
+
 # ONE version source for the whole workspace (the monorepo standard): every
 # crate inherits via `{ workspace = true }` — no per-manifest version repeats.
 # Versions match the pre-centralization manifests exactly; Cargo.lock must

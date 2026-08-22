@@ -25,7 +25,10 @@
 }:
 rustPlatform.buildRustPackage {
   pname = "aoide";
-  version = "0.0.0";
+  # Prebeta versioning start (2026-08-22, root README.md's "Versioning"
+  # section) — matches pkgs/aoide/Cargo.toml's [workspace.package].version,
+  # the single Cargo-side source every crate inherits from.
+  version = "0.0.1";
 
   src = lib.cleanSource ./.;
 

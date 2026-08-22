@@ -1,6 +1,6 @@
 [package]
 name = "aoide-lyra"
-version = "0.0.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 description = "Aoide's graphical/rice binary: the self-ricing loop, screen capture/pointer/OCR, the herald ledger, the shellbridge stage bridge, and the Quickshell IPC trigger — split out of the `aoide` core binary (P-A4 of the binary-split workstream, docs/architecture/PACKAGE-LAYOUT.md)."

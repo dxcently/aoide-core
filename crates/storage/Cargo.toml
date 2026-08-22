@@ -1,6 +1,6 @@
 [package]
 name = "aoide-storage"
-version = "0.0.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 description = "Aoide durable session data: stage-file records, atomic stage I/O, the a2a roster, time."
