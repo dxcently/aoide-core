@@ -9,9 +9,15 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
 
 - `graph` — the session DAG: build/merge/send/spawn/wrap, `normalize_addr`
   (widened to `pub` at P-A1 so `screen` could reach it without duplicating
-  it), `SessionRecord`/`SessionsFile`/`load_stage`/`write_stage`. `graph
-  send` gained `--to <target>` (messaging plan P-C3, mutually exclusive
-  with `--id`): resolves via `aoide_storage::addr::resolve` against local
+  it), `SessionRecord`/`SessionsFile`/`load_stage`/`write_stage`. `--id`
+  accepts a bare session id OR the exact `session:<id>` form `graph view
+  --json` emits for a node id (a known prefix stripped before matching,
+  same discipline `graph focus`/`focus_session` already used) — `graph
+  view`'s own emitted contract is unchanged, only what `--id`/`--to` accept
+  as input widened; an id with any OTHER prefix still errors as unknown,
+  unchanged. `graph send` gained `--to <target>` (messaging plan P-C3, mutually exclusive
+  with `--id`): resolves via `aoide_storage::addr::resolve` (itself
+  `session:`-prefix-tolerant on its exact-id tier) against local
   sessions + registered peers — a LOCAL match re-drives the exact `--id`
   path unchanged, a REMOTE match (`peer/<query>`, resolved against that
   peer's CACHED graph, never a live pull) delivers over A2A `message/send`

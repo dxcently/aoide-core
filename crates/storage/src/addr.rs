@@ -15,7 +15,10 @@
 //! earlier one has something to say:
 //!
 //! 1. **exact session id** — `query == candidate.session_id` verbatim (the
-//!    degraded-legacy form of the label, or a copy-pasted id).
+//!    degraded-legacy form of the label, or a copy-pasted id). A leading
+//!    `session:` prefix — the exact form `graph view --json` emits for a
+//!    node id — is stripped before this (or any later) tier runs, so a
+//!    copy-pasted node id resolves the same as the bare id it wraps.
 //! 2. **id tail4** — `query == short_tail(candidate.session_id)`, the
 //!    `…8948` short form the label parenthesizes.
 //! 3. **petname** — a bare token (no `/`) equal to a local session's minted
@@ -152,6 +155,12 @@ pub fn resolve(query: &str, host: &str, locals: &[LocalCandidate<'_>], peers: &[
     if query.is_empty() {
         return Resolution::NotFound;
     }
+    // A known `session:` prefix (the exact form `graph view --json` emits
+    // for a node id) is stripped before any tier runs, so a copy-pasted
+    // node id resolves identically to the bare id it wraps. No other
+    // prefix is special-cased — an unrecognised one is left verbatim and
+    // simply fails every tier below, same as today.
+    let query = query.strip_prefix("session:").unwrap_or(query);
 
     // Tier 1: exact session id.
     if let Some(r) = match_tier(locals, |c| c.session_id == query) {
@@ -248,6 +257,28 @@ mod tests {
                 ],
                 peers: vec![],
                 expected: Resolution::Local("sess-aaaa-root".into()),
+            },
+            Case {
+                // The exact form `graph view --json` emits for a node id
+                // (`session:<id>`) round-trips through `--to`/`who` just
+                // like a bare copy-pasted id.
+                name: "a session:-prefixed id resolves the same as the bare id",
+                query: "session:sess-aaaa-1111",
+                host: "sakaki",
+                locals: vec![cand("sess-aaaa-1111", Some("brave-otter"), "root")],
+                peers: vec![],
+                expected: Resolution::Local("sess-aaaa-1111".into()),
+            },
+            Case {
+                // Only the KNOWN `session:` prefix is special-cased — an
+                // unrecognised one is left verbatim and still fails every
+                // tier, exactly as before this fix.
+                name: "an id with an unknown prefix is still not found",
+                query: "peerish:sess-aaaa-1111",
+                host: "sakaki",
+                locals: vec![cand("sess-aaaa-1111", Some("brave-otter"), "root")],
+                peers: vec![],
+                expected: Resolution::NotFound,
             },
             // ── Tier 2: id tail4 ──────────────────────────────────────────
             Case {

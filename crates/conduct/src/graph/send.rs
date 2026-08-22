@@ -491,7 +491,15 @@ pub fn session_send(inv: &Invocation) -> Outcome {
 /// reference-vs-owned churn to review).
 fn deliver_local(inv: &Invocation, id: &str) -> Outcome {
     let cmd = "graph.send";
-    let id = id.to_string();
+    // Accept the exact `session:<id>` form `graph view --json` emits for a
+    // node id, so a copy-pasted id round-trips through `--id` — mirrors
+    // `graph focus`'s identical `session:` stripping (window.rs). Only this
+    // known prefix is special-cased; anything else passes through untouched
+    // and still falls into the `unknown session` error below, same as
+    // before this fix. `--to`'s LOCAL branch already hands in a bare,
+    // resolver-produced id (`aoide_storage::addr::resolve`, itself now
+    // prefix-tolerant too), so this is a no-op on that path.
+    let id = id.strip_prefix("session:").unwrap_or(id).to_string();
     let text = inv.args.join(" ");
     let submit = inv.flag_present("submit");
     let yes = inv.flag_present("yes");
@@ -1874,6 +1882,81 @@ mod tests {
             log.contains("graph.send") && log.contains("delivered"),
             "audit log carries the delivered send: {log}"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn send_id_accepts_the_session_prefix_graph_view_emits() {
+        // `graph view --json` emits node ids as `session:<id>` (doc.rs's
+        // `render`); an agent copying that field verbatim into `--id`
+        // must resolve to the exact same session a bare `--id` would.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+
+        let root = unique_stage("send-prefixed-id");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        let id = "send-prefixed-target";
+        let socket = conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        do_session_start(
+            id,
+            Some("claude"),
+            Some("/w"),
+            None,
+            None,
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+            None,
+        );
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+
+        // The exact id `graph view --json` would emit for this session.
+        let prefixed = format!("session:{id}");
+        let out = session_send(&send_invocation(
+            &["hi", "there"],
+            &[("id", prefixed.as_str()), ("submit", "true"), ("yes", "true")],
+        ));
+        let got = acc.join().unwrap();
+
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(out.data.as_ref().unwrap()["delivered"], true);
+        // The resolved id reported back is the BARE id — `graph view`'s own
+        // emitted contract is untouched, but the resolved target is the same
+        // session a bare `--id` would have hit.
+        assert_eq!(out.data.as_ref().unwrap()["id"], id);
+        assert_eq!(String::from_utf8(got).unwrap(), "hi there\n");
+
+        // An id carrying an UNKNOWN prefix is not special-cased — it still
+        // errors as an unknown session, exactly as an unrecognised id always
+        // has.
+        let out = session_send(&send_invocation(
+            &["hi"],
+            &[("id", "peerish:send-prefixed-target"), ("yes", "true")],
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
+        assert_eq!(out.data.as_ref().unwrap()["reason"], "session-not-found");
 
         let _ = std::fs::remove_dir_all(&root);
     }
