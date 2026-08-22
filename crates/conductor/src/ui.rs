@@ -112,6 +112,7 @@ fn keymap_hint(panel: Panel) -> &'static str {
         Panel::Projects => "j/k select · a add · d remove · Tab panel · ? help · q quit",
         Panel::Log => "Tab panel · ? help · q quit",
         Panel::Status => "Tab panel · ? help · q quit",
+        Panel::Roster => "r refresh (auto ~15s while open) · Tab panel · ? help · q quit",
     }
 }
 
@@ -148,6 +149,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &App) {
         Panel::Projects => draw_projects(f, inner, app),
         Panel::Log => draw_log(f, inner, app),
         Panel::Status => draw_status_panel(f, inner, app),
+        Panel::Roster => draw_roster(f, inner, app),
     }
 }
 
@@ -613,6 +615,94 @@ fn palette_summary<'a>(app: &App) -> Line<'a> {
     Line::from(spans)
 }
 
+// ── [5] ROSTER — presence over this box + every registered peer ────────────
+//
+// Read-only (messaging/presence plan, P-C4): rows come straight from the
+// cached `who --json` `Outcome` (`App::roster_nodes` — a reshape, never a
+// re-derivation), local box first then peers in `who`'s own order. Node
+// glyphs (`●`/`◐`/`○`) MATCH `who`'s own Unicode-roster vocabulary
+// (`conduct/src/graph/who.rs`'s private `glyph` helper — independently
+// drawn here since that helper isn't public); session glyphs are the
+// conductor's existing musical-note set
+// (`theme::state_glyph`) applied to `who`'s canonical `state` string —
+// the SAME mapping the SESSIONS panel paints, since `who` classifies
+// sessions off the identical vocabulary.
+
+fn draw_roster(f: &mut Frame, area: Rect, app: &App) {
+    let nodes = app.roster_nodes();
+
+    let parts = Layout::vertical([
+        Constraint::Length(1), // glyph legend
+        Constraint::Length(1), // fetch status (probing… / fetched Ns ago)
+        Constraint::Min(3),    // node/session list
+    ])
+    .split(area);
+
+    let legend = Line::from(
+        " ● online  ◐ unreachable  ○ never-pulled    ♪ working  𝄐 awaiting  𝄁 stopped  𝄽 idle  𝄂 done",
+    )
+    .style(theme::dim());
+    f.render_widget(Paragraph::new(legend), parts[0]);
+
+    let status = Line::from(format!(" {}", app.roster_status())).style(theme::dim());
+    f.render_widget(Paragraph::new(status), parts[1]);
+
+    if nodes.is_empty() {
+        let lines = vec![
+            Line::from(""),
+            Line::from("   no roster data yet — press r to fetch.").style(theme::dim()),
+        ];
+        f.render_widget(Paragraph::new(lines), parts[2]);
+        return;
+    }
+
+    let pal = &app.palette;
+    let mut lines: Vec<Line> = Vec::new();
+    for n in &nodes {
+        let glyph = roster_node_glyph(&n.presence);
+        let head = match n.presence.as_str() {
+            "unreachable" => format!(
+                "{glyph} {} — unreachable (as of {})",
+                n.name,
+                n.fetched_at.as_deref().unwrap_or("unknown")
+            ),
+            "never-pulled" => format!("{glyph} {} — never pulled", n.name),
+            _ if n.is_local => format!("{glyph} {} (this host)", n.name),
+            _ => format!("{glyph} {}", n.name),
+        };
+        lines.push(Line::from(Span::styled(
+            head,
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        for (i, s) in n.sessions.iter().enumerate() {
+            let branch = if i + 1 == n.sessions.len() { "└─ " } else { "├─ " };
+            let st = theme::state_style(&s.state, pal);
+            let sg = theme::state_glyph(&s.state);
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {branch}")),
+                Span::styled(format!("{sg} "), st),
+                Span::raw(format!("{}  ", s.label)),
+                Span::styled(s.state.clone(), st),
+            ]));
+        }
+        if n.sessions.is_empty() && n.presence != "never-pulled" {
+            lines.push(Line::from("     (no sessions)").style(theme::dim()));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), parts[2]);
+}
+
+/// Node-level presence glyph — matches `who`'s own Unicode-roster
+/// vocabulary (`conduct/src/graph/who.rs`'s private `glyph` helper).
+fn roster_node_glyph(presence: &str) -> &'static str {
+    match presence {
+        "online" => "●",
+        "unreachable" => "◐",
+        "never-pulled" => "○",
+        _ => "?",
+    }
+}
+
 // ── Log-tail overlay ────────────────────────────────────────────────────────
 
 /// The headless-session log tail — Enter's other destination
@@ -662,7 +752,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     let help: &[&str] = &[
         "",
         "  Tab / Shift-Tab   cycle panels",
-        "  1 2 3 4 5         DAG / SESSIONS / PROJECTS / LOG / STATUS",
+        "  1 2 3 4 5 6       DAG / SESSIONS / PROJECTS / LOG / STATUS / ROSTER",
         "  j / k  ↓ / ↑      move selection",
         "",
         "  DAG (the visual graph)",
@@ -683,6 +773,9 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         "    ♪ 𝄐 𝄁 𝄽 𝄂        working · awaiting · stopped · idle · done   ‣ fresh",
         "",
         "  PROJECTS: a add · d remove",
+        "",
+        "  ROSTER (read-only): r forces a refresh; auto-probes every ~15s",
+        "    while the pane is open. ● online  ◐ unreachable  ○ never-pulled",
         "",
         "  ?                 toggle this help      q / Ctrl-C  quit",
         "  Every cue runs through the one door; the audit log records it.",
@@ -1113,5 +1206,122 @@ mod tests {
         let backend = TestBackend::new(12, 8);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, &app)).unwrap();
+    }
+
+    // ── ROSTER panel (P-C4): fixed `who --json` fixture -> render ───────────
+
+    /// A fixed `who --json` fixture, shaped exactly like
+    /// `conduct/src/graph/who.rs::who_with`'s real `Outcome.data` (this box
+    /// online, one unreachable peer with a stale-cache session, one
+    /// never-pulled peer) — the ONLY input `draw_roster` is allowed to read.
+    fn who_fixture() -> aoide_protocol::output::Outcome {
+        let data = serde_json::json!({
+            "host": "sakaki",
+            "generatedAt": "2026-08-21T00:00:00Z",
+            "nodes": [
+                {
+                    "name": "sakaki",
+                    "isLocal": true,
+                    "presence": "online",
+                    "fetchedAt": null,
+                    "error": null,
+                    "sessions": [
+                        {
+                            "sessionId": "s1",
+                            "label": "sakaki/root/brave-otter (…s1)",
+                            "petname": "brave-otter",
+                            "agent": "claude",
+                            "state": "working",
+                            "presence": "online",
+                            "cwd": "/x",
+                        },
+                    ],
+                },
+                {
+                    "name": "yomi-strix",
+                    "isLocal": false,
+                    "presence": "unreachable",
+                    "fetchedAt": "2026-08-20T23:00:00Z",
+                    "error": "HTTP 000",
+                    "sessions": [
+                        {
+                            "sessionId": "s2",
+                            "label": "yomi-strix/root/misty-comet (…s2)",
+                            "petname": "misty-comet",
+                            "agent": "claude",
+                            "state": "idle",
+                            "presence": "online",
+                            "cwd": "/y",
+                        },
+                    ],
+                },
+                {
+                    "name": "ghost",
+                    "isLocal": false,
+                    "presence": "never-pulled",
+                    "fetchedAt": null,
+                    "error": "could not reach the agent",
+                    "sessions": [],
+                },
+            ],
+        });
+        aoide_protocol::output::Outcome::ok("who", "3 node(s), 2 session(s)").with_data(data)
+    }
+
+    #[test]
+    fn roster_panel_renders_grouped_nodes_with_presence_glyphs_and_staleness() {
+        let mut a = App::for_test(vec![], vec![], vec![]);
+        a.panel = Panel::Roster;
+        a.roster.outcome = Some(who_fixture());
+
+        let backend = TestBackend::new(100, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &a)).unwrap();
+        let out = dump(term.backend().buffer());
+
+        assert!(out.contains("ROSTER"), "panel title: {out}");
+        assert!(
+            out.contains("● sakaki (this host)"),
+            "local node: online glyph + (this host): {out}"
+        );
+        assert!(
+            out.contains("◐ yomi-strix — unreachable (as of 2026-08-20T23:00:00Z)"),
+            "peer node: unreachable glyph + staleness stamp: {out}"
+        );
+        assert!(
+            out.contains("○ ghost — never pulled"),
+            "peer node: never-pulled glyph: {out}"
+        );
+        assert!(
+            out.contains("brave-otter") && out.contains('♪'),
+            "local session row + its working glyph: {out}"
+        );
+        assert!(
+            out.contains("misty-comet"),
+            "an unreachable peer's last-known session still surfaces: {out}"
+        );
+
+        // Local box first, then peers — `who`'s own node order, never
+        // re-sorted here.
+        let local_pos = out.find("sakaki (this host)").unwrap();
+        let peer_pos = out.find("yomi-strix").unwrap();
+        assert!(local_pos < peer_pos, "local box renders before peers: {out}");
+    }
+
+    #[test]
+    fn roster_panel_shows_a_fetch_hint_when_never_fetched() {
+        let mut a = App::for_test(vec![], vec![], vec![]);
+        a.panel = Panel::Roster;
+        // `a.roster.outcome` stays `None` — never fetched this run.
+
+        let backend = TestBackend::new(80, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &a)).unwrap();
+        let out = dump(term.backend().buffer());
+
+        assert!(
+            out.contains("not yet fetched") && out.contains("press r"),
+            "an empty cache tells the human how to get data: {out}"
+        );
     }
 }

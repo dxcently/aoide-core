@@ -28,13 +28,17 @@ use aoide_storage::fs::stage_dir;
 use crossterm::event::{KeyCode, KeyEvent};
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::sync::mpsc;
+use std::time::{Instant, SystemTime};
 
-/// The five panels, in Tab / 1-5 order. `Graph` is the visual DAG (the new hero
+/// The six panels, in Tab / 1-6 order. `Graph` is the visual DAG (the new hero
 /// view — nodes/edges laid out and drawn); `Sessions` is the collapsible roster
 /// (the terminal-sessions view, keyed off [`App::dag_rows`]). The two are
 /// deliberately distinct lenses on the same data: `Graph` shows the *shape* of
-/// the DAG, `Sessions` the *state* of each terminal.
+/// the DAG, `Sessions` the *state* of each terminal. `Roster` (messaging/
+/// presence plan, P-C4) is a distinct, later addition — appended last so the
+/// existing 1-5 keys never shift (registry append-only discipline,
+/// `pkgs/aoide/crates/AGENTS.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
     Graph,
@@ -42,15 +46,17 @@ pub enum Panel {
     Projects,
     Log,
     Status,
+    Roster,
 }
 
 impl Panel {
-    pub const ALL: [Panel; 5] = [
+    pub const ALL: [Panel; 6] = [
         Panel::Graph,
         Panel::Sessions,
         Panel::Projects,
         Panel::Log,
         Panel::Status,
+        Panel::Roster,
     ];
     pub fn title(self) -> &'static str {
         match self {
@@ -59,6 +65,7 @@ impl Panel {
             Panel::Projects => "PROJECTS",
             Panel::Log => "LOG",
             Panel::Status => "STATUS",
+            Panel::Roster => "ROSTER",
         }
     }
     pub fn index(self) -> usize {
@@ -164,6 +171,48 @@ pub struct LogTail {
     mtime: Option<SystemTime>,
 }
 
+/// Throttle window for the ROSTER panel's `who` dispatch (messaging/presence
+/// plan, P-C4). `who` performs a LIVE network probe of every registered peer
+/// on each invocation (`conduct/src/graph/who.rs`'s module doc), so the pane
+/// re-dispatches at most this often — never on every ~500ms UI tick.
+pub const ROSTER_THROTTLE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// One session row under a [`RosterNode`] — reshaped straight from `who
+/// --json`'s `nodes[].sessions[]` (`conduct/src/graph/who.rs::node_json`),
+/// never re-derived: `label`/`state` are exactly the strings `who` already
+/// computed (display-grammar label, canonical state vocabulary), so
+/// `theme::state_glyph`/`state_style` — the SAME glyph mapping the SESSIONS
+/// panel already paints — apply unchanged.
+#[derive(Debug, Clone, Default)]
+pub struct RosterSession {
+    pub label: String,
+    pub state: String,
+}
+
+/// One node (this box, or a registered peer) as `who --json` reports it —
+/// parsed from the cached `Outcome`'s `data.nodes[]`. `presence` is one of
+/// `who`'s own three node-level classes: `online` | `unreachable` |
+/// `never-pulled` (`who.rs`'s module doc, "Presence model").
+#[derive(Debug, Clone, Default)]
+pub struct RosterNode {
+    pub name: String,
+    pub is_local: bool,
+    pub presence: String,
+    pub fetched_at: Option<String>,
+    pub sessions: Vec<RosterSession>,
+}
+
+/// The ROSTER panel's cache: the last `who` [`Outcome`] plus when it landed.
+/// `fetched_at: None` means "never fetched this run" — always stale, so the
+/// first tick/visit fetches immediately. This is the ONLY state the panel
+/// holds; there is no second copy of presence logic here, only a reshape of
+/// what `who --json` already returned (crate `AGENTS.md`'s "frontend only").
+#[derive(Debug, Clone, Default)]
+pub struct RosterCache {
+    pub outcome: Option<Outcome>,
+    fetched_at: Option<Instant>,
+}
+
 /// The whole conductor state.
 pub struct App {
     pub panel: Panel,
@@ -208,6 +257,13 @@ pub struct App {
     /// real one in — see [`DispatchFn`]'s doc comment for why this is
     /// injected rather than reached for as a trunk global.
     dispatch_fn: DispatchFn,
+    /// The ROSTER panel's cache — last `who` fetch + when.
+    pub roster: RosterCache,
+    /// `Some` while a background `who` dispatch is in flight — set by
+    /// [`App::spawn_roster_fetch`], drained (never blocked on) by
+    /// [`App::drain_roster`]. See the module doc's "Roster: throttled,
+    /// backgrounded dispatch" for why this exists at all.
+    roster_rx: Option<mpsc::Receiver<Outcome>>,
 }
 
 /// How many audit lines the LOG panel keeps in memory.
@@ -253,6 +309,8 @@ impl App {
             initialized: false,
             mtimes: StageMtimes::default(),
             dispatch_fn: no_dispatch,
+            roster: RosterCache::default(),
+            roster_rx: None,
         }
     }
 
@@ -268,6 +326,16 @@ impl App {
         app.projects = projects;
         app.sessions = sessions;
         app.hooks = hooks;
+        app
+    }
+
+    /// Test-only constructor: like [`App::for_test`] but also wires a real
+    /// `DispatchFn` — the ROSTER throttle tests need to observe actual
+    /// dispatch calls (a counting `fn`), not just render/select/navigate.
+    #[cfg(test)]
+    pub fn for_test_with_dispatch(dispatch: DispatchFn) -> Self {
+        let mut app = App::empty();
+        app.dispatch_fn = dispatch;
         app
     }
 
@@ -444,7 +512,153 @@ impl App {
             self.note_new_sessions();
             self.clamp_selection();
         }
+
+        // ROSTER: independent of the stage-mtime watch above — `who` is live
+        // network state, not a stage file. Deliberately outside the
+        // `if changed` block: draining/spawning a roster fetch must run every
+        // tick regardless of whether anything else changed.
+        if self.poll_roster() {
+            changed = true;
+        }
+
         changed
+    }
+
+    // ── ROSTER: throttled, backgrounded `who` dispatch (P-C4) ───────────────
+    //
+    // `who` performs a live network probe of every registered peer on EVERY
+    // invocation (`conduct/src/graph/who.rs`'s module doc) — up to ~2s per
+    // peer, run in parallel inside `who` itself but still ~2s wall-clock in
+    // the worst case. Calling it through `App::dispatch` the way every other
+    // action does would block the ~500ms tick loop for that long, so this
+    // dispatch runs on its OWN `std::thread` (the exact pattern `who`'s own
+    // `probe_peers` already uses one layer down) and reports back over an
+    // `mpsc` channel that the tick loop only ever polls non-blockingly. This
+    // is the ONE dispatch site in the crate that does not go through
+    // `App::dispatch` — `who` never mutates anything, so there is no stage
+    // write to `reload_all()` after, and the audit record still happens
+    // (the dispatched `Invocation` still carries `Door::Cli`).
+
+    /// Is the cached roster stale enough to re-fetch? `None` (never fetched)
+    /// is always stale.
+    fn roster_stale(&self) -> bool {
+        match self.roster.fetched_at {
+            None => true,
+            Some(t) => t.elapsed() >= ROSTER_THROTTLE,
+        }
+    }
+
+    /// Non-blocking: pick up a finished background `who` dispatch, if any.
+    /// A fetch still running just leaves `roster_rx` in place for the next
+    /// poll. Returns `true` when the cache changed (so the tick loop knows to
+    /// repaint).
+    fn drain_roster(&mut self) -> bool {
+        let Some(rx) = &self.roster_rx else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(outcome) => {
+                self.roster.outcome = Some(outcome);
+                self.roster.fetched_at = Some(Instant::now());
+                self.roster_rx = None;
+                true
+            }
+            Err(mpsc::TryRecvError::Empty) => false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // The probe thread ended without sending (panicked) — drop
+                // the in-flight marker so the next stale tick tries again
+                // rather than wedging the pane forever.
+                self.roster_rx = None;
+                false
+            }
+        }
+    }
+
+    /// Spawn the `who` dispatch on a background thread. A no-op while a
+    /// fetch is already in flight — callers (the tick, a panel switch, the
+    /// manual refresh key) never need to check that themselves.
+    fn spawn_roster_fetch(&mut self) {
+        if self.roster_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let dispatch_fn = self.dispatch_fn;
+        std::thread::spawn(move || {
+            let inv = Invocation {
+                path: vec!["who".to_string()],
+                args: Vec::new(),
+                flags: BTreeMap::from([("json".to_string(), "true".to_string())]),
+                door: Door::Cli,
+            };
+            let outcome = dispatch_fn(&inv);
+            // The receiver may already be gone (App dropped mid-fetch, e.g.
+            // conductor quit); nothing to do about that.
+            let _ = tx.send(outcome);
+        });
+        self.roster_rx = Some(rx);
+    }
+
+    /// Tick-driven roster refresh: drain any finished fetch, then — only when
+    /// the pane is the VISIBLE panel and the cache has aged past
+    /// [`ROSTER_THROTTLE`] — kick off the next one. A tick the pane isn't
+    /// showing never starts a probe.
+    fn poll_roster(&mut self) -> bool {
+        let mut changed = self.drain_roster();
+        if self.panel == Panel::Roster && self.roster_stale() {
+            self.spawn_roster_fetch();
+            changed = true; // a fresh "probing…" status is itself a repaint
+        }
+        changed
+    }
+
+    /// The ROSTER panel's rows, parsed from the cached `who` [`Outcome`]
+    /// (never re-derived — the crate's one rule). Malformed/absent data
+    /// yields an empty roster rather than panicking; [`App::roster_status`]
+    /// tells the pane why.
+    pub fn roster_nodes(&self) -> Vec<RosterNode> {
+        let Some(data) = self.roster.outcome.as_ref().and_then(|o| o.data.as_ref()) else {
+            return Vec::new();
+        };
+        let nodes = data
+            .get("nodes")
+            .and_then(|v| v.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or(&[]);
+        nodes
+            .iter()
+            .map(|n| {
+                let sessions = n
+                    .get("sessions")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.as_slice())
+                    .unwrap_or(&[]);
+                RosterNode {
+                    name: n["name"].as_str().unwrap_or("").to_string(),
+                    is_local: n["isLocal"].as_bool().unwrap_or(false),
+                    presence: n["presence"].as_str().unwrap_or("").to_string(),
+                    fetched_at: n["fetchedAt"].as_str().map(String::from),
+                    sessions: sessions
+                        .iter()
+                        .map(|s| RosterSession {
+                            label: s["label"].as_str().unwrap_or("").to_string(),
+                            state: s["state"].as_str().unwrap_or("").to_string(),
+                        })
+                        .collect(),
+                }
+            })
+            .collect()
+    }
+
+    /// A one-line fetch status for the pane header: probing, freshly
+    /// fetched, or never fetched yet.
+    pub fn roster_status(&self) -> String {
+        let probing = self.roster_rx.is_some();
+        match (self.roster.fetched_at, probing) {
+            (None, true) => "probing…".to_string(),
+            (None, false) => "not yet fetched — press r".to_string(),
+            (Some(t), true) => format!("probing… (last fetched {}s ago)", t.elapsed().as_secs()),
+            (Some(t), false) => format!("fetched {}s ago", t.elapsed().as_secs()),
+        }
     }
 
     // ── The DAG row model (one truth for render + keys) ─────────────────────
@@ -564,16 +778,23 @@ impl App {
 
     // ── Panel switching ─────────────────────────────────────────────────────
 
+    /// Switch panels. Landing on ROSTER with a stale (or never-fetched)
+    /// cache fires one immediate background fetch rather than waiting for
+    /// the next ~500ms tick — the pane should not open to a blank "not yet
+    /// fetched" that then sits idle for up to 15s.
     pub fn select_panel(&mut self, p: Panel) {
         self.panel = p;
+        if p == Panel::Roster && self.roster_stale() {
+            self.spawn_roster_fetch();
+        }
     }
     pub fn next_panel(&mut self) {
         let i = (self.panel.index() + 1) % Panel::ALL.len();
-        self.panel = Panel::ALL[i];
+        self.select_panel(Panel::ALL[i]);
     }
     pub fn prev_panel(&mut self) {
         let i = (self.panel.index() + Panel::ALL.len() - 1) % Panel::ALL.len();
-        self.panel = Panel::ALL[i];
+        self.select_panel(Panel::ALL[i]);
     }
 
     pub fn input_active(&self) -> bool {
@@ -676,7 +897,19 @@ impl App {
             Panel::Graph => self.handle_graph_key(key),
             Panel::Sessions => self.handle_dag_key(key),
             Panel::Projects => self.handle_projects_key(key),
+            Panel::Roster => self.handle_roster_key(key),
             Panel::Log | Panel::Status => {} // read-only panels
+        }
+    }
+
+    /// Keys for the ROSTER panel — read-only (messaging/presence plan
+    /// P-C4): the one action is `r`, a manual refresh that FORCES a fetch
+    /// regardless of the throttle window (unlike the tick-driven path,
+    /// which only fires past [`ROSTER_THROTTLE`]). Still a no-op while a
+    /// fetch is already in flight — [`App::spawn_roster_fetch`]'s own guard.
+    fn handle_roster_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('r') {
+            self.spawn_roster_fetch();
         }
     }
 
@@ -1331,5 +1564,205 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&dir);
         });
+    }
+
+    // ── ROSTER: throttle mechanics (P-C4) ────────────────────────────────
+    //
+    // A dedicated counting `fn` (not a closure — `DispatchFn` is a plain fn
+    // pointer, matching production) proves the throttle wiring end to end:
+    // how many times the injected dispatcher actually ran, observed through
+    // the real `App::poll_refresh`/`select_panel`/`handle_key` call sites
+    // rather than a lower-level decision helper.
+
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    static ROSTER_CALLS: AtomicUsize = AtomicUsize::new(0);
+    /// Serialises the roster throttle tests against the shared
+    /// `ROSTER_CALLS` counter (parallel `cargo test` threads within this
+    /// crate would otherwise race on it) — a dedicated lock, since
+    /// `ENV_LOCK` above guards a different piece of shared state.
+    static ROSTER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn counting_who_dispatch(_: &Invocation) -> Outcome {
+        ROSTER_CALLS.fetch_add(1, Ordering::SeqCst);
+        Outcome::ok("who", "1 node(s), 0 session(s)")
+            .with_data(json!({ "host": "h", "generatedAt": "t", "nodes": [] }))
+    }
+
+    #[test]
+    fn roster_tick_with_a_fresh_cache_does_not_redispatch() {
+        with_isolated_stage(|| {
+            let _rguard = ROSTER_TEST_LOCK.lock().unwrap();
+            ROSTER_CALLS.store(0, Ordering::SeqCst);
+
+            let mut app = App::for_test_with_dispatch(counting_who_dispatch);
+            app.panel = Panel::Roster;
+            app.roster.fetched_at = Some(Instant::now()); // just fetched — well inside the window
+
+            app.poll_refresh();
+
+            assert!(app.roster_rx.is_none(), "a fresh cache must not spawn a fetch");
+            assert_eq!(ROSTER_CALLS.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn roster_tick_with_a_stale_cache_while_visible_redispatches() {
+        with_isolated_stage(|| {
+            let _rguard = ROSTER_TEST_LOCK.lock().unwrap();
+            ROSTER_CALLS.store(0, Ordering::SeqCst);
+
+            let mut app = App::for_test_with_dispatch(counting_who_dispatch);
+            app.panel = Panel::Roster; // visible, `fetched_at: None` — always stale
+
+            app.poll_refresh();
+
+            let rx = app.roster_rx.take().expect("a stale, visible pane spawns a fetch");
+            let outcome = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the background dispatch completes");
+            assert_eq!(outcome.command, "who");
+            assert_eq!(ROSTER_CALLS.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn roster_tick_while_hidden_never_dispatches_even_when_stale() {
+        with_isolated_stage(|| {
+            let _rguard = ROSTER_TEST_LOCK.lock().unwrap();
+            ROSTER_CALLS.store(0, Ordering::SeqCst);
+
+            let mut app = App::for_test_with_dispatch(counting_who_dispatch);
+            app.panel = Panel::Sessions; // NOT the roster pane
+
+            app.poll_refresh();
+
+            assert!(app.roster_rx.is_none(), "a hidden pane must never spawn a fetch");
+            assert_eq!(ROSTER_CALLS.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn switching_into_roster_with_a_stale_cache_dispatches_immediately() {
+        let _rguard = ROSTER_TEST_LOCK.lock().unwrap();
+        ROSTER_CALLS.store(0, Ordering::SeqCst);
+
+        let mut app = App::for_test_with_dispatch(counting_who_dispatch);
+        assert_eq!(app.panel, Panel::Graph, "starts elsewhere");
+
+        app.select_panel(Panel::Roster); // no tick involved at all
+
+        let rx = app
+            .roster_rx
+            .take()
+            .expect("landing on a stale ROSTER must fetch immediately, not wait for a tick");
+        rx.recv_timeout(Duration::from_secs(2)).expect("dispatch completes");
+        assert_eq!(ROSTER_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn switching_into_roster_with_a_fresh_cache_does_not_redispatch() {
+        let _rguard = ROSTER_TEST_LOCK.lock().unwrap();
+        ROSTER_CALLS.store(0, Ordering::SeqCst);
+
+        let mut app = App::for_test_with_dispatch(counting_who_dispatch);
+        app.roster.fetched_at = Some(Instant::now());
+
+        app.select_panel(Panel::Roster);
+
+        assert!(app.roster_rx.is_none(), "a fresh cache needs no immediate fetch");
+        assert_eq!(ROSTER_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn manual_refresh_key_forces_a_dispatch_even_with_a_fresh_cache() {
+        let _rguard = ROSTER_TEST_LOCK.lock().unwrap();
+        ROSTER_CALLS.store(0, Ordering::SeqCst);
+
+        let mut app = App::for_test_with_dispatch(counting_who_dispatch);
+        app.panel = Panel::Roster;
+        app.roster.fetched_at = Some(Instant::now()); // fresh — a tick would skip it
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('r')));
+
+        let rx = app
+            .roster_rx
+            .take()
+            .expect("`r` forces a fetch regardless of the throttle window");
+        rx.recv_timeout(Duration::from_secs(2)).expect("dispatch completes");
+        assert_eq!(ROSTER_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_fetch_already_in_flight_is_never_duplicated() {
+        let _rguard = ROSTER_TEST_LOCK.lock().unwrap();
+        ROSTER_CALLS.store(0, Ordering::SeqCst);
+
+        let mut app = App::for_test_with_dispatch(counting_who_dispatch);
+        app.panel = Panel::Roster;
+        app.spawn_roster_fetch();
+        assert!(app.roster_rx.is_some());
+
+        // A second manual refresh while the first is still in flight must be
+        // a no-op — `spawn_roster_fetch`'s own guard, exercised directly
+        // since a real fetch here completes in well under a millisecond and
+        // could otherwise race the assertion.
+        app.spawn_roster_fetch();
+
+        let rx = app.roster_rx.take().unwrap();
+        rx.recv_timeout(Duration::from_secs(2)).expect("dispatch completes");
+        assert_eq!(
+            ROSTER_CALLS.load(Ordering::SeqCst),
+            1,
+            "the in-flight guard must prevent a duplicate dispatch"
+        );
+    }
+
+    #[test]
+    fn roster_nodes_parses_the_who_json_shape_and_status_reports_freshness() {
+        let mut app = App::for_test(Vec::new(), Vec::new(), Vec::new());
+        assert!(app.roster_nodes().is_empty(), "no fetch yet");
+        assert_eq!(app.roster_status(), "not yet fetched — press r");
+
+        let data = json!({
+            "host": "sakaki",
+            "generatedAt": "2026-08-21T00:00:00Z",
+            "nodes": [
+                {
+                    "name": "sakaki",
+                    "isLocal": true,
+                    "presence": "online",
+                    "fetchedAt": null,
+                    "error": null,
+                    "sessions": [
+                        {"sessionId": "s1", "label": "sakaki/root/s1", "petname": null,
+                         "agent": "claude", "state": "working", "presence": "online", "cwd": "/x"}
+                    ],
+                },
+                {
+                    "name": "yomi-strix",
+                    "isLocal": false,
+                    "presence": "unreachable",
+                    "fetchedAt": "2026-08-20T23:00:00Z",
+                    "error": "HTTP 000",
+                    "sessions": [],
+                },
+            ],
+        });
+        app.roster.outcome = Some(Outcome::ok("who", "2 node(s), 1 session(s)").with_data(data));
+        app.roster.fetched_at = Some(Instant::now());
+
+        let nodes = app.roster_nodes();
+        assert_eq!(nodes.len(), 2, "local + one peer, in who's own order");
+        assert!(nodes[0].is_local && nodes[0].name == "sakaki", "local box first");
+        assert_eq!(nodes[0].sessions[0].label, "sakaki/root/s1");
+        assert_eq!(nodes[0].sessions[0].state, "working");
+        assert_eq!(nodes[1].name, "yomi-strix");
+        assert_eq!(nodes[1].presence, "unreachable");
+        assert_eq!(nodes[1].fetched_at.as_deref(), Some("2026-08-20T23:00:00Z"));
+
+        assert!(app.roster_status().starts_with("fetched "), "{}", app.roster_status());
     }
 }
