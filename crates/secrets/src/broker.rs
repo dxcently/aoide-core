@@ -859,7 +859,15 @@ fn put_gate(secrets_home: &Path, secret: &str, value: &str, overwrite: bool) -> 
 
     let _guard = put_lock().lock().unwrap_or_else(|e| e.into_inner());
 
-    let minted = if policy.backend == "age" {
+    // P-G1 review fix (task #70): `age`-named does not by itself mean
+    // "configured" — an existing deployment's `backends.json` can predate
+    // this phase and carry no `age` entry at all, and `secrets add`'s new
+    // default records `backend: "age"` regardless. Confirming
+    // `backend_is_known` first means such a `put` still correctly fails
+    // below with `unknown backend \`age\`` (from `has_value`/
+    // `store_value`), but without first minting a REAL identity for a
+    // backend that was never going to work.
+    let minted = if policy.backend == "age" && crate::backend::backend_is_known(secrets_home, "age") {
         match crate::backend::mint_age_identity_if_needed(secrets_home) {
             Ok(minted) => minted,
             Err(e) => return PutOutcome::Denied(e),
@@ -1900,6 +1908,72 @@ mod tests {
         assert_eq!(mint_events, 1, "the identity must be minted exactly once across both puts");
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// P-G1 review fix (task #70): on an EXISTING deployment whose
+    /// `backends.json` predates this phase (`file` only, no `age` entry —
+    /// see `backend.rs`'s sibling test for the identical GET-side gap), a
+    /// policy recorded via `secrets add`'s new age-default records
+    /// `backend: "age"` even though `age` isn't configured anywhere on
+    /// disk. `put_gate` must not mint a REAL identity — real
+    /// `age-keygen` calls, real `age.key`/`age.recipient` files written to
+    /// this secrets home — for a `put` that is doomed to fail with
+    /// "unknown backend `age`" the instant `has_value`/`store_value` look
+    /// the name up. Uses a fake `age-keygen` shim (this crate's own
+    /// `enroll.rs` precedent for a PATH-shimmed external tool) so this
+    /// runs deterministically with no real `age` install and no
+    /// `age_tools_available()` skip.
+    #[test]
+    fn put_never_mints_an_age_identity_for_a_backend_not_configured_in_backends_json() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("put-age-unconfigured-no-mint");
+        std::fs::create_dir_all(&home).unwrap();
+        // Pre-P-G1 shape: `file` only, no `age` entry at all.
+        std::fs::write(
+            crate::backend::backends_path(&home),
+            br#"{"file":{"get":"cat {home}/store/{name}","set":"install -m 0600 /dev/stdin {home}/store/{name}"}}"#,
+        )
+        .unwrap();
+        crate::store::save_policies(&home, &[Policy::new("t", "age", "t")]).unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        // A fake `age-keygen` that would succeed if ever invoked — proves
+        // a REAL mint attempt, not merely a missing-binary short-circuit.
+        let shim_dir = std::env::temp_dir().join(format!(
+            "aoide-secrets-broker-test-age-keygen-shim-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        let shim = shim_dir.join("age-keygen");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\nif [ \"$1\" = \"-y\" ]; then echo age1fakerecipient > \"$3\"; else echo AGE-SECRET-KEY-1FAKE > \"$2\"; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let saved_path = std::env::var("PATH").ok();
+        std::env::set_var("PATH", format!("{}:{}", shim_dir.display(), saved_path.clone().unwrap_or_default()));
+
+        let outcome = put_gate(&home, "t", "the-stored-value", false);
+
+        match saved_path {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+
+        assert!(
+            matches!(&outcome, PutOutcome::Denied(e) if e == "unknown backend `age`"),
+            "expected Denied(\"unknown backend `age`\"), got {outcome:?}"
+        );
+        assert!(
+            !home.join("age.key").exists(),
+            "put_gate must not mint a real identity for a backend `backends.json` never configured"
+        );
+        assert!(!home.join("age.recipient").exists());
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&shim_dir).ok();
     }
 
     // ── overwrite (P-67, "warn before overwrite") ───────────────────────

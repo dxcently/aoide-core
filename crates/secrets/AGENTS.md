@@ -793,6 +793,28 @@
   this crate supports. No new verb, no wire-op change, no golden-count
   change — this phase is entirely inside the existing `add`/`put`
   surfaces.
+- **P-G1 review fix (task #70, this commit): `age`-NAMED is not the same
+  as `age`-CONFIGURED.** An existing deployment's `backends.json` predates
+  P-G1 (`file` only, no `age` entry — `seed_default_backends` never
+  touches an already-present file, invariant above) and `secrets add`'s
+  new default (previous bullet) records `backend: "age"` regardless, so a
+  brand-new policy on such a home names a backend that isn't configured
+  anywhere. Two call sites gained a "is `age` actually known" check ahead
+  of anything `age`-specific: `backend::fetch_value` now runs its ordinary
+  `unknown backend` lookup BEFORE the missing-identity check — an
+  unconfigured `age` policy's GET reports `unknown backend \`age\`` (the
+  true cause), never `missing_age_identity_hint`'s "run `secrets put` to
+  mint" (actively wrong advice there — `put` hits the identical wall);
+  `broker::put_gate` calls the new `backend::backend_is_known(secrets_home,
+  "age")` before `mint_age_identity_if_needed`, so a doomed `put` against
+  an unconfigured `age` policy never mints a REAL identity (real
+  `age-keygen` calls, real `age.key`/`age.recipient` files) before failing
+  anyway. This does NOT backfill an existing `backends.json` with the
+  `age` entry — that remains the documented, deliberate "seed once, never
+  touch an existing file" contract (invariant above) — it only makes the
+  failure that follows name its true cause instead of a misleading
+  age-specific one, and stops that failure from having a real side effect
+  first.
 
 **KNOWN GAP, deferred, not fixed by P-N2c:** backend `get`/`set` shell-outs
 (`backend::fetch_value`/`store_value`) have NO timeout — a wedged backend

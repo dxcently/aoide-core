@@ -996,6 +996,25 @@ DEFAULT backend, a fresh nix-deployed broker will fail every `age`-backed
 `bash`/`coreutils`/`qrencode` additions above already are, just not yet
 made for this new default.
 
+**A second, related deployment gap, closed PARTIALLY at P-G1 review
+(task #70, this commit) — reporting fixed, backfill still open.** An
+EXISTING deployment's `backends.json` predates P-G1 (`file` only, no
+`age` entry — seeding never touches an already-present file, "Backend
+presets" above), and `secrets add`'s new default records `backend: "age"`
+on a brand-new policy regardless. A `get`/`put` against that policy now
+correctly reports `unknown backend \`age\`` (the review fix:
+`backend::fetch_value`/`broker::put_gate` both confirm `age` is an
+actually-configured backend before doing anything `age`-specific, rather
+than assuming the name implies the seeded built-in) instead of the
+misleading "run `secrets put` to mint" hint, and a doomed `put` no longer
+mints a real identity first. **Still open:** there is no migration path
+that adds the `age`/`has` entries to an already-existing `backends.json`
+— an operator upgrading a live deployment must add them by hand (copy the
+`age` row above, plus `file`'s new `has` row, into the existing file) or
+delete `backends.json` for the broker to reseed both built-ins fresh on
+next start (safe only if no `pass`/`gopass`/`bw`/`sops` custom rows are
+already in it, since deletion loses those too).
+
 ### Any other init (or none) — the non-nix install path
 
 Nothing above is required to run the broker. Manual setup on any Linux

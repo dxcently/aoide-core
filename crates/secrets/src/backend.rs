@@ -118,6 +118,22 @@
 //! remain DOCUMENTATION-ONLY presets (below): copy the shape into
 //! `backends.json` by hand, but integrating with any of those tools is
 //! unsupported, untested territory this crate makes no promise about.
+//!
+//! **`age`-NAMED is not the same as `age`-CONFIGURED (P-G1 review fix,
+//! task #70).** An existing deployment's `backends.json` can predate this
+//! phase entirely — `file` only, no `age` entry — and `secrets add`'s
+//! DEFAULT FLIP (below) records `backend: "age"` on a brand-new policy
+//! regardless of what `backends.json` actually contains, since seeding
+//! never touches an already-present file ([`seed_default_backends`]).
+//! Both entry points check "is `age` actually a configured backend" BEFORE
+//! doing anything `age`-specific: [`fetch_value`] runs the ordinary
+//! `unknown backend` lookup before its identity check, so an unconfigured
+//! `age` policy's GET reports the true cause rather than
+//! [`missing_age_identity_hint`]'s "run `secrets put` to mint" (which
+//! would be actively wrong there — `put` hits the identical unknown-backend
+//! wall); `broker::put_gate` calls [`backend_is_known`] before
+//! [`mint_age_identity_if_needed`], so a doomed `put` against an
+//! unconfigured `age` policy never mints a REAL identity first.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -224,19 +240,25 @@ fn expand_template(template: &str, secrets_home: &Path, key: &str) -> String {
 /// BROKER's own stderr (module doc) and never appears in the returned
 /// `Err` — only the exit status does.
 pub fn fetch_value(secrets_home: &Path, backend_name: &str, key: &str) -> Result<String, String> {
-    // The built-in `age` backend's GET half: a missing identity is a
-    // taught error, NEVER an auto-mint (module doc) — checked before the
-    // template even runs, so this is deterministic and needs no real
-    // `age` binary to exercise.
-    if backend_name == "age" && !secrets_home.join("age.key").exists() {
-        return Err(missing_age_identity_hint());
-    }
-
     let backends = load_backends(secrets_home)?;
     let backend = backends
         .0
         .get(backend_name)
         .ok_or_else(|| format!("unknown backend `{backend_name}`"))?;
+
+    // The built-in `age` backend's GET half: a missing identity is a
+    // taught error, NEVER an auto-mint (module doc) — checked before the
+    // template even runs, so this is deterministic and needs no real
+    // `age` binary to exercise. Checked AFTER the backend lookup above
+    // (P-G1 review fix): an `age` policy against a `backends.json` that
+    // predates this phase (no `age` entry — an existing deployment,
+    // `secrets add`'s new default flip) must report the TRUE cause,
+    // `unknown backend \`age\``, never this hint — "run `secrets put` to
+    // mint" is actively wrong advice there, since `store_value` hits the
+    // identical unknown-backend wall.
+    if backend_name == "age" && !secrets_home.join("age.key").exists() {
+        return Err(missing_age_identity_hint());
+    }
     let command = expand_template(&backend.get, secrets_home, key);
 
     let output = std::process::Command::new("sh")
@@ -482,6 +504,23 @@ fn describe_missing_age_keygen(err: &std::io::Error) -> String {
     } else {
         format!("spawning age-keygen: {err}")
     }
+}
+
+/// Is `name` an actually-configured backend in this home's
+/// `backends.json`? (P-G1 review fix, task #70.) `broker::put_gate` calls
+/// this BEFORE [`mint_age_identity_if_needed`] so a `policy.backend ==
+/// "age"` never mints a REAL identity — real `age-keygen` shell-outs, real
+/// `age.key`/`age.recipient` files — for a `put` that is doomed anyway
+/// (an existing deployment's `backends.json` predates P-G1 and has no
+/// `age` entry, module doc's "The built-in `age` backend" section /
+/// `README.md`'s deployment-gap note); that `put` still correctly fails
+/// with `unknown backend \`age\`` from [`has_value`]/[`store_value`]
+/// either way, just without the wasted side effect first. Any
+/// `load_backends` error (missing/corrupt `backends.json`) reads as
+/// "not known" here — harmless, since the same call fails again, with the
+/// real I/O error, the moment [`has_value`]/[`store_value`] runs.
+pub fn backend_is_known(secrets_home: &Path, name: &str) -> bool {
+    load_backends(secrets_home).map(|b| b.0.contains_key(name)).unwrap_or(false)
 }
 
 /// Lazily mint this host's age identity (`{home}/age.key`, `0600`) and its
@@ -1000,6 +1039,35 @@ mod tests {
 
         let err = fetch_value(&home, "age", "k").unwrap_err();
         assert_eq!(err, missing_age_binary_hint());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// P-G1 review fix (task #70): an EXISTING deployment's `backends.json`
+    /// predates this phase — it has no `age` entry at all (only `file`,
+    /// seeded before P-G1 ever wrote a second built-in). `secrets add`'s
+    /// new default records `backend: "age"` on such a home regardless
+    /// (`commands::DEFAULT_BACKEND`, decoupled from what `backends.json`
+    /// actually contains). A GET against that policy must report the
+    /// TRUE cause — `unknown backend \`age\`` — never the age-specific
+    /// "run `secrets put` to mint" hint, which would be actively
+    /// misleading here: `secrets put` cannot fix this, since `store_value`
+    /// hits the exact same "unknown backend" wall (no `set` template to
+    /// even find). The `backend_name == "age"` shortcut must never fire
+    /// AHEAD of confirming `age` is actually a configured backend.
+    #[test]
+    fn get_on_an_age_policy_against_a_backends_json_missing_the_age_entry_names_the_true_cause() {
+        let home = tmp_home("age-not-configured-get");
+        std::fs::create_dir_all(&home).unwrap();
+        // Pre-P-G1 shape: `file` only, no `age`, no `has` — exactly what a
+        // live deployment's `backends.json` looks like today.
+        let pre_existing = br#"{"file":{"get":"cat {home}/store/{name}","set":"install -m 0600 /dev/stdin {home}/store/{name}"}}"#;
+        std::fs::write(backends_path(&home), pre_existing).unwrap();
+
+        let err = fetch_value(&home, "age", "foo").unwrap_err();
+        assert_eq!(
+            err, "unknown backend `age`",
+            "an unconfigured `age` backend must report the true cause, not the age-specific mint hint: {err}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
