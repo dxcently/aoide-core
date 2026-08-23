@@ -744,37 +744,43 @@ $ aoide secrets watch --json
 
 `released`/`completed`/`dismissed`/`expired` carry no `id`-adjacent extras
 beyond what "Broker notifications" already documents, plus the top-level
-`ts` every line carries (the mirrored log's own `AuditRecord.ts`); `parked`
-additionally carries `requestedAt`/`expiresAt` (`ts` and `ts + timeoutSecs`)
-so a subscriber never has to compute a deadline from a wall-clock delta
-itself. **Never in this shape, ever: a secret value** — same rule as every
-other wire/log shape in this crate.
+`ts` every line carries — **as of P-G4 (task #77) this is the INSTANT
+`secrets watch`'s own tail loop READ the line** (`unix_now()` at poll time),
+not a timestamp the broker wrote: the events feed carries no per-line `ts`
+field of its own (`watch::parse_notify_line`'s own doc), unlike the
+mirrored log's `AuditRecord.ts` this field was sourced from through P-N3.
+In practice this trails the broker's own write by at most one 1s poll tick.
+`parked` additionally carries `requestedAt`/`expiresAt` (`ts` and
+`ts + timeoutSecs`) so a subscriber never has to compute a deadline from a
+wall-clock delta itself. **Never in this shape, ever: a secret value** —
+same rule as every other wire/log shape in this crate.
 
 `aoide secrets watch` is CLI-only (`require_cli`, same door gate as
 `pending`/`approve`/`dismiss`) but NOT an admin/euid verb — it touches no
-`policy.json`, only the mirrored log (read-only) and the broker's in-memory
-registry over the existing socket ops. Socket errors while reconciling
-(the broker not running, or restarting) print the taught connect error
-(`client::describe_connect_error`) and the watcher keeps tailing the log
+`policy.json`, only the broker-owned events feed (read-only, P-G4, task #77
+— see "Broker notifications" above) and the broker's in-memory registry
+over the existing socket ops. Socket errors while reconciling (the broker
+not running, or restarting) print the taught connect error
+(`client::describe_connect_error`) and the watcher keeps tailing the feed
 regardless — the broker may come back. Clean exit on Ctrl-C (a SIGINT
 handler sets a flag the tail loop notices within its next 1s poll) or on
 stdin EOF during a prompt; either way, the parting line names how many asks
 are still parked: `left the watcher — N ask(s) still parked; complete with
 aoide secrets approve <id> --totp <code>`.
 
-**Startup: waits for the log, rather than exiting 1, if it's not there yet**
-(review rider). On a brand-new host `secrets watch` may start before the
-broker has written its first line to `~/Aoide/log` — `watch::
-wait_for_follower` polls once a second and narrates the wait exactly ONCE
-(`waiting for the log to appear at <path>`) rather than failing immediately;
-Ctrl-C during the wait exits cleanly. Any OTHER open error (a permission
-problem, for example) still fails immediately — only "the file doesn't
-exist yet" waits.
+**Startup: waits for the events feed, rather than exiting 1, if it's not
+there yet** (review rider, extended at P-G4 to the feed). On a brand-new
+host `secrets watch` may start before the broker has emitted anything since
+boot — `watch::wait_for_follower` polls once a second and narrates the wait
+exactly ONCE (`waiting for the events feed to appear at <path>`) rather than
+failing immediately; Ctrl-C during the wait exits cleanly. Any OTHER open
+error (a permission problem, for example) still fails immediately — only
+"the file doesn't exist yet" waits.
 
-**Narration timestamps are UTC**, always — `hms()` renders the mirrored
-log's own `AuditRecord.ts` (unix seconds) as `HH:MM:SS` with no local-zone
-conversion, on every line, in every mode (tty prompt, popup narration, and
-the plain pipe path alike).
+**Narration timestamps are UTC**, always — `hms()` renders each line's own
+`ts` (unix seconds, the read-time instant described above as of P-G4) as
+`HH:MM:SS` with no local-zone conversion, on every line, in every mode (tty
+prompt, popup narration, and the plain pipe path alike).
 
 **After an async narration line interrupts an open tty prompt, the FULL
 prompt frame reprints underneath it** — header, the `[a]`/`[d]`/`[i]`
