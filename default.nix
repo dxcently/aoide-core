@@ -60,6 +60,15 @@ rustPlatform.buildRustPackage {
   # reading: the package build runs the whole suite.
   cargoTestFlags = [ "--workspace" ];
 
+  # The secrets crate's suite is single-threaded BY CONTRACT (its EnvGuard
+  # test helper mutates process env with no cross-test lock — its own doc
+  # says so; task #81 is the real fix). Under libtest's default parallelism
+  # the sandbox check flaked for real: one test's AOIDE_SECRETS_BACKEND_
+  # TIMEOUT=1 bled into a concurrently-running test's fetch and killed it
+  # mid-read (two failed deploy builds, 2026-08-23). libtest reads this env
+  # var directly; drop it when #81 lands an actual env lock.
+  RUST_TEST_THREADS = "1";
+
   # P-A7 of the binary-split workstream: this one derivation now ships THREE
   # binaries (aoide, aoided, lyra — `lyra` lives in the separate `crates/lyra`
   # app crate, docs/architecture/PACKAGE-LAYOUT.md). `buildAndTestSubdir`'s
