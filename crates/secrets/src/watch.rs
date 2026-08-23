@@ -83,6 +83,7 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -496,9 +497,18 @@ pub fn event_to_json(event: &Event) -> Value {
 /// the start. As of P-G4 (task #77) this follows the broker-owned events
 /// feed, capped at 1 MiB and truncated back to empty IN PLACE rather than
 /// rotated (`broker::append_events_feed`'s own doc) — the `len() < pos`
-/// branch below is what makes that truncation transparent to a live
-/// watcher, reopening at 0 the same way it would for any other shrink. A
-/// partial trailing line (no `\n` yet) is held across polls, never parsed
+/// branch in [`Follower::poll`] is what makes that truncation transparent
+/// to a live watcher, reopening at 0 the same way it would for any other
+/// shrink. **`poll` also stats the PATH itself and compares `(dev, ino)`
+/// against the open fd on every call** (judge fix, this commit): a broker
+/// restart under `RuntimeDirectory=` unlinks the file and a fresh process
+/// creates a brand-new inode at the same path, and the OLD fd's own
+/// `metadata().len()` freezes at deletion-time forever after — a
+/// length-only comparison can never see that a same-or-larger replacement
+/// landed, so every event after a restart silently vanished into a
+/// permanently frozen read position (falling back to the 30s reconcile
+/// tick, re-triggered by every `Restart=on-failure`) with no error at all.
+/// A partial trailing line (no `\n` yet) is held across polls, never parsed
 /// early.
 pub struct Follower {
     path: PathBuf,
@@ -516,13 +526,42 @@ impl Follower {
         Ok(Self { path: path.to_path_buf(), file, pos: len, partial: String::new() })
     }
 
-    /// One poll: `stat(2)` the file, and if it grew, read exactly the new
-    /// bytes and return every COMPLETE line found (a trailing partial line
-    /// is held for the next poll). No growth returns an empty `Vec` — no
-    /// read syscall at all. `len() < pos` means the file was truncated or
-    /// replaced (a rotation) — reopen and start again from 0 rather than
-    /// sit at a now-meaningless offset forever.
+    /// One poll: `stat(2)` the PATH (never only the open fd — a broker
+    /// restart under `RuntimeDirectory=` unlinks the file our fd still
+    /// refers to, and Linux keeps that deleted inode readable through the
+    /// existing fd with its length FROZEN at whatever it was at deletion;
+    /// comparing lengths alone can never notice a same-or-larger
+    /// replacement file, which is exactly how a delete-and-recreate (or a
+    /// rename-away-and-recreate) went permanently undetected before this
+    /// check existed — the fd's `len()` sat frozen and every later poll
+    /// returned empty forever, silently). If the path now names a
+    /// different `(dev, ino)` than the open fd — a new inode landed at the
+    /// same path — reopen at 0 and start following the new file, the same
+    /// state reset the truncation branch below already performs. If the
+    /// path doesn't exist yet (mid-restart, before the new file lands),
+    /// this poll simply reports no lines; the reopen fires on the next
+    /// poll that finds the path back. Once confirmed to be reading the
+    /// right inode, read exactly the new bytes and return every COMPLETE
+    /// line found (a trailing partial line is held for the next poll); no
+    /// growth returns an empty `Vec`, no read syscall at all. `len() < pos`
+    /// on the (possibly just-reopened) fd still covers an in-place
+    /// truncation/rotation of the SAME inode (the events feed's own 1 MiB
+    /// cap, `broker::append_events_feed`) — reopen and start again from 0
+    /// rather than sit at a now-meaningless offset forever.
     pub fn poll(&mut self) -> std::io::Result<Vec<String>> {
+        match std::fs::metadata(&self.path) {
+            Ok(path_meta) => {
+                let fd_meta = self.file.metadata()?;
+                if (path_meta.dev(), path_meta.ino()) != (fd_meta.dev(), fd_meta.ino()) {
+                    self.file = File::open(&self.path)?;
+                    self.pos = 0;
+                    self.partial.clear();
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        }
+
         let len = self.file.metadata()?.len();
         if len < self.pos {
             self.file = File::open(&self.path)?;
@@ -1553,6 +1592,56 @@ mod tests {
         assert_eq!(f.poll().unwrap(), vec!["fresh".to_string()]);
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn follower_survives_delete_and_recreate() {
+        // The judge's repro shape: systemd wipes RuntimeDirectory on a
+        // broker restart, unlinking the file our open fd still refers to.
+        // A brand-new inode is created at the SAME path afterward — the old
+        // fd's own `metadata().len()` freezes at whatever it was at
+        // deletion and never reflects the new file's growth, so `poll` must
+        // notice the path now names a DIFFERENT inode, not just compare
+        // lengths.
+        let path = tmp_path("delete-recreate");
+        std::fs::write(&path, b"before restart\n").unwrap();
+        let mut f = Follower::open_at_end(&path).unwrap();
+        assert_eq!(f.poll().unwrap(), Vec::<String>::new());
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"after restart\n").unwrap();
+        assert_eq!(
+            f.poll().unwrap(),
+            vec!["after restart".to_string()],
+            "a delete-and-recreate at the same path must not leave the follower deaf"
+        );
+
+        // Keep proving it's actually live, not a one-shot recovery.
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"one more\n").unwrap();
+        assert_eq!(f.poll().unwrap(), vec!["one more".to_string()]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn follower_survives_rename_away_and_recreate() {
+        let path = tmp_path("rename-away");
+        let moved = tmp_path("rename-away-moved");
+        std::fs::write(&path, b"before rename\n").unwrap();
+        let mut f = Follower::open_at_end(&path).unwrap();
+        assert_eq!(f.poll().unwrap(), Vec::<String>::new());
+
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::write(&path, b"after rename\n").unwrap();
+        assert_eq!(
+            f.poll().unwrap(),
+            vec!["after rename".to_string()],
+            "a rename-away-and-recreate at the same path must not leave the follower deaf"
+        );
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&moved).ok();
     }
 
     #[test]
