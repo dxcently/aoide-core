@@ -376,6 +376,81 @@ fn kill_process_group(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
+/// Why [`wait_bounded`] returned without a `(status, stdout, stderr)`
+/// triple: either the deadline passed (the child's whole process group has
+/// already been `SIGKILL`ed and reaped, [`kill_process_group`]) or
+/// `Child::try_wait` itself returned an `Err` (rare — carries the raw
+/// `io::Error` so each caller can word its own message; [`kill_process_group`]
+/// was NOT called in this arm, since the child may still be perfectly
+/// healthy and `try_wait` merely failed to ask).
+enum WaitOutcome {
+    TimedOut,
+    WaitFailed(std::io::Error),
+}
+
+/// Poll `child` until it exits or [`backend_timeout`] elapses, draining
+/// `stdout_pipe`/`stderr_pipe` non-blockingly on every tick — the ONE wait/
+/// kill/reap loop [`run_backend_command`] (a `sh -c` template) and
+/// [`run_age_keygen`] (the plain argv `age-keygen` bootstrap, task #74
+/// review fix — P-G3) both build on, so a future change to the wait
+/// mechanism (still wall-clock `try_wait` polling, never a watchdog thread
+/// or `SIGALRM`) has exactly one place to change. `stdout_pipe`/
+/// `stderr_pipe` are taken by value (moved out of the `Child` by the
+/// caller first) since `Child::try_wait` needs `child` mutably borrowed on
+/// every tick while the pipes are read independently. On success, returns
+/// the exit status plus whatever was captured on both pipes, including one
+/// FINAL drain after the child is confirmed exited (output written between
+/// the last poll and the process actually exiting would otherwise be
+/// lost). On timeout, kills and reaps the whole process group and returns
+/// [`WaitOutcome::TimedOut`] — the caller decides how to word that as a
+/// value-free error; this function never sees a backend name, an op, or a
+/// template/command string, so there is nothing here that COULD leak one.
+fn wait_bounded(
+    child: &mut std::process::Child,
+    mut stdout_pipe: Option<std::process::ChildStdout>,
+    mut stderr_pipe: Option<std::process::ChildStderr>,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), WaitOutcome> {
+    if let Some(ref out) = stdout_pipe {
+        set_nonblocking(out.as_raw_fd());
+    }
+    if let Some(ref err) = stderr_pipe {
+        set_nonblocking(err.as_raw_fd());
+    }
+
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
+    let deadline = Instant::now() + backend_timeout();
+
+    let status = loop {
+        if let Some(ref mut out) = stdout_pipe {
+            drain_nonblocking(out, &mut stdout_buf);
+        }
+        if let Some(ref mut err) = stderr_pipe {
+            drain_nonblocking(err, &mut stderr_buf);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    kill_process_group(child);
+                    return Err(WaitOutcome::TimedOut);
+                }
+                std::thread::sleep(BACKEND_POLL_INTERVAL);
+            }
+            Err(e) => return Err(WaitOutcome::WaitFailed(e)),
+        }
+    };
+    // One final drain — output written between the last poll and the
+    // process actually exiting would otherwise be lost.
+    if let Some(ref mut out) = stdout_pipe {
+        drain_nonblocking(out, &mut stdout_buf);
+    }
+    if let Some(ref mut err) = stderr_pipe {
+        drain_nonblocking(err, &mut stderr_buf);
+    }
+    Ok((status, stdout_buf, stderr_buf))
+}
+
 /// The taught error for a backend shell-out that outran
 /// [`BACKEND_TIMEOUT_ENV`] — names the backend, the op (`get`/`set`/
 /// `has`), and the env knob to raise it. **Never the template text**: a
@@ -453,46 +528,13 @@ fn run_backend_command(backend_name: &str, op: &str, command: &str, stdin_data: 
         // `store_value` held before this function existed.
     }
 
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-    if let Some(ref out) = stdout_pipe {
-        set_nonblocking(out.as_raw_fd());
-    }
-    if let Some(ref err) = stderr_pipe {
-        set_nonblocking(err.as_raw_fd());
-    }
-
-    let mut stdout_buf = Vec::new();
-    let mut stderr_buf = Vec::new();
-    let deadline = Instant::now() + backend_timeout();
-
-    let status = loop {
-        if let Some(ref mut out) = stdout_pipe {
-            drain_nonblocking(out, &mut stdout_buf);
-        }
-        if let Some(ref mut err) = stderr_pipe {
-            drain_nonblocking(err, &mut stderr_buf);
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    kill_process_group(&mut child);
-                    return Err(backend_timeout_error(backend_name, op));
-                }
-                std::thread::sleep(BACKEND_POLL_INTERVAL);
-            }
-            Err(e) => return Err(format!("waiting on backend `{backend_name}` ({op}): {e}")),
-        }
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let (status, stdout_buf, stderr_buf) = match wait_bounded(&mut child, stdout_pipe, stderr_pipe) {
+        Ok(v) => v,
+        Err(WaitOutcome::TimedOut) => return Err(backend_timeout_error(backend_name, op)),
+        Err(WaitOutcome::WaitFailed(e)) => return Err(format!("waiting on backend `{backend_name}` ({op}): {e}")),
     };
-    // One final drain — output written between the last poll and the
-    // process actually exiting would otherwise be lost.
-    if let Some(ref mut out) = stdout_pipe {
-        drain_nonblocking(out, &mut stdout_buf);
-    }
-    if let Some(ref mut err) = stderr_pipe {
-        drain_nonblocking(err, &mut stderr_buf);
-    }
 
     if !status.success() {
         // Full stderr goes ONLY here, to the broker's own stderr — never
@@ -860,11 +902,8 @@ pub fn mint_age_identity_if_needed(secrets_home: &Path) -> Result<bool, String> 
     }
     std::fs::create_dir_all(secrets_home).map_err(|e| format!("creating {}: {e}", secrets_home.display()))?;
 
-    let keygen = std::process::Command::new("age-keygen")
-        .arg("-o")
-        .arg(&key_path)
-        .output()
-        .map_err(|e| describe_missing_age_keygen(&e))?;
+    let key_path_str = key_path.to_string_lossy();
+    let keygen = run_age_keygen(&["-o", &key_path_str])?;
     if !keygen.status.success() {
         eprintln!(
             "[aoide/secrets] age-keygen exited {}: {}",
@@ -876,13 +915,8 @@ pub fn mint_age_identity_if_needed(secrets_home: &Path) -> Result<bool, String> 
     crate::home::secure_file(&key_path).map_err(|e| format!("securing {}: {e}", key_path.display()))?;
 
     let recipient_path = secrets_home.join("age.recipient");
-    let show = std::process::Command::new("age-keygen")
-        .arg("-y")
-        .arg("-o")
-        .arg(&recipient_path)
-        .arg(&key_path)
-        .output()
-        .map_err(|e| describe_missing_age_keygen(&e))?;
+    let recipient_path_str = recipient_path.to_string_lossy();
+    let show = run_age_keygen(&["-y", "-o", &recipient_path_str, &key_path_str])?;
     if !show.status.success() {
         eprintln!(
             "[aoide/secrets] age-keygen -y exited {}: {}",
@@ -894,6 +928,48 @@ pub fn mint_age_identity_if_needed(secrets_home: &Path) -> Result<bool, String> 
     crate::home::secure_file(&recipient_path).map_err(|e| format!("securing {}: {e}", recipient_path.display()))?;
 
     Ok(true)
+}
+
+/// Run one `age-keygen` invocation, bounded by [`backend_timeout`] via the
+/// SAME [`wait_bounded`] loop [`run_backend_command`] uses (task #74 review
+/// fix, P-G3 — the flagged gap this closes: before this function existed,
+/// [`mint_age_identity_if_needed`]'s two `age-keygen` calls ran through a
+/// plain blocking `Command::output()`, exempt from every other backend
+/// shell-out's new bound). `age-keygen` is a plain argv exec, never a
+/// `sh -c` TEMPLATE — no `{name}`/`{home}` substitution applies to it, so
+/// it doesn't go through [`run_backend_command`] itself — but
+/// [`mint_age_identity_if_needed`] runs inside the SAME `broker::put_lock`
+/// critical section a hung `set` template used to wedge indefinitely
+/// before task #74's own fix (`broker.rs`'s module doc): leaving this one
+/// call unbounded would have reopened that exact gap for the `age`
+/// backend's own identity bootstrap specifically, the one case task #74's
+/// commit message claimed to have closed in full. Spawn failure (most
+/// commonly a missing binary) is [`describe_missing_age_keygen`], same as
+/// before this function existed; a timeout gets the same "raise the knob"
+/// wording [`backend_timeout_error`] uses, naming `age-keygen` in place of
+/// a `Backend` (there is no backend name to attach here).
+fn run_age_keygen(args: &[&str]) -> Result<std::process::Output, String> {
+    let mut cmd = std::process::Command::new("age-keygen");
+    cmd.args(args);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    // Same process-group-leader + kill-the-whole-group discipline
+    // `run_backend_command` holds — see `kill_process_group`'s doc.
+    cmd.process_group(0);
+
+    let mut child = cmd.spawn().map_err(|e| describe_missing_age_keygen(&e))?;
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+
+    match wait_bounded(&mut child, stdout_pipe, stderr_pipe) {
+        Ok((status, stdout, stderr)) => Ok(std::process::Output { status, stdout, stderr }),
+        Err(WaitOutcome::TimedOut) => Err(format!(
+            "age-keygen timed out after {}s (`{BACKEND_TIMEOUT_ENV}`) — raise the knob, or fix the hung age-keygen",
+            backend_timeout().as_secs()
+        )),
+        Err(WaitOutcome::WaitFailed(e)) => Err(format!("waiting on age-keygen: {e}")),
+    }
 }
 
 #[cfg(test)]
@@ -1671,5 +1747,75 @@ mod tests {
         write_backends(&home, "printf %s {name}");
         assert_eq!(fetch_value(&home, "scratch", "quick").unwrap(), "quick");
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A template producing several MB of output faster than the 20ms poll
+    /// interval drains it must still round-trip the FULL value under a
+    /// generous timeout, never a truncated one — a truncated GET released
+    /// to a consumer would be corruption, strictly worse than a timeout
+    /// (P-G3 review). Proves `wait_bounded`'s per-tick, non-blocking drain
+    /// never lets a fast writer stall on a full pipe.
+    #[test]
+    fn a_large_output_survives_the_drain_loop_intact() {
+        let home = tmp_home("large-output-drain");
+        write_backends(&home, "head -c 8000000 /dev/urandom | base64 | tr -d '\\n'");
+        let _guard = EnvGuard::set("30");
+        let value = fetch_value(&home, "scratch", "unused").expect("large-output template must succeed");
+        // base64 of 8,000,000 bytes is ceil(n/3)*4 chars; just assert it's
+        // in the right ballpark and not silently truncated to a pipe-buffer
+        // multiple like 64KiB/65536.
+        assert!(value.len() > 10_000_000, "expected ~10.6M base64 chars, got {} -- looks truncated", value.len());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── the age-keygen bootstrap is ALSO bounded (P-G3 review fix) ──────
+
+    /// The flagged gap: before this fix, [`mint_age_identity_if_needed`]'s
+    /// two `age-keygen` calls ran through a plain blocking `Command::
+    /// output()`, exempt from the bound task #74 gave every OTHER backend
+    /// shell-out — a hung `age-keygen` would have wedged `broker::put_lock`
+    /// exactly the way a hung `set` template used to before task #74's own
+    /// fix. A PATH-shimmed fake `age-keygen` that just sleeps (same
+    /// PATH-shim technique `enroll.rs`'s `render_qr` tests already use — no
+    /// real `age` binary needed) proves `mint_age_identity_if_needed` now
+    /// returns a timeout error within bounds, and reaps the shim rather
+    /// than leaving it running.
+    #[test]
+    fn mint_age_identity_against_a_hung_age_keygen_returns_within_bounds() {
+        let home = tmp_home("mint-hung-age-keygen");
+        let shim_dir = std::env::temp_dir().join(format!(
+            "aoide-secrets-age-keygen-shim-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        let shim = shim_dir.join("age-keygen");
+        std::fs::write(&shim, "#!/bin/sh\nsleep 60\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let saved_path = std::env::var("PATH").ok();
+        let new_path = format!("{}:{}", shim_dir.display(), saved_path.clone().unwrap_or_default());
+        std::env::set_var("PATH", &new_path);
+        let _guard = EnvGuard::set("1");
+
+        let start = Instant::now();
+        let err = mint_age_identity_if_needed(&home).unwrap_err();
+        let elapsed = start.elapsed();
+
+        match saved_path {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+
+        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}, expected timeout at ~1s");
+        assert!(err.contains("age-keygen"), "error should name age-keygen: {err}");
+        assert!(err.contains(BACKEND_TIMEOUT_ENV), "error should name the env knob: {err}");
+        assert!(!home.join("age.key").exists(), "a hung age-keygen must never leave a half-written key file");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&shim_dir).ok();
     }
 }

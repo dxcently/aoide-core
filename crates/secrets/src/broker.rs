@@ -2096,6 +2096,80 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// The SAME `put_lock`-freed proof as the two tests above, but for the
+    /// OTHER unbounded shell-out `put_gate` could run inside its critical
+    /// section (P-G3 review fix): a first `age`-backed put with no existing
+    /// identity has to mint one FIRST, inside `put_lock` (module doc, "a
+    /// `policy.backend == \"age\"` put also lazily mints... inside the SAME
+    /// `put_lock` critical section"). A PATH-shimmed hanging `age-keygen`
+    /// (no real `age` binary needed — same shim technique `backend.rs`'s own
+    /// `age-keygen` timeout test uses) proves that hang is now ALSO bounded,
+    /// and that `put_lock` is free for a second, unrelated put right after —
+    /// closing the exact gap a hung mint would otherwise have reopened.
+    #[test]
+    fn a_hung_age_keygen_mint_no_longer_wedges_put_lock_forever() {
+        let shim_dir = std::env::temp_dir().join(format!(
+            "aoide-secrets-broker-age-keygen-shim-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        let shim = shim_dir.join("age-keygen");
+        std::fs::write(&shim, "#!/bin/sh\nsleep 60\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("put-hung-mint-bounded");
+        let out = home.join("out.txt");
+        let p_age = Policy::new("mints", "age", "k");
+        let p_scratch = Policy::new("t", "scratch", "k");
+        crate::store::save_policies(&home, &[p_age, p_scratch]).unwrap();
+        // A REAL `age` entry (never seeded via `age-keygen` here — this
+        // exercises the mint path, which is what must be bounded), plus an
+        // ordinary `scratch` backend for the second, unrelated caller.
+        let backends = serde_json::json!({
+            "age": { "get": "cat {home}/values/{name}.age", "set": "cat > {home}/values/{name}.age" },
+            "scratch": { "get": format!("cat {}", out.display()), "set": format!("cat > {}", out.display()) },
+        });
+        std::fs::write(crate::backend::backends_path(&home), serde_json::to_vec(&backends).unwrap()).unwrap();
+
+        let saved_path = std::env::var("PATH").ok();
+        let new_path = format!("{}:{}", shim_dir.display(), saved_path.clone().unwrap_or_default());
+        std::env::set_var("PATH", &new_path);
+        let saved_timeout = std::env::var(crate::backend::BACKEND_TIMEOUT_ENV).ok();
+        std::env::set_var(crate::backend::BACKEND_TIMEOUT_ENV, "1");
+
+        let start = std::time::Instant::now();
+        let first = put_gate(&home, "mints", "irrelevant", false);
+        let elapsed = start.elapsed();
+        let (granted, result) = put_outcome_as_result(put_gate(&home, "t", "second-caller-value", false));
+
+        match saved_path {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        match saved_timeout {
+            Some(v) => std::env::set_var(crate::backend::BACKEND_TIMEOUT_ENV, v),
+            None => std::env::remove_var(crate::backend::BACKEND_TIMEOUT_ENV),
+        }
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "put_gate against a hung age-keygen mint took {elapsed:?} — put_lock was not freed in bounded time"
+        );
+        assert!(matches!(&first, PutOutcome::Denied(_)), "the hung mint must be denied, not granted: {first:?}");
+        assert!(!home.join("age.key").exists(), "a hung mint must never leave a half-written identity behind");
+        assert!(granted, "the second, unrelated put must succeed once put_lock is freed: {result:?}");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "second-caller-value");
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&shim_dir).ok();
+    }
+
     /// The wire-level version of the two tests above, through `handle_line`
     /// — this is the deliverable's own end-to-end proof: a first `put`
     /// stores; a second `put` (no `overwrite`) is refused with the

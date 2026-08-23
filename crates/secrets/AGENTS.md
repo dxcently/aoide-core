@@ -955,11 +955,11 @@ command string `expand_template` builds). See `README.md`'s "Bounded
 backend shell-outs" for the full mechanism and the invariant immediately
 below for the hard rule this establishes going forward.
 
-- **Every backend shell-out this crate makes — present or future — MUST
-  route through `backend::run_backend_command`, never spawn `sh -c`
-  directly (task #74, hard constraint).** This is what makes the timeout
-  in the note above actually cover EVERY template execution rather than
-  needing a per-call-site fix the way the pre-task-#74 gap did: `age`
+- **Every backend TEMPLATE shell-out this crate makes — present or
+  future — MUST route through `backend::run_backend_command`, never spawn
+  `sh -c` directly (task #74, hard constraint).** This is what makes the
+  timeout in the note above actually cover EVERY template execution rather
+  than needing a per-call-site fix the way the pre-task-#74 gap did: `age`
   (P-G1) and `secrets migrate` (P-G2) already multiplied the CALL SITES
   onto `fetch_value`/`store_value`/`has_value` without multiplying the
   spawn logic itself, and that discipline is exactly why bounding it was a
@@ -970,6 +970,43 @@ below for the hard rule this establishes going forward.
   itself is wall-clock via polling `Child::try_wait`, never a per-child
   watchdog thread and never `SIGALRM` (`run_backend_command`'s own doc) —
   a future change to the wait mechanism holds the same restriction.
+
+**P-G3 review fix (same task #74, follow-up commit): the task #74 commit
+above closed every TEMPLATE shell-out but missed one non-template one —
+`backend::mint_age_identity_if_needed`'s two `age-keygen` calls ran
+through a plain blocking `Command::output()`, exempt from the whole-crate
+bound the note above claimed to establish "in full." Since minting runs
+inside the SAME `broker::put_lock` critical section a hung `set` template
+used to wedge (the invariant just above the task #74 note, "P-G1... a
+`policy.backend == \"age\"` put also lazily mints... inside the SAME
+`put_lock` critical section"), a hung `age-keygen` would have reopened the
+exact `put_lock`-wedging failure task #74 exists to close — just for the
+`age` backend's own bootstrap instead of a `set` template. Closed by
+extracting the poll/drain/kill/reap loop `run_backend_command` used
+internally into its own function, `backend::wait_bounded` — generic over
+an already-spawned `Child` plus its taken stdout/stderr pipes, so it
+carries no backend name, no op, no template/command string — and giving
+`age-keygen` its own thin caller, `backend::run_age_keygen`, that builds
+the plain argv `Command` (no `sh -c`, no template) and calls
+`wait_bounded` the same way `run_backend_command` now does.
+`run_backend_command`'s own external behavior (every message it can
+return) is BYTE-IDENTICAL before and after this refactor — proven by the
+full existing suite passing unchanged.** A future non-template shell-out
+this crate adds (there is currently exactly one, `age-keygen`) bounds
+itself through `wait_bounded` the same way, never a bare blocking
+`Command::output()`/`.status()` — the "every backend shell-out" framing in
+the note above was never meant to exempt a shell-out just because it isn't
+a TEMPLATE; `run_backend_command` is the template-specific caller of
+`wait_bounded`, not the whole bound itself. Two new tests prove this from
+both sides, same PATH-shim technique `enroll.rs`'s `render_qr` tests
+already establish (a fake, sleeping `age-keygen` script on `PATH`, no real
+`age` binary needed): `backend::tests::
+mint_age_identity_against_a_hung_age_keygen_returns_within_bounds` (the
+unit-level bound) and `broker::tests::
+a_hung_age_keygen_mint_no_longer_wedges_put_lock_forever` (the SAME
+put_lock-freed-for-the-next-caller proof the task #74 commit's own
+`a_hung_set_template_no_longer_wedges_put_lock_forever` test gives a `set`
+template, now given to a hung mint too).
 
 ## Docs update required in the same commit
 

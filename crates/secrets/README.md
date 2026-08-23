@@ -905,6 +905,20 @@ nothing is silently overwritten on a mere probe timeout. Behavior for a
 well-behaved template is unchanged under the default knob — this phase
 only bounds the wait, it never slows down the common case.
 
+**P-G3 review fix: the ONE non-template shell-out this crate makes is
+bounded too.** `backend::mint_age_identity_if_needed`'s two `age-keygen`
+calls (the `age` backend's lazy identity bootstrap — a plain argv exec,
+never a `sh -c` template, so it never went through `run_backend_command`)
+originally ran through a plain blocking `Command::output()`, missed by the
+task #74 bound above even though minting happens inside the SAME
+`put_lock` critical section a hung `set` template used to wedge. The
+poll/drain/kill/reap loop `run_backend_command` uses internally is now its
+own function, `backend::wait_bounded` (generic over an already-spawned
+child — no backend name, no op, no command string), so `age-keygen`'s own
+caller, `backend::run_age_keygen`, bounds it the identical way without
+duplicating the loop. `run_backend_command`'s own external behavior is
+unchanged by this refactor.
+
 ## Backend presets
 
 `backend.rs`'s `Backends`/`fetch_value`/`store_value` (Named seams, below)
