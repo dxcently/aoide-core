@@ -880,6 +880,23 @@ fn put_lock() -> &'static std::sync::Mutex<()> {
 /// is checked BY BACKEND NAME rather than made a property every backend
 /// gets — this is a SECOND named exception beside `file`'s own seeded-data
 /// status ("Backend presets", `README.md`), not a general mechanism.
+///
+/// **The `put_lock` critical section's worst-case wait is up to FOUR
+/// `AOIDE_SECRETS_BACKEND_TIMEOUT`s, not one (judge fix, this commit —
+/// corrected from an undercounted "one timeout" framing elsewhere in this
+/// crate's docs).** Every shell-out inside this section is bounded
+/// individually (`backend::run_backend_command`/`backend::wait_bounded`,
+/// task #74/P-G3), but a first-ever `age`-backed `put` can chain up to
+/// FOUR of them sequentially before this function returns: minting calls
+/// `age-keygen` TWICE (`mint_age_identity_if_needed`'s own key-then-
+/// recipient calls, each independently bounded via `backend::
+/// run_age_keygen`), then the existence probe runs a `has`/`get` template
+/// once (`backend::has_value`), then — on the store path — the `set`
+/// template runs once more (`backend::store_value`). Each hop is bounded
+/// on its own, so the whole section can never hang forever, but "bounded"
+/// here means "up to 4x the knob," never "one timeout total" — a caller
+/// (or an operator raising `AOIDE_SECRETS_BACKEND_TIMEOUT`) should size
+/// around the worst case, not the per-call one.
 fn put_gate(secrets_home: &Path, secret: &str, value: &str, overwrite: bool) -> PutOutcome {
     let policies = match crate::store::load_policies(secrets_home) {
         Ok(p) => p,

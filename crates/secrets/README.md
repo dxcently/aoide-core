@@ -1029,7 +1029,7 @@ exceptions:
 | Backend  | `get` template            | `set` template | `has` template | Notes                                            |
 |----------|----------------------------|-----------------|-----------------|--------------------------------------------------|
 | `file` **(built-in, P-V4c)** | `cat {home}/store/{name}` | `mkdir -p -m 0700 {home}/store && install -m 0600 /dev/stdin {home}/store/{name}` | `test -f {home}/store/{name}` (P-G1) | An EXCEPTION — SEEDED automatically into a fresh `backends.json` (below), not merely documented here. Plain `0600` files under `<secrets_home>/store/`, expressed entirely through the template mechanism (house rule 7 — no special-cased Rust reads or writes this backend's bytes). Its `has` template is a cheap `test -f` rather than re-running `cat` and discarding the value — no behavior change, since a `0600` file's existence already implied a value under the old `get`-probe fallback too. |
-| `age` **(built-in, P-G1, task #70)** | `age -d -i {home}/age.key {home}/values/{name}.age` | `mkdir -p -m 0700 {home}/values && age -e -R {home}/age.recipient -o {home}/values/{name}.age && chmod 0600 {home}/values/{name}.age` | `test -f {home}/values/{name}.age` | The SECOND exception — also SEEDED. Age-encrypted `0600` files under `<secrets_home>/values/`; `secrets add`'s own new DEFAULT backend (above). The identity (`{home}/age.key`/`{home}/age.recipient`) is LAZILY MINTED by `backend::mint_age_identity_if_needed` on the first `age`-backed `put` — real Rust I/O, not a template (same one-time-bootstrap shape `enroll`'s TOTP-secret generation already uses), audited as a name-only `age-identity-minted` broker notify event ("Broker notifications" above). **Never minted on `get`** — a missing `age.key` there is a taught error (`backend::missing_age_identity_hint`), never an auto-mint. A missing `age`/`age-keygen` binary on `PATH`, for either template OR the mint itself, is ALSO a taught error naming the package to install (`backend::missing_age_binary_hint`) — never a bare "exited 127". |
+| `age` **(built-in, P-G1, task #70)** | `age -d -i {home}/age.key {home}/values/{name}.age` | `mkdir -p -m 0700 {home}/values && age -e -R {home}/age.recipient -o {home}/values/{name}.age && chmod 0600 {home}/values/{name}.age` | `test -f {home}/values/{name}.age` | The SECOND exception — also SEEDED. Age-encrypted `0600` files under `<secrets_home>/values/`; `secrets add`'s own new DEFAULT backend (above). The identity (`{home}/age.key`/`{home}/age.recipient`) is LAZILY MINTED by `backend::mint_age_identity_if_needed` on the first `age`-backed `put` — real Rust I/O, not a template (same one-time-bootstrap shape `enroll`'s TOTP-secret generation already uses), audited as a name-only `age-identity-minted` broker notify event ("Broker notifications" above). **Never minted on `get`** — a missing `age.key` there is a taught error (`backend::missing_age_identity_hint`), never an auto-mint. **Never minted over orphaned ciphertext either (judge fix)** — a `put` with `age.key` absent but `<home>/values/` already holding `.age` files from a previous, now-missing identity is REFUSED outright (`backend::orphaned_age_ciphertext_refusal`), since a freshly minted identity could never decrypt them and minting anyway would silently orphan them for good; the refusal (and `missing_age_identity_hint` on the `get` side) names the two real fixes — restore the original `age.key`, or remove the orphaned `.age` files first. A missing `age`/`age-keygen` binary on `PATH`, for either template OR the mint itself, is ALSO a taught error naming the package to install (`backend::missing_age_binary_hint`) — never a bare "exited 127". |
 | `pass`   | `pass show {name}`         | — | — | `key` is the pass-store entry path (`prod/db`).  |
 | `gopass` | `gopass show -o {name}`    | — | — | `-o` prints the password line only, no metadata. |
 | `bw`     | `bw get password {name}`   | — | — | `key` is the Bitwarden item's name or id; needs a prior `bw unlock`/`BW_SESSION` in the broker's own environment (secrets-uid-owned, per the ownership-trap note below). |
@@ -1164,6 +1164,20 @@ other value-adjacent audit line in this crate holds: one
 `migrated`/`unchanged`/`refused`) naming the secret, source backend, and
 target backend — never the value, never the key.
 
+**A migrate onto `age` hands sole decryption power to `age.key` (judge fix,
+this commit).** The moment `secrets migrate <name> --backend age` succeeds,
+`<home>/values/<key>.age` is the ONLY copy of that secret's ciphertext and
+`<home>/age.key` is the ONLY thing on this host that can ever decrypt it
+back — a backup that copies `values/` but not `age.key` restores to
+ciphertext nobody can read again. The success message says this in one
+sentence every time the target is `age` (never on a migrate that lands
+anywhere else, since it isn't the backend the value just moved onto), so
+an operator whose instinct is "back up `values/`, that's where the
+secrets live" sees the gap before it becomes a real loss rather than
+after. Back up `age.key` and `age.recipient` alongside `values/`, as one
+unit, the same discipline `backend::mint_age_identity_if_needed`'s own
+`0600` handling already treats them with.
+
 **No lock against a live broker (KNOWN LIMITATION, `AGENTS.md`).** `migrate`
 runs as a separate OS process from `secrets serve` and cannot take the
 daemon's own in-process `put_lock` — a `migrate` racing a `put`/`exec`
@@ -1266,13 +1280,28 @@ backfill_missing_backends(secrets_home)` immediately after
 `backends.json`, backfill acts on an EXISTING one, adding whichever
 built-in entry (`file`/`age`) is missing BY NAME and never touching an
 entry — built-in or hand-customized, even one an operator wrote under the
-name `age` or `file` themselves — that's already present. A `backends.json`
-that already carries both built-ins is not rewritten at all (no gratuitous
-mtime churn); every other row (`pass`/`gopass`/`bw`/`sops` presets, any
-operator-named custom backend) rides through byte-for-byte. This alone
-means a broker restarted after upgrading past P-G1 self-heals its
-`backends.json` with no operator action — the "delete `backends.json` and
-lose your custom rows" workaround above is retired.
+name `age` or `file` themselves — that's already present (presence of the
+NAME is the whole test: an `age` entry that's merely INCOMPLETE, missing
+`has` say, is invisible to this too — structurally impossible for it to
+"repair" a field inside an entry it never opens). A `backends.json` that
+already carries both built-ins is not rewritten at all (no gratuitous
+mtime churn); every other row's own JSON VALUE (`pass`/`gopass`/`bw`/`sops`
+presets, any operator-named custom backend) is left completely untouched
+by content — but the FILE itself is **not** guaranteed byte-for-byte the
+moment anything IS added: this crate doesn't enable serde_json's
+`preserve_order` feature, so the whole document re-serializes with its
+top-level keys sorted ALPHABETICALLY, regardless of the order they
+appeared in the original file (`backend.rs`'s own doc on
+`backfill_missing_backends` has the full correction and a test proving
+it). This alone means a broker restarted after upgrading past P-G1
+self-heals its `backends.json` with no operator action — the "delete
+`backends.json` and lose your custom rows" workaround above is retired.
+**A future change to a built-in's own template text still can't reach an
+already-deployed file this way, either** — backfill only ever fills in a
+NAME that's absent; it has no path that revisits an already-present
+entry's shape, so raising `AGE_BACKEND_GET`/`FILE_BACKEND_SET`/etc. only
+ever affects a freshly-seeded home. Queued follow-up, not solved here
+(`AGENTS.md`'s own corollary on this invariant).
 
 Second, per-secret: `secrets migrate <name> [--backend <target>]`
 (`commands::handle_secrets_migrate`, default target `age`) moves ONE

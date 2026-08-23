@@ -184,7 +184,7 @@ pub fn register(r: &mut Registry) {
         flags: [
             flag!("as", "string", "The consumer name to present to the broker (self-asserted — the policy's consumers[] list is the real gate, not caller identity)."),
             flag!("secret", "string", "The secret's policy name, optionally `name:VAR` to name the injected env var explicitly (default: the name, uppercased, `-` -> `_`)."),
-            flag!("totp", "string", "A TOTP code — accepted on the wire, ignored this phase. No enrollment exists yet, so a requireTotp secret is unresolvable regardless (P-V4 wires verification).")
+            flag!("totp", "string", "A TOTP code for a requireTotp-gated secret — verified live against this host's enrolled secret (±1-timestep window, single-use: a wrong or already-used code is a plain denial). Omitted (or wrong) on a requireTotp secret PARKS the resolve instead of refusing outright — complete it with `secrets pending`/`secrets approve <id> --totp <code>` from another terminal, or wait out the timeout. Unresolvable only when no TOTP enrollment exists yet on this host (`secrets enroll`).")
         ],
         gated: false,
         implemented: true,
@@ -1066,14 +1066,32 @@ fn handle_secrets_migrate(inv: &Invocation) -> Outcome {
     // Remove the OLD value LAST, only for a built-in source whose path is
     // derivable — a non-built-in source is left untouched, reported
     // honestly rather than silently doing nothing.
+    //
+    // Judge fix, this commit: a migrate onto `age` hands sole decryption
+    // power to `age.key` — the value's ciphertext under `values/` is
+    // useless without it (`backend.rs`'s own "age.key is the only
+    // decryptor" framing). The success message says so, once, right here,
+    // so an operator backing up `values/` alone (a natural instinct — it's
+    // where the ciphertext lives) doesn't discover the gap only once the
+    // key is already gone.
+    let key_lifecycle_note = if target == "age" {
+        " — age.key is now the ONLY decryptor of this value; back it up together with values/, \
+          since a backup holding the .age files but not age.key restores to nothing"
+    } else {
+        ""
+    };
     let message = match crate::backend::remove_builtin_value(&home, &source, &key) {
-        Some(Ok(())) => format!("migrated secret `{name}` from `{source}` to `{target}` (old value removed)"),
+        Some(Ok(())) => {
+            format!("migrated secret `{name}` from `{source}` to `{target}` (old value removed){key_lifecycle_note}")
+        }
         Some(Err(e)) => {
-            format!("migrated secret `{name}` from `{source}` to `{target}` (old value NOT removed: {e})")
+            format!(
+                "migrated secret `{name}` from `{source}` to `{target}` (old value NOT removed: {e}){key_lifecycle_note}"
+            )
         }
         None => format!(
             "migrated secret `{name}` from `{source}` to `{target}` (old value under `{source}` left in \
-             place — not a built-in backend, remove it by hand)"
+             place — not a built-in backend, remove it by hand){key_lifecycle_note}"
         ),
     };
     audit_migrate(inv.door, &name, &source, &target, "migrated", None);
@@ -1910,6 +1928,54 @@ mod tests {
 
             assert_eq!(crate::backend::fetch_value(home, "age", "k").unwrap(), "the-value");
             assert!(!home.join("store").join("k").exists(), "old file-backend value must be removed");
+        });
+    }
+
+    /// Judge fix, this commit: a migrate onto `age` must warn that
+    /// `age.key` is now the ONLY decryptor of the moved value, right in the
+    /// success message — an operator backing up `values/` alone (a natural
+    /// instinct, that's where the ciphertext lives) needs to see this
+    /// before discovering the gap the hard way. A migrate that does NOT
+    /// land on `age` (source `age` -> target `file` here) must not carry
+    /// this note at all — it isn't the backend this migrate just moved the
+    /// value onto.
+    #[test]
+    fn migrate_onto_age_warns_that_age_key_is_now_the_only_decryptor() {
+        if !age_tools_available() {
+            eprintln!("skipping migrate_onto_age_warns_that_age_key_is_now_the_only_decryptor: age/age-keygen not found on PATH");
+            return;
+        }
+        with_secrets_home("migrate-key-lifecycle-onto-age", |home| {
+            crate::backend::seed_default_backends(home).unwrap();
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "file"), ("key", "k")]);
+            assert_eq!(handle_secrets_add(&add).status, Status::Ok);
+            crate::backend::store_value(home, "file", "k", "the-value").unwrap();
+
+            let migrate = inv(Door::Cli, &["secrets", "migrate"], &["t"], &[("backend", "age")]);
+            let out = handle_secrets_migrate(&migrate);
+            assert_eq!(out.status, Status::Ok, "{out:?}");
+            assert!(
+                out.message.contains("age.key is now the ONLY decryptor"),
+                "migrate onto age must warn about the key-lifecycle risk: {}",
+                out.message
+            );
+        });
+
+        with_secrets_home("migrate-key-lifecycle-off-age", |home| {
+            crate::backend::seed_default_backends(home).unwrap();
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "age"), ("key", "k")]);
+            assert_eq!(handle_secrets_add(&add).status, Status::Ok);
+            crate::backend::mint_age_identity_if_needed(home).unwrap();
+            crate::backend::store_value(home, "age", "k", "the-value").unwrap();
+
+            let migrate = inv(Door::Cli, &["secrets", "migrate"], &["t"], &[("backend", "file")]);
+            let out = handle_secrets_migrate(&migrate);
+            assert_eq!(out.status, Status::Ok, "{out:?}");
+            assert!(
+                !out.message.contains("age.key is now the ONLY decryptor"),
+                "a migrate that does not land on age must not carry the age-specific note: {}",
+                out.message
+            );
         });
     }
 

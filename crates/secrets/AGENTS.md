@@ -442,6 +442,24 @@
   minting one. Don't add a mint call anywhere on the resolve/GET path
   "for convenience" — a plain read must never have the side effect of
   silently provisioning key material nobody asked for.
+- **`age.key` absent is NOT by itself "safe to mint" — a mint over
+  orphaned ciphertext is REFUSED, never silent (judge fix, this commit,
+  hard constraint).** `backend::mint_age_identity_if_needed` checks
+  `backend::has_orphaned_age_ciphertext(secrets_home)` (any `*.age` file
+  under `<home>/values/`) BEFORE ever calling `age-keygen`, and returns
+  `backend::orphaned_age_ciphertext_refusal()` instead of minting when
+  orphans exist — a freshly minted identity can never decrypt ciphertext
+  produced under a DIFFERENT, now-missing one, and minting anyway would
+  silently and permanently orphan every value already encrypted under the
+  lost identity while `has_value` kept reporting them as present.
+  `backend::missing_age_identity_hint` (the `get`-side taught error) runs
+  the SAME check and swaps its advice accordingly — it must never tell an
+  operator to run `secrets put` when orphans exist, since that call would
+  now be refused anyway and the advice would just be wrong twice over.
+  Don't special-case this away for "a fresh `put` should just work" — the
+  refusal exists precisely because the home ISN'T fresh in that case, and
+  the two real fixes (restore `age.key`, or remove the orphaned `.age`
+  files) are the only ways out.
 - **A backend's OPTIONAL `has` template (P-G1, task #70) is `#[serde(default)]`
   and changes NOTHING for a backend that doesn't carry one.**
   `backend::has_value` runs `Backend::has` when present (treating exit 0
@@ -479,7 +497,22 @@
   `backends.json`... this does NOT backfill" — that invariant above, now
   superseded by this one closing the gap it named). Don't make this
   function overwrite or "repair" an existing entry under a built-in's
-  name — presence of the key is the only test, forever.
+  name — presence of the key is the only test, forever. **Corollary
+  (judge fix, this commit, doc correction): a hand-edited entry that is
+  merely INCOMPLETE — missing `has`, say, but still present under the key
+  `age`/`file` — is invisible to this function for the exact same reason,
+  and so is a future CHANGE to a built-in's own template text
+  (`AGE_BACKEND_GET`/`FILE_BACKEND_SET`/etc.).** Presence of the top-level
+  NAME is the whole test; this function has no path that ever re-derives
+  or corrects the SHAPE of an already-present entry. A future change to a
+  built-in's template text therefore reaches only a freshly-seeded home
+  ([`crate::backend::seed_default_backends`]'s own "absent file only"
+  rule) — it can NEVER retroactively repair an already-deployed
+  `backends.json` that predates the change. This is a queued follow-up gap,
+  not something silently fixed by backfill or seeding as they exist today;
+  don't claim otherwise in a docstring, a commit message, or an operator-
+  facing message. Closing it for real would need an explicit, versioned
+  migration path this crate does not have — out of scope here.
 - **Backfill writes NOTHING when nothing was missing (P-G2, task #72) —
   checked before ever opening a temp file, not merely a same-content
   rewrite.** A `backends.json` that already carries both built-ins must
@@ -531,6 +564,15 @@
   value before the new one is confirmed stored, or before the policy flip
   is saved, would leave a WINDOW where neither backend has a value the
   policy can resolve.
+- **A migrate onto `age` warns, in the success message itself, that
+  `age.key` is now the ONLY decryptor of the moved value (judge fix, this
+  commit).** `commands::handle_secrets_migrate` appends one fixed sentence
+  whenever `target == "age"` — never on a migrate landing anywhere else,
+  since it isn't the backend the value just moved onto. This is a message
+  addition only: it changes no ordering, no gating, no wire shape: don't
+  fold it into a bigger "warn before any key-lifecycle-risky op" mechanism
+  — the whole crate has exactly one such op today (`migrate` onto `age`),
+  and a generic middleware for one call site is the wrong size.
 - **Old-value removal is BUILT-IN-SOURCE-ONLY and PATH-DERIVED, never a
   guess (P-G2, task #72).** `backend::remove_builtin_value` recognizes
   exactly two source backend names — `file` (`<home>/store/<key>`) and

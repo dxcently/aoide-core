@@ -135,6 +135,20 @@
 //! [`mint_age_identity_if_needed`], so a doomed `put` against an
 //! unconfigured `age` policy never mints a REAL identity first.
 //!
+//! **`age.key` absent is not the same as "safe to mint" (judge fix, this
+//! commit).** [`mint_age_identity_if_needed`] refuses outright — never
+//! silently minting — when `age.key` is missing AND `<home>/values/`
+//! already holds orphaned `.age` ciphertext from a PREVIOUS identity that
+//! went away (deleted, a backup that dropped `age.key`, a home copied
+//! without it): a fresh identity cannot decrypt anything already encrypted
+//! under the lost one, so minting there would silently and permanently
+//! orphan every existing value while [`has_value`] kept reporting them as
+//! present. [`missing_age_identity_hint`] (the GET-side taught error) makes
+//! the same call before ever suggesting `secrets put` as the fix — "run
+//! `secrets put` to mint" is exactly the destructive move over orphaned
+//! ciphertext, so it now names the restore-or-clean choice instead
+//! whenever [`has_orphaned_age_ciphertext`] says orphans exist.
+//!
 //! ## Closing the deployment gap: backfill + migrate (P-G2, task #72)
 //!
 //! The P-G1 review fix above only ever REPORTED the "unconfigured `age`"
@@ -580,7 +594,7 @@ pub fn fetch_value(secrets_home: &Path, backend_name: &str, key: &str) -> Result
     // mint" is actively wrong advice there, since `store_value` hits the
     // identical unknown-backend wall.
     if backend_name == "age" && !secrets_home.join("age.key").exists() {
-        return Err(missing_age_identity_hint());
+        return Err(missing_age_identity_hint(secrets_home));
     }
     let command = expand_template(&backend.get, secrets_home, key);
 
@@ -727,15 +741,69 @@ pub fn seed_default_backends(secrets_home: &Path) -> std::io::Result<()> {
     std::fs::rename(&tmp, &path)
 }
 
+/// Does `<home>/values/` hold any `*.age` ciphertext at all? (judge fix,
+/// this commit — the mint-over-orphans refusal below.) A `values/` directory
+/// with orphaned ciphertext means a PREVIOUS `age.key` existed and produced
+/// these files, then went missing (deleted, a lost backup that dropped it,
+/// a home copied without it) — `age.key` is the ONLY decryptor of them
+/// (module doc), so blindly minting a fresh identity here would forever
+/// orphan every one of those values while [`has_value`] keeps reporting
+/// them as present. An unreadable/absent `values/` directory reads as "no
+/// orphans" (`Ok`-shaped default: a brand-new home has no `values/` at all
+/// yet), never an error — the caller's own mint attempt hits the real I/O
+/// error on its own if something deeper is actually wrong.
+fn has_orphaned_age_ciphertext(secrets_home: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(secrets_home.join("values")) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("age"))
+}
+
 /// The taught error for a missing `age.key` on a GET (module doc: never an
 /// auto-mint — minting is SET-only, from `broker::put_gate`'s own critical
 /// section). Deterministic and value-free, and — unlike a bare `age`
 /// stderr string — needs no real `age` binary on `PATH` to reach or to
-/// unit-test.
-fn missing_age_identity_hint() -> String {
-    "no age identity found for this secrets home yet — run `secrets put <name>` once to lazily mint \
-     `age.key`/`age.recipient` (SET mints; GET never does), or provision `age.key`/`age.recipient` \
-     out of band"
+/// unit-test. **Judge fix, this commit:** when [`has_orphaned_age_ciphertext`]
+/// says `values/` already holds ciphertext from a lost identity, this no
+/// longer suggests `secrets put` — [`mint_age_identity_if_needed`] now
+/// refuses that exact call outright (its own taught error, right below),
+/// so repeating that advice here would just point the operator at a
+/// refusal instead of a fix. The two-way choice (restore the old key, or
+/// clean the orphaned ciphertext) replaces it; the ordinary "go ahead and
+/// mint" advice is unchanged for a truly fresh home.
+fn missing_age_identity_hint(secrets_home: &Path) -> String {
+    if has_orphaned_age_ciphertext(secrets_home) {
+        "no age identity found for this secrets home, but `values/` still holds age-encrypted \
+         ciphertext from a previous identity — do NOT run `secrets put`, it would mint a brand-new \
+         recipient and permanently orphan every existing value (`secrets has` would keep reporting \
+         them as present with no way to ever decrypt them again); instead restore the ORIGINAL \
+         `age.key` (it is the only decryptor of those values) or remove the orphaned `.age` files \
+         under `values/` first"
+            .to_string()
+    } else {
+        "no age identity found for this secrets home yet — run `secrets put <name>` once to lazily mint \
+         `age.key`/`age.recipient` (SET mints; GET never does), or provision `age.key`/`age.recipient` \
+         out of band"
+            .to_string()
+    }
+}
+
+/// The taught refusal [`mint_age_identity_if_needed`] returns instead of
+/// minting when `age.key` is absent AND `values/` already holds orphaned
+/// `.age` ciphertext (judge fix, this commit — the mint-over-orphans gap:
+/// before this check, a `put` on ANY secret with no existing identity would
+/// mint a brand-new recipient the moment `age.key` was missing, silently
+/// and permanently orphaning every value already encrypted under a lost
+/// previous identity). Mirrors [`missing_age_identity_hint`]'s
+/// restore-or-clean wording so an operator sees the SAME two-way choice
+/// whichever path (a `get` or a `put`) surfaced the problem.
+fn orphaned_age_ciphertext_refusal() -> String {
+    "refusing to mint a new age identity: `values/` already holds age-encrypted ciphertext from a \
+     previous identity, and a freshly minted identity cannot decrypt any of it — restore the \
+     ORIGINAL `age.key` (it is the only decryptor of those values) or remove the orphaned `.age` \
+     files under `values/` first, then retry"
         .to_string()
 }
 
@@ -769,19 +837,39 @@ fn describe_missing_age_keygen(err: &std::io::Error) -> String {
 /// note left open.** [`seed_default_backends`] only ever writes when the
 /// file is entirely ABSENT (deliberate, unchanged); this is its sibling for
 /// the far more common live case — a `backends.json` that already exists
-/// but predates one or both built-ins (a pre-P-G1 deployment with `file`
-/// only, or a hand-edited file missing `has`). Adds whatever built-in entry
-/// is MISSING BY NAME, and nothing else: an entry already present under a
+/// but predates one or both built-ins (the ONE case this actually helps: a
+/// pre-P-G1 deployment with `file` only and no `age` entry at all). **Not a
+/// repair tool for a hand-edited entry missing a field like `has` (judge
+/// fix, this commit, doc correction only) — that's structurally impossible
+/// for this function to reach.** The test this function runs is presence of
+/// the TOP-LEVEL NAME (`file`/`age`) in the document, nothing about what's
+/// inside an already-present entry — a `backends.json` that already carries
+/// an `age` key (hand-edited, missing `has`, or otherwise incomplete) is
+/// left EXACTLY as it is; only a key that is ENTIRELY ABSENT gets the
+/// built-in's default shape inserted. Adds whatever built-in entry is
+/// MISSING BY NAME, and nothing else: an entry already present under a
 /// built-in's name — `file` or `age` — is NEVER touched, even if an
 /// operator has customized it (a custom `get`/`set` shape under the name
 /// `age`, say) — presence of the KEY is the only test, never a content
-/// comparison. Every OTHER entry in the file (a `pass`/`gopass`/`bw`/`sops`
-/// row, or any operator-named custom backend) rides through byte-for-byte:
-/// this function loads the whole document as an ordered `serde_json::Map`
-/// (never a typed `Backends`/`Backend` round trip, which would reorder or
-/// reformat fields the built-ins loader doesn't itself care about) and only
-/// ever `insert`s a new top-level key, never touching an existing `Value`.
-/// **No write at all when nothing was missing** — checked before ever
+/// comparison. **No correction to a built-in's own template text (a change
+/// to `AGE_BACKEND_GET`/`FILE_BACKEND_SET`/etc. in a future commit) can
+/// ever reach an already-deployed `backends.json` this way** — this
+/// crate's own `AGENTS.md` states that plainly as a queued-follow-up gap,
+/// not something silently fixed by this function; a template-text change
+/// needs its own explicit migration path if one is ever needed. Every OTHER
+/// entry already present in the document (a `pass`/`gopass`/`bw`/`sops`
+/// row, or any operator-named custom backend) has its own JSON VALUE left
+/// completely untouched — but the FILE's bytes are NOT guaranteed
+/// byte-for-byte when anything was added (doc correction, judge fix, this
+/// commit): this function loads the whole document as a `serde_json::Map`,
+/// which — since this crate does not enable serde_json's `preserve_order`
+/// feature — is backed by a `BTreeMap` and therefore re-serializes every
+/// top-level key in ALPHABETICAL order regardless of the order they
+/// appeared in the original file. A `backends.json` whose keys were NOT
+/// already alphabetical (hand-edited, or written by an older version of
+/// this crate) comes back reordered the moment a backfill actually adds
+/// something, even though no existing entry's own content changed one
+/// byte. **No write at all when nothing was missing** — checked before ever
 /// opening a temp file — so re-running this on an already-complete
 /// `backends.json` (the common case: called every broker startup, right
 /// after [`seed_default_backends`]) never churns its mtime. Same
@@ -899,6 +987,17 @@ pub fn mint_age_identity_if_needed(secrets_home: &Path) -> Result<bool, String> 
     let key_path = secrets_home.join("age.key");
     if key_path.exists() {
         return Ok(false);
+    }
+    // Judge fix, this commit: `age.key` absent is not by itself "safe to
+    // mint" — `values/` can already hold ciphertext from a PREVIOUS
+    // identity that went missing (deleted, a backup that dropped
+    // `age.key`, a home copied without it). Minting here would produce a
+    // brand-new recipient nothing already encrypted can ever be opened
+    // with again, while `has_value` keeps reporting those entries as
+    // present — a silent, permanent orphaning. Refuse and teach the two
+    // real fixes instead (`has_orphaned_age_ciphertext`'s own doc).
+    if has_orphaned_age_ciphertext(secrets_home) {
+        return Err(orphaned_age_ciphertext_refusal());
     }
     std::fs::create_dir_all(secrets_home).map_err(|e| format!("creating {}: {e}", secrets_home.display()))?;
 
@@ -1370,6 +1469,78 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// Judge fix, this commit: `age.key` absent used to be treated as
+    /// unconditionally "safe to mint," even when `values/` already held
+    /// `.age` ciphertext from a previous, now-missing identity — minting a
+    /// fresh recipient there can never decrypt any of it, silently and
+    /// permanently orphaning every existing value. Deterministic — the
+    /// refusal fires before `age-keygen` is ever spawned, so this needs no
+    /// real `age` binary on `PATH`.
+    #[test]
+    fn mint_refuses_when_age_key_is_absent_but_values_holds_orphaned_ciphertext() {
+        let home = tmp_home("age-mint-over-orphans");
+        let values_dir = home.join("values");
+        std::fs::create_dir_all(&values_dir).unwrap();
+        std::fs::write(values_dir.join("some-secret.age"), b"orphaned ciphertext").unwrap();
+        assert!(!home.join("age.key").exists());
+
+        let err = mint_age_identity_if_needed(&home).unwrap_err();
+        assert_eq!(err, orphaned_age_ciphertext_refusal());
+        assert!(!home.join("age.key").exists(), "a refused mint must never create a key");
+        assert!(!home.join("age.recipient").exists(), "a refused mint must never create a recipient");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The other half of the same fix: a truly fresh home (no `values/` at
+    /// all, or an empty one) must mint exactly as before — the refusal
+    /// above must never become a blanket "can't mint without an existing
+    /// values dir" regression.
+    #[test]
+    fn mint_proceeds_on_a_truly_fresh_home_with_no_orphaned_ciphertext() {
+        if !age_tools_available() {
+            eprintln!(
+                "skipping mint_proceeds_on_a_truly_fresh_home_with_no_orphaned_ciphertext: age/age-keygen not found on PATH"
+            );
+            return;
+        }
+        let home = tmp_home("age-mint-fresh-no-values-dir");
+        assert!(!home.join("values").exists(), "precondition: no values/ dir at all yet");
+        let minted = mint_age_identity_if_needed(&home).unwrap();
+        assert!(minted, "a truly fresh home must still mint normally");
+        assert!(home.join("age.key").exists());
+        std::fs::remove_dir_all(&home).ok();
+
+        let home2 = tmp_home("age-mint-fresh-empty-values-dir");
+        std::fs::create_dir_all(home2.join("values")).unwrap();
+        let minted2 = mint_age_identity_if_needed(&home2).unwrap();
+        assert!(minted2, "an EMPTY values/ dir (no .age entries) must not be treated as orphaned");
+        assert!(home2.join("age.key").exists());
+        std::fs::remove_dir_all(&home2).ok();
+    }
+
+    #[test]
+    fn missing_age_identity_hint_names_the_restore_or_clean_choice_only_when_orphans_exist() {
+        let fresh_home = tmp_home("age-hint-fresh");
+        let hint = missing_age_identity_hint(&fresh_home);
+        assert!(hint.contains("secrets put"), "a truly fresh home should still be told to run `secrets put`: {hint}");
+        assert!(!hint.contains("restore"), "no orphans present -> no restore-or-clean wording: {hint}");
+        std::fs::remove_dir_all(&fresh_home).ok();
+
+        let orphaned_home = tmp_home("age-hint-orphaned");
+        let values_dir = orphaned_home.join("values");
+        std::fs::create_dir_all(&values_dir).unwrap();
+        std::fs::write(values_dir.join("k.age"), b"orphaned").unwrap();
+        let hint = missing_age_identity_hint(&orphaned_home);
+        assert!(
+            !hint.contains("once to lazily mint"),
+            "must never repeat the fresh-home advice to just run `secrets put` and mint: {hint}"
+        );
+        assert!(hint.contains("do NOT run"), "must actively warn against `secrets put` here: {hint}");
+        assert!(hint.contains("restore"), "must name restoring the original age.key: {hint}");
+        assert!(hint.contains("remove"), "must name removing the orphaned ciphertext: {hint}");
+        std::fs::remove_dir_all(&orphaned_home).ok();
+    }
+
     #[test]
     fn the_seeded_age_backend_round_trips_a_value_through_a_real_age_binary() {
         if !age_tools_available() {
@@ -1402,7 +1573,7 @@ mod tests {
         assert!(!home.join("age.key").exists());
 
         let err = fetch_value(&home, "age", "my-secret-key").unwrap_err();
-        assert_eq!(err, missing_age_identity_hint());
+        assert_eq!(err, missing_age_identity_hint(&home));
         assert!(!home.join("age.key").exists(), "GET must never mint an identity");
         assert!(!home.join("age.recipient").exists());
         std::fs::remove_dir_all(&home).ok();
@@ -1484,6 +1655,50 @@ mod tests {
         let backends = load_backends(&home).unwrap();
         assert!(backends.0.contains_key("age"), "age must be backfilled");
         assert_eq!(backends.0.get("file").unwrap().get, FILE_BACKEND_GET, "file entry must be untouched");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Judge fix, this commit (doc correction): backfill's own doc used to
+    /// claim every other entry "rides through byte-for-byte" — false for
+    /// the FILE as a whole. This crate never enables serde_json's
+    /// `preserve_order` feature, so `backfill_missing_backends`'s
+    /// `serde_json::Map` is `BTreeMap`-backed and re-serializes every
+    /// top-level key ALPHABETICALLY on any write, regardless of the order
+    /// they appeared in the original file. Proven here with a hand-written
+    /// (never round-tripped through this crate's own Map type first) file
+    /// whose keys are deliberately NOT alphabetical.
+    #[test]
+    fn backfill_reorders_top_level_keys_alphabetically_even_though_entry_content_is_unchanged() {
+        let home = tmp_home("backfill-reorder");
+        std::fs::create_dir_all(&home).unwrap();
+        let raw = br#"{
+  "zzz-custom": { "get": "cat {home}/zzz" },
+  "file": { "get": "cat {home}/store/{name}" }
+}"#;
+        std::fs::write(backends_path(&home), raw).unwrap();
+
+        let before_text = std::fs::read_to_string(backends_path(&home)).unwrap();
+        let zzz_before = before_text.find("zzz-custom").unwrap();
+        let file_before = before_text.find("\"file\"").unwrap();
+        assert!(zzz_before < file_before, "precondition: the hand-written file is not already alphabetical");
+
+        backfill_missing_backends(&home).unwrap();
+
+        let after_text = std::fs::read_to_string(backends_path(&home)).unwrap();
+        let file_after = after_text.find("\"file\"").unwrap();
+        let zzz_after = after_text.find("zzz-custom").unwrap();
+        assert!(
+            file_after < zzz_after,
+            "backfill re-serializes the whole document and alphabetizes top-level keys — \
+             the file is NOT byte-for-byte with the original once anything is added: {after_text}"
+        );
+
+        // The custom entry's own VALUE is still exactly what it was — only
+        // the file's overall byte layout changed, never any entry's content.
+        let backends = load_backends(&home).unwrap();
+        assert_eq!(backends.0.get("zzz-custom").unwrap().get, "cat {home}/zzz");
+        assert_eq!(backends.0.get("file").unwrap().get, "cat {home}/store/{name}");
+        assert!(backends.0.contains_key("age"), "age must still have been backfilled");
         std::fs::remove_dir_all(&home).ok();
     }
 
