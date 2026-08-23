@@ -70,9 +70,24 @@
       });
 
       # ── Dev shell ──────────────────────────────────────────────────────────
-      # The Rust toolchain only — the root devShell's Rust half, mirrored. The
-      # root adds the Nix tooling (nixfmt/nil/…) on top for the AoideOS
-      # packaging surface; the core's own shell stays toolchain-only.
+      # The COMPLETE dev surface for this workspace — every tool development
+      # in `crates/` actually uses, so that when this directory graduates to
+      # its own repo (the header's one-line input swap) the shell needs
+      # nothing from the AoideOS flake. Inventory derived from the code, not
+      # aspiration: `grep -r 'Command::new' crates/` enumerates the runtime
+      # shell-outs; the toolchain and jq are the build/probe loop.
+      #
+      # Deliberately ABSENT, each for a reason:
+      #   - hyprctl / quickshell — session-owned: hyprctl's IPC is
+      #     version-coupled to the RUNNING compositor, and a shell-provided
+      #     copy that skews from the host session is worse than none. Both
+      #     come from the deployed system, never from this shell.
+      #   - loginctl / systemctl — systemd host tools; shipping them in a
+      #     shell on a non-systemd host would only fake the probe
+      #     (`watch --popup`'s LockedHint check degrades honestly instead).
+      #   - nix — lyra's song eval shells out to it, but any machine entering
+      #     this shell has nix by construction.
+      #   - sh / coreutils / kill — stdenv givens.
       devShells = forAllSystems (
         system:
         let
@@ -82,12 +97,42 @@
           default = pkgs.mkShell {
             name = "aoide-core-dev";
             packages = with pkgs; [
+              # Rust toolchain — the build/test loop. rustfmt is present for
+              # editor tooling only; running it against this tree is banned
+              # (HEAD is not rustfmt-clean; a run manufactures churn).
               cargo
               rustc
               rustfmt
               clippy
               rust-analyzer
+              # The --json contract's other half: every dev probe is
+              # `aoide <cmd> --json | jq …`.
+              jq
+              # Core runtime shell-outs (crates/client, storage, secrets):
+              curl # client peer pulls / A2A dials
+              git # storage::git derivation capture
+              qrencode # secrets enroll — otpauth QR render
+              zenity # secrets watch --popup — the code-entry dialog
+              libnotify # notify-send, herald's local fallback
+              # Paint-side probes (crates/screen — wayland-session tools,
+              # inert off-desktop but standalone and version-insensitive):
+              grim # screen shot
+              slurp # screen region pick
+              tesseract # screen ocr
+              # This flake's own .nix files (checks.fmt upstream is
+              # nixfmt-only; same formatter here).
+              nixfmt
             ];
+            # AF_UNIX SUN_LEN guard: `nix develop` mints a deep
+            # /tmp/nix-shell.XXXXXX TMPDIR, and conduct's socket tests have
+            # ~5 bytes of headroom under /tmp — the deep default overflows
+            # sun_path and poisons the suite's env_lock in a 58-test cascade
+            # that looks like a broken crate. Pin TMPDIR back to /tmp so
+            # `cargo test -p <crate>` works without the manual TMPDIR=/tmp
+            # incantation.
+            shellHook = ''
+              export TMPDIR=/tmp
+            '';
           };
         }
       );
