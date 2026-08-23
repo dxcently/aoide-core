@@ -420,6 +420,44 @@
   own emission (`README.md`'s "Broker notifications", the pickup-point
   note) from the OUTSIDE — a new adapter in `aoide-conduct`/`lyra`, never a
   new dependency edge pointing the other way.
+- **The `age` backend's identity is minted ONLY from the `put`/SET path,
+  NEVER from `get`/GET (P-G1, task #70, hard constraint).**
+  `backend::mint_age_identity_if_needed` is called ONLY inside
+  `broker::put_gate`'s own critical section (the SAME `put_lock` that
+  already guards the existence-probe->store section — one lock, not a
+  second one, since a concurrent identity bootstrap has the identical
+  TOCTOU shape); `backend::fetch_value` checks for a missing `age.key` and
+  returns `missing_age_identity_hint`'s taught error instead of ever
+  minting one. Don't add a mint call anywhere on the resolve/GET path
+  "for convenience" — a plain read must never have the side effect of
+  silently provisioning key material nobody asked for.
+- **A backend's OPTIONAL `has` template (P-G1, task #70) is `#[serde(default)]`
+  and changes NOTHING for a backend that doesn't carry one.**
+  `backend::has_value` runs `Backend::has` when present (treating exit 0
+  as "has a value") and falls back to its pre-existing
+  `fetch_value(...).is_ok()` probe when absent — byte-identical to every
+  `has_value` call before this field existed. Don't make `has` load-bearing
+  for a backend that omits it; the fallback is not merely a migration
+  shim, it is the PERMANENT behavior for any backend that never adopts
+  `has`.
+- **`secrets add`'s backend defaults to `age`, not `file`, when
+  `--backend` is omitted (P-G1, task #70, DEFAULT FLIP).**
+  `commands::DEFAULT_BACKEND` is the ONE place this is decided — an
+  ALREADY-recorded policy's `backend` field is never touched by this flip
+  (only a brand-new `add` with the flag omitted is affected), and an
+  explicit `--backend` still wins outright. Don't special-case an
+  "upgrade an old `file` policy to `age`" migration anywhere — this flip
+  changes a future default, never a past record.
+- **`pass`/`gopass`/`bw`/`sops` are documentation-only presets, and stay
+  that way (P-G1, task #70, restated as a crate stance).** `file`/`age`
+  are this crate's only SUPPORTED backend implementations — `backend.rs`
+  itself still carries no per-backend knowledge of any of the four
+  documentation-only presets, and no test in this crate exercises them.
+  Don't add code that assumes `pass`/`gopass`/`bw`/`sops` behave a
+  particular way (parsing their stdout beyond the generic trim-one-newline
+  rule, special-casing their exit codes, etc.) — a preset row in
+  "Backend presets" is the full extent of this crate's involvement with
+  any of them.
 
 ## Extension points
 
@@ -719,6 +757,42 @@
   string" — go through the same parameterized functions
   (`spawn_zenity_entry`/`run_zenity_entry`/`zenity_available`) so a future
   test can fake it the same way.
+- **The built-in `age` backend + the per-backend `has` template + the
+  `secrets add` default flip LANDED at P-G1 (task #70, this commit).**
+  `Backend` gained an OPTIONAL `has: Option<String>` field, `#[serde(default)]`
+  so an existing `backends.json` predating this phase loads unchanged (see
+  the invariant above); `backend::has_value` runs it when present,
+  otherwise falls back to its pre-existing `get`-probe behavior byte-for-
+  byte. `backend::seed_default_backends` now seeds TWO built-ins, `file`
+  (unchanged) and `age` (new) — the SAME seeding site, same "an existing
+  `backends.json` is never touched" rule. `age`'s `get`/`set` templates
+  (`AGE_BACKEND_GET`/`AGE_BACKEND_SET`, `backend.rs`) shell out to
+  `age`/`age-keygen` exactly like `file`'s templates shell out to
+  `cat`/`install` — house rule 7, no special-cased Rust reads or writes a
+  secret's ciphertext. `backend::mint_age_identity_if_needed` is the ONE
+  exception: real Rust I/O (two `age-keygen` shell-outs, not templates)
+  that lazily bootstraps `age.key`/`age.recipient` on the FIRST
+  `age`-backed `put`, called from `broker::put_gate`'s own `put_lock`
+  critical section (never from a `get` path — invariant above) and
+  audited as a NAME-ONLY `age-identity-minted` `emit_notify` event
+  (`README.md`'s "Broker notifications") — `handle_put` fires it, not
+  `put_gate` itself, so it happens with no crate lock held (P-N3's own
+  "no lock held" rule, invariant above, extended to this new call site). A
+  missing `age`/`age-keygen` binary is a taught error naming the package
+  to install (`backend::missing_age_binary_hint`), the same
+  "diagnose and teach the fix" idiom `home::describe_home_file_error`/
+  `client::describe_connect_error` already hold in this crate — grep
+  `describe_`/`missing_age_` for the precedent before hand-rolling a new
+  one. `commands::handle_secrets_add`'s `--backend` flag is now OPTIONAL
+  (it was a hard requirement before this phase, not merely defaulted),
+  defaulting to `age` (`commands::DEFAULT_BACKEND`) — a stored policy's
+  `backend` field is untouched either way, only what a BRAND-NEW `add`
+  with the flag omitted records. `pass`/`gopass`/`bw`/`sops` stay
+  documentation-only presets, restated as an explicit crate stance
+  (invariant above): `file`/`age` are the only backend IMPLEMENTATIONS
+  this crate supports. No new verb, no wire-op change, no golden-count
+  change — this phase is entirely inside the existing `add`/`put`
+  surfaces.
 
 **KNOWN GAP, deferred, not fixed by P-N2c:** backend `get`/`set` shell-outs
 (`backend::fetch_value`/`store_value`) have NO timeout — a wedged backend

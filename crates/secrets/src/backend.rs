@@ -78,11 +78,46 @@
 //!
 //! [`has_value`] (P-67, "warn before overwrite") is the broker-side
 //! existence probe `broker::put_gate` uses to decide whether an
-//! `overwrite:false` `put` should be refused: it just runs the `get`
-//! template and reports success/failure, since that IS every backend's
-//! existence contract already (`README.md`'s "Backend presets" table) —
-//! no new per-backend primitive, no special-casing of the built-in `file`
-//! backend.
+//! `overwrite:false` `put` should be refused: when a backend carries no
+//! `has` template it just runs the `get` template and reports
+//! success/failure, since that IS every backend's existence contract
+//! already (`README.md`'s "Backend presets" table). An OPTIONAL `has`
+//! template (P-G1, task #70) lets a backend answer existence more cheaply
+//! or more honestly than re-running `get` and discarding the value — when
+//! present, [`has_value`] runs IT instead, treating exit 0 as "has a
+//! value" — no new per-backend primitive REQUIRED, `has` is purely
+//! additive.
+//!
+//! ## The built-in `age` backend (P-G1)
+//!
+//! A SECOND seeded (not merely documented) built-in, beside `file`:
+//! age-encrypted `0600` files under `<secrets_home>/values/`, decrypted
+//! with an identity file this crate lazily mints on first use
+//! ([`mint_age_identity_if_needed`]). The actual ciphertext read/write
+//! stays entirely template-driven (`AGE_BACKEND_GET`/`AGE_BACKEND_SET`,
+//! shelled via `sh -c` exactly like every other backend, house rule 7) —
+//! only the ONE-TIME identity bootstrap (`age.key`/`age.recipient`) is
+//! real Rust I/O, the same precedent `enroll::generate_secret`/`store::
+//! save_totp_secret` already set for the TOTP secret: key MATERIAL is
+//! bootstrap state, not "this backend's bytes" the template mechanism
+//! owns. Minting happens ONLY from the broker-side `put`/SET path
+//! (`broker::put_gate`, "the same code path that runs SET templates") —
+//! NEVER from a `get`/GET path: a missing `age.key` on GET is
+//! [`missing_age_identity_hint`], a taught error, never an auto-mint (a
+//! GET can only ever decrypt; minting an identity there would hand back
+//! nothing useful and silently create key material nobody asked for on a
+//! plain resolve/read attempt). A missing `age`/`age-keygen` binary on
+//! PATH — either from a `get`/`set` template's own `sh -c` exiting 127
+//! (universally "command not found"), or from [`mint_age_identity_if_needed`]'s
+//! own `age-keygen` spawn failing — is [`missing_age_binary_hint`], the
+//! same "name the package to install" idiom `home::describe_home_file_error`/
+//! `client::describe_connect_error` already hold in this crate.
+//!
+//! `aoide`'s own two built-in stores (`file`, `age`) are the only backend
+//! IMPLEMENTATIONS this crate supports today — `pass`/`gopass`/`bw`/`sops`
+//! remain DOCUMENTATION-ONLY presets (below): copy the shape into
+//! `backends.json` by hand, but integrating with any of those tools is
+//! unsupported, untested territory this crate makes no promise about.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -90,13 +125,20 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Stdio;
 
-/// One named backend: a `get` fetch-command template, and an OPTIONAL `set`
-/// store-command template (P-V4c) — a backend with no `set` is read-only.
+/// One named backend: a `get` fetch-command template, an OPTIONAL `set`
+/// store-command template (P-V4c) — a backend with no `set` is read-only —
+/// and an OPTIONAL `has` existence-probe template (P-G1, task #70).
+/// `#[serde(default)]` on both optional fields means a `backends.json`
+/// written before either field existed loads unchanged: `set` absent stays
+/// read-only, `has` absent falls back to [`has_value`]'s pre-existing
+/// `fetch_value(...).is_ok()` probe exactly as before this field existed.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Backend {
     pub get: String,
     #[serde(default)]
     pub set: Option<String>,
+    #[serde(default)]
+    pub has: Option<String>,
 }
 
 /// `backends.json`'s whole shape: a map of backend name -> [`Backend`].
@@ -182,6 +224,14 @@ fn expand_template(template: &str, secrets_home: &Path, key: &str) -> String {
 /// BROKER's own stderr (module doc) and never appears in the returned
 /// `Err` — only the exit status does.
 pub fn fetch_value(secrets_home: &Path, backend_name: &str, key: &str) -> Result<String, String> {
+    // The built-in `age` backend's GET half: a missing identity is a
+    // taught error, NEVER an auto-mint (module doc) — checked before the
+    // template even runs, so this is deterministic and needs no real
+    // `age` binary to exercise.
+    if backend_name == "age" && !secrets_home.join("age.key").exists() {
+        return Err(missing_age_identity_hint());
+    }
+
     let backends = load_backends(secrets_home)?;
     let backend = backends
         .0
@@ -204,6 +254,13 @@ pub fn fetch_value(secrets_home: &Path, backend_name: &str, key: &str) -> Result
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         );
+        // `sh -c`'s own exit 127 universally means "command not found" —
+        // for the built-in `age` backend (whose templates shell out to
+        // nothing else) that is unambiguous, so it earns the taught error
+        // naming the package to install rather than a bare "exited 127".
+        if backend_name == "age" && output.status.code() == Some(127) {
+            return Err(missing_age_binary_hint());
+        }
         return Err(format!("backend `{backend_name}` exited {}", output.status));
     }
 
@@ -216,24 +273,51 @@ pub fn fetch_value(secrets_home: &Path, backend_name: &str, key: &str) -> Result
 
 /// Cheap-as-possible existence probe for a secret's STORED value (P-67,
 /// "warn before overwrite" — `secrets put` warns+confirms before clobbering
-/// an existing value, and the broker-side check backing that lives here):
-/// runs the SAME `get` template [`fetch_value`] would and treats success as
-/// "has a value", any failure (a missing file, an unknown backend, a spawn
-/// error, a non-zero exit, ...) as "no stored value yet". This is exactly
-/// the contract every `get` template in this crate's "Backend presets"
-/// table already commits to — `cat`, `pass show`, `gopass show -o`, `bw get
-/// password`, `sops -d --extract` all exit non-zero on a missing entry and
-/// zero with the value on stdout otherwise — so there is no separate
-/// "does it exist" primitive to add per backend, and no special-casing of
-/// the built-in `file` backend either (house rule 7: no special-cased Rust
-/// reads this backend's bytes — [`Backend`]'s shape carries only `get`/
-/// `set` templates, nothing else this function could probe more cheaply
-/// against). A backend that is merely misconfigured (unknown name, a
-/// spawn failure) also reads as "no stored value" here — harmless, since
+/// an existing value, and the broker-side check backing that lives here).
+/// **P-G1 (task #70) adds an OPTIONAL per-backend `has` template**: when
+/// [`Backend::has`] is present, this runs THAT template instead and treats
+/// exit 0 as "has a value" — a backend can answer more cheaply (`test -f`,
+/// no need to read and discard a whole value) or more honestly than
+/// re-running `get`. **When `has` is ABSENT, behavior is preserved EXACTLY
+/// as before this field existed**: runs the SAME `get` template
+/// [`fetch_value`] would and treats success as "has a value", any failure
+/// (a missing file, an unknown backend, a spawn error, a non-zero exit,
+/// ...) as "no stored value yet". This is exactly the contract every `get`
+/// template in this crate's "Backend presets" table already commits to —
+/// `cat`, `pass show`, `gopass show -o`, `bw get password`, `sops -d
+/// --extract` all exit non-zero on a missing entry and zero with the value
+/// on stdout otherwise — so the fallback needs no new per-backend
+/// primitive either. A backend that is merely misconfigured (unknown name,
+/// a spawn failure) also reads as "no stored value" here — harmless, since
 /// [`store_value`] re-checks the same policy/backend on the write that
 /// follows and surfaces the real error there if the caller proceeds.
 pub fn has_value(secrets_home: &Path, backend_name: &str, key: &str) -> bool {
-    fetch_value(secrets_home, backend_name, key).is_ok()
+    let Ok(backends) = load_backends(secrets_home) else {
+        return false;
+    };
+    let Some(backend) = backends.0.get(backend_name) else {
+        return false;
+    };
+    match &backend.has {
+        Some(has_template) => run_has_template(secrets_home, backend_name, key, has_template),
+        None => fetch_value(secrets_home, backend_name, key).is_ok(),
+    }
+}
+
+/// Run a backend's OWN `has` template (P-G1) and report its exit status —
+/// the ONE place this crate treats a template's success/failure as the
+/// answer itself rather than reading its stdout. Any spawn failure reads as
+/// "no stored value", the same tolerant shape [`has_value`]'s `get`-probe
+/// fallback already holds.
+fn run_has_template(secrets_home: &Path, backend_name: &str, key: &str, template: &str) -> bool {
+    let command = expand_template(template, secrets_home, key);
+    match std::process::Command::new("sh").arg("-c").arg(&command).output() {
+        Ok(output) => output.status.success(),
+        Err(e) => {
+            eprintln!("[aoide/secrets] spawning backend `{backend_name}`'s has template: {e}");
+            false
+        }
+    }
 }
 
 /// Resolve `backend_name`'s `set` template against `key`/`secrets_home`, run
@@ -287,6 +371,11 @@ pub fn store_value(secrets_home: &Path, backend_name: &str, key: &str, value: &s
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         );
+        // Same taught-error treatment as `fetch_value`'s own exit-127 case
+        // — see that function's comment.
+        if backend_name == "age" && output.status.code() == Some(127) {
+            return Err(missing_age_binary_hint());
+        }
         return Err(format!("backend `{backend_name}` exited {}", output.status));
     }
     Ok(())
@@ -305,15 +394,38 @@ pub fn store_value(secrets_home: &Path, backend_name: &str, key: &str, value: &s
 /// re-worded without changing the resulting file layout.
 const FILE_BACKEND_GET: &str = "cat {home}/store/{name}";
 const FILE_BACKEND_SET: &str = "mkdir -p -m 0700 {home}/store && install -m 0600 /dev/stdin {home}/store/{name}";
+/// P-G1 (task #70): a cheap `test -f`, never a `cat` whose stdout would
+/// just be discarded — see [`has_value`]'s own doc for why this is now
+/// possible at all.
+const FILE_BACKEND_HAS: &str = "test -f {home}/store/{name}";
 
-/// Seed `backends.json` with the built-in `file` backend WHEN ABSENT —
-/// never when a `backends.json` already exists (module doc: this is
-/// exactly the "seeded once, at broker startup" contract). Called from
+/// The built-in `age` backend's `get`/`set`/`has` templates (P-G1, task
+/// #70) — the module doc's "The built-in `age` backend" section has the
+/// full design. `age -d -i {home}/age.key` decrypts; the `set` template
+/// (re)creates `<home>/values/` (`0700`, same `mkdir -p -m` idiom as
+/// `file`'s own `store/`) and pipes stdin through `age -e -R
+/// {home}/age.recipient -o ...` — `age -o` writes the ciphertext itself
+/// (unlike `file`'s `install -m 0600 /dev/stdin`, `age` has no "write with
+/// this mode" flag), so the trailing `chmod 0600` is what actually locks
+/// the file down; without it the file's mode would drift with the ambient
+/// umask, the same problem `home::secure_file`/`secure_dir` exist to close
+/// elsewhere in this crate.
+const AGE_BACKEND_GET: &str = "age -d -i {home}/age.key {home}/values/{name}.age";
+const AGE_BACKEND_SET: &str =
+    "mkdir -p -m 0700 {home}/values && age -e -R {home}/age.recipient -o {home}/values/{name}.age && chmod 0600 {home}/values/{name}.age";
+const AGE_BACKEND_HAS: &str = "test -f {home}/values/{name}.age";
+
+/// Seed `backends.json` with the two built-in backends WHEN ABSENT — never
+/// when a `backends.json` already exists (module doc: this is exactly the
+/// "seeded once, at broker startup" contract). `file` shipped SEEDED since
+/// P-V4c; `age` joins it at P-G1 (task #70), same seeding site, same
+/// exception status ("Backend presets", `README.md`) — `pass`/`gopass`/
+/// `bw`/`sops` stay documentation-only presets, never seeded. Called from
 /// [`crate::broker::serve`] (the seeding site, module doc) immediately
 /// after `secrets_home` is created/secured and before the accept loop
-/// starts, so every resolve/put reaching a backend — the `file` backend
-/// included — always finds a `backends.json` on disk, without this crate
-/// ever special-casing `file` in the resolve/put code paths themselves.
+/// starts, so every resolve/put reaching a backend — `file`/`age` included
+/// — always finds a `backends.json` on disk, without this crate ever
+/// special-casing either backend in the resolve/put code paths themselves.
 /// Locked to `0600` like every other secrets-home file this crate writes
 /// ([`crate::home::secure_file`]), even though `backends.json` holds no
 /// secret value itself — consistency with `policy.json`'s own permissions
@@ -324,7 +436,8 @@ pub fn seed_default_backends(secrets_home: &Path) -> std::io::Result<()> {
         return Ok(());
     }
     let doc = serde_json::json!({
-        "file": { "get": FILE_BACKEND_GET, "set": FILE_BACKEND_SET }
+        "file": { "get": FILE_BACKEND_GET, "set": FILE_BACKEND_SET, "has": FILE_BACKEND_HAS },
+        "age": { "get": AGE_BACKEND_GET, "set": AGE_BACKEND_SET, "has": AGE_BACKEND_HAS },
     });
     let tmp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(&doc)
@@ -332,6 +445,107 @@ pub fn seed_default_backends(secrets_home: &Path) -> std::io::Result<()> {
     std::fs::write(&tmp, &bytes)?;
     crate::home::secure_file(&tmp)?;
     std::fs::rename(&tmp, &path)
+}
+
+/// The taught error for a missing `age.key` on a GET (module doc: never an
+/// auto-mint — minting is SET-only, from `broker::put_gate`'s own critical
+/// section). Deterministic and value-free, and — unlike a bare `age`
+/// stderr string — needs no real `age` binary on `PATH` to reach or to
+/// unit-test.
+fn missing_age_identity_hint() -> String {
+    "no age identity found for this secrets home yet — run `secrets put <name>` once to lazily mint \
+     `age.key`/`age.recipient` (SET mints; GET never does), or provision `age.key`/`age.recipient` \
+     out of band"
+        .to_string()
+}
+
+/// The taught error for a missing `age`/`age-keygen` binary — the SAME
+/// "name the package to install" idiom `home::describe_home_file_error`/
+/// `client::describe_connect_error` already hold in this crate (grep
+/// `describe_` for the precedent), applied to a runtime shell-out rather
+/// than a file/socket error.
+fn missing_age_binary_hint() -> String {
+    "the `age` backend needs the `age`/`age-keygen` CLI on PATH (age-encryption.org) — install it \
+     (e.g. `nix profile install nixpkgs#age`, or your distro's `age` package) and retry"
+        .to_string()
+}
+
+/// Map an `age-keygen` SPAWN failure (as opposed to a nonzero exit — this
+/// is `Command::spawn`/`Command::output` itself returning `Err`, meaning
+/// the binary was never found at all) into the same taught error a missing
+/// `age` binary gets from the template path. Any OTHER spawn-error kind
+/// (permissions, resource exhaustion, ...) rides through unenriched, same
+/// restraint `home::describe_home_file_error`'s own match holds.
+fn describe_missing_age_keygen(err: &std::io::Error) -> String {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        missing_age_binary_hint()
+    } else {
+        format!("spawning age-keygen: {err}")
+    }
+}
+
+/// Lazily mint this host's age identity (`{home}/age.key`, `0600`) and its
+/// derived recipient (`{home}/age.recipient`, `0600`) via `age-keygen` —
+/// real Rust I/O, not a template, the SAME one-time-bootstrap shape
+/// `enroll::generate_secret`/`store::save_totp_secret` already establish
+/// for the TOTP secret (module doc): the identity's own key MATERIAL is
+/// bootstrap state, not "this backend's bytes" the template mechanism
+/// owns — the secret's own ciphertext stays entirely template-driven via
+/// `AGE_BACKEND_GET`/`AGE_BACKEND_SET`. Called ONLY from the broker-side
+/// `put`/SET path (`broker::put_gate`, "the same code path that runs SET
+/// templates") — NEVER from a GET path (module doc: a missing identity on
+/// GET is [`missing_age_identity_hint`], not this function).
+///
+/// `Ok(true)` when THIS call minted a fresh identity — the caller uses
+/// that to decide whether to audit "age identity minted"; `Ok(false)` when
+/// `age.key` already existed (a pure no-op: never re-mints, never touches
+/// an existing key or recipient file, since `age-keygen -o` itself refuses
+/// to overwrite an existing output file — this early return is what keeps
+/// this function itself idempotent even without relying on that). A
+/// missing `age-keygen` binary is [`describe_missing_age_keygen`], the
+/// same taught error the backend's own `get`/`set` templates give for a
+/// missing `age`.
+pub fn mint_age_identity_if_needed(secrets_home: &Path) -> Result<bool, String> {
+    let key_path = secrets_home.join("age.key");
+    if key_path.exists() {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(secrets_home).map_err(|e| format!("creating {}: {e}", secrets_home.display()))?;
+
+    let keygen = std::process::Command::new("age-keygen")
+        .arg("-o")
+        .arg(&key_path)
+        .output()
+        .map_err(|e| describe_missing_age_keygen(&e))?;
+    if !keygen.status.success() {
+        eprintln!(
+            "[aoide/secrets] age-keygen exited {}: {}",
+            keygen.status,
+            String::from_utf8_lossy(&keygen.stderr).trim()
+        );
+        return Err(format!("age-keygen exited {}", keygen.status));
+    }
+    crate::home::secure_file(&key_path).map_err(|e| format!("securing {}: {e}", key_path.display()))?;
+
+    let recipient_path = secrets_home.join("age.recipient");
+    let show = std::process::Command::new("age-keygen")
+        .arg("-y")
+        .arg("-o")
+        .arg(&recipient_path)
+        .arg(&key_path)
+        .output()
+        .map_err(|e| describe_missing_age_keygen(&e))?;
+    if !show.status.success() {
+        eprintln!(
+            "[aoide/secrets] age-keygen -y exited {}: {}",
+            show.status,
+            String::from_utf8_lossy(&show.stderr).trim()
+        );
+        return Err(format!("age-keygen -y exited {}", show.status));
+    }
+    crate::home::secure_file(&recipient_path).map_err(|e| format!("securing {}: {e}", recipient_path.display()))?;
+
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -588,6 +802,21 @@ mod tests {
         let file_backend = backends.0.get("file").expect("seeded `file` backend");
         assert_eq!(file_backend.get, FILE_BACKEND_GET);
         assert_eq!(file_backend.set.as_deref(), Some(FILE_BACKEND_SET));
+        assert_eq!(file_backend.has.as_deref(), Some(FILE_BACKEND_HAS));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// P-G1 (task #70): `age` is seeded ALONGSIDE `file`, not merely
+    /// documented.
+    #[test]
+    fn seed_default_backends_also_writes_the_age_backend_when_absent() {
+        let home = tmp_home("seedabsent-age");
+        seed_default_backends(&home).unwrap();
+        let backends = load_backends(&home).unwrap();
+        let age_backend = backends.0.get("age").expect("seeded `age` backend");
+        assert_eq!(age_backend.get, AGE_BACKEND_GET);
+        assert_eq!(age_backend.set.as_deref(), Some(AGE_BACKEND_SET));
+        assert_eq!(age_backend.has.as_deref(), Some(AGE_BACKEND_HAS));
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -624,6 +853,153 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "the-stored-value");
         assert_eq!(fetch_value(&home, "file", "my-secret-key").unwrap(), "the-stored-value");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── the `has` template (P-G1, task #70) ─────────────────────────────
+
+    fn write_backend_with_has(home: &Path, get: &str, has: &str) {
+        let doc = serde_json::json!({ "scratch": { "get": get, "has": has } });
+        std::fs::write(backends_path(home), serde_json::to_vec(&doc).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn has_value_uses_the_has_template_when_present() {
+        let home = tmp_home("has-template-present");
+        // `get` would SUCCEED, but `has` says no — proving the `has`
+        // template wins over the fallback whenever both are present.
+        write_backend_with_has(&home, "printf %s {name}", "false");
+        assert!(!has_value(&home, "scratch", "x"), "a `has` template must win over a would-succeed `get`");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn has_value_reports_true_via_a_has_template_even_when_get_would_fail() {
+        let home = tmp_home("has-template-true-get-false");
+        write_backend_with_has(&home, "false", "true");
+        assert!(has_value(&home, "scratch", "x"), "a `has` template must be consulted, not the failing `get`");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The exact live shape: a `backends.json` predating `has` carries no
+    /// such key at all — behavior must be BYTE-IDENTICAL to before this
+    /// field existed (`fetch_value(...).is_ok()`).
+    #[test]
+    fn has_value_falls_back_to_the_get_probe_when_has_is_absent() {
+        let home = tmp_home("has-template-absent");
+        write_backends(&home, "printf %s {name}"); // no `has` field at all
+        assert!(has_value(&home, "scratch", "x"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn a_backends_json_predating_the_has_field_loads_cleanly() {
+        let home = tmp_home("old-shape-no-has");
+        let doc = br#"{"file":{"get":"cat {home}/store/{name}","set":"install -m 0600 /dev/stdin {home}/store/{name}"}}"#;
+        std::fs::write(backends_path(&home), doc).unwrap();
+        let backends = load_backends(&home).unwrap();
+        let file_backend = backends.0.get("file").unwrap();
+        assert!(file_backend.has.is_none());
+        assert!(file_backend.set.is_some());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── the built-in `age` backend (P-G1, task #70) ─────────────────────
+
+    /// Feature-detects a real `age`/`age-keygen` on `PATH` the SAME way the
+    /// production code itself does (a spawn attempt, not a `which`/`PATH`
+    /// scan) — tests that need the real binaries skip with a printed reason
+    /// rather than failing when this dev machine/CI box doesn't have `age`
+    /// installed.
+    fn age_tools_available() -> bool {
+        let age_keygen = std::process::Command::new("age-keygen").arg("--version").output();
+        let age = std::process::Command::new("age").arg("--version").output();
+        matches!(age_keygen, Ok(o) if o.status.code().is_some()) && matches!(age, Ok(o) if o.status.code().is_some())
+    }
+
+    #[test]
+    fn age_identity_is_lazily_minted_on_first_call_and_locked_to_0600() {
+        if !age_tools_available() {
+            eprintln!("skipping age_identity_is_lazily_minted_on_first_call_and_locked_to_0600: age/age-keygen not found on PATH");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let home = tmp_home("age-mint");
+        let key_path = home.join("age.key");
+        let recipient_path = home.join("age.recipient");
+        assert!(!key_path.exists());
+        assert!(!recipient_path.exists());
+
+        let minted = mint_age_identity_if_needed(&home).unwrap();
+        assert!(minted, "the first call must mint a fresh identity");
+
+        let key_mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(key_mode, 0o600, "age.key must be 0600, got {key_mode:o}");
+        let recipient_mode = std::fs::metadata(&recipient_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(recipient_mode, 0o600, "age.recipient must be 0600, got {recipient_mode:o}");
+
+        let recipient = std::fs::read_to_string(&recipient_path).unwrap();
+        assert!(recipient.trim().starts_with("age1"), "recipient should be an age1... public key: {recipient}");
+
+        let minted_again = mint_age_identity_if_needed(&home).unwrap();
+        assert!(!minted_again, "a second call must be a no-op — never re-mint");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn the_seeded_age_backend_round_trips_a_value_through_a_real_age_binary() {
+        if !age_tools_available() {
+            eprintln!("skipping the_seeded_age_backend_round_trips_a_value_through_a_real_age_binary: age/age-keygen not found on PATH");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let home = tmp_home("age-roundtrip");
+        seed_default_backends(&home).unwrap();
+        assert!(mint_age_identity_if_needed(&home).unwrap());
+
+        assert!(!has_value(&home, "age", "my-secret-key"), "a fresh age backend must report no stored value");
+        store_value(&home, "age", "my-secret-key", "the-stored-value").unwrap();
+        assert!(has_value(&home, "age", "my-secret-key"));
+        assert_eq!(fetch_value(&home, "age", "my-secret-key").unwrap(), "the-stored-value");
+
+        let values_dir = home.join("values");
+        let dir_mode = std::fs::metadata(&values_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "values dir must be 0700, got {dir_mode:o}");
+        let file_mode =
+            std::fs::metadata(values_dir.join("my-secret-key.age")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "the .age file must be 0600, got {file_mode:o}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn get_on_a_missing_age_identity_is_a_taught_error_and_never_mints() {
+        let home = tmp_home("age-missing-identity");
+        seed_default_backends(&home).unwrap();
+        assert!(!home.join("age.key").exists());
+
+        let err = fetch_value(&home, "age", "my-secret-key").unwrap_err();
+        assert_eq!(err, missing_age_identity_hint());
+        assert!(!home.join("age.key").exists(), "GET must never mint an identity");
+        assert!(!home.join("age.recipient").exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Deterministic, no real `age` binary required: `sh -c`'s own exit 127
+    /// universally means "command not found", so a fake, definitely-absent
+    /// binary name reliably exercises this path.
+    #[test]
+    fn a_missing_age_binary_produces_a_taught_error_naming_the_package() {
+        let home = tmp_home("age-missing-binary");
+        // Bypass the missing-IDENTITY check above so the template actually
+        // runs and hits the missing-BINARY path instead.
+        std::fs::write(home.join("age.key"), b"dummy-identity-for-this-test").unwrap();
+        let doc = serde_json::json!({
+            "age": { "get": "definitely-not-a-real-age-binary-xyz {name}" }
+        });
+        std::fs::write(backends_path(&home), serde_json::to_vec(&doc).unwrap()).unwrap();
+
+        let err = fetch_value(&home, "age", "k").unwrap_err();
+        assert_eq!(err, missing_age_binary_hint());
         std::fs::remove_dir_all(&home).ok();
     }
 }

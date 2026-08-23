@@ -761,17 +761,26 @@ fn handle_put(secrets_home: &Path, req: &Value) -> Value {
     }
 
     let outcome = put_gate(secrets_home, &secret, &value, overwrite);
-    let (granted, reply, reason, replaced) = match &outcome {
-        PutOutcome::Granted { replaced } => {
-            (true, json!({"ok": true, "replaced": replaced}), None, Some(*replaced))
+    let (granted, reply, reason, replaced, minted) = match &outcome {
+        PutOutcome::Granted { replaced, minted } => {
+            (true, json!({"ok": true, "replaced": replaced}), None, Some(*replaced), *minted)
         }
         PutOutcome::DeniedExists => {
             let msg = format!("secret `{secret}` already has a stored value");
-            (false, json!({"ok": false, "error": msg, "exists": true}), Some(msg), None)
+            (false, json!({"ok": false, "error": msg, "exists": true}), Some(msg), None, false)
         }
-        PutOutcome::Denied(reason) => (false, json!({"ok": false, "error": reason}), Some(reason.clone()), None),
+        PutOutcome::Denied(reason) => {
+            (false, json!({"ok": false, "error": reason}), Some(reason.clone()), None, false)
+        }
     };
     audit_put(secrets_home, &secret, granted, reason.as_ref(), replaced);
+    // P-G1 (task #70): fired AFTER `put_gate` has already returned — its own
+    // `put_lock` guard is a local var that dropped when the function
+    // returned, so no lock is held here (the SAME "no lock held" rule
+    // `emit_notify`'s own doc/AGENTS.md hold for every other call site).
+    if minted {
+        emit_notify(secrets_home, "age-identity-minted", json!({"event": "age-identity-minted"}));
+    }
     reply
 }
 
@@ -780,12 +789,15 @@ fn handle_put(secrets_home: &Path, req: &Value) -> Value {
 /// (policy/backend problems, unchanged); `DeniedExists` is the NEW
 /// machine-readable refusal — `overwrite` was false and
 /// `crate::backend::has_value` found the secret already has a stored
-/// value; `Granted { replaced }` distinguishes a first-ever store from an
-/// overwrite so the audit line and the client's own success message can
-/// say which happened.
+/// value; `Granted { replaced, minted }` distinguishes a first-ever store
+/// from an overwrite (`replaced`) so the audit line and the client's own
+/// success message can say which happened, and (P-G1, task #70) whether
+/// THIS put lazily minted a fresh `age` identity (`minted`) so
+/// [`handle_put`] knows whether to fire the "age identity minted" notify
+/// event.
 #[derive(Debug)]
 enum PutOutcome {
-    Granted { replaced: bool },
+    Granted { replaced: bool, minted: bool },
     DeniedExists,
     Denied(String),
 }
@@ -820,6 +832,16 @@ fn put_lock() -> &'static std::sync::Mutex<()> {
 /// same newly-exposed TOCTOU shape [`verify_totp_gate`]'s replay ledger
 /// had, module doc). The probe itself still reads the backend fresh every
 /// time — the lock serializes, it never caches.
+///
+/// **P-G1 (task #70): a `policy.backend == "age"` put also lazily mints
+/// this host's age identity first**, inside the SAME [`put_lock`] critical
+/// section (a concurrent identity bootstrap has the identical TOCTOU shape
+/// the existence-probe->store section already needed a lock for — one
+/// lock, not a second one, since both races share this function's own
+/// critical section already). `crate::backend::mint_age_identity_if_needed`
+/// is checked BY BACKEND NAME rather than made a property every backend
+/// gets — this is a SECOND named exception beside `file`'s own seeded-data
+/// status ("Backend presets", `README.md`), not a general mechanism.
 fn put_gate(secrets_home: &Path, secret: &str, value: &str, overwrite: bool) -> PutOutcome {
     let policies = match crate::store::load_policies(secrets_home) {
         Ok(p) => p,
@@ -836,12 +858,22 @@ fn put_gate(secrets_home: &Path, secret: &str, value: &str, overwrite: bool) -> 
     };
 
     let _guard = put_lock().lock().unwrap_or_else(|e| e.into_inner());
+
+    let minted = if policy.backend == "age" {
+        match crate::backend::mint_age_identity_if_needed(secrets_home) {
+            Ok(minted) => minted,
+            Err(e) => return PutOutcome::Denied(e),
+        }
+    } else {
+        false
+    };
+
     let already_has_value = crate::backend::has_value(secrets_home, &policy.backend, &policy.key);
     if already_has_value && !overwrite {
         return PutOutcome::DeniedExists;
     }
     match crate::backend::store_value(secrets_home, &policy.backend, &policy.key, value) {
-        Ok(()) => PutOutcome::Granted { replaced: already_has_value },
+        Ok(()) => PutOutcome::Granted { replaced: already_has_value, minted },
         Err(e) => PutOutcome::Denied(e),
     }
 }
@@ -1745,7 +1777,7 @@ mod tests {
     /// distinct shape is exercised directly by the P-67 tests below).
     fn put_outcome_as_result(outcome: PutOutcome) -> (bool, Result<bool, String>) {
         match outcome {
-            PutOutcome::Granted { replaced } => (true, Ok(replaced)),
+            PutOutcome::Granted { replaced, .. } => (true, Ok(replaced)),
             PutOutcome::DeniedExists => (false, Err("secret already has a stored value".to_string())),
             PutOutcome::Denied(reason) => (false, Err(reason)),
         }
@@ -1805,6 +1837,68 @@ mod tests {
         let (granted, result) = put_outcome_as_result(put_gate(&home, "t", "value-with-no-totp-anywhere", false));
         assert!(granted, "{result:?}");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "value-with-no-totp-anywhere");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── the built-in `age` backend (P-G1, task #70) ─────────────────────
+
+    /// Same feature-detection idiom `backend.rs`'s own age tests use — a
+    /// spawn attempt, not a `PATH` scan — so this test skips with a
+    /// printed reason on a box without `age`/`age-keygen` rather than
+    /// failing.
+    fn age_tools_available() -> bool {
+        let age_keygen = std::process::Command::new("age-keygen").arg("--version").output();
+        let age = std::process::Command::new("age").arg("--version").output();
+        matches!(age_keygen, Ok(o) if o.status.code().is_some()) && matches!(age, Ok(o) if o.status.code().is_some())
+    }
+
+    /// `handle_put` (via [`put_gate`]) lazily mints the age identity on the
+    /// FIRST `age`-backed put and fires the "age identity minted" notify
+    /// event through the SAME two destinations every other `emit_notify`
+    /// call writes to; a SECOND put through the same identity (even for a
+    /// different secret) must never mint or notify again.
+    #[test]
+    fn a_put_on_an_age_backed_secret_mints_the_identity_once_and_notifies_only_then() {
+        if !age_tools_available() {
+            eprintln!(
+                "skipping a_put_on_an_age_backed_secret_mints_the_identity_once_and_notifies_only_then: \
+                 age/age-keygen not found on PATH"
+            );
+            return;
+        }
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("put-age-mint-notify");
+        crate::backend::seed_default_backends(&home).unwrap();
+        crate::store::save_policies(&home, &[Policy::new("t", "age", "t")]).unwrap();
+        let parked = ParkRegistry::new();
+
+        with_redirected_audit_log(&home, || {
+            let reply =
+                handle_line(&home, r#"{"op":"put","secret":"t","value":"the-stored-value"}"#, &parked, &mut Vec::new());
+            assert_eq!(reply["ok"], true, "{reply}");
+        });
+
+        let own_lines = own_log_lines(&home);
+        let ev = find_notify_event(&own_lines, "age-identity-minted");
+        assert!(!ev.to_string().contains("the-stored-value"), "the notify event leaked the value: {ev}");
+        let mirrored_lines = mirrored_log_lines(&home);
+        let mirrored = find_mirrored_notify(&mirrored_lines, "age-identity-minted");
+        assert!(!mirrored.to_string().contains("the-stored-value"), "{mirrored}");
+
+        // A second put — a DIFFERENT secret, same already-minted identity —
+        // must not mint or notify a second time.
+        crate::store::save_policies(&home, &[Policy::new("t", "age", "t"), Policy::new("t2", "age", "t2")]).unwrap();
+        with_redirected_audit_log(&home, || {
+            let reply =
+                handle_line(&home, r#"{"op":"put","secret":"t2","value":"another-value"}"#, &parked, &mut Vec::new());
+            assert_eq!(reply["ok"], true, "{reply}");
+        });
+        let mint_events = own_log_lines(&home)
+            .iter()
+            .filter(|l| l.get("event").and_then(Value::as_str) == Some("age-identity-minted"))
+            .count();
+        assert_eq!(mint_events, 1, "the identity must be minted exactly once across both puts");
+
         std::fs::remove_dir_all(&home).ok();
     }
 

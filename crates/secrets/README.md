@@ -107,6 +107,30 @@ in a persisted `replay::ReplayLedger` — a missing, wrong, or replayed
 code is a denial, same as any other gate failure (the backend never
 runs).
 
+**P-G1 (task #70, this commit) adds a SECOND seeded built-in backend,
+`age`, beside `file` — and makes it the new `secrets add` default.**
+`age` stores each secret as an age-encrypted `0600` file under
+`<secrets_home>/values/`, decrypted with an identity this crate LAZILY
+MINTS on the first `age`-backed `put` (`age.key`/`age.recipient`,
+`age-keygen`, both `0600`) — never on a `get`, which is a taught error
+instead if no identity exists yet. See "Backend presets" below for the
+exact templates and the mint/taught-error mechanism, and "The write flow"
+above for where the mint slots into `put`'s existing gate. **Backends also
+gained an OPTIONAL `has` template** (task #70): a third, `#[serde(default)]`
+template slot beside `get`/`set` that `has_value` runs directly when
+present (exit 0 = has a value) instead of falling back to a `get`-and-
+discard probe — absent on an old `backends.json`, so every file written
+before this phase loads and behaves identically. **`aoide`'s own two
+built-in stores (`file`, `age`) are the only backend IMPLEMENTATIONS this
+crate supports today** — `pass`/`gopass`/`bw`/`sops` remain
+DOCUMENTATION-ONLY presets ("Backend presets" below): copy the shape into
+`backends.json` by hand, but integrating with any of those tools is
+unsupported, untested territory this crate makes no promise about.
+**DEFAULT FLIP:** `secrets add` with no `--backend` flag now records `age`
+(previously `--backend` was a hard REQUIREMENT, not a defaulted flag, at
+all) — an existing policy's already-recorded `backend` field is untouched
+either way; only a brand-new `add` with the flag omitted is affected.
+
 ## The release-to-client flow (the plan's one subtle decision)
 
 The broker must NOT exec the agent's command: it runs as the secrets uid
@@ -509,6 +533,18 @@ dismissed: {"event":"dismissed", "id", "secret", "consumer"}
 expired:   {"event":"expired", "id", "secret", "consumer"}        — a park that timed out
 ```
 
+**P-G1 (task #70) adds a SIXTH event, `age-identity-minted`, through the
+SAME `emit_notify` mechanism** — `{"event":"age-identity-minted"}`, fired
+from `handle_put` exactly once, the first time an `age`-backed `put`
+lazily mints `age.key`/`age.recipient` ("Backend presets" above). Carries
+no `secret`/`consumer`/`id` at all — the identity is host-level, not tied
+to any one secret — so it is INVISIBLE to `secrets watch`/`--popup`'s own
+event parser (`watch::parse_notify_line` requires both `secret` and
+`consumer` on every event it recognizes; this one has neither, so it is
+silently skipped there, exactly like any other unrecognized `event` kind
+already is) — a deliberate scope cut, not an oversight: task #70 asked
+only for the audit line, not a new `watch` narration.
+
 `released` fires ONLY on a TOTP-free grant — `requireTotp:false`, or an
 automation-skip (P-N1's `automation.enabled` + a listed consumer) — never on
 a resolve that validated its own inline `--totp` code: the caller just typed
@@ -832,29 +868,47 @@ secret (base32): <base32>
 
 `backend.rs`'s `Backends`/`fetch_value`/`store_value` (Named seams, below)
 know nothing about any specific secret manager — `backends.json` is a map
-of named backend -> a `get` command template (and, P-V4c, an OPTIONAL
-`set` template that makes the backend WRITABLE), and the policy's `key` is
-substituted into that template's `{name}` placeholder. A template may also
-use `{home}` (P-V4c), substituted with `secrets_home` itself, quoted the
-SAME way as `{name}`. These presets are DOCUMENTATION, not code — copy the
-shape that matches your backend into `backends.json` — with ONE exception:
+of named backend -> a `get` command template, an OPTIONAL `set` template
+(P-V4c) that makes the backend WRITABLE, and an OPTIONAL `has` template
+(P-G1, task #70) that answers "does this secret already have a value" more
+cheaply/honestly than re-running `get` and discarding its stdout — the
+policy's `key` is substituted into a template's `{name}` placeholder, and
+a template may also use `{home}` (P-V4c), substituted with `secrets_home`
+itself, quoted the SAME way as `{name}`. `has` is `#[serde(default)]`:
+absent on a `backends.json` written before this field existed, and
+`has_value` falls back to its pre-existing `get`-probe behavior byte-for-
+byte in that case. These presets are DOCUMENTATION, not code — copy the
+shape that matches your backend into `backends.json` — with TWO
+exceptions:
 
-| Backend  | `get` template            | `set` template | Notes                                            |
-|----------|----------------------------|-----------------|--------------------------------------------------|
-| `file` **(built-in, P-V4c)** | `cat {home}/store/{name}` | `mkdir -p -m 0700 {home}/store && install -m 0600 /dev/stdin {home}/store/{name}` | The ONE exception — SEEDED automatically into a fresh `backends.json` (below), not merely documented here. Plain `0600` files under `<secrets_home>/store/`, expressed entirely through the template mechanism (house rule 7 — no special-cased Rust reads or writes this backend's bytes). |
-| `pass`   | `pass show {name}`         | — | `key` is the pass-store entry path (`prod/db`).  |
-| `gopass` | `gopass show -o {name}`    | — | `-o` prints the password line only, no metadata. |
-| `bw`     | `bw get password {name}`   | — | `key` is the Bitwarden item's name or id; needs a prior `bw unlock`/`BW_SESSION` in the broker's own environment (secrets-uid-owned, per the ownership-trap note below). |
-| `sops`   | `sops -d --extract {name} secrets.yaml` | — | `key` is the FULL `--extract` JSONPath argument sops expects, e.g. `["password"]` — the brackets+quotes are part of the `key` VALUE (so `backend::shell_single_quote` escapes them along with everything else), not written into the template. The `secrets.yaml` path is fixed in the template, not templated — a second sops file needs its own named backend entry, and the secrets uid needs the sops decryption key (age/GPG/KMS) set up, per the ownership note below. |
+| Backend  | `get` template            | `set` template | `has` template | Notes                                            |
+|----------|----------------------------|-----------------|-----------------|--------------------------------------------------|
+| `file` **(built-in, P-V4c)** | `cat {home}/store/{name}` | `mkdir -p -m 0700 {home}/store && install -m 0600 /dev/stdin {home}/store/{name}` | `test -f {home}/store/{name}` (P-G1) | An EXCEPTION — SEEDED automatically into a fresh `backends.json` (below), not merely documented here. Plain `0600` files under `<secrets_home>/store/`, expressed entirely through the template mechanism (house rule 7 — no special-cased Rust reads or writes this backend's bytes). Its `has` template is a cheap `test -f` rather than re-running `cat` and discarding the value — no behavior change, since a `0600` file's existence already implied a value under the old `get`-probe fallback too. |
+| `age` **(built-in, P-G1, task #70)** | `age -d -i {home}/age.key {home}/values/{name}.age` | `mkdir -p -m 0700 {home}/values && age -e -R {home}/age.recipient -o {home}/values/{name}.age && chmod 0600 {home}/values/{name}.age` | `test -f {home}/values/{name}.age` | The SECOND exception — also SEEDED. Age-encrypted `0600` files under `<secrets_home>/values/`; `secrets add`'s own new DEFAULT backend (above). The identity (`{home}/age.key`/`{home}/age.recipient`) is LAZILY MINTED by `backend::mint_age_identity_if_needed` on the first `age`-backed `put` — real Rust I/O, not a template (same one-time-bootstrap shape `enroll`'s TOTP-secret generation already uses), audited as a name-only `age-identity-minted` broker notify event ("Broker notifications" above). **Never minted on `get`** — a missing `age.key` there is a taught error (`backend::missing_age_identity_hint`), never an auto-mint. A missing `age`/`age-keygen` binary on `PATH`, for either template OR the mint itself, is ALSO a taught error naming the package to install (`backend::missing_age_binary_hint`) — never a bare "exited 127". |
+| `pass`   | `pass show {name}`         | — | — | `key` is the pass-store entry path (`prod/db`).  |
+| `gopass` | `gopass show -o {name}`    | — | — | `-o` prints the password line only, no metadata. |
+| `bw`     | `bw get password {name}`   | — | — | `key` is the Bitwarden item's name or id; needs a prior `bw unlock`/`BW_SESSION` in the broker's own environment (secrets-uid-owned, per the ownership-trap note below). |
+| `sops`   | `sops -d --extract {name} secrets.yaml` | — | — | `key` is the FULL `--extract` JSONPath argument sops expects, e.g. `["password"]` — the brackets+quotes are part of the `key` VALUE (so `backend::shell_single_quote` escapes them along with everything else), not written into the template. The `secrets.yaml` path is fixed in the template, not templated — a second sops file needs its own named backend entry, and the secrets uid needs the sops decryption key (age/GPG/KMS) set up, per the ownership note below. |
 
-**`backends.json` is SEEDED with the `file` backend when absent** — the
-ONE seeding site is `broker::serve`'s startup (decision recorded in
-`broker.rs`'s module doc): the broker is the single long-running process
-that ever actually resolves a backend name against a template, so seeding
-there guarantees every `resolve`/`put` sees a `backends.json` on disk
-without a second seed call at `secrets add`/`secrets put`. **An EXISTING
-`backends.json` is never touched** — seeding only ever writes the file
-when it is entirely absent.
+**`aoide`'s own two built-in stores, `file` and `age`, are the only
+backend IMPLEMENTATIONS this crate supports as of P-G1 (task #70).**
+`pass`/`gopass`/`bw`/`sops` remain exactly what they always were —
+DOCUMENTATION-ONLY presets, copy-paste shapes for a `backends.json` you
+maintain by hand — but this crate makes no support promise about actually
+integrating with any of them: no tests exercise them, no code path knows
+their quirks, and a live problem with one is the operator's own to debug.
+Reach for `age` (encrypted, no external tool) or `file` (plaintext, purely
+local) first; only add a `pass`/`gopass`/`bw`/`sops` row if you already run
+that tool and accept it as unsupported territory.
+
+**`backends.json` is SEEDED with BOTH built-in backends (`file`, `age`)
+when absent** — the ONE seeding site is `broker::serve`'s startup
+(decision recorded in `broker.rs`'s module doc): the broker is the single
+long-running process that ever actually resolves a backend name against a
+template, so seeding there guarantees every `resolve`/`put` sees a
+`backends.json` on disk without a second seed call at `secrets add`/
+`secrets put`. **An EXISTING `backends.json` is never touched** — seeding
+only ever writes the file when it is entirely absent.
 
 **Never pre-quote `{name}`/`{home}`** — `backend.rs`'s module doc: both
 substitutions are already shell-single-quote-escaped
@@ -929,6 +983,19 @@ shell finds the right socket with zero exports. Only the admin verbs below
 still need an explicit `sudo -u aoide-secrets` invocation (sudo does not
 carry the caller's env).
 
+**Open deployment gap, flagged not fixed here (P-G1, task #70 — this
+crate's own hard constraint forbids touching `.nix` files; the unit-path
+packaging is the orchestrator's, root `AGENTS.md`):** the service's `path`
+above does NOT yet carry `pkgs.age` — `age`/`age-keygen` are absent from
+the nix module's `PATH` the same way `bash`/`coreutils` were absent before
+the fix documented two paragraphs up. Since `age` is now `secrets add`'s
+DEFAULT backend, a fresh nix-deployed broker will fail every `age`-backed
+`get`/`set`/mint with the taught "`age`/`age-keygen` CLI on PATH" error
+(`backend::missing_age_binary_hint`) until `modules/nucleus/secrets.nix`'s
+`path` gains `pkgs.age` in a follow-up commit — the SAME fix shape the
+`bash`/`coreutils`/`qrencode` additions above already are, just not yet
+made for this new default.
+
 ### Any other init (or none) — the non-nix install path
 
 Nothing above is required to run the broker. Manual setup on any Linux
@@ -996,7 +1063,7 @@ secrets user — no sudo rule is shipped (nix module or not); the raw form:
 
 ```sh
 sudo -u aoide-secrets aoide secrets enroll
-sudo -u aoide-secrets aoide secrets add <name> --backend <backend> --key <key>
+sudo -u aoide-secrets aoide secrets add <name> --key <key> [--backend <backend>]  # defaults to `age`
 sudo -u aoide-secrets aoide secrets grant <name> <consumer>
 sudo -u aoide-secrets aoide secrets set-totp <name> on
 sudo -u aoide-secrets aoide secrets automate <name> on
@@ -1160,12 +1227,13 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   explicitly on the unit — belt-and-suspenders, not load-bearing anymore —
   and the value MUST equal this function's own default.
 - `backend` — `Backends`/`Backend` (`backends.json`'s shape: a map of
-  named backend -> a `get` template and an OPTIONAL `set` template, P-V4c)
-  and `fetch_value`/`store_value`, which substitute the policy's `key` and
-  (P-V4c) `secrets_home` itself (`{home}`), both SHELL-SINGLE-QUOTE-ESCAPED
-  (never a raw `.replace()` — a key/home with whitespace or an embedded `'`
-  must not be able to break the command or escape its argument boundary)
-  via `expand_template`'s single left-to-right scan (module doc — never a
+  named backend -> a `get` template, an OPTIONAL `set` template (P-V4c),
+  and an OPTIONAL `has` template (P-G1, task #70)) and `fetch_value`/
+  `store_value`, which substitute the policy's `key` and (P-V4c)
+  `secrets_home` itself (`{home}`), both SHELL-SINGLE-QUOTE-ESCAPED (never
+  a raw `.replace()` — a key/home with whitespace or an embedded `'` must
+  not be able to break the command or escape its argument boundary) via
+  `expand_template`'s single left-to-right scan (module doc — never a
   sequential two-pass replace, which could re-scan already-substituted text
   for the other placeholder). `fetch_value` runs the `get` template via
   `sh -c` and trims exactly one trailing newline from stdout; `store_value`
@@ -1174,17 +1242,29 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   (either direction), the returned `Err` carries ONLY the exit status — the
   command's full stderr is `eprintln!`'d to the broker's own stderr and
   never returned, since the `Err` string rides the wire reply and both
-  audit lines' `reason` field. Also `seed_default_backends` (P-V4c): writes
-  the built-in `file` backend into `backends.json` when absent, never when
-  one already exists — see "Backend presets" above for the seeding-site
-  decision. `pass`/`gopass`/`bw`/`sops` are DOC PRESETS ("Backend presets"
-  above), not code — this module has no knowledge of any specific backend;
-  `file` is the one backend that ships as SEEDED DATA rather than mere
-  documentation, still through the same template mechanism. `has_value`
-  (P-67) is the existence probe behind "warn before overwrite" — just
-  `fetch_value(...).is_ok()`, since a `get` template's own contract already
-  IS "exit 0 with the value on stdout when it exists" for every backend
-  above; no new per-backend primitive, no special-casing of `file`.
+  audit lines' `reason` field; exit 127 (`sh -c`'s universal "command not
+  found") from the built-in `age` backend specifically is enriched into
+  `missing_age_binary_hint`'s taught error instead (P-G1). Also
+  `seed_default_backends`: writes the two built-in backends, `file`
+  (P-V4c) and `age` (P-G1, task #70), into `backends.json` when absent,
+  never when one already exists — see "Backend presets" above for the
+  seeding-site decision. `pass`/`gopass`/`bw`/`sops` are DOC PRESETS
+  ("Backend presets" above), not code — this module has no knowledge of
+  any specific backend; `file`/`age` are the two backends that ship as
+  SEEDED DATA rather than mere documentation, still through the same
+  template mechanism. `has_value` (P-67, extended P-G1) is the existence
+  probe behind "warn before overwrite" — when a backend carries a `has`
+  template it runs THAT and reports its exit status (`run_has_template`);
+  otherwise it falls back to its pre-existing `fetch_value(...).is_ok()`
+  probe, unchanged from before `has` existed, since a `get` template's own
+  contract already IS "exit 0 with the value on stdout when it exists" for
+  every backend above. `mint_age_identity_if_needed` (P-G1) is the `age`
+  backend's ONE-TIME identity bootstrap — `age-keygen` twice (the key, then
+  `-y` for its recipient), both locked to `0600` — real Rust I/O, not a
+  template, the same precedent `enroll`'s TOTP-secret generation already
+  sets; called ONLY from `broker::put_gate`'s own critical section, never
+  from a `get` path (a missing identity there is `missing_age_identity_hint`,
+  a taught error, never an auto-mint).
 - `store` — secrets-home file persistence, all write-temp-then-rename +
   `home::secure_dir`/`secure_file`: `load_policies`/`save_policies`
   (`policy.json`, P-V2); `load_totp_secret`/`save_totp_secret`
@@ -1288,7 +1368,12 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   <itself>`, or a hostile re-enrollment, from an already-connected agent).
   Those same seven also call `require_admin_identity` (P-V4f) right after
   `require_cli` — the wrong effective uid gets refused before the file is
-  ever touched too, see "Admin verbs" above. `put` (P-V4c) is gated
+  ever touched too, see "Admin verbs" above. **`add`'s `--backend` flag is
+  now OPTIONAL, defaulting to `age` when omitted (P-G1, task #70, DEFAULT
+  FLIP)** — `handle_secrets_add`'s own `DEFAULT_BACKEND` constant; an
+  explicit `--backend` still wins, and an ALREADY-recorded policy's
+  `backend` field is never touched by this flip, only what a brand-new
+  `add` records. `put` (P-V4c) is gated
   the SAME way (`require_cli`) but is NOT special-cased like `exec`/
   `enroll` — see `commands.rs`'s own module doc for why its wire reply
   carrying no value at all makes that unnecessary. `set-totp` (P-V4e)

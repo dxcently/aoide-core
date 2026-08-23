@@ -184,10 +184,10 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["secrets", "add"],
-        summary: "Register a new secret's policy: backend + key, never a value (the secrets broker never stores one). No consumers/sharing/TOTP unless given.",
+        summary: "Register a new secret's policy: backend + key, never a value (the secrets broker never stores one). No consumers/sharing/TOTP unless given. --backend defaults to `age` (the built-in age-encrypted store) when omitted.",
         args: [arg!("name", "string", true, "The secret's nickname.")],
         flags: [
-            flag!("backend", "string", "The named backend (backends.json) that fetches this secret's value."),
+            flag!("backend", "string", "The named backend (backends.json) that fetches this secret's value. Defaults to `age` (the built-in age-encrypted store) when omitted."),
             flag!("key", "string", "The backend-specific key/identifier substituted into that backend's fetch-command template."),
             flag!("require-totp", "bool", "Require a fresh TOTP code to resolve — the policy is born gated. Unresolvable until this host has run `secrets enroll`; once enrolled, verified live against the enrolled TOTP secret on every resolve (`secrets set-totp` flips this later without re-adding)."),
             flag!("consumers", "string", "Comma-separated consumer names allowed to resolve this secret (empty/omitted = any consumer).")
@@ -248,7 +248,7 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["secrets", "put"],
-        summary: "Store a value for an EXISTING secret's policy, read from stdin (never argv) — prompts on stderr with input hidden when stdin is a terminal, reads piped bytes byte-identically otherwise. Warns and asks [y/N] before overwriting a secret that already has a stored value on a tty; a piped/non-interactive attempt to overwrite is refused and told to pass --force. CLI-only — no TOTP, since put is admin-side, not agent-facing. The named policy's backend must carry a `set` template (the built-in `file` backend has one by default).",
+        summary: "Store a value for an EXISTING secret's policy, read from stdin (never argv) — prompts on stderr with input hidden when stdin is a terminal, reads piped bytes byte-identically otherwise. Warns and asks [y/N] before overwriting a secret that already has a stored value on a tty; a piped/non-interactive attempt to overwrite is refused and told to pass --force. CLI-only — no TOTP, since put is admin-side, not agent-facing. The named policy's backend must carry a `set` template (the built-in `file`/`age` backends both have one by default).",
         args: [arg!("name", "string", true, "The secret's nickname — must already have a policy (`secrets add` first).")],
         flags: [
             flag!("force", "bool", "Store the value even if the secret already has one, skipping the overwrite confirmation. Required to overwrite from a piped/non-interactive stdin (no one to confirm with there).")
@@ -441,9 +441,18 @@ fn policy_io_error(cmd: &str, home: &std::path::Path, err: std::io::Error) -> Ou
     Outcome::error(cmd, home::describe_home_file_error(home, &store::policy_path(home), &err))
 }
 
+/// `secrets add`'s backend when `--backend` is omitted (P-G1, task #70 —
+/// DEFAULT FLIP: was implicitly `file`-shaped in every existing example
+/// in this crate's own docs, never actually enforced as a code default
+/// before this change; `--backend` was REQUIRED before P-G1, not merely
+/// defaulted). Stored policy rows are untouched by this flip — an
+/// EXISTING policy's `backend` field always wins; this only decides what a
+/// brand-new `secrets add` with no `--backend` records.
+const DEFAULT_BACKEND: &str = "age";
+
 fn handle_secrets_add(inv: &Invocation) -> Outcome {
     let cmd = "secrets.add";
-    const USAGE: &str = "usage: secrets add <name> --backend <backend> --key <key>";
+    const USAGE: &str = "usage: secrets add <name> --key <key> [--backend <backend>]";
     if let Some(hint) = require_cli(inv, cmd) {
         return hint;
     }
@@ -462,9 +471,7 @@ fn handle_secrets_add(inv: &Invocation) -> Outcome {
             ),
         );
     }
-    let Some(backend) = inv.flags.get("backend").cloned() else {
-        return Outcome::usage(cmd, format!("secrets add: missing --backend <backend> — {USAGE}"));
-    };
+    let backend = inv.flags.get("backend").cloned().unwrap_or_else(|| DEFAULT_BACKEND.to_string());
     let Some(key) = inv.flags.get("key").cloned() else {
         return Outcome::usage(cmd, format!("secrets add: missing --key <key> — {USAGE}"));
     };
@@ -1058,12 +1065,36 @@ mod tests {
     }
 
     #[test]
-    fn add_requires_backend_and_key() {
+    fn add_requires_key_but_not_backend() {
         with_secrets_home("missingflags", |_home| {
-            let no_backend = inv(Door::Cli, &["secrets", "add"], &["t"], &[("key", "x")]);
-            assert_eq!(handle_secrets_add(&no_backend).status, Status::Usage);
             let no_key = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "pass")]);
             assert_eq!(handle_secrets_add(&no_key).status, Status::Usage);
+        });
+    }
+
+    /// P-G1 (task #70), DEFAULT FLIP: `secrets add` with no `--backend`
+    /// now records `age` (was `file` in spirit, never actually a code
+    /// default before this — `--backend` used to be a hard requirement).
+    #[test]
+    fn add_defaults_backend_to_age_when_backend_flag_is_omitted() {
+        with_secrets_home("default-backend", |home| {
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("key", "x")]);
+            let out = handle_secrets_add(&add);
+            assert_eq!(out.status, Status::Ok, "{out:?}");
+            let policies = store::load_policies(home).unwrap();
+            assert_eq!(policies[0].backend, "age");
+        });
+    }
+
+    /// An EXPLICIT `--backend` still wins over the default — the flip only
+    /// changes what happens when the flag is omitted entirely.
+    #[test]
+    fn add_still_honors_an_explicit_backend() {
+        with_secrets_home("explicit-backend", |home| {
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "pass"), ("key", "x")]);
+            handle_secrets_add(&add);
+            let policies = store::load_policies(home).unwrap();
+            assert_eq!(policies[0].backend, "pass");
         });
     }
 
