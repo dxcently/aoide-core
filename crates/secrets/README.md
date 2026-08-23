@@ -1019,6 +1019,14 @@ other value-adjacent audit line in this crate holds: one
 `migrated`/`unchanged`/`refused`) naming the secret, source backend, and
 target backend — never the value, never the key.
 
+**No lock against a live broker (KNOWN LIMITATION, `AGENTS.md`).** `migrate`
+runs as a separate OS process from `secrets serve` and cannot take the
+daemon's own in-process `put_lock` — a `migrate` racing a `put`/`exec`
+against the SAME secret through a concurrently-running broker is an
+unprotected window (the same class of gap this crate's admin CRUD verbs
+already accept for `policy.json`, `store.rs`'s own module doc). Run it
+against a secret you know isn't being written concurrently.
+
 ## Deployment (P-V4)
 
 The secrets design's target topology: the broker runs as its OWN system user
@@ -1181,9 +1189,10 @@ which one provisioned the parent directory.
 
 ### Admin verbs
 
-`secrets add|rm|grant|revoke|enroll|set-totp|automate|expose` mutate
-`policy.json`/`totp.secret` under the secrets home, so they run AS the
-secrets user — no sudo rule is shipped (nix module or not); the raw form:
+`secrets add|rm|grant|revoke|enroll|set-totp|automate|expose|migrate` mutate
+`policy.json`/`totp.secret` (and, for `migrate`, a backend's own value file)
+under the secrets home, so they run AS the secrets user — no sudo rule is
+shipped (nix module or not); the raw form:
 
 ```sh
 sudo -u aoide-secrets aoide secrets enroll
@@ -1193,6 +1202,7 @@ sudo -u aoide-secrets aoide secrets set-totp <name> on
 sudo -u aoide-secrets aoide secrets automate <name> on
 sudo -u aoide-secrets aoide secrets automate <name> grant <consumer>
 sudo -u aoide-secrets aoide secrets expose <name> on
+sudo -u aoide-secrets aoide secrets migrate <name> [--backend <target>]  # defaults to `age`
 ```
 
 `secrets set-totp <name> on|off` (P-V4e) flips an EXISTING policy's
