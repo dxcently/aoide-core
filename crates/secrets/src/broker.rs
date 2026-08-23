@@ -3596,4 +3596,44 @@ mod tests {
 
         std::fs::remove_dir_all(&home).ok();
     }
+
+    /// P-G4 review gap (task #76 item 6b): the sibling test above proves a
+    /// resolve survives the OTHER two notify destinations failing — this
+    /// closes the matching gap for the events feed itself (P-G4's THIRD
+    /// destination, `append_events_feed`): its PARENT directory is
+    /// read-only, so `OpenOptions::new().create(true)` can never make the
+    /// file at all, the same "best-effort, never blocks the resolve it
+    /// rides alongside" contract `emit_notify`'s own doc holds for all
+    /// three writes. Root ignores directory permissions too, so this skips
+    /// under a root test runner — same precedent as the sibling test.
+    #[test]
+    fn resolve_still_succeeds_when_the_events_feed_path_is_unwritable() {
+        if crate::home::effective_uid() == 0 {
+            return;
+        }
+        let home = tmp_home("events-feed-unwritable");
+        let mut p = Policy::new("t", "scratch", "stored-value");
+        p.consumers = vec!["m".to_string()];
+        seed(&home, &[p]);
+
+        let ro_dir = home.join("events-ro-dir");
+        std::fs::create_dir_all(&ro_dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        // Read + execute (so the dir can still be traversed/stat'd), no
+        // write — a brand-new file can never be created under it.
+        std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let events_path = ro_dir.join("events.jsonl");
+
+        let parked = ParkRegistry::new();
+        let reply = handle_line(&home, &events_path, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
+
+        // Restore write permission before cleanup can remove the tempdir.
+        std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(reply["ok"], true, "a resolve must succeed even when the events feed's own path is unwritable: {reply}");
+        assert_eq!(reply["value"], "stored-value");
+        assert!(!events_path.exists(), "the events feed file must never have been created under a read-only parent");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
