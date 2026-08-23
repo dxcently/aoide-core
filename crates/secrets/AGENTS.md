@@ -895,6 +895,41 @@
   string" — go through the same parameterized functions
   (`spawn_zenity_entry`/`run_zenity_entry`/`zenity_available`) so a future
   test can fake it the same way.
+- **P-N4 (task #76) closes three popup gaps the field/an Opus-judge review
+  found, all landed together, none touching the `--json` machine feed
+  (byte-stable throughout).** (1) **The near-expiry policy is now TWO
+  coherent thresholds, stated in ONE place** (`watch::LOCKOUT_SECS`'s own
+  doc comment — every other mention, this file included, restates it,
+  never redefines it): `LOCKOUT_SECS` (10s) still governs BEFORE-OPEN (no
+  dialog opens, no `[a]` prompt reads a code, below it); `watch::
+  POPUP_KILL_LOCKOUT_SECS` (`LOCKOUT_SECS + POPUP_KILL_MARGIN_SECS` = 15s,
+  a DERIVED constant, never an independently-tuned second magic number)
+  is the NEW already-open half — `zenity --entry`'s own `--text` bakes
+  "Ns left" at spawn time and cannot be updated in place, so an open
+  dialog can go stale while the operator is still looking at it.
+  `popup_loop`'s `should_cancel` closure now ORs `popup_kill_already_open`
+  (pure, unit-tested the same way `code_prompt_allowed` is) alongside the
+  pre-existing "vanished from the queue" check — the SAME
+  `ZenityResult::CancelledExternally` kill idiom fires either way, never a
+  second kill mechanism. `popup_loop` disambiguates the two causes
+  AFTERWARD (is the ask still in the queue?) only to pick the right
+  narration line and to add the ask's id to `ignored` on the near-expiry
+  branch — "don't respawn for that ask" is `ignored`, the same mechanism
+  a Cancel/close already uses, not a new one. (2) **Phantom-ask reaping**:
+  `Queue::reconcile` already dropped an ask no longer in `pending` with no
+  event (P-N2/tracker #71's own doc); this phase pins that `popup_loop`'s
+  kill closure reacts to THAT removal identically to an explicit
+  Completed/Dismissed/Expired event, since it only ever asks the queue "is
+  this id still here," never "did an event say so." (3) **Spawn-retry
+  backoff**: `watch::next_spawn_backoff` doubles from `SPAWN_BACKOFF_INITIAL`
+  (1s) to `SPAWN_BACKOFF_MAX` (60s) on consecutive `ZenityResult::
+  SpawnError`s, reset to the floor on the next successful spawn —
+  `popup_loop`'s own `spawn_failing`/`spawn_backoff` locals, narrated ONCE
+  per state transition (entering the failing state, and recovering from
+  it), never once per attempt. Don't reach for a `SystemTime::now()` call
+  inside `popup_kill_already_open`/`next_spawn_backoff` — both stay pure,
+  clock/timing-as-parameter, the same discipline every other pure fold in
+  this module already holds (`watch.rs`'s own module doc).
 - **The built-in `age` backend + the per-backend `has` template + the
   `secrets add` default flip LANDED at P-G1 (task #70, this commit).**
   `Backend` gained an OPTIONAL `has: Option<String>` field, `#[serde(default)]`

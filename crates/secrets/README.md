@@ -829,17 +829,50 @@ watching secret events — ^C to leave (parked asks stay parked)
   load-bearing on this rig, not a redundant fallback). While locked, the
   loop holds the dialog and re-polls once a second; once unlocked it opens
   the dialog — but ONLY if the near-expiry rule below still allows it.
-- **Near-expiry: no dialog opens below the SAME 10-second lockout**
+- **Near-expiry, two coherent thresholds, one policy (task #76 item 1,
+  `watch::LOCKOUT_SECS`'s own doc is now the single canonical statement of
+  both halves — this bullet restates it, doesn't duplicate it).**
+  BEFORE-OPEN: no dialog opens below the SAME 10-second lockout
   (`watch::LOCKOUT_SECS`) the tty prompt refuses `[a]` below — checked
   BEFORE showing (a locked-then-expiring ask is skipped, never shown late)
   and RE-CHECKED after the dialog returns, before the code is sent (the
   same double-enforcement "Near-expiry lockout" above documents for the
-  tty path).
+  tty path). ALREADY-OPEN: `zenity --entry`'s own `--text` bakes "Ns left"
+  at spawn time and CANNOT be updated in place — a dialog that was fine to
+  open a moment ago can silently go stale while the operator is still
+  looking at it, since nothing about an open zenity window itself ticks
+  down. `watch::POPUP_KILL_LOCKOUT_SECS` (15s, `LOCKOUT_SECS + 5`,
+  deliberately AHEAD of the before-open threshold) closes that: once an
+  ask crosses below it, `popup_loop` kills the ALREADY-OPEN dialog for it —
+  through the SAME `should_cancel`/`ZenityResult::CancelledExternally` kill
+  idiom the "resolved elsewhere" case below already used, not a second
+  mechanism — and does NOT reopen a fresh one for that ask (`ignored`
+  gains its id), since a code typed into a dialog opened this close to
+  expiry would race the deadline exactly the way a not-yet-opened one
+  would. The ask itself is untouched — it stays parked, completable from
+  the tty prompt or another terminal the whole time.
 - **If the ask completes/expires elsewhere while its dialog sits open**,
   `watch::run_zenity_entry` kills that dialog's EXACT child — the
   `std::process::Child` handle it already holds, never a re-derived pid,
   never a name match — and narrates `ask <id> resolved elsewhere while its
-  popup was open`.
+  popup was open`. This includes an ask that simply VANISHES from `pending`
+  with no event at all (a broker restart wiped the park registry, or a
+  feed line was lost, task #76 item 2) — `Queue::reconcile`'s own 30s
+  safety tick (or the next event-triggered reconcile) drops such an ask
+  from the queue the same way it drops a normally-completed one, and
+  `popup_loop`'s `should_cancel` closure reacts identically either way: it
+  only ever asks "is this id still in the queue," never "did an event say
+  so" — so a phantom ask's dialog closes on its own instead of sitting open
+  forever.
+- **A failing zenity spawn backs off instead of busy-looping (task #76
+  item 3).** A missing binary or a dead display mid-session (distinct from
+  the startup `zenity_available` check, which already refuses to even
+  ENTER `--popup` mode on a missing `zenity`) doubles the retry delay from
+  1s up to a 60s ceiling (`watch::SPAWN_BACKOFF_INITIAL`/
+  `SPAWN_BACKOFF_MAX`/`next_spawn_backoff`) rather than reattempting every
+  ~200ms poll tick forever. ONE line narrates entering the failing state
+  and ONE narrates recovery (the next successful spawn, which also resets
+  the backoff to the floor) — not a line per failed attempt.
 - **`released`/`completed`/`dismissed`/`expired` are SUPPRESSED as
   popups** — parked-only is the default (User-flagged): every mode
   narrates all five events on stdout regardless, but only a `parked` event
@@ -1402,6 +1435,33 @@ at all — the fix is `systemctl status aoide-secrets-serve`, or setting
 `AOIDE_SECRETS_SOCKET` if this host's socket lives somewhere else. Both
 `client::resolve`/`client::put` route their connect failure through this
 one function rather than each hand-rolling the diagnosis.
+
+**A silent `AOIDE_SECRETS_EVENTS` mismatch is a live footgun, the same
+shape as the `AOIDE_SECRETS_SOCKET` notes just above (task #76 item 6a).**
+The broker unit resolves `events_path` from ITS OWN environment at `serve`
+startup (the systemd unit's `Environment=`, or `socket::events_path`'s
+sibling-of-the-socket default when unset — "The events feed" under
+"Deployment" above); an operator's `secrets watch`/`--popup` shell resolves
+the SAME env var independently, in a COMPLETELY SEPARATE process. If the
+two ever disagree — an ad hoc `export AOIDE_SECRETS_EVENTS=...` left in one
+shell but not the unit's environment, or the reverse, or simply a stale
+value from an earlier debugging session — the watcher ends up polling a
+path the broker never writes a single line to. This never surfaces as a
+hard error: `wait_for_follower`'s own NotFound-poll (above) narrates once
+and then waits patiently, forever; and if a file happens to already exist
+at whatever path `watch` resolved (a stale leftover from a previous run,
+say), the watcher opens it and sees ZERO new events ever again, silently
+falling all the way back to the 30s `Queue::reconcile` safety tick for
+EVERY popup — exactly the same degraded experience the P-G4
+`ProtectHome=true` incident this feed exists to fix in the first place,
+just triggered by a mismatched env var instead of a blocked mirror write.
+There is no cross-check between the two processes' resolutions (`home`/
+`socket`'s own "nothing else re-derives a path" discipline, `AGENTS.md`,
+cuts the OTHER way here — each process resolves once, independently, by
+design, same as `AOIDE_SECRETS_SOCKET` itself); the fix is operational, not
+a code path: leave `AOIDE_SECRETS_EVENTS` unset everywhere (both sides then
+agree on the same sibling-of-the-socket default) or set it identically on
+both the broker unit and every operator shell that runs `secrets watch`.
 
 ## Named seams (what it exposes)
 

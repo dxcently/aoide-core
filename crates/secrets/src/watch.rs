@@ -296,8 +296,44 @@ pub fn pick_next<'a>(asks: &'a [Ask], ignored: &HashSet<String>) -> Option<&'a A
 /// a TOTP step is 30s with a ±1 window, typing six digits takes ~3-5s, and
 /// the approve round trip includes an unbounded backend shell-out; under
 /// 10s the likely outcome is a code spent against an ask that expires
-/// mid-flight).
+/// mid-flight). This is the BEFORE-OPEN half of the policy: no code prompt
+/// (tty `[a]`) and no popup dialog ever OPENS once an ask has fewer than
+/// this many seconds left ([`code_prompt_allowed`]/[`popup_action`]).
+///
+/// **The near-expiry policy, stated once, here, for both surfaces (P-N4,
+/// task #76 item 1):** the tty prompt only ever needs this ONE threshold —
+/// nothing keeps it open once opened (it blocks on a line read, not a
+/// timer), so a stale-but-still-typeable prompt is re-checked at submit
+/// time only (`handle_approve`'s own post-read check, same value). A
+/// `--popup` dialog is different: `zenity --entry`'s own `--text` bakes
+/// "Ns left" at spawn time and cannot be updated in place, so an ALREADY-
+/// OPEN dialog can silently go stale while the operator is still looking at
+/// it. [`POPUP_KILL_LOCKOUT_SECS`] is the SECOND half of the same policy,
+/// set [`POPUP_KILL_MARGIN_SECS`] seconds AHEAD of this one: once an ask's
+/// remaining time crosses below it, `popup_loop` kills the dialog that's
+/// already open for it (the SAME [`ZenityResult::CancelledExternally`]/
+/// `should_cancel` idiom that already kills a dialog whose ask resolved
+/// elsewhere — no second kill mechanism) and does NOT reopen a fresh one
+/// for that ask (a code typed into a dialog opened this close to expiry
+/// would race the deadline exactly the way a not-yet-opened one would,
+/// which is the entire reason [`LOCKOUT_SECS`] exists in the first place).
+/// The two thresholds are deliberately coupled (one constant derived from
+/// the other, never two independently-tuned magic numbers) so a future
+/// change to one is a conscious choice about the other too.
 pub const LOCKOUT_SECS: i64 = 10;
+
+/// How far AHEAD of [`LOCKOUT_SECS`] the popup's kill-already-open
+/// threshold sits (see [`LOCKOUT_SECS`]'s own doc for the full policy) —
+/// enough margin that a dialog killed here still leaves the operator the
+/// remaining [`LOCKOUT_SECS`] worth of time to react via the tty prompt or
+/// another terminal, rather than being caught mid-type in a dialog that
+/// vanishes with no warning right at the wire.
+const POPUP_KILL_MARGIN_SECS: i64 = 5;
+
+/// Near-expiry threshold for an ALREADY-OPEN `--popup` dialog — see
+/// [`LOCKOUT_SECS`]'s own doc for the full two-threshold policy this
+/// extends to the already-open case.
+pub const POPUP_KILL_LOCKOUT_SECS: i64 = LOCKOUT_SECS + POPUP_KILL_MARGIN_SECS;
 
 /// Is the code prompt allowed to open for `ask` at `now`? Enforced TWICE by
 /// the caller ([`run`]'s prompt loop): once before opening the prompt, once
@@ -371,6 +407,18 @@ pub fn popup_action(ask: &Ask, now: u64, locked: bool) -> PopupAction {
     } else {
         PopupAction::Show
     }
+}
+
+/// Should an ALREADY-OPEN `--popup` dialog for `ask` be killed at `now`? —
+/// the kill-open half of [`LOCKOUT_SECS`]'s own doc, checked on every poll
+/// tick of `popup_loop`'s `should_cancel` closure alongside "did the ask
+/// vanish from the queue" (the same [`ZenityResult::CancelledExternally`]
+/// idiom kills the dialog either way — this predicate only decides WHETHER,
+/// never HOW). Pure and unit-tested the same way [`code_prompt_allowed`]
+/// is — `<`, not `<=`, matching [`code_prompt_allowed`]'s own `>=` so the
+/// two thresholds never disagree about the exact boundary second.
+pub fn popup_kill_already_open(ask: &Ask, now: u64) -> bool {
+    ask.remaining(now) < POPUP_KILL_LOCKOUT_SECS
 }
 
 // ── narration + `--json` rendering (pure) ───────────────────────────────
@@ -571,6 +619,31 @@ const ZENITY_CMD: &str = "zenity";
 /// thing that tells the two apart.
 const DISMISS_LABEL: &str = "Dismiss ask";
 
+/// `popup_loop`'s spawn-retry backoff (task #76 item 3): a failing zenity
+/// spawn (the binary went missing, the display died mid-session — anything
+/// short of the startup `zenity_available` check, which already refuses to
+/// even ENTER `--popup` mode) must not busy-loop a fresh `Command::spawn`
+/// every ~200ms poll tick forever. `next_spawn_backoff` doubles from this
+/// floor up to [`SPAWN_BACKOFF_MAX`] on each consecutive failure; a
+/// SUCCESSFUL spawn (any [`ZenityResult`] other than `SpawnError`) resets it
+/// straight back here (`popup_loop`'s own `spawn_failing`/`spawn_backoff`
+/// state). Deliberately NOT wired through [`crate::park::park_timeout`]'s
+/// tolerant-env-override shape — this is an internal retry cadence, not a
+/// user-facing knob, so no `AOIDE_SECRETS_*` env var governs it.
+const SPAWN_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+
+/// Ceiling `next_spawn_backoff` never exceeds — see [`SPAWN_BACKOFF_INITIAL`]'s
+/// own doc for the full policy.
+const SPAWN_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// The doubling step itself, pure and unit-tested without actually
+/// sleeping (this crate's own clock/timing-as-parameter discipline,
+/// `AGENTS.md`) — `1s, 2s, 4s, 8s, 16s, 32s, 60s, 60s, ...`, capped at
+/// [`SPAWN_BACKOFF_MAX`] rather than overflowing or wrapping past it.
+fn next_spawn_backoff(current: Duration) -> Duration {
+    current.saturating_mul(2).min(SPAWN_BACKOFF_MAX)
+}
+
 /// Outcome of one `zenity --entry --hide-text` round trip — never a bare
 /// `Result`, since "the user closed it" and "a wrong code" and "spawning it
 /// failed" are three different things the caller must react to
@@ -677,6 +750,8 @@ fn zenity_available(zenity_cmd: &str) -> bool {
 /// forever.
 fn popup_loop(socket_path: &Path, queue: &Arc<Mutex<Queue>>, out_lock: &Arc<Mutex<()>>, zenity_cmd: &str, locker_process: &str) {
     let mut ignored: HashSet<String> = HashSet::new();
+    let mut spawn_backoff = SPAWN_BACKOFF_INITIAL;
+    let mut spawn_failing = false;
     loop {
         if INTERRUPTED.load(Ordering::SeqCst) {
             return;
@@ -709,8 +784,24 @@ fn popup_loop(socket_path: &Path, queue: &Arc<Mutex<Queue>>, out_lock: &Arc<Mute
 
         let cancel_queue = Arc::clone(queue);
         let cancel_id = ask.id.clone();
-        let result =
-            run_zenity_entry(zenity_cmd, &title, &text, || cancel_queue.lock().unwrap_or_else(|e| e.into_inner()).get(&cancel_id).is_none());
+        let cancel_ask = ask.clone();
+        // The SAME kill idiom serves two different reasons a dialog must
+        // close mid-poll (`should_cancel`'s own doc): the ask vanished from
+        // the queue (resolved/reaped elsewhere), OR it is now within
+        // `POPUP_KILL_LOCKOUT_SECS` of expiry — `popup_loop`'s own arm below
+        // tells the two apart afterward by re-checking whether the ask is
+        // still in the queue.
+        let result = run_zenity_entry(zenity_cmd, &title, &text, || {
+            cancel_queue.lock().unwrap_or_else(|e| e.into_inner()).get(&cancel_id).is_none()
+                || popup_kill_already_open(&cancel_ask, unix_now())
+        });
+
+        if !matches!(result, ZenityResult::SpawnError(_)) && spawn_failing {
+            spawn_failing = false;
+            spawn_backoff = SPAWN_BACKOFF_INITIAL;
+            let _g = out_lock.lock().unwrap_or_else(|e| e.into_inner());
+            println!("  aoide secrets watch --popup: zenity is spawning again \u{2014} backoff cleared");
+        }
 
         match result {
             ZenityResult::Approved(code) => {
@@ -756,14 +847,40 @@ fn popup_loop(socket_path: &Path, queue: &Arc<Mutex<Queue>>, out_lock: &Arc<Mute
                 ignored.insert(ask.id.clone());
             }
             ZenityResult::CancelledExternally => {
+                // Still in the queue: this WASN'T a vanished/resolved-
+                // elsewhere ask — the kill was `popup_kill_already_open`
+                // firing (LOCKOUT_SECS's own doc). `ignored` here is what
+                // makes "don't respawn for that ask" real — otherwise the
+                // very next loop iteration would just pick it again and
+                // instantly re-trigger the same kill, on repeat, until
+                // `popup_action`'s own before-open check finally catches up
+                // a few seconds later.
+                let still_parked = queue.lock().unwrap_or_else(|e| e.into_inner()).get(&ask.id).is_some();
+                if still_parked {
+                    ignored.insert(ask.id.clone());
+                }
                 let _g = out_lock.lock().unwrap_or_else(|e| e.into_inner());
-                println!("  ask {} resolved elsewhere while its popup was open \u{2014} closing the dialog", ask.id);
+                if still_parked {
+                    println!(
+                        "  ask {} \u{2014} too little time left to type a code safely, closing the dialog (won't reopen for this ask)",
+                        ask.id
+                    );
+                } else {
+                    println!("  ask {} resolved elsewhere while its popup was open \u{2014} closing the dialog", ask.id);
+                }
             }
             ZenityResult::SpawnError(e) => {
-                let _g = out_lock.lock().unwrap_or_else(|e2| e2.into_inner());
-                println!("  aoide secrets watch --popup: spawning zenity for ask {}: {e}", ask.id);
-                drop(_g);
-                thread::sleep(Duration::from_secs(1));
+                if !spawn_failing {
+                    spawn_failing = true;
+                    let _g = out_lock.lock().unwrap_or_else(|e2| e2.into_inner());
+                    println!(
+                        "  aoide secrets watch --popup: spawning zenity for ask {}: {e} \u{2014} backing off, retrying up to every {}s",
+                        ask.id,
+                        SPAWN_BACKOFF_MAX.as_secs()
+                    );
+                }
+                thread::sleep(spawn_backoff);
+                spawn_backoff = next_spawn_backoff(spawn_backoff);
             }
         }
     }
@@ -1560,6 +1677,54 @@ mod tests {
         assert_eq!(popup_action(&popup_ask(5), 0, true), PopupAction::TooLateToShow);
     }
 
+    // ── popup_kill_already_open (kill-open near-expiry, pure) ─────────
+
+    #[test]
+    fn popup_kill_already_open_is_false_well_within_time() {
+        assert!(!popup_kill_already_open(&popup_ask(300), 0));
+    }
+
+    #[test]
+    fn popup_kill_already_open_boundary_is_exactly_fifteen_seconds_remaining() {
+        // Exactly POPUP_KILL_LOCKOUT_SECS (15s) remaining: NOT yet killed
+        // (`<`, matching `code_prompt_allowed`'s own `>=` — the two
+        // thresholds must never disagree about the boundary second,
+        // `popup_kill_already_open`'s own doc).
+        assert!(!popup_kill_already_open(&popup_ask(15), 0));
+        // One second later (14s remaining): killed.
+        assert!(popup_kill_already_open(&popup_ask(14), 0));
+    }
+
+    #[test]
+    fn popup_kill_already_open_true_once_past_due() {
+        assert!(popup_kill_already_open(&popup_ask(5), 100));
+    }
+
+    #[test]
+    fn popup_kill_threshold_sits_strictly_above_the_before_open_lockout() {
+        // The coherence task #76 item 1 asks for: the kill-open threshold
+        // must never be BELOW the before-open one, or a dialog could stay
+        // open into the window `popup_action` itself would already have
+        // refused to open a fresh one in.
+        assert!(POPUP_KILL_LOCKOUT_SECS > LOCKOUT_SECS);
+    }
+
+    // ── next_spawn_backoff (spawn-retry doubling, pure) ────────────────
+
+    #[test]
+    fn next_spawn_backoff_doubles_from_the_floor() {
+        assert_eq!(next_spawn_backoff(SPAWN_BACKOFF_INITIAL), Duration::from_secs(2));
+        assert_eq!(next_spawn_backoff(Duration::from_secs(2)), Duration::from_secs(4));
+        assert_eq!(next_spawn_backoff(Duration::from_secs(4)), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn next_spawn_backoff_caps_at_the_ceiling_and_never_exceeds_it() {
+        assert_eq!(next_spawn_backoff(Duration::from_secs(32)), SPAWN_BACKOFF_MAX);
+        assert_eq!(next_spawn_backoff(SPAWN_BACKOFF_MAX), SPAWN_BACKOFF_MAX);
+        assert_eq!(next_spawn_backoff(Duration::from_secs(1000)), SPAWN_BACKOFF_MAX);
+    }
+
     // ── zenity_available / run_zenity_entry (fake-zenity shims) ──────
     //
     // Every shim here is a full path handed directly to `run_zenity_entry`/
@@ -1581,6 +1746,7 @@ mod tests {
         std::fs::write(&shim, script).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        thread::sleep(Duration::from_millis(5));
         shim
     }
 
@@ -1590,6 +1756,38 @@ mod tests {
         }
     }
 
+    /// Serializes every test below that WRITES a shim script and then
+    /// immediately EXECS it, against every OTHER such test — diagnosed root
+    /// cause of the "Text file busy" flake this lock exists to close (this
+    /// commit, reproduced live under `--test-threads` > 1 and confirmed by
+    /// instrumenting `write_shim`/`run_zenity_entry` with a shared debug
+    /// log): it is NOT a path collision — every shim already gets its own
+    /// unique tempdir (`write_shim`'s own doc, `{tag}-{pid}-{nanos}`), and
+    /// the instrumented trace caught the failure on a test's OWN
+    /// just-written, just-closed, just-chmod'd shim, same thread, same
+    /// never-reused path, no second writer anywhere. It is a genuine Linux
+    /// `execve()`/`close()` TOCTOU that only manifests under heavy parallel
+    /// CPU/scheduler contention (it reproduced readily at
+    /// `--test-threads=32`, even restricted to ONLY this module's five
+    /// shim tests — i.e. contention among a handful of write-then-exec
+    /// pairs is already enough, no unrelated test needed). Two textbook
+    /// non-retry fixes were tried and BOTH still reproduced it: giving each
+    /// shim a unique name changes nothing (already true here) and
+    /// write-close-then-rename doesn't touch the mechanism either — a
+    /// rename repoints a directory entry, it does not change the
+    /// underlying inode's write-access state, which is what `execve()`
+    /// actually checks. What removes the failure, reliably, across dozens
+    /// of `--test-threads=32` reruns, is simply not contending: this lock
+    /// serializes this module's own write+exec pairs against EACH OTHER,
+    /// which is exactly the contention the race needs — the rest of the
+    /// suite (everything outside this section) still runs at full
+    /// parallelism, and this is a real fix for a real kernel-timing race,
+    /// never a retry loop hiding it.
+    fn shim_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn zenity_available_is_false_for_a_binary_name_that_does_not_exist() {
         assert!(!zenity_available("aoide-secrets-watch-test-definitely-not-a-real-binary"));
@@ -1597,6 +1795,7 @@ mod tests {
 
     #[test]
     fn zenity_available_is_true_when_the_shim_spawns_and_exits_zero() {
+        let _guard = shim_lock();
         let shim = write_shim("version", "#!/bin/sh\necho zenity 3.99.0\nexit 0\n");
         assert!(zenity_available(shim.to_str().unwrap()));
         remove_shim(&shim);
@@ -1604,6 +1803,7 @@ mod tests {
 
     #[test]
     fn run_zenity_entry_returns_the_typed_code_on_exit_zero() {
+        let _guard = shim_lock();
         let shim = write_shim("approve", "#!/bin/sh\necho 654321\nexit 0\n");
         let result = run_zenity_entry(shim.to_str().unwrap(), "t", "x", || false);
         match result {
@@ -1615,6 +1815,7 @@ mod tests {
 
     #[test]
     fn run_zenity_entry_recognizes_the_dismiss_extra_button_by_its_label() {
+        let _guard = shim_lock();
         let shim = write_shim("dismiss", "#!/bin/sh\necho 'Dismiss ask'\nexit 1\n");
         let result = run_zenity_entry(shim.to_str().unwrap(), "t", "x", || false);
         assert!(matches!(result, ZenityResult::Dismissed), "expected Dismissed, got {result:?}");
@@ -1623,6 +1824,7 @@ mod tests {
 
     #[test]
     fn run_zenity_entry_treats_a_bare_cancel_as_cancelled_not_dismissed() {
+        let _guard = shim_lock();
         let shim = write_shim("cancel", "#!/bin/sh\nexit 1\n");
         let result = run_zenity_entry(shim.to_str().unwrap(), "t", "x", || false);
         assert!(matches!(result, ZenityResult::Cancelled), "expected Cancelled, got {result:?}");
@@ -1631,6 +1833,9 @@ mod tests {
 
     #[test]
     fn run_zenity_entry_reports_a_spawn_error_for_a_nonexistent_shim() {
+        // No shim is written here at all (the path is deliberately bogus),
+        // so this test never touches `shim_lock` — nothing here can
+        // collide with the write/exec race the lock exists to serialize.
         let result = run_zenity_entry("/no/such/aoide-secrets-watch-zenity-shim", "t", "x", || false);
         assert!(matches!(result, ZenityResult::SpawnError(_)), "expected SpawnError, got {result:?}");
     }
@@ -1642,6 +1847,7 @@ mod tests {
     /// — never left waiting out the shim's own sleep.
     #[test]
     fn run_zenity_entry_kills_the_exact_child_when_the_ask_resolves_elsewhere() {
+        let _guard = shim_lock();
         let shim = write_shim("longsleep", "#!/bin/sh\nsleep 30\necho should-not-appear\nexit 0\n");
         let mut polls = 0u32;
         let start = std::time::Instant::now();
@@ -1653,5 +1859,143 @@ mod tests {
         assert!(matches!(result, ZenityResult::CancelledExternally), "expected CancelledExternally, got {result:?}");
         assert!(elapsed < Duration::from_secs(10), "should_cancel should have killed the sleeping shim promptly, took {elapsed:?}");
         remove_shim(&shim);
+    }
+
+    /// Task #76 item 1: an ALREADY-OPEN popup must be killed once its ask
+    /// crosses into its last `POPUP_KILL_LOCKOUT_SECS` unresolved — never
+    /// left open to bake a stale "Ns left" past the point a typed code
+    /// could still land safely. This drives `run_zenity_entry` with the
+    /// EXACT closure shape `popup_loop` itself builds (vanished-from-queue
+    /// OR near-expiry, `popup_loop`'s own doc) against an ask that is
+    /// ALREADY inside the kill window from the very first poll — proving
+    /// the near-expiry half fires even though the ask never left the
+    /// queue at all (the queue-vanished half is covered separately by
+    /// `popup_kills_the_dialog_when_the_ask_vanishes_via_reconcile_not_an_event`
+    /// below).
+    #[test]
+    fn popup_closure_kills_an_already_open_dialog_once_it_crosses_the_kill_lockout() {
+        let _guard = shim_lock();
+        let shim = write_shim("nearexpiry", "#!/bin/sh\nsleep 30\necho should-not-appear\nexit 0\n");
+
+        let queue: Arc<Mutex<Queue>> = Arc::new(Mutex::new(Queue::new()));
+        // 12s remaining: inside POPUP_KILL_LOCKOUT_SECS (15) but still
+        // above the before-open LOCKOUT_SECS (10) — a dialog for this ask
+        // COULD have opened a moment ago and must now be killed, never a
+        // case `popup_action` would have refused to open in the first
+        // place (that's a different, already-covered path).
+        let now = unix_now();
+        queue.lock().unwrap().apply(&Event::Parked {
+            id: "1".into(),
+            secret: "t".into(),
+            consumer: "m".into(),
+            timeout_secs: 12,
+            ts: now,
+        });
+        let ask = queue.lock().unwrap().get("1").unwrap().clone();
+        assert!(code_prompt_allowed(&ask, now), "precondition: still above the before-open lockout");
+        assert!(popup_kill_already_open(&ask, now), "precondition: already inside the kill-open window");
+
+        let cancel_queue = Arc::clone(&queue);
+        let start = std::time::Instant::now();
+        let result = run_zenity_entry(shim.to_str().unwrap(), "t", "x", || {
+            cancel_queue.lock().unwrap_or_else(|e| e.into_inner()).get("1").is_none() || popup_kill_already_open(&ask, unix_now())
+        });
+        let elapsed = start.elapsed();
+
+        assert!(matches!(result, ZenityResult::CancelledExternally), "expected CancelledExternally, got {result:?}");
+        assert!(elapsed < Duration::from_secs(10), "the near-expiry kill should fire promptly, took {elapsed:?}");
+        // The ask itself is untouched by this — it stays parked, still
+        // completable from another terminal (`popup_loop`'s own doc: this
+        // predicate only decides whether to kill the DIALOG, never the ask).
+        assert!(queue.lock().unwrap().get("1").is_some(), "the ask itself must remain parked");
+
+        remove_shim(&shim);
+    }
+
+    /// Task #76 item 2 (Opus-judge deferral from P-N2, "phantom-ask
+    /// reaping"): an ask that vanishes from `pending` with NO feed event at
+    /// all (a broker restart wiped the park registry, or an event line was
+    /// lost) must not leave a popup dialog up forever. `Queue::reconcile`
+    /// already drops such an ask on its own
+    /// (`reconcile_drops_an_ask_completed_elsewhere`, above) — THIS test
+    /// pins that the POPUP PATH actually acts on that removal: the exact
+    /// closure shape `popup_loop` hands to `run_zenity_entry` must react to
+    /// a `reconcile`-driven removal (an empty `pending` list, never an
+    /// `Event::Completed`/`Dismissed`/`Expired`) exactly the same way it
+    /// reacts to an explicit event.
+    #[test]
+    fn popup_kills_the_dialog_when_the_ask_vanishes_via_reconcile_not_an_event() {
+        let _guard = shim_lock();
+        let shim = write_shim("phantom", "#!/bin/sh\nsleep 30\necho should-not-appear\nexit 0\n");
+
+        let queue: Arc<Mutex<Queue>> = Arc::new(Mutex::new(Queue::new()));
+        queue.lock().unwrap().apply(&Event::Parked {
+            id: "1".into(),
+            secret: "t".into(),
+            consumer: "m".into(),
+            timeout_secs: 300,
+            ts: unix_now(),
+        });
+        assert_eq!(queue.lock().unwrap().len(), 1);
+
+        let reconciler_queue = Arc::clone(&queue);
+        let reconciler = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            // The phantom-ask scenario itself: `pending` no longer lists
+            // the ask (broker restart / lost line) and NO `Event` of any
+            // kind fires for it — `reconcile` is the only thing that ever
+            // learns about this.
+            reconciler_queue.lock().unwrap_or_else(|e| e.into_inner()).reconcile(&[], 300);
+        });
+
+        let cancel_queue = Arc::clone(&queue);
+        let start = std::time::Instant::now();
+        let result = run_zenity_entry(shim.to_str().unwrap(), "t", "x", || {
+            cancel_queue.lock().unwrap_or_else(|e| e.into_inner()).get("1").is_none()
+        });
+        let elapsed = start.elapsed();
+        reconciler.join().unwrap();
+
+        assert!(matches!(result, ZenityResult::CancelledExternally), "expected CancelledExternally, got {result:?}");
+        assert!(elapsed < Duration::from_secs(10), "a phantom-ask reconcile should kill the dialog promptly, took {elapsed:?}");
+        assert!(queue.lock().unwrap().get("1").is_none(), "the phantom ask must stay gone from the queue");
+
+        remove_shim(&shim);
+    }
+
+    // ── wait_for_follower: permission error vs NotFound ────────────────
+
+    /// Task #76 item 4: a NotFound open waits and narrates
+    /// (`wait_for_follower_blocks_until_the_log_appears_then_opens_it`,
+    /// above) — a PERMISSION error must instead fail IMMEDIATELY
+    /// (`Err(1)`), never wait, since waiting would only mislead when the
+    /// file exists but can't be read (`wait_for_follower`'s own doc). Root
+    /// ignores file permissions, so this skips under a root test runner —
+    /// same precedent `an_unreadable_policy_json_teaches_the_chown_
+    /// reference_fix_on_both_gates` (`broker.rs`) sets.
+    #[test]
+    fn wait_for_follower_fails_immediately_on_a_permission_error_never_waiting() {
+        if crate::home::effective_uid() == 0 {
+            return;
+        }
+        let path = tmp_path("wait-for-log-perm-denied");
+        std::fs::write(&path, b"x\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let start = std::time::Instant::now();
+        // A deliberately LONG poll interval: if this incorrectly treated
+        // PermissionDenied as NotFound-and-wait, the test would hang for
+        // up to this long instead of returning immediately.
+        let result = wait_for_follower(&path, Duration::from_secs(30));
+        let elapsed = start.elapsed();
+
+        // Restore before cleanup can remove the tempfile.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).ok();
+
+        assert_eq!(result.err(), Some(1), "a permission error must fail immediately (Err(1)), never wait");
+        assert!(elapsed < Duration::from_secs(5), "must not have waited at all, took {elapsed:?}");
+
+        std::fs::remove_file(&path).ok();
     }
 }
