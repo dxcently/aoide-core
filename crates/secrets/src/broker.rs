@@ -298,8 +298,13 @@ fn bind_socket(socket_path: &Path) -> std::io::Result<UnixListener> {
 /// anywhere else. A seeding failure is logged and NON-fatal — an existing
 /// or hand-authored `backends.json` (or none at all, for a host that only
 /// ever uses non-`file` backends) is still a perfectly servable broker.
-/// Only returns on a bind/permission failure — a running broker never
-/// returns `Ok`.
+/// **Immediately after, backfills any built-in the file is MISSING** (P-G2,
+/// task #72, `crate::backend::backfill_missing_backends`) — additive only,
+/// never touching an entry (built-in or custom) already present by name;
+/// this is what closes the deployment gap a pre-P-G1 `backends.json` (or a
+/// hand-edited one predating `has`) would otherwise leave open forever,
+/// same non-fatal-failure posture as seeding. Only returns on a bind/
+/// permission failure — a running broker never returns `Ok`.
 ///
 /// **ONE [`ParkRegistry`] for the whole broker's lifetime** (P-N2),
 /// wrapped in an `Arc` and cloned into every spawned connection thread
@@ -311,7 +316,17 @@ pub fn serve(secrets_home: &Path, socket_path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(secrets_home)?;
     crate::home::secure_dir(secrets_home)?;
     if let Err(e) = crate::backend::seed_default_backends(secrets_home) {
-        eprintln!("[aoide/secrets] could not seed the default `file` backend into backends.json: {e}");
+        eprintln!("[aoide/secrets] could not seed the default `file`/`age` backends into backends.json: {e}");
+    }
+    // P-G2 (task #72): the additive sibling of the seeding call above — an
+    // EXISTING `backends.json` (the far more common live case) gains
+    // whichever built-in entry it's missing, by name, never touching an
+    // entry — built-in or custom — that's already there. A no-op on a
+    // fresh home (seeding just created both) and on an already-complete
+    // file (no write at all — `backend::backfill_missing_backends`'s own
+    // doc). Non-fatal, same posture as the seeding call it follows.
+    if let Err(e) = crate::backend::backfill_missing_backends(secrets_home) {
+        eprintln!("[aoide/secrets] could not backfill missing built-in backends into backends.json: {e}");
     }
     let listener = bind_socket(socket_path)?;
 

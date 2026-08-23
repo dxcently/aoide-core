@@ -134,6 +134,16 @@
 //! wall); `broker::put_gate` calls [`backend_is_known`] before
 //! [`mint_age_identity_if_needed`], so a doomed `put` against an
 //! unconfigured `age` policy never mints a REAL identity first.
+//!
+//! ## Closing the deployment gap: additive backfill (P-G2, task #72)
+//!
+//! The P-G1 review fix above only ever REPORTED the "unconfigured `age`"
+//! gap honestly; it never closed it. [`backfill_missing_backends`] closes
+//! it: it runs every broker startup, right after [`seed_default_backends`]
+//! (`broker::serve`'s doc). Where seeding only acts on an ABSENT
+//! `backends.json`, backfill acts on an EXISTING one, adding whichever
+//! built-in entry (`file`/`age`) is missing BY NAME and never touching an
+//! entry — built-in or custom — that's already there.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -504,6 +514,72 @@ fn describe_missing_age_keygen(err: &std::io::Error) -> String {
     } else {
         format!("spawning age-keygen: {err}")
     }
+}
+
+/// **Additive backfill for an EXISTING `backends.json` (P-G2, task #72) —
+/// the deployment-gap fix `README.md`'s "A second, related deployment gap"
+/// note left open.** [`seed_default_backends`] only ever writes when the
+/// file is entirely ABSENT (deliberate, unchanged); this is its sibling for
+/// the far more common live case — a `backends.json` that already exists
+/// but predates one or both built-ins (a pre-P-G1 deployment with `file`
+/// only, or a hand-edited file missing `has`). Adds whatever built-in entry
+/// is MISSING BY NAME, and nothing else: an entry already present under a
+/// built-in's name — `file` or `age` — is NEVER touched, even if an
+/// operator has customized it (a custom `get`/`set` shape under the name
+/// `age`, say) — presence of the KEY is the only test, never a content
+/// comparison. Every OTHER entry in the file (a `pass`/`gopass`/`bw`/`sops`
+/// row, or any operator-named custom backend) rides through byte-for-byte:
+/// this function loads the whole document as an ordered `serde_json::Map`
+/// (never a typed `Backends`/`Backend` round trip, which would reorder or
+/// reformat fields the built-ins loader doesn't itself care about) and only
+/// ever `insert`s a new top-level key, never touching an existing `Value`.
+/// **No write at all when nothing was missing** — checked before ever
+/// opening a temp file — so re-running this on an already-complete
+/// `backends.json` (the common case: called every broker startup, right
+/// after [`seed_default_backends`]) never churns its mtime. Same
+/// write-temp-then-rename + [`crate::home::secure_file`] discipline as
+/// [`seed_default_backends`]. A missing `backends.json` is NOT this
+/// function's job — it returns `Ok(())` without writing, leaving the
+/// absent-file case entirely to [`seed_default_backends`] (called first, at
+/// the same startup site) so the two functions never race to create the
+/// same file two different ways.
+pub fn backfill_missing_backends(secrets_home: &Path) -> std::io::Result<()> {
+    let path = backends_path(secrets_home);
+    if !path.exists() {
+        return Ok(());
+    }
+    let bytes = std::fs::read(&path)?;
+    let mut doc: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{}: {e}", path.display())))?;
+
+    let builtins: [(&str, serde_json::Value); 2] = [
+        (
+            "file",
+            serde_json::json!({ "get": FILE_BACKEND_GET, "set": FILE_BACKEND_SET, "has": FILE_BACKEND_HAS }),
+        ),
+        (
+            "age",
+            serde_json::json!({ "get": AGE_BACKEND_GET, "set": AGE_BACKEND_SET, "has": AGE_BACKEND_HAS }),
+        ),
+    ];
+
+    let mut added = false;
+    for (name, value) in builtins {
+        if !doc.contains_key(name) {
+            doc.insert(name.to_string(), value);
+            added = true;
+        }
+    }
+    if !added {
+        return Ok(());
+    }
+
+    let tmp = path.with_extension("json.tmp");
+    let out = serde_json::to_vec_pretty(&doc)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(&tmp, &out)?;
+    crate::home::secure_file(&tmp)?;
+    std::fs::rename(&tmp, &path)
 }
 
 /// Is `name` an actually-configured backend in this home's
@@ -1070,4 +1146,105 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // ── backfill_missing_backends (P-G2, task #72) ──────────────────────
+
+    /// The exact live shape: a pre-P-G1 deployment's `backends.json` has
+    /// `file` only. Backfill must add `age` and leave `file`'s own bytes
+    /// byte-identical — proven here by reserializing the ORIGINAL `file`
+    /// entry through the same `to_vec_pretty` mechanism the whole document
+    /// goes through and comparing the full file, not just structural
+    /// equality of the parsed fields.
+    #[test]
+    fn backfill_adds_age_to_an_existing_file_only_backends_json_and_keeps_file_byte_identical() {
+        let home = tmp_home("backfill-file-only");
+        std::fs::create_dir_all(&home).unwrap();
+        let file_entry = serde_json::json!({ "get": FILE_BACKEND_GET, "set": FILE_BACKEND_SET, "has": FILE_BACKEND_HAS });
+        let before = serde_json::json!({ "file": file_entry.clone() });
+        std::fs::write(backends_path(&home), serde_json::to_vec_pretty(&before).unwrap()).unwrap();
+
+        backfill_missing_backends(&home).unwrap();
+
+        let after_bytes = std::fs::read(backends_path(&home)).unwrap();
+        let expected = serde_json::json!({
+            "file": file_entry,
+            "age": { "get": AGE_BACKEND_GET, "set": AGE_BACKEND_SET, "has": AGE_BACKEND_HAS },
+        });
+        assert_eq!(after_bytes, serde_json::to_vec_pretty(&expected).unwrap());
+
+        let backends = load_backends(&home).unwrap();
+        assert!(backends.0.contains_key("age"), "age must be backfilled");
+        assert_eq!(backends.0.get("file").unwrap().get, FILE_BACKEND_GET, "file entry must be untouched");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A hand-customized `age` entry (an operator's own template, not the
+    /// built-in shape) must survive untouched — presence of the NAME is the
+    /// only test backfill runs, never a content comparison.
+    #[test]
+    fn backfill_never_touches_a_customized_entry_under_a_built_ins_name() {
+        let home = tmp_home("backfill-custom-age");
+        std::fs::create_dir_all(&home).unwrap();
+        let custom_age = serde_json::json!({ "get": "my-custom-age-wrapper {name}" });
+        let before = serde_json::json!({ "age": custom_age.clone() });
+        std::fs::write(backends_path(&home), serde_json::to_vec_pretty(&before).unwrap()).unwrap();
+
+        backfill_missing_backends(&home).unwrap();
+
+        let backends = load_backends(&home).unwrap();
+        assert_eq!(backends.0.get("age").unwrap().get, "my-custom-age-wrapper {name}", "customized age must survive untouched");
+        assert!(backends.0.contains_key("file"), "the missing built-in (file) must still be backfilled");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A brand-new home (no `backends.json` at all) is NOT backfill's job —
+    /// `seed_default_backends` (called first, at the same startup site)
+    /// seeds both built-ins; backfill running right after must see nothing
+    /// missing and write nothing new (the "fresh home still seeds both"
+    /// case, driven through the same two-call startup sequence
+    /// `broker::serve` uses).
+    #[test]
+    fn a_fresh_home_still_seeds_both_builtins_through_the_seed_then_backfill_sequence() {
+        let home = tmp_home("backfill-fresh-home");
+        assert!(!backends_path(&home).exists());
+        seed_default_backends(&home).unwrap();
+        backfill_missing_backends(&home).unwrap();
+
+        let backends = load_backends(&home).unwrap();
+        assert!(backends.0.contains_key("file"));
+        assert!(backends.0.contains_key("age"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// No gratuitous mtime churn: a `backends.json` that already carries
+    /// both built-ins must not be rewritten at all — checked by comparing
+    /// the file's mtime before and after, not merely its content.
+    #[test]
+    fn backfill_skips_the_write_when_both_builtins_are_already_present() {
+        let home = tmp_home("backfill-noop");
+        seed_default_backends(&home).unwrap();
+        let before_mtime = std::fs::metadata(backends_path(&home)).unwrap().modified().unwrap();
+        let before_bytes = std::fs::read(backends_path(&home)).unwrap();
+
+        // A short sleep so a real rewrite (mtime bumped) would be
+        // observable even on a coarse filesystem timestamp clock.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        backfill_missing_backends(&home).unwrap();
+
+        let after_mtime = std::fs::metadata(backends_path(&home)).unwrap().modified().unwrap();
+        let after_bytes = std::fs::read(backends_path(&home)).unwrap();
+        assert_eq!(before_mtime, after_mtime, "backfill must not rewrite a backends.json with nothing missing");
+        assert_eq!(before_bytes, after_bytes);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn backfill_is_a_no_op_on_a_missing_backends_json() {
+        let home = tmp_home("backfill-missing-file");
+        assert!(!backends_path(&home).exists());
+        backfill_missing_backends(&home).unwrap();
+        assert!(!backends_path(&home).exists(), "backfill must never create the file itself");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
 }

@@ -458,6 +458,34 @@
   rule, special-casing their exit codes, etc.) — a preset row in
   "Backend presets" is the full extent of this crate's involvement with
   any of them.
+- **`backend::backfill_missing_backends` (P-G2, task #72) only ever ADDS a
+  missing built-in BY NAME — it never touches an entry already present,
+  built-in or not, and never compares content.** An `age` (or `file`) key
+  already in `backends.json` — even one an operator hand-customized under
+  that name — is left completely alone; only an ABSENT key gets the
+  built-in's default shape inserted. This is the additive backfill the
+  P-G1 review fix's own note left open ("An EXISTING deployment's
+  `backends.json`... this does NOT backfill" — that invariant above, now
+  superseded by this one closing the gap it named). Don't make this
+  function overwrite or "repair" an existing entry under a built-in's
+  name — presence of the key is the only test, forever.
+- **Backfill writes NOTHING when nothing was missing (P-G2, task #72) —
+  checked before ever opening a temp file, not merely a same-content
+  rewrite.** A `backends.json` that already carries both built-ins must
+  come out of `backfill_missing_backends` with its mtime UNCHANGED — don't
+  turn this into an unconditional "reserialize and rewrite" that happens
+  to produce the same bytes; the write itself must not happen at all when
+  the `added` flag stays false.
+- **Backfill runs at the SAME startup site as seeding, immediately after
+  it, and never instead of it (P-G2, task #72).** `broker::serve` calls
+  `seed_default_backends` then `backfill_missing_backends`, both non-fatal
+  on error, same posture. Seeding owns the ABSENT-file case exclusively
+  (unchanged since P-V4c); backfill owns the EXISTING-file case
+  exclusively — on a fresh home, seeding writes both built-ins and the
+  backfill call that follows is then a guaranteed no-op (nothing missing).
+  Don't merge the two into one function or reorder them; a caller
+  (`broker::serve`, and only `broker::serve` — the ONE seeding/backfill
+  site) always calls both, in that order.
 
 ## Extension points
 
@@ -810,11 +838,19 @@
   an unconfigured `age` policy never mints a REAL identity (real
   `age-keygen` calls, real `age.key`/`age.recipient` files) before failing
   anyway. This does NOT backfill an existing `backends.json` with the
-  `age` entry — that remains the documented, deliberate "seed once, never
-  touch an existing file" contract (invariant above) — it only makes the
-  failure that follows name its true cause instead of a misleading
-  age-specific one, and stops that failure from having a real side effect
-  first.
+  `age` entry — that remained the documented, deliberate "seed once, never
+  touch an existing file" contract (invariant above) at THIS phase — it
+  only made the failure that follows name its true cause instead of a
+  misleading age-specific one, and stopped that failure from having a real
+  side effect first. **Superseded at P-G2 (task #72, below): the backfill
+  gap this bullet names is now closed, additively.**
+- **The deployment gap LANDED at P-G1/P-G1-review is CLOSED at P-G2 (task
+  #72, this commit).** `backend::backfill_missing_backends` (invariants
+  above) runs at `broker::serve`'s startup immediately after
+  `seed_default_backends` — an EXISTING `backends.json` now gains any
+  missing built-in entry by name on every broker start, with no operator
+  action, and no entry (built-in or custom) already present is ever
+  touched.
 
 **KNOWN GAP, deferred, not fixed by P-N2c:** backend `get`/`set` shell-outs
 (`backend::fetch_value`/`store_value`) have NO timeout — a wedged backend

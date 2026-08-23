@@ -907,8 +907,13 @@ when absent** — the ONE seeding site is `broker::serve`'s startup
 long-running process that ever actually resolves a backend name against a
 template, so seeding there guarantees every `resolve`/`put` sees a
 `backends.json` on disk without a second seed call at `secrets add`/
-`secrets put`. **An EXISTING `backends.json` is never touched** — seeding
-only ever writes the file when it is entirely absent.
+`secrets put`. **An EXISTING `backends.json` is never touched BY SEEDING**
+— seeding only ever writes the file when it is entirely absent. **P-G2
+(task #72) adds an additive sibling, right after seeding in the SAME
+startup call:** `backend::backfill_missing_backends` acts on an EXISTING
+file, adding whichever built-in (`file`/`age`) is missing BY NAME — never
+touching an entry, built-in or custom, already present — and skipping the
+write entirely when nothing was missing.
 
 **Never pre-quote `{name}`/`{home}`** — `backend.rs`'s module doc: both
 substitutions are already shell-single-quote-escaped
@@ -996,24 +1001,33 @@ DEFAULT backend, a fresh nix-deployed broker will fail every `age`-backed
 `bash`/`coreutils`/`qrencode` additions above already are, just not yet
 made for this new default.
 
-**A second, related deployment gap, closed PARTIALLY at P-G1 review
-(task #70, this commit) — reporting fixed, backfill still open.** An
-EXISTING deployment's `backends.json` predates P-G1 (`file` only, no
-`age` entry — seeding never touches an already-present file, "Backend
-presets" above), and `secrets add`'s new default records `backend: "age"`
-on a brand-new policy regardless. A `get`/`put` against that policy now
-correctly reports `unknown backend \`age\`` (the review fix:
-`backend::fetch_value`/`broker::put_gate` both confirm `age` is an
-actually-configured backend before doing anything `age`-specific, rather
-than assuming the name implies the seeded built-in) instead of the
-misleading "run `secrets put` to mint" hint, and a doomed `put` no longer
-mints a real identity first. **Still open:** there is no migration path
-that adds the `age`/`has` entries to an already-existing `backends.json`
-— an operator upgrading a live deployment must add them by hand (copy the
-`age` row above, plus `file`'s new `has` row, into the existing file) or
-delete `backends.json` for the broker to reseed both built-ins fresh on
-next start (safe only if no `pass`/`gopass`/`bw`/`sops` custom rows are
-already in it, since deletion loses those too).
+**A second, related deployment gap, reporting fixed at P-G1 review (task
+#70), CLOSED at P-G2 (task #72, this commit).** An EXISTING deployment's
+`backends.json` predates P-G1 (`file` only, no `age` entry — seeding never
+touches an already-present file, "Backend presets" above), and `secrets
+add`'s new default records `backend: "age"` on a brand-new policy
+regardless. P-G1 review made the resulting `get`/`put` against that policy
+report the true cause, `unknown backend \`age\`` (`backend::fetch_value`/
+`broker::put_gate` both confirm `age` is an actually-configured backend
+before doing anything `age`-specific, rather than assuming the name implies
+the seeded built-in) instead of the misleading "run `secrets put` to mint"
+hint, and stopped a doomed `put` from minting a real identity first — but
+left the underlying gap itself open: there was still no path that added the
+`age`/`has` entries to an already-existing `backends.json`.
+
+**P-G2 closes it automatically.** Every broker startup, `broker::serve` now
+calls `backend::backfill_missing_backends(secrets_home)` immediately after
+[`seed_default_backends`] — where seeding only ever acts on an ABSENT
+`backends.json`, backfill acts on an EXISTING one, adding whichever
+built-in entry (`file`/`age`) is missing BY NAME and never touching an
+entry — built-in or hand-customized, even one an operator wrote under the
+name `age` or `file` themselves — that's already present. A `backends.json`
+that already carries both built-ins is not rewritten at all (no gratuitous
+mtime churn); every other row (`pass`/`gopass`/`bw`/`sops` presets, any
+operator-named custom backend) rides through byte-for-byte. This means a
+broker restarted after upgrading past P-G1 self-heals its `backends.json`
+with no operator action — the "delete `backends.json` and lose your custom
+rows" workaround above is retired.
 
 ### Any other init (or none) — the non-nix install path
 
