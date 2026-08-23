@@ -65,9 +65,12 @@ rustPlatform.buildRustPackage {
   # says so; task #81 is the real fix). Under libtest's default parallelism
   # the sandbox check flaked for real: one test's AOIDE_SECRETS_BACKEND_
   # TIMEOUT=1 bled into a concurrently-running test's fetch and killed it
-  # mid-read (two failed deploy builds, 2026-08-23). libtest reads this env
-  # var directly; drop it when #81 lands an actual env lock.
-  RUST_TEST_THREADS = "1";
+  # mid-read (two failed deploy builds, 2026-08-23). A bare RUST_TEST_THREADS
+  # env var does NOT work here: cargoCheckHook passes an explicit
+  # `--test-threads=$NIX_BUILD_CORES`, which overrides the env (proven by a
+  # third failed build). This is the hook's own serialization switch; drop
+  # it when #81 lands an actual env lock.
+  dontUseCargoParallelTests = true;
 
   # P-A7 of the binary-split workstream: this one derivation now ships THREE
   # binaries (aoide, aoided, lyra — `lyra` lives in the separate `crates/lyra`
