@@ -633,20 +633,92 @@
   tail/adapter lives in `aoide-conduct`/`lyra`, reading FROM this crate's
   logs — never a new edge pointing the other way.
 - **The tail/adapter P-N3 left for a future phase LANDED at tracker #71
-  Part 1, IN THIS crate, not `aoide-conduct`/`lyra`** — `watch.rs` (the
-  seventh I/O module, invariant above) tail-follows the SAME mirrored log
-  P-N3 writes to and narrates its five events, plus prompts inline for a
-  parked ask when stdin is a terminal. This does NOT contradict the P-N3
+  Part 1, IN THIS crate, not `aoide-conduct`/`lyra`** — `watch.rs` (one of
+  the seven I/O modules, invariant above) tail-follows the SAME mirrored
+  log P-N3 writes to and narrates its five events, plus prompts inline for
+  a parked ask when stdin is a terminal. This does NOT contradict the P-N3
   note above ("never a new edge pointing the other way"): `watch` adds NO
   new dependency edge — it lives inside `aoide-secrets` itself and reaches
   `client::pending`/`approve`/`dismiss` the same way `commands.rs` already
-  does, never a socket into `aoide-conduct`/`herald`. A GRAPHICAL popup
-  (tracker #71 Part 2) is still the `aoide-conduct`/`lyra`-side consumer
-  P-N3 anticipated — it reads `secrets watch --json`'s stdout stream
-  rather than re-deriving this tail, so THAT future edge still only ever
-  points the one sanctioned direction (into this crate's output, never a
-  new dependency onto `herald`/`shellbridge`). See `README.md`'s "Watching
-  events" section for the full mechanism.
+  does, never a socket into `aoide-conduct`/`herald`. See `README.md`'s
+  "Watching events" section for the full mechanism. **Correction, tracker
+  #71 Part 2 (this commit): the graphical popup ALSO landed IN THIS
+  crate**, not as an `aoide-conduct`/`lyra`-side subscriber of `secrets
+  watch --json` the way this note originally anticipated — see the
+  invariant immediately below for why, and `README.md`'s "Popup mode"
+  section for the full mechanism.
+- **`--popup` (tracker #71 Part 2, this commit) is CORE, not a `lyra`/
+  desktop feature, and stays inside `watch.rs` — no new module, no new
+  crate dependency.** The root `AGENTS.md`'s own boundary line ("a
+  capability that works with only a shell and touches no paint is Aoide")
+  is why: `zenity` is a shell-out declared by NAME (`watch::ZENITY_CMD`),
+  the SAME feature-detection shape `enroll::render_qr` already uses for
+  `qrencode` — it is reachable from ANY shell with `zenity` on `PATH`, not
+  only a Quickshell/AoideOS session, so it belongs beside the tty prompt it
+  is an alternative to, not in `lyra`. A future RICE-SHAPED popup (matching
+  the desktop's own look, replacing zenity's default GTK chrome) would be
+  the `lyra`-side consumer of `secrets watch --json` this note originally
+  anticipated — `--popup` itself is not that, and does not block it.
+  **Codes never touch argv, in this popup path either** — `watch::
+  spawn_zenity_entry`'s `Command::new(zenity_cmd).args([...])` carries only
+  the dialog's TITLE and TEXT (secret name, consumer, remaining seconds,
+  all name-only, `README.md`'s own display-fields rule extended here); the
+  typed code arrives back over the CHILD's stdout pipe
+  (`run_zenity_entry`'s `child.stdout.take()`), never a command-line
+  argument, never a second process, never a temp file. Don't add a
+  `--totp`-shaped flag or an intermediate shell wrapper to this spawn path
+  that would put a code anywhere argv-visible — `client::approve` is
+  called with the code exactly the way the tty prompt already does.
+  **Popups are PARKED-ONLY, deliberately (User-flagged default)** —
+  `popup_loop` is only ever entered from a `parked` ask picked off the
+  SAME `Queue`/`pick_next` the tty prompt uses; `released`/`completed`/
+  `dismissed`/`expired` narrate on stdout in every mode (unchanged) but
+  never drive a dialog in ANY mode, popup included. Don't wire a second
+  event kind into `popup_loop`'s dialog trigger without re-deriving why
+  parked-only was chosen (the open Part-1 design question about a toast
+  storm from undeduped `released` events, resolved here by simply never
+  popping one up).
+  **Unlock gating is an OR of two probes, `watch::locked_state`, pure and
+  unit-tested with injected `Option<bool>`/`bool` — the two REAL probes
+  (`watch::probe_loginctl_locked`/`watch::probe_locker_running`) are thin
+  I/O wrappers this function never calls itself**, the same
+  clock-as-parameter split `unix_now()` already holds for the rest of this
+  module. `probe_locker_running` scans `/proc/<pid>/comm` for a name
+  configured by `AOIDE_SECRETS_LOCKER` (default `hyprlock`) — load-bearing,
+  not a redundant fallback, since the design doc verified hyprlock 0.9.6
+  sets no `LockedHint` at all; `probe_loginctl_locked` is still checked
+  first (OR'd, not replaced) so a locker that DOES set `LockedHint` is
+  still honored. An unanswerable probe (no session id, no `loginctl`, a
+  failed scan) reads as "not locked," never as "locked" — don't flip that
+  default; a false negative here only delays a dialog by one poll tick, a
+  false positive would silently show a code-entry dialog to whoever is
+  physically at a supposedly-locked screen.
+  **`watch::popup_action` orders near-expiry ahead of lock-wait, never the
+  reverse** — a dialog must not open below [`LOCKOUT_SECS`] EVEN IF the
+  screen happens to be unlocked at that instant, and an ask already too
+  late to show must never sit "waiting for unlock" either, since that
+  would only spend the time that's left doing nothing. Don't reorder this
+  check without re-deriving why (the pure `popup_action` unit tests assert
+  the ordering directly).
+  **A dialog left open for an ask that resolves ELSEWHERE gets killed by
+  its EXACT pid** — `watch::run_zenity_entry` holds the `std::process::
+  Child` it spawned and calls `child.kill()` on it directly (never a
+  re-derived pid from a stored integer, never a name/argv match) the
+  moment its own `should_cancel` closure (checking the SAME `Queue` the
+  tail thread mutates) reports the ask is gone. Don't replace this with a
+  polling check that merely stops WAITING for the child without killing
+  it — an orphaned zenity window left open for a completed ask is exactly
+  the failure mode this exists to close.
+  **`watch::run`'s zenity spawn path takes the binary name as a
+  parameter — never a hardcoded `Command::new("zenity")` inline at the
+  call site** — production passes the `watch::ZENITY_CMD` constant; this
+  crate's OWN tests pass a fake shim script's full path instead, so
+  `--popup`'s tests need no `PATH` mutation and no `env_lock` (unlike
+  `enroll::render_qr`'s older `PATH`-shim test). Don't inline
+  `Command::new("zenity")` into a new call site "since it's just one
+  string" — go through the same parameterized functions
+  (`spawn_zenity_entry`/`run_zenity_entry`/`zenity_available`) so a future
+  test can fake it the same way.
 
 **KNOWN GAP, deferred, not fixed by P-N2c:** backend `get`/`set` shell-outs
 (`backend::fetch_value`/`store_value`) have NO timeout — a wedged backend

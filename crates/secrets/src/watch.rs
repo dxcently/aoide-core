@@ -3,10 +3,33 @@
 //! narrates every broker event, and — when stdin is a terminal and `--json`
 //! is absent — prompts inline for each parked ask: approve with a hidden
 //! TOTP code, dismiss it outright, or ignore it (leaving it parked for any
-//! other terminal). This is the sixth I/O-carrying module in the crate
-//! (`AGENTS.md`'s "I/O is confined to six named modules" invariant, updated
-//! there in the same commit as this file) — `broker`/`client`/`store`/
-//! `backend`/`enroll` are the other five.
+//! other terminal). This is one of the seven I/O-carrying modules in the
+//! crate (`AGENTS.md`'s "I/O is confined to seven named modules" invariant)
+//! — `broker`/`client`/`store`/`backend`/`enroll` are the other five.
+//!
+//! **`--popup` (tracker #71 Part 2, this commit)** swaps the tty prompt for
+//! a `zenity --entry --hide-text` dialog on each parked ask — the CHILD's
+//! own stdout pipe carries the typed code straight into [`client::approve`],
+//! never argv (`Command::new`'s args carry only prompt TEXT, never the
+//! code). `zenity` is a runtime shell-out declared BY NAME (the plugin
+//! philosophy, root `AGENTS.md` house rule 7) — zero new Cargo dependencies,
+//! same feature-detection shape `enroll::render_qr` already uses for
+//! `qrencode`. Popups are UNLOCK-GATED ([`locked_state`]: `loginctl
+//! LockedHint` OR'd with a `/proc` scan for a named locker process, default
+//! `hyprlock` — `AOIDE_SECRETS_LOCKER` overrides it; the design doc verified
+//! hyprlock cannot set `LockedHint`, so the `/proc` half is load-bearing,
+//! not a redundant fallback) and PARKED-ONLY: `released`/`completed`/
+//! `dismissed`/`expired` never spawn a dialog, only narrate (same as every
+//! other mode) — a tight automation loop never becomes a toast storm. The
+//! near-expiry lockout ([`LOCKOUT_SECS`]) is enforced exactly as it is for
+//! the tty prompt: no dialog OPENS below it, and the remaining time is
+//! re-checked again after the dialog returns, before the code is sent. If
+//! an ask resolves elsewhere (another terminal, or its own timeout) while
+//! its dialog is open, [`run_zenity_entry`] kills that EXACT child by the
+//! `std::process::Child` handle it already holds (never a re-derived pid)
+//! and narrates. `--popup`+`--json` is a usage error (`commands::
+//! handle_secrets_watch`) — the two modes both own "how a parked ask is
+//! completed," and can't both drive it.
 //!
 //! **Why this crate, not a conductor pane.** Reaching the broker from
 //! `aoide-conductor` would add a NEW `aoide-conductor` → `aoide-secrets`
@@ -51,6 +74,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -272,6 +296,72 @@ pub fn code_prompt_allowed(ask: &Ask, now: u64) -> bool {
     ask.remaining(now) >= LOCKOUT_SECS
 }
 
+/// Which loop `run` drives, decided once from the three inputs that can
+/// ever disagree — pure and total, so every combination (including the
+/// `json_mode && popup_mode` one `commands::handle_secrets_watch` already
+/// refuses as a usage error before `run` is ever called) has a defined
+/// answer. `Json` wins over everything (the seam every future consumer
+/// subscribes to, README's "Watching events"); `Popup` wins over tty
+/// detection when `--json` is absent (design doc: "`--popup` with non-tty
+/// stdin is fine — dialogs replace prompts", so a popup session never falls
+/// back to narration-only just because stdin isn't a terminal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Json,
+    Popup,
+    InteractiveTty,
+    NarrationOnly,
+}
+
+pub fn select_mode(json_mode: bool, popup_mode: bool, stdin_tty: bool) -> Mode {
+    if json_mode {
+        Mode::Json
+    } else if popup_mode {
+        Mode::Popup
+    } else if stdin_tty {
+        Mode::InteractiveTty
+    } else {
+        Mode::NarrationOnly
+    }
+}
+
+/// The locked-state OR: `loginctl`'s own `LockedHint` (`None` when it can't
+/// answer — no session id, `loginctl` absent, a non-zero exit — treated as
+/// "doesn't say locked", never as "locked") OR'd with a named locker
+/// process's own liveness (design doc: hyprlock 0.9.6 carries no
+/// `SetLockedHint` symbol, so THIS half is load-bearing on this rig, not a
+/// redundant fallback). Pure — the two real probes ([`probe_loginctl_locked`]/
+/// [`probe_locker_running`]) are thin I/O wrappers this function never
+/// calls itself, the same clock-as-parameter split this module's own doc
+/// holds for `unix_now()`.
+pub fn locked_state(loginctl_locked: Option<bool>, locker_running: bool) -> bool {
+    loginctl_locked.unwrap_or(false) || locker_running
+}
+
+/// What `--popup`'s loop should do about the ask it just picked, given `now`
+/// and the CURRENT locked state — pure, so the ordering itself (near-expiry
+/// beats lock-wait, never the other way around) is unit-tested without a
+/// real screen lock. A dialog must never open below [`LOCKOUT_SECS`]
+/// regardless of lock state (design doc: "no dialog opens below the
+/// existing 10s lockout") — waiting for an unlock that might take minutes
+/// would only spend the ask's remaining time doing nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PopupAction {
+    Show,
+    WaitUnlock,
+    TooLateToShow,
+}
+
+pub fn popup_action(ask: &Ask, now: u64, locked: bool) -> PopupAction {
+    if !code_prompt_allowed(ask, now) {
+        PopupAction::TooLateToShow
+    } else if locked {
+        PopupAction::WaitUnlock
+    } else {
+        PopupAction::Show
+    }
+}
+
 // ── narration + `--json` rendering (pure) ───────────────────────────────
 
 fn hms(ts: u64) -> String {
@@ -396,6 +486,275 @@ impl Follower {
     }
 }
 
+// ── `--popup`: lock probes + the zenity dialog ──────────────────────────
+
+/// The locker process name `--popup`'s unlock gate scans `/proc` for —
+/// `AOIDE_SECRETS_LOCKER`, default `hyprlock` (module doc).
+fn locker_process_name() -> String {
+    std::env::var("AOIDE_SECRETS_LOCKER").unwrap_or_else(|_| "hyprlock".to_string())
+}
+
+/// `loginctl show-session <id> -p LockedHint --value`, gated on
+/// `$XDG_SESSION_ID` being set at all — `None` on any failure (no session
+/// id, `loginctl` missing, a non-zero exit, unparseable output), never an
+/// error: this is one OR term of [`locked_state`], and an unanswerable
+/// probe must read as "doesn't say locked," not "locked."
+fn probe_loginctl_locked() -> Option<bool> {
+    let session = std::env::var("XDG_SESSION_ID").ok()?;
+    let output = Command::new("loginctl")
+        .args(["show-session", &session, "-p", "LockedHint", "--value"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim() == "yes")
+}
+
+/// Is a process named `process_name` (its `/proc/<pid>/comm`, exact match
+/// after trimming) currently running? Best-effort: an unreadable `/proc`
+/// entry (a process that exited mid-scan, a permission gap) is skipped, not
+/// fatal — same "a probe that can't answer reads as false, never crashes
+/// the watcher" posture [`probe_loginctl_locked`] holds.
+fn probe_locker_running(process_name: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else { return false };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let comm_path = entry.path().join("comm");
+        if let Ok(comm) = std::fs::read_to_string(&comm_path) {
+            if comm.trim() == process_name {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The real locked-state read — wires the two probes above into
+/// [`locked_state`]. The only place either probe is called from `--popup`'s
+/// own loop.
+fn is_locked(locker_process: &str) -> bool {
+    locked_state(probe_loginctl_locked(), probe_locker_running(locker_process))
+}
+
+/// The default `zenity` binary name `run` spawns in production — tests pass
+/// a fake shim's own full path instead (this module's own test section),
+/// never mutate `PATH` (unlike `enroll::render_qr`'s test, which predates
+/// this pattern and still uses a `PATH` shim under `env_lock` — this
+/// function exists so `--popup`'s own tests need neither).
+const ZENITY_CMD: &str = "zenity";
+
+/// The `--extra-button` label `run_zenity_entry` recognizes as an explicit
+/// dismiss (design doc: "a second button ... never the window's close
+/// box"). Zenity's own contract: pressing an extra button exits non-zero
+/// (the SAME status a bare Cancel produces) but prints the button's own
+/// label to stdout instead of the entry's typed value — this is the one
+/// thing that tells the two apart.
+const DISMISS_LABEL: &str = "Dismiss ask";
+
+/// Outcome of one `zenity --entry --hide-text` round trip — never a bare
+/// `Result`, since "the user closed it" and "a wrong code" and "spawning it
+/// failed" are three different things the caller must react to
+/// differently.
+#[derive(Debug)]
+pub enum ZenityResult {
+    /// Exit 0 — the code the user typed, trimmed of exactly the one
+    /// trailing newline zenity's own stdout carries
+    /// ([`client::strip_one_trailing_newline`], reused verbatim — never a
+    /// blanket `.trim()`, this crate's own "exactly one, not a blanket
+    /// trim" discipline).
+    Approved(String),
+    /// Non-zero exit, stdout was the [`DISMISS_LABEL`] extra button.
+    Dismissed,
+    /// Non-zero exit, anything else — Cancel, Escape, or the window closed.
+    Cancelled,
+    /// The ask stopped being relevant (completed/dismissed/expired
+    /// elsewhere) WHILE the dialog sat open; the child was killed by its
+    /// exact pid before this returned.
+    CancelledExternally,
+    /// The `zenity` process could not be spawned or waited on at all.
+    SpawnError(String),
+}
+
+fn spawn_zenity_entry(zenity_cmd: &str, title: &str, text: &str) -> std::io::Result<Child> {
+    Command::new(zenity_cmd)
+        .args(["--entry", "--hide-text", "--title", title, "--text", text, "--extra-button", DISMISS_LABEL])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+}
+
+/// Run one zenity code-entry dialog to completion, polling every 200ms
+/// between the dialog's own exit and `should_cancel()` — the mechanism
+/// behind [`ZenityResult::CancelledExternally`] (module doc): `should_cancel`
+/// is the caller's own "is this ask still in the queue?" check, so an ask
+/// that resolves on another terminal while this dialog sits open gets its
+/// EXACT child killed via the `Child` handle this function already holds
+/// (never a re-derived pid, never a name match) rather than left orphaned
+/// on screen for an ask that no longer exists.
+fn run_zenity_entry(zenity_cmd: &str, title: &str, text: &str, mut should_cancel: impl FnMut() -> bool) -> ZenityResult {
+    let mut child = match spawn_zenity_entry(zenity_cmd, title, text) {
+        Ok(c) => c,
+        Err(e) => return ZenityResult::SpawnError(e.to_string()),
+    };
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut raw = String::new();
+                if let Some(mut out) = child.stdout.take() {
+                    let _ = out.read_to_string(&mut raw);
+                }
+                let out = client::strip_one_trailing_newline(raw);
+                return if status.success() {
+                    ZenityResult::Approved(out)
+                } else if out == DISMISS_LABEL {
+                    ZenityResult::Dismissed
+                } else {
+                    ZenityResult::Cancelled
+                };
+            }
+            Ok(None) => {
+                if should_cancel() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return ZenityResult::CancelledExternally;
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            Err(e) => return ZenityResult::SpawnError(e.to_string()),
+        }
+    }
+}
+
+/// A brief `zenity --error`, shown after a wrong code (design doc: "show a
+/// brief zenity --error ... and re-offer"). Blocks until the user closes it
+/// — deliberately no `--timeout`, so the message is never dismissed before
+/// it's read; the ask stays parked underneath regardless of how long this
+/// sits open, same as the tty path's own wrong-code retry.
+fn zenity_error_dialog(zenity_cmd: &str, text: &str) {
+    let _ = Command::new(zenity_cmd)
+        .args(["--error", "--text", text])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Feature-detect `zenity` at `--popup` startup (`run`'s first check) — the
+/// SAME shape [`enroll::render_qr`]'s own `qrencode` feature-detect uses,
+/// spawn failure IS the detection, never a separate "is it on PATH" probe.
+fn zenity_available(zenity_cmd: &str) -> bool {
+    Command::new(zenity_cmd).arg("--version").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok()
+}
+
+/// The `--popup` loop — main thread only, mirrors [`prompt_loop`]'s own
+/// shape (pick the next un-ignored ask, act, repeat) but drives a zenity
+/// dialog instead of reading `[a]`/`[d]`/`[i]` from stdin. `ignored` is the
+/// SAME "Cancel/close stops re-prompting for THIS ask, this session only"
+/// semantics `[i]` holds in [`prompt_loop`] (design doc: "Cancel/close =
+/// IGNORE") — without it, a cancelled dialog would reopen every ~200ms
+/// forever.
+fn popup_loop(socket_path: &Path, queue: &Arc<Mutex<Queue>>, out_lock: &Arc<Mutex<()>>, zenity_cmd: &str, locker_process: &str) {
+    let mut ignored: HashSet<String> = HashSet::new();
+    loop {
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            return;
+        }
+        let ask = {
+            let q = queue.lock().unwrap_or_else(|e| e.into_inner());
+            ignored.retain(|id| q.get(id).is_some());
+            pick_next(q.snapshot(), &ignored).cloned()
+        };
+        let Some(ask) = ask else {
+            thread::sleep(Duration::from_millis(200));
+            continue;
+        };
+
+        let now = unix_now();
+        match popup_action(&ask, now, is_locked(locker_process)) {
+            PopupAction::TooLateToShow => {
+                thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            PopupAction::WaitUnlock => {
+                thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+            PopupAction::Show => {}
+        }
+
+        let title = format!("aoide \u{b7} {}", ask.secret);
+        let text = format!("code for `{}` \u{2190} {} \u{00b7} {}s left", ask.secret, ask.consumer, ask.remaining(now).max(0));
+
+        let cancel_queue = Arc::clone(queue);
+        let cancel_id = ask.id.clone();
+        let result =
+            run_zenity_entry(zenity_cmd, &title, &text, || cancel_queue.lock().unwrap_or_else(|e| e.into_inner()).get(&cancel_id).is_none());
+
+        match result {
+            ZenityResult::Approved(code) => {
+                let still_parked = queue.lock().unwrap_or_else(|e| e.into_inner()).get(&ask.id).cloned();
+                let Some(current) = still_parked else {
+                    let _g = out_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    println!("  ask {} is no longer parked \u{2014} the code was NOT sent", ask.id);
+                    continue;
+                };
+                if !code_prompt_allowed(&current, unix_now()) {
+                    let _g = out_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    println!("  too little time left \u{2014} the code was NOT sent");
+                    continue;
+                }
+                let approved = client::approve(socket_path, &ask.id, &code);
+                if approved.is_ok() {
+                    queue.lock().unwrap_or_else(|e| e.into_inner()).remove(&ask.id);
+                }
+                {
+                    let _g = out_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    match &approved {
+                        Ok(()) => println!("  \u{2713} approved {} (popup) \u{2014} value released to the waiting caller", ask.id),
+                        Err(e) => println!("  \u{2717} invalid or already-used code \u{2014} the ask is STILL PARKED, nothing was spent ({e})"),
+                    }
+                }
+                if approved.is_err() {
+                    zenity_error_dialog(
+                        zenity_cmd,
+                        &format!("invalid code for `{}` \u{2014} the ask is still parked, try again", ask.secret),
+                    );
+                }
+            }
+            ZenityResult::Dismissed => {
+                let dismissed = client::dismiss(socket_path, &ask.id);
+                queue.lock().unwrap_or_else(|e| e.into_inner()).remove(&ask.id);
+                let _g = out_lock.lock().unwrap_or_else(|e| e.into_inner());
+                match dismissed {
+                    Ok(()) => println!("  dismissed ask {} (popup) \u{2014} the waiting caller gets a clean refusal", ask.id),
+                    Err(e) => println!("  could not dismiss ask {}: {e}", ask.id),
+                }
+            }
+            ZenityResult::Cancelled => {
+                ignored.insert(ask.id.clone());
+            }
+            ZenityResult::CancelledExternally => {
+                let _g = out_lock.lock().unwrap_or_else(|e| e.into_inner());
+                println!("  ask {} resolved elsewhere while its popup was open \u{2014} closing the dialog", ask.id);
+            }
+            ZenityResult::SpawnError(e) => {
+                let _g = out_lock.lock().unwrap_or_else(|e2| e2.into_inner());
+                println!("  aoide secrets watch --popup: spawning zenity for ask {}: {e}", ask.id);
+                drop(_g);
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
+    }
+}
+
 // ── P3/P4: the loop ──────────────────────────────────────────────────────
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -432,10 +791,14 @@ fn reconcile_once(socket_path: &Path, queue: &Mutex<Queue>) {
 }
 
 /// Print one event (narration or `--json`), under the output lock, and — if
-/// a prompt is currently open — reprint its header underneath so the
-/// operator's own open prompt is never lost in the scrollback (design
-/// doc's "1.3 Signal flow").
-fn emit_event(event: &Event, json_mode: bool, out_lock: &Mutex<()>, queue: &Mutex<Queue>, prompt_header: &Mutex<Option<String>>) {
+/// a prompt is currently open — reprint the FULL prompt frame (header,
+/// options line, and the `└ > ` entry marker — never just the header)
+/// underneath, so an async narration line can never leave the operator's
+/// own open prompt looking like just a bare header with no way to tell what
+/// `[a]`/`[d]`/`[i]` even do (review rider: "reprint the full prompt frame,
+/// not just the header line" — design doc's "1.3 Signal flow" ASCII already
+/// shows the full block reprinted this way).
+fn emit_event(event: &Event, json_mode: bool, out_lock: &Mutex<()>, queue: &Mutex<Queue>, prompt_frame: &Mutex<Option<String>>) {
     let _g = out_lock.lock().unwrap_or_else(|e| e.into_inner());
     if json_mode {
         println!("{}", event_to_json(event));
@@ -449,9 +812,9 @@ fn emit_event(event: &Event, json_mode: bool, out_lock: &Mutex<()>, queue: &Mute
             println!("            (queued \u{2014} {} ask(s) waiting behind this one)", n - 1);
         }
     }
-    if let Some(header) = prompt_header.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+    if let Some(frame) = prompt_frame.lock().unwrap_or_else(|e| e.into_inner()).clone() {
         println!();
-        println!("{header}");
+        print!("{frame}");
     }
     let _ = std::io::stdout().flush();
 }
@@ -464,7 +827,7 @@ fn print_farewell(queue: &Mutex<Queue>, out_lock: &Mutex<()>) {
     let _ = std::io::stdout().flush();
 }
 
-fn tail_loop(mut follower: Follower, socket_path: PathBuf, queue: Arc<Mutex<Queue>>, out_lock: Arc<Mutex<()>>, prompt_header: Arc<Mutex<Option<String>>>, json_mode: bool) -> ! {
+fn tail_loop(mut follower: Follower, socket_path: PathBuf, queue: Arc<Mutex<Queue>>, out_lock: Arc<Mutex<()>>, prompt_frame: Arc<Mutex<Option<String>>>, json_mode: bool) -> ! {
     let mut ticks_since_reconcile: u32 = 0;
     loop {
         if INTERRUPTED.load(Ordering::SeqCst) {
@@ -479,7 +842,7 @@ fn tail_loop(mut follower: Follower, socket_path: PathBuf, queue: Arc<Mutex<Queu
                         let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
                         q.apply(&event);
                     }
-                    emit_event(&event, json_mode, &out_lock, &queue, &prompt_header);
+                    emit_event(&event, json_mode, &out_lock, &queue, &prompt_frame);
                     reconcile_once(&socket_path, &queue);
                 }
             }
@@ -502,8 +865,22 @@ fn format_prompt_header(ask: &Ask, remaining: i64, closed: bool, queued: usize) 
     format!("\u{250c} ask {} \u{2500} {} \u{2190} {} \u{2500} asked {asked} \u{2500} {left}{tail}", ask.id, ask.secret, ask.consumer)
 }
 
-fn clear_header(prompt_header: &Mutex<Option<String>>) {
-    *prompt_header.lock().unwrap_or_else(|e| e.into_inner()) = None;
+/// The FULL prompt block `emit_event` reprints verbatim after an async
+/// narration line (this module's own "reprint the full frame" rider,
+/// `emit_event`'s doc) — `header`, the options-or-closed line, and the
+/// `└ > ` entry marker, ending WITHOUT a trailing newline so the cursor
+/// sits ready for input exactly where it would after the original print.
+fn format_prompt_frame(header: &str, closed: bool) -> String {
+    let options = if closed {
+        "\u{2502} too little time left to type a code safely \u{2014} [d] dismiss  [i] ignore"
+    } else {
+        "\u{2502} [a] approve (enter code)   [d] dismiss the ask   [i] ignore (stays parked)"
+    };
+    format!("{header}\n{options}\n\u{2514} > ")
+}
+
+fn clear_prompt_frame(prompt_frame: &Mutex<Option<String>>) {
+    *prompt_frame.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// The interactive prompt loop — main thread only, only when stdin is a
@@ -512,7 +889,7 @@ fn clear_header(prompt_header: &Mutex<Option<String>>) {
 /// block, and reads ONE line for `[a]`/`[d]`/`[i]` — never raw single-key
 /// (design doc's "1.5 Prompt flow": works over ssh, no terminal-state
 /// restoration risk).
-fn prompt_loop(socket_path: &Path, queue: &Arc<Mutex<Queue>>, out_lock: &Arc<Mutex<()>>, prompt_header: &Arc<Mutex<Option<String>>>) {
+fn prompt_loop(socket_path: &Path, queue: &Arc<Mutex<Queue>>, out_lock: &Arc<Mutex<()>>, prompt_frame: &Arc<Mutex<Option<String>>>) {
     let mut ignored: HashSet<String> = HashSet::new();
     loop {
         if INTERRUPTED.load(Ordering::SeqCst) {
@@ -534,17 +911,12 @@ fn prompt_loop(socket_path: &Path, queue: &Arc<Mutex<Queue>>, out_lock: &Arc<Mut
         let remaining = ask.remaining(now);
         let closed = !code_prompt_allowed(&ask, now);
         let header = format_prompt_header(&ask, remaining, closed, queued);
+        let frame = format_prompt_frame(&header, closed);
         {
             let _g = out_lock.lock().unwrap_or_else(|e| e.into_inner());
-            *prompt_header.lock().unwrap_or_else(|e| e.into_inner()) = Some(header.clone());
+            *prompt_frame.lock().unwrap_or_else(|e| e.into_inner()) = Some(frame.clone());
             println!();
-            println!("{header}");
-            if closed {
-                println!("\u{2502} too little time left to type a code safely \u{2014} [d] dismiss  [i] ignore");
-            } else {
-                println!("\u{2502} [a] approve (enter code)   [d] dismiss the ask   [i] ignore (stays parked)");
-            }
-            print!("\u{2514} > ");
+            print!("{frame}");
             let _ = std::io::stdout().flush();
         }
 
@@ -552,7 +924,7 @@ fn prompt_loop(socket_path: &Path, queue: &Arc<Mutex<Queue>>, out_lock: &Arc<Mut
         let read = std::io::stdin().lock().read_line(&mut line);
         match read {
             Ok(0) | Err(_) => {
-                clear_header(prompt_header);
+                clear_prompt_frame(prompt_frame);
                 return; // EOF or a read error: leave the watcher cleanly.
             }
             Ok(_) => {}
@@ -582,7 +954,7 @@ fn prompt_loop(socket_path: &Path, queue: &Arc<Mutex<Queue>>, out_lock: &Arc<Mut
                 println!("  unrecognized \u{2014} [a] approve  [d] dismiss  [i] ignore");
             }
         }
-        clear_header(prompt_header);
+        clear_prompt_frame(prompt_frame);
     }
 }
 
@@ -632,28 +1004,74 @@ fn handle_approve(socket_path: &Path, ask: &Ask, queue: &Arc<Mutex<Queue>>, out_
     }
 }
 
+/// Wait for `audit_log` to exist, narrating the wait exactly once, then
+/// open it at EOF — review rider: on a brand-new host the mirrored log may
+/// not exist yet at `secrets watch` startup, and exiting 1 immediately
+/// (the pre-rider behavior) is needlessly hostile when the fix is just "the
+/// broker hasn't written its first line yet, wait a moment." Only
+/// [`std::io::ErrorKind::NotFound`] waits — a PERMISSION error or anything
+/// else still fails immediately (`Err(1)`), same as before this rider: a
+/// wait would only mislead when the log exists but can't be read. `Err(0)`
+/// means Ctrl-C landed while waiting — a clean exit, not a failure.
+/// `poll_interval` is a parameter (never a bare `Duration::from_secs(1)`
+/// inline) so the tempfile test below doesn't have to spend real seconds
+/// waiting on it.
+fn wait_for_follower(audit_log: &Path, poll_interval: Duration) -> Result<Follower, i32> {
+    let mut narrated = false;
+    loop {
+        match Follower::open_at_end(audit_log) {
+            Ok(f) => return Ok(f),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !narrated {
+                    eprintln!("aoide secrets watch: waiting for the log to appear at {}", audit_log.display());
+                    narrated = true;
+                }
+            }
+            Err(e) => {
+                eprintln!("aoide secrets watch: opening {}: {e}", audit_log.display());
+                return Err(1);
+            }
+        }
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            return Err(0);
+        }
+        thread::sleep(poll_interval);
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            return Err(0);
+        }
+    }
+}
+
 /// The full `aoide secrets watch` verb — foreground, blocks until Ctrl-C or
-/// (in the interactive prompt) stdin EOF. `audit_log`/`socket_path` are
-/// resolved ONCE by the caller and passed in (this crate's own
+/// (in the interactive/`--popup` loops) stdin EOF. `audit_log`/`socket_path`
+/// are resolved ONCE by the caller and passed in (this crate's own
 /// `home`/`socket` resolution discipline, `AGENTS.md`) — this function
 /// never re-derives either. `json_mode` forces narration-only regardless of
-/// tty (module doc); otherwise narration-only is whatever
-/// `client::stdin_is_tty` says.
-pub fn run(socket_path: &Path, audit_log: &Path, json_mode: bool) -> i32 {
-    let follower = match Follower::open_at_end(audit_log) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("aoide secrets watch: opening {}: {e}", audit_log.display());
-            return 1;
-        }
-    };
+/// tty (module doc); `popup_mode` (`--popup`, mutually exclusive with
+/// `json_mode` — `commands::handle_secrets_watch` refuses the combination
+/// before this function is ever called) swaps the tty prompt for a zenity
+/// dialog and runs regardless of whether stdin is a terminal. See
+/// [`select_mode`] for the exact precedence between the three.
+pub fn run(socket_path: &Path, audit_log: &Path, json_mode: bool, popup_mode: bool) -> i32 {
+    if popup_mode && !zenity_available(ZENITY_CMD) {
+        eprintln!(
+            "aoide secrets watch --popup: `zenity` not found on PATH \u{2014} install zenity, or run \
+             `aoide secrets watch` (without --popup) instead"
+        );
+        return 1;
+    }
 
     install_sigint_handler();
 
+    let follower = match wait_for_follower(audit_log, Duration::from_secs(1)) {
+        Ok(f) => f,
+        Err(code) => return code,
+    };
+
     let queue = Arc::new(Mutex::new(Queue::new()));
     let out_lock = Arc::new(Mutex::new(()));
-    let prompt_header: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let interactive = !json_mode && client::stdin_is_tty();
+    let prompt_frame: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let mode = select_mode(json_mode, popup_mode, client::stdin_is_tty());
 
     if !json_mode {
         println!("watching secret events \u{2014} ^C to leave (parked asks stay parked)");
@@ -668,16 +1086,23 @@ pub fn run(socket_path: &Path, audit_log: &Path, json_mode: bool) -> i32 {
         let socket_path = socket_path.to_path_buf();
         let queue = Arc::clone(&queue);
         let out_lock = Arc::clone(&out_lock);
-        let prompt_header = Arc::clone(&prompt_header);
-        thread::spawn(move || tail_loop(follower, socket_path, queue, out_lock, prompt_header, json_mode))
+        let prompt_frame = Arc::clone(&prompt_frame);
+        thread::spawn(move || tail_loop(follower, socket_path, queue, out_lock, prompt_frame, json_mode))
     };
 
-    if interactive {
-        prompt_loop(socket_path, &queue, &out_lock, &prompt_header);
-        0
-    } else {
-        let _ = tail_handle.join();
-        0
+    match mode {
+        Mode::Popup => {
+            popup_loop(socket_path, &queue, &out_lock, ZENITY_CMD, &locker_process_name());
+            0
+        }
+        Mode::InteractiveTty => {
+            prompt_loop(socket_path, &queue, &out_lock, &prompt_frame);
+            0
+        }
+        Mode::Json | Mode::NarrationOnly => {
+            let _ = tail_handle.join();
+            0
+        }
     }
 }
 
@@ -1021,5 +1446,197 @@ mod tests {
         let mut f = Follower::open_at_end(&path).unwrap();
         assert_eq!(f.poll().unwrap(), Vec::<String>::new(), "must never re-read from the start");
         std::fs::remove_file(&path).ok();
+    }
+
+    // ── wait_for_follower (review rider: wait, don't exit 1) ─────────
+
+    #[test]
+    fn wait_for_follower_blocks_until_the_log_appears_then_opens_it() {
+        let path = tmp_path("wait-for-log");
+        assert!(!path.exists(), "precondition: the log must not exist yet");
+        let path2 = path.clone();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(60));
+            std::fs::write(&path2, b"hello\n").unwrap();
+        });
+        let result = wait_for_follower(&path, Duration::from_millis(10));
+        writer.join().unwrap();
+        assert!(result.is_ok(), "expected wait_for_follower to open the log once it appeared");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn wait_for_follower_returns_ok_immediately_when_the_log_already_exists() {
+        let path = tmp_path("wait-for-log-present");
+        std::fs::write(&path, b"already here\n").unwrap();
+        let result = wait_for_follower(&path, Duration::from_secs(30));
+        assert!(result.is_ok());
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ── select_mode (the popup/tty mode selection, pure) ─────────────
+
+    #[test]
+    fn select_mode_json_wins_over_popup_and_tty() {
+        assert_eq!(select_mode(true, true, true), Mode::Json);
+        assert_eq!(select_mode(true, false, false), Mode::Json);
+    }
+
+    #[test]
+    fn select_mode_popup_wins_over_tty_detection_when_json_is_absent() {
+        assert_eq!(select_mode(false, true, true), Mode::Popup);
+        assert_eq!(select_mode(false, true, false), Mode::Popup, "--popup on a non-tty stdin still drives the popup loop");
+    }
+
+    #[test]
+    fn select_mode_interactive_tty_when_neither_json_nor_popup() {
+        assert_eq!(select_mode(false, false, true), Mode::InteractiveTty);
+    }
+
+    #[test]
+    fn select_mode_narration_only_on_a_pipe_with_no_popup() {
+        assert_eq!(select_mode(false, false, false), Mode::NarrationOnly);
+    }
+
+    // ── locked_state (the OR logic, injected probes) ─────────────────
+
+    #[test]
+    fn locked_state_true_when_loginctl_says_locked() {
+        assert!(locked_state(Some(true), false));
+    }
+
+    #[test]
+    fn locked_state_true_when_the_locker_process_is_running_even_if_loginctl_disagrees() {
+        assert!(locked_state(Some(false), true));
+    }
+
+    #[test]
+    fn locked_state_true_when_loginctl_cant_answer_but_the_locker_process_is_running() {
+        assert!(locked_state(None, true));
+    }
+
+    #[test]
+    fn locked_state_false_when_neither_signal_says_locked() {
+        assert!(!locked_state(Some(false), false));
+        assert!(!locked_state(None, false));
+    }
+
+    // ── popup_action (dialog-allowed gating, pure) ────────────────────
+
+    fn popup_ask(timeout_secs: u64) -> Ask {
+        Ask { id: "1".into(), secret: "t".into(), consumer: "m".into(), requested_at: 0, timeout_secs, estimated: false }
+    }
+
+    #[test]
+    fn popup_action_shows_when_unlocked_and_well_within_time() {
+        assert_eq!(popup_action(&popup_ask(300), 0, false), PopupAction::Show);
+    }
+
+    #[test]
+    fn popup_action_waits_for_unlock_when_locked_but_in_time() {
+        assert_eq!(popup_action(&popup_ask(300), 0, true), PopupAction::WaitUnlock);
+    }
+
+    #[test]
+    fn popup_action_refuses_below_the_lockout_regardless_of_lock_state() {
+        // 5s remaining is below LOCKOUT_SECS (10) — must never show OR wait,
+        // since waiting for an unlock would only spend the time that's left.
+        assert_eq!(popup_action(&popup_ask(5), 0, false), PopupAction::TooLateToShow);
+        assert_eq!(popup_action(&popup_ask(5), 0, true), PopupAction::TooLateToShow);
+    }
+
+    // ── zenity_available / run_zenity_entry (fake-zenity shims) ──────
+    //
+    // Every shim here is a full path handed directly to `run_zenity_entry`/
+    // `zenity_available` as `zenity_cmd` — never a `PATH` mutation (module
+    // doc: this is exactly why `run`'s `zenity_cmd` parameter exists,
+    // distinct from `enroll::render_qr`'s older `PATH`-shim precedent,
+    // which needs `env_lock` because `PATH` is process-global and cargo
+    // test runs in parallel threads). No `env_lock` needed here for that
+    // reason.
+
+    fn write_shim(tag: &str, script: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aoide-secrets-watch-zenity-shim-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("zenity-shim");
+        std::fs::write(&shim, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        shim
+    }
+
+    fn remove_shim(shim: &Path) {
+        if let Some(dir) = shim.parent() {
+            std::fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    #[test]
+    fn zenity_available_is_false_for_a_binary_name_that_does_not_exist() {
+        assert!(!zenity_available("aoide-secrets-watch-test-definitely-not-a-real-binary"));
+    }
+
+    #[test]
+    fn zenity_available_is_true_when_the_shim_spawns_and_exits_zero() {
+        let shim = write_shim("version", "#!/bin/sh\necho zenity 3.99.0\nexit 0\n");
+        assert!(zenity_available(shim.to_str().unwrap()));
+        remove_shim(&shim);
+    }
+
+    #[test]
+    fn run_zenity_entry_returns_the_typed_code_on_exit_zero() {
+        let shim = write_shim("approve", "#!/bin/sh\necho 654321\nexit 0\n");
+        let result = run_zenity_entry(shim.to_str().unwrap(), "t", "x", || false);
+        match result {
+            ZenityResult::Approved(code) => assert_eq!(code, "654321"),
+            other => panic!("expected Approved(\"654321\"), got {other:?}"),
+        }
+        remove_shim(&shim);
+    }
+
+    #[test]
+    fn run_zenity_entry_recognizes_the_dismiss_extra_button_by_its_label() {
+        let shim = write_shim("dismiss", "#!/bin/sh\necho 'Dismiss ask'\nexit 1\n");
+        let result = run_zenity_entry(shim.to_str().unwrap(), "t", "x", || false);
+        assert!(matches!(result, ZenityResult::Dismissed), "expected Dismissed, got {result:?}");
+        remove_shim(&shim);
+    }
+
+    #[test]
+    fn run_zenity_entry_treats_a_bare_cancel_as_cancelled_not_dismissed() {
+        let shim = write_shim("cancel", "#!/bin/sh\nexit 1\n");
+        let result = run_zenity_entry(shim.to_str().unwrap(), "t", "x", || false);
+        assert!(matches!(result, ZenityResult::Cancelled), "expected Cancelled, got {result:?}");
+        remove_shim(&shim);
+    }
+
+    #[test]
+    fn run_zenity_entry_reports_a_spawn_error_for_a_nonexistent_shim() {
+        let result = run_zenity_entry("/no/such/aoide-secrets-watch-zenity-shim", "t", "x", || false);
+        assert!(matches!(result, ZenityResult::SpawnError(_)), "expected SpawnError, got {result:?}");
+    }
+
+    /// Proves the "kill by its EXACT pid" mechanism (module doc,
+    /// [`ZenityResult::CancelledExternally`]): a shim that sleeps far longer
+    /// than this test's own timeout must still be killed and this call must
+    /// still return promptly, once `should_cancel` starts returning `true`
+    /// — never left waiting out the shim's own sleep.
+    #[test]
+    fn run_zenity_entry_kills_the_exact_child_when_the_ask_resolves_elsewhere() {
+        let shim = write_shim("longsleep", "#!/bin/sh\nsleep 30\necho should-not-appear\nexit 0\n");
+        let mut polls = 0u32;
+        let start = std::time::Instant::now();
+        let result = run_zenity_entry(shim.to_str().unwrap(), "t", "x", || {
+            polls += 1;
+            polls >= 2 // cancel on the second poll tick, well before the 30s sleep would finish
+        });
+        let elapsed = start.elapsed();
+        assert!(matches!(result, ZenityResult::CancelledExternally), "expected CancelledExternally, got {result:?}");
+        assert!(elapsed < Duration::from_secs(10), "should_cancel should have killed the sleeping shim promptly, took {elapsed:?}");
+        remove_shim(&shim);
     }
 }

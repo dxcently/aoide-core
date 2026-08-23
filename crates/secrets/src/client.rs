@@ -503,7 +503,12 @@ pub(crate) fn stdin_is_tty() -> bool {
 /// one character and nothing else a pasted value might legitimately end
 /// with. Pure and total, so it is the "small seam" the tty path's own
 /// termios dance is tested through, per this module's own doc.
-fn strip_one_trailing_newline(mut s: String) -> String {
+///
+/// `pub(crate)`: `watch.rs`'s `--popup` zenity-entry reader trims its own
+/// dialog output through this SAME function (the "reach into the existing
+/// seam, never fork a second trim" discipline `stdin_is_tty`/
+/// `read_hidden_line` already established when `watch` needed them).
+pub(crate) fn strip_one_trailing_newline(mut s: String) -> String {
     if s.ends_with('\n') {
         s.pop();
     }

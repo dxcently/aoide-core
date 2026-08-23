@@ -114,9 +114,12 @@
 //!   surface (`crate::watch`'s own module doc has the full mechanism).
 //!   [`handle_secrets_watch`] only gates the door (CLI-only, same
 //!   [`require_cli`] as `pending`/`approve`/`dismiss` — no admin-identity
-//!   check, same reasoning) and records the launch; the blocking loop
-//!   itself (`crate::watch::run`) is special-cased from `cli`'s `special`
-//!   hook the SAME way `serve`/`exec`/`enroll` already are.
+//!   check, same reasoning), refuses `--popup`+`--json` together as a usage
+//!   error (tracker #71 Part 2, this commit — the `--popup` flag is
+//!   registered on this same `cmd!` entry), and records the launch; the
+//!   blocking loop itself (`crate::watch::run`) is special-cased from
+//!   `cli`'s `special` hook the SAME way `serve`/`exec`/`enroll` already
+//!   are.
 //!
 //! `add`/`rm`/`grant`/`revoke`/`enroll` run AS THE SECRETS USER in deployment
 //! (`sudo -u aoide-secrets ...`, wrapped by the nix module at P-V4), but the
@@ -336,13 +339,17 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["secrets", "watch"],
-        summary: "Foreground, line-mode watcher: tail-follows the mirrored aoide log and narrates every broker event (released/parked/completed/dismissed/expired). On a terminal, also prompts inline for each parked ask — [a]pprove with a hidden TOTP code, [d]ismiss, or [i]gnore (stays parked). --json emits one event object per line instead, narration-only, the seam a future popup helper subscribes to. CLI-only, operator-side (same door gate as pending/approve/dismiss) — blocks until Ctrl-C.",
+        summary: "Foreground, line-mode watcher: tail-follows the mirrored aoide log and narrates every broker event (released/parked/completed/dismissed/expired). On a terminal, also prompts inline for each parked ask — [a]pprove with a hidden TOTP code, [d]ismiss, or [i]gnore (stays parked). --json emits one event object per line instead, narration-only. --popup swaps the terminal prompt for a zenity code-entry dialog on each parked ask (unlock-gated, parked-only; requires zenity on PATH) — mutually exclusive with --json. CLI-only, operator-side (same door gate as pending/approve/dismiss) — blocks until Ctrl-C.",
         args: [],
-        flags: [],
+        flags: [flag!(
+            "popup",
+            "bool",
+            "Surface each parked ask as a zenity --entry --hide-text dialog instead of the terminal's [a]/[d]/[i] prompt. Unlock-gated (holds the dialog while the session is locked, via loginctl LockedHint OR'd with an AOIDE_SECRETS_LOCKER /proc scan, default `hyprlock`) and parked-only (released/completed/dismissed/expired still narrate, never popup). Requires zenity on PATH. Mutually exclusive with --json."
+        )],
         gated: false,
         implemented: true,
         handler: handle_secrets_watch,
-        examples: ["secrets watch", "secrets watch --json"],
+        examples: ["secrets watch", "secrets watch --json", "secrets watch --popup"],
     ));
 }
 
@@ -883,14 +890,24 @@ fn handle_secrets_dismiss(inv: &Invocation) -> Outcome {
 /// [`require_cli`] as `pending`/`approve`/`dismiss` — NOT
 /// [`require_admin_identity`], since watch touches no `policy.json` either,
 /// only the mirrored log and the broker's in-memory registry over the
-/// socket) and records the launch through the single audit log; the actual
-/// foreground loop (`crate::watch::run`) is dispatched from `cli`'s
-/// `special` hook, blocking forever until Ctrl-C — see that crate's `run_cli`
-/// doc comment and `crate::watch`'s own module doc.
+/// socket), refuses the `--popup`+`--json` combination as a usage error
+/// (tracker #71 Part 2 — the two modes both own "how a parked ask gets
+/// completed" and can't both drive it), and records the launch through the
+/// single audit log; the actual foreground loop (`crate::watch::run`) is
+/// dispatched from `cli`'s `special` hook, blocking forever until Ctrl-C —
+/// see that crate's `run_cli` doc comment and `crate::watch`'s own module
+/// doc.
 fn handle_secrets_watch(inv: &Invocation) -> Outcome {
     let cmd = "secrets.watch";
     if let Some(hint) = require_cli(inv, cmd) {
         return hint;
+    }
+    if inv.flag_present("popup") && inv.flag_present("json") {
+        return Outcome::usage(
+            cmd,
+            "secrets watch: --popup and --json are mutually exclusive — --popup replaces the terminal prompt \
+             with a zenity dialog, --json emits narration-only machine-readable lines; pick one",
+        );
     }
     Outcome::ok(cmd, "watching secret events")
 }
@@ -990,6 +1007,24 @@ mod tests {
         assert_eq!(handle_secrets_watch(&watch).status, Status::Usage);
         let watch_cli = inv(Door::Cli, &["secrets", "watch"], &[], &[]);
         assert_eq!(handle_secrets_watch(&watch_cli).status, Status::Ok);
+    }
+
+    /// `--popup`+`--json` (tracker #71 Part 2, this commit): the two modes
+    /// both own "how a parked ask gets completed" and can't both drive it —
+    /// refused as a usage error before `watch::run` is ever reached.
+    /// `--popup` alone, or `--json` alone, are both still fine.
+    #[test]
+    fn watch_refuses_popup_and_json_together_as_a_usage_error() {
+        let both = inv(Door::Cli, &["secrets", "watch"], &[], &[("popup", "true"), ("json", "true")]);
+        let out = handle_secrets_watch(&both);
+        assert_eq!(out.status, Status::Usage);
+        assert!(out.message.contains("--popup") && out.message.contains("--json"), "{}", out.message);
+
+        let popup_only = inv(Door::Cli, &["secrets", "watch"], &[], &[("popup", "true")]);
+        assert_eq!(handle_secrets_watch(&popup_only).status, Status::Ok);
+
+        let json_only = inv(Door::Cli, &["secrets", "watch"], &[], &[("json", "true")]);
+        assert_eq!(handle_secrets_watch(&json_only).status, Status::Ok);
     }
 
     #[test]
