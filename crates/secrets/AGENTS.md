@@ -486,6 +486,72 @@
   Don't merge the two into one function or reorder them; a caller
   (`broker::serve`, and only `broker::serve` — the ONE seeding/backfill
   site) always calls both, in that order.
+- **`secrets migrate` is an EXPLICIT, operator-invoked action — never an
+  automatic upgrade of an old policy's `backend` field (P-G2, task #72).**
+  This does not contradict the DEFAULT-FLIP invariant above ("this flip
+  changes a future default, never a past record... don't special-case an
+  upgrade migration anywhere") — that invariant forbids `secrets add`'s
+  default flip from silently rewriting an EXISTING policy; `secrets
+  migrate` is the opposite of silent: a named admin verb an operator runs
+  on purpose, against a name they typed, gated by the same admin-identity
+  check every other CRUD verb holds. Don't wire anything (a startup hook,
+  a `set-totp`/`automate`/`expose` side effect, `backfill_missing_backends`
+  itself) to call migrate's logic automatically for any policy — every
+  migration is a deliberate, one-secret, operator-typed command.
+- **`secrets migrate`'s value NEVER crosses a wire and lives ONLY as a
+  local `String` inside `commands::handle_secrets_migrate` (P-G2, task
+  #72).** Unlike `put`/`resolve`/`approve`, migrate is a DIRECT-HOME admin
+  verb (mirrors `add`/`rm`/`grant` exactly, `commands.rs`'s own door
+  taxonomy) — it never touches the broker's unix socket at all, so there
+  is no wire reply to keep value-free the way `put`'s/`resolve`'s own
+  replies must be; the discipline here is instead that the value never
+  becomes an `Outcome` field, an audit line, or an error string, from the
+  `backend::fetch_value` call that produces it straight through to the
+  `backend::store_value` call that consumes it and drops it.
+- **`secrets migrate`'s ordering is: fetch → (maybe mint) → store on the
+  TARGET → flip + save `policy.json` → remove the OLD value LAST, and ONLY
+  ever in that order (P-G2, task #72, hard constraint).** Any failure
+  BEFORE the policy save leaves everything untouched — the old value in
+  place, `policy.json` unflipped. Removing the old value only ever happens
+  AFTER the policy flip has already durably saved; a removal failure (or a
+  source backend this crate can't derive a path for) is reported honestly
+  in the success message but never rolls back the already-successful
+  migration and never blocks it. Don't reorder this — removing the old
+  value before the new one is confirmed stored, or before the policy flip
+  is saved, would leave a WINDOW where neither backend has a value the
+  policy can resolve.
+- **Old-value removal is BUILT-IN-SOURCE-ONLY and PATH-DERIVED, never a
+  guess (P-G2, task #72).** `backend::remove_builtin_value` recognizes
+  exactly two source backend names — `file` (`<home>/store/<key>`) and
+  `age` (`<home>/values/<key>.age`), the SAME paths `FILE_BACKEND_SET`/
+  `AGE_BACKEND_SET` themselves write to — and returns `None` for any other
+  backend name, built-in or not (a `pass`/`gopass`/`bw`/`sops` row, or an
+  operator-custom entry). `<key>` is the policy's own `key` field (what a
+  template's `{name}` placeholder substitutes — `backend.rs`'s module
+  doc), never the secret's display `name`. Don't add a third built-in path
+  here without also adding a real seeded backend for it (`backend.rs`'s
+  own "the only backend IMPLEMENTATIONS this crate supports" stance) —
+  this function must never derive a path for a backend the crate doesn't
+  actually seed and know the on-disk shape of.
+- **`secrets migrate` is euid-guarded exactly like `add`/`rm`/`grant`, and
+  runs with NO cross-process lock against a concurrently-running broker
+  daemon (P-G2, task #72, KNOWN LIMITATION, deliberate, not fixed here).**
+  `require_admin_identity(cmd, "migrate")` gates it the same way as every
+  other CRUD-shaped admin verb; but because migrate is a direct-home
+  op — a separate OS process from `secrets serve`, never the daemon itself
+  — it CANNOT take the daemon's own in-process `broker::put_lock` (a
+  `static Mutex` is per-process memory; a second process has no way to
+  observe or wait on it). A `secrets migrate` racing a live `secrets
+  put`/`secrets exec` against the SAME secret via the running daemon is an
+  unprotected TOCTOU window, the same class of gap `store::save_policies`'s
+  own module doc already accepts for every other admin CRUD verb here
+  ("this phase does not lock against a concurrent admin write racing a
+  resolve read"). Don't paper over this by acquiring `broker::put_lock`
+  from `commands.rs` "for symmetry" — doing so would protect nothing (two
+  different `Mutex` instances in two different processes) while implying a
+  guarantee that doesn't exist. Closing this for real needs a real
+  cross-process primitive (a file lock) this crate does not have today —
+  out of scope here, flagged for whoever picks it up next.
 
 ## Extension points
 
@@ -845,12 +911,23 @@
   side effect first. **Superseded at P-G2 (task #72, below): the backfill
   gap this bullet names is now closed, additively.**
 - **The deployment gap LANDED at P-G1/P-G1-review is CLOSED at P-G2 (task
-  #72, this commit).** `backend::backfill_missing_backends` (invariants
-  above) runs at `broker::serve`'s startup immediately after
-  `seed_default_backends` — an EXISTING `backends.json` now gains any
-  missing built-in entry by name on every broker start, with no operator
-  action, and no entry (built-in or custom) already present is ever
-  touched.
+  #72, this commit), two ways, both additive.** `backend::
+  backfill_missing_backends` (invariants above) runs at `broker::serve`'s
+  startup immediately after `seed_default_backends` — an EXISTING
+  `backends.json` now gains any missing built-in entry by name on every
+  broker start, with no operator action, and no entry (built-in or
+  custom) already present is ever touched. `secrets migrate <name>
+  [--backend <target>]` (`commands::handle_secrets_migrate`, default
+  target `age`, `commands::DEFAULT_BACKEND` reused) is the per-secret
+  companion: an admin verb (euid-guarded exactly like `add`/`rm`/`grant`,
+  direct-home, no socket) that fetches a secret's value via its policy's
+  CURRENT backend and stores it via a TARGET backend, flips the policy
+  row, and removes the old value when the source is a built-in with a
+  derivable path (`backend::remove_builtin_value`) — see the invariants
+  above for the exact ordering/removal/locking rules, and `README.md`'s
+  "Migrating a secret between backends" for the full flow. Registered
+  LAST in `commands::register()` (golden discipline — append, never
+  reorder), golden 67 → 68.
 
 **KNOWN GAP, deferred, not fixed by P-N2c:** backend `get`/`set` shell-outs
 (`backend::fetch_value`/`store_value`) have NO timeout — a wedged backend

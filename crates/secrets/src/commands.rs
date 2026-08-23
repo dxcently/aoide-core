@@ -1,5 +1,6 @@
 //! `aoide secrets` — the secrets broker's CLI surface (Workstream SECRETS,
-//! P-V2, P-V3, P-V4c, P-V4e, P-N1, P-N2, P-N3). Registers FIFTEEN verbs:
+//! P-V2, P-V3, P-V4c, P-V4e, P-N1, P-N2, P-N3, P-G2). Registers SIXTEEN
+//! verbs:
 //!
 //! - `serve` — the long-running broker, special-cased at the entry point
 //!   exactly like `a2a serve`/`conductor` (`cli`'s `run_cli`): this
@@ -120,6 +121,14 @@
 //!   blocking loop itself (`crate::watch::run`) is special-cased from
 //!   `cli`'s `special` hook the SAME way `serve`/`exec`/`enroll` already
 //!   are.
+//! - `migrate` (P-G2, task #72) — `secrets migrate <name> [--backend
+//!   <target>]`: moves an EXISTING secret's stored VALUE from its policy's
+//!   current backend to a target backend (default `age`) and flips the
+//!   policy row. Admin verb, DIRECT-HOME — same `require_cli` +
+//!   `require_admin_identity` gate as `add`/`rm`/`grant`, never the
+//!   socket. See [`handle_secrets_migrate`]'s own doc and `README.md`'s
+//!   "Migrating a secret between backends" for the full ordering/removal
+//!   rules. Appended newest, golden 67 -> 68.
 //!
 //! `add`/`rm`/`grant`/`revoke`/`enroll` run AS THE SECRETS USER in deployment
 //! (`sudo -u aoide-secrets ...`, wrapped by the nix module at P-V4), but the
@@ -132,10 +141,10 @@
 //! `set` backend template, over the socket (`crate::broker::handle_put`'s
 //! module doc).
 //!
-//! **`add`/`rm`/`grant`/`revoke`/`set-totp`/`automate`/`expose` also carry
-//! the admin-identity guard** ([`require_admin_identity`], `home::admin_identity_check`'s
+//! **`add`/`rm`/`grant`/`revoke`/`set-totp`/`automate`/`expose`/`migrate`
+//! also carry the admin-identity guard** ([`require_admin_identity`], `home::admin_identity_check`'s
 //! module doc — the yomi-strix incident, 2026-08-22): called right after
-//! [`require_cli`] in every one of those seven handlers, BEFORE
+//! [`require_cli`] in every one of those eight handlers, BEFORE
 //! `store::load_policies`/`store::save_policies` ever runs, it refuses the
 //! call outright when this process's effective uid doesn't own the
 //! secrets home — plain `sudo` (root, euid 0) is explicitly one of the
@@ -350,6 +359,16 @@ pub fn register(r: &mut Registry) {
         implemented: true,
         handler: handle_secrets_watch,
         examples: ["secrets watch", "secrets watch --json", "secrets watch --popup"],
+    ));
+    r.insert(cmd!(
+        path: ["secrets", "migrate"],
+        summary: "Move an EXISTING secret's stored value from its policy's current backend to a target backend (default `age`), then flip the policy's backend field. Admin verb, direct-home (mirrors add/rm/grant, not put/exec's socket round trip). Fetches via the current backend, stores via the target first, flips policy.json only after the new value is durably stored, then removes the old value LAST — only when the source backend is a built-in (file/age) whose value path this crate can derive on its own.",
+        args: [arg!("name", "string", true, "The secret's nickname — must already have a policy (`secrets add` first).")],
+        flags: [flag!("backend", "string", "The target backend to migrate onto. Defaults to `age` (the built-in age-encrypted store) when omitted.")],
+        gated: false,
+        implemented: true,
+        handler: handle_secrets_migrate,
+        examples: ["secrets migrate db-prod", "secrets migrate db-prod --backend age"],
     ));
 }
 
@@ -919,6 +938,146 @@ fn handle_secrets_watch(inv: &Invocation) -> Outcome {
     Outcome::ok(cmd, "watching secret events")
 }
 
+/// Name-only audit line for `secrets migrate` (P-G2, task #72) —
+/// `EventClass::Secret`, the SAME class every other value-adjacent line in
+/// this crate uses (`broker.rs`'s `audit_resolve`/`audit_put`/etc.), same
+/// "never the value, never the key" discipline. Unlike those, this call
+/// site lives here, not in `broker.rs`: migrate is a direct-home admin verb
+/// (`handle_secrets_migrate`'s own doc) that never runs inside the broker
+/// daemon process, so there is no daemon-owned `audit.log` for it to also
+/// write to (that file is `0700` broker-uid and unreachable from an
+/// ordinary admin invocation anyway) — only the mirrored aoide log, the
+/// SAME `aoide_protocol::audit` call every admin verb's generic dispatch
+/// audit already goes through, just with the richer, migrate-specific
+/// message this one extra line adds. `door` is the invocation's own door
+/// (always `Cli` in practice — `require_cli` already refused anything
+/// else) rather than a hardcoded `Door::Daemon`, since this code is not
+/// the daemon speaking.
+fn audit_migrate(door: Door, name: &str, source: &str, target: &str, status: &str, reason: Option<&str>) {
+    let message = match reason {
+        Some(r) => format!("migrate `{name}`: {source} -> {target}: {status} ({r})"),
+        None => format!("migrate `{name}`: {source} -> {target}: {status}"),
+    };
+    let _ = aoide_protocol::audit(
+        &aoide_protocol::default_audit_log(),
+        door,
+        aoide_protocol::EventClass::Secret,
+        "secrets.migrate",
+        status,
+        &message,
+    );
+}
+
+/// `secrets migrate <name> [--backend <target>]` (P-G2, task #72) — moves
+/// an EXISTING secret's stored value from its policy's CURRENT backend to
+/// a TARGET backend (default `age`, [`DEFAULT_BACKEND`]), then flips the
+/// policy's own `backend` field. Admin verb, same door + euid gate as
+/// `add`/`rm`/`grant` (`require_cli` + `require_admin_identity`) — mirrors
+/// their DIRECT-HOME wire shape exactly: no socket round trip, the same
+/// `store::load_policies`/`save_policies` round trip every other CRUD verb
+/// here already uses. The moved value exists ONLY as a local `String`
+/// inside this function, from [`crate::backend::fetch_value`]'s return to
+/// [`crate::backend::store_value`]'s own argument — never an `Outcome`
+/// field, never argv, never audited (`AGENTS.md`'s "never the value"
+/// discipline, held crate-wide).
+///
+/// Ordering is safety-critical (`README.md`'s "Migrating a secret between
+/// backends"): the NEW ciphertext is fetched and durably stored via the
+/// TARGET backend BEFORE the policy is flipped and saved; the OLD value is
+/// removed LAST, and only for a built-in backend whose on-disk path is
+/// derivable ([`crate::backend::remove_builtin_value`]). Any failure before
+/// the policy flip leaves `policy.json`, `backends.json`, and every
+/// backend's own store untouched.
+fn handle_secrets_migrate(inv: &Invocation) -> Outcome {
+    let cmd = "secrets.migrate";
+    const USAGE: &str = "usage: secrets migrate <name> [--backend <target>]";
+    if let Some(hint) = require_cli(inv, cmd) {
+        return hint;
+    }
+    if let Some(hint) = require_admin_identity(cmd, "migrate") {
+        return hint;
+    }
+    let Some(name) = inv.args.first().cloned() else {
+        return Outcome::usage(cmd, USAGE);
+    };
+    let target = inv.flags.get("backend").cloned().unwrap_or_else(|| DEFAULT_BACKEND.to_string());
+
+    let home = home::secrets_home();
+    let mut policies = match store::load_policies(&home) {
+        Ok(p) => p,
+        Err(e) => return policy_io_error(cmd, &home, e),
+    };
+    let Some(policy) = policies.iter_mut().find(|p| p.name == name) else {
+        return Outcome::error(cmd, format!("no policy for secret `{name}`"));
+    };
+
+    let source = policy.backend.clone();
+    let key = policy.key.clone();
+
+    // Same-backend migrate is an idempotent no-op — no fetch, no store, no
+    // policy write (house rule: report exactly what changed).
+    if source == target {
+        audit_migrate(inv.door, &name, &source, &target, "unchanged", None);
+        return Outcome::ok(cmd, format!("secret `{name}` already on backend `{target}` — unchanged"));
+    }
+
+    // Fetch via the CURRENT backend first — a missing value is a clean
+    // refusal, nothing mutated below this point.
+    let value = match crate::backend::fetch_value(&home, &source, &key) {
+        Ok(v) => v,
+        Err(e) => {
+            audit_migrate(inv.door, &name, &source, &target, "refused", Some(&e));
+            return Outcome::error(cmd, format!("secret `{name}`: could not fetch from backend `{source}`: {e}"));
+        }
+    };
+
+    // The target may be the built-in `age` backend needing its identity
+    // lazily minted — the SAME path `broker::put_gate` already runs
+    // (`backend::mint_age_identity_if_needed`), reused rather than
+    // duplicated. Only when `age` is actually configured (the P-G1 review
+    // fix's own "age-named is not age-configured" rule, `backend.rs`'s
+    // module doc) — a doomed migrate onto an unconfigured `age` must not
+    // mint a real identity before failing anyway.
+    if target == "age" && crate::backend::backend_is_known(&home, "age") {
+        if let Err(e) = crate::backend::mint_age_identity_if_needed(&home) {
+            audit_migrate(inv.door, &name, &source, &target, "refused", Some(&e));
+            return Outcome::error(cmd, format!("secret `{name}`: could not prepare backend `{target}`: {e}"));
+        }
+    }
+
+    // Store via the TARGET backend — durably written BEFORE the policy
+    // flips (ordering, module doc: safety-critical).
+    if let Err(e) = crate::backend::store_value(&home, &target, &key, &value) {
+        audit_migrate(inv.door, &name, &source, &target, "refused", Some(&e));
+        return Outcome::error(cmd, format!("secret `{name}`: could not store into backend `{target}`: {e}"));
+    }
+
+    // Flip the policy row and save it — only after this succeeds is the
+    // secret considered migrated at all.
+    policy.backend = target.clone();
+    if let Err(e) = store::save_policies(&home, &policies) {
+        let err_message = home::describe_home_file_error(&home, &store::policy_path(&home), &e);
+        audit_migrate(inv.door, &name, &source, &target, "refused", Some(&err_message));
+        return Outcome::error(cmd, err_message);
+    }
+
+    // Remove the OLD value LAST, only for a built-in source whose path is
+    // derivable — a non-built-in source is left untouched, reported
+    // honestly rather than silently doing nothing.
+    let message = match crate::backend::remove_builtin_value(&home, &source, &key) {
+        Some(Ok(())) => format!("migrated secret `{name}` from `{source}` to `{target}` (old value removed)"),
+        Some(Err(e)) => {
+            format!("migrated secret `{name}` from `{source}` to `{target}` (old value NOT removed: {e})")
+        }
+        None => format!(
+            "migrated secret `{name}` from `{source}` to `{target}` (old value under `{source}` left in \
+             place — not a built-in backend, remove it by hand)"
+        ),
+    };
+    audit_migrate(inv.door, &name, &source, &target, "migrated", None);
+    Outcome::ok(cmd, message).changed(vec![format!("policy:{name}")])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -980,6 +1139,7 @@ mod tests {
                 "secrets.approve",
                 "secrets.dismiss",
                 "secrets.watch",
+                "secrets.migrate",
             ]
         );
         for c in r.commands() {
@@ -1707,5 +1867,169 @@ mod tests {
             Some(v) => std::env::set_var("AOIDE_SECRETS_HOME", v),
             None => std::env::remove_var("AOIDE_SECRETS_HOME"),
         }
+    }
+
+    // ── secrets migrate (P-G2, task #72) ────────────────────────────────
+
+    /// Feature-detects a real `age`/`age-keygen` on `PATH`, mirroring
+    /// `backend::tests::age_tools_available` (each module's own `#[cfg(test)]`
+    /// block, `AGENTS.md`'s "I/O is confined to seven named modules"
+    /// invariant — test helpers are not shared across modules here). Any
+    /// migrate test that migrates ONTO the built-in `age` backend (needing
+    /// a real identity mint) skips cleanly, with a printed reason, rather
+    /// than panicking (and poisoning `env_lock` for every other test in
+    /// this process) when this host has no `age` on `PATH`.
+    fn age_tools_available() -> bool {
+        let age_keygen = std::process::Command::new("age-keygen").arg("--version").output();
+        let age = std::process::Command::new("age").arg("--version").output();
+        matches!(age_keygen, Ok(o) if o.status.code().is_some()) && matches!(age, Ok(o) if o.status.code().is_some())
+    }
+
+    #[test]
+    fn migrate_moves_the_value_flips_the_policy_and_removes_the_old_builtin_value() {
+        if !age_tools_available() {
+            eprintln!("skipping migrate_moves_the_value_flips_the_policy_and_removes_the_old_builtin_value: age/age-keygen not found on PATH");
+            return;
+        }
+        with_secrets_home("migrate-happy-path", |home| {
+            crate::backend::seed_default_backends(home).unwrap();
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "file"), ("key", "k")]);
+            assert_eq!(handle_secrets_add(&add).status, Status::Ok);
+            crate::backend::store_value(home, "file", "k", "the-value").unwrap();
+            assert!(home.join("store").join("k").exists());
+
+            let migrate = inv(Door::Cli, &["secrets", "migrate"], &["t"], &[]);
+            let out = handle_secrets_migrate(&migrate);
+            assert_eq!(out.status, Status::Ok, "{out:?}");
+            assert!(out.message.contains("old value removed"), "{}", out.message);
+
+            let policies = store::load_policies(home).unwrap();
+            assert_eq!(policies[0].backend, "age", "policy must be flipped to the default target `age`");
+
+            assert_eq!(crate::backend::fetch_value(home, "age", "k").unwrap(), "the-value");
+            assert!(!home.join("store").join("k").exists(), "old file-backend value must be removed");
+        });
+    }
+
+    #[test]
+    fn migrate_to_the_same_backend_is_an_idempotent_no_op() {
+        with_secrets_home("migrate-noop", |home| {
+            crate::backend::seed_default_backends(home).unwrap();
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "age"), ("key", "k")]);
+            assert_eq!(handle_secrets_add(&add).status, Status::Ok);
+            let before = store::load_policies(home).unwrap();
+
+            let migrate = inv(Door::Cli, &["secrets", "migrate"], &["t"], &[("backend", "age")]);
+            let out = handle_secrets_migrate(&migrate);
+            assert_eq!(out.status, Status::Ok, "{out:?}");
+            assert!(out.message.contains("unchanged"), "{}", out.message);
+            assert!(out.changed.is_empty(), "a same-backend migrate must not report anything changed");
+
+            assert_eq!(store::load_policies(home).unwrap(), before, "a no-op migrate must not rewrite policy.json");
+        });
+    }
+
+    #[test]
+    fn migrate_with_no_stored_value_under_the_source_is_a_clean_refusal() {
+        with_secrets_home("migrate-missing-value", |home| {
+            crate::backend::seed_default_backends(home).unwrap();
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "file"), ("key", "k")]);
+            assert_eq!(handle_secrets_add(&add).status, Status::Ok);
+            let before = store::load_policies(home).unwrap();
+
+            // No `store_value` call — the source backend has nothing stored.
+            let migrate = inv(Door::Cli, &["secrets", "migrate"], &["t"], &[("backend", "age")]);
+            let out = handle_secrets_migrate(&migrate);
+            assert_eq!(out.status, Status::Error, "{out:?}");
+
+            assert_eq!(store::load_policies(home).unwrap(), before, "a refused migrate must not touch policy.json");
+            assert!(!home.join("values").join("k.age").exists(), "nothing must be stored on the target either");
+        });
+    }
+
+    #[test]
+    fn migrate_on_an_unknown_secret_is_an_error() {
+        with_secrets_home("migrate-unknown", |_home| {
+            let migrate = inv(Door::Cli, &["secrets", "migrate"], &["nope"], &[]);
+            assert_eq!(handle_secrets_migrate(&migrate).status, Status::Error);
+        });
+    }
+
+    /// A source backend this crate has no built-in path for (a doc preset
+    /// like `pass`, or any operator-custom entry) is left completely
+    /// untouched — the migrate still succeeds (the value is safely on the
+    /// target), but the success message says the old value was left in
+    /// place rather than silently doing nothing.
+    #[test]
+    fn migrate_from_a_non_builtin_source_leaves_the_old_value_alone_and_says_so() {
+        if !age_tools_available() {
+            eprintln!("skipping migrate_from_a_non_builtin_source_leaves_the_old_value_alone_and_says_so: age/age-keygen not found on PATH");
+            return;
+        }
+        with_secrets_home("migrate-nonbuiltin-source", |home| {
+            crate::backend::seed_default_backends(home).unwrap();
+            // Add a custom "scratch" backend beside the seeded built-ins,
+            // holding the value `secrets add` never touches.
+            let doc = serde_json::json!({
+                "file": {"get": "cat {home}/store/{name}", "set": "mkdir -p -m 0700 {home}/store && install -m 0600 /dev/stdin {home}/store/{name}"},
+                "age": {"get": "age -d -i {home}/age.key {home}/values/{name}.age", "set": "mkdir -p -m 0700 {home}/values && age -e -R {home}/age.recipient -o {home}/values/{name}.age && chmod 0600 {home}/values/{name}.age"},
+                "scratch": {"get": "cat {home}/scratch-k", "set": "cat > {home}/scratch-k"},
+            });
+            std::fs::write(home.join("backends.json"), serde_json::to_vec(&doc).unwrap()).unwrap();
+            crate::backend::store_value(home, "scratch", "k", "scratch-value").unwrap();
+
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "scratch"), ("key", "k")]);
+            assert_eq!(handle_secrets_add(&add).status, Status::Ok);
+
+            let migrate = inv(Door::Cli, &["secrets", "migrate"], &["t"], &[("backend", "age")]);
+            let out = handle_secrets_migrate(&migrate);
+            assert_eq!(out.status, Status::Ok, "{out:?}");
+            assert!(out.message.contains("not a built-in backend"), "{}", out.message);
+
+            assert_eq!(crate::backend::fetch_value(home, "age", "k").unwrap(), "scratch-value");
+            // The scratch backend's own file is untouched.
+            assert!(home.join("scratch-k").exists());
+        });
+    }
+
+    /// Same discipline as `automate`/`expose` above: an admin-identity
+    /// mismatch refuses BEFORE `policy.json` is ever touched.
+    #[test]
+    fn migrate_refuses_a_mismatched_euid_before_touching_policy_json() {
+        if home::effective_uid() == 0 {
+            return;
+        }
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_SECRETS_HOME").ok();
+        std::env::set_var("AOIDE_SECRETS_HOME", "/");
+
+        let migrate = inv(Door::Cli, &["secrets", "migrate"], &["t"], &[]);
+        let out = handle_secrets_migrate(&migrate);
+        assert_eq!(out.status, Status::Error, "{out:?}");
+        assert!(out.message.contains("must run as the broker user"), "{}", out.message);
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_SECRETS_HOME", v),
+            None => std::env::remove_var("AOIDE_SECRETS_HOME"),
+        }
+    }
+
+    /// Bounce-fix item 2's own discipline (P-V2 review), extended to
+    /// `migrate`: CLI-only, and a gated call never mutates `policy.json`.
+    #[test]
+    fn migrate_is_cli_only_a_non_cli_door_never_mutates_policy_json() {
+        with_secrets_home("migrate-door-gate", |home| {
+            crate::backend::seed_default_backends(home).unwrap();
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "file"), ("key", "k")]);
+            assert_eq!(handle_secrets_add(&add).status, Status::Ok);
+            crate::backend::store_value(home, "file", "k", "the-value").unwrap();
+            let before = store::load_policies(home).unwrap();
+
+            for door in [Door::Mcp, Door::A2a, Door::Daemon] {
+                let migrate = inv(door, &["secrets", "migrate"], &["t"], &[]);
+                assert_eq!(handle_secrets_migrate(&migrate).status, Status::Usage, "migrate over {door:?}");
+                assert_eq!(store::load_policies(home).unwrap(), before, "policy.json mutated over {door:?}");
+            }
+        });
     }
 }

@@ -142,6 +142,7 @@ mod tests {
             "secrets.exec",
             "secrets.expose",
             "secrets.grant",
+            "secrets.migrate",
             "secrets.pending",
             "secrets.put",
             "secrets.revoke",

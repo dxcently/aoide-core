@@ -135,15 +135,21 @@
 //! [`mint_age_identity_if_needed`], so a doomed `put` against an
 //! unconfigured `age` policy never mints a REAL identity first.
 //!
-//! ## Closing the deployment gap: additive backfill (P-G2, task #72)
+//! ## Closing the deployment gap: backfill + migrate (P-G2, task #72)
 //!
 //! The P-G1 review fix above only ever REPORTED the "unconfigured `age`"
-//! gap honestly; it never closed it. [`backfill_missing_backends`] closes
-//! it: it runs every broker startup, right after [`seed_default_backends`]
-//! (`broker::serve`'s doc). Where seeding only acts on an ABSENT
-//! `backends.json`, backfill acts on an EXISTING one, adding whichever
-//! built-in entry (`file`/`age`) is missing BY NAME and never touching an
-//! entry — built-in or custom — that's already there.
+//! gap honestly; it never closed it. Two additive pieces close it here.
+//! [`backfill_missing_backends`] runs every broker startup, right after
+//! [`seed_default_backends`] (`broker::serve`'s doc): where seeding only
+//! acts on an ABSENT `backends.json`, backfill acts on an EXISTING one,
+//! adding whichever built-in entry (`file`/`age`) is missing BY NAME and
+//! never touching an entry — built-in or custom — that's already there.
+//! `secrets migrate <name> [--backend <target>]` (`commands::
+//! handle_secrets_migrate`) is the per-secret companion: an admin verb that
+//! moves one secret's stored VALUE from its policy's current backend to a
+//! target one (default `age`) and flips the policy row, so an operator can
+//! actually act on a secret that's been sitting on a newly-backfilled
+//! backend instead of just being told about it.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -580,6 +586,33 @@ pub fn backfill_missing_backends(secrets_home: &Path) -> std::io::Result<()> {
     std::fs::write(&tmp, &out)?;
     crate::home::secure_file(&tmp)?;
     std::fs::rename(&tmp, &path)
+}
+
+/// Derive and remove the on-disk value file for a BUILT-IN backend only
+/// (P-G2, task #72, `secrets migrate`'s old-value cleanup) — `file`/`age`
+/// are the two backends whose value path this crate can name without
+/// asking their own templates, since it minted the path itself
+/// ([`FILE_BACKEND_SET`]/[`AGE_BACKEND_SET`] above). `None` for any other
+/// backend name (a doc-preset like `pass`/`gopass`/`bw`/`sops`, or an
+/// operator-custom entry) — this crate has no way to know where such a
+/// backend keeps its own bytes, so it is never touched; the caller reports
+/// that case honestly instead of guessing a path. `key` is the policy's own
+/// `key` field — the SAME value `{name}` substitutes into a template
+/// ([`expand_template`]'s module doc) — never the secret's display `name`,
+/// which can differ. A missing file is NOT an error (`Ok(())`): the
+/// migration this backs already succeeded on the TARGET backend by the time
+/// this runs, so there is nothing left to clean up either way.
+pub fn remove_builtin_value(secrets_home: &Path, backend_name: &str, key: &str) -> Option<std::io::Result<()>> {
+    let path = match backend_name {
+        "file" => secrets_home.join("store").join(key),
+        "age" => secrets_home.join("values").join(format!("{key}.age")),
+        _ => return None,
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => Some(Ok(())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Ok(())),
+        Err(e) => Some(Err(e)),
+    }
 }
 
 /// Is `name` an actually-configured backend in this home's
@@ -1247,4 +1280,52 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    // ── remove_builtin_value (P-G2, task #72, `secrets migrate`) ────────
+
+    #[test]
+    fn remove_builtin_value_removes_the_file_backends_value() {
+        let home = tmp_home("remove-file-value");
+        seed_default_backends(&home).unwrap();
+        store_value(&home, "file", "k", "v").unwrap();
+        assert!(home.join("store").join("k").exists());
+
+        let result = remove_builtin_value(&home, "file", "k");
+        assert!(matches!(result, Some(Ok(()))));
+        assert!(!home.join("store").join("k").exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn remove_builtin_value_removes_the_age_backends_value() {
+        if !age_tools_available() {
+            eprintln!("skipping remove_builtin_value_removes_the_age_backends_value: age/age-keygen not found on PATH");
+            return;
+        }
+        let home = tmp_home("remove-age-value");
+        seed_default_backends(&home).unwrap();
+        mint_age_identity_if_needed(&home).unwrap();
+        store_value(&home, "age", "k", "v").unwrap();
+        assert!(home.join("values").join("k.age").exists());
+
+        let result = remove_builtin_value(&home, "age", "k");
+        assert!(matches!(result, Some(Ok(()))));
+        assert!(!home.join("values").join("k.age").exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn remove_builtin_value_is_none_for_a_non_builtin_backend() {
+        let home = tmp_home("remove-nonbuiltin");
+        assert!(remove_builtin_value(&home, "pass", "k").is_none());
+        assert!(remove_builtin_value(&home, "custom-thing", "k").is_none());
+    }
+
+    #[test]
+    fn remove_builtin_value_on_an_already_missing_file_is_a_clean_ok() {
+        let home = tmp_home("remove-missing");
+        std::fs::create_dir_all(&home).unwrap();
+        let result = remove_builtin_value(&home, "file", "never-stored");
+        assert!(matches!(result, Some(Ok(()))));
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

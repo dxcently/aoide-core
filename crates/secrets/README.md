@@ -913,7 +913,8 @@ template, so seeding there guarantees every `resolve`/`put` sees a
 startup call:** `backend::backfill_missing_backends` acts on an EXISTING
 file, adding whichever built-in (`file`/`age`) is missing BY NAME — never
 touching an entry, built-in or custom, already present — and skipping the
-write entirely when nothing was missing.
+write entirely when nothing was missing. See "Migrating a secret between
+backends" below for the per-secret companion this pairs with.
 
 **Never pre-quote `{name}`/`{home}`** — `backend.rs`'s module doc: both
 substitutions are already shell-single-quote-escaped
@@ -937,6 +938,86 @@ sets it as part of the `sh -c` command text itself (`BW_SESSION=... bw get
 password {name}`) — `backends.json` has no separate `env` field for this
 crate to parse, validate, or leak through, and never will; the whole
 adapter surface is ONE string per direction (`get`, `set`), by design.
+
+## Migrating a secret between backends (`secrets migrate`, P-G2, task #72)
+
+`secrets migrate <name> [--backend <target>]` (target defaults to `age`)
+moves ONE secret's already-stored value from its policy's CURRENT backend
+to a TARGET backend, then flips the policy's own `backend` field —
+`backend::backfill_missing_backends`'s per-secret companion (above): where
+backfill closes the GAP (a backend the policy names but `backends.json`
+never configured), migrate is what an operator runs to actually ACT on a
+secret once it's closed, or to move any secret between any two configured
+backends for any other reason.
+
+```
+operator -> aoide secrets migrate db-prod --backend age
+         -> policy gate (same admin door as add/rm/grant: CLI-only,
+            euid-guarded — "Admin verbs" below)
+         -> fetch the value via the policy's CURRENT backend
+         -> store it via the TARGET backend (may lazily mint the target's
+            age identity, the SAME `backend::mint_age_identity_if_needed`
+            put_gate already uses — reused, never duplicated)
+         -> flip policy.backend to the target and save policy.json
+         -> remove the OLD value, ONLY if the source backend is a built-in
+            whose value path this crate can derive on its own
+         <- reports what happened, including whether the old value was
+            actually removed
+```
+
+**Admin verb, direct-home — mirrors `add`/`rm`/`grant` exactly, not
+`put`/`exec`'s socket round trip** (`commands.rs`'s own door taxonomy):
+`require_cli` + `require_admin_identity` gate it before anything touches
+`policy.json`, same euid-ownership refusal (root explicitly included) the
+whole CRUD/`set-totp`/`automate`/`expose` quartet-plus already holds. It
+does **not** go through the running broker's socket at all — like
+`add`/`rm`/`grant`, it reads/writes `policy.json` (and, here, a backend's
+own value file) directly as whatever uid invokes it, normally `sudo -u
+aoide-secrets aoide secrets migrate ...` in deployment.
+
+**Ordering is safety-critical, and deliberately asymmetric with removal**:
+the new ciphertext is fetched and durably stored via the TARGET backend
+BEFORE `policy.json`'s `backend` field ever flips; the OLD value is removed
+LAST, strictly after the policy save has already succeeded. Any failure
+before the policy flip — a fetch failure, a store failure, a policy-save
+failure — leaves EVERYTHING untouched: the old value in place, the policy
+unflipped, no partial state. Once the flip has landed, the secret is fully
+migrated even if the old-value cleanup that follows fails or is skipped —
+cleanup is best-effort tidiness, never load-bearing for correctness.
+
+**Old-value removal only ever happens for a built-in SOURCE backend whose
+value path this crate can derive without asking its own template**
+(`backend::remove_builtin_value`): `file` → `<home>/store/<key>`, `age` →
+`<home>/values/<key>.age` — the SAME paths `FILE_BACKEND_SET`/
+`AGE_BACKEND_SET` themselves write to. `<key>` here is the policy's own
+`key` field (the value a template's `{name}` placeholder substitutes —
+`backend.rs`'s module doc — not the secret's display `name`, which can
+differ). A source backend that ISN'T one of these two built-ins (a
+`pass`/`gopass`/`bw`/`sops` row, or any operator-custom entry) is left
+completely untouched — this crate has no way to know where such a backend
+keeps its own bytes — and the success message says so plainly rather than
+silently doing nothing.
+
+**Idempotent and refusal-clean, matching this crate's other admin verbs**:
+migrating a secret to the backend it's already on is a no-op that reports
+exactly that (house rule: report what changed, never `.changed(...)` on a
+write that never happened) — no fetch, no store, no policy write. A secret
+with no policy is a clean `no policy for secret` error. A MISSING value
+under the source backend (the fetch step fails — including the exact
+"unconfigured `age`" gap this phase's own backfill half closes for future
+secrets, but a secret already pointed at a backend that still isn't
+configured) is a clean refusal: nothing is mutated, the policy keeps
+naming its original (unreachable) backend, and the operator is told to fix
+the source first.
+
+**The moved value exists ONLY as a local `String` inside
+`commands::handle_secrets_migrate`**, from `backend::fetch_value`'s return
+to `backend::store_value`'s own argument — never an `Outcome` field, never
+argv, never logged. **Audit is name-only**, the same discipline every
+other value-adjacent audit line in this crate holds: one
+`EventClass::Secret` line (`command: "secrets.migrate"`, `status`
+`migrated`/`unchanged`/`refused`) naming the secret, source backend, and
+target backend — never the value, never the key.
 
 ## Deployment (P-V4)
 
@@ -1015,8 +1096,9 @@ hint, and stopped a doomed `put` from minting a real identity first — but
 left the underlying gap itself open: there was still no path that added the
 `age`/`has` entries to an already-existing `backends.json`.
 
-**P-G2 closes it automatically.** Every broker startup, `broker::serve` now
-calls `backend::backfill_missing_backends(secrets_home)` immediately after
+**P-G2 closes it two ways, both additive.** First, automatically: every
+broker startup, `broker::serve` now calls `backend::
+backfill_missing_backends(secrets_home)` immediately after
 [`seed_default_backends`] — where seeding only ever acts on an ABSENT
 `backends.json`, backfill acts on an EXISTING one, adding whichever
 built-in entry (`file`/`age`) is missing BY NAME and never touching an
@@ -1024,10 +1106,19 @@ entry — built-in or hand-customized, even one an operator wrote under the
 name `age` or `file` themselves — that's already present. A `backends.json`
 that already carries both built-ins is not rewritten at all (no gratuitous
 mtime churn); every other row (`pass`/`gopass`/`bw`/`sops` presets, any
-operator-named custom backend) rides through byte-for-byte. This means a
-broker restarted after upgrading past P-G1 self-heals its `backends.json`
-with no operator action — the "delete `backends.json` and lose your custom
-rows" workaround above is retired.
+operator-named custom backend) rides through byte-for-byte. This alone
+means a broker restarted after upgrading past P-G1 self-heals its
+`backends.json` with no operator action — the "delete `backends.json` and
+lose your custom rows" workaround above is retired.
+
+Second, per-secret: `secrets migrate <name> [--backend <target>]`
+(`commands::handle_secrets_migrate`, default target `age`) moves ONE
+secret's already-stored VALUE from its policy's current backend to the
+target backend, then flips the policy row — so an existing secret sitting
+on a policy that named `age` before `age` was actually configured (or one
+an operator wants to move off `file` onto `age`, or off any backend onto
+another) can actually be acted on, not merely reported on. See "Migrating a
+secret between backends" below for the full flow.
 
 ### Any other init (or none) — the non-nix install path
 
