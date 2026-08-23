@@ -347,9 +347,13 @@ pub enum WaitResult {
 /// command means this `recv()` blocks for as long as that shell-out does,
 /// not "promptly." `dismiss`'s taker sends immediately after `take` with
 /// no I/O in between, so this gap is `approve`-specific and already
-/// narrow (the race window itself is microseconds); it is a known,
-/// deferred gap (this crate's `AGENTS.md`), not something this function
-/// can fix on its own — a backend timeout would have to exist first.
+/// narrow (the race window itself is microseconds). **Task #74 bounds it:**
+/// every backend shell-out now routes through `backend::run_backend_command`,
+/// which kills and reports a wedged template after `backend::
+/// backend_timeout()` (default 10s) rather than blocking forever — so this
+/// `recv()` is bounded by that same ceiling in the worst case, no longer
+/// truly unbounded, even though it is still not "promptly" in the sub-second
+/// sense the happy path holds.
 pub fn wait_for_outcome(registry: &ParkRegistry, id: &str, rx: mpsc::Receiver<ParkOutcome>, timeout: Duration) -> WaitResult {
     match rx.recv_timeout(timeout) {
         Ok(ParkOutcome::Approved(v)) => WaitResult::Approved(v),

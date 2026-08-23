@@ -2025,6 +2025,77 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    // ── bounded backend shell-outs (task #74) ───────────────────────────
+
+    /// The scenario `AGENTS.md`'s KNOWN GAP note named directly: a hung
+    /// `set` template used to hold `put_lock` for as long as the hang
+    /// lasted, wedging every OTHER `put` on this broker behind it. With
+    /// the backend choke point now bounded (`backend::run_backend_command`,
+    /// task #74), `put_gate` — the function that actually acquires and
+    /// releases `put_lock` — must return within the timeout instead of
+    /// hanging: a fresh secret with no existing value, so `put_gate` runs
+    /// straight through the existence probe into the `set` template that
+    /// hangs, all under the SAME `put_lock` critical section the KNOWN GAP
+    /// note describes.
+    #[test]
+    fn a_hung_set_template_no_longer_wedges_put_lock_forever() {
+        let home = tmp_home("put-hung-set-bounded");
+        let p = Policy::new("t", "scratch", "k");
+        seed_with_set(&home, &[p], "false", "sleep 60");
+
+        let saved = std::env::var(crate::backend::BACKEND_TIMEOUT_ENV).ok();
+        std::env::set_var(crate::backend::BACKEND_TIMEOUT_ENV, "1");
+        let start = std::time::Instant::now();
+        let outcome = put_gate(&home, "t", "the-value", false);
+        let elapsed = start.elapsed();
+        match saved {
+            Some(v) => std::env::set_var(crate::backend::BACKEND_TIMEOUT_ENV, v),
+            None => std::env::remove_var(crate::backend::BACKEND_TIMEOUT_ENV),
+        }
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "put_gate against a hung set template took {elapsed:?} — put_lock was not freed in bounded time"
+        );
+        assert!(
+            matches!(&outcome, PutOutcome::Denied(e) if e.contains("timed out")),
+            "expected a timeout denial, got {outcome:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A second `put_gate` call, run immediately after the hung one above
+    /// returns, must not itself see any lingering effect of the first —
+    /// proving `put_lock` was genuinely released, not merely that the
+    /// first call's own thread gave up waiting on it.
+    #[test]
+    fn put_lock_is_free_for_the_next_caller_right_after_a_timeout() {
+        let home = tmp_home("put-lock-freed-for-next-caller");
+        let out = home.join("out.txt");
+        let p1 = Policy::new("hangs", "hangs", "k");
+        let p2 = Policy::new("t", "scratch", "k");
+        crate::store::save_policies(&home, &[p1, p2]).unwrap();
+        let backends = serde_json::json!({
+            "hangs": { "get": "false", "set": "sleep 60" },
+            "scratch": { "get": format!("cat {}", out.display()), "set": format!("cat > {}", out.display()) },
+        });
+        std::fs::write(crate::backend::backends_path(&home), serde_json::to_vec(&backends).unwrap()).unwrap();
+
+        let saved = std::env::var(crate::backend::BACKEND_TIMEOUT_ENV).ok();
+        std::env::set_var(crate::backend::BACKEND_TIMEOUT_ENV, "1");
+        let first = put_gate(&home, "hangs", "irrelevant", false);
+        let (granted, result) = put_outcome_as_result(put_gate(&home, "t", "second-caller-value", false));
+        match saved {
+            Some(v) => std::env::set_var(crate::backend::BACKEND_TIMEOUT_ENV, v),
+            None => std::env::remove_var(crate::backend::BACKEND_TIMEOUT_ENV),
+        }
+
+        assert!(matches!(first, PutOutcome::Denied(_)), "the hung put must be denied, not granted: {first:?}");
+        assert!(granted, "the second, unrelated put must succeed once put_lock is freed: {result:?}");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "second-caller-value");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// The wire-level version of the two tests above, through `handle_line`
     /// — this is the deliverable's own end-to-end proof: a first `put`
     /// stores; a second `put` (no `overwrite`) is refused with the

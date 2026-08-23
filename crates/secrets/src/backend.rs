@@ -150,12 +150,43 @@
 //! target one (default `age`) and flips the policy row, so an operator can
 //! actually act on a secret that's been sitting on a newly-backfilled
 //! backend instead of just being told about it.
+//!
+//! ## Bounded shell-outs (task #74)
+//!
+//! Every `get`/`set`/`has` template execution above now runs through ONE
+//! shared, bounded spawn path, [`run_backend_command`] — before this phase,
+//! [`fetch_value`], [`store_value`], and `has_value`'s own
+//! `run_has_template` each spawned `sh -c` independently, with NO timeout at
+//! all (this crate's `AGENTS.md`, KNOWN GAP note, now closed): a wedged
+//! template blocked its calling thread forever, and on the `put` path that
+//! thread was holding `broker::put_lock` the entire time, serializing every
+//! OTHER `put` on this broker behind the one hang. [`backend_timeout`]
+//! ([`BACKEND_TIMEOUT_ENV`], default [`DEFAULT_BACKEND_TIMEOUT_SECS`]
+//! seconds, tolerant-fallback-parsed like `park::park_timeout`) bounds the
+//! wait; a template still running past the deadline has its WHOLE PROCESS
+//! GROUP `SIGKILL`ed and reaped ([`kill_process_group`] — never just the
+//! immediate `sh`, so a pipeline the template forked can't outlive it, and
+//! never a zombie left behind), and the caller gets
+//! [`backend_timeout_error`]: the backend name, the op (`get`/`set`/`has`),
+//! and the env knob — **never the template text**, which can't carry a
+//! secret value in the first place ([`store_value`]'s `value` only ever
+//! reaches its child over stdin, never interpolated into the command string
+//! [`expand_template`] builds — that function substitutes only `{name}`/
+//! `{home}`, neither of which is a secret value). Wall-clock via polling
+//! `Child::try_wait`, never a per-child watchdog thread and never
+//! `SIGALRM` — see [`run_backend_command`]'s own doc for why stdout/stderr
+//! are drained NON-BLOCKINGLY while polling rather than read only after the
+//! child exits (a large-output template would otherwise deadlock against
+//! its own full pipe with nobody draining it).
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 /// One named backend: a `get` fetch-command template, an OPTIONAL `set`
 /// store-command template (P-V4c) — a backend with no `set` is read-only —
@@ -248,13 +279,247 @@ fn expand_template(template: &str, secrets_home: &Path, key: &str) -> String {
     out
 }
 
+/// Env override for how long ANY backend template execution (`get`/`set`/
+/// `has`) is allowed to run before [`run_backend_command`] kills it (task
+/// #74). Read once per shell-out, never cached — a long-running broker
+/// picks up a changed value on its very next call, the same "no
+/// re-derivation, no daemon restart needed" shape `park::park_timeout`/
+/// `park::park_cap` already hold for their own env overrides.
+pub const BACKEND_TIMEOUT_ENV: &str = "AOIDE_SECRETS_BACKEND_TIMEOUT";
+
+/// The default backend timeout: 10 seconds (task requirement) — generous
+/// for any well-behaved `get`/`set`/`has` template (a local file read, an
+/// `age`/`pass`/`gopass` invocation), tight enough that a wedged one no
+/// longer serializes every other `put` behind `broker::put_lock`
+/// indefinitely.
+pub const DEFAULT_BACKEND_TIMEOUT_SECS: u64 = 10;
+
+/// Resolve [`BACKEND_TIMEOUT_ENV`]: a valid non-negative integer wins,
+/// anything else (absent, blank, or unparsable — e.g. an operator typo)
+/// falls back to [`DEFAULT_BACKEND_TIMEOUT_SECS`] rather than panicking or
+/// silently treating the backend as unbounded again. Same tolerant shape
+/// `park::park_timeout`/`park::park_cap` already hold for their own env
+/// overrides — documented here as the fallback, not merely implied.
+pub fn backend_timeout() -> Duration {
+    if let Ok(v) = std::env::var(BACKEND_TIMEOUT_ENV) {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            if let Ok(secs) = trimmed.parse::<u64>() {
+                return Duration::from_secs(secs);
+            }
+        }
+    }
+    Duration::from_secs(DEFAULT_BACKEND_TIMEOUT_SECS)
+}
+
+/// Poll interval for [`run_backend_command`]'s wait loop — coarse enough
+/// not to busy-spin the broker, fine enough that a fast template (every
+/// template in practice) never visibly waits on it.
+const BACKEND_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Put `fd` into non-blocking mode — used on a backend child's piped
+/// stdout/stderr so [`run_backend_command`]'s wait loop can drain both
+/// pipes WHILE polling `try_wait`, never only after: a template that
+/// writes more than one pipe buffer's worth of output (the OS default is a
+/// modest fixed size) would otherwise block on the CHILD side waiting for
+/// a reader that only shows up once the process has already exited — a
+/// self-inflicted deadlock this crate's own timeout must not introduce.
+fn set_nonblocking(fd: std::os::fd::RawFd) {
+    // SAFETY: `fd` is a pipe fd this process just created via `Stdio::
+    // piped()` and still owns; `fcntl(F_GETFL)`/`fcntl(F_SETFL)` are
+    // ordinary, always-defined operations on any fd this process holds.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
+
+/// Drain whatever is CURRENTLY available on a non-blocking pipe into `buf`,
+/// without blocking — `WouldBlock` (nothing ready right now) and a clean
+/// EOF both just stop the loop; any other read error is swallowed the same
+/// tolerant way. This is best-effort output CAPTURE for the eventual
+/// success/error message, not the mechanism that decides success or
+/// failure — the child's own exit status is.
+fn drain_nonblocking<R: Read>(reader: &mut R, buf: &mut Vec<u8>) {
+    let mut chunk = [0u8; 4096];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        }
+    }
+}
+
+/// `SIGKILL` the child's WHOLE PROCESS GROUP, then reap it — never just the
+/// immediate `sh`. [`run_backend_command`] spawns every child as its own
+/// process-group leader (`CommandExt::process_group(0)`) specifically so
+/// this can address `-pid` (the process-group form of `kill(2)`) and take
+/// out anything the template itself forked (a pipeline, a backgrounded
+/// helper), not only `sh -c` itself — killing only the shell would leave
+/// such children running, wedged the same way, merely orphaned instead of
+/// dead. `child.wait()` afterward reaps it — the exit status is discarded
+/// (a killed child's own status tells us nothing new; the taught timeout
+/// error is already decided by the time this runs), but the reap itself is
+/// NOT optional: skipping it leaves a zombie behind.
+fn kill_process_group(child: &mut std::process::Child) {
+    let pid = child.id() as libc::pid_t;
+    // SAFETY: `pid` is this process's own child, spawned moments ago as its
+    // own process-group leader, so `-pid` addresses exactly that group and
+    // nothing else running on this host.
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    let _ = child.wait();
+}
+
+/// The taught error for a backend shell-out that outran
+/// [`BACKEND_TIMEOUT_ENV`] — names the backend, the op (`get`/`set`/
+/// `has`), and the env knob to raise it. **Never the template text**: a
+/// `set` template's VALUE only ever reaches its child over the child's OWN
+/// stdin ([`store_value`]'s `run_backend_command(..., Some(value))` call
+/// below), never interpolated into the command string itself —
+/// [`expand_template`] substitutes only `{name}` (the policy's `key`) and
+/// `{home}` (`secrets_home`), neither of which is a secret value — so there
+/// is nothing value-bearing in a template's expanded command to leak here
+/// even in principle. This function doesn't take the command as a
+/// parameter at all, so there is no argument to accidentally echo later.
+fn backend_timeout_error(backend_name: &str, op: &str) -> String {
+    format!(
+        "backend `{backend_name}` ({op}) timed out after {}s (`{BACKEND_TIMEOUT_ENV}`) — raise the knob, or fix the hung template",
+        backend_timeout().as_secs()
+    )
+}
+
+/// **THE shared choke point every `get`/`set`/`has` template execution in
+/// this crate routes through (task #74).** Before this function existed,
+/// [`fetch_value`], [`store_value`], and `has_value`'s own
+/// `run_has_template` each spawned their own `sh -c` independently — three
+/// copies, so a per-site timeout would have needed three separate fixes to
+/// actually cover every backend shell-out this crate makes. The `age`
+/// backend and `secrets migrate` (P-G1/P-G2) already multiplied the CALL
+/// SITES onto `fetch_value`/`store_value`/`has_value` without multiplying
+/// this spawn logic, so unifying here is what makes bounding it a
+/// one-function fix rather than an N-site one.
+///
+/// Runs `sh -c command` as its own process group
+/// (`CommandExt::process_group(0)` — see [`kill_process_group`]'s doc for
+/// why), stdin fed from `stdin_data` when `Some` (a plain `Stdio::null()`
+/// when `None`, so a `get`/`has` template that unexpectedly reads stdin
+/// sees immediate EOF rather than blocking on it), stdout/stderr drained
+/// NON-BLOCKINGLY while polling `Child::try_wait` — never via `Command::
+/// output`'s own blocking wait, which has no bound at all. On success,
+/// returns raw stdout bytes (trimming/UTF-8 interpretation stays the
+/// caller's job, unchanged from before this function existed). On a
+/// non-zero exit, the SAME value-free-error / stderr-eprintln-only /
+/// age-exit-127 discipline [`fetch_value`]/[`store_value`] always held,
+/// now written once. On a timeout (wall-clock, [`backend_timeout`]), kills
+/// and reaps the WHOLE child process group and returns
+/// [`backend_timeout_error`] — never a zombie left behind, never the
+/// template text in the error.
+fn run_backend_command(backend_name: &str, op: &str, command: &str, stdin_data: Option<&str>) -> Result<Vec<u8>, String> {
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c").arg(command);
+    cmd.stdin(if stdin_data.is_some() { Stdio::piped() } else { Stdio::null() });
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    // New process group, pgid == this child's own pid — see
+    // `kill_process_group`'s doc for why a timeout kill needs this.
+    cmd.process_group(0);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("spawning backend `{backend_name}` ({op}): {e}"))?;
+
+    if let Some(data) = stdin_data {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| format!("backend `{backend_name}` ({op}): could not open its stdin"))?;
+        // A pipe write this size (a secret value, a policy key) fits well
+        // inside one pipe buffer in practice, so this blocking write does
+        // not itself need the timeout treatment — the documented edge this
+        // leaves open is a pathologically large value against a template
+        // that never reads its stdin at all (this crate's "ONE VALUE PER
+        // SECRET" invariant keeps values small in the first place).
+        stdin
+            .write_all(data.as_bytes())
+            .map_err(|e| format!("writing to backend `{backend_name}` ({op})'s stdin: {e}"))?;
+        // `stdin` drops here, closing the write end (EOF) before the wait
+        // loop starts — same "close stdin before waiting" discipline
+        // `store_value` held before this function existed.
+    }
+
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    if let Some(ref out) = stdout_pipe {
+        set_nonblocking(out.as_raw_fd());
+    }
+    if let Some(ref err) = stderr_pipe {
+        set_nonblocking(err.as_raw_fd());
+    }
+
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
+    let deadline = Instant::now() + backend_timeout();
+
+    let status = loop {
+        if let Some(ref mut out) = stdout_pipe {
+            drain_nonblocking(out, &mut stdout_buf);
+        }
+        if let Some(ref mut err) = stderr_pipe {
+            drain_nonblocking(err, &mut stderr_buf);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    kill_process_group(&mut child);
+                    return Err(backend_timeout_error(backend_name, op));
+                }
+                std::thread::sleep(BACKEND_POLL_INTERVAL);
+            }
+            Err(e) => return Err(format!("waiting on backend `{backend_name}` ({op}): {e}")),
+        }
+    };
+    // One final drain — output written between the last poll and the
+    // process actually exiting would otherwise be lost.
+    if let Some(ref mut out) = stdout_pipe {
+        drain_nonblocking(out, &mut stdout_buf);
+    }
+    if let Some(ref mut err) = stderr_pipe {
+        drain_nonblocking(err, &mut stderr_buf);
+    }
+
+    if !status.success() {
+        // Full stderr goes ONLY here, to the broker's own stderr — never
+        // into the returned `Err` (module doc: it rides the wire reply,
+        // the calling agent's own stderr via `client::run_exec`, and both
+        // audit lines' `reason` field otherwise).
+        eprintln!(
+            "[aoide/secrets] backend `{backend_name}` ({op}) exited {status}: {}",
+            String::from_utf8_lossy(&stderr_buf).trim()
+        );
+        // `sh -c`'s own exit 127 universally means "command not found" —
+        // for the built-in `age` backend (whose templates shell out to
+        // nothing else) that is unambiguous, so it earns the taught error
+        // naming the package to install rather than a bare "exited 127".
+        if backend_name == "age" && status.code() == Some(127) {
+            return Err(missing_age_binary_hint());
+        }
+        return Err(format!("backend `{backend_name}` exited {status}"));
+    }
+    Ok(stdout_buf)
+}
+
 /// Resolve `backend_name`'s `get` template against `key`/`secrets_home`, run
-/// it, and return stdout with exactly one trailing newline trimmed. Errors
-/// are precise but VALUE-FREE by construction: nothing here ever touches
-/// the secret's value except the `Ok` return itself, so an `Err` path can
-/// never leak one. A failed command's stderr is `eprintln!`'d to the
-/// BROKER's own stderr (module doc) and never appears in the returned
-/// `Err` — only the exit status does.
+/// it (bounded, [`run_backend_command`] — task #74), and return stdout with
+/// exactly one trailing newline trimmed. Errors are precise but VALUE-FREE
+/// by construction: nothing here ever touches the secret's value except the
+/// `Ok` return itself, so an `Err` path can never leak one.
 pub fn fetch_value(secrets_home: &Path, backend_name: &str, key: &str) -> Result<String, String> {
     let backends = load_backends(secrets_home)?;
     let backend = backends
@@ -277,32 +542,7 @@ pub fn fetch_value(secrets_home: &Path, backend_name: &str, key: &str) -> Result
     }
     let command = expand_template(&backend.get, secrets_home, key);
 
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&command)
-        .output()
-        .map_err(|e| format!("spawning backend `{backend_name}`: {e}"))?;
-    if !output.status.success() {
-        // Full stderr goes ONLY here, to the broker's own stderr — never
-        // into the returned `Err` (module doc: it rides the wire reply,
-        // the calling agent's own stderr via `client::run_exec`, and both
-        // audit lines' `reason` field otherwise).
-        eprintln!(
-            "[aoide/secrets] backend `{backend_name}` exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        // `sh -c`'s own exit 127 universally means "command not found" —
-        // for the built-in `age` backend (whose templates shell out to
-        // nothing else) that is unambiguous, so it earns the taught error
-        // naming the package to install rather than a bare "exited 127".
-        if backend_name == "age" && output.status.code() == Some(127) {
-            return Err(missing_age_binary_hint());
-        }
-        return Err(format!("backend `{backend_name}` exited {}", output.status));
-    }
-
-    let mut stdout = output.stdout;
+    let mut stdout = run_backend_command(backend_name, "get", &command, None)?;
     if stdout.last() == Some(&b'\n') {
         stdout.pop();
     }
@@ -342,31 +582,28 @@ pub fn has_value(secrets_home: &Path, backend_name: &str, key: &str) -> bool {
     }
 }
 
-/// Run a backend's OWN `has` template (P-G1) and report its exit status —
-/// the ONE place this crate treats a template's success/failure as the
-/// answer itself rather than reading its stdout. Any spawn failure reads as
-/// "no stored value", the same tolerant shape [`has_value`]'s `get`-probe
-/// fallback already holds.
+/// Run a backend's OWN `has` template (P-G1, bounded by [`run_backend_command`]
+/// since task #74) and report its exit status — the ONE place this crate
+/// treats a template's success/failure as the answer itself rather than
+/// reading its stdout. Any failure (spawn, non-zero exit, or a timeout)
+/// reads as "no stored value", the same tolerant shape [`has_value`]'s
+/// `get`-probe fallback already holds — a `has` template that itself hangs
+/// degrades to "no value" here, and [`store_value`]'s own SET attempt that
+/// follows hits the SAME hang and correctly fails with a real timeout error
+/// there, so nothing gets silently overwritten on a mere probe timeout.
 fn run_has_template(secrets_home: &Path, backend_name: &str, key: &str, template: &str) -> bool {
     let command = expand_template(template, secrets_home, key);
-    match std::process::Command::new("sh").arg("-c").arg(&command).output() {
-        Ok(output) => output.status.success(),
-        Err(e) => {
-            eprintln!("[aoide/secrets] spawning backend `{backend_name}`'s has template: {e}");
-            false
-        }
-    }
+    run_backend_command(backend_name, "has", &command, None).is_ok()
 }
 
 /// Resolve `backend_name`'s `set` template against `key`/`secrets_home`, run
-/// it with `value` piped to the template's OWN stdin (never argv), and
-/// discard its stdout (a `set` template has nothing useful to report back —
-/// unlike `get`'s stdout, which IS the value). Errors are precise but
-/// VALUE-FREE by construction, same discipline as [`fetch_value`]: a
-/// missing backend, a backend with no `set` template, or a failing `set`
-/// command all return an `Err` that carries no part of `value` — the
-/// backend's own stderr is `eprintln!`'d to the BROKER's own stderr and
-/// never returned.
+/// it (bounded, [`run_backend_command`] — task #74) with `value` piped to
+/// the template's OWN stdin (never argv), and discard its stdout (a `set`
+/// template has nothing useful to report back — unlike `get`'s stdout,
+/// which IS the value). Errors are precise but VALUE-FREE by construction,
+/// same discipline as [`fetch_value`]: a missing backend, a backend with no
+/// `set` template, a failing `set` command, or a timeout all return an
+/// `Err` that carries no part of `value`.
 pub fn store_value(secrets_home: &Path, backend_name: &str, key: &str, value: &str) -> Result<(), String> {
     let backends = load_backends(secrets_home)?;
     let backend = backends
@@ -378,44 +615,7 @@ pub fn store_value(secrets_home: &Path, backend_name: &str, key: &str, value: &s
     };
     let command = expand_template(set_template, secrets_home, key);
 
-    let mut child = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&command)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawning backend `{backend_name}`: {e}"))?;
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| format!("backend `{backend_name}`: could not open its stdin"))?;
-        stdin
-            .write_all(value.as_bytes())
-            .map_err(|e| format!("writing to backend `{backend_name}`'s stdin: {e}"))?;
-        // `stdin` drops here, closing the write end (EOF) before we wait —
-        // a `set` template blocked reading its own stdin would otherwise
-        // hang forever.
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("waiting on backend `{backend_name}`: {e}"))?;
-    if !output.status.success() {
-        // Same value-free discipline as `fetch_value` — full stderr goes
-        // ONLY to the broker's own stderr, never into the returned `Err`.
-        eprintln!(
-            "[aoide/secrets] backend `{backend_name}` (set) exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        // Same taught-error treatment as `fetch_value`'s own exit-127 case
-        // — see that function's comment.
-        if backend_name == "age" && output.status.code() == Some(127) {
-            return Err(missing_age_binary_hint());
-        }
-        return Err(format!("backend `{backend_name}` exited {}", output.status));
-    }
+    run_backend_command(backend_name, "set", &command, Some(value))?;
     Ok(())
 }
 
@@ -1326,6 +1526,150 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         let result = remove_builtin_value(&home, "file", "never-stored");
         assert!(matches!(result, Some(Ok(()))));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── bounded backend shell-outs (task #74) ───────────────────────────
+
+    /// Restores whatever `AOIDE_SECRETS_BACKEND_TIMEOUT` held before the
+    /// test ran — every test below that sets it does so through this guard
+    /// rather than a bare `set_var`, so a panic mid-test still leaves the
+    /// env sane for whatever runs next (this crate's whole suite runs
+    /// `--test-threads=1`, so no cross-test lock is needed beyond that).
+    struct EnvGuard {
+        saved: Option<String>,
+    }
+    impl EnvGuard {
+        fn set(value: &str) -> Self {
+            let saved = std::env::var(BACKEND_TIMEOUT_ENV).ok();
+            std::env::set_var(BACKEND_TIMEOUT_ENV, value);
+            Self { saved }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.saved {
+                Some(v) => std::env::set_var(BACKEND_TIMEOUT_ENV, v),
+                None => std::env::remove_var(BACKEND_TIMEOUT_ENV),
+            }
+        }
+    }
+
+    #[test]
+    fn backend_timeout_defaults_to_10_seconds() {
+        let saved = std::env::var(BACKEND_TIMEOUT_ENV).ok();
+        std::env::remove_var(BACKEND_TIMEOUT_ENV);
+        assert_eq!(backend_timeout(), Duration::from_secs(10));
+        match saved {
+            Some(v) => std::env::set_var(BACKEND_TIMEOUT_ENV, v),
+            None => std::env::remove_var(BACKEND_TIMEOUT_ENV),
+        }
+    }
+
+    #[test]
+    fn backend_timeout_env_override_wins() {
+        let _guard = EnvGuard::set("3");
+        assert_eq!(backend_timeout(), Duration::from_secs(3));
+    }
+
+    /// The documented fallback: a garbage value (an operator typo) must
+    /// fall back to the default, never panic and never silently disable
+    /// the bound by treating it as "no timeout".
+    #[test]
+    fn backend_timeout_env_garbage_falls_back_to_the_default() {
+        let _guard = EnvGuard::set("not-a-number");
+        assert_eq!(backend_timeout(), Duration::from_secs(DEFAULT_BACKEND_TIMEOUT_SECS));
+    }
+
+    #[test]
+    fn backend_timeout_env_blank_falls_back_to_the_default() {
+        let _guard = EnvGuard::set("   ");
+        assert_eq!(backend_timeout(), Duration::from_secs(DEFAULT_BACKEND_TIMEOUT_SECS));
+    }
+
+    /// The choke point itself: a `get` template that sleeps well past the
+    /// timeout must be killed, reaped (no zombie), and reported within
+    /// bounds — the exact scenario `AGENTS.md`'s KNOWN GAP note described
+    /// as unbounded before this phase. The template writes its OWN pid to
+    /// a marker file first (via `$$`, the shell's own pid — never a
+    /// subshell) so the test can confirm, from OUTSIDE this module's own
+    /// bookkeeping, that the killed process is actually gone from `/proc`
+    /// afterward rather than lingering as a zombie.
+    #[test]
+    fn a_hung_get_template_times_out_kills_and_reaps_the_child() {
+        let home = tmp_home("hung-get-timeout");
+        let marker = home.join("child.pid");
+        write_backends(&home, &format!("echo $$ > {} && sleep 60", marker.display()));
+
+        let _guard = EnvGuard::set("1");
+        let start = Instant::now();
+        let err = fetch_value(&home, "scratch", "x").unwrap_err();
+        let elapsed = start.elapsed();
+
+        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}, expected timeout at ~1s");
+        assert!(err.contains("scratch"), "error should name the backend: {err}");
+        assert!(err.contains("get"), "error should name the op: {err}");
+        assert!(err.contains(BACKEND_TIMEOUT_ENV), "error should name the env knob: {err}");
+        assert!(!err.contains("sleep 60"), "template text leaked into the error: {err}");
+
+        // The marker is written near-instantly, well before the 1s
+        // deadline — a short settle is just insurance against a slow disk.
+        std::thread::sleep(Duration::from_millis(200));
+        let pid_text = std::fs::read_to_string(&marker).expect("the template should have written its pid before hanging");
+        let pid: i32 = pid_text.trim().parse().expect("marker should carry a bare pid");
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "the killed child (pid {pid}) must be fully reaped, not left as a zombie"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Task requirement: "a put against a sleeping set-template returns
+    /// within bounds rather than hanging" — proven directly at the choke
+    /// point `store_value` (and, transitively, `broker::put_gate`) routes
+    /// through, with the env knob set tiny.
+    #[test]
+    fn store_value_against_a_hung_set_template_returns_within_bounds() {
+        let home = tmp_home("hung-set-timeout");
+        write_backend_with_set(&home, "printf %s {name}", "sleep 60");
+
+        let _guard = EnvGuard::set("1");
+        let start = Instant::now();
+        let err = store_value(&home, "scratch", "k", "the-stored-value").unwrap_err();
+        let elapsed = start.elapsed();
+
+        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}, expected timeout at ~1s");
+        assert!(err.contains("set"), "error should name the op: {err}");
+        assert!(!err.contains("the-stored-value"), "value leaked into the timeout error: {err}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// `has` templates get the same bound — a hung `has` degrades to
+    /// "false" (module doc), never hangs `has_value` itself.
+    #[test]
+    fn a_hung_has_template_times_out_and_reads_as_no_stored_value() {
+        let home = tmp_home("hung-has-timeout");
+        write_backend_with_has(&home, "printf %s {name}", "sleep 60");
+
+        let _guard = EnvGuard::set("1");
+        let start = Instant::now();
+        let result = has_value(&home, "scratch", "x");
+        let elapsed = start.elapsed();
+
+        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}, expected timeout at ~1s");
+        assert!(!result, "a hung `has` template must read as no stored value, never hang has_value itself");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Behavior unchanged for a well-behaved template under the DEFAULT
+    /// (untouched) timeout — the bound must never slow down the common
+    /// case.
+    #[test]
+    fn a_fast_template_is_unaffected_by_the_default_timeout() {
+        let home = tmp_home("fast-template-unaffected");
+        write_backends(&home, "printf %s {name}");
+        assert_eq!(fetch_value(&home, "scratch", "quick").unwrap(), "quick");
         std::fs::remove_dir_all(&home).ok();
     }
 }

@@ -749,8 +749,9 @@
   operator" (any group member reaching the socket can dismiss, not only an
   operator), and `park::wait_for_outcome`'s doc comment no longer claims
   its lost-race `recv()` is "provably prompt" — a hung backend shell-out
-  breaks that promise (see the KNOWN GAP note immediately below), so the
-  comment now states the assumption instead of overclaiming it.
+  breaks that promise (see the note below, closed at task #74 — bounded,
+  not eliminated), so the comment now states the assumption instead of
+  overclaiming it.
 - **Broker event notifications LANDED at P-N3.** `emit_notify` (`broker.rs`)
   fires a name-only line for five events (`released`/`parked`/`completed`/
   `dismissed`/`expired`) into the SAME two destinations every `audit_*`
@@ -929,19 +930,46 @@
   LAST in `commands::register()` (golden discipline — append, never
   reorder), golden 67 → 68.
 
-**KNOWN GAP, deferred, not fixed by P-N2c:** backend `get`/`set` shell-outs
-(`backend::fetch_value`/`store_value`) have NO timeout — a wedged backend
-command blocks its calling thread indefinitely. On the `put` path this
-means `broker::put_lock` (the invariant above) is held across that
-unbounded shell-out, so a single hung `set` template serializes every OTHER
-`put` on this broker behind it for as long as the hang lasts (the
-`resolve`/`approve` path has no equivalent lock held across its own
-backend call, so a hung `get` only blocks that one connection's thread).
-This is a documented, deferred gap, not a P-N2c fix — a future phase adding
-a shell-out timeout (or narrowing `put_lock`'s critical section to exclude
-the backend call, which would need its own TOCTOU analysis) closes it; a
-new `put`-path change must not casually widen `put_lock`'s critical
-section further without accounting for this already-known cost.
+**CLOSED at task #74 (this commit): every backend `get`/`set`/`has`
+shell-out is now BOUNDED, through one shared choke point
+(`backend::run_backend_command`).** Before this phase (the KNOWN GAP this
+note used to describe, left deferred at P-N2c), `backend::fetch_value`/
+`store_value`/`has_value`'s own `run_has_template` each spawned `sh -c`
+independently with NO timeout at all — a wedged backend command blocked
+its calling thread indefinitely, and on the `put` path that meant
+`broker::put_lock` (the invariant above) was held across the hang,
+serializing every OTHER `put` on this broker behind it for as long as it
+lasted. `run_backend_command` now bounds every one of those three call
+sites: `AOIDE_SECRETS_BACKEND_TIMEOUT` (`backend::BACKEND_TIMEOUT_ENV`,
+default 10s, `backend::DEFAULT_BACKEND_TIMEOUT_SECS`), same
+tolerant-fallback env parsing as `park::park_timeout`. A template still
+running past the deadline has its WHOLE PROCESS GROUP `SIGKILL`ed
+(`CommandExt::process_group(0)` at spawn + `libc::kill(-pid, SIGKILL)` at
+timeout — never just the immediate `sh`, so a pipeline the template itself
+forked can't survive as an orphan) and reaped (`Child::wait`, never a
+zombie), and the caller gets a taught error naming the backend, the op
+(`get`/`set`/`has`), and the env knob — never the template text, which
+can't carry a secret value in the first place (`store_value`'s `value`
+only ever reaches its child over stdin, never interpolated into the
+command string `expand_template` builds). See `README.md`'s "Bounded
+backend shell-outs" for the full mechanism and the invariant immediately
+below for the hard rule this establishes going forward.
+
+- **Every backend shell-out this crate makes — present or future — MUST
+  route through `backend::run_backend_command`, never spawn `sh -c`
+  directly (task #74, hard constraint).** This is what makes the timeout
+  in the note above actually cover EVERY template execution rather than
+  needing a per-call-site fix the way the pre-task-#74 gap did: `age`
+  (P-G1) and `secrets migrate` (P-G2) already multiplied the CALL SITES
+  onto `fetch_value`/`store_value`/`has_value` without multiplying the
+  spawn logic itself, and that discipline is exactly why bounding it was a
+  one-function fix. A future backend-adjacent addition (a new template
+  kind, a new per-backend probe) that spawns its own `Command::new("sh")`
+  instead of calling `run_backend_command` silently reopens the unbounded-
+  hang gap this note exists to keep closed — don't. The timeout wait
+  itself is wall-clock via polling `Child::try_wait`, never a per-child
+  watchdog thread and never `SIGALRM` (`run_backend_command`'s own doc) —
+  a future change to the wait mechanism holds the same restriction.
 
 ## Docs update required in the same commit
 

@@ -679,8 +679,10 @@ terminal-state restoration risk, works over ssh and with a piped stdin:
 enforced twice — a code prompt refuses to OPEN below the threshold, and the
 remaining time is re-checked again AFTER the code is read but BEFORE
 `client::approve` is called, so a code typed right at the boundary is
-discarded unspent rather than raced against the broker's own unbounded
-backend shell-out (the crate's documented KNOWN GAP, `AGENTS.md`).
+discarded unspent rather than raced against the broker's own backend
+shell-out — bounded since task #74 (`AOIDE_SECRETS_BACKEND_TIMEOUT`,
+default 10s, "Bounded backend shell-outs" below) but still not
+instantaneous, so this double-check remains load-bearing.
 
 **Non-tty stdin, or `--json`: narration only, no prompts, ever** — `aoide
 secrets watch | tee` and a systemd unit both behave. `--json` emits one
@@ -863,6 +865,45 @@ secret (base32): <base32>
   NEVER argv (`/proc/<pid>/cmdline` is world-readable on Linux, and the
   URI carries the secret). `qrencode`'s absence is feature-detected by the
   spawn itself failing — a one-line hint, never an error.
+
+## Bounded backend shell-outs (task #74)
+
+Every `get`/`set`/`has` template execution — every call this crate makes
+through `backend::fetch_value`/`store_value`/`has_value` — now runs through
+ONE shared, bounded spawn path, `backend::run_backend_command`. Before this
+phase there was no bound at all (this file used to document it as a KNOWN
+GAP, `AGENTS.md`): a wedged template blocked its calling thread forever,
+and on the `put` path that thread was holding `broker::put_lock` the whole
+time, serializing every OTHER `put` on this broker behind the one hang —
+the exact live-shaped failure this phase closes.
+
+`AOIDE_SECRETS_BACKEND_TIMEOUT` (seconds, default **10**) bounds the wait —
+read fresh on every shell-out, never cached, same tolerant-fallback parsing
+as `AOIDE_SECRETS_PARK_TIMEOUT`: a blank or unparsable value falls back to
+the default rather than disabling the bound. A template still running past
+the deadline has its WHOLE PROCESS GROUP `SIGKILL`ed (never just the
+immediate `sh` — a pipeline the template itself forked, e.g. `age -d ... |
+something`, would otherwise survive as orphans) and reaped (`Child::wait`,
+never a zombie left behind); the caller gets a taught error naming the
+backend, the operation (`get`/`set`/`has`), and the env knob — **never the
+template text**, which can't carry a secret value in the first place (a
+`set` template's `value` only ever reaches its child over stdin, never
+interpolated into the command string `expand_template` builds). The wait
+itself is wall-clock via polling `Child::try_wait` — never a per-child
+watchdog thread, never `SIGALRM` — with stdout/stderr drained
+NON-BLOCKINGLY while polling (rather than only after the child exits), so a
+template that happens to write more than one pipe buffer's worth of output
+can't deadlock against the timeout mechanism itself.
+
+A hung `get`/`resolve` only ever blocks its own connection's thread
+(`broker.rs`'s module doc — no lock is held across that call); a hung
+`has`-probe (P-67's "warn before overwrite" existence check) degrades to
+"no stored value" on timeout, the same tolerant fallback it already held
+for a spawn failure or a non-zero exit — the SET attempt that follows hits
+the identical hang and correctly fails with a real timeout error there, so
+nothing is silently overwritten on a mere probe timeout. Behavior for a
+well-behaved template is unchanged under the default knob — this phase
+only bounds the wait, it never slows down the common case.
 
 ## Backend presets
 
@@ -1369,11 +1410,16 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   not be able to break the command or escape its argument boundary) via
   `expand_template`'s single left-to-right scan (module doc — never a
   sequential two-pass replace, which could re-scan already-substituted text
-  for the other placeholder). `fetch_value` runs the `get` template via
-  `sh -c` and trims exactly one trailing newline from stdout; `store_value`
-  (P-V4c) runs the `set` template the same way with `value` piped to ITS
-  OWN stdin (never argv) and discards its stdout. On a failing backend
-  (either direction), the returned `Err` carries ONLY the exit status — the
+  for the other placeholder). `fetch_value`/`store_value`/`has_value`'s
+  `run_has_template` all route through `run_backend_command` (task #74,
+  "Bounded backend shell-outs" above) — the ONE place this crate actually
+  spawns `sh -c`, bounded by `backend_timeout()`
+  (`AOIDE_SECRETS_BACKEND_TIMEOUT`), killing and reaping the child's whole
+  process group on a timeout. `fetch_value` trims exactly one trailing
+  newline from the returned stdout; `store_value` (P-V4c) pipes `value` to
+  the template's OWN stdin (never argv) and discards its stdout. On a
+  failing backend (either direction, or a timeout), the returned `Err`
+  carries ONLY the exit status (or the timeout message) — the
   command's full stderr is `eprintln!`'d to the broker's own stderr and
   never returned, since the `Err` string rides the wire reply and both
   audit lines' `reason` field; exit 127 (`sh -c`'s universal "command not
