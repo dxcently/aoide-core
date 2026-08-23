@@ -84,9 +84,12 @@
 //! invariant and the timeout/completion race, and `README.md`'s "Parking a
 //! TOTP resolve" section for the full lifecycle.
 //!
-//! **`secrets watch` (this commit, tracker #71 Part 1) is a foreground,
-//! line-mode terminal surface** that tail-follows the mirrored aoide log
-//! ([`watch::Follower`], delta-reads only, never re-reads from the start),
+//! **`secrets watch` (tracker #71 Part 1) is a foreground, line-mode
+//! terminal surface** that tail-follows the broker-owned events feed
+//! ([`watch::Follower`], delta-reads only, never re-reads from the start —
+//! P-G4, task #77: corrected from the mirrored `~/Aoide/log`, which the
+//! deployed broker's `ProtectHome=true` unit cannot write into, see
+//! `socket::events_path`'s own doc for the live incident this fixed),
 //! narrates every broker event ([`watch::parse_notify_line`]/[`watch::
 //! Event`]), and — when stdin is a terminal and `--json` is absent —
 //! prompts inline for each parked ask: approve with a hidden TOTP code
@@ -94,10 +97,13 @@
 //! touches argv), dismiss it outright, or ignore it (stays parked for any
 //! other terminal). `client::pending` remains the AUTHORITY — the tail is
 //! only a trigger, reconciled ([`watch::Queue::reconcile`]) on every event
-//! and a 30s safety tick. `--json` emits one event object per line, the
-//! seam a future graphical popup phase (Part 2 of the same design doc)
-//! subscribes to instead of re-tailing the log itself — see `watch`'s own
-//! module doc and `README.md`'s "Watching events" section.
+//! and a 30s safety tick that now serves purely as a RECONCILIATION
+//! backstop rather than the primary delivery path — a parked ask surfaces
+//! through the feed in about a second, not up to 30. `--json` emits one
+//! event object per line, the seam a future graphical popup phase (Part 2
+//! of the same design doc) subscribes to instead of re-tailing the feed
+//! itself — see `watch`'s own module doc and `README.md`'s "Watching
+//! events" section.
 //!
 //! See `README.md` for the wire shape and the release-to-client flow, and
 //! `AGENTS.md` for the invariants a change here must hold — most

@@ -1,11 +1,17 @@
 //! `aoide secrets watch` — a foreground, line-mode terminal surface (design
-//! doc: tracker #71 Part 1) that tail-follows the mirrored aoide log,
-//! narrates every broker event, and — when stdin is a terminal and `--json`
-//! is absent — prompts inline for each parked ask: approve with a hidden
-//! TOTP code, dismiss it outright, or ignore it (leaving it parked for any
-//! other terminal). This is one of the seven I/O-carrying modules in the
-//! crate (`AGENTS.md`'s "I/O is confined to seven named modules" invariant)
-//! — `broker`/`client`/`store`/`backend`/`enroll` are the other five.
+//! doc: tracker #71 Part 1) that tail-follows the broker-owned events feed
+//! (`socket::events_path` — P-G4, task #77, corrected from the mirrored
+//! `~/Aoide/log` this module read through P-N3: the deployed broker unit
+//! runs with `ProtectHome=true`, so its best-effort mirror into the
+//! operator's home silently failed there, and this watcher saw ZERO event
+//! lines, falling back to its 30s pending-reconcile tick for every popup —
+//! found live on yomi-strix, 2026-08-23), narrates every broker event, and
+//! — when stdin is a terminal and `--json` is absent — prompts inline for
+//! each parked ask: approve with a hidden TOTP code, dismiss it outright,
+//! or ignore it (leaving it parked for any other terminal). This is one of
+//! the seven I/O-carrying modules in the crate (`AGENTS.md`'s "I/O is
+//! confined to seven named modules" invariant) — `broker`/`client`/`store`/
+//! `backend`/`enroll` are the other five.
 //!
 //! **`--popup` (tracker #71 Part 2, this commit)** swaps the tty prompt for
 //! a `zenity --entry --hide-text` dialog on each parked ask — the CHILD's
@@ -43,10 +49,14 @@
 //! [`code_prompt_allowed`]/[`narrate_event`]/[`event_to_json`] are PURE —
 //! clock-as-parameter throughout (this crate's own standing rule for
 //! `totp`/`replay`; extended here to the fold, for the same testability
-//! reason). [`Follower`] is the one piece of real file I/O (tail-follow
-//! `AGENTS.md`'s mirrored-log discipline: open once, seek to EOF, delta
-//! reads only — the log is tens of MB and unrotated, so this NEVER re-reads
-//! from the start). [`run`] wires both together behind two threads sharing
+//! reason — `parse_notify_line` takes its own `ts` as a parameter for
+//! exactly this reason, P-G4). [`Follower`] is the one piece of real file
+//! I/O (tail-follow `AGENTS.md`'s events-feed discipline: open once, seek
+//! to EOF, delta reads only, reopen-at-0 on a shrink — the events feed is
+//! capped at 1 MiB and truncated back to empty in place rather than
+//! rotated, `broker::append_events_feed`'s own doc, so this same
+//! reopen-on-shrink branch is what makes that truncation transparent to a
+//! live watcher). [`run`] wires both together behind two threads sharing
 //! one `Queue` and one output lock, and is the only piece that touches a
 //! socket, a terminal, or a signal.
 //!
@@ -82,12 +92,14 @@ use std::time::Duration;
 
 // ── P1: the pure fold ───────────────────────────────────────────────────
 
-/// One broker notification, parsed from a mirrored-log line — the exact
+/// One broker notification, parsed from an events-feed line — the exact
 /// five shapes `broker::emit_notify` writes (crate `README.md`'s "Broker
-/// notifications"). `ts` is the OUTER `AuditRecord`'s own timestamp (the
-/// instant the broker wrote the line), reused as `requestedAt` for a
-/// freshly-seen `Parked` ask — the notify fires right at park time, so the
-/// two are the same instant in practice.
+/// notifications"). `ts` is the instant this line was READ (P-G4: the
+/// events feed carries no per-line timestamp of its own — see
+/// `parse_notify_line`'s own doc), reused as `requestedAt` for a
+/// freshly-seen `Parked` ask — the notify fires right at park time and is
+/// seen within one poll tick, so the two remain the same instant in
+/// practice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Released { secret: String, consumer: String, ts: u64 },
@@ -111,26 +123,25 @@ impl Event {
     }
 }
 
-/// Parse ONE mirrored-log line into an [`Event`] — pure, total, and never
-/// panics. Filters to `class == "secret" && command == "secrets.notify"`
-/// (every other line, e.g. a `graph.session.hook` audit line, returns
-/// `None`); the `message` field rides as a JSON *string* on the wire
-/// (`AuditRecord::message: String`), so it is parsed as JSON itself, never
-/// regex-matched. A malformed line — bad outer JSON, bad inner JSON, an
-/// unrecognized `event` kind, a missing required field — returns `None`
-/// rather than erroring; the caller (the tail loop) skips it and moves on,
-/// same posture as every other log consumer in this crate.
-pub fn parse_notify_line(line: &str) -> Option<Event> {
-    let record: Value = serde_json::from_str(line).ok()?;
-    if record.get("class").and_then(Value::as_str) != Some("secret") {
-        return None;
-    }
-    if record.get("command").and_then(Value::as_str) != Some("secrets.notify") {
-        return None;
-    }
-    let ts = record.get("ts").and_then(Value::as_u64)?;
-    let message = record.get("message").and_then(Value::as_str)?;
-    let payload: Value = serde_json::from_str(message).ok()?;
+/// Parse ONE events-feed line into an [`Event`] — pure, total, and never
+/// panics. As of P-G4 (task #77) this reads the RAW payload
+/// `broker::emit_notify` already writes verbatim to its own `audit.log`
+/// (`append_own_log`) and now, identically, to the broker-owned events
+/// feed (`append_events_feed`) — a bare `{"event": "<kind>", ...}` object,
+/// no `AuditRecord` wrapper and no `message`-as-JSON-string indirection
+/// (that wrapper shape only ever existed on the mirrored `~/Aoide/log`
+/// side, which this module no longer reads — module doc). `ts` arrives as
+/// a PARAMETER (this module's own clock-as-parameter discipline) rather
+/// than being read from the line itself: none of `emit_notify`'s five
+/// payload shapes carry a timestamp field (they never have, even before
+/// this phase — this parser previously borrowed the OUTER `AuditRecord`'s
+/// own `ts` for that purpose, which no longer exists on this path), so the
+/// caller (the tail loop, `unix_now()` at the moment the line was read)
+/// supplies it instead. A malformed line — bad JSON, an unrecognized
+/// `event` kind, a missing required field — returns `None` rather than
+/// erroring; the caller skips it and moves on, same posture as before.
+pub fn parse_notify_line(line: &str, ts: u64) -> Option<Event> {
+    let payload: Value = serde_json::from_str(line).ok()?;
     let kind = payload.get("event").and_then(Value::as_str)?;
     let secret = payload.get("secret").and_then(Value::as_str)?.to_string();
     let consumer = payload.get("consumer").and_then(Value::as_str)?.to_string();
@@ -434,10 +445,13 @@ pub fn event_to_json(event: &Event) -> Value {
 // ── P2: the follower ─────────────────────────────────────────────────────
 
 /// Tail-follows one file from EOF, delta-reads only — NEVER re-reads from
-/// the start (module doc: the mirrored log is tens of MB, unrotated, and
-/// churns constantly from every agent tool call's own `graph.session.hook`
-/// line). A partial trailing line (no `\n` yet) is held across polls, never
-/// parsed early.
+/// the start. As of P-G4 (task #77) this follows the broker-owned events
+/// feed, capped at 1 MiB and truncated back to empty IN PLACE rather than
+/// rotated (`broker::append_events_feed`'s own doc) — the `len() < pos`
+/// branch below is what makes that truncation transparent to a live
+/// watcher, reopening at 0 the same way it would for any other shrink. A
+/// partial trailing line (no `\n` yet) is held across polls, never parsed
+/// early.
 pub struct Follower {
     path: PathBuf,
     file: File,
@@ -837,7 +851,7 @@ fn tail_loop(mut follower: Follower, socket_path: PathBuf, queue: Arc<Mutex<Queu
         match follower.poll() {
             Ok(lines) => {
                 for line in lines {
-                    let Some(event) = parse_notify_line(&line) else { continue };
+                    let Some(event) = parse_notify_line(&line, unix_now()) else { continue };
                     {
                         let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
                         q.apply(&event);
@@ -1004,31 +1018,36 @@ fn handle_approve(socket_path: &Path, ask: &Ask, queue: &Arc<Mutex<Queue>>, out_
     }
 }
 
-/// Wait for `audit_log` to exist, narrating the wait exactly once, then
-/// open it at EOF — review rider: on a brand-new host the mirrored log may
-/// not exist yet at `secrets watch` startup, and exiting 1 immediately
-/// (the pre-rider behavior) is needlessly hostile when the fix is just "the
-/// broker hasn't written its first line yet, wait a moment." Only
+/// Wait for `events_path` to exist, narrating the wait exactly once, then
+/// open it at EOF — review rider: on a brand-new host the events feed may
+/// not exist yet at `secrets watch` startup (the broker hasn't emitted
+/// anything since boot), and exiting 1 immediately (the pre-rider
+/// behavior) is needlessly hostile when the fix is just "the broker hasn't
+/// written its first line yet, wait a moment." Only
 /// [`std::io::ErrorKind::NotFound`] waits — a PERMISSION error or anything
 /// else still fails immediately (`Err(1)`), same as before this rider: a
-/// wait would only mislead when the log exists but can't be read. `Err(0)`
+/// wait would only mislead when the file exists but can't be read. `Err(0)`
 /// means Ctrl-C landed while waiting — a clean exit, not a failure.
 /// `poll_interval` is a parameter (never a bare `Duration::from_secs(1)`
 /// inline) so the tempfile test below doesn't have to spend real seconds
-/// waiting on it.
-fn wait_for_follower(audit_log: &Path, poll_interval: Duration) -> Result<Follower, i32> {
+/// waiting on it. This NotFound-poll semantics is unchanged by P-G4 (task
+/// #77) moving the tail source from the mirrored `~/Aoide/log` to the
+/// broker-owned events feed — a fresh `/run/aoide-secrets/` with no event
+/// emitted yet is exactly the same "wait, don't exit 1" shape a brand-new
+/// `~/Aoide/log` used to be.
+fn wait_for_follower(events_path: &Path, poll_interval: Duration) -> Result<Follower, i32> {
     let mut narrated = false;
     loop {
-        match Follower::open_at_end(audit_log) {
+        match Follower::open_at_end(events_path) {
             Ok(f) => return Ok(f),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if !narrated {
-                    eprintln!("aoide secrets watch: waiting for the log to appear at {}", audit_log.display());
+                    eprintln!("aoide secrets watch: waiting for the events feed to appear at {}", events_path.display());
                     narrated = true;
                 }
             }
             Err(e) => {
-                eprintln!("aoide secrets watch: opening {}: {e}", audit_log.display());
+                eprintln!("aoide secrets watch: opening {}: {e}", events_path.display());
                 return Err(1);
             }
         }
@@ -1043,16 +1062,19 @@ fn wait_for_follower(audit_log: &Path, poll_interval: Duration) -> Result<Follow
 }
 
 /// The full `aoide secrets watch` verb — foreground, blocks until Ctrl-C or
-/// (in the interactive/`--popup` loops) stdin EOF. `audit_log`/`socket_path`
-/// are resolved ONCE by the caller and passed in (this crate's own
-/// `home`/`socket` resolution discipline, `AGENTS.md`) — this function
-/// never re-derives either. `json_mode` forces narration-only regardless of
+/// (in the interactive/`--popup` loops) stdin EOF. `events_path`/
+/// `socket_path` are resolved ONCE by the caller and passed in (this
+/// crate's own `home`/`socket` resolution discipline, `AGENTS.md`) — this
+/// function never re-derives either; `events_path` is `socket::events_path`
+/// applied to the SAME resolved `socket_path` (P-G4, task #77 — replacing
+/// the mirrored `~/Aoide/log` path this parameter carried through P-N3,
+/// see module doc for why). `json_mode` forces narration-only regardless of
 /// tty (module doc); `popup_mode` (`--popup`, mutually exclusive with
 /// `json_mode` — `commands::handle_secrets_watch` refuses the combination
 /// before this function is ever called) swaps the tty prompt for a zenity
 /// dialog and runs regardless of whether stdin is a terminal. See
 /// [`select_mode`] for the exact precedence between the three.
-pub fn run(socket_path: &Path, audit_log: &Path, json_mode: bool, popup_mode: bool) -> i32 {
+pub fn run(socket_path: &Path, events_path: &Path, json_mode: bool, popup_mode: bool) -> i32 {
     if popup_mode && !zenity_available(ZENITY_CMD) {
         eprintln!(
             "aoide secrets watch --popup: `zenity` not found on PATH \u{2014} install zenity, or run \
@@ -1063,7 +1085,7 @@ pub fn run(socket_path: &Path, audit_log: &Path, json_mode: bool, popup_mode: bo
 
     install_sigint_handler();
 
-    let follower = match wait_for_follower(audit_log, Duration::from_secs(1)) {
+    let follower = match wait_for_follower(events_path, Duration::from_secs(1)) {
         Ok(f) => f,
         Err(code) => return code,
     };
@@ -1110,16 +1132,13 @@ pub fn run(socket_path: &Path, audit_log: &Path, json_mode: bool, popup_mode: bo
 mod tests {
     use super::*;
 
-    fn notify_line(ts: u64, kind: &str, payload: &Value) -> String {
-        json!({
-            "ts": ts,
-            "door": "daemon",
-            "class": "secret",
-            "command": "secrets.notify",
-            "status": kind,
-            "message": payload.to_string(),
-        })
-        .to_string()
+    /// The events-feed line shape (P-G4, task #77): the bare
+    /// `emit_notify` payload, verbatim — no `AuditRecord` wrapper. `ts` is
+    /// no longer part of the line at all (`parse_notify_line`'s own doc);
+    /// it is supplied by the CALLER of `parse_notify_line`, not embedded
+    /// here.
+    fn notify_line(payload: &Value) -> String {
+        payload.to_string()
     }
 
     // ── parse_notify_line ────────────────────────────────────────────
@@ -1128,64 +1147,60 @@ mod tests {
     fn parses_every_one_of_the_five_event_kinds() {
         let released = json!({ "event": "released", "secret": "aws-ci", "consumer": "melete" });
         assert_eq!(
-            parse_notify_line(&notify_line(1, "released", &released)),
+            parse_notify_line(&notify_line(&released), 1),
             Some(Event::Released { secret: "aws-ci".into(), consumer: "melete".into(), ts: 1 })
         );
 
         let parked = json!({ "event": "parked", "id": "ab12-1", "secret": "db-prod", "consumer": "claude", "timeoutSecs": 300 });
         assert_eq!(
-            parse_notify_line(&notify_line(2, "parked", &parked)),
+            parse_notify_line(&notify_line(&parked), 2),
             Some(Event::Parked { id: "ab12-1".into(), secret: "db-prod".into(), consumer: "claude".into(), timeout_secs: 300, ts: 2 })
         );
 
         let completed = json!({ "event": "completed", "id": "ab12-1", "secret": "db-prod", "consumer": "claude" });
         assert_eq!(
-            parse_notify_line(&notify_line(3, "completed", &completed)),
+            parse_notify_line(&notify_line(&completed), 3),
             Some(Event::Completed { id: "ab12-1".into(), secret: "db-prod".into(), consumer: "claude".into(), ts: 3 })
         );
 
         let dismissed = json!({ "event": "dismissed", "id": "ab12-1", "secret": "db-prod", "consumer": "claude" });
         assert_eq!(
-            parse_notify_line(&notify_line(4, "dismissed", &dismissed)),
+            parse_notify_line(&notify_line(&dismissed), 4),
             Some(Event::Dismissed { id: "ab12-1".into(), secret: "db-prod".into(), consumer: "claude".into(), ts: 4 })
         );
 
         let expired = json!({ "event": "expired", "id": "ab12-1", "secret": "db-prod", "consumer": "claude" });
         assert_eq!(
-            parse_notify_line(&notify_line(5, "expired", &expired)),
+            parse_notify_line(&notify_line(&expired), 5),
             Some(Event::Expired { id: "ab12-1".into(), secret: "db-prod".into(), consumer: "claude".into(), ts: 5 })
         );
     }
 
+    /// `age-identity-minted` (P-G1) is the one `emit_notify` kind this
+    /// parser has never recognized — it carries no `secret`/`consumer`
+    /// field at all, so it falls out on the `?` right after `kind` is
+    /// read, same as before this phase.
     #[test]
-    fn a_graph_session_hook_line_is_ignored() {
-        let line = json!({
-            "ts": 1, "door": "cli", "class": "audit", "command": "graph.session.hook",
-            "status": "ok", "message": "hook fired",
-        })
-        .to_string();
-        assert_eq!(parse_notify_line(&line), None);
+    fn an_age_identity_minted_line_is_skipped() {
+        let line = json!({ "event": "age-identity-minted" }).to_string();
+        assert_eq!(parse_notify_line(&line, 1), None);
     }
 
     #[test]
-    fn a_malformed_message_is_skipped_not_fatal() {
-        let line = json!({
-            "ts": 1, "door": "daemon", "class": "secret", "command": "secrets.notify",
-            "status": "parked", "message": "not valid json at all {{{",
-        })
-        .to_string();
-        assert_eq!(parse_notify_line(&line), None);
+    fn a_line_missing_the_event_field_is_skipped() {
+        let line = json!({ "secret": "t", "consumer": "m" }).to_string();
+        assert_eq!(parse_notify_line(&line, 1), None);
     }
 
     #[test]
     fn an_unrecognized_event_kind_is_skipped() {
         let payload = json!({ "event": "something-new", "secret": "t", "consumer": "m" });
-        assert_eq!(parse_notify_line(&notify_line(1, "something-new", &payload)), None);
+        assert_eq!(parse_notify_line(&notify_line(&payload), 1), None);
     }
 
     #[test]
-    fn not_even_valid_outer_json_is_skipped() {
-        assert_eq!(parse_notify_line("{{{not json"), None);
+    fn not_even_valid_json_is_skipped() {
+        assert_eq!(parse_notify_line("{{{not json", 1), None);
     }
 
     // ── Queue::apply / reconcile ─────────────────────────────────────

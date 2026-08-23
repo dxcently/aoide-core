@@ -214,15 +214,20 @@ pub fn run_cli(argv: &[String]) -> i32 {
         // `secrets serve`/`exec`/`enroll`: dispatch FIRST (audits the launch
         // attempt, refuses a non-Cli door AND a `--popup`+`--json` combo via
         // `handle_secrets_watch`), then hand off to `aoide_secrets::
-        // watch::run`, which blocks until Ctrl-C. `socket`/`audit_log` are
+        // watch::run`, which blocks until Ctrl-C. `socket`/`events` are
         // resolved ONCE here and passed in (this crate's own "resolve once,
         // pass as a parameter" discipline, same as `secrets exec`/`enroll`
-        // above) — `watch::run` never re-derives either. `--popup` (tracker
-        // #71 Part 2, this commit) swaps the tty prompt for a zenity dialog;
-        // `inv.flag_present("popup")` is read here, not inside `watch::run`,
-        // for the SAME reason `json` already is — `Invocation` is this
-        // crate's own parsed door input, `watch::run` only ever sees plain
-        // booleans.
+        // above) — `watch::run` never re-derives either. **P-G4 (task #77):**
+        // `events` is `secrets::socket::events_path` applied to the SAME
+        // resolved socket, not `dispatch::audit_log_path` — the deployed
+        // broker's `ProtectHome=true` unit cannot write into the operator's
+        // `~/Aoide/log`, so watch reads the broker-owned events feed instead
+        // (`aoide_secrets::watch`'s own module doc has the live incident).
+        // `--popup` (tracker #71 Part 2) swaps the tty prompt for a zenity
+        // dialog; `inv.flag_present("popup")` is read here, not inside
+        // `watch::run`, for the SAME reason `json` already is —
+        // `Invocation` is this crate's own parsed door input, `watch::run`
+        // only ever sees plain booleans.
         if inv.path == ["secrets", "watch"] {
             let launch = dispatch::dispatch(inv);
             if launch.status != output::Status::Ok {
@@ -230,9 +235,10 @@ pub fn run_cli(argv: &[String]) -> i32 {
                 eprintln!("{body}");
                 return Some(code);
             }
-            let audit_log = dispatch::audit_log_path(inv);
+            let socket = secrets::socket::socket_path();
+            let events = secrets::socket::events_path(&socket);
             let popup = inv.flag_present("popup");
-            return Some(secrets::watch::run(&secrets::socket::socket_path(), &audit_log, json, popup));
+            return Some(secrets::watch::run(&socket, &events, json, popup));
         }
 
         // `guide` in text mode prints the full onboarding rather than a summary.

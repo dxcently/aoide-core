@@ -132,30 +132,37 @@
   itself never writes a secrets-home FILE directly — that stays `store`'s
   job (`enroll::run` calls `store::save_totp_secret`/`save_replay_ledger`).
   `watch` itself never writes a secrets-home file OR `policy.json` at all
-  — it only reads the mirrored aoide log (never the broker's own
-  `audit.log`, which is `0700` broker-uid and unreadable from the operator
-  side anyway) and speaks the SAME three socket ops `pending`/`approve`/
-  `dismiss` already expose, never a new wire op.
+  — it only reads the broker-owned events feed (P-G4, task #77; the
+  mirrored aoide log through P-N3 — never the broker's own `audit.log`,
+  which is `0700` broker-uid and unreadable from the operator side anyway)
+  and speaks the SAME three socket ops `pending`/`approve`/`dismiss`
+  already expose, never a new wire op.
 - **`watch`'s pure fold (`Event`/`Queue`/`pick_next`/`code_prompt_allowed`)
   holds the SAME clock-as-parameter discipline this crate's `totp`/`replay`
   modules already hold** (invariant above), extended here for the identical
   testability reason: `Queue::apply`/`Queue::reconcile` take an event/
   `Vec<PendingAsk>` and never call `SystemTime::now()` internally — every
-  timestamp they fold in (`ts` from the mirrored log's own `AuditRecord`,
-  `requestedAt` from `client::pending`'s reply) arrives as a parameter. Only
-  `watch::run`'s own outer loop (and its private `unix_now()`) touches the
-  real clock, the same "thin wrapper reads the real clock, never the pure
-  functions" split `broker.rs`'s own P-N2 tests already establish. Don't
-  add a `SystemTime::now()` call inside `Event`/`Queue`/`pick_next`/
-  `code_prompt_allowed`/`narrate_event`/`event_to_json` — grep for it
-  before merging a change to `watch.rs`'s pure half.
+  timestamp they fold in (`requestedAt` from `client::pending`'s reply, and
+  as of P-G4 task #77, `ts` passed in by the tail loop's own `unix_now()`
+  at the instant a line was READ, since the events feed carries no
+  per-line timestamp of its own — `parse_notify_line`'s own doc) arrives
+  as a parameter. Only `watch::run`'s own outer loop (and its private
+  `unix_now()`) touches the real clock, the same "thin wrapper reads the
+  real clock, never the pure functions" split `broker.rs`'s own P-N2 tests
+  already establish. Don't add a `SystemTime::now()` call inside
+  `Event`/`Queue`/`pick_next`/`code_prompt_allowed`/`narrate_event`/
+  `event_to_json`/`parse_notify_line` — grep for it before merging a
+  change to `watch.rs`'s pure half.
 - **`watch`'s tail is a TRIGGER; `client::pending` is the AUTHORITY** — the
   SAME rule P-N2's own README section states for `secrets pending`'s poll,
   extended to this surface: `Queue::reconcile` runs once at `watch::run`
   startup (so a watcher started AFTER an ask parked still converges) and
-  again on every parsed event plus a 30s safety tick. Don't let a future
+  again on every parsed event plus a 30s safety tick — as of P-G4 (task
+  #77) this tick is purely a RECONCILIATION BACKSTOP, not the primary
+  delivery path (a parked ask now surfaces through the broker-owned events
+  feed in about a second, README's "Watching events"). Don't let a future
   event kind become load-bearing on its own without a reconcile behind it
-  — the mirrored log can miss a line (a truncation between polls, a
+  — the events feed can still miss a line (a truncation between polls, a
   process restart) in a way the broker's own in-memory `ParkRegistry`
   cannot.
 - **Every admin verb that reads/writes `policy.json`/`totp.secret` refuses
@@ -390,7 +397,11 @@
   id/ask/grant has already returned (their own internal locks are
   acquire-then-release entirely inside those functions, never held across
   the return). Don't add a notify call inside a `_guard = ...lock()...`
-  scope; a future call site follows the same rule.
+  scope; a future call site follows the same rule. **`append_events_feed`
+  (P-G4, task #77) is reached ONLY from inside `emit_notify` and inherits
+  this same guarantee rather than re-earning it** — don't call it from
+  anywhere else without re-deriving the no-lock-held proof this note gives
+  `emit_notify`'s own three call sites.
 - **`released` fires ONLY on a TOTP-free grant, never on a code-verified
   one (P-N3).** `GateOutcome::Granted`'s `totp_free: bool` field is the ONE
   place this is decided — set once in `resolve_gate` from the SAME
@@ -775,12 +786,44 @@
   `client::pending`/`approve`/`dismiss` the same way `commands.rs` already
   does, never a socket into `aoide-conduct`/`herald`. See `README.md`'s
   "Watching events" section for the full mechanism. **Correction, tracker
-  #71 Part 2 (this commit): the graphical popup ALSO landed IN THIS
+  #71 Part 2: the graphical popup ALSO landed IN THIS
   crate**, not as an `aoide-conduct`/`lyra`-side subscriber of `secrets
   watch --json` the way this note originally anticipated — see the
   invariant immediately below for why, and `README.md`'s "Popup mode"
   section for the full mechanism.
-- **`--popup` (tracker #71 Part 2, this commit) is CORE, not a `lyra`/
+- **The mirrored `~/Aoide/log` tail LANDED at tracker #71 Part 1 was
+  ITSELF REPLACED at P-G4 (task #77): `watch.rs` now tail-follows a
+  broker-owned EVENTS FEED instead, not the mirrored aoide log.** Found
+  live on yomi-strix (2026-08-23): the deployed broker unit runs with
+  `ProtectHome=true` (`modules/nucleus/secrets.nix`), so `emit_notify`'s
+  best-effort mirror into the operator's `~/Aoide/log` silently failed
+  there — `secrets watch` received ZERO event lines and fell back to its
+  30s pending-reconcile tick for EVERY popup, turning the "about a second"
+  design intent into "up to 30s late, and a stale dialog can linger up to
+  30s after resolution." `broker::append_events_feed`/`socket::events_path`
+  are the fix: a THIRD `emit_notify` destination beside the broker's own
+  socket (`/run/aoide-secrets/events.jsonl` by default, env override
+  `AOIDE_SECRETS_EVENTS`), inside the SAME `RuntimeDirectory` the socket
+  itself already lives in, so it survives `ProtectHome=true` the same way
+  the socket does. `watch::parse_notify_line` now parses THIS feed's bare
+  `{"event": "<kind>", ...}` lines directly (no `AuditRecord` wrapper, no
+  `message`-as-JSON-string indirection — that shape only ever existed on
+  the mirrored-log side) and takes its `ts` as a PARAMETER rather than
+  reading one from the line (clock-as-parameter invariant above) since
+  none of `emit_notify`'s payload shapes carry a timestamp field. The
+  mirrored `~/Aoide/log` write in `emit_notify` is UNCHANGED — it still
+  serves the audit trail; only `secrets watch`'s own tail moved off it.
+  Capped at 1 MiB (`broker::EVENTS_MAX_BYTES`) since it is ephemeral cues
+  on `/run`'s tmpfs, not a second audit trail — past the cap, the next
+  append truncates the file to empty first rather than rotating it, which
+  `watch::Follower::poll`'s pre-existing `len() < pos` reopen-at-0 branch
+  (needed since P-N2c's own broker-restart case) already makes
+  transparent to a live tail with no changes needed there. Don't revert
+  `watch`'s tail source back to `dispatch::audit_log_path`/
+  `aoide_protocol::default_audit_log()` "for consistency with the other
+  audit-trail readers" — that mirror is exactly the path this fix moved
+  off of, for a proven, live reason.
+- **`--popup` (tracker #71 Part 2) is CORE, not a `lyra`/
   desktop feature, and stays inside `watch.rs` — no new module, no new
   crate dependency.** The root `AGENTS.md`'s own boundary line ("a
   capability that works with only a shell and touches no paint is Aoide")

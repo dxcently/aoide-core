@@ -26,7 +26,7 @@
 //! relying on this default, which is now a fixed absolute path independent
 //! of any tempdir nesting.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Resolve the broker's socket path: `$AOIDE_SECRETS_SOCKET` when set to a
 /// non-blank value, else the canonical deployed path
@@ -38,6 +38,49 @@ pub fn socket_path() -> PathBuf {
         }
     }
     PathBuf::from("/run/aoide-secrets/secrets.sock")
+}
+
+/// Resolve the broker's events feed path (P-G4, task #77 — the
+/// ProtectHome fix): `$AOIDE_SECRETS_EVENTS` when set to a non-blank
+/// value, else a sibling of `socket_path` named `events.jsonl` — the SAME
+/// directory the socket itself lives in, so the deployed default is
+/// `/run/aoide-secrets/events.jsonl` next to `secrets.sock` with zero new
+/// nix provisioning (`RuntimeDirectory=aoide-secrets` already creates that
+/// directory), and a scratch/test home's short `/tmp`-direct socket lands
+/// its events file in the exact same tempdir.
+///
+/// Takes the ALREADY-RESOLVED socket path as a parameter rather than
+/// re-deriving it — this crate's own "`home::secrets_home`/
+/// `socket::socket_path` are THE resolution" discipline (`AGENTS.md`)
+/// extends to this derived path too: every caller (`broker::serve`, and
+/// `cli`'s dispatch resolving it once for `watch::run`, the SAME site that
+/// already resolves `socket_path` once for that call) already has a
+/// resolved socket path on hand, so this stays a pure function of that
+/// parameter, never a second read of `AOIDE_SECRETS_SOCKET`.
+///
+/// **Why the broker OWNS this path instead of the operator's `~/Aoide/log`
+/// mirror `emit_notify` already writes to**: that mirror lives under the
+/// OPERATOR's home, and the deployed broker unit runs with
+/// `ProtectHome=true` — its best-effort write into `~/Aoide/log` silently
+/// fails there in the field (found live on yomi-strix, 2026-08-23), so
+/// `secrets watch` received zero event lines and fell back to its 30s
+/// pending-reconcile tick for every popup. A path beside the broker's own
+/// socket is inside the directory the broker's own unit already owns and
+/// writes to (`RuntimeDirectory=`/`/run`), so it exists under
+/// `ProtectHome=true` exactly the way the socket itself already does. The
+/// `~/Aoide/log` mirror in `emit_notify` is UNCHANGED by this — it still
+/// serves the audit trail; only `secrets watch`'s own tail moves to this
+/// feed (`watch.rs`'s module doc).
+pub fn events_path(socket_path: &Path) -> PathBuf {
+    if let Ok(p) = std::env::var("AOIDE_SECRETS_EVENTS") {
+        if !p.trim().is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    match socket_path.parent() {
+        Some(parent) => parent.join("events.jsonl"),
+        None => PathBuf::from("events.jsonl"),
+    }
 }
 
 #[cfg(test)]
@@ -92,6 +135,60 @@ mod tests {
         match saved_home {
             Some(v) => std::env::set_var("AOIDE_SECRETS_HOME", v),
             None => std::env::remove_var("AOIDE_SECRETS_HOME"),
+        }
+    }
+
+    // ── events_path (P-G4, task #77) ────────────────────────────────────
+
+    #[test]
+    fn events_default_is_a_sibling_of_the_socket_path() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_SECRETS_EVENTS").ok();
+        std::env::remove_var("AOIDE_SECRETS_EVENTS");
+        assert_eq!(
+            events_path(&PathBuf::from("/run/aoide-secrets/secrets.sock")),
+            PathBuf::from("/run/aoide-secrets/events.jsonl")
+        );
+        // A scratch/test socket under a tempdir lands its events file in
+        // the SAME tempdir the socket does — no separate provisioning
+        // needed for a short `/tmp`-direct test socket.
+        assert_eq!(
+            events_path(&PathBuf::from("/tmp/av-test-sock/secrets.sock")),
+            PathBuf::from("/tmp/av-test-sock/events.jsonl")
+        );
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_SECRETS_EVENTS", v),
+            None => std::env::remove_var("AOIDE_SECRETS_EVENTS"),
+        }
+    }
+
+    #[test]
+    fn events_env_override_wins_over_the_derived_sibling() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_SECRETS_EVENTS").ok();
+        std::env::set_var("AOIDE_SECRETS_EVENTS", "/tmp/av-test-events.jsonl");
+        assert_eq!(
+            events_path(&PathBuf::from("/run/aoide-secrets/secrets.sock")),
+            PathBuf::from("/tmp/av-test-events.jsonl")
+        );
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_SECRETS_EVENTS", v),
+            None => std::env::remove_var("AOIDE_SECRETS_EVENTS"),
+        }
+    }
+
+    #[test]
+    fn events_blank_env_value_falls_back_to_the_derived_sibling() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_SECRETS_EVENTS").ok();
+        std::env::set_var("AOIDE_SECRETS_EVENTS", "   ");
+        assert_eq!(
+            events_path(&PathBuf::from("/run/aoide-secrets/secrets.sock")),
+            PathBuf::from("/run/aoide-secrets/events.jsonl")
+        );
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_SECRETS_EVENTS", v),
+            None => std::env::remove_var("AOIDE_SECRETS_EVENTS"),
         }
     }
 }

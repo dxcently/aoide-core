@@ -35,7 +35,7 @@
 //! identically regardless of what `run_exec` set the inherited fd to. This
 //! exercises the real, unmodified `run_exec`/`Stdio::inherit()` path.
 
-use aoide_secrets::{backend, broker, client, home, policy::Policy, store};
+use aoide_secrets::{backend, broker, client, home, policy::Policy, store, watch};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -536,4 +536,111 @@ fn secrets_home_resolves_through_the_env_override() {
     std::env::set_var("AOIDE_SECRETS_HOME", &dir);
     assert_eq!(home::secrets_home(), dir);
     std::env::remove_var("AOIDE_SECRETS_HOME");
+}
+
+/// P-G4 (task #77) — the live-proven fix itself, end to end: a scratch
+/// broker + a REAL `watch::Follower` on the events feed sees a `parked`
+/// event in about a second, through the real file, never mocked. This is
+/// the whole point of moving `secrets watch`'s tail off the mirrored
+/// `~/Aoide/log` — the deployed broker's `ProtectHome=true` unit cannot
+/// write there, so a watcher used to fall back to its 30s pending-reconcile
+/// tick for every popup (found live on yomi-strix, 2026-08-23); this proves
+/// the fix lands well under that tick.
+///
+/// `AOIDE_SECRETS_EVENTS` pins the feed under `secrets_home` for test
+/// isolation — every socket path in this file is a short `/tmp`-direct
+/// path (the SUN_LEN concern, module doc) whose parent is always plain
+/// `/tmp`, so the DEFAULT sibling-of-socket derivation would collide
+/// across the several tests in this same binary if left to its default;
+/// that derivation itself is already proven directly in `socket.rs`'s own
+/// unit tests (`events_default_is_a_sibling_of_the_socket_path`), so using
+/// the env override here for isolation costs this test nothing — it still
+/// exercises `append_events_feed`/`Follower` against a real file on disk.
+#[test]
+fn watch_follower_sees_a_parked_event_within_about_a_second_through_the_real_events_feed() {
+    let _guard = audit_env_lock().lock().unwrap();
+    let secrets_home = short_tmp("eventslatencyhome");
+    std::fs::create_dir_all(&secrets_home).unwrap();
+    let socket_path = PathBuf::from(format!("{}.sock", short_tmp("eventslatencysock").display()));
+    let aoide_log = secrets_home.join("mirrored-aoide-log");
+    std::env::set_var("AOIDE_AUDIT_LOG", &aoide_log);
+    let events_path = secrets_home.join("events.jsonl");
+    std::env::set_var("AOIDE_SECRETS_EVENTS", &events_path);
+
+    let mut free = Policy::new("open", "file", "open-key");
+    free.consumers = vec!["m".to_string()];
+    let mut gated = Policy::new("locked", "file", "locked-key");
+    gated.consumers = vec!["m".to_string()];
+    gated.require_totp = true;
+    store::save_policies(&secrets_home, &[free, gated]).unwrap();
+    let totp_secret = b"a-twenty-byte-totp-s".to_vec();
+    store::save_totp_secret(&secrets_home, &totp_secret).unwrap();
+
+    let home_for_thread = secrets_home.clone();
+    let sock_for_thread = socket_path.clone();
+    let broker_thread = std::thread::spawn(move || {
+        let _ = broker::serve(&home_for_thread, &sock_for_thread);
+    });
+    let mut connected = false;
+    for _ in 0..50 {
+        if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+            connected = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(connected, "broker did not bind {} in time", socket_path.display());
+
+    // Fire ONE harmless TOTP-free resolve first, purely so the events feed
+    // FILE already exists before we open a `Follower` on it — `open_at_end`
+    // seeks to the CURRENT end of file, so opening it before the file
+    // exists (or after the line we care about already landed) would either
+    // fail or silently skip the line. `wait_for_follower`'s own
+    // NotFound-poll semantics (goal 3) are proven directly in `watch.rs`'s
+    // own unit tests; this test only needs a file to already be there.
+    assert_eq!(client::put(&socket_path, "open", "open-value", false).unwrap(), false);
+    assert_eq!(client::resolve(&socket_path, "open", "m", None, None).unwrap(), "open-value");
+
+    let mut follower =
+        watch::Follower::open_at_end(&events_path).expect("the events feed must already exist after the resolve above");
+
+    // NOW start the clock and park a `resolve` with no code.
+    assert_eq!(client::put(&socket_path, "locked", "the-real-value", false).unwrap(), false);
+    let start = std::time::Instant::now();
+    let sock_for_resolve = socket_path.clone();
+    let resolve_thread = std::thread::spawn(move || client::resolve(&sock_for_resolve, "locked", "m", None, None));
+
+    let mut seen_parked_id: Option<String> = None;
+    let mut elapsed = Duration::from_secs(0);
+    for _ in 0..100 {
+        for line in follower.poll().expect("polling the real events feed file") {
+            if let Some(watch::Event::Parked { id, secret, consumer, .. }) = watch::parse_notify_line(&line, 0) {
+                assert_eq!(secret, "locked");
+                assert_eq!(consumer, "m");
+                seen_parked_id = Some(id);
+            }
+        }
+        if seen_parked_id.is_some() {
+            elapsed = start.elapsed();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let id = seen_parked_id.expect("the watch Follower never saw a `parked` event through the real events feed file");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the events feed took {elapsed:?} to surface a parked event \u{2014} expected well under a second, and \
+         certainly nowhere near the 30s pending-reconcile tick this feed exists to beat"
+    );
+    assert!(!std::fs::read_to_string(&events_path).unwrap().contains("the-real-value"), "the events feed leaked the value");
+
+    // Clean up: dismiss the still-parked ask so the spawned thread returns.
+    client::dismiss(&socket_path, &id).unwrap();
+    assert!(resolve_thread.join().unwrap().is_err());
+
+    drop(broker_thread);
+    std::env::remove_var("AOIDE_AUDIT_LOG");
+    std::env::remove_var("AOIDE_SECRETS_EVENTS");
+    std::fs::remove_dir_all(&secrets_home).ok();
+    std::fs::remove_file(&socket_path).ok();
 }

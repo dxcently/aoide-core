@@ -331,11 +331,17 @@ pub fn serve(secrets_home: &Path, socket_path: &Path) -> std::io::Result<()> {
     let listener = bind_socket(socket_path)?;
 
     let home = secrets_home.to_path_buf();
+    // P-G4 (task #77): resolved ONCE here, from the ALREADY-resolved
+    // `socket_path` parameter — never re-derived per connection, same
+    // "resolve once, pass as parameter" discipline `home`/`parked` already
+    // follow in this loop (`AGENTS.md`).
+    let events_path = crate::socket::events_path(socket_path);
     let parked = Arc::new(ParkRegistry::new());
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
                 let home = home.clone();
+                let events_path = events_path.clone();
                 let parked = Arc::clone(&parked);
                 // FIX 3a (P-N2c, deploy blocker): `std::thread::spawn`
                 // PANICS if the OS refuses to create a thread (e.g. the
@@ -349,8 +355,8 @@ pub fn serve(secrets_home: &Path, socket_path: &Path) -> std::io::Result<()> {
                 // accepting everyone else, same "one connection's failure
                 // never touches another's" discipline this module doc
                 // already holds for every other per-connection failure.
-                if let Err(e) =
-                    std::thread::Builder::new().spawn(move || handle_conn(&home, stream, &parked))
+                if let Err(e) = std::thread::Builder::new()
+                    .spawn(move || handle_conn(&home, &events_path, stream, &parked))
                 {
                     eprintln!("[aoide/secrets] could not spawn a connection thread (dropping this connection): {e}");
                 }
@@ -379,7 +385,7 @@ pub fn serve(secrets_home: &Path, socket_path: &Path) -> std::io::Result<()> {
 /// `resolve` that parks (`handle_resolve`) blocks THIS thread only, for as
 /// long as `crate::park::park_timeout()` allows — every other connection's
 /// `handle_conn` thread is unaffected.
-fn handle_conn(secrets_home: &Path, stream: UnixStream, parked: &ParkRegistry) {
+fn handle_conn(secrets_home: &Path, events_path: &Path, stream: UnixStream, parked: &ParkRegistry) {
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
         Err(e) => {
@@ -396,7 +402,7 @@ fn handle_conn(secrets_home: &Path, stream: UnixStream, parked: &ParkRegistry) {
         if line.trim().is_empty() {
             continue;
         }
-        let reply = handle_line(secrets_home, &line, parked, &mut writer);
+        let reply = handle_line(secrets_home, events_path, &line, parked, &mut writer);
         if write_json_line(&mut writer, &reply).is_err() {
             break;
         }
@@ -426,17 +432,23 @@ fn write_json_line(writer: &mut impl Write, value: &Value) -> std::io::Result<()
 /// unknown `op` always gets a FINAL reply line, never a silently dropped
 /// connection (unlike shellbridge's fire-and-forget commands, a secrets
 /// client is BLOCKED waiting on this reply).
-fn handle_line(secrets_home: &Path, line: &str, parked: &ParkRegistry, interim_out: &mut impl Write) -> Value {
+fn handle_line(
+    secrets_home: &Path,
+    events_path: &Path,
+    line: &str,
+    parked: &ParkRegistry,
+    interim_out: &mut impl Write,
+) -> Value {
     let req: Value = match serde_json::from_str(line.trim()) {
         Ok(v) => v,
         Err(_) => return json!({"ok": false, "error": "malformed request: not valid JSON"}),
     };
     match req.get("op").and_then(Value::as_str) {
-        Some("resolve") => handle_resolve(secrets_home, &req, parked, interim_out),
-        Some("put") => handle_put(secrets_home, &req),
+        Some("resolve") => handle_resolve(secrets_home, events_path, &req, parked, interim_out),
+        Some("put") => handle_put(secrets_home, events_path, &req),
         Some("pending") => handle_pending(parked),
-        Some("approve") => handle_approve(secrets_home, parked, &req),
-        Some("dismiss") => handle_dismiss(secrets_home, parked, &req),
+        Some("approve") => handle_approve(secrets_home, events_path, parked, &req),
+        Some("dismiss") => handle_dismiss(secrets_home, events_path, parked, &req),
         Some(other) => json!({"ok": false, "error": format!("unknown op `{other}`")}),
         None => json!({"ok": false, "error": "malformed request: missing `op`"}),
     }
@@ -454,7 +466,13 @@ fn handle_line(secrets_home: &Path, line: &str, parked: &ParkRegistry, interim_o
 /// is swallowed, not propagated: the park proceeds regardless, since a
 /// gone caller learning its own id is moot but the ask itself is still a
 /// legitimate parked state an operator could dismiss.
-fn handle_resolve(secrets_home: &Path, req: &Value, parked: &ParkRegistry, interim_out: &mut impl Write) -> Value {
+fn handle_resolve(
+    secrets_home: &Path,
+    events_path: &Path,
+    req: &Value,
+    parked: &ParkRegistry,
+    interim_out: &mut impl Write,
+) -> Value {
     let secret = req.get("secret").and_then(Value::as_str).unwrap_or("").to_string();
     let consumer = req.get("consumer").and_then(Value::as_str).unwrap_or("").to_string();
     let argv0 = req.get("argv0").and_then(Value::as_str).map(str::to_string);
@@ -478,6 +496,7 @@ fn handle_resolve(secrets_home: &Path, req: &Value, parked: &ParkRegistry, inter
             if totp_free {
                 emit_notify(
                     secrets_home,
+                    events_path,
                     "released",
                     json!({"event": "released", "secret": secret, "consumer": consumer}),
                 );
@@ -517,6 +536,7 @@ fn handle_resolve(secrets_home: &Path, req: &Value, parked: &ParkRegistry, inter
             // returned).
             emit_notify(
                 secrets_home,
+                events_path,
                 "parked",
                 json!({
                     "event": "parked",
@@ -554,6 +574,7 @@ fn handle_resolve(secrets_home: &Path, req: &Value, parked: &ParkRegistry, inter
                     audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), false, Some(&reason));
                     emit_notify(
                         secrets_home,
+                        events_path,
                         "expired",
                         json!({"event": "expired", "id": id, "secret": secret, "consumer": consumer}),
                     );
@@ -643,7 +664,7 @@ fn authorize_release(secrets_home: &Path, secret: &str, consumer: &str) -> Resul
 /// identity/possession, which is a real event regardless of what the
 /// re-gate decides next; it is not un-spent just because authorization
 /// changed underneath it a moment later.
-fn handle_approve(secrets_home: &Path, parked: &ParkRegistry, req: &Value) -> Value {
+fn handle_approve(secrets_home: &Path, events_path: &Path, parked: &ParkRegistry, req: &Value) -> Value {
     let id = req.get("id").and_then(Value::as_str).unwrap_or("").to_string();
     if id.is_empty() {
         return json!({"ok": false, "error": "malformed request: `id` is required"});
@@ -697,6 +718,7 @@ fn handle_approve(secrets_home: &Path, parked: &ParkRegistry, req: &Value) -> Va
             // lifecycle event.
             emit_notify(
                 secrets_home,
+                events_path,
                 "completed",
                 json!({"event": "completed", "id": id, "secret": secret, "consumer": consumer}),
             );
@@ -726,7 +748,7 @@ fn fetch_secret_value(secrets_home: &Path, secret: &str) -> Result<String, Strin
 /// parked connection gets a clean "dismissed" refusal, the dismisser gets
 /// `{"ok":true}`. An unknown id is a taught error naming it explicitly
 /// (task requirement).
-fn handle_dismiss(secrets_home: &Path, parked: &ParkRegistry, req: &Value) -> Value {
+fn handle_dismiss(secrets_home: &Path, events_path: &Path, parked: &ParkRegistry, req: &Value) -> Value {
     let id = req.get("id").and_then(Value::as_str).unwrap_or("").to_string();
     if id.is_empty() {
         return json!({"ok": false, "error": "malformed request: `id` is required"});
@@ -739,6 +761,7 @@ fn handle_dismiss(secrets_home: &Path, parked: &ParkRegistry, req: &Value) -> Va
             audit_dismiss(secrets_home, &id, &secret, true, None);
             emit_notify(
                 secrets_home,
+                events_path,
                 "dismissed",
                 json!({"event": "dismissed", "id": id, "secret": secret, "consumer": consumer}),
             );
@@ -766,7 +789,7 @@ fn handle_dismiss(secrets_home: &Path, parked: &ParkRegistry, req: &Value) -> Va
 /// `DeniedExists` -> `{"ok":false,"exists":true,"error":...}` (the
 /// machine-readable refusal); `Denied(reason)` -> the ordinary
 /// `{"ok":false,"error":reason}`, unchanged from before this feature.
-fn handle_put(secrets_home: &Path, req: &Value) -> Value {
+fn handle_put(secrets_home: &Path, events_path: &Path, req: &Value) -> Value {
     let secret = req.get("secret").and_then(Value::as_str).unwrap_or("").to_string();
     let value = req.get("value").and_then(Value::as_str).unwrap_or("").to_string();
     let overwrite = req.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
@@ -794,7 +817,7 @@ fn handle_put(secrets_home: &Path, req: &Value) -> Value {
     // returned, so no lock is held here (the SAME "no lock held" rule
     // `emit_notify`'s own doc/AGENTS.md hold for every other call site).
     if minted {
-        emit_notify(secrets_home, "age-identity-minted", json!({"event": "age-identity-minted"}));
+        emit_notify(secrets_home, events_path, "age-identity-minted", json!({"event": "age-identity-minted"}));
     }
     reply
 }
@@ -1067,6 +1090,83 @@ fn append_own_log(secrets_home: &Path, record: &Value) -> std::io::Result<()> {
     f.write_all(line.as_bytes())
 }
 
+/// The events feed's size cap (P-G4, task #77): events are ephemeral cues
+/// on a `/run`-backed tmpfs, not an audit trail (that's still
+/// `own_audit_log_path`/the mirrored `~/Aoide/log`, both unbounded and
+/// unrotated by design) — 1 MiB is comfortably past anything a live
+/// watcher needs to have caught up on, and no rotation machinery exists or
+/// is needed: past the cap, [`append_events_feed`] simply truncates the
+/// file to empty before writing the new line, which `watch::Follower::
+/// poll`'s own `len() < pos` branch already treats as a truncation/
+/// rotation and reopens from 0 (confirmed by reading `watch.rs` directly —
+/// see that function's doc comment).
+const EVENTS_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Append ONE event line to the broker-owned events feed (P-G4, task
+/// #77) — the live-proven fix for `ProtectHome=true`: the deployed broker
+/// unit cannot write into the operator's `~/Aoide/log` (`emit_notify`'s
+/// mirror there silently fails under that sandboxing), so `secrets watch`
+/// received zero event lines and fell back to its 30s pending-reconcile
+/// tick for every popup (found live on yomi-strix, 2026-08-23). This feed
+/// lives beside the broker's own socket — inside the directory the
+/// broker's unit already owns (`socket::events_path`'s own doc) — so it is
+/// reachable under the SAME sandboxing that already lets the socket itself
+/// bind there.
+///
+/// **Best-effort, always, exactly like [`append_own_log`]/`emit_notify`'s
+/// own two existing destinations**: every failure here is `eprintln!`'d
+/// and swallowed, never propagated — a notification, and now this feed
+/// write alongside it, must never fail or block the resolve it rides with
+/// (`emit_notify`'s own doc, unchanged by this addition). **MUST be called
+/// with no crate lock held**, the identical rule `emit_notify` itself
+/// already holds — this function is only ever reached FROM `emit_notify`,
+/// so it inherits that guarantee rather than re-earning it.
+///
+/// Created `0640` with an EXPLICIT `chmod` right after the file is first
+/// created — never left to the process umask, since the deployed unit's
+/// `Group=aoide-secrets-access` makes group-read exactly the socket's own
+/// audience, and umask alone could leave it world-unreadable or
+/// group-writable depending on the operator's shell. The chmod fires only
+/// on the write that actually creates the file (checked via `exists()`
+/// immediately before opening, the same one-time-only shape
+/// `home::secure_dir`/`secure_file` already follow for the secrets home
+/// itself) — every later append reuses the permissions already set.
+fn append_events_feed(events_path: &Path, payload: &Value) {
+    if let Some(parent) = events_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("[aoide/secrets] could not create the events feed directory: {e}");
+            return;
+        }
+    }
+    let existed = events_path.exists();
+    let over_cap = std::fs::metadata(events_path).map(|m| m.len() >= EVENTS_MAX_BYTES).unwrap_or(false);
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true);
+    if over_cap {
+        opts.write(true).truncate(true);
+    } else {
+        opts.append(true);
+    }
+    let mut f = match opts.open(events_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[aoide/secrets] could not open the secrets events feed: {e}");
+            return;
+        }
+    };
+    if !existed {
+        if let Err(e) = std::fs::set_permissions(events_path, std::fs::Permissions::from_mode(0o640)) {
+            eprintln!("[aoide/secrets] could not chmod the secrets events feed to 0640: {e}");
+        }
+    }
+    let mut line = payload.to_string();
+    line.push('\n');
+    if let Err(e) = f.write_all(line.as_bytes()) {
+        eprintln!("[aoide/secrets] could not write the secrets events feed: {e}");
+    }
+}
+
 /// Write BOTH audit lines for one resolve attempt (module doc). Name-only,
 /// by construction: nothing passed here is ever the secret's value.
 fn audit_resolve(
@@ -1244,19 +1344,22 @@ fn audit_dismiss(secrets_home: &Path, id: &str, secret: &str, granted: bool, rea
 /// "timeoutSecs"?}` — never a value, same discipline every other record in
 /// this module already holds).
 ///
-/// Two destinations, the SAME two the `audit_*` functions above already
-/// write to: the broker's own structured `audit.log`
-/// (`append_own_log`/`own_audit_log_path`, so `tail -f
-/// <secrets_home>/audit.log` shows the raw event JSON verbatim) and the
+/// THREE destinations as of P-G4 (task #77): the broker's own structured
+/// `audit.log` (`append_own_log`/`own_audit_log_path`, so `tail -f
+/// <secrets_home>/audit.log` shows the raw event JSON verbatim), the
 /// mirrored aoide log (`EventClass::Secret`, command `secrets.notify`,
 /// status = `kind` — `tail -f ~/Aoide/log | grep secrets.notify` is the
-/// cross-host-readable half). See `README.md`'s "Broker notifications"
-/// section for the full pickup-point note (no adapter exists yet — this
-/// emission IS the substrate a popup phase reads from, same framing P-N2's
-/// park lifecycle used for `secrets pending`/`approve`/`dismiss`).
+/// cross-host-readable half, kept for the audit trail), and NOW the
+/// broker-owned events feed (`append_events_feed`, `events_path` —
+/// `socket::events_path`'s own doc has the ProtectHome reasoning). The
+/// first two are UNCHANGED from P-N3; `secrets watch`'s own tail moved
+/// OFF the mirrored log and onto this third destination exclusively
+/// (`watch.rs`'s module doc) — the mirror stays for the audit trail, it is
+/// simply no longer what the watcher reads. See `README.md`'s "Broker
+/// notifications" section for the full pickup-point note.
 ///
 /// **Best-effort, always** (task requirement): a notification must never
-/// fail or block the resolve it rides alongside. Both writes are
+/// fail or block the resolve it rides alongside. All three writes are
 /// `eprintln!`/swallowed exactly like every `audit_*` function's own `if
 /// let Err(e) = ...` above — never a `?`, never a panic.
 ///
@@ -1269,11 +1372,13 @@ fn audit_dismiss(secrets_home: &Path, id: &str, secret: &str, granted: bool, rea
 /// `verify_totp_gate`'s `replay_ledger_lock` guard (a block-scoped
 /// `_guard`) has already gone out of scope. A future call site follows the
 /// same rule: emit only once every lock this event's own outcome depended
-/// on has already been released.
-fn emit_notify(secrets_home: &Path, kind: &str, payload: Value) {
+/// on has already been released. `append_events_feed` inherits this same
+/// guarantee (its own doc) rather than re-earning it.
+fn emit_notify(secrets_home: &Path, events_path: &Path, kind: &str, payload: Value) {
     if let Err(e) = append_own_log(secrets_home, &payload) {
         eprintln!("[aoide/secrets] could not write the secrets notify log: {e}");
     }
+    append_events_feed(events_path, &payload);
     let message = payload.to_string();
     let _ = aoide_protocol::audit(
         &aoide_protocol::default_audit_log(),
@@ -1688,7 +1793,7 @@ mod tests {
     #[test]
     fn malformed_json_gets_a_reply_not_a_dropped_connection() {
         let home = tmp_home("malformed");
-        let reply = handle_line(&home, "not json at all", &ParkRegistry::new(), &mut Vec::new());
+        let reply = handle_line(&home, &home.join("events.jsonl"), "not json at all", &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("not valid JSON"));
         std::fs::remove_dir_all(&home).ok();
@@ -1697,7 +1802,7 @@ mod tests {
     #[test]
     fn missing_op_is_a_clear_error() {
         let home = tmp_home("missingop");
-        let reply = handle_line(&home, r#"{"secret":"t","consumer":"m"}"#, &ParkRegistry::new(), &mut Vec::new());
+        let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"secret":"t","consumer":"m"}"#, &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("missing `op`"));
         std::fs::remove_dir_all(&home).ok();
@@ -1706,7 +1811,7 @@ mod tests {
     #[test]
     fn unknown_op_is_a_clear_error() {
         let home = tmp_home("unknownop");
-        let reply = handle_line(&home, r#"{"op":"explode"}"#, &ParkRegistry::new(), &mut Vec::new());
+        let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"explode"}"#, &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("unknown op"));
         std::fs::remove_dir_all(&home).ok();
@@ -1715,7 +1820,7 @@ mod tests {
     #[test]
     fn resolve_with_missing_fields_is_malformed() {
         let home = tmp_home("missingfields");
-        let reply = handle_line(&home, r#"{"op":"resolve","secret":"t"}"#, &ParkRegistry::new(), &mut Vec::new());
+        let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t"}"#, &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("required"));
         std::fs::remove_dir_all(&home).ok();
@@ -1736,7 +1841,7 @@ mod tests {
 
         let p = Policy::new("t", "scratch", "stored-value");
         seed(&home, &[p]);
-        let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &ParkRegistry::new(), &mut Vec::new());
+        let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(reply["ok"], true);
         assert_eq!(reply["value"], "stored-value");
 
@@ -1767,7 +1872,7 @@ mod tests {
         });
         std::fs::write(crate::backend::backends_path(&home), serde_json::to_vec(&backends).unwrap()).unwrap();
 
-        let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &ParkRegistry::new(), &mut Vec::new());
+        let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(reply["ok"], false);
         let wire_error = reply["error"].as_str().unwrap();
         assert!(!wire_error.contains("SENTINEL"), "wire reply leaked stderr: {wire_error}");
@@ -1897,7 +2002,7 @@ mod tests {
 
         with_redirected_audit_log(&home, || {
             let reply =
-                handle_line(&home, r#"{"op":"put","secret":"t","value":"the-stored-value"}"#, &parked, &mut Vec::new());
+                handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","secret":"t","value":"the-stored-value"}"#, &parked, &mut Vec::new());
             assert_eq!(reply["ok"], true, "{reply}");
         });
 
@@ -1913,7 +2018,7 @@ mod tests {
         crate::store::save_policies(&home, &[Policy::new("t", "age", "t"), Policy::new("t2", "age", "t2")]).unwrap();
         with_redirected_audit_log(&home, || {
             let reply =
-                handle_line(&home, r#"{"op":"put","secret":"t2","value":"another-value"}"#, &parked, &mut Vec::new());
+                handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","secret":"t2","value":"another-value"}"#, &parked, &mut Vec::new());
             assert_eq!(reply["ok"], true, "{reply}");
         });
         let mint_events = own_log_lines(&home)
@@ -2183,20 +2288,20 @@ mod tests {
         seed_with_set(&home, &[p], &format!("cat {}", out.display()), &format!("cat > {}", out.display()));
 
         // 1. Empty -> stores, `replaced` is false.
-        let first = handle_line(&home, r#"{"op":"put","secret":"t","value":"first-value"}"#, &ParkRegistry::new(), &mut Vec::new());
+        let first = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","secret":"t","value":"first-value"}"#, &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(first["ok"], true, "{first}");
         assert_eq!(first["replaced"], false, "{first}");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "first-value");
 
         // 2. Existing, no `overwrite` -> the distinct `exists` refusal, and
         //    the stored value is UNCHANGED.
-        let second = handle_line(&home, r#"{"op":"put","secret":"t","value":"attempted-overwrite"}"#, &ParkRegistry::new(), &mut Vec::new());
+        let second = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","secret":"t","value":"attempted-overwrite"}"#, &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(second["ok"], false, "{second}");
         assert_eq!(second["exists"], true, "the refusal must be machine-readable via `exists`, not error prose: {second}");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "first-value", "a refused put must never touch the store");
 
         // 3. Existing, `overwrite: true` -> replaced, `replaced` is true.
-        let third = handle_line(&home, r#"{"op":"put","secret":"t","value":"second-value","overwrite":true}"#, &ParkRegistry::new(), &mut Vec::new());
+        let third = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","secret":"t","value":"second-value","overwrite":true}"#, &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(third["ok"], true, "{third}");
         assert_eq!(third["replaced"], true, "{third}");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "second-value");
@@ -2216,8 +2321,8 @@ mod tests {
         seed_with_set(&home, &[p], &format!("cat {}", out.display()), &format!("cat > {}", out.display()));
         std::fs::write(&out, "original-value").unwrap();
 
-        let with_false = handle_line(&home, r#"{"op":"put","secret":"t","value":"x","overwrite":false}"#, &ParkRegistry::new(), &mut Vec::new());
-        let without_field = handle_line(&home, r#"{"op":"put","secret":"t","value":"x"}"#, &ParkRegistry::new(), &mut Vec::new());
+        let with_false = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","secret":"t","value":"x","overwrite":false}"#, &ParkRegistry::new(), &mut Vec::new());
+        let without_field = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","secret":"t","value":"x"}"#, &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(with_false, without_field, "an explicit `overwrite:false` and an absent field must match byte-for-byte");
         assert_eq!(with_false["exists"], true, "{with_false}");
         std::fs::remove_dir_all(&home).ok();
@@ -2234,7 +2339,7 @@ mod tests {
         let p = Policy::new("t", "scratch", "k");
         seed_with_set(&home, &[p], &format!("cat {}", out.display()), &format!("cat > {}", out.display()));
 
-        let reply = handle_line(&home, r#"{"op":"put","secret":"t","value":"stored-value"}"#, &ParkRegistry::new(), &mut Vec::new());
+        let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","secret":"t","value":"stored-value"}"#, &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(reply["ok"], true);
         assert!(reply.get("value").is_none(), "put's reply must never carry a value: {reply}");
         assert_eq!(reply["replaced"], false, "the store starts empty — this is a new store, not a replace: {reply}");
@@ -2250,7 +2355,7 @@ mod tests {
     #[test]
     fn put_with_a_missing_secret_field_is_malformed() {
         let home = tmp_home("put-missingfields");
-        let reply = handle_line(&home, r#"{"op":"put","value":"x"}"#, &ParkRegistry::new(), &mut Vec::new());
+        let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","value":"x"}"#, &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("required"));
         std::fs::remove_dir_all(&home).ok();
@@ -2270,7 +2375,7 @@ mod tests {
 
         // ── failure 1: no policy at all for this secret ────────────────
         seed(&home, &[]);
-        let reply = handle_line(&home, &format!(r#"{{"op":"put","secret":"nope","value":"{SENTINEL}"}}"#), &ParkRegistry::new(), &mut Vec::new());
+        let reply = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"put","secret":"nope","value":"{SENTINEL}"}}"#), &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(reply["ok"], false);
         assert!(!reply.to_string().contains(SENTINEL), "wire reply leaked the sentinel: {reply}");
 
@@ -2282,7 +2387,7 @@ mod tests {
         let p = Policy::new("t", "scratch", "k");
         seed(&home, &[p]); // `seed`'s fixture backend is get-only.
         let reply =
-            handle_line(&home, &format!(r#"{{"op":"put","secret":"t","value":"{SENTINEL}","overwrite":true}}"#), &ParkRegistry::new(), &mut Vec::new());
+            handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"put","secret":"t","value":"{SENTINEL}","overwrite":true}}"#), &ParkRegistry::new(), &mut Vec::new());
         assert_eq!(reply["ok"], false);
         assert!(!reply.to_string().contains(SENTINEL), "wire reply leaked the sentinel: {reply}");
 
@@ -2346,7 +2451,7 @@ mod tests {
         let parked = ParkRegistry::new();
 
         with_redirected_audit_log(&home, || {
-            let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m","wait":false}"#, &parked, &mut Vec::new());
+            let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m","wait":false}"#, &parked, &mut Vec::new());
             assert_eq!(reply["ok"], false);
             assert_eq!(
                 reply["error"], "requireTotp is set but no totp code was provided",
@@ -2374,7 +2479,7 @@ mod tests {
         with_redirected_audit_log(&home, || {
             let resolved = std::thread::scope(|scope| {
                 let resolve_handle =
-                    scope.spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
+                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
 
                 let mut id = None;
                 for _ in 0..200 {
@@ -2391,7 +2496,7 @@ mod tests {
 
                 let code = code_for_now(&secret, unix_now());
                 let approve_req = format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#);
-                let approve_reply = handle_line(&home, &approve_req, &parked, &mut Vec::new());
+                let approve_reply = handle_line(&home, &home.join("events.jsonl"), &approve_req, &parked, &mut Vec::new());
                 assert_eq!(approve_reply["ok"], true, "{approve_reply}");
                 assert!(
                     approve_reply.get("value").is_none(),
@@ -2421,7 +2526,7 @@ mod tests {
         with_redirected_audit_log(&home, || {
             std::thread::scope(|scope| {
                 let resolve_handle =
-                    scope.spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
+                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
 
                 let mut id = None;
                 for _ in 0..200 {
@@ -2433,7 +2538,7 @@ mod tests {
                 }
                 let id = id.expect("the resolve did not park in time");
 
-                let dismiss_reply = handle_line(&home, &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new());
+                let dismiss_reply = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new());
                 assert_eq!(dismiss_reply["ok"], true, "{dismiss_reply}");
 
                 let resolved = resolve_handle.join().unwrap();
@@ -2466,7 +2571,7 @@ mod tests {
         with_redirected_audit_log(&home, || {
             std::thread::scope(|scope| {
                 let resolve_handle =
-                    scope.spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
+                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
 
                 let mut id = None;
                 for _ in 0..200 {
@@ -2488,7 +2593,7 @@ mod tests {
 
                 let code = code_for_now(&secret, unix_now());
                 let approve_reply =
-                    handle_line(&home, &format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#), &parked, &mut Vec::new());
+                    handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#), &parked, &mut Vec::new());
                 assert_eq!(approve_reply["ok"], false, "{approve_reply}");
                 assert_eq!(approve_reply["error"], "consumer not authorized for this secret", "{approve_reply}");
                 assert!(
@@ -2527,7 +2632,7 @@ mod tests {
             std::thread::scope(|scope| {
                 // Fills the ONE slot the cap allows.
                 let first_handle =
-                    scope.spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
+                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
                 let mut id = None;
                 for _ in 0..200 {
                     if let Some((pid, ..)) = parked.list().into_iter().next() {
@@ -2543,7 +2648,7 @@ mod tests {
                 // immediately — same connection thread, so this call
                 // itself must NOT block.
                 let second_reply =
-                    handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
+                    handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
                 assert_eq!(second_reply["ok"], false, "{second_reply}");
                 let err = second_reply["error"].as_str().unwrap();
                 assert!(err.contains("queue is full"), "{err}");
@@ -2551,7 +2656,7 @@ mod tests {
                 assert_eq!(parked.list().len(), 1, "the cap refusal must never grow the queue");
 
                 // Clean up the still-parked first ask so its thread returns.
-                let dismissed = handle_line(&home, &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new());
+                let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new());
                 assert_eq!(dismissed["ok"], true, "{dismissed}");
                 let _ = first_handle.join().unwrap();
             });
@@ -2582,9 +2687,11 @@ mod tests {
         with_redirected_audit_log(&home, || {
             let (client_end, server_end) = UnixStream::pair().expect("socketpair");
             let home_for_conn = home.clone();
+            let events_for_conn = home.join("events.jsonl");
             let parked_for_conn = Arc::clone(&parked);
-            let conn_handle =
-                std::thread::spawn(move || handle_conn(&home_for_conn, server_end, &parked_for_conn));
+            let conn_handle = std::thread::spawn(move || {
+                handle_conn(&home_for_conn, &events_for_conn, server_end, &parked_for_conn)
+            });
 
             let mut writer = client_end.try_clone().expect("clone client end");
             writer
@@ -2603,7 +2710,7 @@ mod tests {
 
             // Resolve it so the connection's second (final) line arrives
             // without waiting out the real timeout.
-            let dismissed = handle_line(&home, &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new());
+            let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new());
             assert_eq!(dismissed["ok"], true, "{dismissed}");
 
             // Line 2: the final reply — exactly one, and it is NOT interim.
@@ -2643,7 +2750,7 @@ mod tests {
         with_redirected_audit_log(&home, || {
             std::thread::scope(|scope| {
                 let resolve_handle =
-                    scope.spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
+                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
 
                 let mut id = None;
                 for _ in 0..200 {
@@ -2656,13 +2763,13 @@ mod tests {
                 let id = id.expect("the resolve did not park in time");
 
                 // A wrong code: denied, but the ask must still be there.
-                let wrong = handle_line(&home, &format!(r#"{{"op":"approve","id":"{id}","totp":"000000"}}"#), &parked, &mut Vec::new());
+                let wrong = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"approve","id":"{id}","totp":"000000"}}"#), &parked, &mut Vec::new());
                 assert_eq!(wrong["ok"], false, "{wrong}");
                 assert_eq!(parked.list().len(), 1, "an invalid code must leave the ask parked");
 
                 // The REAL correct code now completes it.
                 let code = code_for_now(&secret, unix_now());
-                let right = handle_line(&home, &format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#), &parked, &mut Vec::new());
+                let right = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#), &parked, &mut Vec::new());
                 assert_eq!(right["ok"], true, "{right}");
 
                 let resolved = resolve_handle.join().unwrap();
@@ -2679,7 +2786,7 @@ mod tests {
         let home = tmp_home("approve-unknown");
         let parked = ParkRegistry::new();
         with_redirected_audit_log(&home, || {
-            let reply = handle_line(&home, r#"{"op":"approve","id":"9","totp":"123456"}"#, &parked, &mut Vec::new());
+            let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"approve","id":"9","totp":"123456"}"#, &parked, &mut Vec::new());
             assert_eq!(reply["ok"], false);
             assert!(reply["error"].as_str().unwrap().contains("unknown pending id `9`"), "{reply}");
         });
@@ -2692,7 +2799,7 @@ mod tests {
         let home = tmp_home("dismiss-unknown");
         let parked = ParkRegistry::new();
         with_redirected_audit_log(&home, || {
-            let reply = handle_line(&home, r#"{"op":"dismiss","id":"9"}"#, &parked, &mut Vec::new());
+            let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"dismiss","id":"9"}"#, &parked, &mut Vec::new());
             assert_eq!(reply["ok"], false);
             assert!(reply["error"].as_str().unwrap().contains("unknown pending id `9`"), "{reply}");
         });
@@ -2709,7 +2816,7 @@ mod tests {
         let (id, _rx) = parked.park("t", "m", NOW);
 
         with_redirected_audit_log(&home, || {
-            let reply = handle_line(&home, &format!(r#"{{"op":"approve","id":"{id}"}}"#), &parked, &mut Vec::new());
+            let reply = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"approve","id":"{id}"}}"#), &parked, &mut Vec::new());
             assert_eq!(reply["ok"], false);
             assert!(reply["error"].as_str().unwrap().contains("`totp` is required"), "{reply}");
         });
@@ -2726,12 +2833,12 @@ mod tests {
         let home = tmp_home("pending-list");
         let parked = ParkRegistry::new();
 
-        let empty = handle_line(&home, r#"{"op":"pending"}"#, &parked, &mut Vec::new());
+        let empty = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"pending"}"#, &parked, &mut Vec::new());
         assert_eq!(empty["ok"], true);
         assert_eq!(empty["pending"].as_array().unwrap().len(), 0);
 
         let (id, _rx) = parked.park("db-prod", "m", 1_700_000_123);
-        let listed = handle_line(&home, r#"{"op":"pending"}"#, &parked, &mut Vec::new());
+        let listed = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"pending"}"#, &parked, &mut Vec::new());
         let arr = listed["pending"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["id"], id);
@@ -2757,6 +2864,7 @@ mod tests {
         with_redirected_audit_log(&home, || {
             let reply = handle_line(
                 &home,
+                &home.join("events.jsonl"),
                 &format!(r#"{{"op":"resolve","secret":"t","consumer":"m","totp":"{code}"}}"#),
                 &parked,
                 &mut Vec::new(),
@@ -2783,7 +2891,7 @@ mod tests {
         let parked = ParkRegistry::new();
 
         with_redirected_audit_log(&home, || {
-            let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
+            let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
             assert_eq!(reply["ok"], false);
             let err = reply["error"].as_str().unwrap();
             assert!(err.contains("timed out after 1s"), "{err}");
@@ -2826,7 +2934,7 @@ mod tests {
         with_redirected_audit_log(&home, || {
             std::thread::scope(|scope| {
                 let resolve_handle = scope
-                    .spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"locked","consumer":"m"}"#, &parked, &mut Vec::new()));
+                    .spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"locked","consumer":"m"}"#, &parked, &mut Vec::new()));
 
                 let mut parked_yet = false;
                 for _ in 0..200 {
@@ -2840,14 +2948,14 @@ mod tests {
 
                 // An unrelated resolve, on the SAME registry, completes
                 // immediately — proving the parked ask never blocked it.
-                let free_reply = handle_line(&home, r#"{"op":"resolve","secret":"open","consumer":"m"}"#, &parked, &mut Vec::new());
+                let free_reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"open","consumer":"m"}"#, &parked, &mut Vec::new());
                 assert_eq!(free_reply["ok"], true, "{free_reply}");
                 assert_eq!(free_reply["value"], "open-value");
 
                 // Clean up: dismiss the still-parked ask so the spawned
                 // thread returns and this test doesn't leak a blocked one.
                 let (id, ..) = parked.list().into_iter().next().unwrap();
-                let dismissed = handle_line(&home, &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new());
+                let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new());
                 assert_eq!(dismissed["ok"], true, "{dismissed}");
                 let resolved = resolve_handle.join().unwrap();
                 assert_eq!(resolved["ok"], false);
@@ -2971,16 +3079,18 @@ mod tests {
         }
     }
 
-    // ── broker event notifications (P-N3) ────────────────────────────────
+    // ── broker event notifications (P-N3, extended P-G4/task #77) ───────
     //
-    // Every notable broker event fires a NAME-ONLY line into the SAME two
-    // destinations every `audit_*` function above already writes to: the
-    // broker's own structured `audit.log` (read back via
-    // [`own_log_lines`]) and the mirrored aoide log (`with_redirected_
+    // Every notable broker event fires a NAME-ONLY line into THREE
+    // destinations: the broker's own structured `audit.log` (read back via
+    // [`own_log_lines`]), the mirrored aoide log (`with_redirected_
     // audit_log`, the same fixture every P-N2 park test above already
-    // uses). No dedup/throttle, deliberately (User decision, this phase,
-    // `README.md`'s "Broker notifications" section): every TOTP-free
-    // release notifies, every single time.
+    // uses), and — as of P-G4 — the broker-owned events feed (read back
+    // via [`events_feed_lines`], the destination `secrets watch` itself
+    // now tails; the mirrored log stays audit-trail-only). No dedup/
+    // throttle, deliberately (User decision, this phase, `README.md`'s
+    // "Broker notifications" section): every TOTP-free release notifies,
+    // every single time.
 
     /// Read the broker's own `audit.log` back as parsed JSON lines — every
     /// `emit_notify` call lands here via the SAME `append_own_log` every
@@ -2997,6 +3107,22 @@ mod tests {
     /// The mirrored aoide-log's own lines, same shape.
     fn mirrored_log_lines(home: &Path) -> Vec<Value> {
         std::fs::read_to_string(home.join("mirrored-aoide-log"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// The events feed's own lines (P-G4, task #77) — every test in this
+    /// suite that calls `handle_line`/`handle_conn` uses `home.join(
+    /// "events.jsonl")` as its events path (this module's own convention),
+    /// so this reads that same file back. Byte-identical shape to
+    /// [`own_log_lines`] (both come from the SAME `payload` — `emit_notify`'s
+    /// own doc), so a hit here can be matched with the SAME [`find_notify_
+    /// event`] helper.
+    fn events_feed_lines(home: &Path) -> Vec<Value> {
+        std::fs::read_to_string(home.join("events.jsonl"))
             .unwrap_or_default()
             .lines()
             .filter(|l| !l.trim().is_empty())
@@ -3039,7 +3165,7 @@ mod tests {
         let parked = ParkRegistry::new();
 
         with_redirected_audit_log(&home, || {
-            let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
+            let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
             assert_eq!(reply["ok"], true, "{reply}");
         });
 
@@ -3053,6 +3179,14 @@ mod tests {
         let mirrored_lines = mirrored_log_lines(&home);
         let mirrored = find_mirrored_notify(&mirrored_lines, "released");
         assert!(!mirrored.to_string().contains("stored-value"), "{mirrored}");
+
+        // P-G4 (task #77): the THIRD destination, byte-identical to the
+        // own `audit.log` line — `secrets watch` now tails this one.
+        let feed_lines = events_feed_lines(&home);
+        let feed_ev = find_notify_event(&feed_lines, "released");
+        assert_eq!(feed_ev["secret"], "t");
+        assert_eq!(feed_ev["consumer"], "m");
+        assert!(!feed_ev.to_string().contains("stored-value"), "the events feed leaked the value: {feed_ev}");
 
         std::fs::remove_dir_all(&home).ok();
     }
@@ -3075,7 +3209,7 @@ mod tests {
         let parked = ParkRegistry::new();
 
         with_redirected_audit_log(&home, || {
-            let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
+            let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
             assert_eq!(reply["ok"], true, "{reply}");
         });
 
@@ -3105,6 +3239,7 @@ mod tests {
         with_redirected_audit_log(&home, || {
             let reply = handle_line(
                 &home,
+                &home.join("events.jsonl"),
                 &format!(r#"{{"op":"resolve","secret":"t","consumer":"m","totp":"{code}"}}"#),
                 &parked,
                 &mut Vec::new(),
@@ -3134,7 +3269,7 @@ mod tests {
         with_redirected_audit_log(&home, || {
             std::thread::scope(|scope| {
                 let resolve_handle =
-                    scope.spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
+                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
 
                 let mut id = None;
                 for _ in 0..200 {
@@ -3154,7 +3289,7 @@ mod tests {
                 assert!(ev["timeoutSecs"].as_u64().is_some(), "{ev}");
 
                 // Clean up: dismiss so the spawned thread returns.
-                let dismissed = handle_line(&home, &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new());
+                let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new());
                 assert_eq!(dismissed["ok"], true, "{dismissed}");
                 resolve_handle.join().unwrap();
             });
@@ -3176,7 +3311,7 @@ mod tests {
         with_redirected_audit_log(&home, || {
             std::thread::scope(|scope| {
                 let resolve_handle =
-                    scope.spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
+                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
 
                 let mut id = None;
                 for _ in 0..200 {
@@ -3190,7 +3325,7 @@ mod tests {
                 let code = code_for_now(&secret, unix_now());
 
                 let approved =
-                    handle_line(&home, &format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#), &parked, &mut Vec::new());
+                    handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#), &parked, &mut Vec::new());
                 assert_eq!(approved["ok"], true, "{approved}");
 
                 let own_lines = own_log_lines(&home);
@@ -3220,7 +3355,7 @@ mod tests {
         with_redirected_audit_log(&home, || {
             std::thread::scope(|scope| {
                 let resolve_handle =
-                    scope.spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
+                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
 
                 let mut id = None;
                 for _ in 0..200 {
@@ -3232,7 +3367,7 @@ mod tests {
                 }
                 let id = id.expect("the ask did not park in time");
 
-                let dismissed = handle_line(&home, &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new());
+                let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new());
                 assert_eq!(dismissed["ok"], true, "{dismissed}");
 
                 let own_lines = own_log_lines(&home);
@@ -3264,7 +3399,7 @@ mod tests {
         let parked = ParkRegistry::new();
 
         with_redirected_audit_log(&home, || {
-            let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
+            let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
             assert_eq!(reply["ok"], false, "{reply}");
         });
 
@@ -3300,7 +3435,7 @@ mod tests {
         with_redirected_audit_log(&home, || {
             std::thread::scope(|scope| {
                 let resolve_handle =
-                    scope.spawn(|| handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
+                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
 
                 let mut id = None;
                 for _ in 0..200 {
@@ -3313,7 +3448,7 @@ mod tests {
                 let id = id.expect("the ask did not park in time");
                 let code = code_for_now(&secret, unix_now());
                 let approved =
-                    handle_line(&home, &format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#), &parked, &mut Vec::new());
+                    handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#), &parked, &mut Vec::new());
                 assert_eq!(approved["ok"], true, "{approved}");
                 assert!(!approved.to_string().contains(SENTINEL), "the approve reply leaked the value: {approved}");
 
@@ -3326,7 +3461,89 @@ mod tests {
         assert!(!own_log.contains(SENTINEL), "the broker's own audit.log leaked the sentinel via a notify line:\n{own_log}");
         let mirrored_log = std::fs::read_to_string(home.join("mirrored-aoide-log")).unwrap();
         assert!(!mirrored_log.contains(SENTINEL), "the mirrored aoide log leaked the sentinel via a notify line:\n{mirrored_log}");
+        // P-G4 (task #77): the name-only discipline extends to the THIRD
+        // notify destination, the broker-owned events feed.
+        let events_feed = std::fs::read_to_string(home.join("events.jsonl")).unwrap();
+        assert!(!events_feed.contains(SENTINEL), "the events feed leaked the sentinel via a notify line:\n{events_feed}");
+        assert!(events_feed.contains("\"event\":\"parked\""), "{events_feed}");
+        assert!(events_feed.contains("\"event\":\"completed\""), "{events_feed}");
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── the events feed itself (P-G4, task #77) ─────────────────────────
+
+    /// `append_events_feed` creates the file `0640` — group-read, no
+    /// world access, never left to the process umask.
+    #[test]
+    fn append_events_feed_creates_the_file_0640() {
+        let home = tmp_home("events-perms");
+        let events_path = home.join("events.jsonl");
+        append_events_feed(&events_path, &json!({"event": "released", "secret": "t", "consumer": "m"}));
+        let mode = std::fs::metadata(&events_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "the events feed must be 0640, got {mode:o}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A second (and later) append never re-chmods — proven indirectly by
+    /// the file staying readable/writable by its own owner after a mode
+    /// change in between (if a later append re-created it, the manual
+    /// chmod below would have been silently undone).
+    #[test]
+    fn append_events_feed_does_not_rechmod_an_existing_file() {
+        let home = tmp_home("events-no-rechmod");
+        let events_path = home.join("events.jsonl");
+        append_events_feed(&events_path, &json!({"event": "released", "secret": "t", "consumer": "m"}));
+        std::fs::set_permissions(&events_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        append_events_feed(&events_path, &json!({"event": "released", "secret": "t2", "consumer": "m"}));
+        let mode = std::fs::metadata(&events_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a later append must not re-chmod an already-existing file, got {mode:o}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The size guard (task requirement): past `EVENTS_MAX_BYTES`, the next
+    /// append truncates the file to empty FIRST — `watch::Follower::poll`'s
+    /// own `len() < pos` branch is what makes this transparent to a live
+    /// tail (confirmed by reading `watch.rs` directly: `Follower::poll`
+    /// reopens at 0 whenever the file has shrunk since the last poll,
+    /// which a truncate-then-write always produces relative to a follower
+    /// sitting at the old, larger EOF).
+    #[test]
+    fn append_events_feed_truncates_once_the_cap_is_exceeded() {
+        let home = tmp_home("events-cap");
+        let events_path = home.join("events.jsonl");
+        // Pad the file past the cap directly — writing enough real events
+        // one at a time to cross 1 MiB would make this test slow for no
+        // extra coverage; `append_events_feed` only ever consults the
+        // file's CURRENT size, not how it got there.
+        std::fs::write(&events_path, vec![b'x'; (EVENTS_MAX_BYTES + 1) as usize]).unwrap();
+        assert!(std::fs::metadata(&events_path).unwrap().len() > EVENTS_MAX_BYTES);
+
+        append_events_feed(&events_path, &json!({"event": "released", "secret": "t", "consumer": "m"}));
+
+        let contents = std::fs::read_to_string(&events_path).unwrap();
+        assert!(!contents.contains('x'), "the oversized padding must be gone after truncation: {contents}");
+        assert!(contents.contains("\"event\":\"released\""), "{contents}");
+        assert!(
+            (contents.len() as u64) < EVENTS_MAX_BYTES,
+            "the file must be back under the cap right after truncating, got {} bytes",
+            contents.len()
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Below the cap, an append is an ordinary append — proven by two
+    /// lines both surviving (a truncating append would lose the first).
+    #[test]
+    fn append_events_feed_appends_normally_under_the_cap() {
+        let home = tmp_home("events-normal-append");
+        let events_path = home.join("events.jsonl");
+        append_events_feed(&events_path, &json!({"event": "released", "secret": "first", "consumer": "m"}));
+        append_events_feed(&events_path, &json!({"event": "released", "secret": "second", "consumer": "m"}));
+        let contents = std::fs::read_to_string(&events_path).unwrap();
+        assert!(contents.contains("first"), "{contents}");
+        assert!(contents.contains("second"), "{contents}");
+        assert_eq!(contents.lines().count(), 2, "{contents}");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -3365,7 +3582,7 @@ mod tests {
         std::env::set_var("AOIDE_AUDIT_LOG", &unreachable_mirror);
 
         let parked = ParkRegistry::new();
-        let reply = handle_line(&home, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
+        let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_AUDIT_LOG", v),

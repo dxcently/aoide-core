@@ -588,30 +588,58 @@ aoide log (`~/Aoide/log`) and republishes anything from it into `herald`
 either — `aoide-client`'s adapter skeleton (`crates/client/src/adapter.rs`)
 subscribes to `EventClass::{Audit,Gate,Rice,Content,Notification}` but has
 no `Secret` case at all, and no other crate in this workspace tails that
-file live. So this phase lands EMISSION ONLY, into the SAME two
-destinations every `audit_*` function in `broker.rs` already writes to
-(`broker.rs`'s own module doc, "Two destinations"): the broker's own
-structured `<secrets_home>/audit.log` (`emit_notify`'s `payload`, written
-verbatim by `append_own_log` — `tail -f <secrets_home>/audit.log` shows the
-five event shapes above exactly as written) and the mirrored aoide log
-(`EventClass::Secret`, `command: "secrets.notify"`, `status` = the event
-kind, `message` = the same payload JSON stringified — `tail -f ~/Aoide/log |
-grep secrets.notify` is the cross-host-readable half). Both writes are
-best-effort: a notification must never fail or block the resolve/approve/
-dismiss it rides alongside, so both `append_own_log` and `aoide_protocol::
-audit`'s own errors are `eprintln!`d and swallowed, the SAME posture every
-`audit_*` function already holds.
+file live.
 
-**The popup phase's pickup point is `aoide secrets watch --json` (landed
-this commit, tracker #71 Part 1)** — see "Watching events" below. It tails
-the mirrored `~/Aoide/log`, filtering `command == "secrets.notify"`, the
-same way `secrets pending` already polls the in-memory `ParkRegistry` — a
-`parked` line is the exact trigger `secrets pending`'s own poll would
-eventually see, just pushed instead of pulled. A future GRAPHICAL popup (a
-`lyra`/desktop consumer, tracker #71 Part 2) reads `secrets watch --json`'s
-stdout stream directly rather than re-deriving this tail itself — this
-emission plus `watch`'s own tail/reconcile loop are the substrate, the same
-relationship P-N2's park/approve/dismiss lifecycle already has to that UI.
+**THREE destinations as of P-G4 (task #77 — the `ProtectHome` fix, see
+below).** `emit_notify` writes the SAME `payload` verbatim to all three: the
+broker's own structured `<secrets_home>/audit.log` (`append_own_log` —
+`tail -f <secrets_home>/audit.log` shows the five event shapes above exactly
+as written), the mirrored aoide log (`EventClass::Secret`, `command:
+"secrets.notify"`, `status` = the event kind, `message` = the same payload
+JSON stringified — `tail -f ~/Aoide/log | grep secrets.notify` is the
+cross-host-readable audit-trail half, UNCHANGED by P-G4), and NOW the
+broker-owned **events feed** (`append_events_feed`, `socket::events_path` —
+default a sibling of the broker's own socket, e.g.
+`/run/aoide-secrets/events.jsonl` next to `secrets.sock`; env override
+`AOIDE_SECRETS_EVENTS`). All three writes are best-effort: a notification
+must never fail or block the resolve/approve/dismiss it rides alongside, so
+every one of `append_own_log`/`aoide_protocol::audit`/`append_events_feed`'s
+own errors is `eprintln!`d and swallowed, the SAME posture every `audit_*`
+function already holds — and, like every other notify write, NEVER runs
+while a crate lock is held (see below).
+
+**Why a third destination, and why it lives beside the socket rather than
+under the operator's home.** The deployed broker unit runs with
+`ProtectHome=true` (`modules/nucleus/secrets.nix`) — its best-effort mirror
+into `~/Aoide/log` silently fails there, so `secrets watch` (below) received
+ZERO event lines in the field and fell back to its 30s pending-reconcile
+tick for every popup (found live on yomi-strix, 2026-08-23). A path beside
+the broker's own socket sits inside the directory the unit already owns and
+writes to (`RuntimeDirectory=`/`/run`), so it is reachable under
+`ProtectHome=true` exactly the way the socket itself already is. Created
+`0640` with an explicit `chmod` right after the file is first created (never
+left to the process umask) — the deployed unit's `Group=
+aoide-secrets-access` makes group-read exactly the socket's own audience.
+Events are ephemeral cues on a `/run`-backed tmpfs, not a second audit trail
+— capped at 1 MiB (`broker::EVENTS_MAX_BYTES`); past the cap, the next
+append truncates the file to empty first rather than rotating it, and
+`watch::Follower::poll`'s own `len() < pos` branch (already needed for a
+broker restart replacing the file) is what makes that truncation
+transparent to a live tail. The mirrored `~/Aoide/log` write is UNCHANGED —
+it still serves the audit trail; only `secrets watch`'s own tail moved off
+it (below).
+
+**The popup phase's pickup point is `aoide secrets watch --json`
+(tracker #71 Part 1)** — see "Watching events" below. It tails the
+broker-owned events feed (P-G4; the mirrored `~/Aoide/log` through P-N3),
+the same way `secrets pending` already polls the in-memory `ParkRegistry` —
+a `parked` line is the exact trigger `secrets pending`'s own poll would
+eventually see, just pushed instead of pulled, and delivered in about a
+second instead of up to 30. A future GRAPHICAL popup (a `lyra`/desktop
+consumer, tracker #71 Part 2) reads `secrets watch --json`'s stdout stream
+directly rather than re-deriving this tail itself — this emission plus
+`watch`'s own tail/reconcile loop are the substrate, the same relationship
+P-N2's park/approve/dismiss lifecycle already has to that UI.
 
 `emit_notify` (`broker.rs`) is the ONE function that builds and writes a
 notify line — every call site (`handle_resolve`'s `Granted`/`NeedsTotp`/
@@ -619,29 +647,44 @@ notify line — every call site (`handle_resolve`'s `Granted`/`NeedsTotp`/
 `handle_dismiss`'s found arm) calls it only AFTER the crate lock its own
 outcome depended on has already been released (`park::ParkRegistry`'s
 internal `Mutex`, or `broker::replay_ledger_lock`) — see `emit_notify`'s own
-doc comment for the exact "no lock held" accounting at each site.
+doc comment for the exact "no lock held" accounting at each site;
+`append_events_feed` inherits the same guarantee rather than re-earning it.
 
-## Watching events (`secrets watch`, tracker #71 Part 1, this commit)
+## Watching events (`secrets watch`, tracker #71 Part 1)
 
 `aoide secrets watch` is a foreground, line-mode terminal surface — the
 "delete every `.qml`" proof for the code-entry-popup design (root
 `AGENTS.md` house rule 7): the whole capability is reachable with nothing
-but a shell. It tail-follows the mirrored `~/Aoide/log` from EOF
-(`crate::watch::Follower` — delta reads only, `stat(2)` once a second, never
-re-reads the file from the start; the log is tens of MB and unrotated on a
-live rig, and every agent tool call appends a `graph.session.hook` line, so
-it churns constantly), parses only `class:"secret", command:"secrets.notify"`
-lines as a TRIGGER, and narrates every one of the five broker events
-(`released`/`parked`/`completed`/`dismissed`/`expired`, "Broker
-notifications" above). `client::pending` remains the AUTHORITY — the tail
-never is — so `crate::watch::Queue::reconcile` runs once at startup (so a
-watcher started AFTER an ask parked still sees it) and again on every event
-plus a 30s safety tick (so a missed line, a completion from another
-terminal, or a broker restart all still converge on the truth). An ask
-`reconcile` discovers with no matching `parked` line has no `timeoutSecs` to
-go on — the wire's `pending` reply never carries one — so its countdown is
+but a shell. **As of P-G4 (task #77) it tail-follows the broker-owned
+events feed** (`socket::events_path` — default a sibling of the broker's
+own socket, env override `AOIDE_SECRETS_EVENTS`; see "Broker notifications"
+above for why) **from EOF** (`crate::watch::Follower` — delta reads only,
+`stat(2)` once a second, reopening at 0 whenever the file has shrunk, which
+covers both a broker restart replacing the file and the feed's own 1 MiB
+truncate-in-place cap). Through P-N3 this tailed the mirrored `~/Aoide/log`
+instead, filtering `class:"secret", command:"secrets.notify"` lines — that
+mirror silently went dark under the deployed broker's `ProtectHome=true`
+unit, delivering nothing until the reconcile tick below caught up, up to
+30s late; corrected at P-G4, see "Broker notifications" above for the live
+incident. `watch::parse_notify_line` now parses the events feed's bare
+`{"event": "<kind>", ...}` payload lines directly — no wrapper, no
+`message`-as-JSON-string indirection — and narrates every one of the five
+broker events (`released`/`parked`/`completed`/`dismissed`/`expired`,
+"Broker notifications" above). `client::pending` remains the AUTHORITY —
+the tail never is — so `crate::watch::Queue::reconcile` runs once at
+startup (so a watcher started AFTER an ask parked still sees it) and again
+on every event plus a 30s safety tick that is now purely a RECONCILIATION
+BACKSTOP (a missed line, a completion from another terminal, or a broker
+restart) rather than the primary delivery path — a parked ask surfaces
+through the feed in about a second, not up to 30. An ask `reconcile`
+discovers with no matching `parked` line has no `timeoutSecs` to go on —
+the wire's `pending` reply never carries one — so its countdown is
 `park::park_timeout()` used as an ESTIMATE, marked with a `~` prefix in the
-prompt so the operator knows it's a guess.
+prompt so the operator knows it's a guess. On a brand-new host where the
+broker hasn't emitted anything since boot, the events feed may not exist
+yet at `secrets watch` startup — `watch::wait_for_follower`'s
+`NotFound`-poll narrates once and waits, the same "wait, don't exit 1"
+shape this held for the mirrored log through P-N3.
 
 ```
 $ aoide secrets watch
@@ -1131,6 +1174,16 @@ default now equals the module's `AOIDE_SECRETS_SOCKET` value, so a bare
 shell finds the right socket with zero exports. Only the admin verbs below
 still need an explicit `sudo -u aoide-secrets` invocation (sudo does not
 carry the caller's env).
+
+**The events feed (P-G4, task #77) needs NO nix change either.**
+`socket::events_path`'s default is a sibling of the resolved socket path —
+`/run/aoide-secrets/events.jsonl` next to `secrets.sock` — so it lands
+inside the SAME `RuntimeDirectory = "aoide-secrets"` the module above
+already provisions, with no new `AOIDE_SECRETS_EVENTS` export needed on
+either the broker or `secrets watch`'s side. This is what fixed the
+`ProtectHome=true` gap live: the mirrored `~/Aoide/log` write is under the
+operator's home, which that setting blocks; a path inside `RuntimeDirectory`
+is not.
 
 **Open deployment gap, flagged not fixed here (P-G1, task #70 — this
 crate's own hard constraint forbids touching `.nix` files; the unit-path

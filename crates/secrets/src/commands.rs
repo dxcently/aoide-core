@@ -348,7 +348,7 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["secrets", "watch"],
-        summary: "Foreground, line-mode watcher: tail-follows the mirrored aoide log and narrates every broker event (released/parked/completed/dismissed/expired). On a terminal, also prompts inline for each parked ask — [a]pprove with a hidden TOTP code, [d]ismiss, or [i]gnore (stays parked). --json emits one event object per line instead, narration-only. --popup swaps the terminal prompt for a zenity code-entry dialog on each parked ask (unlock-gated, parked-only; requires zenity on PATH) — mutually exclusive with --json. CLI-only, operator-side (same door gate as pending/approve/dismiss) — blocks until Ctrl-C.",
+        summary: "Foreground, line-mode watcher: tail-follows the broker-owned events feed and narrates every broker event (released/parked/completed/dismissed/expired). On a terminal, also prompts inline for each parked ask — [a]pprove with a hidden TOTP code, [d]ismiss, or [i]gnore (stays parked). --json emits one event object per line instead, narration-only. --popup swaps the terminal prompt for a zenity code-entry dialog on each parked ask (unlock-gated, parked-only; requires zenity on PATH) — mutually exclusive with --json. CLI-only, operator-side (same door gate as pending/approve/dismiss) — blocks until Ctrl-C.",
         args: [],
         flags: [flag!(
             "popup",
@@ -915,8 +915,10 @@ fn handle_secrets_dismiss(inv: &Invocation) -> Outcome {
 /// `exec`/`enroll`: this handler only gates the door (CLI-only, same
 /// [`require_cli`] as `pending`/`approve`/`dismiss` — NOT
 /// [`require_admin_identity`], since watch touches no `policy.json` either,
-/// only the mirrored log and the broker's in-memory registry over the
-/// socket), refuses the `--popup`+`--json` combination as a usage error
+/// only the broker-owned events feed (P-G4, task #77 — corrected from the
+/// mirrored aoide log, `watch.rs`'s own module doc) and the broker's
+/// in-memory registry over the socket), refuses the `--popup`+`--json`
+/// combination as a usage error
 /// (tracker #71 Part 2 — the two modes both own "how a parked ask gets
 /// completed" and can't both drive it), and records the launch through the
 /// single audit log; the actual foreground loop (`crate::watch::run`) is
