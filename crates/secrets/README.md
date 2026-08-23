@@ -872,7 +872,15 @@ watching secret events — ^C to leave (parked asks stay parked)
   `SPAWN_BACKOFF_MAX`/`next_spawn_backoff`) rather than reattempting every
   ~200ms poll tick forever. ONE line narrates entering the failing state
   and ONE narrates recovery (the next successful spawn, which also resets
-  the backoff to the floor) — not a line per failed attempt.
+  the backoff to the floor) — not a line per failed attempt. **The backoff
+  is GLOBAL across every parked ask, not per-ask** — `popup_loop`'s single
+  serial loop picks one ask at a time and its `thread::sleep(spawn_backoff)`
+  blocks that same loop, so a second ask parking mid-backoff is not given
+  its own timer; it simply waits out whatever sleep is already running
+  before the loop can pick it up. This is deliberate: zenity itself is what
+  is broken (a missing binary, a dead display) when this path triggers at
+  all, not any one ask, so there is nothing to gain from racing a fresh
+  spawn attempt per ask against a display that is failing for all of them.
 - **`released`/`completed`/`dismissed`/`expired` are SUPPRESSED as
   popups** — parked-only is the default (User-flagged): every mode
   narrates all five events on stdout regardless, but only a `parked` event
