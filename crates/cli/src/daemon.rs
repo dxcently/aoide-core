@@ -17,10 +17,15 @@
 //! too (Phase 4a restructure) and are likewise re-exported. `run` (the daemon
 //! skeleton's own wiring/demo) moved to `aoide-server` (Phase 4c restructure)
 //! and is re-exported the same way — every existing `crate::daemon::*` caller
-//! (incl. `bin/aoided.rs`, `commands/infra.rs`) is untouched.
+//! (incl. `commands/infra.rs`) is untouched. `run_loop`/`socket_path`/
+//! `events_path` (P-D2, the resident daemon — `docs/architecture/AOIDED.md`)
+//! are re-exported the same way for `bin/aoided.rs`, the one caller that
+//! wires the assembled registry + dispatcher into them (the DI seam
+//! `aoide-server` itself cannot close, `aoide_server::daemon`'s own module
+//! doc).
 
 pub use aoide_protocol::{
     append_audit, audit, aoide_home, default_audit_log, AuditRecord, Door, EventClass,
 };
 pub use aoide_protocol::{Gate, GateProposal, Subscription};
-pub use aoide_server::daemon::run;
+pub use aoide_server::daemon::{events_path, run, run_loop, socket_path};

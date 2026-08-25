@@ -1,11 +1,19 @@
-//! The `aoided` binary — the orchestrator daemon skeleton.
+//! The `aoided` binary — the resident orchestrator daemon (P-D2,
+//! `docs/architecture/AOIDED.md`).
 //!
 //! Owns the single policy surface: audit log, user rebuild gate, neutral event
-//! stream with default-deny-per-class subscriptions (entities/aoided). This is
-//! the same code path reachable via `aoide daemon`; the standalone binary is
-//! what a systemd unit would launch.
+//! stream with default-deny-per-class subscriptions (entities/aoided). Binds
+//! its own control socket (`ping`/`subscribe`, P-D4 adds `dispatch`) and runs
+//! forever — this is what the systemd unit execs (`modules/nucleus/
+//! aoided.nix`, `Type=simple` + `Restart=on-failure` as of this phase).
+//! `dispatch::registry()`/`dispatch::dispatch` are injected here — the SAME
+//! DI seam `mcp serve --stdio`/`a2a serve` close at their own launch sites
+//! (`lib.rs`'s `run_cli`) — because `aoide-server` sits BELOW this crate and
+//! cannot reach the fully-assembled registry itself
+//! (`aoide_server::daemon`'s own module doc).
 
 use aoide::daemon;
+use aoide::dispatch;
 
 fn main() {
     // Allow `aoided --audit-log <path>`; else use the aoide.auditLog default.
@@ -17,12 +25,11 @@ fn main() {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(daemon::default_audit_log);
 
-    let status = daemon::run(log);
-    match serde_json::to_string_pretty(&status) {
-        Ok(s) => println!("{s}"),
-        Err(e) => {
-            eprintln!("aoided: {e}");
-            std::process::exit(1);
-        }
+    let socket = daemon::socket_path();
+    let events = daemon::events_path(&socket);
+
+    if let Err(e) = daemon::run_loop(socket, events, log, dispatch::registry(), dispatch::dispatch) {
+        eprintln!("aoided: {e}");
+        std::process::exit(1);
     }
 }

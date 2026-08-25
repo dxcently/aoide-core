@@ -7,7 +7,23 @@ the inbound half of the two-door contract (the outbound half is
 
 ## Named seams (what it exposes)
 
-- `daemon` — the `aoided` policy skeleton and `run` entry point.
+- `daemon` — the `aoided` daemon. `run` is the one-shot policy self-check
+  `aoide daemon` still runs. `run_loop`/`serve_daemon` (P-D2,
+  `docs/architecture/AOIDED.md`) are the RESIDENT daemon `bin/aoided.rs`
+  execs: bind the control socket
+  (`$AOIDE_DAEMON_SOCKET`, else `$XDG_RUNTIME_DIR/aoide/aoided.sock`,
+  `daemon::socket_path`), spawn a thread-per-connection accept loop
+  (fallible `Builder::spawn`, accept-error backoff — the secrets broker's
+  own accept-loop discipline, reused by convention), then tick forever
+  (~1s; no producers yet — P-D3 adds the secrets-feed mirror and the #69
+  hand-edit watcher). Newline-delimited JSON, the secrets wire framing
+  verbatim: `ping` (liveness) and `subscribe` (follow the daemon's own
+  events feed — `$AOIDE_DAEMON_EVENTS`, else a sibling of the socket,
+  `daemon::events_path` — filtered by an explicit `classes` array,
+  default-deny) are live; `dispatch` (the fourth door, `Door::Daemon`) is
+  P-D4. `registry`/`dispatch` fn parameters thread all the way to the
+  per-connection handler, unused until P-D4 — the same DI seam
+  `mcp::serve_stdio`/`a2a::serve` already close at their own launch sites.
 - `mcp` — `serve_stdio`, the MCP stdio server.
 - `a2a` — the serve half of A2A (JSON-RPC/HTTP/SSE); the client half stays
   in `aoide-client`. Two `message/send` arms, two different relationships to
