@@ -507,6 +507,7 @@ fn handle_peer_add(inv: &Invocation) -> Outcome {
         hub: false,
         pubkey: None,
         verified: false,
+        allows: Vec::new(),
         added_at: aoide_storage::time::now_iso_utc(),
     };
     aoide_storage::peer_store::insert_peer(&mut peers, peer.clone());
@@ -599,6 +600,72 @@ fn handle_peer_remove(inv: &Invocation) -> Outcome {
 /// `clear_hub` report exactly what changed (set/moved/cleared/no-op) and
 /// this handler's message says so plainly rather than a bare "ok"; a no-op
 /// never touches disk (nothing to write back).
+/// `peer allow <name> <cap> on|off` (P-P3, `docs/architecture/PAIRING.md`
+/// decision 5): flip one capability in `name`'s `allows` set —
+/// `aoide_storage::peer_store::set_peer_allow` holds the closed-set
+/// validation and the idempotence invariant; this handler just reports
+/// exactly what changed (enabled/disabled/no-op), mirroring `handle_peer_hub`'s
+/// "report the change, never a bare ok" discipline one field over. Refuses
+/// an unknown peer AND an unknown capability — the capability check runs
+/// FIRST (`set_peer_allow`'s own ordering), so a typo'd capability against a
+/// typo'd name still names the capability problem, not the peer one.
+fn handle_peer_allow(inv: &Invocation) -> Outcome {
+    let cmd = "peer.allow";
+    const USAGE: &str = "usage: aoide peer allow <name> <cap> on|off";
+    let name = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(n) => n.to_string(),
+        None => return Outcome::usage(cmd, USAGE),
+    };
+    let cap = match inv.args.get(1).map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(c) => c.to_string(),
+        None => return Outcome::usage(cmd, USAGE),
+    };
+    let on = match inv.args.get(2).map(|s| s.trim()) {
+        Some("on") => true,
+        Some("off") => false,
+        _ => return Outcome::usage(cmd, USAGE),
+    };
+
+    let mut peers = aoide_storage::peer_store::load_peers();
+    let change = match aoide_storage::peer_store::set_peer_allow(&mut peers, &name, &cap, on) {
+        Ok(c) => c,
+        Err(aoide_storage::peer_store::AllowError::UnknownCapability) => {
+            return Outcome::error(
+                cmd,
+                format!(
+                    "unknown capability `{cap}` — valid capabilities: {}",
+                    aoide_storage::peer_store::PEER_CAPABILITIES.join(", ")
+                ),
+            )
+            .with_data(json!({ "reason": "unknown-capability", "cap": cap }));
+        }
+        Err(aoide_storage::peer_store::AllowError::UnknownPeer) => {
+            return Outcome::error(cmd, format!("no peer named `{name}`"))
+                .with_data(json!({ "reason": "unknown-peer", "name": name }));
+        }
+    };
+
+    use aoide_storage::peer_store::AllowChange;
+    let (msg, tag) = match &change {
+        AllowChange::Enabled => (format!("`{cap}` is now allowed for peer `{name}`"), "enabled"),
+        AllowChange::Disabled => (format!("`{cap}` is no longer allowed for peer `{name}`"), "disabled"),
+        AllowChange::NoOp if on => (format!("`{name}` already allows `{cap}`"), "no-op"),
+        AllowChange::NoOp => (format!("`{name}` already does not allow `{cap}`"), "no-op"),
+    };
+    let data = json!({ "name": name, "cap": cap, "on": on, "change": tag });
+
+    if matches!(change, AllowChange::NoOp) {
+        return Outcome::ok(cmd, msg).with_data(data);
+    }
+    if let Err(e) = aoide_storage::peer_store::save_peers(&peers) {
+        return Outcome::error(cmd, format!("writing the peer registry: {e}"))
+            .with_data(json!({ "reason": "registry-write-failed" }));
+    }
+    Outcome::ok(cmd, msg)
+        .changed(vec![aoide_storage::peer_store::peers_path().to_string_lossy().into_owned()])
+        .with_data(data)
+}
+
 fn handle_peer_hub(inv: &Invocation) -> Outcome {
     let cmd = "peer.hub";
     let name = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -824,8 +891,8 @@ fn handle_peer_status(_inv: &Invocation) -> Outcome {
     Outcome::ok(cmd, msg).with_data(json!({ "peers": rows }))
 }
 
-/// The six `peer` verbs (CONTRACTS.md §7; `hub` is P-D5), registered as
-/// their own group.
+/// The seven `peer` verbs (CONTRACTS.md §7; `hub` is P-D5, `allow` is P-P3),
+/// registered as their own group.
 pub fn register_peers(r: &mut Registry) {
     r.insert(cmd!(
         path: ["peer", "add"],
@@ -890,6 +957,20 @@ pub fn register_peers(r: &mut Registry) {
         implemented: true,
         handler: handle_peer_hub,
     ));
+    r.insert(cmd!(
+        path: ["peer", "allow"],
+        summary: "Flip one capability in a peer's `allows` set (P-P3, PAIRING.md decision 5) — idempotent, reports exactly what changed.",
+        args: [
+            arg!("name", "string", true, "The registered peer's name."),
+            arg!("cap", "string", true, "The capability — one of the closed set: read, spawn."),
+            arg!("state", "string", true, "`on` or `off`."),
+        ],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_peer_allow,
+        examples: ["peer allow yomi-strix spawn on", "peer allow yomi-strix spawn off"],
+    ));
 }
 
 // ── The four `peer pair` verbs (P-P2, CONTRACTS.md §6 — the pairing
@@ -903,8 +984,11 @@ pub fn register_peers(r: &mut Registry) {
 // A2A door (`aoide-server::a2a::pair_request`/`pair_reveal`/
 // `pair_approve_callback`), SAS derivation + display
 // (`aoide_storage::pairing::derive_sas`), commit via
-// `aoide_storage::peer_store::upsert_paired_peer`. Neither this section nor
-// the door it drives touches `allows`/any gate — P-P3's lane.
+// `aoide_storage::peer_store::upsert_paired_peer` — which ALSO stamps the
+// ceremony's own default `allows` (`["read","spawn"]`) the first time a
+// peer becomes verified (P-P3, PAIRING.md decision 5); editing that default
+// afterward is `peer allow <name> <cap> on|off`'s own separate verb
+// (registered in `register_peers` above), never a second write site here.
 //
 // **Both humans confirm, for real (review-bounce Finding 2).** `peer pair
 // approve <id>` does double duty by DIRECTION, never a fifth verb (golden
@@ -1531,8 +1615,105 @@ mod tests {
             hub: false,
             pubkey: None,
             verified: false,
+            allows: Vec::new(),
             added_at: "2026-08-24T00:00:00Z".to_string(),
         }
+    }
+
+    // ── `handle_peer_allow` (P-P3) — pure file I/O, so unlike most `peer`
+    // ── verbs (network-touching, tested at `cli/tests/peer_connectivity.rs`'s
+    // ── `#[ignore]`'d integration layer) this one is directly unit-testable,
+    // ── same reasoning `handle_peer_hub`'s own storage-layer tests already
+    // ── rest on. ─────────────────────────────────────────────────────────────
+
+    fn with_peer_state<T>(tag: &str, f: impl FnOnce() -> T) -> T {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!(
+            "aoide-client-peer-allow-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::env::set_var("AOIDE_STATE_DIR", &dir);
+        let out = f();
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+        out
+    }
+
+    fn allow_inv(args: &[&str]) -> Invocation {
+        Invocation {
+            path: vec!["peer".to_string(), "allow".to_string()],
+            args: args.iter().map(|s| s.to_string()).collect(),
+            flags: Default::default(),
+            door: aoide_protocol::Door::Cli,
+        }
+    }
+
+    #[test]
+    fn peer_allow_enables_and_disables_idempotently_and_reports_exactly_what_changed() {
+        with_peer_state("toggle", || {
+            aoide_storage::peer_store::save_peers(&[fixture_peer(None)]).unwrap();
+
+            let on = handle_peer_allow(&allow_inv(&["yomi-strix", "spawn", "on"]));
+            assert_eq!(on.status, aoide_protocol::output::Status::Ok, "{on:?}");
+            assert!(!on.changed.is_empty());
+            let peers = aoide_storage::peer_store::load_peers();
+            assert_eq!(peers[0].allows, vec!["spawn".to_string()]);
+
+            // Re-enabling is a reported no-op — nothing written, nothing duplicated.
+            let on_again = handle_peer_allow(&allow_inv(&["yomi-strix", "spawn", "on"]));
+            assert_eq!(on_again.status, aoide_protocol::output::Status::Ok);
+            assert!(on_again.changed.is_empty(), "a no-op never touches disk");
+
+            let off = handle_peer_allow(&allow_inv(&["yomi-strix", "spawn", "off"]));
+            assert_eq!(off.status, aoide_protocol::output::Status::Ok, "{off:?}");
+            assert!(aoide_storage::peer_store::load_peers()[0].allows.is_empty());
+
+            let off_again = handle_peer_allow(&allow_inv(&["yomi-strix", "spawn", "off"]));
+            assert!(off_again.changed.is_empty(), "disabling an already-absent cap is also a no-op");
+        });
+    }
+
+    #[test]
+    fn peer_allow_refuses_an_unknown_peer_or_an_unknown_capability() {
+        with_peer_state("refusals", || {
+            aoide_storage::peer_store::save_peers(&[fixture_peer(None)]).unwrap();
+
+            let unknown_peer = handle_peer_allow(&allow_inv(&["ghost", "spawn", "on"]));
+            assert_eq!(unknown_peer.status, aoide_protocol::output::Status::Error);
+            assert_eq!(
+                unknown_peer.data.as_ref().and_then(|d| d.get("reason")).and_then(|v| v.as_str()),
+                Some("unknown-peer")
+            );
+
+            let unknown_cap = handle_peer_allow(&allow_inv(&["yomi-strix", "write", "on"]));
+            assert_eq!(unknown_cap.status, aoide_protocol::output::Status::Error);
+            assert!(unknown_cap.message.contains("read"), "names the valid set: {}", unknown_cap.message);
+            assert!(unknown_cap.message.contains("spawn"), "names the valid set: {}", unknown_cap.message);
+            assert_eq!(
+                unknown_cap.data.as_ref().and_then(|d| d.get("reason")).and_then(|v| v.as_str()),
+                Some("unknown-capability")
+            );
+
+            assert!(aoide_storage::peer_store::load_peers()[0].allows.is_empty(), "no refusal mutates the registry");
+        });
+    }
+
+    #[test]
+    fn peer_allow_reports_usage_on_a_missing_or_malformed_on_off_argument() {
+        with_peer_state("usage", || {
+            assert_eq!(handle_peer_allow(&allow_inv(&[])).status, aoide_protocol::output::Status::Usage);
+            assert_eq!(handle_peer_allow(&allow_inv(&["yomi-strix"])).status, aoide_protocol::output::Status::Usage);
+            assert_eq!(handle_peer_allow(&allow_inv(&["yomi-strix", "spawn"])).status, aoide_protocol::output::Status::Usage);
+            assert_eq!(
+                handle_peer_allow(&allow_inv(&["yomi-strix", "spawn", "maybe"])).status,
+                aoide_protocol::output::Status::Usage
+            );
+        });
     }
 
     // ── resolve_peer_bearer — the no-secret-configured short circuit ────────

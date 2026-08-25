@@ -100,8 +100,41 @@ pub struct Peer {
     /// records the ceremony's own outcome.
     #[serde(default, skip_serializing_if = "is_false")]
     pub verified: bool,
+    /// This peer's capability set (P-P3, `docs/architecture/PAIRING.md`
+    /// decision 5) — a CLOSED vocabulary ([`PEER_CAPABILITIES`]), never a
+    /// per-capability serde bool scatter (the kill-list). `"spawn"` gates
+    /// the A2A door's spawn arm (decision 6); `"read"` is reserved for a
+    /// future graph/who-summary gate over A2A, not read by anything yet.
+    /// Empty for every unpaired peer (today's every `peer add` entry) and
+    /// for a legacy `peers.json` predating this field — same
+    /// `#[serde(default)]`+`skip_serializing_if` discipline `hub`/`verified`
+    /// already hold. Set ONLY by [`upsert_paired_peer`] (the ceremony's
+    /// default-stamp, on first pairing) and [`set_peer_allow`] (`peer allow
+    /// <name> <cap> on|off`) — never a raw `Peer { .. }` literal outside
+    /// this module.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allows: Vec<String>,
     #[serde(rename = "addedAt", default)]
     pub added_at: String,
+}
+
+/// The closed capability vocabulary `allows` may ever contain (P-P3,
+/// PAIRING.md decision 5) — the ONLY valid strings; [`valid_capability`] and
+/// [`set_peer_allow`]'s taught refusal both name this set directly rather
+/// than duplicating it.
+pub const PEER_CAPABILITIES: &[&str] = &["read", "spawn"];
+
+/// Is `cap` one of [`PEER_CAPABILITIES`]? Pure.
+pub fn valid_capability(cap: &str) -> bool {
+    PEER_CAPABILITIES.contains(&cap)
+}
+
+/// The default `allows` a peer gets the moment it FIRST becomes `verified`
+/// (PAIRING.md decision 5: "a peer that completes the pairing ceremony gets
+/// `["read","spawn"]` stamped at commit time") — [`upsert_paired_peer`]'s
+/// only caller of this.
+fn default_paired_allows() -> Vec<String> {
+    vec!["read".to_string(), "spawn".to_string()]
 }
 
 /// `skip_serializing_if` helper for a plain (non-`Option`) `bool` field whose
@@ -189,20 +222,29 @@ pub enum PairChange {
 /// Commit the pairing ceremony's own outcome (P-P2, both call sites: the
 /// approver writing the requester's record, and the requester's own door
 /// writing the approver's record on the callback) — the ONE place either
-/// side of the ceremony writes a peer's `pubkey`/`verified`. Never touches
-/// `allows`/any gate (P-P3's lane, `PAIRING.md`'s house rule for this
-/// phase): a fresh insert takes every unpaired field's ordinary default
-/// (`autogate: false`, no token/bearer, not the hub), and re-pairing an
-/// EXISTING peer (decision: "replaces key material only after the same SAS
-/// confirmation, never silently" — the caller's own confirmation gate, not
-/// this function's) touches ONLY `pubkey`/`verified`/`url`, leaving
-/// whatever the operator already set on `autogate`/`token_file`/
-/// `bearer_secret`/`hub` completely alone.
+/// side of the ceremony writes a peer's `pubkey`/`verified`/default
+/// `allows`. A fresh insert takes every unpaired field's ordinary default
+/// (`autogate: false`, no token/bearer, not the hub) PLUS the ceremony's
+/// own default `allows` ([`default_paired_allows`], P-P3 decision 5:
+/// `["read","spawn"]`) — completing the ceremony for the first time IS
+/// "becoming verified," so the default stamp belongs here, not a second
+/// call site. Re-pairing an EXISTING peer (decision: "replaces key material
+/// only after the same SAS confirmation, never silently" — the caller's own
+/// confirmation gate, not this function's) touches `pubkey`/`verified`/`url`
+/// always, but `allows` ONLY when the peer was NOT already verified before
+/// this call — a key rotation on an ALREADY-paired peer must never silently
+/// re-grant a capability an operator revoked via `peer allow ... off`
+/// (P-P3), so `allows` (like `autogate`/`token_file`/`bearer_secret`/`hub`)
+/// is left exactly as it was once a peer has been verified at least once.
 pub fn upsert_paired_peer(peers: &mut Vec<Peer>, name: &str, url: &str, pubkey_hex: &str, added_at: &str) -> PairChange {
     if let Some(p) = peers.iter_mut().find(|p| p.name == name) {
+        let first_pairing = !p.verified;
         p.pubkey = Some(pubkey_hex.to_string());
         p.verified = true;
         p.url = url.to_string();
+        if first_pairing {
+            p.allows = default_paired_allows();
+        }
         return PairChange::Updated;
     }
     peers.push(Peer {
@@ -214,9 +256,97 @@ pub fn upsert_paired_peer(peers: &mut Vec<Peer>, name: &str, url: &str, pubkey_h
         hub: false,
         pubkey: Some(pubkey_hex.to_string()),
         verified: true,
+        allows: default_paired_allows(),
         added_at: added_at.to_string(),
     });
     PairChange::Inserted
+}
+
+/// What [`set_peer_allow`] actually did — mirrors [`HubChange`]'s "report
+/// exactly what changed" shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AllowChange {
+    /// The capability was absent and is now present.
+    Enabled,
+    /// The capability was present and is now absent.
+    Disabled,
+    /// Already in the requested state — nothing written.
+    NoOp,
+}
+
+/// Why [`set_peer_allow`] refused, distinctly from either half of a valid
+/// call — `peer allow`'s CLI handler names which, per PAIRING.md decision 5
+/// ("Unknown capability strings are refused... refuses an unknown peer and
+/// an unknown cap").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AllowError {
+    UnknownPeer,
+    UnknownCapability,
+}
+
+/// `peer allow <name> <cap> on|off` (P-P3, PAIRING.md decision 5): flip one
+/// capability in `name`'s `allows` set. The capability is validated against
+/// [`PEER_CAPABILITIES`] BEFORE the peer lookup — an unknown cap is refused
+/// the same way regardless of whether `name` exists, never a per-capability
+/// bool field (the kill-list). Idempotent either direction: turning ON an
+/// already-present capability, or OFF an already-absent one, is
+/// [`AllowChange::NoOp`] and writes nothing — mirrors [`set_hub`]/
+/// [`clear_hub`]'s exact idempotence discipline.
+pub fn set_peer_allow(peers: &mut [Peer], name: &str, cap: &str, on: bool) -> Result<AllowChange, AllowError> {
+    if !valid_capability(cap) {
+        return Err(AllowError::UnknownCapability);
+    }
+    let Some(p) = peers.iter_mut().find(|p| p.name == name) else {
+        return Err(AllowError::UnknownPeer);
+    };
+    let has = p.allows.iter().any(|a| a == cap);
+    if on {
+        if has {
+            return Ok(AllowChange::NoOp);
+        }
+        p.allows.push(cap.to_string());
+        Ok(AllowChange::Enabled)
+    } else {
+        if !has {
+            return Ok(AllowChange::NoOp);
+        }
+        p.allows.retain(|a| a != cap);
+        Ok(AllowChange::Disabled)
+    }
+}
+
+/// Resolve the CALLING peer's identity (P-P3, PAIRING.md decision 6) — the
+/// specific registered [`Peer`] a caller's presented credential names,
+/// independent of that peer's own `autogate` flag. Unlike
+/// [`is_autogated_peer_token`]/[`is_autogated_peer_addr`] (which fold ONLY
+/// over `autogate`-marked peers, for the unrelated "skip the pending queue"
+/// question), this looks at EVERY registered peer — a gate that needs to
+/// know WHICH peer is calling (not merely "does some autogate-marked peer
+/// match") goes through this instead.
+///
+/// Ladder, first match wins: a presented bearer token that matches a peer's
+/// OWN `token_file` ([`token_bytes_eq`], the mechanism that survives a
+/// reverse proxy — same precedence [`is_autogated_peer_token`]'s own doc
+/// gives it) is tried FIRST; failing that, an `addr` whose host resolves
+/// against a peer's registered `url` ([`peer_url_matches_addr`]) is tried
+/// second. `None` for an unmatched token, a missing/unmatched address, or
+/// both — a caller presenting only the door-wide bearer (which by
+/// construction matches no PEER's own `token_file`) never resolves to a
+/// name here.
+pub fn resolve_peer<'a>(peers: &'a [Peer], addr: Option<IpAddr>, presented_token: Option<&str>) -> Option<&'a Peer> {
+    if let Some(t) = presented_token {
+        if let Some(p) = peers.iter().find(|p| {
+            p.token_file
+                .as_deref()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .map(|raw| token_bytes_eq(raw.trim(), t))
+                .unwrap_or(false)
+        }) {
+            return Some(p);
+        }
+    }
+    let addr = addr?;
+    peers.iter().find(|p| peer_url_matches_addr(&p.url, addr))
 }
 
 /// A default local nickname for a peer named only by URL (`aoide peer pair
@@ -517,6 +647,7 @@ mod tests {
             hub: false,
             pubkey: None,
             verified: false,
+            allows: Vec::new(),
             added_at: "2026-08-14T00:00:00Z".to_string(),
         }
     }
@@ -879,7 +1010,8 @@ mod tests {
         assert!(!back.verified);
     }
 
-    // ── `upsert_paired_peer` (P-P2's one write site for pubkey/verified) ────
+    // ── `upsert_paired_peer` (the pairing ceremony's one write site for
+    // ── pubkey/verified/default allows, P-P2 + P-P3) ─────────────────────────
 
     #[test]
     fn upsert_paired_peer_inserts_a_fresh_verified_entry_with_unpaired_fields_at_default() {
@@ -891,6 +1023,7 @@ mod tests {
         assert_eq!(peers[0].url, "http://b/");
         assert_eq!(peers[0].pubkey.as_deref(), Some("deadbeef"));
         assert!(peers[0].verified);
+        assert_eq!(peers[0].allows, vec!["read".to_string(), "spawn".to_string()], "a fresh pairing stamps the ceremony's default allows (decision 5)");
         assert!(!peers[0].autogate, "a fresh paired peer is never autogated by construction");
         assert!(peers[0].token_file.is_none());
         assert!(peers[0].bearer_secret.is_none());
@@ -898,10 +1031,12 @@ mod tests {
     }
 
     #[test]
-    fn upsert_paired_peer_on_an_existing_name_replaces_only_pubkey_verified_url() {
+    fn upsert_paired_peer_on_a_never_before_verified_name_replaces_pubkey_verified_url_and_stamps_default_allows() {
         let mut existing = fixture_peer("box-b", "http://old-b/", true);
         existing.token_file = Some("/tmp/tok".to_string());
         existing.bearer_secret = Some("secret-name".to_string());
+        // `existing.verified` is false (fixture default) and `allows` is
+        // empty — an unpaired `peer add` entry pairing for the FIRST time.
         let mut peers = vec![existing];
 
         let change = upsert_paired_peer(&mut peers, "box-b", "http://new-b/", "cafef00d", "2026-08-25T00:00:00Z");
@@ -910,9 +1045,134 @@ mod tests {
         assert_eq!(peers[0].url, "http://new-b/", "url is replaced");
         assert_eq!(peers[0].pubkey.as_deref(), Some("cafef00d"));
         assert!(peers[0].verified);
+        assert_eq!(peers[0].allows, vec!["read".to_string(), "spawn".to_string()], "first-time verification stamps the default allows same as a fresh insert");
         assert!(peers[0].autogate, "autogate is untouched by re-pairing");
         assert_eq!(peers[0].token_file.as_deref(), Some("/tmp/tok"), "token_file untouched");
         assert_eq!(peers[0].bearer_secret.as_deref(), Some("secret-name"), "bearer_secret untouched");
+    }
+
+    #[test]
+    fn upsert_paired_peer_on_an_already_verified_name_never_resets_allows() {
+        // A key rotation (re-pairing) on a peer that was ALREADY verified —
+        // its operator may have since revoked `spawn` via `peer allow ...
+        // off`; re-pairing must never silently re-grant it.
+        let mut existing = fixture_peer("box-b", "http://old-b/", false);
+        existing.verified = true;
+        existing.pubkey = Some("oldkey".to_string());
+        existing.allows = vec!["read".to_string()]; // spawn already revoked.
+        let mut peers = vec![existing];
+
+        let change = upsert_paired_peer(&mut peers, "box-b", "http://new-b/", "newkey", "2026-08-25T00:00:00Z");
+        assert_eq!(change, PairChange::Updated);
+        assert_eq!(peers[0].pubkey.as_deref(), Some("newkey"), "key material still rotates");
+        assert!(peers[0].verified);
+        assert_eq!(peers[0].allows, vec!["read".to_string()], "already-verified peer's allows survive a key rotation untouched — a revoked spawn stays revoked");
+    }
+
+    // ── `allows` — P-P3 additive field ────────────────────────────────────────
+
+    #[test]
+    fn allows_round_trips_and_omits_when_empty() {
+        let mut peer = fixture_peer("alpha", "http://a/", false);
+        let v = serde_json::to_value(&peer).unwrap();
+        assert!(v.get("allows").is_none(), "an empty allows set is omitted, not written as `[]`");
+
+        peer.allows = vec!["read".to_string(), "spawn".to_string()];
+        let v2 = serde_json::to_value(&peer).unwrap();
+        assert_eq!(v2["allows"], serde_json::json!(["read", "spawn"]));
+        let back: Peer = serde_json::from_value(v2).unwrap();
+        assert_eq!(back.allows, vec!["read".to_string(), "spawn".to_string()]);
+    }
+
+    #[test]
+    fn a_legacy_peers_json_predating_allows_loads_an_empty_set() {
+        let old_shape = serde_json::json!({
+            "name": "gamma", "url": "http://c/", "autogate": false, "addedAt": "2026-08-14T00:00:00Z"
+        });
+        let back: Peer = serde_json::from_value(old_shape).unwrap();
+        assert!(back.allows.is_empty());
+    }
+
+    #[test]
+    fn valid_capability_accepts_only_the_closed_set() {
+        assert!(valid_capability("read"));
+        assert!(valid_capability("spawn"));
+        assert!(!valid_capability("write"));
+        assert!(!valid_capability(""));
+        assert!(!valid_capability("Spawn"), "case-sensitive — the closed set is exact strings");
+    }
+
+    // ── `set_peer_allow` (`peer allow <name> <cap> on|off`) ──────────────────
+
+    #[test]
+    fn set_peer_allow_enables_and_disables_idempotently() {
+        let mut peers = vec![fixture_peer("alpha", "http://a/", false)];
+
+        assert_eq!(set_peer_allow(&mut peers, "alpha", "spawn", true), Ok(AllowChange::Enabled));
+        assert_eq!(peers[0].allows, vec!["spawn".to_string()]);
+        // Re-enabling the same cap is a no-op — nothing duplicated.
+        assert_eq!(set_peer_allow(&mut peers, "alpha", "spawn", true), Ok(AllowChange::NoOp));
+        assert_eq!(peers[0].allows, vec!["spawn".to_string()]);
+
+        assert_eq!(set_peer_allow(&mut peers, "alpha", "spawn", false), Ok(AllowChange::Disabled));
+        assert!(peers[0].allows.is_empty());
+        // Disabling an already-absent cap is also a no-op.
+        assert_eq!(set_peer_allow(&mut peers, "alpha", "spawn", false), Ok(AllowChange::NoOp));
+    }
+
+    #[test]
+    fn set_peer_allow_refuses_an_unknown_peer_or_an_unknown_capability() {
+        let mut peers = vec![fixture_peer("alpha", "http://a/", false)];
+        assert_eq!(set_peer_allow(&mut peers, "ghost", "spawn", true), Err(AllowError::UnknownPeer));
+        assert_eq!(set_peer_allow(&mut peers, "alpha", "write", true), Err(AllowError::UnknownCapability));
+        // An unknown capability is refused even against an unknown peer —
+        // the capability check runs first, so it never depends on the
+        // registry's own contents.
+        assert_eq!(set_peer_allow(&mut peers, "ghost", "write", true), Err(AllowError::UnknownCapability));
+        assert!(peers[0].allows.is_empty(), "no refusal mutates the registry");
+    }
+
+    // ── `resolve_peer` (P-P3 decision 6's identity ladder) ────────────────────
+
+    #[test]
+    fn resolve_peer_matches_a_presented_token_against_any_registered_peers_own_token_file_regardless_of_autogate() {
+        let dir = std::env::temp_dir().join(format!("aoide-peer-resolve-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let token_path = dir.join("box-b.token");
+        std::fs::write(&token_path, "secret-b\n").unwrap();
+
+        // NOT autogate-marked — resolve_peer must still find it by token,
+        // unlike is_autogated_peer_token which would refuse it.
+        let mut paired = fixture_peer("box-b", "http://10.0.0.5:8710/", false);
+        paired.verified = true;
+        paired.token_file = Some(token_path.to_string_lossy().into_owned());
+        let peers = vec![paired];
+
+        let resolved = resolve_peer(&peers, None, Some("secret-b"));
+        assert_eq!(resolved.map(|p| p.name.as_str()), Some("box-b"));
+        assert!(resolve_peer(&peers, None, Some("wrong")).is_none());
+        assert!(resolve_peer(&peers, None, None).is_none(), "no token, no address — nothing to resolve against");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_peer_falls_back_to_address_when_no_token_matches() {
+        let peer = fixture_peer("box-b", "http://10.0.0.5:8710/", false);
+        let peers = vec![peer];
+        let ip: IpAddr = "10.0.0.5".parse().unwrap();
+
+        assert_eq!(resolve_peer(&peers, Some(ip), None).map(|p| p.name.as_str()), Some("box-b"));
+        // A presented token that matches NO peer's own token_file still
+        // falls through to the address ladder rather than short-circuiting
+        // to None — the door-wide-bearer-only case (no peer token_file set
+        // anywhere) resolves by address exactly as if no token was sent.
+        assert_eq!(resolve_peer(&peers, Some(ip), Some("door-wide-bearer")).map(|p| p.name.as_str()), Some("box-b"));
+
+        let stranger: IpAddr = "10.0.0.9".parse().unwrap();
+        assert!(resolve_peer(&peers, Some(stranger), None).is_none());
+        assert!(resolve_peer(&[], Some(ip), None).is_none(), "an empty registry resolves nothing");
     }
 
     // ── `default_peer_name_from_url` ─────────────────────────────────────────

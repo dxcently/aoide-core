@@ -283,6 +283,7 @@ fn peer_add_against_an_unreachable_url_never_registers_and_pull_of_a_down_peer_m
         hub: false,
         pubkey: None,
         verified: false,
+        allows: Vec::new(),
         added_at: aoide_storage::time::now_iso_utc(),
     });
     aoide_storage::peer_store::save_peers(&peers).unwrap();

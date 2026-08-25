@@ -115,6 +115,10 @@ pub fn upsert_session(
             // resurrect path (P-D8) stamps this after the fact via
             // `stamp_resumed_from`, once the new record exists.
             resumed_from: None,
+            // Stamped later by `stamp_origin` (P-P3), only for a session
+            // aoide-server's A2A door spawned on behalf of a paired peer; a
+            // fresh registration otherwise starts without one.
+            origin: None,
             extra: Map::new(),
         });
         true

@@ -9,7 +9,7 @@ use super::doc::restage_graph;
 use super::model::{
     canonical_state, load_stage, sessions_path, write_stage, SessionsFile, STAGE_GRAPH_VERSION,
 };
-use super::session_store::{do_session_end, do_session_start, set_session_log_path, stamp_headless};
+use super::session_store::{do_session_end, do_session_start, set_session_log_path, stamp_headless, stamp_origin};
 use super::window::{discover_window_address, resolve_registration_parent};
 use aoide_protocol::Invocation;
 use aoide_protocol::output::Outcome;
@@ -883,6 +883,17 @@ pub fn session_conduct(inv: &Invocation) -> Outcome {
     if headless {
         stamp_headless(&id);
     }
+    // Origin (P-P3, `docs/architecture/PAIRING.md` decision 7): threaded in
+    // via `AOIDE_SESSION_ORIGIN`, set by `aoide-server::a2a::do_spawn` on
+    // the child it launches when the A2A spawn arm resolved the caller to
+    // an identified, paired peer — absent for every locally-launched
+    // `conduct` (a plain terminal, `graph spawn`, etc.), which is exactly
+    // when this env var is simply unset.
+    if let Ok(origin) = std::env::var("AOIDE_SESSION_ORIGIN") {
+        if !origin.is_empty() {
+            stamp_origin(&id, &origin);
+        }
+    }
 
     // `--headless`: no controlling tty at all — the pty's output goes to a
     // per-session log file instead of stdout, and the multiplexer never reads
@@ -1382,6 +1393,52 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn conduct_registration_stamps_origin_from_the_env_var_and_leaves_it_absent_when_unset() {
+        // P-P3, `docs/architecture/PAIRING.md` decision 7: `aoide-server`'s
+        // `a2a::do_spawn` sets `AOIDE_SESSION_ORIGIN=peer:<name>` on the
+        // child it launches; `session_conduct` reads it right after
+        // registration and stamps `SessionRecord.origin` — proven here
+        // without spawning through the real A2A door (this crate can't see
+        // `aoide-server` at all), mirroring `headless_conduct_registration_
+        // stamps_the_permanent_headless_marker`'s exact shape one env var
+        // over.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_SESSION_ORIGIN"]);
+
+        let root = unique_stage("conduct-origin-marker");
+        let stage = root.join("stage");
+        let state = root.join("state");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+
+        std::env::set_var("AOIDE_SESSION_ORIGIN", "peer:yomi-strix");
+        let out = session_conduct(&conduct_invocation(
+            &["sh", "-c", "true"],
+            &[("id", "conduct-origin-peer")],
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let rec = s.sessions.iter().find(|r| r.session_id == "conduct-origin-peer").unwrap();
+        assert_eq!(rec.origin.as_deref(), Some("peer:yomi-strix"));
+
+        // No env var set at all — a plain local registration never gets one.
+        std::env::remove_var("AOIDE_SESSION_ORIGIN");
+        let out2 = session_conduct(&conduct_invocation(
+            &["sh", "-c", "true"],
+            &[("id", "conduct-origin-local")],
+        ));
+        assert_eq!(out2.status, aoide_protocol::output::Status::Ok, "msg: {}", out2.message);
+        let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let rec2 = s2.sessions.iter().find(|r| r.session_id == "conduct-origin-local").unwrap();
+        assert_eq!(rec2.origin, None, "a locally-launched conduct never stamps an origin");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn session_refresh_drives_shell_cwd_command_and_state() {
         let _guard = crate::env_lock().lock().unwrap();

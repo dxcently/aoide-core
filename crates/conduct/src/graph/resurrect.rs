@@ -251,6 +251,7 @@ mod tests {
             started_at: "2026-08-20T00:00:00Z".to_string(),
             ended_at: ended_at.to_string(),
             resumed_from: None,
+            origin: None,
         }
     }
 

@@ -59,6 +59,7 @@ pub(crate) fn session(
         headless: false,
         harness_session_id: None,
         resumed_from: None,
+        origin: None,
         extra: Map::new(),
     }
 }

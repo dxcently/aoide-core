@@ -129,6 +129,7 @@ mod tests {
             "mcp.serve",
             "onboard",
             "peer.add",
+            "peer.allow",
             "peer.hub",
             "peer.list",
             "peer.pair.approve",

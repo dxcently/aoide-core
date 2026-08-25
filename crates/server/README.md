@@ -150,8 +150,11 @@ the inbound half of the two-door contract (the outbound half is
   the ceremony's whole point is establishing a credential where none
   exists yet, so gating any of the three on one would be circular. None
   grants anything beyond a `pubkey`/`verified` peer record, and that
-  record commits only on BOTH ends' own separate human confirmation — no
-  `allows`/permission, no spawn/bearer gate (P-P3's lane). `pair_request`
+  record commits only on BOTH ends' own separate human confirmation — the
+  default `allows` (`["read","spawn"]`) is stamped by
+  `aoide_storage::peer_store::upsert_paired_peer` itself, the moment a peer
+  first becomes verified (P-P3, PAIRING.md decision 5), never by these three
+  methods directly. `pair_request`
   validates every field (64-hex pubkey, 64-hex commitment, a
   `valid_peer_name` name, a non-empty `://`-bearing url) before calling
   `aoide_storage::pairing::park_inbound` — malformed input never reaches
@@ -178,6 +181,31 @@ the inbound half of the two-door contract (the outbound half is
   instance's own operator confirms the SAS a second time. All three audit
   via the existing `Door::A2a` audit sink (`a2a.pairRequest`/
   `a2a.pairReveal`/`a2a.pairApprove`), same as every other A2A method.
+  **The Spawn arm's gate (P-P3, PAIRING.md decision 6)** —
+  `message_send`'s `SendAction::Spawn` arm no longer consults
+  `token_authorized` (the door-wide bearer, 2026-08-19's own amendment) at
+  all: it requires `aoide_storage::peer_store::resolve_peer` (origin
+  address / a peer's own `token_file`, the SAME identification ladder
+  `is_autogated_peer_addr`/`is_autogated_peer_token` already fold, just
+  unfiltered by `autogate` and narrowed to ONE named peer) to resolve to a
+  peer that is BOTH `verified` and carries `"spawn"` in `allows`
+  (`peer_may_spawn`, pure and directly unit-tested against `Peer` fixtures
+  — no test in this file drives `do_spawn`'s real OS-level process spawn,
+  same house rule every other Spawn-arm test already follows). A caller
+  holding only the plain door-wide bearer, with no peer identity behind it,
+  gets the taught `-32006` refusal naming the pairing ceremony. **Honesty
+  note**: this resolution rides the SAME two pre-pairing mechanisms above,
+  not a new signature — P-P4 is what makes either one unforgeable
+  (CONTRACTS.md §6's own amendment carries the full note). The resolved
+  peer's name also threads two ways past the gate: `do_spawn` sets
+  `AOIDE_SESSION_ORIGIN=peer:<name>` on the child it launches (read by
+  `aoide-conduct`'s `session_conduct`, which stamps
+  `SessionRecord.origin`), and the Inject arm's own `resolved_peer` (a
+  SEPARATE, ungated identity lookup — attribution, never a gate) rides
+  `do_inject`'s existing `--from` flag onto a QUEUED `pending.json` entry
+  only (an immediately-delivered payload's bytes stay untouched, so an
+  already-autogated peer's delivery is byte-identical to before this
+  phase).
 - `commands` — this crate's CLI verbs: `daemon`, `shellbridge` (registration
   only — the files stay in `conduct`), `a2a serve`, `events tail` (P-D3,
   appended newest — CLI-only, the same door-policy shape `a2a serve`/

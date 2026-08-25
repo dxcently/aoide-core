@@ -563,6 +563,7 @@ pub(crate) fn ledger_session_exit(rec: &SessionRecord, ended_at: &str) {
         started_at: rec.started_at.clone(),
         ended_at: ended_at.to_string(),
         resumed_from: rec.resumed_from.clone(),
+        origin: rec.origin.clone(),
     };
     if let Err(e) = aoide_storage::ledger::append_ledger_entry(&entry) {
         eprintln!(
@@ -1002,6 +1003,7 @@ mod tests {
             hub: false,
             pubkey: None,
             verified: false,
+            allows: Vec::new(),
             added_at: "2026-08-14T00:00:00Z".into(),
         }])
         .unwrap();
@@ -1066,6 +1068,7 @@ mod tests {
             hub: false,
             pubkey: None,
             verified: false,
+            allows: Vec::new(),
             added_at: "2026-08-14T00:00:00Z".into(),
         }])
         .unwrap();
@@ -1086,6 +1089,7 @@ mod tests {
             hub: false,
             pubkey: None,
             verified: false,
+            allows: Vec::new(),
             added_at: "2026-08-14T00:00:00Z".into(),
         }])
         .unwrap();
@@ -1117,6 +1121,7 @@ mod tests {
             hub: false,
             pubkey: None,
             verified: false,
+            allows: Vec::new(),
             added_at: "2026-08-14T00:00:00Z".into(),
         }])
         .unwrap();

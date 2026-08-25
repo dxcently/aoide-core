@@ -467,6 +467,42 @@ pub(in crate::graph) fn stamp_headless(id: &str) {
     });
 }
 
+/// Stamp `origin` on a just-registered session record (P-P3,
+/// `docs/architecture/PAIRING.md` decision 7) — `"peer:<name>"` for a
+/// session `aoide-server`'s A2A door spawned on behalf of an identified,
+/// paired peer, threaded here via the `AOIDE_SESSION_ORIGIN` env var
+/// `a2a::do_spawn` sets on the child it launches (`session_conduct` reads
+/// it right after `do_session_start`, the same seam [`stamp_headless`]
+/// uses). A PERMANENT birth fact, like `headless`/`hookAncestry`: stamped
+/// once, change-only (a no-op once already set to this exact value), never
+/// re-derived later. No `restage_graph()` — like `hookAncestry`/`headless`,
+/// consumed internally (the durable session ledger, via
+/// `doc::ledger_session_exit`) rather than rendered into `graph.json`, so
+/// stamping it must not churn the widget-facing document. A silent no-op
+/// for an unknown id or an empty `origin`.
+pub(in crate::graph) fn stamp_origin(id: &str, origin: &str) {
+    if origin.is_empty() {
+        return;
+    }
+    with_stage_lock(|| {
+        let mut file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        if let Some(s) = file
+            .sessions
+            .iter_mut()
+            .find(|s| s.session_id == id && s.origin.as_deref() != Some(origin))
+        {
+            s.origin = Some(origin.to_string());
+            if file.schema_version.is_empty() {
+                file.schema_version = STAGE_GRAPH_VERSION.to_string();
+            }
+            let _ = write_stage(&sessions_path(), &file);
+        }
+    });
+}
+
 /// Stamp `harnessSessionId` — the raw hook payload's OWN `session_id` field
 /// (P-D7) — on a session record, on EVERY hook event that carries one, not
 /// just at registration: unlike `hookAncestry`/`headless` (birth facts,
@@ -2238,6 +2274,42 @@ mod tests {
         // proven indirectly: an unknown id is a silent no-op and never
         // panics or errors.
         stamp_resumed_from("no-such-session", "old-2");
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn stamp_origin_lands_the_field_and_never_restages_graph_json() {
+        // P-P3: `stamp_origin` is `graph.json`-invisible, like
+        // `hookAncestry`/`headless` — unlike `stamp_resumed_from`, which
+        // DOES restage.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("stamp-origin");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        do_session_start("peer-spawned-1", Some("claude"), Some("/w"), None, None, None, None, None, None);
+        stamp_origin("peer-spawned-1", "peer:yomi-strix");
+
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let rec = s.sessions.iter().find(|r| r.session_id == "peer-spawned-1").unwrap();
+        assert_eq!(rec.origin.as_deref(), Some("peer:yomi-strix"));
+
+        // A local (non-peer) registration never gets an origin at all.
+        do_session_start("local-1", Some("claude"), Some("/w"), None, None, None, None, None, None);
+        let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let local = s2.sessions.iter().find(|r| r.session_id == "local-1").unwrap();
+        assert_eq!(local.origin, None);
+
+        // An empty origin string is a no-op, same as an unknown id.
+        stamp_origin("local-1", "");
+        stamp_origin("no-such-session", "peer:ghost");
+        let s3: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(s3.sessions.iter().find(|r| r.session_id == "local-1").unwrap().origin, None);
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),

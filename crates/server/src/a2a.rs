@@ -744,6 +744,7 @@ fn do_inject(
     prompt: &str,
     audit_log: &Path,
     deliver_now: bool,
+    from: Option<&str>,
 ) -> Result<Value, (i64, String)> {
     let mut flags = std::collections::BTreeMap::new();
     flags.insert("id".to_string(), session_id.to_string());
@@ -752,6 +753,17 @@ fn do_inject(
         flags.insert("yes".to_string(), "true".to_string());
     }
     flags.insert("audit-log".to_string(), audit_log.to_string_lossy().into_owned());
+    // The resolved peer's identity (P-P3, PAIRING.md decision 7), when the
+    // caller resolved to one (`aoide_storage::peer_store::resolve_peer` —
+    // ATTRIBUTION, not a gate, same posture `graph send --from` already
+    // documents): rides straight into `graph send`'s own EXISTING `--from`
+    // flag, so a peer-driven send that lands in `pending.json` carries
+    // `"from": "peer:<name>"` through the exact same field a local
+    // `--from`/`AOIDE_SESSION_ID` attribution already populates — no second
+    // attribution field invented.
+    if let Some(f) = from {
+        flags.insert("from".to_string(), f.to_string());
+    }
     let inv = Invocation {
         path: vec!["graph".to_string(), "send".to_string()],
         args: vec![prompt.to_string()],
@@ -834,7 +846,16 @@ fn spawn_inject_prompt(id: &str, prompt: &str) {
 /// generalizes exactly this detach/register/reap shape as its own verb; a
 /// later phase can have this handler ride on it instead of hand-rolling the
 /// same mechanics here.
-fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path) -> Result<Value, (i64, String)> {
+///
+/// `peer_name` is the resolved, PAIRED, spawn-allowed peer `message_send`'s
+/// gate already proved before calling this (P-P3, PAIRING.md decision 6) —
+/// never optional at this call site, since the gate refuses outright
+/// otherwise. Threaded to the child as `AOIDE_SESSION_ORIGIN=peer:<name>`
+/// (`graph/conduct.rs::session_conduct` reads it right after registration
+/// and stamps `SessionRecord.origin`, decision 7) and folded into this
+/// call's own audit line, so the spawned session's provenance is visible
+/// both in the audit log and on the record itself, end to end.
+fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path, peer_name: &str) -> Result<Value, (i64, String)> {
     let id = format!("a2a-{}-{}", std::process::id(), unix_ts_now());
     let aoide_bin = std::env::current_exe()
         .map_err(|e| (-32603_i64, format!("resolving the aoide binary: {e}")))?;
@@ -849,9 +870,16 @@ fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path) -> Result<Value, (i
     ];
     argv.extend(agent_cmd.split_whitespace().map(str::to_string));
 
+    let origin = format!("peer:{peer_name}");
     let mut cmd = std::process::Command::new(&aoide_bin);
     cmd.args(&argv)
         .env("AOIDE_AUDIT_LOG", audit_log)
+        // Explicitly cleared first: `Command` otherwise inherits this
+        // process's own full environment, and `a2a serve` itself is never
+        // launched with `AOIDE_SESSION_ORIGIN` set, but this keeps the
+        // child's origin stamp honest even if that ever changed.
+        .env_remove("AOIDE_SESSION_ORIGIN")
+        .env("AOIDE_SESSION_ORIGIN", &origin)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -889,7 +917,7 @@ fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path) -> Result<Value, (i
                 EventClass::Audit,
                 "a2a.message/send",
                 "ok",
-                &format!("spawned conducted session `{id}` (configured agent)"),
+                &format!("spawned conducted session `{id}` (configured agent, {origin})"),
             );
             let task = Task {
                 id: id.clone(),
@@ -903,7 +931,7 @@ fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path) -> Result<Value, (i
             Ok(serde_json::to_value(&task).expect("Task always serializes"))
         }
         Err(e) => {
-            let msg = format!("failed to spawn A2A agent: {e}");
+            let msg = format!("failed to spawn A2A agent: {e} ({origin})");
             let _ = audit(
                 audit_log,
                 Door::A2a,
@@ -939,6 +967,36 @@ fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path) -> Result<Value, (i
 /// - Spawn gained a gate it never had at all: [`token_authorized`] must pass
 ///   before [`do_spawn`] runs. This is the actual must-fix gap this
 ///   amendment closes — Spawn was origin-blind AND token-blind before it.
+///
+/// **Amendment (2026-08-25, P-P3): the Spawn arm is regated a SECOND time —
+/// from the door-wide bearer to a named, paired peer.** PAIRING.md decision
+/// 6: spawning now requires the caller to resolve to a specific,
+/// `verified` `aoide_storage::peer_store::Peer` whose `allows` contains
+/// `"spawn"` — [`token_authorized`] (the 2026-08-19 amendment above) is no longer
+/// consulted at all for Spawn; holding the plain door-wide bearer, with no
+/// peer identity behind it, no longer reaches [`do_spawn`]. The refusal is
+/// `-32006`, naming the pairing ceremony (`peer pair request`).
+///
+/// **HONESTY NOTE (P-P4 not yet landed):** "resolve to a peer" today rides
+/// the SAME inbound identification this file already had before pairing
+/// existed — there is no per-request signature yet (that is P-P4's own
+/// lane, `docs/architecture/PAIRING.md`'s "Wire authentication" section).
+/// [`aoide_storage::peer_store::resolve_peer`] is the ladder: a presented
+/// bearer that matches a peer's own `token_file` FIRST (survives a proxy),
+/// else the TCP-observed `origin` address against that peer's registered
+/// `url` SECOND — the exact same two signals [`is_autogated_peer_token`]/
+/// [`is_autogated_peer_addr`] already fold for the unrelated autogate
+/// question, just unfiltered by `autogate` and narrowed to ONE specific
+/// peer rather than a bool. Neither signal is cryptographically bound to
+/// the caller: a `token_file`'s bearer is a shared secret (spoofable by
+/// anyone who can read that file or sniff the header), and a source
+/// address is spoofable by anyone who can reach the door from that address
+/// (or sits behind the same proxy/NAT). **The gate SHAPE (paired + `spawn`
+/// in `allows`) is what this phase lands; the UNFORGEABLE binding — a
+/// per-request ed25519 signature over method/path/timestamp/nonce/body —
+/// is P-P4's, not invented here.** Until P-P4 lands, a resolved peer
+/// identity is only as strong as whichever of these two legacy mechanisms
+/// carried it.
 ///
 /// **Amendment (2026-08-20, #50): a context-id send answers UNIFORMLY, not
 /// with a hard gate, once a token is configured and the caller holds
@@ -985,6 +1043,21 @@ fn message_send(
         .unwrap_or(false);
     let autogate_match = ip_autogate || token_autogate;
 
+    // The caller's resolved peer IDENTITY (P-P3, PAIRING.md decision 6/7) —
+    // deliberately a SEPARATE question from `ip_autogate`/`token_autogate`
+    // above (which fold ONLY over `autogate`-marked peers, for the
+    // unrelated "skip the pending queue" question): `resolve_peer` looks at
+    // EVERY registered peer, autogate or not. Used two ways below: the
+    // Spawn arm requires it to be a VERIFIED peer with `spawn` in `allows`
+    // (the hard gate); the Inject arm, when it queues, stamps it onto
+    // `pending.json`'s `from` field for attribution only (never a gate —
+    // see `do_inject`'s own doc comment).
+    let addr = match origin {
+        PeerOrigin::Remote(ip) => Some(ip),
+        PeerOrigin::Loopback | PeerOrigin::Unknown => None,
+    };
+    let resolved_peer = aoide_storage::peer_store::resolve_peer(&peers, addr, presented_token);
+
     // Uniform-response guard (see the amendment above) — mirrors
     // `decide_send_action`'s OWN `spawn_asked`/`context_id` split exactly
     // (`context_id.is_some() && !spawn_asked` is that function's "past this
@@ -1008,16 +1081,58 @@ fn message_send(
         SendAction::Inject { session_id } => {
             let eff_origin = effective_origin(origin, token_configured, token_state);
             let deliver_now = should_deliver_now(eff_origin, autogate_match);
-            do_inject(&session_id, &prompt, audit_log, deliver_now)
+            // The `from` attribution rides ONLY the QUEUED path (P-P3
+            // decision 7: "pending-queue entries a peer's send creates").
+            // `session_send`'s own `from` mechanism ALSO prefixes an
+            // IMMEDIATELY-delivered payload's text ("from <sender>: ",
+            // `provenance_prefix`) — scoping this to `!deliver_now` keeps
+            // an already-autogated peer's DELIVERED payload byte-identical
+            // to before this phase (pinned by
+            // `autogated_peer_delivers_despite_being_non_loopback`), while
+            // still attributing every entry that actually reaches
+            // `pending.json`.
+            let from = if deliver_now { None } else { resolved_peer.map(|p| format!("peer:{}", p.name)) };
+            do_inject(&session_id, &prompt, audit_log, deliver_now, from.as_deref())
         }
-        SendAction::Spawn { agent_cmd } => {
-            if !token_authorized(token_configured, token_state) {
-                return Err(unauthorized());
+        SendAction::Spawn { agent_cmd } => match resolved_peer.filter(|p| peer_may_spawn(p)) {
+            Some(peer) => do_spawn(&agent_cmd, &prompt, audit_log, &peer.name),
+            None => {
+                let _ = audit(
+                    audit_log,
+                    Door::A2a,
+                    EventClass::Audit,
+                    "a2a.message/send",
+                    "unauthorized",
+                    "spawn refused: the caller does not resolve to a PAIRED peer with `spawn` allowed",
+                );
+                Err(spawn_requires_pairing())
             }
-            do_spawn(&agent_cmd, &prompt, audit_log)
-        }
+        },
         SendAction::Error { code, msg } => Err((code, msg)),
     }
+}
+
+/// The Spawn admission predicate itself (P-P3, PAIRING.md decision 6) — a
+/// paired peer whose `allows` contains `"spawn"`. Pure, split out of
+/// [`message_send`] so the gate table (paired+allowed / paired+denied /
+/// unpaired) is directly unit-testable against plain `Peer` fixtures,
+/// without ever touching [`do_spawn`]'s real OS-level process spawn.
+fn peer_may_spawn(peer: &aoide_storage::peer_store::Peer) -> bool {
+    peer.verified && peer.allows.iter().any(|a| a == "spawn")
+}
+
+/// The `-32006` refusal every unpaired/unallowed Spawn attempt returns
+/// (P-P3) — a distinct code from `unauthorized()`'s `-32005` (the door-wide
+/// bearer gate every OTHER arm still uses), since this is a DIFFERENT
+/// question: not "do you hold a valid door-wide token" but "do you resolve
+/// to a specific peer this operator has paired with and allowed to spawn."
+fn spawn_requires_pairing() -> (i64, String) {
+    (
+        -32006,
+        "spawn refused: the caller does not resolve to a PAIRED peer whose `allows` includes \
+         `spawn` — pair first via `peer pair request`, then `peer allow <name> spawn on`"
+            .to_string(),
+    )
 }
 
 /// `aoide/graphSummary` (CONTRACTS.md §7): wrap the EXISTING resolved
@@ -2288,6 +2403,28 @@ mod tests {
         }
     }
 
+    /// A minimal `Peer` fixture (P-P3) — unpaired/unautogated/no-token by
+    /// default, the same "mostly default, caller sets what it needs" shape
+    /// `aoide_storage::peer_store::tests::fixture_peer` uses in its own
+    /// crate; kept as a separate small copy here (this crate's tests build
+    /// several ad hoc `Peer { .. }` literals of their own already, and this
+    /// one intentionally matches that local style rather than reaching for
+    /// a cross-crate test helper that doesn't exist).
+    fn fixture_peer(name: &str, url: &str, autogate: bool) -> aoide_storage::peer_store::Peer {
+        aoide_storage::peer_store::Peer {
+            name: name.to_string(),
+            url: url.to_string(),
+            autogate,
+            token_file: None,
+            bearer_secret: None,
+            hub: false,
+            pubkey: None,
+            verified: false,
+            allows: Vec::new(),
+            added_at: "2026-08-25T00:00:00Z".to_string(),
+        }
+    }
+
     // (a) AgentCard generation from a small fake schema.
     #[test]
     fn agent_card_only_advertises_implemented_commands_as_skills() {
@@ -3189,12 +3326,14 @@ mod tests {
     }
 
     #[test]
-    fn message_send_spawn_rejects_without_a_valid_token_once_one_is_configured() {
+    fn message_send_spawn_rejects_an_unpaired_caller_with_the_p_p3_taught_error() {
         // No contextId → the Spawn arm — spawn_agent is non-empty so
-        // `decide_send_action` resolves to Spawn, and the NEW token gate must
+        // `decide_send_action` resolves to Spawn, and the P-P3 gate must
         // reject it BEFORE `do_spawn` ever runs (so this never actually
         // spawns a process — the house rule every other error-branch test in
-        // this suite already follows).
+        // this suite already follows). No peer is registered at all, so
+        // NEITHER the old door-wide-token gate NOR the new pairing gate can
+        // possibly pass — -32006, not the old -32005.
         let params = json!({
             "message": { "parts": [{ "kind": "text", "text": "hi" }] }
         });
@@ -3207,7 +3346,7 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert_eq!(err.0, -32005);
+        assert_eq!(err.0, -32006);
 
         let err2 = message_send(
             &params,
@@ -3218,7 +3357,102 @@ mod tests {
             Some("wrong-secret"),
         )
         .unwrap_err();
-        assert_eq!(err2.0, -32005);
+        assert_eq!(err2.0, -32006);
+    }
+
+    // ── Spawn gate table (P-P3, PAIRING.md decision 6) ───────────────────────
+    //
+    // `peer_may_spawn` (the pure predicate) covers paired+allowed / paired+
+    // denied / unpaired directly against `Peer` fixtures — never through
+    // `message_send`/`do_spawn`, which would actually launch a process (see
+    // `spawn_inject_prompts_success_branch_files_the_opening_turn_into_the_inbox`'s
+    // own doc comment on why no test in this file drives `do_spawn`'s real
+    // OS-level spawn). The integration tests below drive `message_send`
+    // itself for the REFUSAL branches, which never reach `do_spawn` at all.
+
+    #[test]
+    fn peer_may_spawn_covers_paired_allowed_paired_denied_and_unpaired() {
+        let mut paired_allowed = fixture_peer("box-b", "http://10.0.0.5:8710/", false);
+        paired_allowed.verified = true;
+        paired_allowed.allows = vec!["read".to_string(), "spawn".to_string()];
+        assert!(peer_may_spawn(&paired_allowed), "paired + spawn in allows");
+
+        let mut paired_denied = paired_allowed.clone();
+        paired_denied.allows = vec!["read".to_string()]; // spawn revoked.
+        assert!(!peer_may_spawn(&paired_denied), "paired but spawn NOT in allows");
+
+        let mut unpaired = paired_allowed.clone();
+        unpaired.verified = false; // never completed the ceremony.
+        assert!(!peer_may_spawn(&unpaired), "allows populated but never verified — still refused");
+    }
+
+    #[test]
+    fn message_send_spawn_refuses_a_paired_peer_whose_allows_lacks_spawn() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-spawn-denied-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", root.join("stage"));
+        std::env::set_var("AOIDE_STATE_DIR", root.join("state"));
+
+        let mut peer = fixture_peer("denied-peer", "http://10.0.0.5:8710/", false);
+        peer.verified = true;
+        peer.allows = vec!["read".to_string()]; // spawn explicitly absent (revoked or never granted).
+        aoide_storage::peer_store::save_peers(&[peer]).unwrap();
+
+        let params = json!({ "message": { "parts": [{ "kind": "text", "text": "hi" }] } });
+        let remote_origin = PeerOrigin::Remote("10.0.0.5".parse().unwrap());
+        let err = message_send(&params, &root.join("log"), "claude", remote_origin, "", None).unwrap_err();
+        assert_eq!(err.0, -32006, "resolved to a REAL peer, but `spawn` is not in its allows");
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+    }
+
+    #[test]
+    fn message_send_spawn_refuses_the_door_wide_bearer_alone_with_no_peer_identity() {
+        // The exact scenario decision 6 names explicitly: a caller presenting
+        // a VALID door-wide bearer (the OLD gate this amendment replaces)
+        // but resolving to no specific registered peer at all — no peer's
+        // own `token_file` matches this token, and the registry is empty so
+        // no address can match either. Under the pre-P-P3 gate this would
+        // have passed (`token_authorized` was the whole gate); now it must
+        // still refuse.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-spawn-doorwide-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", root.join("stage"));
+        std::env::set_var("AOIDE_STATE_DIR", root.join("state"));
+
+        let params = json!({ "message": { "parts": [{ "kind": "text", "text": "hi" }] } });
+        let err = message_send(
+            &params,
+            &root.join("log"),
+            "claude",
+            PeerOrigin::Loopback,
+            "the-door-wide-secret",
+            Some("the-door-wide-secret"), // matches expected_token exactly.
+        )
+        .unwrap_err();
+        assert_eq!(err.0, -32006, "a valid DOOR-WIDE bearer alone no longer reaches the spawn arm");
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
     }
 
     #[test]
@@ -3288,6 +3522,69 @@ mod tests {
         assert!(log.contains("\"door\":\"a2a\""), "audited through Door::A2a: {log}");
         assert!(log.contains("\"status\":\"pending\""), "audited as pending: {log}");
         assert!(log.contains("graph.send"), "reuses graph send's own audit command label: {log}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
+    fn a_held_pending_send_from_a_resolved_but_non_autogated_peer_carries_its_origin() {
+        // P-P3 decision 7: a pending-queue entry a PEER's send creates
+        // carries that resolved peer's identity — even an UNPAIRED,
+        // non-autogated one (attribution, not a gate — same "ATTRIBUTION,
+        // NOT SECURITY" posture `resolve_sender`/`--from` already document).
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-pending-origin-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_STATE_DIR", root.join("state"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        // Registered, resolvable by address, but NOT autogate-marked — the
+        // send still queues (unaffected), but now RESOLVES to a name.
+        aoide_storage::peer_store::save_peers(&[fixture_peer("watching-peer", "http://10.0.0.9:8710/", false)]).unwrap();
+
+        let id = "attributed-target";
+        let socket = aoide_conduct::graph::conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![conductable_session(id, &socket)],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let audit_log = root.join("log");
+        let params = serde_json::json!({
+            "message": { "parts": [{ "kind": "text", "text": "who sent this" }], "contextId": id }
+        });
+        let remote_origin = PeerOrigin::Remote("10.0.0.9".parse().unwrap());
+        let result = message_send(&params, &audit_log, "", remote_origin, "", None);
+        assert!(result.is_ok(), "still a submitted Task, never a JSON-RPC error");
+
+        let pending: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(stage.join("pending.json")).unwrap()).unwrap();
+        let entries = pending["pending"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["from"], "peer:watching-peer", "the resolved peer's identity stamps the pending entry");
 
         let _ = std::fs::remove_dir_all(&root);
         match saved_stage {
@@ -3709,6 +4006,7 @@ mod tests {
             hub: false,
             pubkey: None,
             verified: false,
+            allows: Vec::new(),
             added_at: "2026-08-14T00:00:00Z".into(),
         }])
         .unwrap();
@@ -3807,6 +4105,7 @@ mod tests {
             hub: false,
             pubkey: None,
             verified: false,
+            allows: Vec::new(),
             added_at: "2026-08-18T00:00:00Z".into(),
         }])
         .unwrap();
@@ -4162,6 +4461,7 @@ mod tests {
             hub: false,
             pubkey: None,
             verified: false,
+            allows: Vec::new(),
             added_at: "2026-08-20T00:00:00Z".into(),
         }])
         .unwrap();

@@ -32,7 +32,22 @@ cache (CONTRACTS.md §7). File-first by decision — no embedded database yet
   loads with `pubkey: None`/`verified: false` unchanged.
   `default_peer_name_from_url` sanitizes a bare URL host into the same
   nickname shape `valid_peer_name` requires, for `peer pair request`'s
-  no-`--name` default.
+  no-`--name` default. `allows` (P-P3, `docs/architecture/PAIRING.md`
+  decision 5) is a CLOSED capability set (`PEER_CAPABILITIES`: `"read"`,
+  `"spawn"`) — never a per-capability serde bool scatter — additive,
+  empty for every unpaired/legacy peer; `upsert_paired_peer` stamps the
+  ceremony's own default (`["read","spawn"]`) the moment a peer FIRST
+  becomes verified, and leaves it untouched on a later key rotation (a
+  revoked capability survives re-pairing). `set_peer_allow` (`peer allow
+  <name> <cap> on|off`'s library half) is the only OTHER writer —
+  idempotent, refuses an unknown peer or an unknown capability (the
+  capability check runs first). `resolve_peer` (decision 6) is the
+  caller-identity ladder the A2A door's spawn gate keys off: a presented
+  bearer against a peer's own `token_file` first, an origin address
+  against that peer's `url` second — unlike `is_autogated_peer_token`/
+  `is_autogated_peer_addr` above, it looks at EVERY registered peer, not
+  only `autogate`-marked ones, since resolving WHICH peer is calling is a
+  different question from "should this peer skip the pending queue."
 - `pairing` — the pairing ceremony's own park-and-approve state (P-P2,
   `docs/architecture/PAIRING.md`, CONTRACTS.md §4's `state/peer-pairing-
   inbound.json`/`-outbound.json` subsection): two disk-persisted queues,
@@ -82,6 +97,14 @@ cache (CONTRACTS.md §7). File-first by decision — no embedded database yet
   (both additive/v0-safe, `skip_serializing_if`) are this same phase's
   other two wire-shape additions — the daemon's boot-time auto-resume flag
   and the mark a resurrected session's own record carries.
+  `records::SessionRecord.origin`/`LedgerEntry.origin` (P-P3,
+  `docs/architecture/PAIRING.md` decision 7) are the provenance pair:
+  `"peer:<name>"` for a session an identified, paired peer's A2A spawn
+  created, additive on the live record (`skip_serializing_if`), always
+  present (possibly `null`) on the closed ledger line — `SessionRecord`'s
+  own value is projected verbatim into the `LedgerEntry` at exit, the same
+  "additive live field, always-serialized ledger field" shape
+  `resumedFrom` already set the precedent for.
 - `takes` — the per-draft take store behind `rice back`/`rice take`.
 - `petname`/`display` — the adjective-noun petname mint and its
   render-time-only display grammar.
@@ -116,8 +139,9 @@ cache (CONTRACTS.md §7). File-first by decision — no embedded database yet
   fingerprint, mint time) is the only serializable shape this module
   emits, and a source-scanning test in `identity.rs` mechanically holds
   that boundary. The pairing ceremony (`peer pair`, P-P2) builds on this
-  directly (`peer_store`/`pairing` above); the `allows` set + spawn-gate
-  flip (P-P3) and signed wire requests (P-P4) build on it next.
+  directly (`peer_store`/`pairing` above); the `allows` set + A2A spawn-gate
+  flip (P-P3, `peer_store::allows`/`resolve_peer` above) also build on it —
+  signed wire requests (P-P4) are what's still ahead.
 - `commands` — this crate's CLI verbs: `usage` (local token/cost rollup),
   `inbox list|read|clear` (the store above's CLI surface), and `identity`
   (the module above's CLI surface). `peer pair request|pending|approve|

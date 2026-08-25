@@ -50,6 +50,14 @@ pub struct LedgerEntry {
     pub ended_at: String,
     #[serde(rename = "resumedFrom", default)]
     pub resumed_from: Option<String>,
+    /// Projected verbatim from `SessionRecord.origin` (P-P3,
+    /// `docs/architecture/PAIRING.md` decision 7) — `"peer:<name>"` for a
+    /// session an identified, paired peer's A2A spawn created; `None` for
+    /// every locally-registered session and every entry predating this
+    /// field. Always serializes (never `skip_serializing_if`), same
+    /// closed-historical-record discipline every other field here holds.
+    #[serde(rename = "origin", default)]
+    pub origin: Option<String>,
 }
 
 /// The ledger's path: `state/session-ledger.jsonl`, under
@@ -129,6 +137,7 @@ mod tests {
             started_at: "2026-08-24T00:00:00Z".to_string(),
             ended_at: "2026-08-24T01:00:00Z".to_string(),
             resumed_from: None,
+            origin: Some("peer:yomi-strix".to_string()),
         };
         append_ledger_entry(&entry).unwrap();
 
@@ -137,6 +146,7 @@ mod tests {
         assert_eq!(back[0].session_id, "s1");
         assert_eq!(back[0].harness_session_id.as_deref(), Some("h1"));
         assert_eq!(back[0].resumed_from, None);
+        assert_eq!(back[0].origin.as_deref(), Some("peer:yomi-strix"));
 
         std::env::remove_var("AOIDE_STATE_DIR");
         let _ = std::fs::remove_dir_all(&state);

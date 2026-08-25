@@ -260,6 +260,17 @@ pub struct SessionRecord {
         skip_serializing_if = "Option::is_none"
     )]
     pub resumed_from: Option<String>,
+    /// Who caused this session to exist, when it wasn't a local registration
+    /// (P-P3, `docs/architecture/PAIRING.md` decision 7): `"peer:<name>"`
+    /// for a session the A2A door spawned on behalf of an identified,
+    /// paired peer (`aoide-server`'s `a2a::do_spawn`). Additive/v0-safe —
+    /// absent on a legacy record and on every LOCALLY-registered session
+    /// (a plain `aoide conduct`/`graph spawn`/hook registration never sets
+    /// it). Stamped once, at registration (`stamp_origin`), never changed
+    /// afterward; `ledger_session_exit` (`aoide-conduct::graph::doc`)
+    /// projects it verbatim into the durable session ledger on exit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }

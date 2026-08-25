@@ -39,8 +39,14 @@ never the inbound/serve half (that's `aoide-server`).
   (`pair_request`/`pair_reveal`/`pair_approve_callback`) live in
   `aoide-server::a2a`, never duplicated here.
 - `commands` — this crate's CLI verbs: `a2a agent add/list/remove/send`,
-  `peer add/list/remove/pull/status/hub`, `peer pair request/pending/
+  `peer add/list/remove/pull/status/hub/allow`, `peer pair request/pending/
   approve/reject` (P-P2, CONTRACTS.md §6/§7 —
+  `handle_peer_allow` (`peer allow <name> <cap> on|off`, P-P3, `docs/
+  architecture/PAIRING.md` decision 5) is a thin wire around
+  `aoide_storage::peer_store::set_peer_allow` — idempotent, refuses an
+  unknown peer or an unknown capability with distinct taught errors, no
+  network call (this instance's own `state/peers.json` is authoritative
+  for its own `allows` grants) —
   `confirm_sas`/`default_self_url` are this group's own local helpers: the
   y/N confirmation prompt mirrors `aoide-secrets::client::
   confirm_overwrite`'s exact idiom rather than importing it, since this

@@ -161,6 +161,35 @@
   again with no state to reconcile. Don't reintroduce a peer-store write
   in this function, and don't drop/re-park the entry on a mismatch — both
   would commit or destroy state no human on this end confirmed.
+- **`message_send`'s Spawn arm gates on a resolved, paired, spawn-allowed
+  peer — never on `token_authorized` (P-P3, `docs/architecture/
+  PAIRING.md` decision 6).** `peer_may_spawn(peer)` (`verified &&
+  allows.contains("spawn")`) is the ONLY admission check; the door-wide
+  bearer that gates every OTHER arm (read verbs, the uniform-response
+  guard, Inject's `effective_origin` coupling) is not consulted here at
+  all. `aoide_storage::peer_store::resolve_peer` is the identity ladder —
+  a presented token against a peer's own `token_file`, else the TCP
+  origin against that peer's `url` — and it is honest, not
+  cryptographically bound: neither signal is unforgeable until P-P4 lands
+  (see `message_send`'s own doc comment for the full note). Don't invent
+  an interim signature scheme to "strengthen" this in the meantime — that
+  is P-P4's own lane, scoped and reviewed separately. No test in this file
+  drives `do_spawn`'s real OS-level process spawn (an established
+  precedent, `spawn_inject_prompts_success_branch_files_the_opening_
+  turn_into_the_inbox`'s own doc comment) — the gate itself is proven via
+  the pure `peer_may_spawn` predicate and `message_send`'s REFUSAL
+  branches only.
+- **`do_inject`'s `from` attribution (P-P3 decision 7) is scoped to the
+  QUEUED path only — never an immediately-delivered payload's bytes.**
+  `session_send`'s own `from` mechanism also prefixes DELIVERED text
+  (`provenance_prefix`, "from `<sender>`: "), so stamping a resolved
+  peer's identity unconditionally would change what an already-autogated
+  peer's delivered message looks like — a regression
+  `autogated_peer_delivers_despite_being_non_loopback` pins against.
+  `message_send`'s Inject arm computes `from` as `None` whenever
+  `deliver_now` is `true`, `Some("peer:<name>")` only when it's `false`
+  (queuing). Don't lift that `!deliver_now` guard without re-reading why
+  it's there.
 
 ## Extension points
 

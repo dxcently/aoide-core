@@ -164,6 +164,18 @@
   template parser) is a PURE function on purpose — no env read, no spawn —
   so it stays directly unit-testable; do the env reads (`terminal_template`/
   `require_display`) in the thin callers around it, never inside it.
+- **`SessionRecord.origin` is a PERMANENT birth fact stamped ONCE, the same
+  discipline `headless`/`hookAncestry` already hold (P-P3, `docs/
+  architecture/PAIRING.md` decision 7) — never re-derived or re-stamped
+  later.** `session_store.rs::stamp_origin` is the one writer;
+  `graph/conduct.rs::session_conduct` calls it right after
+  `do_session_start`, reading `AOIDE_SESSION_ORIGIN` off the process env —
+  this crate has no dependency on `aoide-server` and cannot see the A2A
+  door directly, so the env var IS the seam (mirrors how `AOIDE_AUDIT_LOG`
+  already threads a per-child fact from a spawning process into a
+  `conduct` child). No `restage_graph()` — like `headless`, `origin` is
+  consumed internally (`doc.rs::ledger_session_exit`'s projection into the
+  durable ledger), not rendered into `graph.json`.
 
 ## Extension points
 

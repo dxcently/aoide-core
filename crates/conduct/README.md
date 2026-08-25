@@ -130,6 +130,18 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   auto-resume trigger (`aoide-server`'s `daemon.rs`) call this exact
   command core in-process without ever risking its own tick on a
   headless box.
+- **Session origin (P-P3, `docs/architecture/PAIRING.md` decision 7):**
+  `session_store.rs::stamp_origin` stamps `SessionRecord.origin` —
+  `"peer:<name>"` for a session `aoide-server`'s A2A door spawned on
+  behalf of an identified, paired peer — right after `do_session_start`,
+  same seam `stamp_headless` uses. `graph/conduct.rs::session_conduct`
+  reads it off the `AOIDE_SESSION_ORIGIN` env var `aoide-server`'s
+  `a2a::do_spawn` sets on the child it launches; a locally-launched
+  `conduct` (a plain terminal, `graph spawn`, etc.) never has that env var
+  set, so `origin` stays absent. No `graph.json` projection (like
+  `headless`/`hookAncestry`, consumed internally, not rendered) —
+  `doc.rs::ledger_session_exit` is the ONE place it surfaces, projected
+  verbatim into the durable session ledger's own `origin` field.
 - `who` — `aoide who [filter] [--json] [--all]` (`graph/who.rs`): live
   presence over this box's own sessions plus every registered peer,
   probed in parallel on each invocation (messaging workstream C2). A

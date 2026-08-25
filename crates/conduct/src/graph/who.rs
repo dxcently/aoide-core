@@ -436,6 +436,7 @@ mod tests {
             hub: false,
             pubkey: None,
             verified: false,
+            allows: Vec::new(),
             added_at: "2026-08-14T00:00:00Z".to_string(),
         }
     }
