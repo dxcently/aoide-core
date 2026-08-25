@@ -661,6 +661,25 @@
   (`backend.rs`'s own "the only backend IMPLEMENTATIONS this crate
   supports" stance, restated above) — this function must never resolve a
   name to compiled-in text the crate doesn't actually own the shape of.
+- **Every `client.rs` socket op bounds its CONNECT, not only its reads
+  (rider task).** `client::connect_bounded` is the ONE place this crate
+  opens a connection to the broker's socket — `resolve`/`resolve_bounded`/
+  `put`/`pending`/`approve`/`dismiss` all route through it (a fixed 5s
+  bound, no env override) instead of a bare `UnixStream::connect`, since
+  `std`'s `UnixStream` has no `connect_timeout` and a saturated accept
+  backlog (plausible when many callers legitimately hold a parked
+  connection open for up to `park::park_timeout()`, default 300s) could
+  otherwise block the connect syscall itself, past any read-side bound a
+  caller thought it had. Hand-rolled via `libc` (nonblocking connect, then
+  `poll()`, then `SO_ERROR` — the same pattern `std` itself uses
+  internally for `TcpStream::connect_timeout`) rather than a new
+  dependency (`socket2` was considered and rejected — zero new deps is the
+  house rule, and `libc` was already present). Returns the identical
+  `io::Result<UnixStream>` shape `UnixStream::connect` always did, so
+  `describe_connect_error` needed no change. A new client op added to this
+  module connects through `connect_bounded`, never a bare
+  `UnixStream::connect` — that would silently reopen this exact gap for
+  just that one op.
 
 ## Extension points
 

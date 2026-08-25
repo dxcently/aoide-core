@@ -1518,6 +1518,26 @@ at all — the fix is `systemctl status aoide-secrets-serve`, or setting
 `client::resolve`/`client::put` route their connect failure through this
 one function rather than each hand-rolling the diagnosis.
 
+**Every client call bounds the CONNECT itself, not only reads (rider
+task).** `std::os::unix::net::UnixStream` has no `connect_timeout` (unlike
+`TcpStream`) — `client::connect_bounded` hand-rolls the same
+nonblocking-connect-then-poll pattern `std` uses internally for
+`TcpStream::connect_timeout`, entirely on `libc` (already a dependency,
+zero new deps). Every one of `resolve`/`resolve_bounded`/`put`/`pending`/
+`approve`/`dismiss` routes through it with a fixed 5s bound, with the
+identical `io::Result<UnixStream>` shape `UnixStream::connect` always
+returned, so `describe_connect_error` needed no change to keep handling
+every case. This closes the one gap `resolve_bounded`'s own explicit
+`set_read_timeout` never covered: a connect can itself block indefinitely
+if the broker's kernel-level accept backlog is saturated (a burst of
+callers hitting a broker with many connections legitimately parked for up
+to `park::park_timeout()`, default 300s, each holding its own thread and
+its own accept-queue slot) — before this fix, a caller in that situation
+would hang on the connect syscall itself, past any read-side bound it
+thought it had. No env override, unlike `AOIDE_SECRETS_BACKEND_TIMEOUT`/
+`AOIDE_SECRETS_PARK_TIMEOUT` — a fixed defensive bound, not a tuned
+operational one, until real evidence says otherwise.
+
 **A silent `AOIDE_SECRETS_EVENTS` mismatch is a live footgun, the same
 shape as the `AOIDE_SECRETS_SOCKET` notes just above (task #76 item 6a).**
 The broker unit resolves `events_path` from ITS OWN environment at `serve`

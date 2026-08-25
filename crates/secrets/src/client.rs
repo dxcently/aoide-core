@@ -81,6 +81,8 @@ use aoide_protocol::Invocation;
 use serde_json::{json, Value};
 use std::io;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Stdio;
@@ -127,6 +129,148 @@ fn describe_connect_error(socket_path: &Path, err: &io::Error, reinvoke: &str) -
         ),
         _ => format!("connecting to the secrets broker at {}: {err}", socket_path.display()),
     }
+}
+
+/// The bound on the CONNECT half of every socket op this module makes
+/// (rider task, alongside #75/#81/#82). `UnixStream::connect` alone can
+/// block indefinitely if the broker's accept BACKLOG is saturated — every
+/// `resolve` on a `requireTotp` secret can legitimately hold its own
+/// connection parked for up to `park::park_timeout()` (default 300s), so a
+/// burst of callers hitting an already-busy broker can queue at the kernel
+/// listen-backlog level, before the broker's own thread-per-connection
+/// accept loop (`broker.rs`'s module doc) ever gets a chance to shed load.
+/// Every read this module already bounds (`resolve_bounded`'s
+/// `set_read_timeout`) or leaves unbounded (`resolve`/`put`/`pending`/
+/// `approve`/`dismiss` — an interactive human is expected to wait for
+/// those); this constant closes the ONE gap none of them closed: the
+/// connect itself. Fixed, no env override (unlike `BACKEND_TIMEOUT_ENV`/
+/// `PARK_TIMEOUT_ENV`) — this is a defensive bound against a saturated
+/// backlog, not an operational knob anyone has needed to tune yet; add one
+/// the same tolerant-parsing way if that changes.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Put `fd` into (or out of) non-blocking mode — same `fcntl(F_GETFL)`/
+/// `fcntl(F_SETFL)` idiom `backend::set_nonblocking` already uses for a
+/// backend child's output pipes, applied here to a socket fd instead.
+fn set_fd_nonblocking(fd: RawFd, nonblocking: bool) {
+    // SAFETY: `fd` is a fd this function's caller owns for the duration of
+    // this call (a freshly created socket, never shared); `fcntl(F_GETFL)`/
+    // `fcntl(F_SETFL)` are ordinary, always-defined operations on any fd
+    // this process holds.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+        if flags >= 0 {
+            let next = if nonblocking { flags | libc::O_NONBLOCK } else { flags & !libc::O_NONBLOCK };
+            libc::fcntl(fd, libc::F_SETFL, next);
+        }
+    }
+}
+
+/// Build a `sockaddr_un` for `path` — `Err` if the path is too long for
+/// `sun_path` (the same hard cap `AF_UNIX` addresses have always had, no
+/// different from what `UnixStream::connect` would itself refuse).
+fn unix_sockaddr(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY-ADJACENT (not unsafe, just a real constraint): `sun_path` is a
+    // fixed-size buffer; this crate's own callers (short, fixed socket
+    // paths — `socket::socket_path`'s own doc) never come close, but a
+    // caller-supplied path is still checked rather than silently truncated.
+    if bytes.len() >= 108 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "path too long for a unix socket address"));
+    }
+    // SAFETY: `sockaddr_un` is a plain-old-data C struct — zero-initializing
+    // it (a valid bit pattern for every field) and then writing only the
+    // fields below is the standard idiom for building one from Rust.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (dst, &src) in addr.sun_path.iter_mut().zip(bytes.iter()) {
+        *dst = src as libc::c_char;
+    }
+    let len = (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
+    Ok((addr, len))
+}
+
+/// Bounded replacement for `UnixStream::connect` — `std`'s `UnixStream` has
+/// no `connect_timeout` (unlike `TcpStream`), so this hand-rolls the same
+/// nonblocking-connect-then-poll pattern `std` itself uses internally for
+/// `TcpStream::connect_timeout`, entirely on top of `libc` (already a
+/// dependency, `Cargo.toml`'s own doc comment — zero new deps, the house
+/// rule). Every caller in this module gets the identical `io::Result`
+/// shape `UnixStream::connect` already returned, so every existing
+/// `.map_err(describe_connect_error(...))` call site needed no change
+/// beyond the function name.
+fn connect_bounded(socket_path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+    let (addr, addr_len) = unix_sockaddr(socket_path)?;
+
+    // SAFETY: a fresh AF_UNIX/SOCK_STREAM fd this function exclusively owns
+    // from here on — handed to `UnixStream::from_raw_fd` on every success
+    // path below, `libc::close`d on every error path, never both.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    set_fd_nonblocking(fd, true);
+
+    // SAFETY: `addr`/`addr_len` describe a valid, fully-initialized
+    // `sockaddr_un` for this exact `fd`'s own address family.
+    let rc = unsafe { libc::connect(fd, &addr as *const libc::sockaddr_un as *const libc::sockaddr, addr_len) };
+    if rc == 0 {
+        set_fd_nonblocking(fd, false);
+        // SAFETY: `fd` is connected and owned solely by this function up to
+        // this point; handing it to `UnixStream` transfers that ownership
+        // exactly once.
+        return Ok(unsafe { UnixStream::from_raw_fd(fd) });
+    }
+
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() != Some(libc::EINPROGRESS) {
+        // SAFETY: `fd` was never handed to anything else on this path.
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
+
+    let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+    let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: `pfd` names exactly the one fd this function owns, polled for
+    // exactly one event.
+    let poll_rc = unsafe { libc::poll(&mut pfd, 1, millis) };
+    if poll_rc == 0 {
+        unsafe { libc::close(fd) };
+        return Err(io::Error::new(io::ErrorKind::TimedOut, format!("timed out after {timeout:?}")));
+    }
+    if poll_rc < 0 {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+
+    // The connect finished one way or the other — SO_ERROR says which.
+    let mut sock_err: libc::c_int = 0;
+    let mut sock_err_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `sock_err`/`sock_err_len` are correctly sized, exclusively
+    // owned out-params for `SO_ERROR` on this function's own `fd`.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            &mut sock_err as *mut libc::c_int as *mut libc::c_void,
+            &mut sock_err_len,
+        )
+    };
+    if rc < 0 {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    if sock_err != 0 {
+        unsafe { libc::close(fd) };
+        return Err(io::Error::from_raw_os_error(sock_err));
+    }
+
+    set_fd_nonblocking(fd, false);
+    // SAFETY: same as the immediate-success path above.
+    Ok(unsafe { UnixStream::from_raw_fd(fd) })
 }
 
 /// Parsed `secrets exec` arguments — pure, no I/O, fully unit-testable
@@ -201,7 +345,7 @@ pub fn resolve(
     totp: Option<&str>,
     argv0: Option<&str>,
 ) -> Result<String, String> {
-    let mut stream = UnixStream::connect(socket_path).map_err(|e| {
+    let mut stream = connect_bounded(socket_path, CONNECT_TIMEOUT).map_err(|e| {
         describe_connect_error(
             socket_path,
             &e,
@@ -297,7 +441,7 @@ pub fn resolve_bounded(
     consumer: &str,
     timeout: Duration,
 ) -> Result<String, String> {
-    let mut stream = UnixStream::connect(socket_path).map_err(|e| {
+    let mut stream = connect_bounded(socket_path, CONNECT_TIMEOUT).map_err(|e| {
         describe_connect_error(
             socket_path,
             &e,
@@ -382,7 +526,7 @@ impl std::fmt::Display for PutError {
 /// compat, `broker.rs`'s module doc), same discipline `resolve`'s optional
 /// `totp`/`argv0` fields already hold.
 pub fn put(socket_path: &Path, secret: &str, value: &str, overwrite: bool) -> Result<bool, PutError> {
-    let mut stream = UnixStream::connect(socket_path).map_err(|e| {
+    let mut stream = connect_bounded(socket_path, CONNECT_TIMEOUT).map_err(|e| {
         PutError::Other(describe_connect_error(socket_path, &e, &format!("aoide secrets put {secret}")))
     })?;
 
@@ -438,7 +582,7 @@ pub struct PendingAsk {
 /// wire's `pending` reply never carries one; this simply reads the fields
 /// that ARE there).
 pub fn pending(socket_path: &Path) -> Result<Vec<PendingAsk>, String> {
-    let mut stream = UnixStream::connect(socket_path)
+    let mut stream = connect_bounded(socket_path, CONNECT_TIMEOUT)
         .map_err(|e| describe_connect_error(socket_path, &e, "aoide secrets pending"))?;
 
     let line = json!({ "op": "pending" }).to_string() + "\n";
@@ -495,7 +639,7 @@ pub fn pending(socket_path: &Path) -> Result<Vec<PendingAsk>, String> {
 /// never has one, `handle_approve`'s own doc). An invalid/expired code, or
 /// an unknown id, comes back as a value-free `Err`.
 pub fn approve(socket_path: &Path, id: &str, totp: &str) -> Result<(), String> {
-    let mut stream = UnixStream::connect(socket_path)
+    let mut stream = connect_bounded(socket_path, CONNECT_TIMEOUT)
         .map_err(|e| describe_connect_error(socket_path, &e, &format!("aoide secrets approve {id} --totp ...")))?;
 
     let line = json!({ "op": "approve", "id": id, "totp": totp }).to_string() + "\n";
@@ -525,7 +669,7 @@ pub fn approve(socket_path: &Path, id: &str, totp: &str) -> Result<(), String> {
 /// ONE reply line. An unknown id is a taught error (`handle_dismiss`'s own
 /// doc), value-free either way.
 pub fn dismiss(socket_path: &Path, id: &str) -> Result<(), String> {
-    let mut stream = UnixStream::connect(socket_path)
+    let mut stream = connect_bounded(socket_path, CONNECT_TIMEOUT)
         .map_err(|e| describe_connect_error(socket_path, &e, &format!("aoide secrets dismiss {id}")))?;
 
     let line = json!({ "op": "dismiss", "id": id }).to_string() + "\n";
@@ -767,6 +911,57 @@ mod tests {
             flags: flag_map,
             door: Door::Cli,
         }
+    }
+
+    // ── bounded connect (rider task, alongside #75/#81/#82) ─────────────
+
+    fn tmp_socket_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aoide-secrets-client-connect-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A path too long for `sun_path` is a clean, immediate `Err` — never a
+    /// panic, and never reached via a raw slice-index that could.
+    #[test]
+    fn unix_sockaddr_rejects_a_path_too_long_for_sun_path() {
+        let long = "/tmp/".to_string() + &"x".repeat(200);
+        let err = unix_sockaddr(Path::new(&long)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// The ordinary case: a real listener at a real path connects well
+    /// within the bound — proves the happy path never pays the poll/
+    /// timeout machinery's cost (an immediate `connect()` success returns
+    /// straight away, no `poll()` call at all).
+    #[test]
+    fn connect_bounded_succeeds_against_a_real_listener_fast() {
+        let dir = tmp_socket_dir("ok");
+        let sock = dir.join("s.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+        let start = std::time::Instant::now();
+        let stream = connect_bounded(&sock, Duration::from_secs(5)).unwrap();
+        assert!(start.elapsed() < Duration::from_millis(500), "a live listener must connect near-instantly");
+        drop(stream);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A nonexistent path fails FAST with a real `NotFound`-shaped error —
+    /// proves `connect_bounded` doesn't secretly block on the negative path
+    /// either (the immediate `connect()` syscall itself returns `ENOENT`,
+    /// never reaching the `poll()` branch at all).
+    #[test]
+    fn connect_bounded_fails_fast_against_a_nonexistent_socket() {
+        let dead = tmp_socket_dir("dead").join("nothing-here.sock");
+        let start = std::time::Instant::now();
+        let err = connect_bounded(&dead, Duration::from_secs(5)).unwrap_err();
+        assert!(start.elapsed() < Duration::from_millis(500), "a dead path must fail near-instantly, not wait out the bound");
+        assert_ne!(err.kind(), io::ErrorKind::TimedOut, "ENOENT is not a timeout");
     }
 
     #[test]
