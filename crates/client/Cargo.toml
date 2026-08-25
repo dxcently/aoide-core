@@ -14,3 +14,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 aoide-protocol = { workspace = true }
 aoide-storage = { workspace = true }
+# task #84: `peer` verbs resolve a per-peer outbound Authorization: Bearer
+# value through the secrets broker's unix-socket wire
+# (`aoide_secrets::client::resolve_bounded`, `commands::resolve_peer_bearer`)
+# rather than sending no bearer at all. `aoide-secrets` depends on nothing in
+# this crate's own tree (protocol/libc/serde/serde_json only), so no cycle.
+aoide-secrets = { workspace = true }

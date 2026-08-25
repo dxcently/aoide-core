@@ -928,6 +928,7 @@ mod tests {
             url: "http://yomi-strix:8710/".into(),
             autogate: false,
             token_file: None,
+            bearer_secret: None,
             added_at: "2026-08-14T00:00:00Z".into(),
         }])
         .unwrap();
@@ -988,6 +989,7 @@ mod tests {
             url: "http://never:8710/".into(),
             autogate: false,
             token_file: None,
+            bearer_secret: None,
             added_at: "2026-08-14T00:00:00Z".into(),
         }])
         .unwrap();
@@ -1004,6 +1006,7 @@ mod tests {
             url: "http://flaky:8710/".into(),
             autogate: false,
             token_file: None,
+            bearer_secret: None,
             added_at: "2026-08-14T00:00:00Z".into(),
         }])
         .unwrap();
@@ -1031,6 +1034,7 @@ mod tests {
             url: "http://expired:8710/".into(),
             autogate: false,
             token_file: None,
+            bearer_secret: None,
             added_at: "2026-08-14T00:00:00Z".into(),
         }])
         .unwrap();

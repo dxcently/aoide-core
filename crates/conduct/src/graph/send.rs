@@ -3190,6 +3190,7 @@ mod tests {
             url: url.to_string(),
             autogate: false,
             token_file: None,
+            bearer_secret: None,
             added_at: "2026-08-21T00:00:00Z".to_string(),
         }
     }

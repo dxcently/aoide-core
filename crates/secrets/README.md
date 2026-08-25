@@ -325,7 +325,18 @@ exactly the way `secrets exec`/`secrets put` do internally.
 group-membership trust model, the `consumer`-self-assertion honesty note)
 for a reader who never opens this crate's Rust; THIS section is the
 canonical copy — a wire change lands here (and in `broker.rs`'s module
-doc) first, `CONTRACTS.md` follows in the same commit.
+doc) first, `CONTRACTS.md` follows in the same commit. **`client::
+resolve_bounded` (task #84) is the first exported library entry point for
+exactly this kind of direct machine speaker**: `aoide-server`'s A2A door
+and `aoide-client`'s outbound peer client both call it — never a socket
+write of their own — to resolve their bearer token as consumers
+`a2a-door`/`a2a-client` respectively, fresh on every verification/request,
+with a short bounded read timeout (`wait:false` on the wire, so a
+misconfigured `requireTotp` secret refuses immediately rather than parking
+the door) and NO caching anywhere in either caller. Both are ordinary,
+un-privileged callers of this wire, same `resolve` op, same self-asserted
+`consumer` honesty note as any other caller — nothing about being a door
+or a client grants them a distinct trust tier.
 
 ## Parking a TOTP resolve (P-N2)
 

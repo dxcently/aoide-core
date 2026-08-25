@@ -22,14 +22,30 @@ the inbound half of the two-door contract (the outbound half is
   that moment, so it cannot reach `session_send` at all (see
   `spawn_inject_prompt`'s doc comment for the race that rules it out).
   These are the only two inbox-filing call sites in the whole tree.
+  **Inbound bearer verification (task #84)** resolves the door's expected
+  `Authorization: Bearer` token through `aoide-secrets`'s broker rather
+  than only reading a static token file: `--bearer-secret <name>` (or
+  `AOIDE_A2A_BEARER_SECRET`) names a secret, resolved FRESH on every
+  connection via `aoide_secrets::client::resolve_bounded` as consumer
+  `a2a-door`, with a short (~2s) timeout so a misconfigured `requireTotp`
+  secret refuses immediately instead of parking the door open. Unset
+  stays the pre-existing token-file behavior exactly; set takes
+  precedence over `--token-file`. A broker-unreachable or denied resolve
+  fails CLOSED — the connection is refused the same way a wrong bearer
+  is, never held open and never treated as "unconfigured." The resolved
+  value is never cached, logged, or placed in any audit line — see
+  `CONTRACTS.md`'s "Secrets wire"/§6 sections for the wire contract and
+  the resolve-consumer honesty note.
 - `commands` — this crate's CLI verbs: `daemon`, `shellbridge` (registration
   only — the files stay in `conduct`), `a2a serve`.
 
 ## What it consumes
 
-`aoide-protocol`, `aoide-storage`, `aoide-conduct`. `aoide-client` is a
-dev-dependency only (one round-trip test) — production code never calls
-into the outbound client from here.
+`aoide-protocol`, `aoide-storage`, `aoide-conduct`, `aoide-secrets` (task
+#84 — the A2A door's inbound bearer resolve, `aoide_secrets::client::
+resolve_bounded`, reused rather than a second wire client written here).
+`aoide-client` is a dev-dependency only (one round-trip test) — production
+code never calls into the outbound client from here.
 
 ## How it composes
 

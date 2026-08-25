@@ -99,6 +99,13 @@ aoide-lyra = { path = "crates/lyra" }
 # `aoide-cli` depends on this crate as of P-V2 (`secrets serve`/`exec`/
 # `add`/`rm`/`grant`/`revoke`/`enroll`/`put`/`set-totp`/`automate`/
 # `expose`/`pending`/`approve`/`dismiss` register into its `Registry`).
+# `aoide-server` and `aoide-client` also depend on it (task #84): the A2A
+# door resolves its inbound bearer token, and the outbound peer client
+# resolves a per-peer bearer to present, both through this crate's
+# `client::resolve_bounded` — the first real machine consumers of the
+# unix-socket wire this crate's own docs call a first-class API. Neither
+# edge introduces a cycle (`aoide-secrets` depends on nothing in
+# `aoide-server`/`aoide-client`/`aoide-storage`/`aoide-conduct`).
 aoide-secrets = { path = "crates/secrets" }
 
 [profile.release]

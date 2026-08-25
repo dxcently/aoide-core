@@ -14,6 +14,12 @@ cache (CONTRACTS.md §7). File-first by decision — no embedded database yet
 - `session` — pure session/hook upsert operations.
 - `a2a_store` — the client-side A2A agent roster.
 - `peer_store` — the peer-federation registry + pull cache (CONTRACTS.md §7).
+  `Peer` carries two independent, opposite-direction credential fields:
+  `tokenFile` (inbound — what a peer presents TO US, read from a local
+  file) and `bearerSecret` (outbound — what WE present TO a peer, a
+  secrets-broker secret NAME resolved fresh at request time by
+  `aoide-client`, task #84). Both are optional and independently settable
+  via `peer add`; neither implies the other.
 - `mode` — the staging/declarative mode marker, read by `shellbridge`
   (which stays in `conduct`, see that crate's charter-smudge note).
 - `takes` — the per-draft take store behind `rice back`/`rice take`.

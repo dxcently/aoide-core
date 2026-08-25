@@ -53,6 +53,7 @@ name = "aoide-client"
 version = "0.0.1"
 dependencies = [
  "aoide-protocol",
+ "aoide-secrets",
  "aoide-storage",
  "serde",
  "serde_json",
@@ -138,6 +139,7 @@ dependencies = [
  "aoide-client",
  "aoide-conduct",
  "aoide-protocol",
+ "aoide-secrets",
  "aoide-storage",
  "libc",
  "serde",

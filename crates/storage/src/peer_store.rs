@@ -52,6 +52,18 @@ pub struct Peer {
     /// as before this field existed.
     #[serde(rename = "tokenFile", default, skip_serializing_if = "Option::is_none")]
     pub token_file: Option<String>,
+    /// The name of a secret, resolved through the LOCAL secrets broker at
+    /// OUTBOUND request time (task #84), that THIS instance presents as
+    /// `Authorization: Bearer <value>` when it calls this peer's own A2A
+    /// door — the opposite direction from [`Self::token_file`] above (what
+    /// the PEER presents to us). Set via `peer add --bearer-secret <name>`.
+    /// Absent by default; an unmarked peer's outbound requests carry no
+    /// bearer at all, exactly as before this field existed. Resolved fresh
+    /// on every request (`aoide-client`'s `commands::resolve_peer_bearer`)
+    /// — never cached here or anywhere else, so revoking the underlying
+    /// secret takes effect on the very next call.
+    #[serde(rename = "bearerSecret", default, skip_serializing_if = "Option::is_none")]
+    pub bearer_secret: Option<String>,
     #[serde(rename = "addedAt", default)]
     pub added_at: String,
 }
@@ -310,6 +322,7 @@ mod tests {
             url: url.to_string(),
             autogate,
             token_file: None,
+            bearer_secret: None,
             added_at: "2026-08-14T00:00:00Z".to_string(),
         }
     }
@@ -362,6 +375,29 @@ mod tests {
             Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
             None => std::env::remove_var("AOIDE_STATE_DIR"),
         }
+    }
+
+    // ── `bearerSecret` — outbound bearer config (task #84) ───────────────────
+
+    #[test]
+    fn bearer_secret_round_trips_as_camel_case_and_omits_when_absent() {
+        let mut with_secret = fixture_peer("alpha", "http://a/", false);
+        with_secret.bearer_secret = Some("melete-door-token".to_string());
+        let v = serde_json::to_value(&with_secret).unwrap();
+        assert_eq!(v["bearerSecret"], "melete-door-token");
+        let back: Peer = serde_json::from_value(v).unwrap();
+        assert_eq!(back.bearer_secret.as_deref(), Some("melete-door-token"));
+
+        // Absent by default: the key is omitted outright (skip_serializing_if),
+        // and an OLD peers.json predating this field loads cleanly as `None`.
+        let without = fixture_peer("beta", "http://b/", false);
+        let v2 = serde_json::to_value(&without).unwrap();
+        assert!(v2.get("bearerSecret").is_none(), "absent bearer_secret is omitted, not null");
+        let old_shape = serde_json::json!({
+            "name": "gamma", "url": "http://c/", "autogate": false, "addedAt": "2026-08-14T00:00:00Z"
+        });
+        let back2: Peer = serde_json::from_value(old_shape).unwrap();
+        assert_eq!(back2.bearer_secret, None);
     }
 
     // ── Peer nickname validation (path-traversal guard) ──────────────────────

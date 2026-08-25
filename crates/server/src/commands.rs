@@ -84,6 +84,7 @@ pub fn register_a2a_serve(r: &mut Registry) {
             flag!("spawn-agent", "string", "Override the command message/send's spawn path conducts (default aoide.a2a.spawnAgent; empty = spawning disabled)."),
             flag!("peer-name", "string", "Override this instance's aoide/graphSummary instance name (default: the OS hostname)."),
             flag!("token-file", "string", "Path to a file holding the shared secret an inbound message/send must present (Authorization: Bearer <token>) (default aoide.a2a.tokenFile; empty = no token required, loopback keeps today's automatic trust)."),
+            flag!("bearer-secret", "string", "Name of a secret, resolved fresh on every request through the local secrets broker, this door expects as its inbound Authorization: Bearer token (default AOIDE_A2A_BEARER_SECRET; empty = not configured). Takes precedence over --token-file when set; a broker resolve failure fails closed."),
         ],
         gated: false,
         implemented: true,

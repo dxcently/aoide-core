@@ -19,6 +19,14 @@ aoide-conduct = { workspace = true }
 # survives the HTTP handler thread — the same direct `libc` edge `aoide-conduct`
 # and `aoide-storage` already carry, not a new vendored crate.
 libc = { workspace = true }
+# task #84: the A2A door resolves its own inbound Authorization: Bearer
+# token through the secrets broker's unix-socket wire
+# (`aoide_secrets::client::resolve_bounded`, a2a.rs's `resolve_inbound_bearer`)
+# rather than only ever a static token FILE — this crate's own README/AGENTS
+# document the precedence and the fail-closed behavior. `aoide-secrets`
+# depends on nothing in this crate's own dependency tree (protocol/libc/
+# serde/serde_json only), so no cycle.
+aoide-secrets = { workspace = true }
 
 [dev-dependencies]
 # Only the round-trip test that exercises `parse_message_send_params` (this

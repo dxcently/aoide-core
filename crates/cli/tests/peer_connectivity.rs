@@ -36,7 +36,7 @@ use aoide::dispatch::{dispatch, registry, Invocation};
 use aoide_protocol::output::Status;
 use aoide_protocol::Door;
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn unique_root(tag: &str) -> PathBuf {
@@ -128,7 +128,17 @@ fn peer_add_and_pull_round_trip_over_real_http_between_two_loopback_instances() 
     // genuine JSON-RPC dispatch. Never bound non-loopback.
     let port_b = free_port();
     std::thread::spawn(move || {
-        let _ = aoide::a2a::serve("127.0.0.1", port_b, &PathBuf::from("/dev/null"), "", "yomi-strix", "", registry());
+        let _ = aoide::a2a::serve(
+            "127.0.0.1",
+            port_b,
+            &PathBuf::from("/dev/null"),
+            "",
+            "yomi-strix",
+            "",
+            "",
+            Path::new("/tmp/aoide-a2a-peer-connectivity-unused.sock"),
+            registry(),
+        );
     });
     wait_for_tcp_up(&format!("127.0.0.1:{port_b}"));
     let peer_url = format!("http://127.0.0.1:{port_b}/");
@@ -243,7 +253,17 @@ fn peer_add_against_an_unreachable_url_never_registers_and_pull_of_a_down_peer_m
     // the bad one.
     let port_b = free_port();
     std::thread::spawn(move || {
-        let _ = aoide::a2a::serve("127.0.0.1", port_b, &PathBuf::from("/dev/null"), "", "good-peer", "", registry());
+        let _ = aoide::a2a::serve(
+            "127.0.0.1",
+            port_b,
+            &PathBuf::from("/dev/null"),
+            "",
+            "good-peer",
+            "",
+            "",
+            Path::new("/tmp/aoide-a2a-peer-connectivity-unused.sock"),
+            registry(),
+        );
     });
     wait_for_tcp_up(&format!("127.0.0.1:{port_b}"));
     let good_url = format!("http://127.0.0.1:{port_b}/");
@@ -259,6 +279,7 @@ fn peer_add_against_an_unreachable_url_never_registers_and_pull_of_a_down_peer_m
         url: dead_url.clone(),
         autogate: false,
         token_file: None,
+        bearer_secret: None,
         added_at: aoide_storage::time::now_iso_utc(),
     });
     aoide_storage::peer_store::save_peers(&peers).unwrap();

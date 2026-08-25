@@ -23,6 +23,7 @@ use aoide_protocol::Invocation;
 use serde_json::{json, Value};
 use std::io::Write;
 use std::process::Stdio;
+use std::time::Duration;
 
 // ── curl transport ((code, body) discipline from commands/usage.rs) ─────────
 
@@ -78,6 +79,133 @@ fn run_curl_with_timeout(
         return Err("could not reach the agent (connection failed or timed out)".to_string());
     }
     Ok((code, body.to_string()))
+}
+
+// ── Outbound bearer presentation (task #84) ──────────────────────────────────
+//
+// The client half of the same secrets-broker resolve consumer `aoide-server`
+// gained on the inbound side (`a2a.rs`'s `resolve_inbound_bearer`): a
+// registered peer whose `Peer.bearer_secret` (`aoide_storage::peer_store`)
+// is set gets that secret resolved fresh, through the SAME
+// `aoide_secrets::client::resolve_bounded` this crate now depends on (see
+// this crate's `Cargo.toml` comment), and presented as `Authorization:
+// Bearer <value>` on every outbound `peer pull`/`peer status`'s live probe/
+// `graph send --to` request to that one peer. Before this task, aoide's
+// outbound A2A requests sent no Authorization header at all — see
+// CONTRACTS.md §6/§7 for the settled shape.
+
+/// The self-asserted consumer name this client presents to the secrets
+/// broker when resolving an outbound peer bearer — see
+/// `crates/secrets/AGENTS.md`'s honesty note (consumer identity is
+/// self-asserted until #63): nothing on the wire authenticates this string,
+/// it is simply the name an operator's `policy.json` `consumers[]`/
+/// `automation.consumers` lists to grant this client access to the named
+/// secret.
+const BEARER_CONSUMER_CLIENT: &str = "a2a-client";
+
+/// Bound on an outbound bearer resolve's socket read — the same PARKING
+/// HAZARD reasoning `aoide-server`'s `a2a.rs::BEARER_RESOLVE_TIMEOUT` states
+/// for the inbound side, mirrored here: a misconfigured `requireTotp`
+/// secret with no `automation`-open exemption for [`BEARER_CONSUMER_CLIENT`]
+/// must never hang an outbound peer call. `aoide_secrets::client::
+/// resolve_bounded`'s own `wait:false` on the wire means the deployed,
+/// automation-open happy path never reaches this timeout at all.
+const BEARER_RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Resolve `peer.bearer_secret`, if set, fresh through the local secrets
+/// broker — `Ok(None)` when the peer has no bearer configured (today's
+/// unchanged, no-Authorization-header behavior); `Ok(Some(value))` on a
+/// granted resolve; `Err` with a taught message naming the secret, the
+/// peer, and the broker socket on ANY failure (unreachable broker, denied,
+/// or the bounded timeout elapsing) — the outbound call this feeds is
+/// refused outright rather than silently sent unauthenticated. **NO
+/// CACHING**: a fresh resolve runs on every call to this function; nothing
+/// it returns is stored anywhere beyond the caller's own local `Option<String>`
+/// for the span of the one outbound request it feeds.
+fn resolve_peer_bearer(peer: &aoide_storage::peer_store::Peer) -> Result<Option<String>, String> {
+    let Some(secret) = peer.bearer_secret.as_deref().filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let socket = aoide_secrets::socket::socket_path();
+    aoide_secrets::client::resolve_bounded(&socket, secret, BEARER_CONSUMER_CLIENT, BEARER_RESOLVE_TIMEOUT)
+        .map(Some)
+        .map_err(|e| {
+            format!(
+                "resolving outbound bearer secret `{secret}` for peer `{}` via the secrets broker at {}: {e}",
+                peer.name,
+                socket.display(),
+            )
+        })
+}
+
+/// A short-lived scratch file holding an outbound JSON-RPC request BODY —
+/// only created when a bearer is ALSO being sent on the same call, since
+/// curl's `-H @-` (reading the `Authorization` header from stdin, see
+/// [`post_json`]'s doc) claims stdin for the header instead of the body.
+/// Removed on drop. Holds no secret — only the peer-directed message text/
+/// JSON-RPC envelope, which is not sensitive — unlike the bearer value
+/// itself, which never touches disk in either code path below.
+struct ScratchBodyFile(std::path::PathBuf);
+
+impl ScratchBodyFile {
+    fn write(body: &str) -> Result<Self, String> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("aoide-a2a-body-{}-{nanos}.json", std::process::id()));
+        std::fs::write(&path, body).map_err(|e| format!("writing a scratch request body file: {e}"))?;
+        Ok(Self(path))
+    }
+
+    fn arg(&self) -> String {
+        format!("@{}", self.0.display())
+    }
+}
+
+impl Drop for ScratchBodyFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// One outbound JSON-RPC POST — the single body+optional-bearer transport
+/// every `peer` verb that calls a registered peer's A2A door now shares
+/// (`pull_one_peer`, `pull_peer_live`, `send_message_to_peer`).
+///
+/// With no bearer, this is BYTE-IDENTICAL to how each of those three called
+/// `run_curl`/`run_curl_with_timeout` directly before this task — the body
+/// rides `--data-binary @-` over stdin, unchanged.
+///
+/// With a bearer, the resolved VALUE must never touch this (or any) child
+/// process's own argv — `/proc/<pid>/cmdline` is world-readable for that
+/// child's whole lifetime, the exact concern `a2a::resolve_token_file`'s own
+/// doc already flags for a different bearer on the inbound side. So it
+/// rides curl's `-H @-` (`man curl`'s "-H, --header": `@filename` — or,
+/// with `@-`, stdin — adds one header per line read from there) instead of
+/// a `-H "Authorization: Bearer <token>"` argv literal. Since stdin is then
+/// claimed by the header line, the body rides a short-lived
+/// [`ScratchBodyFile`] via `--data-binary @<path>` instead. The bearer value
+/// itself NEVER touches disk in either branch — only this process's own
+/// memory and curl's stdin pipe, for exactly the span of this one call.
+fn post_json(url: &str, body: &str, bearer: Option<&str>, timeout_secs: u64) -> Result<(u16, String), String> {
+    match bearer {
+        None => run_curl_with_timeout(
+            timeout_secs,
+            &["-X", "POST", "-H", "Content-Type: application/json", "--data-binary", "@-", "--", url],
+            Some(body),
+        ),
+        Some(token) => {
+            let scratch = ScratchBodyFile::write(body)?;
+            let data_arg = scratch.arg();
+            let header_line = format!("Authorization: Bearer {token}\n");
+            run_curl_with_timeout(
+                timeout_secs,
+                &["-X", "POST", "-H", "Content-Type: application/json", "-H", "@-", "--data-binary", &data_arg, "--", url],
+                Some(&header_line),
+            )
+        }
+    }
 }
 
 /// A unique `messageId` for one outbound `message/send` (pid + wall-clock
@@ -343,6 +471,7 @@ fn handle_peer_add(inv: &Invocation) -> Outcome {
     }
     let autogate = inv.flag_present("autogate");
     let token_file = inv.flags.get("token-file").cloned().filter(|s| !s.is_empty());
+    let bearer_secret = inv.flags.get("bearer-secret").cloned().filter(|s| !s.is_empty());
 
     let mut peers = aoide_storage::peer_store::load_peers();
     if peers.iter().any(|p| p.name == name) {
@@ -374,6 +503,7 @@ fn handle_peer_add(inv: &Invocation) -> Outcome {
         url: url.clone(),
         autogate,
         token_file,
+        bearer_secret,
         added_at: aoide_storage::time::now_iso_utc(),
     };
     aoide_storage::peer_store::insert_peer(&mut peers, peer.clone());
@@ -471,10 +601,8 @@ fn pull_one_peer(peer: &aoide_storage::peer_store::Peer) -> Value {
     let body_str = serde_json::to_string(&body).unwrap_or_default();
 
     let attempt: Result<aoide_storage::peer_store::PeerCacheEntry, String> = (|| {
-        let (code, resp_body) = run_curl(
-            &["-X", "POST", "-H", "Content-Type: application/json", "--data-binary", "@-", "--", &peer.url],
-            Some(&body_str),
-        )?;
+        let bearer = resolve_peer_bearer(peer)?;
+        let (code, resp_body) = post_json(&peer.url, &body_str, bearer.as_deref(), 15)?;
         if code != 200 {
             return Err(format!("HTTP {code}"));
         }
@@ -525,11 +653,8 @@ fn pull_one_peer(peer: &aoide_storage::peer_store::Peer) -> Value {
 pub fn pull_peer_live(peer: &aoide_storage::peer_store::Peer, timeout_secs: u64) -> Result<Value, String> {
     let body = crate::peer::build_graph_summary_request();
     let body_str = serde_json::to_string(&body).unwrap_or_default();
-    let (code, resp_body) = run_curl_with_timeout(
-        timeout_secs,
-        &["-X", "POST", "-H", "Content-Type: application/json", "--data-binary", "@-", "--", &peer.url],
-        Some(&body_str),
-    )?;
+    let bearer = resolve_peer_bearer(peer)?;
+    let (code, resp_body) = post_json(&peer.url, &body_str, bearer.as_deref(), timeout_secs)?;
     if code != 200 {
         return Err(format!("HTTP {code}"));
     }
@@ -565,19 +690,8 @@ pub fn send_message_to_peer(
     let message_id = gen_message_id();
     let body = crate::wire::build_message_send_body(text, &message_id, Some(context_id));
     let body_str = serde_json::to_string(&body).unwrap_or_default();
-    let (code, resp) = run_curl(
-        &[
-            "-X",
-            "POST",
-            "-H",
-            "Content-Type: application/json",
-            "--data-binary",
-            "@-",
-            "--",
-            &peer.url,
-        ],
-        Some(&body_str),
-    )?;
+    let bearer = resolve_peer_bearer(peer)?;
+    let (code, resp) = post_json(&peer.url, &body_str, bearer.as_deref(), 15)?;
     if code != 200 {
         return Err(format!("HTTP {code}"));
     }
@@ -670,6 +784,7 @@ pub fn register_peers(r: &mut Registry) {
         flags: [
             flag!("autogate", "bool", "Trust this peer: its inbound message/send auto-delivers without the pending queue."),
             flag!("token-file", "string", "Path to a file holding the shared secret this peer must present (Authorization: Bearer <token>) to be identified as this peer — required for --autogate to survive a proxy/tunnel, where every caller's address looks the same."),
+            flag!("bearer-secret", "string", "Name of a secret, resolved fresh on every outbound call through the local secrets broker, THIS instance presents as Authorization: Bearer <value> when calling this peer's own A2A door. Absent = no bearer sent (today's behavior)."),
         ],
         gated: false,
         implemented: true,
@@ -779,4 +894,63 @@ pub fn register_post_graph(r: &mut Registry) {
         implemented: true,
         handler: handle_adapter_melete,
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_peer(bearer_secret: Option<&str>) -> aoide_storage::peer_store::Peer {
+        aoide_storage::peer_store::Peer {
+            name: "yomi-strix".to_string(),
+            url: "http://yomi-strix:8710/".to_string(),
+            autogate: false,
+            token_file: None,
+            bearer_secret: bearer_secret.map(str::to_string),
+            added_at: "2026-08-24T00:00:00Z".to_string(),
+        }
+    }
+
+    // ── resolve_peer_bearer — the no-secret-configured short circuit ────────
+    //
+    // This is the one branch testable with NO broker/socket at all: an
+    // unconfigured peer never even tries to connect. Every OTHER branch
+    // (a real resolve, a broker-down failure) is exercised end-to-end in
+    // `cli/tests/peer_connectivity.rs`, mirroring how every other `peer`
+    // verb in this file is tested at that integration layer rather than
+    // here (this module carried zero unit tests before this task).
+
+    #[test]
+    fn resolve_peer_bearer_is_none_when_unset() {
+        assert_eq!(resolve_peer_bearer(&fixture_peer(None)).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_peer_bearer_is_none_when_set_to_an_empty_string() {
+        assert_eq!(resolve_peer_bearer(&fixture_peer(Some(""))).unwrap(), None);
+    }
+
+    // ── ScratchBodyFile — pure I/O, no broker needed ─────────────────────────
+
+    #[test]
+    fn scratch_body_file_writes_the_body_verbatim_and_removes_itself_on_drop() {
+        let path = {
+            let scratch = ScratchBodyFile::write(r#"{"jsonrpc":"2.0"}"#).unwrap();
+            let path = scratch.0.clone();
+            assert!(path.exists());
+            let arg = scratch.arg();
+            assert_eq!(arg, format!("@{}", path.display()));
+            let contents = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(contents, r#"{"jsonrpc":"2.0"}"#);
+            path
+        };
+        assert!(!path.exists(), "the scratch file must not outlive its guard");
+    }
+
+    #[test]
+    fn scratch_body_file_paths_are_unique_across_calls() {
+        let a = ScratchBodyFile::write("a").unwrap();
+        let b = ScratchBodyFile::write("b").unwrap();
+        assert_ne!(a.0, b.0);
+    }
 }

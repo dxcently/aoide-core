@@ -68,7 +68,20 @@
   EVERY call so revocation is immediate; don't introduce a warm cache, a
   TTL, or a "remember the last resolve for this secret" optimization —
   that would make revocation lag behind `secrets rm`/backend rotation,
-  which is exactly the property this crate exists to hold.
+  which is exactly the property this crate exists to hold. **This binds
+  `client::resolve_bounded` (task #84) exactly as it binds `resolve`** —
+  it is the same client-side function family, just with a caller-supplied
+  read timeout and `wait:false` on the wire instead of the interactive
+  park path, exported so `aoide-server`'s A2A door and `aoide-client`'s
+  outbound peer client can resolve their own bearer token as ordinary
+  wire callers (consumers `a2a-door`/`a2a-client`) rather than duplicating
+  the wire protocol in either crate (the workspace's "no cross-crate
+  copying" rule, `pkgs/aoide/crates/AGENTS.md`). Neither caller may hold
+  the resolved value past its own request/verification — don't add a
+  memoizing wrapper around `resolve_bounded` in this crate OR either
+  downstream one "to save a round trip"; a bounded, uncached, fresh-per-call
+  resolve is the entire contract a new machine consumer of this wire
+  inherits by construction.
 - **ONE VALUE PER SECRET is the contract, not an implementation detail.**
   `policy::Policy` models exactly one backend-fetched value per policy
   entry; a credential with multiple fields is multiple named secrets, each

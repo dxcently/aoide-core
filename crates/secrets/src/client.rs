@@ -84,6 +84,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 
 /// Map a `UnixStream::connect` failure against the broker socket into an
 /// actionable message — pure (an injected [`io::Error`], no real socket),
@@ -264,6 +265,71 @@ fn read_final_reply(reader: &mut impl BufRead) -> Result<Value, String> {
             continue;
         }
         return Ok(value);
+    }
+}
+
+/// Resolve a secret's value BOUNDED — an explicit socket read `timeout`
+/// PLUS `wait:false` on the wire — for a caller with no human to type a
+/// TOTP code and that must never hang waiting for one (task #84: the A2A
+/// door's inbound bearer check, and its outbound client's per-peer bearer
+/// presentation — see `crates/server/src/a2a.rs`'s consumers of this
+/// function). Two independent bounds, not one:
+///
+/// - `wait:false` is the wire's OWN documented escape hatch for exactly
+///   this caller shape (`CONTRACTS.md`'s "Secrets wire" section) — a
+///   `requireTotp` secret with no `automation`-open exemption for the
+///   asserted `consumer` denies IMMEDIATELY instead of parking, so the
+///   deployed, automation-open happy path never even reaches the timeout
+///   below at all.
+/// - `timeout` (via `UnixStream::set_read_timeout`, set BEFORE the request
+///   is written) caps the socket READ regardless of why the broker might
+///   still be slow to answer — a defense-in-depth second bound, not the
+///   primary mechanism.
+///
+/// **NO CACHING**: every call is a fresh connect → one request → one reply.
+/// Nothing this function returns is ever stored anywhere by it; the caller
+/// owns the value for exactly as long as its own request needs it — this
+/// crate's "NO CACHE, EVER" invariant, extended to every caller of this
+/// function exactly as it already binds [`resolve`]/`secrets exec`.
+pub fn resolve_bounded(
+    socket_path: &Path,
+    secret: &str,
+    consumer: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    let mut stream = UnixStream::connect(socket_path).map_err(|e| {
+        describe_connect_error(
+            socket_path,
+            &e,
+            &format!("aoide secrets exec --as {consumer} --secret {secret} -- ..."),
+        )
+    })?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| format!("setting a read timeout on the secrets broker connection at {}: {e}", socket_path.display()))?;
+
+    let req = json!({ "op": "resolve", "secret": secret, "consumer": consumer, "wait": false });
+    let mut line = req.to_string();
+    line.push('\n');
+    stream
+        .write_all(line.as_bytes())
+        .map_err(|e| format!("writing to the secrets broker: {e}"))?;
+
+    let mut reader = BufReader::new(stream);
+    let reply = read_final_reply(&mut reader)?;
+
+    if reply.get("ok").and_then(Value::as_bool) == Some(true) {
+        reply
+            .get("value")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "the secrets broker's reply had no `value`".to_string())
+    } else {
+        Err(reply
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("the secrets broker denied the request")
+            .to_string())
     }
 }
 
@@ -1066,5 +1132,116 @@ mod tests {
         // attaches a tty would fail loudly here instead of silently
         // changing `run_put`'s behavior under every other test.
         assert!(!stdin_is_tty());
+    }
+
+    // ── resolve_bounded (task #84: bounded, wait:false, no cache) ───────────
+
+    #[test]
+    fn resolve_bounded_against_a_dead_socket_is_a_connect_error() {
+        let dead = Path::new("/tmp/aoide-secrets-nonexistent-bounded-test.sock");
+        let err = resolve_bounded(dead, "t", "a2a-door", Duration::from_secs(2)).unwrap_err();
+        assert!(err.contains("connecting"), "{err}");
+    }
+
+    /// A real broker + socket round trip proving [`resolve_bounded`] returns
+    /// the value on a granted, TOTP-free resolve — the deployed automation-
+    /// open happy path task #84's PINNED CONSTRAINTS describe.
+    #[test]
+    fn resolve_bounded_returns_the_value_on_a_granted_resolve() {
+        let home = std::env::temp_dir().join(format!(
+            "aoide-secrets-client-bounded-ok-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        crate::store::save_policies(&home, &[crate::policy::Policy::new("t", "file", "k")]).unwrap();
+
+        let socket_path = std::path::PathBuf::from(format!(
+            "/tmp/aoide-secrets-client-bounded-ok-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let home_for_thread = home.clone();
+        let sock_for_thread = socket_path.clone();
+        let broker_thread = std::thread::spawn(move || {
+            let _ = crate::broker::serve(&home_for_thread, &sock_for_thread);
+        });
+        let mut connected = false;
+        for _ in 0..50 {
+            if UnixStream::connect(&socket_path).is_ok() {
+                connected = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(connected, "broker did not bind {} in time", socket_path.display());
+
+        assert_eq!(put(&socket_path, "t", "bounded-value", false), Ok(false));
+        assert_eq!(
+            resolve_bounded(&socket_path, "t", "a2a-door", Duration::from_secs(2)),
+            Ok("bounded-value".to_string())
+        );
+
+        drop(broker_thread);
+        std::fs::remove_file(&socket_path).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// **The PARKING HAZARD test (task #84).** A `requireTotp` secret with
+    /// NO code and NO automation-open exemption would, under plain
+    /// [`resolve`], PARK — holding the connection open for the full
+    /// `AOIDE_SECRETS_PARK_TIMEOUT` (300s default). [`resolve_bounded`]
+    /// must never do that: `wait:false` on the wire makes the broker deny
+    /// immediately instead of parking at all, so this returns well inside
+    /// the bound (asserted against a generous few-second wall-clock budget,
+    /// never the full park timeout) with a denial, not a hang.
+    #[test]
+    fn resolve_bounded_never_parks_on_a_requiretotp_secret_with_no_code() {
+        let home = std::env::temp_dir().join(format!(
+            "aoide-secrets-client-bounded-parking-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let mut p = crate::policy::Policy::new("t", "file", "k");
+        p.require_totp = true;
+        crate::store::save_policies(&home, &[p]).unwrap();
+        let totp_secret = b"a-twenty-byte-totp-s".to_vec();
+        crate::store::save_totp_secret(&home, &totp_secret).unwrap();
+
+        let socket_path = std::path::PathBuf::from(format!(
+            "/tmp/aoide-secrets-client-bounded-parking-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let home_for_thread = home.clone();
+        let sock_for_thread = socket_path.clone();
+        let broker_thread = std::thread::spawn(move || {
+            let _ = crate::broker::serve(&home_for_thread, &sock_for_thread);
+        });
+        let mut connected = false;
+        for _ in 0..50 {
+            if UnixStream::connect(&socket_path).is_ok() {
+                connected = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(connected, "broker did not bind {} in time", socket_path.display());
+
+        assert_eq!(put(&socket_path, "t", "never-released", false), Ok(false));
+
+        let started = std::time::Instant::now();
+        let err = resolve_bounded(&socket_path, "t", "a2a-door", Duration::from_secs(2)).unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "resolve_bounded must never approach the 300s park timeout — took {elapsed:?}"
+        );
+        assert!(err.contains("totp") || err.contains("TOTP"), "{err}");
+
+        drop(broker_thread);
+        std::fs::remove_file(&socket_path).ok();
+        std::fs::remove_dir_all(&home).ok();
     }
 }

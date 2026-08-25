@@ -200,6 +200,24 @@ pub fn read_expected_token(token_file: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Resolve `aoide.a2a.bearerSecret`: the NAME of a secret this door resolves
+/// through the LOCAL secrets broker, fresh on every request, as its own
+/// expected inbound bearer (task #84) — the first real machine consumer of
+/// the secrets broker's unix-socket wire (`CONTRACTS.md`'s "Secrets wire"
+/// section). `--bearer-secret` flag → `AOIDE_A2A_BEARER_SECRET` env →
+/// default `""` (empty = not configured), mirroring
+/// [`resolve_token_file`]'s exact precedence shape. When set, it TAKES
+/// PRECEDENCE over the token-file mechanism above — see
+/// [`resolve_inbound_bearer`] for the exact precedence and the fail-closed
+/// behavior on a broker resolve failure.
+pub fn resolve_bearer_secret(inv: &Invocation) -> String {
+    inv.flags
+        .get("bearer-secret")
+        .cloned()
+        .or_else(|| std::env::var("AOIDE_A2A_BEARER_SECRET").ok())
+        .unwrap_or_default()
+}
+
 /// Resolve this instance's `aoide/graphSummary` `instance.name` (CONTRACTS.md
 /// §7): `--peer-name` flag → `AOIDE_A2A_PEER_NAME` env (set by the
 /// `aoide-a2a` systemd unit, mirroring `resolve_bind_port`/
@@ -1611,6 +1629,134 @@ fn route(
     }
 }
 
+// ── Inbound bearer resolved via the secrets broker (task #84) ───────────────
+//
+// The token-FILE mechanism above (`resolve_token_file`/`read_expected_token`)
+// reads its value ONCE, at `a2a serve` launch, and holds it in memory for the
+// server's whole lifetime — fine for a file, since revoking it means editing
+// the file and restarting the daemon anyway. A secrets-broker-resolved
+// bearer must NOT work that way: the whole point of routing it through the
+// broker is that `secrets rm`/a policy edit takes effect immediately, with
+// no daemon restart — so this door must resolve it FRESH, every connection,
+// never once and cached. That is the one deliberate architectural
+// difference from the file mechanism below, and it is why
+// [`InboundBearerConfig`] carries the INPUTS to a resolve (a secret name, a
+// socket path) rather than a resolved value.
+
+/// The self-asserted consumer name this door presents to the secrets broker
+/// when resolving its own inbound bearer — see `crates/secrets/AGENTS.md`'s
+/// honesty note (consumer identity is self-asserted until #63): nothing on
+/// the wire authenticates this string, it is simply the name an operator's
+/// `policy.json` `consumers[]`/`automation.consumers` lists to grant
+/// `a2a serve` access to the named secret.
+const BEARER_CONSUMER_DOOR: &str = "a2a-door";
+
+/// Bound on the inbound bearer resolve's socket READ (the PARKING HAZARD,
+/// task #84): a misconfigured `requireTotp`-gated bearer secret with no
+/// `automation`-open exemption for [`BEARER_CONSUMER_DOOR`] would otherwise
+/// let the broker hold this call's read open for up to
+/// `AOIDE_SECRETS_PARK_TIMEOUT` (default 300s) — an HTTP door has no human
+/// to type a code into. `aoide_secrets::client::resolve_bounded`'s own
+/// `wait:false` on the wire means the deployed, automation-open happy path
+/// never even reaches this timeout; it exists purely as the second,
+/// independent bound for a misconfigured deployment (that function's own
+/// doc comment).
+const BEARER_RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The inbound-bearer MECHANISM `a2a serve` resolves once at launch (task
+/// #84) — everything [`resolve_inbound_bearer`] needs to compute one
+/// request's expected token fresh, never the value itself. `Clone` so
+/// [`serve`]'s accept loop can hand each spawned connection-handler thread
+/// its own copy, the same shape every other per-connection input below
+/// already takes.
+#[derive(Clone)]
+struct InboundBearerConfig {
+    /// [`resolve_bearer_secret`]'s result — a secrets-broker secret NAME,
+    /// resolved fresh on every connection when non-empty. Takes precedence
+    /// over `file_token` below.
+    bearer_secret: String,
+    /// The secrets broker's socket path (`aoide_secrets::socket::
+    /// socket_path`), resolved once at launch — reused for every
+    /// connection's resolve, never re-derived per request.
+    secrets_socket: std::path::PathBuf,
+    /// [`read_expected_token`]'s result — the pre-existing token-FILE
+    /// mechanism's value, read once at launch. Consulted only when
+    /// `bearer_secret` is empty; unchanged from before this task.
+    file_token: String,
+}
+
+/// Resolve THIS connection's effective expected inbound bearer token (task
+/// #84). `cfg.bearer_secret`, when set, takes precedence over
+/// `cfg.file_token` and is resolved FRESH from the secrets broker via
+/// [`aoide_secrets::client::resolve_bounded`] — nothing this function
+/// returns is ever cached: `handle_connection` calls it once per accepted
+/// connection and drops it once that connection's response has been
+/// written, the "value lives only in the request path" discipline task
+/// #84's brief calls for (`crates/secrets/AGENTS.md`'s "NO CACHE, EVER"
+/// invariant, extended here to this door's consumption of the broker).
+///
+/// **Fails CLOSED without a second `token_configured` boolean rippling
+/// through every downstream function (and its tests) in this file.** A
+/// broker resolve failure (unreachable, denied, or
+/// [`BEARER_RESOLVE_TIMEOUT`] elapsing) returns [`resolve_failure_sentinel`]
+/// instead of an empty string. Unlike the true "no bearer mechanism
+/// configured at all" case (empty string), this is a FRESH,
+/// practically-unguessable-per-call value — so every downstream call site's
+/// existing `!expected_token.is_empty()` "is a token configured" check
+/// still reads `true` (every bearer check this request denies), while no
+/// presented `Authorization: Bearer <token>` can ever happen to equal it
+/// ([`resolve_failure_sentinel`]'s own doc). This reuses the EXACT
+/// [`token_authorized`]/[`classify_token`] machinery every other bearer
+/// check in this file already runs — `route`/`message_send`/`handle_jsonrpc`/
+/// `stream_task` are UNCHANGED by this task, only `handle_connection`/
+/// [`serve`] resolve the value differently now.
+fn resolve_inbound_bearer(cfg: &InboundBearerConfig) -> String {
+    if cfg.bearer_secret.is_empty() {
+        return cfg.file_token.clone();
+    }
+    match aoide_secrets::client::resolve_bounded(
+        &cfg.secrets_socket,
+        &cfg.bearer_secret,
+        BEARER_CONSUMER_DOOR,
+        BEARER_RESOLVE_TIMEOUT,
+    ) {
+        Ok(value) => value,
+        Err(e) => {
+            // `e` is one of the resolve wire's own error strings
+            // (CONTRACTS.md's "Secrets wire" catalog) — never the secret's
+            // VALUE (this crate's own invariant, restated in
+            // `resolve_bounded`'s doc); safe to log the secret's NAME and
+            // this reason for an operator debugging a misconfiguration.
+            eprintln!(
+                "aoide a2a: inbound bearer resolve failed for secret `{}` via {}: {e} — \
+                 refusing every bearer check on this connection (fail closed)",
+                cfg.bearer_secret,
+                cfg.secrets_socket.display(),
+            );
+            resolve_failure_sentinel()
+        }
+    }
+}
+
+/// A fresh, non-empty value no remote caller could predict or observe —
+/// [`resolve_inbound_bearer`]'s fail-closed return on a broker resolve
+/// failure. Built ONLY from this process's own pid, the current instant to
+/// nanosecond precision, and a per-process atomic counter — never printed,
+/// logged, or compared against anything but a presented bearer (and even
+/// then, only ever on the LOSING side of that comparison: this value exists
+/// solely to keep `!expected_token.is_empty()` true so every check fails
+/// closed, not to BE a real credential).
+fn resolve_failure_sentinel() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("unresolvable-a2a-bearer-secret::{}::{nanos}::{n}", std::process::id())
+}
+
 // ── The blocking accept loop ─────────────────────────────────────────────────
 
 /// RAII in-flight-connection-slot guard: decrements [`IN_FLIGHT`] on drop,
@@ -1651,10 +1797,17 @@ pub fn serve(
     spawn_agent: &str,
     peer_name: &str,
     expected_token: &str,
+    bearer_secret: &str,
+    secrets_socket: &Path,
     registry: &'static Registry,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind((bind, port))?;
     eprintln!("aoide a2a: listening on http://{bind}:{port}/");
+    let bearer_cfg = InboundBearerConfig {
+        bearer_secret: bearer_secret.to_string(),
+        secrets_socket: secrets_socket.to_path_buf(),
+        file_token: expected_token.to_string(),
+    };
     for incoming in listener.incoming() {
         let mut stream = match incoming {
             Ok(s) => s,
@@ -1682,7 +1835,7 @@ pub fn serve(
         let audit_log = audit_log.to_path_buf();
         let spawn_agent = spawn_agent.to_string();
         let peer_name = peer_name.to_string();
-        let expected_token = expected_token.to_string();
+        let bearer_cfg = bearer_cfg.clone();
         std::thread::spawn(move || {
             let _guard = ConnGuard; // released on every exit path, incl. panic
             if let Err(e) = handle_connection(
@@ -1692,7 +1845,7 @@ pub fn serve(
                 &audit_log,
                 &spawn_agent,
                 &peer_name,
-                &expected_token,
+                &bearer_cfg,
                 registry,
             ) {
                 eprintln!("aoide a2a: connection error: {e}");
@@ -1712,7 +1865,7 @@ fn handle_connection(
     audit_log: &Path,
     spawn_agent: &str,
     peer_name: &str,
-    expected_token: &str,
+    bearer_cfg: &InboundBearerConfig,
     registry: &Registry,
 ) -> std::io::Result<()> {
     // The connection's ORIGIN (CONTRACTS.md §6 amendment, 2026-08-14): TCP
@@ -1749,6 +1902,14 @@ fn handle_connection(
         }
     };
 
+    // task #84: resolve THIS connection's effective expected bearer fresh —
+    // AFTER a successful parse (a malformed request never touches the
+    // broker at all), never once at `a2a serve` launch when a broker secret
+    // is configured — see `resolve_inbound_bearer`'s own doc for the
+    // fail-closed/no-cache reasoning. `expected_token` is a local `String`
+    // that lives only for the rest of this one connection's handling.
+    let expected_token = resolve_inbound_bearer(bearer_cfg);
+
     // Phase C: a `message/stream` / `tasks/resubscribe` POST takes over the
     // socket — headers-once + an SSE event loop in `stream_task` — instead of
     // the one-shot `route()`→`write_http_response` path below (which every
@@ -1772,7 +1933,7 @@ fn handle_connection(
             audit_log,
             spawn_agent,
             origin,
-            expected_token,
+            &expected_token,
             req.bearer.as_deref(),
         );
     }
@@ -1785,7 +1946,7 @@ fn handle_connection(
         spawn_agent,
         peer_name,
         origin,
-        expected_token,
+        &expected_token,
         registry,
     );
 
@@ -3258,6 +3419,7 @@ mod tests {
             url: "http://10.0.0.9:8710/".into(),
             autogate: true,
             token_file: None,
+            bearer_secret: None,
             added_at: "2026-08-14T00:00:00Z".into(),
         }])
         .unwrap();
@@ -3352,6 +3514,7 @@ mod tests {
             url: "http://192.0.2.99:8710/".into(),
             autogate: true,
             token_file: Some(token_path.to_string_lossy().into_owned()),
+            bearer_secret: None,
             added_at: "2026-08-18T00:00:00Z".into(),
         }])
         .unwrap();
@@ -3703,6 +3866,7 @@ mod tests {
             url: "http://192.0.2.99:8710/".into(),
             autogate: true,
             token_file: Some(token_path.to_string_lossy().into_owned()),
+            bearer_secret: None,
             added_at: "2026-08-20T00:00:00Z".into(),
         }])
         .unwrap();
@@ -4232,5 +4396,211 @@ mod tests {
         assert_eq!(agent.name, "aoide");
         assert_eq!(agent.url, "http://127.0.0.1:8710/");
         assert_eq!(agent.description, "", "stripped card carries no description field to read");
+    }
+
+    // ── task #84: inbound bearer resolved via the secrets broker ────────────
+
+    fn bearer_cfg(bearer_secret: &str, secrets_socket: &Path, file_token: &str) -> InboundBearerConfig {
+        InboundBearerConfig {
+            bearer_secret: bearer_secret.to_string(),
+            secrets_socket: secrets_socket.to_path_buf(),
+            file_token: file_token.to_string(),
+        }
+    }
+
+    #[test]
+    fn resolve_inbound_bearer_falls_through_to_the_file_token_when_bearer_secret_is_unset() {
+        let cfg = bearer_cfg("", Path::new("/tmp/aoide-a2a-unused.sock"), "file-token-value");
+        assert_eq!(resolve_inbound_bearer(&cfg), "file-token-value");
+    }
+
+    #[test]
+    fn resolve_inbound_bearer_with_neither_configured_is_the_empty_off_path() {
+        let cfg = bearer_cfg("", Path::new("/tmp/aoide-a2a-unused.sock"), "");
+        assert_eq!(resolve_inbound_bearer(&cfg), "");
+        // Off-path is byte-identical to before this task: `token_authorized`
+        // never gates anything when `expected_token` is empty.
+        assert!(token_authorized(false, classify_token("", None)));
+    }
+
+    /// A dead broker socket (unreachable — the same shape as a stopped
+    /// broker) FAILS CLOSED: [`resolve_inbound_bearer`] returns a non-empty
+    /// sentinel, never the file token (a resolve failure must not silently
+    /// fall back to the weaker mechanism) and never empty (which would read
+    /// as "not configured" and open the door wide).
+    #[test]
+    fn resolve_inbound_bearer_fails_closed_on_an_unreachable_broker() {
+        let dead = Path::new("/tmp/aoide-a2a-bearer-nonexistent-test.sock");
+        let cfg = bearer_cfg("some-secret", dead, "file-token-should-be-ignored");
+        let sentinel = resolve_inbound_bearer(&cfg);
+        assert!(!sentinel.is_empty(), "a resolve failure must never read as 'not configured'");
+        assert_ne!(sentinel, "file-token-should-be-ignored", "must not silently fall back to the file token");
+
+        // Feed it through the EXACT machinery every other bearer check in
+        // this file runs: nothing a caller could plausibly present matches,
+        // and even the sentinel value ITSELF is never handed to a caller —
+        // it only ever exists on this side of the comparison.
+        assert!(!token_authorized(true, classify_token(&sentinel, Some("wrong"))));
+        assert!(!token_authorized(true, classify_token(&sentinel, None)));
+    }
+
+    /// Two consecutive resolve failures never produce the same sentinel —
+    /// pinning that it is fresh per call, not a fixed placeholder string an
+    /// attacker could learn once and replay.
+    #[test]
+    fn resolve_inbound_bearer_sentinel_is_fresh_every_call() {
+        let dead = Path::new("/tmp/aoide-a2a-bearer-nonexistent-test-2.sock");
+        let cfg = bearer_cfg("some-secret", dead, "");
+        let a = resolve_inbound_bearer(&cfg);
+        let b = resolve_inbound_bearer(&cfg);
+        assert_ne!(a, b);
+    }
+
+    /// A real broker + socket round trip: `bearer_secret` set AND a
+    /// (deliberately wrong) `file_token` also set — the broker-resolved
+    /// value wins outright, proving the precedence [`resolve_inbound_bearer`]'s
+    /// own doc states.
+    #[test]
+    fn resolve_inbound_bearer_prefers_a_resolved_broker_secret_over_the_file_token() {
+        let home = std::env::temp_dir().join(format!(
+            "aoide-a2a-bearer-precedence-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        aoide_secrets::store::save_policies(
+            &home,
+            &[aoide_secrets::policy::Policy::new("melete-door-token", "file", "k")],
+        )
+        .unwrap();
+
+        let socket_path = std::path::PathBuf::from(format!(
+            "/tmp/aoide-a2a-bearer-precedence-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let home_for_thread = home.clone();
+        let sock_for_thread = socket_path.clone();
+        let broker_thread = std::thread::spawn(move || {
+            let _ = aoide_secrets::broker::serve(&home_for_thread, &sock_for_thread);
+        });
+        let mut connected = false;
+        for _ in 0..50 {
+            if UnixStream::connect(&socket_path).is_ok() {
+                connected = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(connected, "broker did not bind {} in time", socket_path.display());
+
+        assert_eq!(
+            aoide_secrets::client::put(&socket_path, "melete-door-token", "the-broker-value", false),
+            Ok(false)
+        );
+
+        let cfg = bearer_cfg("melete-door-token", &socket_path, "the-file-value-must-lose");
+        assert_eq!(resolve_inbound_bearer(&cfg), "the-broker-value");
+
+        drop(broker_thread);
+        std::fs::remove_file(&socket_path).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── NO-CACHE / no-log grep gate (task #84 PINNED CONSTRAINT) ────────────
+
+    /// A resolved/expected bearer value must NEVER reach an `audit(...)`
+    /// call — grep this crate's own source for every `audit(` call site and
+    /// forbid the identifiers that hold token bytes (`expected_token`,
+    /// `presented_token`) from appearing inside its argument list. A future
+    /// edit that accidentally threads either one into an audit line fails
+    /// this test loudly instead of silently leaking a bearer into
+    /// `~/Aoide/log`.
+    /// Only the PRODUCTION half of this file (everything before `mod
+    /// tests {`) — scanning the test module itself would trip over this
+    /// very grep gate's own source text (its doc comments and string
+    /// literals mention "audit(`"/`expected_token` by name to describe
+    /// what it checks), which is noise, not a real call site.
+    fn production_source() -> &'static str {
+        let src = include_str!("a2a.rs");
+        let test_mod_start = src.find("#[cfg(test)]\nmod tests {").expect("this file has a `mod tests` block");
+        &src[..test_mod_start]
+    }
+
+    /// Every balanced-paren call site in `production_source()` whose callee
+    /// name is `name` (e.g. `"audit"`, `"eprintln!"` including its `!`) —
+    /// paren-depth tracked so a call whose OWN arguments contain a nested
+    /// `(...)` (a `format!(...)` argument, a `Door::A2a` path — none
+    /// actually parenthesized, but future-proofed anyway) is captured
+    /// whole, not truncated at the first inner `)`.
+    fn call_sites<'a>(src: &'a str, name: &str) -> Vec<&'a str> {
+        let needle = format!("{name}(");
+        let mut sites = Vec::new();
+        let mut idx = 0;
+        while let Some(rel) = src[idx..].find(&needle) {
+            let start = idx + rel;
+            let mut depth = 0i32;
+            let mut end = None;
+            for (offset, ch) in src[start..].char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(start + offset + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(end) = end else { break };
+            sites.push(&src[start..end]);
+            idx = end;
+        }
+        sites
+    }
+
+    /// A resolved/expected bearer value must NEVER reach an `audit(...)`
+    /// call — grep this crate's own PRODUCTION source (never the test
+    /// module — see `production_source`'s doc) for every `audit(` call
+    /// site and forbid the identifiers that hold token bytes
+    /// (`expected_token`, `presented_token`) from appearing inside its
+    /// argument list. A future edit that accidentally threads either one
+    /// into an audit line fails this test loudly instead of silently
+    /// leaking a bearer into `~/Aoide/log`.
+    #[test]
+    fn bearer_identifiers_never_reach_an_audit_call_grep_gate() {
+        let src = production_source();
+        let forbidden = ["expected_token", "presented_token"];
+        let sites = call_sites(src, "audit");
+        for call in &sites {
+            for name in forbidden {
+                assert!(
+                    !call.contains(name),
+                    "an audit(...) call mentions `{name}` — a resolved/expected bearer value must \
+                     never reach the audit log:\n{call}"
+                );
+            }
+        }
+        assert!(sites.len() > 5, "sanity: this file should have several audit( call sites to check");
+    }
+
+    /// Same discipline, `eprintln!` (`resolve_inbound_bearer`'s own
+    /// diagnostic on a resolve failure logs the SECRET'S NAME and the
+    /// broker's error reason — never a resolved value).
+    #[test]
+    fn bearer_identifiers_never_reach_an_eprintln_call_grep_gate() {
+        let src = production_source();
+        let forbidden = ["expected_token", "presented_token"];
+        for call in call_sites(src, "eprintln!") {
+            for name in forbidden {
+                assert!(
+                    !call.contains(name),
+                    "an eprintln!(...) call mentions `{name}` — a resolved/expected bearer value must \
+                     never reach a log line:\n{call}"
+                );
+            }
+        }
     }
 }
