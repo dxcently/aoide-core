@@ -1825,8 +1825,17 @@ mod tests {
     /// Restores whatever `AOIDE_SECRETS_BACKEND_TIMEOUT` held before the
     /// test ran — every test below that sets it does so through this guard
     /// rather than a bare `set_var`, so a panic mid-test still leaves the
-    /// env sane for whatever runs next (this crate's whole suite runs
-    /// `--test-threads=1`, so no cross-test lock is needed beyond that).
+    /// env sane for whatever runs next. `EnvGuard` itself does NOT take
+    /// `crate::env_lock()` (task #81 fix) — a bare `std::sync::Mutex` isn't
+    /// reentrant, and the one call site that also mutates `PATH` around an
+    /// `EnvGuard` needs the lock held across BOTH mutations, acquired once
+    /// up front. Every call site below is responsible for its own
+    /// `let _lock = crate::env_lock().lock().unwrap();` ahead of
+    /// `EnvGuard::set(...)`, the same convention `home.rs`/`socket.rs`/
+    /// `enroll.rs`/`broker.rs`/`commands.rs` already hold for every other
+    /// process-env mutation in this crate — this crate's suite no longer
+    /// depends on `--test-threads=1` for correctness (`default.nix`'s
+    /// `dontUseCargoParallelTests` switch is dropped in the same commit).
     struct EnvGuard {
         saved: Option<String>,
     }
@@ -1848,6 +1857,7 @@ mod tests {
 
     #[test]
     fn backend_timeout_defaults_to_10_seconds() {
+        let _guard = crate::env_lock().lock().unwrap();
         let saved = std::env::var(BACKEND_TIMEOUT_ENV).ok();
         std::env::remove_var(BACKEND_TIMEOUT_ENV);
         assert_eq!(backend_timeout(), Duration::from_secs(10));
@@ -1859,6 +1869,7 @@ mod tests {
 
     #[test]
     fn backend_timeout_env_override_wins() {
+        let _lock = crate::env_lock().lock().unwrap();
         let _guard = EnvGuard::set("3");
         assert_eq!(backend_timeout(), Duration::from_secs(3));
     }
@@ -1868,12 +1879,14 @@ mod tests {
     /// the bound by treating it as "no timeout".
     #[test]
     fn backend_timeout_env_garbage_falls_back_to_the_default() {
+        let _lock = crate::env_lock().lock().unwrap();
         let _guard = EnvGuard::set("not-a-number");
         assert_eq!(backend_timeout(), Duration::from_secs(DEFAULT_BACKEND_TIMEOUT_SECS));
     }
 
     #[test]
     fn backend_timeout_env_blank_falls_back_to_the_default() {
+        let _lock = crate::env_lock().lock().unwrap();
         let _guard = EnvGuard::set("   ");
         assert_eq!(backend_timeout(), Duration::from_secs(DEFAULT_BACKEND_TIMEOUT_SECS));
     }
@@ -1892,6 +1905,7 @@ mod tests {
         let marker = home.join("child.pid");
         write_backends(&home, &format!("echo $$ > {} && sleep 60", marker.display()));
 
+        let _lock = crate::env_lock().lock().unwrap();
         let _guard = EnvGuard::set("1");
         let start = Instant::now();
         let err = fetch_value(&home, "scratch", "x").unwrap_err();
@@ -1925,6 +1939,7 @@ mod tests {
         let home = tmp_home("hung-set-timeout");
         write_backend_with_set(&home, "printf %s {name}", "sleep 60");
 
+        let _lock = crate::env_lock().lock().unwrap();
         let _guard = EnvGuard::set("1");
         let start = Instant::now();
         let err = store_value(&home, "scratch", "k", "the-stored-value").unwrap_err();
@@ -1943,6 +1958,7 @@ mod tests {
         let home = tmp_home("hung-has-timeout");
         write_backend_with_has(&home, "printf %s {name}", "sleep 60");
 
+        let _lock = crate::env_lock().lock().unwrap();
         let _guard = EnvGuard::set("1");
         let start = Instant::now();
         let result = has_value(&home, "scratch", "x");
@@ -1974,6 +1990,7 @@ mod tests {
     fn a_large_output_survives_the_drain_loop_intact() {
         let home = tmp_home("large-output-drain");
         write_backends(&home, "head -c 8000000 /dev/urandom | base64 | tr -d '\\n'");
+        let _lock = crate::env_lock().lock().unwrap();
         let _guard = EnvGuard::set("30");
         let value = fetch_value(&home, "scratch", "unused").expect("large-output template must succeed");
         // base64 of 8,000,000 bytes is ceil(n/3)*4 chars; just assert it's
@@ -2012,6 +2029,12 @@ mod tests {
             std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
+        // Held across BOTH the raw PATH mutation below and the EnvGuard's
+        // own BACKEND_TIMEOUT_ENV mutation — acquired once, up front, so
+        // EnvGuard::set (which does not itself lock, task #81) never needs
+        // a second, deadlocking acquisition of this same non-reentrant
+        // mutex.
+        let _lock = crate::env_lock().lock().unwrap();
         let saved_path = std::env::var("PATH").ok();
         let new_path = format!("{}:{}", shim_dir.display(), saved_path.clone().unwrap_or_default());
         std::env::set_var("PATH", &new_path);

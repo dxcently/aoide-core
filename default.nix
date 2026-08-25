@@ -60,17 +60,19 @@ rustPlatform.buildRustPackage {
   # reading: the package build runs the whole suite.
   cargoTestFlags = [ "--workspace" ];
 
-  # The secrets crate's suite is single-threaded BY CONTRACT (its EnvGuard
-  # test helper mutates process env with no cross-test lock — its own doc
-  # says so; task #81 is the real fix). Under libtest's default parallelism
-  # the sandbox check flaked for real: one test's AOIDE_SECRETS_BACKEND_
-  # TIMEOUT=1 bled into a concurrently-running test's fetch and killed it
-  # mid-read (two failed deploy builds, 2026-08-23). A bare RUST_TEST_THREADS
-  # env var does NOT work here: cargoCheckHook passes an explicit
-  # `--test-threads=$NIX_BUILD_CORES`, which overrides the env (proven by a
-  # third failed build). This is the hook's own serialization switch; drop
-  # it when #81 lands an actual env lock.
-  dontUseCargoParallelTests = true;
+  # task #81 (this commit): the secrets crate's EnvGuard test helper
+  # (backend.rs) now takes the SAME crate::env_lock() every other
+  # process-env-mutating test in this crate already held — before this fix
+  # it mutated AOIDE_SECRETS_BACKEND_TIMEOUT/PATH with no lock at all, so
+  # under libtest's default parallelism one test's timeout override could
+  # bleed into a concurrently-running test's fetch and kill it mid-read
+  # (two failed deploy builds, 2026-08-23), and the resulting panic — since
+  # it usually landed inside SOME OTHER test's env_lock()-held section —
+  # poisoned that lock for every test queued behind it. `cargo test -p
+  # aoide-secrets` is green under default parallelism, repeated 3x, so the
+  # sandbox check now runs the secrets crate's suite parallel like every
+  # other crate; the `dontUseCargoParallelTests` switch this comment used to
+  # document is dropped.
 
   # P-A7 of the binary-split workstream: this one derivation now ships THREE
   # binaries (aoide, aoided, lyra — `lyra` lives in the separate `crates/lyra`
