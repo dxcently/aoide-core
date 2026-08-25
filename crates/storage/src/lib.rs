@@ -32,6 +32,13 @@
 //! `inbox` (messaging plan, P-C6) is the newest: the durable per-host
 //! message store (`state/inbox.json`) both delivery seams file into — see
 //! its own module doc for the one-writer-covers-both-seams reasoning.
+//!
+//! `identity` (pairing workstream, P-P1, `docs/architecture/PAIRING.md`) is
+//! the newest: this instance's lazily-minted ed25519 keypair
+//! (`state/identity/`) — the substrate the pairing ceremony (P-P2),
+//! per-peer `allows` (P-P3), and signed wire requests (P-P4) all build on.
+//! Its own module doc states the private-key-never-serializes discipline
+//! and the mechanical test that holds it.
 
 pub mod a2a_store;
 pub mod addr;
@@ -40,6 +47,7 @@ pub mod display;
 pub mod edits;
 pub mod fs;
 pub mod git;
+pub mod identity;
 pub mod inbox;
 pub mod ledger;
 pub mod mode;

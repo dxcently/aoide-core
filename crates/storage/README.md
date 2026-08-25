@@ -68,12 +68,29 @@ cache (CONTRACTS.md §7). File-first by decision — no embedded database yet
   precedent). `context` is an opaque `serde_json::Value` passthrough
   reserved for a future Mneme (memory-manager) integration — v0 never reads
   it.
-- `commands` — this crate's CLI verbs: `usage` (local token/cost rollup) and
-  `inbox list|read|clear` (the store above's CLI surface).
+- `identity` — this instance's lazily-minted ed25519 keypair (pairing
+  workstream P-P1, `docs/architecture/PAIRING.md`, CONTRACTS.md §4's
+  `state/identity/` subsection): `state/identity/ed25519.key` (the raw
+  32-byte private seed, `fs::atomic_write_private`'s 0600 discipline,
+  written once) plus a `created_at` sidecar. `Keypair` holds the private
+  key and is never `Serialize`/`Deserialize` — `IdentityInfo` (pubkey hex,
+  fingerprint, mint time) is the only serializable shape this module
+  emits, and a source-scanning test in `identity.rs` mechanically holds
+  that boundary. The pairing ceremony (`peer pair`, P-P2), the `allows`
+  set + spawn-gate flip (P-P3), and signed wire requests (P-P4) all build
+  on this.
+- `commands` — this crate's CLI verbs: `usage` (local token/cost rollup),
+  `inbox list|read|clear` (the store above's CLI surface), and `identity`
+  (the module above's CLI surface).
 
 ## What it consumes
 
-`aoide-protocol` only (plus `aoide-test-support` as a dev-dependency). It is
+`aoide-protocol` (plus `aoide-test-support` as a dev-dependency), and — as
+of P-P1 — `ed25519-dalek`/`getrandom` for `identity`: the ONE sanctioned
+exception to this workspace's zero-new-deps discipline, scoped to
+cryptographic primitives specifically (User ruling 2026-08-25,
+`docs/architecture/PAIRING.md`'s kill-list; see the workspace `Cargo.toml`'s
+own comment on those two entries for the version/feature reasoning). It is
 the second-lowest crate in the DAG — everything that persists state sits
 above it.
 

@@ -14,6 +14,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 aoide-protocol = { workspace = true }
 libc = { workspace = true }
+# `identity` — the pairing workstream's instance keypair (P-P1,
+# docs/architecture/PAIRING.md). See the workspace Cargo.toml's own
+# comment for the version/feature reasoning; this crate is the sanctioned
+# dependent, per that comment's "consumer" note.
+ed25519-dalek = { workspace = true }
+getrandom = { workspace = true }
 
 [dev-dependencies]
 # The commands tests share the workspace rig (scratch dirs, EnvSaver,

@@ -75,6 +75,32 @@ aoide-screen = { path = "crates/screen" }
 # assembled from the SAME domain crates `aoide-cli` already depends on
 # (`aoide-song`, `aoide-conduct`, `aoide-screen`) — nothing here is a copy.
 aoide-lyra = { path = "crates/lyra" }
+# `ed25519-dalek`/`getrandom` — the pairing workstream's instance identity
+# (P-P1, `docs/architecture/PAIRING.md`'s "Identity" section, consumer
+# `aoide-storage::identity`): cryptography is never hand-rolled here (User
+# ruling, 2026-08-25, PAIRING.md's kill-list) — the ONE sanctioned break of
+# this workspace's zero-new-deps discipline, scoped to cryptographic
+# primitives specifically. PAIRING.md's design grill named "ed25519-dalek
+# 2.x" as the illustrative candidate; verified against the live crates.io
+# index at land time, `2.x` topped out at 2.2.0 (2025-07-09) and `3.0.0`
+# (dalek-cryptography, the same maintainers, RC'd twice before a
+# 2026-07-06 stable release) is the current line — used here instead, on
+# the "verify current versions" instruction the design doc itself gives
+# the executor. Default features only (`fast`, `zeroize` — precomputed
+# tables and drop-time key scrubbing, both wanted, neither new work to
+# justify). The `rand_core` feature is deliberately NOT enabled: rand_core
+# 0.10 dropped `OsRng` entirely (a real ecosystem restructuring, not an
+# oversight — confirmed by reading its own source), so keygen instead
+# seeds a 32-byte array via `getrandom::fill` and builds the key with
+# `SigningKey::from_bytes` — one primitive (`fill`), no `rand_core`
+# dependency, no extra feature edge. `getrandom` needs no feature flag for
+# this either (`fill` is unconditional; `std`/`sys_rng` gate unrelated
+# surface). `sha2` is already in the resolved tree transitively (EdDSA's
+# own SHA-512 internals) but is NOT a direct dependency of anything this
+# workspace owns yet — P-P4 (signed wire requests) adds it directly only
+# when a canonical-string digest needs it, per this phase's own scope note.
+ed25519-dalek = "3"
+getrandom = { version = "0.4", default-features = false }
 # `aoide-secrets` — Workstream SECRETS's secrets broker (named "vault"
 # until the P-V4b rename — same crate, no split-brain): TOTP, policy
 # types, replay ledger, otpauth:// URI construction (P-V1); the

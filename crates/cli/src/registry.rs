@@ -121,6 +121,7 @@ mod tests {
             "graph.wrap",
             "guide",
             "hooks.install",
+            "identity",
             "inbox.clear",
             "inbox.list",
             "inbox.read",

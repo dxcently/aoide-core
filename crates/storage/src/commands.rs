@@ -767,6 +767,53 @@ fn handle_inbox_clear(_inv: &Invocation) -> Outcome {
     }
 }
 
+// ── `aoide identity` (pairing workstream P-P1, PAIRING.md) ─────────────────
+
+/// `aoide identity` — this instance's ed25519 identity, appended newest
+/// into `cli`'s `commands::all()`. See `identity.rs`'s module doc for the
+/// storage shape; this handler only mints/loads and renders — never the
+/// private half.
+pub fn register_identity(r: &mut Registry) {
+    r.insert(cmd!(
+        path: ["identity"],
+        summary: "Show this instance's ed25519 identity (pubkey, fingerprint, created-at). Mints one lazily on first call; every later call is a no-op read. The private key is never shown.",
+        args: [],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_identity,
+        examples: ["identity"],
+    ));
+}
+
+/// `aoide identity [--json]` — load-or-mint this instance's keypair and
+/// report its public info. Minting on first call is a `changed` entry (a
+/// new file was written); every later call is an idempotent read with no
+/// `changed` at all (house rule 2).
+fn handle_identity(_inv: &Invocation) -> Outcome {
+    let cmd = "identity";
+    let (kp, minted) = match crate::identity::load_or_mint() {
+        Ok(v) => v,
+        Err(e) => {
+            return Outcome::error(cmd, format!("{}: {e}", crate::identity::identity_dir().display()))
+                .with_data(json!({ "reason": "identity-io-failed" }));
+        }
+    };
+    let info = kp.info();
+    let message = format!(
+        "{} pubkey {} (fingerprint {}, created {})",
+        if minted { "minted new identity —" } else { "identity" },
+        info.pubkey_hex,
+        info.fingerprint,
+        info.created_at,
+    );
+    let mut out = Outcome::ok(cmd, message).with_data(json!(info));
+    if minted {
+        out = out.changed(vec![crate::identity::identity_dir().to_string_lossy().into_owned()]);
+    }
+    out
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
@@ -1233,5 +1280,45 @@ mod tests {
         assert!(paths.contains(&"inbox.list".to_string()));
         assert!(paths.contains(&"inbox.read".to_string()));
         assert!(paths.contains(&"inbox.clear".to_string()));
+    }
+
+    // ── `aoide identity` ─────────────────────────────────────────────────────
+
+    #[test]
+    fn register_identity_wires_the_verb() {
+        let mut r = Registry::new();
+        register_identity(&mut r);
+        let paths: Vec<String> = r.commands().map(|c| c.dotted()).collect();
+        assert!(paths.contains(&"identity".to_string()));
+    }
+
+    #[test]
+    fn handle_identity_mints_once_then_reports_a_no_op_read() {
+        let _g = crate::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STATE_DIR"]);
+        let root = unique_tmp("identity-handler");
+        std::env::set_var("AOIDE_STATE_DIR", &root);
+
+        let first = handle_identity(&inv(&["identity"], &[]));
+        assert_eq!(first.status, Status::Ok, "msg: {}", first.message);
+        assert!(!first.changed.is_empty(), "minting is a changed entry");
+        let first_data = first.data.unwrap();
+        assert!(first_data.get("pubkeyHex").is_some());
+        assert!(first_data.get("fingerprint").is_some());
+        assert!(first_data.get("createdAt").is_some());
+        // The private key never appears anywhere in the Outcome.
+        let dumped = first_data.to_string();
+        assert!(!dumped.to_lowercase().contains("signing"), "no private material in the Outcome data");
+
+        let second = handle_identity(&inv(&["identity"], &[]));
+        assert_eq!(second.status, Status::Ok);
+        assert!(second.changed.is_empty(), "the second call is an idempotent read, no changed entries");
+        assert_eq!(
+            second.data.unwrap()["pubkeyHex"],
+            first_data["pubkeyHex"],
+            "both calls resolve the SAME identity"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

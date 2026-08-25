@@ -274,6 +274,28 @@ pub fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<(
     atomic_write_bytes(path, contents.as_bytes())
 }
 
+/// Atomic write of a SENSITIVE file: [`atomic_write_bytes`], then locked to
+/// `0600` (owner rw only) — this crate's own precedent for private material
+/// that must never enter a `Serialize`/`Deserialize` type (the identity
+/// keypair's private-key file, `identity.rs`'s own module doc is the first
+/// caller), mirroring the `aoide-secrets` crate's `home::secure_file`
+/// discipline for a file rather than that crate's whole home directory. The
+/// permission lock is a SEPARATE syscall after the rename (POSIX `rename()`
+/// preserves the destination's existing mode when replacing a file, so a
+/// second write to an already-locked-down path is a no-op chmod, not a
+/// window where the new bytes are briefly world-readable under the OLD
+/// file's permissions — the very first write is the only case that matters,
+/// and it locks down immediately after the rename lands, same as every
+/// other `set_permissions`-after-write call site in this workspace). A
+/// failed chmod is a real error, not swallowed — a private file left at
+/// whatever mode `atomic_write_bytes` happened to create it under is never
+/// treated as "good enough."
+pub fn atomic_write_private(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    atomic_write_bytes(path, contents)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
 /// Run `f` while holding an exclusive advisory lock on the stage directory,
 /// serialising the whole load-modify-write of the shared stage files across
 /// every writer (per-hook processes, the ~1 Hz conduct ticks, the window
@@ -813,6 +835,30 @@ mod tests {
         atomic_write(&path, "content").unwrap();
         assert!(!std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "content");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_private_locks_the_file_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aoide-atomic-private-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret.key");
+
+        atomic_write_private(&path, b"private bytes").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "atomic_write_private must lock to 0600, got {mode:o}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"private bytes");
+
+        // A second write to the SAME path (the re-mint-never-happens case,
+        // but the primitive itself must stay correct either way) is still
+        // locked to 0600 afterward.
+        atomic_write_private(&path, b"replaced").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"replaced");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
