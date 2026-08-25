@@ -40,11 +40,13 @@
 //! matches its baseline — [`HandEditWatcher::sweep`] then re-baselines
 //! every file it just checked, matching or not, so a genuine change is
 //! reported exactly once. [`HandEditWatcher::note_own_write`] lets a
-//! FUTURE writer (no daemon-side write path exists yet this phase — P-D6's
-//! graph residency is the first one) update a single file's baseline
-//! without going through a full `sweep`, so a write the daemon itself just
-//! made is folded into the baseline instead of being reported back to
-//! itself as a "hand" edit on the very next tick.
+//! daemon-side writer update a single file's baseline without going
+//! through a full `sweep`, so a write the daemon itself just made is
+//! folded into the baseline instead of being reported back to itself as a
+//! "hand" edit on the very next tick. Two callers exist: the tick's own
+//! reconcile/reap writes (P-D6), and — through the shared watcher's
+//! roster-wide re-baseline (`daemon::rebaseline_stage_roster`, task #92)
+//! — every dispatched invocation's writes.
 
 use aoide_protocol::feed::{FeedWriter, Follower};
 use aoide_protocol::{audit::now_secs, EventClass};

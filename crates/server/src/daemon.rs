@@ -136,6 +136,13 @@
 //! tick's own `note_own_write` calls already accept for
 //! `reconcile_graph_projection`/`run_internal_reap`. Out of scope: the next
 //! genuine hand edit still fires on the following tick, same as always.
+//! The mirror-image window exists too and is equally accepted: the tick's
+//! `sweep` can interleave between the handler's write landing on disk and
+//! this re-baseline acquiring the lock, in which case the daemon's OWN
+//! write is (very rarely) still reported once — bounded now by the tail of
+//! one `dispatch()` call rather than the old full tick period, and closing
+//! it entirely would mean holding the watcher lock across dispatch, which
+//! the accept-loop discipline forbids.
 //!
 //! ## Graph residency: reconcile + reap in the tick (P-D6)
 //!
