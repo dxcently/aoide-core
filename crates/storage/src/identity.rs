@@ -30,21 +30,32 @@
 //! build if any `#[derive(...Serialize...)]` struct in it ever grows a
 //! field that looks like it holds key material.
 //!
-//! **Storage** (`fs::state_dir()/identity/`, using [`fs::atomic_write_private`]
-//! for the sensitive half — added to `fs.rs` by this phase as the
-//! atomic-write-then-0600 precedent the design doc anticipated but this
-//! crate didn't have a named helper for yet):
-//! - `ed25519.key` — the raw 32-byte private seed, 0600, written ONCE at
-//!   mint and never rewritten afterward. `SigningKey::from_bytes`
-//!   reconstructs the full keypair from it on every later load — nothing
-//!   else needs to persist, since the public key and every signature
-//!   derive from this one seed deterministically.
+//! **Storage** (`fs::state_dir()/identity/`, locked down at both levels —
+//! [`fs::secure_private_dir`] on the directory, [`fs::atomic_write_private`]
+//! on the sensitive file — added to `fs.rs` by this phase as the named
+//! helpers the design doc anticipated but this crate didn't have yet):
+//! - `identity/` itself is created via [`fs::secure_private_dir`] (`0700`,
+//!   owner rwx only) BEFORE anything is written into it — a locked-down
+//!   file inside a world-listable directory still leaks the directory's
+//!   own entry names, so the dir gets the same treatment the file does.
+//! - `ed25519.key` — the raw 32-byte private seed, `0600`, written via
+//!   [`fs::atomic_write_private`], which creates its temp file ALREADY at
+//!   `0600` (via `OpenOptions::mode`, not a `chmod` after the fact) so
+//!   there is no window at any wider mode between the write landing and
+//!   the permission lock — see that function's own doc for the exact
+//!   defect an earlier revision of this phase shipped and how the fix
+//!   closes it. Written ONCE at mint and never rewritten afterward;
+//!   `SigningKey::from_bytes` reconstructs the full keypair from it on
+//!   every later load — nothing else needs to persist, since the public
+//!   key and every signature derive from this one seed deterministically.
 //! - `created_at` — a plain ISO-8601 UTC string ([`crate::time::now_iso_utc`]),
-//!   written once alongside the key, 0644 (not sensitive — a mint
-//!   timestamp leaks nothing). Kept as its own tiny file rather than folded
-//!   into a JSON metadata file next to the key so there is exactly ONE file
-//!   this module ever re-derives the public key from (the key itself) —
-//!   no second copy of the pubkey to keep in sync or trust.
+//!   written once alongside the key, `0644` (not sensitive — a mint
+//!   timestamp leaks nothing; the directory's own `0700` already keeps it
+//!   from being LISTED by anyone else regardless). Kept as its own tiny
+//!   file rather than folded into a JSON metadata file next to the key so
+//!   there is exactly ONE file this module ever re-derives the public key
+//!   from (the key itself) — no second copy of the pubkey to keep in sync
+//!   or trust.
 //!
 //! **Keygen** seeds a 32-byte array via `getrandom::fill` and builds the
 //! key with `SigningKey::from_bytes` — see the workspace `Cargo.toml`'s own
@@ -196,8 +207,14 @@ pub fn load_or_mint() -> io::Result<(Keypair, bool)> {
 /// from [`load_or_mint`]'s not-found branch — every other caller goes
 /// through the idempotent `load_or_mint`.
 fn mint() -> io::Result<(Keypair, bool)> {
-    let dir = identity_dir();
-    std::fs::create_dir_all(&dir)?;
+    // Locks the directory itself down to 0700 — `atomic_write_private`
+    // below only ever secures the FILE it writes; nothing else in this
+    // crate secured `identity/` as a directory, so on a state dir whose
+    // default mode is whatever `create_dir_all` leaves it at (0755 under
+    // this box's normal umask), the directory's entries would stay
+    // world-listable even with `ed25519.key` itself locked to 0600
+    // (review rider — RIDER 1).
+    fs::secure_private_dir(&identity_dir())?;
 
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed)
@@ -267,6 +284,27 @@ mod tests {
 
         let mode = std::fs::metadata(key_path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "ed25519.key must be 0600, got {mode:o}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_identity_directory_itself_is_locked_to_0700() {
+        // RIDER 1 (review): the file lock alone isn't enough — the
+        // directory it lives in must be locked down too, or its entries
+        // stay world-listable under `create_dir_all`'s umask-derived
+        // default.
+        use std::os::unix::fs::PermissionsExt;
+        let _g = crate::env_lock().lock().unwrap();
+        let _s = aoide_test_support::EnvSaver::capture(&["AOIDE_STATE_DIR"]);
+        let root = aoide_test_support::unique_tmp("identity-dir-0700");
+        env(&root);
+
+        let (_kp, minted) = load_or_mint().unwrap();
+        assert!(minted);
+
+        let mode = std::fs::metadata(identity_dir()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "identity/ must be 0700, got {mode:o}");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -385,28 +423,55 @@ mod tests {
 
     // ── The mechanical private-material gate ────────────────────────────
 
+    /// `true` when `field_name` (lowercased already) is explicitly
+    /// permitted despite mentioning `key`/`seed` — the PUBLIC half of a
+    /// keypair is exactly what [`IdentityInfo`] is FOR, so `pubkey_hex`/
+    /// `pubkeyHex`/`public_key`/`publicKey`-shaped names must not trip the
+    /// gate below. Anything not on this allowlist that mentions `key` or
+    /// `seed` is refused — a closed allowlist, not a growing denylist of
+    /// specific bad names (RIDER 2 review fix: the old denylist named
+    /// `signing_key`/`private_key`/`secret_key`/`seed` explicitly and would
+    /// have missed a struct with a field simply named `key`).
+    fn field_name_is_allowed_to_mention_key_or_seed(lower_field_name: &str) -> bool {
+        lower_field_name.contains("pubkey") || lower_field_name.contains("public_key")
+    }
+
+    /// Extract a struct field's name from one line of its body, or `None`
+    /// when the line isn't a simple `[pub] name: Type,`-shaped field
+    /// declaration (an attribute line, a blank line, the `struct Foo {`
+    /// opener, the closing `}`, etc. all correctly yield `None`).
+    fn field_name_on_line(line: &str) -> Option<&str> {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with('#') || l.starts_with("//") || l.contains("struct ") || l == "{" || l == "}" {
+            return None;
+        }
+        let stripped = l.strip_prefix("pub ").unwrap_or(l);
+        let colon = stripped.find(':')?;
+        let name = stripped[..colon].trim();
+        if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return None; // not a plain identifier — nothing to false-positive on
+        }
+        Some(name)
+    }
+
     /// Reads THIS FILE'S OWN source and fails if any `#[derive(...)]`
     /// attribute that mentions `Serialize`/`Deserialize` decorates a struct
-    /// whose field names look like they could hold key material. This is
-    /// the module doc's "MECHANICAL gate": today [`IdentityInfo`] is the
-    /// only such struct, and it must stay that way — a future field added
-    /// to it (or a future `derive(Serialize)` struct added anywhere in this
-    /// file) that is named `signing_key`/`private_key`/`secret_key`/`seed`
-    /// (case-insensitively, and their un-underscored spellings) trips this
-    /// test rather than silently shipping.
+    /// with a FIELD NAME containing `key` or `seed` (case-insensitive)
+    /// that isn't on the public-key allowlist above. This is the module
+    /// doc's "MECHANICAL gate": today [`IdentityInfo`] is the only such
+    /// struct, and it must stay that way — a future field named
+    /// `signing_key`/`private_key`/`secret_key`/`seed`, OR simply `key`,
+    /// added to it (or to a future `derive(Serialize)` struct added
+    /// anywhere in this file) trips this test rather than silently
+    /// shipping. Checking FIELD NAMES rather than scanning the whole
+    /// struct body as one blob (the gate's original shape) is what catches
+    /// a bare `key` field — a whole-body substring scan for `"key"` would
+    /// also match `pubkey_hex`'s legitimate mention and every doc comment
+    /// reproduced inside the block, so it isn't a workable denylist shape
+    /// once `key` alone must be caught.
     #[test]
     fn no_private_material_in_any_serialize_type() {
         let src = include_str!("identity.rs");
-        let banned = [
-            "signingkey",
-            "signing_key",
-            "privatekey",
-            "private_key",
-            "secretkey",
-            "secret_key",
-            "seed:",
-            "seed :",
-        ];
 
         // Real code lines only — a doc comment (`//!`/`///`) or a plain `//`
         // comment mentioning "derive(Serialize)" in PROSE (this very test's
@@ -428,7 +493,7 @@ mod tests {
                 // body up to the matching `}` (flat — no nested braces
                 // appear inside any field list in this file today).
                 let mut j = i + 1;
-                let mut body = String::new();
+                let mut body_lines = Vec::new();
                 let mut opened = false;
                 while j < lines.len() {
                     let l = lines[j];
@@ -436,24 +501,48 @@ mod tests {
                         opened = true;
                     }
                     if opened {
-                        body.push_str(l);
-                        body.push('\n');
+                        body_lines.push(l);
                     }
                     if opened && l.contains('}') {
                         break;
                     }
                     j += 1;
                 }
-                let lower = body.to_lowercase();
-                for needle in banned {
-                    assert!(
-                        !lower.contains(needle),
-                        "a #[derive(Serialize/Deserialize)] struct in identity.rs contains `{needle}` — private key material must never enter a Serialize/Deserialize type (PAIRING.md's kill-list). Offending block:\n{body}"
-                    );
+                for body_line in &body_lines {
+                    let Some(field_name) = field_name_on_line(body_line) else {
+                        continue;
+                    };
+                    let lower = field_name.to_lowercase();
+                    let mentions_key_or_seed = lower.contains("key") || lower.contains("seed");
+                    if mentions_key_or_seed && !field_name_is_allowed_to_mention_key_or_seed(&lower) {
+                        panic!(
+                            "a #[derive(Serialize/Deserialize)] struct in identity.rs has a field named `{field_name}` — private key material must never enter a Serialize/Deserialize type (PAIRING.md's kill-list), and this field name isn't on the pubkey/public_key allowlist. Offending block:\n{}",
+                            body_lines.join("\n")
+                        );
+                    }
                 }
                 i = j;
             }
             i += 1;
         }
+    }
+
+    #[test]
+    fn the_gate_allows_pubkey_shaped_names_but_refuses_a_bare_key_field() {
+        // Proves the allowlist/denylist boundary directly, independent of
+        // this file's real structs — a plain `key`-named field (the exact
+        // shape RIDER 2 flagged as missed by the old whole-body scan) must
+        // be refused, while `pubkey_hex`/`public_key` must not be.
+        assert!(!field_name_is_allowed_to_mention_key_or_seed("key"));
+        assert!(!field_name_is_allowed_to_mention_key_or_seed("signing_key"));
+        assert!(!field_name_is_allowed_to_mention_key_or_seed("seed"));
+        assert!(field_name_is_allowed_to_mention_key_or_seed("pubkey_hex"));
+        assert!(field_name_is_allowed_to_mention_key_or_seed("public_key"));
+
+        assert_eq!(field_name_on_line("pub pubkey_hex: String,"), Some("pubkey_hex"));
+        assert_eq!(field_name_on_line("    key: [u8; 32],"), Some("key"));
+        assert_eq!(field_name_on_line("#[serde(rename = \"pubkeyHex\")]"), None);
+        assert_eq!(field_name_on_line("pub struct IdentityInfo {"), None);
+        assert_eq!(field_name_on_line("}"), None);
     }
 }

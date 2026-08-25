@@ -238,6 +238,26 @@ pub fn draft_dir(song: &str, draft: &str) -> std::path::PathBuf {
 /// verbatim into the runtime tree, `crate::widgets`-equivalent callers) route
 /// through here directly instead of paying a lossy UTF-8 round-trip.
 pub fn atomic_write_bytes(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    atomic_write_bytes_impl(path, contents, None)
+}
+
+/// Shared write-temp-then-rename core for [`atomic_write_bytes`] and
+/// [`atomic_write_private`]. `create_mode` is `None` for the ordinary
+/// (`atomic_write_bytes`) path — the temp is created via `File::create`,
+/// whatever mode the process umask leaves it at, matching every existing
+/// caller's behavior byte-for-byte — and `Some(0o600)` for the private
+/// path, which creates the temp ALREADY locked down via
+/// `OpenOptions::mode` (review fix: an earlier revision created the temp at
+/// the default mode and `chmod`ed the FINAL path only after the rename,
+/// leaving the private seed briefly world/group-readable under this box's
+/// 022 umask between the rename landing and the chmod call — see
+/// [`atomic_write_private`]'s own doc for the exact defect and why creating
+/// the temp pre-locked closes the window instead of narrowing it).
+fn atomic_write_bytes_impl(
+    path: &std::path::Path,
+    contents: &[u8],
+    create_mode: Option<u32>,
+) -> std::io::Result<()> {
     let target = match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => {
             let link = std::fs::read_link(path)?;
@@ -253,11 +273,7 @@ pub fn atomic_write_bytes(path: &std::path::Path, contents: &[u8]) -> std::io::R
         std::fs::create_dir_all(parent)?;
     }
     let tmp = target.with_extension(format!("tmp.{}", std::process::id()));
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(contents)?;
-        f.sync_all()?;
-    }
+    write_temp_file(&tmp, contents, create_mode)?;
     let res = std::fs::rename(&tmp, &target);
     if res.is_err() {
         // The rename failed; drop the temp we just wrote so a failed write never
@@ -268,32 +284,85 @@ pub fn atomic_write_bytes(path: &std::path::Path, contents: &[u8]) -> std::io::R
     res
 }
 
+/// Create `tmp` and write `contents` into it, optionally via
+/// `OpenOptions::mode(create_mode)` when `create_mode` is `Some` — the ONE
+/// place [`atomic_write_bytes_impl`] creates a temp file, factored out so a
+/// test can call it directly and inspect the temp's mode BEFORE any rename
+/// happens, rather than only observing the final path after the whole
+/// write-then-rename round trip completes (see
+/// `fs::tests::the_private_temp_is_created_already_0600_before_any_rename`).
+/// `create_mode` is `None`'s ordinary case: `File::create`'s default,
+/// whatever the process umask leaves it at, matching every existing
+/// `atomic_write_bytes` caller's behavior byte-for-byte.
+fn write_temp_file(
+    tmp: &std::path::Path,
+    contents: &[u8],
+    create_mode: Option<u32>,
+) -> std::io::Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    if let Some(mode) = create_mode {
+        use std::os::unix::fs::OpenOptionsExt;
+        // `open(2)`'s O_CREAT mode is still subject to the process umask,
+        // but 0600 carries no group/other bits for a umask to strip in the
+        // first place — the temp is created AT 0600, not narrowed to it
+        // afterward, so there is no instant where it exists on disk under
+        // any wider mode.
+        opts.mode(mode);
+    }
+    let mut f = opts.open(tmp)?;
+    f.write_all(contents)?;
+    f.sync_all()
+}
+
 /// `&str` convenience wrapper over [`atomic_write_bytes`] — every existing
 /// JSON/text stage-file writer routes through here.
 pub fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     atomic_write_bytes(path, contents.as_bytes())
 }
 
-/// Atomic write of a SENSITIVE file: [`atomic_write_bytes`], then locked to
-/// `0600` (owner rw only) — this crate's own precedent for private material
-/// that must never enter a `Serialize`/`Deserialize` type (the identity
-/// keypair's private-key file, `identity.rs`'s own module doc is the first
-/// caller), mirroring the `aoide-secrets` crate's `home::secure_file`
-/// discipline for a file rather than that crate's whole home directory. The
-/// permission lock is a SEPARATE syscall after the rename (POSIX `rename()`
-/// preserves the destination's existing mode when replacing a file, so a
-/// second write to an already-locked-down path is a no-op chmod, not a
-/// window where the new bytes are briefly world-readable under the OLD
-/// file's permissions — the very first write is the only case that matters,
-/// and it locks down immediately after the rename lands, same as every
-/// other `set_permissions`-after-write call site in this workspace). A
-/// failed chmod is a real error, not swallowed — a private file left at
-/// whatever mode `atomic_write_bytes` happened to create it under is never
-/// treated as "good enough."
+/// Atomic write of a SENSITIVE file, locked to `0600` (owner rw only) with
+/// NO window at any wider mode — this crate's own precedent for private
+/// material that must never enter a `Serialize`/`Deserialize` type (the
+/// identity keypair's private-key file, `identity.rs`'s own module doc is
+/// the first caller), mirroring `aoide-secrets/src/store.rs`'s
+/// `save_policies`/`save_totp_secret` discipline: secure the TEMP file
+/// BEFORE the rename, never the final path after it. Here that means
+/// creating the temp with `OpenOptions::mode(0o600)` set from the very
+/// first `open(2)` call (see [`atomic_write_bytes_impl`]'s doc) rather than
+/// `File::create`-then-`chmod` — since `rename(2)` preserves the SOURCE
+/// file's mode when replacing a destination, the temp already being 0600
+/// means the destination is 0600 the instant the rename lands, never
+/// briefly world/group-readable under the process umask the way a
+/// create-then-chmod-the-final-path ordering would leave it (review fix:
+/// an earlier revision of this function did exactly that — wrote the temp
+/// at `File::create`'s default mode, renamed onto the live path, and
+/// `chmod`ed only afterward, leaving `state/identity/ed25519.key` briefly
+/// world/group-readable on a 022-umask box between the rename and the
+/// chmod). Every OTHER concern (symlink transparency, stale-temp sweeping,
+/// the rename-failure cleanup) is identical to [`atomic_write_bytes`] —
+/// both route through the same [`atomic_write_bytes_impl`] core.
 pub fn atomic_write_private(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
-    atomic_write_bytes(path, contents)?;
+    atomic_write_bytes_impl(path, contents, Some(0o600))
+}
+
+/// Create `dir` (if absent) and lock it down to `0700` (owner rwx only) —
+/// the directory-level half of [`atomic_write_private`]'s discipline
+/// (review rider: nothing else in this crate secured the DIRECTORY a
+/// private file lives in, only the file itself, so a state dir left at
+/// `create_dir_all`'s umask-derived default — 0755 under this box's normal
+/// 022 — would leave `identity/`'s directory entries world-LISTABLE even
+/// with `ed25519.key` itself locked to 0600). Mirrors `aoide-secrets`'s
+/// `home::secure_dir` for one directory inside this crate's own state tree
+/// rather than that crate's whole secrets home. `create_dir_all` is
+/// idempotent on an already-present directory, and so is the chmod that
+/// follows it — calling this on every mint (not only the very first one)
+/// costs nothing and never regresses a directory some earlier run already
+/// locked down.
+pub fn secure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
 /// Run `f` while holding an exclusive advisory lock on the stage directory,
@@ -859,6 +928,68 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(std::fs::read(&path).unwrap(), b"replaced");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_private_temp_is_created_already_0600_before_any_rename() {
+        // The review-bounced defect: an earlier revision of
+        // `atomic_write_private` created its temp at `File::create`'s
+        // umask-derived default mode and `chmod`ed the FINAL path only
+        // AFTER the rename, leaving the live private-key path briefly
+        // world/group-readable under this box's 022 umask between the
+        // rename landing and the chmod call. Calling `write_temp_file`
+        // directly — the one place `atomic_write_bytes_impl` ever creates a
+        // temp — proves the mode is right at the moment of CREATION, before
+        // any rename has happened at all, rather than only checking the
+        // final path after the whole write-then-rename round trip returns
+        // (which the OLD, buggy code would also have passed, since its
+        // chmod ran before returning — the defect was a window DURING the
+        // call, not a wrong end state).
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aoide-write-temp-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join("secret.key.tmp");
+
+        write_temp_file(&tmp, b"private seed bytes", Some(0o600)).unwrap();
+        let mode = std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the TEMP file itself must already be 0600 the instant it's created, got {mode:o}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_private_locks_the_final_path_to_0600_under_a_permissive_umask() {
+        // Complements the test above: end-to-end through the public
+        // `atomic_write_private` entry point, forcing a wide-open umask
+        // (000 — even more permissive than this box's normal 022, so a
+        // regression to "create at the umask default, chmod after" would
+        // show up as a would-be-0666 window rather than a merely-0644 one)
+        // to prove the FINAL path is 0600 regardless of what the process
+        // umask would otherwise have widened a plain `File::create` to.
+        let _g = crate::env_lock().lock().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aoide-atomic-private-umask-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret.key");
+
+        // SAFETY: umask(2) takes a plain mode_t and cannot fail; restored
+        // unconditionally immediately after, under the same env_lock every
+        // other process-global-state test in this crate already serializes
+        // behind (umask is process-wide, wider even than an env var).
+        let old_umask = unsafe { libc::umask(0o000) };
+        let result = atomic_write_private(&path, b"private seed bytes");
+        unsafe { libc::umask(old_umask) };
+        result.unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the file at its FINAL path must be 0600 immediately after mint even under an 000 umask, got {mode:o}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -24,12 +24,28 @@
   `identity.rs`) that could plausibly carry key material gets checked
   against this test before it lands, not after.
 - **`fs::atomic_write_private` is the ONE way a sensitive file gets written
-  in this crate** (`identity.rs`'s `ed25519.key` is its first caller) —
-  atomic write, then locked to `0600`, mirroring `aoide-secrets`'s
-  `home::secure_file` discipline for one file rather than a whole home
-  directory. A future sensitive file in this crate routes through it
-  rather than hand-rolling its own `atomic_write_bytes` + `set_permissions`
-  pair.
+  in this crate** (`identity.rs`'s `ed25519.key` is its first caller) — the
+  TEMP file is created ALREADY at `0600` (`OpenOptions::mode`, not
+  `File::create`-then-`chmod`), so a `rename(2)` onto the live path never
+  passes through a wider-mode window, mirroring `aoide-secrets/src/
+  store.rs`'s `save_policies`/`save_totp_secret` (secure the temp BEFORE
+  the rename, never the final path after it). **A review bounce caught
+  the wrong ordering once already** (an earlier revision created the temp
+  at the default mode and `chmod`ed the FINAL path only after the rename,
+  leaving a real private-key file briefly world/group-readable under this
+  box's 022 umask) — don't reintroduce a `File::create` + post-rename
+  `set_permissions` pair for a new sensitive file "since it worked for
+  `atomic_write_bytes`"; that shape is exactly the defect this function
+  exists to close, and `fs::tests::the_private_temp_is_created_already_0600_before_any_rename`
+  pins the fix directly against the temp, not just the end state.
+- **`fs::secure_private_dir` locks the DIRECTORY a sensitive file lives
+  in, not only the file** (`identity.rs`'s `mint()` calls it on
+  `identity_dir()` before writing anything into it) — a `0600` file inside
+  a `create_dir_all`-default (`0755`) directory still leaves that
+  directory's entries world-listable. A future sensitive file that lives
+  in its OWN new subdirectory (not an existing already-secured one) calls
+  this on that subdirectory the same way, before the first
+  `atomic_write_private` into it.
 - **`ledger` is append-only and never a lookup key for live state (P-D8).**
   `append_ledger_entry` only ever opens `state/session-ledger.jsonl` in
   append mode — nothing in this crate truncates, rewrites, or prunes it;
