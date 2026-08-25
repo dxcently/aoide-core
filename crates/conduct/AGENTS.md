@@ -18,20 +18,39 @@
 - **A killed terminal never self-reports `done`.** `reap` is the only
   sanctioned sweep of dead sessions; don't add a second liveness mechanism.
 - **A nested headless session is windowless BY CONSTRUCTION — never
-  pid-ancestry-walk it to a window (task #89).** `window::windowless_by_lineage`/
-  `_from_parent` is the ONE gate: a session whose `parentSessionId` chain
-  passes through a conducted (`conductable`) wrap with an EMPTY
-  `windowAddress` must skip the backfill outright, everywhere a window gets
-  discovered for it — `graph/window.rs::ensure_session_window`, the two
-  `discover_window()` call sites in `graph/send.rs`'s hook Start handling,
-  AND `resolve_pending_session_windows` (the shellbridge event listener).
-  Miss any one of those four and a nested `conduct --headless`/`graph spawn`
-  re-acquires the ENCLOSING terminal's window, which is exactly what made
-  the same-window eviction (below) treat an agent and its own headless
-  grandchild as stale twins. `reap`'s own dedup pass (`superseded_*`) needs
-  NO parallel lineage check — it groups by `windowAddress`, and a windowless
-  session by construction never enters a group at all; don't add a second
-  mechanism there either.
+  pid-ancestry-walk it to a window (task #89, corrected in review round 2).**
+  It is NOT enough to gate the four historical backfill call sites — a
+  headless wrap's OWN record needs the same protection its descendants get,
+  or the whole mechanism re-poisons on a live compositor. Two parts, both
+  required:
+  - **The discovery gate.** `graph/conduct.rs::session_conduct` must never
+    call window discovery for a `--headless` registration in the first
+    place — gated on `!headless`, right where the winsize/headless branch
+    already lives. `setsid()` detaches the tty/session-leader relationship,
+    not the OS parent-child (`/proc` ppid) one, so an unconditional
+    discovery call on a headless wrap resolves straight through to its
+    ENCLOSING terminal's window — the review-round-2 defect. The same call
+    site stamps the permanent `headless: bool` marker via
+    `session_store::stamp_headless` (change-only, written once, never
+    cleared) right after registration.
+  - **The listener self-check.** `window::windowless_by_lineage` checks a
+    session's OWN record FIRST (via `is_windowless_wrap`: `conductable` and
+    (`headless` OR its own `windowAddress` empty)) before ever walking its
+    parent chain — so the wrap's own record is caught by the same function
+    that catches its descendants, not by a bolted-on second mechanism. Every
+    backfill site routes through this one function: `resolve_pending_session_windows`
+    (the shellbridge event listener), `graph/window.rs::ensure_session_window`,
+    and the two `discover_window()` call sites in `graph/send.rs`'s hook
+    Start handling. Miss the discovery gate, the self-check, OR any one of
+    the four backfill sites, and a nested `conduct --headless`/`graph spawn`
+    re-acquires the ENCLOSING terminal's window — which is exactly what made
+    the same-window eviction (below) treat an agent and its own headless
+    grandchild as stale twins, and (via `reap`'s dedup pass, next bullet)
+    then retire one of them.
+  - `headless` deliberately overrides a stray non-empty `windowAddress`:
+    it is a PERMANENT self-reported registration fact, not a live re-check,
+    so a bug elsewhere that stamps a window onto a headless wrap's record
+    still can't make `is_windowless_wrap` say otherwise.
 - **The same-window eviction carve-out is the new record's WHOLE lineage,
   not just its direct parent (task #89).** `session_store::lineage_of`
   (ancestors + descendants, walking `parentSessionId`) is what
@@ -41,7 +60,15 @@
   grandparent/grandchild (or cousins through a shared ancestor), not direct
   parent/child. A genuine same-window twin with NO lineage relation (a
   compact/resume pair) still collapses instantly — don't widen the carve-out
-  further than actual graph membership.
+  further than actual graph membership. `reap`'s own same-window dedup pass
+  (`superseded_agent_duplicates`) carries the IDENTICAL `lineage_of`
+  carve-out as defense in depth (review round 2) — a windowless-by-
+  construction session never enters a same-window dedup group to begin
+  with, but if the discovery gate or the listener self-check above ever
+  regresses and lets one acquire a window anyway, `reap` still won't retire
+  its own lineage. Both carve-outs must move together: widening or
+  narrowing `lineage_of` changes both call sites at once, by construction —
+  don't let one drift from the other with a hand-rolled duplicate.
 - **`hookAncestry` is stamped ONCE, at a hook session's own registration,
   never touched again.** `session_store::stamp_hook_ancestry` is the only
   writer (change-only: it refuses to overwrite an already-populated

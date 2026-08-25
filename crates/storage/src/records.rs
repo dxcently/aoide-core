@@ -13,6 +13,13 @@ use serde_json::{Map, Value};
 /// graph.json / projects.json stage-file format version (CONTRACTS.md §4).
 pub const STAGE_GRAPH_VERSION: &str = "0";
 
+/// `skip_serializing_if` helper for a plain (non-`Option`) `bool` field whose
+/// common case is `false` — keeps the common case off the wire without the
+/// `Option<bool>` round-trip ceremony every other additive flag here uses.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// One registered project anchor root (`song/stage/projects.json`).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Project {
@@ -193,6 +200,22 @@ pub struct SessionRecord {
     /// on every non-agent kind (shells/subagents never stamp it).
     #[serde(rename = "hookAncestry", default, skip_serializing_if = "Vec::is_empty")]
     pub hook_ancestry: Vec<i32>,
+    /// True for a HEADLESS `aoide conduct` wrap's own record — a PERMANENT,
+    /// self-reported registration fact (stamped once, at `--headless`
+    /// registration, never cleared) distinct from "`windowAddress` happens
+    /// to be empty right now": a bug in window discovery or the backfill
+    /// listener could otherwise stamp a stray window onto a headless wrap
+    /// (task #89, review round 2 — an unconditional discovery call did
+    /// exactly that, finding the ENCLOSING terminal's window through the
+    /// wrap's own `/proc` ancestry). `windowless_by_lineage` and
+    /// `resolve_pending_session_windows` both key off THIS field first, not
+    /// `windowAddress` emptiness, so a headless wrap's windowlessness (and
+    /// its whole hook-child subtree's) survives even a corrupted address.
+    /// Additive/v0-safe: `false`/absent for every INTERACTIVE session and
+    /// every legacy record (`skip_serializing_if` keeps a `false` value off
+    /// the wire entirely — no "false" noise on the common case).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub headless: bool,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -294,6 +317,36 @@ mod tests {
         let legacy: SessionRecord =
             serde_json::from_str(r#"{ "sessionId": "s", "windowAddress": "0x1" }"#).unwrap();
         assert!(legacy.hook_ancestry.is_empty());
+    }
+    #[test]
+    fn session_record_headless_round_trips_and_stays_absent_when_unset() {
+        // serde: `headless` serialises as `true` only when set — the common
+        // `false` case is skipped entirely (skip_serializing_if = "is_false"),
+        // keeping every ordinary interactive record's wire form unchanged.
+        // This is the PERMANENT registration-fact flag (task #89 review round
+        // 2) that lets `windowless_by_lineage` answer true for a headless
+        // conducted wrap's OWN record, not just its descendants' parent chain.
+        let mut rec = SessionRecord {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        rec.headless = true;
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("\"headless\":true"), "serialised: {json}");
+        let back: SessionRecord = serde_json::from_str(&json).unwrap();
+        assert!(back.headless);
+
+        // The default/unset case omits the key entirely (no `false` noise)
+        // and a legacy record with no `headless` field parses to `false`.
+        let bare = SessionRecord {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        let bare_json = serde_json::to_string(&bare).unwrap();
+        assert!(!bare_json.contains("headless"), "serialised: {bare_json}");
+        let legacy: SessionRecord =
+            serde_json::from_str(r#"{ "sessionId": "s", "windowAddress": "0x1" }"#).unwrap();
+        assert!(!legacy.headless);
     }
     #[test]
     fn session_record_needs_sudo_round_trips_and_stays_absent_when_unset() {

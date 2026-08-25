@@ -394,16 +394,28 @@ pub(in crate::graph) fn resolve_registration_parent(
         .filter(|p| !p.is_empty() && p != id)
 }
 
+/// Is `rec` itself a headless conducted wrap — the PERMANENT windowless
+/// anchor a lineage walk stops at? Checks the `headless` flag FIRST (task
+/// #89, review round 2: a registration-fact, stamped once, that survives a
+/// corrupted `windowAddress`) and falls back to `windowAddress` emptiness
+/// only for a record from before that field existed (or a conducted wrap
+/// that legitimately hasn't resolved its window yet — an INTERACTIVE
+/// `conduct`/`wrap` still degrades to the old empty-address signal).
+fn is_windowless_wrap(rec: &SessionRecord) -> bool {
+    rec.conductable == Some(true) && (rec.headless || rec.window_address.is_empty())
+}
+
 /// True when `parent`'s lineage runs through a conducted wrap (`conductable`)
-/// with an EMPTY `windowAddress` before reaching any windowed anchor — the
-/// session is windowless BY CONSTRUCTION (a nested headless `conduct`/
-/// `spawn`, task #89), so the caller must skip the window backfill outright
-/// rather than pid-ancestry-walking to the wrong window (the ENCLOSING
-/// terminal's — the exact bug that made a headless nested session collide,
-/// same-window, with the very agent it runs beneath). Walks
+/// that is windowless — either `headless` (the permanent registration fact)
+/// or, for a legacy record, an EMPTY `windowAddress` — before reaching any
+/// windowed anchor. The session is windowless BY CONSTRUCTION (a nested
+/// headless `conduct`/`spawn`, task #89), so the caller must skip the window
+/// backfill outright rather than pid-ancestry-walking to the wrong window
+/// (the ENCLOSING terminal's — the exact bug that made a headless nested
+/// session collide, same-window, with the very agent it runs beneath). Walks
 /// `parentSessionId` from `parent` itself, bounded against a cycle; stops at
-/// the FIRST conducted-wrap ancestor found — its window (present or empty)
-/// decides outright. No conducted-wrap ancestor at all (no parent, a
+/// the FIRST conducted-wrap ancestor found — [`is_windowless_wrap`] decides
+/// outright, whichever way. No conducted-wrap ancestor at all (no parent, a
 /// dangling link, or a chain that never crosses one) keeps today's
 /// backfill — there is no evidence of windowlessness to act on.
 pub(in crate::graph) fn windowless_by_lineage_from_parent(
@@ -422,7 +434,7 @@ pub(in crate::graph) fn windowless_by_lineage_from_parent(
             return false; // dangling parent link
         };
         if rec.conductable == Some(true) {
-            return rec.window_address.is_empty();
+            return is_windowless_wrap(rec);
         }
         match &rec.parent_session_id {
             Some(p) => current = p.clone(),
@@ -431,14 +443,23 @@ pub(in crate::graph) fn windowless_by_lineage_from_parent(
     }
 }
 
-/// Same check, starting from an ALREADY-REGISTERED session's own record (its
-/// `parentSessionId`) rather than a raw parent id — the shape
-/// `ensure_session_window`/`resolve_pending_session_windows` need. `false`
-/// (keep today's backfill) for an unknown `id`.
+/// Same check, starting from an ALREADY-REGISTERED session's own record
+/// rather than a raw parent id — the shape `ensure_session_window`/
+/// `resolve_pending_session_windows` need. `false` (keep today's backfill)
+/// for an unknown `id`. Answers `true` in TWO cases: `id` is ITSELF a
+/// windowless conducted wrap (task #89, review round 2 — the sweep in
+/// `resolve_pending_session_windows` iterates every record with an empty
+/// address, the wrap's own included, so its self-windowlessness must be
+/// checked directly, not only inferred from a child's parent chain), or its
+/// `parentSessionId` chain is (delegates to
+/// [`windowless_by_lineage_from_parent`]).
 pub(in crate::graph) fn windowless_by_lineage(id: &str, sessions: &[SessionRecord]) -> bool {
     let Some(rec) = sessions.iter().find(|s| s.session_id == id) else {
         return false;
     };
+    if is_windowless_wrap(rec) {
+        return true;
+    }
     windowless_by_lineage_from_parent(rec.parent_session_id.as_deref(), sessions)
 }
 
@@ -698,12 +719,21 @@ pub fn resolve_pending_session_windows() -> bool {
             Ok(f) => f,
             Err(_) => return false,
         };
-        // Windowless-by-construction ids (task #89): computed off an
-        // immutable snapshot BEFORE the mutable loop below — a nested
-        // headless session's own recorded pid (self-reported by the
-        // harness, independent of window discovery) would otherwise still
+        // Windowless-by-construction ids (task #89, review round 2):
+        // computed off an immutable snapshot BEFORE the mutable loop below.
+        // Two distinct cases `windowless_by_lineage` now catches: (a) a
+        // nested headless session's own recorded pid (self-reported by the
+        // harness, independent of window discovery) would otherwise
         // pid-ancestry-walk straight to the ENCLOSING terminal's window
-        // here, the same collision `ensure_session_window` guards against.
+        // here — the same collision `ensure_session_window` guards against;
+        // and (b) a headless `conduct` wrap's OWN record ALSO carries a pid
+        // (conduct's own, stamped at registration) and an empty address —
+        // this sweep would otherwise "discover" and stamp the SAME
+        // enclosing-terminal window onto the wrap itself, which is exactly
+        // what re-poisons (a)'s check downstream (it inspects the parent's
+        // `headless`/`windowAddress`). `windowless_by_lineage`'s own
+        // self-check (`is_windowless_wrap`) is what catches (b) — this
+        // sweep never needs a second, parallel `headless` filter here.
         let windowless: HashSet<String> = file
             .sessions
             .iter()
@@ -1595,6 +1625,98 @@ mod tests {
         wrap.window_address = String::new();
         let child = session("child", "/w", "working", "2", Some("wrap"));
         assert!(windowless_by_lineage("child", &[wrap, child]));
+    }
+
+    /// Review round 2 of task #89: `headless` is the PERMANENT registration
+    /// fact — it must decide windowlessness even when `windowAddress` has
+    /// (wrongly) been stamped with something, the exact "re-poison" shape
+    /// the review flagged (an unconditional discovery call, or the listener
+    /// sweep, backfilling the ENCLOSING terminal's window onto a headless
+    /// wrap's own record before this fix).
+    #[test]
+    fn headless_flag_overrides_a_stray_nonempty_window_address() {
+        let mut wrap = session("wrap", "/w", "working", "1", None);
+        wrap.conductable = Some(true);
+        wrap.headless = true;
+        wrap.window_address = "0xSTALE".to_string(); // corrupted/stray — must not matter
+        assert!(
+            is_windowless_wrap(&wrap),
+            "a headless wrap is windowless regardless of a stray windowAddress"
+        );
+
+        let child = session("child", "/w", "working", "2", Some("wrap"));
+        assert!(
+            windowless_by_lineage("child", &[wrap.clone(), child]),
+            "the child's own backfill check must see through the parent's stray address"
+        );
+
+        // The self-check on `windowless_by_lineage` (not just `_from_parent`)
+        // also answers true for the WRAP's own record — the shape
+        // `resolve_pending_session_windows`'s sweep needs, since it iterates
+        // every record with an empty address (or, here, a stray non-empty
+        // one it might otherwise "confirm") including the wrap itself.
+        assert!(is_windowless_wrap(&wrap));
+
+        // An INTERACTIVE conducted wrap (no `headless` flag) still falls
+        // back to plain `windowAddress` emptiness — unchanged, pre-existing
+        // behavior for a legacy record or a real interactive `conduct`.
+        let mut interactive = session("term", "/w", "working", "1", None);
+        interactive.conductable = Some(true);
+        interactive.window_address = String::new();
+        assert!(is_windowless_wrap(&interactive));
+        interactive.window_address = "0xREAL".to_string();
+        assert!(!is_windowless_wrap(&interactive));
+    }
+
+    /// `resolve_pending_session_windows`'s SKIP decision for a headless
+    /// wrap's own record is `windowless_by_lineage`'s self-check (proven
+    /// directly above) — the listener function itself is deliberately NOT
+    /// exercised end-to-end here: it early-returns the moment
+    /// `hyprctl_clients()` fails (no `HYPRLAND_INSTANCE_SIGNATURE` in a
+    /// CI/test environment), so the mutating loop that consults the
+    /// `windowless` set never even runs off-Hyprland. This test pins the
+    /// one thing that IS honestly testable without a compositor: the
+    /// function is a safe, total no-op — never a panic, never a change —
+    /// on a roster that includes a headless wrap when Hyprland is absent.
+    #[test]
+    fn resolve_pending_session_windows_is_a_safe_noop_off_hyprland() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
+        std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("resolve-pending-noop");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let mut wrap = session("wrap", "/w", "working", "1", None);
+        wrap.conductable = Some(true);
+        wrap.headless = true;
+        wrap.window_address = String::new();
+        wrap.pid = Some(999999);
+        let file = SessionsFile {
+            schema_version: "0".into(),
+            sessions: vec![wrap],
+        };
+        write_stage(&sessions_path(), &file).unwrap();
+
+        assert!(
+            !resolve_pending_session_windows(),
+            "no Hyprland signature → hyprctl_clients() fails → an honest false, never a stray write"
+        );
+        let after: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(
+            after.sessions[0].window_address, "",
+            "the headless wrap's record is untouched"
+        );
+
+        match saved_sig {
+            Some(v) => std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", v),
+            None => std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"),
+        }
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
     }
 
     #[test]

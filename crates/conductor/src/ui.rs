@@ -951,6 +951,7 @@ mod tests {
             log_path: None,
             petname: None,
             hook_ancestry: Vec::new(),
+            headless: false,
             extra: Map::new(),
         }
     }

@@ -82,7 +82,7 @@ pub(crate) use self::common::stage_error;
 pub(crate) use self::doc::{drop_sessions, prune_done, restage_graph};
 pub(crate) use self::model::{hooks_path, STAGE_GRAPH_VERSION};
 pub(crate) use self::session_store::{
-    refresh_subagent_says, refresh_transcript_fields, upsert_hook,
+    lineage_of, refresh_subagent_says, refresh_transcript_fields, upsert_hook,
 };
 pub(crate) use self::window::hyprctl_clients;
 /// Widened from `pub(crate)` to `pub` at P-A1 of the binary-split

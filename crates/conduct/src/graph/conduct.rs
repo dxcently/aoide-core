@@ -9,7 +9,7 @@ use super::doc::restage_graph;
 use super::model::{
     canonical_state, load_stage, sessions_path, write_stage, SessionsFile, STAGE_GRAPH_VERSION,
 };
-use super::session_store::{do_session_end, do_session_start, set_session_log_path};
+use super::session_store::{do_session_end, do_session_start, set_session_log_path, stamp_headless};
 use super::window::{discover_window_address, resolve_registration_parent};
 use aoide_protocol::Invocation;
 use aoide_protocol::output::Outcome;
@@ -821,8 +821,18 @@ pub fn session_conduct(inv: &Invocation) -> Outcome {
     let conductable = listener.is_some();
     let socket_str = socket_path.to_string_lossy().into_owned();
 
-    // Phase ②: best-effort window-address discovery (never fails/slows conduct).
-    let window = discover_window_address();
+    // Phase ②: best-effort window-address discovery (never fails/slows
+    // conduct) — INTERACTIVE only. `headless` has no controlling tty at all,
+    // but its `/proc` ancestry still passes straight through whatever
+    // launched it (a shell, an agent, a terminal) — `setsid()` (below)
+    // detaches its TTY session, never its OS parent — so an unconditional
+    // discovery here found and stamped the ENCLOSING terminal's window onto
+    // a headless wrap's own record (task #89, review round 2): a `graph
+    // spawn` run from inside an agent's shell tool re-acquired its
+    // grandparent terminal's window every time, defeating the windowless-
+    // lineage fix below (its whole premise is that a headless wrap's own
+    // record NEVER holds a window).
+    let window = if headless { None } else { discover_window_address() };
 
     // Automatic parenting (task #89): explicit `--parent` > this registering
     // process's own `/proc` ancestry matched against a live agent's
@@ -863,6 +873,16 @@ pub fn session_conduct(inv: &Invocation) -> Outcome {
         // in the default `conduct-<pid>-<ts>` id.)
         Some(std::process::id()),
     );
+    // Stamp `headless` unconditionally (not only once the log file opens
+    // below) — it is a registration fact about THIS wrap's own record, the
+    // PERMANENT signal `windowless_by_lineage` and
+    // `resolve_pending_session_windows` key off (task #89, review round 2):
+    // even if the discovery gate above or the listener skip below somehow
+    // missed, this field is what makes a headless wrap's own windowlessness
+    // survive a corrupted `windowAddress`.
+    if headless {
+        stamp_headless(&id);
+    }
 
     // `--headless`: no controlling tty at all — the pty's output goes to a
     // per-session log file instead of stdout, and the multiplexer never reads
@@ -1301,6 +1321,64 @@ mod tests {
         assert!(log_path.ends_with("conduct-headless.log"));
         let logged = std::fs::read_to_string(&log_path).unwrap();
         assert!(logged.contains("mark-headless"), "log contents: {logged:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    /// Review round 2 of task #89: `--headless` registration must stamp the
+    /// PERMANENT `headless` marker AND never call window discovery at all.
+    /// The discovery GATE itself (`if headless { None } else {
+    /// discover_window_address() }`) can't be distinguished from "discovery
+    /// ran and simply found nothing" in this test environment (no
+    /// `HYPRLAND_INSTANCE_SIGNATURE` — `discover_window_address()` would
+    /// return `None` either way, gated or not), so this pins the one thing
+    /// that IS honestly observable without a live compositor: the stamped
+    /// `headless` flag, which is what makes the wrap's windowlessness
+    /// permanent regardless of what any discovery path does or doesn't find.
+    #[test]
+    fn headless_conduct_registration_stamps_the_permanent_headless_marker() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR"]);
+
+        let root = unique_stage("conduct-headless-marker");
+        let stage = root.join("stage");
+        let state = root.join("state");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+
+        let out = session_conduct(&conduct_invocation(
+            &["sh", "-c", "sleep 1"],
+            &[("id", "conduct-headless-marker"), ("headless", "true")],
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let rec = s
+            .sessions
+            .iter()
+            .find(|r| r.session_id == "conduct-headless-marker")
+            .unwrap();
+        assert!(rec.headless, "a --headless registration must stamp headless=true");
+        assert_eq!(
+            rec.window_address, "",
+            "off-Hyprland (no HYPRLAND_INSTANCE_SIGNATURE) this holds even ungated — the marker \
+             is the permanent, gate-independent signal windowless_by_lineage actually keys off"
+        );
+
+        // An INTERACTIVE (non-headless) registration never stamps the marker.
+        let out2 = session_conduct(&conduct_invocation(
+            &["sh", "-c", "true"],
+            &[("id", "conduct-interactive-marker")],
+        ));
+        assert_eq!(out2.status, aoide_protocol::output::Status::Ok, "msg: {}", out2.message);
+        let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let rec2 = s2
+            .sessions
+            .iter()
+            .find(|r| r.session_id == "conduct-interactive-marker")
+            .unwrap();
+        assert!(!rec2.headless, "an interactive registration must never stamp headless=true");
 
         let _ = std::fs::remove_dir_all(&root);
     }

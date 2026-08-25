@@ -47,10 +47,10 @@
 use aoide_protocol::Invocation;
 use aoide_protocol::agents::{agent_profile, AgentProfile, CLAUDE_PROFILE};
 use crate::graph::{
-    canonical_state, drop_sessions, hooks_path, hyprctl_clients, load_stage, normalize_addr,
-    now_iso_utc, prune_done, refresh_subagent_says, refresh_transcript_fields, restage_graph,
-    sessions_path, stage_error, upsert_hook, write_stage, HookRecord, HooksFile, SessionRecord,
-    SessionsFile, STAGE_GRAPH_VERSION,
+    canonical_state, drop_sessions, hooks_path, hyprctl_clients, lineage_of, load_stage,
+    normalize_addr, now_iso_utc, prune_done, refresh_subagent_says, refresh_transcript_fields,
+    restage_graph, sessions_path, stage_error, upsert_hook, write_stage, HookRecord, HooksFile,
+    SessionRecord, SessionsFile, STAGE_GRAPH_VERSION,
 };
 use aoide_protocol::output::Outcome;
 use serde_json::{json, Value};
@@ -377,8 +377,19 @@ fn superseded_agent_duplicates(
             )
         };
         let keeper = group.iter().max_by(|a, b| rank(a).cmp(&rank(b))).unwrap();
+        // Defense in depth (task #89, review round 2): never retire a member
+        // of the KEEPER's own lineage as a "duplicate" — the same carve-out
+        // `session_store`'s registration-time eviction applies, reused here
+        // via the SAME `lineage_of` (ancestors + descendants), never a
+        // second computation. By design a windowless-by-construction nested
+        // session never shares a real window with its own launching agent
+        // in the first place (the fix this whole task landed), so this
+        // should be a no-op on a healthy roster — it only matters if
+        // something upstream still manages to stamp a stray shared window
+        // onto a lineage-related pair.
+        let keeper_lineage = lineage_of(&keeper.session_id, sessions);
         for s in group {
-            if s.session_id != keeper.session_id {
+            if s.session_id != keeper.session_id && !keeper_lineage.contains(&s.session_id) {
                 losers.push(s.session_id.clone());
             }
         }
@@ -1682,6 +1693,36 @@ mod tests {
             losers,
             vec!["old-session".to_string()],
             "the newer, still-transcript-less session is the real occupant and must survive"
+        );
+    }
+
+    /// Defense in depth (task #89, review round 2): even if something
+    /// upstream still manages to stamp a shared window onto a lineage-
+    /// related pair — never the healthy-roster case after this task's fix,
+    /// since a windowless-by-construction nested session no longer
+    /// re-acquires its launching agent's window at all — the dedup pass
+    /// must not retire a member of the KEEPER's own lineage. An UNRELATED
+    /// same-window twin with no lineage relation to the keeper still gets
+    /// retired exactly as before.
+    #[test]
+    fn superseded_agent_duplicates_spares_the_keepers_own_lineage_but_not_an_unrelated_twin() {
+        let mut claude = agent("claude", "0xW", "2026-08-24T01:00:00Z");
+        claude.kind = Some("agent".into());
+        let mut nested = agent("nested", "0xW", "2026-08-24T03:00:00Z"); // latest → keeper
+        nested.kind = Some("agent".into());
+        nested.parent_session_id = Some("claude".into());
+        let mut twin = agent("twin", "0xW", "2026-08-24T02:00:00Z"); // no lineage relation
+        twin.kind = Some("agent".into());
+
+        let sessions = vec![claude, nested, twin];
+        let none_recent = |_: &SessionRecord| false;
+        let no_tx = |_: &SessionRecord| false;
+
+        let losers = superseded_agent_duplicates(&sessions, none_recent, no_tx);
+        assert_eq!(
+            losers,
+            vec!["twin".to_string()],
+            "claude survives as the keeper's own ancestor; the unrelated twin still retires"
         );
     }
 

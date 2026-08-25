@@ -259,6 +259,7 @@ mod tests {
             log_path: Some(path.to_string_lossy().into_owned()),
             petname: None,
             hook_ancestry: Vec::new(),
+            headless: false,
             extra: serde_json::Map::new(),
         }
     }

@@ -44,7 +44,13 @@ use aoide_storage::time::iso_utc_from_epoch;
 /// `parentSessionId` chain must never loop forever); the descendant walk is
 /// naturally bounded by the finite session list. `id` itself is never
 /// inserted (the caller already excludes `s.session_id != id` separately).
-fn lineage_of(id: &str, sessions: &[SessionRecord]) -> HashSet<String> {
+///
+/// `pub(crate)`, not private or `pub(in crate::graph)`: `crate::reap`'s own
+/// `superseded_agent_duplicates` (review round 2 of task #89) — a SIBLING
+/// module, not a descendant of `graph` — reuses this SAME lineage set as its
+/// own defense-in-depth carve-out — never a second, parallel lineage
+/// computation.
+pub(crate) fn lineage_of(id: &str, sessions: &[SessionRecord]) -> HashSet<String> {
     let mut out = HashSet::new();
     let mut current = id.to_string();
     let mut seen_ancestors = HashSet::new();
@@ -419,6 +425,38 @@ pub(in crate::graph) fn stamp_hook_ancestry(id: &str, ancestry: &[i32]) {
             .find(|s| s.session_id == id && s.hook_ancestry.is_empty())
         {
             s.hook_ancestry = ancestry.to_vec();
+            if file.schema_version.is_empty() {
+                file.schema_version = STAGE_GRAPH_VERSION.to_string();
+            }
+            let _ = write_stage(&sessions_path(), &file);
+        }
+    });
+}
+
+/// Stamp `headless = true` on a headless `aoide conduct` wrap's OWN record —
+/// a PERMANENT registration fact (task #89, review round 2), called
+/// unconditionally right after `do_session_start` whenever `--headless` was
+/// given, regardless of whether window discovery or the log-file open below
+/// succeed. Distinct from "`windowAddress` happens to be empty right now":
+/// `window::windowless_by_lineage`/`resolve_pending_session_windows` key off
+/// THIS field first, so a headless wrap's windowlessness (and its whole
+/// hook-child subtree's) survives even if something upstream still manages
+/// to stamp a stray window onto the record. Change-only (a no-op once
+/// already `true`) and a silent no-op for an unknown id, same posture as
+/// [`set_session_log_path`]/[`stamp_hook_ancestry`]. No `restage_graph()` —
+/// like `hookAncestry`, `headless` is consumed internally, never rendered.
+pub(in crate::graph) fn stamp_headless(id: &str) {
+    with_stage_lock(|| {
+        let mut file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        if let Some(s) = file
+            .sessions
+            .iter_mut()
+            .find(|s| s.session_id == id && !s.headless)
+        {
+            s.headless = true;
             if file.schema_version.is_empty() {
                 file.schema_version = STAGE_GRAPH_VERSION.to_string();
             }
@@ -1434,11 +1472,19 @@ mod tests {
             Some("claude"),
             "kimi's nested wrap must parent under claude via ancestry, never the terminal"
         );
-        // The nested wrap itself: headless (no window), conducted.
+        // The nested wrap itself: headless (no window), conducted. Registered
+        // the same two-step way the real `session_conduct` verb does it —
+        // `do_session_start` first, then `stamp_headless` right after (see
+        // `conduct.rs`'s own `headless_conduct_registration_stamps_the_
+        // permanent_headless_marker`, which exercises the REAL verb end to
+        // end, discovery gate included; this test reuses the same
+        // stage-writer `stamp_headless` calls, not a raw field literal, so
+        // it stays honest about what actually gets written).
         do_session_start(
             "kimi-wrap", Some("kimi"), Some("/w"), None, resolved.as_deref(), Some(true), None,
             None, None,
         );
+        stamp_headless("kimi-wrap");
 
         // Part 1 — windowless lineage: kimi-wrap is a conducted wrap with an
         // EMPTY window, so kimi's own hook session (its child) is windowless
@@ -1452,6 +1498,40 @@ mod tests {
         // claude, by contrast, anchors in a WINDOWED wrap directly — its own
         // backfill stays live (today's behavior, unchanged).
         assert!(!crate::graph::window::windowless_by_lineage_from_parent(Some("term-wrap"), &snapshot));
+
+        // Review round 2 — the re-poison scenario: even if window discovery
+        // (or the shellbridge listener) somehow still stamped a STRAY window
+        // onto kimi-wrap's own record — the exact bug the gate at
+        // `conduct.rs:825` and the listener skip now prevent — the
+        // PERMANENT `headless` marker keeps kimi's own backfill check
+        // windowless regardless. Force the stray value directly on the
+        // stage file (bypassing every write path) to prove the marker alone
+        // decides, not `windowAddress` emptiness.
+        with_stage_lock(|| {
+            let mut f: SessionsFile = load_stage(&sessions_path()).unwrap();
+            for s in f.sessions.iter_mut() {
+                if s.session_id == "kimi-wrap" {
+                    s.window_address = "0xWIN".to_string(); // stray/corrupted
+                }
+            }
+            write_stage(&sessions_path(), &f).unwrap();
+        });
+        let poisoned = load_stage::<SessionsFile>(&sessions_path()).unwrap().sessions;
+        assert!(
+            crate::graph::window::windowless_by_lineage_from_parent(Some("kimi-wrap"), &poisoned),
+            "the headless marker must override even a corrupted, non-empty windowAddress"
+        );
+        // Restore for the rest of the test — the corruption above was a
+        // deliberate, isolated probe, not this test's real topology.
+        with_stage_lock(|| {
+            let mut f: SessionsFile = load_stage(&sessions_path()).unwrap();
+            for s in f.sessions.iter_mut() {
+                if s.session_id == "kimi-wrap" {
+                    s.window_address = String::new();
+                }
+            }
+            write_stage(&sessions_path(), &f).unwrap();
+        });
 
         // Part 2 — lineage-safe eviction: register kimi's own hook session,
         // deliberately forced (the pre-fix DEGRADED symptom — what actually

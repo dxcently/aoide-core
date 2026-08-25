@@ -106,6 +106,7 @@ pub fn upsert_session(
             log_path: None,
             petname: Some(petname),
             hook_ancestry: Vec::new(),
+            headless: false,
             extra: Map::new(),
         });
         true
