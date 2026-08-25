@@ -49,7 +49,10 @@ use daemon::Door;
 /// blocks until Ctrl-C, never through the generic `Outcome` envelope —
 /// `--popup` (tracker #71 Part 2) swaps the tty prompt for a zenity
 /// code-entry dialog, unlock-gated and parked-only, mutually exclusive with
-/// `--json` — `conductor` hands off
+/// `--json` — `events tail` (P-D3, `docs/architecture/AOIDED.md`) is the
+/// SAME shape once more: a foreground, line-mode follow of aoided's own
+/// events feed that blocks until Ctrl-C, `--class` filtering to matching
+/// event classes — `conductor` hands off
 /// to the interactive terminal loop, `guide`/`schema` bypass the generic
 /// `Outcome` envelope — everything else routes through the single dispatcher
 /// (so the audit log + gate apply uniformly). `livery` was an earlier special
@@ -251,6 +254,37 @@ pub fn run_cli(argv: &[String]) -> i32 {
             let events = secrets::socket::events_path(&socket);
             let popup = inv.flag_present("popup");
             return Some(secrets::watch::run(&socket, &events, json, popup));
+        }
+
+        // `events tail` (P-D3, `docs/architecture/AOIDED.md`'s "L1" section)
+        // is a foreground, line-mode follow of aoided's OWN events feed —
+        // special-cased the SAME way as `secrets watch` just above: dispatch
+        // FIRST (audits the launch attempt, refuses a non-Cli door via
+        // `aoide_server::commands::handle_events_tail`), then hand off to
+        // `server::events::tail`, which blocks until Ctrl-C. `events_path`
+        // is resolved ONCE here — `server::daemon::events_path` applied to
+        // `server::daemon::socket_path()`, the SAME resolution `aoided`'s
+        // own `run_loop` uses — so a CLI-side tail and the daemon it's
+        // tailing always agree on where the feed lives without re-deriving
+        // it a second time. `--class` is a comma-separated filter (empty/
+        // absent = every class — a passive read, not the daemon socket's
+        // `subscribe` op, which stays default-deny-per-class for its own
+        // security reason; `handle_events_tail`'s doc has the full
+        // reasoning).
+        if inv.path == ["events", "tail"] {
+            let launch = dispatch::dispatch(inv);
+            if launch.status != output::Status::Ok {
+                let (body, code) = launch.render(json);
+                eprintln!("{body}");
+                return Some(code);
+            }
+            let events_path = server::daemon::events_path(&server::daemon::socket_path());
+            let classes: Vec<String> = inv
+                .flags
+                .get("class")
+                .map(|s| s.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())
+                .unwrap_or_default();
+            return Some(server::events::tail(&events_path, &classes, json));
         }
 
         // `guide` in text mode prints the full onboarding rather than a summary.

@@ -71,9 +71,16 @@ pub struct PendingFile {
     pub pending: Vec<PendingSend>,
 }
 
-/// `pub(in crate::graph)`, not private: `graph/pending.rs` (the read/approve/
-/// deny surface over this queue) needs the same path record_pending writes.
-pub(in crate::graph) fn pending_path() -> PathBuf {
+/// `pub`, not `pub(in crate::graph)`: `graph/pending.rs` (the read/approve/
+/// deny surface over this queue) needs the same path `record_pending`
+/// writes, and as of P-D3 (`docs/architecture/AOIDED.md`'s "L1" section)
+/// so does `aoide-server`'s #69 hand-edit watcher, which folds
+/// `pending.json` into the same watched-file roster as `sessions.json`/
+/// `hooks.json`/`projects.json`/`graph.json`/`herald.json` — reached via
+/// `aoide_conduct::graph::pending_path()` rather than a second `stage_dir()
+/// .join("pending.json")` literal elsewhere (this crate's own "no
+/// cross-crate copying" convention, widen-don't-fork).
+pub fn pending_path() -> PathBuf {
     stage_dir().join("pending.json")
 }
 

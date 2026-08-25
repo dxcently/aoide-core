@@ -29,7 +29,9 @@
 pub mod a2a;
 pub mod commands;
 pub mod daemon;
+pub mod events;
 pub mod mcp;
+pub mod producers;
 
 /// A crate-wide lock serialising every test that mutates process-global env
 /// (`AOIDE_STAGE_DIR`, …) — mirrors `aoide::env_lock()` (root `src/lib.rs`),

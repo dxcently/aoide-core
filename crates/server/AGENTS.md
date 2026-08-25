@@ -24,15 +24,44 @@
   `aoide-secrets`'s private `serve` fn) rather than `a2a::serve`'s plain
   `thread::spawn` — don't copy `a2a.rs`'s precedent onto a new socket-based
   door; copy `daemon.rs`'s instead.
+- **`producers::SecretsMirror` never depends on `aoide-secrets`'s wire or
+  record TYPES, even though this crate already carries an `aoide-secrets`
+  dependency for an unrelated reason (the A2A door's inbound bearer
+  resolve, `a2a.rs`).** `secrets_socket_path`/`secrets_events_path`
+  reimplement `aoide_secrets::socket`'s own two resolution functions
+  (env override, else the canonical `/run/aoide-secrets/...` default)
+  rather than calling them, and `mirror_secrets_line` parses a bare
+  `serde_json::Value` and copies exactly the four named fields
+  (`id`/`secret`/`consumer`/`timeoutSecs`) it recognizes — never the
+  parsed object wholesale. This is what makes "an unknown field never
+  rides the mirror" a STRUCTURAL property instead of a discipline a future
+  edit could quietly break by switching to a shared typed struct; don't
+  "simplify" this producer by importing `aoide_secrets::watch`'s own event
+  type or calling `aoide_secrets::socket::events_path` directly.
+- **Every tick-driven producer (`producers::SecretsMirror::tick`,
+  `producers::HandEditWatcher::sweep`, `events::poll_once`) stays a
+  bounded, non-blocking, non-sleeping call — the loop/signal-handling
+  wrapper around it lives ONE layer up** (`daemon::run_loop`'s tick,
+  `events::tail`'s `SIGINT` loop). This is what lets every one of their
+  tests call the bounded function directly with a deadline-poll or a plain
+  synchronous assertion, never a fixed sleep or a real signal sent into
+  the shared test binary — don't fold a `thread::sleep`/signal check into
+  one of the bounded functions "to save a caller the loop."
 
 ## Extension points
 
 - **A new serve-side verb** (`daemon`, `shellbridge` registration, `a2a
-  serve`) adds a `cmd!`/`register` entry in `commands.rs`, wired into the
-  owning app crate's `commands::all()` — core-only today (`daemon`/`a2a
-  serve` are core identity, per root `AGENTS.md`).
+  serve`, `events tail`) adds a `cmd!`/`register` entry in `commands.rs`,
+  wired into the owning app crate's `commands::all()` — core-only today
+  (`daemon`/`a2a serve`/`events tail` are core identity, per root
+  `AGENTS.md`).
 - **A new door type** (beyond CLI/MCP/A2A) gets its own `serve_*` function
   here, taking `Registry`/dispatcher the same injected way.
+- **A new daemon tick producer** (P-D3's `SecretsMirror`/`HandEditWatcher`
+  are the first two) is a plain struct in `producers.rs` with its own
+  bounded `tick`/`sweep` method, constructed once in `daemon::run_loop`
+  before its tick loop and called once per iteration — never a producer
+  that spawns its OWN thread or sleeps internally (previous invariant).
 
 ## Docs update required in the same commit
 

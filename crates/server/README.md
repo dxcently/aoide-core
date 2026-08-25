@@ -15,15 +15,44 @@ the inbound half of the two-door contract (the outbound half is
   `daemon::socket_path`), spawn a thread-per-connection accept loop
   (fallible `Builder::spawn`, accept-error backoff — the secrets broker's
   own accept-loop discipline, reused by convention), then tick forever
-  (~1s; no producers yet — P-D3 adds the secrets-feed mirror and the #69
-  hand-edit watcher). Newline-delimited JSON, the secrets wire framing
-  verbatim: `ping` (liveness) and `subscribe` (follow the daemon's own
-  events feed — `$AOIDE_DAEMON_EVENTS`, else a sibling of the socket,
-  `daemon::events_path` — filtered by an explicit `classes` array,
+  (~1s; P-D3's two producers, below). Newline-delimited JSON, the secrets
+  wire framing verbatim: `ping` (liveness) and `subscribe` (follow the
+  daemon's own events feed — `$AOIDE_DAEMON_EVENTS`, else a sibling of the
+  socket, `daemon::events_path` — filtered by an explicit `classes` array,
   default-deny) are live; `dispatch` (the fourth door, `Door::Daemon`) is
   P-D4. `registry`/`dispatch` fn parameters thread all the way to the
   per-connection handler, unused until P-D4 — the same DI seam
   `mcp::serve_stdio`/`a2a::serve` already close at their own launch sites.
+- `producers` (P-D3, `docs/architecture/AOIDED.md`'s "L1" section) — the
+  daemon tick's two producers, both constructed once at `run_loop` startup
+  and ticked every iteration. `SecretsMirror` tails the secrets broker's
+  OWN events feed (`producers::secrets_socket_path`/`secrets_events_path`
+  — the SAME `$AOIDE_SECRETS_SOCKET`/`$AOIDE_SECRETS_EVENTS` resolution
+  `aoide_secrets::socket` documents, reimplemented here rather than
+  imported: this crate's own `aoide-secrets` dependency exists only for
+  the A2A door's inbound bearer resolve, and the mirror is deliberately
+  kept off that crate's wire/record TYPES so "never copy an unknown field"
+  is structural — `mirror_secrets_line` reads a bare `serde_json::Value`
+  and copies exactly four named fields, `id`/`secret`/`consumer`/
+  `timeoutSecs`, for one of the five recognized outcomes,
+  `released`/`parked`/`completed`/`dismissed`/`expired`) and re-publishes
+  each as a `class:"secret",source:"secrets-mirror"` record on the
+  daemon's own feed. `HandEditWatcher` stat-sweeps a fixed six-file roster
+  (`daemon::stage_roster`: `sessions.json`/`hooks.json`/`projects.json`/
+  `graph.json` from `aoide-storage`, `pending.json`/`herald.json` from
+  `aoide-conduct`) each tick and fires a `class:"audit",kind:"hand-edit"`
+  event for any file whose `(mtime, len)` no longer matches its baseline
+  (the #69 hand-edit watcher) — detection and narration only, this daemon
+  never reverts a hand edit. `note_own_write` is the seam a FUTURE
+  daemon-side write path (P-D6) folds its own writes into so they are
+  never reported back as a hand edit; no such write path exists yet this
+  phase, so it has no live caller today.
+- `events` — `tail`, the blocking loop behind `aoide events tail` (P-D3):
+  follows the daemon's own events feed with a `Follower` and prints every
+  line whose `class` passes an (optional, comma-separated) filter, `--json`
+  verbatim or narrated otherwise. `poll_once` is the bounded, non-blocking
+  core a test drives directly; `tail` is the thin `SIGINT`-handling wrapper
+  around it, mirroring `aoide_secrets::watch`'s own tail-loop shape.
 - `mcp` — `serve_stdio`, the MCP stdio server.
 - `a2a` — the serve half of A2A (JSON-RPC/HTTP/SSE); the client half stays
   in `aoide-client`. Two `message/send` arms, two different relationships to
@@ -53,7 +82,10 @@ the inbound half of the two-door contract (the outbound half is
   `CONTRACTS.md`'s "Secrets wire"/§6 sections for the wire contract and
   the resolve-consumer honesty note.
 - `commands` — this crate's CLI verbs: `daemon`, `shellbridge` (registration
-  only — the files stay in `conduct`), `a2a serve`.
+  only — the files stay in `conduct`), `a2a serve`, `events tail` (P-D3,
+  appended newest — CLI-only, the same door-policy shape `a2a serve`/
+  `aoide_secrets::commands::handle_secrets_watch` already hold for a
+  foreground/blocking verb).
 
 ## What it consumes
 

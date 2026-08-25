@@ -97,6 +97,7 @@ mod tests {
             "content.query",
             "content.register",
             "daemon",
+            "events.tail",
             "graph.emit",
             "graph.focus",
             "graph.link",

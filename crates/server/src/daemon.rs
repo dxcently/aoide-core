@@ -76,11 +76,26 @@
 //! shared file from wherever that connection subscribed, the same way any
 //! other tail (`aoide events tail`, a future desktop surface) would.
 //!
-//! ## No producers yet (P-D2)
+//! ## The tick's two producers (P-D3)
 //!
-//! `run_loop`'s own tick (~1s) is a bare sleep loop this phase — the
-//! secrets-feed mirror and the #69 hand-edit watcher are P-D3, deliberately
-//! NOT preimplemented here.
+//! `run_loop`'s tick (~1s) now runs two producers every iteration, both
+//! defined in [`crate::producers`] and constructed once at `run_loop`
+//! startup (the same "construct once outside the loop, tick inside it"
+//! shape the [`aoide_protocol::feed::FeedWriter`]/socket listener already
+//! hold): [`crate::producers::SecretsMirror::tick`] tails the secrets
+//! broker's own events feed and re-publishes a name-only mirror record for
+//! each of its five recognized outcomes onto THIS daemon's own feed (via
+//! the SAME [`FeedWriter`] the startup line above already writes through —
+//! one writer per process, `docs/architecture/AOIDED.md`'s "L1" section);
+//! [`crate::producers::HandEditWatcher::sweep`] stat-sweeps [`stage_roster`]
+//! (the six broker-owned stage files) and appends one `class:"audit",
+//! kind:"hand-edit"` line per file whose `(mtime, len)` changed since the
+//! last tick — detection and narration only, this daemon never reverts a
+//! hand edit. No daemon-side write path into any of those six files exists
+//! yet this phase (P-D6's graph residency is the first one), so
+//! `HandEditWatcher::note_own_write` currently has no live caller — it is
+//! proved by that struct's own tests, the seam P-D6 wires into rather than
+//! a signature this run_loop needs to grow again later.
 
 use aoide_protocol::feed::{FeedWriter, Follower};
 use aoide_protocol::registry::{Registry, AOIDE_VERSION};
@@ -191,6 +206,24 @@ pub fn events_path(socket_path: &Path) -> PathBuf {
         Some(parent) => parent.join("events.jsonl"),
         None => PathBuf::from("events.jsonl"),
     }
+}
+
+/// The #69 hand-edit watcher's watched-file roster (`docs/architecture/
+/// AOIDED.md`'s "The first producer" section): the six broker-owned stage
+/// files. `pending.json`/`herald.json` come from `aoide-conduct` (this
+/// crate already depends on it — `daemon.rs`'s own module doc), the other
+/// four from `aoide-storage`; every path is reached through its owning
+/// crate's own accessor rather than a second `stage_dir().join(...)`
+/// literal here (the workspace's "no cross-crate copying" convention).
+fn stage_roster() -> Vec<PathBuf> {
+    vec![
+        aoide_storage::stage::sessions_path(),
+        aoide_storage::stage::hooks_path(),
+        aoide_storage::stage::projects_path(),
+        aoide_storage::stage::graph_path(),
+        aoide_conduct::graph::pending_path(),
+        aoide_conduct::herald::herald_path(),
+    ]
 }
 
 fn runtime_dir() -> PathBuf {
@@ -456,9 +489,22 @@ pub fn run_loop(
     std::thread::Builder::new()
         .spawn(move || accept_loop(listener, accept_events_path, registry, dispatch))?;
 
-    // Tick (~1s): no producers yet (P-D3 adds the secrets-feed mirror and
-    // the #69 hand-edit watcher here — module doc's "No producers yet").
+    // Tick (~1s): the two P-D3 producers (module doc's "The tick's two
+    // producers"), constructed once here, outside the loop.
+    let mut secrets_mirror = crate::producers::SecretsMirror::new(crate::producers::secrets_events_path());
+    let mut hand_edit_watcher = crate::producers::HandEditWatcher::new(stage_roster());
     loop {
+        secrets_mirror.tick(&feed);
+        for file in hand_edit_watcher.sweep() {
+            feed.append(&json!({
+                "v": 0,
+                "ts": aoide_protocol::audit::now_secs(),
+                "class": serde_json::to_value(EventClass::Audit).unwrap_or_else(|_| json!("audit")),
+                "kind": "hand-edit",
+                "source": "aoided",
+                "payload": {"file": file},
+            }));
+        }
         std::thread::sleep(Duration::from_secs(1));
     }
 }

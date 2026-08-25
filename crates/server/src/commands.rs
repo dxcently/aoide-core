@@ -28,6 +28,29 @@ use aoide_protocol::registry::{cmd, flag, Registry};
 use aoide_protocol::{Door, Invocation};
 use serde_json::json;
 
+/// `events tail`'s launch-record handler (P-D3, `docs/architecture/
+/// AOIDED.md`'s "L1" section, "Terminal reachability" paragraph) — the
+/// SAME shape `handle_a2a_serve`/`aoide_secrets::commands::
+/// handle_secrets_watch` already hold for a foreground/blocking verb:
+/// this only gates the door and reports where the actual tail loop lives;
+/// the blocking loop itself (`crate::events::tail`) runs from `cli`'s
+/// `special` hook, dispatched to AFTER this handler records the launch
+/// attempt through the single audit log. CLI-only — a follow-style verb
+/// that blocks a connection until Ctrl-C makes no sense over MCP/A2A,
+/// exactly the reasoning `secrets watch` already established for the same
+/// shape of verb.
+fn handle_events_tail(inv: &Invocation) -> Outcome {
+    match inv.door {
+        Door::Cli => Outcome::ok("events.tail", "following aoided's own events feed").with_data(json!({
+            "eventsPath": crate::daemon::events_path(&crate::daemon::socket_path()).to_string_lossy(),
+        })),
+        _ => Outcome::usage(
+            "events.tail",
+            "events tail is a foreground follow that blocks until Ctrl-C; run it from a terminal (not over this door)",
+        ),
+    }
+}
+
 /// `a2a serve`'s handler. On the Cli door this is only ever reached via
 /// `run_cli`'s special-case (dispatch first, to record the launch, THEN
 /// block in the accept loop); on any other door (e.g. an MCP `tools/call`
@@ -71,6 +94,25 @@ pub fn register_infra(r: &mut Registry) {
     ));
 }
 
+/// `events tail`, appended newest (P-D3) — see [`handle_events_tail`]'s doc
+/// for the door-policy reasoning. `--class` is a comma-separated filter
+/// (the same convention `secrets add --consumers` already uses for a
+/// multi-value flag over this registry's flat `BTreeMap<String,String>`
+/// flag model — there is no repeatable-flag primitive to reach for
+/// instead); omitted or empty means every class.
+pub fn register_events(r: &mut Registry) {
+    r.insert(cmd!(
+        path: ["events", "tail"],
+        summary: "Foreground, line-mode follow of aoided's own events feed (the secrets-mirror's name-only lines, the #69 hand-edit watcher, and any future producer). Blocks until Ctrl-C. CLI-only — a follow-style verb makes no sense over MCP/A2A.",
+        args: [],
+        flags: [flag!("class", "string", "Only print events whose `class` matches (comma-separated; default: every class).")],
+        gated: false,
+        implemented: true,
+        handler: handle_events_tail,
+        examples: ["events tail", "events tail --class secret", "events tail --class secret,audit --json"],
+    ));
+}
+
 /// `a2a serve`, registered directly before `aoide-client`'s four `agent`
 /// verbs (the historical `a2a` group order).
 pub fn register_a2a_serve(r: &mut Registry) {
@@ -90,4 +132,42 @@ pub fn register_a2a_serve(r: &mut Registry) {
         implemented: true,
         handler: handle_a2a_serve,
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aoide_protocol::output::Status;
+    use std::collections::BTreeMap;
+
+    fn inv(door: Door, flags: &[(&str, &str)]) -> Invocation {
+        Invocation {
+            path: vec!["events".into(), "tail".into()],
+            args: vec![],
+            flags: flags.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<_, _>>(),
+            door,
+        }
+    }
+
+    #[test]
+    fn events_tail_is_cli_only() {
+        assert_eq!(handle_events_tail(&inv(Door::Cli, &[])).status, Status::Ok);
+        assert_eq!(handle_events_tail(&inv(Door::Mcp, &[])).status, Status::Usage);
+        assert_eq!(handle_events_tail(&inv(Door::A2a, &[])).status, Status::Usage);
+    }
+
+    #[test]
+    fn events_tail_ok_reports_the_resolved_events_path() {
+        let out = handle_events_tail(&inv(Door::Cli, &[]));
+        assert!(out.data.as_ref().and_then(|d| d.get("eventsPath")).is_some(), "{out:?}");
+    }
+
+    #[test]
+    fn events_tail_registers_at_the_expected_path() {
+        let mut r = Registry::new();
+        register_events(&mut r);
+        let cmd = r.get(&["events".to_string(), "tail".to_string()]).expect("events tail must be registered");
+        assert_eq!(cmd.dotted(), "events.tail");
+        assert!(cmd.flags.iter().any(|f| f.name == "class"), "{:?}", cmd.flags);
+    }
 }

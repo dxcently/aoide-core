@@ -29,7 +29,9 @@ use crate::registry::Registry;
 /// messaging workstream C2), inbox list/read/clear (appended newest — the
 /// durable per-host message store, messaging workstream C6), secrets
 /// serve/exec/add/rm/grant/revoke (appended newest — Workstream SECRETS's
-/// broker daemon + client + admin CLI surface, P-V2).
+/// broker daemon + client + admin CLI surface, P-V2), events tail
+/// (appended newest — the aoided event bus's own terminal-reachable follow
+/// verb, P-D3, `docs/architecture/AOIDED.md`'s "L1" section).
 ///
 /// P-A5 (binary-split workstream) removed the 11 register lines for the
 /// graphical bundle — rice/draft/mode/cover/livery/rice-late-stubs/
@@ -60,6 +62,7 @@ pub fn all() -> Registry {
     aoide_conduct::commands::who::register(&mut r); // who — live presence over sessions + registered peers (messaging workstream C2)
     aoide_storage::commands::register_inbox(&mut r); // inbox list/read/clear — durable per-host message store (messaging workstream C6, appended newest)
     aoide_secrets::commands::register(&mut r); // secrets serve/exec/add/rm/grant/revoke — the secrets broker (Workstream SECRETS P-V2, appended newest)
+    aoide_server::commands::register_events(&mut r); // events tail — aoided's own feed follow verb (P-D3, appended newest)
 
     r
 }
