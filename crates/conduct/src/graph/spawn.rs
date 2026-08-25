@@ -310,6 +310,7 @@ mod tests {
             "AOIDE_STAGE_DIR",
             "AOIDE_STATE_DIR",
             "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
             "AOIDE_CONDUCT_SPAWN_EXE",
         ]);
 
@@ -320,6 +321,13 @@ mod tests {
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
         std::env::set_var("AOIDE_STATE_DIR", &state);
         std::env::set_var("XDG_RUNTIME_DIR", &root);
+        // The re-exec'd `conduct --headless` child (below) inherits this
+        // process's full env, `AOIDE_AUDIT_LOG` included — without scoping it
+        // here, both this test process AND the detached child it spawns
+        // audit into the real `~/Aoide/log` (task #89: proven live via
+        // "/no/such/binary-aoide-spawn-test" lines landing in the real log
+        // from the sibling test below).
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
         std::env::set_var("AOIDE_CONDUCT_SPAWN_EXE", built_aoide_bin());
 
         let id = "spawn-ok";
@@ -368,6 +376,7 @@ mod tests {
             "AOIDE_STAGE_DIR",
             "AOIDE_STATE_DIR",
             "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
             "AOIDE_CONDUCT_SPAWN_EXE",
         ]);
 
@@ -378,6 +387,7 @@ mod tests {
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
         std::env::set_var("AOIDE_STATE_DIR", &state);
         std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
         std::env::set_var("AOIDE_CONDUCT_SPAWN_EXE", built_aoide_bin());
 
         let id = "spawn-badexec";
@@ -418,6 +428,7 @@ mod tests {
             "AOIDE_STAGE_DIR",
             "AOIDE_STATE_DIR",
             "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
             "AOIDE_CONDUCT_SPAWN_EXE",
         ]);
 
@@ -428,6 +439,7 @@ mod tests {
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
         std::env::set_var("AOIDE_STATE_DIR", &state);
         std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
         std::env::set_var("AOIDE_CONDUCT_SPAWN_EXE", built_aoide_bin());
 
         let id = "spawn-prompt-skip";
