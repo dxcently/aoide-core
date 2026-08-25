@@ -12,7 +12,12 @@ never the inbound/serve half (that's `aoide-server`).
   agnostic of any one downstream agent's shape).
 - `peer` — peer-federation client half (CONTRACTS.md §7).
 - `commands` — this crate's CLI verbs: `a2a agent add/list/remove/send`,
-  `peer add/list/remove/pull/status`, `adapter melete`; also exposes two
+  `peer add/list/remove/pull/status/hub`, `adapter melete` (`peer hub
+  <name> [--clear]`, P-D5, designates at most one registered peer as the
+  hub `aoide_storage::addr::resolve_with_hub` prefers as a last-resort
+  remote target — `peer_store::set_hub`/`clear_hub` hold the invariants,
+  this handler just reports which of set/moved/cleared/no-op happened);
+  also exposes two
   non-verb functions that are the `conduct → client` edge's crossing
   points: `pull_peer_live` (`who`'s live per-peer probe, read-only) and
   `send_message_to_peer` (`graph send --to <peer>/<query>`'s delivery,

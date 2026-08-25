@@ -64,8 +64,31 @@ pub struct Peer {
     /// secret takes effect on the very next call.
     #[serde(rename = "bearerSecret", default, skip_serializing_if = "Option::is_none")]
     pub bearer_secret: Option<String>,
+    /// At most one registered peer is marked `hub` — the always-on host
+    /// (e.g. sakaki) this mesh's address resolution prefers as a
+    /// last-resort remote target when a query matches nothing else (P-D5,
+    /// `docs/architecture/AOIDED.md`'s "The hub option"). `#[serde(default)]`
+    /// + `skip_serializing_if` on `false` is the SAME additive/v0-safe
+    /// discipline `SessionRecord.headless` set the precedent for
+    /// (`records.rs`): an old `peers.json` predating this field
+    /// deserializes every peer's `hub` as `false`, and a peer that has
+    /// never held the hub omits the key entirely rather than writing an
+    /// explicit `"hub":false` into every entry. Set/moved/cleared only via
+    /// [`set_hub`]/[`clear_hub`] below, which hold the "at most one" and
+    /// idempotence invariants — nothing else in this tree writes the field
+    /// directly.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hub: bool,
     #[serde(rename = "addedAt", default)]
     pub added_at: String,
+}
+
+/// `skip_serializing_if` helper for a plain (non-`Option`) `bool` field whose
+/// common case is `false` — mirrors `records.rs`'s own private `is_false`
+/// (not reused directly: that one is private to its module, and a peer's
+/// hub flag has nothing to do with a session record).
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// The `state/peers.json` container.
@@ -125,6 +148,65 @@ pub fn remove_peer(peers: &mut Vec<Peer>, name: &str) -> bool {
     let before = peers.len();
     peers.retain(|p| p.name != name);
     peers.len() != before
+}
+
+/// What [`set_hub`]/[`clear_hub`] actually did — the CLI's `peer hub`
+/// Outcome message names the exact change (P-D5) rather than a bare
+/// success bool, mirroring `insert_peer`/`remove_peer`'s "report what
+/// happened" discipline one step further.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HubChange {
+    /// No peer held the hub before; the named peer now does.
+    Set,
+    /// A DIFFERENT peer held the hub before (named here); it moved to the
+    /// requested peer in the same write.
+    Moved { from: String },
+    /// `clear_hub` removed the hub designation from the named peer.
+    Cleared,
+    /// Nothing changed: `set_hub` on the peer already holding the hub, or
+    /// `clear_hub` on a peer that wasn't holding it (including "no peer is
+    /// the hub at all") — both idempotent no-ops, never an error.
+    NoOp,
+}
+
+/// Set `name` as the sole hub peer, moving it from whichever OTHER peer (if
+/// any) held it before, in the SAME write — at most one peer is ever marked
+/// `hub` (`Peer::hub`'s doc). Idempotent: calling this twice in a row with
+/// the same `name` is a [`HubChange::NoOp`] the second time. `Err` when
+/// `name` names no registered peer — mirrors `remove_peer`'s "a missing
+/// name is a clean error, not a silent no-op" discipline every other `peer`
+/// verb already holds.
+pub fn set_hub(peers: &mut [Peer], name: &str) -> Result<HubChange, String> {
+    if !peers.iter().any(|p| p.name == name) {
+        return Err(format!("no peer named `{name}`"));
+    }
+    let previous_holder = peers.iter().find(|p| p.hub).map(|p| p.name.clone());
+    if previous_holder.as_deref() == Some(name) {
+        return Ok(HubChange::NoOp);
+    }
+    for p in peers.iter_mut() {
+        p.hub = p.name == name;
+    }
+    Ok(match previous_holder {
+        Some(from) => HubChange::Moved { from },
+        None => HubChange::Set,
+    })
+}
+
+/// Clear the hub designation from `name`, if it currently holds it. `Err`
+/// when `name` names no registered peer. A [`HubChange::NoOp`] — never an
+/// error — when `name` exists but isn't currently the hub, which also
+/// covers "no peer is the hub at all" (the idempotent "clear on no-hub"
+/// case `set_hub`'s sibling test battery exercises).
+pub fn clear_hub(peers: &mut [Peer], name: &str) -> Result<HubChange, String> {
+    let Some(p) = peers.iter_mut().find(|p| p.name == name) else {
+        return Err(format!("no peer named `{name}`"));
+    };
+    if !p.hub {
+        return Ok(HubChange::NoOp);
+    }
+    p.hub = false;
+    Ok(HubChange::Cleared)
 }
 
 /// A valid peer nickname: `^[a-z0-9][a-z0-9-]*$` — the same shape as
@@ -323,6 +405,7 @@ mod tests {
             autogate,
             token_file: None,
             bearer_secret: None,
+            hub: false,
             added_at: "2026-08-14T00:00:00Z".to_string(),
         }
     }
@@ -398,6 +481,95 @@ mod tests {
         });
         let back2: Peer = serde_json::from_value(old_shape).unwrap();
         assert_eq!(back2.bearer_secret, None);
+    }
+
+    // ── `hub` — the P-D5 hub designation (additive, at-most-one) ─────────────
+
+    #[test]
+    fn hub_absent_deserializes_false_and_a_true_value_omits_the_key_only_when_false() {
+        // A raw fixture with no `hub` key at all — an old `peers.json`
+        // predating this field — must deserialize `false`, the same
+        // additive discipline `SessionRecord.headless` established.
+        let old_shape = serde_json::json!({
+            "name": "gamma", "url": "http://c/", "autogate": false, "addedAt": "2026-08-14T00:00:00Z"
+        });
+        let back: Peer = serde_json::from_value(old_shape).unwrap();
+        assert!(!back.hub, "absent hub deserializes false");
+
+        let not_hub = fixture_peer("alpha", "http://a/", false);
+        let v = serde_json::to_value(&not_hub).unwrap();
+        assert!(v.get("hub").is_none(), "false hub is omitted, not written as `\"hub\":false`");
+
+        let mut is_hub = fixture_peer("beta", "http://b/", false);
+        is_hub.hub = true;
+        let v2 = serde_json::to_value(&is_hub).unwrap();
+        assert_eq!(v2["hub"], true);
+        let back2: Peer = serde_json::from_value(v2).unwrap();
+        assert!(back2.hub);
+    }
+
+    #[test]
+    fn set_hub_is_idempotent_and_moves_the_previous_holder_in_one_write() {
+        let mut peers = vec![
+            fixture_peer("alpha", "http://a/", false),
+            fixture_peer("beta", "http://b/", false),
+        ];
+
+        // No hub yet — setting alpha is a fresh `Set`.
+        assert_eq!(set_hub(&mut peers, "alpha").unwrap(), HubChange::Set);
+        assert!(peers[0].hub);
+        assert!(!peers[1].hub);
+
+        // Setting the SAME peer again is a no-op — idempotent.
+        assert_eq!(set_hub(&mut peers, "alpha").unwrap(), HubChange::NoOp);
+        assert!(peers[0].hub, "still the hub after the no-op re-set");
+
+        // Setting a DIFFERENT peer moves it: the previous holder is
+        // reported AND cleared in the same write — at most one hub ever.
+        assert_eq!(
+            set_hub(&mut peers, "beta").unwrap(),
+            HubChange::Moved { from: "alpha".to_string() }
+        );
+        assert!(!peers[0].hub, "alpha lost the hub in the same write beta gained it");
+        assert!(peers[1].hub);
+    }
+
+    #[test]
+    fn set_hub_rejects_an_unknown_peer_name() {
+        let mut peers = vec![fixture_peer("alpha", "http://a/", false)];
+        let err = set_hub(&mut peers, "ghost").unwrap_err();
+        assert!(err.contains("ghost"));
+        assert!(!peers[0].hub, "the registry is untouched on an unknown-name error");
+    }
+
+    #[test]
+    fn clear_hub_is_idempotent_and_a_no_op_when_no_peer_holds_it() {
+        let mut peers = vec![
+            fixture_peer("alpha", "http://a/", false),
+            fixture_peer("beta", "http://b/", false),
+        ];
+
+        // Clearing on a fully hub-less registry is a no-op — the
+        // "clear on no-hub" idempotent case.
+        assert_eq!(clear_hub(&mut peers, "alpha").unwrap(), HubChange::NoOp);
+
+        set_hub(&mut peers, "alpha").unwrap();
+        assert_eq!(clear_hub(&mut peers, "alpha").unwrap(), HubChange::Cleared);
+        assert!(!peers[0].hub);
+
+        // Clearing again — already cleared — is a no-op, not a repeat
+        // `Cleared`.
+        assert_eq!(clear_hub(&mut peers, "alpha").unwrap(), HubChange::NoOp);
+
+        // Clearing a peer that was never the hub (beta never held it) is
+        // also a no-op, never an error.
+        assert_eq!(clear_hub(&mut peers, "beta").unwrap(), HubChange::NoOp);
+    }
+
+    #[test]
+    fn clear_hub_rejects_an_unknown_peer_name() {
+        let mut peers = vec![fixture_peer("alpha", "http://a/", false)];
+        assert!(clear_hub(&mut peers, "ghost").is_err());
     }
 
     // ── Peer nickname validation (path-traversal guard) ──────────────────────

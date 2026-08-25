@@ -3420,6 +3420,7 @@ mod tests {
             autogate: true,
             token_file: None,
             bearer_secret: None,
+            hub: false,
             added_at: "2026-08-14T00:00:00Z".into(),
         }])
         .unwrap();
@@ -3515,6 +3516,7 @@ mod tests {
             autogate: true,
             token_file: Some(token_path.to_string_lossy().into_owned()),
             bearer_secret: None,
+            hub: false,
             added_at: "2026-08-18T00:00:00Z".into(),
         }])
         .unwrap();
@@ -3867,6 +3869,7 @@ mod tests {
             autogate: true,
             token_file: Some(token_path.to_string_lossy().into_owned()),
             bearer_secret: None,
+            hub: false,
             added_at: "2026-08-20T00:00:00Z".into(),
         }])
         .unwrap();

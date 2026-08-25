@@ -929,6 +929,7 @@ mod tests {
             autogate: false,
             token_file: None,
             bearer_secret: None,
+            hub: false,
             added_at: "2026-08-14T00:00:00Z".into(),
         }])
         .unwrap();
@@ -990,6 +991,7 @@ mod tests {
             autogate: false,
             token_file: None,
             bearer_secret: None,
+            hub: false,
             added_at: "2026-08-14T00:00:00Z".into(),
         }])
         .unwrap();
@@ -1007,6 +1009,7 @@ mod tests {
             autogate: false,
             token_file: None,
             bearer_secret: None,
+            hub: false,
             added_at: "2026-08-14T00:00:00Z".into(),
         }])
         .unwrap();
@@ -1035,6 +1038,7 @@ mod tests {
             autogate: false,
             token_file: None,
             bearer_secret: None,
+            hub: false,
             added_at: "2026-08-14T00:00:00Z".into(),
         }])
         .unwrap();

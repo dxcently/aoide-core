@@ -426,7 +426,7 @@ pub fn handle_agent_send(inv: &Invocation) -> Outcome {
     }))
 }
 
-// ── The five `peer` verbs (CONTRACTS.md §7: same-network federation) ────────
+// ── The six `peer` verbs (CONTRACTS.md §7: same-network federation) ─────────
 //
 // A peer is ANOTHER aoide instance, addressed by URL (topology-agnostic —
 // the protocol never cares whether that URL happens to resolve on the same
@@ -504,6 +504,7 @@ fn handle_peer_add(inv: &Invocation) -> Outcome {
         autogate,
         token_file,
         bearer_secret,
+        hub: false,
         added_at: aoide_storage::time::now_iso_utc(),
     };
     aoide_storage::peer_store::insert_peer(&mut peers, peer.clone());
@@ -586,6 +587,55 @@ fn handle_peer_remove(inv: &Invocation) -> Outcome {
     Outcome::ok(cmd, format!("removed peer `{name}` ({} remaining)", peers.len()))
         .changed(vec![aoide_storage::peer_store::peers_path().to_string_lossy().into_owned()])
         .with_data(json!({ "removed": true, "name": name, "count": peers.len() }))
+}
+
+/// `peer hub <name> [--clear]` — designate `name` as THE hub (at most one;
+/// setting a new hub moves it, clearing the previous holder in the same
+/// write) or, with `--clear`, remove the hub designation from `name` if it
+/// currently holds it (P-D5, `docs/architecture/AOIDED.md`'s "The hub
+/// option"). Both directions are idempotent — `peer_store::set_hub`/
+/// `clear_hub` report exactly what changed (set/moved/cleared/no-op) and
+/// this handler's message says so plainly rather than a bare "ok"; a no-op
+/// never touches disk (nothing to write back).
+fn handle_peer_hub(inv: &Invocation) -> Outcome {
+    let cmd = "peer.hub";
+    let name = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(n) => n.to_string(),
+        None => return Outcome::usage(cmd, "usage: aoide peer hub <name> [--clear] [--json]"),
+    };
+    let clear = inv.flag_present("clear");
+    let mut peers = aoide_storage::peer_store::load_peers();
+
+    let change = if clear {
+        aoide_storage::peer_store::clear_hub(&mut peers, &name)
+    } else {
+        aoide_storage::peer_store::set_hub(&mut peers, &name)
+    };
+    let change = match change {
+        Ok(c) => c,
+        Err(e) => return Outcome::error(cmd, e).with_data(json!({ "reason": "unknown-peer", "name": name })),
+    };
+
+    use aoide_storage::peer_store::HubChange;
+    let (msg, tag) = match &change {
+        HubChange::Set => (format!("peer `{name}` is now the hub"), "set"),
+        HubChange::Moved { from } => (format!("hub moved from `{from}` to `{name}`"), "moved"),
+        HubChange::Cleared => (format!("cleared the hub designation from `{name}`"), "cleared"),
+        HubChange::NoOp if clear => (format!("`{name}` was not the hub — nothing to clear"), "no-op"),
+        HubChange::NoOp => (format!("`{name}` is already the hub"), "no-op"),
+    };
+    let data = json!({ "name": name, "clear": clear, "change": tag });
+
+    if matches!(change, HubChange::NoOp) {
+        return Outcome::ok(cmd, msg).with_data(data);
+    }
+    if let Err(e) = aoide_storage::peer_store::save_peers(&peers) {
+        return Outcome::error(cmd, format!("writing the peer registry: {e}"))
+            .with_data(json!({ "reason": "registry-write-failed" }));
+    }
+    Outcome::ok(cmd, msg)
+        .changed(vec![aoide_storage::peer_store::peers_path().to_string_lossy().into_owned()])
+        .with_data(data)
 }
 
 /// Pull ONE peer: POST `aoide/graphSummary`, parse, write the cache. On ANY
@@ -772,7 +822,8 @@ fn handle_peer_status(_inv: &Invocation) -> Outcome {
     Outcome::ok(cmd, msg).with_data(json!({ "peers": rows }))
 }
 
-/// The five `peer` verbs (CONTRACTS.md §7), registered as their own group.
+/// The six `peer` verbs (CONTRACTS.md §7; `hub` is P-D5), registered as
+/// their own group.
 pub fn register_peers(r: &mut Registry) {
     r.insert(cmd!(
         path: ["peer", "add"],
@@ -825,6 +876,17 @@ pub fn register_peers(r: &mut Registry) {
         gated: false,
         implemented: true,
         handler: handle_peer_status,
+    ));
+    r.insert(cmd!(
+        path: ["peer", "hub"],
+        summary: "Designate a peer as THE hub (at most one) that address resolution prefers as a last-resort remote target; --clear removes the designation.",
+        args: [arg!("name", "string", true, "The registered peer's name.")],
+        flags: [
+            flag!("clear", "bool", "Remove the hub designation from this peer instead of setting it."),
+        ],
+        gated: false,
+        implemented: true,
+        handler: handle_peer_hub,
     ));
 }
 
@@ -907,6 +969,7 @@ mod tests {
             autogate: false,
             token_file: None,
             bearer_secret: bearer_secret.map(str::to_string),
+            hub: false,
             added_at: "2026-08-24T00:00:00Z".to_string(),
         }
     }

@@ -19,7 +19,13 @@ cache (CONTRACTS.md §7). File-first by decision — no embedded database yet
   file) and `bearerSecret` (outbound — what WE present TO a peer, a
   secrets-broker secret NAME resolved fresh at request time by
   `aoide-client`, task #84). Both are optional and independently settable
-  via `peer add`; neither implies the other.
+  via `peer add`; neither implies the other. `hub` (P-D5,
+  `docs/architecture/AOIDED.md`) marks AT MOST ONE registered peer as the
+  standing orchestrator address resolution falls back to — additive,
+  `#[serde(default)]`, omitted from the wire when `false`
+  (`SessionRecord::headless`'s precedent, `records.rs`). `set_hub`/
+  `clear_hub` hold the "at most one" and idempotence invariants; nothing
+  else writes the field directly.
 - `mode` — the staging/declarative mode marker, read by `shellbridge`
   (which stays in `conduct`, see that crate's charter-smudge note).
 - `takes` — the per-draft take store behind `rice back`/`rice take`.
@@ -28,8 +34,15 @@ cache (CONTRACTS.md §7). File-first by decision — no embedded database yet
 - `addr` — the pure address resolver (messaging/presence plan, P-C1),
   inverting `display::session_label`'s grammar to turn a typed query back
   into a local session id or a deferred `peer/<rest>` remote query. Zero
-  I/O, agnostic of any call site — planned callers are `aoide who` (C2) and
-  `graph send --to` (C3), neither wired in yet.
+  I/O, agnostic of any call site — `aoide who` (`aoide-conduct::graph::who`,
+  C2) and `graph send --to` (`aoide-conduct::graph::send`, C3) both call
+  `resolve` directly. `resolve_with_hub` (P-D5) composes it with the hub
+  preference (`peer_store::Peer.hub`): a hub-designated peer is offered as
+  one last, least-specific `Remote` candidate only on `resolve`'s own
+  `NotFound` — every earlier precedence tier is untouched. As of P-D5 it is
+  a tested library function only; `graph send --to`'s live call site still
+  calls plain `resolve` (the same "land the function, wire a caller later"
+  order this module's own tier-5 `peer/<rest>` grammar went through).
 - `inbox` — the durable per-host message store (messaging plan P-C6,
   `state/inbox.json`, CONTRACTS.md §4): every message that lands in a local
   session, filed by `conduct`'s `deliver_local` success path — the ONE

@@ -204,6 +204,40 @@ pub fn resolve(query: &str, host: &str, locals: &[LocalCandidate<'_>], peers: &[
     Resolution::NotFound
 }
 
+/// Compose [`resolve`] with the P-D5 hub preference: when every tier above
+/// comes up completely empty (`Resolution::NotFound` — no exact id, no
+/// tail4, no petname, no host/role match, no peer-name match), a
+/// hub-designated peer (if the caller names one via `hub`) is offered as
+/// one last, least-specific candidate — `Resolution::Remote { peer: hub,
+/// query }`, carrying the ORIGINAL trimmed query verbatim, since no
+/// `peer/<rest>` prefix was ever recognized in it for there to be anything
+/// to strip. Any OTHER resolution — `Local`, tier 5's own `Remote`, or
+/// `Ambiguous` — passes through completely untouched: the hub is a
+/// fallback of last resort, never a shadow over any tier's existing
+/// precedence (`docs/architecture/AOIDED.md`'s "The hub option": "resolution
+/// prefers the hub only when nothing else matches"). `hub: None` (no peer
+/// currently marked hub, `peer_store::Peer::hub`) makes this an identity
+/// wrapper over [`resolve`] — a mesh with no hub behaves exactly as before
+/// this function existed.
+pub fn resolve_with_hub(
+    query: &str,
+    host: &str,
+    locals: &[LocalCandidate<'_>],
+    peers: &[&str],
+    hub: Option<&str>,
+) -> Resolution {
+    match resolve(query, host, locals, peers) {
+        Resolution::NotFound => match hub {
+            Some(name) => Resolution::Remote {
+                peer: name.to_string(),
+                query: query.trim().to_string(),
+            },
+            None => Resolution::NotFound,
+        },
+        other => other,
+    }
+}
+
 /// Apply one tier's predicate over `locals`, returning `None` when nothing
 /// matched (so the caller falls through to the next tier), `Some(Local)` on
 /// exactly one hit, `Some(Ambiguous)` on more than one — the one piece of
@@ -502,6 +536,72 @@ mod tests {
             let got = resolve(c.query, c.host, &c.locals, &c.peers);
             assert_eq!(got, c.expected, "case failed: {}", c.name);
         }
+    }
+
+    // ── `resolve_with_hub` — the P-D5 hub-preference wrapper ─────────────────
+
+    #[test]
+    fn hub_is_used_only_when_every_tier_finds_nothing() {
+        let locals = vec![cand("sess-aaaa-1111", Some("brave-otter"), "root")];
+
+        // No hub configured: identical to plain `resolve` — NotFound stays
+        // NotFound, not silently upgraded.
+        assert_eq!(
+            resolve_with_hub("ghost-name", "sakaki", &locals, &[], None),
+            Resolution::NotFound
+        );
+
+        // A hub IS configured, and nothing else matches: the hub wins as
+        // the last-resort remote, carrying the original query verbatim.
+        assert_eq!(
+            resolve_with_hub("ghost-name", "sakaki", &locals, &[], Some("hub-box")),
+            Resolution::Remote { peer: "hub-box".into(), query: "ghost-name".into() }
+        );
+    }
+
+    #[test]
+    fn an_exact_local_match_beats_the_hub_outright() {
+        let locals = vec![cand("sess-aaaa-1111", Some("brave-otter"), "root")];
+        // The query resolves locally via tier 1 — the hub is never even
+        // consulted, even though one is configured.
+        assert_eq!(
+            resolve_with_hub("sess-aaaa-1111", "sakaki", &locals, &[], Some("hub-box")),
+            Resolution::Local("sess-aaaa-1111".into())
+        );
+    }
+
+    #[test]
+    fn tier_5_peer_rest_beats_the_hub_outright() {
+        let locals: Vec<LocalCandidate<'_>> = vec![];
+        // `yomi-strix` is a KNOWN peer distinct from the hub — tier 5 wins,
+        // the hub (a different peer) never gets a turn.
+        assert_eq!(
+            resolve_with_hub("yomi-strix/brave-otter", "sakaki", &locals, &["yomi-strix"], Some("hub-box")),
+            Resolution::Remote { peer: "yomi-strix".into(), query: "brave-otter".into() }
+        );
+    }
+
+    #[test]
+    fn ambiguous_never_falls_through_to_the_hub() {
+        let locals = vec![
+            cand("sess-aaaa-1111", Some("brave-otter"), "root"),
+            cand("sess-dddd-3333", Some("brave-otter"), "child"),
+        ];
+        // A genuine collision is NOT "nothing matches" — it must surface as
+        // Ambiguous, never get silently resolved via the hub.
+        assert_eq!(
+            resolve_with_hub("brave-otter", "sakaki", &locals, &[], Some("hub-box")),
+            Resolution::Ambiguous(vec!["sess-aaaa-1111".into(), "sess-dddd-3333".into()])
+        );
+    }
+
+    #[test]
+    fn no_hub_and_no_match_is_notfound_unchanged() {
+        let locals = vec![cand("sess-aaaa-1111", Some("brave-otter"), "root")];
+        assert_eq!(
+            resolve_with_hub("nobody-here", "sakaki", &locals, &["yomi-strix"], None),
+            Resolution::NotFound
+        );
     }
 
     #[test]
