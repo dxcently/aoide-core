@@ -126,12 +126,31 @@ fn a_plain_verb_dispatches_and_audits_door_daemon() {
 /// door with the SAME door-hint `Outcome` it already returns over MCP/A2A —
 /// `secrets::commands::require_cli` is the ONE gate, unedited by this
 /// phase, and it returns before `store::load_policies`/`save_policies` is
-/// ever reached (`secrets/src/commands.rs`'s own doc), so "mutates nothing"
-/// holds structurally: no secrets-home file is touched by this call at all,
-/// regardless of what path `AOIDE_SECRETS_HOME` resolves to in this
-/// environment.
+/// ever reached (`secrets/src/commands.rs`'s own doc).
+///
+/// "Mutates nothing" is asserted on DISK here, not taken on the strength of
+/// that code-path comment alone (review nit on bb682da): `AOIDE_SECRETS_HOME`
+/// is pointed at a fresh scratch dir before the refused dispatch, and both
+/// `policy.json`'s bytes AND the scratch dir's very existence are checked
+/// unchanged afterward — `store::save_policies` calls `create_dir_all` on
+/// the secrets home before it ever writes the file, so even a mutation that
+/// stopped short of a successful write would still leave a trace this test
+/// catches. A future reorder of `require_cli` inside `handle_secrets_add`
+/// (or any other admin handler swapped in here) fails THIS test, not just
+/// a stale comment. Serialized under `aoide_test_support::env_lock()`
+/// (`AOIDE_SECRETS_HOME` is process-global) and restored via `EnvSaver` so
+/// a panic mid-test can't leak the override into a later test.
 #[test]
-fn a_cli_only_secrets_admin_verb_refuses_with_the_door_hint() {
+fn a_cli_only_secrets_admin_verb_refuses_with_the_door_hint_and_mutates_nothing_on_disk() {
+    let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _saver = aoide_test_support::EnvSaver::capture(&["AOIDE_SECRETS_HOME"]);
+    let scratch_home = short_tmp("secadmin-home");
+    std::env::set_var("AOIDE_SECRETS_HOME", &scratch_home);
+    let policy_file = aoide_secrets::store::policy_path(&scratch_home);
+
+    assert!(!scratch_home.exists(), "the scratch secrets home must start out absent");
+    let before = std::fs::read(&policy_file).ok();
+
     let (stream, socket_path, events_path) = start_daemon("secadmin");
     let mut writer = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);
@@ -148,6 +167,13 @@ fn a_cli_only_secrets_admin_verb_refuses_with_the_door_hint() {
     let message = outcome["message"].as_str().unwrap_or_default();
     assert!(message.contains("CLI-only"), "{outcome}");
     assert_eq!(outcome["command"], "secrets.add", "{outcome}");
+
+    let after = std::fs::read(&policy_file).ok();
+    assert_eq!(before, after, "the refused dispatch must not have touched {policy_file:?} at all");
+    assert!(
+        !scratch_home.exists(),
+        "the refused dispatch must not have even created the secrets home directory"
+    );
 
     cleanup(&socket_path, &events_path);
 }

@@ -278,8 +278,11 @@ fn write_json_line(writer: &mut impl Write, value: &Value) -> std::io::Result<()
 /// How [`read_capped_line`] failed — the two cases [`handle_conn`]'s caller
 /// tells apart, since only one of them still has a peer worth replying to.
 enum LineReadError {
-    /// A real read error, or bytes that aren't valid UTF-8 (mirrors
-    /// `BufReader::read_line`'s own `Err(_)` case) — no reply is attempted.
+    /// A real I/O read error (`fill_buf` itself failed) — no reply is
+    /// attempted. Invalid UTF-8 is a SEPARATE case this variant does not
+    /// cover: `read_capped_line` only ever hands back raw bytes, and
+    /// [`handle_conn`]'s own `String::from_utf8` check on those bytes is
+    /// what mirrors `BufReader::read_line`'s `Err(_)` case for that one.
     Io,
     /// The accumulated line crossed [`MAX_REQUEST_LINE_BYTES`] before a
     /// `\n` (or EOF) ever arrived — the P-D2 nit this phase closes (module
