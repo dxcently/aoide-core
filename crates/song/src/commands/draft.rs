@@ -1,6 +1,6 @@
 //! `rice draft {save,list,drop}` — durable scratch snapshots of the live
-//! stage (concepts/Self-Ricing's draft extension, khoa 2026-08-14; symlink
-//! routing + `rice mode draft`, khoa 2026-08-14).
+//! stage (concepts/Self-Ricing's draft extension, the User 2026-08-14; symlink
+//! routing + `rice mode draft`, the User 2026-08-14).
 //!
 //! A draft is a saved snapshot living at
 //! `song/songbook/<song>/drafts/<name>/livery.json` (+ `cover.json` when the

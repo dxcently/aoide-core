@@ -1,7 +1,7 @@
 //! `screen info` / `screen shot` / `screen point <verb>` — thin
 //! registrations over this crate's domain modules (Phase 1: info/shot;
 //! Phase 2: the six `screen point` verbs; Phase B of the pointer-emulation
-//! workstream, khoa 2026-08-17, adds `drag`/`hover` and extends `click`
+//! workstream, the User 2026-08-17, adds `drag`/`hover` and extends `click`
 //! --count and `scroll` to two axes, for eight `screen point` verbs total;
 //! Phase E, same day, adds `screen diff`; Phase F, same day, adds
 //! `screen point text`, for nine `screen point` verbs total). Handler

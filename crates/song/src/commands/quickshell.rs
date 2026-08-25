@@ -1,6 +1,6 @@
 //! `quickshell reload` — trigger Quickshell's in-process reload via IPC.
 //!
-//! Named `quickshell`, not `shell` (khoa, 2026-08-15): a top-level command
+//! Named `quickshell`, not `shell` (the User, 2026-08-15): a top-level command
 //! whose first path segment is `shell` collides with `--agent shell`, the
 //! value `graph conduct`/`aoide-shell`'s kitty wrapper have used for a long
 //! time — `cli.rs`'s `is_command_token` treats any bare token matching a
