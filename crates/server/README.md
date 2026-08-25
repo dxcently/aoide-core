@@ -80,6 +80,25 @@ the inbound half of the two-door contract (the outbound half is
   `Invocation { door: Door::Daemon, .. }` for the tick's own internal
   calls, so the tick's writes and a routed client's writes go through
   literally the same code.
+- **Boot-time auto-resume trigger (P-D8, `docs/architecture/AOIDED.md`'s
+  "L5"/"Open knobs")** — `daemon::run_boot_auto_resume`, called exactly
+  ONCE at `run_loop`'s entry, before the tick loop starts (never from
+  inside it). Boot-epoch guarded: `epoch_already_fired` (a pure predicate,
+  unit-testable with no `/proc/stat` involved) compares a one-line marker
+  file under `state_dir` (`daemon::auto_resume_marker_path`) against
+  `aoide_conduct::reap::boot_epoch()` — reused directly rather than
+  re-derived, that function's own doc names this exact caller — so a
+  `Restart=on-failure` restart within the SAME boot is a no-op, and only a
+  real reboot (a changed epoch) reopens the guard. On a fresh boot, for
+  every `autoResume` project (`projects.json`, P-D8) with no live
+  (non-`done`) session anchored to it (`aoide_conduct::graph::anchor_for`),
+  calls `aoide_conduct::graph::session_resurrect` in-process
+  (`Door::Daemon`) — the identical command core `graph resurrect --project`
+  runs over the CLI, the same in-process-call pattern `run_internal_reap`
+  already uses for `graph reap`. That function never hard-errors on a
+  per-candidate spawn failure; a headless host's taught "no
+  `$AOIDE_TERMINAL`" error is only `eprintln!`'d here, never propagated —
+  the tick/loop itself is never at risk.
 - `events` — `tail`, the blocking loop behind `aoide events tail` (P-D3):
   follows the daemon's own events feed with a `Follower` and prints every
   line whose `class` passes an (optional, comma-separated) filter, `--json`

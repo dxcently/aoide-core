@@ -13,6 +13,13 @@
 - **Test env mutation is serialized.** Any test touching
   `AOIDE_STAGE_DIR`/`AOIDE_STATE_DIR` (or similar process-global env) takes
   this crate's `env_lock()` (delegates to `aoide-test-support`).
+- **`ledger` is append-only and never a lookup key for live state (P-D8).**
+  `append_ledger_entry` only ever opens `state/session-ledger.jsonl` in
+  append mode — nothing in this crate truncates, rewrites, or prunes it;
+  that is precisely what makes it survive `sessions.json`'s own pruning.
+  Don't add a "compact the ledger" or "delete old entries" path without
+  re-reading `docs/architecture/AOIDED.md`'s "L5" — the design leans on
+  this file staying a complete, permanent record.
 
 ## Extension points
 

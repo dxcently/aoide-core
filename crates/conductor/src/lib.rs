@@ -261,6 +261,7 @@ mod tests {
             hook_ancestry: Vec::new(),
             headless: false,
             harness_session_id: None,
+            resumed_from: None,
             extra: serde_json::Map::new(),
         }
     }

@@ -97,7 +97,22 @@
   isolated tempdir still calls `env_lock()` first (existing convention)
   and restores what it captured on exit, same as `aoide-conduct`'s sibling
   `$AOIDE_DAEMON_SOCKET` floor (see that crate's own `AGENTS.md`) — don't
-  remove or weaken either without re-reading why it exists.
+  remove or weaken either without re-reading why it exists. **A second
+  floor (P-D8, same reasoning, one env var over) does the identical thing
+  for `$AOIDE_STATE_DIR`:** `daemon::run_loop`'s entry now also calls
+  `run_boot_auto_resume` once, which reads/writes a marker under
+  `aoide_storage::fs::state_dir()` — the SAME un-joined background thread
+  makes that call too, so without this floor it would eventually touch the
+  real `~/Aoide/state/auto-resume-boot-epoch` on this box.
+- **`daemon::run_boot_auto_resume` fires exactly ONCE per `run_loop` call,
+  strictly BEFORE the tick loop — never move it inside the loop (P-D8).**
+  It is a boot-time trigger, not a tick-cadence one: the guard
+  (`daemon::epoch_already_fired`, a pure predicate deliberately factored
+  out so it is unit-testable without `/proc/stat`) exists specifically to
+  make a `Restart=on-failure` restart within the same boot a no-op, which
+  only holds if the call happens once at entry, not once per tick. Don't
+  fold it into the tick loop "for consistency with reap" — that would
+  re-fire it every `REAP_EVERY_TICKS` and defeat the whole guard.
 
 ## Extension points
 

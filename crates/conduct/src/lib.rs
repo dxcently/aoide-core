@@ -38,6 +38,22 @@ pub mod shellbridge;
 /// stamp existed). This establishes the SAFE DEFAULT only — a test that
 /// wants to prove routing against a FAKE daemon still installs its own
 /// `AOIDE_DAEMON_SOCKET` override afterward, same as any other env var here.
+///
+/// **P-D8 safety net, same shape as the P-D6 one directly above:** the first
+/// call ALSO floors `AOIDE_STATE_DIR` to a private per-process tempdir,
+/// unless a test already set one. `do_session_end`/`graph reap` now write a
+/// ledger line (`state/session-ledger.jsonl`, under `aoide_storage::fs::
+/// state_dir`) on every roster exit — `session_store.rs`'s and `reap.rs`'s
+/// own test suites never previously touched `state_dir()` at all, so
+/// neither ever needed to set this var, and without this floor EVERY
+/// `session_end`/`reap` test in the crate would append into the REAL
+/// `~/Aoide/state/session-ledger.jsonl` on a dev box whenever it happened to
+/// run before some other test set the var (the exact class of incident the
+/// `AOIDE_DAEMON_SOCKET` floor above already exists to prevent, one env var
+/// over). A test that wants to assert real ledger CONTENT still installs
+/// its own `AOIDE_STATE_DIR` override afterward (`ledger.rs`'s and
+/// `resurrect.rs`'s own tests do exactly that) — this only keeps every
+/// OTHER test's incidental ledger append off production disk.
 #[cfg(test)]
 pub(crate) fn env_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -47,6 +63,12 @@ pub(crate) fn env_lock() -> &'static std::sync::Mutex<()> {
             std::env::set_var(
                 "AOIDE_DAEMON_SOCKET",
                 "/nonexistent/aoide-conduct-tests-never-a-real-daemon.sock",
+            );
+        }
+        if std::env::var("AOIDE_STATE_DIR").is_err() {
+            std::env::set_var(
+                "AOIDE_STATE_DIR",
+                std::env::temp_dir().join(format!("aoide-conduct-tests-state-{}", std::process::id())),
             );
         }
     });

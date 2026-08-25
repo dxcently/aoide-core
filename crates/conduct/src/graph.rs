@@ -19,6 +19,7 @@ mod doc;
 mod model;
 mod pending;
 mod permit;
+mod resurrect;
 mod send;
 mod session_store;
 mod spawn;
@@ -56,6 +57,13 @@ pub use self::session_store::{session_end, session_phase, session_start, session
 // `conduct`/`wrap` that re-execs `conduct --headless` and returns without
 // waiting on the agent's own lifetime — see `graph/spawn.rs`'s module doc.
 pub use self::spawn::session_spawn;
+// `graph resurrect` (P-D8, `docs/architecture/AOIDED.md`'s "L5"): revives a
+// project's most recently-ended resumable session off the durable ledger,
+// via the windowed spawn path — see `graph/resurrect.rs`'s module doc. Also
+// the daemon's own boot-time auto-resume trigger (`aoide-server`'s
+// `daemon.rs`), called in-process the same way `run_internal_reap` calls
+// `crate::reap::reap_and_announce`.
+pub use self::resurrect::session_resurrect;
 pub use self::verbs::{emit, link, project_add, project_list, project_remove, prune, view};
 // `aoide who` (messaging/presence plan, P-C2): live presence over this
 // box's own sessions plus every registered peer — see `graph/who.rs`'s
@@ -79,7 +87,7 @@ pub use self::session_store::now_iso_utc;
 // `use crate::graph::{...}`" section) — never reached from root, so they stay
 // `pub(crate)`.
 pub(crate) use self::common::stage_error;
-pub(crate) use self::doc::{drop_sessions, prune_done, restage_graph};
+pub(crate) use self::doc::{drop_sessions, ledger_session_exit, prune_done, restage_graph};
 pub(crate) use self::model::{hooks_path, STAGE_GRAPH_VERSION};
 pub(crate) use self::session_store::{
     lineage_of, refresh_subagent_says, refresh_transcript_fields, upsert_hook,

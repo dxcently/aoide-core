@@ -27,6 +27,18 @@ pub struct Project {
     pub name: String,
     #[serde(default)]
     pub path: String,
+    /// Additive/v0-safe (P-D8, `docs/architecture/AOIDED.md`'s "L5"): when
+    /// true, the daemon's `run_loop` entry (once per BOOT, boot-epoch
+    /// guarded — `aoide-server`'s `daemon.rs`) resurrects this project's
+    /// single most recent resumable ledger session whenever it currently
+    /// has no live one. Default `false`; `skip_serializing_if` keeps a
+    /// `false` value off the wire, same discipline `SessionRecord.headless`
+    /// set the precedent for. Set via `graph project add --auto-resume`
+    /// (idempotent-upsert; no `project set`/`project edit` verb exists to
+    /// clear it back to `false` today — hand-edit `projects.json` in the
+    /// meantime).
+    #[serde(rename = "autoResume", default, skip_serializing_if = "is_false")]
+    pub auto_resume: bool,
 }
 
 /// One session record (`song/stage/sessions.json`, written by shellbridge).
@@ -232,6 +244,22 @@ pub struct SessionRecord {
         skip_serializing_if = "Option::is_none"
     )]
     pub harness_session_id: Option<String>,
+    /// Additive/v0-safe (P-D8, `docs/architecture/AOIDED.md`'s "L5"): names
+    /// the durable ledger entry's own `sessionId` this record was REVIVED
+    /// from by `graph resurrect` — never a live lookup key (the named
+    /// session has already left the roster by construction; this is
+    /// provenance only). Stamped once, right after registration, by
+    /// `stamp_resumed_from`; `build_graph` projects it as an additive
+    /// `resumed` edge beside `spawned`/`anchors` (CONTRACTS.md §4). Absent
+    /// means "not a resurrected session" (the common case, and every legacy
+    /// record); readers must tolerate both forms and round-trip fields they
+    /// do not know.
+    #[serde(
+        rename = "resumedFrom",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub resumed_from: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -363,6 +391,27 @@ mod tests {
         let legacy: SessionRecord =
             serde_json::from_str(r#"{ "sessionId": "s", "windowAddress": "0x1" }"#).unwrap();
         assert!(!legacy.headless);
+    }
+    #[test]
+    fn project_auto_resume_round_trips_and_stays_absent_when_unset() {
+        // serde: `autoResume` serialises as `true` only when set — the
+        // common `false`/unset case is skipped entirely (skip_serializing_if
+        // = "is_false"), the same additive-bool contract `SessionRecord.
+        // headless` set the precedent for (P-D8). Default is `false`: a
+        // project registered before this field existed, or one never opted
+        // in, never trips the daemon's boot-time auto-resume trigger.
+        let mut proj = Project { name: "aoide".into(), path: "/home/x/Aoide".into(), ..Default::default() };
+        assert!(!proj.auto_resume, "default is off");
+        let bare_json = serde_json::to_string(&proj).unwrap();
+        assert!(!bare_json.contains("autoResume"), "serialised: {bare_json}");
+        let legacy: Project = serde_json::from_str(r#"{ "name": "aoide", "path": "/home/x/Aoide" }"#).unwrap();
+        assert!(!legacy.auto_resume, "a legacy project with no autoResume key defaults to off");
+
+        proj.auto_resume = true;
+        let json = serde_json::to_string(&proj).unwrap();
+        assert!(json.contains("\"autoResume\":true"), "serialised: {json}");
+        let back: Project = serde_json::from_str(&json).unwrap();
+        assert!(back.auto_resume, "a set autoResume persists through the round trip");
     }
     #[test]
     fn session_record_harness_session_id_round_trips_and_stays_absent_when_unset() {

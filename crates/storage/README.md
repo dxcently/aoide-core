@@ -28,6 +28,21 @@ cache (CONTRACTS.md §7). File-first by decision — no embedded database yet
   else writes the field directly.
 - `mode` — the staging/declarative mode marker, read by `shellbridge`
   (which stays in `conduct`, see that crate's charter-smudge note).
+- `ledger` — the durable, append-only session HISTORY (`state/
+  session-ledger.jsonl`, under `fs::state_dir` — real disk, never tmpfs;
+  P-D8, `docs/architecture/AOIDED.md`'s "L5"). `sessions.json` is the live
+  roster; this is what survives its pruning. One `LedgerEntry` line per
+  session, written at the exact moment it leaves the roster (`aoide-conduct`
+  owns the single shared call site both `session end` and `reap` route
+  through — never two independently-written appenders); every field
+  serializes unconditionally, unlike `records::SessionRecord`'s additive
+  optional fields, since a ledger line is a closed historical shape, not a
+  growing live record. `append_ledger_entry`/`read_ledger` are the only
+  I/O; a malformed line is skipped on read rather than failing the file.
+  `records::Project.autoResume` and `records::SessionRecord.resumedFrom`
+  (both additive/v0-safe, `skip_serializing_if`) are this same phase's
+  other two wire-shape additions — the daemon's boot-time auto-resume flag
+  and the mark a resurrected session's own record carries.
 - `takes` — the per-draft take store behind `rice back`/`rice take`.
 - `petname`/`display` — the adjective-noun petname mint and its
   render-time-only display grammar.

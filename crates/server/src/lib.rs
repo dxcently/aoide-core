@@ -55,6 +55,16 @@ pub mod producers;
 /// and restores to what it captured on exit — which, because of this floor,
 /// is never "fully unset" for the rest of the binary's life once the first
 /// test has run.
+///
+/// **P-D8 addendum, same reasoning, one env var over:** also floors
+/// `AOIDE_STATE_DIR`. `daemon::run_loop` now calls `run_boot_auto_resume`
+/// once at entry, which reads/writes a marker under `aoide_storage::fs::
+/// state_dir()` — the SAME `run_loop` test's un-joined background thread
+/// makes that call too, so without this floor it would eventually read
+/// `AOIDE_STATE_DIR` as unset and touch the real
+/// `~/Aoide/state/auto-resume-boot-epoch` on this box (`aoide-conduct`'s
+/// own `env_lock()` carries the identical second floor, for the identical
+/// reason — see that crate's `lib.rs`).
 #[cfg(test)]
 pub(crate) fn env_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -64,6 +74,11 @@ pub(crate) fn env_lock() -> &'static std::sync::Mutex<()> {
             let dir = std::env::temp_dir().join(format!("aoide-server-tests-floor-{}", std::process::id()));
             let _ = std::fs::create_dir_all(&dir);
             std::env::set_var("AOIDE_STAGE_DIR", &dir);
+        }
+        if std::env::var("AOIDE_STATE_DIR").is_err() {
+            let dir = std::env::temp_dir().join(format!("aoide-server-tests-state-floor-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            std::env::set_var("AOIDE_STATE_DIR", &dir);
         }
     });
     &LOCK

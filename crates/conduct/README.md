@@ -101,8 +101,35 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
 - `shellbridge`, `herald` — files only; their CLI verbs (registry lines)
   moved to `lyra` at P-A2, but both stay resident here (see charter smudge
   below).
-- `commands` — this crate's CLI verbs: `graph *` (15 paths), `conduct`,
-  `hooks install`, `who`.
+- `commands` — this crate's CLI verbs: `graph *` (21 paths, including
+  `graph resurrect`, P-D8), `conduct`, `hooks install`, `who`.
+- **The durable session ledger + resurrect (P-D8, `docs/architecture/
+  AOIDED.md`'s "L5"):** `graph/doc.rs::ledger_session_exit` is the ONE
+  shared call both `session_store.rs::do_session_end_inner` (a clean
+  `graph session end`) and `reap.rs::reap_inner` (every id its `reaped` set
+  collects) route through to append one `aoide_storage::ledger::
+  LedgerEntry` line at the exact instant a session leaves the roster —
+  never two independently-written appenders, so a given session
+  contributes exactly one ledger line regardless of which path retired it.
+  `graph/resurrect.rs::session_resurrect` (`graph resurrect --project
+  <name> [--all | --id <ledgerSessionId>]`) reads that ledger, anchors
+  entries to a project by the SAME `anchor_for` longest-prefix rule `graph
+  emit` uses, filters to harnesses with a verified `AgentProfile.
+  resume_args` (`aoide_protocol::agents` — a harness with none is skipped
+  with a taught message naming it, never a guessed invocation), and spawns
+  each survivor via the windowed path (`graph/spawn.rs`, P-D7) with the
+  harness's own resume argv and `--cwd` set to the ledger entry's own cwd.
+  A resurrected session is ALWAYS a fresh `sessionId` — ids are never
+  recycled — and gets stamped `resumedFrom` (`session_store.rs::
+  stamp_resumed_from`) naming the ledger entry it continues; `build_graph`
+  projects that as an additive `resumed` edge beside `spawned`/`anchors`.
+  Never a hard `Outcome::error` over a per-candidate spawn failure (a
+  headless host's taught "no `$AOIDE_TERMINAL`" error, for one) — every
+  outcome folds into `resurrected`/`skipped`/`failed` and the command
+  itself stays `Ok`, which is what lets the daemon's own boot-time
+  auto-resume trigger (`aoide-server`'s `daemon.rs`) call this exact
+  command core in-process without ever risking its own tick on a
+  headless box.
 - `who` — `aoide who [filter] [--json] [--all]` (`graph/who.rs`): live
   presence over this box's own sessions plus every registered peer,
   probed in parallel on each invocation (messaging workstream C2). A

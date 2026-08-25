@@ -33,13 +33,14 @@ pub fn register(r: &mut Registry) {
             arg!("name", "string", true, "Project name (its node id becomes project:<name>)."),
             arg!("path", "string", false, "Project root path (defaults to the current working directory); sessions anchor by cwd prefix (longest wins)."),
         ],
-        flags: [],
+        flags: [flag!("auto-resume", "bool", "Opt this project into the daemon's boot-time auto-resume sweep (`graph resurrect --project <name>` on `run_loop` entry, once per boot). Only ever sets it true — hand-edit projects.json to clear it.")],
         gated: false,
         implemented: true,
         handler: crate::graph::project_add,
         examples: [
             "graph project add aoide ~/Aoide",
             "graph project add aoide",
+            "graph project add aoide ~/Aoide --auto-resume",
         ],
     ));
     r.insert(cmd!(
@@ -141,11 +142,29 @@ pub fn register(r: &mut Registry) {
             flag!("id", "string", "Session id override (default spawn-<pid>-<unixts>)."),
             flag!("prompt", "string", "A first turn to inject once the session registers (skipped, honestly reported, if it never does)."),
             flag!("windowed", "bool", "Open a real terminal (from $AOIDE_TERMINAL, a whitespace-split argv with a `{cmd}` placeholder) instead of a detached headless child. A bare `{cmd}` splices the conducted argv as separate arguments (`kitty -e {cmd}`); a quote-wrapped `'{cmd}'` joins it shell-quoted into one word for `sh -c` templates (`foot sh -c '{cmd}'`). Taught errors when unset, or when no display is present."),
+            flag!("cwd", "string", "Working directory for the spawned child (default: this process's own cwd) — for --windowed, the terminal emulator's own cwd, which its own shell inherits."),
         ],
         gated: false,
         implemented: true,
         handler: crate::graph::session_spawn,
         examples: ["graph spawn --agent codex -- codex --model x"],
+    ));
+    r.insert(cmd!(
+        path: ["graph", "resurrect"],
+        summary: "Revive a project's most recently-ended resumable session off the durable ledger (state/session-ledger.jsonl): resolves --project by exact name, filters ledger entries anchored to it (longest-prefix, same rule `graph emit` uses) to harnesses with a verified resume argv, and spawns each via the windowed path (--windowed, a fresh terminal running `<harness> --resume <id>`) in its original cwd. The revived session always mints a NEW sessionId (ids are never recycled) and is stamped resumedFrom, rendered as a `resumed` graph edge. A no-resume-argv harness is skipped with a taught message naming it; a windowed-spawn failure (no $AOIDE_TERMINAL / no display) is folded into `failed` rather than erroring the command, so a headless host degrades gracefully.",
+        args: [],
+        flags: [
+            flag!("project", "string", "Project name to resurrect a session for (required); resolved against projects.json by exact name."),
+            flag!("all", "bool", "Resurrect every anchored, resumable ledger entry instead of just the single most recent."),
+            flag!("id", "string", "Resurrect one specific ledger sessionId instead of the most recent (mutually exclusive with --all; --id wins if both given)."),
+        ],
+        gated: false,
+        implemented: true,
+        handler: crate::graph::session_resurrect,
+        examples: [
+            "graph resurrect --project aoide",
+            "graph resurrect --project aoide --all",
+        ],
     ));
     r.insert(cmd!(
         path: ["graph", "send"],

@@ -110,6 +110,7 @@ mod tests {
             "graph.project.remove",
             "graph.prune",
             "graph.reap",
+            "graph.resurrect",
             "graph.send",
             "graph.session.end",
             "graph.session.hook",

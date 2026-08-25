@@ -7,7 +7,9 @@
 //! graph.json so the read path lights up immediately.
 
 use super::common::{require_flag, stage_error};
-use super::doc::{doomed_subagent_descendants, prune_done, restage_graph, would_cycle};
+use super::doc::{
+    doomed_subagent_descendants, ledger_session_exit, prune_done, restage_graph, would_cycle,
+};
 use super::model::{
     canonical_state, hooks_path, load_stage, sessions_path, write_stage, HooksFile,
     SessionRecord, SessionsFile, STAGE_GRAPH_VERSION,
@@ -498,6 +500,41 @@ pub(in crate::graph) fn stamp_harness_session_id(id: &str, harness_session_id: &
     });
 }
 
+/// Stamp `resumedFrom` on a just-registered session record — the ledger
+/// entry's own `sessionId` its resume argv was built from (P-D8,
+/// `docs/architecture/AOIDED.md`'s "L5"). Unlike [`stamp_harness_session_id`]
+/// this DOES call [`restage_graph`]: `build_graph` projects the field as a
+/// `resumed` edge beside `spawned`/`anchors` (CONTRACTS.md §4), so it must be
+/// RENDERED, not only held for internal use — the conductor needs to see the
+/// edge without a second `graph emit`. Change-only; a silent no-op for an
+/// unknown id (the windowed spawn's own terminal may not have registered by
+/// the time `graph resurrect` gets here — an honest no-op, never a crash).
+pub(in crate::graph) fn stamp_resumed_from(id: &str, resumed_from: &str) {
+    if resumed_from.is_empty() {
+        return;
+    }
+    with_stage_lock(|| {
+        let mut file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let Some(s) = file
+            .sessions
+            .iter_mut()
+            .find(|s| s.session_id == id && s.resumed_from.as_deref() != Some(resumed_from))
+        else {
+            return;
+        };
+        s.resumed_from = Some(resumed_from.to_string());
+        if file.schema_version.is_empty() {
+            file.schema_version = STAGE_GRAPH_VERSION.to_string();
+        }
+        if write_stage(&sessions_path(), &file).is_ok() {
+            let _ = restage_graph();
+        }
+    });
+}
+
 /// Best-effort: refresh a session's transcript-derived fields at a hook boundary —
 /// its `say` (the agent's latest words) and, set-once, its `title` (the session
 /// NAME, from `custom-title`). Change-only; never touches state/activity/pid;
@@ -981,8 +1018,22 @@ fn do_session_end_inner(id: &str) -> Outcome {
         )
         .with_data(json!({ "sessionId": id }));
     }
+    let now = now_iso_utc();
     for s in s_file.sessions.iter_mut() {
         if s.session_id == id {
+            // The ledger write (P-D8), gated on an ACTUAL transition: unlike
+            // `reap_inner` (whose `reaped` set is only ever built from
+            // not-`done` records, so it can never re-process an id), this
+            // handler leaves the record present-and-`done` rather than
+            // pruning it — so a REPEAT `session end` on the same id must
+            // find it already `done` and skip the write, or every repeat
+            // call would append a second line for one exit. Only the first
+            // call (a genuine not-done → done transition) reaches
+            // `ledger_session_exit` (`doc.rs`) — the same one shared call
+            // `reap_inner`'s own exit routes through too.
+            if s.state != "done" {
+                ledger_session_exit(s, &now);
+            }
             s.state = "done".to_string();
         }
     }
@@ -1002,11 +1053,12 @@ fn do_session_end_inner(id: &str) -> Outcome {
     }
 
     // Mirror the terminal state into hooks.json so the merged live phase agrees.
+    // Reuses the SAME `now` the ledger write above stamped as this session's
+    // `endedAt` — one instant for the whole roster-exit, not two clock reads.
     let mut h_file: HooksFile = match load_stage(&hooks_path()) {
         Ok(f) => f,
         Err(e) => return stage_error(cmd, e),
     };
-    let now = now_iso_utc();
     upsert_hook(&mut h_file.hooks, id, "done", &now);
     if h_file.schema_version.is_empty() {
         h_file.schema_version = STAGE_GRAPH_VERSION.to_string();
@@ -1745,6 +1797,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&stage);
     }
     #[test]
+    fn session_end_appends_exactly_one_ledger_line() {
+        // P-D8: the `do_session_end` half of "clean end and reap each
+        // produce one ledger line, never two" — `reap`'s own half lives in
+        // `reap.rs`'s test suite; both route through the SAME
+        // `ledger_session_exit` (`doc.rs`).
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR"]);
+        let stage = unique_stage("sess-end-ledger");
+        let state = stage.join("state");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+
+        session_start(&flag_invocation(
+            &["graph", "session", "start"],
+            &[("id", "end-ledger-1"), ("agent", "claude"), ("cwd", "/w")],
+        ));
+        let out = session_end(&flag_invocation(
+            &["graph", "session", "end"],
+            &[("id", "end-ledger-1")],
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+
+        let lines = aoide_storage::ledger::read_ledger().unwrap();
+        let mine: Vec<_> = lines.iter().filter(|l| l.session_id == "end-ledger-1").collect();
+        assert_eq!(mine.len(), 1, "exactly one ledger line, never two: {lines:?}");
+        assert_eq!(mine[0].agent, "claude");
+        assert_eq!(mine[0].cwd, "/w");
+        assert!(!mine[0].ended_at.is_empty());
+
+        // Ending it again (a repeat/idempotent call) must NOT append a
+        // second line — the record is already gone from the LIVE (not-done)
+        // set the write loop iterates, so the second call is a genuine no-op
+        // for the ledger, same as it already is for sessions.json.
+        let _ = session_end(&flag_invocation(
+            &["graph", "session", "end"],
+            &[("id", "end-ledger-1")],
+        ));
+        let lines2 = aoide_storage::ledger::read_ledger().unwrap();
+        let mine2: usize = lines2.iter().filter(|l| l.session_id == "end-ledger-1").count();
+        assert_eq!(mine2, 1, "a repeat `session end` must not double-append");
+
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+    #[test]
     fn set_session_log_path_is_change_only_and_noops_on_an_unknown_id() {
         let _guard = crate::env_lock().lock().unwrap();
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
@@ -2106,5 +2202,47 @@ mod tests {
 
         // No compositor at all stays None (unchanged).
         assert!(effective_live_addresses(None, &windowed).is_none());
+    }
+
+    #[test]
+    fn stamp_resumed_from_lands_the_field_and_renders_a_resumed_edge() {
+        // P-D8: the mechanical half of "resurrect mints a new id with
+        // resumedFrom set" — no spawn involved, just the stage-write + the
+        // graph.json projection it triggers (unlike `stamp_harness_session_id`,
+        // this one DOES restage).
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("stamp-resumed-from");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        do_session_start("new-1", Some("claude"), Some("/w"), None, None, None, None, None, None);
+        stamp_resumed_from("new-1", "old-1");
+
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let rec = s.sessions.iter().find(|r| r.session_id == "new-1").unwrap();
+        assert_eq!(rec.resumed_from.as_deref(), Some("old-1"));
+
+        let g: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(stage.join("graph.json")).unwrap(),
+        )
+        .unwrap();
+        let edges = g["edges"].as_array().unwrap();
+        assert!(
+            edges.iter().any(|e| e["from"] == "session:old-1"
+                && e["to"] == "session:new-1"
+                && e["kind"] == "resumed"),
+            "graph.json must be re-staged with the resumed edge: {edges:?}"
+        );
+
+        // A second stamp with the SAME value is change-only (no-op) —
+        // proven indirectly: an unknown id is a silent no-op and never
+        // panics or errors.
+        stamp_resumed_from("no-such-session", "old-2");
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
     }
 }

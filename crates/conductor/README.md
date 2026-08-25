@@ -74,6 +74,23 @@ entry shifts every id after it. `App::dispatch` already re-lists via
 second a/d keypress in the same visit always resolves the row actually on
 screen, never a stale index.
 
+## PROJECTS: register/remove/resurrect (P-D8 adds `r`)
+
+Rows are `App::projects` (the live-loaded `projects.json`, already read for
+the DAG panel's own anchoring), sorted by name (`sorted_project_names`) for
+a stable, deterministic row order independent of file-write order. `j`/`k`
+walk the rows; `a` opens the same inline `Input` line editor ROSTER's
+compose flow uses to `graph project add <path>`; `d` dispatches `graph
+project remove <name>` for the row under the cursor; `r` (P-D8,
+`docs/architecture/AOIDED.md`'s "L5") dispatches `graph resurrect --project
+<name>` through `App::dispatch_with_flags` — the SAME single dispatch seam
+every other action uses, just with the project name riding as a flag
+rather than a positional arg (`graph resurrect` takes no positional args
+at all). `r` is unclaimed on this panel (it binds only `j`/`k`/`a`/`d`
+otherwise); the ROSTER panel's own `r` = force-refresh is a different
+handler, different panel, so the two never collide. All three actions are
+no-ops with the cursor on an empty list.
+
 ## What it consumes
 
 `aoide-protocol`, `aoide-conduct` (`build_graph`/`merged_sessions`/

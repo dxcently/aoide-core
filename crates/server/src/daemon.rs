@@ -334,6 +334,96 @@ fn run_internal_reap() {
     let _ = aoide_conduct::reap::reap_and_announce(&internal_invocation(&["graph", "reap"]));
 }
 
+/// Where [`run_boot_auto_resume`] remembers which boot it last fired
+/// under — a one-line text file holding a `boot_epoch()` value, under
+/// `state_dir` (durable operational state, not a stage/roster file the
+/// rest of the tree reads).
+fn auto_resume_marker_path() -> PathBuf {
+    aoide_storage::fs::state_dir().join("auto-resume-boot-epoch")
+}
+
+/// The boot-epoch guard's own decision, pulled out as a PURE predicate
+/// (no `/proc/stat`, no filesystem) so it is directly unit-testable
+/// without depending on this machine's real boot instant — "unit-level
+/// with the epoch seam, no real daemon needed"
+/// (`docs/architecture/AOIDED.md`'s P-D8 phase entry). `marker_contents`
+/// is whatever [`auto_resume_marker_path`] held when read (`None` if
+/// absent, unreadable, or the file predates this trigger); `current_epoch`
+/// is [`aoide_conduct::reap::boot_epoch`]'s own return. `true` means
+/// "already fired this boot — skip".
+fn epoch_already_fired(marker_contents: Option<&str>, current_epoch: i64) -> bool {
+    marker_contents
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .is_some_and(|prev| prev == current_epoch)
+}
+
+/// P-D8's boot-time auto-resume trigger (`docs/architecture/AOIDED.md`'s
+/// "Open knobs" — the ONE open knob, decided: daemon start, boot-epoch
+/// guarded). Called exactly ONCE, right before [`run_loop`]'s tick loop
+/// starts — never from inside the loop itself — so a crash-looping
+/// `Restart=on-failure` unit never re-spawns a terminal for a project
+/// that already got one earlier this SAME boot.
+///
+/// The guard is [`auto_resume_marker_path`]: a one-line marker holding the
+/// boot epoch (`aoide_conduct::reap::boot_epoch`, reused rather than
+/// re-derived — that function's own doc names this exact caller,
+/// `pkgs/aoide/crates/AGENTS.md`'s "no cross-crate copying") this trigger
+/// last ran under. A real reboot changes the epoch and reopens the guard;
+/// a `run_loop` restart within the same boot reads the same epoch back
+/// and returns immediately. `boot_epoch() == None` (no `/proc/stat` — a
+/// stripped container) means "never fire", the same safe direction
+/// `boot_epoch`'s own doc states for the pre-boot-ghost reap signal.
+///
+/// For each `autoResume` project (`projects.json`) with no live
+/// (non-`done`) session anchored to it (the same `anchor_for` longest-
+/// prefix rule `graph emit` uses), resurrects its single most recent
+/// resumable ledger entry by calling `aoide_conduct::graph::
+/// session_resurrect` directly, in-process, `Door::Daemon` — the SAME
+/// command core `graph resurrect --project` runs over the CLI, the exact
+/// pattern [`run_internal_reap`] already uses for `graph reap`. That
+/// function never hard-errors on a per-candidate spawn failure (its own
+/// module doc): a headless host's taught "no `$AOIDE_TERMINAL`" error
+/// lands in its `failed` array and this function only logs it — the
+/// caller (`run_loop`) never sees an `Err` and the tick loop is never at
+/// risk, satisfying "a headless host's windowed spawn degrades gracefully,
+/// never crashes the tick/loop."
+fn run_boot_auto_resume() {
+    let Some(epoch) = aoide_conduct::reap::boot_epoch() else { return };
+    let marker = auto_resume_marker_path();
+    let marker_contents = std::fs::read_to_string(&marker).ok();
+    if epoch_already_fired(marker_contents.as_deref(), epoch) {
+        return;
+    }
+
+    let projects: aoide_storage::records::ProjectsFile =
+        aoide_storage::stage::load_stage(&aoide_storage::stage::projects_path()).unwrap_or_default();
+    let sessions: aoide_storage::records::SessionsFile =
+        aoide_storage::stage::load_stage(&aoide_storage::stage::sessions_path()).unwrap_or_default();
+
+    for (idx, p) in projects.projects.iter().enumerate() {
+        if !p.auto_resume {
+            continue;
+        }
+        let has_live = sessions.sessions.iter().any(|s| {
+            s.state != "done" && aoide_conduct::graph::anchor_for(&s.cwd, &projects.projects) == Some(idx)
+        });
+        if has_live {
+            continue;
+        }
+        let mut inv = internal_invocation(&["graph", "resurrect"]);
+        inv.flags.insert("project".to_string(), p.name.clone());
+        let out = aoide_conduct::graph::session_resurrect(&inv);
+        if out.status != aoide_protocol::output::Status::Ok {
+            eprintln!("[aoided] boot auto-resume for project `{}` failed: {}", p.name, out.message);
+        }
+    }
+
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&marker, epoch.to_string());
+}
+
 fn runtime_dir() -> PathBuf {
     let runtime = std::env::var("XDG_RUNTIME_DIR")
         .ok()
@@ -724,6 +814,12 @@ pub fn run_loop(
     let accept_events_path = events_path.clone();
     std::thread::Builder::new()
         .spawn(move || accept_loop(listener, accept_events_path, registry, dispatch))?;
+
+    // P-D8 boot-time auto-resume (module doc's "Open knobs" — decided: daemon
+    // start). Runs ONCE here, at `run_loop` entry — never inside the tick
+    // loop below — boot-epoch-guarded so a `Restart=on-failure` restart
+    // within the same boot is a no-op; see `run_boot_auto_resume`'s own doc.
+    run_boot_auto_resume();
 
     // Tick (~1s): the two P-D3 producers (module doc's "The tick's two
     // producers"), constructed once here, outside the loop.
@@ -1207,6 +1303,130 @@ mod tests {
         run_internal_reap(); // must not panic
 
         restore_stage(&stage, saved);
+    }
+
+    // ── P-D8 boot-time auto-resume trigger ───────────────────────────────
+
+    /// Like [`isolated_stage`] but also isolates `AOIDE_STATE_DIR` — this
+    /// crate's `env_lock()` floors it too (P-D8 addendum, `lib.rs`), but
+    /// that floor is a shared per-BINARY fallback, not a per-test tempdir;
+    /// [`run_boot_auto_resume`] writes a marker file there, so a test that
+    /// wants to inspect or pre-seed that marker needs its OWN isolated dir,
+    /// the same reasoning `isolated_stage` already applies to the stage.
+    fn isolated_stage_and_state() -> (std::sync::MutexGuard<'static, ()>, PathBuf, PathBuf, Option<String>, Option<String>) {
+        let guard = crate::env_lock().lock().unwrap();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let stage = short_tmp("dstage");
+        let state = short_tmp("dstate");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        (guard, stage, state, saved_stage, saved_state)
+    }
+
+    fn restore_stage_and_state(stage: &Path, state: &Path, saved_stage: Option<String>, saved_state: Option<String>) {
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+        std::fs::remove_dir_all(stage).ok();
+        std::fs::remove_dir_all(state).ok();
+    }
+
+    /// [`epoch_already_fired`] pulled the boot-epoch guard's whole decision
+    /// out as a pure function specifically so it is testable without
+    /// `/proc/stat` or a filesystem — "unit-level with the epoch seam, no
+    /// real daemon needed" (`docs/architecture/AOIDED.md`'s P-D8 phase
+    /// entry, "Tests:" line).
+    #[test]
+    fn epoch_already_fired_reads_the_guard_exactly() {
+        // No marker at all (first boot ever, or the file predates this
+        // trigger) — never "already fired", regardless of the epoch.
+        assert!(!epoch_already_fired(None, 1_000_000));
+
+        // Marker names the SAME boot the caller is asking about — guard
+        // trips, the whole point of the mechanism (a `Restart=on-failure`
+        // restart within one boot must not re-fire).
+        assert!(epoch_already_fired(Some("1000000"), 1_000_000));
+
+        // Marker names a DIFFERENT (older) boot — a real reboot happened
+        // since; the guard must reopen.
+        assert!(!epoch_already_fired(Some("999999"), 1_000_000));
+
+        // A corrupt/unparseable marker is treated as "unknown", not
+        // "already fired" — the safe direction is to fire again (at worst
+        // a redundant, still-gated resurrect attempt), never to silently
+        // wedge the trigger shut forever over one bad write.
+        assert!(!epoch_already_fired(Some("not-a-number"), 1_000_000));
+        assert!(!epoch_already_fired(Some(""), 1_000_000));
+    }
+
+    /// `run_boot_auto_resume`'s write side, against a real (empty)
+    /// projects.json: on a fresh boot with nothing to resurrect, it still
+    /// records the marker — proving the wiring reaches
+    /// `auto_resume_marker_path()` and writes a value `epoch_already_fired`
+    /// can read back, not just that the pure predicate is correct in
+    /// isolation.
+    #[test]
+    fn run_boot_auto_resume_records_the_current_boot_epoch_on_a_fresh_marker() {
+        let (_guard, stage, state, saved_stage, saved_state) = isolated_stage_and_state();
+
+        let marker = auto_resume_marker_path();
+        assert!(!marker.exists(), "no marker yet in a freshly isolated state dir");
+
+        run_boot_auto_resume(); // no autoResume projects registered — cheap no-op besides the marker
+
+        let real_epoch = aoide_conduct::reap::boot_epoch()
+            .expect("this dev box's /proc/stat is readable — the test assumes a real boot epoch exists");
+        let recorded = std::fs::read_to_string(&marker).expect("run_boot_auto_resume must write the marker");
+        assert_eq!(
+            recorded.trim().parse::<i64>().ok(),
+            Some(real_epoch),
+            "the marker must record boot_epoch()'s own value: {recorded:?}"
+        );
+
+        restore_stage_and_state(&stage, &state, saved_stage, saved_state);
+    }
+
+    /// A marker already naming the CURRENT boot means the guard trips
+    /// before any project is touched — even with an `autoResume` project
+    /// registered, `run_boot_auto_resume` must return having left the
+    /// marker byte-identical to what it found (an early return never
+    /// reaches the rewrite at the function's tail) and must never panic
+    /// walking a real (if minimal) `projects.json`/`sessions.json` pair.
+    #[test]
+    fn run_boot_auto_resume_is_a_no_op_once_the_marker_matches_the_current_boot() {
+        let (_guard, stage, state, saved_stage, saved_state) = isolated_stage_and_state();
+
+        let real_epoch = aoide_conduct::reap::boot_epoch()
+            .expect("this dev box's /proc/stat is readable — the test assumes a real boot epoch exists");
+        let marker = auto_resume_marker_path();
+        let pre_written = real_epoch.to_string();
+        std::fs::write(&marker, &pre_written).unwrap();
+
+        let pf = aoide_storage::records::ProjectsFile {
+            schema_version: "0".to_string(),
+            projects: vec![aoide_storage::records::Project {
+                name: "proj".to_string(),
+                path: stage.to_string_lossy().to_string(),
+                auto_resume: true,
+                ..Default::default()
+            }],
+        };
+        aoide_storage::stage::write_stage(&aoide_storage::stage::projects_path(), &pf).unwrap();
+
+        run_boot_auto_resume(); // must not panic, must not touch the marker
+
+        let after = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(after, pre_written, "a guarded call must leave the marker byte-identical");
+
+        restore_stage_and_state(&stage, &state, saved_stage, saved_state);
     }
 
     /// `bind_socket` itself creates missing parent directories — every test

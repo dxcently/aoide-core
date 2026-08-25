@@ -37,6 +37,20 @@
   routing, not sweep logic) reaches `reap_and_announce` for real and has to
   neutralize `notify-send` itself (e.g. blanking `$PATH` for that one call)
   rather than letting a test fire a real toast on the machine running it.
+- **A session's exit — a clean `graph session end` OR a `reap` sweep — MUST
+  append exactly one line to the durable session ledger, through the SAME
+  shared call (P-D8, `docs/architecture/AOIDED.md`'s "L5").**
+  `graph/doc.rs::ledger_session_exit` is that one call;
+  `session_store.rs::do_session_end_inner` gates it on the record's own
+  `state != "done"` BEFORE mutating (a re-run `session end` on an
+  already-done id must never double-append — `do_session_end` never prunes
+  its primary record the way `reap` does, so a second call on the same id
+  is a real, reachable case), while `reap_inner` needs no such gate since
+  every id in its `reaped` set is already filtered to `state != "done"` by
+  construction and gets physically pruned within the same call. Don't add
+  a second ledger-append call site for a new session-write handler — route
+  it through `ledger_session_exit` (re-exported `pub(crate)` at `graph.rs`
+  specifically so `reap.rs`, a sibling module, can reach it) the same way.
 - **This crate's own `env_lock()` (`lib.rs`)'s first call in a test binary
   also floors
   `$AOIDE_DAEMON_SOCKET` at a path nothing could ever listen on, unless a
@@ -47,7 +61,15 @@
   sessions.json` through it before this floor existed).** Don't remove or
   weaken this floor to "simplify" `env_lock()` — a test that WANTS to prove
   real daemon routing still installs its own `$AOIDE_DAEMON_SOCKET`
-  override afterward, same as any other env var here.
+  override afterward, same as any other env var here. **A second floor
+  (P-D8, same reasoning, one env var over) does the identical thing for
+  `$AOIDE_STATE_DIR`:** `session_store.rs`/`reap.rs` had zero prior
+  references to it before the ledger write landed, so without this floor
+  every `session_end`/`reap` test in either file would silently append
+  into the REAL `~/Aoide/state/session-ledger.jsonl` on this box the
+  moment its own test forgot (or never needed) an override. Same rule:
+  don't remove it, and a test proving something about the ledger installs
+  its own `$AOIDE_STATE_DIR` override on top, same as any other env var.
 - **A nested headless session is windowless BY CONSTRUCTION — never
   pid-ancestry-walk it to a window (task #89, corrected in review round 2).**
   It is NOT enough to gate the four historical backfill call sites — a

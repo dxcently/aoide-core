@@ -679,6 +679,7 @@ mod tests {
             hook_ancestry: Vec::new(),
             headless: false,
             harness_session_id: None,
+            resumed_from: None,
             extra: Map::new(),
         }
     }
@@ -689,6 +690,7 @@ mod tests {
             vec![Project {
                 name: "aoide".into(),
                 path: "/home/k/Aoide".into(),
+                ..Default::default()
             }],
             vec![
                 session("root", "/home/k/Aoide", "running", None),
@@ -739,6 +741,7 @@ mod tests {
             vec![Project {
                 name: "aoide".into(),
                 path: "/home/k/Aoide".into(),
+                ..Default::default()
             }],
             vec![root, sub, shell],
             Vec::new(),
@@ -761,6 +764,7 @@ mod tests {
             vec![Project {
                 name: "aoide".into(),
                 path: "/home/k/Aoide".into(),
+                ..Default::default()
             }],
             vec![s],
             Vec::new(),
@@ -787,6 +791,7 @@ mod tests {
             vec![Project {
                 name: "aoide".into(),
                 path: "/home/k/Aoide".into(),
+                ..Default::default()
             }],
             vec![root, kid, legacy],
             Vec::new(),
@@ -836,6 +841,7 @@ mod tests {
             vec![Project {
                 name: "aoide".into(),
                 path: "/home/k/Aoide".into(),
+                ..Default::default()
             }],
             vec![root],
             Vec::new(),

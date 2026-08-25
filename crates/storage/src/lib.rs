@@ -41,6 +41,7 @@ pub mod edits;
 pub mod fs;
 pub mod git;
 pub mod inbox;
+pub mod ledger;
 pub mod mode;
 pub mod peer_store;
 pub mod petname;

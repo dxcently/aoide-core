@@ -79,27 +79,52 @@ pub fn project_add(inv: &Invocation) -> Outcome {
         Err(e) => return stage_error("graph.project.add", e),
     };
 
+    // `--auto-resume` (P-D8, `docs/architecture/AOIDED.md`'s "L5"): opts this
+    // project into the daemon's boot-time auto-resume sweep. Only ever sets
+    // it true here — no `project set`/`project edit` verb exists yet to flip
+    // it back (see this crate's own `AGENTS.md`).
+    let auto_resume = inv.flag_present("auto-resume");
+
     let mut changed: Vec<String> = Vec::new();
     let message;
     match file.projects.iter_mut().find(|p| p.name == name) {
-        Some(existing) if existing.path == path => {
-            message = format!("project `{name}` already registered at {path} (no change)");
-        }
         Some(existing) => {
-            changed.push(format!("project {name}: path {} → {path}", existing.path));
-            existing.path = path.clone();
-            message = format!("updated project `{name}` → {path}");
+            let mut this_changed = false;
+            if existing.path != path {
+                changed.push(format!("project {name}: path {} → {path}", existing.path));
+                existing.path = path.clone();
+                this_changed = true;
+            }
+            if auto_resume && !existing.auto_resume {
+                changed.push(format!("project {name}: autoResume → true"));
+                existing.auto_resume = true;
+                this_changed = true;
+            }
+            message = if this_changed {
+                format!("updated project `{name}` → {path}")
+            } else {
+                format!("project `{name}` already registered at {path} (no change)")
+            };
         }
         None => {
             file.projects.push(Project {
                 name: name.clone(),
                 path: path.clone(),
+                auto_resume,
             });
             changed.push(format!("registered project {name} → {path}"));
+            if auto_resume {
+                changed.push(format!("project {name}: autoResume → true"));
+            }
             message = format!("registered project `{name}` → {path}");
         }
     }
 
+    let final_auto_resume = auto_resume
+        || file
+            .projects
+            .iter()
+            .any(|p| p.name == name && p.auto_resume);
     if !changed.is_empty() {
         file.schema_version = STAGE_GRAPH_VERSION.to_string();
         file.projects.sort_by(|a, b| a.name.cmp(&b.name));
@@ -112,9 +137,12 @@ pub fn project_add(inv: &Invocation) -> Outcome {
             Err(e) => return stage_error("graph.project.add", e),
         }
     }
-    Outcome::ok("graph.project.add", message)
-        .changed(changed)
-        .with_data(json!({ "name": name, "path": path, "file": projects_path().to_string_lossy() }))
+    Outcome::ok("graph.project.add", message).changed(changed).with_data(json!({
+        "name": name,
+        "path": path,
+        "autoResume": final_auto_resume,
+        "file": projects_path().to_string_lossy(),
+    }))
 }
 
 /// `graph project remove <name>` — unregister; ok + no-op if absent.

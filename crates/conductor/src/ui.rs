@@ -953,6 +953,7 @@ mod tests {
             hook_ancestry: Vec::new(),
             headless: false,
             harness_session_id: None,
+            resumed_from: None,
             extra: Map::new(),
         }
     }
@@ -991,6 +992,7 @@ mod tests {
             vec![Project {
                 name: "aoide".into(),
                 path: "/home/k/Aoide".into(),
+                ..Default::default()
             }],
             vec![root, kid],
         );
@@ -1018,6 +1020,7 @@ mod tests {
             vec![Project {
                 name: "aoide".into(),
                 path: "/home/k/Aoide".into(),
+                ..Default::default()
             }],
             vec![session("s1", "/home/k/Aoide", "running", None)],
         );
@@ -1043,6 +1046,7 @@ mod tests {
             vec![Project {
                 name: "aoide".into(),
                 path: "/home/k/Aoide".into(),
+                ..Default::default()
             }],
             vec![rec],
         );
@@ -1066,6 +1070,7 @@ mod tests {
             vec![Project {
                 name: "aoide".into(),
                 path: "/home/k/Aoide".into(),
+                ..Default::default()
             }],
             vec![rec],
         );
@@ -1091,6 +1096,7 @@ mod tests {
             vec![Project {
                 name: "aoide".into(),
                 path: "/home/k/Aoide".into(),
+                ..Default::default()
             }],
             vec![session("s1", "/home/k/Aoide", "running", None)],
         );
@@ -1121,6 +1127,7 @@ mod tests {
             vec![Project {
                 name: "aoide".into(),
                 path: "/home/k/Aoide".into(),
+                ..Default::default()
             }],
             vec![root, sub],
         );
@@ -1157,6 +1164,7 @@ mod tests {
             vec![Project {
                 name: "aoide".into(),
                 path: "/home/k/Aoide".into(),
+                ..Default::default()
             }],
             vec![root, sub],
         );
@@ -1171,10 +1179,12 @@ mod tests {
                 Project {
                     name: "zeta".into(),
                     path: "/z".into(),
+                    ..Default::default()
                 },
                 Project {
                     name: "alpha".into(),
                     path: "/a".into(),
+                    ..Default::default()
                 },
             ],
             vec![],

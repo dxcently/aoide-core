@@ -114,10 +114,20 @@ fn build_conduct_args(
 /// Spawn `argv0` with `args`, detached into its own session (`setsid`) with
 /// stdio nulled, so it outlives this call — the exact posture both the
 /// headless re-exec and the windowed terminal exec need; only WHAT gets
-/// exec'd differs between the two callers.
+/// exec'd differs between the two callers. `cwd`, when given, becomes the
+/// spawned process's own working directory (P-D8): for the windowed branch
+/// that is the TERMINAL EMULATOR's cwd, which every terminal this codebase
+/// targets starts its own shell/child in by default — the mechanism `graph
+/// resurrect` relies on to reopen a revived agent in its original project
+/// directory without a `--cwd` flag on `conduct`/`session_conduct` itself
+/// (that process derives its OWN `cwd` from `std::env::current_dir()` at
+/// registration, so setting the terminal's cwd here is sufficient). `None`
+/// (every pre-P-D8 caller) leaves the child on this process's own cwd,
+/// unchanged from before.
 fn spawn_detached(
     argv0: impl AsRef<std::ffi::OsStr>,
     args: &[String],
+    cwd: Option<&str>,
 ) -> std::io::Result<std::process::Child> {
     let mut command = std::process::Command::new(argv0);
     command
@@ -125,6 +135,9 @@ fn spawn_detached(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
+        command.current_dir(dir);
+    }
     // SAFETY: `setsid()` is async-signal-safe and the only call made in this
     // pre_exec hook (same discipline as the two call sites this helper
     // replaces) — it detaches the child into its own session so it survives
@@ -342,6 +355,7 @@ pub fn session_spawn(inv: &Invocation) -> Outcome {
         .unwrap_or_else(|| format!("spawn-{}-{}", std::process::id(), unix_ts()));
 
     let windowed = inv.flag_present("windowed");
+    let cwd = inv.flags.get("cwd").map(String::as_str);
 
     let exe = match spawn_exe() {
         Ok(e) => e,
@@ -373,7 +387,7 @@ pub fn session_spawn(inv: &Invocation) -> Outcome {
             Ok(a) => a,
             Err(outcome) => return outcome,
         };
-        match spawn_detached(&argv[0], &argv[1..]) {
+        match spawn_detached(&argv[0], &argv[1..], cwd) {
             Ok(c) => c,
             Err(e) => {
                 return Outcome::error(
@@ -384,7 +398,7 @@ pub fn session_spawn(inv: &Invocation) -> Outcome {
             }
         }
     } else {
-        match spawn_detached(&exe, &conduct_args) {
+        match spawn_detached(&exe, &conduct_args, cwd) {
             Ok(c) => c,
             Err(e) => {
                 return Outcome::error(cmd, format!("failed to spawn headless `{program}`: {e}"))
@@ -507,26 +521,9 @@ mod tests {
     use crate::graph::model::SessionsFile;
     use crate::graph::testutil::*;
 
-    /// Locate the real, already-built `aoide` binary as `current_exe()`'s
-    /// sibling in the shared `target/<profile>/` dir (`current_exe()` under
-    /// `cargo test` resolves to `target/<profile>/deps/aoide_conduct-<hash>`
-    /// — the profile dir's PARENT of `deps/` is where cargo also drops the
-    /// workspace's own `[[bin]]` outputs). Panics with a clear message rather
-    /// than silently no-op-ing if it isn't there — the box this ships on has
-    /// already built it (P1 landed and tested against this same binary).
-    fn built_aoide_bin() -> std::path::PathBuf {
-        let test_exe = std::env::current_exe().expect("current_exe resolves under cargo test");
-        let profile_dir = test_exe
-            .parent() // .../target/<profile>/deps
-            .and_then(|p| p.parent()) // .../target/<profile>
-            .expect("test exe has a target/<profile>/deps parent");
-        let bin = profile_dir.join("aoide");
-        assert!(
-            bin.exists(),
-            "expected a pre-built `aoide` binary at {bin:?} — run `cargo build --bin aoide` first"
-        );
-        bin
-    }
+    // `built_aoide_bin` moved to `testutil.rs` (P-D8) — `resurrect.rs`'s own
+    // end-to-end tests need the identical fixture; glob-imported above via
+    // `use crate::graph::testutil::*;`.
 
     #[test]
     fn spawn_registers_a_detached_headless_child_and_mirrors_its_log() {

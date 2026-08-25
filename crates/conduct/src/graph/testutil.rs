@@ -58,6 +58,7 @@ pub(crate) fn session(
         hook_ancestry: Vec::new(),
         headless: false,
         harness_session_id: None,
+        resumed_from: None,
         extra: Map::new(),
     }
 }
@@ -66,10 +67,12 @@ pub(crate) fn fixture_projects() -> Vec<Project> {
         Project {
             name: "nested".into(),
             path: "/home/k/Aoide/sub".into(),
+            ..Default::default()
         },
         Project {
             name: "aoide".into(),
             path: "/home/k/Aoide".into(),
+            ..Default::default()
         },
     ]
 }
@@ -175,6 +178,29 @@ impl Drop for EnvVars {
             }
         }
     }
+}
+/// Locate the real, already-built `aoide` binary as `current_exe()`'s
+/// sibling in the shared `target/<profile>/` dir (`current_exe()` under
+/// `cargo test` resolves to `target/<profile>/deps/aoide_conduct-<hash>` —
+/// the profile dir's PARENT of `deps/` is where cargo also drops the
+/// workspace's own `[[bin]]` outputs). Panics with a clear message rather
+/// than silently no-op-ing if it isn't there — the box this ships on has
+/// already built it (P1 landed and tested against this same binary).
+/// Shared by `spawn.rs`'s and `resurrect.rs`'s own end-to-end tests, both of
+/// which point `AOIDE_CONDUCT_SPAWN_EXE` at it so `graph spawn [--windowed]`
+/// re-execs a real dispatcher instead of the test harness binary.
+pub(crate) fn built_aoide_bin() -> PathBuf {
+    let test_exe = std::env::current_exe().expect("current_exe resolves under cargo test");
+    let profile_dir = test_exe
+        .parent() // .../target/<profile>/deps
+        .and_then(|p| p.parent()) // .../target/<profile>
+        .expect("test exe has a target/<profile>/deps parent");
+    let bin = profile_dir.join("aoide");
+    assert!(
+        bin.exists(),
+        "expected a pre-built `aoide` binary at {bin:?} — run `cargo build --bin aoide` first"
+    );
+    bin
 }
 pub(crate) fn flag_invocation(path: &[&str], flags: &[(&str, &str)]) -> Invocation {
     Invocation {

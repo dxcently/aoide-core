@@ -132,6 +132,19 @@ pub fn build_graph(
                 "kind": "anchors",
             }));
         }
+        // Additive `resumed` edge (P-D8, CONTRACTS.md §4): a session revived
+        // by `graph resurrect` names the ledger entry's own sessionId it was
+        // built from. Rides BESIDE the spawned/anchors edge above, never in
+        // place of it — the source id names a session that has, by
+        // construction, already left the roster (the whole premise of
+        // resurrecting it), so it need not resolve to a node in `ids`.
+        if let Some(from) = &s.resumed_from {
+            edges.push(json!({
+                "from": format!("session:{from}"),
+                "to": format!("session:{}", s.session_id),
+                "kind": "resumed",
+            }));
+        }
     }
 
     // Fold registered EXTERNAL A2A agents into the DAG (CONTRACTS.md §6, client
@@ -527,6 +540,38 @@ pub(crate) fn drop_sessions(
     (kept_sessions, kept_hooks, removed, cleared)
 }
 
+/// Append this session's line to the durable ledger (`state/session-ledger.
+/// jsonl`, `aoide_storage::ledger` — P-D8, `docs/architecture/AOIDED.md`'s
+/// "L5") at the moment it transitions to `done` — the "leaves the roster"
+/// instant. The ONE shared call both roster-exit paths route through:
+/// `do_session_end_inner` (`session_store.rs`) for a clean end, `reap_inner`
+/// (`reap.rs`) for every id its own `reaped` set collects — so the ledger
+/// can never double-write or diverge between the two (the test this buys:
+/// exactly one line per exit, never two). Best-effort: a write failure is
+/// eprintln'd and swallowed, never propagated onto the caller's own
+/// stage-write success — same posture as every other best-effort side
+/// channel in this crate (the reap toast, the transcript refresh).
+pub(crate) fn ledger_session_exit(rec: &SessionRecord, ended_at: &str) {
+    let entry = aoide_storage::ledger::LedgerEntry {
+        v: 0,
+        session_id: rec.session_id.clone(),
+        agent: rec.agent.clone(),
+        harness_session_id: rec.harness_session_id.clone(),
+        cwd: rec.cwd.clone(),
+        title: rec.title.clone(),
+        petname: rec.petname.clone(),
+        started_at: rec.started_at.clone(),
+        ended_at: ended_at.to_string(),
+        resumed_from: rec.resumed_from.clone(),
+    };
+    if let Err(e) = aoide_storage::ledger::append_ledger_entry(&entry) {
+        eprintln!(
+            "[aoide/conduct] session ledger append failed for {}: {e}",
+            rec.session_id
+        );
+    }
+}
+
 /// Re-stage `graph.json` from the CURRENT registries so the document Quickshell
 /// hot-reloads never drifts from what `graph view` (and a fresh `graph emit`)
 /// would compute. Every mutation of projects/sessions calls this, so the staged
@@ -688,6 +733,31 @@ mod tests {
             && e["kind"] == "spawned"));
         assert_eq!(edges.len(), 2);
         assert_eq!(doc["schemaVersion"], "0");
+    }
+    #[test]
+    fn resumed_from_projects_an_additive_resumed_edge_beside_anchors() {
+        // P-D8: a revived session carries BOTH its ordinary anchors edge
+        // (from `graph resurrect`'s windowed re-registration, unrelated to
+        // resurrection) AND an additive `resumed` edge naming the ledger
+        // entry's own sessionId — the source need not be a live node (the
+        // whole premise of resurrecting it is that it already left the
+        // roster), so the edge renders even though `session:old-1` has no
+        // matching node.
+        let projects = fixture_projects();
+        let mut s = session("s1", "/home/k/Aoide", "running", "1", None);
+        s.resumed_from = Some("old-1".to_string());
+        let doc = build_graph(&projects, &[s], &[]);
+        let edges = doc["edges"].as_array().unwrap();
+        assert!(edges.iter().any(|e| e["from"] == "project:aoide"
+            && e["to"] == "session:s1"
+            && e["kind"] == "anchors"));
+        assert!(
+            edges.iter().any(|e| e["from"] == "session:old-1"
+                && e["to"] == "session:s1"
+                && e["kind"] == "resumed"),
+            "edges: {edges:?}"
+        );
+        assert_eq!(edges.len(), 2);
     }
     #[test]
     fn prune_clears_orphaned_parent_links() {

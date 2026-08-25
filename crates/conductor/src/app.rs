@@ -1375,6 +1375,22 @@ impl App {
                     self.dispatch(&["graph", "project", "remove"], &[name]);
                 }
             }
+            // r: resurrect the focused project's most recent resumable
+            // session off the durable ledger (P-D8, `graph resurrect
+            // --project <name>`) — the one new project-scoped action this
+            // phase adds, so it lands beside `a`/`d` in the panel that is
+            // already the projects list's own home. `r` is unclaimed here
+            // (this panel binds only `j`/`k`/`a`/`d` today); the roster
+            // panel's own `r` = refresh is a different handler/different
+            // scope, so the two never collide.
+            KeyCode::Char('r') => {
+                let sorted = sorted_project_names(&self.projects);
+                if let Some(name) = sorted.get(self.proj_sel).cloned() {
+                    let mut flags = BTreeMap::new();
+                    flags.insert("project".to_string(), name);
+                    self.dispatch_with_flags(&["graph", "resurrect"], &[], flags);
+                }
+            }
             _ => {}
         }
     }
@@ -1727,6 +1743,7 @@ mod tests {
             hook_ancestry: Vec::new(),
             headless: false,
             harness_session_id: None,
+            resumed_from: None,
             extra: Map::new(),
         }
     }
@@ -2273,6 +2290,72 @@ mod tests {
         app.handle_key(KeyEvent::from(KeyCode::Char('s')));
 
         assert!(app.input.is_none(), "no session under the cursor — nothing to compose to");
+    }
+
+    // ── Projects panel: `r` resurrects the focused project (P-D8) ────────
+
+    static PROJECTS_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static RESURRECT_CALLS: Mutex<Vec<(Vec<String>, Vec<String>, BTreeMap<String, String>)>> =
+        Mutex::new(Vec::new());
+
+    fn recording_resurrect_dispatch(inv: &Invocation) -> Outcome {
+        RESURRECT_CALLS
+            .lock()
+            .unwrap()
+            .push((inv.path.clone(), inv.args.clone(), inv.flags.clone()));
+        Outcome::ok("graph.resurrect", "resurrected 1 session")
+    }
+
+    #[test]
+    fn r_on_the_projects_panel_resurrects_the_focused_project() {
+        let _g = PROJECTS_TEST_LOCK.lock().unwrap();
+        RESURRECT_CALLS.lock().unwrap().clear();
+
+        let mut app = App::for_test_with_dispatch(recording_resurrect_dispatch);
+        app.panel = Panel::Projects;
+        app.projects = vec![
+            graph::Project { name: "aoide".to_string(), path: "/home/x/Aoide".to_string(), ..Default::default() },
+            graph::Project { name: "melete".to_string(), path: "/home/x/Melete".to_string(), ..Default::default() },
+        ];
+        // `sorted_project_names` sorts by name: ["aoide", "melete"].
+        app.proj_sel = 1; // "melete"
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('r')));
+
+        // `dispatch_with_flags` also calls `reload_all()` right after, which
+        // fires its own dispatches (who/graph view/…) through the SAME
+        // injected fn — filter to the resurrect call specifically, same as
+        // `compose_builds_the_exact_expected_invocation` does for `graph.send`.
+        let calls = RESURRECT_CALLS.lock().unwrap();
+        let resurrect_calls: Vec<_> = calls
+            .iter()
+            .filter(|(path, ..)| path == &vec!["graph".to_string(), "resurrect".to_string()])
+            .collect();
+        assert_eq!(resurrect_calls.len(), 1, "exactly one resurrect dispatch fired");
+        let (path, args, flags) = resurrect_calls[0];
+        assert_eq!(path, &vec!["graph".to_string(), "resurrect".to_string()]);
+        assert!(args.is_empty(), "the project rides as a flag, not a positional arg");
+        let mut expected_flags = BTreeMap::new();
+        expected_flags.insert("project".to_string(), "melete".to_string());
+        assert_eq!(flags, &expected_flags);
+    }
+
+    #[test]
+    fn r_on_the_projects_panel_with_no_projects_is_a_no_op() {
+        let _g = PROJECTS_TEST_LOCK.lock().unwrap();
+        RESURRECT_CALLS.lock().unwrap().clear();
+
+        let mut app = App::for_test_with_dispatch(recording_resurrect_dispatch);
+        app.panel = Panel::Projects;
+        app.projects = vec![];
+        app.proj_sel = 0;
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('r')));
+
+        assert!(
+            RESURRECT_CALLS.lock().unwrap().is_empty(),
+            "no project under the cursor — nothing to resurrect"
+        );
     }
 
     // ── PENDING: verb spellings, id-as-position, re-list mechanics (P-C5) ─

@@ -47,10 +47,10 @@
 use aoide_protocol::Invocation;
 use aoide_protocol::agents::{agent_profile, AgentProfile, CLAUDE_PROFILE};
 use crate::graph::{
-    canonical_state, drop_sessions, hooks_path, hyprctl_clients, lineage_of, load_stage,
-    normalize_addr, now_iso_utc, prune_done, refresh_subagent_says, refresh_transcript_fields,
-    restage_graph, sessions_path, stage_error, upsert_hook, write_stage, HookRecord, HooksFile,
-    SessionRecord, SessionsFile, STAGE_GRAPH_VERSION,
+    canonical_state, drop_sessions, hooks_path, hyprctl_clients, ledger_session_exit, lineage_of,
+    load_stage, normalize_addr, now_iso_utc, prune_done, refresh_subagent_says,
+    refresh_transcript_fields, restage_graph, sessions_path, stage_error, upsert_hook,
+    write_stage, HookRecord, HooksFile, SessionRecord, SessionsFile, STAGE_GRAPH_VERSION,
 };
 use aoide_protocol::output::Outcome;
 use serde_json::{json, Value};
@@ -480,7 +480,14 @@ const SOCKET_SETTLE_SECS: i64 = 60;
 /// `/proc/stat`. `None` whenever it cannot be read or parsed (no `/proc`, a
 /// stripped container): the pre-boot signal then never fires at all, which is
 /// the safe direction.
-fn boot_epoch() -> Option<i64> {
+///
+/// `pub`, not `pub(crate)` (P-D8): `aoide-server`'s `daemon.rs` reuses this
+/// EXACT read for its own boot-epoch-guarded auto-resume trigger
+/// (`docs/architecture/AOIDED.md`'s "Open knobs" — "using the boot-epoch
+/// read the reaper already has") rather than re-deriving `/proc/stat`
+/// parsing a second time (`pkgs/aoide/crates/AGENTS.md`'s "no cross-crate
+/// copying").
+pub fn boot_epoch() -> Option<i64> {
     let stat = std::fs::read_to_string("/proc/stat").ok()?;
     stat.lines()
         .find_map(|l| l.strip_prefix("btime "))
@@ -1096,6 +1103,13 @@ fn reap_inner(
     for s in s_file.sessions.iter_mut() {
         if dead.contains(s.session_id.as_str()) {
             s.state = "done".to_string();
+            // The ledger write (P-D8): every id `reaped` collected — the
+            // liveness kill AND the dedup/pre-boot-ghost/orphaned-subagent
+            // folds above that feed into this same set — leaves the roster
+            // HERE. The one shared call `do_session_end_inner`'s own clean
+            // exit routes through too (`doc.rs`'s `ledger_session_exit`), so
+            // the two roster-exit paths can never double-write or diverge.
+            ledger_session_exit(s, &now);
         }
     }
     for id in &reaped {
@@ -1960,6 +1974,53 @@ mod tests {
             hook_ids,
             ["live", "lonely"].into_iter().collect::<HashSet<&str>>()
         );
+
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn reap_appends_exactly_one_ledger_line_per_reaped_session() {
+        // P-D8: the `reaped` half of "clean end and reap each produce one
+        // ledger line, never two" — `do_session_end`'s own half lives in
+        // `session_store.rs`'s test suite. A pre-boot ghost (every evidence
+        // stream predates `boot_epoch()`) is used to guarantee a REAL reap
+        // deterministically, with no dependency on a real `/proc/<pid>`
+        // probe finding a pid absent.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = crate::graph::testutil::EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_STATE_DIR",
+            "HYPRLAND_INSTANCE_SIGNATURE",
+        ]);
+        std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"); // pid-only/no-window liveness
+        let stage = crate::graph::testutil::unique_stage("reap-ledger");
+        let state = stage.join("state");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+
+        let mut dead = hook_only("dead-1", "idle");
+        dead.started_at = "2000-01-01T00:00:00Z".into(); // long before any real boot
+        dead.cwd = "/nonexistent/pre-boot-ghost".into();
+        write_stage(
+            &sessions_path(),
+            &SessionsFile { schema_version: "0".into(), sessions: vec![dead] },
+        )
+        .unwrap();
+
+        let out = reap(&crate::graph::testutil::invocation(&["graph", "reap"], &[]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let reaped: Vec<String> = out.data.as_ref().unwrap()["reaped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(reaped.contains(&"dead-1".to_string()), "reaped: {reaped:?}");
+
+        let lines = aoide_storage::ledger::read_ledger().unwrap();
+        let mine: Vec<_> = lines.iter().filter(|l| l.session_id == "dead-1").collect();
+        assert_eq!(mine.len(), 1, "exactly one ledger line, never two: {lines:?}");
+        assert!(!mine[0].ended_at.is_empty());
 
         let _ = std::fs::remove_dir_all(&stage);
     }
