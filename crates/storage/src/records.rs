@@ -178,6 +178,21 @@ pub struct SessionRecord {
     /// one stays absent" discipline as `logPath` above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub petname: Option<String>,
+    /// Up to 8 ancestor pids of the HOOK-FIRING process (a `/proc` `ppid`
+    /// walk, self-first), stamped ONCE at a hook session's own
+    /// SessionStart/self-heal registration (`graph session hook`,
+    /// CONTRACTS.md §4) — never re-stamped later, since it records a birth
+    /// fact, not a live signal. This captures the harness process's real OS
+    /// ancestry regardless of shell nesting, so a LATER `wrap`/`conduct`/
+    /// `spawn` registration with no explicit `--parent` can find its true
+    /// launching agent by walking ITS OWN `/proc` ancestry and intersecting
+    /// against every live agent's `hookAncestry` — the automatic-parenting
+    /// fix (task #89) for a nested headless spawn otherwise registering as a
+    /// SIBLING of its launching agent (via a stale ambient `AOIDE_SESSION_ID`)
+    /// instead of its child. Additive/v0-safe: empty on a legacy record and
+    /// on every non-agent kind (shells/subagents never stamp it).
+    #[serde(rename = "hookAncestry", default, skip_serializing_if = "Vec::is_empty")]
+    pub hook_ancestry: Vec<i32>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -251,6 +266,34 @@ mod tests {
         let legacy: SessionRecord =
             serde_json::from_str(r#"{ "sessionId": "s", "windowAddress": "0x1" }"#).unwrap();
         assert_eq!(legacy.workspace, None);
+    }
+    #[test]
+    fn session_record_hook_ancestry_round_trips_and_stays_empty_when_unset() {
+        // serde: `hookAncestry` serialises as an int array when non-empty, and
+        // is skipped (skip_serializing_if = "Vec::is_empty") when empty —
+        // additive/v0-safe on the wire, same contract as `workspace`/
+        // `needsSudo` above.
+        let mut rec = SessionRecord {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        rec.hook_ancestry = vec![111, 22, 3];
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("\"hookAncestry\":[111,22,3]"), "serialised: {json}");
+        let back: SessionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.hook_ancestry, vec![111, 22, 3]);
+
+        // A record with no ancestry omits the key entirely (no `[]` noise) and
+        // a legacy record with no `hookAncestry` field parses to an empty vec.
+        let bare = SessionRecord {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        let bare_json = serde_json::to_string(&bare).unwrap();
+        assert!(!bare_json.contains("hookAncestry"), "serialised: {bare_json}");
+        let legacy: SessionRecord =
+            serde_json::from_str(r#"{ "sessionId": "s", "windowAddress": "0x1" }"#).unwrap();
+        assert!(legacy.hook_ancestry.is_empty());
     }
     #[test]
     fn session_record_needs_sudo_round_trips_and_stays_absent_when_unset() {

@@ -36,6 +36,43 @@ pub use aoide_storage::time::now_iso_utc;
 #[cfg(test)]
 use aoide_storage::time::iso_utc_from_epoch;
 
+/// Every ancestor (walking `parentSessionId` to the root) AND every
+/// descendant (transitive children) of `id` — the same-window eviction's
+/// carve-out (task #89): a member of `id`'s own lineage is never a stale
+/// twin, however many hops of `conduct`/`spawn` nesting separate them.
+/// Bounded against a cycle on the ancestor walk (a malformed
+/// `parentSessionId` chain must never loop forever); the descendant walk is
+/// naturally bounded by the finite session list. `id` itself is never
+/// inserted (the caller already excludes `s.session_id != id` separately).
+fn lineage_of(id: &str, sessions: &[SessionRecord]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut current = id.to_string();
+    let mut seen_ancestors = HashSet::new();
+    while let Some(rec) = sessions.iter().find(|s| s.session_id == current) {
+        let Some(p) = rec.parent_session_id.clone() else {
+            break;
+        };
+        if !seen_ancestors.insert(p.clone()) {
+            break; // cycle guard
+        }
+        out.insert(p.clone());
+        current = p;
+    }
+    let mut stack: Vec<String> = vec![id.to_string()];
+    let mut seen_descendants: HashSet<String> = HashSet::new();
+    while let Some(cur) = stack.pop() {
+        for s in sessions {
+            if s.parent_session_id.as_deref() == Some(cur.as_str())
+                && seen_descendants.insert(s.session_id.clone())
+            {
+                out.insert(s.session_id.clone());
+                stack.push(s.session_id.clone());
+            }
+        }
+    }
+    out
+}
+
 /// Core of `graph session start`: cycle-check a parent, UPSERT, re-stage.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::graph) fn do_session_start(
@@ -122,26 +159,33 @@ fn do_session_start_inner(
     // Two carve-outs: a conducted PTY host (`conductable` — e.g. `conduct --
     // kimi`'s wrapper, which `is_agent_kind` refuses despite its published
     // "agent" kind) is the control-socket owner, not a second foreground
-    // agent; and the new record's own parent (the wrapper id threaded to the
-    // child via AOIDE_SESSION_ID) is excluded outright.
+    // agent; and the new record's WHOLE LINEAGE (every ancestor AND
+    // descendant, not just its direct parent) is excluded outright. Widened
+    // from "direct parent only" (task #89): a nested headless `conduct`/
+    // `spawn` chain — terminal wrap -> agent hook session -> nested headless
+    // wrap -> that wrap's own hook session — can legitimately land a
+    // same-window pair that are grandparent/grandchild (or cousins through a
+    // shared ancestor) rather than direct parent/child, and the old
+    // direct-parent-only carve-out evicted them as if they were stale twins.
+    // A genuine stale twin (a compact/resume pair with NO lineage relation)
+    // still has an empty intersection with the new record's lineage, so it
+    // collapses exactly as before.
     let new_rec = file.sessions.iter().find(|s| s.session_id == id).cloned();
     let evicted: Vec<String> = match &new_rec {
-        Some(rec) if crate::reap::is_agent_kind(rec) && !rec.window_address.is_empty() => file
-            .sessions
-            .iter()
-            .filter(|s| {
-                s.session_id != id
-                    // Never evict the new record's own parent: a hook session
-                    // carries the wrapper id (threaded via AOIDE_SESSION_ID),
-                    // and that conducted PTY host is the control-socket owner,
-                    // not a foreground-agent duplicate.
-                    && rec.parent_session_id.as_deref() != Some(s.session_id.as_str())
-                    && s.state != "done"
-                    && s.window_address == rec.window_address
-                    && crate::reap::is_agent_kind(s)
-            })
-            .map(|s| s.session_id.clone())
-            .collect(),
+        Some(rec) if crate::reap::is_agent_kind(rec) && !rec.window_address.is_empty() => {
+            let lineage = lineage_of(id, &file.sessions);
+            file.sessions
+                .iter()
+                .filter(|s| {
+                    s.session_id != id
+                        && !lineage.contains(&s.session_id)
+                        && s.state != "done"
+                        && s.window_address == rec.window_address
+                        && crate::reap::is_agent_kind(s)
+                })
+                .map(|s| s.session_id.clone())
+                .collect()
+        }
         _ => Vec::new(),
     };
     if !evicted.is_empty() {
@@ -343,6 +387,42 @@ pub(in crate::graph) fn set_session_log_path(id: &str, path: &str) {
             }
             let _ = write_stage(&sessions_path(), &file);
             let _ = restage_graph();
+        }
+    });
+}
+
+/// Stamp `hookAncestry` — up to 8 ancestor pids of the hook-firing process,
+/// self-first — on a session record, ONCE, at its own SessionStart/self-heal
+/// registration (`graph session hook`'s two Start-shaped call sites in
+/// `send.rs`). A later `wrap`/`conduct`/`spawn` registration with no
+/// explicit `--parent` walks ITS OWN `/proc` ancestry and looks for a live
+/// agent whose `hookAncestry` intersects it — the automatic-parenting seam
+/// (task #89) this field backs. Change-only: never re-stamps an
+/// already-populated record (the ancestry is a birth fact, not a live
+/// signal, so a later hook on the same id must not overwrite it) and never
+/// writes an empty slice. No `restage_graph()` — `hookAncestry` is consumed
+/// internally for parent resolution only, never rendered, so stamping it
+/// must not churn the widget-facing `graph.json`. Silent no-op on a stage
+/// error or an unknown id, same posture as [`set_session_log_path`].
+pub(in crate::graph) fn stamp_hook_ancestry(id: &str, ancestry: &[i32]) {
+    if ancestry.is_empty() {
+        return;
+    }
+    with_stage_lock(|| {
+        let mut file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        if let Some(s) = file
+            .sessions
+            .iter_mut()
+            .find(|s| s.session_id == id && s.hook_ancestry.is_empty())
+        {
+            s.hook_ancestry = ancestry.to_vec();
+            if file.schema_version.is_empty() {
+                file.schema_version = STAGE_GRAPH_VERSION.to_string();
+            }
+            let _ = write_stage(&sessions_path(), &file);
         }
     });
 }
@@ -965,12 +1045,27 @@ pub fn session_wrap(inv: &Invocation) -> Outcome {
         Err(e) => return Outcome::error(cmd, format!("failed to spawn `{program}`: {e}")),
     };
 
+    // Automatic parenting (task #89): explicit `--parent` > this registering
+    // process's own `/proc` ancestry matched against a live agent's
+    // `hookAncestry` > the ambient `AOIDE_SESSION_ID` env, in that order —
+    // see `window::resolve_registration_parent`'s own doc for the full
+    // reasoning (a nested headless wrap launched from inside an agent's
+    // shell tool otherwise registers parentless/sibling instead of as that
+    // agent's child).
+    let sessions_snapshot = load_stage::<SessionsFile>(&sessions_path())
+        .map(|f| f.sessions)
+        .unwrap_or_default();
+    let parent = crate::graph::window::resolve_registration_parent(
+        inv.flags.get("parent").map(String::as_str),
+        &id,
+        &sessions_snapshot,
+    );
     let _ = do_session_start(
         &id,
         Some(&agent),
         cwd.as_deref(),
         None,
-        inv.flags.get("parent").map(String::as_str),
+        parent.as_deref(),
         None,
         None,
         None,
@@ -1281,6 +1376,125 @@ mod tests {
         assert_eq!(host.kind.as_deref(), Some("agent"));
         assert_eq!(host.conductable, Some(true));
         assert_eq!(host.state, "idle", "still live, not evicted-done");
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+    /// The exact live topology diagnosed for task #89: a windowed terminal
+    /// wrap hosts claude (same window); claude's own shell tool runs `graph
+    /// spawn` for kimi with NO `--parent`, launching a nested HEADLESS wrap
+    /// whose own hook session must land as claude's CHILD — not, via a stale
+    /// `AOIDE_SESSION_ID` env fallback, as the TERMINAL's sibling. All three
+    /// User-decided fixes this regression pins at once: (1) kimi is
+    /// windowless by construction (never backfilled to the terminal's
+    /// window); (3) the nested wrap parents under claude via the `/proc`
+    /// ancestry ↔ `hookAncestry` walk, not the terminal; (2) even forced onto
+    /// the SAME window as claude (the pre-fix degraded symptom), the widened
+    /// lineage carve-out never evicts either side, because they are
+    /// grandparent/grandchild through the nested wrap — never unrelated
+    /// same-window twins.
+    #[test]
+    fn nested_headless_lineage_is_windowless_ancestry_parented_and_never_evicted() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("lineage-nested");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        // Terminal wrap: windowed, conducted (`aoide conduct` on the shell).
+        do_session_start(
+            "term-wrap", Some("shell"), Some("/w"), Some("0xWIN"), None, Some(true), None, None,
+            None,
+        );
+        // claude's own hook SessionStart: same window (it runs IN that
+        // terminal), parented under the wrap.
+        do_session_start(
+            "claude", Some("claude"), Some("/w"), Some("0xWIN"), Some("term-wrap"), None, None,
+            None, None,
+        );
+        // claude's own `hookAncestry`, stamped as it would be at its real
+        // SessionStart: a REAL ancestor pid of THIS test process — the
+        // ancestry walk below has no fake `/proc` to read from, so the only
+        // way to exercise the real mechanism is to seed it with the test
+        // process's own genuine ancestry.
+        let my_ancestry = crate::graph::window::pid_ancestry(std::process::id() as i32);
+        stamp_hook_ancestry("claude", &[my_ancestry[1]]);
+
+        // Part 3 — automatic parenting: `graph spawn`'s own re-exec'd
+        // `conduct --headless` for kimi carries no explicit `--parent`. The
+        // ancestry walk must resolve to claude, not fall through to an env
+        // fallback that would carry the TERMINAL's id (the "spawned wraps
+        // parent under the terminal as siblings" bug).
+        let snapshot = load_stage::<SessionsFile>(&sessions_path()).unwrap().sessions;
+        let resolved = crate::graph::window::resolve_registration_parent(None, "kimi-wrap", &snapshot);
+        assert_eq!(
+            resolved.as_deref(),
+            Some("claude"),
+            "kimi's nested wrap must parent under claude via ancestry, never the terminal"
+        );
+        // The nested wrap itself: headless (no window), conducted.
+        do_session_start(
+            "kimi-wrap", Some("kimi"), Some("/w"), None, resolved.as_deref(), Some(true), None,
+            None, None,
+        );
+
+        // Part 1 — windowless lineage: kimi-wrap is a conducted wrap with an
+        // EMPTY window, so kimi's own hook session (its child) is windowless
+        // BY CONSTRUCTION and must never backfill to the enclosing
+        // terminal's window.
+        let snapshot = load_stage::<SessionsFile>(&sessions_path()).unwrap().sessions;
+        assert!(
+            crate::graph::window::windowless_by_lineage_from_parent(Some("kimi-wrap"), &snapshot),
+            "kimi must be windowless: its own wrap is headless"
+        );
+        // claude, by contrast, anchors in a WINDOWED wrap directly — its own
+        // backfill stays live (today's behavior, unchanged).
+        assert!(!crate::graph::window::windowless_by_lineage_from_parent(Some("term-wrap"), &snapshot));
+
+        // Part 2 — lineage-safe eviction: register kimi's own hook session,
+        // deliberately forced (the pre-fix DEGRADED symptom — what actually
+        // happened live before part 1 existed) onto the SAME window as
+        // claude. The widened carve-out must protect BOTH sides: kimi and
+        // claude are grandchild/grandparent through kimi-wrap, never
+        // unrelated same-window twins.
+        let out = do_session_start(
+            "kimi", Some("kimi"), Some("/w"), Some("0xWIN"), Some("kimi-wrap"), None, None, None,
+            None,
+        );
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        for id in ["term-wrap", "claude", "kimi-wrap", "kimi"] {
+            let rec = s
+                .sessions
+                .iter()
+                .find(|r| r.session_id == id)
+                .unwrap_or_else(|| panic!("{id} missing from sessions.json"));
+            assert_ne!(rec.state, "done", "{id} must survive — lineage-safe eviction");
+        }
+
+        // The legitimate case, regression-pinned alongside the fix: a
+        // genuine compact/resume twin holding the SAME window with NO
+        // lineage relation to anything already there must still collapse
+        // instantly — the widened carve-out protects only an ACTUAL lineage
+        // member, never every same-window occupant.
+        let out2 = do_session_start(
+            "claude-resumed", Some("claude"), Some("/w"), Some("0xWIN"), None, None, None, None,
+            None,
+        );
+        assert_eq!(out2.status, aoide_protocol::output::Status::Ok);
+        let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let ids2: Vec<&str> = s2.sessions.iter().map(|r| r.session_id.as_str()).collect();
+        assert!(ids2.contains(&"claude-resumed"), "the new twin survives");
+        assert!(
+            !ids2.contains(&"claude"),
+            "the old same-window twin with no lineage relation to the new one still collapses (evicted, then pruned)"
+        );
+        assert!(
+            !ids2.contains(&"kimi"),
+            "kimi too — same window, no lineage relation to the freshly-registered twin"
+        );
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),

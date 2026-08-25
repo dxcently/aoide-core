@@ -23,9 +23,9 @@ use super::model::{
 use super::session_store::{
     do_session_end, do_session_phase, do_session_phase_if, do_session_start, do_subagent_end,
     do_subagent_rekey, do_subagent_spawn, ensure_session_ceiling, now_iso_utc,
-    refresh_subagent_says, refresh_transcript_fields, set_owner_activity,
+    refresh_subagent_says, refresh_transcript_fields, set_owner_activity, stamp_hook_ancestry,
 };
-use super::window::{discover_window, ensure_session_window};
+use super::window::{discover_window, ensure_session_window, pid_ancestry, windowless_by_lineage_from_parent};
 use aoide_protocol::agents::{agent_profile, known_agents, AgentProfile, HookClass, CLAUDE_PROFILE};
 use aoide_protocol::Invocation;
 use aoide_protocol::output::Outcome;
@@ -1375,6 +1375,15 @@ fn payload_ceiling(payload: &Value) -> Option<u64> {
     (n > 0).then_some(n)
 }
 
+/// Up to 8 ancestor pids of THIS hook-firing process, self-first — the
+/// `hookAncestry` a fresh hook session stamps ONCE at registration (task
+/// #89), consumed later by a `wrap`/`conduct`/`spawn` registration's own
+/// ancestry walk (`window::ancestry_parent`) to find its true launching
+/// agent.
+fn my_hook_ancestry() -> Vec<i32> {
+    pid_ancestry(std::process::id() as i32).into_iter().take(8).collect()
+}
+
 /// The profile-parametrized core of [`hook_from_str`].
 ///
 /// Split from `session_hook` so the whole path — parse, map, execute — is
@@ -1402,7 +1411,9 @@ fn hook_ensure_session(profile: &AgentProfile, payload: &Value, id: &str) {
         return;
     }
     let reported = payload_pid(payload);
-    let exists = load_stage::<SessionsFile>(&sessions_path())
+    let existing = load_stage::<SessionsFile>(&sessions_path()).ok();
+    let exists = existing
+        .as_ref()
         .map(|f| f.sessions.iter().any(|s| s.session_id == id))
         .unwrap_or(false);
     if exists {
@@ -1436,16 +1447,30 @@ fn hook_ensure_session(profile: &AgentProfile, payload: &Value, id: &str) {
         return;
     }
     let cwd = payload.get("cwd").and_then(Value::as_str).map(str::to_string);
-    let (window, discovered) = match discover_window() {
-        Some((addr, pid, _workspace)) => (Some(addr), Some(pid)),
-        None => (None, None),
+    let env_parent = std::env::var("AOIDE_SESSION_ID")
+        .ok()
+        .filter(|p| !p.is_empty() && *p != id);
+    // Windowless by construction (task #89): a hook session whose
+    // (about-to-be-set) parent's own lineage runs through an unwindowed
+    // conducted wrap must never discover a window at all — that walk would
+    // find the ENCLOSING terminal's window, not this session's own (it has
+    // none), which is exactly what made the same-window eviction treat two
+    // unrelated agents as stale twins.
+    let windowless = existing
+        .as_ref()
+        .map(|f| windowless_by_lineage_from_parent(env_parent.as_deref(), &f.sessions))
+        .unwrap_or(false);
+    let (window, discovered) = if windowless {
+        (None, None)
+    } else {
+        match discover_window() {
+            Some((addr, pid, _workspace)) => (Some(addr), Some(pid)),
+            None => (None, None),
+        }
     };
     // The harness's own pid wins over the discovered terminal pid — see
     // [`payload_pid`].
     let pid = reported.or(discovered);
-    let env_parent = std::env::var("AOIDE_SESSION_ID")
-        .ok()
-        .filter(|p| !p.is_empty() && *p != id);
     let _ = do_session_start(
         &id,
         Some(profile.name),
@@ -1457,6 +1482,7 @@ fn hook_ensure_session(profile: &AgentProfile, payload: &Value, id: &str) {
         None,
         pid,
     );
+    stamp_hook_ancestry(id, &my_hook_ancestry());
 }
 
 fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
@@ -1478,21 +1504,6 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
     };
     let inner = match action {
         HookAction::Start { id, cwd } => {
-            // Best-effort: the hook is a subprocess of the agent's terminal, so
-            // discover that window (+ its owning pid) now and register it — this
-            // is what makes a hook-only Claude session `graph focus`-jumpable.
-            // Workspace is stamped later by the shellbridge window-event listener
-            // (resolve_pending_session_windows), which is authoritative and keeps
-            // it fresh across moves — do_session_start carries only window + pid.
-            let (window, discovered) = match discover_window() {
-                Some((addr, pid, _workspace)) => (Some(addr), Some(pid)),
-                None => (None, None),
-            };
-            // The harness's own pid wins over the discovered terminal pid (see
-            // [`payload_pid`]) — pi reports `process.pid`, so a pi that dies
-            // inside a still-open terminal still trips the reaper's `/proc`
-            // signal.
-            let pid = payload_pid(&payload).or(discovered);
             // A claude launched INSIDE a conducted session inherits its parent's
             // `AOIDE_SESSION_ID` in the hook process env — thread it as the
             // parent so a claude-conducting-claude (or a claude-in-a-shell) nests
@@ -1500,6 +1511,35 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
             let env_parent = std::env::var("AOIDE_SESSION_ID")
                 .ok()
                 .filter(|p| !p.is_empty() && *p != id);
+            // Windowless by construction (task #89): this (about-to-be-set)
+            // parent's own lineage running through an unwindowed conducted
+            // wrap means THIS session has no window either — skip discovery
+            // outright rather than pid-ancestry-walking to the ENCLOSING
+            // terminal's window (the exact same-window collision that made
+            // the eviction pass treat two unrelated agents as stale twins).
+            let windowless = load_stage::<SessionsFile>(&sessions_path())
+                .ok()
+                .map(|f| windowless_by_lineage_from_parent(env_parent.as_deref(), &f.sessions))
+                .unwrap_or(false);
+            // Best-effort: the hook is a subprocess of the agent's terminal, so
+            // discover that window (+ its owning pid) now and register it — this
+            // is what makes a hook-only Claude session `graph focus`-jumpable.
+            // Workspace is stamped later by the shellbridge window-event listener
+            // (resolve_pending_session_windows), which is authoritative and keeps
+            // it fresh across moves — do_session_start carries only window + pid.
+            let (window, discovered) = if windowless {
+                (None, None)
+            } else {
+                match discover_window() {
+                    Some((addr, pid, _workspace)) => (Some(addr), Some(pid)),
+                    None => (None, None),
+                }
+            };
+            // The harness's own pid wins over the discovered terminal pid (see
+            // [`payload_pid`]) — pi reports `process.pid`, so a pi that dies
+            // inside a still-open terminal still trips the reaper's `/proc`
+            // signal.
+            let pid = payload_pid(&payload).or(discovered);
             let out = do_session_start(
                 &id,
                 Some(profile.name),
@@ -1511,6 +1551,7 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
                 None,
                 pid,
             );
+            stamp_hook_ancestry(&id, &my_hook_ancestry());
             // A FRESH id is inserted `idle` by `upsert_session`. A RESUME (same id,
             // SessionStart source=resume/compact/clear) deliberately preserves the
             // stored state — a working/awaiting session must not be reset — but a

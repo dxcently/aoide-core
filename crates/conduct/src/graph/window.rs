@@ -317,7 +317,12 @@ fn parent_pid(pid: i32) -> Option<i32> {
 /// The pid-ancestry chain of `pid`, self first, walking up the ppid chain via
 /// `/proc`. Bounded (a bad `/proc` or a self-parenting loop can never spin) and
 /// stops at init (ppid ≤ 1) — the terminal is always a mid-chain ancestor.
-fn pid_ancestry(pid: i32) -> Vec<i32> {
+///
+/// Widened from module-private to `pub(in crate::graph)` (task #89): the
+/// automatic-parenting seam (`ancestry_parent`, below) and the hook door
+/// (`send.rs`, stamping a fresh session's own `hookAncestry`) both need this
+/// SAME real-`/proc` walk — never a second implementation of it.
+pub(in crate::graph) fn pid_ancestry(pid: i32) -> Vec<i32> {
     let mut chain = Vec::new();
     let mut cur = pid;
     for _ in 0..64 {
@@ -328,6 +333,113 @@ fn pid_ancestry(pid: i32) -> Vec<i32> {
         }
     }
     chain
+}
+
+/// Automatic-parenting seam (task #89), tier 2: find the live AGENT-kind
+/// session whose own `hookAncestry` (stamped once at ITS SessionStart, see
+/// `session_store::stamp_hook_ancestry`) intersects THIS process's own
+/// `/proc` ancestry — i.e. the agent this `wrap`/`conduct`/`spawn`
+/// registration is genuinely running underneath, however many shells or
+/// nested `conduct`s separate them. Walks the ancestry SELF-OUTWARD (nearest
+/// ancestor first) so the first match is also the DEEPEST/closest one —
+/// exactly the tie-break the design calls for when more than one live
+/// agent's ancestry could theoretically match. `None` when nothing
+/// intersects (a bare-terminal `aoide conduct` with no agent above it).
+pub(in crate::graph) fn ancestry_parent(sessions: &[SessionRecord]) -> Option<String> {
+    let mine = pid_ancestry(std::process::id() as i32);
+    for pid in &mine {
+        if let Some(s) = sessions
+            .iter()
+            .find(|s| s.state != "done" && crate::reap::is_agent_kind(s) && s.hook_ancestry.contains(pid))
+        {
+            return Some(s.session_id.clone());
+        }
+    }
+    None
+}
+
+/// The full 3-tier parent-resolution precedence for a `wrap`/`conduct`/
+/// `spawn` registration (task #89) — `graph spawn` re-execs `conduct
+/// --headless`, so this single function backs all three verbs via
+/// `conduct`'s own call and `wrap`'s parallel one:
+///
+///   1. an explicit `--parent` flag wins outright (unchanged, pre-existing);
+///   2. failing that, [`ancestry_parent`] — the registering process's own
+///      `/proc` ancestry intersected against every live agent's
+///      `hookAncestry`;
+///   3. failing THAT, the ambient `AOIDE_SESSION_ID` env, guarded against
+///      naming the record's OWN fresh `id` (a self-parent) — the same
+///      env-parent pattern the hook door (`send.rs`) already uses, kept
+///      here only as a last resort now that the ancestry walk is primary:
+///      unlike a hook session (whose env is set explicitly by ITS OWN
+///      launching wrap, and so is reliable), a `wrap`/`conduct`/`spawn`
+///      invoked from deep inside an agent's shell tool inherits whatever
+///      ambient id an OUTER terminal wrap set, which can be a stale
+///      ancestor rather than the true launching agent — exactly the
+///      "spawned wraps parent under the terminal as siblings" bug this
+///      whole precedence order exists to fix.
+pub(in crate::graph) fn resolve_registration_parent(
+    explicit: Option<&str>,
+    id: &str,
+    sessions: &[SessionRecord],
+) -> Option<String> {
+    if let Some(p) = explicit {
+        return Some(p.to_string());
+    }
+    if let Some(p) = ancestry_parent(sessions) {
+        return Some(p);
+    }
+    std::env::var("AOIDE_SESSION_ID")
+        .ok()
+        .filter(|p| !p.is_empty() && p != id)
+}
+
+/// True when `parent`'s lineage runs through a conducted wrap (`conductable`)
+/// with an EMPTY `windowAddress` before reaching any windowed anchor — the
+/// session is windowless BY CONSTRUCTION (a nested headless `conduct`/
+/// `spawn`, task #89), so the caller must skip the window backfill outright
+/// rather than pid-ancestry-walking to the wrong window (the ENCLOSING
+/// terminal's — the exact bug that made a headless nested session collide,
+/// same-window, with the very agent it runs beneath). Walks
+/// `parentSessionId` from `parent` itself, bounded against a cycle; stops at
+/// the FIRST conducted-wrap ancestor found — its window (present or empty)
+/// decides outright. No conducted-wrap ancestor at all (no parent, a
+/// dangling link, or a chain that never crosses one) keeps today's
+/// backfill — there is no evidence of windowlessness to act on.
+pub(in crate::graph) fn windowless_by_lineage_from_parent(
+    parent: Option<&str>,
+    sessions: &[SessionRecord],
+) -> bool {
+    let Some(mut current) = parent.map(str::to_string) else {
+        return false;
+    };
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(current.clone()) {
+            return false; // cycle guard
+        }
+        let Some(rec) = sessions.iter().find(|s| s.session_id == current) else {
+            return false; // dangling parent link
+        };
+        if rec.conductable == Some(true) {
+            return rec.window_address.is_empty();
+        }
+        match &rec.parent_session_id {
+            Some(p) => current = p.clone(),
+            None => return false,
+        }
+    }
+}
+
+/// Same check, starting from an ALREADY-REGISTERED session's own record (its
+/// `parentSessionId`) rather than a raw parent id — the shape
+/// `ensure_session_window`/`resolve_pending_session_windows` need. `false`
+/// (keep today's backfill) for an unknown `id`.
+pub(in crate::graph) fn windowless_by_lineage(id: &str, sessions: &[SessionRecord]) -> bool {
+    let Some(rec) = sessions.iter().find(|s| s.session_id == id) else {
+        return false;
+    };
+    windowless_by_lineage_from_parent(rec.parent_session_id.as_deref(), sessions)
 }
 
 /// Pure core: the window address of the nearest ancestor in `ancestry` that owns
@@ -408,7 +520,14 @@ pub(in crate::graph) fn ensure_session_window(id: &str) {
     // never a lost update (the actual write is locked+re-checked below).
     let needs_window = match load_stage::<SessionsFile>(&sessions_path()) {
         Ok(f) => {
-            matches!(f.sessions.iter().find(|s| s.session_id == id), Some(s) if s.window_address.is_empty())
+            let needs = matches!(f.sessions.iter().find(|s| s.session_id == id), Some(s) if s.window_address.is_empty());
+            // Windowless by construction (task #89): a nested headless
+            // `conduct`/`spawn` whose lineage runs through an unwindowed
+            // wrap must never backfill via pid-ancestry — that walk would
+            // find the ENCLOSING terminal's window, the exact same-window
+            // collision that made the reaper evict this session and its
+            // launching agent as if they were stale twins.
+            needs && !windowless_by_lineage(id, &f.sessions)
         }
         Err(_) => return,
     };
@@ -579,9 +698,24 @@ pub fn resolve_pending_session_windows() -> bool {
             Ok(f) => f,
             Err(_) => return false,
         };
+        // Windowless-by-construction ids (task #89): computed off an
+        // immutable snapshot BEFORE the mutable loop below — a nested
+        // headless session's own recorded pid (self-reported by the
+        // harness, independent of window discovery) would otherwise still
+        // pid-ancestry-walk straight to the ENCLOSING terminal's window
+        // here, the same collision `ensure_session_window` guards against.
+        let windowless: HashSet<String> = file
+            .sessions
+            .iter()
+            .filter(|s| s.window_address.is_empty() && windowless_by_lineage(&s.session_id, &file.sessions))
+            .map(|s| s.session_id.clone())
+            .collect();
         let mut changed = false;
         for s in file.sessions.iter_mut() {
             if s.window_address.is_empty() {
+                if windowless.contains(&s.session_id) {
+                    continue;
+                }
                 // Pending window: resolve it via pid-ancestry, stamping workspace off
                 // the same snapshot (None → left absent, degrades gracefully).
                 let Some(pid) = s.pid else {
@@ -1404,5 +1538,143 @@ mod tests {
         assert!(chain.len() <= 64, "the walk is bounded");
         // A nonexistent pid yields just the seed (no /proc entry to walk up).
         assert_eq!(pid_ancestry(2_000_000_000), vec![2_000_000_000]);
+    }
+
+    #[test]
+    fn windowless_by_lineage_stops_at_the_first_conducted_wrap_ancestor() {
+        // No parent at all: no evidence of windowlessness — keep today's
+        // backfill.
+        assert!(!windowless_by_lineage_from_parent(None, &[]));
+
+        // A dangling parent link (the record doesn't exist): same — no
+        // evidence, keep today's backfill.
+        assert!(!windowless_by_lineage_from_parent(Some("ghost"), &[]));
+
+        // The immediate parent IS a conducted wrap with an EMPTY window —
+        // windowless by construction.
+        let mut wrap = session("wrap", "/w", "working", "1", None);
+        wrap.conductable = Some(true);
+        wrap.window_address = String::new();
+        assert!(windowless_by_lineage_from_parent(Some("wrap"), &[wrap.clone()]));
+
+        // The immediate parent is a conducted wrap WITH a window — anchored
+        // normally, backfill stays live.
+        let mut windowed_wrap = wrap.clone();
+        windowed_wrap.window_address = "0xWIN".into();
+        assert!(!windowless_by_lineage_from_parent(
+            Some("wrap"),
+            &[windowed_wrap]
+        ));
+
+        // A non-wrap ancestor in between (e.g. an agent parenting another
+        // agent directly) is skipped — the walk continues past it to find
+        // the conducted wrap further up.
+        let mut mid_agent = session("mid", "/w", "working", "2", Some("wrap"));
+        mid_agent.kind = Some("agent".into());
+        let sessions = vec![wrap.clone(), mid_agent];
+        assert!(windowless_by_lineage_from_parent(Some("mid"), &sessions));
+
+        // A cycle in the parent chain must never loop forever — it degrades
+        // to "no evidence, keep today's backfill" rather than hanging.
+        let mut a = session("a", "/w", "working", "1", Some("b"));
+        let mut b = session("b", "/w", "working", "2", Some("a"));
+        a.kind = Some("agent".into());
+        b.kind = Some("agent".into());
+        assert!(!windowless_by_lineage_from_parent(Some("a"), &[a, b]));
+    }
+
+    #[test]
+    fn windowless_by_lineage_looks_up_its_own_record_first() {
+        // `windowless_by_lineage` (unlike the `_from_parent` core) starts
+        // from an EXISTING session's own record — an unknown id has no
+        // evidence either way.
+        assert!(!windowless_by_lineage("unknown", &[]));
+
+        let mut wrap = session("wrap", "/w", "working", "1", None);
+        wrap.conductable = Some(true);
+        wrap.window_address = String::new();
+        let child = session("child", "/w", "working", "2", Some("wrap"));
+        assert!(windowless_by_lineage("child", &[wrap, child]));
+    }
+
+    #[test]
+    fn ancestry_parent_finds_the_deepest_matching_live_agent() {
+        // No live agent's `hookAncestry` intersects THIS process's own real
+        // ancestry — no match.
+        assert_eq!(ancestry_parent(&[]), None);
+
+        let mine = pid_ancestry(std::process::id() as i32);
+        assert!(mine.len() >= 3, "need at least self+parent+grandparent to test depth ordering");
+
+        // A distant ancestor (grandparent) matches — found.
+        let mut distant = session("distant", "/w", "working", "1", None);
+        distant.kind = Some("agent".into());
+        distant.hook_ancestry = vec![mine[2]];
+        assert_eq!(ancestry_parent(&[distant.clone()]), Some("distant".to_string()));
+
+        // A CLOSER ancestor (immediate parent) also matches, on a DIFFERENT
+        // live agent — the closer one wins (deepest/closest match), whatever
+        // order the sessions list carries them in.
+        let mut close = session("close", "/w", "working", "2", None);
+        close.kind = Some("agent".into());
+        close.hook_ancestry = vec![mine[1]];
+        assert_eq!(
+            ancestry_parent(&[distant.clone(), close.clone()]),
+            Some("close".to_string()),
+            "the nearer ancestor's own live agent wins over a more distant match"
+        );
+
+        // A `done` agent is never a candidate, even with a matching ancestry.
+        let mut dead = close.clone();
+        dead.session_id = "dead".into();
+        dead.state = "done".into();
+        assert_eq!(ancestry_parent(&[dead]), None);
+
+        // A conducted wrap (`is_agent_kind` refuses it) is never a candidate
+        // either, even with a matching ancestry and a published "agent" kind.
+        let mut wrap = close.clone();
+        wrap.session_id = "wrap".into();
+        wrap.conductable = Some(true);
+        assert_eq!(ancestry_parent(&[wrap]), None);
+    }
+
+    #[test]
+    fn resolve_registration_parent_precedence_explicit_then_ancestry_then_env() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_SESSION_ID"]);
+
+        // Tier 1: an explicit `--parent` wins outright, even with a matching
+        // ancestry candidate ALSO present.
+        let mine = pid_ancestry(std::process::id() as i32);
+        let mut ancestry_match = session("ancestry-match", "/w", "working", "1", None);
+        ancestry_match.kind = Some("agent".into());
+        ancestry_match.hook_ancestry = vec![mine[1]];
+        std::env::set_var("AOIDE_SESSION_ID", "env-sid");
+        assert_eq!(
+            resolve_registration_parent(Some("explicit"), "new-id", &[ancestry_match.clone()]),
+            Some("explicit".to_string())
+        );
+
+        // Tier 2: no explicit flag, but the ancestry walk matches — wins over
+        // the env fallback even though both are present.
+        assert_eq!(
+            resolve_registration_parent(None, "new-id", &[ancestry_match]),
+            Some("ancestry-match".to_string())
+        );
+
+        // Tier 3: no explicit flag, no ancestry match — the ambient env,
+        // guarded against naming the record's OWN fresh id.
+        assert_eq!(
+            resolve_registration_parent(None, "new-id", &[]),
+            Some("env-sid".to_string())
+        );
+        std::env::set_var("AOIDE_SESSION_ID", "new-id");
+        assert_eq!(
+            resolve_registration_parent(None, "new-id", &[]),
+            None,
+            "the env value must never self-parent the fresh id"
+        );
+        std::env::remove_var("AOIDE_SESSION_ID");
+        assert_eq!(resolve_registration_parent(None, "new-id", &[]), None);
     }
 }

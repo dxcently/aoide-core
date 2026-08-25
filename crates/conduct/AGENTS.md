@@ -17,6 +17,43 @@
   without checking that dependency first.
 - **A killed terminal never self-reports `done`.** `reap` is the only
   sanctioned sweep of dead sessions; don't add a second liveness mechanism.
+- **A nested headless session is windowless BY CONSTRUCTION — never
+  pid-ancestry-walk it to a window (task #89).** `window::windowless_by_lineage`/
+  `_from_parent` is the ONE gate: a session whose `parentSessionId` chain
+  passes through a conducted (`conductable`) wrap with an EMPTY
+  `windowAddress` must skip the backfill outright, everywhere a window gets
+  discovered for it — `graph/window.rs::ensure_session_window`, the two
+  `discover_window()` call sites in `graph/send.rs`'s hook Start handling,
+  AND `resolve_pending_session_windows` (the shellbridge event listener).
+  Miss any one of those four and a nested `conduct --headless`/`graph spawn`
+  re-acquires the ENCLOSING terminal's window, which is exactly what made
+  the same-window eviction (below) treat an agent and its own headless
+  grandchild as stale twins. `reap`'s own dedup pass (`superseded_*`) needs
+  NO parallel lineage check — it groups by `windowAddress`, and a windowless
+  session by construction never enters a group at all; don't add a second
+  mechanism there either.
+- **The same-window eviction carve-out is the new record's WHOLE lineage,
+  not just its direct parent (task #89).** `session_store::lineage_of`
+  (ancestors + descendants, walking `parentSessionId`) is what
+  `do_session_start_inner`'s registration-time eviction excludes from
+  retirement — widened from "direct parent only" because a nested
+  `conduct`/`spawn` chain can legitimately land a same-window pair that are
+  grandparent/grandchild (or cousins through a shared ancestor), not direct
+  parent/child. A genuine same-window twin with NO lineage relation (a
+  compact/resume pair) still collapses instantly — don't widen the carve-out
+  further than actual graph membership.
+- **`hookAncestry` is stamped ONCE, at a hook session's own registration,
+  never touched again.** `session_store::stamp_hook_ancestry` is the only
+  writer (change-only: it refuses to overwrite an already-populated
+  record) — a later `wrap`/`conduct`/`spawn` registration with no explicit
+  `--parent` reads it via `window::ancestry_parent`/
+  `resolve_registration_parent` to find its true launching agent by
+  intersecting ITS OWN `/proc` ancestry against every live agent's
+  `hookAncestry` (deepest/closest match wins), falling back to the ambient
+  `AOIDE_SESSION_ID` env only when nothing intersects. Precedence is
+  explicit `--parent` > ancestry walk > env, in that order, for all three of
+  `wrap`/`conduct`/`spawn` (spawn re-execs `conduct --headless`, so fixing
+  `conduct`'s own call covers it).
 - **`who` is a projection, never a store.** It must never write
   `state/peer-cache/<name>.json` — `build_graph`'s own fold (`doc.rs`) is
   the ONLY writer of that cache. `who`'s live probe reads straight off the

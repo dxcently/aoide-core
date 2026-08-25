@@ -105,6 +105,7 @@ pub fn upsert_session(
             // `aoide conduct` session; every other fresh record starts without one.
             log_path: None,
             petname: Some(petname),
+            hook_ancestry: Vec::new(),
             extra: Map::new(),
         });
         true

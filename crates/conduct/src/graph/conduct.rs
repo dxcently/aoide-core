@@ -10,7 +10,7 @@ use super::model::{
     canonical_state, load_stage, sessions_path, write_stage, SessionsFile, STAGE_GRAPH_VERSION,
 };
 use super::session_store::{do_session_end, do_session_start, set_session_log_path};
-use super::window::discover_window_address;
+use super::window::{discover_window_address, resolve_registration_parent};
 use aoide_protocol::Invocation;
 use aoide_protocol::output::Outcome;
 use aoide_storage::fs::{session_logs_dir, with_stage_lock};
@@ -824,13 +824,29 @@ pub fn session_conduct(inv: &Invocation) -> Outcome {
     // Phase ②: best-effort window-address discovery (never fails/slows conduct).
     let window = discover_window_address();
 
+    // Automatic parenting (task #89): explicit `--parent` > this registering
+    // process's own `/proc` ancestry matched against a live agent's
+    // `hookAncestry` > the ambient `AOIDE_SESSION_ID` env — see
+    // `window::resolve_registration_parent`'s own doc for the full
+    // reasoning (a nested headless `conduct --headless` launched from
+    // inside an agent's shell tool — `graph spawn`'s own re-exec — otherwise
+    // registers parentless/sibling instead of as that agent's child).
+    let sessions_snapshot = load_stage::<SessionsFile>(&sessions_path())
+        .map(|f| f.sessions)
+        .unwrap_or_default();
+    let parent = resolve_registration_parent(
+        inv.flags.get("parent").map(String::as_str),
+        &id,
+        &sessions_snapshot,
+    );
+
     // Register running + conductable with its socket, so `graph send` resolves it.
     let _ = do_session_start(
         &id,
         Some(&agent),
         cwd.as_deref(),
         window.as_deref(),
-        inv.flags.get("parent").map(String::as_str),
+        parent.as_deref(),
         Some(conductable),
         if conductable {
             Some(socket_str.as_str())

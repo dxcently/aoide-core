@@ -36,6 +36,16 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   `aoide_storage::inbox`'s module doc for the full two-writer reasoning.
 - `reap` — liveness reaping (`aoide graph reap`), sweeping sessions a
   `SIGKILL`'d terminal could never mark `done`.
+- `graph/window.rs` — window discovery/backfill/listener PLUS the
+  automatic-parenting seam (task #89): `windowless_by_lineage`/
+  `_from_parent` (a nested headless `conduct`/`spawn` never pid-ancestry-
+  walks to its enclosing terminal's window), `ancestry_parent`/
+  `resolve_registration_parent` (the `--parent` flag > `/proc` ancestry ↔
+  `hookAncestry` > `AOIDE_SESSION_ID` env precedence `wrap`/`conduct`/`spawn`
+  registration resolve their parent through). `session_store::lineage_of`
+  (ancestors + descendants) is the matching widened carve-out for the
+  same-window registration-time eviction. See AGENTS.md's invariants for
+  the full reasoning and the four call sites that must all agree.
 - `shellbridge`, `herald` — files only; their CLI verbs (registry lines)
   moved to `lyra` at P-A2, but both stay resident here (see charter smudge
   below).
