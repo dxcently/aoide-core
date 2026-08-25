@@ -230,7 +230,16 @@
   mirrored aoide log through P-N3 — never the broker's own `audit.log`,
   which is `0700` broker-uid and unreadable from the operator side anyway)
   and speaks the SAME three socket ops `pending`/`approve`/`dismiss`
-  already expose, never a new wire op.
+  already expose, never a new wire op. **`watch::Follower`'s own file-tail
+  mechanics moved to `aoide_protocol::feed::Follower` at P-D1** (`docs/
+  architecture/AOIDED.md`'s "L1 — the event bus" section) — `watch.rs`
+  holds `pub use aoide_protocol::feed::Follower;` at the old path (shim
+  discipline, `pkgs/aoide/crates/AGENTS.md`'s "no cross-crate copying"),
+  so this module remains the ONE place in the crate that ever constructs
+  or polls one; the boundary this bullet states is unchanged, only the
+  type's own implementation now lives one crate down the DAG. Similarly,
+  `broker::append_events_feed`'s own file-write mechanics moved to
+  `aoide_protocol::feed::FeedWriter`, called from `broker` alone.
 - **`watch`'s pure fold (`Event`/`Queue`/`pick_next`/`code_prompt_allowed`)
   holds the SAME clock-as-parameter discipline this crate's `totp`/`replay`
   modules already hold** (invariant above), extended here for the identical

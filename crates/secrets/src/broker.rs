@@ -1414,6 +1414,12 @@ fn append_own_log(secrets_home: &Path, record: &Value) -> std::io::Result<()> {
 /// see that function's doc comment).
 const EVENTS_MAX_BYTES: u64 = 1024 * 1024;
 
+/// The events feed's create mode (P-G4, task #77): `0640` — group-read,
+/// no world access, never left to the process umask, since the deployed
+/// unit's `Group=aoide-secrets-access` makes group-read exactly the
+/// socket's own audience.
+const EVENTS_CREATE_MODE: u32 = 0o640;
+
 /// Append ONE event line to the broker-owned events feed (P-G4, task
 /// #77) — the live-proven fix for `ProtectHome=true`: the deployed broker
 /// unit cannot write into the operator's `~/Aoide/log` (`emit_notify`'s
@@ -1425,58 +1431,22 @@ const EVENTS_MAX_BYTES: u64 = 1024 * 1024;
 /// reachable under the SAME sandboxing that already lets the socket itself
 /// bind there.
 ///
-/// **Best-effort, always, exactly like [`append_own_log`]/`emit_notify`'s
-/// own two existing destinations**: every failure here is `eprintln!`'d
-/// and swallowed, never propagated — a notification, and now this feed
-/// write alongside it, must never fail or block the resolve it rides with
-/// (`emit_notify`'s own doc, unchanged by this addition). **MUST be called
-/// with no crate lock held**, the identical rule `emit_notify` itself
-/// already holds — this function is only ever reached FROM `emit_notify`,
-/// so it inherits that guarantee rather than re-earning it.
-///
-/// Created `0640` with an EXPLICIT `chmod` right after the file is first
-/// created — never left to the process umask, since the deployed unit's
-/// `Group=aoide-secrets-access` makes group-read exactly the socket's own
-/// audience, and umask alone could leave it world-unreadable or
-/// group-writable depending on the operator's shell. The chmod fires only
-/// on the write that actually creates the file (checked via `exists()`
-/// immediately before opening, the same one-time-only shape
-/// `home::secure_dir`/`secure_file` already follow for the secrets home
-/// itself) — every later append reuses the permissions already set.
+/// **Delegates its mechanics to [`aoide_protocol::feed::FeedWriter`] as of
+/// P-D1** (`docs/architecture/AOIDED.md`'s "L1 — the event bus" section) —
+/// this function is now the thin, secrets-specific caller: it supplies
+/// `events_path`, [`EVENTS_MAX_BYTES`], and [`EVENTS_CREATE_MODE`], and
+/// `FeedWriter::append` does the create/cap-truncate/chmod-once/write-line
+/// work. Best-effort, always, exactly like [`append_own_log`]/
+/// `emit_notify`'s own two existing destinations — a failure inside
+/// `FeedWriter::append` is `eprintln!`'d and swallowed there, never
+/// propagated back here, so a notification write must never fail or block
+/// the resolve it rides with (`emit_notify`'s own doc, unchanged by this
+/// move). **MUST be called with no crate lock held**, the identical rule
+/// `emit_notify` itself already holds — this function is only ever reached
+/// FROM `emit_notify`, so it inherits that guarantee rather than
+/// re-earning it.
 fn append_events_feed(events_path: &Path, payload: &Value) {
-    if let Some(parent) = events_path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            eprintln!("[aoide/secrets] could not create the events feed directory: {e}");
-            return;
-        }
-    }
-    let existed = events_path.exists();
-    let over_cap = std::fs::metadata(events_path).map(|m| m.len() >= EVENTS_MAX_BYTES).unwrap_or(false);
-
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true);
-    if over_cap {
-        opts.write(true).truncate(true);
-    } else {
-        opts.append(true);
-    }
-    let mut f = match opts.open(events_path) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("[aoide/secrets] could not open the secrets events feed: {e}");
-            return;
-        }
-    };
-    if !existed {
-        if let Err(e) = std::fs::set_permissions(events_path, std::fs::Permissions::from_mode(0o640)) {
-            eprintln!("[aoide/secrets] could not chmod the secrets events feed to 0640: {e}");
-        }
-    }
-    let mut line = payload.to_string();
-    line.push('\n');
-    if let Err(e) = f.write_all(line.as_bytes()) {
-        eprintln!("[aoide/secrets] could not write the secrets events feed: {e}");
-    }
+    aoide_protocol::feed::FeedWriter::new(events_path.to_path_buf(), EVENTS_MAX_BYTES, EVENTS_CREATE_MODE).append(payload);
 }
 
 /// Write BOTH audit lines for one resolve attempt (module doc). Name-only,

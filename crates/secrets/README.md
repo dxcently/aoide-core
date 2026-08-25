@@ -762,6 +762,19 @@ transparent to a live tail. The mirrored `~/Aoide/log` write is UNCHANGED —
 it still serves the audit trail; only `secrets watch`'s own tail moved off
 it (below).
 
+**The mechanics behind both halves now live in `aoide-protocol` (P-D1,
+`docs/architecture/AOIDED.md`'s "L1 — the event bus" section) — this
+crate's own spellings are unchanged.** `broker::append_events_feed` is a
+thin caller of `aoide_protocol::feed::FeedWriter::append` (supplying
+`events_path`, the cap, and the `0640` create mode); `watch::Follower` is
+`pub use aoide_protocol::feed::Follower` at its original path. This is a
+pure extraction — `aoide-protocol` is the DAG leaf this crate already
+depends on (`AGENTS.md`'s "depends on `aoide-protocol`/`libc`/`serde`/
+`serde_json` only"), so hosting the shared primitive there adds no new
+dependency edge, and every wire shape, file layout, permission, and
+truncation behavior documented above is exactly what `FeedWriter`/
+`Follower` still do.
+
 **The popup phase's pickup point is `aoide secrets watch --json`
 (tracker #71 Part 1)** — see "Watching events" below. It tails the
 broker-owned events feed (P-G4; the mirrored `~/Aoide/log` through P-N3),
@@ -791,10 +804,12 @@ doc comment for the exact "no lock held" accounting at each site;
 but a shell. **As of P-G4 (task #77) it tail-follows the broker-owned
 events feed** (`socket::events_path` — default a sibling of the broker's
 own socket, env override `AOIDE_SECRETS_EVENTS`; see "Broker notifications"
-above for why) **from EOF** (`crate::watch::Follower` — delta reads only,
-`stat(2)` once a second, reopening at 0 whenever the file has shrunk, which
-covers both a broker restart replacing the file and the feed's own 1 MiB
-truncate-in-place cap). Through P-N3 this tailed the mirrored `~/Aoide/log`
+above for why) **from EOF** (`crate::watch::Follower` — a `pub use
+aoide_protocol::feed::Follower` re-export as of P-D1, "Broker
+notifications" above — delta reads only, `stat(2)` once a second,
+reopening at 0 whenever the file has shrunk, which covers both a broker
+restart replacing the file and the feed's own 1 MiB truncate-in-place
+cap). Through P-N3 this tailed the mirrored `~/Aoide/log`
 instead, filtering `class:"secret", command:"secrets.notify"` lines — that
 mirror silently went dark under the deployed broker's `ProtectHome=true`
 unit, delivering nothing until the reconcile tick below caught up, up to

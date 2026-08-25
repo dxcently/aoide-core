@@ -26,6 +26,15 @@ other crate in this workspace sits above.
   parameterized by a `special` hook so each binary's one-shot exceptions
   (`mcp serve --stdio`, `a2a serve`, `conductor`, `guide`/`schema` raw
   output) don't fork the loop itself.
+- `feed` — the append-only JSON-lines feed primitive: `FeedWriter` (append
+  one JSON object per line, capped and truncated-in-place rather than
+  rotated) and `Follower` (tail one file from EOF, delta-reads only,
+  transparently reopening across both an in-place truncation and a
+  delete-and-recreate). Extracted from `aoide-secrets`' broker/watch
+  modules (`docs/architecture/AOIDED.md`'s "L1 — the event bus" section) so
+  `aoided`'s own event bus and any future producer/consumer pair can share
+  it — `aoide-secrets` consumes it via `pub use` at its old
+  `watch::Follower` path.
 - `state` — `canonical_state`, the session-state vocabulary every producer
   folds onto and every reader trusts verbatim.
 - `wire` — typed A2A-JSON-RPC and MCP payload shapes.

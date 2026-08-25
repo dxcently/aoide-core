@@ -81,9 +81,7 @@
 use crate::client::{self, PendingAsk};
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::{BufRead, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::MetadataExt;
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -494,98 +492,18 @@ pub fn event_to_json(event: &Event) -> Value {
 // ── P2: the follower ─────────────────────────────────────────────────────
 
 /// Tail-follows one file from EOF, delta-reads only — NEVER re-reads from
-/// the start. As of P-G4 (task #77) this follows the broker-owned events
-/// feed, capped at 1 MiB and truncated back to empty IN PLACE rather than
-/// rotated (`broker::append_events_feed`'s own doc) — the `len() < pos`
-/// branch in [`Follower::poll`] is what makes that truncation transparent
-/// to a live watcher, reopening at 0 the same way it would for any other
-/// shrink. **`poll` also stats the PATH itself and compares `(dev, ino)`
-/// against the open fd on every call** (judge fix, this commit): a broker
-/// restart under `RuntimeDirectory=` unlinks the file and a fresh process
-/// creates a brand-new inode at the same path, and the OLD fd's own
-/// `metadata().len()` freezes at deletion-time forever after — a
-/// length-only comparison can never see that a same-or-larger replacement
-/// landed, so every event after a restart silently vanished into a
-/// permanently frozen read position (falling back to the 30s reconcile
-/// tick, re-triggered by every `Restart=on-failure`) with no error at all.
-/// A partial trailing line (no `\n` yet) is held across polls, never parsed
-/// early.
-pub struct Follower {
-    path: PathBuf,
-    file: File,
-    pos: u64,
-    partial: String,
-}
-
-impl Follower {
-    /// Open `path`, seek to its CURRENT end, and start following from
-    /// there — history before this call is never read.
-    pub fn open_at_end(path: &Path) -> std::io::Result<Self> {
-        let file = File::open(path)?;
-        let len = file.metadata()?.len();
-        Ok(Self { path: path.to_path_buf(), file, pos: len, partial: String::new() })
-    }
-
-    /// One poll: `stat(2)` the PATH (never only the open fd — a broker
-    /// restart under `RuntimeDirectory=` unlinks the file our fd still
-    /// refers to, and Linux keeps that deleted inode readable through the
-    /// existing fd with its length FROZEN at whatever it was at deletion;
-    /// comparing lengths alone can never notice a same-or-larger
-    /// replacement file, which is exactly how a delete-and-recreate (or a
-    /// rename-away-and-recreate) went permanently undetected before this
-    /// check existed — the fd's `len()` sat frozen and every later poll
-    /// returned empty forever, silently). If the path now names a
-    /// different `(dev, ino)` than the open fd — a new inode landed at the
-    /// same path — reopen at 0 and start following the new file, the same
-    /// state reset the truncation branch below already performs. If the
-    /// path doesn't exist yet (mid-restart, before the new file lands),
-    /// this poll simply reports no lines; the reopen fires on the next
-    /// poll that finds the path back. Once confirmed to be reading the
-    /// right inode, read exactly the new bytes and return every COMPLETE
-    /// line found (a trailing partial line is held for the next poll); no
-    /// growth returns an empty `Vec`, no read syscall at all. `len() < pos`
-    /// on the (possibly just-reopened) fd still covers an in-place
-    /// truncation/rotation of the SAME inode (the events feed's own 1 MiB
-    /// cap, `broker::append_events_feed`) — reopen and start again from 0
-    /// rather than sit at a now-meaningless offset forever.
-    pub fn poll(&mut self) -> std::io::Result<Vec<String>> {
-        match std::fs::metadata(&self.path) {
-            Ok(path_meta) => {
-                let fd_meta = self.file.metadata()?;
-                if (path_meta.dev(), path_meta.ino()) != (fd_meta.dev(), fd_meta.ino()) {
-                    self.file = File::open(&self.path)?;
-                    self.pos = 0;
-                    self.partial.clear();
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e),
-        }
-
-        let len = self.file.metadata()?.len();
-        if len < self.pos {
-            self.file = File::open(&self.path)?;
-            self.pos = 0;
-            self.partial.clear();
-        }
-        let len = self.file.metadata()?.len();
-        if len == self.pos {
-            return Ok(Vec::new());
-        }
-        self.file.seek(SeekFrom::Start(self.pos))?;
-        let mut buf = Vec::new();
-        (&self.file).take(len - self.pos).read_to_end(&mut buf)?;
-        self.pos += buf.len() as u64;
-        self.partial.push_str(&String::from_utf8_lossy(&buf));
-
-        let mut lines = Vec::new();
-        while let Some(idx) = self.partial.find('\n') {
-            let line: String = self.partial.drain(..=idx).collect();
-            lines.push(line.trim_end_matches('\n').to_string());
-        }
-        Ok(lines)
-    }
-}
+/// the start. **Moved to `aoide_protocol::feed::Follower` at P-D1**
+/// (`docs/architecture/AOIDED.md`'s "L1 — the event bus" section): the
+/// mechanics — open-at-end, `(dev, ino)` reopen detection across a broker
+/// restart, `len() < pos` reopen on the events feed's own 1 MiB
+/// truncate-in-place cap (`broker::append_events_feed`'s own doc), and
+/// holding a partial trailing line across polls — are documented on
+/// [`aoide_protocol::feed::Follower`] itself now; this re-export is the
+/// shim discipline (`pkgs/aoide/crates/AGENTS.md`'s "no cross-crate
+/// copying") that keeps every existing `watch::Follower` call site
+/// (this module's own `tail_loop`/`wait_for_follower`, `tests/e2e.rs`)
+/// unchanged.
+pub use aoide_protocol::feed::Follower;
 
 // ── `--popup`: lock probes + the zenity dialog ──────────────────────────
 
