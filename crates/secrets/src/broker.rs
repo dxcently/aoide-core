@@ -1053,7 +1053,13 @@ fn handle_admin(secrets_home: &Path, req: &Value, peer: Option<crate::peercred::
             },
             "migrate" => {
                 let target = req.get("target").and_then(Value::as_str).unwrap_or("age").to_string();
-                crate::admin::migrate(secrets_home, aoide_protocol::Door::Daemon, &name, &target).map(|(outcome, ..)| outcome)
+                // `audit_admin` below is deliberately verb-generic (no
+                // structured source-backend field) — the real backend
+                // name, when `crate::admin::migrate` knew one, is already
+                // folded into `MigrateError`'s own message text.
+                crate::admin::migrate(secrets_home, aoide_protocol::Door::Daemon, &name, &target)
+                    .map(|(outcome, ..)| outcome)
+                    .map_err(|e| e.message)
             }
             other => Err(format!("malformed request: unknown admin verb `{other}`")),
         }
@@ -4290,6 +4296,64 @@ mod tests {
 
         assert_eq!(crate::backend::fetch_value(&home, "age", "k").unwrap(), "the-value", "the new backend must durably hold the value");
         assert!(!home.join("store").join("k").exists(), "the old file-backend value must be removed");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Task #79 composed with task #74/P-G3: `handle_admin`'s "migrate" arm
+    /// runs `crate::admin::migrate` — which shells out to the SOURCE
+    /// backend's `get` via `crate::backend::fetch_value` — INSIDE the same
+    /// `put_lock` critical section `put_gate` itself uses (`handle_admin`'s
+    /// own module doc: "run inside `put_lock`'s critical section... the
+    /// SAME lock a `put` already serializes under"). The two tests above
+    /// (`a_hung_set_template_no_longer_wedges_put_lock_forever`,
+    /// `a_hung_age_keygen_mint_no_longer_wedges_put_lock_forever`) already
+    /// prove `wait_bounded` frees `put_lock` for `put_gate`'s own shell-outs
+    /// — this proves the SAME bound applies through the admin socket op,
+    /// since that composition (admin verb -> `crate::admin` -> a hung
+    /// backend shell-out -> `put_lock`) was never exercised by those two.
+    #[test]
+    fn a_hung_admin_migrate_no_longer_wedges_put_lock_forever() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("admin-migrate-hung-bounded");
+        let out = home.join("out.txt");
+        let p_hangs = Policy::new("t", "hangs", "k");
+        let p_scratch = Policy::new("other", "scratch", "k");
+        crate::store::save_policies(&home, &[p_hangs, p_scratch]).unwrap();
+        let backends = serde_json::json!({
+            "hangs": { "get": "sleep 60", "set": "true" },
+            "scratch": { "get": format!("cat {}", out.display()), "set": format!("cat > {}", out.display()) },
+        });
+        std::fs::write(crate::backend::backends_path(&home), serde_json::to_vec(&backends).unwrap()).unwrap();
+
+        let saved_timeout = std::env::var(crate::backend::BACKEND_TIMEOUT_ENV).ok();
+        std::env::set_var(crate::backend::BACKEND_TIMEOUT_ENV, "1");
+
+        let (elapsed, reply, granted, result) = with_redirected_audit_log(&home, || {
+            let req = json!({"op": "admin", "verb": "migrate", "name": "t", "target": "scratch"});
+            let start = std::time::Instant::now();
+            let reply = handle_admin(&home, &req, operator_peer());
+            let elapsed = start.elapsed();
+            // A second, unrelated put right after — the SAME "lock genuinely
+            // freed, not just this caller giving up" proof the two
+            // precedent tests make.
+            let (granted, result) = put_outcome_as_result(put_gate(&home, "other", "second-caller-value", false));
+            (elapsed, reply, granted, result)
+        });
+
+        match saved_timeout {
+            Some(v) => std::env::set_var(crate::backend::BACKEND_TIMEOUT_ENV, v),
+            None => std::env::remove_var(crate::backend::BACKEND_TIMEOUT_ENV),
+        }
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "handle_admin migrate against a hung source-backend fetch took {elapsed:?} — put_lock was not freed in bounded time"
+        );
+        assert_eq!(reply["ok"], false, "{reply}");
+        assert!(reply["error"].as_str().unwrap().contains("timed out"), "{reply}");
+        assert!(granted, "the second, unrelated put must succeed once put_lock is freed: {result:?}");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "second-caller-value");
+
         std::fs::remove_dir_all(&home).ok();
     }
 }

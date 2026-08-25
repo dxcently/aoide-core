@@ -191,6 +191,35 @@ pub fn automate_consumer(home: &Path, name: &str, consumer: &str, want_listed: b
     Ok(AdminOutcome::changed(format!("secret `{name}` automation {verb} consumer `{consumer}`"), format!("policy:{name}")))
 }
 
+/// A refused [`migrate`] carries its message PLUS the source backend name,
+/// whenever the migration got far enough to know one — the structured
+/// sibling of the message text, since the message alone (e.g. "could not
+/// fetch from backend `file`") already names it in prose but a caller's
+/// own audit line (`commands::audit_migrate`'s `source`/`target` fields,
+/// `broker::audit_admin`'s generic line) needs it as data, not something
+/// re-parsed out of a sentence. `"?"` ONLY on the one failure mode that
+/// truly precedes knowing a source at all — no policy for `name` exists.
+/// Fixes a real fidelity regression this struct's own history records: the
+/// pre-task-#79 direct path's `audit_migrate` calls always had the real
+/// source backend name at every failure point; the first task-#79 cut
+/// collapsed every failure into a bare `Err(String)`, so a broker-path
+/// migrate failure audited `source: "?"` even when the true backend name
+/// was sitting right there in the error text — this type is what restores
+/// that fidelity without a third copy of the message-building logic.
+pub struct MigrateError {
+    pub message: String,
+    pub source: String,
+}
+
+impl MigrateError {
+    fn unknown_source(message: impl Into<String>) -> Self {
+        Self { message: message.into(), source: "?".to_string() }
+    }
+    fn with_source(message: impl Into<String>, source: impl Into<String>) -> Self {
+        Self { message: message.into(), source: source.into() }
+    }
+}
+
 /// `secrets migrate <name> [--backend <target>]` — the exact fetch ->
 /// (maybe mint) -> store -> flip+save -> remove-old ordering
 /// `commands::handle_secrets_migrate` used to run inline (this crate's
@@ -203,10 +232,12 @@ pub fn automate_consumer(home: &Path, name: &str, consumer: &str, want_listed: b
 /// lives only in `commands.rs`"; the SAME split applies to auditing —
 /// `commands.rs`'s `audit_migrate` on the direct path,
 /// `broker::audit_admin` on the socket path, never a third copy here).
-pub fn migrate(home: &Path, door: Door, name: &str, target: &str) -> Result<(AdminOutcome, String, String), String> {
-    let mut policies = store::load_policies(home).map_err(|e| policy_io_error(home, e))?;
+/// See [`MigrateError`] for why the `Err` arm carries the source backend
+/// name alongside the message, not just the message.
+pub fn migrate(home: &Path, door: Door, name: &str, target: &str) -> Result<(AdminOutcome, String, String), MigrateError> {
+    let mut policies = store::load_policies(home).map_err(|e| MigrateError::unknown_source(policy_io_error(home, e)))?;
     let Some(policy) = policies.iter_mut().find(|p| p.name == name) else {
-        return Err(format!("no policy for secret `{name}`"));
+        return Err(MigrateError::unknown_source(format!("no policy for secret `{name}`")));
     };
     let source = policy.backend.clone();
     let key = policy.key.clone();
@@ -217,25 +248,25 @@ pub fn migrate(home: &Path, door: Door, name: &str, target: &str) -> Result<(Adm
     }
 
     let value = crate::backend::fetch_value(home, &source, &key)
-        .map_err(|e| format!("secret `{name}`: could not fetch from backend `{source}`: {e}"))?;
+        .map_err(|e| MigrateError::with_source(format!("secret `{name}`: could not fetch from backend `{source}`: {e}"), &source))?;
 
     if target == "age" && crate::backend::backend_is_known(home, "age") {
         crate::backend::mint_age_identity_if_needed(home)
-            .map_err(|e| format!("secret `{name}`: could not prepare backend `{target}`: {e}"))?;
+            .map_err(|e| MigrateError::with_source(format!("secret `{name}`: could not prepare backend `{target}`: {e}"), &source))?;
     }
 
     crate::backend::store_value(home, target, &key, &value)
-        .map_err(|e| format!("secret `{name}`: could not store into backend `{target}`: {e}"))?;
+        .map_err(|e| MigrateError::with_source(format!("secret `{name}`: could not store into backend `{target}`: {e}"), &source))?;
 
     // Reload+re-find: `store_value`/`mint_age_identity_if_needed` touch no
     // in-memory state here, but re-borrowing `policy` across the two
     // backend calls above would fight the borrow checker for no reason —
     // simplest is finding it once more, immediately before the flip.
     let Some(policy) = policies.iter_mut().find(|p| p.name == name) else {
-        return Err(format!("no policy for secret `{name}` (vanished mid-migration)"));
+        return Err(MigrateError::with_source(format!("no policy for secret `{name}` (vanished mid-migration)"), &source));
     };
     policy.backend = target.to_string();
-    store::save_policies(home, &policies).map_err(|e| policy_io_error(home, e))?;
+    store::save_policies(home, &policies).map_err(|e| MigrateError::with_source(policy_io_error(home, e), &source))?;
 
     let key_lifecycle_note = if target == "age" {
         " — age.key is now the ONLY decryptor of this value; back it up together with values/, \

@@ -939,14 +939,15 @@ fn handle_secrets_migrate(inv: &Invocation) -> Outcome {
             audit_migrate(door, &name, &source, &target, status, None);
             Ok(outcome)
         }
-        Err(e) => {
-            // The exact failing backend name is already inside `e`'s own
-            // text (`crate::admin::migrate`'s own error messages name it) —
-            // `"?"` here is only the STRUCTURED audit field, since a
-            // failure this early (e.g. "no policy for secret x") may not
-            // even know a source backend yet.
-            audit_migrate(door, &name, "?", &target, "refused", Some(&e));
-            Err(e)
+        Err(crate::admin::MigrateError { message, source }) => {
+            // `source` is the REAL backend name whenever `crate::admin::
+            // migrate` got far enough to know one (`MigrateError`'s own
+            // doc) — only `"?"` on the one failure mode that truly
+            // precedes knowing a source at all (no policy for `name`).
+            // Same fidelity the pre-#79 direct path's multi-stage
+            // `audit_migrate` calls always had.
+            audit_migrate(door, &name, &source, &target, "refused", Some(&message));
+            Err(message)
         }
     })
 }
