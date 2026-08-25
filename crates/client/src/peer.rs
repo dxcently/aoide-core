@@ -8,14 +8,19 @@
 //! in `commands.rs`, same split as `wire.rs`/`commands.rs`'s existing
 //! `a2a agent *` verbs.
 //!
-//! The pairing ceremony's two wire shapes (P-P2, CONTRACTS.md §6) join the
+//! The pairing ceremony's three wire shapes (P-P2, CONTRACTS.md §6) join the
 //! same split: [`build_pair_request_body`]/[`parse_pair_request_response`]
-//! for the requester's `aoide/pairRequest` call, and
-//! [`build_pair_approve_body`] for the approver's `aoide/pairApprove`
+//! for the requester's `aoide/pairRequest` call (carrying a COMMITMENT to
+//! its own nonce, never the nonce itself — the commit-then-reveal fix,
+//! `aoide_storage::pairing`'s module doc), [`build_pair_reveal_body`]/
+//! [`check_pair_reveal_response`] for the requester's immediate follow-up
+//! `aoide/pairReveal` call (same `peer pair request` invocation, two
+//! sequential POSTs), and [`build_pair_approve_body`]/
+//! [`check_pair_approve_response`] for the approver's `aoide/pairApprove`
 //! callback — the server-side handlers live in `aoide-server::a2a`
-//! (`pair_request`/`pair_approve_callback`), never duplicated here; this
-//! module only builds/parses the JSON-RPC envelope either side of that
-//! wire.
+//! (`pair_request`/`pair_reveal`/`pair_approve_callback`), never duplicated
+//! here; this module only builds/parses the JSON-RPC envelope either side
+//! of that wire.
 
 use aoide_protocol::wire::JsonRpcRequest;
 use aoide_storage::peer_store::PeerCacheEntry;
@@ -70,14 +75,17 @@ pub fn parse_graph_summary_response(resp: &Value, name: &str, fetched_at: &str) 
 
 /// Build the JSON-RPC `aoide/pairRequest` body `peer pair request` POSTs to
 /// the approver's door: this instance's own public key, its claimed local
-/// nickname for the approver, a fresh nonce, and its own advertised A2A
-/// door URL (where the later approval callback is delivered). Pure.
-pub fn build_pair_request_body(pubkey_hex: &str, name: &str, nonce_hex: &str, self_url: &str) -> Value {
+/// nickname for the approver, a COMMITMENT to a fresh nonce (`commit_hex` —
+/// `aoide_storage::pairing::derive_commit(pubkey_hex, nonce_hex)`, the
+/// nonce itself stays local until [`build_pair_reveal_body`]'s follow-up
+/// call), and its own advertised A2A door URL (where the later reveal and
+/// approval callbacks are delivered). Pure.
+pub fn build_pair_request_body(pubkey_hex: &str, name: &str, commit_hex: &str, self_url: &str) -> Value {
     let req = JsonRpcRequest {
         jsonrpc: "2.0".to_string(),
         id: json!(1),
         method: "aoide/pairRequest".to_string(),
-        params: json!({ "pubkeyHex": pubkey_hex, "name": name, "nonceHex": nonce_hex, "url": self_url }),
+        params: json!({ "pubkeyHex": pubkey_hex, "name": name, "commitHex": commit_hex, "url": self_url }),
     };
     serde_json::to_value(&req).expect("JsonRpcRequest always serializes")
 }
@@ -119,6 +127,21 @@ pub fn parse_pair_request_response(resp: &Value) -> Result<PairRequestAck, Strin
     Ok(PairRequestAck { id, pubkey_hex, nonce_hex, expires_at })
 }
 
+/// Build the JSON-RPC `aoide/pairReveal` body the REQUESTER's `peer pair
+/// request` POSTs immediately after `aoide/pairRequest` (same invocation,
+/// two sequential POSTs) — `id` is the id the approver's `aoide/pairRequest`
+/// response returned; `nonce_hex` is the nonce `commit_hex` already
+/// committed to. Pure.
+pub fn build_pair_reveal_body(id: &str, nonce_hex: &str) -> Value {
+    let req = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: json!(1),
+        method: "aoide/pairReveal".to_string(),
+        params: json!({ "id": id, "nonceHex": nonce_hex }),
+    };
+    serde_json::to_value(&req).expect("JsonRpcRequest always serializes")
+}
+
 /// Build the JSON-RPC `aoide/pairApprove` body the APPROVER's `peer pair
 /// approve` POSTs back to the requester's own door once its operator has
 /// confirmed the SAS — `id` is the SAME id `aoide/pairRequest` returned;
@@ -133,15 +156,28 @@ pub fn build_pair_approve_body(id: &str, pubkey_hex: &str) -> Value {
     serde_json::to_value(&req).expect("JsonRpcRequest always serializes")
 }
 
-/// `aoide/pairApprove`'s reply carries only `{ok, name}` — no data this
-/// crate needs to parse structurally beyond checking for a JSON-RPC
-/// `error`. Pure.
-pub fn check_pair_approve_response(resp: &Value) -> Result<(), String> {
+/// The shared shape [`check_pair_reveal_response`]/[`check_pair_approve_response`]
+/// both check: a JSON-RPC `error` becomes a refusal message prefixed by
+/// `refusal_prefix`; anything else is `Ok(())` — neither reply carries any
+/// data this crate needs to parse structurally beyond that. Pure.
+fn check_ok_response(resp: &Value, refusal_prefix: &str) -> Result<(), String> {
     if let Some(err) = resp.get("error") {
         let detail = err.get("message").and_then(Value::as_str).unwrap_or("(no message)");
-        return Err(format!("the requester refused the approval: {detail}"));
+        return Err(format!("{refusal_prefix}: {detail}"));
     }
     Ok(())
+}
+
+/// `aoide/pairReveal`'s reply carries only `{ok}` — see [`check_ok_response`].
+/// Pure.
+pub fn check_pair_reveal_response(resp: &Value) -> Result<(), String> {
+    check_ok_response(resp, "the peer refused the reveal")
+}
+
+/// `aoide/pairApprove`'s reply carries only `{ok, name}` — see
+/// [`check_ok_response`]. Pure.
+pub fn check_pair_approve_response(resp: &Value) -> Result<(), String> {
+    check_ok_response(resp, "the requester refused the approval")
 }
 
 #[cfg(test)]
@@ -194,12 +230,13 @@ mod tests {
 
     #[test]
     fn build_pair_request_body_matches_the_jsonrpc_shape() {
-        let body = build_pair_request_body("pk", "box-b", "nonce", "http://a/");
+        let body = build_pair_request_body("pk", "box-b", "commit", "http://a/");
         assert_eq!(body["method"], "aoide/pairRequest");
         assert_eq!(body["params"]["pubkeyHex"], "pk");
         assert_eq!(body["params"]["name"], "box-b");
-        assert_eq!(body["params"]["nonceHex"], "nonce");
+        assert_eq!(body["params"]["commitHex"], "commit");
         assert_eq!(body["params"]["url"], "http://a/");
+        assert!(body["params"].get("nonceHex").is_none(), "the nonce itself never rides pairRequest");
     }
 
     #[test]
@@ -227,6 +264,20 @@ mod tests {
         assert!(parse_pair_request_response(&missing_pubkey).is_err());
 
         assert!(parse_pair_request_response(&json!({})).is_err());
+    }
+
+    #[test]
+    fn build_pair_reveal_body_matches_the_jsonrpc_shape() {
+        let body = build_pair_reveal_body("abc12345", "d".repeat(32).as_str());
+        assert_eq!(body["method"], "aoide/pairReveal");
+        assert_eq!(body["params"]["id"], "abc12345");
+        assert_eq!(body["params"]["nonceHex"], "d".repeat(32));
+    }
+
+    #[test]
+    fn check_pair_reveal_response_passes_ok_and_surfaces_an_error() {
+        assert!(check_pair_reveal_response(&json!({ "result": { "ok": true } })).is_ok());
+        assert!(check_pair_reveal_response(&json!({ "error": { "code": -32002, "message": "commitment mismatch" } })).is_err());
     }
 
     #[test]

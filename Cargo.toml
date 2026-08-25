@@ -101,6 +101,12 @@ aoide-lyra = { path = "crates/lyra" }
 # decision 1 names it explicitly) — pinned to `0.11`, the exact version
 # `ed25519-dalek 3.0.0` already resolves, so this direct dependency adds no
 # second `sha2` version to the tree. Consumer: `aoide-storage::pairing`.
+# `sha2`'s default `oid` feature (unification with `digest`, already pulled
+# in transitively by `curve25519-dalek`'s own use of `digest`) promotes
+# `const-oid 0.10.2` into the resolved tree — no new crate this dependency
+# introduces on its own, since `digest` (and therefore `const-oid`) was
+# already present before `sha2` became direct; named here so a future
+# `cargo tree` audit doesn't mistake it for an unexplained addition.
 ed25519-dalek = "3"
 getrandom = { version = "0.4", default-features = false }
 sha2 = "0.11"

@@ -1,7 +1,9 @@
 //! The pairing ceremony's own state (P-P2, `docs/architecture/PAIRING.md`
 //! "The ceremony"): the two park-and-approve queues either side of a
-//! request holds, and the SAS (short authentication string) derivation both
-//! sides compute independently from the same public transcript.
+//! request holds, the commit-then-reveal handshake that keeps the SAS
+//! honest against an active on-path attacker, and the SAS (short
+//! authentication string) derivation both sides compute independently from
+//! the same public transcript.
 //!
 //! **Two files, two directions — never one.** A request rides from the
 //! REQUESTER (box A) to the APPROVER (box B); box B parks it
@@ -13,6 +15,49 @@
 //! dir family as `peer_store`'s own `state/peers.json` (account/global
 //! runtime, not song-scoped), same tolerate-missing/additive-round-trip
 //! discipline, same atomic writes.
+//!
+//! **Commit-then-reveal, not "both nonces in the clear in one round trip"
+//! (review-bounce fix, standard Bluetooth SSP idiom, PAIRING.md's "standard
+//! numeric-comparison SAS construction, no invention").** The original
+//! shape — A's request carrying `nonceHex` directly — let an active
+//! on-path attacker control four of the SAS transcript's six fields AFTER
+//! observing the real ones (both pubkeys, both nonces, choosable to land on
+//! any six-digit code against fast SHA-256), showing both honest operators
+//! the SAME code while each is actually paired to the attacker. Only the
+//! FIRST MOVER needs to commit (Bluetooth SSP's own numeric-comparison
+//! rule): A's `aoide/pairRequest` carries [`derive_commit`]`(pubkey_A,
+//! nonce_A)` instead of `nonce_A` itself — A's nonce is FIXED the moment B
+//! parks the commitment, before B (or anyone on-path) has seen it, so a
+//! counterpart choosing its own values after seeing the commit cannot force
+//! SAS equality. B may reveal its own nonce immediately in its synchronous
+//! response (nothing to hide on B's side — it moves second). A then POSTs
+//! `aoide/pairReveal {id, nonceHex}` right after, in the same `peer pair
+//! request` invocation ([`reveal_inbound`]); B verifies the revealed nonce
+//! against the stored commitment and DROPS the parked entry outright on a
+//! mismatch — a wrong nonce means either a bug or a tamper, and there is
+//! nothing left worth keeping parked either way. An inbound entry with no
+//! revealed nonce yet ([`InboundPairingRequest::requester_nonce_hex`]
+//! still `None`) has no SAS to show and cannot be approved — `peer pair
+//! pending` lists it without a code, `peer pair approve` refuses it
+//! outright (`docs/architecture/PAIRING.md`'s "awaiting reveal" wording).
+//!
+//! **Neither side commits a peer record on the FIRST human confirmation
+//! alone (review-bounce fix, decision 4's mutual confirmation, for real).**
+//! B's `peer pair approve` still commits B's own record right away (B
+//! already confirmed the SAS before delivering the callback — nothing left
+//! for B to do). But A's outbound entry does NOT auto-commit the moment
+//! B's `aoide/pairApprove` callback arrives with a matching pubkey — that
+//! would let a network round trip stand in for A's OWN operator ever
+//! looking at the code. Instead [`mark_outbound_awaiting_confirm`]
+//! transitions the entry to [`OutboundState::AwaitingConfirm`]; `peer pair
+//! pending` lists it (SAS shown — A already has both nonces since an
+//! outbound entry only exists post-reveal); `peer pair approve <id>` on an
+//! entry in this state shows the SAME confirm-then-commit y/N prompt B's
+//! own approve already holds, and only THEN calls `upsert_paired_peer`.
+//! `peer pair reject <id>` aborts an outbound entry at EITHER state
+//! ([`OutboundState::AwaitingApproval`] or [`OutboundState::AwaitingConfirm`])
+//! — the ceremony's own missing abort verb, closed without a new command
+//! (golden count unchanged).
 //!
 //! **Ids are NOT the array-position ids `song/stage/pending.json` uses**
 //! (CONTRACTS.md's own doc for that file) — a pairing request's id is
@@ -26,46 +71,74 @@
 //! the list it joins is small and checkable in memory.
 //!
 //! **Expiry is swept lazily, not on a timer.** Every reader that lists or
-//! resolves either queue calls [`sweep_expired_inbound`]/
-//! [`sweep_expired_outbound`] first — an expired entry is simply dropped
-//! from the file on the next touch; nothing here runs a background thread.
-//! [`pairing_timeout_secs`] is the knob (`AOIDE_PAIRING_TIMEOUT` env,
-//! default 4 hours — "hours, not minutes; it waits for a human",
+//! resolves either queue calls [`sweep`]/[`sweep_outbound`] first (via
+//! [`list_inbound`]/[`list_outbound`]/[`take_inbound`]/[`take_outbound`]/
+//! [`park_inbound`]'s own cap accounting) — an expired entry is simply
+//! dropped from the file on the next touch; nothing here runs a background
+//! thread. [`pairing_timeout_secs`] is the knob (`AOIDE_PAIRING_TIMEOUT`
+//! env, default 4 hours — "hours, not minutes; it waits for a human",
 //! PAIRING.md's own wording).
+//!
+//! **`park_inbound` is capped (review-bounce fix, P-N2c FIX 3b's exact
+//! shape reused): [`pairing_park_cap`] concurrently parked inbound
+//! requests, default 32, `AOIDE_PAIRING_PARK_CAP` override.** Unlike
+//! `secrets::park::ParkRegistry` (an in-memory registry backing a
+//! connection held open for the whole park), this queue is disk-persisted
+//! and unauthenticated by design (module doc on `pair_request` in
+//! `aoide-server::a2a`) — an unbounded queue of parked requests is an
+//! unbounded `state/peer-pairing-inbound.json`, cheap for an on-path or
+//! local attacker to grow with no credential at all. `park_inbound` checks
+//! the (post-sweep) length against the cap and inserts under the SAME
+//! process-local [`std::sync::Mutex`] acquisition — never a separate
+//! `len()` check followed by a second unlocked insert — so two racing
+//! `pair_request` calls on one broker process can never jointly overrun
+//! the cap by one, the identical TOCTOU discipline `secrets::park::
+//! ParkRegistry::park_if_room` already holds. **Known limitation, same
+//! shape as that crate's own admin-CRUD note:** the lock is per-process
+//! memory; it does not serialize two SEPARATE `a2a serve` processes
+//! against the same `state/` dir (there is normally only ever one). Beyond
+//! the cap, [`park_inbound`] refuses with a taught error naming the cap
+//! and its env knob — the caller (`aoide-server::a2a::pair_request`) maps
+//! that refusal to a JSON-RPC error, never a silent drop. Outbound entries
+//! are operator-created (one `peer pair request` invocation, one entry)
+//! and carry no equivalent cap — nothing unauthenticated can grow that
+//! queue.
 //!
 //! **The SAS ([`derive_sas`]) is a transcript hash over the FOUR public
 //! values every ceremony makes visible to both sides: the requester's
 //! pubkey, the approver's pubkey, the requester's nonce, the approver's
 //! nonce — in that fixed order, always** (PAIRING.md: "derived from a
 //! transcript hash over (pubkey_A, pubkey_B, nonce_A, nonce_B)... standard
-//! numeric-comparison SAS construction, no invention"). Hashing the
-//! lowercased hex TEXT of each field (not decoded raw bytes) sidesteps a
-//! hex-parse failure mode entirely — the four fields are already
-//! opaque hex strings by the time they reach here (never
-//! reinterpreted as anything else), so hashing their canonical text is
-//! exactly as strong a transcript binding as hashing the decoded bytes
-//! would be, with strictly fewer error paths. A `\x00` separator after
-//! EVERY field (including the last) closes the classic "field
-//! concatenation ambiguity" (`"ab"+"c"` vs `"a"+"bc"`) the same way a
-//! length-prefixed or delimited encoding would, without adding one.
-//! `sha2::Sha256`'s first 4 bytes, big-endian, mod 1,000,000, rendered
-//! `NNN-NNN` — this exact derivation is pinned by
+//! numeric-comparison SAS construction, no invention"). [`derive_commit`]
+//! shares the SAME canonical field-hashing shape ([`transcript_digest`]) —
+//! lowercased hex TEXT of each field (not decoded raw bytes), NUL-separated
+//! after EVERY field including the last (closes the classic "field
+//! concatenation ambiguity" the same way a length-prefixed encoding
+//! would) — over exactly two fields (pubkey, nonce) instead of four,
+//! rendered as the full 32-byte digest in hex rather than truncated/
+//! reduced, since a commitment must be collision-resistant on its own,
+//! never a short human-facing code. `derive_sas` itself takes
+//! `transcript_digest`'s first 4 bytes, big-endian, mod 1,000,000,
+//! rendered `NNN-NNN` — unchanged by this phase (the review that required
+//! the commitment fix independently re-verified this derivation's own
+//! pinned vectors); this exact derivation is pinned by
 //! [`tests::derive_sas_stability_vectors_never_drift`] so it renders
 //! identically on both boxes forever (PAIRING.md's own requirement).
 
 use crate::fs::{atomic_write, state_dir};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::Mutex;
 
 /// `state/peer-pairing-inbound.json`/`-outbound.json` schema version.
 pub const PAIRING_VERSION: &str = "0";
 
 /// Env override for how long an unapproved pairing request stays parked
-/// before [`sweep_expired_inbound`]/[`sweep_expired_outbound`] drop it —
-/// "hours, not minutes; it waits for a human" (PAIRING.md). A blank or
-/// unparsable value falls back to [`DEFAULT_PAIRING_TIMEOUT_SECS`], the
-/// same tolerant-fallback shape `aoide_secrets::park::park_timeout` holds
-/// for its own (much shorter) analogous knob.
+/// before [`sweep`]/[`sweep_outbound`] drop it — "hours, not minutes; it
+/// waits for a human" (PAIRING.md). A blank or unparsable value falls back
+/// to [`DEFAULT_PAIRING_TIMEOUT_SECS`], the same tolerant-fallback shape
+/// `aoide_secrets::park::park_timeout` holds for its own (much shorter)
+/// analogous knob.
 pub const PAIRING_TIMEOUT_ENV: &str = "AOIDE_PAIRING_TIMEOUT";
 
 /// The default pairing-request timeout: 4 hours (PAIRING.md: "default
@@ -88,19 +161,52 @@ pub fn pairing_timeout_secs() -> u64 {
     DEFAULT_PAIRING_TIMEOUT_SECS
 }
 
+/// Env override for the registry-wide max PARKED inbound requests at once
+/// (review-bounce Finding 3 — an unauthenticated, unbounded queue is an
+/// unbounded file). Same tolerant-fallback shape as [`PAIRING_TIMEOUT_ENV`].
+pub const PAIRING_PARK_CAP_ENV: &str = "AOIDE_PAIRING_PARK_CAP";
+
+/// The default inbound park cap: 32 concurrently parked requests — the same
+/// number `secrets::park::DEFAULT_PARK_CAP` uses for its own analogous
+/// unauthenticated-queue concern.
+pub const DEFAULT_PAIRING_PARK_CAP: usize = 32;
+
+/// Resolve the inbound park cap: [`PAIRING_PARK_CAP_ENV`] when set to a
+/// valid positive integer, else [`DEFAULT_PAIRING_PARK_CAP`].
+pub fn pairing_park_cap() -> usize {
+    if let Ok(v) = std::env::var(PAIRING_PARK_CAP_ENV) {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            if let Ok(cap) = trimmed.parse::<usize>() {
+                if cap > 0 {
+                    return cap;
+                }
+            }
+        }
+    }
+    DEFAULT_PAIRING_PARK_CAP
+}
+
+/// Guards [`park_inbound`]'s check-then-insert — module doc's cap section.
+/// Poison-recovering like every other production lock in this workspace
+/// (`aoide_secrets::park::ParkRegistry`'s own precedent): a panic inside
+/// one caller must never wedge every OTHER pairing request behind a
+/// poisoned lock forever.
+static PARK_LOCK: Mutex<()> = Mutex::new(());
+
 /// `n_bytes` random bytes off the system RNG, hex-encoded lowercase — the
-/// ONE randomness primitive this module uses, for BOTH a fresh nonce
-/// (16 bytes, the ceremony's `nonce_a`/`nonce_b`) and a fresh request id (4
-/// bytes, [`gen_request_id`]). `getrandom::fill` is already a workspace
-/// dependency (`identity.rs`'s own keygen) — reused here rather than a
-/// second RNG entry point. A read failure is vanishingly unlikely on Linux
-/// once the kernel CSPRNG is seeded (the same assumption `identity::mint`
-/// already makes for key generation); this function panics on that failure
-/// rather than silently degrading a SECURITY-relevant nonce/id to something
+/// ONE randomness primitive this module uses, for a fresh nonce (16 bytes,
+/// the ceremony's `nonce_a`/`nonce_b`) and a fresh request id (4 bytes,
+/// [`gen_request_id`]). `getrandom::fill` is already a workspace dependency
+/// (`identity.rs`'s own keygen) — reused here rather than a second RNG
+/// entry point. A read failure is vanishingly unlikely on Linux once the
+/// kernel CSPRNG is seeded (the same assumption `identity::mint` already
+/// makes for key generation); this function panics on that failure rather
+/// than silently degrading a SECURITY-relevant nonce/id to something
 /// weaker — unlike `aoide_secrets::park::random_nonce`'s own
 /// `/dev/urandom`-read fallback (that nonce only needs to usually differ
 /// across restarts, not resist prediction; a pairing nonce feeds directly
-/// into the SAS transcript and must never be guessable).
+/// into the commitment/SAS transcript and must never be guessable).
 pub fn random_hex(n_bytes: usize) -> String {
     let mut buf = vec![0u8; n_bytes];
     getrandom::fill(&mut buf).expect("system RNG unavailable");
@@ -121,32 +227,56 @@ fn gen_request_id(existing: &[String]) -> String {
     }
 }
 
+/// The canonical field-hashing shape [`derive_sas`]/[`derive_commit`] both
+/// build on (module doc): every field trimmed and lowercased before
+/// hashing (so a caller need not pre-normalize hex case), a `\x00`
+/// separator after EVERY field including the last. Returns the full
+/// 32-byte SHA-256 digest — callers reduce it however their own contract
+/// requires ([`derive_sas`]'s mod-1,000,000 truncation, [`derive_commit`]'s
+/// full hex encoding).
+fn transcript_digest(fields: &[&str]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for field in fields {
+        hasher.update(field.trim().to_ascii_lowercase().as_bytes());
+        hasher.update([0u8]);
+    }
+    hasher.finalize().into()
+}
+
 /// The SAS derivation (module doc) — pure, deterministic, order-sensitive.
-/// Every field is trimmed and lowercased before hashing, so a caller need
-/// not pre-normalize hex case; a `\x00` separator follows every field.
+/// Unchanged by the commit-then-reveal fix (module doc); still exactly
+/// `(requester_pubkey, approver_pubkey, requester_nonce, approver_nonce)`.
 pub fn derive_sas(
     requester_pubkey_hex: &str,
     approver_pubkey_hex: &str,
     requester_nonce_hex: &str,
     approver_nonce_hex: &str,
 ) -> String {
-    let mut hasher = Sha256::new();
-    for field in [requester_pubkey_hex, approver_pubkey_hex, requester_nonce_hex, approver_nonce_hex] {
-        hasher.update(field.trim().to_ascii_lowercase().as_bytes());
-        hasher.update([0u8]);
-    }
-    let digest = hasher.finalize();
+    let digest = transcript_digest(&[requester_pubkey_hex, approver_pubkey_hex, requester_nonce_hex, approver_nonce_hex]);
     let n = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
     format!("{:03}-{:03}", n / 1000, n % 1000)
+}
+
+/// The commitment [`park_inbound`]'s `commit_hex` param carries and
+/// [`reveal_inbound`] verifies (module doc, review-bounce Finding 1) — the
+/// FULL SHA-256 digest, hex-encoded, over `(pubkey_hex, nonce_hex)`. Full
+/// digest rather than a truncated code on purpose: a commitment must resist
+/// collision/second-preimage on its own, unlike the human-facing SAS, which
+/// only needs to resist an active real-time forger, not an offline search
+/// against a fixed target.
+pub fn derive_commit(pubkey_hex: &str, nonce_hex: &str) -> String {
+    let digest = transcript_digest(&[pubkey_hex, nonce_hex]);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // ── Inbound (approver-side): a request PARKED for this instance to approve ──
 
 /// One pairing request parked on the APPROVER's own instance — everything
 /// the approver needs to display it (`peer pair pending`), derive the SAS
-/// (`derive_sas` against this instance's own identity), and commit a peer
-/// record on approval (`peer pair approve`), all without any further wire
-/// round trip to the requester until the approval callback itself.
+/// once revealed (`derive_sas` against this instance's own identity), and
+/// commit a peer record on approval (`peer pair approve`), all without any
+/// further wire round trip to the requester until the approval callback
+/// itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboundPairingRequest {
     pub id: String,
@@ -164,16 +294,24 @@ pub struct InboundPairingRequest {
     /// security decision in this phase (no pairing exists yet to gate on).
     #[serde(rename = "originAddr")]
     pub origin_addr: String,
-    /// The requester's own self-reported A2A door URL — where the approval
-    /// callback (`aoide/pairApprove`) is POSTed.
+    /// The requester's own self-reported A2A door URL — where the reveal
+    /// and (eventually) the approval callback are POSTed.
     pub url: String,
-    /// The requester's own nonce, hex.
-    #[serde(rename = "requesterNonceHex")]
-    pub requester_nonce_hex: String,
+    /// `SHA256(pubkeyHex, requesterNonceHex)` (module doc, [`derive_commit`])
+    /// — the requester's own nonce is NOT parked until [`reveal_inbound`]
+    /// verifies it against this commitment.
+    #[serde(rename = "commitHex")]
+    pub commit_hex: String,
+    /// The requester's own nonce, hex — `None` until [`reveal_inbound`]
+    /// verifies it matches [`Self::commit_hex`]; `peer pair pending` shows
+    /// no SAS and `peer pair approve` refuses this entry while it stays
+    /// `None`.
+    #[serde(rename = "requesterNonceHex", default, skip_serializing_if = "Option::is_none")]
+    pub requester_nonce_hex: Option<String>,
     /// THIS instance's (the approver's) own nonce, hex — generated fresh at
     /// park time and returned synchronously in the same response, so the
-    /// requester can derive its own SAS immediately with no further wire
-    /// call.
+    /// requester can derive its own SAS immediately once it reveals its own
+    /// nonce.
     #[serde(rename = "approverNonceHex")]
     pub approver_nonce_hex: String,
     #[serde(rename = "requestedAt")]
@@ -213,7 +351,8 @@ fn save_inbound(requests: &[InboundPairingRequest]) -> Result<(), String> {
 
 /// List every currently-unexpired inbound request, sweeping (and persisting
 /// the removal of) any that expired since the last touch. `peer pair
-/// pending`'s whole reply.
+/// pending`'s whole reply (inbound half) — an entry with
+/// `requester_nonce_hex: None` has no SAS to show yet (module doc).
 pub fn list_inbound(now_epoch: i64) -> Vec<InboundPairingRequest> {
     let all = load_inbound_raw();
     let (kept, expired) = sweep(all, now_epoch);
@@ -224,20 +363,37 @@ pub fn list_inbound(now_epoch: i64) -> Vec<InboundPairingRequest> {
 }
 
 /// Park a fresh inbound request — the approver's `aoide/pairRequest`
-/// handler's whole job. Returns the freshly-minted [`InboundPairingRequest`]
-/// (including its new `id` and freshly-generated `approver_nonce_hex`) so
-/// the caller can build the synchronous wire response from it directly.
+/// handler's whole job. Cap-checked under [`PARK_LOCK`] (module doc,
+/// review-bounce Finding 3): a full queue refuses BEFORE any id is minted
+/// or anything is written. Returns the freshly-minted
+/// [`InboundPairingRequest`] (including its new `id`,
+/// `requester_nonce_hex: None`, and freshly-generated
+/// `approver_nonce_hex`) so the caller can build the synchronous wire
+/// response from it directly.
 #[allow(clippy::too_many_arguments)]
 pub fn park_inbound(
     pubkey_hex: &str,
     name: &str,
     origin_addr: &str,
     url: &str,
-    requester_nonce_hex: &str,
+    commit_hex: &str,
     requested_at: &str,
     expires_at: &str,
 ) -> Result<InboundPairingRequest, String> {
-    let mut requests = load_inbound_raw();
+    let _guard = PARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // `requested_at` is the caller's own "now" (module doc) — reused as the
+    // sweep reference so a cap check never counts an already-expired entry
+    // against the live queue.
+    let now_epoch = crate::time::parse_iso_utc(requested_at).unwrap_or(i64::MAX);
+    let (mut requests, _expired) = sweep(load_inbound_raw(), now_epoch);
+    let cap = pairing_park_cap();
+    if requests.len() >= cap {
+        return Err(format!(
+            "the pairing park queue is already at its cap of {cap} concurrently parked inbound \
+             requests ({PAIRING_PARK_CAP_ENV} raises it) — approve, reject, or wait for an \
+             existing request to expire before retrying"
+        ));
+    }
     let id = gen_request_id(&requests.iter().map(|r| r.id.clone()).collect::<Vec<_>>());
     let entry = InboundPairingRequest {
         id,
@@ -245,7 +401,8 @@ pub fn park_inbound(
         name: name.to_string(),
         origin_addr: origin_addr.to_string(),
         url: url.to_string(),
-        requester_nonce_hex: requester_nonce_hex.to_string(),
+        commit_hex: commit_hex.to_string(),
+        requester_nonce_hex: None,
         approver_nonce_hex: random_hex(16),
         requested_at: requested_at.to_string(),
         expires_at: expires_at.to_string(),
@@ -258,8 +415,8 @@ pub fn park_inbound(
 /// Remove and return one inbound request by id, `None` if it never existed
 /// OR has already expired (sweeping happens here too, so an approve/reject
 /// against a just-expired id gets the same honest "unknown id" a genuinely
-/// unknown one would). `peer pair approve`/`peer pair reject`'s shared
-/// lookup.
+/// unknown one would). `peer pair reject`'s inbound-side lookup, and
+/// `peer pair approve`'s final removal once a callback has succeeded.
 pub fn take_inbound(id: &str, now_epoch: i64) -> Result<Option<InboundPairingRequest>, String> {
     let all = load_inbound_raw();
     let (mut kept, _expired) = sweep(all, now_epoch);
@@ -269,18 +426,112 @@ pub fn take_inbound(id: &str, now_epoch: i64) -> Result<Option<InboundPairingReq
     Ok(taken)
 }
 
-// ── Outbound (requester-side): a request THIS instance is awaiting approval on ──
+/// Why [`reveal_inbound`] refused — a machine-readable enum, never a string
+/// a caller would need to pattern-match (the same "distinct machine flag,
+/// not inferred from error text" discipline `aoide-secrets`'s `put`
+/// overwrite refusal holds).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevealError {
+    /// No parked inbound request has this id (unknown, already resolved,
+    /// or expired).
+    Unknown,
+    /// The revealed nonce does not hash to the entry's stored commitment —
+    /// the parked entry is DROPPED as part of this outcome (module doc):
+    /// there is nothing left worth keeping parked once the commitment
+    /// fails to check out.
+    Mismatch,
+    /// Reading or writing `state/peer-pairing-inbound.json` itself failed.
+    Io(String),
+}
+
+/// Complete the commit-then-reveal handshake (module doc, review-bounce
+/// Finding 1) for one parked inbound request: verify `nonce_hex` hashes to
+/// the entry's stored `commit_hex` (`derive_commit(entry.pubkey_hex,
+/// nonce_hex) == entry.commit_hex`) and, on a match, store it as
+/// `requester_nonce_hex` so `peer pair pending`/`approve` can finally
+/// derive a SAS for this entry. A MISMATCH drops the entry outright rather
+/// than leaving it parked — `aoide-server::a2a::pair_reveal` is the wire
+/// caller (`aoide/pairReveal`), `peer pair request`'s second POST (client
+/// crate) is the one production caller of that method.
+pub fn reveal_inbound(id: &str, nonce_hex: &str, now_epoch: i64) -> Result<InboundPairingRequest, RevealError> {
+    let all = load_inbound_raw();
+    let (mut kept, _expired) = sweep(all, now_epoch);
+    let idx = match kept.iter().position(|r| r.id == id) {
+        Some(i) => i,
+        None => {
+            if let Err(e) = save_inbound(&kept) {
+                return Err(RevealError::Io(e));
+            }
+            return Err(RevealError::Unknown);
+        }
+    };
+    let expected = derive_commit(&kept[idx].pubkey_hex, nonce_hex);
+    if expected != kept[idx].commit_hex {
+        kept.remove(idx);
+        if let Err(e) = save_inbound(&kept) {
+            return Err(RevealError::Io(e));
+        }
+        return Err(RevealError::Mismatch);
+    }
+    kept[idx].requester_nonce_hex = Some(nonce_hex.to_string());
+    let out = kept[idx].clone();
+    if let Err(e) = save_inbound(&kept) {
+        return Err(RevealError::Io(e));
+    }
+    Ok(out)
+}
+
+// ── Outbound (requester-side): a request THIS instance is awaiting on ──────
+
+/// An outbound pairing request's own place in the ceremony (module doc,
+/// review-bounce Finding 2) — never conflated with [`InboundPairingRequest`]
+/// simply lacking a revealed nonce; an outbound entry only ever exists
+/// AFTER its own reveal already succeeded (`park_outbound`'s one caller,
+/// `peer pair request`, parks only on a successful reveal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OutboundState {
+    /// Waiting on the approver's own human to confirm the SAS and deliver
+    /// `aoide/pairApprove` — the state every outbound entry starts in.
+    #[serde(rename = "awaiting-approval")]
+    AwaitingApproval,
+    /// The approver's callback arrived with a matching pubkey
+    /// ([`mark_outbound_awaiting_confirm`]) — THIS instance's own operator
+    /// still has to confirm the SAS before anything commits (`peer pair
+    /// approve <id>` on this entry, the requester-side confirm path).
+    #[serde(rename = "awaiting-confirm")]
+    AwaitingConfirm,
+}
+
+impl Default for OutboundState {
+    fn default() -> Self {
+        Self::AwaitingApproval
+    }
+}
+
+impl OutboundState {
+    /// The wire/CLI-display string for this state — matches this type's
+    /// own serde `rename`s exactly, exposed as a method so a caller
+    /// building a `serde_json::json!` row doesn't need to round-trip
+    /// through `serde_json::to_value` for one field.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AwaitingApproval => "awaiting-approval",
+            Self::AwaitingConfirm => "awaiting-confirm",
+        }
+    }
+}
 
 /// One pairing request THIS instance (the requester) sent out and is
-/// waiting on — the callback (`aoide/pairApprove`) resolves it, committing
-/// this instance's own peer record for the approver.
+/// waiting on — either the approver's own callback ([`OutboundState::
+/// AwaitingApproval`]) or this instance's OWN operator's confirm-then-
+/// commit ([`OutboundState::AwaitingConfirm`], module doc).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboundPairingRequest {
     /// Same id the approver parked it under (module doc — one shared id,
     /// no separate counters to reconcile).
     pub id: String,
     /// The approver's own A2A door URL — this becomes the peer record's
-    /// `url` on approval.
+    /// `url` on commit.
     pub url: String,
     /// THIS instance's own local nickname for the approver
     /// (`peer pair request <url> --name <n>`, or its URL-derived default).
@@ -289,13 +540,26 @@ pub struct OutboundPairingRequest {
     /// `aoide/pairRequest` response.
     #[serde(rename = "pubkeyHex")]
     pub pubkey_hex: String,
-    /// THIS instance's own nonce, hex.
+    /// THIS instance's own nonce, hex — chosen locally before the
+    /// commitment was ever sent, never transmitted until the reveal.
     #[serde(rename = "requesterNonceHex")]
     pub requester_nonce_hex: String,
+    /// The approver's own nonce, hex — learned from the synchronous
+    /// `aoide/pairRequest` response, stored here so this entry can
+    /// re-derive its SAS at confirm time with no further wire call.
+    #[serde(rename = "approverNonceHex")]
+    pub approver_nonce_hex: String,
     #[serde(rename = "requestedAt")]
     pub requested_at: String,
     #[serde(rename = "expiresAt")]
     pub expires_at: String,
+    /// This entry's own place in the ceremony (module doc) — `#[serde(default)]`
+    /// so a file predating this field (there is none in production yet,
+    /// this phase is new; kept for the same additive discipline every
+    /// other wire-shape change in this crate holds) loads as
+    /// [`OutboundState::AwaitingApproval`].
+    #[serde(default)]
+    pub state: OutboundState,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -327,8 +591,10 @@ fn save_outbound(requests: &[OutboundPairingRequest]) -> Result<(), String> {
     atomic_write(&path, &body).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Remember that THIS instance sent a request out — `peer pair request`'s
-/// own write, once it has the approver's synchronous response in hand.
+/// Remember that THIS instance sent a request out and its own reveal
+/// already succeeded — `peer pair request`'s own write
+/// ([`OutboundState::AwaitingApproval`] by default). Replaces by id rather
+/// than duplicating (operator-created, no cap needed — module doc).
 pub fn park_outbound(entry: OutboundPairingRequest) -> Result<(), String> {
     let mut requests = load_outbound_raw();
     requests.retain(|r| r.id != entry.id);
@@ -336,9 +602,9 @@ pub fn park_outbound(entry: OutboundPairingRequest) -> Result<(), String> {
     save_outbound(&requests)
 }
 
-/// Remove and return one outbound request by id — the `aoide/pairApprove`
-/// callback handler's lookup. `None` for an unknown OR expired id (same
-/// sweep-on-touch discipline as [`take_inbound`]).
+/// Remove and return one outbound request by id — `peer pair reject`'s
+/// outbound-side lookup (any state), and the requester-side confirm's
+/// final removal once its own operator has committed.
 pub fn take_outbound(id: &str, now_epoch: i64) -> Result<Option<OutboundPairingRequest>, String> {
     let all = load_outbound_raw();
     let (mut kept, _expired) = sweep_outbound(all, now_epoch);
@@ -349,10 +615,9 @@ pub fn take_outbound(id: &str, now_epoch: i64) -> Result<Option<OutboundPairingR
 }
 
 /// List every currently-unexpired outbound request, sweeping expired ones
-/// the same way [`list_inbound`] does. Mainly a diagnostic/test seam today
-/// — no CLI verb lists this side (PAIRING.md's ceremony only ever prompts
-/// the APPROVER interactively; the requester's `peer pair request` already
-/// printed its own SAS synchronously and has nothing further to poll).
+/// the same way [`list_inbound`] does. `peer pair pending`'s outbound half
+/// (review-bounce Finding 2 — this used to be a diagnostic-only seam with
+/// no CLI reader; it is now load-bearing).
 pub fn list_outbound(now_epoch: i64) -> Vec<OutboundPairingRequest> {
     let all = load_outbound_raw();
     let (kept, expired) = sweep_outbound(all, now_epoch);
@@ -360,6 +625,55 @@ pub fn list_outbound(now_epoch: i64) -> Vec<OutboundPairingRequest> {
         let _ = save_outbound(&kept);
     }
     kept
+}
+
+/// Why [`mark_outbound_awaiting_confirm`] refused — same machine-readable
+/// shape as [`RevealError`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmMarkError {
+    /// No parked outbound request has this id (unknown, already completed,
+    /// or expired).
+    Unknown,
+    /// The callback's `pubkeyHex` does not match what this instance
+    /// learned at request time — the entry is left EXACTLY as it was
+    /// (never removed, never re-parked with different data — there was
+    /// nothing to restore since nothing was ever taken off the queue for
+    /// this check).
+    Mismatch,
+    /// Reading or writing `state/peer-pairing-outbound.json` itself failed.
+    Io(String),
+}
+
+/// The `aoide/pairApprove` callback's handler-side effect (review-bounce
+/// Finding 2): on a pubkey match, transition the outbound entry to
+/// [`OutboundState::AwaitingConfirm`] — deliberately NOT a commit. This
+/// instance's OWN operator still has to run `peer pair approve <id>` and
+/// confirm the SAS before `upsert_paired_peer` ever runs on this side
+/// (module doc: mutual confirmation, for real).
+pub fn mark_outbound_awaiting_confirm(id: &str, pubkey_hex: &str, now_epoch: i64) -> Result<OutboundPairingRequest, ConfirmMarkError> {
+    let all = load_outbound_raw();
+    let (mut kept, _expired) = sweep_outbound(all, now_epoch);
+    let idx = match kept.iter().position(|r| r.id == id) {
+        Some(i) => i,
+        None => {
+            if let Err(e) = save_outbound(&kept) {
+                return Err(ConfirmMarkError::Io(e));
+            }
+            return Err(ConfirmMarkError::Unknown);
+        }
+    };
+    if kept[idx].pubkey_hex != pubkey_hex {
+        if let Err(e) = save_outbound(&kept) {
+            return Err(ConfirmMarkError::Io(e));
+        }
+        return Err(ConfirmMarkError::Mismatch);
+    }
+    kept[idx].state = OutboundState::AwaitingConfirm;
+    let out = kept[idx].clone();
+    if let Err(e) = save_outbound(&kept) {
+        return Err(ConfirmMarkError::Io(e));
+    }
+    Ok(out)
 }
 
 fn sweep(entries: Vec<InboundPairingRequest>, now_epoch: i64) -> (Vec<InboundPairingRequest>, usize) {
@@ -403,7 +717,9 @@ mod tests {
     /// boxes forever. Computed independently (sha256sum over the exact byte
     /// transcript `derive_sas` builds) rather than by calling the function
     /// itself, so this test actually pins the algorithm rather than just
-    /// asserting it agrees with itself.
+    /// asserting it agrees with itself. UNCHANGED by the commit-then-reveal
+    /// fix (module doc) — `derive_sas`'s own math never moved, only
+    /// `park_inbound`'s callers stopped handing it a same-round-trip nonce.
     #[test]
     fn derive_sas_stability_vectors_never_drift() {
         let pubkey_a = "a".repeat(64);
@@ -446,6 +762,30 @@ mod tests {
         }
     }
 
+    // ── derive_commit ────────────────────────────────────────────────────
+
+    #[test]
+    fn derive_commit_is_a_64_char_hex_digest_and_content_sensitive() {
+        let c1 = derive_commit(&"a".repeat(64), &"c".repeat(16));
+        assert_eq!(c1.len(), 64, "full SHA-256 digest, hex-encoded — never truncated like the SAS");
+        assert!(c1.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let c2 = derive_commit(&"a".repeat(64), &"d".repeat(16));
+        assert_ne!(c1, c2, "a different nonce must change the commitment");
+
+        let c3 = derive_commit(&"b".repeat(64), &"c".repeat(16));
+        assert_ne!(c1, c3, "a different pubkey must change the commitment");
+    }
+
+    #[test]
+    fn derive_commit_is_case_and_whitespace_insensitive_like_derive_sas() {
+        let lower = derive_commit("aabbcc", "1122");
+        let upper = derive_commit("AABBCC", "1122");
+        let padded = derive_commit("  aabbcc  ", "1122");
+        assert_eq!(lower, upper);
+        assert_eq!(lower, padded);
+    }
+
     // ── pairing_timeout_secs ─────────────────────────────────────────────
 
     #[test]
@@ -467,6 +807,30 @@ mod tests {
         match saved {
             Some(v) => std::env::set_var(PAIRING_TIMEOUT_ENV, v),
             None => std::env::remove_var(PAIRING_TIMEOUT_ENV),
+        }
+    }
+
+    // ── pairing_park_cap ─────────────────────────────────────────────────
+
+    #[test]
+    fn pairing_park_cap_defaults_to_32_and_honors_a_valid_override() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved = std::env::var(PAIRING_PARK_CAP_ENV).ok();
+        std::env::remove_var(PAIRING_PARK_CAP_ENV);
+        assert_eq!(pairing_park_cap(), 32);
+
+        std::env::set_var(PAIRING_PARK_CAP_ENV, "5");
+        assert_eq!(pairing_park_cap(), 5);
+
+        std::env::set_var(PAIRING_PARK_CAP_ENV, "0");
+        assert_eq!(pairing_park_cap(), 32, "zero falls back to the default, never an always-refusing cap");
+
+        std::env::set_var(PAIRING_PARK_CAP_ENV, "nope");
+        assert_eq!(pairing_park_cap(), 32, "unparsable falls back to the default");
+
+        match saved {
+            Some(v) => std::env::set_var(PAIRING_PARK_CAP_ENV, v),
+            None => std::env::remove_var(PAIRING_PARK_CAP_ENV),
         }
     }
 
@@ -507,23 +871,26 @@ mod tests {
         assert!(list_inbound(0).is_empty(), "missing file tolerates as empty");
 
         let now = 1_700_000_000_i64;
+        let commit = derive_commit("requesterpubkeyhex", "requesternoncehex");
         let entry = park_inbound(
             "requesterpubkeyhex",
             "box-a",
             "10.0.0.5",
             "http://box-a:8710/",
-            "requesternoncehex",
+            &commit,
             &crate::time::iso_utc_from_epoch(now),
             &expires_at_from(now),
         )
         .unwrap();
         assert_eq!(entry.id.len(), 8);
         assert!(!entry.approver_nonce_hex.is_empty());
+        assert!(entry.requester_nonce_hex.is_none(), "unrevealed at park time");
 
         let listed = list_inbound(now);
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, entry.id);
         assert_eq!(listed[0].pubkey_hex, "requesterpubkeyhex");
+        assert_eq!(listed[0].commit_hex, commit);
 
         let taken = take_inbound(&entry.id, now).unwrap();
         assert_eq!(taken.unwrap().id, entry.id);
@@ -546,8 +913,9 @@ mod tests {
         env(&dir);
 
         let requested_at = 1_700_000_000_i64;
+        let commit = derive_commit("pk", "nonce");
         let entry = park_inbound(
-            "pk", "name", "addr", "url", "nonce",
+            "pk", "name", "addr", "url", &commit,
             &crate::time::iso_utc_from_epoch(requested_at),
             &crate::time::iso_utc_from_epoch(requested_at + 10), // expires in 10s
         )
@@ -568,7 +936,134 @@ mod tests {
         }
     }
 
+    #[test]
+    fn park_inbound_refuses_beyond_the_cap_and_admits_again_after_a_take() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved_dir = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_cap = std::env::var(PAIRING_PARK_CAP_ENV).ok();
+        let dir = std::env::temp_dir().join(format!("aoide-pairing-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        env(&dir);
+        std::env::set_var(PAIRING_PARK_CAP_ENV, "2");
+
+        let now = 1_700_000_000_i64;
+        let requested_at = crate::time::iso_utc_from_epoch(now);
+        let expires_at = expires_at_from(now);
+        let park = |pk: &str| park_inbound(pk, "name", "addr", "url", &derive_commit(pk, "n"), &requested_at, &expires_at);
+
+        let first = park("pk1").expect("first park is under the cap");
+        park("pk2").expect("second park is exactly at the cap");
+        let refused = park("pk3");
+        assert!(refused.is_err(), "a third park must refuse at cap 2");
+        assert_eq!(list_inbound(now).len(), 2, "the refused park wrote nothing");
+
+        // Freeing a slot admits the next one again.
+        take_inbound(&first.id, now).unwrap();
+        park("pk4").expect("a freed slot admits a new park");
+        assert_eq!(list_inbound(now).len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved_dir {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+        match saved_cap {
+            Some(v) => std::env::set_var(PAIRING_PARK_CAP_ENV, v),
+            None => std::env::remove_var(PAIRING_PARK_CAP_ENV),
+        }
+    }
+
+    // ── reveal_inbound ───────────────────────────────────────────────────
+
+    #[test]
+    fn reveal_inbound_on_a_matching_nonce_stores_it_and_round_trips() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-pairing-reveal-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        env(&dir);
+
+        let now = 1_700_000_000_i64;
+        let requested_at = crate::time::iso_utc_from_epoch(now);
+        let expires_at = expires_at_from(now);
+        let commit = derive_commit("pk", "the-real-nonce");
+        let entry = park_inbound("pk", "name", "addr", "url", &commit, &requested_at, &expires_at).unwrap();
+        assert!(entry.requester_nonce_hex.is_none());
+
+        let revealed = reveal_inbound(&entry.id, "the-real-nonce", now).unwrap();
+        assert_eq!(revealed.requester_nonce_hex.as_deref(), Some("the-real-nonce"));
+
+        let listed = list_inbound(now);
+        assert_eq!(listed.len(), 1, "revealing never removes the entry");
+        assert_eq!(listed[0].requester_nonce_hex.as_deref(), Some("the-real-nonce"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
+    fn reveal_inbound_on_a_wrong_nonce_is_refused_and_drops_the_entry() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-pairing-reveal-mismatch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        env(&dir);
+
+        let now = 1_700_000_000_i64;
+        let requested_at = crate::time::iso_utc_from_epoch(now);
+        let expires_at = expires_at_from(now);
+        let commit = derive_commit("pk", "the-real-nonce");
+        let entry = park_inbound("pk", "name", "addr", "url", &commit, &requested_at, &expires_at).unwrap();
+
+        let err = reveal_inbound(&entry.id, "a-different-nonce", now).unwrap_err();
+        assert_eq!(err, RevealError::Mismatch);
+
+        assert!(list_inbound(now).is_empty(), "a mismatched reveal drops the parked entry outright");
+        assert_eq!(reveal_inbound(&entry.id, "the-real-nonce", now).unwrap_err(), RevealError::Unknown, "gone — even the correct nonce now finds nothing");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
+    fn reveal_inbound_on_an_unknown_id_is_refused() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-pairing-reveal-unknown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        env(&dir);
+
+        assert_eq!(reveal_inbound("nosuchid", "n", 0).unwrap_err(), RevealError::Unknown);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
     // ── outbound park/take round trip ────────────────────────────────────
+
+    fn sample_outbound(id: &str, state: OutboundState) -> OutboundPairingRequest {
+        let now = 1_700_000_000_i64;
+        OutboundPairingRequest {
+            id: id.to_string(),
+            url: "http://box-b/".to_string(),
+            name: "box-b".to_string(),
+            pubkey_hex: "approverpubkeyhex".to_string(),
+            requester_nonce_hex: "reqnonce".to_string(),
+            approver_nonce_hex: "apprnonce".to_string(),
+            requested_at: crate::time::iso_utc_from_epoch(now),
+            expires_at: expires_at_from(now),
+            state,
+        }
+    }
 
     #[test]
     fn park_outbound_then_take_round_trips_and_is_removed_after_taking() {
@@ -579,20 +1074,13 @@ mod tests {
         env(&dir);
 
         let now = 1_700_000_000_i64;
-        let entry = OutboundPairingRequest {
-            id: "deadbeef".to_string(),
-            url: "http://box-b:8710/".to_string(),
-            name: "box-b".to_string(),
-            pubkey_hex: "approverpubkeyhex".to_string(),
-            requester_nonce_hex: "reqnonce".to_string(),
-            requested_at: crate::time::iso_utc_from_epoch(now),
-            expires_at: expires_at_from(now),
-        };
+        let entry = sample_outbound("deadbeef", OutboundState::AwaitingApproval);
         park_outbound(entry.clone()).unwrap();
 
         let listed = list_outbound(now);
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, "deadbeef");
+        assert_eq!(listed[0].state, OutboundState::AwaitingApproval);
 
         let taken = take_outbound("deadbeef", now).unwrap();
         assert_eq!(taken.unwrap().pubkey_hex, "approverpubkeyhex");
@@ -615,15 +1103,7 @@ mod tests {
         env(&dir);
 
         let now = 1_700_000_000_i64;
-        let mut entry = OutboundPairingRequest {
-            id: "sameid00".to_string(),
-            url: "http://old/".to_string(),
-            name: "n".to_string(),
-            pubkey_hex: "pk1".to_string(),
-            requester_nonce_hex: "n1".to_string(),
-            requested_at: crate::time::iso_utc_from_epoch(now),
-            expires_at: expires_at_from(now),
-        };
+        let mut entry = sample_outbound("sameid00", OutboundState::AwaitingApproval);
         park_outbound(entry.clone()).unwrap();
         entry.url = "http://new/".to_string();
         park_outbound(entry).unwrap();
@@ -631,6 +1111,75 @@ mod tests {
         let listed = list_outbound(now);
         assert_eq!(listed.len(), 1, "re-parking the same id replaces, never duplicates");
         assert_eq!(listed[0].url, "http://new/");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    // ── mark_outbound_awaiting_confirm ───────────────────────────────────
+
+    #[test]
+    fn mark_outbound_awaiting_confirm_on_a_matching_pubkey_transitions_the_state() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-pairing-confirm-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        env(&dir);
+
+        let now = 1_700_000_000_i64;
+        park_outbound(sample_outbound("id1", OutboundState::AwaitingApproval)).unwrap();
+
+        let marked = mark_outbound_awaiting_confirm("id1", "approverpubkeyhex", now).unwrap();
+        assert_eq!(marked.state, OutboundState::AwaitingConfirm);
+
+        let listed = list_outbound(now);
+        assert_eq!(listed.len(), 1, "marking never removes the entry — the requester still has to confirm");
+        assert_eq!(listed[0].state, OutboundState::AwaitingConfirm);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
+    fn mark_outbound_awaiting_confirm_on_a_pubkey_mismatch_leaves_the_entry_untouched() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-pairing-confirm-mismatch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        env(&dir);
+
+        let now = 1_700_000_000_i64;
+        park_outbound(sample_outbound("id1", OutboundState::AwaitingApproval)).unwrap();
+
+        let err = mark_outbound_awaiting_confirm("id1", "wrong-pubkey", now).unwrap_err();
+        assert_eq!(err, ConfirmMarkError::Mismatch);
+
+        let listed = list_outbound(now);
+        assert_eq!(listed.len(), 1, "a mismatch never removes the entry — a legitimate retry can still resolve it");
+        assert_eq!(listed[0].state, OutboundState::AwaitingApproval, "state stays exactly where it was");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
+    fn mark_outbound_awaiting_confirm_on_an_unknown_id_is_refused() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-pairing-confirm-unknown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        env(&dir);
+
+        assert_eq!(mark_outbound_awaiting_confirm("nosuchid", "pk", 0).unwrap_err(), ConfirmMarkError::Unknown);
 
         let _ = std::fs::remove_dir_all(&dir);
         match saved {

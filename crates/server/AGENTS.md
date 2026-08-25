@@ -127,27 +127,41 @@
   fold it into the tick loop "for consistency with reap" — that would
   re-fire it every `REAP_EVERY_TICKS` and defeat the whole guard.
 
-- **`pair_request`/`pair_approve_callback` (P-P2) are deliberately UNGATED
-  by `read_ok`/bearer verification, and this is not an oversight to
-  "fix."** The pairing ceremony's entire purpose is establishing a
-  credential where none exists yet — gating either method on an existing
-  credential would be circular. What keeps this safe: a parked/approved
+- **`pair_request`/`pair_reveal`/`pair_approve_callback` (P-P2, the third
+  reworked review-bounce forward) are deliberately UNGATED by `read_ok`/
+  bearer verification, and this is not an oversight to "fix."** The
+  pairing ceremony's entire purpose is establishing a credential where
+  none exists yet — gating any of the three on an existing credential
+  would be circular. What keeps this safe: a parked/revealed/approved
   request grants NOTHING by itself (no `allows`, no spawn/bearer gate,
   P-P3's lane untouched), every field is validated BEFORE anything is
-  parked (`valid_pubkey_hex`/`valid_nonce_hex`/`valid_peer_name`/
-  `valid_callback_url`), and the SAS confirmation
-  (`aoide_storage::pairing::derive_sas`) is the actual human-verified gate
-  — it lives in the CLIENT's `peer pair approve` prompt, not in this door.
-  Don't add a bearer check to either handler "for consistency with
-  `message/send`" — that would break the bootstrap the whole ceremony
-  exists to solve.
-- **`pair_approve_callback`'s pubkey-mismatch path RE-PARKS the outbound
-  entry via `park_outbound`, never drops it.** A mismatch could be a
-  transient data-integrity hiccup, not necessarily an attack; destroying
-  the entry outright would force the requester to restart the whole
-  ceremony (a fresh nonce, a fresh SAS, a fresh out-of-band code exchange)
-  for what might be a recoverable retry. Don't "simplify" this to a bare
-  `take_outbound` + discard.
+  parked or resolved (`valid_pubkey_hex`/`valid_nonce_hex`/
+  `valid_commit_hex`/`valid_peer_name`/`valid_callback_url`), the
+  commitment check (`aoide_storage::pairing::reveal_inbound`) binds a
+  reveal to its own earlier request with no signature needed yet
+  (review-bounce Finding 1 — an active MITM can no longer force a shared
+  SAS by choosing its own values after seeing the real ones), and the SAS
+  confirmation (`aoide_storage::pairing::derive_sas`) is the actual
+  human-verified gate — it lives in the CLIENT's `peer pair approve`
+  prompt (BOTH times it fires — once on each end, review-bounce Finding
+  2), not in this door. Don't add a bearer check to any of the three
+  handlers "for consistency with `message/send`" — that would break the
+  bootstrap the whole ceremony exists to solve.
+- **`pair_approve_callback` no longer writes a peer record on either a
+  match or a mismatch (review-bounce Finding 2) — it only ever moves an
+  OUTBOUND entry's `state`.** On a pubkey match it calls
+  `aoide_storage::pairing::mark_outbound_awaiting_confirm`, which
+  transitions `AwaitingApproval` → `AwaitingConfirm` and nothing else; the
+  requester's own peer record commits later, entirely inside
+  `aoide-client`, gated behind that instance's own operator running `peer
+  pair approve <id>` a second time. On a pubkey mismatch the outbound
+  entry is left completely UNTOUCHED (still `AwaitingApproval`, never
+  re-parked, never dropped) — a mismatch could be a transient
+  data-integrity hiccup, not necessarily an attack, and leaving the entry
+  exactly where it was lets a legitimate retry just try the callback
+  again with no state to reconcile. Don't reintroduce a peer-store write
+  in this function, and don't drop/re-park the entry on a mismatch — both
+  would reopen exactly what Finding 2 closed.
 
 ## Extension points
 

@@ -447,3 +447,205 @@ fn peer_pair_pending_on_an_empty_registry_is_ok_with_an_empty_list() {
     std::env::remove_var("XDG_RUNTIME_DIR");
     std::env::remove_var("AOIDE_AUDIT_LOG");
 }
+
+// ── Review-bounce fix forward on cad70ad — direction-dispatching
+// ── `peer pair approve`/`reject` (Finding 2) and the unrevealed-inbound
+// ── refusal (Finding 1). These drive the storage-level `pairing` functions
+// ── directly to park/transition entries (the same way the network-free
+// ── tests above bypass `run_curl`), rather than standing up a real loopback
+// ── A2A server — the ceremony's WIRE round trip is already proven end to
+// ── end by `aoide-server`'s own
+// ── `full_pairing_ceremony_request_reveal_pending_approve_confirm_writes_records_on_both_ends`
+// ── test; what's under test here is the CLI's OWN direction dispatch atop
+// ── an already-parked entry. ──────────────────────────────────────────────
+
+#[test]
+fn peer_pair_approve_on_an_unrevealed_inbound_entry_is_refused_with_awaiting_reveal() {
+    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let root = unique_root("pair-approve-unrevealed");
+    let _stage = setup_env(&root);
+
+    let now = aoide_storage::time::now_iso_utc();
+    let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
+    let expires = aoide_storage::pairing::expires_at_from(now_epoch);
+    let commit = aoide_storage::pairing::derive_commit(&"a".repeat(64), &"c".repeat(32));
+    let entry = aoide_storage::pairing::park_inbound(&"a".repeat(64), "box-a", "127.0.0.1", "http://a/", &commit, &now, &expires).unwrap();
+    assert!(entry.requester_nonce_hex.is_none(), "freshly parked, never revealed");
+
+    let out = dispatch(&cli_invocation(&["peer", "pair", "approve"], &[entry.id.as_str()], &[("yes", "true")]));
+    assert_eq!(out.status, Status::Error);
+    assert_eq!(out.data.unwrap()["reason"], "awaiting-reveal");
+    assert!(aoide_storage::peer_store::load_peers().is_empty(), "an unrevealed entry never commits a peer record");
+    let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
+    assert_eq!(aoide_storage::pairing::list_inbound(now_epoch).len(), 1, "the entry stays parked — refusal, not a drop");
+
+    let _ = std::fs::remove_dir_all(&root);
+    std::env::remove_var("AOIDE_STAGE_DIR");
+    std::env::remove_var("AOIDE_STATE_DIR");
+    std::env::remove_var("XDG_RUNTIME_DIR");
+    std::env::remove_var("AOIDE_AUDIT_LOG");
+}
+
+#[test]
+fn peer_pair_reject_on_an_outbound_entry_aborts_before_the_approvers_callback() {
+    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let root = unique_root("pair-reject-outbound-pre-callback");
+    let _stage = setup_env(&root);
+
+    let now = aoide_storage::time::now_iso_utc();
+    let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
+    let expires = aoide_storage::pairing::expires_at_from(now_epoch);
+    let entry = aoide_storage::pairing::OutboundPairingRequest {
+        id: "abcd1234".to_string(),
+        url: "http://b/".to_string(),
+        name: "box-b".to_string(),
+        pubkey_hex: "b".repeat(64),
+        requester_nonce_hex: "c".repeat(32),
+        approver_nonce_hex: "d".repeat(32),
+        requested_at: now.clone(),
+        expires_at: expires,
+        state: aoide_storage::pairing::OutboundState::AwaitingApproval,
+    };
+    aoide_storage::pairing::park_outbound(entry).unwrap();
+
+    let out = dispatch(&cli_invocation(&["peer", "pair", "reject"], &["abcd1234"], &[]));
+    assert_eq!(out.status, Status::Ok, "{}", out.message);
+    assert_eq!(out.data.as_ref().unwrap()["direction"], "outbound");
+    assert!(aoide_storage::peer_store::load_peers().is_empty(), "reject writes no peer record");
+    let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
+    assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "the outbound entry is gone");
+
+    let _ = std::fs::remove_dir_all(&root);
+    std::env::remove_var("AOIDE_STAGE_DIR");
+    std::env::remove_var("AOIDE_STATE_DIR");
+    std::env::remove_var("XDG_RUNTIME_DIR");
+    std::env::remove_var("AOIDE_AUDIT_LOG");
+}
+
+#[test]
+fn peer_pair_reject_on_an_outbound_entry_aborts_after_the_approvers_callback() {
+    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let root = unique_root("pair-reject-outbound-post-callback");
+    let _stage = setup_env(&root);
+
+    let now = aoide_storage::time::now_iso_utc();
+    let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
+    let expires = aoide_storage::pairing::expires_at_from(now_epoch);
+    let entry = aoide_storage::pairing::OutboundPairingRequest {
+        id: "abcd5678".to_string(),
+        url: "http://b/".to_string(),
+        name: "box-b".to_string(),
+        pubkey_hex: "b".repeat(64),
+        requester_nonce_hex: "c".repeat(32),
+        approver_nonce_hex: "d".repeat(32),
+        requested_at: now.clone(),
+        expires_at: expires,
+        state: aoide_storage::pairing::OutboundState::AwaitingApproval,
+    };
+    aoide_storage::pairing::park_outbound(entry).unwrap();
+    let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
+    let after_callback = aoide_storage::pairing::mark_outbound_awaiting_confirm("abcd5678", &"b".repeat(64), now_epoch).unwrap();
+    assert_eq!(after_callback.state, aoide_storage::pairing::OutboundState::AwaitingConfirm);
+
+    let out = dispatch(&cli_invocation(&["peer", "pair", "reject"], &["abcd5678"], &[]));
+    assert_eq!(out.status, Status::Ok, "{}", out.message);
+    assert_eq!(out.data.as_ref().unwrap()["direction"], "outbound");
+    assert!(aoide_storage::peer_store::load_peers().is_empty(), "reject writes no peer record even mid-ceremony");
+    assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "the outbound entry is gone");
+
+    let _ = std::fs::remove_dir_all(&root);
+    std::env::remove_var("AOIDE_STAGE_DIR");
+    std::env::remove_var("AOIDE_STATE_DIR");
+    std::env::remove_var("XDG_RUNTIME_DIR");
+    std::env::remove_var("AOIDE_AUDIT_LOG");
+}
+
+#[test]
+fn peer_pair_approve_on_an_outbound_entry_still_awaiting_the_peers_own_approval_is_refused() {
+    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let root = unique_root("pair-approve-outbound-too-early");
+    let _stage = setup_env(&root);
+
+    let now = aoide_storage::time::now_iso_utc();
+    let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
+    let expires = aoide_storage::pairing::expires_at_from(now_epoch);
+    let entry = aoide_storage::pairing::OutboundPairingRequest {
+        id: "efgh1234".to_string(),
+        url: "http://b/".to_string(),
+        name: "box-b".to_string(),
+        pubkey_hex: "b".repeat(64),
+        requester_nonce_hex: "c".repeat(32),
+        approver_nonce_hex: "d".repeat(32),
+        requested_at: now.clone(),
+        expires_at: expires,
+        state: aoide_storage::pairing::OutboundState::AwaitingApproval,
+    };
+    aoide_storage::pairing::park_outbound(entry).unwrap();
+
+    let out = dispatch(&cli_invocation(&["peer", "pair", "approve"], &["efgh1234"], &[("yes", "true")]));
+    assert_eq!(out.status, Status::Error);
+    assert_eq!(out.data.unwrap()["reason"], "awaiting-peer-approval");
+    assert!(aoide_storage::peer_store::load_peers().is_empty());
+    let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
+    assert_eq!(
+        aoide_storage::pairing::list_outbound(now_epoch)[0].state,
+        aoide_storage::pairing::OutboundState::AwaitingApproval,
+        "a refused early confirm leaves the entry exactly where it was"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    std::env::remove_var("AOIDE_STAGE_DIR");
+    std::env::remove_var("AOIDE_STATE_DIR");
+    std::env::remove_var("XDG_RUNTIME_DIR");
+    std::env::remove_var("AOIDE_AUDIT_LOG");
+}
+
+#[test]
+fn peer_pair_approve_on_an_outbound_entry_awaiting_confirm_commits_with_yes() {
+    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let root = unique_root("pair-approve-outbound-confirm");
+    let _stage = setup_env(&root);
+
+    let (kp, _) = aoide_storage::identity::load_or_mint().unwrap();
+    let own_pubkey = kp.info().pubkey_hex;
+
+    let now = aoide_storage::time::now_iso_utc();
+    let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
+    let expires = aoide_storage::pairing::expires_at_from(now_epoch);
+    let entry = aoide_storage::pairing::OutboundPairingRequest {
+        id: "ijkl1234".to_string(),
+        url: "http://b/".to_string(),
+        name: "box-b".to_string(),
+        pubkey_hex: "b".repeat(64),
+        requester_nonce_hex: "c".repeat(32),
+        approver_nonce_hex: "d".repeat(32),
+        requested_at: now.clone(),
+        expires_at: expires,
+        state: aoide_storage::pairing::OutboundState::AwaitingApproval,
+    };
+    aoide_storage::pairing::park_outbound(entry).unwrap();
+    let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
+    aoide_storage::pairing::mark_outbound_awaiting_confirm("ijkl1234", &"b".repeat(64), now_epoch).unwrap();
+
+    let expected_sas = aoide_storage::pairing::derive_sas(&own_pubkey, &"b".repeat(64), &"c".repeat(32), &"d".repeat(32));
+
+    let out = dispatch(&cli_invocation(&["peer", "pair", "approve"], &["ijkl1234"], &[("yes", "true")]));
+    assert_eq!(out.status, Status::Ok, "{}", out.message);
+    let data = out.data.unwrap();
+    assert_eq!(data["sas"], expected_sas);
+    assert_eq!(data["direction"], "outbound");
+
+    let peers = aoide_storage::peer_store::load_peers();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].name, "box-b");
+    assert_eq!(peers[0].url, "http://b/");
+    assert_eq!(peers[0].pubkey.as_deref(), Some("b".repeat(64).as_str()));
+    assert_eq!(peers[0].verified, true);
+    assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "committed and removed from the outbound queue");
+
+    let _ = std::fs::remove_dir_all(&root);
+    std::env::remove_var("AOIDE_STAGE_DIR");
+    std::env::remove_var("AOIDE_STATE_DIR");
+    std::env::remove_var("XDG_RUNTIME_DIR");
+    std::env::remove_var("AOIDE_AUDIT_LOG");
+}

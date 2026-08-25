@@ -1041,22 +1041,30 @@ fn graph_summary(peer_name: &str, self_url: &str) -> Result<Value, (i64, String)
 // ── The pairing ceremony wire (CONTRACTS.md §6, P-P2,
 // ── `docs/architecture/PAIRING.md`) ─────────────────────────────────────────
 //
-// Two new JSON-RPC methods, both deliberately UNAUTHENTICATED (no token/
-// origin gate) — this IS the bootstrap: there is no established pairing yet
-// to authenticate against, and a parked/relayed request grants NOTHING by
+// Three JSON-RPC methods, all deliberately UNAUTHENTICATED (no token/origin
+// gate) — this IS the bootstrap: there is no established pairing yet to
+// authenticate against, and a parked/relayed request grants NOTHING by
 // itself (PAIRING.md: "a parked request grants NOTHING until approved").
 // P-P4 (signed wire requests) is the later phase that adds real
 // authentication to paired callers; unpaired bootstrap traffic like this
 // stays exactly as open as `message/send`'s own unauthenticated read arms
 // were before any token was ever configured.
 //
-// `aoide/pairRequest` is the REQUESTER -> APPROVER direction: box A asks
-// box B to park a pairing request. `aoide/pairApprove` is the reverse
-// callback the APPROVER's own `peer pair approve` verb (client crate) POSTs
-// back to the REQUESTER once a human has confirmed the SAS — it completes
-// the requester's own half of the ceremony (`aoide-client::commands::
-// handle_peer_pair_approve` is the one caller; nothing else in this tree
-// sends it).
+// `aoide/pairRequest` is the REQUESTER -> APPROVER direction: box A asks box
+// B to park a pairing request, carrying a COMMITMENT to A's own nonce, not
+// the nonce itself (review-bounce Finding 1 — the original shape let an
+// active on-path attacker choose four of the SAS transcript's six fields
+// after observing the real ones; see `aoide_storage::pairing`'s module doc
+// for the full commit-then-reveal reasoning, the Bluetooth SSP idiom this
+// borrows). `aoide/pairReveal` is A's immediate follow-up (same `peer pair
+// request` invocation, two sequential POSTs) that hands over the nonce the
+// commitment already fixed; B verifies it and only THEN has a SAS to show.
+// `aoide/pairApprove` is the REVERSE callback the APPROVER's own `peer pair
+// approve` verb (client crate) POSTs back to the REQUESTER once a human has
+// confirmed the SAS — it does NOT commit A's own peer record by itself
+// (review-bounce Finding 2): it transitions A's outbound entry to
+// "awaiting confirm," and A's own operator still has to run `peer pair
+// approve <id>` a second time, on THIS side, before anything commits there.
 
 /// [`PeerOrigin`] rendered for DISPLAY only — [`InboundPairingRequest`]'s
 /// `originAddr` field (`peer pair pending`'s own column, PAIRING.md: "parks
@@ -1070,10 +1078,20 @@ fn origin_display(origin: PeerOrigin) -> String {
     }
 }
 
+/// A lowercase-hex string of exactly `len` characters. The one shape check
+/// [`valid_pubkey_hex`]/[`valid_nonce_hex`]/[`valid_commit_hex`] each pin to
+/// a different fixed length — pubkeys and commitments are both full
+/// SHA-256/ed25519-key-shaped (64 hex chars), nonces are half that (32 hex
+/// chars, 16 bytes) — factored once so the three validators can't drift out
+/// of sync with each other's character-class check. Pure.
+fn valid_hex(s: &str, len: usize) -> bool {
+    s.len() == len && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// A 64-lowercase-hex-char ed25519 public key, exactly as
 /// [`aoide_storage::identity::IdentityInfo::pubkey_hex`] renders one. Pure.
 fn valid_pubkey_hex(s: &str) -> bool {
-    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+    valid_hex(s, 64)
 }
 
 /// A 32-lowercase-hex-char (16-byte) nonce, exactly as
@@ -1081,29 +1099,39 @@ fn valid_pubkey_hex(s: &str) -> bool {
 /// and the client crate mint nonces the same way, so this length is a fixed
 /// contract, not a range. Pure.
 fn valid_nonce_hex(s: &str) -> bool {
-    s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit())
+    valid_hex(s, 32)
 }
 
-/// A URL sane enough to remember for the later approval callback — no
-/// scheme/host validation beyond "looks like a URL and isn't absurdly
+/// A 64-lowercase-hex-char commitment, exactly as
+/// [`aoide_storage::pairing::derive_commit`] renders one (a full SHA-256
+/// digest, hex-encoded — the same length as a pubkey, a coincidence of both
+/// being 32-byte digests, not a shared meaning). Pure.
+fn valid_commit_hex(s: &str) -> bool {
+    valid_hex(s, 64)
+}
+
+/// A URL sane enough to remember for the later reveal/approval callbacks —
+/// no scheme/host validation beyond "looks like a URL and isn't absurdly
 /// long" (`post_json`/curl, `aoide-client`'s job, will fail loudly on
-/// anything genuinely malformed when the callback actually fires). Pure.
+/// anything genuinely malformed when a callback actually fires). Pure.
 fn valid_callback_url(s: &str) -> bool {
     !s.is_empty() && s.len() <= 2048 && s.contains("://")
 }
 
 /// `aoide/pairRequest` (CONTRACTS.md §6, P-P2): the pairing ceremony's
-/// bootstrap request. Box A POSTs `{pubkeyHex, name, nonceHex, url}` — its
-/// own public key, its claimed local nickname for THIS instance, a fresh
-/// nonce, and its own advertised A2A door URL (so the later approval
-/// callback knows where to go). THIS instance (box B) parks it
-/// ([`aoide_storage::pairing::park_inbound`]) and answers SYNCHRONOUSLY
-/// with its OWN public key and a freshly-minted nonce — public material,
-/// same "freely shown" stance `docs/architecture/PAIRING.md`'s "Identity"
-/// section already states for `aoide identity` — so box A can derive its
-/// own copy of the SAS immediately, with no further round trip
-/// (PAIRING.md's "The ceremony" diagram: "both sides display: SAS code...
-/// derived from (pubkey_A, pubkey_B, nonce_A, nonce_B)").
+/// bootstrap request. Box A POSTs `{pubkeyHex, name, commitHex, url}` — its
+/// own public key, its claimed local nickname for THIS instance, a
+/// COMMITMENT to its own nonce (`aoide_storage::pairing::derive_commit`,
+/// never the nonce itself — module doc on `aoide_storage::pairing`, the
+/// commit-then-reveal fix), and its own advertised A2A door URL (so the
+/// later reveal/approval callbacks know where to go). THIS instance (box B)
+/// parks it ([`aoide_storage::pairing::park_inbound`], cap-checked — a
+/// full queue is `-32000`, review-bounce Finding 3) and answers
+/// SYNCHRONOUSLY with its OWN public key and a freshly-minted nonce —
+/// public material, same "freely shown" stance `docs/architecture/
+/// PAIRING.md`'s "Identity" section already states for `aoide identity`,
+/// and safe to reveal immediately since B moves SECOND (nothing of B's is
+/// fixed by a commitment A could exploit the way the reverse would be).
 ///
 /// `name` is validated against [`aoide_storage::peer_store::valid_peer_name`]
 /// HERE, at park time — not merely at `peer add`'s door the way a
@@ -1111,12 +1139,12 @@ fn valid_callback_url(s: &str) -> bool {
 /// self-claimed name VERBATIM as the approver's own local nickname (no
 /// separate `--name` flag on `approve`), and that nickname later joins a
 /// `state/peer-cache/<name>.json` path; a traversal-shaped name must never
-/// reach that far. A malformed request (bad pubkey/name/nonce/url shape) is
+/// reach that far. A malformed request (bad pubkey/name/commit/url shape) is
 /// refused with `-32602` before anything is parked.
 fn pair_request(params: &Value, origin: PeerOrigin, audit_log: &Path) -> Result<Value, (i64, String)> {
     let pubkey_hex = params.get("pubkeyHex").and_then(Value::as_str).unwrap_or("");
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-    let nonce_hex = params.get("nonceHex").and_then(Value::as_str).unwrap_or("");
+    let commit_hex = params.get("commitHex").and_then(Value::as_str).unwrap_or("");
     let url = params.get("url").and_then(Value::as_str).unwrap_or("");
 
     if !valid_pubkey_hex(pubkey_hex) {
@@ -1128,8 +1156,8 @@ fn pair_request(params: &Value, origin: PeerOrigin, audit_log: &Path) -> Result<
             "invalid params: name must match `^[a-z0-9][a-z0-9-]*$`".to_string(),
         ));
     }
-    if !valid_nonce_hex(nonce_hex) {
-        return Err((-32602, "invalid params: nonceHex must be 32 hex characters".to_string()));
+    if !valid_commit_hex(commit_hex) {
+        return Err((-32602, "invalid params: commitHex must be 64 hex characters".to_string()));
     }
     if !valid_callback_url(url) {
         return Err((-32602, "invalid params: url must be a non-empty URL, at most 2048 characters".to_string()));
@@ -1148,11 +1176,11 @@ fn pair_request(params: &Value, origin: PeerOrigin, audit_log: &Path) -> Result<
         name,
         &origin_display(origin),
         url,
-        nonce_hex,
+        commit_hex,
         &requested_at,
         &expires_at,
     )
-    .map_err(|e| (-32603_i64, format!("parking the pairing request: {e}")))?;
+    .map_err(|e| (-32000_i64, e))?;
 
     let _ = audit(
         audit_log,
@@ -1175,18 +1203,82 @@ fn pair_request(params: &Value, origin: PeerOrigin, audit_log: &Path) -> Result<
     }))
 }
 
+/// `aoide/pairReveal` (CONTRACTS.md §6, P-P2, review-bounce Finding 1): box
+/// A's immediate follow-up to `aoide/pairRequest` (same `peer pair request`
+/// invocation, two sequential POSTs), handing over the nonce its earlier
+/// `commitHex` already fixed. `{id, nonceHex}` — `id` is the SAME id
+/// [`pair_request`] handed back synchronously. THIS instance (box B) checks
+/// `derive_commit(entry.pubkeyHex, nonceHex) == entry.commitHex`
+/// ([`aoide_storage::pairing::reveal_inbound`]); a match stores the nonce
+/// (so `peer pair pending`/`approve` can finally derive a SAS for this
+/// entry) and a MISMATCH drops the parked entry outright — there is nothing
+/// left worth keeping once the commitment fails to check out (a genuine
+/// tamper, or a bug; either way the honest path is to start over, not to
+/// leave a broken entry sitting in the queue).
+fn pair_reveal(params: &Value, audit_log: &Path) -> Result<Value, (i64, String)> {
+    let id = params.get("id").and_then(Value::as_str).unwrap_or("");
+    let nonce_hex = params.get("nonceHex").and_then(Value::as_str).unwrap_or("");
+    if id.is_empty() {
+        return Err((-32602, "invalid params: id is required".to_string()));
+    }
+    if !valid_nonce_hex(nonce_hex) {
+        return Err((-32602, "invalid params: nonceHex must be 32 hex characters".to_string()));
+    }
+
+    let now_epoch = aoide_storage::time::parse_iso_utc(&now_iso_utc()).unwrap_or_else(|| unix_ts_now() as i64);
+    match aoide_storage::pairing::reveal_inbound(id, nonce_hex, now_epoch) {
+        Ok(entry) => {
+            let _ = audit(
+                audit_log,
+                Door::A2a,
+                EventClass::Audit,
+                "a2a.pairReveal",
+                "ok",
+                &format!("pairing request `{id}` revealed — commitment verified (claimed name `{}`)", entry.name),
+            );
+            Ok(json!({ "ok": true }))
+        }
+        Err(aoide_storage::pairing::RevealError::Unknown) => Err((
+            -32001,
+            "no pending inbound pairing request with that id (unknown, already resolved, or expired)".to_string(),
+        )),
+        Err(aoide_storage::pairing::RevealError::Mismatch) => {
+            let _ = audit(
+                audit_log,
+                Door::A2a,
+                EventClass::Audit,
+                "a2a.pairReveal",
+                "mismatch",
+                &format!("pairing request `{id}` dropped — the revealed nonce did not match its commitment"),
+            );
+            Err((
+                -32002,
+                "commitment mismatch: the revealed nonce does not match the pubkey's earlier commitment — the parked request has been dropped".to_string(),
+            ))
+        }
+        Err(aoide_storage::pairing::RevealError::Io(e)) => Err((-32603, format!("resolving the inbound pairing request: {e}"))),
+    }
+}
+
 /// `aoide/pairApprove` (CONTRACTS.md §6, P-P2): the approval callback. Once
 /// box B's own operator confirms the SAS (`aoide peer pair approve <id>`,
-/// client crate) and box B has already committed ITS OWN peer record for
-/// A, this method is what B's `peer pair approve` POSTs back to box A
-/// (the URL A supplied in its own `aoide/pairRequest`) so A's door can
-/// finish A's own half of the ceremony. `{id, pubkeyHex}` — `id` is the
-/// SAME id [`pair_request`] handed back synchronously (module doc: one
-/// shared id, no separate counters to reconcile); `pubkeyHex` is B's own
-/// public key, cross-checked against what A already learned at request
-/// time (a mismatch is a data-integrity refusal, not a security gate —
-/// there is no signature to verify yet, P-P4's lane). A REJECTED callback
-/// re-parks the outbound entry (never destroys it on a refusal) so a
+/// client crate) and box B has already committed ITS OWN peer record for A,
+/// this method is what B's `peer pair approve` POSTs back to box A (the URL
+/// A supplied in its own `aoide/pairRequest`) so A's door can advance A's
+/// own half of the ceremony. `{id, pubkeyHex}` — `id` is the SAME id
+/// [`pair_request`] handed back synchronously (module doc: one shared id,
+/// no separate counters to reconcile); `pubkeyHex` is B's own public key,
+/// cross-checked against what A already learned at request time (a
+/// mismatch is a data-integrity refusal, not a security gate — there is no
+/// signature to verify yet, P-P4's lane).
+///
+/// **Deliberately does NOT commit A's own peer record (review-bounce
+/// Finding 2).** A matching pubkey only transitions A's outbound entry to
+/// `awaiting-confirm` (`aoide_storage::pairing::mark_outbound_awaiting_confirm`)
+/// — A's own operator still has to run `peer pair approve <id>` a SECOND
+/// time, on THIS side, and confirm the SAME code, before
+/// `upsert_paired_peer` ever runs here. A mismatch leaves the outbound
+/// entry completely untouched (never removed, never mutated) so a
 /// legitimate retry still has something to resolve against.
 fn pair_approve_callback(params: &Value, audit_log: &Path) -> Result<Value, (i64, String)> {
     let id = params.get("id").and_then(Value::as_str).unwrap_or("");
@@ -1199,39 +1291,28 @@ fn pair_approve_callback(params: &Value, audit_log: &Path) -> Result<Value, (i64
     }
 
     let now_epoch = aoide_storage::time::parse_iso_utc(&now_iso_utc()).unwrap_or_else(|| unix_ts_now() as i64);
-    let entry = aoide_storage::pairing::take_outbound(id, now_epoch)
-        .map_err(|e| (-32603_i64, format!("resolving the outbound pairing request: {e}")))?
-        .ok_or_else(|| {
-            (
-                -32001_i64,
-                "no pending outbound pairing request with that id (unknown, already completed, or expired)".to_string(),
-            )
-        })?;
-
-    if entry.pubkey_hex != pubkey_hex {
-        // Restore the entry — a rejected callback must never destroy state
-        // a legitimate retry could still resolve against.
-        let _ = aoide_storage::pairing::park_outbound(entry);
-        return Err((
+    match aoide_storage::pairing::mark_outbound_awaiting_confirm(id, pubkey_hex, now_epoch) {
+        Ok(entry) => {
+            let _ = audit(
+                audit_log,
+                Door::A2a,
+                EventClass::Audit,
+                "a2a.pairApprove",
+                "awaiting-confirm",
+                &format!("pairing with `{}` approved by the peer — awaiting this instance's own confirm", entry.name),
+            );
+            Ok(json!({ "ok": true, "name": entry.name }))
+        }
+        Err(aoide_storage::pairing::ConfirmMarkError::Unknown) => Err((
+            -32001,
+            "no pending outbound pairing request with that id (unknown, already completed, or expired)".to_string(),
+        )),
+        Err(aoide_storage::pairing::ConfirmMarkError::Mismatch) => Err((
             -32602,
             "invalid params: pubkeyHex does not match the key learned at request time".to_string(),
-        ));
+        )),
+        Err(aoide_storage::pairing::ConfirmMarkError::Io(e)) => Err((-32603, format!("resolving the outbound pairing request: {e}"))),
     }
-
-    let mut peers = aoide_storage::peer_store::load_peers();
-    aoide_storage::peer_store::upsert_paired_peer(&mut peers, &entry.name, &entry.url, pubkey_hex, &now_iso_utc());
-    aoide_storage::peer_store::save_peers(&peers).map_err(|e| (-32603_i64, format!("writing the peer registry: {e}")))?;
-
-    let _ = audit(
-        audit_log,
-        Door::A2a,
-        EventClass::Audit,
-        "a2a.pairApprove",
-        "ok",
-        &format!("pairing with `{}` approved — peer record written", entry.name),
-    );
-
-    Ok(json!({ "ok": true, "name": entry.name }))
 }
 
 /// Per-request context [`handle_jsonrpc`]/[`handle_jsonrpc_bytes`] thread
@@ -1292,6 +1373,7 @@ fn handle_jsonrpc(req: &Value, ctx: &RequestCtx) -> Value {
         // established credential to check yet (see the section doc above
         // `pair_request`).
         "aoide/pairRequest" => pair_request(&params, ctx.origin, ctx.audit_log),
+        "aoide/pairReveal" => pair_reveal(&params, ctx.audit_log),
         "aoide/pairApprove" => pair_approve_callback(&params, ctx.audit_log),
         "" => Err((-32600, "invalid request: missing method".to_string())),
         other => Err((-32601, format!("method not found: {other}"))),
@@ -1808,6 +1890,7 @@ fn route(
                     Some("message/send") => "message/send",
                     Some("aoide/graphSummary") => "aoide/graphSummary",
                     Some("aoide/pairRequest") => "aoide/pairRequest",
+                    Some("aoide/pairReveal") => "aoide/pairReveal",
                     Some("aoide/pairApprove") => "aoide/pairApprove",
                     _ => "rpc",
                 };
@@ -4264,10 +4347,11 @@ mod tests {
         act_as(&root, "b");
 
         let audit_log = root.join("log");
+        let commit = aoide_storage::pairing::derive_commit(&"a".repeat(64), &"c".repeat(16));
         let params = json!({
             "pubkeyHex": "a".repeat(64),
             "name": "box-a",
-            "nonceHex": "c".repeat(32),
+            "commitHex": commit,
             "url": "http://box-a:8710/",
         });
         let resp = pair_request(&params, PeerOrigin::Remote("10.0.0.5".parse().unwrap()), &audit_log).unwrap();
@@ -4277,13 +4361,16 @@ mod tests {
         assert!(valid_nonce_hex(resp["nonceHex"].as_str().unwrap()));
         assert!(resp["expiresAt"].as_str().unwrap().ends_with('Z'));
 
-        // Parked on disk, origin recorded for display.
+        // Parked on disk, origin recorded for display, NOT YET revealed —
+        // no nonce, so no SAS to show, until `aoide/pairReveal` runs.
         let now_epoch = aoide_storage::time::parse_iso_utc(&now_iso_utc()).unwrap();
         let pending = aoide_storage::pairing::list_inbound(now_epoch);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].name, "box-a");
         assert_eq!(pending[0].origin_addr, "10.0.0.5");
         assert_eq!(pending[0].url, "http://box-a:8710/");
+        assert_eq!(pending[0].commit_hex, commit);
+        assert!(pending[0].requester_nonce_hex.is_none(), "unrevealed at request time");
 
         // Audited.
         let log = std::fs::read_to_string(&audit_log).unwrap_or_default();
@@ -4301,7 +4388,7 @@ mod tests {
     }
 
     #[test]
-    fn pair_request_rejects_malformed_pubkey_name_nonce_or_url_before_parking_anything() {
+    fn pair_request_rejects_malformed_pubkey_name_commit_or_url_before_parking_anything() {
         let _guard = crate::env_lock().lock().unwrap();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
@@ -4313,7 +4400,8 @@ mod tests {
         act_as(&root, "b");
         let audit_log = root.join("log");
 
-        let good = json!({ "pubkeyHex": "a".repeat(64), "name": "box-a", "nonceHex": "c".repeat(32), "url": "http://a/" });
+        let commit = aoide_storage::pairing::derive_commit(&"a".repeat(64), &"c".repeat(16));
+        let good = json!({ "pubkeyHex": "a".repeat(64), "name": "box-a", "commitHex": commit, "url": "http://a/" });
 
         let bad_pubkey = { let mut p = good.clone(); p["pubkeyHex"] = json!("too-short"); p };
         assert_eq!(pair_request(&bad_pubkey, PeerOrigin::Loopback, &audit_log).unwrap_err().0, -32602);
@@ -4321,8 +4409,8 @@ mod tests {
         let bad_name = { let mut p = good.clone(); p["name"] = json!("../../evil"); p };
         assert_eq!(pair_request(&bad_name, PeerOrigin::Loopback, &audit_log).unwrap_err().0, -32602);
 
-        let bad_nonce = { let mut p = good.clone(); p["nonceHex"] = json!("zz"); p };
-        assert_eq!(pair_request(&bad_nonce, PeerOrigin::Loopback, &audit_log).unwrap_err().0, -32602);
+        let bad_commit = { let mut p = good.clone(); p["commitHex"] = json!("zz"); p };
+        assert_eq!(pair_request(&bad_commit, PeerOrigin::Loopback, &audit_log).unwrap_err().0, -32602);
 
         let bad_url = { let mut p = good.clone(); p["url"] = json!(""); p };
         assert_eq!(pair_request(&bad_url, PeerOrigin::Loopback, &audit_log).unwrap_err().0, -32602);
@@ -4345,7 +4433,151 @@ mod tests {
     }
 
     #[test]
-    fn pair_approve_callback_rejects_a_pubkey_mismatch_and_restores_the_outbound_entry() {
+    fn pair_request_refuses_beyond_the_park_cap() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_cap = std::env::var(aoide_storage::pairing::PAIRING_PARK_CAP_ENV).ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-pairrequest-cap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        act_as(&root, "b");
+        std::env::set_var(aoide_storage::pairing::PAIRING_PARK_CAP_ENV, "1");
+        let audit_log = root.join("log");
+
+        let request = |name: &str| {
+            let commit = aoide_storage::pairing::derive_commit(&"a".repeat(64), &"c".repeat(16));
+            json!({ "pubkeyHex": "a".repeat(64), "name": name, "commitHex": commit, "url": "http://a/" })
+        };
+        pair_request(&request("box-a"), PeerOrigin::Loopback, &audit_log).expect("first request is under the cap");
+        let err = pair_request(&request("box-c"), PeerOrigin::Loopback, &audit_log).unwrap_err();
+        assert_eq!(err.0, -32000, "a distinct code from ordinary invalid-params -32602");
+
+        let now_epoch = aoide_storage::time::parse_iso_utc(&now_iso_utc()).unwrap();
+        assert_eq!(aoide_storage::pairing::list_inbound(now_epoch).len(), 1, "the refused request wrote nothing");
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        match saved_cap {
+            Some(v) => std::env::set_var(aoide_storage::pairing::PAIRING_PARK_CAP_ENV, v),
+            None => std::env::remove_var(aoide_storage::pairing::PAIRING_PARK_CAP_ENV),
+        }
+    }
+
+    #[test]
+    fn pair_reveal_completes_the_commitment_and_the_entry_gains_a_sas() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-pairreveal-ok-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        act_as(&root, "b");
+        let audit_log = root.join("log");
+
+        let nonce_a = "c".repeat(32);
+        let commit = aoide_storage::pairing::derive_commit(&"a".repeat(64), &nonce_a);
+        let request_params = json!({ "pubkeyHex": "a".repeat(64), "name": "box-a", "commitHex": commit, "url": "http://a/" });
+        let resp = pair_request(&request_params, PeerOrigin::Loopback, &audit_log).unwrap();
+        let id = resp["id"].as_str().unwrap().to_string();
+
+        let reveal_resp = pair_reveal(&json!({ "id": id, "nonceHex": nonce_a }), &audit_log).unwrap();
+        assert_eq!(reveal_resp["ok"], true);
+
+        let now_epoch = aoide_storage::time::parse_iso_utc(&now_iso_utc()).unwrap();
+        let pending = aoide_storage::pairing::list_inbound(now_epoch);
+        assert_eq!(pending.len(), 1, "revealing never removes the entry");
+        assert_eq!(pending[0].requester_nonce_hex.as_deref(), Some(nonce_a.as_str()));
+
+        let log = std::fs::read_to_string(&audit_log).unwrap_or_default();
+        assert!(log.contains("a2a.pairReveal"), "{log}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+    }
+
+    #[test]
+    fn pair_reveal_rejects_a_wrong_nonce_and_drops_the_parked_entry() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-pairreveal-mismatch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        act_as(&root, "b");
+        let audit_log = root.join("log");
+
+        let commit = aoide_storage::pairing::derive_commit(&"a".repeat(64), &"c".repeat(32));
+        let request_params = json!({ "pubkeyHex": "a".repeat(64), "name": "box-a", "commitHex": commit, "url": "http://a/" });
+        let resp = pair_request(&request_params, PeerOrigin::Loopback, &audit_log).unwrap();
+        let id = resp["id"].as_str().unwrap().to_string();
+
+        let err = pair_reveal(&json!({ "id": id, "nonceHex": "d".repeat(32) }), &audit_log).unwrap_err();
+        assert_eq!(err.0, -32002, "a distinct code from an unknown id or ordinary invalid params");
+
+        let now_epoch = aoide_storage::time::parse_iso_utc(&now_iso_utc()).unwrap();
+        assert!(aoide_storage::pairing::list_inbound(now_epoch).is_empty(), "the mismatched reveal dropped the parked entry outright");
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+    }
+
+    #[test]
+    fn pair_reveal_rejects_an_unknown_id() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-pairreveal-unknown-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        act_as(&root, "b");
+        let audit_log = root.join("log");
+
+        let err = pair_reveal(&json!({ "id": "nosuchid", "nonceHex": "c".repeat(32) }), &audit_log).unwrap_err();
+        assert_eq!(err.0, -32001);
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+    }
+
+    #[test]
+    fn pair_approve_callback_rejects_a_pubkey_mismatch_and_leaves_the_outbound_entry_untouched() {
         let _guard = crate::env_lock().lock().unwrap();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
@@ -4362,8 +4594,10 @@ mod tests {
             name: "box-b".to_string(),
             pubkey_hex: "b".repeat(64),
             requester_nonce_hex: "c".repeat(32),
+            approver_nonce_hex: "d".repeat(32),
             requested_at: now_iso_utc(),
             expires_at: aoide_storage::pairing::expires_at_from(now_epoch),
+            state: aoide_storage::pairing::OutboundState::AwaitingApproval,
         })
         .unwrap();
 
@@ -4372,10 +4606,12 @@ mod tests {
         let err = pair_approve_callback(&bad, &audit_log).unwrap_err();
         assert_eq!(err.0, -32602);
 
-        // Restored, not destroyed — a legitimate retry can still resolve it.
+        // Untouched, not destroyed — a legitimate retry can still resolve it,
+        // and its state never advanced past `awaiting-approval`.
         let listed = aoide_storage::pairing::list_outbound(now_epoch);
-        assert_eq!(listed.len(), 1, "the mismatch refusal re-parked the entry");
+        assert_eq!(listed.len(), 1, "the mismatch refusal left the entry exactly where it was");
         assert_eq!(listed[0].pubkey_hex, "b".repeat(64));
+        assert_eq!(listed[0].state, aoide_storage::pairing::OutboundState::AwaitingApproval);
 
         // No peer record was written on a refusal.
         assert!(aoide_storage::peer_store::load_peers().is_empty());
@@ -4420,18 +4656,74 @@ mod tests {
         }
     }
 
-    /// The full ceremony, end to end: request -> pending -> SAS shown (both
-    /// sides derive the SAME code independently) -> approve -> peer records
-    /// written on BOTH ends — PAIRING.md's own "The ceremony" diagram,
-    /// driven through the real handler functions (`pair_request`/
+    #[test]
+    fn pair_approve_callback_on_a_pubkey_match_transitions_to_awaiting_confirm_without_committing_either_record() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-pairapprove-awaiting-confirm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        act_as(&root, "a");
+        let now_epoch = aoide_storage::time::parse_iso_utc(&now_iso_utc()).unwrap();
+        aoide_storage::pairing::park_outbound(aoide_storage::pairing::OutboundPairingRequest {
+            id: "deadbeef".to_string(),
+            url: "http://box-b/".to_string(),
+            name: "box-b".to_string(),
+            pubkey_hex: "b".repeat(64),
+            requester_nonce_hex: "c".repeat(32),
+            approver_nonce_hex: "d".repeat(32),
+            requested_at: now_iso_utc(),
+            expires_at: aoide_storage::pairing::expires_at_from(now_epoch),
+            state: aoide_storage::pairing::OutboundState::AwaitingApproval,
+        })
+        .unwrap();
+
+        let audit_log = root.join("log");
+        let resp = pair_approve_callback(&json!({ "id": "deadbeef", "pubkeyHex": "b".repeat(64) }), &audit_log).unwrap();
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["name"], "box-b");
+
+        // Review-bounce Finding 2: the callback alone must NEVER commit a
+        // peer record on either side — only the state transitions.
+        assert!(aoide_storage::peer_store::load_peers().is_empty(), "no peer record from the callback alone");
+        let listed = aoide_storage::pairing::list_outbound(now_epoch);
+        assert_eq!(listed.len(), 1, "the entry is still parked, awaiting THIS instance's own confirm");
+        assert_eq!(listed[0].state, aoide_storage::pairing::OutboundState::AwaitingConfirm);
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+    }
+
+    /// The full ceremony, end to end: request -> reveal -> pending -> SAS
+    /// shown (both sides derive the SAME code independently) -> B approves
+    /// (commits B's own record, delivers the callback) -> A's outbound entry
+    /// transitions to `awaiting-confirm` -> A's own operator confirms
+    /// (commits A's own record) — PAIRING.md's own "The ceremony" diagram,
+    /// review-bounce Findings 1 and 2 both exercised end to end, driven
+    /// through the real handler functions (`pair_request`/`pair_reveal`/
     /// `pair_approve_callback`) and the real `aoide_storage::peer_store`/
     /// `pairing` state, with `AOIDE_STATE_DIR`/`AOIDE_STAGE_DIR` swapped
     /// between steps to play box A then box B then box A again (see
     /// [`act_as`]'s own doc for why this test cannot be a genuine two-thread
     /// two-identity proof the way `cli/tests/peer_connectivity.rs` is for
-    /// the read-only `graphSummary` pull).
+    /// the read-only `graphSummary` pull). A's OWN final confirm-then-commit
+    /// step (`peer pair approve` on an `awaiting-confirm` outbound entry)
+    /// lives in `aoide-client::commands` — simulated here by calling the
+    /// same two library functions that handler calls
+    /// (`upsert_paired_peer`/`take_outbound`), since this crate cannot
+    /// depend on `aoide-client` (wrong DAG direction).
     #[test]
-    fn full_pairing_ceremony_request_pending_approve_writes_records_on_both_ends() {
+    fn full_pairing_ceremony_request_reveal_pending_approve_confirm_writes_records_on_both_ends() {
         let _guard = crate::env_lock().lock().unwrap();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
@@ -4442,29 +4734,36 @@ mod tests {
         ));
         let audit_log = root.join("log");
 
-        // ── Step 1: box A mints its identity and builds the request it
-        // would send (`aoide-client`'s own body-builder is unit-tested
-        // separately against this exact shape; here we construct the wire
-        // params directly, the same way `pair_request` will receive them).
+        // ── Step 1: box A mints its identity, picks a nonce, and commits to
+        // it (`aoide-client`'s own body-builder is unit-tested separately
+        // against this exact shape; here we construct the wire params
+        // directly, the same way `pair_request`/`pair_reveal` will receive
+        // them).
         act_as(&root, "a");
         let (kp_a, _) = aoide_storage::identity::load_or_mint().unwrap();
         let pubkey_a = kp_a.info().pubkey_hex;
         let nonce_a = aoide_storage::pairing::random_hex(16);
+        let commit_a = aoide_storage::pairing::derive_commit(&pubkey_a, &nonce_a);
         let request_params = json!({
-            "pubkeyHex": pubkey_a, "name": "box-a", "nonceHex": nonce_a, "url": "http://box-a:9-a2a/",
+            "pubkeyHex": pubkey_a, "name": "box-a", "commitHex": commit_a, "url": "http://box-a:9-a2a/",
         });
 
-        // ── Step 2: box B receives it — parks pending, answers with its own
-        // pubkey + nonce.
+        // ── Step 2: box B receives it — parks pending (no SAS yet, unrevealed),
+        // answers with its own pubkey + nonce.
         act_as(&root, "b");
         let resp = pair_request(&request_params, PeerOrigin::Remote("10.0.0.9".parse().unwrap()), &audit_log).unwrap();
         let id = resp["id"].as_str().unwrap().to_string();
         let pubkey_b = resp["pubkeyHex"].as_str().unwrap().to_string();
         let nonce_b = resp["nonceHex"].as_str().unwrap().to_string();
 
-        // ── Step 3: back on box A — it now has everything to derive its OWN
-        // SAS immediately (no further wire call needed for THIS step,
-        // exactly PAIRING.md's diagram), and remembers the outbound request.
+        // ── Step 3: back on box A — reveal the nonce the commitment already
+        // fixed (review-bounce Finding 1's own second POST), then derive its
+        // OWN SAS (now that it has both nonces) and remember the outbound
+        // request in `awaiting-approval`.
+        let reveal_params = json!({ "id": id, "nonceHex": nonce_a });
+        act_as(&root, "b");
+        let reveal_resp = pair_reveal(&reveal_params, &audit_log).unwrap();
+        assert_eq!(reveal_resp["ok"], true);
         act_as(&root, "a");
         let sas_a = aoide_storage::pairing::derive_sas(&pubkey_a, &pubkey_b, &nonce_a, &nonce_b);
         let now_epoch = aoide_storage::time::parse_iso_utc(&now_iso_utc()).unwrap();
@@ -4474,23 +4773,26 @@ mod tests {
             name: "box-b".to_string(),
             pubkey_hex: pubkey_b.clone(),
             requester_nonce_hex: nonce_a.clone(),
+            approver_nonce_hex: nonce_b.clone(),
             requested_at: now_iso_utc(),
             expires_at: aoide_storage::pairing::expires_at_from(now_epoch),
+            state: aoide_storage::pairing::OutboundState::AwaitingApproval,
         })
         .unwrap();
 
         // ── Step 4: box B's operator lists pending, derives the SAME code
-        // independently from its own stored copy of the transcript, and
-        // approves — committing B's OWN peer record for A.
+        // independently from its own stored (now-revealed) copy of the
+        // transcript, and approves — committing B's OWN peer record for A.
         act_as(&root, "b");
         let pending = aoide_storage::pairing::list_inbound(now_epoch);
         assert_eq!(pending.len(), 1);
         let entry = pending.into_iter().find(|e| e.id == id).unwrap();
+        let requester_nonce = entry.requester_nonce_hex.clone().expect("revealed by step 3");
         let (kp_b, _) = aoide_storage::identity::load_or_mint().unwrap();
         let sas_b = aoide_storage::pairing::derive_sas(
             &entry.pubkey_hex,
             &kp_b.info().pubkey_hex,
-            &entry.requester_nonce_hex,
+            &requester_nonce,
             &entry.approver_nonce_hex,
         );
         assert_eq!(sas_a, sas_b, "both sides must derive the IDENTICAL SAS from the same transcript");
@@ -4514,11 +4816,29 @@ mod tests {
 
         // ── Step 5: B's `peer pair approve` POSTs the callback to A — here,
         // that's calling `pair_approve_callback` directly under A's own env.
+        // Review-bounce Finding 2: this must NOT commit A's record yet.
         let callback_params = json!({ "id": id, "pubkeyHex": kp_b.info().pubkey_hex });
         act_as(&root, "a");
         let approve_resp = pair_approve_callback(&callback_params, &audit_log).unwrap();
         assert_eq!(approve_resp["ok"], true);
         assert_eq!(approve_resp["name"], "box-b");
+        assert!(aoide_storage::peer_store::load_peers().is_empty(), "the callback alone commits nothing on A's side");
+        let outbound_awaiting = aoide_storage::pairing::list_outbound(now_epoch);
+        assert_eq!(outbound_awaiting.len(), 1);
+        assert_eq!(outbound_awaiting[0].state, aoide_storage::pairing::OutboundState::AwaitingConfirm);
+
+        // ── Step 6: A's OWN operator now confirms the SAS on THIS side
+        // (`peer pair approve <id>` a second time, requester-side —
+        // `aoide-client::commands::handle_peer_pair_approve`'s own confirm
+        // branch; simulated here via the same two library calls that
+        // handler makes, since this crate cannot depend on `aoide-client`).
+        let entry_a = outbound_awaiting.into_iter().find(|e| e.id == id).unwrap();
+        let sas_a_confirm = aoide_storage::pairing::derive_sas(&pubkey_a, &entry_a.pubkey_hex, &entry_a.requester_nonce_hex, &entry_a.approver_nonce_hex);
+        assert_eq!(sas_a_confirm, sas_a, "A re-derives the identical code at its own confirm step");
+        let mut peers_a = aoide_storage::peer_store::load_peers();
+        aoide_storage::peer_store::upsert_paired_peer(&mut peers_a, &entry_a.name, &entry_a.url, &entry_a.pubkey_hex, &now_iso_utc());
+        aoide_storage::peer_store::save_peers(&peers_a).unwrap();
+        aoide_storage::pairing::take_outbound(&id, now_epoch).unwrap();
 
         // A's own record for B: pubkey = B's real key, verified, name = the
         // nickname A itself chose at request time, url = what A dialed.
@@ -4529,14 +4849,14 @@ mod tests {
         assert!(peers_a_final[0].verified);
         assert_eq!(peers_a_final[0].url, "http://box-b:9-a2a/");
 
-        // The outbound entry is consumed — a second callback with the same
+        // The outbound entry is consumed — a second confirm with the same
         // id now finds nothing.
         assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty());
 
         // The private key never rode any wire body this test constructed —
         // grep every JSON value exchanged for anything key-shaped beyond the
         // public hex fields already asserted above.
-        for v in [&request_params, &resp, &callback_params, &approve_resp] {
+        for v in [&request_params, &resp, &reveal_params, &reveal_resp, &callback_params, &approve_resp] {
             let dumped = v.to_string().to_lowercase();
             assert!(!dumped.contains("signing"), "no private material anywhere on the wire: {dumped}");
         }

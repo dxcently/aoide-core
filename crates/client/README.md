@@ -29,22 +29,36 @@ never the inbound/serve half (that's `aoide-server`).
 - `peer` — peer-federation client half (CONTRACTS.md §7), joined at P-P2 by
   the pairing ceremony's own wire builders/parsers:
   `build_pair_request_body`/`parse_pair_request_response` (the requester's
-  `aoide/pairRequest` call) and `build_pair_approve_body`/
+  `aoide/pairRequest` call, now carrying a `commitHex` rather than a
+  `nonceHex` — review-bounce Finding 1), `build_pair_reveal_body`/
+  `check_pair_reveal_response` (the requester's immediately-following
+  `aoide/pairReveal` call), and `build_pair_approve_body`/
   `check_pair_approve_response` (the approver's `aoide/pairApprove`
   callback) — pure JSON-RPC envelope builders/parsers only, same split as
   the graphSummary pair above them; the server-side handlers
-  (`pair_request`/`pair_approve_callback`) live in `aoide-server::a2a`,
-  never duplicated here.
+  (`pair_request`/`pair_reveal`/`pair_approve_callback`) live in
+  `aoide-server::a2a`, never duplicated here.
 - `commands` — this crate's CLI verbs: `a2a agent add/list/remove/send`,
   `peer add/list/remove/pull/status/hub`, `peer pair request/pending/
-  approve/reject` (P-P2, CONTRACTS.md §6/§7 — `confirm_sas`/
-  `default_self_url` are this group's own local helpers: the y/N
-  confirmation prompt mirrors `aoide-secrets::client::confirm_overwrite`'s
-  exact idiom rather than importing it, since this crate holds no
-  dependency on that one; `handle_peer_pair_approve` delivers the
-  `aoide/pairApprove` callback to the requester BEFORE writing any local
-  peer record — an unreachable requester must leave BOTH ends unpaired,
-  never just the approver's), `adapter melete` (`peer hub
+  approve/reject` (P-P2, CONTRACTS.md §6/§7, review-bounce fix forward —
+  `confirm_sas`/`default_self_url` are this group's own local helpers: the
+  y/N confirmation prompt mirrors `aoide-secrets::client::
+  confirm_overwrite`'s exact idiom rather than importing it, since this
+  crate holds no dependency on that one). `handle_peer_pair_request` sends
+  the commitment and its reveal as two sequential POSTs in one invocation
+  (Finding 1) before ever computing a SAS. `handle_peer_pair_approve`
+  dispatches by direction: on an INBOUND entry (`approve_inbound`) it
+  refuses an unrevealed one outright, then delivers the `aoide/pairApprove`
+  callback to the requester BEFORE writing any local peer record — an
+  unreachable requester must leave BOTH ends unpaired, never just the
+  approver's; on an OUTBOUND entry (`approve_outbound`, reached only once
+  the approver's own callback already transitioned it to
+  `awaiting-confirm`) it makes no wire call at all and commits THIS
+  instance's own record directly on confirmation (Finding 2 — decision 4's
+  mutual confirmation, on both ends now). `handle_peer_pair_reject` tries
+  the inbound queue then the outbound queue, aborting an outbound entry at
+  any stage — the ceremony's own missing abort verb.
+  `adapter melete` (`peer hub
   <name> [--clear]`, P-D5, designates at most one registered peer as the
   hub `aoide_storage::addr::resolve_with_hub` prefers as a last-resort
   remote target — `peer_store::set_hub`/`clear_hub` hold the invariants,
