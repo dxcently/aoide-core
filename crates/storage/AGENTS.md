@@ -51,14 +51,41 @@
   Don't add a "compact the ledger" or "delete old entries" path without
   re-reading `docs/architecture/AOIDED.md`'s "L5" — the design leans on
   this file staying a complete, permanent record.
+- **`peer_store::upsert_paired_peer` is the ONE write site for `Peer.pubkey`/
+  `Peer.verified` (P-P2).** `peer add` never sets either field; a caller
+  wanting to record a verified key relationship goes through this function,
+  which touches only `pubkey`/`verified`/`url` on an existing entry and
+  leaves `autogate`/`tokenFile`/`bearerSecret`/`hub` untouched — don't widen
+  it to a general-purpose peer editor, and don't set those two fields via a
+  raw `Peer { .. }` literal anywhere outside `peer_store.rs` itself.
+- **`pairing`'s request ids are deliberately NOT `song/stage/pending.json`'s
+  array-position ids.** A pairing correlation must survive the requester's
+  CLI process exiting and an async `aoide/pairApprove` callback arriving
+  arbitrarily later, so ids are stable 8-hex-char values
+  (`gen_request_id`), generated once at park time and never renumbered by
+  a later list mutation. Don't "simplify" this back to array-position ids
+  — that would break exactly the cross-process correlation the module
+  exists to hold.
+- **`pairing::derive_sas`'s four-field order is the wire contract, not an
+  implementation detail.** `(requester_pubkey, approver_pubkey,
+  requester_nonce, approver_nonce)`, each lowercased/trimmed with a
+  trailing NUL separator, is pinned by
+  `tests::derive_sas_stability_vectors_never_drift` — changing the
+  hash, the field order, the separator, or the truncation/format breaks
+  the SAS rendering identically on both boxes, which is the entire point
+  of the ceremony. A change here needs new pinned vectors AND a
+  CONTRACTS.md §6 update in the same commit, never a silent drift.
 
 ## Extension points
 
 - **A new durable record shape** adds a type to `records` and a read/write
   pair to `fs`/`stage`; existing consumers never touch raw file paths for it.
-- **A new CLI verb** (this crate has two groups today, `usage` and `inbox
-  list|read|clear`) adds a `cmd!`/`register` entry in `commands.rs`, wired
-  into the owning app crate's `commands::all()`.
+- **A new CLI verb** (this crate has three groups today, `usage`, `inbox
+  list|read|clear`, and `identity`) adds a `cmd!`/`register` entry in
+  `commands.rs`, wired into the owning app crate's `commands::all()`. The
+  pairing ceremony's own CLI verbs (`peer pair *`) live in `aoide-client`
+  instead — this crate exposes the `pairing`/`peer_store` library only,
+  since the ceremony needs outbound HTTP transport this crate never holds.
 
 ## Docs update required in the same commit
 

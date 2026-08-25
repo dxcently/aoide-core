@@ -16,7 +16,7 @@ correspondence").
   hook (`mcp serve --stdio`, `a2a serve`, `secrets serve`, `secrets exec`,
   `secrets enroll`, `secrets watch`, `events tail`, `conductor`,
   `guide`/`schema` raw output).
-- `registry` — the golden command-path snapshot test (72 paths).
+- `registry` — the golden command-path snapshot test (76 paths).
 - `guide` — `aoide guide`, the onboarding tier map.
 - `commands` — the three root-coupled groups that must read the ASSEMBLED
   registry: `meta` (guide/schema), `stubs` (not-yet-implemented
@@ -35,11 +35,12 @@ depends on it.
 
 ## How it composes
 
-72 command paths (core's headless-capable, agent-orchestration surface: the
+76 command paths (core's headless-capable, agent-orchestration surface: the
 project/session graph (including `graph resurrect`, P-D8's ledger-backed
 session revival), A2A, peers (including the `peer hub` designation,
-P-D5), presence, the daemon, its own event bus (`events tail`), usage,
-hooks, the message inbox, the secrets broker, this instance's own
+P-D5, and the `peer pair request|pending|approve|reject` pairing
+ceremony, P-P2), presence, the daemon, its own event bus (`events tail`),
+usage, hooks, the message inbox, the secrets broker, this instance's own
 `identity` (P-P1 of the pairing workstream, `docs/architecture/PAIRING.md`)).
 Never depends on
 `aoide-song`/`aoide-screen` — painting is `lyra`'s bundle, assembled the

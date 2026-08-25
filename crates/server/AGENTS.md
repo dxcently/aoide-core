@@ -127,6 +127,28 @@
   fold it into the tick loop "for consistency with reap" — that would
   re-fire it every `REAP_EVERY_TICKS` and defeat the whole guard.
 
+- **`pair_request`/`pair_approve_callback` (P-P2) are deliberately UNGATED
+  by `read_ok`/bearer verification, and this is not an oversight to
+  "fix."** The pairing ceremony's entire purpose is establishing a
+  credential where none exists yet — gating either method on an existing
+  credential would be circular. What keeps this safe: a parked/approved
+  request grants NOTHING by itself (no `allows`, no spawn/bearer gate,
+  P-P3's lane untouched), every field is validated BEFORE anything is
+  parked (`valid_pubkey_hex`/`valid_nonce_hex`/`valid_peer_name`/
+  `valid_callback_url`), and the SAS confirmation
+  (`aoide_storage::pairing::derive_sas`) is the actual human-verified gate
+  — it lives in the CLIENT's `peer pair approve` prompt, not in this door.
+  Don't add a bearer check to either handler "for consistency with
+  `message/send`" — that would break the bootstrap the whole ceremony
+  exists to solve.
+- **`pair_approve_callback`'s pubkey-mismatch path RE-PARKS the outbound
+  entry via `park_outbound`, never drops it.** A mismatch could be a
+  transient data-integrity hiccup, not necessarily an attack; destroying
+  the entry outright would force the requester to restart the whole
+  ceremony (a fresh nonce, a fresh SAS, a fresh out-of-band code exchange)
+  for what might be a recoverable retry. Don't "simplify" this to a bare
+  `take_outbound` + discard.
+
 ## Extension points
 
 - **A new serve-side verb** (`daemon`, `shellbridge` registration, `a2a

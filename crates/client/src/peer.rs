@@ -7,6 +7,15 @@
 //! the curl transport + CLI verbs (`peer add|list|remove|pull|status`) live
 //! in `commands.rs`, same split as `wire.rs`/`commands.rs`'s existing
 //! `a2a agent *` verbs.
+//!
+//! The pairing ceremony's two wire shapes (P-P2, CONTRACTS.md §6) join the
+//! same split: [`build_pair_request_body`]/[`parse_pair_request_response`]
+//! for the requester's `aoide/pairRequest` call, and
+//! [`build_pair_approve_body`] for the approver's `aoide/pairApprove`
+//! callback — the server-side handlers live in `aoide-server::a2a`
+//! (`pair_request`/`pair_approve_callback`), never duplicated here; this
+//! module only builds/parses the JSON-RPC envelope either side of that
+//! wire.
 
 use aoide_protocol::wire::JsonRpcRequest;
 use aoide_storage::peer_store::PeerCacheEntry;
@@ -57,6 +66,84 @@ pub fn parse_graph_summary_response(resp: &Value, name: &str, fetched_at: &str) 
     })
 }
 
+// ── The pairing ceremony (P-P2, CONTRACTS.md §6) ─────────────────────────
+
+/// Build the JSON-RPC `aoide/pairRequest` body `peer pair request` POSTs to
+/// the approver's door: this instance's own public key, its claimed local
+/// nickname for the approver, a fresh nonce, and its own advertised A2A
+/// door URL (where the later approval callback is delivered). Pure.
+pub fn build_pair_request_body(pubkey_hex: &str, name: &str, nonce_hex: &str, self_url: &str) -> Value {
+    let req = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: json!(1),
+        method: "aoide/pairRequest".to_string(),
+        params: json!({ "pubkeyHex": pubkey_hex, "name": name, "nonceHex": nonce_hex, "url": self_url }),
+    };
+    serde_json::to_value(&req).expect("JsonRpcRequest always serializes")
+}
+
+/// The approver's synchronous `aoide/pairRequest` acknowledgement — its own
+/// public identity plus a freshly-minted nonce, everything the requester
+/// needs to derive its own copy of the SAS with no further round trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairRequestAck {
+    pub id: String,
+    pub pubkey_hex: String,
+    pub nonce_hex: String,
+    pub expires_at: String,
+}
+
+/// Parse the `aoide/pairRequest` response into a [`PairRequestAck`]. Pure.
+pub fn parse_pair_request_response(resp: &Value) -> Result<PairRequestAck, String> {
+    if let Some(err) = resp.get("error") {
+        let detail = err.get("message").and_then(Value::as_str).unwrap_or("(no message)");
+        return Err(format!("the peer returned an error: {detail}"));
+    }
+    let result = resp.get("result").ok_or_else(|| "response has no `result`".to_string())?;
+    let id = result
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "response has no `id`".to_string())?
+        .to_string();
+    let pubkey_hex = result
+        .get("pubkeyHex")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "response has no `pubkeyHex`".to_string())?
+        .to_string();
+    let nonce_hex = result
+        .get("nonceHex")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "response has no `nonceHex`".to_string())?
+        .to_string();
+    let expires_at = result.get("expiresAt").and_then(Value::as_str).unwrap_or("").to_string();
+    Ok(PairRequestAck { id, pubkey_hex, nonce_hex, expires_at })
+}
+
+/// Build the JSON-RPC `aoide/pairApprove` body the APPROVER's `peer pair
+/// approve` POSTs back to the requester's own door once its operator has
+/// confirmed the SAS — `id` is the SAME id `aoide/pairRequest` returned;
+/// `pubkey_hex` is the approver's own public key. Pure.
+pub fn build_pair_approve_body(id: &str, pubkey_hex: &str) -> Value {
+    let req = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: json!(1),
+        method: "aoide/pairApprove".to_string(),
+        params: json!({ "id": id, "pubkeyHex": pubkey_hex }),
+    };
+    serde_json::to_value(&req).expect("JsonRpcRequest always serializes")
+}
+
+/// `aoide/pairApprove`'s reply carries only `{ok, name}` — no data this
+/// crate needs to parse structurally beyond checking for a JSON-RPC
+/// `error`. Pure.
+pub fn check_pair_approve_response(resp: &Value) -> Result<(), String> {
+    if let Some(err) = resp.get("error") {
+        let detail = err.get("message").and_then(Value::as_str).unwrap_or("(no message)");
+        return Err(format!("the requester refused the approval: {detail}"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,5 +188,58 @@ mod tests {
 
         let empty = json!({});
         assert!(parse_graph_summary_response(&empty, "p", "T").is_err());
+    }
+
+    // ── The pairing ceremony (P-P2) ──────────────────────────────────────
+
+    #[test]
+    fn build_pair_request_body_matches_the_jsonrpc_shape() {
+        let body = build_pair_request_body("pk", "box-b", "nonce", "http://a/");
+        assert_eq!(body["method"], "aoide/pairRequest");
+        assert_eq!(body["params"]["pubkeyHex"], "pk");
+        assert_eq!(body["params"]["name"], "box-b");
+        assert_eq!(body["params"]["nonceHex"], "nonce");
+        assert_eq!(body["params"]["url"], "http://a/");
+    }
+
+    #[test]
+    fn parse_pair_request_response_extracts_the_ack() {
+        let resp = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "id": "abc12345", "pubkeyHex": "b".repeat(64), "nonceHex": "d".repeat(32), "expiresAt": "2026-08-25T04:00:00Z" }
+        });
+        let ack = parse_pair_request_response(&resp).unwrap();
+        assert_eq!(ack.id, "abc12345");
+        assert_eq!(ack.pubkey_hex, "b".repeat(64));
+        assert_eq!(ack.nonce_hex, "d".repeat(32));
+        assert_eq!(ack.expires_at, "2026-08-25T04:00:00Z");
+    }
+
+    #[test]
+    fn parse_pair_request_response_rejects_an_error_or_missing_fields() {
+        let err_resp = json!({ "error": { "code": -32602, "message": "invalid params" } });
+        assert!(parse_pair_request_response(&err_resp).is_err());
+
+        let missing_id = json!({ "result": { "pubkeyHex": "a", "nonceHex": "b" } });
+        assert!(parse_pair_request_response(&missing_id).is_err());
+
+        let missing_pubkey = json!({ "result": { "id": "x", "nonceHex": "b" } });
+        assert!(parse_pair_request_response(&missing_pubkey).is_err());
+
+        assert!(parse_pair_request_response(&json!({})).is_err());
+    }
+
+    #[test]
+    fn build_pair_approve_body_matches_the_jsonrpc_shape() {
+        let body = build_pair_approve_body("abc12345", "pk");
+        assert_eq!(body["method"], "aoide/pairApprove");
+        assert_eq!(body["params"]["id"], "abc12345");
+        assert_eq!(body["params"]["pubkeyHex"], "pk");
+    }
+
+    #[test]
+    fn check_pair_approve_response_passes_ok_and_surfaces_an_error() {
+        assert!(check_pair_approve_response(&json!({ "result": { "ok": true, "name": "box-a" } })).is_ok());
+        assert!(check_pair_approve_response(&json!({ "error": { "code": -32001, "message": "unknown id" } })).is_err());
     }
 }

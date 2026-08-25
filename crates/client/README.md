@@ -26,9 +26,25 @@ never the inbound/serve half (that's `aoide-server`).
   (`build_message_send_body` and siblings).
 - `adapter` — the melete neutral-event adapter (consumes events, stays
   agnostic of any one downstream agent's shape).
-- `peer` — peer-federation client half (CONTRACTS.md §7).
+- `peer` — peer-federation client half (CONTRACTS.md §7), joined at P-P2 by
+  the pairing ceremony's own wire builders/parsers:
+  `build_pair_request_body`/`parse_pair_request_response` (the requester's
+  `aoide/pairRequest` call) and `build_pair_approve_body`/
+  `check_pair_approve_response` (the approver's `aoide/pairApprove`
+  callback) — pure JSON-RPC envelope builders/parsers only, same split as
+  the graphSummary pair above them; the server-side handlers
+  (`pair_request`/`pair_approve_callback`) live in `aoide-server::a2a`,
+  never duplicated here.
 - `commands` — this crate's CLI verbs: `a2a agent add/list/remove/send`,
-  `peer add/list/remove/pull/status/hub`, `adapter melete` (`peer hub
+  `peer add/list/remove/pull/status/hub`, `peer pair request/pending/
+  approve/reject` (P-P2, CONTRACTS.md §6/§7 — `confirm_sas`/
+  `default_self_url` are this group's own local helpers: the y/N
+  confirmation prompt mirrors `aoide-secrets::client::confirm_overwrite`'s
+  exact idiom rather than importing it, since this crate holds no
+  dependency on that one; `handle_peer_pair_approve` delivers the
+  `aoide/pairApprove` callback to the requester BEFORE writing any local
+  peer record — an unreachable requester must leave BOTH ends unpaired,
+  never just the approver's), `adapter melete` (`peer hub
   <name> [--clear]`, P-D5, designates at most one registered peer as the
   hub `aoide_storage::addr::resolve_with_hub` prefers as a last-resort
   remote target — `peer_store::set_hub`/`clear_hub` hold the invariants,

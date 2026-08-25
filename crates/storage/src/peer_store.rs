@@ -79,6 +79,27 @@ pub struct Peer {
     /// directly.
     #[serde(default, skip_serializing_if = "is_false")]
     pub hub: bool,
+    /// This peer's ed25519 public key, hex, no separator — set ONLY by the
+    /// pairing ceremony (P-P2, `docs/architecture/PAIRING.md`), never by
+    /// `peer add`. Absent for an unpaired peer (today's every registered
+    /// peer, and every peer registered before this field existed); a
+    /// `peers.json` predating P-P2 loads every entry's `pubkey` as `None`,
+    /// the same additive/`skip_serializing_if` discipline `hub`/
+    /// `bearerSecret` already hold.
+    #[serde(rename = "pubkey", default, skip_serializing_if = "Option::is_none")]
+    pub pubkey: Option<String>,
+    /// Whether the pairing ceremony has confirmed this peer's [`Self::pubkey`]
+    /// against a human-compared SAS (P-P2). `false` for every peer registered
+    /// through the legacy `peer add` path (unpaired) and for every peer that
+    /// predates this field — same `#[serde(default)]`+`skip_serializing_if`
+    /// shape `hub` set the precedent for: an old `peers.json` deserializes
+    /// `verified: false` on every entry, and an unverified entry omits the
+    /// key entirely rather than writing `"verified":false` everywhere.
+    /// Nothing in this phase reads `verified` to gate `allows`/spawn — that
+    /// wiring is P-P3's lane (`PAIRING.md`'s phase table); this field only
+    /// records the ceremony's own outcome.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub verified: bool,
     #[serde(rename = "addedAt", default)]
     pub added_at: String,
 }
@@ -148,6 +169,94 @@ pub fn remove_peer(peers: &mut Vec<Peer>, name: &str) -> bool {
     let before = peers.len();
     peers.retain(|p| p.name != name);
     peers.len() != before
+}
+
+/// What [`upsert_paired_peer`] actually did — the pairing ceremony's own
+/// "report exactly what changed" (house rule 2), mirroring [`HubChange`]'s
+/// shape one field over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PairChange {
+    /// No peer named `name` existed — a fresh entry was inserted, unpaired
+    /// fields (`autogate`/`token_file`/`bearer_secret`/`hub`) at their
+    /// defaults.
+    Inserted,
+    /// A peer named `name` already existed (re-pairing) — its `pubkey`/
+    /// `verified`/`url` were REPLACED; every other field (`autogate`,
+    /// `token_file`, `bearer_secret`, `hub`) is left exactly as it was.
+    Updated,
+}
+
+/// Commit the pairing ceremony's own outcome (P-P2, both call sites: the
+/// approver writing the requester's record, and the requester's own door
+/// writing the approver's record on the callback) — the ONE place either
+/// side of the ceremony writes a peer's `pubkey`/`verified`. Never touches
+/// `allows`/any gate (P-P3's lane, `PAIRING.md`'s house rule for this
+/// phase): a fresh insert takes every unpaired field's ordinary default
+/// (`autogate: false`, no token/bearer, not the hub), and re-pairing an
+/// EXISTING peer (decision: "replaces key material only after the same SAS
+/// confirmation, never silently" — the caller's own confirmation gate, not
+/// this function's) touches ONLY `pubkey`/`verified`/`url`, leaving
+/// whatever the operator already set on `autogate`/`token_file`/
+/// `bearer_secret`/`hub` completely alone.
+pub fn upsert_paired_peer(peers: &mut Vec<Peer>, name: &str, url: &str, pubkey_hex: &str, added_at: &str) -> PairChange {
+    if let Some(p) = peers.iter_mut().find(|p| p.name == name) {
+        p.pubkey = Some(pubkey_hex.to_string());
+        p.verified = true;
+        p.url = url.to_string();
+        return PairChange::Updated;
+    }
+    peers.push(Peer {
+        name: name.to_string(),
+        url: url.to_string(),
+        autogate: false,
+        token_file: None,
+        bearer_secret: None,
+        hub: false,
+        pubkey: Some(pubkey_hex.to_string()),
+        verified: true,
+        added_at: added_at.to_string(),
+    });
+    PairChange::Inserted
+}
+
+/// A default local nickname for a peer named only by URL (`aoide peer pair
+/// request <url>` with no `--name`) — [`url_host`]'s bare authority,
+/// lowercased and sanitized to [`valid_peer_name`]'s shape (`.`/`:` become
+/// `-`, anything else not in `[a-z0-9-]` is dropped), leading/trailing/
+/// duplicate hyphens collapsed. `None` when the URL has no parseable host
+/// at all, or the sanitized result is empty/still invalid — the caller
+/// (`aoide-client::commands::handle_peer_pair_request`) then requires an
+/// explicit `--name` rather than guessing further. Pure.
+pub fn default_peer_name_from_url(url: &str) -> Option<String> {
+    let host = url_host(url)?;
+    let host_only = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(&host);
+    let mut out = String::new();
+    let mut last_was_hyphen = false;
+    for c in host_only.chars() {
+        let mapped = if c.is_ascii_alphanumeric() {
+            Some(c.to_ascii_lowercase())
+        } else if c == '.' || c == '-' || c == '_' {
+            Some('-')
+        } else {
+            None
+        };
+        match mapped {
+            Some('-') if last_was_hyphen || out.is_empty() => {}
+            Some(ch) => {
+                out.push(ch);
+                last_was_hyphen = ch == '-';
+            }
+            None => {}
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if valid_peer_name(&out) {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 /// What [`set_hub`]/[`clear_hub`] actually did — the CLI's `peer hub`
@@ -406,6 +515,8 @@ mod tests {
             token_file: None,
             bearer_secret: None,
             hub: false,
+            pubkey: None,
+            verified: false,
             added_at: "2026-08-14T00:00:00Z".to_string(),
         }
     }
@@ -737,5 +848,80 @@ mod tests {
         assert!(!is_autogated_peer_token(&[], "trusted-secret"), "an empty registry matches nothing");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── `pubkey`/`verified` — P-P2 additive fields ───────────────────────────
+
+    #[test]
+    fn pubkey_and_verified_round_trip_and_omit_when_absent_or_false() {
+        let mut unpaired = fixture_peer("alpha", "http://a/", false);
+        let v = serde_json::to_value(&unpaired).unwrap();
+        assert!(v.get("pubkey").is_none(), "absent pubkey is omitted, not null");
+        assert!(v.get("verified").is_none(), "false verified is omitted, not written");
+
+        unpaired.pubkey = Some("ab".repeat(32));
+        unpaired.verified = true;
+        let v2 = serde_json::to_value(&unpaired).unwrap();
+        assert_eq!(v2["pubkey"], "ab".repeat(32));
+        assert_eq!(v2["verified"], true);
+        let back: Peer = serde_json::from_value(v2).unwrap();
+        assert_eq!(back.pubkey.as_deref(), Some("ab".repeat(32).as_str()));
+        assert!(back.verified);
+    }
+
+    #[test]
+    fn a_legacy_peers_json_predating_pairing_loads_pubkey_none_and_verified_false() {
+        let old_shape = serde_json::json!({
+            "name": "gamma", "url": "http://c/", "autogate": false, "addedAt": "2026-08-14T00:00:00Z"
+        });
+        let back: Peer = serde_json::from_value(old_shape).unwrap();
+        assert_eq!(back.pubkey, None);
+        assert!(!back.verified);
+    }
+
+    // ── `upsert_paired_peer` (P-P2's one write site for pubkey/verified) ────
+
+    #[test]
+    fn upsert_paired_peer_inserts_a_fresh_verified_entry_with_unpaired_fields_at_default() {
+        let mut peers: Vec<Peer> = Vec::new();
+        let change = upsert_paired_peer(&mut peers, "box-b", "http://b/", "deadbeef", "2026-08-25T00:00:00Z");
+        assert_eq!(change, PairChange::Inserted);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].name, "box-b");
+        assert_eq!(peers[0].url, "http://b/");
+        assert_eq!(peers[0].pubkey.as_deref(), Some("deadbeef"));
+        assert!(peers[0].verified);
+        assert!(!peers[0].autogate, "a fresh paired peer is never autogated by construction");
+        assert!(peers[0].token_file.is_none());
+        assert!(peers[0].bearer_secret.is_none());
+        assert!(!peers[0].hub);
+    }
+
+    #[test]
+    fn upsert_paired_peer_on_an_existing_name_replaces_only_pubkey_verified_url() {
+        let mut existing = fixture_peer("box-b", "http://old-b/", true);
+        existing.token_file = Some("/tmp/tok".to_string());
+        existing.bearer_secret = Some("secret-name".to_string());
+        let mut peers = vec![existing];
+
+        let change = upsert_paired_peer(&mut peers, "box-b", "http://new-b/", "cafef00d", "2026-08-25T00:00:00Z");
+        assert_eq!(change, PairChange::Updated);
+        assert_eq!(peers.len(), 1, "re-pairing never duplicates the entry");
+        assert_eq!(peers[0].url, "http://new-b/", "url is replaced");
+        assert_eq!(peers[0].pubkey.as_deref(), Some("cafef00d"));
+        assert!(peers[0].verified);
+        assert!(peers[0].autogate, "autogate is untouched by re-pairing");
+        assert_eq!(peers[0].token_file.as_deref(), Some("/tmp/tok"), "token_file untouched");
+        assert_eq!(peers[0].bearer_secret.as_deref(), Some("secret-name"), "bearer_secret untouched");
+    }
+
+    // ── `default_peer_name_from_url` ─────────────────────────────────────────
+
+    #[test]
+    fn default_peer_name_from_url_sanitizes_a_bare_host_or_hostport() {
+        assert_eq!(default_peer_name_from_url("http://yomi-strix:8710/"), Some("yomi-strix".to_string()));
+        assert_eq!(default_peer_name_from_url("http://10.0.0.5:8710/"), Some("10-0-0-5".to_string()));
+        assert_eq!(default_peer_name_from_url("http://SAKAKI.local/"), Some("sakaki-local".to_string()));
+        assert_eq!(default_peer_name_from_url("not-a-url"), None);
     }
 }

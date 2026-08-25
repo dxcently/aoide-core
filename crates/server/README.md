@@ -142,6 +142,24 @@ the inbound half of the two-door contract (the outbound half is
   value is never cached, logged, or placed in any audit line — see
   `CONTRACTS.md`'s "Secrets wire"/§6 sections for the wire contract and
   the resolve-consumer honesty note.
+  **The pairing ceremony's two methods (P-P2, CONTRACTS.md §6's "Pairing
+  wire" subsection)** — `pair_request` (`aoide/pairRequest`) and
+  `pair_approve_callback` (`aoide/pairApprove`) — join this same JSON-RPC
+  dispatch table, deliberately UNGATED by `read_ok`/bearer verification:
+  the ceremony's whole point is establishing a credential where none
+  exists yet, so gating either method on one would be circular. Neither
+  grants anything beyond a `pubkey`/`verified` peer record on approval —
+  no `allows`/permission, no spawn/bearer gate (P-P3's lane). `pair_request`
+  validates every field (64-hex pubkey, 32-hex nonce, a `valid_peer_name`
+  name, a non-empty `://`-bearing url) before calling
+  `aoide_storage::pairing::park_inbound` — malformed input never reaches
+  the parked-state file. `pair_approve_callback` looks up the matching
+  `aoide_storage::pairing::take_outbound` entry by id, re-parks it (never
+  destroys it) on a pubkey mismatch so a legitimate retry after a
+  transient hiccup isn't permanently broken, and only on a match commits
+  the local peer record via `aoide_storage::peer_store::upsert_paired_peer`.
+  Both audit via the existing `Door::A2a` audit sink
+  (`a2a.pairRequest`/`a2a.pairApprove`), same as every other A2A method.
 - `commands` — this crate's CLI verbs: `daemon`, `shellbridge` (registration
   only — the files stay in `conduct`), `a2a serve`, `events tail` (P-D3,
   appended newest — CLI-only, the same door-policy shape `a2a serve`/

@@ -434,6 +434,8 @@ mod tests {
             token_file: None,
             bearer_secret: None,
             hub: false,
+            pubkey: None,
+            verified: false,
             added_at: "2026-08-14T00:00:00Z".to_string(),
         }
     }

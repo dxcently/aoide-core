@@ -40,6 +40,19 @@
   path simple" — it hides real daemon failures as ordinary "no daemon
   running."
 
+- **`handle_peer_pair_approve`'s wire-then-commit ordering is load-bearing
+  (P-P2).** The approval callback (`aoide/pairApprove`) MUST be delivered
+  to the requester's own door and acknowledged BEFORE this instance writes
+  its own `pubkey`/`verified` peer record — never the reverse, and never
+  in parallel. An unreachable or refusing requester must leave BOTH ends
+  unpaired, not just the approver's; committing local state first would
+  let a network hiccup produce an asymmetric pair (one side verified, the
+  other not) with no way for either operator to notice. The SAS itself is
+  ALWAYS re-derived from this instance's own identity plus the parked
+  entry's stored fields (`aoide_storage::pairing::derive_sas`) — never
+  trusted from anything the wire carries, since the entire point of the
+  ceremony is a code neither side can spoof to the other.
+
 ## Extension points
 
 - **A new outbound A2A verb** adds a `cmd!`/`register` entry in

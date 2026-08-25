@@ -20,6 +20,11 @@ libc = { workspace = true }
 # dependent, per that comment's "consumer" note.
 ed25519-dalek = { workspace = true }
 getrandom = { workspace = true }
+# `pairing` — the P-P2 ceremony's SAS transcript hash (`docs/architecture/
+# PAIRING.md` decision 1 names `sha2` explicitly). Same sanctioned-break
+# scope as `ed25519-dalek`/`getrandom` above — see the workspace
+# Cargo.toml's own comment.
+sha2 = { workspace = true }
 
 [dev-dependencies]
 # The commands tests share the workspace rig (scratch dirs, EnvSaver,

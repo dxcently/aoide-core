@@ -21,7 +21,7 @@ use aoide_protocol::output::Outcome;
 use aoide_protocol::registry::{arg, cmd, flag, Registry};
 use aoide_protocol::Invocation;
 use serde_json::{json, Value};
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -505,6 +505,8 @@ fn handle_peer_add(inv: &Invocation) -> Outcome {
         token_file,
         bearer_secret,
         hub: false,
+        pubkey: None,
+        verified: false,
         added_at: aoide_storage::time::now_iso_utc(),
     };
     aoide_storage::peer_store::insert_peer(&mut peers, peer.clone());
@@ -890,6 +892,373 @@ pub fn register_peers(r: &mut Registry) {
     ));
 }
 
+// ── The four `peer pair` verbs (P-P2, CONTRACTS.md §6 — the pairing
+// ── ceremony's wire + CLI ceremony) ──────────────────────────────────────
+//
+// `peer add`/`peer pair` are two SEPARATE paths onto the same registry
+// (`docs/architecture/PAIRING.md`'s "Settled decisions" #2): `peer add` is
+// the legacy escape for an UNPAIRED peer (a hand-set URL, never verified by
+// key), `peer pair` is the ONE ceremony that mints a `pubkey`/`verified`
+// peer record on BOTH ends — request/park/approve/reject over the A2A door
+// (`aoide-server::a2a::pair_request`/`pair_approve_callback`), SAS
+// derivation + display (`aoide_storage::pairing::derive_sas`), commit via
+// `aoide_storage::peer_store::upsert_paired_peer`. Neither this section nor
+// the door it drives touches `allows`/any gate — P-P3's lane.
+
+/// Prompt `y/N` on stderr and read ONE line from stdin, unhidden (a
+/// confirmation code isn't sensitive) — mirrors `aoide-secrets::client::
+/// confirm_overwrite`'s exact idiom (a different crate; this crate has no
+/// dependency on that one to reuse the function directly). `true` only for
+/// `y`/`yes` (case-insensitive, trimmed); EOF or anything else defaults to
+/// `false` — the ceremony's own "never silently commit" stance.
+fn confirm_sas(sas: &str, name: &str) -> Result<bool, String> {
+    eprint!("pairing request from `{name}` — confirmation code {sas} — do the codes match? [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    let read = std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| format!("reading confirmation from stdin: {e}"))?;
+    Ok(read > 0 && matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+/// This instance's own default advertised A2A door URL — `--peer-name`'s
+/// sibling precedence chain (`aoide_server::a2a::resolve_peer_name`) but
+/// resolved HERE, since this crate cannot depend on `aoide-server`: the
+/// port comes from `AOIDE_A2A_PORT` (the same env the `aoide-a2a` systemd
+/// unit sets, mirroring `a2a::resolve_bind_port`'s own precedence) or the
+/// house default `8710`; the host is `aoide_storage::display::
+/// local_host_name` (already the shared fallback chain `a2a::
+/// resolve_peer_name` itself delegates to). `--self-url` overrides this
+/// outright — the one flag `peer pair request` needs when the door binds
+/// somewhere this default can't guess (a non-default port, a reverse
+/// proxy/tunnel hostname).
+fn default_self_url() -> String {
+    let host = aoide_storage::display::local_host_name();
+    let port: u16 = std::env::var("AOIDE_A2A_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8710);
+    format!("http://{host}:{port}/")
+}
+
+/// `peer pair request <url> [--name <n>] [--self-url <url>]` — the
+/// REQUESTER's half. Mints this instance's identity if it doesn't exist
+/// yet (`aoide_storage::identity::load_or_mint`), mints a fresh nonce,
+/// POSTs `aoide/pairRequest` to `url`, and on a valid ack derives THIS
+/// instance's own copy of the SAS immediately (PAIRING.md's diagram: no
+/// further round trip needed to display it) and remembers the outbound
+/// request (`aoide_storage::pairing::park_outbound`) so this instance's own
+/// `a2a serve` can finish the ceremony when the approval callback arrives,
+/// however long after this CLI process exits.
+fn handle_peer_pair_request(inv: &Invocation) -> Outcome {
+    let cmd = "peer.pair.request";
+    let url = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(u) => u.to_string(),
+        None => return Outcome::usage(cmd, "usage: aoide peer pair request <url> [--name <n>] [--self-url <url>] [--json]"),
+    };
+    let name = match inv.flags.get("name").cloned().filter(|s| !s.is_empty()) {
+        Some(n) => n,
+        None => match aoide_storage::peer_store::default_peer_name_from_url(&url) {
+            Some(n) => n,
+            None => {
+                return Outcome::error(cmd, "could not derive a nickname from the URL — pass --name explicitly")
+                    .with_data(json!({ "reason": "no-default-name", "url": url }))
+            }
+        },
+    };
+    if !aoide_storage::peer_store::valid_peer_name(&name) {
+        return Outcome::error(
+            cmd,
+            format!(
+                "`{name}` is not a valid peer nickname: must match `^[a-z0-9][a-z0-9-]*$` \
+                 (lowercase letters, digits, hyphens; no leading hyphen, no `/`, no `..`)"
+            ),
+        )
+        .with_data(json!({ "reason": "invalid-name", "name": name }));
+    }
+    let self_url = inv
+        .flags
+        .get("self-url")
+        .cloned()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(default_self_url);
+
+    let (kp, _) = match aoide_storage::identity::load_or_mint() {
+        Ok(v) => v,
+        Err(e) => {
+            return Outcome::error(cmd, format!("loading this instance's identity: {e}"))
+                .with_data(json!({ "reason": "identity-io-failed" }))
+        }
+    };
+    let own_pubkey = kp.info().pubkey_hex;
+    let own_nonce = aoide_storage::pairing::random_hex(16);
+
+    let body = crate::peer::build_pair_request_body(&own_pubkey, &name, &own_nonce, &self_url);
+    let body_str = serde_json::to_string(&body).unwrap_or_default();
+    let (code, resp_body) = match post_json(&url, &body_str, None, 15) {
+        Ok(v) => v,
+        Err(e) => {
+            return Outcome::error(cmd, format!("sending the pairing request to {url}: {e}"))
+                .with_data(json!({ "reason": "fetch-failed", "url": url }))
+        }
+    };
+    if code != 200 {
+        return Outcome::error(cmd, format!("sending the pairing request to {url}: HTTP {code}"))
+            .with_data(json!({ "reason": "fetch-http-error", "url": url, "httpCode": code }));
+    }
+    let resp: Value = match serde_json::from_str(&resp_body) {
+        Ok(v) => v,
+        Err(_) => {
+            return Outcome::error(cmd, format!("sending the pairing request to {url}: unparseable response"))
+                .with_data(json!({ "reason": "unparseable", "url": url }))
+        }
+    };
+    let ack = match crate::peer::parse_pair_request_response(&resp) {
+        Ok(a) => a,
+        Err(e) => {
+            return Outcome::error(cmd, format!("the peer refused the pairing request: {e}"))
+                .with_data(json!({ "reason": "refused", "url": url }))
+        }
+    };
+
+    let sas = aoide_storage::pairing::derive_sas(&own_pubkey, &ack.pubkey_hex, &own_nonce, &ack.nonce_hex);
+    let requested_at = aoide_storage::time::now_iso_utc();
+    let outbound = aoide_storage::pairing::OutboundPairingRequest {
+        id: ack.id.clone(),
+        url: url.clone(),
+        name: name.clone(),
+        pubkey_hex: ack.pubkey_hex.clone(),
+        requester_nonce_hex: own_nonce,
+        requested_at,
+        expires_at: ack.expires_at.clone(),
+    };
+    if let Err(e) = aoide_storage::pairing::park_outbound(outbound) {
+        return Outcome::error(cmd, format!("remembering the outbound pairing request: {e}"));
+    }
+
+    Outcome::ok(
+        cmd,
+        format!(
+            "pairing request sent to `{name}` ({url}) — confirmation code {sas} — \
+             read this aloud (or otherwise out-of-band) to {name}'s operator; once they run \
+             `aoide peer pair approve {}` and confirm the SAME code, the pair completes automatically",
+            ack.id
+        ),
+    )
+    .with_data(json!({ "id": ack.id, "name": name, "url": url, "sas": sas, "expiresAt": ack.expires_at }))
+}
+
+/// `peer pair pending` — this instance's own parked (inbound) pairing
+/// requests, each with its OWN independently-derived SAS (never trusted
+/// from the wire — recomputed here from this instance's own identity plus
+/// the entry's stored transcript fields, exactly what `peer pair approve`
+/// will re-derive again before committing anything).
+fn handle_peer_pair_pending(_inv: &Invocation) -> Outcome {
+    let cmd = "peer.pair.pending";
+    let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
+    let pending = aoide_storage::pairing::list_inbound(now_epoch);
+    if pending.is_empty() {
+        return Outcome::ok(cmd, "no pending pairing requests").with_data(json!({ "requests": [] }));
+    }
+    let (kp, _) = match aoide_storage::identity::load_or_mint() {
+        Ok(v) => v,
+        Err(e) => {
+            return Outcome::error(cmd, format!("loading this instance's identity: {e}"))
+                .with_data(json!({ "reason": "identity-io-failed" }))
+        }
+    };
+    let own_pubkey = kp.info().pubkey_hex;
+    let rows: Vec<Value> = pending
+        .iter()
+        .map(|e| {
+            let sas = aoide_storage::pairing::derive_sas(&e.pubkey_hex, &own_pubkey, &e.requester_nonce_hex, &e.approver_nonce_hex);
+            json!({
+                "id": e.id, "name": e.name, "originAddr": e.origin_addr, "url": e.url,
+                "sas": sas, "requestedAt": e.requested_at, "expiresAt": e.expires_at,
+            })
+        })
+        .collect();
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            format!(
+                "{} · {} · origin {} · code {} · requested {}",
+                r["id"].as_str().unwrap_or(""),
+                r["name"].as_str().unwrap_or(""),
+                r["originAddr"].as_str().unwrap_or(""),
+                r["sas"].as_str().unwrap_or(""),
+                r["requestedAt"].as_str().unwrap_or(""),
+            )
+        })
+        .collect();
+    Outcome::ok(cmd, format!("{} pending pairing request(s):\n{}", rows.len(), lines.join("\n")))
+        .with_data(json!({ "requests": rows }))
+}
+
+/// `peer pair approve <id> [--yes]` — the APPROVER's half. Re-derives the
+/// SAS from this instance's own identity plus the parked entry (never
+/// trusting a wire-supplied code) and requires an explicit `y`/`yes`
+/// confirmation (CLI prompt, or `--yes` for scripted tests) BEFORE anything
+/// commits. Delivers the `aoide/pairApprove` callback to the requester's
+/// own door FIRST — nothing local writes until that callback is
+/// acknowledged (PAIRING.md: "a parked request grants NOTHING until
+/// approved"; an unreachable requester must leave BOTH ends unpaired, not
+/// just one) — then commits THIS instance's own peer record
+/// (`upsert_paired_peer`) and removes the parked entry.
+fn handle_peer_pair_approve(inv: &Invocation) -> Outcome {
+    let cmd = "peer.pair.approve";
+    let id = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(i) => i.to_string(),
+        None => return Outcome::usage(cmd, "usage: aoide peer pair approve <id> [--yes] [--json]"),
+    };
+
+    let now = aoide_storage::time::now_iso_utc();
+    let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap_or(0);
+    let pending = aoide_storage::pairing::list_inbound(now_epoch);
+    let Some(entry) = pending.into_iter().find(|e| e.id == id) else {
+        return Outcome::error(cmd, format!("no pending pairing request with id `{id}` (unknown, already resolved, or expired)"))
+            .with_data(json!({ "reason": "unknown-id", "id": id }));
+    };
+
+    let (kp, _) = match aoide_storage::identity::load_or_mint() {
+        Ok(v) => v,
+        Err(e) => {
+            return Outcome::error(cmd, format!("loading this instance's identity: {e}"))
+                .with_data(json!({ "reason": "identity-io-failed" }))
+        }
+    };
+    let own_pubkey = kp.info().pubkey_hex;
+    let sas = aoide_storage::pairing::derive_sas(&entry.pubkey_hex, &own_pubkey, &entry.requester_nonce_hex, &entry.approver_nonce_hex);
+
+    if !inv.flag_present("yes") {
+        match confirm_sas(&sas, &entry.name) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Outcome::ok(
+                    cmd,
+                    format!(
+                        "not confirmed — the request remains pending (confirmation code was {sas}); \
+                         run `aoide peer pair reject {id}` to refuse it outright"
+                    ),
+                )
+                .with_data(json!({ "confirmed": false, "sas": sas, "id": id }))
+            }
+            Err(e) => return Outcome::error(cmd, e),
+        }
+    }
+
+    let body = crate::peer::build_pair_approve_body(&entry.id, &own_pubkey);
+    let body_str = serde_json::to_string(&body).unwrap_or_default();
+    let (code, resp_body) = match post_json(&entry.url, &body_str, None, 15) {
+        Ok(v) => v,
+        Err(e) => {
+            return Outcome::error(
+                cmd,
+                format!(
+                    "delivering the approval to `{}` at {}: {e} — the request remains pending; \
+                     retry `aoide peer pair approve {id}` once it's reachable",
+                    entry.name, entry.url
+                ),
+            )
+            .with_data(json!({ "reason": "callback-unreachable", "id": id, "sas": sas }))
+        }
+    };
+    if code != 200 {
+        return Outcome::error(cmd, format!("delivering the approval to `{}`: HTTP {code}", entry.name))
+            .with_data(json!({ "reason": "callback-http-error", "id": id, "httpCode": code }));
+    }
+    let parsed_resp: Value = serde_json::from_str(&resp_body).unwrap_or(Value::Null);
+    if let Err(e) = crate::peer::check_pair_approve_response(&parsed_resp) {
+        return Outcome::error(cmd, e).with_data(json!({ "reason": "callback-refused", "id": id }));
+    }
+
+    let mut peers = aoide_storage::peer_store::load_peers();
+    let change = aoide_storage::peer_store::upsert_paired_peer(&mut peers, &entry.name, &entry.url, &entry.pubkey_hex, &now);
+    if let Err(e) = aoide_storage::peer_store::save_peers(&peers) {
+        return Outcome::error(cmd, format!("writing the peer registry: {e}"));
+    }
+    let _ = aoide_storage::pairing::take_inbound(&id, now_epoch);
+
+    use aoide_storage::peer_store::PairChange;
+    let verb = match change {
+        PairChange::Inserted => "paired with",
+        PairChange::Updated => "re-paired with",
+    };
+    Outcome::ok(cmd, format!("{verb} `{}` (code {sas}) — verified", entry.name))
+        .changed(vec![aoide_storage::peer_store::peers_path().to_string_lossy().into_owned()])
+        .with_data(json!({ "confirmed": true, "sas": sas, "peer": entry.name, "pubkeyHex": entry.pubkey_hex }))
+}
+
+/// `peer pair reject <id>` — a clean refusal: removes the parked entry, no
+/// peer record on either end. Never notifies the requester (no wire call);
+/// its own outbound entry simply expires on its own timeout (PAIRING.md
+/// names no explicit reject-notification requirement, and a same-shaped
+/// "clean refusal" is exactly what `secrets dismiss` gives an operator
+/// without a wire round trip either).
+fn handle_peer_pair_reject(inv: &Invocation) -> Outcome {
+    let cmd = "peer.pair.reject";
+    let id = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(i) => i.to_string(),
+        None => return Outcome::usage(cmd, "usage: aoide peer pair reject <id> [--json]"),
+    };
+    let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
+    match aoide_storage::pairing::take_inbound(&id, now_epoch) {
+        Ok(Some(entry)) => Outcome::ok(cmd, format!("rejected pairing request `{id}` from `{}` — no peer record written", entry.name))
+            .with_data(json!({ "rejected": true, "id": id, "name": entry.name })),
+        Ok(None) => Outcome::error(cmd, format!("no pending pairing request with id `{id}` (unknown, already resolved, or expired)"))
+            .with_data(json!({ "reason": "unknown-id", "id": id })),
+        Err(e) => Outcome::error(cmd, format!("removing the pairing request: {e}")),
+    }
+}
+
+/// The four `peer pair` verbs (P-P2), registered directly after the six
+/// legacy `peer` verbs — same-network federation's pairing ceremony joins
+/// the group it extends, nothing existing reorders.
+pub fn register_peer_pair(r: &mut Registry) {
+    r.insert(cmd!(
+        path: ["peer", "pair", "request"],
+        summary: "Send a pairing request to another aoide instance's A2A door and display the confirmation code (SAS) to compare out-of-band.",
+        args: [arg!("url", "string", true, "The other instance's A2A door URL (e.g. http://host:8710/).")],
+        flags: [
+            flag!("name", "string", "A local nickname for the other instance; defaults to a sanitized form of the URL's host."),
+            flag!("self-url", "string", "This instance's own advertised A2A door URL, for the later approval callback; defaults to http://<host>:<AOIDE_A2A_PORT or 8710>/."),
+        ],
+        gated: false,
+        implemented: true,
+        handler: handle_peer_pair_request,
+    ));
+    r.insert(cmd!(
+        path: ["peer", "pair", "pending"],
+        summary: "List pairing requests parked on this instance, each with its own independently-derived confirmation code.",
+        args: [],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_peer_pair_pending,
+    ));
+    r.insert(cmd!(
+        path: ["peer", "pair", "approve"],
+        summary: "Approve a pending pairing request after confirming its code matches (CLI y/N unless --yes) — writes verified peer records on both ends.",
+        args: [arg!("id", "string", true, "The pending pairing request's id (see `peer pair pending`).")],
+        flags: [
+            flag!("yes", "bool", "Skip the interactive y/N confirmation (scripted use)."),
+        ],
+        gated: false,
+        implemented: true,
+        handler: handle_peer_pair_approve,
+    ));
+    r.insert(cmd!(
+        path: ["peer", "pair", "reject"],
+        summary: "Refuse a pending pairing request — a clean removal, no peer record on either end.",
+        args: [arg!("id", "string", true, "The pending pairing request's id (see `peer pair pending`).")],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_peer_pair_reject,
+    ));
+}
+
 /// `adapter melete`'s handler (moved from the root package's `infra.rs`).
 fn handle_adapter_melete(_inv: &Invocation) -> Outcome {
     let status = crate::adapter::run_melete();
@@ -970,6 +1339,8 @@ mod tests {
             token_file: None,
             bearer_secret: bearer_secret.map(str::to_string),
             hub: false,
+            pubkey: None,
+            verified: false,
             added_at: "2026-08-24T00:00:00Z".to_string(),
         }
     }

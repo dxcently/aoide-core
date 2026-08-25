@@ -95,12 +95,15 @@ aoide-lyra = { path = "crates/lyra" }
 # `SigningKey::from_bytes` — one primitive (`fill`), no `rand_core`
 # dependency, no extra feature edge. `getrandom` needs no feature flag for
 # this either (`fill` is unconditional; `std`/`sys_rng` gate unrelated
-# surface). `sha2` is already in the resolved tree transitively (EdDSA's
-# own SHA-512 internals) but is NOT a direct dependency of anything this
-# workspace owns yet — P-P4 (signed wire requests) adds it directly only
-# when a canonical-string digest needs it, per this phase's own scope note.
+# surface). `sha2` was already in the resolved tree transitively (EdDSA's
+# own SHA-512 internals) before it became a direct dependency at P-P2 (the
+# pairing ceremony's SAS derivation, `docs/architecture/PAIRING.md`
+# decision 1 names it explicitly) — pinned to `0.11`, the exact version
+# `ed25519-dalek 3.0.0` already resolves, so this direct dependency adds no
+# second `sha2` version to the tree. Consumer: `aoide-storage::pairing`.
 ed25519-dalek = "3"
 getrandom = { version = "0.4", default-features = false }
+sha2 = "0.11"
 # `aoide-secrets` — Workstream SECRETS's secrets broker (named "vault"
 # until the P-V4b rename — same crate, no split-brain): TOTP, policy
 # types, replay ledger, otpauth:// URI construction (P-V1); the

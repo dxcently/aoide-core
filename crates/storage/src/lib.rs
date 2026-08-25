@@ -34,11 +34,18 @@
 //! its own module doc for the one-writer-covers-both-seams reasoning.
 //!
 //! `identity` (pairing workstream, P-P1, `docs/architecture/PAIRING.md`) is
-//! the newest: this instance's lazily-minted ed25519 keypair
-//! (`state/identity/`) — the substrate the pairing ceremony (P-P2),
-//! per-peer `allows` (P-P3), and signed wire requests (P-P4) all build on.
-//! Its own module doc states the private-key-never-serializes discipline
-//! and the mechanical test that holds it.
+//! this instance's lazily-minted ed25519 keypair (`state/identity/`) — the
+//! substrate the pairing ceremony (P-P2), per-peer `allows` (P-P3), and
+//! signed wire requests (P-P4) all build on. Its own module doc states the
+//! private-key-never-serializes discipline and the mechanical test that
+//! holds it.
+//!
+//! `pairing` (P-P2) is the newest: the ceremony's own park-and-approve
+//! state (`state/peer-pairing-inbound.json`/`-outbound.json`, one file per
+//! direction) and the SAS transcript-hash derivation both sides compute
+//! independently. `peer_store::Peer` gained `pubkey`/`verified` in the same
+//! phase — additive fields `peer_store::upsert_paired_peer` is the one
+//! write site for.
 
 pub mod a2a_store;
 pub mod addr;
@@ -51,6 +58,7 @@ pub mod identity;
 pub mod inbox;
 pub mod ledger;
 pub mod mode;
+pub mod pairing;
 pub mod peer_store;
 pub mod petname;
 pub mod records;

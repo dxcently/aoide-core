@@ -281,6 +281,8 @@ fn peer_add_against_an_unreachable_url_never_registers_and_pull_of_a_down_peer_m
         token_file: None,
         bearer_secret: None,
         hub: false,
+        pubkey: None,
+        verified: false,
         added_at: aoide_storage::time::now_iso_utc(),
     });
     aoide_storage::peer_store::save_peers(&peers).unwrap();
@@ -354,6 +356,90 @@ fn peer_remove_rejects_a_path_traversal_name_before_touching_the_cache_file() {
     let out = dispatch(&cli_invocation(&["peer", "remove"], &["../../evil"], &[]));
     assert_eq!(out.status, Status::Error);
     assert_eq!(out.data.unwrap()["reason"], "invalid-name");
+
+    let _ = std::fs::remove_dir_all(&root);
+    std::env::remove_var("AOIDE_STAGE_DIR");
+    std::env::remove_var("AOIDE_STATE_DIR");
+    std::env::remove_var("XDG_RUNTIME_DIR");
+    std::env::remove_var("AOIDE_AUDIT_LOG");
+}
+
+// ── The pairing ceremony's CLI half (P-P2) ───────────────────────────────
+
+#[test]
+fn peer_pair_request_rejects_an_invalid_name_without_touching_the_network_or_registry() {
+    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let root = unique_root("pair-request-invalid-name");
+    let _stage = setup_env(&root);
+
+    // Same short-circuit proof as `peer add`'s traversal test above: the
+    // url points at a port nothing listens on, so a `reason: invalid-name`
+    // (not a fetch error) proves the name check fired before any network
+    // I/O or identity mint.
+    let out = dispatch(&cli_invocation(
+        &["peer", "pair", "request"],
+        &["http://127.0.0.1:1/"],
+        &[("name", "../../evil")],
+    ));
+    assert_eq!(out.status, Status::Error);
+    assert_eq!(out.data.unwrap()["reason"], "invalid-name");
+    assert!(aoide_storage::peer_store::load_peers().is_empty(), "nothing registered");
+
+    let _ = std::fs::remove_dir_all(&root);
+    std::env::remove_var("AOIDE_STAGE_DIR");
+    std::env::remove_var("AOIDE_STATE_DIR");
+    std::env::remove_var("XDG_RUNTIME_DIR");
+    std::env::remove_var("AOIDE_AUDIT_LOG");
+}
+
+#[test]
+fn peer_pair_request_with_no_url_is_a_usage_error() {
+    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let root = unique_root("pair-request-no-url");
+    let _stage = setup_env(&root);
+
+    let out = dispatch(&cli_invocation(&["peer", "pair", "request"], &[], &[]));
+    assert_eq!(out.status, Status::Usage);
+
+    let _ = std::fs::remove_dir_all(&root);
+    std::env::remove_var("AOIDE_STAGE_DIR");
+    std::env::remove_var("AOIDE_STATE_DIR");
+    std::env::remove_var("XDG_RUNTIME_DIR");
+    std::env::remove_var("AOIDE_AUDIT_LOG");
+}
+
+#[test]
+fn peer_pair_approve_and_reject_on_an_unknown_id_leave_no_record_change() {
+    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let root = unique_root("pair-unknown-id");
+    let _stage = setup_env(&root);
+
+    let approve = dispatch(&cli_invocation(&["peer", "pair", "approve"], &["nosuchid"], &[("yes", "true")]));
+    assert_eq!(approve.status, Status::Error);
+    assert_eq!(approve.data.unwrap()["reason"], "unknown-id");
+    assert!(aoide_storage::peer_store::load_peers().is_empty(), "approve of an unknown id writes no peer");
+
+    let reject = dispatch(&cli_invocation(&["peer", "pair", "reject"], &["nosuchid"], &[]));
+    assert_eq!(reject.status, Status::Error);
+    assert_eq!(reject.data.unwrap()["reason"], "unknown-id");
+    assert!(aoide_storage::peer_store::load_peers().is_empty(), "reject of an unknown id writes no peer");
+
+    let _ = std::fs::remove_dir_all(&root);
+    std::env::remove_var("AOIDE_STAGE_DIR");
+    std::env::remove_var("AOIDE_STATE_DIR");
+    std::env::remove_var("XDG_RUNTIME_DIR");
+    std::env::remove_var("AOIDE_AUDIT_LOG");
+}
+
+#[test]
+fn peer_pair_pending_on_an_empty_registry_is_ok_with_an_empty_list() {
+    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let root = unique_root("pair-pending-empty");
+    let _stage = setup_env(&root);
+
+    let out = dispatch(&cli_invocation(&["peer", "pair", "pending"], &[], &[]));
+    assert_eq!(out.status, Status::Ok);
+    assert_eq!(out.data.unwrap()["requests"].as_array().unwrap().len(), 0);
 
     let _ = std::fs::remove_dir_all(&root);
     std::env::remove_var("AOIDE_STAGE_DIR");
