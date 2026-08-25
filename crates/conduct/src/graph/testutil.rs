@@ -10,7 +10,10 @@ use super::window::TermWindow;
 use aoide_protocol::Invocation;
 use serde_json::Map;
 use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) fn term_win(addr: &str, class: &str, cwd: &str) -> TermWindow {
     TermWindow {
         address: addr.into(),
@@ -72,16 +75,31 @@ pub(crate) fn fixture_projects() -> Vec<Project> {
 pub(crate) fn argv(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| s.to_string()).collect()
 }
+/// Monotonic per-process counter backing `unique_stage`'s directory name —
+/// see that function's doc for why a counter, not a nanosecond timestamp.
+static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Returns a fresh, already-created temp directory for one test's stage
+/// (frequently doubled as `$XDG_RUNTIME_DIR`, one path segment above where a
+/// `session-<id>.sock` control socket gets bound). The directory name is
+/// deliberately SHORT: a hash of `tag` plus pid plus a monotonic counter —
+/// never the tag text itself, never a full nanosecond timestamp. `AF_UNIX`
+/// addresses cap at `sizeof(sun_path)` (108 bytes on Linux), and this path
+/// sits under `$TMPDIR`, which varies (`/tmp` bare vs. `/tmp/nix-shell.XXXXXX`
+/// under `nix develop`). The old `aoide-graph-<tag>-<pid>-<nanos>` name ate
+/// most of that budget on its own — a long tag plus a 19-digit nanosecond
+/// timestamp plus a nix `$TMPDIR` plus `/aoide/session-<id>.sock` blew past
+/// `SUN_LEN` and panicked, poisoning `env_lock` for every test after it
+/// (#75). The hash keeps some of the tag's grep-ability (same tag, same
+/// prefix) without its length; the counter — not the timestamp — is what
+/// actually guarantees uniqueness between calls in the same process.
 pub(crate) fn unique_stage(tag: &str) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    tag.hash(&mut hasher);
+    let tag_hash = (hasher.finish() as u32) & 0xffff;
+    let seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
     let mut dir = std::env::temp_dir();
-    dir.push(format!(
-        "aoide-graph-{tag}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    dir.push(format!("ao{:x}-{:x}-{:x}", std::process::id(), tag_hash, seq));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
