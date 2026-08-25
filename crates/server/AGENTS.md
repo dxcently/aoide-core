@@ -161,24 +161,32 @@
   again with no state to reconcile. Don't reintroduce a peer-store write
   in this function, and don't drop/re-park the entry on a mismatch — both
   would commit or destroy state no human on this end confirmed.
-- **`message_send`'s Spawn arm gates on a resolved, paired, spawn-allowed
-  peer — never on `token_authorized` (P-P3, `docs/architecture/
-  PAIRING.md` decision 6).** `peer_may_spawn(peer)` (`verified &&
-  allows.contains("spawn")`) is the ONLY admission check; the door-wide
-  bearer that gates every OTHER arm (read verbs, the uniform-response
-  guard, Inject's `effective_origin` coupling) is not consulted here at
-  all. `aoide_storage::peer_store::resolve_peer` is the identity ladder —
-  a presented token against a peer's own `token_file`, else the TCP
-  origin against that peer's `url` — and it is honest, not
-  cryptographically bound: neither signal is unforgeable until P-P4 lands
-  (see `message_send`'s own doc comment for the full note). Don't invent
-  an interim signature scheme to "strengthen" this in the meantime — that
-  is P-P4's own lane, scoped and reviewed separately. No test in this file
-  drives `do_spawn`'s real OS-level process spawn (an established
-  precedent, `spawn_inject_prompts_success_branch_files_the_opening_
-  turn_into_the_inbox`'s own doc comment) — the gate itself is proven via
-  the pure `peer_may_spawn` predicate and `message_send`'s REFUSAL
-  branches only.
+- **`message_send`'s Spawn arm gates on `spawn_admitted`, which requires a
+  resolved, paired, spawn-allowed peer identified via its OWN TOKEN —
+  never on `token_authorized`, and never on the address rung (P-P3,
+  `docs/architecture/PAIRING.md` decision 6).**
+  `aoide_storage::peer_store::resolve_peer` is the identity ladder — a
+  presented token against a peer's own `token_file` FIRST
+  (`PeerRung::Token`), else the TCP origin against that peer's `url`
+  SECOND (`PeerRung::Addr`) — and `spawn_admitted` accepts ONLY a
+  `PeerRung::Token` resolution, deferring the peer-side check to
+  `peer_may_spawn(peer)` (`verified && allows.contains("spawn")`) only in
+  that case. The address rung still resolves a peer identity for every
+  OTHER purpose (Inject's `from` attribution, autogate) — it is excluded
+  from Spawn specifically, since a bare source-address match carries no
+  possession proof and would otherwise let a shared NAT/reverse-proxy
+  address spawn a process attributed to whichever peer's `url` it happens
+  to match. The door-wide bearer that gates every OTHER arm (read verbs,
+  the uniform-response guard, Inject's `effective_origin` coupling) is not
+  consulted here at all. Neither rung is cryptographically bound to the
+  caller: unforgeable per-request binding is P-P4's own lane, not invented
+  here (see `message_send`'s own doc comment for the full honesty note).
+  Don't invent an interim signature scheme to "strengthen" this in the
+  meantime. No test in this file drives `do_spawn`'s real OS-level process
+  spawn (an established precedent, `spawn_inject_prompts_success_branch_
+  files_the_opening_turn_into_the_inbox`'s own doc comment) — the gate
+  itself is proven via the pure `peer_may_spawn`/`spawn_admitted`
+  predicates and `message_send`'s REFUSAL branches only.
 - **`do_inject`'s `from` attribution (P-P3 decision 7) is scoped to the
   QUEUED path only — never an immediately-delivered payload's bytes.**
   `session_send`'s own `from` mechanism also prefixes DELIVERED text

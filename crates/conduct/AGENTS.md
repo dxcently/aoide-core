@@ -175,7 +175,14 @@
   already threads a per-child fact from a spawning process into a
   `conduct` child). No `restage_graph()` — like `headless`, `origin` is
   consumed internally (`doc.rs::ledger_session_exit`'s projection into the
-  durable ledger), not rendered into `graph.json`.
+  durable ledger), not rendered into `graph.json`. **`origin` is
+  attribution, not authentication** — `stamp_origin` trusts whatever
+  `AOIDE_SESSION_ORIGIN` says, and any same-uid process can set that var
+  before running `aoide conduct` and forge `"peer:X"` with no door
+  involved at all; don't let a future consumer gate a decision on it
+  without first upgrading it to an authenticated channel (task #63's
+  lane) — it is exactly as spoofable as `--from`/`AOIDE_SESSION_ID`
+  already are.
 
 ## Extension points
 

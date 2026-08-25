@@ -141,7 +141,13 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   set, so `origin` stays absent. No `graph.json` projection (like
   `headless`/`hookAncestry`, consumed internally, not rendered) —
   `doc.rs::ledger_session_exit` is the ONE place it surfaces, projected
-  verbatim into the durable session ledger's own `origin` field.
+  verbatim into the durable session ledger's own `origin` field. `origin`
+  is attribution, not authentication: any same-uid process can set
+  `AOIDE_SESSION_ORIGIN` before running `aoide conduct` and forge
+  `"peer:X"` with no door involved, the same ordinary spoofable
+  same-user process state `--from`/`AOIDE_SESSION_ID` already are — nothing
+  may ever gate on it without upgrading it to an authenticated channel
+  first (task #63's lane).
 - `who` — `aoide who [filter] [--json] [--all]` (`graph/who.rs`): live
   presence over this box's own sessions plus every registered peer,
   probed in parallel on each invocation (messaging workstream C2). A

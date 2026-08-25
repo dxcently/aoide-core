@@ -95,9 +95,10 @@ pub struct Peer {
     /// shape `hub` set the precedent for: an old `peers.json` deserializes
     /// `verified: false` on every entry, and an unverified entry omits the
     /// key entirely rather than writing `"verified":false` everywhere.
-    /// Nothing in this phase reads `verified` to gate `allows`/spawn — that
-    /// wiring is P-P3's lane (`PAIRING.md`'s phase table); this field only
-    /// records the ceremony's own outcome.
+    /// `verified` alone grants nothing; combined with a `"spawn"`-carrying
+    /// `allows` (below) AND a TOKEN-rung resolution ([`resolve_peer`]'s
+    /// stronger rung, never the address one), it is what the A2A door's
+    /// spawn arm requires (P-P3, decision 6, `a2a.rs::spawn_admitted`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub verified: bool,
     /// This peer's capability set (P-P3, `docs/architecture/PAIRING.md`
@@ -315,25 +316,50 @@ pub fn set_peer_allow(peers: &mut [Peer], name: &str, cap: &str, on: bool) -> Re
     }
 }
 
+/// WHICH signal resolved a caller to a [`Peer`] ([`resolve_peer`], P-P3
+/// decision 6). The two rungs are not interchangeable strength: `Token` is
+/// possession of that peer's own `token_file` secret — it survives any
+/// reverse proxy/NAT, the same reason [`is_autogated_peer_token`] is
+/// preferred over the address check for autogate. `Addr` is a bare
+/// TCP-source-IP-vs-`url` match — spoofable by anyone who can reach the
+/// door from that address, or who merely sits behind the same NAT/proxy as
+/// the real peer. Both rungs are fine for ATTRIBUTION (Inject's `from`
+/// field, origin-stamping) and for autogate's existing "skip the pending
+/// queue" question; the A2A door's spawn arm is the one consumer narrow
+/// enough to require `Token` specifically (`a2a.rs::spawn_admitted`,
+/// amendment 2026-08-25 to decision 6 — the addr rung must never itself
+/// authorize launching a process attributed to the matched peer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerRung {
+    Token,
+    Addr,
+}
+
 /// Resolve the CALLING peer's identity (P-P3, PAIRING.md decision 6) — the
-/// specific registered [`Peer`] a caller's presented credential names,
-/// independent of that peer's own `autogate` flag. Unlike
-/// [`is_autogated_peer_token`]/[`is_autogated_peer_addr`] (which fold ONLY
-/// over `autogate`-marked peers, for the unrelated "skip the pending queue"
-/// question), this looks at EVERY registered peer — a gate that needs to
-/// know WHICH peer is calling (not merely "does some autogate-marked peer
-/// match") goes through this instead.
+/// specific registered [`Peer`] a caller's presented credential names, PLUS
+/// which [`PeerRung`] matched, independent of that peer's own `autogate`
+/// flag. Unlike [`is_autogated_peer_token`]/[`is_autogated_peer_addr`]
+/// (which fold ONLY over `autogate`-marked peers, for the unrelated "skip
+/// the pending queue" question), this looks at EVERY registered peer — a
+/// gate that needs to know WHICH peer is calling (not merely "does some
+/// autogate-marked peer match") goes through this instead.
 ///
-/// Ladder, first match wins: a presented bearer token that matches a peer's
-/// OWN `token_file` ([`token_bytes_eq`], the mechanism that survives a
-/// reverse proxy — same precedence [`is_autogated_peer_token`]'s own doc
-/// gives it) is tried FIRST; failing that, an `addr` whose host resolves
-/// against a peer's registered `url` ([`peer_url_matches_addr`]) is tried
-/// second. `None` for an unmatched token, a missing/unmatched address, or
-/// both — a caller presenting only the door-wide bearer (which by
-/// construction matches no PEER's own `token_file`) never resolves to a
-/// name here.
-pub fn resolve_peer<'a>(peers: &'a [Peer], addr: Option<IpAddr>, presented_token: Option<&str>) -> Option<&'a Peer> {
+/// Ladder, first match wins, first REGISTRY-ORDER match within a rung: a
+/// presented bearer token that matches a peer's OWN `token_file`
+/// ([`token_bytes_eq`], the mechanism that survives a reverse proxy — same
+/// precedence [`is_autogated_peer_token`]'s own doc gives it) is tried
+/// FIRST (`PeerRung::Token` on a hit); failing that, an `addr` whose host
+/// resolves against a peer's registered `url` ([`peer_url_matches_addr`])
+/// is tried second (`PeerRung::Addr` on a hit). `None` for an unmatched
+/// token, a missing/unmatched address, or both — a caller presenting only
+/// the door-wide bearer (which by construction matches no PEER's own
+/// `token_file`) never resolves to a name here. `peer add` only refuses a
+/// duplicate NAME (CONTRACTS.md §7) — two peers sharing a URL host, or two
+/// `token_file`s that happen to hold identical bytes, are both possible,
+/// and either ladder step then resolves to whichever of them iterates
+/// first (registry insertion order — `peers.json`'s `peers` array order,
+/// unchanged by this function).
+pub fn resolve_peer<'a>(peers: &'a [Peer], addr: Option<IpAddr>, presented_token: Option<&str>) -> Option<(&'a Peer, PeerRung)> {
     if let Some(t) = presented_token {
         if let Some(p) = peers.iter().find(|p| {
             p.token_file
@@ -342,11 +368,11 @@ pub fn resolve_peer<'a>(peers: &'a [Peer], addr: Option<IpAddr>, presented_token
                 .map(|raw| token_bytes_eq(raw.trim(), t))
                 .unwrap_or(false)
         }) {
-            return Some(p);
+            return Some((p, PeerRung::Token));
         }
     }
     let addr = addr?;
-    peers.iter().find(|p| peer_url_matches_addr(&p.url, addr))
+    peers.iter().find(|p| peer_url_matches_addr(&p.url, addr)).map(|p| (p, PeerRung::Addr))
 }
 
 /// A default local nickname for a peer named only by URL (`aoide peer pair
@@ -1150,7 +1176,7 @@ mod tests {
         let peers = vec![paired];
 
         let resolved = resolve_peer(&peers, None, Some("secret-b"));
-        assert_eq!(resolved.map(|p| p.name.as_str()), Some("box-b"));
+        assert_eq!(resolved.map(|(p, rung)| (p.name.as_str(), rung)), Some(("box-b", PeerRung::Token)));
         assert!(resolve_peer(&peers, None, Some("wrong")).is_none());
         assert!(resolve_peer(&peers, None, None).is_none(), "no token, no address — nothing to resolve against");
 
@@ -1163,16 +1189,57 @@ mod tests {
         let peers = vec![peer];
         let ip: IpAddr = "10.0.0.5".parse().unwrap();
 
-        assert_eq!(resolve_peer(&peers, Some(ip), None).map(|p| p.name.as_str()), Some("box-b"));
+        assert_eq!(
+            resolve_peer(&peers, Some(ip), None).map(|(p, rung)| (p.name.as_str(), rung)),
+            Some(("box-b", PeerRung::Addr))
+        );
         // A presented token that matches NO peer's own token_file still
         // falls through to the address ladder rather than short-circuiting
         // to None — the door-wide-bearer-only case (no peer token_file set
         // anywhere) resolves by address exactly as if no token was sent.
-        assert_eq!(resolve_peer(&peers, Some(ip), Some("door-wide-bearer")).map(|p| p.name.as_str()), Some("box-b"));
+        assert_eq!(
+            resolve_peer(&peers, Some(ip), Some("door-wide-bearer")).map(|(p, rung)| (p.name.as_str(), rung)),
+            Some(("box-b", PeerRung::Addr))
+        );
 
         let stranger: IpAddr = "10.0.0.9".parse().unwrap();
         assert!(resolve_peer(&peers, Some(stranger), None).is_none());
         assert!(resolve_peer(&[], Some(ip), None).is_none(), "an empty registry resolves nothing");
+    }
+
+    #[test]
+    fn resolve_peer_ambiguity_is_a_deterministic_first_registry_order_match_not_last_or_random() {
+        // `peer add` refuses only a duplicate NAME (CONTRACTS.md §7) — two
+        // peers can share a url host, or hold token_files with byte-identical
+        // contents, and resolve_peer must still answer deterministically
+        // rather than "whichever the iterator happens to land on."
+        let dir = std::env::temp_dir().join(format!("aoide-peer-resolve-ambiguous-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let token_path = dir.join("shared.token");
+        std::fs::write(&token_path, "shared-secret\n").unwrap();
+
+        let mut first = fixture_peer("first-registered", "http://10.0.0.5:8710/", false);
+        first.token_file = Some(token_path.to_string_lossy().into_owned());
+        let mut second = fixture_peer("second-registered", "http://10.0.0.5:8710/", false);
+        second.token_file = Some(token_path.to_string_lossy().into_owned());
+        let peers = vec![first, second];
+
+        // Same URL host, same token bytes — the FIRST entry in registry
+        // (array) order wins on either rung, every time, not the last one.
+        let ip: IpAddr = "10.0.0.5".parse().unwrap();
+        assert_eq!(
+            resolve_peer(&peers, Some(ip), None).map(|(p, _)| p.name.as_str()),
+            Some("first-registered"),
+            "addr rung: first registry-order match wins"
+        );
+        assert_eq!(
+            resolve_peer(&peers, None, Some("shared-secret")).map(|(p, _)| p.name.as_str()),
+            Some("first-registered"),
+            "token rung: first registry-order match wins"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── `default_peer_name_from_url` ─────────────────────────────────────────

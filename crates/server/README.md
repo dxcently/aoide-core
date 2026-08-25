@@ -184,20 +184,30 @@ the inbound half of the two-door contract (the outbound half is
   **The Spawn arm's gate (P-P3, PAIRING.md decision 6)** —
   `message_send`'s `SendAction::Spawn` arm no longer consults
   `token_authorized` (the door-wide bearer, 2026-08-19's own amendment) at
-  all: it requires `aoide_storage::peer_store::resolve_peer` (origin
-  address / a peer's own `token_file`, the SAME identification ladder
+  all: it requires `spawn_admitted`, which calls
+  `aoide_storage::peer_store::resolve_peer` (origin address / a peer's own
+  `token_file`, the SAME identification ladder
   `is_autogated_peer_addr`/`is_autogated_peer_token` already fold, just
-  unfiltered by `autogate` and narrowed to ONE named peer) to resolve to a
-  peer that is BOTH `verified` and carries `"spawn"` in `allows`
-  (`peer_may_spawn`, pure and directly unit-tested against `Peer` fixtures
-  — no test in this file drives `do_spawn`'s real OS-level process spawn,
-  same house rule every other Spawn-arm test already follows). A caller
-  holding only the plain door-wide bearer, with no peer identity behind it,
-  gets the taught `-32006` refusal naming the pairing ceremony. **Honesty
-  note**: this resolution rides the SAME two pre-pairing mechanisms above,
-  not a new signature — P-P4 is what makes either one unforgeable
-  (CONTRACTS.md §6's own amendment carries the full note). The resolved
-  peer's name also threads two ways past the gate: `do_spawn` sets
+  unfiltered by `autogate` and narrowed to ONE named peer, returning WHICH
+  rung matched as `PeerRung::Token`/`PeerRung::Addr`) and accepts ONLY a
+  `PeerRung::Token` resolution to a peer that is BOTH `verified` and
+  carries `"spawn"` in `allows` (`peer_may_spawn`, pure and directly
+  unit-tested against `Peer` fixtures — no test in this file drives
+  `do_spawn`'s real OS-level process spawn, same house rule every other
+  Spawn-arm test already follows). The `PeerRung::Addr` resolution is
+  refused outright regardless of `allows` — a bare TCP-source-IP-vs-`url`
+  match carries no possession proof, and behind any NAT/reverse-proxy
+  deployment would otherwise let a shared source address spawn a process
+  attributed to whichever peer's `url` it happens to match; that rung
+  still resolves a peer identity for attribution/origin-stamping purposes
+  below, just never for Spawn. A caller holding only the plain door-wide
+  bearer, with no peer identity behind it, gets the taught `-32006`
+  refusal naming both remaining prerequisites (the pairing ceremony and a
+  configured `token_file`). **Honesty note**: even the token rung rides
+  the SAME pre-pairing mechanism above, not a new per-request
+  signature — P-P4 is what makes it unforgeable (CONTRACTS.md §6's own
+  amendment carries the full note). The resolved peer's name also threads
+  two ways past the gate: `do_spawn` sets
   `AOIDE_SESSION_ORIGIN=peer:<name>` on the child it launches (read by
   `aoide-conduct`'s `session_conduct`, which stamps
   `SessionRecord.origin`), and the Inject arm's own `resolved_peer` (a

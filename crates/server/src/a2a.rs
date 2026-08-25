@@ -969,34 +969,44 @@ fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path, peer_name: &str) ->
 ///   amendment closes — Spawn was origin-blind AND token-blind before it.
 ///
 /// **Amendment (2026-08-25, P-P3): the Spawn arm is regated a SECOND time —
-/// from the door-wide bearer to a named, paired peer.** PAIRING.md decision
-/// 6: spawning now requires the caller to resolve to a specific,
-/// `verified` `aoide_storage::peer_store::Peer` whose `allows` contains
-/// `"spawn"` — [`token_authorized`] (the 2026-08-19 amendment above) is no longer
-/// consulted at all for Spawn; holding the plain door-wide bearer, with no
-/// peer identity behind it, no longer reaches [`do_spawn`]. The refusal is
-/// `-32006`, naming the pairing ceremony (`peer pair request`).
-///
-/// **HONESTY NOTE (P-P4 not yet landed):** "resolve to a peer" today rides
-/// the SAME inbound identification this file already had before pairing
-/// existed — there is no per-request signature yet (that is P-P4's own
-/// lane, `docs/architecture/PAIRING.md`'s "Wire authentication" section).
-/// [`aoide_storage::peer_store::resolve_peer`] is the ladder: a presented
-/// bearer that matches a peer's own `token_file` FIRST (survives a proxy),
-/// else the TCP-observed `origin` address against that peer's registered
-/// `url` SECOND — the exact same two signals [`is_autogated_peer_token`]/
+/// from the door-wide bearer to a named, paired peer resolved via its OWN
+/// token.** PAIRING.md decision 6: spawning requires the caller to resolve
+/// to a specific, `verified` `aoide_storage::peer_store::Peer` whose
+/// `allows` contains `"spawn"` — [`token_authorized`] (the 2026-08-19
+/// amendment above) is no longer consulted at all for Spawn; holding the
+/// plain door-wide bearer, with no peer identity behind it, no longer
+/// reaches [`do_spawn`]. [`spawn_admitted`] is the full check, and it is
+/// narrower than "resolved to *some* peer": [`aoide_storage::peer_store::
+/// resolve_peer`] answers via one of two rungs — a presented bearer that
+/// matches a peer's own `token_file` (survives a reverse proxy) or, failing
+/// that, the TCP-observed `origin` address against that peer's registered
+/// `url` (the exact same two signals [`is_autogated_peer_token`]/
 /// [`is_autogated_peer_addr`] already fold for the unrelated autogate
 /// question, just unfiltered by `autogate` and narrowed to ONE specific
-/// peer rather than a bool. Neither signal is cryptographically bound to
-/// the caller: a `token_file`'s bearer is a shared secret (spoofable by
-/// anyone who can read that file or sniff the header), and a source
-/// address is spoofable by anyone who can reach the door from that address
-/// (or sits behind the same proxy/NAT). **The gate SHAPE (paired + `spawn`
-/// in `allows`) is what this phase lands; the UNFORGEABLE binding — a
+/// peer). Spawn accepts ONLY the token rung — a bare address match resolves
+/// a peer identity for attribution (Inject's `from` field, origin-stamping)
+/// and for the ordinary autogate question, but never for spawning a process
+/// attributed to that peer; behind any NAT/reverse-proxy deployment an
+/// address match is exactly the shared-source-IP situation that would
+/// otherwise let one tenant spawn "as" another. The refusal is `-32006`,
+/// naming both remaining prerequisites: the pairing ceremony (`peer pair
+/// request`) and a configured `token_file` (`peer add --token-file`).
+///
+/// **HONESTY NOTE (P-P4 not yet landed):** even narrowed to the token rung,
+/// resolution here rides the SAME inbound identification this file already
+/// had before pairing existed — there is no per-request signature yet (that
+/// is P-P4's own lane, `docs/architecture/PAIRING.md`'s "Wire
+/// authentication" section). A `token_file`'s bearer is a shared secret,
+/// not a proof of possession bound to any one request: it is spoofable by
+/// anyone who can read that file or sniff the header, and identical across
+/// every request the true peer or an impersonator ever sends. **The gate
+/// SHAPE (paired + `spawn` in `allows` + resolved via the TOKEN rung
+/// specifically) is what this phase lands; the UNFORGEABLE binding — a
 /// per-request ed25519 signature over method/path/timestamp/nonce/body —
 /// is P-P4's, not invented here.** Until P-P4 lands, a resolved peer
-/// identity is only as strong as whichever of these two legacy mechanisms
-/// carried it.
+/// identity is only as strong as whichever `token_file` carried it, and the
+/// address rung is excluded from Spawn specifically because it carries no
+/// possession proof at all.
 ///
 /// **Amendment (2026-08-20, #50): a context-id send answers UNIFORMLY, not
 /// with a hard gate, once a token is configured and the caller holds
@@ -1043,15 +1053,18 @@ fn message_send(
         .unwrap_or(false);
     let autogate_match = ip_autogate || token_autogate;
 
-    // The caller's resolved peer IDENTITY (P-P3, PAIRING.md decision 6/7) —
-    // deliberately a SEPARATE question from `ip_autogate`/`token_autogate`
-    // above (which fold ONLY over `autogate`-marked peers, for the
-    // unrelated "skip the pending queue" question): `resolve_peer` looks at
-    // EVERY registered peer, autogate or not. Used two ways below: the
-    // Spawn arm requires it to be a VERIFIED peer with `spawn` in `allows`
-    // (the hard gate); the Inject arm, when it queues, stamps it onto
-    // `pending.json`'s `from` field for attribution only (never a gate —
-    // see `do_inject`'s own doc comment).
+    // The caller's resolved peer IDENTITY, PLUS which rung resolved it
+    // (P-P3, PAIRING.md decision 6/7) — deliberately a SEPARATE question
+    // from `ip_autogate`/`token_autogate` above (which fold ONLY over
+    // `autogate`-marked peers, for the unrelated "skip the pending queue"
+    // question): `resolve_peer` looks at EVERY registered peer, autogate or
+    // not. Used two ways below, DELIBERATELY UNEQUALLY: the Inject arm, when
+    // it queues, stamps EITHER rung onto `pending.json`'s `from` field for
+    // attribution only (never a gate — see `do_inject`'s own doc comment);
+    // the Spawn arm's `spawn_admitted` below requires specifically the
+    // TOKEN rung — a bare address match must never itself authorize
+    // launching a process attributed to the matched peer (2026-08-25
+    // narrowing, see `spawn_admitted`'s own doc comment).
     let addr = match origin {
         PeerOrigin::Remote(ip) => Some(ip),
         PeerOrigin::Loopback | PeerOrigin::Unknown => None,
@@ -1091,46 +1104,81 @@ fn message_send(
             // `autogated_peer_delivers_despite_being_non_loopback`), while
             // still attributing every entry that actually reaches
             // `pending.json`.
-            let from = if deliver_now { None } else { resolved_peer.map(|p| format!("peer:{}", p.name)) };
+            let from = if deliver_now { None } else { resolved_peer.map(|(p, _rung)| format!("peer:{}", p.name)) };
             do_inject(&session_id, &prompt, audit_log, deliver_now, from.as_deref())
         }
-        SendAction::Spawn { agent_cmd } => match resolved_peer.filter(|p| peer_may_spawn(p)) {
-            Some(peer) => do_spawn(&agent_cmd, &prompt, audit_log, &peer.name),
-            None => {
+        SendAction::Spawn { agent_cmd } => {
+            if spawn_admitted(resolved_peer) {
+                let peer = resolved_peer.expect("spawn_admitted only returns true when resolved_peer is Some").0;
+                do_spawn(&agent_cmd, &prompt, audit_log, &peer.name)
+            } else {
                 let _ = audit(
                     audit_log,
                     Door::A2a,
                     EventClass::Audit,
                     "a2a.message/send",
                     "unauthorized",
-                    "spawn refused: the caller does not resolve to a PAIRED peer with `spawn` allowed",
+                    "spawn refused: the caller does not resolve, via its own token, to a PAIRED peer with `spawn` allowed",
                 );
                 Err(spawn_requires_pairing())
             }
-        },
+        }
         SendAction::Error { code, msg } => Err((code, msg)),
     }
 }
 
-/// The Spawn admission predicate itself (P-P3, PAIRING.md decision 6) — a
-/// paired peer whose `allows` contains `"spawn"`. Pure, split out of
-/// [`message_send`] so the gate table (paired+allowed / paired+denied /
-/// unpaired) is directly unit-testable against plain `Peer` fixtures,
-/// without ever touching [`do_spawn`]'s real OS-level process spawn.
+/// The peer-side half of the Spawn admission check (P-P3, PAIRING.md
+/// decision 6) — a paired peer whose `allows` contains `"spawn"`. Pure,
+/// split out of [`message_send`] so the gate table (paired+allowed /
+/// paired+denied / unpaired) is directly unit-testable against plain
+/// `Peer` fixtures, without ever touching [`do_spawn`]'s real OS-level
+/// process spawn. Deliberately says nothing about HOW the caller resolved
+/// to this peer — that question is [`spawn_admitted`]'s job, one layer up.
 fn peer_may_spawn(peer: &aoide_storage::peer_store::Peer) -> bool {
     peer.verified && peer.allows.iter().any(|a| a == "spawn")
 }
 
-/// The `-32006` refusal every unpaired/unallowed Spawn attempt returns
-/// (P-P3) — a distinct code from `unauthorized()`'s `-32005` (the door-wide
-/// bearer gate every OTHER arm still uses), since this is a DIFFERENT
-/// question: not "do you hold a valid door-wide token" but "do you resolve
-/// to a specific peer this operator has paired with and allowed to spawn."
+/// The Spawn arm's FULL admission check (P-P3 decision 6, narrowed
+/// 2026-08-25): a resolved peer only reaches [`do_spawn`] when the TOKEN
+/// rung matched — never the ADDR rung. Before this narrowing,
+/// `resolve_peer`'s address fallback (a bare TCP-source-IP-vs-`url` match)
+/// could itself put a caller into the Spawn arm attributed as whichever
+/// peer's `url` its source address happened to match; behind any
+/// NAT/reverse-proxy deployment that is a straight line from "message
+/// delivered a little faster" (the address rung's original, and still
+/// legitimate, purpose — Inject attribution, autogate) to "spawn a session
+/// as someone else." The address rung keeps resolving a peer identity for
+/// every OTHER purpose (Inject's `from` attribution, origin-stamping); this
+/// function is the ONE place the narrowing to token-only lives, rather than
+/// re-derived at each call site. Pure — unit-testable directly against
+/// `(Peer, PeerRung)` fixtures without touching [`do_spawn`]'s real
+/// OS-level process spawn, the same "predicate-level, not through
+/// `message_send`" precedent [`peer_may_spawn`]'s own doc comment already
+/// established for the positive case.
+fn spawn_admitted(resolved: Option<(&aoide_storage::peer_store::Peer, aoide_storage::peer_store::PeerRung)>) -> bool {
+    match resolved {
+        Some((peer, aoide_storage::peer_store::PeerRung::Token)) => peer_may_spawn(peer),
+        Some((_, aoide_storage::peer_store::PeerRung::Addr)) | None => false,
+    }
+}
+
+/// The `-32006` refusal every unpaired/unallowed/addr-only-resolved Spawn
+/// attempt returns (P-P3) — a distinct code from `unauthorized()`'s
+/// `-32005` (the door-wide bearer gate every OTHER arm still uses), since
+/// this is a DIFFERENT question: not "do you hold a valid door-wide token"
+/// but "do you resolve, via your OWN token, to a specific peer this
+/// operator has paired with and allowed to spawn." One message covers
+/// every refusal branch uniformly (never paired, paired but `spawn` not in
+/// `allows`, or resolved only via the address rung) because all three need
+/// the SAME two remaining prerequisites named: pairing, and a configured
+/// `token_file` — an addr-resolved caller is not told "you're already
+/// fine," since address alone never admits spawn.
 fn spawn_requires_pairing() -> (i64, String) {
     (
         -32006,
-        "spawn refused: the caller does not resolve to a PAIRED peer whose `allows` includes \
-         `spawn` — pair first via `peer pair request`, then `peer allow <name> spawn on`"
+        "spawn refused: spawn requires the caller be identified via its own `token_file` \
+         (an address match alone never admits spawn) — pair first via `peer pair request`, \
+         set `peer add --token-file <path>` if not already configured, then `peer allow <name> spawn on`"
             .to_string(),
     )
 }
@@ -3363,7 +3411,9 @@ mod tests {
     // ── Spawn gate table (P-P3, PAIRING.md decision 6) ───────────────────────
     //
     // `peer_may_spawn` (the pure predicate) covers paired+allowed / paired+
-    // denied / unpaired directly against `Peer` fixtures — never through
+    // denied / unpaired, and `spawn_admitted` (the full check, folding in
+    // WHICH rung resolved the caller) covers token-rung-admitted /
+    // addr-rung-refused, both directly against fixtures — never through
     // `message_send`/`do_spawn`, which would actually launch a process (see
     // `spawn_inject_prompts_success_branch_files_the_opening_turn_into_the_inbox`'s
     // own doc comment on why no test in this file drives `do_spawn`'s real
@@ -3384,6 +3434,30 @@ mod tests {
         let mut unpaired = paired_allowed.clone();
         unpaired.verified = false; // never completed the ceremony.
         assert!(!peer_may_spawn(&unpaired), "allows populated but never verified — still refused");
+    }
+
+    #[test]
+    fn spawn_admitted_requires_the_token_rung_specifically() {
+        // The 2026-08-25 narrowing (review finding on P-P3): `peer_may_spawn`
+        // alone says nothing about HOW the caller resolved to this peer —
+        // `spawn_admitted` is the full check, and it must refuse the SAME
+        // paired+allowed peer when only the address rung matched. Proven at
+        // the predicate/wiring level directly against `(Peer, PeerRung)`
+        // fixtures, the same "never through `message_send`/`do_spawn`"
+        // precedent this suite already holds for the positive case.
+        let mut paired_allowed = fixture_peer("box-b", "http://10.0.0.5:8710/", false);
+        paired_allowed.verified = true;
+        paired_allowed.allows = vec!["read".to_string(), "spawn".to_string()];
+
+        assert!(
+            spawn_admitted(Some((&paired_allowed, aoide_storage::peer_store::PeerRung::Token))),
+            "paired + spawn in allows + resolved via its OWN token — admitted"
+        );
+        assert!(
+            !spawn_admitted(Some((&paired_allowed, aoide_storage::peer_store::PeerRung::Addr))),
+            "the SAME paired+allowed peer, resolved only by address — refused: address alone never admits spawn"
+        );
+        assert!(!spawn_admitted(None), "no resolution at all — refused");
     }
 
     #[test]
@@ -3408,6 +3482,49 @@ mod tests {
         let remote_origin = PeerOrigin::Remote("10.0.0.5".parse().unwrap());
         let err = message_send(&params, &root.join("log"), "claude", remote_origin, "", None).unwrap_err();
         assert_eq!(err.0, -32006, "resolved to a REAL peer, but `spawn` is not in its allows");
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+    }
+
+    #[test]
+    fn message_send_spawn_refuses_an_addr_resolved_paired_and_allowed_peer_with_no_token_file_configured() {
+        // The gap the 2026-08-25 review finding closed: a peer that IS
+        // paired AND has `spawn` in `allows` — everything decision 6
+        // originally asked for — but has no `token_file` set, so it can
+        // ONLY resolve via the address rung. Before the narrowing this
+        // would have reached `do_spawn`; behind any NAT/reverse-proxy
+        // deployment a shared source address is exactly the unsigned
+        // signal that must never itself authorize launching a process
+        // attributed to this peer.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-spawn-addr-only-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", root.join("stage"));
+        std::env::set_var("AOIDE_STATE_DIR", root.join("state"));
+
+        let mut peer = fixture_peer("addr-only-peer", "http://10.0.0.5:8710/", false);
+        peer.verified = true;
+        peer.allows = vec!["read".to_string(), "spawn".to_string()];
+        // `token_file` deliberately left `None` — this peer can only ever
+        // resolve via the address rung.
+        aoide_storage::peer_store::save_peers(&[peer]).unwrap();
+
+        let params = json!({ "message": { "parts": [{ "kind": "text", "text": "hi" }] } });
+        let remote_origin = PeerOrigin::Remote("10.0.0.5".parse().unwrap());
+        let err = message_send(&params, &root.join("log"), "claude", remote_origin, "", None).unwrap_err();
+        assert_eq!(
+            err.0, -32006,
+            "paired AND `spawn` in allows, but resolved ONLY via address — still refused"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
         match saved {

@@ -42,12 +42,23 @@ cache (CONTRACTS.md §7). File-first by decision — no embedded database yet
   <name> <cap> on|off`'s library half) is the only OTHER writer —
   idempotent, refuses an unknown peer or an unknown capability (the
   capability check runs first). `resolve_peer` (decision 6) is the
-  caller-identity ladder the A2A door's spawn gate keys off: a presented
-  bearer against a peer's own `token_file` first, an origin address
-  against that peer's `url` second — unlike `is_autogated_peer_token`/
+  caller-identity ladder the A2A door keys off, returning WHICH `PeerRung`
+  matched alongside the `Peer`: a presented bearer against a peer's own
+  `token_file` first (`PeerRung::Token`), an origin address against that
+  peer's `url` second (`PeerRung::Addr`) — unlike `is_autogated_peer_token`/
   `is_autogated_peer_addr` above, it looks at EVERY registered peer, not
   only `autogate`-marked ones, since resolving WHICH peer is calling is a
-  different question from "should this peer skip the pending queue."
+  different question from "should this peer skip the pending queue." The
+  two rungs are not interchangeable strength: `aoide-server`'s spawn arm
+  (`spawn_admitted`) accepts ONLY `PeerRung::Token` — a bare address match
+  carries no possession proof and must never itself authorize launching a
+  process attributed to the matched peer — while `PeerRung::Addr` remains
+  fine for attribution/origin-stamping and the ordinary autogate question.
+  Ambiguity resolves deterministically: `peer add` refuses only a
+  duplicate NAME (CONTRACTS.md §7), so two peers can share a URL host or
+  hold byte-identical `token_file` contents, and `resolve_peer` then
+  answers with whichever matches FIRST in registry (array) order — not
+  the last, not random.
 - `pairing` — the pairing ceremony's own park-and-approve state (P-P2,
   `docs/architecture/PAIRING.md`, CONTRACTS.md §4's `state/peer-pairing-
   inbound.json`/`-outbound.json` subsection): two disk-persisted queues,
@@ -104,7 +115,14 @@ cache (CONTRACTS.md §7). File-first by decision — no embedded database yet
   present (possibly `null`) on the closed ledger line — `SessionRecord`'s
   own value is projected verbatim into the `LedgerEntry` at exit, the same
   "additive live field, always-serialized ledger field" shape
-  `resumedFrom` already set the precedent for.
+  `resumedFrom` already set the precedent for. `origin` is attribution,
+  not authentication — `aoide-conduct`'s `stamp_origin` takes whatever the
+  `AOIDE_SESSION_ORIGIN` env var says, and any same-uid process can set
+  that var before running `aoide conduct`, the same ordinary spoofable
+  same-user process state `--from`/`AOIDE_SESSION_ID` already are (this
+  crate's own `records`/`ledger` section, and CONTRACTS.md's pending-queue
+  note); nothing may ever gate on it without upgrading it to an
+  authenticated channel first (task #63's lane).
 - `takes` — the per-draft take store behind `rice back`/`rice take`.
 - `petname`/`display` — the adjective-noun petname mint and its
   render-time-only display grammar.
