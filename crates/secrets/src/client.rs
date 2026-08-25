@@ -957,11 +957,13 @@ mod tests {
     /// never reaching the `poll()` branch at all).
     #[test]
     fn connect_bounded_fails_fast_against_a_nonexistent_socket() {
-        let dead = tmp_socket_dir("dead").join("nothing-here.sock");
+        let dir = tmp_socket_dir("dead");
+        let dead = dir.join("nothing-here.sock");
         let start = std::time::Instant::now();
         let err = connect_bounded(&dead, Duration::from_secs(5)).unwrap_err();
         assert!(start.elapsed() < Duration::from_millis(500), "a dead path must fail near-instantly, not wait out the bound");
         assert_ne!(err.kind(), io::ErrorKind::TimedOut, "ENOENT is not a timeout");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
