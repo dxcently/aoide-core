@@ -72,6 +72,32 @@
   instant it crosses the cap. A future op or connection type reading more
   request lines off this same socket reuses `read_capped_line`, never a
   second hand-rolled read loop.
+- **The tick's own reconcile/reap (P-D6) keep NO separate in-memory
+  roster.** `reconcile_graph_projection` and `run_internal_reap` both
+  re-read the stage files fresh on every call, the same as any other
+  dispatch would — this is deliberate, not a missing optimization: since
+  "no logic forks" already means a routed dispatch does a plain
+  read-modify-write against disk with no daemon-side cache, the tick has
+  nothing else to compare against either, and "fold in the newest
+  out-of-band write" falls straight out of "the file on disk is the single
+  source of truth at every instant." Don't introduce a persistent
+  `HashMap<SessionId, SessionRecord>` cache here "for performance" — it
+  would reintroduce exactly the two-writer divergence this design avoids.
+- **This crate's own `env_lock()` (`lib.rs`)'s first call in a test binary
+  also floors `$AOIDE_STAGE_DIR` at a fresh private tempdir, unless a test
+  already set one (P-D6 safety net).** `daemon::run_loop`'s tick now
+  WRITES through `aoide_conduct::graph::emit`/`aoide_conduct::reap::
+  reap_and_announce`; a `run_loop` test spawns that tick loop on a
+  background thread it deliberately never joins (so the test itself can
+  return once its own assertion holds), so that thread keeps ticking for
+  the rest of the test BINARY's life — without this floor it would
+  eventually read `$AOIDE_STAGE_DIR` as unset (once whichever test set it
+  restores its own prior value) and start reading/writing the REAL
+  `~/Aoide/song/stage/*` on this box. Every test that wants its own
+  isolated tempdir still calls `env_lock()` first (existing convention)
+  and restores what it captured on exit, same as `aoide-conduct`'s sibling
+  `$AOIDE_DAEMON_SOCKET` floor (see that crate's own `AGENTS.md`) — don't
+  remove or weaken either without re-reading why it exists.
 
 ## Extension points
 

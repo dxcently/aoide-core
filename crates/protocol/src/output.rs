@@ -5,7 +5,7 @@
 //! This is the "every command emits `--json`, structured errors, meaningful
 //! exit codes, reports exactly what changed" contract (CONTRACTS.md §3).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Canonical exit codes (must match `schema.rs` `exit_codes`).
@@ -17,7 +17,7 @@ pub mod exit {
 }
 
 /// Coarse status of a command, one-to-one with an exit code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Status {
     Ok,
@@ -38,7 +38,16 @@ impl Status {
 }
 
 /// The structured result of running one command.
-#[derive(Debug, Clone, Serialize)]
+///
+/// `Deserialize` (P-D6, `docs/architecture/AOIDED.md`'s "L4 — graph
+/// residency"): `aoide_client::daemon::daemon_dispatch` reconstructs the
+/// `Outcome` a routed handler produced on the OTHER side of the daemon
+/// socket from the wire's `{"outcome": <this shape>}` reply — the exact
+/// same shape [`Outcome::render`]'s `--json` branch already serializes,
+/// round-tripped losslessly since every field here is already `pub`. Purely
+/// additive: no field, tag, or rename changed, so every existing
+/// `--json` consumer outside this repo is unaffected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Outcome {
     pub status: Status,
     /// The command path that produced this, e.g. `rice.declare`.
@@ -48,10 +57,16 @@ pub struct Outcome {
     /// Whether this operation would route through the user rebuild gate.
     pub gated: bool,
     /// Exactly what changed (empty when nothing changed — idempotency signal).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// `default` alongside `skip_serializing_if` (P-D6): the field is OMITTED
+    /// when empty on the way out, so a round trip through `Deserialize` needs
+    /// the matching default to reconstruct that same empty `Vec` back rather
+    /// than erroring on a "missing field."
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changed: Vec<String>,
     /// Free-form structured payload (schema output, audit records, etc.).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// `default` alongside `skip_serializing_if`, same P-D6 round-trip reason
+    /// as `changed` above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
 }
 

@@ -38,8 +38,33 @@ pub mod producers;
 /// `aoide_storage::env_lock()`, and `aoide_conduct::env_lock()`. Each crate's
 /// tests run in their own process (`cargo test -p <crate>`), so a single
 /// crate-local lock is enough; it doesn't need to coordinate across crates.
+///
+/// **P-D6 safety net (incident, this phase — see `aoide-conduct/AGENTS.md`'s
+/// sibling note for the full story):** the first call in the WHOLE test
+/// binary also stamps `AOIDE_STAGE_DIR` to a fresh, private tempdir, unless
+/// a test already set one. `daemon::run_loop`'s tick now WRITES through
+/// `aoide_conduct::graph::emit`/`aoide_conduct::reap::reap_and_announce`
+/// (`docs/architecture/AOIDED.md`'s "L4") — a `run_loop` test spawns that
+/// tick loop on a background thread it never joins (by design, so the test
+/// itself can return once its own assertion is proven), so that thread
+/// keeps ticking for the rest of THIS PROCESS's life; without this floor it
+/// would eventually read `AOIDE_STAGE_DIR` as unset (once whichever test set
+/// it restores its own prior value) and start reading/writing the REAL
+/// `~/Aoide/song/stage/*` on this box. Every test that wants its OWN
+/// isolated tempdir still calls `env_lock()` first (existing convention)
+/// and restores to what it captured on exit — which, because of this floor,
+/// is never "fully unset" for the rest of the binary's life once the first
+/// test has run.
 #[cfg(test)]
 pub(crate) fn env_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static ISOLATE_STAGE_DIR: std::sync::Once = std::sync::Once::new();
+    ISOLATE_STAGE_DIR.call_once(|| {
+        if std::env::var("AOIDE_STAGE_DIR").is_err() {
+            let dir = std::env::temp_dir().join(format!("aoide-server-tests-floor-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            std::env::set_var("AOIDE_STAGE_DIR", &dir);
+        }
+    });
     &LOCK
 }

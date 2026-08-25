@@ -20,3 +20,9 @@ aoide-storage = { workspace = true }
 # rather than sending no bearer at all. `aoide-secrets` depends on nothing in
 # this crate's own tree (protocol/libc/serde/serde_json only), so no cycle.
 aoide-secrets = { workspace = true }
+
+[dev-dependencies]
+# `daemon`'s tests mutate `AOIDE_DAEMON_SOCKET` — the shared env-serialization
+# mutex every crate touching process-global env carries, dev-only edge
+# (`pkgs/aoide/crates/AGENTS.md`).
+aoide-test-support = { workspace = true }

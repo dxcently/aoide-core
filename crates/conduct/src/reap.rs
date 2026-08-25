@@ -784,7 +784,19 @@ pub fn reap(inv: &Invocation) -> Outcome {
 /// shellbridge's audit log answers "did the button ring the daemon" on its own
 /// — a missing notifier is otherwise an `eprintln` into a systemd child's
 /// stderr, i.e. invisible exactly when someone is asking why nothing appeared.
+///
+/// P-D6 graph residency (`docs/architecture/AOIDED.md`'s "L4"/"Liveness"):
+/// tries the resident daemon's `dispatch` op first — daemon up, the sweep
+/// (and its toast) run IN the daemon against its own roster; daemon down,
+/// this falls back to the direct sweep below byte-identically. The ~12s
+/// systemd timer keeps firing `aoide graph reap` either way; once a daemon
+/// is resident this makes the timer a redundant backstop rather than the
+/// mechanism (the daemon's own tick also runs this same reap internally —
+/// `aoide_server::daemon::run_loop`).
 pub fn reap_and_announce(inv: &Invocation) -> Outcome {
+    if let Some(outcome) = aoide_client::daemon::daemon_dispatch(inv) {
+        return outcome;
+    }
     let mut outcome = reap(inv);
     if inv.flag_present("announce") || !outcome.changed.is_empty() {
         let announced = announce_reap(&outcome.message);

@@ -18,6 +18,27 @@
 - **Forwarded event text from `adapter` is untrusted data**, same as root
   `AGENTS.md` house rule 4 — an adapter never lets forwarded text execute as
   a command.
+- **`daemon::daemon_dispatch` is outbound too, not an exception to "outbound
+  only."** It is the CLIENT side of the fourth door (P-D6): a routed
+  handler in `conduct`/`server` calling OUT to the resident `aoided`'s
+  socket, never anything that listens. `daemon::socket_path` re-derives
+  `aoide_server::daemon::socket_path`'s exact convention rather than
+  importing it — this crate sits BELOW `aoide-server` in the DAG (`server`
+  depends on `conduct`, which depends on this crate), so an import would
+  invert it; a change to the daemon socket's resolution rule updates BOTH
+  copies in the same commit.
+- **`daemon_dispatch` returning `None` is not the same as an error, and the
+  distinction is load-bearing.** `None` means "nothing usable answered" —
+  dead socket, refused connect, or `inv.door == Door::Daemon` (the
+  reentrancy guard: a handler already running INSIDE the daemon must take
+  its direct path, never try to connect to itself) — and the caller's own
+  pre-existing direct path must run unchanged. Once a connection is
+  actually made, every other failure becomes `Some(Outcome::error(...))`
+  instead, since a daemon that answered but broke is a real anomaly, not
+  something to paper over with a fallback that would mask a daemon-side
+  bug. Don't collapse that second case into `None` "to keep the fallback
+  path simple" — it hides real daemon failures as ordinary "no daemon
+  running."
 
 ## Extension points
 
@@ -25,6 +46,12 @@
   `commands.rs`, wired into the owning app crate's `commands::all()`.
 - **A new adapter consumer** (beyond melete) gets its own module beside
   `adapter.rs`, built the same neutral-event-in/typed-event-out shape.
+- **A new session-write handler that should route through the daemon**
+  calls `daemon::daemon_dispatch(inv)` as its own first line and returns
+  early on `Some(outcome)` — the exact one-line prefix every P-D6 handler
+  in `conduct` already uses; nothing in THIS crate changes for a new
+  routed verb, since `daemon_dispatch` is already generic over any
+  `Invocation`.
 
 ## Docs update required in the same commit
 

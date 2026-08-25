@@ -7,6 +7,18 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
 
 ## Named seams (what it exposes)
 
+- **Graph residency (P-D6, `docs/architecture/AOIDED.md`'s "L4")**: the
+  session-write family — `graph session start/phase/end`, `graph session
+  hook`, and `graph reap` (below) — each try `aoide_client::daemon::
+  daemon_dispatch(inv)` FIRST and fall back to their pre-existing direct
+  stage-write path byte-identically on `None`. The daemon executes the
+  SAME registered handler code (its `dispatch` fn IS `cli::dispatch::
+  dispatch`) — no logic forks, no daemon-specific policy anywhere in this
+  crate. `session_hook` smuggles its already-read stdin payload through
+  the routed `Invocation`'s `flags` map under an internal-only key
+  (`STDIN_PAYLOAD_FLAG`) rather than growing the daemon wire a stdin
+  channel — the daemon-side handler reads that flag first and never
+  touches its own stdin.
 - `graph` — the session DAG: build/merge/send/spawn/wrap, `normalize_addr`
   (widened to `pub` at P-A1 so `screen` could reach it without duplicating
   it), `SessionRecord`/`SessionsFile`/`load_stage`/`write_stage`. `--id`
@@ -23,7 +35,13 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   peer's CACHED graph, never a live pull) delivers over A2A `message/send`
   instead, gated entirely on the RECEIVING peer's side (this door's own
   `--yes`/pending/autogate machinery is a local-socket concept and does not
-  apply to a remote delivery). `send::deliver_local`'s success path is ONE
+  apply to a remote delivery). A `--to` query that resolves against neither
+  a local session nor any peer/prefix form falls through to a registered
+  **hub peer** (P-D5's `peer hub`, wired here at P-D6 —
+  `aoide_storage::addr::resolve_with_hub`, given the one peer with
+  `hub: true` if any) instead of erroring `not-found` — the ONE routing
+  consumer of the hub preference in this crate; `who.rs`'s own listing
+  filter deliberately keeps the plain, hub-blind `addr::resolve`. `send::deliver_local`'s success path is ONE
   of exactly TWO seams that file a delivered message into
   `aoide_storage::inbox` (messaging plan P-C6, `state/inbox.json`) — every
   route that lands a message into an ALREADY-REGISTERED session (direct
@@ -35,7 +53,13 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   at all, so it can't reach `deliver_local` and files itself instead — see
   `aoide_storage::inbox`'s module doc for the full two-writer reasoning.
 - `reap` — liveness reaping (`aoide graph reap`), sweeping sessions a
-  `SIGKILL`'d terminal could never mark `done`.
+  `SIGKILL`'d terminal could never mark `done`. `reap_and_announce` (the
+  registered CLI handler) routes through `daemon_dispatch` first like every
+  other session-write verb above; the toast-free `reap` underneath is what
+  every in-crate caller and unit test calls directly, and what the
+  daemon's own tick runs internally on its ~12s cadence — the systemd timer
+  becomes a redundant backstop once a daemon is resident, never a second
+  liveness mechanism.
 - `graph/window.rs` — window discovery/backfill/listener PLUS the
   automatic-parenting seam (task #89, corrected in review round 2):
   `is_windowless_wrap` (a conducted record is windowless when `headless` is
@@ -76,7 +100,8 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
 probe calls `aoide_client::commands::pull_peer_live` — the peer-pull
 transport `peer pull` itself uses, workstream C2; `graph send --to`'s
 remote branch calls `aoide_client::commands::send_message_to_peer`,
-workstream C3; see `client`'s own README for why that edge stays).
+workstream C3; every session-write handler calls `aoide_client::daemon::
+daemon_dispatch`, P-D6; see `client`'s own README for why that edge stays).
 
 ## How it composes
 

@@ -13,7 +13,14 @@ other crate in this workspace sits above.
   derive from the assembled `Registry`.
 - `invocation` — `Invocation`, the parsed call handed to a dispatcher.
 - `output` — `Outcome` + exit codes, the generic envelope every command
-  returns.
+  returns. `Outcome`/`Status` derive `Deserialize` as well as `Serialize`
+  (P-D6, `docs/architecture/AOIDED.md`'s "L4"): the daemon door's client
+  half (`aoide-client`'s `daemon_dispatch`) parses a real `Outcome` back
+  out of the wire's `{"outcome": ...}` reply rather than re-deriving a
+  second envelope shape — `changed`/`data` pair `#[serde(default)]` with
+  their existing `skip_serializing_if`, so a field this crate omits on
+  serialize (an empty `changed`, an absent `data`) still deserializes
+  cleanly instead of erroring "missing field."
 - `audit` — `append_audit`/`audit`/`Door`/`EventClass`/`audit_log_path`, the
   one audit log both doors write through (root `AGENTS.md` house rule 6).
   `EventClass::Secret` (Workstream SECRETS, P-V2) is the secrets broker's

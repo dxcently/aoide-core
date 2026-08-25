@@ -17,6 +17,37 @@
   without checking that dependency first.
 - **A killed terminal never self-reports `done`.** `reap` is the only
   sanctioned sweep of dead sessions; don't add a second liveness mechanism.
+  Reaping now also runs IN the daemon's own tick (P-D6, ~12s cadence) when
+  one is resident — that is the SAME sweep (`reap`), not a second one; the
+  ~12s systemd timer's own `graph reap` becomes a redundant backstop, never
+  a third mechanism.
+- **Every session-write handler routes through `aoide_client::daemon::
+  daemon_dispatch(inv)` FIRST, as its own first line, falling back to its
+  pre-existing direct stage-write path byte-identically on `None` (P-D6,
+  `docs/architecture/AOIDED.md`'s "L4").** `graph session start/phase/end`,
+  `graph session hook`, and `reap::reap_and_announce` all follow this exact
+  one-line prefix. A new session-write handler joins the family the same
+  way — see `client`'s own `AGENTS.md` extension-point note.
+- **`reap` (toast-free) and `reap_and_announce` (the registered CLI/daemon
+  handler) are deliberately two functions, not one.** `reap_and_announce`
+  spawns a REAL `notify-send` on the live desktop whenever the sweep
+  changed anything (or `--announce` is passed) — every in-crate caller and
+  unit test calls the bare `reap` instead, and MUST keep doing so; a test
+  that dispatches the real `graph reap` command path (proving daemon/socket
+  routing, not sweep logic) reaches `reap_and_announce` for real and has to
+  neutralize `notify-send` itself (e.g. blanking `$PATH` for that one call)
+  rather than letting a test fire a real toast on the machine running it.
+- **This crate's own `env_lock()` (`lib.rs`)'s first call in a test binary
+  also floors
+  `$AOIDE_DAEMON_SOCKET` at a path nothing could ever listen on, unless a
+  test already set one (P-D6 safety net — an incident, this phase: a real
+  resident `aoided` on this exact dev box shares the default socket path
+  every routed test handler resolves to when unset, and a test that forgot
+  its own override silently mutated PRODUCTION `~/Aoide/song/stage/
+  sessions.json` through it before this floor existed).** Don't remove or
+  weaken this floor to "simplify" `env_lock()` — a test that WANTS to prove
+  real daemon routing still installs its own `$AOIDE_DAEMON_SOCKET`
+  override afterward, same as any other env var here.
 - **A nested headless session is windowless BY CONSTRUCTION — never
   pid-ancestry-walk it to a window (task #89, corrected in review round 2).**
   It is NOT enough to gate the four historical backfill call sites — a

@@ -6,6 +6,22 @@ never the inbound/serve half (that's `aoide-server`).
 
 ## Named seams (what it exposes)
 
+- `daemon` — the fourth door's outbound half (P-D6, `docs/architecture/
+  AOIDED.md`'s "L4 — graph residency"): `daemon_dispatch(&Invocation) ->
+  Option<Outcome>` tries the resident `aoided`'s `{"op":"dispatch"}` wire
+  (`socket_path()` re-derives `$AOIDE_DAEMON_SOCKET` →
+  `$XDG_RUNTIME_DIR/aoide/aoided.sock`, the identical convention
+  `aoide_server::daemon::socket_path` resolves — re-derived rather than
+  imported, since this crate sits BELOW `aoide-server` in the DAG) with a
+  bounded connect (`connect_bounded`, a background-thread-plus-channel
+  race, ~100ms). `None` means "nothing usable answered" — the caller's own
+  pre-existing direct stage-write path runs unchanged; any OTHER failure
+  once a connection exists becomes `Some(Outcome::error(...))` instead of a
+  silent fallback, since a daemon that answered but broke is a real bug
+  worth surfacing. `inv.door == Door::Daemon` short-circuits to `None`
+  immediately — the reentrancy guard that stops a handler running INSIDE
+  the daemon (because a remote caller's request just landed) from trying
+  to connect to itself.
 - `wire` — client-side A2A JSON-RPC message builders/parsers
   (`build_message_send_body` and siblings).
 - `adapter` — the melete neutral-event adapter (consumes events, stays
@@ -50,8 +66,9 @@ rather than a second wire client written here).
 test), and `cli` depend on it. **The `conduct → client` edge is intentional,
 not technical debt**: `conduct`'s `who` presence verb (workstream C2,
 landed) calls this crate's `commands::pull_peer_live` for its live
-per-peer probe, and `graph send --to`'s remote branch (workstream C3,
-landed) calls `commands::send_message_to_peer` to deliver — the edge stays
-even though the original reason (`screen/send.rs`) moved out to the
-`screen` crate at P-A1 (`docs/architecture/PACKAGE-LAYOUT.md`, "Verified
-facts").
+per-peer probe, `graph send --to`'s remote branch (workstream C3, landed)
+calls `commands::send_message_to_peer` to deliver, and (P-D6) every
+session-write handler (`graph session start/phase/end/hook`, `graph reap`)
+calls `daemon::daemon_dispatch` first — the edge stays even though the
+original reason (`screen/send.rs`) moved out to the `screen` crate at P-A1
+(`docs/architecture/PACKAGE-LAYOUT.md`, "Verified facts").

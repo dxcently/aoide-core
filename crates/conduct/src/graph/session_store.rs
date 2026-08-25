@@ -997,7 +997,16 @@ fn do_session_end_inner(id: &str) -> Outcome {
 
 /// `graph session start --id <id> [--agent --cwd --window --parent]` — UPSERT a
 /// running session record (idempotent; startedAt preserved on re-start).
+///
+/// P-D6 graph residency (`docs/architecture/AOIDED.md`'s "L4"): tries the
+/// resident daemon's `dispatch` op FIRST — same registered handler, same
+/// stage-write bytes, just run in the daemon's process — and falls back to
+/// the direct write below byte-identically when nothing answers
+/// (`aoide_client::daemon::daemon_dispatch`'s own contract).
 pub fn session_start(inv: &Invocation) -> Outcome {
+    if let Some(outcome) = aoide_client::daemon::daemon_dispatch(inv) {
+        return outcome;
+    }
     let id = match require_flag(inv, "id") {
         Ok(v) => v,
         Err(o) => return o,
@@ -1016,7 +1025,12 @@ pub fn session_start(inv: &Invocation) -> Outcome {
 }
 
 /// `graph session phase --id <id> --phase <phase>` — UPSERT the live hook phase.
+///
+/// P-D6 routing (see [`session_start`]'s own doc for the full contract).
 pub fn session_phase(inv: &Invocation) -> Outcome {
+    if let Some(outcome) = aoide_client::daemon::daemon_dispatch(inv) {
+        return outcome;
+    }
     let id = match require_flag(inv, "id") {
         Ok(v) => v,
         Err(o) => return o,
@@ -1029,7 +1043,12 @@ pub fn session_phase(inv: &Invocation) -> Outcome {
 }
 
 /// `graph session end --id <id>` — mark the session done (ok no-op if unknown).
+///
+/// P-D6 routing (see [`session_start`]'s own doc for the full contract).
 pub fn session_end(inv: &Invocation) -> Outcome {
+    if let Some(outcome) = aoide_client::daemon::daemon_dispatch(inv) {
+        return outcome;
+    }
     let id = match require_flag(inv, "id") {
         Ok(v) => v,
         Err(o) => return o,
@@ -1733,6 +1752,11 @@ mod tests {
     }
     #[test]
     fn session_start_requires_the_id_flag() {
+        // P-D6: `session_start` now tries the daemon FIRST — this test does
+        // no stage/env setup of its own, but still needs `env_lock`'s own
+        // one-time `AOIDE_DAEMON_SOCKET` isolation stamp (`lib.rs`'s own
+        // doc) so a real resident daemon on this box is never reached.
+        let _guard = crate::env_lock().lock().unwrap();
         let out = session_start(&flag_invocation(&["graph", "session", "start"], &[]));
         assert_eq!(out.status, aoide_protocol::output::Status::Usage);
         assert_eq!(out.render(false).1, aoide_protocol::output::exit::USAGE);

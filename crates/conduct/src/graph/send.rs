@@ -737,8 +737,20 @@ fn session_send_to(inv: &Invocation, target: &str) -> Outcome {
         .collect();
     let peers = aoide_storage::peer_store::load_peers();
     let peer_names: Vec<&str> = peers.iter().map(|p| p.name.as_str()).collect();
+    // P-D5's hub option, wired at its own ROUTING consumer (P-D6 rider,
+    // `docs/architecture/AOIDED.md`'s "The hub option": "address resolution
+    // prefers the hub as the default remote target when a --to query
+    // matches no local session and names no explicit peer") — every OTHER
+    // tier (exact id, tail4, petname, host/role/petname, an explicit
+    // `peer/<rest>` prefix) still wins outright; the hub only ever fills in
+    // for an otherwise-`NotFound` query. `who.rs`'s own `apply_filter` is a
+    // LISTING/display filter, not a route, and deliberately keeps the plain
+    // `addr::resolve` — the design doc names exactly two hub-preference
+    // consumers (this `--to` resolution and the messaging inbox relay),
+    // neither of which is `who`'s display semantics.
+    let hub = peers.iter().find(|p| p.hub).map(|p| p.name.as_str());
 
-    match addr::resolve(target, &host, &candidates, &peer_names) {
+    match addr::resolve_with_hub(target, &host, &candidates, &peer_names, hub) {
         Resolution::Local(id) => deliver_local(inv, &id),
         Resolution::Remote { peer, query } => match peers.iter().find(|p| p.name == peer) {
             Some(p) => deliver_remote(inv, p, &query),
@@ -1761,18 +1773,57 @@ fn hook_profile_for(inv: &Invocation) -> Result<&'static AgentProfile, Outcome> 
     })
 }
 
+/// Internal-only flag key `session_hook`'s own P-D6 routing stamps onto a
+/// SYNTHETIC invocation before calling `daemon_dispatch` — never set by a
+/// real CLI/MCP/A2A caller, and never registered in this verb's own
+/// `flags:` list (`commands/graph.rs`), so it carries no schema surface.
+/// The daemon `dispatch` wire (`{"op":"dispatch","path":...,"args":...,
+/// "flags":...}`) has no channel for forwarding stdin bytes, and this door
+/// is the one session-write verb whose payload arrives THAT way rather than
+/// through `path`/`args`/`flags` — smuggling the already-read payload
+/// through the existing `flags` map avoids inventing new wire framing
+/// (out of scope this phase, per the phase brief) while still making this
+/// verb routable: the DAEMON side sees this key present (its own
+/// `invocation_from_dispatch_request` copies `flags` verbatim off the wire)
+/// and reads the payload from there instead of its own process's stdin,
+/// which is never the calling hook's own pipe.
+const STDIN_PAYLOAD_FLAG: &str = "__daemon-stdin-payload";
+
 /// `graph session hook [--agent <name>]` — the hook door for agent harnesses.
 /// Reads ONE JSON object from stdin and maps it (through the selected agent
 /// profile) to the session verbs. Never exits non-zero for a payload problem
 /// (see [`hook_for_profile`]); a bogus `--agent` is a plain CLI error.
+///
+/// P-D6 routing (`docs/architecture/AOIDED.md`'s "L4"): stdin is read FIRST,
+/// always, from THIS process's own pipe — a routed call cannot read it a
+/// second time on the daemon's side, so the already-read bytes ride along
+/// on [`STDIN_PAYLOAD_FLAG`] instead of the wire growing a new field. The
+/// daemon-side invocation (flag present) skips both the routing attempt AND
+/// the real stdin read, using the forwarded payload directly.
 pub fn session_hook(inv: &Invocation) -> Outcome {
     use std::io::Read;
     let profile = match hook_profile_for(inv) {
         Ok(p) => p,
         Err(o) => return o,
     };
+    if let Some(payload) = inv.flags.get(STDIN_PAYLOAD_FLAG) {
+        return hook_for_profile(profile, payload);
+    }
     let mut buf = String::new();
     let _ = std::io::stdin().lock().read_to_string(&mut buf);
+    let routed = Invocation {
+        path: inv.path.clone(),
+        args: inv.args.clone(),
+        flags: {
+            let mut f = inv.flags.clone();
+            f.insert(STDIN_PAYLOAD_FLAG.to_string(), buf.clone());
+            f
+        },
+        door: inv.door,
+    };
+    if let Some(outcome) = aoide_client::daemon::daemon_dispatch(&routed) {
+        return outcome;
+    }
     hook_for_profile(profile, &buf)
 }
 
@@ -3547,6 +3598,51 @@ mod tests {
         assert_eq!(out.status, aoide_protocol::output::Status::Error);
         assert_eq!(out.data.as_ref().unwrap()["reason"], "peer-never-pulled");
         assert!(out.message.contains("peer pull"), "msg: {}", out.message);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P-D6 rider (`docs/architecture/AOIDED.md`'s "The hub option"): a
+    /// `--to` query that matches no local session and names no peer at all
+    /// (no local candidates, no `peer/` prefix, not even a bare known-peer
+    /// name) falls through every tier of `addr::resolve` to `NotFound` —
+    /// with a hub peer registered, `resolve_with_hub` fills that `NotFound`
+    /// in as `Remote { peer: <hub>, .. }` rather than leaving it an error.
+    /// Proven unit-level with no live network, exactly as the phase's own
+    /// test list asks: two peers are registered, only one `hub: true`, and
+    /// the assertion is that resolution reached THAT peer specifically (its
+    /// name shows up in the deterministic, network-free `peer-never-pulled`
+    /// error — same proof-shape `to_remote_with_no_cache_points_at_peer_pull`
+    /// already uses right above) — not the non-hub peer, and not a plain
+    /// "not-found" error.
+    #[test]
+    fn send_to_an_unmatched_target_routes_via_the_hub_peer() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_AUDIT_LOG"]);
+
+        let root = unique_stage("to-hub-fallback");
+        let stage = root.join("stage");
+        let state = root.join("state");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+
+        let mut hub_peer = test_peer("beacon-hub", "http://127.0.0.1:9/");
+        hub_peer.hub = true;
+        aoide_storage::peer_store::save_peers(&[test_peer("yomi-strix", "http://127.0.0.1:9/"), hub_peer]).unwrap();
+
+        // No local sessions, and the target names neither peer — every tier
+        // of plain `addr::resolve` misses, so ONLY the hub preference can
+        // explain the outcome naming `beacon-hub`.
+        let out = session_send(&send_invocation(
+            &["hi"],
+            &[("to", "nothing-else-matches-this"), ("yes", "true")],
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
+        assert_eq!(out.data.as_ref().unwrap()["reason"], "peer-never-pulled");
+        assert_eq!(out.data.as_ref().unwrap()["peer"], "beacon-hub", "{out:?}");
 
         let _ = std::fs::remove_dir_all(&root);
     }

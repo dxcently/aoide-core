@@ -10,6 +10,15 @@
   `wire`'s A2A/MCP payload shapes, and `state::canonical_state` are read by
   `schema --json` consumers outside this repo. A shape change is
   schema-visible; treat it like an API break, not a refactor.
+- **`output::Outcome`/`Status` are round-trippable, not serialize-only —
+  keep every field's `#[serde(skip_serializing_if = ...)]` paired with
+  `#[serde(default)]` (P-D6).** The daemon door's client half parses a
+  real `Outcome` back out of a wire reply (`aoide-client`'s
+  `daemon_dispatch`); a field omitted on serialize (an empty `changed`, an
+  absent `data`) has to reconstruct on deserialize without `serde` erroring
+  "missing field." A future field on `Outcome`/`Status` that skips
+  serializing when absent/default needs the same pairing, or a daemon
+  reply that omitted it stops parsing.
 - **`door::run`'s `special` hook is the only sanctioned one-shot escape.**
   A binary that needs to bypass the generic `Outcome` envelope (raw stdout,
   a long-running server) adds a case to its own `special` closure — never a

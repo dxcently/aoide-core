@@ -55,6 +55,7 @@ dependencies = [
  "aoide-protocol",
  "aoide-secrets",
  "aoide-storage",
+ "aoide-test-support",
  "serde",
  "serde_json",
 ]

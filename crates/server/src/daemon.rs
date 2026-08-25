@@ -108,6 +108,46 @@
 //! `HandEditWatcher::note_own_write` currently has no live caller — it is
 //! proved by that struct's own tests, the seam P-D6 wires into rather than
 //! a signature this run_loop needs to grow again later.
+//!
+//! ## Graph residency: reconcile + reap in the tick (P-D6)
+//!
+//! `docs/architecture/AOIDED.md`'s "L4 — graph residency": the session-write
+//! family (`graph session start/phase/end/hook`) and `graph reap` now try
+//! this daemon's own `dispatch` op FIRST (`aoide_client::daemon::
+//! daemon_dispatch`, the client-side half) before falling back to their
+//! pre-existing direct stage-write path — so while a daemon is resident,
+//! most mutations already land here, through the SAME registered handler
+//! `graph session start`/etc. run directly (no logic forks: `dispatch` IS
+//! `cli::dispatch::dispatch`, the same fn injected here since P-D2).
+//!
+//! Two things this daemon does NOT get for free from that alone:
+//!
+//! - **An out-of-band write** (the direct-path fallback firing because this
+//!   daemon was briefly down, or a genuine hand edit) changes
+//!   `sessions.json`/`hooks.json` with nobody having called `graph emit`
+//!   afterward — [`HandEditWatcher::sweep`] already detects the mtime
+//!   change; [`reconcile_graph_projection`] is the ACTION this phase wires
+//!   into that seam (the module doc above names it as reserved for exactly
+//!   this): re-derive `graph.json` via `aoide_conduct::graph::emit`, the
+//!   SAME handler `graph emit` runs. There is no separate daemon-held
+//!   roster to conflict with — the files ARE the truth at every instant, so
+//!   re-deriving from CURRENT content on the very next tick (≤ ~1s) is
+//!   "newest write wins" by construction.
+//! - **The liveness sweep** the ~12s systemd timer drives by firing
+//!   `aoide graph reap` (now itself routed once a daemon is resident) gets
+//!   a REDUNDANT internal backstop here too — [`run_internal_reap`] calls
+//!   the SAME `aoide_conduct::reap::reap_and_announce` handler directly, on
+//!   [`REAP_EVERY_TICKS`]' own ~12s cadence, so the sweep keeps running even
+//!   if the timer unit itself is ever disabled. This is the SAME reap, not
+//!   a second liveness mechanism (`conduct/AGENTS.md`'s invariant) — both
+//!   callers converge on `aoide_conduct::reap::reap`'s one predicate.
+//!
+//! Both actions build a synthetic `Invocation { door: Door::Daemon, .. }`
+//! directly (never over the socket to itself) and call the target function
+//! straight — `daemon_dispatch`'s own reentrancy guard treats `Door::Daemon`
+//! as "never route further" regardless, so this is simply the same
+//! shortcut every other in-process caller of a `Door::Daemon` invocation
+//! already takes.
 
 use aoide_protocol::feed::{FeedWriter, Follower};
 use aoide_protocol::registry::{Registry, AOIDE_VERSION};
@@ -237,6 +277,61 @@ fn stage_roster() -> Vec<PathBuf> {
         aoide_conduct::graph::pending_path(),
         aoide_conduct::herald::herald_path(),
     ]
+}
+
+/// A synthetic, in-process-only `Invocation` for a command this daemon runs
+/// against itself, on its own tick — never built from the wire (module doc's
+/// "Graph residency" section). `Door::Daemon` is what makes
+/// `aoide_client::daemon::daemon_dispatch` refuse to route it any further,
+/// so calling the target handler function directly (never over the socket)
+/// is the correct, guard-respecting shortcut, not a bypass of one.
+fn internal_invocation(path: &[&str]) -> Invocation {
+    Invocation {
+        path: path.iter().map(|s| s.to_string()).collect(),
+        args: Vec::new(),
+        flags: BTreeMap::new(),
+        door: Door::Daemon,
+    }
+}
+
+/// P-D6 fold: given the base filenames [`HandEditWatcher::sweep`] just
+/// reported changed, re-derive `graph.json` (via `aoide_conduct::graph::
+/// emit`, the exact `graph emit` handler) when `sessions.json` or
+/// `hooks.json` was among them — module doc's "Graph residency" explains
+/// why re-deriving from CURRENT content is the whole fold (no separate
+/// daemon-held roster exists to conflict with). A no-op (returns `None`,
+/// touches nothing) when neither file changed, so a hand-edit to
+/// `pending.json`/`herald.json`/`projects.json` alone never triggers a
+/// spurious `graph.json` rewrite. Returns `graph.json`'s path on the
+/// reconcile branch so the caller can fold it into the watcher's own
+/// baseline (`HandEditWatcher::note_own_write`) and not re-report this very
+/// write as a hand edit on the NEXT sweep.
+fn reconcile_graph_projection(changed_files: &[String]) -> Option<PathBuf> {
+    if !changed_files.iter().any(|f| f == "sessions.json" || f == "hooks.json") {
+        return None;
+    }
+    let _ = aoide_conduct::graph::emit(&internal_invocation(&["graph", "emit"]));
+    Some(aoide_storage::stage::graph_path())
+}
+
+/// How often [`run_internal_reap`] fires, in ticks of `run_loop`'s ~1s
+/// cadence — mirrors the systemd timer's own ~12s interval (module doc's
+/// "Graph residency"; `conduct/AGENTS.md`'s "a killed terminal never
+/// self-reports done... don't add a second liveness mechanism" — this is
+/// the SAME reap, just also fired from here).
+const REAP_EVERY_TICKS: u64 = 12;
+
+/// P-D6's in-daemon liveness sweep: calls `aoide_conduct::reap::
+/// reap_and_announce` directly — the identical handler `graph reap` (routed
+/// or direct) runs — so the timer becomes a redundant backstop once a
+/// daemon is resident (module doc's "Graph residency"). Cheap on a quiet
+/// pass (`reap`'s own doc: "a stage WRITE only when something was actually
+/// reaped"); [`run_loop`]'s caller re-baselines the watcher for
+/// `sessions.json`/`hooks.json`/`graph.json` unconditionally afterward —
+/// harmless on a quiet pass (re-stamping an UNCHANGED file's own current
+/// state is idempotent), and correct on a changed one.
+fn run_internal_reap() {
+    let _ = aoide_conduct::reap::reap_and_announce(&internal_invocation(&["graph", "reap"]));
 }
 
 fn runtime_dir() -> PathBuf {
@@ -636,9 +731,15 @@ pub fn run_loop(
     let secrets_events = aoide_secrets::socket::events_path(&secrets_socket);
     let mut secrets_mirror = crate::producers::SecretsMirror::new(secrets_events);
     let mut hand_edit_watcher = crate::producers::HandEditWatcher::new(stage_roster());
+    // P-D6 graph residency (module doc's "Graph residency"): a plain tick
+    // counter, not a second timer — `run_loop` already sleeps ~1s per
+    // iteration, so `REAP_EVERY_TICKS` iterations is ~12s, matching the
+    // systemd timer's own cadence with no new clock.
+    let mut ticks: u64 = 0;
     loop {
         secrets_mirror.tick(&feed);
-        for file in hand_edit_watcher.sweep() {
+        let hand_edits = hand_edit_watcher.sweep();
+        for file in &hand_edits {
             feed.append(&json!({
                 "v": 0,
                 "ts": aoide_protocol::audit::now_secs(),
@@ -648,6 +749,21 @@ pub fn run_loop(
                 "payload": {"file": file},
             }));
         }
+        if let Some(graph_path) = reconcile_graph_projection(&hand_edits) {
+            hand_edit_watcher.note_own_write(&graph_path);
+        }
+
+        ticks += 1;
+        if ticks % REAP_EVERY_TICKS == 0 {
+            run_internal_reap();
+            // Re-baseline all three graph-residency files unconditionally —
+            // idempotent on a quiet pass (module doc's "Graph residency" /
+            // `run_internal_reap`'s own doc).
+            hand_edit_watcher.note_own_write(&aoide_storage::stage::sessions_path());
+            hand_edit_watcher.note_own_write(&aoide_storage::stage::hooks_path());
+            hand_edit_watcher.note_own_write(&aoide_storage::stage::graph_path());
+        }
+
         std::thread::sleep(Duration::from_secs(1));
     }
 }
@@ -979,6 +1095,11 @@ mod tests {
     /// — this test only proves `run_loop`'s WIRING passes the real cap).
     #[test]
     fn run_loop_creates_and_caps_the_events_feed() {
+        // P-D6: `run_loop`'s tick now writes through `aoide_conduct` (`lib.rs`'s
+        // own doc) — this spawns a background thread it never joins, so it
+        // needs `env_lock`'s one-time `AOIDE_STAGE_DIR` floor in place before
+        // that thread's first tick, never the real `~/Aoide/song/stage/*`.
+        let _guard = crate::env_lock().lock().unwrap();
         let socket_path = short_tmp("loop").with_extension("sock");
         let events_path = short_tmp("loop-events").with_extension("jsonl");
         let log_path = short_tmp("loop-log");
@@ -1011,6 +1132,81 @@ mod tests {
         std::fs::remove_file(&socket_path).ok();
         std::fs::remove_file(&events_path).ok();
         std::fs::remove_file(&log_path).ok();
+    }
+
+    // ── P-D6 graph residency: reconcile + reap in the tick ──────────────
+
+    fn isolated_stage() -> (std::sync::MutexGuard<'static, ()>, PathBuf, Option<String>) {
+        let guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = short_tmp("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        (guard, stage, saved)
+    }
+
+    fn restore_stage(stage: &Path, saved: Option<String>) {
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        std::fs::remove_dir_all(stage).ok();
+    }
+
+    /// A hand-edit-shaped filename list that names neither `sessions.json`
+    /// nor `hooks.json` is a no-op: [`reconcile_graph_projection`] touches
+    /// nothing, `graph.json` is never created.
+    #[test]
+    fn reconcile_graph_projection_is_a_noop_when_neither_sessions_nor_hooks_changed() {
+        let (_guard, stage, saved) = isolated_stage();
+
+        let out = reconcile_graph_projection(&["pending.json".to_string(), "herald.json".to_string()]);
+        assert!(out.is_none(), "an unrelated changed file must not trigger a reconcile");
+        assert!(!aoide_storage::stage::graph_path().exists(), "graph.json must not have been created");
+
+        restore_stage(&stage, saved);
+    }
+
+    /// `sessions.json` (or `hooks.json`) among the changed files DOES
+    /// trigger a reconcile — `aoide_conduct::graph::emit` re-derives
+    /// `graph.json` from CURRENT stage content, the exact `graph emit`
+    /// handler, no forked logic.
+    #[test]
+    fn reconcile_graph_projection_re_derives_graph_json_when_sessions_changed() {
+        let (_guard, stage, saved) = isolated_stage();
+
+        let sf = aoide_storage::records::SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![aoide_storage::records::SessionRecord {
+                session_id: "s1".to_string(),
+                agent: "claude".to_string(),
+                state: "idle".to_string(),
+                started_at: "2026-01-01T00:00:00Z".to_string(),
+                ..Default::default()
+            }],
+        };
+        aoide_storage::stage::write_stage(&aoide_storage::stage::sessions_path(), &sf).unwrap();
+
+        let out = reconcile_graph_projection(&["sessions.json".to_string()]);
+        assert_eq!(out, Some(aoide_storage::stage::graph_path()), "must report graph.json as the reconciled path");
+        let contents = std::fs::read_to_string(aoide_storage::stage::graph_path()).unwrap();
+        assert!(contents.contains("s1"), "the re-derived graph.json must reflect the session just written: {contents}");
+
+        restore_stage(&stage, saved);
+    }
+
+    /// [`run_internal_reap`] calls the SAME `aoide_conduct::reap::
+    /// reap_and_announce` handler `graph reap` runs — a smoke test that it
+    /// runs cleanly (never panics) against an empty roster; `reap`'s own
+    /// exhaustive liveness-predicate coverage lives in `aoide-conduct`,
+    /// this crate only proves the daemon-tick WIRING calls it.
+    #[test]
+    fn run_internal_reap_runs_cleanly_against_an_empty_roster() {
+        let (_guard, stage, saved) = isolated_stage();
+
+        run_internal_reap(); // must not panic
+
+        restore_stage(&stage, saved);
     }
 
     /// `bind_socket` itself creates missing parent directories — every test

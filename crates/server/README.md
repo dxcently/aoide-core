@@ -55,10 +55,31 @@ the inbound half of the two-door contract (the outbound half is
   `aoide-conduct`) each tick and fires a `class:"audit",kind:"hand-edit"`
   event for any file whose `(mtime, len)` no longer matches its baseline
   (the #69 hand-edit watcher) — detection and narration only, this daemon
-  never reverts a hand edit. `note_own_write` is the seam a FUTURE
-  daemon-side write path (P-D6) folds its own writes into so they are
-  never reported back as a hand edit; no such write path exists yet this
-  phase, so it has no live caller today.
+  never reverts a hand edit. `note_own_write` is the seam P-D6's own
+  tick-reconcile/reap writes (below) fold into so they are never reported
+  back as a hand edit.
+- **Graph residency (P-D6, `docs/architecture/AOIDED.md`'s "L4")** —
+  `run_loop`'s tick, after narrating the hand-edit sweep above, does two
+  more things every iteration: `reconcile_graph_projection(changed_files)`
+  re-derives `song/stage/graph.json` (via the exact `graph emit` handler —
+  no forked logic) whenever `sessions.json`/`hooks.json` is among the
+  files the sweep just reported changed, so an out-of-band write (the
+  direct-fallback CLI path, or a hand edit) is folded into the projection
+  on the very next tick rather than waiting for the next dispatch to touch
+  it; `run_internal_reap` calls the SAME `aoide_conduct::reap::
+  reap_and_announce` `graph reap` always runs, every `REAP_EVERY_TICKS`
+  (12) ticks (~12s, matching the systemd timer's own cadence), re-baselining
+  `HandEditWatcher` via `note_own_write` for whatever it touched so its own
+  sweep is never mistaken for a hand edit next tick. Neither producer keeps
+  a separate in-memory roster — every dispatch (routed or internal) reads
+  the stage files fresh, so "fold in the newest write" falls directly out
+  of "the file on disk is the single source of truth at every instant";
+  `daemon::handle_conn`'s `dispatch` op is also how a REMOTE `graph
+  session start/phase/end/hook`/`graph reap` call actually executes once
+  routed here — `internal_invocation` builds the same shape of
+  `Invocation { door: Door::Daemon, .. }` for the tick's own internal
+  calls, so the tick's writes and a routed client's writes go through
+  literally the same code.
 - `events` — `tail`, the blocking loop behind `aoide events tail` (P-D3):
   follows the daemon's own events feed with a `Follower` and prints every
   line whose `class` passes an (optional, comma-separated) filter, `--json`
