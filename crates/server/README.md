@@ -16,13 +16,25 @@ the inbound half of the two-door contract (the outbound half is
   (fallible `Builder::spawn`, accept-error backoff — the secrets broker's
   own accept-loop discipline, reused by convention), then tick forever
   (~1s; P-D3's two producers, below). Newline-delimited JSON, the secrets
-  wire framing verbatim: `ping` (liveness) and `subscribe` (follow the
-  daemon's own events feed — `$AOIDE_DAEMON_EVENTS`, else a sibling of the
-  socket, `daemon::events_path` — filtered by an explicit `classes` array,
-  default-deny) are live; `dispatch` (the fourth door, `Door::Daemon`) is
-  P-D4. `registry`/`dispatch` fn parameters thread all the way to the
-  per-connection handler, unused until P-D4 — the same DI seam
-  `mcp::serve_stdio`/`a2a::serve` already close at their own launch sites.
+  wire framing verbatim, request lines read via `read_capped_line`'s
+  `fill_buf`/`consume` loop (P-D4 — the byte cap is checked on every buffer
+  fill, not only after a `\n` arrives, closing the P-D2-flagged gap where a
+  newline-less stream could grow one connection's buffer unbounded). Three
+  ops: `ping` (liveness), `subscribe` (follow the daemon's own events feed
+  — `$AOIDE_DAEMON_EVENTS`, else a sibling of the socket,
+  `daemon::events_path` — filtered by an explicit `classes` array,
+  default-deny), and `dispatch` (P-D4, the fourth door) — builds an
+  `Invocation { path, args, flags, door: Door::Daemon }` LITERALLY from the
+  wire's `path`/`args`/`flags` and runs it through the injected `dispatch`
+  fn, replying with one `{"outcome": <the full Outcome envelope>}` line.
+  Door policy is not reimplemented here: every command's own `inv.door`
+  branch (a CLI-only admin verb's refusal, a gated command's `gated: true`,
+  `mcp.serve`/`a2a.serve`'s non-Cli metadata reply) runs exactly as it
+  already does over MCP/A2A, since the injected fn IS
+  `cli::dispatch::dispatch` — no daemon-specific allowlist exists or is
+  planned (`docs/architecture/AOIDED.md`'s "L2" section). `registry` still
+  rides along the DI seam unused — no op resolves a dotted tool name
+  against it the way MCP's `tools/call` does.
 - `producers` (P-D3, `docs/architecture/AOIDED.md`'s "L1" section) — the
   daemon tick's two producers, both constructed once at `run_loop` startup
   and ticked every iteration. `SecretsMirror` tails the secrets broker's

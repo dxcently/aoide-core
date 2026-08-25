@@ -33,34 +33,46 @@
 //! is no cross-uid audience, `$XDG_RUNTIME_DIR` is `0700` anyway, the chmod
 //! is belt-and-braces.
 //!
-//! ## Framing (P-D2)
+//! ## Framing (P-D2, `dispatch` landed P-D4)
 //!
 //! Newline-delimited JSON, the secrets wire contract verbatim (`AGENTS.md`'s
 //! framing rule): one request line → zero or more interim lines
 //! (`"interim":true`) → exactly one final reply line, though `subscribe`'s
 //! own "final reply" never arrives in practice (the daemon runs forever; the
-//! stream ends only when the client hangs up). Two ops in this phase —
-//! `ping`/`subscribe`; `dispatch` (the fourth door) is P-D4, so an
-//! `{"op":"dispatch",...}` line here still falls through the same
-//! `unknown op` handling every other unrecognized op gets. [`handle_conn`]
-//! already takes the registry/dispatch-fn DI seam
-//! ([`crate::mcp::DispatchFn`], same shape as [`crate::mcp::serve_stdio`])
-//! as parameters, unused by `ping`/`subscribe`, so P-D4 adds the `dispatch`
-//! arm without another signature change threading through every function
-//! between `run_loop` and here.
+//! stream ends only when the client hangs up). Three ops: `ping`/`subscribe`
+//! (P-D2) and `dispatch` (P-D4, `docs/architecture/AOIDED.md`'s "L2 — the
+//! fourth door" section) — [`handle_conn`]'s registry/dispatch-fn DI seam
+//! ([`crate::mcp::DispatchFn`], same shape as [`crate::mcp::serve_stdio`]),
+//! threaded but unused since P-D2, is what `dispatch` finally calls.
 //!
-//! **KNOWN LIMITATION, deliberate, not fixed this phase**: request-line
-//! reads go through `BufReader::read_line`, which has no OWN incremental
-//! size cap — a line is checked against [`MAX_REQUEST_LINE_BYTES`] only
-//! AFTER a `\n` arrives (or the connection closes), so a single line sent
-//! with no trailing newline can still grow this connection's own buffer
-//! unbounded while the client keeps streaming it. The socket is `0600`
-//! user-private (no cross-uid audience, this module's own doc above), so the
-//! blast radius is one connection using its own uid's own memory, not a
-//! cross-user DoS; a byte-incremental cap (checking length inside the read
-//! loop itself, before the newline arrives) would need a hand-rolled
-//! `fill_buf`/`consume` loop in place of `read_line` — flagged for whoever
-//! hardens this further, not built speculatively here.
+//! `{"op":"dispatch","path":[...],"args":[...],"flags":{...}}`
+//! ([`invocation_from_dispatch_request`]) builds an
+//! `Invocation { path, args, flags, door: Door::Daemon }` LITERALLY from the
+//! wire — no dotted-name lookup the way [`crate::mcp::invocation_from_call`]
+//! resolves MCP's `tools/call` into a path, since this door's own caller
+//! already knows the path array it wants — and runs it through the injected
+//! `dispatch` fn. The final reply is one `{"outcome": <the full Outcome
+//! envelope>}` line; interim-message discipline is RESERVED for this op, not
+//! built this phase — there are no interim producers on the dispatch path.
+//!
+//! **Door policy is not reimplemented here** (`docs/architecture/AOIDED.md`'s
+//! "L2" section, "Policy: no new allowlist"): every command's
+//! own `inv.door` branch (a CLI-only admin verb's refusal, a gated command's
+//! `gated: true`, `mcp.serve`/`a2a.serve`'s non-Cli metadata replies) runs
+//! exactly the same way it already does over MCP/A2A, since `dispatch` (the
+//! injected fn) is the SAME `cli::dispatch::dispatch` every other door
+//! calls. This module adds no daemon-specific permission table, and never
+//! will.
+//!
+//! **The P-D2 incremental-cap gap is CLOSED this phase.** Request-line reads
+//! now go through [`read_capped_line`], a hand-rolled `fill_buf`/`consume`
+//! loop in place of `BufReader::read_line`: the accumulated byte count is
+//! checked on EVERY buffer fill, not only after a `\n` finally arrives, so a
+//! line sent with no trailing newline can no longer grow this connection's
+//! own buffer past [`MAX_REQUEST_LINE_BYTES`] while the client keeps
+//! streaming it — the connection is dropped (with one error reply, when a
+//! peer is still there to receive it) the instant the cap is crossed, never
+//! only after EOF or a newline finally shows up.
 //!
 //! ## The events feed (P-D2)
 //!
@@ -99,8 +111,9 @@
 
 use aoide_protocol::feed::{FeedWriter, Follower};
 use aoide_protocol::registry::{Registry, AOIDE_VERSION};
-use aoide_protocol::{audit, Door, EventClass, Gate, Subscription};
+use aoide_protocol::{audit, Door, EventClass, Gate, Invocation, Subscription};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -262,6 +275,105 @@ fn write_json_line(writer: &mut impl Write, value: &Value) -> std::io::Result<()
     writer.write_all(out.as_bytes())
 }
 
+/// How [`read_capped_line`] failed — the two cases [`handle_conn`]'s caller
+/// tells apart, since only one of them still has a peer worth replying to.
+enum LineReadError {
+    /// A real read error, or bytes that aren't valid UTF-8 (mirrors
+    /// `BufReader::read_line`'s own `Err(_)` case) — no reply is attempted.
+    Io,
+    /// The accumulated line crossed [`MAX_REQUEST_LINE_BYTES`] before a
+    /// `\n` (or EOF) ever arrived — the P-D2 nit this phase closes (module
+    /// doc's "Framing").
+    TooLarge,
+}
+
+/// Read one newline-delimited line off `reader`, via [`BufRead::fill_buf`]/
+/// [`BufRead::consume`] instead of [`BufRead::read_line`] (module doc's
+/// "Framing" — the P-D2 nit this phase closes): `cap` is checked after
+/// EVERY buffer fill that didn't contain a `\n`, not only once a complete
+/// line has been read, so a client streaming more than `cap` bytes with no
+/// trailing newline is caught the instant it crosses the cap rather than
+/// growing this connection's own buffer for as long as it keeps sending.
+///
+/// `Ok(None)` is a clean EOF with nothing pending (the old `Ok(0)` case).
+/// `Ok(Some(bytes))` is one line's raw bytes with any trailing `\n` (and the
+/// `\n` alone) stripped — including a FINAL, newline-less line found only at
+/// EOF, the same case `read_line` already returned a value for, so a
+/// last message with no trailing newline is still processed exactly as
+/// before this fix. `Err(LineReadError::TooLarge)` fires the moment the
+/// accumulated length exceeds `cap` with no `\n` in sight yet.
+fn read_capped_line(reader: &mut BufReader<UnixStream>, cap: usize) -> Result<Option<Vec<u8>>, LineReadError> {
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        let buf = match reader.fill_buf() {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(LineReadError::Io),
+        };
+        if buf.is_empty() {
+            // EOF: a pending newline-less line is still a message (matches
+            // `read_line`'s own behavior); nothing pending is a clean close.
+            return Ok(if line.is_empty() { None } else { Some(line) });
+        }
+        match buf.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                line.extend_from_slice(&buf[..pos]);
+                reader.consume(pos + 1);
+                return Ok(Some(line));
+            }
+            None => {
+                let n = buf.len();
+                line.extend_from_slice(buf);
+                reader.consume(n);
+                if line.len() > cap {
+                    return Err(LineReadError::TooLarge);
+                }
+            }
+        }
+    }
+}
+
+/// Build an [`Invocation`] from a `dispatch` op's request object (module
+/// doc's "Framing"): `path`/`args` are literal string arrays, `flags` a
+/// literal string-to-string object — no dotted-name lookup, no schema
+/// validation (that's the injected `dispatch` fn's own job, exactly as it
+/// is for a CLI/MCP-originated `Invocation`). `door` is always
+/// [`Door::Daemon`], never read off the wire — a caller cannot claim to be
+/// a different door for the per-verb policy checks `dispatch` runs (module
+/// doc's "Door policy is not reimplemented here").
+fn invocation_from_dispatch_request(req: &Value) -> Result<Invocation, String> {
+    let path: Vec<String> = req
+        .get("path")
+        .and_then(Value::as_array)
+        .ok_or("dispatch request missing a `path` array")?
+        .iter()
+        .map(|v| v.as_str().map(str::to_string))
+        .collect::<Option<Vec<String>>>()
+        .ok_or("dispatch request's `path` must be an array of strings")?;
+    if path.is_empty() {
+        return Err("dispatch request's `path` must not be empty".to_string());
+    }
+
+    let args: Vec<String> = match req.get("args") {
+        None => Vec::new(),
+        Some(Value::Array(arr)) => arr.iter().map(crate::mcp::value_to_string).collect(),
+        Some(_) => return Err("dispatch request's `args` must be an array".to_string()),
+    };
+
+    let mut flags: BTreeMap<String, String> = BTreeMap::new();
+    match req.get("flags") {
+        None => {}
+        Some(Value::Object(obj)) => {
+            for (k, v) in obj {
+                flags.insert(k.clone(), crate::mcp::value_to_string(v));
+            }
+        }
+        Some(_) => return Err("dispatch request's `flags` must be an object".to_string()),
+    }
+
+    Ok(Invocation { path, args, flags, door: Door::Daemon })
+}
+
 /// Bind `socket_path` and accept `ping`/`subscribe` connections forever
 /// (module doc's "Framing"). Thread-per-connection via the FALLIBLE
 /// `thread::Builder::spawn` (never the panicking `thread::spawn`) so a
@@ -269,9 +381,9 @@ fn write_json_line(writer: &mut impl Write, value: &Value) -> std::io::Result<()
 /// unwinding this accept loop — the secrets broker's own accept-loop
 /// discipline (`aoide_secrets::broker::serve`'s module doc), reused here by
 /// convention since `aoide-server` cannot depend on `aoide-secrets`'s
-/// private `serve` fn. `registry`/`dispatch` are threaded all the way to
-/// [`handle_conn`] unused this phase (module doc's "Framing") — the DI seam
-/// P-D4's `dispatch` op lands into without another signature change.
+/// private `serve` fn. `dispatch` is threaded all the way to [`handle_conn`],
+/// which now calls it for the `dispatch` op (module doc's "Framing");
+/// `registry` still rides along unused this phase — no op needs it yet.
 /// Only returns on a bind failure — a running daemon never returns `Ok`.
 pub fn serve_daemon(
     socket_path: &Path,
@@ -311,10 +423,12 @@ fn accept_loop(listener: UnixListener, events_path: PathBuf, registry: &'static 
 /// only this connection — nothing here can unwind into `accept_loop` or any
 /// other connection's own thread (module doc's "Framing").
 fn handle_conn(events_path: &Path, stream: UnixStream, registry: &'static Registry, dispatch: DispatchFn) {
-    // Unused this phase (`dispatch` is P-D4) — kept as real parameters, not
-    // dropped at the call site, so the DI seam threading them here never
-    // needs a second signature change (module doc's "Framing").
-    let _ = (registry, dispatch);
+    // `registry` has no caller yet — no op resolves a tool name against it
+    // the way MCP's `tools/call` does (module doc's "Framing": `dispatch`
+    // takes `path` literally). Kept as a real parameter, not dropped at the
+    // call site, so a future op that DOES need it needs no signature change
+    // threading through `run_loop`/`accept_loop` again.
+    let _ = registry;
 
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
@@ -325,22 +439,24 @@ fn handle_conn(events_path: &Path, stream: UnixStream, registry: &'static Regist
     };
     let mut reader = BufReader::new(stream);
     loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => return, // EOF: client closed.
-            Ok(_) => {}
-            Err(_) => return,
-        }
+        let line_bytes = match read_capped_line(&mut reader, MAX_REQUEST_LINE_BYTES) {
+            Ok(None) => return, // EOF: client closed.
+            Ok(Some(bytes)) => bytes,
+            Err(LineReadError::TooLarge) => {
+                let _ = write_json_line(
+                    &mut writer,
+                    &json!({"ok": false, "error": format!("request line exceeds the {MAX_REQUEST_LINE_BYTES}-byte cap")}),
+                );
+                return; // Oversized line → error, drop connection (module doc).
+            }
+            Err(LineReadError::Io) => return, // Read error/invalid UTF-8: no peer left to usefully reply to.
+        };
+        let Ok(line) = String::from_utf8(line_bytes) else {
+            return; // Invalid UTF-8 — mirrors `read_line`'s own Err(_) => return path.
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
-        }
-        if trimmed.len() > MAX_REQUEST_LINE_BYTES {
-            let _ = write_json_line(
-                &mut writer,
-                &json!({"ok": false, "error": format!("request line exceeds the {MAX_REQUEST_LINE_BYTES}-byte cap")}),
-            );
-            return; // Oversized line → error, drop connection (module doc).
         }
 
         let req: Value = match serde_json::from_str(trimmed) {
@@ -372,6 +488,28 @@ fn handle_conn(events_path: &Path, stream: UnixStream, registry: &'static Regist
                 // connection after this call returns.
                 stream_subscribe(events_path, &req, &mut reader, &mut writer);
                 return;
+            }
+            Some("dispatch") => {
+                // The fourth door (P-D4, module doc's "Framing"): build the
+                // Invocation LITERALLY from the wire and run it through the
+                // SAME injected `dispatch` fn every other door calls — no
+                // door-specific policy lives here (module doc).
+                match invocation_from_dispatch_request(&req) {
+                    Ok(inv) => {
+                        let outcome = dispatch(&inv);
+                        if write_json_line(&mut writer, &json!({"outcome": outcome})).is_err() {
+                            return;
+                        }
+                    }
+                    Err(msg) => {
+                        // A malformed `dispatch` request (missing/wrong-typed
+                        // `path`/`args`/`flags`) gets one error reply and the
+                        // connection SURVIVES — same posture as a malformed
+                        // JSON line above, since nothing here has dispatched
+                        // anything yet.
+                        let _ = write_json_line(&mut writer, &json!({"ok": false, "error": msg}));
+                    }
+                }
             }
             Some(other) => {
                 let _ = write_json_line(&mut writer, &json!({"ok": false, "error": format!("unknown op `{other}`")}));
@@ -515,7 +653,6 @@ pub fn run_loop(
 mod tests {
     use super::*;
     use aoide_protocol::output::Outcome;
-    use aoide_protocol::Invocation;
     use std::sync::OnceLock;
 
     /// A short path directly under `/tmp` — NOT `std::env::temp_dir()`,
@@ -530,10 +667,19 @@ mod tests {
         PathBuf::from(format!("/tmp/av-aoided-{tag}-{}-{nanos}", std::process::id()))
     }
 
-    /// Never called this phase (`dispatch` is P-D4) — exists only to satisfy
-    /// [`DispatchFn`]'s signature for tests that need a real fn pointer.
-    fn noop_dispatch(_inv: &Invocation) -> Outcome {
-        Outcome::ok("test.noop", "unreachable in P-D2 tests")
+    /// A fixture [`DispatchFn`] proving [`handle_conn`]'s `dispatch` op wires
+    /// the injected fn correctly (this module's own tests use a fixture, not
+    /// a real registry, since the FULLY-ASSEMBLED registry only exists in
+    /// the `cli` crate above this one — real per-verb door-policy proof
+    /// against that registry lives in `aoide-cli`'s own integration test,
+    /// per this crate's own DI-seam invariant). Every other op ignores this
+    /// fn entirely, so most tests below still never call it.
+    fn noop_dispatch(inv: &Invocation) -> Outcome {
+        Outcome::ok(inv.dotted(), "the injected dispatch fn ran").with_data(json!({
+            "path": inv.path,
+            "args": inv.args,
+            "flags": inv.flags,
+        }))
     }
 
     fn test_registry() -> &'static Registry {
@@ -679,6 +825,144 @@ mod tests {
         second_writer.write_all(b"{\"v\":0,\"op\":\"ping\"}\n").unwrap();
         let second_reply = read_one_line(&mut second_reader);
         assert_eq!(second_reply["ok"], true, "{second_reply}");
+
+        std::fs::remove_file(&socket_path).ok();
+        std::fs::remove_file(&events_path).ok();
+    }
+
+    /// `dispatch` (P-D4): builds the `Invocation` from `path`/`args`/`flags`
+    /// literally, calls the injected fn, and replies `{"outcome": ...}` with
+    /// the fn's own [`Outcome`] verbatim. This proves `handle_conn`'s WIRING
+    /// only — real per-verb door-policy proof (a CLI-only admin verb's
+    /// refusal, a gated verb's `gated: true`, `mcp.serve`/`a2a.serve`'s
+    /// non-Cli replies, and the `"door":"daemon"` audit line) runs against
+    /// the fully-assembled registry in `aoide-cli`'s own integration test
+    /// (this crate's DI-seam invariant — the assembled registry doesn't
+    /// exist here).
+    #[test]
+    fn serve_daemon_dispatch_calls_the_injected_fn_and_replies_with_the_outcome() {
+        let socket_path = short_tmp("dispatch").with_extension("sock");
+        let events_path = short_tmp("dispatch-events").with_extension("jsonl");
+        let sp = socket_path.clone();
+        let ep = events_path.clone();
+        std::thread::spawn(move || {
+            let _ = serve_daemon(&sp, &ep, test_registry(), noop_dispatch);
+        });
+
+        let stream = connect_retrying(&socket_path);
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        writer
+            .write_all(br#"{"v":0,"op":"dispatch","path":["foo","bar"],"args":["a"],"flags":{"x":"y"}}"#)
+            .unwrap();
+        writer.write_all(b"\n").unwrap();
+
+        let reply = read_one_line(&mut reader);
+        let outcome = &reply["outcome"];
+        assert_eq!(outcome["status"], "ok", "{reply}");
+        assert_eq!(outcome["command"], "foo.bar", "{reply}");
+        assert_eq!(outcome["data"]["path"], json!(["foo", "bar"]), "{reply}");
+        assert_eq!(outcome["data"]["args"], json!(["a"]), "{reply}");
+        assert_eq!(outcome["data"]["flags"]["x"], "y", "{reply}");
+
+        std::fs::remove_file(&socket_path).ok();
+        std::fs::remove_file(&events_path).ok();
+    }
+
+    /// A `dispatch` request missing its `path` array gets one error reply
+    /// and the connection SURVIVES — the same posture a malformed JSON line
+    /// already holds, since nothing has been dispatched yet.
+    #[test]
+    fn serve_daemon_dispatch_with_no_path_survives() {
+        let socket_path = short_tmp("dispatch-bad").with_extension("sock");
+        let events_path = short_tmp("dispatch-bad-events").with_extension("jsonl");
+        let sp = socket_path.clone();
+        let ep = events_path.clone();
+        std::thread::spawn(move || {
+            let _ = serve_daemon(&sp, &ep, test_registry(), noop_dispatch);
+        });
+
+        let stream = connect_retrying(&socket_path);
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+
+        writer.write_all(b"{\"v\":0,\"op\":\"dispatch\"}\n").unwrap();
+        let reply = read_one_line(&mut reader);
+        assert_eq!(reply["ok"], false, "{reply}");
+        assert!(reply["error"].as_str().unwrap().contains("path"), "{reply}");
+
+        writer.write_all(b"{\"v\":0,\"op\":\"ping\"}\n").unwrap();
+        let ping_reply = read_one_line(&mut reader);
+        assert_eq!(ping_reply["ok"], true, "{ping_reply}");
+
+        std::fs::remove_file(&socket_path).ok();
+        std::fs::remove_file(&events_path).ok();
+    }
+
+    /// The P-D2 nit, closed this phase: a client that streams well past
+    /// [`MAX_REQUEST_LINE_BYTES`] with NO trailing newline, and never closes
+    /// its end, is disconnected the instant it crosses the cap — never only
+    /// after EOF or a newline that never comes (module doc's "Framing").
+    /// Deadline-polled: alternates a bounded write with a non-blocking probe
+    /// read, accepting either the cap's own error reply or a bare close as
+    /// proof of disconnect (timing decides which one the client observes
+    /// first; both mean the SAME fix fired).
+    #[test]
+    fn serve_daemon_disconnects_a_newline_less_oversized_stream() {
+        let socket_path = short_tmp("cap").with_extension("sock");
+        let events_path = short_tmp("cap-events").with_extension("jsonl");
+        let sp = socket_path.clone();
+        let ep = events_path.clone();
+        std::thread::spawn(move || {
+            let _ = serve_daemon(&sp, &ep, test_registry(), noop_dispatch);
+        });
+
+        let stream = connect_retrying(&socket_path);
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        reader.get_ref().set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+
+        let chunk = vec![b'x'; 32 * 1024];
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut sent: usize = 0;
+        let mut disconnected = false;
+        let mut got_cap_error = false;
+        while std::time::Instant::now() < deadline {
+            match writer.write(&chunk) {
+                Ok(0) | Err(_) => {
+                    disconnected = true;
+                    break;
+                }
+                Ok(n) => sent += n,
+            }
+            let mut probe = [0u8; 4096];
+            match reader.get_mut().read(&mut probe) {
+                Ok(0) => {
+                    disconnected = true;
+                    break;
+                }
+                Ok(n) => {
+                    if String::from_utf8_lossy(&probe[..n]).contains("exceeds") {
+                        got_cap_error = true;
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(_) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+            if sent > MAX_REQUEST_LINE_BYTES * 3 {
+                break;
+            }
+        }
+
+        assert!(
+            got_cap_error || disconnected,
+            "expected the daemon to reply with the cap error or disconnect once the \
+             newline-less stream crossed {MAX_REQUEST_LINE_BYTES} bytes; sent {sent} bytes with neither"
+        );
 
         std::fs::remove_file(&socket_path).ok();
         std::fs::remove_file(&events_path).ok();

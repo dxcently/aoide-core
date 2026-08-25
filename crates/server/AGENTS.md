@@ -49,6 +49,29 @@
   synchronous assertion, never a fixed sleep or a real signal sent into
   the shared test binary — don't fold a `thread::sleep`/signal check into
   one of the bounded functions "to save a caller the loop."
+- **`daemon::handle_conn`'s `dispatch` op (P-D4) adds no daemon-specific
+  policy, and never will.** Every per-verb door check that already runs
+  over MCP/A2A (a CLI-only admin verb's refusal, a gated command's
+  `gated: true`, `mcp.serve`/`a2a.serve`'s non-Cli metadata replies) runs
+  IDENTICALLY over this door, because the injected `dispatch` fn IS
+  `cli::dispatch::dispatch` — the same function, the same registry, the
+  same `inv.door` branches. Don't add a daemon-specific allowlist or
+  permission table here "for symmetry with MCP's tool list" —
+  `docs/architecture/AOIDED.md`'s "L2" section names a daemon-door
+  allowlist a review-blocking violation; a new per-verb policy need is
+  proved by a failing test against the EXISTING handler's `inv.door`
+  branch, never by a new table in this crate.
+- **Request-line reads on the daemon socket go through
+  `daemon::read_capped_line` (a hand-rolled `fill_buf`/`consume` loop),
+  never `BufReader::read_line` (P-D4, closing a P-D2-flagged gap).**
+  `read_line` only checks a size cap AFTER a `\n` (or EOF) finally
+  arrives — a client that streams past the cap with no trailing newline
+  could grow that connection's own buffer for as long as it kept sending.
+  `read_capped_line` checks the accumulated length on EVERY buffer fill
+  instead, so an over-cap, newline-less stream is disconnected the
+  instant it crosses the cap. A future op or connection type reading more
+  request lines off this same socket reuses `read_capped_line`, never a
+  second hand-rolled read loop.
 
 ## Extension points
 
@@ -69,5 +92,7 @@
 
 - This `README.md` when a new module or serve-side verb is added.
 - `CONTRACTS.md §6` when an A2A/MCP wire shape changes.
+- `CONTRACTS.md §3`'s "Daemon wire" subsection when the daemon socket's own
+  wire shape changes (`ping`/`subscribe`/`dispatch`).
 - `pkgs/aoide/crates/AGENTS.md` for cross-crate invariants — not restated
   here.

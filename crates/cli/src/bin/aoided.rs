@@ -1,9 +1,10 @@
-//! The `aoided` binary — the resident orchestrator daemon (P-D2,
+//! The `aoided` binary — the resident orchestrator daemon (P-D2/P-D4,
 //! `docs/architecture/AOIDED.md`).
 //!
 //! Owns the single policy surface: audit log, user rebuild gate, neutral event
 //! stream with default-deny-per-class subscriptions (entities/aoided). Binds
-//! its own control socket (`ping`/`subscribe`, P-D4 adds `dispatch`) and runs
+//! its own control socket (`ping`/`subscribe`/`dispatch` — the fourth door
+//! onto this binary's own registry) and runs
 //! forever — this is what the systemd unit execs (`modules/nucleus/
 //! aoided.nix`, `Type=simple` + `Restart=on-failure` as of this phase).
 //! `dispatch::registry()`/`dispatch::dispatch` are injected here — the SAME

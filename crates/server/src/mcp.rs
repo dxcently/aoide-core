@@ -113,7 +113,13 @@ fn invocation_from_call(name: &str, arguments: &Value, registry: &Registry) -> O
     })
 }
 
-fn value_to_string(v: &Value) -> String {
+/// `pub(crate)` (not `pub`) so [`crate::daemon`]'s own `dispatch` op
+/// (P-D4, `docs/architecture/AOIDED.md`'s "L2" section) can reuse the exact
+/// same JSON-value-to-wire-string conversion its `flags`/`args` parsing
+/// needs — the "no cross-crate copying" convention
+/// (`pkgs/aoide/crates/AGENTS.md`) applied within one crate too: widen a
+/// `pub(crate)` scope rather than fork the four-line match a second time.
+pub(crate) fn value_to_string(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         other => other.to_string(),
