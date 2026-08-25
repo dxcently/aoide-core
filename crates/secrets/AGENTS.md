@@ -517,15 +517,17 @@
   and so is a future CHANGE to a built-in's own template text
   (`AGE_BACKEND_GET`/`FILE_BACKEND_SET`/etc.).** Presence of the top-level
   NAME is the whole test; this function has no path that ever re-derives
-  or corrects the SHAPE of an already-present entry. A future change to a
-  built-in's template text therefore reaches only a freshly-seeded home
-  ([`crate::backend::seed_default_backends`]'s own "absent file only"
-  rule) — it can NEVER retroactively repair an already-deployed
-  `backends.json` that predates the change. This is a queued follow-up gap,
-  not something silently fixed by backfill or seeding as they exist today;
-  don't claim otherwise in a docstring, a commit message, or an operator-
-  facing message. Closing it for real would need an explicit, versioned
-  migration path this crate does not have — out of scope here.
+  or corrects the SHAPE of an already-present entry, and this stays true
+  after task #82 below — `backfill`/`seed_default_backends` still never
+  rewrite an already-present entry's STORED bytes, full stop. **What
+  changed at task #82: a built-in's template text no longer needs the
+  file's bytes rewritten to take effect.** `backend::resolve_backend` (the
+  invariant below) makes `file`/`age`'s stored `get`/`set`/`has` text
+  irrelevant at USE TIME — every read/write goes through this binary's own
+  current compiled default regardless of what backfill/seeding left on
+  disk under those two names. Don't read this bullet as saying a built-in
+  template change is still unreachable; it is reachable, just through a
+  different seam than this function ever gained.
 - **Backfill writes NOTHING when nothing was missing (P-G2, task #72) —
   checked before ever opening a temp file, not merely a same-content
   rewrite.** A `backends.json` that already carries both built-ins must
@@ -618,6 +620,47 @@
   guarantee that doesn't exist. Closing this for real needs a real
   cross-process primitive (a file lock) this crate does not have today —
   out of scope here, flagged for whoever picks it up next.
+- **Both built-in `set` templates are ATOMIC — `.tmp`-then-`mv`, matching
+  `storage::fs::atomic_write`'s temp-then-rename shape (task #82).**
+  `FILE_BACKEND_SET`/`AGE_BACKEND_SET` write to a `.tmp`/`.age.tmp` sibling
+  in the SAME directory first, then `mv` it over the real destination —
+  `mv` within one directory is `rename(2)`, so the real path is at every
+  instant either fully the OLD value or fully the NEW one, never torn,
+  even if the broker is killed mid-write or the template fails partway
+  (a failure now leaves the OLD value completely untouched instead of
+  possibly truncating it on the way to failing). These templates run as
+  SHELL TEXT under the broker uid (module doc, house rule 7) — there is no
+  Rust I/O call to make atomic here, so the atomicity has to live in the
+  template text itself. A stale orphaned `.tmp`/`.age.tmp` left by an
+  interrupted run is harmless clutter, overwritten the same atomic way by
+  the next successful `set` to that key. A future built-in `set` template
+  (there are none planned) follows this same `.tmp`-then-`mv` shape — never
+  a direct write to the live path.
+- **`backend::resolve_backend` makes `file`/`age`'s STORED template text
+  advisory, never authoritative (task #82) — the ONE seam
+  `fetch_value`/`has_value`/`store_value` route through instead of reading
+  a loaded `Backends` map directly.** For a name it recognizes as built-in
+  (`file`, `age` — [`builtin_backend_defaults`]'s match, the SAME two names
+  `seed_default_backends`/`backfill_missing_backends` ever insert by name),
+  the `get`/`set`/`has` text actually loaded from `backends.json` is
+  IGNORED in favor of this binary's OWN CURRENT compiled constant
+  (`FILE_BACKEND_GET`/`AGE_BACKEND_SET`/etc.) — closing the gap the
+  bullet above (backfill/seeding) used to name as a queued follow-up: a
+  template fix now reaches every already-deployed `backends.json` the
+  moment the broker restarts, with NO file rewrite and NO migration step.
+  **Presence of the name in `backends.json` is UNCHANGED by this** — a
+  `file`/`age` entry still has to exist there (seeding/backfill's own job,
+  untouched) or resolution still fails with `unknown backend`, exactly as
+  before this function existed; only the on-disk TEXT under those two
+  names stops being read. Any name `builtin_backend_defaults` does NOT
+  recognize (`pass`/`gopass`/`bw`/`sops`, any operator-custom entry) is
+  returned from `backends.json` EXACTLY as stored — this crate has and
+  makes no opinion about a non-built-in entry's template text, unchanged.
+  Don't add a third recognized name to `builtin_backend_defaults` without
+  also giving it a real seeded default the way `file`/`age` have one
+  (`backend.rs`'s own "the only backend IMPLEMENTATIONS this crate
+  supports" stance, restated above) — this function must never resolve a
+  name to compiled-in text the crate doesn't actually own the shape of.
 
 ## Extension points
 

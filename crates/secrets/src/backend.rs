@@ -236,6 +236,55 @@ fn load_backends(secrets_home: &Path) -> Result<Backends, String> {
     serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// This binary's CURRENT compiled-in template shape for a recognized
+/// BUILT-IN backend name — the two names
+/// [`seed_default_backends`]/[`backfill_missing_backends`] ever insert by
+/// name, never by content (task #82, same by-name recognition those two
+/// functions already document, reused here for resolution rather than
+/// insertion). `None` for any other name.
+fn builtin_backend_defaults(name: &str) -> Option<Backend> {
+    match name {
+        "file" => Some(Backend {
+            get: FILE_BACKEND_GET.to_string(),
+            set: Some(FILE_BACKEND_SET.to_string()),
+            has: Some(FILE_BACKEND_HAS.to_string()),
+        }),
+        "age" => Some(Backend {
+            get: AGE_BACKEND_GET.to_string(),
+            set: Some(AGE_BACKEND_SET.to_string()),
+            has: Some(AGE_BACKEND_HAS.to_string()),
+        }),
+        _ => None,
+    }
+}
+
+/// Resolve `name`'s TEMPLATE SHAPE for actual use — the ONE seam
+/// [`fetch_value`]/[`has_value`]/[`store_value`] all route through instead
+/// of reading a loaded [`Backends`] directly (task #82, closing the gap
+/// this crate's own `AGENTS.md` used to name as a queued follow-up: "no
+/// correction to a built-in's own template text... can ever reach an
+/// already-deployed `backends.json`"). `backends.json` is STILL the
+/// registry of which NAMES exist — presence there gates every backend,
+/// built-in or custom, exactly as before (`Err("unknown backend")` when
+/// absent, unchanged) — but for a name [`builtin_backend_defaults`]
+/// recognizes, the on-disk `get`/`set`/`has` text is IGNORED in favor of
+/// [`builtin_backend_defaults`]'s CURRENT compiled-in shape, so a fix or
+/// improvement to a built-in's own template (this commit's atomicity fix,
+/// or a future one) reaches every already-deployed `backends.json` the
+/// moment the broker restarts, with no migration step and no rewrite of
+/// the file on disk — the stored entry stays exactly as
+/// `seed_default_backends`/`backfill_missing_backends` left it, it just
+/// stops being the AUTHORITY for those two names. A name NOT recognized as
+/// built-in (a `pass`/`gopass`/`bw`/`sops` row, or any operator-custom
+/// entry) is returned EXACTLY as stored — this crate has and makes no
+/// opinion about a non-built-in entry's template text, unchanged from
+/// before this function existed.
+fn resolve_backend(secrets_home: &Path, name: &str) -> Result<Backend, String> {
+    let backends = load_backends(secrets_home)?;
+    let stored = backends.0.get(name).ok_or_else(|| format!("unknown backend `{name}`"))?;
+    Ok(builtin_backend_defaults(name).unwrap_or_else(|| stored.clone()))
+}
+
 /// Single-quote shell-escape `s`: wrap in `'...'`, escaping any embedded
 /// `'` as `'\''` (close the quote, emit an escaped literal quote, reopen
 /// the quote — the standard POSIX technique). The result is always safe
@@ -577,11 +626,7 @@ fn run_backend_command(backend_name: &str, op: &str, command: &str, stdin_data: 
 /// by construction: nothing here ever touches the secret's value except the
 /// `Ok` return itself, so an `Err` path can never leak one.
 pub fn fetch_value(secrets_home: &Path, backend_name: &str, key: &str) -> Result<String, String> {
-    let backends = load_backends(secrets_home)?;
-    let backend = backends
-        .0
-        .get(backend_name)
-        .ok_or_else(|| format!("unknown backend `{backend_name}`"))?;
+    let backend = resolve_backend(secrets_home, backend_name)?;
 
     // The built-in `age` backend's GET half: a missing identity is a
     // taught error, NEVER an auto-mint (module doc) — checked before the
@@ -626,10 +671,7 @@ pub fn fetch_value(secrets_home: &Path, backend_name: &str, key: &str) -> Result
 /// [`store_value`] re-checks the same policy/backend on the write that
 /// follows and surfaces the real error there if the caller proceeds.
 pub fn has_value(secrets_home: &Path, backend_name: &str, key: &str) -> bool {
-    let Ok(backends) = load_backends(secrets_home) else {
-        return false;
-    };
-    let Some(backend) = backends.0.get(backend_name) else {
+    let Ok(backend) = resolve_backend(secrets_home, backend_name) else {
         return false;
     };
     match &backend.has {
@@ -661,11 +703,7 @@ fn run_has_template(secrets_home: &Path, backend_name: &str, key: &str, template
 /// `set` template, a failing `set` command, or a timeout all return an
 /// `Err` that carries no part of `value`.
 pub fn store_value(secrets_home: &Path, backend_name: &str, key: &str, value: &str) -> Result<(), String> {
-    let backends = load_backends(secrets_home)?;
-    let backend = backends
-        .0
-        .get(backend_name)
-        .ok_or_else(|| format!("unknown backend `{backend_name}`"))?;
+    let backend = resolve_backend(secrets_home, backend_name)?;
     let Some(set_template) = &backend.set else {
         return Err(format!("backend `{backend_name}` has no `set` template"));
     };
@@ -687,7 +725,24 @@ pub fn store_value(secrets_home: &Path, backend_name: &str, key: &str, value: &s
 /// the template text itself is just documentation-as-data and could be
 /// re-worded without changing the resulting file layout.
 const FILE_BACKEND_GET: &str = "cat {home}/store/{name}";
-const FILE_BACKEND_SET: &str = "mkdir -p -m 0700 {home}/store && install -m 0600 /dev/stdin {home}/store/{name}";
+/// **Atomic (task #82):** writes to a `.tmp` sibling in the SAME directory
+/// first, then `mv`s it over the real path — `mv` within one filesystem is
+/// `rename(2)`, so the real `{name}` file is at every instant either fully
+/// the OLD value or fully the NEW one, never torn. Before this fix,
+/// `install -m 0600 /dev/stdin {home}/store/{name}` wrote directly to the
+/// live path — a broker killed mid-write (or a template step that failed
+/// partway) could leave a half-written file behind, or (worse) a `set`
+/// that failed AFTER already truncating the destination could destroy a
+/// perfectly good existing value for nothing. A stale `.tmp` left behind
+/// by an interrupted run is harmless clutter, cleaned up by the next
+/// successful `set` to the same key (which overwrites it in the same
+/// atomic way) — see `storage::fs::atomic_write` for the same
+/// temp-then-rename shape expressed as real Rust I/O rather than shell
+/// text; this crate's SET templates run as shell under the broker uid
+/// (module doc, house rule 7), so atomicity has to live in the template
+/// text itself.
+const FILE_BACKEND_SET: &str =
+    "mkdir -p -m 0700 {home}/store && install -m 0600 /dev/stdin {home}/store/{name}.tmp && mv {home}/store/{name}.tmp {home}/store/{name}";
 /// P-G1 (task #70): a cheap `test -f`, never a `cat` whose stdout would
 /// just be discarded — see [`has_value`]'s own doc for why this is now
 /// possible at all.
@@ -705,8 +760,15 @@ const FILE_BACKEND_HAS: &str = "test -f {home}/store/{name}";
 /// umask, the same problem `home::secure_file`/`secure_dir` exist to close
 /// elsewhere in this crate.
 const AGE_BACKEND_GET: &str = "age -d -i {home}/age.key {home}/values/{name}.age";
-const AGE_BACKEND_SET: &str =
-    "mkdir -p -m 0700 {home}/values && age -e -R {home}/age.recipient -o {home}/values/{name}.age && chmod 0600 {home}/values/{name}.age";
+/// **Atomic (task #82), same `.tmp`-then-`mv` shape as [`FILE_BACKEND_SET`]
+/// above:** encrypts to a `.age.tmp` sibling, `chmod`s THAT file, then `mv`s
+/// it over the real `.age` path — a decrypt attempt (age reads are
+/// auth-or-nothing, module doc) can only ever see a complete, correctly
+/// permissioned ciphertext file at the real path, never a torn one, and a
+/// `set` that fails partway (a killed broker, a full disk) can no longer
+/// destroy an existing good value before the replacement is confirmed
+/// written.
+const AGE_BACKEND_SET: &str = "mkdir -p -m 0700 {home}/values && age -e -R {home}/age.recipient -o {home}/values/{name}.age.tmp && chmod 0600 {home}/values/{name}.age.tmp && mv {home}/values/{name}.age.tmp {home}/values/{name}.age";
 const AGE_BACKEND_HAS: &str = "test -f {home}/values/{name}.age";
 
 /// Seed `backends.json` with the two built-in backends WHEN ABSENT — never
@@ -1379,6 +1441,92 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    // ── atomic SET templates + code-owned built-in resolution (task #82) ─
+
+    /// The `.tmp`-then-`mv` shape (module doc on [`FILE_BACKEND_SET`]) must
+    /// leave NO trace behind on a successful `set` — only the real
+    /// destination file exists afterward, never a stray `.tmp` sibling.
+    #[test]
+    fn a_successful_file_set_leaves_no_tmp_sibling_behind() {
+        let home = tmp_home("file-set-no-tmp");
+        seed_default_backends(&home).unwrap();
+        store_value(&home, "file", "my-secret-key", "the-stored-value").unwrap();
+
+        let store_dir = home.join("store");
+        let entries: Vec<_> = std::fs::read_dir(&store_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["my-secret-key"], "no .tmp sibling may survive a successful set: {entries:?}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Same no-leftover proof for the `age` backend's `.age.tmp` sibling.
+    #[test]
+    fn a_successful_age_set_leaves_no_tmp_sibling_behind() {
+        if !age_tools_available() {
+            eprintln!("skipping a_successful_age_set_leaves_no_tmp_sibling_behind: age/age-keygen not found on PATH");
+            return;
+        }
+        let home = tmp_home("age-set-no-tmp");
+        seed_default_backends(&home).unwrap();
+        mint_age_identity_if_needed(&home).unwrap();
+        store_value(&home, "age", "my-secret-key", "the-stored-value").unwrap();
+
+        let values_dir = home.join("values");
+        let entries: Vec<_> = std::fs::read_dir(&values_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["my-secret-key.age"],
+            "no .age.tmp sibling may survive a successful set: {entries:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// **The headline task #82 proof:** a `backends.json` whose `file`/`age`
+    /// entries were hand-edited (or written by an older binary whose
+    /// built-in template text has since changed) must NOT reach the shell —
+    /// [`resolve_backend`] resolves to THIS binary's own current
+    /// [`FILE_BACKEND_GET`]/[`AGE_BACKEND_GET`] regardless of what's stored
+    /// on disk. Proven by a customized `get` template that would return an
+    /// obviously different value if it ever ran.
+    #[test]
+    fn a_customized_stored_template_under_a_builtin_name_is_ignored_at_use_time() {
+        let home = tmp_home("builtin-template-ignored");
+        std::fs::create_dir_all(&home.join("store")).unwrap();
+        std::fs::write(home.join("store").join("k"), "the-real-stored-value").unwrap();
+        let doc = serde_json::json!({
+            "file": { "get": "printf %s this-would-prove-the-stale-template-ran" }
+        });
+        std::fs::write(backends_path(&home), serde_json::to_vec(&doc).unwrap()).unwrap();
+
+        assert_eq!(
+            fetch_value(&home, "file", "k").unwrap(),
+            "the-real-stored-value",
+            "a customized `file` template on disk must be ignored — the compiled-in default runs instead"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The presence gate is UNCHANGED by task #82 — only the TEMPLATE TEXT
+    /// for a recognized built-in name is code-owned; the name still has to
+    /// be present in `backends.json` at all (the seeding/backfill
+    /// mechanism's own job, untouched here) or resolution still fails
+    /// exactly as before.
+    #[test]
+    fn a_builtin_name_absent_from_backends_json_is_still_unknown() {
+        let home = tmp_home("builtin-name-absent");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(backends_path(&home), br#"{"scratch":{"get":"echo hi"}}"#).unwrap();
+
+        let err = fetch_value(&home, "file", "k").unwrap_err();
+        assert_eq!(err, "unknown backend `file`");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     // ── the `has` template (P-G1, task #70) ─────────────────────────────
 
     fn write_backend_with_has(home: &Path, get: &str, has: &str) {
@@ -1579,23 +1727,54 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// Deterministic, no real `age` binary required: `sh -c`'s own exit 127
-    /// universally means "command not found", so a fake, definitely-absent
-    /// binary name reliably exercises this path.
+    /// Deterministic, no real `age` binary required to actually decrypt
+    /// anything: `sh -c`'s own exit 127 universally means "command not
+    /// found", so a PATH-shimmed `age` that just `exit`s 127 reliably
+    /// exercises this path — the SAME PATH-shim technique
+    /// `mint_age_identity_against_a_hung_age_keygen_returns_within_bounds`
+    /// (below) already uses for `age-keygen`. **Not a custom
+    /// `backends.json` entry anymore (task #82):** `age`'s `get` template
+    /// is now CODE-OWNED ([`resolve_backend`]) — stuffing a bogus template
+    /// under the stored `age` key, this test's old approach, is now
+    /// silently ignored by design, so the missing-binary scenario has to
+    /// come from making the REAL `age` unreachable instead.
     #[test]
     fn a_missing_age_binary_produces_a_taught_error_naming_the_package() {
         let home = tmp_home("age-missing-binary");
         // Bypass the missing-IDENTITY check above so the template actually
         // runs and hits the missing-BINARY path instead.
         std::fs::write(home.join("age.key"), b"dummy-identity-for-this-test").unwrap();
-        let doc = serde_json::json!({
-            "age": { "get": "definitely-not-a-real-age-binary-xyz {name}" }
-        });
-        std::fs::write(backends_path(&home), serde_json::to_vec(&doc).unwrap()).unwrap();
+        seed_default_backends(&home).unwrap();
+
+        let shim_dir = std::env::temp_dir().join(format!(
+            "aoide-secrets-age-missing-binary-shim-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        let shim = shim_dir.join("age");
+        std::fs::write(&shim, "#!/bin/sh\nexit 127\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let _lock = crate::env_lock().lock().unwrap();
+        let saved_path = std::env::var("PATH").ok();
+        let new_path = format!("{}:{}", shim_dir.display(), saved_path.clone().unwrap_or_default());
+        std::env::set_var("PATH", &new_path);
 
         let err = fetch_value(&home, "age", "k").unwrap_err();
+
+        match saved_path {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+
         assert_eq!(err, missing_age_binary_hint());
         std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&shim_dir).ok();
     }
 
     /// P-G1 review fix (task #70): an EXISTING deployment's `backends.json`
