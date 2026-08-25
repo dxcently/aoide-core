@@ -7,7 +7,7 @@
   drew. If a paint feature seems to need the graph or A2A, that's a signal
   it belongs in core, not a reason to add the dependency here.
 - **Lyra's golden is independent of core's.** `registry.rs`'s snapshot (42
-  paths) is its own list, not a subset check against `cli`'s 68 — the two
+  paths) is its own list, not a subset check against `cli`'s 69 — the two
   evolve separately.
 - **`commands::all()`'s order is byte-stable**, same discipline as `cli`'s —
   append, never reorder (see `pkgs/aoide/crates/AGENTS.md`).

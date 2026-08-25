@@ -26,12 +26,12 @@ the inbound half of the two-door contract (the outbound half is
 - `producers` (P-D3, `docs/architecture/AOIDED.md`'s "L1" section) — the
   daemon tick's two producers, both constructed once at `run_loop` startup
   and ticked every iteration. `SecretsMirror` tails the secrets broker's
-  OWN events feed (`producers::secrets_socket_path`/`secrets_events_path`
-  — the SAME `$AOIDE_SECRETS_SOCKET`/`$AOIDE_SECRETS_EVENTS` resolution
-  `aoide_secrets::socket` documents, reimplemented here rather than
-  imported: this crate's own `aoide-secrets` dependency exists only for
-  the A2A door's inbound bearer resolve, and the mirror is deliberately
-  kept off that crate's wire/record TYPES so "never copy an unknown field"
+  OWN events feed, its location resolved via `aoide_secrets::socket::
+  socket_path`/`events_path` (`daemon::run_loop`'s own construction site —
+  plain, wire-type-free `PathBuf` resolvers, reused rather than re-derived;
+  this crate's `aoide-secrets` dependency also covers the A2A door's
+  inbound bearer resolve). The mirror IS deliberately kept off that
+  crate's wire/record TYPES for parsing, so "never copy an unknown field"
   is structural — `mirror_secrets_line` reads a bare `serde_json::Value`
   and copies exactly four named fields, `id`/`secret`/`consumer`/
   `timeoutSecs`, for one of the five recognized outcomes,

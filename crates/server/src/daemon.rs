@@ -491,7 +491,9 @@ pub fn run_loop(
 
     // Tick (~1s): the two P-D3 producers (module doc's "The tick's two
     // producers"), constructed once here, outside the loop.
-    let mut secrets_mirror = crate::producers::SecretsMirror::new(crate::producers::secrets_events_path());
+    let secrets_socket = aoide_secrets::socket::socket_path();
+    let secrets_events = aoide_secrets::socket::events_path(&secrets_socket);
+    let mut secrets_mirror = crate::producers::SecretsMirror::new(secrets_events);
     let mut hand_edit_watcher = crate::producers::HandEditWatcher::new(stage_roster());
     loop {
         secrets_mirror.tick(&feed);

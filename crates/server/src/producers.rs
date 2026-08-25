@@ -10,27 +10,28 @@
 //!
 //! ## The secrets mirror
 //!
-//! [`SecretsMirror`] tails the secrets broker's OWN events feed (module
-//! doc's own resolution functions below) with a
+//! [`SecretsMirror`] tails the secrets broker's OWN events feed — its
+//! location resolved via `aoide_secrets::socket::socket_path`/`events_path`
+//! (this crate already depends on `aoide-secrets` for an unrelated reason,
+//! the A2A door's inbound bearer resolve in `a2a.rs`; those two path
+//! functions are plain, wire-type-free `PathBuf` resolvers, so importing
+//! them is the "no cross-crate copying" convention
+//! (`pkgs/aoide/crates/AGENTS.md`) working as intended rather than a
+//! boundary this producer needs to route around) — with a
 //! [`aoide_protocol::feed::Follower`] and re-publishes every line matching
 //! one of the crate's five notable outcomes — `released`/`parked`/
 //! `completed`/`dismissed`/`expired` (`aoide-secrets`'s `broker::
 //! emit_notify` module doc names these as the crate's ONLY five) — onto
-//! the daemon's own feed as a name-only mirror record. **This module
-//! deliberately does NOT depend on `aoide-secrets`'s wire/record types for
-//! either the path resolution or the parsing**, even though this crate
-//! already carries an `aoide-secrets` dependency for an unrelated reason
-//! (the A2A door's inbound bearer resolve, `a2a.rs`) — the phase brief for
-//! this producer is explicit that the mirror must resolve the broker's
-//! events-feed location BY CONVENTION/ENV (mirroring, not importing,
-//! `aoide_secrets::socket`'s two resolution functions — [`secrets_socket_path`]/
-//! [`secrets_events_path`] below are that convention, re-derived) and parse
-//! each line as a bare `serde_json::Value`, reading ONLY the four known
-//! field names ([`SECRETS_MIRROR_FIELDS`]) — never a typed struct, and
-//! never the parsed object wholesale. This is what makes "never copy an
-//! unknown field" a STRUCTURAL property of [`mirror_secrets_line`] rather
-//! than a discipline someone could quietly break by widening a shared
-//! struct: there is no struct to widen.
+//! the daemon's own feed as a name-only mirror record. **What this module
+//! DOES deliberately avoid is `aoide-secrets`'s wire/record TYPES for the
+//! parsing half**: each line is parsed as a bare `serde_json::Value`,
+//! reading ONLY the four known field names ([`SECRETS_MIRROR_FIELDS`]) —
+//! never a typed struct, and never the parsed object wholesale. This is
+//! what makes "never copy an unknown field" a STRUCTURAL property of
+//! [`mirror_secrets_line`] rather than a discipline someone could quietly
+//! break by widening a shared struct: there is no struct to widen. The
+//! path resolution carries no such risk (a `PathBuf` has no unknown-field
+//! surface to leak), so it is reused rather than re-derived.
 //!
 //! ## The hand-edit watcher (#69)
 //!
@@ -53,38 +54,13 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 // ── the secrets-feed mirror ──────────────────────────────────────────────
-
-/// The secrets broker's socket path — the SAME resolution
-/// `aoide_secrets::socket::socket_path` documents (`AOIDE_SECRETS_SOCKET`
-/// env override, else the canonical deployed path
-/// `/run/aoide-secrets/secrets.sock`), reimplemented here rather than
-/// imported (module doc: the mirror must not depend on that crate's own
-/// types for this).
-pub fn secrets_socket_path() -> PathBuf {
-    if let Ok(p) = std::env::var("AOIDE_SECRETS_SOCKET") {
-        if !p.trim().is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    PathBuf::from("/run/aoide-secrets/secrets.sock")
-}
-
-/// The secrets broker's own events feed path — the SAME resolution
-/// `aoide_secrets::socket::events_path` documents (`AOIDE_SECRETS_EVENTS`
-/// env override, else a sibling of the resolved socket path named
-/// `events.jsonl`), reimplemented here for the same reason
-/// [`secrets_socket_path`] is.
-pub fn secrets_events_path() -> PathBuf {
-    if let Ok(p) = std::env::var("AOIDE_SECRETS_EVENTS") {
-        if !p.trim().is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    match secrets_socket_path().parent() {
-        Some(parent) => parent.join("events.jsonl"),
-        None => PathBuf::from("events.jsonl"),
-    }
-}
+//
+// The broker's own socket/events-feed path resolution lives ONLY in
+// `aoide_secrets::socket::{socket_path, events_path}` — both plain,
+// wire-type-free `PathBuf` resolvers this crate already has a dependency
+// edge to reach (module doc). `crate::daemon::run_loop` calls them
+// directly when constructing a `SecretsMirror`; nothing in this module
+// re-derives that resolution.
 
 /// The five broker outcomes this mirror recognizes — `aoide-secrets`'s
 /// `broker::emit_notify` module doc's own list, restated here since this
@@ -140,8 +116,10 @@ pub struct SecretsMirror {
 impl SecretsMirror {
     /// `events_path` is resolved ONCE by the caller (this crate's own
     /// "resolve once, pass as a parameter" discipline,
-    /// `crate::daemon`'s module doc) — typically [`secrets_events_path`]'s
-    /// result, though a test passes an arbitrary tempdir path directly.
+    /// `crate::daemon`'s module doc) — typically `aoide_secrets::socket::
+    /// events_path(&aoide_secrets::socket::socket_path())`'s result
+    /// (`crate::daemon::run_loop`'s own construction site), though a test
+    /// passes an arbitrary tempdir path directly.
     pub fn new(events_path: PathBuf) -> Self {
         Self { events_path, follower: None }
     }
