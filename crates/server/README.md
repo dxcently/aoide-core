@@ -142,7 +142,7 @@ the inbound half of the two-door contract (the outbound half is
   value is never cached, logged, or placed in any audit line — see
   `CONTRACTS.md`'s "Secrets wire"/§6 sections for the wire contract and
   the resolve-consumer honesty note.
-  **The pairing ceremony's three methods (P-P2, review-bounce fix forward,
+  **The pairing ceremony's three methods (P-P2,
   CONTRACTS.md §6's "Pairing wire" subsection)** — `pair_request`
   (`aoide/pairRequest`), `pair_reveal` (`aoide/pairReveal`), and
   `pair_approve_callback` (`aoide/pairApprove`) — join this same JSON-RPC
@@ -156,18 +156,22 @@ the inbound half of the two-door contract (the outbound half is
   `valid_peer_name` name, a non-empty `://`-bearing url) before calling
   `aoide_storage::pairing::park_inbound` — malformed input never reaches
   the parked-state file, and a park past the configured cap is refused
-  with a distinct `-32000` (Finding 3). `pair_reveal` is the ceremony's
-  new third message: it checks a POSTed nonce against the parked entry's
+  with a distinct `-32000`. `pair_reveal` is the ceremony's
+  third message: it checks a POSTed nonce against the parked entry's
   earlier commitment (`aoide_storage::pairing::reveal_inbound`) — a match
   stores the nonce so a SAS becomes derivable; a mismatch DROPS the parked
-  entry outright and answers the distinct `-32002` (Finding 1 — unlike the
+  entry outright and answers the distinct `-32002` (unlike the
   approve callback's mismatch handling below, a bad reveal is exactly the
   shape a MITM's forced retry would take, so it is not treated as a
-  recoverable hiccup). `pair_approve_callback` looks up the matching
+  recoverable hiccup — the reveal is unauthenticated, so a third party
+  who obtains a live pending id can destroy that one ceremony attempt
+  with a bogus reveal: an accepted denial-of-one-attempt, never an
+  impersonation, and the operators simply re-run the ceremony).
+  `pair_approve_callback` looks up the matching
   outbound entry by id and, on a pubkey match, only TRANSITIONS its state
   (`aoide_storage::pairing::mark_outbound_awaiting_confirm`,
   `AwaitingApproval` → `AwaitingConfirm`) — it commits no peer record on
-  either a match or a mismatch (Finding 2); a mismatch leaves the entry
+  either a match or a mismatch; a mismatch leaves the entry
   untouched (never re-parked, never dropped) so a legitimate retry after a
   transient hiccup isn't permanently broken. The requester's own peer
   record commits later, entirely inside `aoide-client`, once that

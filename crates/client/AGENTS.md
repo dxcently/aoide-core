@@ -41,7 +41,7 @@
   running."
 
 - **`handle_peer_pair_approve` dispatches by DIRECTION — inbound first,
-  outbound second (P-P2, review-bounce Finding 2 fix forward) — and the
+  outbound second (P-P2) — and the
   two halves have opposite wire-then-commit orderings, not a shared one.**
   `approve_inbound` (this instance is the APPROVER) keeps the original
   ordering: the approval callback (`aoide/pairApprove`) MUST be delivered
@@ -58,14 +58,14 @@
   confirming the SAS commits THIS instance's own record directly via
   `upsert_paired_peer`. `approve_inbound` also refuses outright
   (`"awaiting-reveal"`) on an entry whose `requester_nonce_hex` is still
-  `None` — the commitment hasn't been revealed yet (Finding 1), so there
+  `None` — the commitment hasn't been revealed yet, so there
   is no SAS to confirm. The SAS itself is ALWAYS re-derived from this
   instance's own identity plus the parked entry's stored fields
   (`aoide_storage::pairing::derive_sas`) on EITHER path — never trusted
   from anything the wire carries, since the entire point of the ceremony
   is a code neither side can spoof to the other.
 - **`handle_peer_pair_request` sends the commitment and the reveal as TWO
-  sequential POSTs inside ONE invocation (P-P2, Finding 1) — never split
+  sequential POSTs inside ONE invocation (P-P2) — never split
   across two separate CLI calls.** It mints its own nonce locally, POSTs
   `build_pair_request_body` carrying only `derive_commit(pubkey, nonce)`
   (the nonce itself never rides that first message), then immediately
@@ -76,7 +76,7 @@
   entry with an unrevealed commitment on this side, since this side chose
   the nonce and always has it.
 - **`handle_peer_pair_reject` tries the inbound queue, THEN the outbound
-  queue — never just one (P-P2, Finding 2).** An outbound entry at EITHER
+  queue — never just one (P-P2).** An outbound entry at EITHER
   `OutboundState` aborts cleanly on reject; this is the ceremony's only
   abort verb, so collapsing this back to inbound-only would leave a
   requester with no way to cancel a pairing it no longer wants.

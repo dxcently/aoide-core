@@ -76,7 +76,7 @@
   of the ceremony. A change here needs new pinned vectors AND a
   CONTRACTS.md §6 update in the same commit, never a silent drift.
 - **`pairing::derive_commit` is a separate, one-way commitment, never
-  folded into `derive_sas` (review-bounce Finding 1).** It hashes exactly
+  folded into `derive_sas`.** It hashes exactly
   two fields (a pubkey and a nonce, same canonical lowercased/trimmed/
   NUL-separated style `derive_sas` uses) and returns the FULL 64-hex-char
   digest — no truncation, unlike the SAS's mod-1,000,000 shortening, since
@@ -88,8 +88,8 @@
   hash different field counts for different purposes (binding vs. display)
   and must stay independently callable.
 - **`InboundPairingRequest.requester_nonce_hex` is `Option<String>`, and
-  `None` is a real, load-bearing state, not a placeholder (review-bounce
-  Finding 1).** An entry parks with it absent (`park_inbound` never takes
+  `None` is a real, load-bearing state, not a placeholder.** An entry
+  parks with it absent (`park_inbound` never takes
   a nonce — only a commitment) and gains it only once `reveal_inbound`
   verifies the commitment. A caller deriving a SAS from an inbound entry
   MUST check `is_some()` first (`peer pair pending`'s `sas: Option<..>`,
@@ -97,7 +97,7 @@
   "empty string" or defaulting it would let an unrevealed entry's SAS
   silently derive from an attacker-guessable value instead of refusing.
 - **The inbound park queue is capped under the SAME lock the insert itself
-  takes (review-bounce Finding 3) — check-then-insert, one lock
+  takes — check-then-insert, one lock
   acquisition, never a separate `len()` check followed by an unlocked
   push.** `park_inbound` acquires `PARK_LOCK`, sweeps expired entries,
   checks `requests.len() >= pairing_park_cap()` (default 32,
@@ -113,7 +113,7 @@
   Outbound entries (`park_outbound`) are operator-created, one per `peer
   pair request` invocation, and carry no cap.
 - **`OutboundPairingRequest.state` defers the requester's own peer-record
-  commit past the approver's callback (review-bounce Finding 2) — never
+  commit past the approver's callback — never
   collapse the two-state machine back to an implicit "callback arrived
   means paired."** An entry parks `AwaitingApproval`;
   `mark_outbound_awaiting_confirm` (called from the `aoide/pairApprove`

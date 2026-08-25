@@ -48,8 +48,8 @@ cache (CONTRACTS.md §7). File-first by decision — no embedded database yet
   SHA-256 over the four public transcript values (both pubkeys, both
   nonces, NUL-separated, order-sensitive), pinned by stability test
   vectors so it renders identically on both boxes forever. `derive_commit`
-  is a SEPARATE, one-way, untruncated SHA-256 over just a pubkey + a nonce
-  (review-bounce Finding 1, fix forward on P-P2's first commit) — the
+  is a SEPARATE, one-way, untruncated SHA-256 over just a pubkey + a
+  nonce — the
   requester commits to its own nonce (`park_inbound`'s `commit_hex`) BEFORE
   ever revealing it (`reveal_inbound`, verified against the parked
   commitment; a mismatch DROPS the entry, a match stores the now-revealed
@@ -57,13 +57,13 @@ cache (CONTRACTS.md §7). File-first by decision — no embedded database yet
   caller MUST check that before deriving a SAS). `park_inbound` is capped
   (`pairing_park_cap`, `AOIDE_PAIRING_PARK_CAP` env, default 32,
   check-then-insert under one `PARK_LOCK` acquisition, same discipline
-  `aoide-secrets::park::park_if_room` holds — Finding 3); `park_outbound`
+  `aoide-secrets::park::park_if_room` holds); `park_outbound`
   is uncapped (operator-created, one per `peer pair request` call).
   `OutboundPairingRequest.state` (`AwaitingApproval` → `AwaitingConfirm`,
   `mark_outbound_awaiting_confirm`) defers the REQUESTER's own peer-record
   commit until its own operator confirms a second time, after the
   approver's `aoide/pairApprove` callback already landed and the approver
-  has already committed its own side (Finding 2) — both humans now confirm
+  has already committed its own side — both humans confirm
   the same code before either end calls itself paired.
 - `mode` — the staging/declarative mode marker, read by `shellbridge`
   (which stays in `conduct`, see that crate's charter-smudge note).
