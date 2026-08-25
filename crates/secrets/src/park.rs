@@ -163,10 +163,21 @@ pub enum ParkOutcome {
 /// One parked ask's metadata — never a value (module doc). `tx` is `pub`
 /// only within this module; [`ParkedAsk::send`] is the sole way to consume
 /// it, so a caller can never "peek" a `Sender` and forget to send.
+///
+/// `peer_uid` (task #73) is the ORIGINAL requesting connection's
+/// kernel-truth `SO_PEERCRED` uid, stamped ONCE at park time
+/// (`ParkRegistry::park_if_room`'s own caller, `broker::handle_resolve`) —
+/// `None` when that connection's peer cred could not be read
+/// (`peercred::peer_cred`'s own "unidentified, never a panic" contract).
+/// This is the one fact `broker::handle_dismiss`'s authorization check
+/// (#73) is keyed on: an ordinary caller may only dismiss an ask whose
+/// STAMPED `peer_uid` matches its OWN connection's peer uid, never a
+/// self-asserted claim.
 pub struct ParkedAsk {
     pub secret: String,
     pub consumer: String,
     pub requested_at: u64,
+    pub peer_uid: Option<u32>,
     tx: mpsc::Sender<ParkOutcome>,
 }
 
@@ -234,17 +245,20 @@ impl ParkRegistry {
     /// caller (tests, and any future one with no cap concern) keeps this
     /// simpler unconditional signature.
     pub fn park(&self, secret: &str, consumer: &str, requested_at: u64) -> (String, mpsc::Receiver<ParkOutcome>) {
-        self.park_if_room(secret, consumer, requested_at, usize::MAX)
+        self.park_if_room(secret, consumer, requested_at, usize::MAX, None)
             .expect("an unbounded park (cap = usize::MAX) must never refuse")
     }
 
     /// [`Self::park`]'s cap-aware sibling (P-N2c FIX 3b) — `broker::
     /// handle_resolve` is the one production call site, passing
-    /// [`park_cap`]'s resolved limit. Checks-then-inserts under the SAME
-    /// lock acquisition (never a separate `len()` check followed by a
-    /// second locked insert) so two threads racing the last open slot can
-    /// never both succeed and overrun the cap by one. Returns `None` when
-    /// the registry is already at `cap` — the caller falls back to the
+    /// [`park_cap`]'s resolved limit and (task #73) the requesting
+    /// connection's own `SO_PEERCRED` uid, stamped onto the [`ParkedAsk`]
+    /// for `broker::handle_dismiss`'s later authorization check
+    /// (`peer_uid`'s own doc on [`ParkedAsk`]). Checks-then-inserts under
+    /// the SAME lock acquisition (never a separate `len()` check followed
+    /// by a second locked insert) so two threads racing the last open slot
+    /// can never both succeed and overrun the cap by one. Returns `None`
+    /// when the registry is already at `cap` — the caller falls back to the
     /// immediate pre-park refusal (the `wait:false` text) rather than
     /// growing the queue further.
     pub fn park_if_room(
@@ -253,6 +267,7 @@ impl ParkRegistry {
         consumer: &str,
         requested_at: u64,
         cap: usize,
+        peer_uid: Option<u32>,
     ) -> Option<(String, mpsc::Receiver<ParkOutcome>)> {
         let (tx, rx) = mpsc::channel();
         let mut guard = self.lock();
@@ -260,19 +275,25 @@ impl ParkRegistry {
             return None;
         }
         let n = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
-        guard.insert(n, ParkedAsk { secret: secret.to_string(), consumer: consumer.to_string(), requested_at, tx });
+        guard.insert(
+            n,
+            ParkedAsk { secret: secret.to_string(), consumer: consumer.to_string(), requested_at, peer_uid, tx },
+        );
         drop(guard);
         Some((self.format_id(n), rx))
     }
 
-    /// Look up an ask's `(secret, consumer)` WITHOUT removing it — the
-    /// first half of `secrets approve`'s two-step flow (module doc on
+    /// Look up an ask's `(secret, consumer, peer_uid)` WITHOUT removing it
+    /// — the first half of `secrets approve`'s two-step flow (module doc on
     /// `broker::handle_approve`): a code must validate before the ask is
     /// ever taken off the registry, so an INVALID code leaves the ask
-    /// exactly where it was (task requirement: "ask STAYS parked").
-    pub fn peek(&self, id: &str) -> Option<(String, String)> {
+    /// exactly where it was (task requirement: "ask STAYS parked"). Also
+    /// the read `broker::handle_dismiss` (task #73) uses to check
+    /// authorization BEFORE removing the ask, so a refused dismiss leaves
+    /// it exactly where it was too.
+    pub fn peek(&self, id: &str) -> Option<(String, String, Option<u32>)> {
         let n = self.parse_id(id)?;
-        self.lock().get(&n).map(|a| (a.secret.clone(), a.consumer.clone()))
+        self.lock().get(&n).map(|a| (a.secret.clone(), a.consumer.clone(), a.peer_uid))
     }
 
     /// Remove and return the ask at `id`, if it still exists — the ONE
@@ -299,16 +320,20 @@ impl ParkRegistry {
         }
     }
 
-    /// Every parked ask's `(id, secret, consumer, requested_at)` — never a
-    /// value, never a channel handle (`secrets pending`'s whole reply).
-    /// Ordered by the internal counter (insertion order, since it's
-    /// monotonic) via `BTreeMap`'s own iteration order — the nonce prefix
-    /// is constant across every entry in one registry, so formatting it
-    /// on afterward never disturbs that order.
-    pub fn list(&self) -> Vec<(String, String, String, u64)> {
+    /// Every parked ask's `(id, secret, consumer, requested_at, peer_uid)`
+    /// — never a value, never a channel handle (`secrets pending`'s whole
+    /// reply). `peer_uid` (task #73) is additive over the pre-#73 shape —
+    /// the kernel-truth uid stamped at park time, `None` when it couldn't
+    /// be read. Ordered by the internal counter (insertion order, since
+    /// it's monotonic) via `BTreeMap`'s own iteration order — the nonce
+    /// prefix is constant across every entry in one registry, so
+    /// formatting it on afterward never disturbs that order.
+    pub fn list(&self) -> Vec<(String, String, String, u64, Option<u32>)> {
         self.lock()
             .iter()
-            .map(|(id, ask)| (self.format_id(*id), ask.secret.clone(), ask.consumer.clone(), ask.requested_at))
+            .map(|(id, ask)| {
+                (self.format_id(*id), ask.secret.clone(), ask.consumer.clone(), ask.requested_at, ask.peer_uid)
+            })
             .collect()
     }
 }
@@ -398,7 +423,10 @@ mod tests {
         assert!(id.len() > "-1".len(), "the nonce half must be non-empty: {id:?}");
         let list = reg.list();
         assert_eq!(list.len(), 1);
-        assert_eq!(list[0], (id, "db-prod".to_string(), "m".to_string(), 1_700_000_000));
+        // `park` (unbounded, no peer info) always stamps `None` — only
+        // `park_if_room`'s real production caller (`broker::handle_resolve`)
+        // ever supplies a peer uid.
+        assert_eq!(list[0], (id, "db-prod".to_string(), "m".to_string(), 1_700_000_000, None));
     }
 
     #[test]
@@ -442,26 +470,45 @@ mod tests {
     #[test]
     fn park_if_room_refuses_beyond_the_cap_and_admits_again_after_a_take() {
         let reg = ParkRegistry::new();
-        assert!(reg.park_if_room("a", "m", 1, 2).is_some());
-        assert!(reg.park_if_room("b", "m", 2, 2).is_some());
-        assert!(reg.park_if_room("c", "m", 3, 2).is_none(), "a third park must refuse at cap 2");
+        assert!(reg.park_if_room("a", "m", 1, 2, None).is_some());
+        assert!(reg.park_if_room("b", "m", 2, 2, None).is_some());
+        assert!(reg.park_if_room("c", "m", 3, 2, None).is_none(), "a third park must refuse at cap 2");
         assert_eq!(reg.list().len(), 2);
 
         // Freeing one slot (a take, as approve/dismiss/timeout would do)
         // lets the next park through again.
         let first_id = reg.list().into_iter().next().unwrap().0;
         reg.take(&first_id);
-        assert!(reg.park_if_room("d", "m", 4, 2).is_some());
+        assert!(reg.park_if_room("d", "m", 4, 2, None).is_some());
     }
 
     #[test]
     fn peek_does_not_remove_the_ask() {
         let reg = ParkRegistry::new();
         let (id, _rx) = reg.park("t", "m", 1);
-        assert_eq!(reg.peek(&id), Some(("t".to_string(), "m".to_string())));
+        assert_eq!(reg.peek(&id), Some(("t".to_string(), "m".to_string(), None)));
         // Still there — peek is read-only.
-        assert_eq!(reg.peek(&id), Some(("t".to_string(), "m".to_string())));
+        assert_eq!(reg.peek(&id), Some(("t".to_string(), "m".to_string(), None)));
         assert_eq!(reg.list().len(), 1);
+    }
+
+    // ── peer_uid (task #73) ─────────────────────────────────────────────
+
+    #[test]
+    fn park_if_room_stamps_the_given_peer_uid_and_peek_returns_it() {
+        let reg = ParkRegistry::new();
+        let (id, _rx) = reg.park_if_room("t", "m", 1, usize::MAX, Some(4242)).unwrap();
+        assert_eq!(reg.peek(&id), Some(("t".to_string(), "m".to_string(), Some(4242))));
+        let list = reg.list();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].4, Some(4242));
+    }
+
+    #[test]
+    fn park_if_room_with_no_peer_uid_stamps_none() {
+        let reg = ParkRegistry::new();
+        let (id, _rx) = reg.park_if_room("t", "m", 1, usize::MAX, None).unwrap();
+        assert_eq!(reg.peek(&id), Some(("t".to_string(), "m".to_string(), None)));
     }
 
     #[test]

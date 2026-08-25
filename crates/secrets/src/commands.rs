@@ -859,6 +859,7 @@ fn handle_secrets_pending(inv: &Invocation) -> Outcome {
                         "secret": a.secret,
                         "consumer": a.consumer,
                         "requestedAt": a.requested_at,
+                        "peerUid": a.peer_uid,
                     })
                 })
                 .collect();

@@ -1405,7 +1405,13 @@ mod tests {
     #[test]
     fn reconcile_adds_an_ask_the_tail_never_saw_as_an_estimate() {
         let mut q = Queue::new();
-        let pending = vec![PendingAsk { id: "unseen".into(), secret: "t".into(), consumer: "m".into(), requested_at: 42 }];
+        let pending = vec![PendingAsk {
+            id: "unseen".into(),
+            secret: "t".into(),
+            consumer: "m".into(),
+            requested_at: 42,
+            peer_uid: None,
+        }];
         q.reconcile(&pending, 300);
         let ask = q.get("unseen").unwrap();
         assert_eq!(ask.requested_at, 42);
@@ -1426,7 +1432,8 @@ mod tests {
     fn reconcile_never_downgrades_a_known_timeout_into_an_estimate() {
         let mut q = Queue::new();
         q.apply(&Event::Parked { id: "1".into(), secret: "t".into(), consumer: "m".into(), timeout_secs: 60, ts: 0 });
-        let pending = vec![PendingAsk { id: "1".into(), secret: "t".into(), consumer: "m".into(), requested_at: 0 }];
+        let pending =
+            vec![PendingAsk { id: "1".into(), secret: "t".into(), consumer: "m".into(), requested_at: 0, peer_uid: None }];
         q.reconcile(&pending, 300);
         let ask = q.get("1").unwrap();
         assert_eq!(ask.timeout_secs, 60);

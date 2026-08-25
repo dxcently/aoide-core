@@ -63,7 +63,7 @@
 //! <- {"ok":false,"error":"<value-free message>"}      (denied/error)
 //!
 //! -> {"op":"pending"}
-//! <- {"ok":true,"pending":[{"id":"<id>","secret":"<name>","consumer":"<consumer>","requestedAt":<unix-seconds>},...]}
+//! <- {"ok":true,"pending":[{"id":"<id>","secret":"<name>","consumer":"<consumer>","requestedAt":<unix-seconds>,"peerUid":<uid-or-null>},...]}
 //!
 //! -> {"op":"approve","id":"<id>","totp":"<code>"}
 //! <- {"ok":true}                                      (code valid — the
@@ -83,6 +83,15 @@
 //!                                                       gets a clean
 //!                                                       "dismissed" refusal)
 //! <- {"ok":false,"error":"unknown pending id `<id>`"}
+//! <- {"ok":false,"error":"<peer-uid-mismatch refusal>"} (task #73 — the
+//!                                                       dismissing
+//!                                                       connection's own
+//!                                                       peer uid is
+//!                                                       neither the ask's
+//!                                                       stamped peer uid
+//!                                                       nor the broker's
+//!                                                       own; the ask stays
+//!                                                       parked, untouched)
 //! ```
 //! `totp`/`argv0`/`wait` are optional on `resolve`; `overwrite` is optional
 //! on `put` — ABSENT MEANS `false` (P-67, wire compatibility: an old client
@@ -104,6 +113,25 @@
 //! exec`/`secrets put`/`secrets pending`/`secrets approve`/`secrets
 //! dismiss` are convenience wrappers over the same ops, not the only door
 //! onto them.
+//!
+//! **Kernel-truth peer identity (task #73, this commit).** The paragraph
+//! above is about the wire's `consumer` field, which STAYS self-asserted —
+//! #73 does not change that. What it adds is a SEPARATE, orthogonal fact
+//! this crate did not have before: `handle_conn` reads `SO_PEERCRED`
+//! ([`crate::peercred::peer_cred`]) once, at connection start, and threads
+//! it into every op handler on that connection — the connecting process's
+//! REAL uid, verified by the kernel, independent of anything the wire
+//! request itself claims. A parked ask is stamped with the requesting
+//! connection's peer uid at park time (`park::ParkedAsk::peer_uid`'s own
+//! doc), shown (additively) in `pending`'s reply, and is the ONE fact
+//! [`handle_dismiss`] gates a decision on — see that function's own doc.
+//! Every resolve/park/approve/dismiss/put audit line also carries the
+//! acting connection's peer uid alongside the pre-existing self-asserted
+//! name, for the identical reason: a kernel fact recorded next to a
+//! self-asserted one, never conflated with it. A `SO_PEERCRED` read
+//! failure is treated as an UNIDENTIFIED connection (`None`) — never a
+//! panic, never a fabricated uid; every decision keyed on it fails CLOSED
+//! on `None`, not open.
 //!
 //! **Parking a TOTP-gated resolve (P-N2, this commit).** Today (before this
 //! phase) a `resolve` for a `requireTotp`-gated secret with no code was an
@@ -386,6 +414,14 @@ pub fn serve(secrets_home: &Path, socket_path: &Path) -> std::io::Result<()> {
 /// long as `crate::park::park_timeout()` allows — every other connection's
 /// `handle_conn` thread is unaffected.
 fn handle_conn(secrets_home: &Path, events_path: &Path, stream: UnixStream, parked: &ParkRegistry) {
+    // #73: read SO_PEERCRED ONCE, at connection start, and thread the same
+    // value into every op this connection sends — never re-read per line
+    // (the peer identity of an already-accepted connection cannot change
+    // mid-stream, and re-reading would just be wasted syscalls). `None`
+    // when the read fails (`peercred::peer_cred`'s own "unidentified, never
+    // a panic" contract) — every handler below already treats an absent
+    // peer uid as "cannot be authorized," never as "trust it."
+    let peer = crate::peercred::peer_cred(&stream);
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
         Err(e) => {
@@ -402,7 +438,7 @@ fn handle_conn(secrets_home: &Path, events_path: &Path, stream: UnixStream, park
         if line.trim().is_empty() {
             continue;
         }
-        let reply = handle_line(secrets_home, events_path, &line, parked, &mut writer);
+        let reply = handle_line(secrets_home, events_path, &line, parked, &mut writer, peer);
         if write_json_line(&mut writer, &reply).is_err() {
             break;
         }
@@ -438,20 +474,29 @@ fn handle_line(
     line: &str,
     parked: &ParkRegistry,
     interim_out: &mut impl Write,
+    peer: Option<crate::peercred::PeerCred>,
 ) -> Value {
     let req: Value = match serde_json::from_str(line.trim()) {
         Ok(v) => v,
         Err(_) => return json!({"ok": false, "error": "malformed request: not valid JSON"}),
     };
     match req.get("op").and_then(Value::as_str) {
-        Some("resolve") => handle_resolve(secrets_home, events_path, &req, parked, interim_out),
-        Some("put") => handle_put(secrets_home, events_path, &req),
+        Some("resolve") => handle_resolve(secrets_home, events_path, &req, parked, interim_out, peer),
+        Some("put") => handle_put(secrets_home, events_path, &req, peer),
         Some("pending") => handle_pending(parked),
-        Some("approve") => handle_approve(secrets_home, events_path, parked, &req),
-        Some("dismiss") => handle_dismiss(secrets_home, events_path, parked, &req),
+        Some("approve") => handle_approve(secrets_home, events_path, parked, &req, peer),
+        Some("dismiss") => handle_dismiss(secrets_home, events_path, parked, &req, peer),
         Some(other) => json!({"ok": false, "error": format!("unknown op `{other}`")}),
         None => json!({"ok": false, "error": "malformed request: missing `op`"}),
     }
+}
+
+/// Render a peer uid for a taught error message or an audit line — `None`
+/// (an unidentified connection, `peercred::peer_cred`'s own doc) prints as
+/// `"unidentified"` rather than a bare blank, so a human reading `audit.log`
+/// or a refusal never mistakes it for uid 0 or an omitted field.
+fn peer_uid_display(peer_uid: Option<u32>) -> String {
+    peer_uid.map(|u| u.to_string()).unwrap_or_else(|| "unidentified".to_string())
 }
 
 /// `resolve` — the fast path is UNCHANGED (module doc): a code present, or
@@ -472,12 +517,14 @@ fn handle_resolve(
     req: &Value,
     parked: &ParkRegistry,
     interim_out: &mut impl Write,
+    peer: Option<crate::peercred::PeerCred>,
 ) -> Value {
     let secret = req.get("secret").and_then(Value::as_str).unwrap_or("").to_string();
     let consumer = req.get("consumer").and_then(Value::as_str).unwrap_or("").to_string();
     let argv0 = req.get("argv0").and_then(Value::as_str).map(str::to_string);
     let totp = req.get("totp").and_then(Value::as_str).map(str::to_string);
     let wait = req.get("wait").and_then(Value::as_bool).unwrap_or(true);
+    let peer_uid = peer.map(|p| p.uid);
 
     if secret.is_empty() || consumer.is_empty() {
         return json!({"ok": false, "error": "malformed request: `secret` and `consumer` are required"});
@@ -487,7 +534,7 @@ fn handle_resolve(
     let now_unix = aoide_protocol::audit::now_secs();
     match resolve_gate(secrets_home, &secret, &consumer, totp.as_deref(), now_unix) {
         GateOutcome::Granted { value, totp_free } => {
-            audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), true, None);
+            audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), true, None, peer_uid);
             // P-N3: notify only the TOTP-free grant (`requireTotp:false`, or
             // an automation-skip) — a resolve that validated its own inline
             // `--totp` code needs no desktop notice, the caller just typed
@@ -504,17 +551,21 @@ fn handle_resolve(
             json!({"ok": true, "value": value})
         }
         GateOutcome::Denied(reason) => {
-            audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), false, Some(&reason));
+            audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), false, Some(&reason), peer_uid);
             json!({"ok": false, "error": reason})
         }
         GateOutcome::NeedsTotp => {
             if !wait {
                 let reason = "requireTotp is set but no totp code was provided".to_string();
-                audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), false, Some(&reason));
+                audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), false, Some(&reason), peer_uid);
                 return json!({"ok": false, "error": reason});
             }
             let cap = crate::park::park_cap();
-            let Some((id, rx)) = parked.park_if_room(&secret, &consumer, now_unix, cap) else {
+            // #73: the requesting connection's own kernel-truth peer uid is
+            // stamped onto the ask right here, at park time — the ONE fact
+            // `handle_dismiss` later checks a dismisser's own peer uid
+            // against (`park::ParkedAsk::peer_uid`'s own doc).
+            let Some((id, rx)) = parked.park_if_room(&secret, &consumer, now_unix, cap, peer_uid) else {
                 // FIX 3b: at the registry-wide cap — the SAME immediate
                 // refusal `wait:false` gives, plus a hint naming the
                 // cap/knob, rather than growing an unbounded thread queue
@@ -526,10 +577,10 @@ fn handle_resolve(
                      an operator clears a pending ask",
                     crate::park::PARK_CAP_ENV
                 );
-                audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), false, Some(&reason));
+                audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), false, Some(&reason), peer_uid);
                 return json!({"ok": false, "error": reason});
             };
-            audit_park(secrets_home, &id, &secret, &consumer);
+            audit_park(secrets_home, &id, &secret, &consumer, peer_uid);
             let timeout = crate::park::park_timeout();
             // P-N3: the popup's future trigger — fired once per park, right
             // alongside `audit_park`, no lock held (`park_if_room` already
@@ -554,11 +605,11 @@ fn handle_resolve(
             let _ = write_json_line(interim_out, &interim);
             match crate::park::wait_for_outcome(parked, &id, rx, timeout) {
                 WaitResult::Approved(value) => {
-                    audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), true, None);
+                    audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), true, None, peer_uid);
                     json!({"ok": true, "value": value})
                 }
                 WaitResult::Denied(reason) => {
-                    audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), false, Some(&reason));
+                    audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), false, Some(&reason), peer_uid);
                     json!({"ok": false, "error": reason})
                 }
                 WaitResult::Dismissed => {
@@ -566,12 +617,12 @@ fn handle_resolve(
                     // holding a valid socket connection can dismiss, not
                     // necessarily "an operator" in any privileged sense.
                     let reason = "the pending TOTP ask was dismissed before a code was provided".to_string();
-                    audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), false, Some(&reason));
+                    audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), false, Some(&reason), peer_uid);
                     json!({"ok": false, "error": reason})
                 }
                 WaitResult::TimedOut => {
                     let reason = park_timeout_message(&secret, timeout.as_secs());
-                    audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), false, Some(&reason));
+                    audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), false, Some(&reason), peer_uid);
                     emit_notify(
                         secrets_home,
                         events_path,
@@ -604,13 +655,18 @@ fn park_timeout_message(secret: &str, timeout_secs: u64) -> String {
 /// doc); never errors (an empty queue is `{"ok":true,"pending":[]}`, same
 /// tolerant shape `graph pending list` already holds). Not audited — a mere
 /// read of in-memory state, same precedent `graph pending list` sets (that
-/// command doesn't audit either).
+/// command doesn't audit either). **`peerUid` (task #73) is an ADDITIVE
+/// field over the pre-#73 wire shape** — the kernel-truth `SO_PEERCRED` uid
+/// stamped on each ask at park time (`null` when it couldn't be read),
+/// alongside the pre-existing self-asserted `consumer` name — an old client
+/// that doesn't know this field simply ignores it, per this crate's own
+/// wire-compatibility discipline (`AGENTS.md`).
 fn handle_pending(parked: &ParkRegistry) -> Value {
     let pending: Vec<Value> = parked
         .list()
         .into_iter()
-        .map(|(id, secret, consumer, requested_at)| {
-            json!({"id": id, "secret": secret, "consumer": consumer, "requestedAt": requested_at})
+        .map(|(id, secret, consumer, requested_at, peer_uid)| {
+            json!({"id": id, "secret": secret, "consumer": consumer, "requestedAt": requested_at, "peerUid": peer_uid})
         })
         .collect();
     json!({"ok": true, "pending": pending})
@@ -664,21 +720,28 @@ fn authorize_release(secrets_home: &Path, secret: &str, consumer: &str) -> Resul
 /// identity/possession, which is a real event regardless of what the
 /// re-gate decides next; it is not un-spent just because authorization
 /// changed underneath it a moment later.
-fn handle_approve(secrets_home: &Path, events_path: &Path, parked: &ParkRegistry, req: &Value) -> Value {
+fn handle_approve(
+    secrets_home: &Path,
+    events_path: &Path,
+    parked: &ParkRegistry,
+    req: &Value,
+    peer: Option<crate::peercred::PeerCred>,
+) -> Value {
+    let approver_uid = peer.map(|p| p.uid);
     let id = req.get("id").and_then(Value::as_str).unwrap_or("").to_string();
     if id.is_empty() {
         return json!({"ok": false, "error": "malformed request: `id` is required"});
     }
-    let Some((secret, consumer)) = parked.peek(&id) else {
+    let Some((secret, consumer, _ask_peer_uid)) = parked.peek(&id) else {
         let reason = format!("unknown pending id `{id}`");
-        audit_approve(secrets_home, &id, None, false, &reason);
+        audit_approve(secrets_home, &id, None, false, &reason, approver_uid);
         return json!({"ok": false, "error": reason});
     };
 
     let totp = req.get("totp").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
     let Some(code) = totp else {
         let reason = "malformed request: `totp` is required".to_string();
-        audit_approve(secrets_home, &id, Some(&secret), false, &reason);
+        audit_approve(secrets_home, &id, Some(&secret), false, &reason, approver_uid);
         return json!({"ok": false, "error": reason});
     };
 
@@ -687,7 +750,7 @@ fn handle_approve(secrets_home: &Path, events_path: &Path, parked: &ParkRegistry
     if let Err(e) = verify_totp_gate(secrets_home, Some(code), now_unix) {
         // Invalid/expired/already-used code: the ask STAYS parked (task
         // requirement) — never `take`n on this path.
-        audit_approve(secrets_home, &id, Some(&secret), false, &e);
+        audit_approve(secrets_home, &id, Some(&secret), false, &e, approver_uid);
         return json!({"ok": false, "error": e});
     }
 
@@ -695,7 +758,7 @@ fn handle_approve(secrets_home: &Path, events_path: &Path, parked: &ParkRegistry
     // another from here, never stay parked.
     let Some(ask) = parked.take(&id) else {
         let reason = format!("pending ask `{id}` no longer exists (it may have timed out or been dismissed)");
-        audit_approve(secrets_home, &id, Some(&secret), false, &reason);
+        audit_approve(secrets_home, &id, Some(&secret), false, &reason, approver_uid);
         return json!({"ok": false, "error": reason});
     };
 
@@ -704,14 +767,14 @@ fn handle_approve(secrets_home: &Path, events_path: &Path, parked: &ParkRegistry
     // the release, not just a future one.
     if let Err(e) = authorize_release(secrets_home, &secret, &consumer) {
         ask.send(ParkOutcome::Denied(e.clone()));
-        audit_approve(secrets_home, &id, Some(&secret), false, &e);
+        audit_approve(secrets_home, &id, Some(&secret), false, &e, approver_uid);
         return json!({"ok": false, "error": e});
     }
 
     match fetch_secret_value(secrets_home, &secret) {
         Ok(value) => {
             ask.send(ParkOutcome::Approved(value));
-            audit_approve(secrets_home, &id, Some(&secret), true, "");
+            audit_approve(secrets_home, &id, Some(&secret), true, "", approver_uid);
             // P-N3: fired once, on the approver's own side — the ORIGINAL
             // parked caller's `resolve` return (`WaitResult::Approved` in
             // `handle_resolve`) does not fire a second one for the same
@@ -726,7 +789,7 @@ fn handle_approve(secrets_home: &Path, events_path: &Path, parked: &ParkRegistry
         }
         Err(e) => {
             ask.send(ParkOutcome::Denied(e.clone()));
-            audit_approve(secrets_home, &id, Some(&secret), false, &e);
+            audit_approve(secrets_home, &id, Some(&secret), false, &e, approver_uid);
             json!({"ok": false, "error": e})
         }
     }
@@ -744,21 +807,91 @@ fn fetch_secret_value(secrets_home: &Path, secret: &str) -> Result<String, Strin
     crate::backend::fetch_value(secrets_home, &policy.backend, &policy.key)
 }
 
-/// `dismiss <id>` (P-N2): resolve a parked ask with no code at all — the
-/// parked connection gets a clean "dismissed" refusal, the dismisser gets
-/// `{"ok":true}`. An unknown id is a taught error naming it explicitly
-/// (task requirement).
-fn handle_dismiss(secrets_home: &Path, events_path: &Path, parked: &ParkRegistry, req: &Value) -> Value {
+/// **#73: who may `dismiss` a parked ask** — the dismissing connection's own
+/// kernel-truth `SO_PEERCRED` uid must match the ask's STAMPED `peer_uid`
+/// (from park time, `park::ParkedAsk::peer_uid`'s own doc), OR the broker's
+/// own effective uid (`home::effective_uid()` — the operator/admin path:
+/// the broker process's own uid can always clear a parked ask, the same
+/// "this process's uid decides" precedent `home::admin_identity_check`
+/// already holds for the direct-home admin verbs). Pure — no I/O, so it's
+/// unit-tested directly with injected uids, no real socket/process needed.
+///
+/// **Fail closed on any missing kernel fact — never fail open.** An
+/// UNIDENTIFIED dismisser (`dismisser_uid: None`, `SO_PEERCRED` read
+/// failed on the DISMISSING connection) is NEVER authorized, even against
+/// an ask whose own `peer_uid` is also `None` — there is nothing to prove a
+/// match against, so the safe default is refusal, not a pass. An
+/// UNIDENTIFIED ask (`ask_peer_uid: None` — the ORIGINAL `resolve`
+/// connection's own peer cred could not be read at park time) can still be
+/// dismissed by the broker's own uid (the operator path never depended on
+/// matching the ask's uid to begin with), but by no ordinary caller — again,
+/// nothing to match.
+fn dismiss_authorized(dismisser_uid: Option<u32>, ask_peer_uid: Option<u32>, broker_euid: u32) -> bool {
+    match dismisser_uid {
+        Some(uid) if uid == broker_euid => true,
+        Some(uid) => ask_peer_uid == Some(uid),
+        None => false,
+    }
+}
+
+/// The taught error a refused `dismiss` (task #73) gets — names BOTH uids
+/// (task requirement) so an operator immediately sees why the refusal fired
+/// rather than having to go correlate `audit.log` by hand.
+fn dismiss_refused_message(id: &str, dismisser_uid: Option<u32>, ask_peer_uid: Option<u32>, broker_euid: u32) -> String {
+    format!(
+        "dismiss `{id}` refused: this connection's peer uid ({}) is neither the ask's own peer uid ({}) nor \
+         the broker's own uid ({broker_euid}) — only the original caller or the broker's own operator (uid \
+         {broker_euid}) may dismiss it",
+        peer_uid_display(dismisser_uid),
+        peer_uid_display(ask_peer_uid),
+    )
+}
+
+/// `dismiss <id>` (P-N2; peer-uid-gated, task #73): resolve a parked ask
+/// with no code at all — the parked connection gets a clean "dismissed"
+/// refusal, the dismisser gets `{"ok":true}`. An unknown id is a taught
+/// error naming it explicitly (task requirement).
+///
+/// **#73: authorization is checked BEFORE the ask is ever taken off the
+/// registry** ([`ParkRegistry::peek`], read-only — the same "peek first,
+/// take only once resolved" shape [`handle_approve`] already holds for an
+/// invalid code): a REFUSED dismiss leaves the ask exactly where it was,
+/// dismissable by its rightful owner or the broker's own operator, rather
+/// than being silently consumed by an unauthorized caller's failed attempt.
+fn handle_dismiss(
+    secrets_home: &Path,
+    events_path: &Path,
+    parked: &ParkRegistry,
+    req: &Value,
+    peer: Option<crate::peercred::PeerCred>,
+) -> Value {
+    let dismisser_uid = peer.map(|p| p.uid);
     let id = req.get("id").and_then(Value::as_str).unwrap_or("").to_string();
     if id.is_empty() {
         return json!({"ok": false, "error": "malformed request: `id` is required"});
     }
+    let Some((secret, _consumer, ask_peer_uid)) = parked.peek(&id) else {
+        let reason = format!("unknown pending id `{id}`");
+        audit_dismiss(secrets_home, &id, "", false, Some(&reason), dismisser_uid);
+        return json!({"ok": false, "error": reason});
+    };
+
+    let broker_euid = crate::home::effective_uid();
+    if !dismiss_authorized(dismisser_uid, ask_peer_uid, broker_euid) {
+        let reason = dismiss_refused_message(&id, dismisser_uid, ask_peer_uid, broker_euid);
+        // The ask itself is left exactly where it was — never `take`n on
+        // this path, same "refused = untouched" shape an invalid `approve`
+        // code already holds.
+        audit_dismiss(secrets_home, &id, &secret, false, Some(&reason), dismisser_uid);
+        return json!({"ok": false, "error": reason});
+    }
+
     match parked.take(&id) {
         Some(ask) => {
             let secret = ask.secret.clone();
             let consumer = ask.consumer.clone();
             ask.send(ParkOutcome::Dismissed);
-            audit_dismiss(secrets_home, &id, &secret, true, None);
+            audit_dismiss(secrets_home, &id, &secret, true, None, dismisser_uid);
             emit_notify(
                 secrets_home,
                 events_path,
@@ -768,8 +901,12 @@ fn handle_dismiss(secrets_home: &Path, events_path: &Path, parked: &ParkRegistry
             json!({"ok": true})
         }
         None => {
+            // Lost a race against a concurrent approve/dismiss/timeout
+            // between the `peek` above and this `take` — the SAME "unknown
+            // pending id" shape a never-existed id already gets, since the
+            // ask is genuinely gone by now.
             let reason = format!("unknown pending id `{id}`");
-            audit_dismiss(secrets_home, &id, "", false, Some(&reason));
+            audit_dismiss(secrets_home, &id, "", false, Some(&reason), dismisser_uid);
             json!({"ok": false, "error": reason})
         }
     }
@@ -789,10 +926,11 @@ fn handle_dismiss(secrets_home: &Path, events_path: &Path, parked: &ParkRegistry
 /// `DeniedExists` -> `{"ok":false,"exists":true,"error":...}` (the
 /// machine-readable refusal); `Denied(reason)` -> the ordinary
 /// `{"ok":false,"error":reason}`, unchanged from before this feature.
-fn handle_put(secrets_home: &Path, events_path: &Path, req: &Value) -> Value {
+fn handle_put(secrets_home: &Path, events_path: &Path, req: &Value, peer: Option<crate::peercred::PeerCred>) -> Value {
     let secret = req.get("secret").and_then(Value::as_str).unwrap_or("").to_string();
     let value = req.get("value").and_then(Value::as_str).unwrap_or("").to_string();
     let overwrite = req.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
+    let peer_uid = peer.map(|p| p.uid);
 
     if secret.is_empty() {
         return json!({"ok": false, "error": "malformed request: `secret` is required"});
@@ -811,7 +949,7 @@ fn handle_put(secrets_home: &Path, events_path: &Path, req: &Value) -> Value {
             (false, json!({"ok": false, "error": reason}), Some(reason.clone()), None, false)
         }
     };
-    audit_put(secrets_home, &secret, granted, reason.as_ref(), replaced);
+    audit_put(secrets_home, &secret, granted, reason.as_ref(), replaced, peer_uid);
     // P-G1 (task #70): fired AFTER `put_gate` has already returned — its own
     // `put_lock` guard is a local var that dropped when the function
     // returned, so no lock is held here (the SAME "no lock held" rule
@@ -1186,6 +1324,12 @@ fn append_events_feed(events_path: &Path, payload: &Value) {
 
 /// Write BOTH audit lines for one resolve attempt (module doc). Name-only,
 /// by construction: nothing passed here is ever the secret's value.
+/// **`peer_uid` (task #73) rides alongside the self-asserted `consumer`
+/// name — kernel-truth via `SO_PEERCRED`, read once at connection start
+/// (`handle_conn`'s own doc), `None` when it couldn't be read. Honesty
+/// note, restated from `peercred.rs`'s own module doc: this does NOT make
+/// `consumer` itself authenticated — it is a separate fact recorded
+/// alongside it, not a replacement for it.**
 fn audit_resolve(
     secrets_home: &Path,
     secret: &str,
@@ -1193,11 +1337,13 @@ fn audit_resolve(
     argv0: Option<&str>,
     granted: bool,
     reason: Option<&String>,
+    peer_uid: Option<u32>,
 ) {
     let record = json!({
         "ts": aoide_protocol::audit::now_secs(),
         "secret": secret,
         "consumer": consumer,
+        "peerUid": peer_uid,
         "argv0": argv0,
         "granted": granted,
         "reason": reason,
@@ -1208,8 +1354,13 @@ fn audit_resolve(
 
     let status = if granted { "granted" } else { "denied" };
     let message = match reason {
-        Some(r) => format!("secret `{secret}` for consumer `{consumer}`: {status} ({r})"),
-        None => format!("secret `{secret}` for consumer `{consumer}`: {status}"),
+        Some(r) => format!(
+            "secret `{secret}` for consumer `{consumer}` (peer uid {}): {status} ({r})",
+            peer_uid_display(peer_uid)
+        ),
+        None => {
+            format!("secret `{secret}` for consumer `{consumer}` (peer uid {}): {status}", peer_uid_display(peer_uid))
+        }
     };
     let _ = aoide_protocol::audit(
         &aoide_protocol::default_audit_log(),
@@ -1229,11 +1380,19 @@ fn audit_resolve(
 /// GRANTED put — names only, never a value, same as everything else this
 /// function writes — so the audit trail can say "replaced" vs "stored new"
 /// without re-deriving it from the reason string.
-fn audit_put(secrets_home: &Path, secret: &str, granted: bool, reason: Option<&String>, replaced: Option<bool>) {
+fn audit_put(
+    secrets_home: &Path,
+    secret: &str,
+    granted: bool,
+    reason: Option<&String>,
+    replaced: Option<bool>,
+    peer_uid: Option<u32>,
+) {
     let record = json!({
         "ts": aoide_protocol::audit::now_secs(),
         "op": "put",
         "secret": secret,
+        "peerUid": peer_uid,
         "granted": granted,
         "reason": reason,
         "replaced": replaced,
@@ -1243,11 +1402,12 @@ fn audit_put(secrets_home: &Path, secret: &str, granted: bool, reason: Option<&S
     }
 
     let status = if granted { "granted" } else { "denied" };
+    let puid = peer_uid_display(peer_uid);
     let message = match (reason, replaced) {
-        (Some(r), _) => format!("put `{secret}`: {status} ({r})"),
-        (None, Some(true)) => format!("put `{secret}`: {status} (replaced existing value)"),
-        (None, Some(false)) => format!("put `{secret}`: {status} (stored new value)"),
-        (None, None) => format!("put `{secret}`: {status}"),
+        (Some(r), _) => format!("put `{secret}` (peer uid {puid}): {status} ({r})"),
+        (None, Some(true)) => format!("put `{secret}` (peer uid {puid}): {status} (replaced existing value)"),
+        (None, Some(false)) => format!("put `{secret}` (peer uid {puid}): {status} (stored new value)"),
+        (None, None) => format!("put `{secret}` (peer uid {puid}): {status}"),
     };
     let _ = aoide_protocol::audit(
         &aoide_protocol::default_audit_log(),
@@ -1268,18 +1428,22 @@ fn audit_put(secrets_home: &Path, secret: &str, granted: bool, reason: Option<&S
 /// other audit call in this module — carries the ask's `id` so the two
 /// lines (park, then eventual resolution) can be correlated by a human
 /// reading `audit.log`, never a code or value.
-fn audit_park(secrets_home: &Path, id: &str, secret: &str, consumer: &str) {
+fn audit_park(secrets_home: &Path, id: &str, secret: &str, consumer: &str, peer_uid: Option<u32>) {
     let record = json!({
         "ts": aoide_protocol::audit::now_secs(),
         "op": "park",
         "id": id,
         "secret": secret,
         "consumer": consumer,
+        "peerUid": peer_uid,
     });
     if let Err(e) = append_own_log(secrets_home, &record) {
         eprintln!("[aoide/secrets] could not write the secrets audit log: {e}");
     }
-    let message = format!("secret `{secret}` for consumer `{consumer}`: parked (id `{id}`, awaiting a TOTP code)");
+    let message = format!(
+        "secret `{secret}` for consumer `{consumer}` (peer uid {}): parked (id `{id}`, awaiting a TOTP code)",
+        peer_uid_display(peer_uid)
+    );
     let _ = aoide_protocol::audit(
         &aoide_protocol::default_audit_log(),
         aoide_protocol::Door::Daemon,
@@ -1295,12 +1459,13 @@ fn audit_park(secrets_home: &Path, id: &str, secret: &str, consumer: &str) {
 /// eventual line on the PARKED caller's side. `secret` is `None` only for
 /// an unknown id (nothing to name). Never carries the typed code (untrusted
 /// input, module doc) or the released value.
-fn audit_approve(secrets_home: &Path, id: &str, secret: Option<&str>, granted: bool, reason: &str) {
+fn audit_approve(secrets_home: &Path, id: &str, secret: Option<&str>, granted: bool, reason: &str, peer_uid: Option<u32>) {
     let record = json!({
         "ts": aoide_protocol::audit::now_secs(),
         "op": "approve",
         "id": id,
         "secret": secret,
+        "peerUid": peer_uid,
         "granted": granted,
         "reason": if reason.is_empty() { Value::Null } else { Value::String(reason.to_string()) },
     });
@@ -1308,10 +1473,11 @@ fn audit_approve(secrets_home: &Path, id: &str, secret: Option<&str>, granted: b
         eprintln!("[aoide/secrets] could not write the secrets audit log: {e}");
     }
     let status = if granted { "granted" } else { "denied" };
+    let puid = peer_uid_display(peer_uid);
     let message = match secret {
-        Some(s) if !reason.is_empty() => format!("approve `{id}` for secret `{s}`: {status} ({reason})"),
-        Some(s) => format!("approve `{id}` for secret `{s}`: {status}"),
-        None => format!("approve `{id}`: {status} ({reason})"),
+        Some(s) if !reason.is_empty() => format!("approve `{id}` for secret `{s}` (approver peer uid {puid}): {status} ({reason})"),
+        Some(s) => format!("approve `{id}` for secret `{s}` (approver peer uid {puid}): {status}"),
+        None => format!("approve `{id}` (approver peer uid {puid}): {status} ({reason})"),
     };
     let _ = aoide_protocol::audit(
         &aoide_protocol::default_audit_log(),
@@ -1325,12 +1491,13 @@ fn audit_approve(secrets_home: &Path, id: &str, secret: Option<&str>, granted: b
 
 /// Write BOTH audit lines for one `dismiss` attempt (P-N2) — mirrors
 /// [`audit_approve`]'s shape. `secret` is `""` only for an unknown id.
-fn audit_dismiss(secrets_home: &Path, id: &str, secret: &str, granted: bool, reason: Option<&str>) {
+fn audit_dismiss(secrets_home: &Path, id: &str, secret: &str, granted: bool, reason: Option<&str>, peer_uid: Option<u32>) {
     let record = json!({
         "ts": aoide_protocol::audit::now_secs(),
         "op": "dismiss",
         "id": id,
         "secret": if secret.is_empty() { Value::Null } else { Value::String(secret.to_string()) },
+        "peerUid": peer_uid,
         "granted": granted,
         "reason": reason,
     });
@@ -1338,10 +1505,11 @@ fn audit_dismiss(secrets_home: &Path, id: &str, secret: &str, granted: bool, rea
         eprintln!("[aoide/secrets] could not write the secrets audit log: {e}");
     }
     let status = if granted { "dismissed" } else { "denied" };
+    let puid = peer_uid_display(peer_uid);
     let message = match reason {
-        Some(r) => format!("dismiss `{id}`: {status} ({r})"),
-        None if !secret.is_empty() => format!("dismiss `{id}` for secret `{secret}`: {status}"),
-        None => format!("dismiss `{id}`: {status}"),
+        Some(r) => format!("dismiss `{id}` (peer uid {puid}): {status} ({r})"),
+        None if !secret.is_empty() => format!("dismiss `{id}` for secret `{secret}` (peer uid {puid}): {status}"),
+        None => format!("dismiss `{id}` (peer uid {puid}): {status}"),
     };
     let _ = aoide_protocol::audit(
         &aoide_protocol::default_audit_log(),
@@ -1423,6 +1591,19 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A peer identity matching the broker's OWN effective uid — task
+    /// #73's `dismiss_authorized` always admits the broker's own euid
+    /// regardless of an ask's stamped `peer_uid` (invariant: `dismiss_
+    /// authorized_always_admits_the_brokers_own_euid`). This is the
+    /// cleanup identity every pre-#73 test that dismisses its own parked
+    /// ask (never itself testing peer-uid gating) uses — an `None` peer
+    /// there would now be a genuinely unidentified dismisser, refused by
+    /// the fail-closed rule even against an ask whose own `peer_uid` is
+    /// also `None`.
+    fn operator_peer() -> Option<crate::peercred::PeerCred> {
+        Some(crate::peercred::PeerCred { uid: crate::home::effective_uid(), gid: 0, pid: 0 })
     }
 
     fn seed(home: &Path, policies: &[Policy]) {
@@ -1810,7 +1991,7 @@ mod tests {
     #[test]
     fn malformed_json_gets_a_reply_not_a_dropped_connection() {
         let home = tmp_home("malformed");
-        let reply = handle_line(&home, &home.join("events.jsonl"), "not json at all", &ParkRegistry::new(), &mut Vec::new());
+        let reply = handle_line(&home, &home.join("events.jsonl"), "not json at all", &ParkRegistry::new(), &mut Vec::new(), None);
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("not valid JSON"));
         std::fs::remove_dir_all(&home).ok();
@@ -1819,7 +2000,7 @@ mod tests {
     #[test]
     fn missing_op_is_a_clear_error() {
         let home = tmp_home("missingop");
-        let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"secret":"t","consumer":"m"}"#, &ParkRegistry::new(), &mut Vec::new());
+        let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"secret":"t","consumer":"m"}"#, &ParkRegistry::new(), &mut Vec::new(), None);
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("missing `op`"));
         std::fs::remove_dir_all(&home).ok();
@@ -1828,7 +2009,7 @@ mod tests {
     #[test]
     fn unknown_op_is_a_clear_error() {
         let home = tmp_home("unknownop");
-        let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"explode"}"#, &ParkRegistry::new(), &mut Vec::new());
+        let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"explode"}"#, &ParkRegistry::new(), &mut Vec::new(), None);
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("unknown op"));
         std::fs::remove_dir_all(&home).ok();
@@ -1837,7 +2018,7 @@ mod tests {
     #[test]
     fn resolve_with_missing_fields_is_malformed() {
         let home = tmp_home("missingfields");
-        let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t"}"#, &ParkRegistry::new(), &mut Vec::new());
+        let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t"}"#, &ParkRegistry::new(), &mut Vec::new(), None);
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("required"));
         std::fs::remove_dir_all(&home).ok();
@@ -1858,7 +2039,7 @@ mod tests {
 
         let p = Policy::new("t", "scratch", "stored-value");
         seed(&home, &[p]);
-        let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &ParkRegistry::new(), &mut Vec::new());
+        let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &ParkRegistry::new(), &mut Vec::new(), None);
         assert_eq!(reply["ok"], true);
         assert_eq!(reply["value"], "stored-value");
 
@@ -1889,7 +2070,7 @@ mod tests {
         });
         std::fs::write(crate::backend::backends_path(&home), serde_json::to_vec(&backends).unwrap()).unwrap();
 
-        let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &ParkRegistry::new(), &mut Vec::new());
+        let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &ParkRegistry::new(), &mut Vec::new(), None);
         assert_eq!(reply["ok"], false);
         let wire_error = reply["error"].as_str().unwrap();
         assert!(!wire_error.contains("SENTINEL"), "wire reply leaked stderr: {wire_error}");
@@ -2019,7 +2200,7 @@ mod tests {
 
         with_redirected_audit_log(&home, || {
             let reply =
-                handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","secret":"t","value":"the-stored-value"}"#, &parked, &mut Vec::new());
+                handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","secret":"t","value":"the-stored-value"}"#, &parked, &mut Vec::new(), None);
             assert_eq!(reply["ok"], true, "{reply}");
         });
 
@@ -2035,7 +2216,7 @@ mod tests {
         crate::store::save_policies(&home, &[Policy::new("t", "age", "t"), Policy::new("t2", "age", "t2")]).unwrap();
         with_redirected_audit_log(&home, || {
             let reply =
-                handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","secret":"t2","value":"another-value"}"#, &parked, &mut Vec::new());
+                handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","secret":"t2","value":"another-value"}"#, &parked, &mut Vec::new(), None);
             assert_eq!(reply["ok"], true, "{reply}");
         });
         let mint_events = own_log_lines(&home)
@@ -2305,20 +2486,20 @@ mod tests {
         seed_with_set(&home, &[p], &format!("cat {}", out.display()), &format!("cat > {}", out.display()));
 
         // 1. Empty -> stores, `replaced` is false.
-        let first = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","secret":"t","value":"first-value"}"#, &ParkRegistry::new(), &mut Vec::new());
+        let first = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","secret":"t","value":"first-value"}"#, &ParkRegistry::new(), &mut Vec::new(), None);
         assert_eq!(first["ok"], true, "{first}");
         assert_eq!(first["replaced"], false, "{first}");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "first-value");
 
         // 2. Existing, no `overwrite` -> the distinct `exists` refusal, and
         //    the stored value is UNCHANGED.
-        let second = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","secret":"t","value":"attempted-overwrite"}"#, &ParkRegistry::new(), &mut Vec::new());
+        let second = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","secret":"t","value":"attempted-overwrite"}"#, &ParkRegistry::new(), &mut Vec::new(), None);
         assert_eq!(second["ok"], false, "{second}");
         assert_eq!(second["exists"], true, "the refusal must be machine-readable via `exists`, not error prose: {second}");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "first-value", "a refused put must never touch the store");
 
         // 3. Existing, `overwrite: true` -> replaced, `replaced` is true.
-        let third = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","secret":"t","value":"second-value","overwrite":true}"#, &ParkRegistry::new(), &mut Vec::new());
+        let third = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","secret":"t","value":"second-value","overwrite":true}"#, &ParkRegistry::new(), &mut Vec::new(), None);
         assert_eq!(third["ok"], true, "{third}");
         assert_eq!(third["replaced"], true, "{third}");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "second-value");
@@ -2338,8 +2519,8 @@ mod tests {
         seed_with_set(&home, &[p], &format!("cat {}", out.display()), &format!("cat > {}", out.display()));
         std::fs::write(&out, "original-value").unwrap();
 
-        let with_false = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","secret":"t","value":"x","overwrite":false}"#, &ParkRegistry::new(), &mut Vec::new());
-        let without_field = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","secret":"t","value":"x"}"#, &ParkRegistry::new(), &mut Vec::new());
+        let with_false = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","secret":"t","value":"x","overwrite":false}"#, &ParkRegistry::new(), &mut Vec::new(), None);
+        let without_field = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","secret":"t","value":"x"}"#, &ParkRegistry::new(), &mut Vec::new(), None);
         assert_eq!(with_false, without_field, "an explicit `overwrite:false` and an absent field must match byte-for-byte");
         assert_eq!(with_false["exists"], true, "{with_false}");
         std::fs::remove_dir_all(&home).ok();
@@ -2356,7 +2537,7 @@ mod tests {
         let p = Policy::new("t", "scratch", "k");
         seed_with_set(&home, &[p], &format!("cat {}", out.display()), &format!("cat > {}", out.display()));
 
-        let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","secret":"t","value":"stored-value"}"#, &ParkRegistry::new(), &mut Vec::new());
+        let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","secret":"t","value":"stored-value"}"#, &ParkRegistry::new(), &mut Vec::new(), None);
         assert_eq!(reply["ok"], true);
         assert!(reply.get("value").is_none(), "put's reply must never carry a value: {reply}");
         assert_eq!(reply["replaced"], false, "the store starts empty — this is a new store, not a replace: {reply}");
@@ -2372,7 +2553,7 @@ mod tests {
     #[test]
     fn put_with_a_missing_secret_field_is_malformed() {
         let home = tmp_home("put-missingfields");
-        let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","value":"x"}"#, &ParkRegistry::new(), &mut Vec::new());
+        let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"put","value":"x"}"#, &ParkRegistry::new(), &mut Vec::new(), None);
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("required"));
         std::fs::remove_dir_all(&home).ok();
@@ -2392,7 +2573,7 @@ mod tests {
 
         // ── failure 1: no policy at all for this secret ────────────────
         seed(&home, &[]);
-        let reply = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"put","secret":"nope","value":"{SENTINEL}"}}"#), &ParkRegistry::new(), &mut Vec::new());
+        let reply = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"put","secret":"nope","value":"{SENTINEL}"}}"#), &ParkRegistry::new(), &mut Vec::new(), None);
         assert_eq!(reply["ok"], false);
         assert!(!reply.to_string().contains(SENTINEL), "wire reply leaked the sentinel: {reply}");
 
@@ -2404,7 +2585,7 @@ mod tests {
         let p = Policy::new("t", "scratch", "k");
         seed(&home, &[p]); // `seed`'s fixture backend is get-only.
         let reply =
-            handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"put","secret":"t","value":"{SENTINEL}","overwrite":true}}"#), &ParkRegistry::new(), &mut Vec::new());
+            handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"put","secret":"t","value":"{SENTINEL}","overwrite":true}}"#), &ParkRegistry::new(), &mut Vec::new(), None);
         assert_eq!(reply["ok"], false);
         assert!(!reply.to_string().contains(SENTINEL), "wire reply leaked the sentinel: {reply}");
 
@@ -2468,7 +2649,7 @@ mod tests {
         let parked = ParkRegistry::new();
 
         with_redirected_audit_log(&home, || {
-            let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m","wait":false}"#, &parked, &mut Vec::new());
+            let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m","wait":false}"#, &parked, &mut Vec::new(), None);
             assert_eq!(reply["ok"], false);
             assert_eq!(
                 reply["error"], "requireTotp is set but no totp code was provided",
@@ -2496,12 +2677,12 @@ mod tests {
         with_redirected_audit_log(&home, || {
             let resolved = std::thread::scope(|scope| {
                 let resolve_handle =
-                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
+                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new(), None));
 
                 let mut id = None;
                 for _ in 0..200 {
                     let list = parked.list();
-                    if let Some((pid, secret, consumer, _)) = list.into_iter().next() {
+                    if let Some((pid, secret, consumer, _, _)) = list.into_iter().next() {
                         assert_eq!(secret, "t");
                         assert_eq!(consumer, "m");
                         id = Some(pid);
@@ -2513,7 +2694,7 @@ mod tests {
 
                 let code = code_for_now(&secret, unix_now());
                 let approve_req = format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#);
-                let approve_reply = handle_line(&home, &home.join("events.jsonl"), &approve_req, &parked, &mut Vec::new());
+                let approve_reply = handle_line(&home, &home.join("events.jsonl"), &approve_req, &parked, &mut Vec::new(), None);
                 assert_eq!(approve_reply["ok"], true, "{approve_reply}");
                 assert!(
                     approve_reply.get("value").is_none(),
@@ -2543,7 +2724,7 @@ mod tests {
         with_redirected_audit_log(&home, || {
             std::thread::scope(|scope| {
                 let resolve_handle =
-                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
+                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new(), None));
 
                 let mut id = None;
                 for _ in 0..200 {
@@ -2555,7 +2736,7 @@ mod tests {
                 }
                 let id = id.expect("the resolve did not park in time");
 
-                let dismiss_reply = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new());
+                let dismiss_reply = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new(), operator_peer());
                 assert_eq!(dismiss_reply["ok"], true, "{dismiss_reply}");
 
                 let resolved = resolve_handle.join().unwrap();
@@ -2588,7 +2769,7 @@ mod tests {
         with_redirected_audit_log(&home, || {
             std::thread::scope(|scope| {
                 let resolve_handle =
-                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
+                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new(), None));
 
                 let mut id = None;
                 for _ in 0..200 {
@@ -2610,7 +2791,7 @@ mod tests {
 
                 let code = code_for_now(&secret, unix_now());
                 let approve_reply =
-                    handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#), &parked, &mut Vec::new());
+                    handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#), &parked, &mut Vec::new(), None);
                 assert_eq!(approve_reply["ok"], false, "{approve_reply}");
                 assert_eq!(approve_reply["error"], "consumer not authorized for this secret", "{approve_reply}");
                 assert!(
@@ -2649,7 +2830,7 @@ mod tests {
             std::thread::scope(|scope| {
                 // Fills the ONE slot the cap allows.
                 let first_handle =
-                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
+                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new(), None));
                 let mut id = None;
                 for _ in 0..200 {
                     if let Some((pid, ..)) = parked.list().into_iter().next() {
@@ -2665,7 +2846,7 @@ mod tests {
                 // immediately — same connection thread, so this call
                 // itself must NOT block.
                 let second_reply =
-                    handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
+                    handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new(), None);
                 assert_eq!(second_reply["ok"], false, "{second_reply}");
                 let err = second_reply["error"].as_str().unwrap();
                 assert!(err.contains("queue is full"), "{err}");
@@ -2673,7 +2854,7 @@ mod tests {
                 assert_eq!(parked.list().len(), 1, "the cap refusal must never grow the queue");
 
                 // Clean up the still-parked first ask so its thread returns.
-                let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new());
+                let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new(), operator_peer());
                 assert_eq!(dismissed["ok"], true, "{dismissed}");
                 let _ = first_handle.join().unwrap();
             });
@@ -2727,7 +2908,7 @@ mod tests {
 
             // Resolve it so the connection's second (final) line arrives
             // without waiting out the real timeout.
-            let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new());
+            let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new(), operator_peer());
             assert_eq!(dismissed["ok"], true, "{dismissed}");
 
             // Line 2: the final reply — exactly one, and it is NOT interim.
@@ -2767,7 +2948,7 @@ mod tests {
         with_redirected_audit_log(&home, || {
             std::thread::scope(|scope| {
                 let resolve_handle =
-                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
+                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new(), None));
 
                 let mut id = None;
                 for _ in 0..200 {
@@ -2780,13 +2961,13 @@ mod tests {
                 let id = id.expect("the resolve did not park in time");
 
                 // A wrong code: denied, but the ask must still be there.
-                let wrong = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"approve","id":"{id}","totp":"000000"}}"#), &parked, &mut Vec::new());
+                let wrong = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"approve","id":"{id}","totp":"000000"}}"#), &parked, &mut Vec::new(), None);
                 assert_eq!(wrong["ok"], false, "{wrong}");
                 assert_eq!(parked.list().len(), 1, "an invalid code must leave the ask parked");
 
                 // The REAL correct code now completes it.
                 let code = code_for_now(&secret, unix_now());
-                let right = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#), &parked, &mut Vec::new());
+                let right = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#), &parked, &mut Vec::new(), None);
                 assert_eq!(right["ok"], true, "{right}");
 
                 let resolved = resolve_handle.join().unwrap();
@@ -2803,7 +2984,7 @@ mod tests {
         let home = tmp_home("approve-unknown");
         let parked = ParkRegistry::new();
         with_redirected_audit_log(&home, || {
-            let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"approve","id":"9","totp":"123456"}"#, &parked, &mut Vec::new());
+            let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"approve","id":"9","totp":"123456"}"#, &parked, &mut Vec::new(), None);
             assert_eq!(reply["ok"], false);
             assert!(reply["error"].as_str().unwrap().contains("unknown pending id `9`"), "{reply}");
         });
@@ -2816,10 +2997,124 @@ mod tests {
         let home = tmp_home("dismiss-unknown");
         let parked = ParkRegistry::new();
         with_redirected_audit_log(&home, || {
-            let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"dismiss","id":"9"}"#, &parked, &mut Vec::new());
+            let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"dismiss","id":"9"}"#, &parked, &mut Vec::new(), None);
             assert_eq!(reply["ok"], false);
             assert!(reply["error"].as_str().unwrap().contains("unknown pending id `9`"), "{reply}");
         });
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #73: peer-uid-gated dismiss ─────────────────────────────────────
+    //
+    // A real socketpair's SO_PEERCRED always reports THIS test process's
+    // own euid on either end — there is no way to fabricate a genuinely
+    // different uid without a second real user. So these tests construct
+    // the ask's stamped `peer_uid` directly via `ParkRegistry::
+    // park_if_room` (never through a live `resolve` that parks) and hand
+    // `handle_dismiss`/`handle_line` a directly-constructed `PeerCred` for
+    // the dismissing side — both are ordinary function parameters, no
+    // socket needed either way.
+
+    /// `dismiss_authorized` (the pure decision) — every combination the
+    /// task requirement names, no I/O.
+    #[test]
+    fn dismiss_authorized_matches_the_asks_own_peer_uid() {
+        assert!(dismiss_authorized(Some(1000), Some(1000), 0));
+        assert!(!dismiss_authorized(Some(1000), Some(1001), 0), "a different peer uid must be refused");
+    }
+
+    #[test]
+    fn dismiss_authorized_always_admits_the_brokers_own_euid() {
+        // The broker's own operator uid may dismiss ANY ask, regardless of
+        // who parked it — including one whose own peer_uid is unidentified.
+        assert!(dismiss_authorized(Some(4242), Some(1000), 4242));
+        assert!(dismiss_authorized(Some(4242), None, 4242));
+    }
+
+    #[test]
+    fn dismiss_authorized_fails_closed_on_an_unidentified_dismisser() {
+        // No kernel fact to check the dismisser against — refuse, never
+        // pass, even when the ask's own peer_uid is ALSO unidentified (a
+        // coincidental "both unknown" is not a match).
+        assert!(!dismiss_authorized(None, Some(1000), 4242));
+        assert!(!dismiss_authorized(None, None, 4242));
+    }
+
+    #[test]
+    fn dismiss_refused_message_names_both_uids() {
+        let msg = dismiss_refused_message("3f2a-1", Some(1001), Some(1000), 0);
+        assert!(msg.contains("1001"), "{msg}");
+        assert!(msg.contains("1000"), "{msg}");
+        assert!(msg.contains("3f2a-1"), "{msg}");
+    }
+
+    #[test]
+    fn dismiss_refused_message_spells_unidentified_not_a_blank() {
+        let msg = dismiss_refused_message("id", None, Some(1000), 0);
+        assert!(msg.contains("unidentified"), "{msg}");
+    }
+
+    /// End-to-end: an ask stamped with one peer uid, dismissed by a
+    /// DIFFERENT (directly-constructed) peer uid, is refused — and the ask
+    /// stays parked, exactly like an invalid `approve` code leaves it
+    /// parked (never silently consumed by a failed unauthorized attempt).
+    #[test]
+    fn dismiss_by_a_mismatched_peer_uid_is_refused_and_the_ask_stays_parked() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("dismiss-wrong-peer-uid");
+        let parked = ParkRegistry::new();
+        let real_euid = unsafe { libc::geteuid() };
+        // Sentinel uids deliberately far from this test process's own real
+        // euid (which would otherwise coincidentally satisfy the
+        // broker-euid bypass in `dismiss_authorized`).
+        let owner_uid = real_euid.wrapping_add(10_000);
+        let wrong_uid = real_euid.wrapping_add(20_000);
+        let (id, _rx) = parked.park_if_room("t", "m", NOW, usize::MAX, Some(owner_uid)).unwrap();
+
+        with_redirected_audit_log(&home, || {
+            let wrong_peer = Some(crate::peercred::PeerCred { uid: wrong_uid, gid: 0, pid: 0 });
+            let reply = handle_line(
+                &home,
+                &home.join("events.jsonl"),
+                &format!(r#"{{"op":"dismiss","id":"{id}"}}"#),
+                &parked,
+                &mut Vec::new(),
+                wrong_peer,
+            );
+            assert_eq!(reply["ok"], false, "{reply}");
+            let err = reply["error"].as_str().unwrap();
+            assert!(err.contains(&owner_uid.to_string()), "{err}");
+            assert!(err.contains(&wrong_uid.to_string()), "{err}");
+        });
+        // Refused — the ask is untouched, still parked.
+        assert!(parked.peek(&id).is_some(), "a refused dismiss must leave the ask parked");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The matching half: dismissing with the SAME peer uid the ask was
+    /// stamped with succeeds.
+    #[test]
+    fn dismiss_by_the_asks_own_matching_peer_uid_succeeds() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("dismiss-matching-peer-uid");
+        let parked = ParkRegistry::new();
+        let real_euid = unsafe { libc::geteuid() };
+        let owner_uid = real_euid.wrapping_add(30_000);
+        let (id, _rx) = parked.park_if_room("t", "m", NOW, usize::MAX, Some(owner_uid)).unwrap();
+
+        with_redirected_audit_log(&home, || {
+            let matching_peer = Some(crate::peercred::PeerCred { uid: owner_uid, gid: 0, pid: 0 });
+            let reply = handle_line(
+                &home,
+                &home.join("events.jsonl"),
+                &format!(r#"{{"op":"dismiss","id":"{id}"}}"#),
+                &parked,
+                &mut Vec::new(),
+                matching_peer,
+            );
+            assert_eq!(reply["ok"], true, "{reply}");
+        });
+        assert!(parked.peek(&id).is_none(), "a granted dismiss must remove the ask");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -2833,7 +3128,7 @@ mod tests {
         let (id, _rx) = parked.park("t", "m", NOW);
 
         with_redirected_audit_log(&home, || {
-            let reply = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"approve","id":"{id}"}}"#), &parked, &mut Vec::new());
+            let reply = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"approve","id":"{id}"}}"#), &parked, &mut Vec::new(), None);
             assert_eq!(reply["ok"], false);
             assert!(reply["error"].as_str().unwrap().contains("`totp` is required"), "{reply}");
         });
@@ -2850,12 +3145,12 @@ mod tests {
         let home = tmp_home("pending-list");
         let parked = ParkRegistry::new();
 
-        let empty = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"pending"}"#, &parked, &mut Vec::new());
+        let empty = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"pending"}"#, &parked, &mut Vec::new(), None);
         assert_eq!(empty["ok"], true);
         assert_eq!(empty["pending"].as_array().unwrap().len(), 0);
 
         let (id, _rx) = parked.park("db-prod", "m", 1_700_000_123);
-        let listed = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"pending"}"#, &parked, &mut Vec::new());
+        let listed = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"pending"}"#, &parked, &mut Vec::new(), None);
         let arr = listed["pending"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["id"], id);
@@ -2863,6 +3158,31 @@ mod tests {
         assert_eq!(arr[0]["consumer"], "m");
         assert_eq!(arr[0]["requestedAt"], 1_700_000_123);
         assert!(!listed.to_string().to_lowercase().contains("value"), "{listed}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #73: `pending`'s reply carries the kernel-truth `peerUid` — additive
+    /// over the pre-#73 wire shape (`null` when unstamped, the exact
+    /// stamped value otherwise).
+    #[test]
+    fn pending_list_carries_the_stamped_peer_uid() {
+        let home = tmp_home("pending-peer-uid");
+        let parked = ParkRegistry::new();
+
+        // Unstamped (e.g. `park()`'s own unbounded/no-peer-info shape) ->
+        // `null`, never a bare-omitted field (additive-but-present, same
+        // discipline `argv0`/`reason` already hold elsewhere in this file).
+        let (unstamped_id, _rx1) = parked.park("no-peer", "m", 1);
+        let listed = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"pending"}"#, &parked, &mut Vec::new(), None);
+        let arr = listed["pending"].as_array().unwrap();
+        let entry = arr.iter().find(|e| e["id"] == unstamped_id).unwrap();
+        assert!(entry["peerUid"].is_null(), "{entry}");
+
+        let (stamped_id, _rx2) = parked.park_if_room("with-peer", "m", 2, usize::MAX, Some(4242)).unwrap();
+        let listed = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"pending"}"#, &parked, &mut Vec::new(), None);
+        let arr = listed["pending"].as_array().unwrap();
+        let entry = arr.iter().find(|e| e["id"] == stamped_id).unwrap();
+        assert_eq!(entry["peerUid"], 4242);
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -2885,6 +3205,7 @@ mod tests {
                 &format!(r#"{{"op":"resolve","secret":"t","consumer":"m","totp":"{code}"}}"#),
                 &parked,
                 &mut Vec::new(),
+                None,
             );
             assert_eq!(reply["ok"], true, "{reply}");
             assert_eq!(reply["value"], "stored-value");
@@ -2908,7 +3229,7 @@ mod tests {
         let parked = ParkRegistry::new();
 
         with_redirected_audit_log(&home, || {
-            let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
+            let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new(), None);
             assert_eq!(reply["ok"], false);
             let err = reply["error"].as_str().unwrap();
             assert!(err.contains("timed out after 1s"), "{err}");
@@ -2951,7 +3272,7 @@ mod tests {
         with_redirected_audit_log(&home, || {
             std::thread::scope(|scope| {
                 let resolve_handle = scope
-                    .spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"locked","consumer":"m"}"#, &parked, &mut Vec::new()));
+                    .spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"locked","consumer":"m"}"#, &parked, &mut Vec::new(), None));
 
                 let mut parked_yet = false;
                 for _ in 0..200 {
@@ -2965,14 +3286,14 @@ mod tests {
 
                 // An unrelated resolve, on the SAME registry, completes
                 // immediately — proving the parked ask never blocked it.
-                let free_reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"open","consumer":"m"}"#, &parked, &mut Vec::new());
+                let free_reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"open","consumer":"m"}"#, &parked, &mut Vec::new(), None);
                 assert_eq!(free_reply["ok"], true, "{free_reply}");
                 assert_eq!(free_reply["value"], "open-value");
 
                 // Clean up: dismiss the still-parked ask so the spawned
                 // thread returns and this test doesn't leak a blocked one.
                 let (id, ..) = parked.list().into_iter().next().unwrap();
-                let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new());
+                let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new(), operator_peer());
                 assert_eq!(dismissed["ok"], true, "{dismissed}");
                 let resolved = resolve_handle.join().unwrap();
                 assert_eq!(resolved["ok"], false);
@@ -3182,7 +3503,7 @@ mod tests {
         let parked = ParkRegistry::new();
 
         with_redirected_audit_log(&home, || {
-            let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
+            let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new(), None);
             assert_eq!(reply["ok"], true, "{reply}");
         });
 
@@ -3226,7 +3547,7 @@ mod tests {
         let parked = ParkRegistry::new();
 
         with_redirected_audit_log(&home, || {
-            let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
+            let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new(), None);
             assert_eq!(reply["ok"], true, "{reply}");
         });
 
@@ -3260,6 +3581,7 @@ mod tests {
                 &format!(r#"{{"op":"resolve","secret":"t","consumer":"m","totp":"{code}"}}"#),
                 &parked,
                 &mut Vec::new(),
+                None,
             );
             assert_eq!(reply["ok"], true, "{reply}");
         });
@@ -3286,7 +3608,7 @@ mod tests {
         with_redirected_audit_log(&home, || {
             std::thread::scope(|scope| {
                 let resolve_handle =
-                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
+                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new(), None));
 
                 let mut id = None;
                 for _ in 0..200 {
@@ -3306,7 +3628,7 @@ mod tests {
                 assert!(ev["timeoutSecs"].as_u64().is_some(), "{ev}");
 
                 // Clean up: dismiss so the spawned thread returns.
-                let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new());
+                let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new(), operator_peer());
                 assert_eq!(dismissed["ok"], true, "{dismissed}");
                 resolve_handle.join().unwrap();
             });
@@ -3328,7 +3650,7 @@ mod tests {
         with_redirected_audit_log(&home, || {
             std::thread::scope(|scope| {
                 let resolve_handle =
-                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
+                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new(), None));
 
                 let mut id = None;
                 for _ in 0..200 {
@@ -3342,7 +3664,7 @@ mod tests {
                 let code = code_for_now(&secret, unix_now());
 
                 let approved =
-                    handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#), &parked, &mut Vec::new());
+                    handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#), &parked, &mut Vec::new(), None);
                 assert_eq!(approved["ok"], true, "{approved}");
 
                 let own_lines = own_log_lines(&home);
@@ -3372,7 +3694,7 @@ mod tests {
         with_redirected_audit_log(&home, || {
             std::thread::scope(|scope| {
                 let resolve_handle =
-                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
+                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new(), None));
 
                 let mut id = None;
                 for _ in 0..200 {
@@ -3384,7 +3706,7 @@ mod tests {
                 }
                 let id = id.expect("the ask did not park in time");
 
-                let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new());
+                let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new(), operator_peer());
                 assert_eq!(dismissed["ok"], true, "{dismissed}");
 
                 let own_lines = own_log_lines(&home);
@@ -3416,7 +3738,7 @@ mod tests {
         let parked = ParkRegistry::new();
 
         with_redirected_audit_log(&home, || {
-            let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
+            let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new(), None);
             assert_eq!(reply["ok"], false, "{reply}");
         });
 
@@ -3452,7 +3774,7 @@ mod tests {
         with_redirected_audit_log(&home, || {
             std::thread::scope(|scope| {
                 let resolve_handle =
-                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new()));
+                    scope.spawn(|| handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new(), None));
 
                 let mut id = None;
                 for _ in 0..200 {
@@ -3465,7 +3787,7 @@ mod tests {
                 let id = id.expect("the ask did not park in time");
                 let code = code_for_now(&secret, unix_now());
                 let approved =
-                    handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#), &parked, &mut Vec::new());
+                    handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"approve","id":"{id}","totp":"{code}"}}"#), &parked, &mut Vec::new(), None);
                 assert_eq!(approved["ok"], true, "{approved}");
                 assert!(!approved.to_string().contains(SENTINEL), "the approve reply leaked the value: {approved}");
 
@@ -3599,7 +3921,7 @@ mod tests {
         std::env::set_var("AOIDE_AUDIT_LOG", &unreachable_mirror);
 
         let parked = ParkRegistry::new();
-        let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
+        let reply = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new(), None);
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_AUDIT_LOG", v),
@@ -3642,7 +3964,7 @@ mod tests {
         let events_path = ro_dir.join("events.jsonl");
 
         let parked = ParkRegistry::new();
-        let reply = handle_line(&home, &events_path, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new());
+        let reply = handle_line(&home, &events_path, r#"{"op":"resolve","secret":"t","consumer":"m"}"#, &parked, &mut Vec::new(), None);
 
         // Restore write permission before cleanup can remove the tempdir.
         std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o700)).unwrap();

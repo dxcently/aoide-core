@@ -639,14 +639,20 @@ pub fn put(socket_path: &Path, secret: &str, value: &str, overwrite: bool) -> Re
 }
 
 /// One parked ask, as `secrets pending` lists it — id/secret/consumer/
-/// requestedAt ONLY, never a value (mirrors the wire's own `pending` reply
-/// shape, `broker.rs`'s module doc's wire table).
+/// requestedAt/peerUid ONLY, never a value (mirrors the wire's own
+/// `pending` reply shape, `broker.rs`'s module doc's wire table).
+/// `peer_uid` (task #73) is the kernel-truth `SO_PEERCRED` uid stamped at
+/// park time — additive over the pre-#73 wire shape, `None` both when the
+/// field is entirely absent (an older broker) and when the broker sent an
+/// explicit `null` (an unidentified connection at park time) — a caller of
+/// this struct has no need to tell those two apart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingAsk {
     pub id: String,
     pub secret: String,
     pub consumer: String,
     pub requested_at: u64,
+    pub peer_uid: Option<u32>,
 }
 
 /// Connect to `socket_path`, send ONE `pending` request, read ONE reply
@@ -698,6 +704,9 @@ pub fn pending(socket_path: &Path) -> Result<Vec<PendingAsk>, String> {
                     .get("requestedAt")
                     .and_then(Value::as_u64)
                     .ok_or("a pending entry had no `requestedAt`")?,
+                // #73: additive — absent (an older broker) and an explicit
+                // `null` (unidentified at park time) both read as `None`.
+                peer_uid: a.get("peerUid").and_then(Value::as_u64).map(|u| u as u32),
             })
         })
         .collect::<Result<Vec<_>, &str>>()
@@ -1468,6 +1477,11 @@ mod tests {
         let ask = ask.expect("the resolve did not park in time");
         assert_eq!(ask.secret, "t");
         assert_eq!(ask.consumer, "m");
+        // #73: a REAL socket connection's SO_PEERCRED is this same test
+        // process's own euid (the resolving thread and this thread are one
+        // process) — proves the peer uid survives the full accept ->
+        // park -> pending round trip, not just the in-process unit tests.
+        assert_eq!(ask.peer_uid, Some(unsafe { libc::geteuid() }));
 
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let step = crate::totp::timestep(now);

@@ -122,6 +122,7 @@ pub mod enroll;
 pub mod hmac;
 pub mod home;
 pub mod park;
+pub mod peercred;
 pub mod policy;
 pub mod replay;
 pub mod sha1;

@@ -104,6 +104,35 @@
   label. Don't reintroduce a consumer dimension to `replay::ReplayLedger`
   without authenticated consumer identity landing first (#51-adjacent,
   not planned).
+- **`SO_PEERCRED` (task #73) gives kernel-truth CALLER identity — it does
+  NOT authenticate the wire's `consumer` field, which stays self-asserted
+  exactly as the ruling above states.** `handle_conn` reads `SO_PEERCRED`
+  (`peercred::peer_cred`, hand-rolled over `libc::getsockopt` since `std`'s
+  own accessor is unstable) ONCE per connection, at connection start, and
+  threads the same value into every op that connection sends — never
+  re-read per line. A read failure is an UNIDENTIFIED connection (`None`),
+  never a panic, never a fabricated uid. `park::ParkedAsk::peer_uid` stamps
+  the parking connection's peer uid at park time (shown additively in
+  `pending`'s `peerUid`); `broker::handle_dismiss` is the one place this
+  fact gates a decision (`dismiss_authorized`, pure and unit-tested): an
+  ordinary caller may only dismiss an ask whose stamped `peer_uid` matches
+  its OWN connection's peer uid, or the broker's own effective uid
+  (`home::effective_uid()`) may always dismiss any ask. **Fail closed on
+  any missing kernel fact** — an unidentified dismisser is NEVER
+  authorized, even against an ask whose own `peer_uid` is also
+  unidentified; there is nothing to match, so the safe default is refusal.
+  `approve` is UNCHANGED — it stays open to any local caller, gated by the
+  TOTP code alone, never by identity. Every `audit_resolve`/`audit_park`/
+  `audit_approve`/`audit_dismiss`/`audit_put` call now also carries the
+  acting connection's peer uid, alongside (never replacing) the
+  self-asserted name it already carried. Don't read this as closing the
+  `consumer`-self-assertion gap the ruling above and `CONTRACTS.md`'s
+  honesty note describe — that gap is authenticated CONSUMER identity,
+  which `SO_PEERCRED` cannot provide (it identifies the connecting
+  PROCESS, not which of possibly many self-asserted consumer names that
+  process is claiming); don't wire `SO_PEERCRED`'s uid into
+  `automation.consumers`/policy `consumers[]` matching as if it were an
+  authenticated consumer name — it isn't one.
 - **Clock-as-parameter, everywhere.** Every function in `totp`/`replay`
   takes `unix_time`/`timestep`/cutoff as an explicit argument. Nothing in
   `src/` calls `SystemTime::now()` — grep for it before merging a change
@@ -130,18 +159,22 @@
   run). Don't "consolidate" the two without re-deriving why secrets secret
   names are held to a tighter bar (they name on-disk backend-store paths
   under a privileged uid; a peer name only names a JSON cache file).
-- **I/O is confined to seven named modules: `broker`, `client`, `store`,
-  `backend`, `enroll` (P-V3), `watch` (tracker #71 Part 1), and each
-  module's own `#[cfg(test)]` block.** `sha1`/`hmac`/`totp`/`base32`/`uri`/
-  `replay`/`policy` stay pure — no `SystemTime::now()`, no socket, no
-  `exec`, no reads/writes of secrets home in any of them. This is the P-V2
-  narrowing of the old P-V1 rule ("nothing in this crate performs I/O" —
-  true then because there were no I/O modules yet), widened once more at
-  P-V3 for `enroll`'s `/dev/urandom`/`gethostname`/`qrencode` calls, and
-  again for `watch`'s log-tail (`File`/`stat`), socket calls
+- **I/O is confined to eight named modules: `broker`, `client`, `store`,
+  `backend`, `enroll` (P-V3), `watch` (tracker #71 Part 1), `peercred`
+  (task #73), and each module's own `#[cfg(test)]` block.** `sha1`/`hmac`/
+  `totp`/`base32`/`uri`/`replay`/`policy` stay pure — no `SystemTime::now()`,
+  no socket, no `exec`, no reads/writes of secrets home in any of them.
+  This is the P-V2 narrowing of the old P-V1 rule ("nothing in this crate
+  performs I/O" — true then because there were no I/O modules yet), widened
+  once more at P-V3 for `enroll`'s `/dev/urandom`/`gethostname`/`qrencode`
+  calls, again for `watch`'s log-tail (`File`/`stat`), socket calls
   (`client::pending`/`approve`/`dismiss`, reused, never duplicated), and
-  `SIGINT` handling (`libc::signal`) — the boundary moves as new I/O
-  concerns earn their own named module, it does not disappear. `enroll`
+  `SIGINT` handling (`libc::signal`), and again at task #73 for
+  `peercred::peer_cred`'s `getsockopt(2)` call — the boundary moves as new
+  I/O concerns earn their own named module, it does not disappear. `peercred`
+  itself never writes anything or touches the secrets home at all — it is
+  a pure READ of one already-open connection's kernel-stamped identity,
+  called once by `broker::handle_conn`. `enroll`
   itself never writes a secrets-home FILE directly — that stays `store`'s
   job (`enroll::run` calls `store::save_totp_secret`/`save_replay_ledger`).
   `watch` itself never writes a secrets-home file OR `policy.json` at all

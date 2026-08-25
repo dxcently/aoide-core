@@ -271,7 +271,7 @@ below) into something richer.
 <- {"ok":false,"error":"<value-free message>"}      (denied/error)
 
 -> {"op":"pending"}
-<- {"ok":true,"pending":[{"id":"<id>","secret":"<name>","consumer":"<consumer>","requestedAt":<unix-seconds>},...]}
+<- {"ok":true,"pending":[{"id":"<id>","secret":"<name>","consumer":"<consumer>","requestedAt":<unix-seconds>,"peerUid":<uid-or-null>},...]}
 
 -> {"op":"approve","id":"<id>","totp":"<code>"}
 <- {"ok":true}                                      (code valid — the VALUE
@@ -287,6 +287,9 @@ below) into something richer.
                                                        a clean "dismissed"
                                                        refusal)
 <- {"ok":false,"error":"unknown pending id `<id>`"}
+<- {"ok":false,"error":"<peer-uid-mismatch refusal>"} (task #73 — see "Peer
+                                                       identity" below; the
+                                                       ask stays parked)
 ```
 
 `client::resolve` (`secrets exec`/`secrets get`) consumes any interim line
@@ -302,15 +305,56 @@ that is indistinguishable from a wedged broker for up to
 `overwrite` at P-67 (also optional — absent means `false`, same shape as
 `resolve`'s own optional fields). `consumer` is SELF-ASSERTED (the V1
 ruling `replay.rs` carries): the policy's `consumers[]` list is the real
-gate, never caller identity. `argv0` (the wrapped command's own argv[0],
-sent by `secrets exec`) exists purely so the broker's audit lines can name
-it — the broker never runs it. `totp` is consulted ONLY when the resolved
-policy has `requireTotp: true` (`broker::verify_totp_gate`) — on a policy
-without it, or on a `put` (never checked at all), `totp` rides the wire
-unread if present, same as before P-V3. The `exists` flag on a denied
-`put` is what a consumer of this wire checks — never string-matching the
-`error` text — to tell "already has a value" apart from every other
-denial.
+gate, never caller identity — **task #73 does not change this.** What #73
+adds is a separate, orthogonal fact this crate did not have before: the
+connecting process's real uid, read via `SO_PEERCRED` (kernel-truth, not
+self-asserted) and recorded alongside the self-asserted `consumer` name,
+never in place of it — see "Peer identity (`SO_PEERCRED`, task #73)" below.
+`argv0` (the wrapped command's own argv[0], sent by `secrets exec`) exists
+purely so the broker's audit lines can name it — the broker never runs it.
+`totp` is consulted ONLY when the resolved policy has `requireTotp: true`
+(`broker::verify_totp_gate`) — on a policy without it, or on a `put` (never
+checked at all), `totp` rides the wire unread if present, same as before
+P-V3. The `exists` flag on a denied `put` is what a consumer of this wire
+checks — never string-matching the `error` text — to tell "already has a
+value" apart from every other denial.
+
+## Peer identity (`SO_PEERCRED`, task #73)
+
+Every `handle_conn`-served connection reads its own kernel-truth caller
+identity ONCE, at connection start, via `SO_PEERCRED`
+(`peercred::peer_cred` — hand-rolled over `libc::getsockopt`, since `std`'s
+own `UnixStream::peer_cred` accessor is unstable) — the connecting
+process's real `uid`/`gid`/`pid`, verified by the kernel, independent of
+anything the wire request itself claims. A read failure (a non-`AF_UNIX`
+stream, an unexpected `getsockopt` error) is treated as an UNIDENTIFIED
+connection, never a panic and never a fabricated uid — every decision keyed
+on it below fails CLOSED on that case, never open.
+
+**This does not authenticate `consumer`.** The self-asserted honesty note
+above is unchanged: nothing on the wire proves a caller's claimed
+`consumer` name. What peer identity adds is a SEPARATE fact recorded
+alongside it:
+
+- **Parked asks are stamped with their requesting connection's peer uid**
+  at park time (`park::ParkedAsk::peer_uid`), shown ADDITIVELY in
+  `pending`'s reply as `peerUid` (`null` when unidentified — an old client
+  ignoring the field is unaffected, same wire-compatibility discipline
+  every other additive field here holds).
+- **`dismiss` is peer-uid-gated.** An ordinary caller may only dismiss an
+  ask whose STAMPED `peerUid` matches its OWN connection's peer uid — the
+  broker's own effective uid (the operator/admin path — the same "this
+  process's uid decides" precedent `home::admin_identity_check` holds for
+  the direct-home admin verbs) may always dismiss any ask, regardless of
+  who parked it. A refused dismiss names BOTH uids and leaves the ask
+  exactly where it was, dismissable by its rightful owner or the broker's
+  own operator. `approve` stays OPEN to any local caller reaching the
+  socket — the TOTP code is its gate, not identity; peer identity does not
+  change that.
+- **Every audit line for resolve/park/approve/dismiss/put now carries the
+  acting connection's peer uid** alongside the pre-existing self-asserted
+  consumer name — a human reading `audit.log` sees both: what the caller
+  CLAIMED to be, and who the kernel says actually connected.
 
 Both replies are hand-built `serde_json::Value` (`serde_json::json!`),
 never a `#[derive(Serialize)]` struct — see "Invariants held" below.
