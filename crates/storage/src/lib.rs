@@ -46,6 +46,17 @@
 //! independently. `peer_store::Peer` gained `pubkey`/`verified` in the same
 //! phase — additive fields `peer_store::upsert_paired_peer` is the one
 //! write site for.
+//!
+//! `wire_auth` (P-P4) is the newest: the canonical string every signed A2A
+//! POST binds itself to (method, path, timestamp, nonce, body digest) and
+//! the sign/verify wrappers around `identity::Keypair` that keep every
+//! `ed25519_dalek` type contained to THIS crate — `aoide-client` (the
+//! signer) and `aoide-server` (the verifier) each call through it rather
+//! than depending on the crypto crate directly. `peer_store::PeerRung`
+//! gained a `Signature` variant in the same phase — the new strongest rung,
+//! yielded only by the server's own request-verification flow (never by
+//! `peer_store::resolve_peer`, which has no access to the raw HTTP request
+//! a signature needs).
 
 pub mod a2a_store;
 pub mod addr;
@@ -66,6 +77,7 @@ pub mod session;
 pub mod stage;
 pub mod takes;
 pub mod time;
+pub mod wire_auth;
 
 /// A crate-wide lock serialising every test that mutates process-global env
 /// (`AOIDE_STAGE_DIR`, `AOIDE_STATE_DIR`, …). Delegates to

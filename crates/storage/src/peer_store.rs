@@ -317,22 +317,41 @@ pub fn set_peer_allow(peers: &mut [Peer], name: &str, cap: &str, on: bool) -> Re
 }
 
 /// WHICH signal resolved a caller to a [`Peer`] ([`resolve_peer`], P-P3
-/// decision 6). The two rungs are not interchangeable strength: `Token` is
-/// possession of that peer's own `token_file` secret — it survives any
-/// reverse proxy/NAT, the same reason [`is_autogated_peer_token`] is
-/// preferred over the address check for autogate. `Addr` is a bare
+/// decision 6; a third rung joined in P-P4). The three rungs are not
+/// interchangeable strength, weakest to strongest: `Addr` is a bare
 /// TCP-source-IP-vs-`url` match — spoofable by anyone who can reach the
 /// door from that address, or who merely sits behind the same NAT/proxy as
-/// the real peer. Both rungs are fine for ATTRIBUTION (Inject's `from`
-/// field, origin-stamping) and for autogate's existing "skip the pending
-/// queue" question; the A2A door's spawn arm is the one consumer narrow
-/// enough to require `Token` specifically (`a2a.rs::spawn_admitted`,
-/// amendment 2026-08-25 to decision 6 — the addr rung must never itself
-/// authorize launching a process attributed to the matched peer).
+/// the real peer. `Token` is possession of that peer's own `token_file`
+/// secret — it survives any reverse proxy/NAT, the same reason
+/// [`is_autogated_peer_token`] is preferred over the address check for
+/// autogate, but it is still a bare shared secret: not bound to any one
+/// request, replayable, and identical across every request the true peer
+/// or an impersonator ever sends. `Signature` (P-P4,
+/// `docs/architecture/PAIRING.md`'s "Wire authentication" section) is an
+/// ed25519 signature over that ONE request's own method/path/timestamp/
+/// nonce/body-digest, verified against the peer's stored pubkey — the only
+/// rung cryptographically bound to the specific request that carried it.
+/// `Signature` is deliberately NOT produced by this function
+/// ([`resolve_peer`]) — verifying one needs the raw HTTP request
+/// (method/path/body/signature headers) that this pure, address-and-token-
+/// only function never sees; it is yielded instead by the door's own
+/// verification flow (`aoide-server::a2a::verify_signed_request`) once a
+/// signature checks out, then fed to [`Peer`]-consuming code the exact same
+/// way a `resolve_peer` result would be. All three rungs are fine for
+/// ATTRIBUTION (Inject's `from` field, origin-stamping) and for autogate's
+/// existing "skip the pending queue" question; the A2A door's spawn arm is
+/// the one consumer narrow enough to require `Signature` specifically
+/// (`a2a.rs::spawn_admitted` — Token admitted spawn from 2026-08-25 to
+/// P-P4's landing, when the requirement moved to `Signature` alone; `Addr`
+/// never admitted spawn at any point).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerRung {
     Token,
     Addr,
+    /// A verified per-request ed25519 signature (P-P4) — see this enum's
+    /// own doc comment for the full grounding. Never produced by
+    /// [`resolve_peer`] itself.
+    Signature,
 }
 
 /// Resolve the CALLING peer's identity (P-P3, PAIRING.md decision 6) — the
@@ -499,6 +518,30 @@ pub fn url_host(url: &str) -> Option<String> {
         None
     } else {
         Some(host.to_string())
+    }
+}
+
+/// The path a request to `url` actually rides on the wire (curl sends
+/// exactly this in the HTTP request line, and the door's own
+/// `parse_http_request` captures exactly this into `HttpRequest.path`) —
+/// P-P4's own reason this exists: a signer must build its canonical string
+/// (`aoide_storage::wire_auth::canonical_string`) over the SAME path the
+/// verifier will see, never a hardcoded `"/"` that would silently drift the
+/// moment a peer's `url` carries a path prefix (a reverse proxy fronting
+/// the door at e.g. `https://box/aoide/`). Query string and fragment are
+/// dropped (this door parses none) and an empty/missing path becomes `"/"`
+/// — the same default an HTTP client sends for a bare
+/// `scheme://host[:port]` URL with no explicit path.
+pub fn url_path(url: &str) -> String {
+    let Some((_, rest)) = url.trim().split_once("://") else {
+        return "/".to_string();
+    };
+    let after_host = rest.find('/').map(|i| &rest[i..]).unwrap_or("");
+    let path = after_host.split(['?', '#']).next().unwrap_or("");
+    if path.is_empty() {
+        "/".to_string()
+    } else {
+        path.to_string()
     }
 }
 
@@ -863,6 +906,15 @@ mod tests {
         assert_eq!(url_host("http://10.0.0.5:8710/"), Some("10.0.0.5:8710".to_string()));
         assert_eq!(url_host("http://yomi-strix:8710/x/y"), Some("yomi-strix:8710".to_string()));
         assert_eq!(url_host("not-a-url"), None);
+    }
+
+    #[test]
+    fn url_path_extracts_the_wire_path_p_p4() {
+        assert_eq!(url_path("http://10.0.0.5:8710/"), "/");
+        assert_eq!(url_path("http://10.0.0.5:8710"), "/", "no trailing slash at all still defaults to /");
+        assert_eq!(url_path("https://box.example.com/aoide/"), "/aoide/");
+        assert_eq!(url_path("http://box:8710/aoide?x=1#frag"), "/aoide", "query/fragment are dropped");
+        assert_eq!(url_path("not-a-url"), "/", "unparseable input defaults to /, never panics");
     }
 
     #[test]

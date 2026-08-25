@@ -15,6 +15,19 @@
   adding cross-host context threading extends the function's parameters
   rather than working around it — the server side already routes a
   `context_id` when given one.
+- **`sign_headers_for_peer` (P-P4) is the ONE production call site that
+  ever builds the `X-Aoide-*` signature headers — every real peer-POST
+  function threads `post_json`'s `extra_headers` through it, never
+  hand-rolls a header set inline.** It returns `vec![]` for an
+  unverified/unpaired peer, never a partial or malformed header set —
+  `verify_signed_request` (`aoide-server`) refuses a request carrying SOME
+  but not all four headers, so a future edit that adds a header
+  conditionally (e.g. "only send `X-Aoide-Nonce` if X") would silently
+  turn every affected outbound request into a hard refusal on the far
+  end. The pairing ceremony's own three wire calls
+  (`aoide/pairRequest`/`aoide/pairReveal`/`aoide/pairApprove`) always pass
+  an empty header slice — they are unauthenticated by protocol design (see
+  the P-P2 ceremony invariants below), not merely "not yet wired."
 - **Forwarded event text from `adapter` is untrusted data**, same as root
   `AGENTS.md` house rule 4 — an adapter never lets forwarded text execute as
   a command.

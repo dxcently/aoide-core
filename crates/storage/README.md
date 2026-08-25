@@ -32,7 +32,12 @@ cache (CONTRACTS.md §7). File-first by decision — no embedded database yet
   loads with `pubkey: None`/`verified: false` unchanged.
   `default_peer_name_from_url` sanitizes a bare URL host into the same
   nickname shape `valid_peer_name` requires, for `peer pair request`'s
-  no-`--name` default. `allows` (P-P3, `docs/architecture/PAIRING.md`
+  no-`--name` default. `url_path` (P-P4) extracts just the path component
+  from a peer's `url` (`"http://host:port/foo?x"` → `"/foo"`, `""` when
+  none) — the ONE function both `aoide-client`'s signer and
+  `aoide-server`'s HTTP request parser derive a wire path from, so a
+  signature's canonical string binds to the exact same string on both
+  ends. `allows` (P-P3, `docs/architecture/PAIRING.md`
   decision 5) is a CLOSED capability set (`PEER_CAPABILITIES`: `"read"`,
   `"spawn"`) — never a per-capability serde bool scatter — additive,
   empty for every unpaired/legacy peer; `upsert_paired_peer` stamps the
@@ -48,13 +53,20 @@ cache (CONTRACTS.md §7). File-first by decision — no embedded database yet
   peer's `url` second (`PeerRung::Addr`) — unlike `is_autogated_peer_token`/
   `is_autogated_peer_addr` above, it looks at EVERY registered peer, not
   only `autogate`-marked ones, since resolving WHICH peer is calling is a
-  different question from "should this peer skip the pending queue." The
-  two rungs are not interchangeable strength: `aoide-server`'s spawn arm
-  (`spawn_admitted`) accepts ONLY `PeerRung::Token` — a bare address match
-  carries no possession proof and must never itself authorize launching a
-  process attributed to the matched peer — while `PeerRung::Addr` remains
-  fine for attribution/origin-stamping and the ordinary autogate question.
-  Ambiguity resolves deterministically: `peer add` refuses only a
+  different question from "should this peer skip the pending queue."
+  `PeerRung` carries a THIRD variant, `Signature` (P-P4) — the strongest
+  rung, never produced by `resolve_peer` itself (it has no access to the
+  raw HTTP request a signature needs); it is yielded only by
+  `aoide-server::a2a::verify_signed_request`, which authenticates a
+  request's `X-Aoide-*` headers against the peer's stored `pubkey` (see
+  `wire_auth` below, CONTRACTS.md §6's P-P4 amendment for the full wire
+  shape). None of the three rungs are interchangeable strength:
+  `aoide-server`'s spawn arm (`spawn_admitted`) accepts ONLY
+  `PeerRung::Signature` — a bare address match carries no possession
+  proof, and a bare token match is replayable and identical across every
+  request the real peer or an impersonator ever sends; both remain fine
+  for attribution/origin-stamping and the ordinary autogate question, just
+  never for Spawn. Ambiguity resolves deterministically: `peer add` refuses only a
   duplicate NAME (CONTRACTS.md §7), so two peers can share a URL host or
   hold byte-identical `token_file` contents, and `resolve_peer` then
   answers with whichever matches FIRST in registry (array) order — not
@@ -158,8 +170,31 @@ cache (CONTRACTS.md §7). File-first by decision — no embedded database yet
   emits, and a source-scanning test in `identity.rs` mechanically holds
   that boundary. The pairing ceremony (`peer pair`, P-P2) builds on this
   directly (`peer_store`/`pairing` above); the `allows` set + A2A spawn-gate
-  flip (P-P3, `peer_store::allows`/`resolve_peer` above) also build on it —
-  signed wire requests (P-P4) are what's still ahead.
+  flip (P-P3, `peer_store::allows`/`resolve_peer` above) also build on it;
+  so does `wire_auth` below (P-P4) — `Keypair::sign`/`Keypair::verify` are
+  its ONLY two entry points into `ed25519_dalek`, so neither
+  `aoide-client` nor `aoide-server` needs that dependency directly.
+- `wire_auth` — per-request signed wire authentication for paired peers
+  (P-P4, `docs/architecture/PAIRING.md`'s "Wire authentication (paired
+  peers)" section, CONTRACTS.md §6's own amendment for the full wire
+  shape and pinned vectors). `canonical_string(method, path, timestamp,
+  nonce, body)` is the ONE function both ends build independently (never
+  a wire-carried canonical string) — five fields, each trimmed+lowercased,
+  NUL-separated after every field including the last (P-P2's
+  `derive_sas`/`derive_commit` style, reused verbatim), with only the body
+  digested (`sha2`) rather than riding the string whole. `sign_hex`/
+  `verify_signature_hex` are thin hex-in/hex-out wrappers around
+  `identity::Keypair`'s two entry points — neither `aoide-client` nor
+  `aoide-server` touches `ed25519_dalek` types directly.
+  `signature_skew_secs` (`AOIDE_SIGNATURE_SKEW_SECS` env, 120s default)
+  and `within_skew` are the replay guard's timestamp half; the OTHER half
+  (the nonce cache) is deliberately NOT here — it is ephemeral,
+  process-local, per-`a2a serve` runtime state with no durable file behind
+  it at all, unlike everything else this crate persists, so it lives in
+  `aoide-server::a2a` next to its one consumer instead (this module's own
+  doc comment states the reasoning). `HEADER_PEER`/`HEADER_TIMESTAMP`/
+  `HEADER_NONCE`/`HEADER_SIGNATURE` are the four wire header names — always
+  present together or not at all, never independently optional.
 - `commands` — this crate's CLI verbs: `usage` (local token/cost rollup),
   `inbox list|read|clear` (the store above's CLI surface), and `identity`
   (the module above's CLI surface). `peer pair request|pending|approve|

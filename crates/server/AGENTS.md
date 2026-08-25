@@ -162,31 +162,51 @@
   in this function, and don't drop/re-park the entry on a mismatch — both
   would commit or destroy state no human on this end confirmed.
 - **`message_send`'s Spawn arm gates on `spawn_admitted`, which requires a
-  resolved, paired, spawn-allowed peer identified via its OWN TOKEN —
-  never on `token_authorized`, and never on the address rung (P-P3,
-  `docs/architecture/PAIRING.md` decision 6).**
-  `aoide_storage::peer_store::resolve_peer` is the identity ladder — a
-  presented token against a peer's own `token_file` FIRST
-  (`PeerRung::Token`), else the TCP origin against that peer's `url`
-  SECOND (`PeerRung::Addr`) — and `spawn_admitted` accepts ONLY a
-  `PeerRung::Token` resolution, deferring the peer-side check to
-  `peer_may_spawn(peer)` (`verified && allows.contains("spawn")`) only in
-  that case. The address rung still resolves a peer identity for every
-  OTHER purpose (Inject's `from` attribution, autogate) — it is excluded
-  from Spawn specifically, since a bare source-address match carries no
-  possession proof and would otherwise let a shared NAT/reverse-proxy
-  address spawn a process attributed to whichever peer's `url` it happens
-  to match. The door-wide bearer that gates every OTHER arm (read verbs,
-  the uniform-response guard, Inject's `effective_origin` coupling) is not
-  consulted here at all. Neither rung is cryptographically bound to the
-  caller: unforgeable per-request binding is P-P4's own lane, not invented
-  here (see `message_send`'s own doc comment for the full honesty note).
-  Don't invent an interim signature scheme to "strengthen" this in the
-  meantime. No test in this file drives `do_spawn`'s real OS-level process
-  spawn (an established precedent, `spawn_inject_prompts_success_branch_
+  resolved, paired, spawn-allowed peer identified via its OWN PER-REQUEST
+  SIGNATURE — never a bare token, and never the address rung (P-P3
+  decision 6, narrowed again by P-P4, `docs/architecture/PAIRING.md`'s
+  wire-authentication section, CONTRACTS.md §6).** `handle_connection`
+  calls `verify_signed_request` exactly once per connection, strictly
+  before either dispatch path, and threads its result down as
+  `signed_peer_name: Option<&str>` through `route`/`stream_task`/
+  `RequestCtx` into `message_send`. When `Some(name)`, `message_send`
+  resolves EXCLUSIVELY against that name (`PeerRung::Signature`) — no
+  fallback to `aoide_storage::peer_store::resolve_peer`'s addr/token
+  ladder even on a registry-lookup miss, since a request
+  `verify_signed_request` already proved came from a specific peer must
+  never be silently re-resolved as if it came from whoever's address or
+  token happens to match instead. Only when the request carries no
+  signature headers at all does `resolve_peer` run its own two-rung
+  ladder (a presented token against a peer's own `token_file` first —
+  `PeerRung::Token` — else the TCP origin against that peer's `url` —
+  `PeerRung::Addr`). `spawn_admitted` accepts ONLY a `PeerRung::Signature`
+  resolution, deferring the peer-side check to `peer_may_spawn(peer)`
+  (`verified && allows.contains("spawn")`) only in that case — neither the
+  address rung nor the (now-insufficient) token rung reaches `do_spawn`
+  any more. Both unsigned rungs still resolve a peer identity fine for
+  every OTHER purpose (Inject's `from` attribution, autogate) — they are
+  excluded from Spawn specifically, since neither one is cryptographically
+  bound to the one request presenting it: a bare source-address match
+  carries no possession proof at all, and a bare shared-secret token is
+  replayable and identical across every request the true peer or an
+  impersonator ever sends. `spawn_refusal` gives a SHAPE-SPECIFIC message
+  for the code `-32006` still returns uniformly: a genuinely paired peer
+  resolved via the Token rung is told its aoide is too old to sign
+  requests (upgrade the caller, don't re-pair); a Signature-resolved peer
+  whose `allows` lacks `spawn` is told the exact `peer allow` fix; every
+  other shape gets the original "pair first, then allow" message, now
+  naming the signature requirement too. The door-wide bearer that gates
+  every OTHER arm (read verbs, the uniform-response guard, Inject's
+  `effective_origin` coupling) is not consulted here at all. Signing
+  itself never touches this crate — `aoide_storage::wire_auth` holds the
+  canonical-string/verify logic, `aoide-client` holds the signer; this
+  crate is verify-only, consistent with "inbound/serve only" above. No
+  test in this file drives `do_spawn`'s real OS-level process spawn (an
+  established precedent, `spawn_inject_prompts_success_branch_
   files_the_opening_turn_into_the_inbox`'s own doc comment) — the gate
-  itself is proven via the pure `peer_may_spawn`/`spawn_admitted`
-  predicates and `message_send`'s REFUSAL branches only.
+  itself is proven via the pure `peer_may_spawn`/`spawn_admitted`/
+  `spawn_refusal` predicates, `verify_signed_request`'s own dedicated test
+  section, and `message_send`'s REFUSAL branches only.
 - **`do_inject`'s `from` attribution (P-P3 decision 7) is scoped to the
   QUEUED path only — never an immediately-delivered payload's bytes.**
   `session_send`'s own `from` mechanism also prefixes DELIVERED text
@@ -198,6 +218,23 @@
   `deliver_now` is `true`, `Some("peer:<name>")` only when it's `false`
   (queuing). Don't lift that `!deliver_now` guard without re-reading why
   it's there.
+- **`NONCE_CACHE` (P-P4) is process-local, in-memory, and deliberately NOT
+  a `HashSet` — a bounded `VecDeque<(peer, nonce)>` capped at
+  `NONCE_CACHE_CAP` with FIFO eviction, so it never needs a second
+  data structure to know which entry is oldest.** It lives in THIS crate
+  (`a2a.rs`), not `aoide-storage::wire_auth` — the module doc there states
+  why: it is the one piece of P-P4 state with no durable file behind it at
+  all, so it belongs beside its only consumer
+  (`verify_signed_request`), the same "ephemeral runtime state stays where
+  it's used" reasoning that already keeps `producers.rs`'s tick state out
+  of `aoide-storage`. `verify_signed_request` records a nonce ONLY after
+  every cheaper check (including the signature itself) already passed —
+  don't move the `nonce_is_replay` call earlier "to fail faster"; a forged
+  or garbage nonce must never consume a cache slot. `handle_connection`
+  calls `verify_signed_request` exactly ONCE per connection, strictly
+  before both the streaming and the plain-JSON-RPC dispatch branches —
+  don't duplicate that call inside `route`/`stream_task`/`handle_jsonrpc`;
+  they only ever receive the already-computed `signed_peer_name`.
 
 ## Extension points
 

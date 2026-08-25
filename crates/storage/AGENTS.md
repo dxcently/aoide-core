@@ -23,6 +23,23 @@
   field on `IdentityInfo` (or a new serializable type anywhere in
   `identity.rs`) that could plausibly carry key material gets checked
   against this test before it lands, not after.
+- **`wire_auth::canonical_string`'s five-field order, NUL-separator, and
+  lowercased/trimmed style are the wire contract, not an implementation
+  detail (P-P4) — pinned by
+  `tests::canonical_string_stability_vectors_never_drift`, mirroring
+  `pairing::derive_sas`'s own pinning discipline.** A change to the field
+  order, the separator, the case-folding, or the digest algorithm breaks
+  both this test AND every deployed signer/verifier pair simultaneously
+  (unlike `derive_sas`, where only display drifts) — it needs new pinned
+  vectors AND a CONTRACTS.md §6 update in the same commit, never silent
+  drift. **The nonce cache does NOT live in this crate, on purpose** — it
+  is ephemeral, process-local, per-`a2a serve` runtime state with no
+  durable file behind it, unlike everything else `aoide-storage` persists,
+  so it lives in `aoide-server::a2a` next to its one consumer
+  (`verify_signed_request`) instead. Don't "complete" `wire_auth` by
+  adding a nonce store here — that would duplicate state across a
+  crate boundary for no benefit, the same anti-pattern the "no cross-crate
+  copying" cross-crate rule already forbids.
 - **`fs::atomic_write_private` is the ONE way a sensitive file gets written
   in this crate** (`identity.rs`'s `ed25519.key` is its first caller) — the
   TEMP file is created ALREADY at `0600` (`OpenOptions::mode`, not
@@ -143,5 +160,7 @@
 - This `README.md` when a new module or stage-file shape is added.
 - `CONTRACTS.md §4`/`§7` when a stage-file or peer-registry wire shape
   changes.
+- `CONTRACTS.md §6` when `wire_auth`'s canonical string, header names, or
+  pinned vectors change (P-P4).
 - `pkgs/aoide/crates/AGENTS.md` for cross-crate invariants (registry order,
   golden discipline) — not restated here.

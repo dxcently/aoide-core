@@ -188,24 +188,99 @@ impl Drop for ScratchBodyFile {
 /// [`ScratchBodyFile`] via `--data-binary @<path>` instead. The bearer value
 /// itself NEVER touches disk in either branch — only this process's own
 /// memory and curl's stdin pipe, for exactly the span of this one call.
-fn post_json(url: &str, body: &str, bearer: Option<&str>, timeout_secs: u64) -> Result<(u16, String), String> {
+///
+/// `extra_headers` (P-P4) rides as plain `-H "<name>: <value>"` argv
+/// literals in EITHER branch, never the stdin-hiding trick the bearer gets
+/// — every P-P4 signed-request header (peer name, timestamp, nonce,
+/// signature) is PUBLIC, verifiable wire material, not a secret; there is
+/// nothing in it worth hiding from `/proc/<pid>/cmdline` the way a bearer
+/// token is. [`sign_headers_for_peer`] is the one production caller that
+/// ever passes a non-empty slice here; every other call site (unpaired
+/// peers, the pairing-ceremony wire methods themselves) passes `&[]`,
+/// making this parameter's addition byte-identical-when-empty by
+/// construction.
+fn post_json(url: &str, body: &str, bearer: Option<&str>, extra_headers: &[(String, String)], timeout_secs: u64) -> Result<(u16, String), String> {
+    let header_args: Vec<String> = extra_headers.iter().flat_map(|(k, v)| ["-H".to_string(), format!("{k}: {v}")]).collect();
     match bearer {
-        None => run_curl_with_timeout(
-            timeout_secs,
-            &["-X", "POST", "-H", "Content-Type: application/json", "--data-binary", "@-", "--", url],
-            Some(body),
-        ),
+        None => {
+            let mut args: Vec<&str> = vec!["-X", "POST", "-H", "Content-Type: application/json"];
+            args.extend(header_args.iter().map(String::as_str));
+            args.extend(["--data-binary", "@-", "--", url]);
+            run_curl_with_timeout(timeout_secs, &args, Some(body))
+        }
         Some(token) => {
             let scratch = ScratchBodyFile::write(body)?;
             let data_arg = scratch.arg();
             let header_line = format!("Authorization: Bearer {token}\n");
+            let mut args: Vec<&str> = vec!["-X", "POST", "-H", "Content-Type: application/json"];
+            args.extend(header_args.iter().map(String::as_str));
+            args.extend(["-H", "@-", "--data-binary", &data_arg, "--", url]);
             run_curl_with_timeout(
                 timeout_secs,
-                &["-X", "POST", "-H", "Content-Type: application/json", "-H", "@-", "--data-binary", &data_arg, "--", url],
+                &args,
                 Some(&header_line),
             )
         }
     }
+}
+
+/// Build the four P-P4 signature headers for one outbound POST to `peer`,
+/// or `vec![]` when `peer.verified` is `false` — an unpaired/unverified
+/// peer keeps today's door-wide-bearer-only path exactly as before this
+/// task, unchanged (`docs/architecture/PAIRING.md`, decision 6, "Unpaired
+/// callers keep today's door-wide bearer path"). This is the ONE production
+/// call site [`post_json`]'s doc comment names as the non-empty-slice
+/// caller.
+///
+/// Mints a fresh nonce (`aoide_storage::pairing::random_hex(16)` — the same
+/// mint the pairing ceremony itself already uses, reused rather than a
+/// second nonce generator), stamps the current instant
+/// (`aoide_storage::time::now_iso_utc`), computes the wire PATH via
+/// `aoide_storage::peer_store::url_path(&peer.url)` (never re-derived ad
+/// hoc — this is the exact string the server's own `HttpRequest.path` will
+/// carry, so client and server MUST agree byte-for-byte or every signature
+/// fails to verify), and signs
+/// `aoide_storage::wire_auth::canonical_string("POST", path, timestamp,
+/// nonce, body.as_bytes())` with THIS instance's own identity
+/// (`aoide_storage::identity::load_or_mint()`) — never the peer's.
+///
+/// `X-Aoide-Peer` carries `peer.name` — THIS instance's own LOCAL registry
+/// name for `peer`, not a separate self-identity string. The pairing
+/// ceremony (P-P2, `handle_peer_pair_request`) mints exactly ONE name per
+/// pairing relationship and threads it through three places identically:
+/// the wire `pairRequest.name` param, this instance's own `park_outbound`
+/// record, and (via `upsert_paired_peer` on the far end) the far end's
+/// registry entry naming THIS instance — so, on either side of an already-
+/// completed pairing, the local `Peer.name` for the counterpart is always
+/// the exact string the counterpart's own registry resolves back to THIS
+/// instance. There is no separate "self-name" field anywhere in
+/// `peer_store::Peer` to invent one for.
+///
+/// Returns `Err` only on a genuine identity-load failure (a corrupt or
+/// unwritable `state/identity/` — the same failure shape
+/// `identity::load_or_mint` already surfaces for every other caller); a
+/// verified peer with no loadable identity refuses the whole outbound call
+/// rather than silently falling back to an unsigned request, since an
+/// unsigned request to a peer that has since upgraded to require signed
+/// spawn admission would otherwise fail opaquely on the far end instead of
+/// here, where the real cause is known.
+fn sign_headers_for_peer(peer: &aoide_storage::peer_store::Peer, body: &str) -> Result<Vec<(String, String)>, String> {
+    if !peer.verified {
+        return Ok(Vec::new());
+    }
+    let (keypair, _) = aoide_storage::identity::load_or_mint()
+        .map_err(|e| format!("loading this instance's identity to sign a request to peer `{}`: {e}", peer.name))?;
+    let path = aoide_storage::peer_store::url_path(&peer.url);
+    let timestamp = aoide_storage::time::now_iso_utc();
+    let nonce = aoide_storage::pairing::random_hex(16);
+    let canonical = aoide_storage::wire_auth::canonical_string("POST", &path, &timestamp, &nonce, body.as_bytes());
+    let signature = aoide_storage::wire_auth::sign_hex(&keypair, canonical.as_bytes());
+    Ok(vec![
+        (aoide_storage::wire_auth::HEADER_PEER.to_string(), peer.name.clone()),
+        (aoide_storage::wire_auth::HEADER_TIMESTAMP.to_string(), timestamp),
+        (aoide_storage::wire_auth::HEADER_NONCE.to_string(), nonce),
+        (aoide_storage::wire_auth::HEADER_SIGNATURE.to_string(), signature),
+    ])
 }
 
 /// A unique `messageId` for one outbound `message/send` (pid + wall-clock
@@ -721,7 +796,8 @@ fn pull_one_peer(peer: &aoide_storage::peer_store::Peer) -> Value {
 
     let attempt: Result<aoide_storage::peer_store::PeerCacheEntry, String> = (|| {
         let bearer = resolve_peer_bearer(peer)?;
-        let (code, resp_body) = post_json(&peer.url, &body_str, bearer.as_deref(), 15)?;
+        let extra_headers = sign_headers_for_peer(peer, &body_str)?;
+        let (code, resp_body) = post_json(&peer.url, &body_str, bearer.as_deref(), &extra_headers, 15)?;
         if code != 200 {
             return Err(format!("HTTP {code}"));
         }
@@ -773,7 +849,8 @@ pub fn pull_peer_live(peer: &aoide_storage::peer_store::Peer, timeout_secs: u64)
     let body = crate::peer::build_graph_summary_request();
     let body_str = serde_json::to_string(&body).unwrap_or_default();
     let bearer = resolve_peer_bearer(peer)?;
-    let (code, resp_body) = post_json(&peer.url, &body_str, bearer.as_deref(), timeout_secs)?;
+    let extra_headers = sign_headers_for_peer(peer, &body_str)?;
+    let (code, resp_body) = post_json(&peer.url, &body_str, bearer.as_deref(), &extra_headers, timeout_secs)?;
     if code != 200 {
         return Err(format!("HTTP {code}"));
     }
@@ -810,7 +887,8 @@ pub fn send_message_to_peer(
     let body = crate::wire::build_message_send_body(text, &message_id, Some(context_id));
     let body_str = serde_json::to_string(&body).unwrap_or_default();
     let bearer = resolve_peer_bearer(peer)?;
-    let (code, resp) = post_json(&peer.url, &body_str, bearer.as_deref(), 15)?;
+    let extra_headers = sign_headers_for_peer(peer, &body_str)?;
+    let (code, resp) = post_json(&peer.url, &body_str, bearer.as_deref(), &extra_headers, 15)?;
     if code != 200 {
         return Err(format!("HTTP {code}"));
     }
@@ -1102,7 +1180,7 @@ fn handle_peer_pair_request(inv: &Invocation) -> Outcome {
 
     let body = crate::peer::build_pair_request_body(&own_pubkey, &name, &commit, &self_url);
     let body_str = serde_json::to_string(&body).unwrap_or_default();
-    let (code, resp_body) = match post_json(&url, &body_str, None, 15) {
+    let (code, resp_body) = match post_json(&url, &body_str, None, &[], 15) {
         Ok(v) => v,
         Err(e) => {
             return Outcome::error(cmd, format!("sending the pairing request to {url}: {e}"))
@@ -1133,7 +1211,7 @@ fn handle_peer_pair_request(inv: &Invocation) -> Outcome {
     // the ceremony never completes; nothing is parked on this side either.
     let reveal_body = crate::peer::build_pair_reveal_body(&ack.id, &own_nonce);
     let reveal_body_str = serde_json::to_string(&reveal_body).unwrap_or_default();
-    let (reveal_code, reveal_resp_body) = match post_json(&url, &reveal_body_str, None, 15) {
+    let (reveal_code, reveal_resp_body) = match post_json(&url, &reveal_body_str, None, &[], 15) {
         Ok(v) => v,
         Err(e) => {
             return Outcome::error(cmd, format!("revealing the nonce to {url}: {e}"))
@@ -1337,7 +1415,7 @@ fn approve_inbound(
 
     let body = crate::peer::build_pair_approve_body(&entry.id, &own_pubkey);
     let body_str = serde_json::to_string(&body).unwrap_or_default();
-    let (code, resp_body) = match post_json(&entry.url, &body_str, None, 15) {
+    let (code, resp_body) = match post_json(&entry.url, &body_str, None, &[], 15) {
         Ok(v) => v,
         Err(e) => {
             return Outcome::error(
@@ -1675,6 +1753,60 @@ mod tests {
 
             let off_again = handle_peer_allow(&allow_inv(&["yomi-strix", "spawn", "off"]));
             assert!(off_again.changed.is_empty(), "disabling an already-absent cap is also a no-op");
+        });
+    }
+
+    // ── `sign_headers_for_peer` (P-P4) — outbound signing. ───────────────────
+
+    #[test]
+    fn sign_headers_for_peer_is_empty_for_an_unverified_peer() {
+        with_peer_state("sign-unverified", || {
+            let peer = fixture_peer(None);
+            assert!(!peer.verified);
+            let headers = sign_headers_for_peer(&peer, "{}").unwrap();
+            assert!(headers.is_empty(), "an unpaired/unverified peer gets no signature headers: {headers:?}");
+        });
+    }
+
+    #[test]
+    fn sign_headers_for_peer_round_trips_a_genuine_signature_for_a_verified_peer() {
+        with_peer_state("sign-verified", || {
+            let info = aoide_storage::identity::load_or_mint().unwrap().0.info();
+            let mut peer = fixture_peer(None);
+            peer.verified = true;
+            let body = r#"{"jsonrpc":"2.0","method":"message/send"}"#;
+            let headers = sign_headers_for_peer(&peer, body).unwrap();
+
+            let get = |name: &str| {
+                headers
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| panic!("missing header {name}: {headers:?}"))
+            };
+            assert_eq!(get(aoide_storage::wire_auth::HEADER_PEER), peer.name);
+            let timestamp = get(aoide_storage::wire_auth::HEADER_TIMESTAMP);
+            let nonce = get(aoide_storage::wire_auth::HEADER_NONCE);
+            let signature = get(aoide_storage::wire_auth::HEADER_SIGNATURE);
+            assert!(aoide_storage::time::parse_iso_utc(&timestamp).is_some(), "a parseable timestamp: {timestamp}");
+            assert!(!nonce.is_empty());
+
+            // The server verifies against the SAME path this instance's own
+            // `peer_store::url_path` derives from `peer.url` — recomputing it
+            // here, rather than hardcoding "/", proves the client and server
+            // sides stay bound to the one shared function.
+            let path = aoide_storage::peer_store::url_path(&peer.url);
+            let canonical = aoide_storage::wire_auth::canonical_string("POST", &path, &timestamp, &nonce, body.as_bytes());
+            assert!(
+                aoide_storage::wire_auth::verify_signature_hex(&info.pubkey_hex, canonical.as_bytes(), &signature),
+                "the signature must verify against this instance's own identity"
+            );
+
+            // Tampering with the body must break verification — proves the
+            // signature is actually bound to the body's digest, not just
+            // structurally present.
+            let tampered = aoide_storage::wire_auth::canonical_string("POST", &path, &timestamp, &nonce, b"{\"tampered\":true}");
+            assert!(!aoide_storage::wire_auth::verify_signature_hex(&info.pubkey_hex, tampered.as_bytes(), &signature));
         });
     }
 

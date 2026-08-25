@@ -88,6 +88,29 @@ never the inbound/serve half (that's `aoide-server`).
   `ScratchBodyFile` only on the bearer-present path. A broker-unreachable
   or denied resolve errors out with a taught message naming the secret
   and the broker socket, rather than silently sending no bearer.
+  **Outbound signed-request headers (P-P4,
+  `docs/architecture/PAIRING.md`'s wire-authentication section,
+  CONTRACTS.md §6's own amendment)**: `sign_headers_for_peer` is the ONE
+  production caller that builds the four `X-Aoide-*` headers — for a
+  `peer.verified` target it loads this instance's own P-P1 identity
+  (`aoide_storage::identity::load_or_mint`), mints a nonce
+  (`aoide_storage::pairing::random_hex(16)`, the same mint the pairing
+  ceremony already uses), signs
+  `aoide_storage::wire_auth::canonical_string("POST",
+  aoide_storage::peer_store::url_path(&peer.url), timestamp, nonce, body)`
+  with `aoide_storage::wire_auth::sign_hex`, and sends `X-Aoide-Peer` as
+  `peer.name` (this instance's own local registry name for the
+  counterpart — the pairing ceremony's single shared `name` value makes it
+  identical to what the counterpart's own registry resolves back to this
+  instance). An unverified/unpaired peer gets an empty header list —
+  byte-identical to the pre-P-P4 transport. Wired into all three real
+  peer-POST call sites (`pull_one_peer`, `pull_peer_live`,
+  `send_message_to_peer`); the pairing ceremony's own three wire calls
+  stay unauthenticated by design and always pass an empty slice. `post_json`
+  threads `extra_headers` as plain `-H "<name>: <value>"` curl argv
+  literals in EITHER the bearer or no-bearer branch — unlike the bearer
+  token, nothing in a signature header is a secret worth hiding from
+  `/proc/<pid>/cmdline`.
 
 ## What it consumes
 
