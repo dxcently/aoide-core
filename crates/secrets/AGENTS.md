@@ -670,11 +670,23 @@
   backlog (plausible when many callers legitimately hold a parked
   connection open for up to `park::park_timeout()`, default 300s) could
   otherwise block the connect syscall itself, past any read-side bound a
-  caller thought it had. Hand-rolled via `libc` (nonblocking connect, then
-  `poll()`, then `SO_ERROR` — the same pattern `std` itself uses
-  internally for `TcpStream::connect_timeout`) rather than a new
-  dependency (`socket2` was considered and rejected — zero new deps is the
-  house rule, and `libc` was already present). Returns the identical
+  caller thought it had. Hand-rolled via `libc`, over TWO genuinely
+  different failure shapes — this is load-bearing, not incidental (a
+  review-bounce fix, this commit, proved it with a raw-libc probe on this
+  kernel): `EINPROGRESS` (a real half-open connection — waited out with
+  `poll(POLLOUT)` then `SO_ERROR`, the same pattern `std` itself uses
+  internally for `TcpStream::connect_timeout`) and `EAGAIN` (a SATURATED
+  `AF_UNIX` listen backlog — Linux returns this IMMEDIATELY, never
+  `EINPROGRESS`, so there is no half-open state to `poll()` at all, only a
+  rejected ATTEMPT; handled by retrying the `connect(2)` SYSCALL ITSELF on
+  a short interval, `CONNECT_RETRY_INTERVAL`, bounded by the same overall
+  budget). **Don't collapse `EAGAIN` back into the `EINPROGRESS`/`poll()`
+  path "for simplicity"** — the first version of this function did exactly
+  that (fell through to an immediate hard error), which made the
+  saturated-backlog scenario this function exists for WORSE than the old
+  blocking `UnixStream::connect` it replaced. No new dependency
+  (`socket2` was considered and rejected — zero new deps is the house
+  rule, and `libc` was already present). Returns the identical
   `io::Result<UnixStream>` shape `UnixStream::connect` always did, so
   `describe_connect_error` needed no change. A new client op added to this
   module connects through `connect_bounded`, never a bare

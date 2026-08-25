@@ -190,12 +190,37 @@ fn unix_sockaddr(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)
     Ok((addr, len))
 }
 
-/// Bounded replacement for `UnixStream::connect` — `std`'s `UnixStream` has
-/// no `connect_timeout` (unlike `TcpStream`), so this hand-rolls the same
-/// nonblocking-connect-then-poll pattern `std` itself uses internally for
-/// `TcpStream::connect_timeout`, entirely on top of `libc` (already a
-/// dependency, `Cargo.toml`'s own doc comment — zero new deps, the house
-/// rule). Every caller in this module gets the identical `io::Result`
+/// Short sleep between retries of the raw `connect(2)` syscall itself,
+/// on `EAGAIN` (review-bounce fix, this commit — see [`connect_bounded`]'s
+/// own doc for why `EAGAIN` gets a retry loop rather than `poll()`).
+const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(15);
+
+/// Bounded replacement for `UnixStream::connect`, over TWO genuinely
+/// different failure shapes a nonblocking `connect(2)` to an `AF_UNIX`
+/// socket can return — `std`'s `UnixStream` has no `connect_timeout`
+/// (unlike `TcpStream`), so both are hand-rolled on top of `libc` (already
+/// a dependency, `Cargo.toml`'s own doc comment — zero new deps, the house
+/// rule):
+///
+/// - **`EINPROGRESS`**: the kernel accepted the attempt and queued it — a
+///   real half-open state exists, so `poll(POLLOUT)` is the right
+///   primitive to wait on it, then `SO_ERROR` says whether it actually
+///   succeeded.
+/// - **`EAGAIN`**: on Linux, a saturated `AF_UNIX` listen backlog makes
+///   `connect(2)` return `EAGAIN` IMMEDIATELY, never `EINPROGRESS` —
+///   there is no half-open connection and no fd event to `poll()` for,
+///   only a rejected ATTEMPT (review-bounce fix, this commit: the first
+///   version of this function only special-cased `EINPROGRESS` and fell
+///   through everything else, `EAGAIN` included, straight to an immediate
+///   hard error — making the exact saturated-backlog scenario this
+///   function exists for WORSE than the old blocking `UnixStream::connect`,
+///   which would have slept in the kernel's `unix_wait_for_peer()` and
+///   succeeded once a slot freed). The fix is to retry the `connect(2)`
+///   SYSCALL ITSELF on a short interval ([`CONNECT_RETRY_INTERVAL`]),
+///   bounded by the same overall `timeout` budget — not to poll a fd for
+///   an event that will never arrive.
+///
+/// Every caller in this module gets the identical `io::Result<UnixStream>`
 /// shape `UnixStream::connect` already returned, so every existing
 /// `.map_err(describe_connect_error(...))` call site needed no change
 /// beyond the function name.
@@ -211,37 +236,82 @@ fn connect_bounded(socket_path: &Path, timeout: Duration) -> io::Result<UnixStre
     }
     set_fd_nonblocking(fd, true);
 
-    // SAFETY: `addr`/`addr_len` describe a valid, fully-initialized
-    // `sockaddr_un` for this exact `fd`'s own address family.
-    let rc = unsafe { libc::connect(fd, &addr as *const libc::sockaddr_un as *const libc::sockaddr, addr_len) };
-    if rc == 0 {
-        set_fd_nonblocking(fd, false);
-        // SAFETY: `fd` is connected and owned solely by this function up to
-        // this point; handing it to `UnixStream` transfers that ownership
-        // exactly once.
-        return Ok(unsafe { UnixStream::from_raw_fd(fd) });
+    let deadline = std::time::Instant::now() + timeout;
+
+    // Phase 1: attempt the syscall itself, retrying on `EAGAIN`/`EINTR`
+    // (both are about the ATTEMPT, not a queued connection) until it
+    // either succeeds outright, reports `EINPROGRESS` (a real half-open
+    // state — falls out of this loop into phase 2 below), or fails for
+    // real.
+    loop {
+        // SAFETY: `addr`/`addr_len` describe a valid, fully-initialized
+        // `sockaddr_un` for this exact `fd`'s own address family.
+        let rc = unsafe { libc::connect(fd, &addr as *const libc::sockaddr_un as *const libc::sockaddr, addr_len) };
+        if rc == 0 {
+            set_fd_nonblocking(fd, false);
+            // SAFETY: `fd` is connected and owned solely by this function
+            // up to this point; handing it to `UnixStream` transfers that
+            // ownership exactly once.
+            return Ok(unsafe { UnixStream::from_raw_fd(fd) });
+        }
+
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINPROGRESS) => break,
+            Some(libc::EAGAIN) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    // SAFETY: `fd` was never handed to anything else.
+                    unsafe { libc::close(fd) };
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("timed out after {timeout:?} connecting (the broker's connection backlog is saturated)"),
+                    ));
+                }
+                std::thread::sleep(CONNECT_RETRY_INTERVAL.min(deadline - now));
+                continue;
+            }
+            Some(libc::EINTR) => continue, // the syscall itself was interrupted — just retry it
+            _ => {
+                // SAFETY: `fd` was never handed to anything else.
+                unsafe { libc::close(fd) };
+                return Err(err);
+            }
+        }
     }
 
-    let err = io::Error::last_os_error();
-    if err.raw_os_error() != Some(libc::EINPROGRESS) {
-        // SAFETY: `fd` was never handed to anything else on this path.
-        unsafe { libc::close(fd) };
-        return Err(err);
-    }
-
-    let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
-    let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
-    // SAFETY: `pfd` names exactly the one fd this function owns, polled for
-    // exactly one event.
-    let poll_rc = unsafe { libc::poll(&mut pfd, 1, millis) };
-    if poll_rc == 0 {
-        unsafe { libc::close(fd) };
-        return Err(io::Error::new(io::ErrorKind::TimedOut, format!("timed out after {timeout:?}")));
-    }
-    if poll_rc < 0 {
-        let e = io::Error::last_os_error();
-        unsafe { libc::close(fd) };
-        return Err(e);
+    // Phase 2: `EINPROGRESS` — a real half-open connection exists now, so
+    // `poll(POLLOUT)` is the right wait primitive, bounded by whatever's
+    // left of `timeout`. `EINTR` here means the `poll()` CALL itself was
+    // interrupted (not the connection) — recompute the remaining budget
+    // and poll again, rather than surfacing `Interrupted` to the caller.
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            // SAFETY: `fd` was never handed to anything else.
+            unsafe { libc::close(fd) };
+            return Err(io::Error::new(io::ErrorKind::TimedOut, format!("timed out after {timeout:?}")));
+        }
+        let millis = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX).max(1);
+        let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+        // SAFETY: `pfd` names exactly the one fd this function owns,
+        // polled for exactly one event.
+        let poll_rc = unsafe { libc::poll(&mut pfd, 1, millis) };
+        if poll_rc == 0 {
+            // SAFETY: `fd` was never handed to anything else.
+            unsafe { libc::close(fd) };
+            return Err(io::Error::new(io::ErrorKind::TimedOut, format!("timed out after {timeout:?}")));
+        }
+        if poll_rc < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            // SAFETY: `fd` was never handed to anything else.
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+        break;
     }
 
     // The connect finished one way or the other — SO_ERROR says which.
@@ -260,10 +330,12 @@ fn connect_bounded(socket_path: &Path, timeout: Duration) -> io::Result<UnixStre
     };
     if rc < 0 {
         let e = io::Error::last_os_error();
+        // SAFETY: `fd` was never handed to anything else.
         unsafe { libc::close(fd) };
         return Err(e);
     }
     if sock_err != 0 {
+        // SAFETY: `fd` was never handed to anything else.
         unsafe { libc::close(fd) };
         return Err(io::Error::from_raw_os_error(sock_err));
     }
@@ -963,6 +1035,149 @@ mod tests {
         let err = connect_bounded(&dead, Duration::from_secs(5)).unwrap_err();
         assert!(start.elapsed() < Duration::from_millis(500), "a dead path must fail near-instantly, not wait out the bound");
         assert_ne!(err.kind(), io::ErrorKind::TimedOut, "ENOENT is not a timeout");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Hand-rolled listener + a single unaccepted connection, exactly the
+    /// reviewer's own reproduction recipe (review-bounce fix, this
+    /// commit): `std::os::unix::net::UnixListener::bind` hardcodes a
+    /// backlog of 128, far too large to saturate cheaply in a test, so
+    /// this builds the listener directly with `libc::listen(fd, 1)` —
+    /// the same raw-socket construction `connect_bounded`/`unix_sockaddr`
+    /// already use in production code, reused here for the test's own
+    /// setup. Returns the listening fd and the one filler fd occupying
+    /// the single backlog slot; asserts the backlog is GENUINELY
+    /// saturated (a probe connect must observe a real `EAGAIN`) before
+    /// handing control to the caller, so this is never a simulated
+    /// condition.
+    fn saturate_backlog_of_one(sock: &Path) -> (RawFd, Vec<RawFd>) {
+        let (addr, addr_len) = unix_sockaddr(sock).unwrap();
+
+        // SAFETY: a fresh listening socket this test exclusively owns.
+        let listen_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(listen_fd >= 0, "socket: {}", io::Error::last_os_error());
+        // SAFETY: `addr`/`addr_len` describe a valid `sockaddr_un` for
+        // this exact fd's own address family, matching `connect_bounded`'s
+        // own construction of the same struct.
+        let bind_rc =
+            unsafe { libc::bind(listen_fd, &addr as *const libc::sockaddr_un as *const libc::sockaddr, addr_len) };
+        assert_eq!(bind_rc, 0, "bind: {}", io::Error::last_os_error());
+        // SAFETY: `listen_fd` is this test's own fd, backlog requested at
+        // 1 — but Linux's actual accept-queue capacity for a given
+        // `listen()` argument is a kernel implementation detail (commonly
+        // rounded up by one, or more, for historical BSD-compat reasons),
+        // so this is a REQUEST, not a hard guarantee of exactly one slot.
+        let listen_rc = unsafe { libc::listen(listen_fd, 1) };
+        assert_eq!(listen_rc, 0, "listen: {}", io::Error::last_os_error());
+
+        // Fill the backlog with unaccepted connections until a connect
+        // attempt genuinely observes `EAGAIN` — never assume the queue
+        // holds exactly `listen()`'s own argument; PROVE saturation by
+        // continuing to fill until the kernel itself refuses one, capped
+        // so a kernel that (for whatever reason) never saturates fails
+        // the test loudly instead of hanging.
+        let mut fillers = Vec::new();
+        loop {
+            assert!(fillers.len() < 256, "backlog never saturated after 256 connects — test assumption invalid on this kernel");
+            // SAFETY: a fresh client-side socket this test exclusively
+            // owns, pushed into `fillers` (and closed by the caller) on
+            // every path except the terminal EAGAIN below, where it is
+            // the rejected attempt itself and closed immediately.
+            let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+            assert!(fd >= 0, "socket: {}", io::Error::last_os_error());
+            set_fd_nonblocking(fd, true);
+            // SAFETY: same address-struct contract as the bind above.
+            let rc = unsafe { libc::connect(fd, &addr as *const libc::sockaddr_un as *const libc::sockaddr, addr_len) };
+            if rc == 0 {
+                fillers.push(fd);
+                continue;
+            }
+            let e = io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(libc::EINPROGRESS) => {
+                    fillers.push(fd);
+                }
+                Some(libc::EAGAIN) => {
+                    // SAFETY: this attempt was rejected — never queued,
+                    // never handed to anything else.
+                    unsafe { libc::close(fd) };
+                    break;
+                }
+                _ => panic!("unexpected connect error while saturating the backlog: {e}"),
+            }
+        }
+        assert!(!fillers.is_empty(), "the backlog accepted zero connections before EAGAIN — test setup invalid");
+
+        (listen_fd, fillers)
+    }
+
+    /// **The headline review-bounce proof:** `connect_bounded` must
+    /// actually RETRY through a saturated backlog and succeed once a slot
+    /// frees, not fail immediately on the first `EAGAIN` the way the
+    /// bounced version of this function did. A background thread frees
+    /// the one occupied slot (by accepting the filler connection) ~80ms
+    /// in; `connect_bounded`'s own retry interval is 15ms, so it must
+    /// notice well within its 3s budget — and the elapsed time must be
+    /// LONG ENOUGH to prove it actually waited (not a lucky race past a
+    /// backlog that was never really full).
+    #[test]
+    fn connect_bounded_retries_through_a_saturated_backlog_until_a_slot_frees() {
+        let dir = tmp_socket_dir("saturated-frees");
+        let sock = dir.join("s.sock");
+        let (listen_fd, fillers) = saturate_backlog_of_one(&sock);
+
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            // SAFETY: accepting exactly one of the queued connections
+            // `saturate_backlog_of_one` created; frees exactly one slot —
+            // enough for `connect_bounded`'s own retry to take. The
+            // LISTENER itself stays open (closing it would refuse every
+            // further connect outright, which is not the condition this
+            // test is proving) — closed by the main thread once
+            // `connect_bounded` has already succeeded, below.
+            let accepted = unsafe { libc::accept(listen_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+            assert!(accepted >= 0, "accept: {}", io::Error::last_os_error());
+            // SAFETY: `accepted` was never handed to anything else.
+            unsafe { libc::close(accepted) };
+        });
+
+        let start = std::time::Instant::now();
+        let stream = connect_bounded(&sock, Duration::from_secs(3)).unwrap();
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_millis(60), "should have genuinely waited for the slot to free: {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(1), "should succeed well within the 3s bound once the slot frees: {elapsed:?}");
+
+        handle.join().unwrap();
+        drop(stream);
+        // SAFETY: none of these fds were ever handed to anything else.
+        unsafe { libc::close(listen_fd) };
+        for fd in fillers {
+            unsafe { libc::close(fd) };
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The deadline half of the same proof: when the backlog stays
+    /// saturated for good (nothing ever accepts), `connect_bounded`'s
+    /// `EAGAIN` retry loop must still respect the overall bound rather
+    /// than retrying forever.
+    #[test]
+    fn connect_bounded_times_out_when_the_backlog_stays_saturated() {
+        let dir = tmp_socket_dir("saturated-stuck");
+        let sock = dir.join("s.sock");
+        let (listen_fd, fillers) = saturate_backlog_of_one(&sock);
+
+        let start = std::time::Instant::now();
+        let err = connect_bounded(&sock, Duration::from_millis(200)).unwrap_err();
+        let elapsed = start.elapsed();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(elapsed < Duration::from_millis(500), "must not overrun the bound by much: {elapsed:?}");
+
+        // SAFETY: none of these fds were ever handed to anything else.
+        unsafe { libc::close(listen_fd) };
+        for fd in fillers {
+            unsafe { libc::close(fd) };
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

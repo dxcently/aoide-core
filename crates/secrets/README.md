@@ -1520,21 +1520,36 @@ one function rather than each hand-rolling the diagnosis.
 
 **Every client call bounds the CONNECT itself, not only reads (rider
 task).** `std::os::unix::net::UnixStream` has no `connect_timeout` (unlike
-`TcpStream`) — `client::connect_bounded` hand-rolls the same
-nonblocking-connect-then-poll pattern `std` uses internally for
-`TcpStream::connect_timeout`, entirely on `libc` (already a dependency,
-zero new deps). Every one of `resolve`/`resolve_bounded`/`put`/`pending`/
-`approve`/`dismiss` routes through it with a fixed 5s bound, with the
-identical `io::Result<UnixStream>` shape `UnixStream::connect` always
-returned, so `describe_connect_error` needed no change to keep handling
-every case. This closes the one gap `resolve_bounded`'s own explicit
-`set_read_timeout` never covered: a connect can itself block indefinitely
-if the broker's kernel-level accept backlog is saturated (a burst of
-callers hitting a broker with many connections legitimately parked for up
-to `park::park_timeout()`, default 300s, each holding its own thread and
-its own accept-queue slot) — before this fix, a caller in that situation
-would hang on the connect syscall itself, past any read-side bound it
-thought it had. No env override, unlike `AOIDE_SECRETS_BACKEND_TIMEOUT`/
+`TcpStream`) — `client::connect_bounded` hand-rolls it on `libc` (already
+a dependency, zero new deps). Every one of `resolve`/`resolve_bounded`/
+`put`/`pending`/`approve`/`dismiss` routes through it with a fixed 5s
+overall bound, with the identical `io::Result<UnixStream>` shape
+`UnixStream::connect` always returned, so `describe_connect_error` needed
+no change to keep handling every case. This closes the one gap
+`resolve_bounded`'s own explicit `set_read_timeout` never covered: a
+connect can itself block indefinitely if the broker's kernel-level accept
+backlog is saturated (a burst of callers hitting a broker with many
+connections legitimately parked for up to `park::park_timeout()`, default
+300s, each holding its own thread and its own accept-queue slot) — before
+this fix, a caller in that situation would hang on the connect syscall
+itself, past any read-side bound it thought it had.
+**The mechanism is two DIFFERENT waits for two DIFFERENT `errno`s, not one
+poll loop (review-bounce fix — the reviewer proved the original version
+was wrong with a raw-libc probe on this kernel):** a nonblocking
+`connect(2)` to an `AF_UNIX` socket reports `EINPROGRESS` when the kernel
+queues the attempt (a real half-open connection — waited out with
+`poll(POLLOUT)` then `SO_ERROR`, the pattern `std` itself uses internally
+for `TcpStream::connect_timeout`), but reports `EAGAIN` IMMEDIATELY, never
+`EINPROGRESS`, when the listen backlog is already saturated — the exact
+scenario this function exists for. There is no half-open state to `poll()`
+for in that case, only a rejected attempt, so `connect_bounded` retries
+the `connect(2)` syscall itself on a short interval instead, bounded by
+the same 5s overall budget. The first version of this function only
+handled `EINPROGRESS` and fell through everything else — `EAGAIN`
+included — to an immediate hard error, which made the saturated-backlog
+case WORSE than the old blocking `UnixStream::connect` (which would have
+slept in the kernel's own wait queue and succeeded once a slot freed).
+No env override, unlike `AOIDE_SECRETS_BACKEND_TIMEOUT`/
 `AOIDE_SECRETS_PARK_TIMEOUT` — a fixed defensive bound, not a tuned
 operational one, until real evidence says otherwise.
 
