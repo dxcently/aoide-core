@@ -23,7 +23,8 @@ use super::model::{
 use super::session_store::{
     do_session_end, do_session_phase, do_session_phase_if, do_session_start, do_subagent_end,
     do_subagent_rekey, do_subagent_spawn, ensure_session_ceiling, now_iso_utc,
-    refresh_subagent_says, refresh_transcript_fields, set_owner_activity, stamp_hook_ancestry,
+    refresh_subagent_says, refresh_transcript_fields, set_owner_activity, stamp_harness_session_id,
+    stamp_hook_ancestry,
 };
 use super::window::{discover_window, ensure_session_window, pid_ancestry, windowless_by_lineage_from_parent};
 use aoide_protocol::agents::{agent_profile, known_agents, AgentProfile, HookClass, CLAUDE_PROFILE};
@@ -1519,6 +1520,20 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
     // agent_name land on user_prompt / tool_use_id / agent_type).
     (profile.normalize_payload)(&mut payload);
     let Some(action) = map_hook(profile, &payload) else {
+        // Even an event this door has no graph ACTION for (kimi's
+        // PreCompact/StopFailure, a Notification whose detail classifies as
+        // neither awaiting tier, …) still carries the harness's own raw
+        // `session_id` whenever the payload does — capture it here too
+        // (P-D7), not only on the mapped path below: a silent no-op for a
+        // session that hasn't registered yet (nothing to stamp onto), a
+        // same-value refresh for one that already has.
+        if let Some(sid) = payload
+            .get("session_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            stamp_harness_session_id(sid, sid);
+        }
         return noop("unmapped-or-missing-event");
     };
     let inner = match action {
@@ -1703,6 +1718,20 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
         {
             ensure_session_ceiling(sid, ceiling);
         }
+    }
+    // Stamp `harnessSessionId` — the raw hook payload's OWN `session_id` —
+    // onto the record NOW that the action above has registered/self-healed
+    // it (`do_session_start`/`hook_ensure_session` have already run for this
+    // event's `id`), so this covers a session's very first SessionStart, not
+    // just later events (P-D7). Stamped regardless of whether it equals the
+    // record's own `sessionId` — see `SessionRecord::harness_session_id`'s
+    // doc comment for why a same-valued stamp is still meaningful.
+    if let Some(sid) = payload
+        .get("session_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        stamp_harness_session_id(sid, sid);
     }
     // After applying the action, refresh the session's transcript `say` at the
     // boundaries where fresh prose has just landed: the turn end (Stop), a tool
@@ -4769,6 +4798,73 @@ mod tests {
         );
         hook_for_profile(pi, &pay);
         assert_eq!(ceil(&load_stage(&sessions_path()).unwrap()), Some(200_000));
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+    #[test]
+    fn hook_stamps_harness_session_id_from_the_raw_payload_on_every_carrying_event() {
+        // P-D7: `harnessSessionId` is stamped from the raw hook payload's own
+        // `session_id`, regardless of whether the event maps to a graph
+        // action — both the registering SessionStart itself AND a later
+        // event this door has no action for (kimi's PreCompact) must land
+        // it, but an unmapped event for a session that never registered
+        // must stay a silent no-op (no ghost record).
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("harness-sid");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let kimi = agent_profile("kimi").unwrap();
+        let hsid = |f: &SessionsFile| {
+            f.sessions
+                .iter()
+                .find(|s| s.session_id == "hs1")
+                .and_then(|s| s.harness_session_id.clone())
+        };
+
+        // SessionStart: the record is created AND stamped in the SAME
+        // event — not deferred to a later hook.
+        hook_for_profile(
+            kimi,
+            r#"{ "session_id": "hs1", "hook_event_name": "SessionStart", "cwd": "/proj" }"#,
+        );
+        assert_eq!(
+            hsid(&load_stage(&sessions_path()).unwrap()).as_deref(),
+            Some("hs1")
+        );
+
+        // PreCompact maps to no graph action at all for kimi (an ok
+        // observational no-op — ground-truthed in agents.rs's own
+        // kimi_hook_event tests) but still carries session_id, and must
+        // still stamp: the mapped/unmapped split is invisible to this
+        // field.
+        let out = hook_for_profile(
+            kimi,
+            r#"{ "session_id": "hs1", "hook_event_name": "PreCompact" }"#,
+        );
+        assert_eq!(out.data.as_ref().unwrap()["reason"], "unmapped-or-missing-event");
+        assert_eq!(
+            hsid(&load_stage(&sessions_path()).unwrap()).as_deref(),
+            Some("hs1")
+        );
+
+        // An unmapped event naming a session that never registered stays a
+        // silent no-op — never a ghost record.
+        hook_for_profile(
+            kimi,
+            r#"{ "session_id": "hs-never-registered", "hook_event_name": "PreCompact" }"#,
+        );
+        assert!(
+            !load_stage::<SessionsFile>(&sessions_path())
+                .unwrap()
+                .sessions
+                .iter()
+                .any(|s| s.session_id == "hs-never-registered"),
+            "an unmapped event must never register a ghost session"
+        );
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),

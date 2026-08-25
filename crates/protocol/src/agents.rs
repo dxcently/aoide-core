@@ -146,6 +146,16 @@ pub struct AgentProfile {
     pub model_ceiling: fn(Option<&str>) -> u64,
     pub transcript: TranscriptSpec,
     pub hook_settings: SettingsSpec,
+    /// argv that launches this harness fresh (claude: `&["claude"]`) — the
+    /// program name plus any args every invocation needs, BEFORE a caller's
+    /// own extra args (e.g. `--resume` or a task prompt) are appended.
+    pub launch: &'static [&'static str],
+    /// argv that resumes a prior session of this harness by ITS OWN id
+    /// (claude: `["claude", "--resume", <id>]`). `None` means the harness's
+    /// resume flag has not been verified against real CLI/extension
+    /// material — never a guessed flag — so `graph resurrect` (P-D8) skips
+    /// it with a taught message rather than typing a wrong invocation.
+    pub resume_args: Option<fn(harness_session_id: &str) -> Vec<String>>,
 }
 
 // ── claude ──────────────────────────────────────────────────────────────────
@@ -648,7 +658,23 @@ pub static CLAUDE_PROFILE: AgentProfile = AgentProfile {
         relative_path: ".claude/settings.json",
         format: SettingsFormat::Json,
     },
+    launch: &["claude"],
+    // `claude --resume <id>` is documented/well-known CLI behaviour, named
+    // verbatim in this field's own doc comment in `docs/architecture/
+    // AOIDED.md`'s L5 section — the design authority for this table, not a
+    // guess made here.
+    resume_args: Some(claude_resume_args),
 };
+
+/// `claude --resume <harness_session_id>` — resume a prior claude session by
+/// its own id.
+fn claude_resume_args(harness_session_id: &str) -> Vec<String> {
+    vec![
+        "claude".to_string(),
+        "--resume".to_string(),
+        harness_session_id.to_string(),
+    ]
+}
 
 // ── kimi ────────────────────────────────────────────────────────────────────
 
@@ -1034,7 +1060,27 @@ pub static KIMI_PROFILE: AgentProfile = AgentProfile {
         relative_path: ".kimi-code/config.toml",
         format: SettingsFormat::Toml,
     },
+    launch: &["kimi"],
+    // Verified 2026-08-25 against the real installed `kimi` binary — the
+    // exact 0.31.1 build `pkgs/kimi-code/default.nix` pins (`kimi --version`
+    // matches the pinned version byte for byte) — via `kimi --help`:
+    // `-S, --session [id]  Resume a session. With ID: resume that session.
+    // Without ID: interactively pick.` Passing an id resumes THAT session
+    // (not a guess — the flag's own help text names the id-resume case
+    // explicitly, and the id kimi expects is the same `<session_id>` this
+    // profile's transcript locator already keys `kimi_session_dir` on).
+    resume_args: Some(kimi_resume_args),
 };
+
+/// `kimi --session <harness_session_id>` — resume a prior kimi session by
+/// its own id (see [`KIMI_PROFILE`]'s doc comment for the verification).
+fn kimi_resume_args(harness_session_id: &str) -> Vec<String> {
+    vec![
+        "kimi".to_string(),
+        "--session".to_string(),
+        harness_session_id.to_string(),
+    ]
+}
 
 // ── pi ─────────────────────────────────────────────────────────────────────
 
@@ -1332,7 +1378,37 @@ pub static PI_PROFILE: AgentProfile = AgentProfile {
         relative_path: ".pi/agent/extensions/aoide-pi-session.ts",
         format: SettingsFormat::Declarative,
     },
+    launch: &["pi"],
+    // Verified 2026-08-25 by ACTUALLY RESUMING a session with the real
+    // installed `pi` binary (the `pi-coding-agent` package
+    // `modules/dendrites/pi-coding-agent.nix` installs) — not read off
+    // `--help` alone, since pi's help text names THREE candidate flags
+    // (`--resume`/`-r` "Select a session to resume" — no id argument, an
+    // interactive picker; `--session <path|id>` — "Use specific session
+    // file or partial UUID", ambiguous open-vs-continue; `--session-id
+    // <id>` — "Use exact project session ID, creating it if missing") and
+    // only live behaviour disambiguates them. Ran `pi --session-id
+    // probe-1 -p "hello"` (created a new transcript, id `probe-1`, one
+    // exchange logged), then ran `pi --session-id probe-1 -p "what did I
+    // say before?"` again: NO new transcript file was created (same
+    // `<ts>_probe-1.jsonl`, line count grew), and the reply correctly
+    // recalled "hello" as the first message — proof the second call loaded
+    // and continued the SAME session rather than starting a fresh one.
+    // `--resume`/`-r` and `--session <path|id>` were not chosen: neither
+    // takes a bare id + unambiguous continue semantics the way
+    // `--session-id` demonstrably does.
+    resume_args: Some(pi_resume_args),
 };
+
+/// `pi --session-id <harness_session_id>` — resume a prior pi session by its
+/// own id (see [`PI_PROFILE`]'s doc comment for the live verification).
+fn pi_resume_args(harness_session_id: &str) -> Vec<String> {
+    vec![
+        "pi".to_string(),
+        "--session-id".to_string(),
+        harness_session_id.to_string(),
+    ]
+}
 
 /// The profile table. New harnesses land here as another entry.
 static PROFILES: &[&AgentProfile] = &[&CLAUDE_PROFILE, &KIMI_PROFILE, &PI_PROFILE];
@@ -1373,6 +1449,41 @@ mod tests {
         assert_eq!(CLAUDE_PROFILE.submit_key, "\n");
         assert_eq!(KIMI_PROFILE.submit_key, "\r");
         assert_eq!(PI_PROFILE.submit_key, "\n");
+    }
+
+    #[test]
+    fn every_profile_names_a_nonempty_launch_argv() {
+        // A new harness is a table entry — this is the one field EVERY
+        // registered profile must fill (P-D7), unlike `resume_args`, which
+        // is legitimately `None` for a harness whose resume flag is
+        // unverified.
+        for p in [&CLAUDE_PROFILE, &KIMI_PROFILE, &PI_PROFILE] {
+            assert!(!p.launch.is_empty(), "{} has an empty launch argv", p.name);
+        }
+        assert_eq!(CLAUDE_PROFILE.launch, &["claude"]);
+        assert_eq!(KIMI_PROFILE.launch, &["kimi"]);
+        assert_eq!(PI_PROFILE.launch, &["pi"]);
+    }
+
+    #[test]
+    fn resume_args_produce_the_exact_verified_argv() {
+        // claude: named verbatim in `docs/architecture/AOIDED.md`'s L5
+        // section (the design authority for this table).
+        let claude = CLAUDE_PROFILE.resume_args.expect("claude resumes");
+        assert_eq!(claude("sess-123"), vec!["claude", "--resume", "sess-123"]);
+
+        // kimi: verified against `kimi --help`'s own text on the exact
+        // pinned 0.31.1 binary (`-S, --session [id]  Resume a session. With
+        // ID: resume that session.`).
+        let kimi = KIMI_PROFILE.resume_args.expect("kimi resumes");
+        assert_eq!(kimi("sess-456"), vec!["kimi", "--session", "sess-456"]);
+
+        // pi: verified LIVE — `pi --session-id <id>` run twice against the
+        // same id continued the same on-disk transcript (no new file, and
+        // the second run recalled the first run's own prompt), rather than
+        // starting a fresh session.
+        let pi = PI_PROFILE.resume_args.expect("pi resumes");
+        assert_eq!(pi("sess-789"), vec!["pi", "--session-id", "sess-789"]);
     }
 
     #[test]

@@ -107,6 +107,10 @@ pub fn upsert_session(
             petname: Some(petname),
             hook_ancestry: Vec::new(),
             headless: false,
+            // Stamped later by `graph session hook` from the raw hook
+            // payload's own `session_id` (P-D7); a fresh record starts
+            // without one.
+            harness_session_id: None,
             extra: Map::new(),
         });
         true

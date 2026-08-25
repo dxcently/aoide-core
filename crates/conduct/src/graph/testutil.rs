@@ -57,6 +57,7 @@ pub(crate) fn session(
         petname: None,
         hook_ancestry: Vec::new(),
         headless: false,
+        harness_session_id: None,
         extra: Map::new(),
     }
 }

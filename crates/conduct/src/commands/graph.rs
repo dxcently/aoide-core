@@ -133,13 +133,14 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["graph", "spawn"],
-        summary: "Spawn ANY agent command as a DETACHED headless conducted session that outlives this call: re-execs `conduct --headless`, waits briefly for it to register its control socket, and returns. Exports AOIDE_SESSION_ID to the child same as `conduct`/`wrap`. An optional --prompt is injected through the one gated injection door (`graph send --yes --submit`) once registration succeeds; skipped (honestly reported) if it never does.",
+        summary: "Spawn ANY agent command as a DETACHED conducted session that outlives this call — headless by default (re-execs `conduct --headless`), or in a real terminal with --windowed (execs $AOIDE_TERMINAL running the same conducted command) — waits briefly for it to register its control socket, and returns. Exports AOIDE_SESSION_ID to the child same as `conduct`/`wrap`. An optional --prompt is injected through the one gated injection door (`graph send --yes --submit`) once registration succeeds; skipped (honestly reported) if it never does.",
         args: [arg!("command", "string", true, "The wrapped command and its args — put them after `--` so the child's own flags pass through verbatim.")],
         flags: [
             flag!("agent", "string", "Agent name for the roster (default: the command's basename)."),
             flag!("parent", "string", "Spawning session id — records the spawned-by edge (passed through to `conduct`)."),
             flag!("id", "string", "Session id override (default spawn-<pid>-<unixts>)."),
             flag!("prompt", "string", "A first turn to inject once the session registers (skipped, honestly reported, if it never does)."),
+            flag!("windowed", "bool", "Open a real terminal (from $AOIDE_TERMINAL, a whitespace-split argv with a `{cmd}` placeholder) instead of a detached headless child. Taught errors when unset, or when no display is present."),
         ],
         gated: false,
         implemented: true,

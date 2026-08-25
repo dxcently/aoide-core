@@ -216,6 +216,22 @@ pub struct SessionRecord {
     /// the wire entirely — no "false" noise on the common case).
     #[serde(default, skip_serializing_if = "is_false")]
     pub headless: bool,
+    /// The harness's OWN session id, straight off the raw hook payload's own
+    /// `session_id` field (P-D7) — stamped on every `graph session hook`
+    /// event that carries one, regardless of whether it equals this
+    /// record's own `sessionId` (today, for a hook-registered record, it
+    /// always does — `map_hook` mints the record's id FROM this same
+    /// value — but the field is stamped unconditionally so a later
+    /// consumer, e.g. `graph resurrect`'s ledger reader (P-D8), never has
+    /// to know which registration path produced a given record to find the
+    /// id a harness's own `resume_args` needs). Additive/v0-safe: absent on
+    /// a legacy record and on any record no hook has ever touched.
+    #[serde(
+        rename = "harnessSessionId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub harness_session_id: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -347,6 +363,42 @@ mod tests {
         let legacy: SessionRecord =
             serde_json::from_str(r#"{ "sessionId": "s", "windowAddress": "0x1" }"#).unwrap();
         assert!(!legacy.headless);
+    }
+    #[test]
+    fn session_record_harness_session_id_round_trips_and_stays_absent_when_unset() {
+        // serde: `harnessSessionId` serialises as a string when Some, and is
+        // skipped (skip_serializing_if) when None — additive/v0-safe on the
+        // wire, matching `workspace`/`needsSudo`'s contract above (P-D7).
+        let mut rec = SessionRecord {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        rec.harness_session_id = Some("claude-uuid-123".into());
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(
+            json.contains("\"harnessSessionId\":\"claude-uuid-123\""),
+            "serialised: {json}"
+        );
+        let back: SessionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.harness_session_id.as_deref(), Some("claude-uuid-123"));
+
+        // The default/unset case omits the key entirely (no null noise), and
+        // a LEGACY record predating this field (no `harnessSessionId` key at
+        // all) parses to None rather than failing — the whole point of an
+        // additive field is that an old record round-trips untouched.
+        let bare = SessionRecord {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        let bare_json = serde_json::to_string(&bare).unwrap();
+        assert!(!bare_json.contains("harnessSessionId"), "serialised: {bare_json}");
+        let legacy: SessionRecord = serde_json::from_str(
+            r#"{ "sessionId": "s", "windowAddress": "0x1", "agent": "claude" }"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.harness_session_id, None);
+        assert_eq!(legacy.session_id, "s", "the rest of a legacy record is unaffected");
+        assert_eq!(legacy.agent, "claude");
     }
     #[test]
     fn session_record_needs_sudo_round_trips_and_stays_absent_when_unset() {

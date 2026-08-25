@@ -132,6 +132,16 @@
   can never reach `deliver_local`/`session_send` and has to file itself
   (see `aoide_storage::inbox`'s module doc for the full two-writer
   reasoning).
+- **`graph/spawn.rs`'s `build_conduct_args` is the ONE place the `aoide
+  conduct -- <agent cmd>` argv gets built (P-D7).** Both `graph spawn`
+  launch modes — headless (default) and `--windowed` (execs a real terminal
+  from `$AOIDE_TERMINAL` instead of detaching) — call it, `--headless`
+  aside; do NOT hand-roll a second argv builder for the windowed path, or
+  registration/the control socket/the parent-autogate lane can drift
+  between the two modes. `build_terminal_argv` (the `$AOIDE_TERMINAL`
+  template parser) is a PURE function on purpose — no env read, no spawn —
+  so it stays directly unit-testable; do the env reads (`terminal_template`/
+  `require_display`) in the thin callers around it, never inside it.
 
 ## Extension points
 

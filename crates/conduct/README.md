@@ -19,6 +19,24 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   (`STDIN_PAYLOAD_FLAG`) rather than growing the daemon wire a stdin
   channel — the daemon-side handler reads that flag first and never
   touches its own stdin.
+- `graph/spawn.rs` — `graph spawn [--windowed]` (P-D7,
+  `docs/architecture/AOIDED.md`'s "L5"): the child is always `aoide conduct
+  -- <agent cmd>`, built by the ONE shared `build_conduct_args` (`--headless`
+  aside) — headless by default (detaches, re-execs this same binary), or,
+  under `--windowed`, execs a real terminal named by `$AOIDE_TERMINAL` (env
+  only) that runs the identical conducted command, so registration, the
+  control socket, and the parent-autogate lane come for free either way.
+  `build_terminal_argv` parses the template (whitespace split, a `{cmd}`
+  placeholder token spliced in as separate argv slots when bare, or POSIX
+  single-quote-joined into ONE slot when the token is quote-wrapped —
+  `foot sh -c '{cmd}'`) — pure, unit-tested, never a real terminal spawned in
+  a test. Taught errors, no process ever touched: no `$AOIDE_TERMINAL` set,
+  or neither `$WAYLAND_DISPLAY` nor `$DISPLAY` present (a headless host,
+  steered back to plain `graph spawn`).
+- `graph/send.rs`'s `graph session hook` stamps `SessionRecord.
+  harness_session_id` (P-D7) from the raw hook payload's own `session_id`
+  on every event that carries one, mapped-to-an-action or not — see
+  `CONTRACTS.md`'s `sessions.json` entry for the full field contract.
 - `graph` — the session DAG: build/merge/send/spawn/wrap, `normalize_addr`
   (widened to `pub` at P-A1 so `screen` could reach it without duplicating
   it), `SessionRecord`/`SessionsFile`/`load_stage`/`write_stage`. `--id`

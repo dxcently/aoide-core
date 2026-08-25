@@ -15,6 +15,18 @@
 //! `--parent` flag (`session_conduct` already reads `inv.flags.get("parent")`
 //! and threads it into `do_session_start` — no re-implementation needed
 //! here, unlike `graph wrap`, which registers the session itself in-process).
+//!
+//! `--windowed` (P-D7) is the sibling launch mode: instead of detaching a
+//! headless `conduct --headless` child, it execs a real terminal (its
+//! invocation named by `$AOIDE_TERMINAL`, env only) that runs the exact SAME
+//! `aoide conduct -- <agent cmd>` — built by [`build_conduct_args`], the one
+//! command-construction path both branches share, `--headless` aside — so
+//! registration, the control socket, and the parent-autogate lane come for
+//! free either way. Parsing the terminal template into an argv
+//! ([`build_terminal_argv`]) is pure string manipulation, no shell involved;
+//! see that function's own doc for the placeholder-substitution rules. No
+//! nix anywhere in this path — a terminal emulator is a shell concern, never
+//! `lyra`'s.
 
 use super::conduct::{conduct_socket_path, unix_ts};
 use super::model::{load_stage, sessions_path, SessionsFile};
@@ -67,6 +79,209 @@ fn spawn_exe() -> std::io::Result<PathBuf> {
     std::env::current_exe()
 }
 
+/// Build the `conduct` subcommand's own argv — the ONE command-construction
+/// path shared by the headless (`graph spawn`) and windowed (`graph spawn
+/// --windowed`) branches, the `--headless` flag aside: `["conduct",
+/// ("--headless",)? "--agent", agent, "--id", id, ("--parent", parent)?,
+/// "--", <command…>]`. Registration, the control socket, and the
+/// parent-autogate lane (`send.rs`'s `sender_is_parent`) all key off this
+/// same shape either way — do NOT fork a second builder for the windowed
+/// path.
+fn build_conduct_args(
+    headless: bool,
+    agent: &str,
+    id: &str,
+    parent: Option<&str>,
+    command: &[String],
+) -> Vec<String> {
+    let mut args: Vec<String> = vec!["conduct".to_string()];
+    if headless {
+        args.push("--headless".to_string());
+    }
+    args.push("--agent".to_string());
+    args.push(agent.to_string());
+    args.push("--id".to_string());
+    args.push(id.to_string());
+    if let Some(parent) = parent {
+        args.push("--parent".to_string());
+        args.push(parent.to_string());
+    }
+    args.push("--".to_string());
+    args.extend(command.iter().cloned());
+    args
+}
+
+/// Spawn `argv0` with `args`, detached into its own session (`setsid`) with
+/// stdio nulled, so it outlives this call — the exact posture both the
+/// headless re-exec and the windowed terminal exec need; only WHAT gets
+/// exec'd differs between the two callers.
+fn spawn_detached(
+    argv0: impl AsRef<std::ffi::OsStr>,
+    args: &[String],
+) -> std::io::Result<std::process::Child> {
+    let mut command = std::process::Command::new(argv0);
+    command
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: `setsid()` is async-signal-safe and the only call made in this
+    // pre_exec hook (same discipline as the two call sites this helper
+    // replaces) — it detaches the child into its own session so it survives
+    // THIS call's own process lifetime.
+    unsafe {
+        command.pre_exec(|| {
+            let _ = libc::setsid();
+            Ok(())
+        });
+    }
+    command.spawn()
+}
+
+// ── `--windowed`: terminal template parsing (pure) ──────────────────────────
+//
+// `$AOIDE_TERMINAL` names a terminal emulator invocation as a plain string,
+// e.g. `kitty -e {cmd}` or `foot sh -c '{cmd}'`. Parsing it is whitespace
+// splitting ONLY — no shell-quote awareness — so a `{cmd}` placeholder is
+// recognised two ways:
+//
+// - a BARE token, exactly `{cmd}` — the terminal execs its own argv
+//   directly with no intervening shell (`kitty -e {cmd}`), so the conducted
+//   command's OWN argv elements splice in as that many separate argv slots.
+// - `{cmd}` wrapped in one layer of matching `'`/`"` (`foot sh -c '{cmd}'`)
+//   — the terminal's own next argument is handed to a REAL shell as ONE
+//   string (`sh -c <script>`), so the conducted argv is POSIX-single-quoted
+//   and JOINED into that one slot. The wrapping quote characters are
+//   template notation, not literal argv content: a config author writing
+//   `foot sh -c '{cmd}'` is composing the line the way they would type it at
+//   a shell prompt, and this parser honours that reading even though it
+//   never invokes an actual shell to strip the quotes itself — they are
+//   dropped along with the token they wrapped, never carried into the
+//   spliced-in command.
+//
+// A template with no placeholder token at all gets the conducted command
+// appended (bare-spliced) at the end — `kitty -e` alone, or a template that
+// simply forgot the placeholder, still works.
+
+/// Strip one layer of matching leading/trailing `'` or `"` from `tok`, if
+/// present (`'{cmd}'` → `Some("{cmd}")`). A bare `{cmd}` (no quotes) returns
+/// `None` here — it is matched separately, never conflated with a quoted
+/// token of the same inner text.
+fn strip_matching_quotes(tok: &str) -> Option<&str> {
+    let bytes = tok.as_bytes();
+    if bytes.len() >= 2 {
+        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
+        if (first == b'\'' || first == b'"') && first == last {
+            return Some(&tok[1..tok.len() - 1]);
+        }
+    }
+    None
+}
+
+/// Single-quote `s` the POSIX way if it needs it (anything outside a
+/// conservative bare-safe set), so a `sh -c` re-split of the joined line
+/// yields back the exact same word.
+fn shell_quote(s: &str) -> String {
+    let bare_safe = !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_./:=@".contains(&b));
+    if bare_safe {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+/// Join `argv` into ONE POSIX shell command-line string — the "one slot"
+/// substitution a quoted `{cmd}` placeholder needs.
+fn shell_join(argv: &[String]) -> String {
+    argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ")
+}
+
+/// Parse `$AOIDE_TERMINAL`'s raw string into a real argv, splicing `cmd` in
+/// for a `{cmd}` placeholder token per the module doc above. Pure: no env
+/// access, no process spawn — directly unit-testable, and the seam
+/// `graph spawn --windowed`'s own tests stop at (never a real terminal in a
+/// test).
+pub(crate) fn build_terminal_argv(template: &str, cmd: &[String]) -> Vec<String> {
+    let tokens: Vec<&str> = template.split_whitespace().collect();
+    let mut placeholder: Option<(usize, bool)> = None; // (token index, was-quoted)
+    for (i, tok) in tokens.iter().enumerate() {
+        if *tok == "{cmd}" {
+            placeholder = Some((i, false));
+            break;
+        }
+        if strip_matching_quotes(tok) == Some("{cmd}") {
+            placeholder = Some((i, true));
+            break;
+        }
+    }
+    match placeholder {
+        Some((i, quoted)) => {
+            let mut out: Vec<String> = tokens[..i].iter().map(|s| s.to_string()).collect();
+            if quoted {
+                out.push(shell_join(cmd));
+            } else {
+                out.extend(cmd.iter().cloned());
+            }
+            out.extend(tokens[i + 1..].iter().map(|s| s.to_string()));
+            out
+        }
+        None => {
+            let mut out: Vec<String> = tokens.iter().map(|s| s.to_string()).collect();
+            out.extend(cmd.iter().cloned());
+            out
+        }
+    }
+}
+
+/// Resolve `$AOIDE_TERMINAL`, or a taught error naming the env var plus one
+/// worked example.
+fn terminal_template() -> Result<String, Outcome> {
+    match std::env::var("AOIDE_TERMINAL") {
+        Ok(t) if !t.trim().is_empty() => Ok(t),
+        _ => Err(Outcome::error(
+            "graph.spawn",
+            "no terminal configured — set $AOIDE_TERMINAL, e.g. AOIDE_TERMINAL=\"kitty -e {cmd}\"",
+        )
+        .with_data(json!({ "reason": "no-terminal-template" }))),
+    }
+}
+
+/// A live display present (`$WAYLAND_DISPLAY` or `$DISPLAY`, non-empty), or
+/// a taught error steering back to the headless path.
+fn require_display() -> Result<(), Outcome> {
+    let has_display = std::env::var_os("WAYLAND_DISPLAY")
+        .filter(|v| !v.is_empty())
+        .is_some()
+        || std::env::var_os("DISPLAY").filter(|v| !v.is_empty()).is_some();
+    if has_display {
+        Ok(())
+    } else {
+        Err(
+            Outcome::error("graph.spawn", "headless host — use `graph spawn` without `--windowed`")
+                .with_data(json!({ "reason": "headless-host" })),
+        )
+    }
+}
+
+/// Pre-flight `--windowed` (template + display), then build the terminal's
+/// own exec argv: the conduct command's argv (the resolved `aoide` binary
+/// followed by `conduct_args`) spliced into the template per
+/// [`build_terminal_argv`]. Everything up to and including this function is
+/// argv construction only — no spawn — so a test can exercise it end to end
+/// without ever opening a real terminal.
+fn resolve_windowed_argv(
+    exe: &std::path::Path,
+    conduct_args: &[String],
+) -> Result<Vec<String>, Outcome> {
+    let template = terminal_template()?;
+    require_display()?;
+    let mut full_cmd: Vec<String> = vec![exe.to_string_lossy().into_owned()];
+    full_cmd.extend(conduct_args.iter().cloned());
+    Ok(build_terminal_argv(&template, &full_cmd))
+}
+
 /// Poll for a LIVE control socket at `path`, every [`REGISTRATION_POLL`],
 /// until `budget` elapses. Returns whether one answered.
 ///
@@ -90,21 +305,28 @@ fn wait_for(path: &std::path::Path, budget: Duration) -> bool {
 }
 
 /// `aoide graph spawn [--agent <name>] [--parent <sessionId>] [--id <id>]
-/// [--prompt <text>] -- <command …>` — spawn `<command>` as a headless
-/// conducted session that OUTLIVES this call, wait briefly for it to
-/// register, and return `{ sessionId, agent, socket, logPath, registered,
-/// prompt }`.
+/// [--prompt <text>] [--windowed] -- <command …>` — spawn `<command>` as a
+/// conducted session that OUTLIVES this call (headless by default, or in a
+/// real terminal with `--windowed`), wait briefly for it to register, and
+/// return `{ sessionId, agent, socket, logPath, registered, prompt,
+/// windowed }`.
 ///
-/// Ordering mirrors `conduct`/`wrap`: the re-exec'd `conduct --headless`
-/// child spawns its own command FIRST and only registers on success, so a
-/// bad `<command>` never leaves a ghost session — the control socket simply
-/// never appears here and `registered` comes back `false`.
+/// Ordering mirrors `conduct`/`wrap`: the re-exec'd `conduct` child (headless
+/// or, under `--windowed`, running inside the just-opened terminal) spawns
+/// its own command FIRST and only registers on success, so a bad `<command>`
+/// never leaves a ghost session — the control socket simply never appears
+/// here and `registered` comes back `false`.
+///
+/// `--windowed` pre-flights against two taught errors before ever touching a
+/// process: no `$AOIDE_TERMINAL` set, and no live display
+/// (`$WAYLAND_DISPLAY`/`$DISPLAY` both absent — a headless host, told to use
+/// plain `graph spawn` instead).
 pub fn session_spawn(inv: &Invocation) -> Outcome {
     let cmd = "graph.spawn";
     if inv.args.is_empty() {
         return Outcome::usage(
             cmd,
-            "usage: aoide graph spawn [--agent <name>] [--parent <sessionId>] [--id <id>] [--prompt <text>] -- <command …>",
+            "usage: aoide graph spawn [--agent <name>] [--parent <sessionId>] [--id <id>] [--prompt <text>] [--windowed] -- <command …>",
         );
     }
     let program = inv.args[0].clone();
@@ -119,6 +341,8 @@ pub fn session_spawn(inv: &Invocation) -> Outcome {
         .cloned()
         .unwrap_or_else(|| format!("spawn-{}-{}", std::process::id(), unix_ts()));
 
+    let windowed = inv.flag_present("windowed");
+
     let exe = match spawn_exe() {
         Ok(e) => e,
         Err(e) => {
@@ -127,46 +351,45 @@ pub fn session_spawn(inv: &Invocation) -> Outcome {
         }
     };
 
-    let mut args: Vec<String> = vec![
-        "conduct".to_string(),
-        "--headless".to_string(),
-        "--agent".to_string(),
-        agent.clone(),
-        "--id".to_string(),
-        id.clone(),
-    ];
-    if let Some(parent) = inv.flags.get("parent") {
-        args.push("--parent".to_string());
-        args.push(parent.clone());
-    }
-    args.push("--".to_string());
-    args.extend(inv.args.iter().cloned());
+    // The child is `aoide conduct -- <agent cmd>` — built the ONE way,
+    // shared by both the headless and windowed branches (headless flag
+    // aside), so registration, the control socket, and the parent-autogate
+    // lane come for free either way (P-D7 — never a second
+    // command-construction path).
+    let conduct_args = build_conduct_args(
+        !windowed,
+        &agent,
+        &id,
+        inv.flags.get("parent").map(String::as_str),
+        &inv.args,
+    );
 
-    let mut command = std::process::Command::new(&exe);
-    command
-        .args(&args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    // SAFETY: `setsid()` is async-signal-safe and the only call made in this
-    // pre_exec hook (same discipline as `graph/conduct.rs::spawn_on_pty`'s and
-    // `server/src/a2a.rs::do_spawn`'s pre_exec) — it detaches the child into
-    // its own session so it survives THIS call's own process lifetime. A
-    // failure here (already a session leader — vanishingly unlikely for a
-    // freshly-forked child) is not fatal to the spawn; the child would just
-    // inherit our process group instead.
-    unsafe {
-        command.pre_exec(|| {
-            let _ = libc::setsid();
-            Ok(())
-        });
-    }
-
-    let mut child = match command.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            return Outcome::error(cmd, format!("failed to spawn headless `{program}`: {e}"))
+    let mut child = if windowed {
+        // Instead of detaching a headless `conduct --headless` child, exec a
+        // real terminal (from `$AOIDE_TERMINAL`) that runs the SAME
+        // conducted command — a terminal emulator is a shell concern, no
+        // nix, no `lyra`.
+        let argv = match resolve_windowed_argv(&exe, &conduct_args) {
+            Ok(a) => a,
+            Err(outcome) => return outcome,
+        };
+        match spawn_detached(&argv[0], &argv[1..]) {
+            Ok(c) => c,
+            Err(e) => {
+                return Outcome::error(
+                    cmd,
+                    format!("failed to open a windowed terminal (`{}`): {e}", argv[0]),
+                )
                 .with_data(json!({ "reason": "spawn-failed", "sessionId": id }));
+            }
+        }
+    } else {
+        match spawn_detached(&exe, &conduct_args) {
+            Ok(c) => c,
+            Err(e) => {
+                return Outcome::error(cmd, format!("failed to spawn headless `{program}`: {e}"))
+                    .with_data(json!({ "reason": "spawn-failed", "sessionId": id }));
+            }
         }
     };
 
@@ -248,8 +471,9 @@ pub fn session_spawn(inv: &Invocation) -> Outcome {
         }
     };
 
+    let mode = if windowed { "windowed" } else { "headless" };
     let mut changed = vec![format!(
-        "session {id}: spawned headless{}",
+        "session {id}: spawned {mode}{}",
         if registered { ", registered" } else { " (not yet registered)" }
     )];
     if prompt_result == "delivered" {
@@ -263,12 +487,13 @@ pub fn session_spawn(inv: &Invocation) -> Outcome {
         "logPath": log_path,
         "registered": registered,
         "prompt": prompt_result,
+        "windowed": windowed,
     });
 
     Outcome::ok(
         cmd,
         format!(
-            "`{agent}` spawned headless (session `{id}`){}",
+            "`{agent}` spawned {mode} (session `{id}`){}",
             if registered { "" } else { " — not yet registered" }
         ),
     )
@@ -450,5 +675,247 @@ mod tests {
         assert_eq!(out.data.as_ref().unwrap()["prompt"], "skipped-unregistered");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── `--windowed`: terminal template parsing (pure, no spawn) ───────────
+
+    #[test]
+    fn terminal_argv_splices_a_bare_placeholder_token_as_separate_args() {
+        // `kitty -e {cmd}` execs its own argv directly — the conducted
+        // command's elements splice in as that many separate argv slots.
+        let cmd = vec![
+            "aoide".to_string(),
+            "conduct".to_string(),
+            "--".to_string(),
+            "claude".to_string(),
+        ];
+        let argv = build_terminal_argv("kitty -e {cmd}", &cmd);
+        assert_eq!(argv, vec!["kitty", "-e", "aoide", "conduct", "--", "claude"]);
+    }
+
+    #[test]
+    fn terminal_argv_joins_a_single_quoted_placeholder_into_one_shell_string() {
+        // `foot sh -c '{cmd}'` hands its next argument to a REAL shell as ONE
+        // string — the conducted argv is single-quoted and joined into that
+        // one slot, and the template's own wrapping quotes (notation, not
+        // literal argv content) are dropped along with the token they wrapped.
+        let cmd = vec![
+            "aoide".to_string(),
+            "conduct".to_string(),
+            "--".to_string(),
+            "claude".to_string(),
+        ];
+        let argv = build_terminal_argv("foot sh -c '{cmd}'", &cmd);
+        assert_eq!(argv, vec!["foot", "sh", "-c", "aoide conduct -- claude"]);
+    }
+
+    #[test]
+    fn terminal_argv_joins_a_double_quoted_placeholder_too() {
+        let cmd = vec!["aoide".to_string(), "conduct".to_string()];
+        let argv = build_terminal_argv(r#"alacritty -e sh -c "{cmd}""#, &cmd);
+        assert_eq!(argv, vec!["alacritty", "-e", "sh", "-c", "aoide conduct"]);
+    }
+
+    #[test]
+    fn terminal_argv_appends_the_command_when_the_template_has_no_placeholder() {
+        let cmd = vec![
+            "aoide".to_string(),
+            "conduct".to_string(),
+            "--".to_string(),
+            "claude".to_string(),
+        ];
+        let argv = build_terminal_argv("kitty -e", &cmd);
+        assert_eq!(argv, vec!["kitty", "-e", "aoide", "conduct", "--", "claude"]);
+    }
+
+    #[test]
+    fn terminal_argv_multi_token_template_keeps_the_words_around_the_placeholder() {
+        let cmd = vec!["aoide".to_string(), "conduct".to_string()];
+        let argv = build_terminal_argv("wezterm start --always-new-process -- {cmd}", &cmd);
+        assert_eq!(
+            argv,
+            vec!["wezterm", "start", "--always-new-process", "--", "aoide", "conduct"]
+        );
+    }
+
+    #[test]
+    fn terminal_argv_quoted_join_escapes_spaces_and_embedded_quotes() {
+        // A conducted argv element containing whitespace or a literal single
+        // quote (an agent flag value, a task prompt) must survive a REAL
+        // `sh -c` re-split as ONE word — this is the whole reason the quoted
+        // placeholder joins with POSIX single-quoting rather than a bare
+        // space-join.
+        let cmd = vec![
+            "aoide".to_string(),
+            "conduct".to_string(),
+            "--".to_string(),
+            "claude".to_string(),
+            "--append-system-prompt".to_string(),
+            "two words".to_string(),
+            "it's fine".to_string(),
+        ];
+        let argv = build_terminal_argv("foot sh -c '{cmd}'", &cmd);
+        assert_eq!(argv.len(), 4);
+        assert_eq!(
+            argv[3],
+            r#"aoide conduct -- claude --append-system-prompt 'two words' 'it'\''s fine'"#
+        );
+    }
+
+    #[test]
+    fn terminal_argv_bare_placeholder_ignores_an_empty_command() {
+        let argv = build_terminal_argv("kitty -e {cmd}", &[]);
+        assert_eq!(argv, vec!["kitty", "-e"]);
+    }
+
+    #[test]
+    fn resolve_windowed_argv_end_to_end_without_spawning_anything() {
+        // Everything up to and including argv construction is exercised
+        // here with no process ever spawned — the LIVE gate (a real
+        // terminal opening under the compositor) is the orchestrator's and
+        // the User's, never this crate's tests.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_TERMINAL", "WAYLAND_DISPLAY", "DISPLAY"]);
+        std::env::set_var("AOIDE_TERMINAL", "foot sh -c '{cmd}'");
+        std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+        std::env::remove_var("DISPLAY");
+
+        let exe = std::path::Path::new("/usr/bin/aoide");
+        let conduct_args = build_conduct_args(false, "claude", "win-1", None, &["claude".to_string()]);
+        let argv = resolve_windowed_argv(exe, &conduct_args).expect("template + display resolve");
+        assert_eq!(
+            argv,
+            vec![
+                "foot".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "/usr/bin/aoide conduct --agent claude --id win-1 -- claude".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn windowed_spawn_without_a_template_is_a_taught_error_naming_the_env_var() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_TERMINAL", "WAYLAND_DISPLAY", "DISPLAY"]);
+        std::env::remove_var("AOIDE_TERMINAL");
+        std::env::set_var("WAYLAND_DISPLAY", "wayland-0"); // a display IS present —
+        // isolates this test to the template check alone.
+
+        let out = session_spawn(&spawn_invocation(&["claude"], &[("windowed", "true")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error, "msg: {}", out.message);
+        assert_eq!(out.data.as_ref().unwrap()["reason"], "no-terminal-template");
+        assert!(out.message.contains("AOIDE_TERMINAL"), "message: {}", out.message);
+    }
+
+    #[test]
+    fn windowed_spawn_without_a_template_never_touches_the_stage() {
+        // The taught error is a pure pre-flight — it must return before ANY
+        // process spawn or session-registration attempt (unlike a bad
+        // `<command>`, which still registers-then-fails inside `conduct`).
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_TERMINAL",
+            "WAYLAND_DISPLAY",
+            "DISPLAY",
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+        ]);
+        std::env::remove_var("AOIDE_TERMINAL");
+        std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+        let root = unique_stage("spawn-windowed-no-template");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+
+        let id = "spawn-windowed-no-template";
+        let out = session_spawn(&spawn_invocation(
+            &["claude"],
+            &[("id", id), ("windowed", "true")],
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap_or_default();
+        assert!(
+            !s.sessions.iter().any(|r| r.session_id == id),
+            "a pre-flight taught error must never register a session"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn windowed_spawn_without_a_display_is_a_taught_error_naming_the_fallback() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_TERMINAL", "WAYLAND_DISPLAY", "DISPLAY"]);
+        std::env::set_var("AOIDE_TERMINAL", "kitty -e {cmd}");
+        std::env::remove_var("WAYLAND_DISPLAY");
+        std::env::remove_var("DISPLAY");
+
+        let out = session_spawn(&spawn_invocation(&["claude"], &[("windowed", "true")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error, "msg: {}", out.message);
+        assert_eq!(out.data.as_ref().unwrap()["reason"], "headless-host");
+        assert!(out.message.contains("--windowed"), "message: {}", out.message);
+    }
+
+    #[test]
+    fn windowed_spawn_accepts_either_display_variable() {
+        // Only $DISPLAY (no Wayland) must still pass the display check — the
+        // taught error is "both absent", not "Wayland absent".
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_TERMINAL", "WAYLAND_DISPLAY", "DISPLAY"]);
+        std::env::set_var("AOIDE_TERMINAL", "kitty -e {cmd}");
+        std::env::remove_var("WAYLAND_DISPLAY");
+        std::env::set_var("DISPLAY", ":0");
+        assert!(require_display().is_ok());
+    }
+
+    #[test]
+    fn plain_spawn_without_windowed_never_checks_the_display_or_template() {
+        // The default (headless) path must stay completely unaffected by
+        // `--windowed`'s pre-flight — a headless host with neither
+        // $AOIDE_TERMINAL nor a display must still spawn headless exactly as
+        // before P-D7.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_STATE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_SPAWN_EXE",
+            "AOIDE_TERMINAL",
+            "WAYLAND_DISPLAY",
+            "DISPLAY",
+        ]);
+        std::env::remove_var("AOIDE_TERMINAL");
+        std::env::remove_var("WAYLAND_DISPLAY");
+        std::env::remove_var("DISPLAY");
+
+        let root = unique_stage("spawn-plain-unaffected");
+        let stage = root.join("stage");
+        let state = root.join("state");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        std::env::set_var("AOIDE_CONDUCT_SPAWN_EXE", built_aoide_bin());
+
+        let id = "spawn-plain-unaffected";
+        let out = session_spawn(&spawn_invocation(&["sh", "-c", "true"], &[("id", id)]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(out.data.as_ref().unwrap()["windowed"], false);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shell_quote_is_identity_for_bare_safe_words_and_quotes_the_rest() {
+        assert_eq!(shell_quote("claude"), "claude");
+        assert_eq!(shell_quote("--resume"), "--resume");
+        assert_eq!(shell_quote("a/b:c=d@e.f"), "a/b:c=d@e.f");
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("two words"), "'two words'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
     }
 }

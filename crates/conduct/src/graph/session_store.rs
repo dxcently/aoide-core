@@ -465,6 +465,39 @@ pub(in crate::graph) fn stamp_headless(id: &str) {
     });
 }
 
+/// Stamp `harnessSessionId` — the raw hook payload's OWN `session_id` field
+/// (P-D7) — on a session record, on EVERY hook event that carries one, not
+/// just at registration: unlike `hookAncestry`/`headless` (birth facts,
+/// stamped once), this can legitimately be re-asserted on every event
+/// without harm (a resumed/compacted session refires SessionStart with the
+/// same id), so the guard is "would this write actually change anything",
+/// not "is this the first time". A locked read-modify-write like
+/// [`ensure_session_ceiling`]/[`set_session_log_path`]: change-only, and a
+/// silent no-op for an unknown id. No `restage_graph()` — like
+/// `hookAncestry`/`headless`, this field is consumed internally (a future
+/// `graph resurrect` reader, P-D8) rather than rendered, so stamping it must
+/// not churn the widget-facing `graph.json`.
+pub(in crate::graph) fn stamp_harness_session_id(id: &str, harness_session_id: &str) {
+    if harness_session_id.is_empty() {
+        return;
+    }
+    with_stage_lock(|| {
+        let mut file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        if let Some(s) = file.sessions.iter_mut().find(|s| {
+            s.session_id == id && s.harness_session_id.as_deref() != Some(harness_session_id)
+        }) {
+            s.harness_session_id = Some(harness_session_id.to_string());
+            if file.schema_version.is_empty() {
+                file.schema_version = STAGE_GRAPH_VERSION.to_string();
+            }
+            let _ = write_stage(&sessions_path(), &file);
+        }
+    });
+}
+
 /// Best-effort: refresh a session's transcript-derived fields at a hook boundary —
 /// its `say` (the agent's latest words) and, set-once, its `title` (the session
 /// NAME, from `custom-title`). Change-only; never touches state/activity/pid;
