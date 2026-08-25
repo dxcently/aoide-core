@@ -242,7 +242,7 @@ fn terminal_template() -> Result<String, Outcome> {
         Ok(t) if !t.trim().is_empty() => Ok(t),
         _ => Err(Outcome::error(
             "graph.spawn",
-            "no terminal configured — set $AOIDE_TERMINAL, e.g. AOIDE_TERMINAL=\"kitty -e {cmd}\"",
+            "no terminal configured — set $AOIDE_TERMINAL, e.g. AOIDE_TERMINAL=\"kitty -e {cmd}\" (argv splice) or AOIDE_TERMINAL=\"foot sh -c '{cmd}'\" (quoted: joined into one shell word)",
         )
         .with_data(json!({ "reason": "no-terminal-template" }))),
     }

@@ -140,7 +140,7 @@ pub fn register(r: &mut Registry) {
             flag!("parent", "string", "Spawning session id — records the spawned-by edge (passed through to `conduct`)."),
             flag!("id", "string", "Session id override (default spawn-<pid>-<unixts>)."),
             flag!("prompt", "string", "A first turn to inject once the session registers (skipped, honestly reported, if it never does)."),
-            flag!("windowed", "bool", "Open a real terminal (from $AOIDE_TERMINAL, a whitespace-split argv with a `{cmd}` placeholder) instead of a detached headless child. Taught errors when unset, or when no display is present."),
+            flag!("windowed", "bool", "Open a real terminal (from $AOIDE_TERMINAL, a whitespace-split argv with a `{cmd}` placeholder) instead of a detached headless child. A bare `{cmd}` splices the conducted argv as separate arguments (`kitty -e {cmd}`); a quote-wrapped `'{cmd}'` joins it shell-quoted into one word for `sh -c` templates (`foot sh -c '{cmd}'`). Taught errors when unset, or when no display is present."),
         ],
         gated: false,
         implemented: true,
