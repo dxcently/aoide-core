@@ -486,6 +486,7 @@ fn handle_line(
         Some("pending") => handle_pending(parked),
         Some("approve") => handle_approve(secrets_home, events_path, parked, &req, peer),
         Some("dismiss") => handle_dismiss(secrets_home, events_path, parked, &req, peer),
+        Some("admin") => handle_admin(secrets_home, &req, peer),
         Some(other) => json!({"ok": false, "error": format!("unknown op `{other}`")}),
         None => json!({"ok": false, "error": "malformed request: missing `op`"}),
     }
@@ -958,6 +959,156 @@ fn handle_put(secrets_home: &Path, events_path: &Path, req: &Value, peer: Option
         emit_notify(secrets_home, events_path, "age-identity-minted", json!({"event": "age-identity-minted"}));
     }
     reply
+}
+
+/// Task #79's admin-op peer-cred gate: an `{op:"admin"}` request is
+/// accepted ONLY when the CONNECTING process's own uid is the broker's own
+/// effective uid — reuses [`home::admin_identity_error`]'s exact wording
+/// (root's extra "plain `sudo` runs as root" clause included) by treating
+/// the peer's uid as that function's "process euid" argument and the
+/// broker's own euid as its "home owner" argument, so a refusal here
+/// teaches the IDENTICAL fix the direct-write path's
+/// [`crate::commands::require_admin_identity`] already teaches — this is
+/// deliberately the same identity check aimed at two different processes,
+/// never a second wording for it. Root (uid 0) is refused exactly the way
+/// [`home::admin_identity_error`] already refuses it — there is nothing
+/// admin-op-specific to add. An unidentified connection (`peer_uid` is
+/// `None` — the ucred read failed) is refused outright, the SAME
+/// fail-closed default [`dismiss_authorized`] holds: there is no uid to
+/// compare, so the safe answer is refusal, never a permissive fallback.
+fn admin_gate(peer_uid: Option<u32>, secrets_home: &Path, verb: &str) -> Option<String> {
+    let broker_euid = crate::home::effective_uid();
+    match peer_uid {
+        Some(uid) => crate::home::admin_identity_error(uid, broker_euid, secrets_home, verb),
+        None => Some(format!(
+            "secrets {verb} over the broker socket must come from an IDENTIFIED connection — this connection's \
+             peer uid could not be determined (SO_PEERCRED read failed), so it is refused the same way a \
+             mismatched uid would be. Run: sudo -u aoide-secrets aoide secrets {verb} ..."
+        )),
+    }
+}
+
+/// The `{op:"admin", verb:...}` op family (task #79): the live daemon
+/// becomes the single writer for `policy.json`/backend-store mutation, with
+/// the SAME eight verbs `commands.rs`'s direct-home CRUD quintet always
+/// exposed (`add`/`rm`/`grant`/`revoke`/`set-totp`/`automate`/`expose`/
+/// `migrate`) — this function is the ONE place any of them executes over
+/// the socket, gated by [`admin_gate`] before a single byte of `policy.json`
+/// is touched, and run inside [`put_lock`]'s critical section (the SAME
+/// lock a `put` already serializes under — one process, one writer, one
+/// lock guarding every read-modify-write this crate makes) so a `secrets
+/// add` racing a live `secrets put` against the same secret can no longer
+/// interleave (`AGENTS.md`'s pre-#79 KNOWN LIMITATION, closed by this
+/// function for the daemon-running case — see that file's rewritten
+/// section for what remains open: no daemon + two concurrent direct-write
+/// admin processes, since THAT case never reaches this function at all).
+/// Every verb's actual mutation lives in [`crate::admin`], never
+/// duplicated here — this function only parses the wire's typed fields
+/// into that module's typed arguments and shapes the reply; argument
+/// VALIDATION (name shape, `on`/`off` spelling) is `commands.rs`'s job on
+/// the way IN (a malformed field reaching this function is a client bug,
+/// not a human mistyping a terminal command), so an admin op with a
+/// missing/malformed field gets a plain domain error from [`crate::admin`],
+/// never a second usage-error vocabulary grown here.
+fn handle_admin(secrets_home: &Path, req: &Value, peer: Option<crate::peercred::PeerCred>) -> Value {
+    let peer_uid = peer.map(|p| p.uid);
+    let Some(verb) = req.get("verb").and_then(Value::as_str) else {
+        return json!({"ok": false, "error": "malformed request: `verb` is required"});
+    };
+    if let Some(reason) = admin_gate(peer_uid, secrets_home, verb) {
+        audit_admin(secrets_home, verb, "", false, Some(&reason), peer_uid);
+        return json!({"ok": false, "error": reason});
+    }
+
+    let str_field = |k: &str| req.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let bool_field = |k: &str| req.get(k).and_then(Value::as_bool).unwrap_or(false);
+    let strs_field = |k: &str| {
+        req.get(k)
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+
+    let name = str_field("name");
+    let result: Result<crate::admin::AdminOutcome, String> = {
+        // `put_lock`'s critical section covers exactly the mutation call —
+        // never the audit write that follows (P-N3's "no lock held across
+        // I/O" discipline, `audit_put`'s own call shape: `put_gate`
+        // acquires+releases internally, `handle_put` audits only after it
+        // returns).
+        let _guard = put_lock().lock().unwrap_or_else(|e| e.into_inner());
+        match verb {
+            "add" => crate::admin::add(secrets_home, &name, &str_field("backend"), &str_field("key"), bool_field("requireTotp"), strs_field("consumers")),
+            "rm" => crate::admin::rm(secrets_home, &name),
+            "grant" => crate::admin::grant(secrets_home, &name, &str_field("consumer")),
+            "revoke" => crate::admin::revoke(secrets_home, &name, &str_field("consumer")),
+            "set-totp" => crate::admin::set_totp(secrets_home, &name, str_field("state") == "on"),
+            "expose" => crate::admin::expose(secrets_home, &name, str_field("state") == "on"),
+            "automate" => match str_field("action").as_str() {
+                "on" => crate::admin::automate_toggle(secrets_home, &name, true),
+                "off" => crate::admin::automate_toggle(secrets_home, &name, false),
+                "grant" => crate::admin::automate_consumer(secrets_home, &name, &str_field("consumer"), true),
+                "revoke" => crate::admin::automate_consumer(secrets_home, &name, &str_field("consumer"), false),
+                other => Err(format!("malformed request: unknown automate action `{other}`")),
+            },
+            "migrate" => {
+                let target = req.get("target").and_then(Value::as_str).unwrap_or("age").to_string();
+                crate::admin::migrate(secrets_home, aoide_protocol::Door::Daemon, &name, &target).map(|(outcome, ..)| outcome)
+            }
+            other => Err(format!("malformed request: unknown admin verb `{other}`")),
+        }
+    };
+
+    match result {
+        Ok(outcome) => {
+            audit_admin(secrets_home, verb, &name, true, None, peer_uid);
+            json!({"ok": true, "message": outcome.message, "changed": outcome.changed})
+        }
+        Err(e) => {
+            audit_admin(secrets_home, verb, &name, false, Some(&e), peer_uid);
+            json!({"ok": false, "error": e})
+        }
+    }
+}
+
+/// Task #79: ONE generic audit line for every `{op:"admin"}` mutation
+/// executed over the broker socket — the socket path has no OTHER audit
+/// mechanism at all (unlike the CLI direct-write path, which keeps its own
+/// pre-existing generic per-command dispatch audit, plus `migrate`'s own
+/// richer `commands::audit_migrate` line, both entirely unchanged by this
+/// phase), so this is the one place a broker-routed admin mutation is ever
+/// recorded. Deliberately verb-generic (never a per-verb bespoke message
+/// the way `commands::audit_migrate`'s `source -> target` detail is) —
+/// `name` is empty when a request never got far enough to know one (a
+/// missing `verb`, an `admin_gate` refusal before any field was read).
+fn audit_admin(secrets_home: &Path, verb: &str, name: &str, granted: bool, reason: Option<&String>, peer_uid: Option<u32>) {
+    let record = json!({
+        "ts": aoide_protocol::audit::now_secs(),
+        "op": "admin",
+        "verb": verb,
+        "name": name,
+        "peerUid": peer_uid,
+        "granted": granted,
+        "reason": reason,
+    });
+    if let Err(e) = append_own_log(secrets_home, &record) {
+        eprintln!("[aoide/secrets] could not write the secrets audit log: {e}");
+    }
+
+    let status = if granted { "granted" } else { "denied" };
+    let puid = peer_uid_display(peer_uid);
+    let message = match reason {
+        Some(r) => format!("admin {verb} `{name}` (peer uid {puid}): {status} ({r})"),
+        None => format!("admin {verb} `{name}` (peer uid {puid}): {status}"),
+    };
+    let _ = aoide_protocol::audit(
+        &aoide_protocol::default_audit_log(),
+        aoide_protocol::Door::Daemon,
+        aoide_protocol::EventClass::Secret,
+        &format!("secrets.admin.{verb}"),
+        status,
+        &message,
+    );
 }
 
 /// Outcome of the `put` policy gate + existence probe + backend store
@@ -3973,6 +4124,172 @@ mod tests {
         assert_eq!(reply["value"], "stored-value");
         assert!(!events_path.exists(), "the events feed file must never have been created under a read-only parent");
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── task #79: `{op:"admin"}` over the broker socket ─────────────────
+
+    /// Task #79 item 6a: an `{op:"admin","verb":"add"}` request over a REAL
+    /// socket connection (`UnixStream::pair` + [`handle_conn`], the same
+    /// pattern [`park_over_a_real_connection_writes_the_interim_line_then_the_final_reply`]
+    /// already establishes) round-trips a genuine mutation into
+    /// `policy.json` — proving the wire framing end to end, not just
+    /// [`handle_admin`]'s own logic called directly. A real socketpair
+    /// reports THIS test process's own euid on both ends, which is exactly
+    /// [`admin_gate`]'s happy path: the connecting peer IS the broker's own
+    /// process here, so no uid needs to be faked for this test to exercise
+    /// the real gate honestly.
+    #[test]
+    fn admin_add_over_a_real_socket_connection_round_trips_into_policy_json() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("admin-add-real-socket");
+        let parked = Arc::new(ParkRegistry::new());
+
+        with_redirected_audit_log(&home, || {
+            let (client_end, server_end) = UnixStream::pair().expect("socketpair");
+            let home_for_conn = home.clone();
+            let events_for_conn = home.join("events.jsonl");
+            let parked_for_conn = Arc::clone(&parked);
+            let conn_handle =
+                std::thread::spawn(move || handle_conn(&home_for_conn, &events_for_conn, server_end, &parked_for_conn));
+
+            let mut writer = client_end.try_clone().expect("clone client end");
+            let req = json!({
+                "op": "admin", "verb": "add", "name": "t", "backend": "scratch", "key": "k",
+                "requireTotp": false, "consumers": [],
+            });
+            writer.write_all((req.to_string() + "\n").as_bytes()).unwrap();
+
+            let mut reader = BufReader::new(client_end);
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("reading the admin reply");
+            let reply: Value = serde_json::from_str(line.trim()).expect("reply must be JSON");
+            assert_eq!(reply["ok"], true, "{reply}");
+            assert!(reply["message"].as_str().unwrap().contains("added secret `t`"), "{reply}");
+            assert_eq!(reply["changed"], json!(["policy:t"]), "{reply}");
+
+            drop(reader);
+            drop(writer);
+            conn_handle.join().unwrap();
+        });
+
+        let policies = crate::store::load_policies(&home).unwrap();
+        assert_eq!(policies.len(), 1, "the admin op must have landed a real policy row");
+        assert_eq!(policies[0].name, "t");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Task #79 item 6b (wrong-uid refusal): a connection whose peer uid
+    /// does NOT match the broker's own effective uid gets [`admin_gate`]'s
+    /// refusal, and `policy.json` is never touched — the scratch broker's
+    /// OWN euid is this test process's real euid, so the mismatch is
+    /// manufactured the same `wrapping_add` sentinel way the dismiss-gate
+    /// tests above already establish (a real socketpair can't produce a
+    /// genuinely different uid in-test).
+    #[test]
+    fn admin_op_from_a_mismatched_peer_uid_is_refused_and_policy_json_is_untouched() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("admin-wrong-uid");
+        let real_euid = unsafe { libc::geteuid() };
+        let wrong_uid = real_euid.wrapping_add(40_000);
+
+        with_redirected_audit_log(&home, || {
+            let req = json!({"op": "admin", "verb": "add", "name": "t", "backend": "scratch", "key": "k"});
+            let wrong_peer = Some(crate::peercred::PeerCred { uid: wrong_uid, gid: 0, pid: 0 });
+            let reply = handle_admin(&home, &req, wrong_peer);
+            assert_eq!(reply["ok"], false, "{reply}");
+            let err = reply["error"].as_str().unwrap();
+            assert!(err.contains(&wrong_uid.to_string()), "{err}");
+            assert!(err.contains("must run as the broker user"), "{err}");
+        });
+
+        assert!(crate::store::load_policies(&home).unwrap_or_default().is_empty(), "a refused admin op must never touch policy.json");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Task #79 item 2: root (uid 0) is refused the identical taught error
+    /// the direct-write path's `require_admin_identity` already gives —
+    /// plain `sudo` is still wrong over the socket too, never a bypass.
+    #[test]
+    fn admin_op_from_root_is_refused_the_same_taught_error_the_direct_path_gives() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("admin-root");
+        with_redirected_audit_log(&home, || {
+            let req = json!({"op": "admin", "verb": "add", "name": "t", "backend": "scratch", "key": "k"});
+            let root_peer = Some(crate::peercred::PeerCred { uid: 0, gid: 0, pid: 0 });
+            let reply = handle_admin(&home, &req, root_peer);
+            assert_eq!(reply["ok"], false, "{reply}");
+            let err = reply["error"].as_str().unwrap();
+            assert!(err.contains("root (uid 0)"), "{err}");
+            assert!(err.to_lowercase().contains("plain `sudo`"), "{err}");
+        });
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Task #79's fail-closed default, extended from `dismiss_authorized`
+    /// to `admin_gate`: an unidentified connection (SO_PEERCRED read
+    /// failed) is refused outright — there's no uid to compare, so the
+    /// safe answer is refusal, never a permissive fallback.
+    #[test]
+    fn admin_op_from_an_unidentified_connection_is_refused() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("admin-unidentified");
+        with_redirected_audit_log(&home, || {
+            let req = json!({"op": "admin", "verb": "add", "name": "t", "backend": "scratch", "key": "k"});
+            let reply = handle_admin(&home, &req, None);
+            assert_eq!(reply["ok"], false, "{reply}");
+            assert!(reply["error"].as_str().unwrap().contains("IDENTIFIED"), "{reply}");
+        });
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Task #79 item 6d (migrate-over-socket durability order): the SAME
+    /// fetch -> store -> flip -> remove-old-last ordering [`crate::admin::
+    /// migrate`]'s own doc holds regardless of caller, proven here end to
+    /// end over the real wire — the new backend already holds the value
+    /// AND the old built-in's file is gone, both observed AFTER a single
+    /// `{op:"admin","verb":"migrate"}` round trip.
+    #[test]
+    fn admin_migrate_over_a_real_socket_connection_lands_the_new_value_and_removes_the_old_one() {
+        if !age_tools_available() {
+            eprintln!(
+                "skipping admin_migrate_over_a_real_socket_connection_lands_the_new_value_and_removes_the_old_one: \
+                 age/age-keygen not found on PATH"
+            );
+            return;
+        }
+        let _guard = crate::env_lock().lock().unwrap();
+        let home = tmp_home("admin-migrate-real-socket");
+        crate::backend::seed_default_backends(&home).unwrap();
+        crate::store::save_policies(&home, &[Policy::new("t", "file", "k")]).unwrap();
+        crate::backend::store_value(&home, "file", "k", "the-value").unwrap();
+        let parked = Arc::new(ParkRegistry::new());
+
+        with_redirected_audit_log(&home, || {
+            let (client_end, server_end) = UnixStream::pair().expect("socketpair");
+            let home_for_conn = home.clone();
+            let events_for_conn = home.join("events.jsonl");
+            let parked_for_conn = Arc::clone(&parked);
+            let conn_handle =
+                std::thread::spawn(move || handle_conn(&home_for_conn, &events_for_conn, server_end, &parked_for_conn));
+
+            let mut writer = client_end.try_clone().expect("clone client end");
+            let req = json!({"op": "admin", "verb": "migrate", "name": "t", "target": "age"});
+            writer.write_all((req.to_string() + "\n").as_bytes()).unwrap();
+
+            let mut reader = BufReader::new(client_end);
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("reading the admin reply");
+            let reply: Value = serde_json::from_str(line.trim()).expect("reply must be JSON");
+            assert_eq!(reply["ok"], true, "{reply}");
+
+            drop(reader);
+            drop(writer);
+            conn_handle.join().unwrap();
+        });
+
+        assert_eq!(crate::backend::fetch_value(&home, "age", "k").unwrap(), "the-value", "the new backend must durably hold the value");
+        assert!(!home.join("store").join("k").exists(), "the old file-backend value must be removed");
         std::fs::remove_dir_all(&home).ok();
     }
 }

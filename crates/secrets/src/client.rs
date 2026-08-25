@@ -638,6 +638,69 @@ pub fn put(socket_path: &Path, secret: &str, value: &str, overwrite: bool) -> Re
     }
 }
 
+/// Task #79: whether [`admin_request`]'s CONNECT attempt hit "nothing is
+/// listening" (`io::ErrorKind::NotFound`: no socket file at all;
+/// `ConnectionRefused`: a stale socket file with nothing behind it) — the
+/// ONLY two cases `commands.rs`'s admin verbs fall back to their
+/// direct-write path on ([`NoSocket`](AdminError::NoSocket)). Every other
+/// failure — a different connect error, a write/read failure, an
+/// unparseable reply, or the broker's own `{"ok":false}` domain denial
+/// (a bad admin-identity peer uid, "no policy for secret x", a poisoned
+/// `policy.json`) — is [`Other`](AdminError::Other) and MUST be reported,
+/// never silently downgraded to a direct write: a live-but-sick daemon (a
+/// permission error, a saturated backlog `connect_bounded` gave up
+/// waiting on, or — the case this gate exists for — an authoritative
+/// denial from the single-writer daemon) must never be bypassed into a
+/// TOCTOU race against a direct write landing underneath it. This is the
+/// SAME two-way split [`PutError`] already draws for `put`'s own
+/// `exists`-vs-everything-else distinction, extended here for a different
+/// pair of cases.
+pub enum AdminError {
+    NoSocket,
+    Other(String),
+}
+
+/// Task #79: connect to `socket_path`, send ONE `{"op":"admin",...}`
+/// request (`req` already carries `op` and `verb` — every field
+/// `commands.rs`'s admin verbs need to send, this function adds none of
+/// its own), read ONE reply line, and return the parsed reply `Value` on
+/// `{"ok":true}` — the caller (`commands.rs`) reads `message`/`changed`
+/// off it exactly the way it would from a [`crate::admin::AdminOutcome`]
+/// on the direct-write path, so the two paths report through the same
+/// shape. See [`AdminError`] for the fallback-vs-report split; this is the
+/// ONE place that split is decided; a new admin verb added later sends its
+/// own `req` through this SAME function, never a hand-rolled write/read
+/// pair.
+pub fn admin_request(socket_path: &Path, req: Value) -> Result<Value, AdminError> {
+    let mut stream = connect_bounded(socket_path, CONNECT_TIMEOUT).map_err(|e| match e.kind() {
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => AdminError::NoSocket,
+        _ => AdminError::Other(describe_connect_error(socket_path, &e, "aoide secrets <admin verb> ...")),
+    })?;
+
+    let mut line = req.to_string();
+    line.push('\n');
+    stream.write_all(line.as_bytes()).map_err(|e| AdminError::Other(format!("writing to the secrets broker: {e}")))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut reply_line = String::new();
+    reader
+        .read_line(&mut reply_line)
+        .map_err(|e| AdminError::Other(format!("reading from the secrets broker: {e}")))?;
+    if reply_line.trim().is_empty() {
+        return Err(AdminError::Other("the secrets broker closed the connection with no reply".to_string()));
+    }
+    let reply: Value = serde_json::from_str(reply_line.trim())
+        .map_err(|e| AdminError::Other(format!("the secrets broker sent an unparseable reply: {e}")))?;
+
+    if reply.get("ok").and_then(Value::as_bool) == Some(true) {
+        Ok(reply)
+    } else {
+        Err(AdminError::Other(
+            reply.get("error").and_then(Value::as_str).unwrap_or("the secrets broker denied the request").to_string(),
+        ))
+    }
+}
+
 /// One parked ask, as `secrets pending` lists it — id/secret/consumer/
 /// requestedAt/peerUid ONLY, never a value (mirrors the wire's own
 /// `pending` reply shape, `broker.rs`'s module doc's wire table).

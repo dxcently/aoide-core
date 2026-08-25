@@ -290,6 +290,20 @@ below) into something richer.
 <- {"ok":false,"error":"<peer-uid-mismatch refusal>"} (task #73 — see "Peer
                                                        identity" below; the
                                                        ask stays parked)
+
+-> {"op":"admin","verb":"add"|"rm"|"grant"|"revoke"|"set-totp"|"expose"
+    |"automate"|"migrate", ...verb-specific fields}
+<- {"ok":true,"message":"<summary>","changed":["policy:<name>"]}
+                                                      (mutation applied —
+                                                      `changed` is empty on
+                                                      an idempotent no-op,
+                                                      same discipline every
+                                                      CLI `Outcome` already
+                                                      holds)
+<- {"ok":false,"error":"<message>"}                  (peer-cred refusal, or
+                                                      a domain denial — "no
+                                                      policy for secret x",
+                                                      an I/O diagnosis)
 ```
 
 `client::resolve` (`secrets exec`/`secrets get`) consumes any interim line
@@ -381,6 +395,70 @@ the door) and NO caching anywhere in either caller. Both are ordinary,
 un-privileged callers of this wire, same `resolve` op, same self-asserted
 `consumer` honesty note as any other caller — nothing about being a door
 or a client grants them a distinct trust tier.
+
+## Admin mutations over the socket (task #79)
+
+Before this phase, `secrets add`/`rm`/`grant`/`revoke`/`set-totp`/
+`automate`/`expose`/`migrate` wrote `policy.json` DIRECTLY — a separate OS
+process from `secrets serve`, with no way to serialize against a live
+daemon's own `put_lock` (a `static Mutex` is per-process memory). Task #79
+makes the live daemon the SINGLE WRITER instead: every admin verb's CLI
+handler now tries the broker socket FIRST, sending
+`{"op":"admin","verb":"<verb>",...verb-specific fields}`; the broker
+executes the mutation inside the SAME `put_lock` critical section a `put`
+already runs under, so an admin verb racing a live `put`/`exec` against the
+same secret can no longer interleave. Direct-write-to-`policy.json`
+survives ONLY as the no-daemon fallback (`AGENTS.md`'s KNOWN LIMITATION —
+narrowed by this phase to exactly that one remaining case).
+
+```
+-> {"op":"admin","verb":"add","name":"<name>","backend":"<backend>","key":"<key>","requireTotp":<bool>?,"consumers":[<name>,...]?}
+-> {"op":"admin","verb":"rm","name":"<name>"}
+-> {"op":"admin","verb":"grant"|"revoke","name":"<name>","consumer":"<consumer>"}
+-> {"op":"admin","verb":"set-totp"|"expose","name":"<name>","state":"on"|"off"}
+-> {"op":"admin","verb":"automate","name":"<name>","action":"on"|"off"|"grant"|"revoke","consumer":"<consumer>"?}
+-> {"op":"admin","verb":"migrate","name":"<name>","target":"<backend>"}
+```
+
+**The peer-cred gate is strict where `dismiss`'s is permissive: ONLY the
+broker's own effective uid may send `{"op":"admin"}`, full stop.** Unlike
+`dismiss` (any caller may dismiss its OWN ask), an admin mutation touches
+`policy.json` for every consumer of a secret at once — the same bar the
+direct-write path's `require_admin_identity` already holds. `broker::
+admin_gate` reuses `home::admin_identity_error`'s exact wording (root's
+"plain `sudo` runs as root" clause included) by treating the connecting
+peer's uid as that function's "process euid" argument — a refusal here
+teaches the IDENTICAL fix the direct path already teaches. Root (uid 0) is
+refused exactly like the direct path refuses it — plain `sudo` is still
+wrong, `sudo -u aoide-secrets` is still right. An unidentified connection
+(the `SO_PEERCRED` read failed) is refused outright, the same fail-closed
+default `dismiss` holds.
+
+**The CLI never silently downgrades a live daemon's answer into a direct
+write.** `commands.rs`'s `admin_dispatch` falls back to the direct-write
+path ONLY when the socket connect itself fails with `ENOENT`/
+`ConnectionRefused` (nothing listening) — every OTHER outcome, including
+the broker's own `{"ok":false}` denial (a wrong peer uid, a domain error, a
+poisoned `policy.json`), is reported straight through as the command's
+result. A live-but-sick daemon (a permission error, a saturated accept
+backlog) is therefore never bypassed into a TOCTOU race against a direct
+write landing underneath it. Every admin verb's `Outcome` carries
+`data: {"path":"broker"}` or `{"path":"direct"}` naming which one actually
+ran, alongside the usual `message`/`changed` fields — idempotency
+discipline (house rule 2) extended to "which write path" as one more thing
+a caller is told exactly.
+
+`crate::admin` is the one module holding every verb's actual mutation
+logic — typed arguments in, a message + changed-keys report out, no
+`Invocation`, no `Outcome`, no wire `Value` — so `commands.rs`'s
+direct-write fallback and `broker::handle_admin`'s socket path call the
+IDENTICAL functions, never two copies that could drift. The broker's own
+audit line for this op family, `broker::audit_admin`, is verb-generic and
+name-only (never the value, matching every other audit line in this
+crate) — it is the ONLY audit record the socket path produces, since it
+never goes through `commands.rs`'s own per-command dispatch audit at all;
+the direct-write fallback keeps that pre-existing audit, plus `migrate`'s
+own richer source-to-target line, both unchanged by this phase.
 
 ## Parking a TOTP resolve (P-N2)
 
@@ -1194,15 +1272,20 @@ operator -> aoide secrets migrate db-prod --backend age
             actually removed
 ```
 
-**Admin verb, direct-home — mirrors `add`/`rm`/`grant` exactly, not
-`put`/`exec`'s socket round trip** (`commands.rs`'s own door taxonomy):
-`require_cli` + `require_admin_identity` gate it before anything touches
-`policy.json`, same euid-ownership refusal (root explicitly included) the
-whole CRUD/`set-totp`/`automate`/`expose` quartet-plus already holds. It
-does **not** go through the running broker's socket at all — like
-`add`/`rm`/`grant`, it reads/writes `policy.json` (and, here, a backend's
-own value file) directly as whatever uid invokes it, normally `sudo -u
-aoide-secrets aoide secrets migrate ...` in deployment.
+**Admin verb — same socket-first, direct-write-fallback shape as
+`add`/`rm`/`grant`** (task #79, "Admin mutations over the socket" above):
+`secrets migrate` tries the running broker's `{"op":"admin","verb":
+"migrate",...}` FIRST, executed inside the SAME `put_lock` critical section
+a `put` already runs under, so a migrate racing a live `put`/`exec` against
+the same secret through a concurrently-running broker now serializes
+behind that lock instead of racing it. Only when NO daemon is listening
+does it fall back to the direct-home path — `require_cli` +
+`require_admin_identity` gate it before anything touches `policy.json`,
+same euid-ownership refusal (root explicitly included) the whole
+CRUD/`set-totp`/`automate`/`expose` quartet-plus already holds, reading/
+writing `policy.json` (and, here, a backend's own value file) directly as
+whatever uid invokes it, normally `sudo -u aoide-secrets aoide secrets
+migrate ...` in deployment.
 
 **Ordering is safety-critical, and deliberately asymmetric with removal**:
 the new ciphertext is fetched and durably stored via the TARGET backend
@@ -1262,13 +1345,15 @@ after. Back up `age.key` and `age.recipient` alongside `values/`, as one
 unit, the same discipline `backend::mint_age_identity_if_needed`'s own
 `0600` handling already treats them with.
 
-**No lock against a live broker (KNOWN LIMITATION, `AGENTS.md`).** `migrate`
-runs as a separate OS process from `secrets serve` and cannot take the
-daemon's own in-process `put_lock` — a `migrate` racing a `put`/`exec`
-against the SAME secret through a concurrently-running broker is an
-unprotected window (the same class of gap this crate's admin CRUD verbs
-already accept for `policy.json`, `store.rs`'s own module doc). Run it
-against a secret you know isn't being written concurrently.
+**No cross-process lock ONLY when no daemon is running (KNOWN LIMITATION,
+narrowed by task #79, `AGENTS.md`).** When a broker IS listening, migrate
+(like every other admin verb) runs inside its `put_lock` and is fully
+serialized against a concurrent `put`/`exec`/another admin verb. The
+remaining gap is the no-daemon case: the direct-write fallback is a
+separate OS process from any other admin invocation, with no cross-process
+primitive to serialize two of them racing the SAME secret concurrently —
+run those against a secret you know isn't being written by another
+`aoide secrets` invocation at the same time.
 
 ## Deployment (P-V4)
 
@@ -1464,8 +1549,13 @@ which one provisioned the parent directory.
 
 `secrets add|rm|grant|revoke|enroll|set-totp|automate|expose|migrate` mutate
 `policy.json`/`totp.secret` (and, for `migrate`, a backend's own value file)
-under the secrets home, so they run AS the secrets user — no sudo rule is
-shipped (nix module or not); the raw form:
+under the secrets home. `enroll` is always direct-home (`totp.secret` never
+crosses the wire — see "TOTP enrollment" below); the other eight try the
+running broker's socket FIRST and fall back to a direct write only when no
+daemon is listening ("Admin mutations over the socket" above) — either
+way, the caller has to BE the secrets user for the mutation to succeed, so
+they still run AS the secrets user in deployment — no sudo rule is shipped
+(nix module or not); the raw form:
 
 ```sh
 sudo -u aoide-secrets aoide secrets enroll
@@ -1840,9 +1930,12 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   Daemon) gets the door-hint `Outcome` before `policy.json`/`totp.secret` is
   ever touched, closing off a self-escalation path (`secrets grant <secret>
   <itself>`, or a hostile re-enrollment, from an already-connected agent).
-  Those same seven also call `require_admin_identity` (P-V4f) right after
-  `require_cli` — the wrong effective uid gets refused before the file is
-  ever touched too, see "Admin verbs" above. **`add`'s `--backend` flag is
+  Those same seven, plus `migrate`, route through `admin_dispatch` (task
+  #79) — the broker socket FIRST, `require_admin_identity` (P-V4f) gating
+  the direct-write fallback ONLY (reached ONLY when nothing is listening,
+  `client::AdminError::NoSocket`) right after `require_cli` — the wrong
+  effective uid gets refused before the file is ever touched either way,
+  see "Admin verbs" and "Admin mutations over the socket" above. **`add`'s `--backend` flag is
   now OPTIONAL, defaulting to `age` when omitted (P-G1, task #70, DEFAULT
   FLIP)** — `handle_secrets_add`'s own `DEFAULT_BACKEND` constant; an
   explicit `--backend` still wins, and an ALREADY-recorded policy's
@@ -1860,6 +1953,15 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   `require_admin_identity`-gated, since they never touch `policy.json`,
   only the broker's in-memory `ParkRegistry` over the socket, the same
   operator-side-but-not-admin-side distinction `put`/`exec` already draw.
+
+- `admin` (task #79) — the ONE module holding every admin verb's actual
+  mutation logic (`add`/`rm`/`grant`/`revoke`/`set_totp`/`expose`/
+  `automate_toggle`/`automate_consumer`/`migrate`): typed arguments in, an
+  `AdminOutcome{message,changed}` or `Err(String)` out, no `Invocation`, no
+  `Outcome`, no wire `Value` — the SAME function serves `commands.rs`'s
+  direct-write fallback and `broker::handle_admin`'s socket path, never two
+  copies. Makes no admin-identity decision of its own; the euid/peer-cred
+  gate belongs entirely to whichever caller invokes it.
 
 ## What it consumes
 

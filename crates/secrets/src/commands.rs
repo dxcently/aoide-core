@@ -159,8 +159,7 @@
 //! this guard was never meant to cover (`home.rs`'s module doc).
 
 use crate::home;
-use crate::policy::{valid_secret_name, Policy};
-use crate::store;
+use crate::policy::valid_secret_name;
 use aoide_protocol::output::Outcome;
 use aoide_protocol::registry::{arg, cmd, flag, Registry};
 use aoide_protocol::{Door, Invocation};
@@ -452,14 +451,6 @@ fn require_admin_identity(cmd: &str, verb: &str) -> Option<Outcome> {
     home::admin_identity_check(&home::secrets_home(), verb).map(|msg| Outcome::error(cmd, msg))
 }
 
-/// Enrich a `policy.json` I/O error via [`home::describe_home_file_error`]
-/// — the ONE seam every admin-verb load/save call site below routes
-/// through, so the poisoned-file diagnosis (this crate's `AGENTS.md`) is
-/// written once, not copied at each of the CRUD quintet's eight call sites.
-fn policy_io_error(cmd: &str, home: &std::path::Path, err: std::io::Error) -> Outcome {
-    Outcome::error(cmd, home::describe_home_file_error(home, &store::policy_path(home), &err))
-}
-
 /// `secrets add`'s backend when `--backend` is omitted (P-G1, task #70 —
 /// DEFAULT FLIP: was implicitly `file`-shaped in every existing example
 /// in this crate's own docs, never actually enforced as a code default
@@ -469,13 +460,63 @@ fn policy_io_error(cmd: &str, home: &std::path::Path, err: std::io::Error) -> Ou
 /// brand-new `secrets add` with no `--backend` records.
 const DEFAULT_BACKEND: &str = "age";
 
+/// Task #79: try the broker socket first (an `{op:"admin",verb:...}`
+/// request carrying `fields` plus `op`/`verb`), falling back to the
+/// direct-write path — [`require_admin_identity`] then `direct()`, running
+/// the SAME mutation from [`crate::admin`] locally — ONLY when nothing is
+/// listening (`crate::client::AdminError::NoSocket`). Any other socket
+/// error (including the broker's own authoritative `{"ok":false}` denial —
+/// `client::admin_request`'s own doc) is reported outright, never silently
+/// downgraded: a live-but-sick daemon must never be bypassed into a TOCTOU
+/// race against a direct write landing underneath it. Reports which path
+/// executed via `Outcome::with_data({"path":"broker"|"direct"})` — the
+/// message/changed-keys shape is otherwise identical either way, since both
+/// paths report through the same [`crate::admin::AdminOutcome`] fields.
+fn admin_dispatch(
+    cmd: &str,
+    verb: &str,
+    mut fields: serde_json::Map<String, serde_json::Value>,
+    direct: impl FnOnce() -> Result<crate::admin::AdminOutcome, String>,
+) -> Outcome {
+    fields.insert("op".to_string(), json!("admin"));
+    fields.insert("verb".to_string(), json!(verb));
+    match crate::client::admin_request(&crate::socket::socket_path(), serde_json::Value::Object(fields)) {
+        Ok(reply) => {
+            let message = reply.get("message").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
+            let changed: Vec<String> = reply
+                .get("changed")
+                .and_then(serde_json::Value::as_array)
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            let mut outcome = Outcome::ok(cmd, message).with_data(json!({"path": "broker"}));
+            if !changed.is_empty() {
+                outcome = outcome.changed(changed);
+            }
+            outcome
+        }
+        Err(crate::client::AdminError::NoSocket) => {
+            if let Some(hint) = require_admin_identity(cmd, verb) {
+                return hint;
+            }
+            match direct() {
+                Ok(r) => {
+                    let mut outcome = Outcome::ok(cmd, r.message).with_data(json!({"path": "direct"}));
+                    if !r.changed.is_empty() {
+                        outcome = outcome.changed(r.changed);
+                    }
+                    outcome
+                }
+                Err(e) => Outcome::error(cmd, e),
+            }
+        }
+        Err(crate::client::AdminError::Other(e)) => Outcome::error(cmd, e),
+    }
+}
+
 fn handle_secrets_add(inv: &Invocation) -> Outcome {
     let cmd = "secrets.add";
     const USAGE: &str = "usage: secrets add <name> --key <key> [--backend <backend>]";
     if let Some(hint) = require_cli(inv, cmd) {
-        return hint;
-    }
-    if let Some(hint) = require_admin_identity(cmd, "add") {
         return hint;
     }
     let Some(name) = inv.args.first().cloned() else {
@@ -494,29 +535,23 @@ fn handle_secrets_add(inv: &Invocation) -> Outcome {
     let Some(key) = inv.flags.get("key").cloned() else {
         return Outcome::usage(cmd, format!("secrets add: missing --key <key> — {USAGE}"));
     };
-
-    let home = home::secrets_home();
-    let mut policies = match store::load_policies(&home) {
-        Ok(p) => p,
-        Err(e) => return policy_io_error(cmd, &home, e),
-    };
-    if policies.iter().any(|p| p.name == name) {
-        return Outcome::error(cmd, format!("secret `{name}` already has a policy — use `secrets rm` first"));
-    }
-
-    let mut policy = Policy::new(&name, backend, key);
-    policy.require_totp = inv.flag_present("require-totp");
-    policy.consumers = inv
+    let require_totp = inv.flag_present("require-totp");
+    let consumers: Vec<String> = inv
         .flags
         .get("consumers")
         .map(|s| s.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())
         .unwrap_or_default();
-    policies.push(policy);
 
-    if let Err(e) = store::save_policies(&home, &policies) {
-        return policy_io_error(cmd, &home, e);
-    }
-    Outcome::ok(cmd, format!("added secret `{name}`")).changed(vec![format!("policy:{name}")])
+    let fields = serde_json::Map::from_iter([
+        ("name".to_string(), json!(name.clone())),
+        ("backend".to_string(), json!(backend.clone())),
+        ("key".to_string(), json!(key.clone())),
+        ("requireTotp".to_string(), json!(require_totp)),
+        ("consumers".to_string(), json!(consumers.clone())),
+    ]);
+    admin_dispatch(cmd, "add", fields, || {
+        crate::admin::add(&home::secrets_home(), &name, &backend, &key, require_totp, consumers)
+    })
 }
 
 fn handle_secrets_rm(inv: &Invocation) -> Outcome {
@@ -525,45 +560,20 @@ fn handle_secrets_rm(inv: &Invocation) -> Outcome {
     if let Some(hint) = require_cli(inv, cmd) {
         return hint;
     }
-    if let Some(hint) = require_admin_identity(cmd, "rm") {
-        return hint;
-    }
     let Some(name) = inv.args.first().cloned() else {
         return Outcome::usage(cmd, USAGE);
     };
-
-    let home = home::secrets_home();
-    let mut policies = match store::load_policies(&home) {
-        Ok(p) => p,
-        Err(e) => return policy_io_error(cmd, &home, e),
-    };
-    let before = policies.len();
-    policies.retain(|p| p.name != name);
-    if policies.len() == before {
-        return Outcome::error(cmd, format!("no policy for secret `{name}`"));
-    }
-
-    if let Err(e) = store::save_policies(&home, &policies) {
-        return policy_io_error(cmd, &home, e);
-    }
-    Outcome::ok(cmd, format!("removed secret `{name}`")).changed(vec![format!("policy:{name}")])
+    let fields = serde_json::Map::from_iter([("name".to_string(), json!(name.clone()))]);
+    admin_dispatch(cmd, "rm", fields, || crate::admin::rm(&home::secrets_home(), &name))
 }
 
 /// Shared shape behind `grant`/`revoke`: both take `<name> <consumer>` and
-/// differ only in what they do to the `consumers[]` list. `verb` names the
-/// bare word (`"grant"`/`"revoke"`) for [`require_admin_identity`]'s
-/// corrective spelling.
-fn edit_consumer(
-    inv: &Invocation,
-    cmd: &str,
-    verb: &str,
-    usage: &str,
-    edit: impl FnOnce(&mut Vec<String>, &str),
-) -> Outcome {
+/// differ only in `want_listed` (`true` pushes the consumer if absent,
+/// `false` removes it if present — [`crate::admin::grant`]/[`crate::admin::
+/// revoke`]'s own job). `verb` names the bare word for the wire request and
+/// [`require_admin_identity`]'s corrective spelling.
+fn edit_consumer(inv: &Invocation, cmd: &str, verb: &str, usage: &str, want_listed: bool) -> Outcome {
     if let Some(hint) = require_cli(inv, cmd) {
-        return hint;
-    }
-    if let Some(hint) = require_admin_identity(cmd, verb) {
         return hint;
     }
     let Some(name) = inv.args.first().cloned() else {
@@ -572,47 +582,26 @@ fn edit_consumer(
     let Some(consumer) = inv.args.get(1).cloned() else {
         return Outcome::usage(cmd, format!("secrets {verb}: missing <consumer> — {usage}"));
     };
-
-    let home = home::secrets_home();
-    let mut policies = match store::load_policies(&home) {
-        Ok(p) => p,
-        Err(e) => return policy_io_error(cmd, &home, e),
-    };
-    let Some(policy) = policies.iter_mut().find(|p| p.name == name) else {
-        return Outcome::error(cmd, format!("no policy for secret `{name}`"));
-    };
-    edit(&mut policy.consumers, &consumer);
-
-    if let Err(e) = store::save_policies(&home, &policies) {
-        return policy_io_error(cmd, &home, e);
-    }
-    Outcome::ok(cmd, format!("updated consumers for secret `{name}`")).changed(vec![format!("policy:{name}")])
+    let fields = serde_json::Map::from_iter([
+        ("name".to_string(), json!(name.clone())),
+        ("consumer".to_string(), json!(consumer.clone())),
+    ]);
+    admin_dispatch(cmd, verb, fields, || {
+        let home = home::secrets_home();
+        if want_listed {
+            crate::admin::grant(&home, &name, &consumer)
+        } else {
+            crate::admin::revoke(&home, &name, &consumer)
+        }
+    })
 }
 
 fn handle_secrets_grant(inv: &Invocation) -> Outcome {
-    edit_consumer(
-        inv,
-        "secrets.grant",
-        "grant",
-        "usage: secrets grant <name> <consumer>",
-        |consumers, consumer| {
-            if !consumers.iter().any(|c| c == consumer) {
-                consumers.push(consumer.to_string());
-            }
-        },
-    )
+    edit_consumer(inv, "secrets.grant", "grant", "usage: secrets grant <name> <consumer>", true)
 }
 
 fn handle_secrets_revoke(inv: &Invocation) -> Outcome {
-    edit_consumer(
-        inv,
-        "secrets.revoke",
-        "revoke",
-        "usage: secrets revoke <name> <consumer>",
-        |consumers, consumer| {
-            consumers.retain(|c| c != consumer);
-        },
-    )
+    edit_consumer(inv, "secrets.revoke", "revoke", "usage: secrets revoke <name> <consumer>", false)
 }
 
 /// `secrets put <name>` (P-V4c, `--force` P-67) — CLI-only via the SAME
@@ -664,9 +653,6 @@ fn handle_secrets_set_totp(inv: &Invocation) -> Outcome {
     if let Some(hint) = require_cli(inv, cmd) {
         return hint;
     }
-    if let Some(hint) = require_admin_identity(cmd, "set-totp") {
-        return hint;
-    }
     let Some(name) = inv.args.first().cloned() else {
         return Outcome::usage(cmd, format!("secrets set-totp: missing <name> — {USAGE}"));
     };
@@ -678,25 +664,9 @@ fn handle_secrets_set_totp(inv: &Invocation) -> Outcome {
         "off" => false,
         _ => return Outcome::usage(cmd, format!("secrets set-totp expects `on` or `off`, got `{state}` — {USAGE}")),
     };
-
-    let home = home::secrets_home();
-    let mut policies = match store::load_policies(&home) {
-        Ok(p) => p,
-        Err(e) => return policy_io_error(cmd, &home, e),
-    };
-    let Some(policy) = policies.iter_mut().find(|p| p.name == name) else {
-        return Outcome::error(cmd, format!("no policy for secret `{name}`"));
-    };
-
-    if policy.require_totp == want {
-        return Outcome::ok(cmd, format!("secret `{name}` requireTotp already `{state}` — unchanged"));
-    }
-    policy.require_totp = want;
-
-    if let Err(e) = store::save_policies(&home, &policies) {
-        return policy_io_error(cmd, &home, e);
-    }
-    Outcome::ok(cmd, format!("secret `{name}` requireTotp set to `{state}`")).changed(vec![format!("policy:{name}")])
+    let fields =
+        serde_json::Map::from_iter([("name".to_string(), json!(name.clone())), ("state".to_string(), json!(state))]);
+    admin_dispatch(cmd, "set-totp", fields, || crate::admin::set_totp(&home::secrets_home(), &name, want))
 }
 
 /// `secrets automate <name> on|off | grant|revoke <consumer>` (P-N1) — the
@@ -714,9 +684,6 @@ fn handle_secrets_automate(inv: &Invocation) -> Outcome {
     if let Some(hint) = require_cli(inv, cmd) {
         return hint;
     }
-    if let Some(hint) = require_admin_identity(cmd, "automate") {
-        return hint;
-    }
     let Some(name) = inv.args.first().cloned() else {
         return Outcome::usage(cmd, format!("secrets automate: missing <name> — {USAGE}"));
     };
@@ -724,25 +691,14 @@ fn handle_secrets_automate(inv: &Invocation) -> Outcome {
         return Outcome::usage(cmd, format!("secrets automate: missing on|off|grant|revoke — {USAGE}"));
     };
 
-    let home = home::secrets_home();
-    let mut policies = match store::load_policies(&home) {
-        Ok(p) => p,
-        Err(e) => return policy_io_error(cmd, &home, e),
-    };
-    let Some(policy) = policies.iter_mut().find(|p| p.name == name) else {
-        return Outcome::error(cmd, format!("no policy for secret `{name}`"));
-    };
-
-    let outcome = match action.as_str() {
+    match action.as_str() {
         "on" | "off" => {
             let want = action == "on";
-            if policy.automation.enabled == want {
-                Outcome::ok(cmd, format!("secret `{name}` automation already `{action}` — unchanged"))
-            } else {
-                policy.automation.enabled = want;
-                Outcome::ok(cmd, format!("secret `{name}` automation set to `{action}`"))
-                    .changed(vec![format!("policy:{name}")])
-            }
+            let fields = serde_json::Map::from_iter([
+                ("name".to_string(), json!(name.clone())),
+                ("action".to_string(), json!(action.clone())),
+            ]);
+            admin_dispatch(cmd, "automate", fields, || crate::admin::automate_toggle(&home::secrets_home(), &name, want))
         }
         "grant" | "revoke" => {
             let Some(consumer) = inv.args.get(2).cloned() else {
@@ -757,38 +713,18 @@ fn handle_secrets_automate(inv: &Invocation) -> Outcome {
                     ),
                 );
             }
-            let already_listed = policy.automation.consumers.iter().any(|c| c == &consumer);
-            if action == "grant" {
-                if already_listed {
-                    Outcome::ok(cmd, format!("secret `{name}` automation already lists consumer `{consumer}` — unchanged"))
-                } else {
-                    policy.automation.consumers.push(consumer.clone());
-                    Outcome::ok(cmd, format!("secret `{name}` automation now lists consumer `{consumer}`"))
-                        .changed(vec![format!("policy:{name}")])
-                }
-            } else if already_listed {
-                policy.automation.consumers.retain(|c| c != &consumer);
-                Outcome::ok(cmd, format!("secret `{name}` automation no longer lists consumer `{consumer}`"))
-                    .changed(vec![format!("policy:{name}")])
-            } else {
-                Outcome::ok(cmd, format!("secret `{name}` automation does not list consumer `{consumer}` — unchanged"))
-            }
+            let want_listed = action == "grant";
+            let fields = serde_json::Map::from_iter([
+                ("name".to_string(), json!(name.clone())),
+                ("action".to_string(), json!(action.clone())),
+                ("consumer".to_string(), json!(consumer.clone())),
+            ]);
+            admin_dispatch(cmd, "automate", fields, || {
+                crate::admin::automate_consumer(&home::secrets_home(), &name, &consumer, want_listed)
+            })
         }
-        _ => {
-            return Outcome::usage(
-                cmd,
-                format!("secrets automate expects on|off|grant|revoke, got `{action}` — {USAGE}"),
-            )
-        }
-    };
-
-    if outcome.changed.is_empty() {
-        return outcome;
+        _ => Outcome::usage(cmd, format!("secrets automate expects on|off|grant|revoke, got `{action}` — {USAGE}")),
     }
-    if let Err(e) = store::save_policies(&home, &policies) {
-        return policy_io_error(cmd, &home, e);
-    }
-    outcome
 }
 
 /// `secrets expose <name> on|off` (P-N1) — flips `crate::policy::
@@ -798,9 +734,6 @@ fn handle_secrets_expose(inv: &Invocation) -> Outcome {
     let cmd = "secrets.expose";
     const USAGE: &str = "usage: secrets expose <name> on|off";
     if let Some(hint) = require_cli(inv, cmd) {
-        return hint;
-    }
-    if let Some(hint) = require_admin_identity(cmd, "expose") {
         return hint;
     }
     let Some(name) = inv.args.first().cloned() else {
@@ -814,25 +747,9 @@ fn handle_secrets_expose(inv: &Invocation) -> Outcome {
         "off" => false,
         _ => return Outcome::usage(cmd, format!("secrets expose expects `on` or `off`, got `{state}` — {USAGE}")),
     };
-
-    let home = home::secrets_home();
-    let mut policies = match store::load_policies(&home) {
-        Ok(p) => p,
-        Err(e) => return policy_io_error(cmd, &home, e),
-    };
-    let Some(policy) = policies.iter_mut().find(|p| p.name == name) else {
-        return Outcome::error(cmd, format!("no policy for secret `{name}`"));
-    };
-
-    if policy.remote == want {
-        return Outcome::ok(cmd, format!("secret `{name}` remote already `{state}` — unchanged"));
-    }
-    policy.remote = want;
-
-    if let Err(e) = store::save_policies(&home, &policies) {
-        return policy_io_error(cmd, &home, e);
-    }
-    Outcome::ok(cmd, format!("secret `{name}` remote set to `{state}`")).changed(vec![format!("policy:{name}")])
+    let fields =
+        serde_json::Map::from_iter([("name".to_string(), json!(name.clone())), ("state".to_string(), json!(state))]);
+    admin_dispatch(cmd, "expose", fields, || crate::admin::expose(&home::secrets_home(), &name, want))
 }
 
 /// `secrets pending` (P-N2) — CLI-only via the SAME [`require_cli`] gate as
@@ -997,111 +914,47 @@ fn handle_secrets_migrate(inv: &Invocation) -> Outcome {
     if let Some(hint) = require_cli(inv, cmd) {
         return hint;
     }
-    if let Some(hint) = require_admin_identity(cmd, "migrate") {
-        return hint;
-    }
     let Some(name) = inv.args.first().cloned() else {
         return Outcome::usage(cmd, USAGE);
     };
     let target = inv.flags.get("backend").cloned().unwrap_or_else(|| DEFAULT_BACKEND.to_string());
+    let door = inv.door;
 
-    let home = home::secrets_home();
-    let mut policies = match store::load_policies(&home) {
-        Ok(p) => p,
-        Err(e) => return policy_io_error(cmd, &home, e),
-    };
-    let Some(policy) = policies.iter_mut().find(|p| p.name == name) else {
-        return Outcome::error(cmd, format!("no policy for secret `{name}`"));
-    };
-
-    let source = policy.backend.clone();
-    let key = policy.key.clone();
-
-    // Same-backend migrate is an idempotent no-op — no fetch, no store, no
-    // policy write (house rule: report exactly what changed).
-    if source == target {
-        audit_migrate(inv.door, &name, &source, &target, "unchanged", None);
-        return Outcome::ok(cmd, format!("secret `{name}` already on backend `{target}` — unchanged"));
-    }
-
-    // Fetch via the CURRENT backend first — a missing value is a clean
-    // refusal, nothing mutated below this point.
-    let value = match crate::backend::fetch_value(&home, &source, &key) {
-        Ok(v) => v,
+    let fields = serde_json::Map::from_iter([
+        ("name".to_string(), json!(name.clone())),
+        ("target".to_string(), json!(target.clone())),
+    ]);
+    // `crate::admin::migrate`'s own ordering (fetch -> maybe mint -> store
+    // -> flip+save -> remove-old-last) is unchanged by this phase, whether
+    // it runs here (direct-write fallback) or inside the broker's
+    // `put_lock` critical section (`broker::handle_admin`) — this closure
+    // only adds the one thing that stays HERE regardless of which path
+    // ran: `audit_migrate`'s own richer source->target audit line
+    // (`commands.rs`'s own audit mechanism, distinct from — and in
+    // addition to — `broker::audit_admin`'s generic line on the broker
+    // path).
+    admin_dispatch(cmd, "migrate", fields, || match crate::admin::migrate(&home::secrets_home(), door, &name, &target) {
+        Ok((outcome, source, target)) => {
+            let status = if outcome.changed.is_empty() { "unchanged" } else { "migrated" };
+            audit_migrate(door, &name, &source, &target, status, None);
+            Ok(outcome)
+        }
         Err(e) => {
-            audit_migrate(inv.door, &name, &source, &target, "refused", Some(&e));
-            return Outcome::error(cmd, format!("secret `{name}`: could not fetch from backend `{source}`: {e}"));
+            // The exact failing backend name is already inside `e`'s own
+            // text (`crate::admin::migrate`'s own error messages name it) —
+            // `"?"` here is only the STRUCTURED audit field, since a
+            // failure this early (e.g. "no policy for secret x") may not
+            // even know a source backend yet.
+            audit_migrate(door, &name, "?", &target, "refused", Some(&e));
+            Err(e)
         }
-    };
-
-    // The target may be the built-in `age` backend needing its identity
-    // lazily minted — the SAME path `broker::put_gate` already runs
-    // (`backend::mint_age_identity_if_needed`), reused rather than
-    // duplicated. Only when `age` is actually configured (the P-G1 review
-    // fix's own "age-named is not age-configured" rule, `backend.rs`'s
-    // module doc) — a doomed migrate onto an unconfigured `age` must not
-    // mint a real identity before failing anyway.
-    if target == "age" && crate::backend::backend_is_known(&home, "age") {
-        if let Err(e) = crate::backend::mint_age_identity_if_needed(&home) {
-            audit_migrate(inv.door, &name, &source, &target, "refused", Some(&e));
-            return Outcome::error(cmd, format!("secret `{name}`: could not prepare backend `{target}`: {e}"));
-        }
-    }
-
-    // Store via the TARGET backend — durably written BEFORE the policy
-    // flips (ordering, module doc: safety-critical).
-    if let Err(e) = crate::backend::store_value(&home, &target, &key, &value) {
-        audit_migrate(inv.door, &name, &source, &target, "refused", Some(&e));
-        return Outcome::error(cmd, format!("secret `{name}`: could not store into backend `{target}`: {e}"));
-    }
-
-    // Flip the policy row and save it — only after this succeeds is the
-    // secret considered migrated at all.
-    policy.backend = target.clone();
-    if let Err(e) = store::save_policies(&home, &policies) {
-        let err_message = home::describe_home_file_error(&home, &store::policy_path(&home), &e);
-        audit_migrate(inv.door, &name, &source, &target, "refused", Some(&err_message));
-        return Outcome::error(cmd, err_message);
-    }
-
-    // Remove the OLD value LAST, only for a built-in source whose path is
-    // derivable — a non-built-in source is left untouched, reported
-    // honestly rather than silently doing nothing.
-    //
-    // Judge fix, this commit: a migrate onto `age` hands sole decryption
-    // power to `age.key` — the value's ciphertext under `values/` is
-    // useless without it (`backend.rs`'s own "age.key is the only
-    // decryptor" framing). The success message says so, once, right here,
-    // so an operator backing up `values/` alone (a natural instinct — it's
-    // where the ciphertext lives) doesn't discover the gap only once the
-    // key is already gone.
-    let key_lifecycle_note = if target == "age" {
-        " — age.key is now the ONLY decryptor of this value; back it up together with values/, \
-          since a backup holding the .age files but not age.key restores to nothing"
-    } else {
-        ""
-    };
-    let message = match crate::backend::remove_builtin_value(&home, &source, &key) {
-        Some(Ok(())) => {
-            format!("migrated secret `{name}` from `{source}` to `{target}` (old value removed){key_lifecycle_note}")
-        }
-        Some(Err(e)) => {
-            format!(
-                "migrated secret `{name}` from `{source}` to `{target}` (old value NOT removed: {e}){key_lifecycle_note}"
-            )
-        }
-        None => format!(
-            "migrated secret `{name}` from `{source}` to `{target}` (old value under `{source}` left in \
-             place — not a built-in backend, remove it by hand){key_lifecycle_note}"
-        ),
-    };
-    audit_migrate(inv.door, &name, &source, &target, "migrated", None);
-    Outcome::ok(cmd, message).changed(vec![format!("policy:{name}")])
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store;
     use aoide_protocol::output::Status;
     use std::collections::BTreeMap;
 
@@ -1115,7 +968,40 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("AOIDE_SECRETS_HOME", &dir);
+        // Task #79: `admin_dispatch` tries the REAL socket
+        // `crate::socket::socket_path()` resolves to FIRST — which, unlike
+        // `AOIDE_SECRETS_HOME`, is NOT derived from this tempdir at all
+        // (`socket.rs`'s own module doc: hardcoded so an env-less client
+        // shell finds the real deployed broker). On a box that happens to
+        // be running a real `aoide secrets serve` (this crate's own dev/
+        // deployment host, `/run/aoide-secrets/secrets.sock`), an admin-verb
+        // test that didn't override this would silently talk to THAT real
+        // daemon instead of exercising the direct-write fallback these
+        // tests exist to prove — never acceptable for a unit test to touch
+        // live system state. Pointing at a path inside this SAME
+        // never-existing tempdir guarantees `ENOENT` on every connect
+        // attempt, so every admin-verb test hermetically takes the
+        // `AdminError::NoSocket` fallback branch, exactly like every one of
+        // these tests behaved before task #79 introduced the socket path
+        // at all.
+        // Deliberately a SHORT, FIXED path, never `dir.join(...)`:
+        // `std::env::temp_dir()` plus this function's own long, descriptive
+        // tag/pid/nanosecond suffix can push a socket path past `AF_UNIX`'s
+        // 108-byte `sun_path` limit, which `client::unix_sockaddr` (rightly)
+        // refuses as `InvalidInput` — a genuine `AdminError::Other`, not
+        // `NoSocket`, which would skip the fallback branch entirely rather
+        // than exercise it (found live: `migrate_onto_age_warns_that_age_
+        // key_is_now_the_only_decryptor`'s tag alone was long enough to
+        // trip this). Serialized under `env_lock()` like every other env
+        // mutation in this fixture, so the one shared literal path is safe
+        // across tests despite never being unique per-tag.
+        let saved_socket = std::env::var("AOIDE_SECRETS_SOCKET").ok();
+        std::env::set_var("AOIDE_SECRETS_SOCKET", "/nonexistent/aoide-secrets-test/no-such-broker.sock");
         let result = f(&dir);
+        match saved_socket {
+            Some(v) => std::env::set_var("AOIDE_SECRETS_SOCKET", v),
+            None => std::env::remove_var("AOIDE_SECRETS_SOCKET"),
+        }
         match saved {
             Some(v) => std::env::set_var("AOIDE_SECRETS_HOME", v),
             None => std::env::remove_var("AOIDE_SECRETS_HOME"),
@@ -1873,6 +1759,12 @@ mod tests {
         let _guard = crate::env_lock().lock().unwrap();
         let saved = std::env::var("AOIDE_SECRETS_HOME").ok();
         std::env::set_var("AOIDE_SECRETS_HOME", "/");
+        // Task #79: guarantee the `NoSocket` fallback branch (`with_secrets_
+        // home`'s own doc, same reasoning — this test doesn't use that
+        // fixture since it needs `AOIDE_SECRETS_HOME` pinned to `/`, not a
+        // fresh tempdir, but the real-broker hazard is identical).
+        let saved_socket = std::env::var("AOIDE_SECRETS_SOCKET").ok();
+        std::env::set_var("AOIDE_SECRETS_SOCKET", "/nonexistent/aoide-secrets-test/no-such-broker.sock");
 
         let automate = inv(Door::Cli, &["secrets", "automate"], &["t", "on"], &[]);
         let out = handle_secrets_automate(&automate);
@@ -1884,6 +1776,10 @@ mod tests {
         assert_eq!(out.status, Status::Error, "{out:?}");
         assert!(out.message.contains("must run as the broker user"), "{}", out.message);
 
+        match saved_socket {
+            Some(v) => std::env::set_var("AOIDE_SECRETS_SOCKET", v),
+            None => std::env::remove_var("AOIDE_SECRETS_SOCKET"),
+        }
         match saved {
             Some(v) => std::env::set_var("AOIDE_SECRETS_HOME", v),
             None => std::env::remove_var("AOIDE_SECRETS_HOME"),
@@ -2071,16 +1967,107 @@ mod tests {
         let _guard = crate::env_lock().lock().unwrap();
         let saved = std::env::var("AOIDE_SECRETS_HOME").ok();
         std::env::set_var("AOIDE_SECRETS_HOME", "/");
+        // Task #79: same real-broker hazard as `automate_and_expose_refuse_
+        // a_mismatched_euid_before_touching_policy_json` above — pin the
+        // socket to a guaranteed-absent path.
+        let saved_socket = std::env::var("AOIDE_SECRETS_SOCKET").ok();
+        std::env::set_var("AOIDE_SECRETS_SOCKET", "/nonexistent/aoide-secrets-test/no-such-broker.sock");
 
         let migrate = inv(Door::Cli, &["secrets", "migrate"], &["t"], &[]);
         let out = handle_secrets_migrate(&migrate);
         assert_eq!(out.status, Status::Error, "{out:?}");
         assert!(out.message.contains("must run as the broker user"), "{}", out.message);
 
+        match saved_socket {
+            Some(v) => std::env::set_var("AOIDE_SECRETS_SOCKET", v),
+            None => std::env::remove_var("AOIDE_SECRETS_SOCKET"),
+        }
         match saved {
             Some(v) => std::env::set_var("AOIDE_SECRETS_HOME", v),
             None => std::env::remove_var("AOIDE_SECRETS_HOME"),
         }
+    }
+
+    // ── task #79: socket-first admin dispatch ───────────────────────────
+
+    /// Task #79 item 6c (fallback path fires when no socket exists): every
+    /// `with_secrets_home` test already exercises this branch implicitly
+    /// (its own doc — `AOIDE_SECRETS_SOCKET` is pinned to a guaranteed-
+    /// absent path), but this test makes the CONTRACT explicit — `add`
+    /// reports `path: "direct"` in its `Outcome::data`, not merely "it
+    /// worked somehow".
+    #[test]
+    fn add_falls_back_to_the_direct_write_path_and_reports_it_when_no_socket_is_listening() {
+        with_secrets_home("fallback-reports-direct", |_home| {
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "pass"), ("key", "x")]);
+            let out = handle_secrets_add(&add);
+            assert_eq!(out.status, Status::Ok, "{out:?}");
+            assert_eq!(out.data, Some(json!({"path": "direct"})), "{out:?}");
+        });
+    }
+
+    /// Task #79 item 6a/1 (broker path taken when the daemon IS listening):
+    /// a REAL `broker::serve` bound to a scratch home + socket (the exact
+    /// pattern `tests/e2e.rs` already establishes for a real broker), with
+    /// `AOIDE_SECRETS_SOCKET` pointed at it and `AOIDE_SECRETS_HOME` left
+    /// somewhere ELSE entirely — proving the mutation landed via the
+    /// SOCKET (the broker's own home), not a direct write that happened to
+    /// share a path by coincidence. A real socket connection in-process
+    /// reports THIS test process's own euid on both ends, which is exactly
+    /// `broker::admin_gate`'s happy path (same reasoning as `broker.rs`'s
+    /// own `admin_add_over_a_real_socket_connection_round_trips_into_
+    /// policy_json`).
+    #[test]
+    fn add_over_a_real_broker_socket_takes_the_broker_path_and_lands_in_the_brokers_own_home() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_home = std::env::var("AOIDE_SECRETS_HOME").ok();
+        let saved_socket = std::env::var("AOIDE_SECRETS_SOCKET").ok();
+
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos();
+        let broker_home = std::path::PathBuf::from(format!("/tmp/av-cmdadmin-home-{}-{nanos}", std::process::id()));
+        let socket_path = std::path::PathBuf::from(format!("/tmp/av-cmdadmin-{}-{nanos}.sock", std::process::id()));
+        std::fs::create_dir_all(&broker_home).unwrap();
+
+        let home_for_thread = broker_home.clone();
+        let sock_for_thread = socket_path.clone();
+        let _broker_thread = std::thread::spawn(move || {
+            let _ = crate::broker::serve(&home_for_thread, &sock_for_thread);
+        });
+        let mut connected = false;
+        for _ in 0..50 {
+            if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+                connected = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(connected, "broker did not bind {} in time", socket_path.display());
+
+        std::env::set_var("AOIDE_SECRETS_SOCKET", &socket_path);
+        std::env::remove_var("AOIDE_SECRETS_HOME");
+
+        let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "scratch"), ("key", "k")]);
+        let out = handle_secrets_add(&add);
+        assert_eq!(out.status, Status::Ok, "{out:?}");
+        assert_eq!(out.data, Some(json!({"path": "broker"})), "{out:?}");
+
+        let policies = store::load_policies(&broker_home).unwrap();
+        assert_eq!(policies.len(), 1, "the new policy must have landed in the BROKER's own home");
+        assert_eq!(policies[0].name, "t");
+
+        match saved_socket {
+            Some(v) => std::env::set_var("AOIDE_SECRETS_SOCKET", v),
+            None => std::env::remove_var("AOIDE_SECRETS_SOCKET"),
+        }
+        match saved_home {
+            Some(v) => std::env::set_var("AOIDE_SECRETS_HOME", v),
+            None => std::env::remove_var("AOIDE_SECRETS_HOME"),
+        }
+        std::fs::remove_dir_all(&broker_home).ok();
+        std::fs::remove_file(&socket_path).ok();
+        // `broker::serve` loops forever accepting connections — detached
+        // rather than joined, the same posture `tests/e2e.rs`'s own broker
+        // threads already take (module doc precedent there).
     }
 
     /// Bounce-fix item 2's own discipline (P-V2 review), extended to

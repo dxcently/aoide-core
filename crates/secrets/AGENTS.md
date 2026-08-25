@@ -133,6 +133,54 @@
   process is claiming); don't wire `SO_PEERCRED`'s uid into
   `automation.consumers`/policy `consumers[]` matching as if it were an
   authenticated consumer name — it isn't one.
+- **The broker socket is the single writer for every admin CRUD mutation
+  when a daemon is listening (task #79, built on #73's peer-cred gate) —
+  direct-write-to-`policy.json` survives ONLY as the no-daemon fallback.**
+  `crate::admin` is the ONE module holding every verb's actual
+  read-modify-write logic (`add`/`rm`/`grant`/`revoke`/`set_totp`/
+  `expose`/`automate_toggle`/`automate_consumer`/`migrate`) — typed
+  arguments in, an `AdminOutcome{message,changed}` or `Err(String)` out, no
+  `Invocation`, no `Outcome`, no wire `Value`, so the IDENTICAL function
+  serves two callers with two different gates: `commands.rs`'s direct-write
+  fallback (reached only after `require_admin_identity` already passed) and
+  `broker::handle_admin` (reached only after `admin_gate` already passed).
+  `commands.rs`'s admin verbs never read/write `policy.json` themselves any
+  more — `admin_dispatch` is the ONE place that decides which path ran: it
+  sends `{"op":"admin","verb":...}` over `client::admin_request` FIRST, and
+  falls back to `require_admin_identity` + a direct `crate::admin` call
+  ONLY on `client::AdminError::NoSocket` (`ENOENT`/`ConnectionRefused` —
+  nothing listening). **Every other socket error is `AdminError::Other`
+  and is reported outright, NEVER silently downgraded into the fallback**
+  — this includes the broker's own authoritative `{"ok":false}` denial (a
+  bad admin-identity peer uid, "no policy for secret x", a poisoned
+  `policy.json`): a live-but-sick daemon, or a daemon that correctly
+  refused the request, must never be bypassed into a direct write racing
+  underneath it. Don't add a verb whose direct-write fallback re-derives
+  its own mutation logic instead of calling `crate::admin` — the whole
+  point of this split is that ONE function's behavior is what BOTH paths
+  give a caller, never two implementations that could drift.
+  `broker::admin_gate` is the socket-side identity gate: an `{op:"admin"}`
+  request is accepted ONLY when the CONNECTING peer's own uid is the
+  broker's own effective uid — reusing `home::admin_identity_error`'s exact
+  wording (root's "plain `sudo` runs as root" clause included) by treating
+  the peer's uid as that function's "process euid" argument and the
+  broker's own euid as its "home owner" argument, so a refusal here teaches
+  the IDENTICAL fix the direct path already teaches, never a second
+  wording for the same underlying check aimed at two different processes.
+  An unidentified connection is refused outright, the SAME fail-closed
+  default `dismiss_authorized` holds (invariant above) — there is no uid to
+  compare, so the safe answer is refusal. Every admin mutation — either
+  path — reports WHICH path ran via `Outcome::data`'s `{"path":"broker"}`/
+  `{"path":"direct"}` (`admin_dispatch`'s own job; the broker's OWN audit
+  line, `broker::audit_admin`, is a SEPARATE generic name-only line for the
+  socket path specifically, since that path has no other audit mechanism
+  at all — the direct-write fallback still gets `commands.rs`'s
+  pre-existing generic per-command dispatch audit, plus `migrate`'s own
+  richer `audit_migrate` line, both unchanged by this phase). Don't drop
+  the `path` field from a new admin verb's `Outcome` "since it's obvious
+  which one ran" — idempotency discipline (house rule 2) means reporting
+  exactly what happened, and which of two genuinely different write paths
+  executed is part of that.
 - **Clock-as-parameter, everywhere.** Every function in `totp`/`replay`
   takes `unix_time`/`timestep`/cutoff as an explicit argument. Nothing in
   `src/` calls `SystemTime::now()` — grep for it before merging a change
@@ -634,25 +682,44 @@
   own "the only backend IMPLEMENTATIONS this crate supports" stance) —
   this function must never derive a path for a backend the crate doesn't
   actually seed and know the on-disk shape of.
-- **`secrets migrate` is euid-guarded exactly like `add`/`rm`/`grant`, and
-  runs with NO cross-process lock against a concurrently-running broker
-  daemon (P-G2, task #72, KNOWN LIMITATION, deliberate, not fixed here).**
-  `require_admin_identity(cmd, "migrate")` gates it the same way as every
-  other CRUD-shaped admin verb; but because migrate is a direct-home
-  op — a separate OS process from `secrets serve`, never the daemon itself
-  — it CANNOT take the daemon's own in-process `broker::put_lock` (a
-  `static Mutex` is per-process memory; a second process has no way to
-  observe or wait on it). A `secrets migrate` racing a live `secrets
-  put`/`secrets exec` against the SAME secret via the running daemon is an
-  unprotected TOCTOU window, the same class of gap `store::save_policies`'s
-  own module doc already accepts for every other admin CRUD verb here
-  ("this phase does not lock against a concurrent admin write racing a
-  resolve read"). Don't paper over this by acquiring `broker::put_lock`
-  from `commands.rs` "for symmetry" — doing so would protect nothing (two
-  different `Mutex` instances in two different processes) while implying a
-  guarantee that doesn't exist. Closing this for real needs a real
+- **Every admin CRUD verb — `add`/`rm`/`grant`/`revoke`/`set-totp`/
+  `automate`/`expose`/`migrate` — routes through the LIVE BROKER FIRST
+  (task #79), executed inside the SAME `broker::put_lock` critical section
+  a `put` already runs under: one process, one writer, one lock guarding
+  every `policy.json`/backend-store read-modify-write this crate makes.**
+  `commands.rs`'s own handlers (`admin_dispatch`) send an
+  `{"op":"admin","verb":...}` request over the socket FIRST; `broker::
+  handle_admin` peer-cred-gates it (`admin_gate`, ONLY the broker's own
+  effective uid — root and an unidentified connection both refused, the
+  identical taught error `home::admin_identity_error` already gives on the
+  direct path, since this reuses that exact function rather than a second
+  wording) and runs the mutation via `crate::admin`'s typed functions
+  (`add`/`rm`/`grant`/`revoke`/`set_totp`/`expose`/`automate_toggle`/
+  `automate_consumer`/`migrate` — the SAME logic the direct-write path
+  calls, never duplicated) inside `put_lock`. This is what closes the
+  TOCTOU the daemon-running case used to have: a `secrets migrate` (or any
+  other admin verb) racing a live `secrets put`/`secrets exec` against the
+  same secret now serializes behind the identical lock, exactly the way two
+  concurrent `put`s already did before this phase.
+  **KNOWN LIMITATION, narrowed by task #79, deliberate, not fixed here:**
+  the direct-write path (`crate::admin`'s functions called straight from
+  `commands.rs`, no socket, no lock) is reached ONLY as a fallback, and
+  ONLY on `AdminError::NoSocket` (`client::admin_request`'s own doc —
+  `ENOENT`/`ConnectionRefused`, nothing listening; any OTHER socket error
+  is reported outright, never silently downgraded into this fallback, so a
+  live-but-sick daemon can never be bypassed into a TOCTOU). With NO daemon
+  running at all, two CONCURRENT direct-write admin processes racing each
+  other against the same secret still have no cross-process lock to
+  serialize behind — a `static Mutex` is per-process memory, and there is
+  no daemon process for either of them to route through in the first
+  place. This is now the ENTIRE remaining gap (was: any admin verb racing
+  the live daemon at all); closing it for real needs a genuine
   cross-process primitive (a file lock) this crate does not have today —
-  out of scope here, flagged for whoever picks it up next.
+  out of scope here, flagged for whoever picks it up next. Don't paper over
+  it by acquiring `broker::put_lock` from `commands.rs`'s own fallback
+  branch "for symmetry" — there is no daemon process alive to hold that
+  lock's state, so doing so would protect nothing while implying a
+  guarantee that doesn't exist.
 - **Both built-in `set` templates are ATOMIC — `.tmp`-then-`mv`, matching
   `storage::fs::atomic_write`'s temp-then-rename shape (task #82).**
   `FILE_BACKEND_SET`/`AGE_BACKEND_SET` write to a `.tmp`/`.age.tmp` sibling

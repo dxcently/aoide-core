@@ -113,6 +113,7 @@
 //! resolve reply and the put reply are hand-built `serde_json::Value`,
 //! never a struct); NO CACHE EVER; and ONE VALUE PER SECRET.
 
+pub mod admin;
 pub mod backend;
 pub mod base32;
 pub mod broker;
