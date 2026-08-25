@@ -29,15 +29,13 @@
   `File::create`-then-`chmod`), so a `rename(2)` onto the live path never
   passes through a wider-mode window, mirroring `aoide-secrets/src/
   store.rs`'s `save_policies`/`save_totp_secret` (secure the temp BEFORE
-  the rename, never the final path after it). **A review bounce caught
-  the wrong ordering once already** (an earlier revision created the temp
-  at the default mode and `chmod`ed the FINAL path only after the rename,
-  leaving a real private-key file briefly world/group-readable under this
-  box's 022 umask) — don't reintroduce a `File::create` + post-rename
-  `set_permissions` pair for a new sensitive file "since it worked for
-  `atomic_write_bytes`"; that shape is exactly the defect this function
-  exists to close, and `fs::tests::the_private_temp_is_created_already_0600_before_any_rename`
-  pins the fix directly against the temp, not just the end state.
+  the rename, never the final path after it). Never write a sensitive
+  file as a `File::create` + post-rename `set_permissions` pair — the
+  temp inherits the umask-derived default mode and the live path sits
+  world/group-readable until the `chmod` lands; that window is exactly
+  what this function exists to close, and
+  `fs::tests::the_private_temp_is_created_already_0600_before_any_rename`
+  pins the invariant directly against the temp, not just the end state.
 - **`fs::secure_private_dir` locks the DIRECTORY a sensitive file lives
   in, not only the file** (`identity.rs`'s `mint()` calls it on
   `identity_dir()` before writing anything into it) — a `0600` file inside
