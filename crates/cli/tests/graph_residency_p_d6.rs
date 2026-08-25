@@ -16,7 +16,7 @@
 
 use aoide::dispatch::{dispatch, registry};
 use aoide_protocol::{Door, Invocation};
-use aoide_server::daemon::serve_daemon;
+use aoide_server::daemon::{run_loop, serve_daemon};
 use std::collections::BTreeMap;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -63,6 +63,45 @@ fn start_daemon(tag: &str) -> PathBuf {
     let probe = connect_retrying(&socket_path);
     drop(probe);
     socket_path
+}
+
+/// Like [`start_daemon`] but the RESIDENT `run_loop` (not the bare
+/// `serve_daemon` accept-loop-only entry point) — the tick loop, and
+/// therefore the #69 hand-edit watcher's `sweep`/feed-append, only exist on
+/// this path (task #92's own regression tests need to observe the feed a
+/// tick actually writes to, which `serve_daemon` alone never produces).
+/// Callers MUST set `$AOIDE_STAGE_DIR` before calling this — `run_loop`
+/// resolves `stage_roster()` (and therefore the watcher's startup baseline)
+/// on its own thread before the accept loop even starts, but that thread
+/// shares this process's env, so the ordering that matters is "env var set
+/// on any thread before `run_loop`'s own resolve line runs," which setting
+/// it before spawning trivially guarantees. Returns `(socket_path,
+/// events_path)`.
+fn start_run_loop(tag: &str) -> (PathBuf, PathBuf) {
+    let socket_path = unique_dir(tag).with_extension("sock");
+    let events_path = unique_dir(&format!("{tag}-events")).with_extension("jsonl");
+    let log_path = unique_dir(&format!("{tag}-log"));
+    let sp = socket_path.clone();
+    let ep = events_path.clone();
+    std::thread::spawn(move || {
+        let _ = run_loop(sp, ep, log_path, registry(), dispatch);
+    });
+    let probe = connect_retrying(&socket_path);
+    drop(probe);
+    (socket_path, events_path)
+}
+
+/// Read every JSON line currently in the daemon's own events feed whose
+/// `kind` is `hand-edit` and whose `payload.file` is `file_name` — used by
+/// the task #92 tests below to assert presence/absence without caring about
+/// any other line the feed carries.
+fn hand_edit_events_for(events_path: &Path, file_name: &str) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(events_path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|rec| rec["kind"] == "hand-edit" && rec["payload"]["file"] == file_name)
+        .collect()
 }
 
 /// Block until the wall clock crosses a fresh second boundary. Every stage
@@ -252,4 +291,75 @@ fn graph_reap_over_the_socket_reaps_a_dead_pid_session() {
 
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_file(&daemon_socket).ok();
+}
+
+/// Task #92 regression: `graph session start`, ROUTED through a resident
+/// daemon's `{"op":"dispatch"}`, must never make the #69 hand-edit watcher
+/// (`aoide-server`'s `producers::HandEditWatcher`, ticked by `run_loop`)
+/// report the daemon's OWN write back to itself as a `hand-edit` event on a
+/// later tick — this was the live defect: the dispatched handler wrote
+/// `sessions.json` on `handle_conn`'s own connection thread while the
+/// watcher's baseline only ever moved on the SEPARATE tick thread, so the
+/// very next sweep saw a changed mtime nobody had told it about. Waits
+/// across several ~1s tick cycles (long enough that the pre-fix daemon
+/// reliably fired the false event by now) before asserting the feed is
+/// clean, then proves the watcher itself is still alive by making a truly
+/// out-of-band edit (bypassing the daemon entirely) and confirming THAT one
+/// still fires on the next tick — the fix re-baselines once per dispatch,
+/// it does not blind the watcher going forward.
+#[test]
+fn dispatched_session_start_produces_no_false_hand_edit_event() {
+    let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _saver = aoide_test_support::EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_DAEMON_SOCKET", "XDG_RUNTIME_DIR"]);
+
+    let dir = unique_dir("hand-edit-stage");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Set BEFORE starting the daemon (`start_run_loop`'s own doc): its
+    // `stage_roster()`-seeded baseline must resolve against THIS directory,
+    // not whatever `AOIDE_STAGE_DIR` happened to hold before.
+    std::env::set_var("AOIDE_STAGE_DIR", &dir);
+
+    let (daemon_socket, events_path) = start_run_loop("hand-edit");
+    std::env::set_var("AOIDE_DAEMON_SOCKET", &daemon_socket);
+
+    // Routed `graph session start` — the write happens on the daemon's own
+    // accept thread (same as `routed_session_start_...` above), exactly the
+    // write task #92 mis-reported.
+    let outcome = dispatch(&session_start_inv("pd92-hand-edit"));
+    assert_eq!(outcome.status, aoide_protocol::output::Status::Ok, "{outcome:?}");
+    assert!(dir.join("sessions.json").exists(), "the routed dispatch must have written sessions.json");
+
+    // Several tick cycles' worth of headroom (~1s cadence) — long enough
+    // that a stale-baseline false positive would reliably have landed in
+    // the feed by now.
+    std::thread::sleep(Duration::from_millis(3500));
+
+    let false_positives = hand_edit_events_for(&events_path, "sessions.json");
+    assert!(
+        false_positives.is_empty(),
+        "the daemon's own dispatched write must never be reported as a hand edit: {false_positives:?}"
+    );
+
+    // A GENUINE out-of-band edit — made directly on disk, never through the
+    // daemon — must still fire on the next tick: the fix re-baselines after
+    // a dispatch, it doesn't suppress the watcher permanently.
+    let sessions_path = dir.join("sessions.json");
+    let mut sf: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&sessions_path).unwrap()).unwrap();
+    sf["handEdited"] = serde_json::json!(true);
+    std::fs::write(&sessions_path, serde_json::to_vec_pretty(&sf).unwrap()).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut fired = false;
+    while Instant::now() < deadline {
+        if !hand_edit_events_for(&events_path, "sessions.json").is_empty() {
+            fired = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(fired, "a genuine out-of-band edit made after the dispatch must still fire a hand-edit event");
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_file(&daemon_socket).ok();
+    std::fs::remove_file(&events_path).ok();
 }

@@ -61,6 +61,19 @@
   allowlist a review-blocking violation; a new per-verb policy need is
   proved by a failing test against the EXISTING handler's `inv.door`
   branch, never by a new table in this crate.
+- **`producers::HandEditWatcher` is ONE shared `Arc<Mutex<..>>` instance
+  (`daemon::SharedHandEditWatcher`), not tick-private (task #92).** A
+  dispatched session verb writes stage files on `handle_conn`'s own
+  connection thread, never the tick thread, so `daemon::run_loop` hands the
+  SAME watcher instance to `accept_loop`/`handle_conn` it ticks itself;
+  `daemon::rebaseline_stage_roster` re-baselines the WHOLE roster after
+  every completed `dispatch` op, unconditionally — never a per-verb "which
+  files did this write" table (the same drift trap the door-policy
+  invariant above already forbids). Don't reintroduce a tick-private
+  `HandEditWatcher::new(..)` inside `run_loop`'s loop body or inside
+  `accept_loop`/`handle_conn` — a second instance means two baselines that
+  can each independently go stale against the other's writes, reopening
+  task #92 by a different door.
 - **Request-line reads on the daemon socket go through
   `daemon::read_capped_line` (a hand-rolled `fill_buf`/`consume` loop),
   never `BufReader::read_line` (P-D4, closing a P-D2-flagged gap).**

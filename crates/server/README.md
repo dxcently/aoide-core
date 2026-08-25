@@ -57,7 +57,16 @@ the inbound half of the two-door contract (the outbound half is
   (the #69 hand-edit watcher) — detection and narration only, this daemon
   never reverts a hand edit. `note_own_write` is the seam P-D6's own
   tick-reconcile/reap writes (below) fold into so they are never reported
-  back as a hand edit.
+  back as a hand edit. **The watcher itself is a single `Arc<Mutex<
+  HandEditWatcher>>` (task #92), shared between the tick thread and
+  `handle_conn`'s connection threads** — not tick-private: a dispatched
+  session verb (`graph session start/end`/etc., `{"op":"dispatch"}`) writes
+  stage files on ITS OWN connection thread, not the tick's, so
+  `rebaseline_stage_roster` re-baselines the WHOLE roster after every
+  completed dispatch (roster-wide, not a per-verb "which files did this
+  write" table) before that connection's reply goes out — closing the
+  window where the daemon's own routed write got reported back to itself as
+  a hand edit one tick later.
 - **Graph residency (P-D6, `docs/architecture/AOIDED.md`'s "L4")** —
   `run_loop`'s tick, after narrating the hand-edit sweep above, does two
   more things every iteration: `reconcile_graph_projection(changed_files)`

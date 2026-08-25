@@ -103,11 +103,39 @@
 //! (the six broker-owned stage files) and appends one `class:"audit",
 //! kind:"hand-edit"` line per file whose `(mtime, len)` changed since the
 //! last tick — detection and narration only, this daemon never reverts a
-//! hand edit. No daemon-side write path into any of those six files exists
-//! yet this phase (P-D6's graph residency is the first one), so
-//! `HandEditWatcher::note_own_write` currently has no live caller — it is
-//! proved by that struct's own tests, the seam P-D6 wires into rather than
-//! a signature this run_loop needs to grow again later.
+//! hand edit.
+//!
+//! **The watcher is shared with the `dispatch` door, not tick-private
+//! (task #92 fix).** A dispatched session verb
+//! (`graph session start/end`/etc., arriving over `{"op":"dispatch"}`) runs
+//! the SAME `do_session_*` code the CLI runs and writes stage files exactly
+//! like the tick's own `reconcile_graph_projection`/`run_internal_reap`
+//! calls do — but on `handle_conn`'s own connection thread, not the tick
+//! thread, so it used to leave the watcher's baseline stale and the VERY
+//! NEXT tick reported the daemon's own write back to itself as a hand edit.
+//! [`run_loop`] now constructs the watcher once as a
+//! [`SharedHandEditWatcher`] (`Arc<Mutex<HandEditWatcher>>`) and hands the
+//! SAME instance to `accept_loop`/`handle_conn`; after every dispatched
+//! invocation (module doc's "Framing" `dispatch` op) — success or failure,
+//! regardless of which verb ran — [`rebaseline_stage_roster`] re-baselines
+//! the WHOLE roster via [`crate::producers::HandEditWatcher::note_own_write`],
+//! the same call the tick's own reconcile fold already made. This is
+//! deliberately roster-wide rather than a per-verb "which files did this
+//! path write" table (a drift trap this workstream already forbids
+//! elsewhere) — stat-ing six files is cheap, and a dispatch that wrote
+//! nothing just re-baselines to the state that was already there.
+//! `serve_daemon` (the test-only, tick-less entry point) constructs its own
+//! private watcher the same way so `handle_conn`'s dispatch path never
+//! special-cases which caller wired it up.
+//!
+//! **Known race, stated honestly rather than engineered around:** baselining
+//! AFTER the dispatched write closes the window this bug lived in, but a
+//! genuine out-of-band hand edit landing in the same instant as a dispatch
+//! — between the handler's write and this re-baseline call — is folded into
+//! the new baseline and missed for that one transition, exactly like the
+//! tick's own `note_own_write` calls already accept for
+//! `reconcile_graph_projection`/`run_internal_reap`. Out of scope: the next
+//! genuine hand edit still fires on the following tick, same as always.
 //!
 //! ## Graph residency: reconcile + reap in the tick (P-D6)
 //!
@@ -158,6 +186,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Re-exported so a caller of this module never needs `crate::mcp::` too —
@@ -277,6 +306,28 @@ fn stage_roster() -> Vec<PathBuf> {
         aoide_conduct::graph::pending_path(),
         aoide_conduct::herald::herald_path(),
     ]
+}
+
+/// The tick's own [`crate::producers::HandEditWatcher`], shared with the
+/// `dispatch` door (task #92 fix, module doc's "The tick's two producers")
+/// so a dispatched invocation's stage-file writes can re-baseline the same
+/// instance the tick sweeps, not a second, disconnected watcher.
+type SharedHandEditWatcher = Arc<Mutex<crate::producers::HandEditWatcher>>;
+
+/// Re-baseline every [`stage_roster`] file against its CURRENT on-disk state
+/// (module doc's task #92 note) — called once after every completed
+/// `dispatch` op, regardless of outcome or which verb ran, so the daemon's
+/// own writes are folded into the watcher's baseline before the next tick's
+/// [`crate::producers::HandEditWatcher::sweep`] runs. Deliberately
+/// roster-wide rather than a per-verb "which files did this write" table:
+/// six stats is cheap, and this is the exact call
+/// [`reconcile_graph_projection`]'s own caller already makes for the tick's
+/// two internal writers.
+fn rebaseline_stage_roster(watcher: &SharedHandEditWatcher) {
+    let Ok(mut w) = watcher.lock() else { return };
+    for path in stage_roster() {
+        w.note_own_write(&path);
+    }
 }
 
 /// A synthetic, in-process-only `Invocation` for a command this daemon runs
@@ -580,17 +631,29 @@ pub fn serve_daemon(
     dispatch: DispatchFn,
 ) -> std::io::Result<()> {
     let listener = bind_socket(socket_path)?;
-    accept_loop(listener, events_path.to_path_buf(), registry, dispatch);
+    // A private watcher — this entry point never ticks, so nothing ever
+    // sweeps it, but `handle_conn`'s dispatch path re-baselines it the same
+    // way regardless of caller (module doc's task #92 note): no
+    // caller-conditional branch in `handle_conn` itself.
+    let watcher: SharedHandEditWatcher = Arc::new(Mutex::new(crate::producers::HandEditWatcher::new(stage_roster())));
+    accept_loop(listener, events_path.to_path_buf(), registry, dispatch, watcher);
     Ok(())
 }
 
-fn accept_loop(listener: UnixListener, events_path: PathBuf, registry: &'static Registry, dispatch: DispatchFn) {
+fn accept_loop(
+    listener: UnixListener,
+    events_path: PathBuf,
+    registry: &'static Registry,
+    dispatch: DispatchFn,
+    watcher: SharedHandEditWatcher,
+) {
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
                 let events_path = events_path.clone();
-                if let Err(e) =
-                    std::thread::Builder::new().spawn(move || handle_conn(&events_path, stream, registry, dispatch))
+                let watcher = Arc::clone(&watcher);
+                if let Err(e) = std::thread::Builder::new()
+                    .spawn(move || handle_conn(&events_path, stream, registry, dispatch, watcher))
                 {
                     eprintln!("[aoided] could not spawn a connection thread (dropping this connection): {e}");
                 }
@@ -610,7 +673,13 @@ fn accept_loop(listener: UnixListener, events_path: PathBuf, registry: &'static 
 /// JSON requests and reply to each. A read error (dropped connection) ends
 /// only this connection — nothing here can unwind into `accept_loop` or any
 /// other connection's own thread (module doc's "Framing").
-fn handle_conn(events_path: &Path, stream: UnixStream, registry: &'static Registry, dispatch: DispatchFn) {
+fn handle_conn(
+    events_path: &Path,
+    stream: UnixStream,
+    registry: &'static Registry,
+    dispatch: DispatchFn,
+    watcher: SharedHandEditWatcher,
+) {
     // `registry` has no caller yet — no op resolves a tool name against it
     // the way MCP's `tools/call` does (module doc's "Framing": `dispatch`
     // takes `path` literally). Kept as a real parameter, not dropped at the
@@ -685,6 +754,14 @@ fn handle_conn(events_path: &Path, stream: UnixStream, registry: &'static Regist
                 match invocation_from_dispatch_request(&req) {
                     Ok(inv) => {
                         let outcome = dispatch(&inv);
+                        // task #92: this handler may have just written stage
+                        // files via the SAME `do_session_*` code the CLI
+                        // runs (module doc) — re-baseline the shared watcher
+                        // BEFORE replying so the next tick's sweep never
+                        // reports this write back as a hand edit. Runs
+                        // regardless of outcome/verb (module doc: roster-wide,
+                        // not a per-verb table).
+                        rebaseline_stage_roster(&watcher);
                         if write_json_line(&mut writer, &json!({"outcome": outcome})).is_err() {
                             return;
                         }
@@ -811,9 +888,18 @@ pub fn run_loop(
         "payload": {},
     }));
 
+    // Shared with `accept_loop`/`handle_conn`'s `dispatch` op (task #92,
+    // module doc's "The tick's two producers"): ONE watcher instance, not a
+    // tick-private one and a dispatch-private one, so a dispatched
+    // invocation's re-baseline (`rebaseline_stage_roster`) and the tick's
+    // own `sweep` observe the same baseline state.
+    let hand_edit_watcher: SharedHandEditWatcher =
+        Arc::new(Mutex::new(crate::producers::HandEditWatcher::new(stage_roster())));
+
     let accept_events_path = events_path.clone();
+    let accept_watcher = Arc::clone(&hand_edit_watcher);
     std::thread::Builder::new()
-        .spawn(move || accept_loop(listener, accept_events_path, registry, dispatch))?;
+        .spawn(move || accept_loop(listener, accept_events_path, registry, dispatch, accept_watcher))?;
 
     // P-D8 boot-time auto-resume (module doc's "Open knobs" — decided: daemon
     // start). Runs ONCE here, at `run_loop` entry — never inside the tick
@@ -826,7 +912,6 @@ pub fn run_loop(
     let secrets_socket = aoide_secrets::socket::socket_path();
     let secrets_events = aoide_secrets::socket::events_path(&secrets_socket);
     let mut secrets_mirror = crate::producers::SecretsMirror::new(secrets_events);
-    let mut hand_edit_watcher = crate::producers::HandEditWatcher::new(stage_roster());
     // P-D6 graph residency (module doc's "Graph residency"): a plain tick
     // counter, not a second timer — `run_loop` already sleeps ~1s per
     // iteration, so `REAP_EVERY_TICKS` iterations is ~12s, matching the
@@ -834,7 +919,12 @@ pub fn run_loop(
     let mut ticks: u64 = 0;
     loop {
         secrets_mirror.tick(&feed);
-        let hand_edits = hand_edit_watcher.sweep();
+        // A poisoned lock (only possible if a dispatch-side re-baseline ever
+        // panicked mid-lock) is not this loop's problem to fix — fall back
+        // to an empty sweep rather than `continue`, so the tick still hits
+        // its sleep below instead of busy-spinning.
+        let hand_edits =
+            hand_edit_watcher.lock().map(|mut w| w.sweep()).unwrap_or_default();
         for file in &hand_edits {
             feed.append(&json!({
                 "v": 0,
@@ -846,7 +936,9 @@ pub fn run_loop(
             }));
         }
         if let Some(graph_path) = reconcile_graph_projection(&hand_edits) {
-            hand_edit_watcher.note_own_write(&graph_path);
+            if let Ok(mut w) = hand_edit_watcher.lock() {
+                w.note_own_write(&graph_path);
+            }
         }
 
         ticks += 1;
@@ -855,9 +947,11 @@ pub fn run_loop(
             // Re-baseline all three graph-residency files unconditionally —
             // idempotent on a quiet pass (module doc's "Graph residency" /
             // `run_internal_reap`'s own doc).
-            hand_edit_watcher.note_own_write(&aoide_storage::stage::sessions_path());
-            hand_edit_watcher.note_own_write(&aoide_storage::stage::hooks_path());
-            hand_edit_watcher.note_own_write(&aoide_storage::stage::graph_path());
+            if let Ok(mut w) = hand_edit_watcher.lock() {
+                w.note_own_write(&aoide_storage::stage::sessions_path());
+                w.note_own_write(&aoide_storage::stage::hooks_path());
+                w.note_own_write(&aoide_storage::stage::graph_path());
+            }
         }
 
         std::thread::sleep(Duration::from_secs(1));
