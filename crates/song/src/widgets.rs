@@ -114,9 +114,13 @@ pub struct RegistrySyncOk {
 /// Opt-in only, read once per call, and validated exactly like the real `nix
 /// eval` payload below (never a default/empty value on missing/malformed
 /// input) — this is an alternate SOURCE for the same validated shape, not a
-/// fallback that lets a broken/missing `nix` proceed quietly. A deployed
-/// system that never sets this variable is byte-for-byte the pre-existing
-/// code path.
+/// fallback that lets a broken/missing `nix` proceed quietly. `#[cfg(test)]`
+/// on both this constant and its read in [`eval_songbook`] compiles the seam
+/// out of every non-test build: a deployed binary contains no read of this
+/// variable, so its eval can never be redirected through the environment.
+/// All setters live in this crate's own `mod tests` (`commands/rice.rs`),
+/// the same compilation unit, so the plain `cfg(test)` gate reaches them.
+#[cfg(test)]
 pub(crate) const SONGBOOK_EVAL_FIXTURE_VAR: &str = "AOIDE_SONGBOOK_EVAL_FIXTURE";
 
 /// One `nix eval --json` shell-out against the `songbookManifest` flake
@@ -142,6 +146,7 @@ pub(crate) const SONGBOOK_EVAL_FIXTURE_VAR: &str = "AOIDE_SONGBOOK_EVAL_FIXTURE"
 /// [`SONGBOOK_EVAL_FIXTURE_VAR`] short-circuits this whole shell-out for
 /// tests — see that constant's own doc.
 fn eval_songbook() -> Result<SongbookEval, WidgetSyncErr> {
+    #[cfg(test)]
     if let Ok(path) = std::env::var(SONGBOOK_EVAL_FIXTURE_VAR) {
         let bytes = std::fs::read(&path).map_err(|e| WidgetSyncErr {
             error: format!(
