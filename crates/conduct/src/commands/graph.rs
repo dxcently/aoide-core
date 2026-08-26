@@ -143,6 +143,7 @@ pub fn register(r: &mut Registry) {
             flag!("prompt", "string", "A first turn to inject once the session registers (skipped, honestly reported, if it never does)."),
             flag!("windowed", "bool", "Open a real terminal (from $AOIDE_TERMINAL, a whitespace-split argv with a `{cmd}` placeholder) instead of a detached headless child. A bare `{cmd}` splices the conducted argv as separate arguments (`kitty -e {cmd}`); a quote-wrapped `'{cmd}'` joins it shell-quoted into one word for `sh -c` templates (`foot sh -c '{cmd}'`). Taught errors when unset, or when no display is present."),
             flag!("cwd", "string", "Working directory for the spawned child (default: this process's own cwd) — for --windowed, the terminal emulator's own cwd, which its own shell inherits."),
+            flag!("carry", "bool", "Mark the spawned session durable in state/carry.json once it registers (no-op if it never does) — the same mark `graph session carry on` sets, so this project's whole carried set can later be resurrected together."),
         ],
         gated: false,
         implemented: true,

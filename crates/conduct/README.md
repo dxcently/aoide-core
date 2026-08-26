@@ -19,7 +19,7 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   (`STDIN_PAYLOAD_FLAG`) rather than growing the daemon wire a stdin
   channel — the daemon-side handler reads that flag first and never
   touches its own stdin.
-- `graph/spawn.rs` — `graph spawn [--windowed]` (P-D7,
+- `graph/spawn.rs` — `graph spawn [--windowed] [--carry]` (P-D7,
   `docs/architecture/AOIDED.md`'s "L5"): the child is always `aoide conduct
   -- <agent cmd>`, built by the ONE shared `build_conduct_args` (`--headless`
   aside) — headless by default (detaches, re-execs this same binary), or,
@@ -32,7 +32,10 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   `foot sh -c '{cmd}'`) — pure, unit-tested, never a real terminal spawned in
   a test. Taught errors, no process ever touched: no `$AOIDE_TERMINAL` set,
   or neither `$WAYLAND_DISPLAY` nor `$DISPLAY` present (a headless host,
-  steered back to plain `graph spawn`).
+  steered back to plain `graph spawn`). `--carry` (P-C3, durable-sessions
+  plan) marks the spawned id in `state/carry.json` once — and only once —
+  the registration wait actually succeeds; an id that never registers has no
+  live session behind it, so nothing is marked.
 - `graph/send.rs`'s `graph session hook` stamps `SessionRecord.
   harness_session_id` (P-D7) from the raw hook payload's own `session_id`
   on every event that carries one, mapped-to-an-action or not — see
@@ -70,7 +73,7 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   session's first turn is typed before that session has a `SessionRecord`
   at all, so it can't reach `deliver_local` and files itself instead — see
   `aoide_storage::inbox`'s module doc for the full two-writer reasoning.
-- **The carry mark (P-C2, durable-sessions plan):** `graph/carry.rs`'s
+- **The carry mark (P-C2/P-C3, durable-sessions plan):** `graph/carry.rs`'s
   `session_carry` (`graph session carry on|off [--self | --id <id>]`) is the
   command over `aoide_storage::carry`'s store (`state/carry.json`) — a
   session id marked DURABLE, so a project's whole carried set can later be
@@ -80,7 +83,16 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   L4 dual-writer surface. `--id` targets any session id, live or not — no
   roster lookup gates the write, which is what makes the mark flippable
   post-mortem off a bare ledger id; bare and `--self` both resolve the
-  target from `$AOIDE_SESSION_ID`.
+  target from `$AOIDE_SESSION_ID`. Two more sites touch the same store:
+  `graph spawn --carry` marks at birth (above), and `graph/resurrect.rs`'s
+  `resurrect_one` moves the mark from an old, carried ledger id onto its
+  freshly spawned replacement — new id added, old id dropped, in ONE
+  `save_carry` call, only when the spawn actually reached `Status::Ok` and
+  only when the old id was carried to begin with. The new id is added
+  BEFORE the old one is dropped in the shared in-memory vector, so a crash
+  between that edit and the write leaves the OLD id carried (retryable)
+  rather than neither (silent loss) — the same bias a failed spawn gets
+  deliberately, by never touching the store at all.
 - `reap` — liveness reaping (`aoide graph reap`), sweeping sessions a
   `SIGKILL`'d terminal could never mark `done`. `reap_and_announce` (the
   registered CLI handler) routes through `daemon_dispatch` first like every

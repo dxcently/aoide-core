@@ -22,7 +22,10 @@
 //! reopens in a real terminal, in its original project directory. On success
 //! the new record is stamped `resumedFrom` (`stamp_resumed_from`), naming the
 //! ledger entry's own `sessionId` — `build_graph` projects that as a
-//! `resumed` edge beside `spawned`/`anchors` (CONTRACTS.md §4).
+//! `resumed` edge beside `spawned`/`anchors` (CONTRACTS.md §4). If the old id
+//! was carried (`state/carry.json`, durable-sessions plan P-C3), the mark
+//! transfers onto the new id in the same step — never left on the now-dead
+//! old id, which would double-resurrect on the next sweep.
 //!
 //! Never a hard `Outcome::error` over a per-candidate spawn failure (a
 //! headless host has no `$AOIDE_TERMINAL`/display — `session_spawn`'s own
@@ -124,6 +127,28 @@ fn resurrect_one(
     // false` on a slow terminal open) — never a second wait loop here;
     // `session_spawn` already spent its own registration budget.
     stamp_resumed_from(&new_id, &c.entry.session_id);
+
+    // Carry transfer (P-C3, durable-sessions plan): if the OLD id was
+    // durable, move the mark onto the fresh one rather than leaving it
+    // behind — a mark left on a ledger id would double-resurrect on the next
+    // sweep once P-C4 selects off the carried set. A no-op when the old id
+    // was never carried at all (this resurrect did not originate from the
+    // carried set), so an ordinary `--all`/`--id` revive never starts
+    // carrying sessions nobody marked.
+    //
+    // Both mutations land in ONE in-memory vector before the SINGLE
+    // `save_carry` write below — mark the new id BEFORE dropping the old
+    // one, so a crash between the two in-memory edits and the write is
+    // impossible, and a crash right before the write leaves the OLD id
+    // still carried (retry-safe) rather than neither (silent loss). Also
+    // idempotent: re-running this on an already-transferred pair finds the
+    // old id no longer carried and writes nothing.
+    let mut carried = aoide_storage::carry::load_carry();
+    if aoide_storage::carry::is_carried(&carried, &c.entry.session_id) {
+        aoide_storage::carry::set_carried(&mut carried, &new_id, true);
+        aoide_storage::carry::set_carried(&mut carried, &c.entry.session_id, false);
+        let _ = aoide_storage::carry::save_carry(&carried);
+    }
     changed.push(format!(
         "session {new_id}: resurrected from {} ({}){}",
         c.entry.session_id,
@@ -366,6 +391,150 @@ mod tests {
             failed[0]["reason"].as_str().unwrap().contains("AOIDE_TERMINAL"),
             "reason: {}",
             failed[0]["reason"]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A successful resurrect of a CARRIED old id transfers the mark: the
+    /// new id ends up carried, the old id does not, and an unrelated carried
+    /// id already in the set is left exactly as it was (P-C3, durable-
+    /// sessions plan). `AOIDE_TERMINAL=true` is enough to make the windowed
+    /// spawn itself succeed (`Status::Ok`) without a real terminal — `true`
+    /// exits 0 the instant it's exec'd; the point of this test is the carry
+    /// transfer, not registration, which `resurrect_one` never gates it on.
+    #[test]
+    fn a_successful_resurrect_transfers_the_carry_mark_from_old_to_new() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_STATE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_TERMINAL",
+            "WAYLAND_DISPLAY",
+            "DISPLAY",
+        ]);
+        let (root, proj_path) = setup("resurrect-carry-transfer");
+        std::env::set_var("AOIDE_TERMINAL", "true");
+        std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+
+        set_ledger(&[ledger_entry("ledger-carried", "claude", &proj_path, "2026-08-20T01:00:00Z")]);
+
+        let mut carried = Vec::new();
+        aoide_storage::carry::set_carried(&mut carried, "ledger-carried", true);
+        aoide_storage::carry::set_carried(&mut carried, "unrelated-id", true);
+        aoide_storage::carry::save_carry(&carried).unwrap();
+
+        let out = session_resurrect(&flag_invocation(&["graph", "resurrect"], &[("project", "proj")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.as_ref().unwrap();
+        let resurrected = data["resurrected"].as_array().unwrap();
+        assert_eq!(resurrected.len(), 1, "data: {data}");
+        let new_id = resurrected[0]["sessionId"].as_str().unwrap().to_string();
+
+        let carried = aoide_storage::carry::load_carry();
+        assert!(aoide_storage::carry::is_carried(&carried, &new_id), "the new id must be carried");
+        assert!(
+            !aoide_storage::carry::is_carried(&carried, "ledger-carried"),
+            "the old id must no longer be carried"
+        );
+        assert!(
+            aoide_storage::carry::is_carried(&carried, "unrelated-id"),
+            "an unrelated carried id must be left untouched"
+        );
+        assert_eq!(carried.len(), 2, "exactly one id moves — the set's size is unchanged");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The failure half of the same rule: a spawn that never even reaches
+    /// `Status::Ok` (the headless-host taught error, no `$AOIDE_TERMINAL`)
+    /// must leave the old id carried, so the next sweep retries it.
+    #[test]
+    fn a_failed_resurrect_leaves_the_old_id_carried() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_STATE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_TERMINAL",
+            "WAYLAND_DISPLAY",
+            "DISPLAY",
+        ]);
+        let (root, proj_path) = setup("resurrect-carry-failed");
+        std::env::remove_var("AOIDE_TERMINAL");
+        std::env::remove_var("WAYLAND_DISPLAY");
+        std::env::remove_var("DISPLAY");
+
+        set_ledger(&[ledger_entry("ledger-carried-fail", "claude", &proj_path, "2026-08-20T01:00:00Z")]);
+
+        let mut carried = Vec::new();
+        aoide_storage::carry::set_carried(&mut carried, "ledger-carried-fail", true);
+        aoide_storage::carry::save_carry(&carried).unwrap();
+
+        let out = session_resurrect(&flag_invocation(&["graph", "resurrect"], &[("project", "proj")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(out.data.as_ref().unwrap()["failed"].as_array().unwrap().len(), 1);
+
+        let carried = aoide_storage::carry::load_carry();
+        assert!(
+            aoide_storage::carry::is_carried(&carried, "ledger-carried-fail"),
+            "a failed resurrect must leave the old id carried so the next sweep retries it"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Re-running a resurrect against the same (append-only, so still
+    /// selectable) ledger entry after it has already transferred must not
+    /// carry the SECOND new id or touch the set again — the transfer step
+    /// only fires when the old id is currently carried, and by the second
+    /// call it no longer is.
+    #[test]
+    fn transfer_is_idempotent_when_the_pair_has_already_transferred() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_STATE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_TERMINAL",
+            "WAYLAND_DISPLAY",
+            "DISPLAY",
+        ]);
+        let (root, proj_path) = setup("resurrect-carry-idempotent");
+        std::env::set_var("AOIDE_TERMINAL", "true");
+        std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+
+        set_ledger(&[ledger_entry("ledger-idem", "claude", &proj_path, "2026-08-20T01:00:00Z")]);
+
+        let mut carried = Vec::new();
+        aoide_storage::carry::set_carried(&mut carried, "ledger-idem", true);
+        aoide_storage::carry::save_carry(&carried).unwrap();
+
+        let first = session_resurrect(&flag_invocation(&["graph", "resurrect"], &[("project", "proj")]));
+        assert_eq!(first.status, aoide_protocol::output::Status::Ok, "msg: {}", first.message);
+        let first_new_id =
+            first.data.as_ref().unwrap()["resurrected"][0]["sessionId"].as_str().unwrap().to_string();
+        let after_first = aoide_storage::carry::load_carry();
+        assert!(aoide_storage::carry::is_carried(&after_first, &first_new_id));
+        assert!(!aoide_storage::carry::is_carried(&after_first, "ledger-idem"));
+
+        let second = session_resurrect(&flag_invocation(&["graph", "resurrect"], &[("project", "proj")]));
+        assert_eq!(second.status, aoide_protocol::output::Status::Ok, "msg: {}", second.message);
+        let second_new_id =
+            second.data.as_ref().unwrap()["resurrected"][0]["sessionId"].as_str().unwrap().to_string();
+
+        let after_second = aoide_storage::carry::load_carry();
+        assert!(
+            !aoide_storage::carry::is_carried(&after_second, &second_new_id),
+            "the old id was no longer carried, so nothing transfers to the second new id"
+        );
+        assert_eq!(
+            after_second, after_first,
+            "a re-run transfer on an already-transferred pair changes nothing"
         );
 
         let _ = std::fs::remove_dir_all(&root);
