@@ -772,7 +772,7 @@ pub fn reap(inv: &Invocation) -> Outcome {
     outcome
 }
 
-/// The `graph reap` VERB — [`reap`], plus the desktop toast that says what it
+/// The `graph reap` COMMAND — [`reap`], plus the desktop toast that says what it
 /// did. Registered as the command handler while `reap` itself stays toast-free,
 /// so every in-crate caller (and every unit test) gets the sweep without
 /// spawning notifiers.
