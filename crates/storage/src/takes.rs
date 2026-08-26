@@ -10,7 +10,7 @@
 //! monotone counter, NEVER renumbered and NEVER per-branch; a per-draft
 //! `takes/head.json` cursor names where the NEXT take will hang. Reverting
 //! moves the cursor; the next snapshot parents off wherever it points.
-//! Branching needs no name, no registry, no verb — two takes sharing a
+//! Branching needs no name, no registry, no command — two takes sharing a
 //! parent simply IS a branch, discovered by scanning the directory this
 //! module already reads, never indexed.
 //!

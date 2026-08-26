@@ -56,7 +56,7 @@
 //! own approve already holds, and only THEN calls `upsert_paired_peer`.
 //! `peer pair reject <id>` aborts an outbound entry at EITHER state
 //! ([`OutboundState::AwaitingApproval`] or [`OutboundState::AwaitingConfirm`])
-//! — the ceremony's own missing abort verb, closed without a new command
+//! — the ceremony's own missing abort command, closed without a new command
 //! (golden count unchanged).
 //!
 //! **Ids are NOT the array-position ids `song/stage/pending.json` uses**
@@ -284,7 +284,7 @@ pub struct InboundPairingRequest {
     #[serde(rename = "pubkeyHex")]
     pub pubkey_hex: String,
     /// The requester's self-claimed local nickname (`peer pair request
-    /// <url> --name <n>`, or that verb's own URL-derived default) — used,
+    /// <url> --name <n>`, or that command's own URL-derived default) — used,
     /// self-asserted, as the approver's OWN nickname for this peer too
     /// (`peer pair approve` takes no separate `--name`).
     pub name: String,

@@ -56,7 +56,7 @@ pub fn state_dir() -> std::path::PathBuf {
 }
 
 /// Screen-capture artifacts: `~/Aoide/state/captures/` (`aoide screen shot`,
-/// PACKAGE-LAYOUT.md Phase-1 `screen` verb family).
+/// PACKAGE-LAYOUT.md Phase-1 `screen` command family).
 ///
 /// Under [`state_dir`], not [`stage_dir`]: a capture is a DURABLE artifact a
 /// caller asked for and keeps around (like `state/usage.json`,
@@ -80,7 +80,7 @@ pub fn session_logs_dir() -> std::path::PathBuf {
 }
 
 /// Saved pointer position: `~/Aoide/state/pointer-pos.json` (`aoide screen
-/// point save`/`restore`, Phase 2 of the `screen` verb family).
+/// point save`/`restore`, Phase 2 of the `screen` command family).
 ///
 /// Under [`state_dir`], not [`stage_dir`] — same reasoning as
 /// [`captures_dir`]: a saved cursor position is durable operator-convenience
@@ -134,7 +134,7 @@ pub fn run_qml_dir() -> std::path::PathBuf {
 ///
 /// Mirrors [`run_qml_dir`]'s own derivation exactly (`song_dir().parent()`),
 /// so an `$AOIDE_STAGE_DIR` override relocates this too — `aoide soundcheck`
-/// (`aoide-upkeep`, the mechanical-integrity verb) scans the WORKING tree
+/// (`aoide-upkeep`, the mechanical-integrity command) scans the WORKING tree
 /// starting here, and a test pointing the stage dir at a scratch tree gets an
 /// isolated fake repo root alongside it for free, same as every other seam in
 /// this file. Consequence, flagged once: `soundcheck` always inspects the ONE

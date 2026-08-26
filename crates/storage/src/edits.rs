@@ -21,7 +21,7 @@
 //!
 //! **Every fold below is pure and IO-free** — [`by_path`], [`session_plan`],
 //! [`classify_file`], and [`movers_since`] all take a `&[EditLine]` slice a
-//! caller already produced via [`read_all`], so the later verbs (`graph
+//! caller already produced via [`read_all`], so the later commands (`graph
 //! project edits`, `graph project back`, R4/R5) are unit-testable on a
 //! literal `Vec<EditLine>` without ever touching a filesystem — the same
 //! shape `takes::reparent`/`takes::ancestry` already establish for the

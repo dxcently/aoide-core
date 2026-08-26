@@ -2,7 +2,7 @@
 //! event bus" section, "Terminal reachability" paragraph): a foreground,
 //! line-mode follow of `aoided`'s own events feed. This is the bridge
 //! house rule 7's "delete every `.qml`" test asks for — a desktop surface
-//! (or any other shell) picks the bus up through this verb, or by tailing
+//! (or any other shell) picks the bus up through this command, or by tailing
 //! the feed file directly, with NO daemon socket needed at all.
 //!
 //! Mirrors `aoide_secrets::watch`'s own tail-loop shape (a static

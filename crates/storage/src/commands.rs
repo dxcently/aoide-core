@@ -1,4 +1,4 @@
-//! This crate's own CLI verbs. Two groups today:
+//! This crate's own CLI commands. Two groups today:
 //!
 //! - `aoide usage` — the offline half of the usage widget (CONTRACTS.md
 //!   §2/§4, `state/usage.json` v0): a LOCAL token/cost rollup computed
@@ -613,7 +613,7 @@ fn handle_usage(_inv: &Invocation) -> Outcome {
 
 // ── `aoide inbox list|read|clear` (messaging plan P-C6) ─────────────────────
 
-/// `aoide inbox list|read|clear` verbs, appended newest into `cli`'s
+/// `aoide inbox list|read|clear` commands, appended newest into `cli`'s
 /// `commands::all()` — see that assembly's own module doc for why this
 /// lives in `storage` (inbox is state; storage owns the store, the way
 /// `usage` already does above).
@@ -640,7 +640,7 @@ pub fn register_inbox(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["inbox", "clear"],
-        summary: "Empty the message inbox. Unconditional — matches graph.prune's precedent (no --yes, no gate): the verb name is the whole blast radius, nothing selective to confirm.",
+        summary: "Empty the message inbox. Unconditional — matches graph.prune's precedent (no --yes, no gate): the command name is the whole blast radius, nothing selective to confirm.",
         args: [],
         flags: [],
         gated: false,

@@ -4,9 +4,9 @@
 //! (`aoide-storage::peer_store::PeerCacheEntry`).
 //!
 //! Mirrors `wire.rs`'s separation exactly — the pure wire shapes live here,
-//! the curl transport + CLI verbs (`peer add|list|remove|pull|status`) live
+//! the curl transport + CLI commands (`peer add|list|remove|pull|status`) live
 //! in `commands.rs`, same split as `wire.rs`/`commands.rs`'s existing
-//! `a2a agent *` verbs.
+//! `a2a agent *` commands.
 //!
 //! The pairing ceremony's three wire shapes (P-P2, CONTRACTS.md §6) join the
 //! same split: [`build_pair_request_body`]/[`parse_pair_request_response`]

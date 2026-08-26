@@ -7,7 +7,7 @@
 //! Moved from `graph/session_store.rs` (Phase 3a restructure,
 //! docs/architecture/PACKAGE-LAYOUT.md); re-exported at the old path so every
 //! existing `crate::graph::{upsert_session, upsert_hook}` (and the
-//! `session_store.rs`-local) caller is untouched. The verb handlers
+//! `session_store.rs`-local) caller is untouched. The command handlers
 //! (`do_session_start/end/phase/phase_if`, …) stay in root — they move in
 //! Phase 3b.
 

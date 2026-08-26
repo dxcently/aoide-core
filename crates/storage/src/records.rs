@@ -34,7 +34,7 @@ pub struct Project {
     /// has no live one. Default `false`; `skip_serializing_if` keeps a
     /// `false` value off the wire, same discipline `SessionRecord.headless`
     /// set the precedent for. Set via `graph project add --auto-resume`
-    /// (idempotent-upsert; no `project set`/`project edit` verb exists to
+    /// (idempotent-upsert; no `project set`/`project edit` command exists to
     /// clear it back to `false` today — hand-edit `projects.json` in the
     /// meantime).
     #[serde(rename = "autoResume", default, skip_serializing_if = "is_false")]

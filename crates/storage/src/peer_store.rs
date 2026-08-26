@@ -459,7 +459,7 @@ pub enum HubChange {
 /// the same `name` is a [`HubChange::NoOp`] the second time. `Err` when
 /// `name` names no registered peer — mirrors `remove_peer`'s "a missing
 /// name is a clean error, not a silent no-op" discipline every other `peer`
-/// verb already holds.
+/// command already holds.
 pub fn set_hub(peers: &mut [Peer], name: &str) -> Result<HubChange, String> {
     if !peers.iter().any(|p| p.name == name) {
         return Err(format!("no peer named `{name}`"));

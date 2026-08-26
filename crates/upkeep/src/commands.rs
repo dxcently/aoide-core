@@ -1,6 +1,6 @@
 //! `aoide soundcheck` — report-only, forever (the User's binding
 //! correction: "repairing should mainly just point out what's not supposed
-//! to be there"). This verb never mutates, never repairs, never moves or
+//! to be there"). This command never mutates, never repairs, never moves or
 //! deletes anything; it names findings precisely enough that a human or an
 //! agent can go fix them. `--json` is free on every command (`cmd!`'s
 //! `JSON_FLAG`) — there is no `--only` (cut: speculative, `--json | jq`
@@ -18,7 +18,7 @@
 //!
 //! **Rendering.** Bare-on-a-tty gets [`aoide_protocol::output::Outcome`]'s
 //! own default human line (`[status] soundcheck: <message>`) — plain text,
-//! no picker (there is nothing to select: the verb reports, it doesn't
+//! no picker (there is nothing to select: the command reports, it doesn't
 //! branch). A grouped per-finding report is a later step's job, not this
 //! one's.
 //!

@@ -1,7 +1,7 @@
 //! Instance identity (`docs/architecture/PAIRING.md`'s "Identity" section,
 //! P-P1 of the pairing workstream): a real ed25519 keypair identifying THIS
 //! Aoide instance. Landed here: the dependency + mint/load/store + the
-//! `aoide identity` show verb. The pairing ceremony itself (`peer pair`,
+//! `aoide identity` show command. The pairing ceremony itself (`peer pair`,
 //! P-P2), the `allows`/spawn-gate wiring (P-P3), and signed wire requests
 //! (P-P4) are later phases — this module exists so they have an identity to
 //! build on, nothing more.

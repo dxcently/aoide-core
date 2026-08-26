@@ -1,9 +1,9 @@
-//! The server domain's CLI verbs: `a2a serve`'s door-hint handler and
+//! The server domain's CLI commands: `a2a serve`'s door-hint handler and
 //! `daemon` (the aoided skeleton).
 //!
 //! Moved from the root package's `src/commands/a2a.rs` + the server half of
 //! `src/commands/infra.rs` (Phase 9 restructure,
-//! docs/architecture/PACKAGE-LAYOUT.md): a domain's CLI verbs live with the
+//! docs/architecture/PACKAGE-LAYOUT.md): a domain's CLI commands live with the
 //! domain. The root package's `commands::all()` calls [`register_infra`]
 //! directly after its own root-coupled `mcp serve` registration and
 //! [`register_a2a_serve`] directly before
@@ -31,14 +31,14 @@ use serde_json::json;
 /// `events tail`'s launch-record handler (P-D3, `docs/architecture/
 /// AOIDED.md`'s "L1" section, "Terminal reachability" paragraph) — the
 /// SAME shape `handle_a2a_serve`/`aoide_secrets::commands::
-/// handle_secrets_watch` already hold for a foreground/blocking verb:
+/// handle_secrets_watch` already hold for a foreground/blocking command:
 /// this only gates the door and reports where the actual tail loop lives;
 /// the blocking loop itself (`crate::events::tail`) runs from `cli`'s
 /// `special` hook, dispatched to AFTER this handler records the launch
-/// attempt through the single audit log. CLI-only — a follow-style verb
+/// attempt through the single audit log. CLI-only — a follow-style command
 /// that blocks a connection until Ctrl-C makes no sense over MCP/A2A,
 /// exactly the reasoning `secrets watch` already established for the same
-/// shape of verb.
+/// shape of command.
 fn handle_events_tail(inv: &Invocation) -> Outcome {
     match inv.door {
         Door::Cli => Outcome::ok("events.tail", "following aoided's own events feed").with_data(json!({
@@ -103,7 +103,7 @@ pub fn register_infra(r: &mut Registry) {
 pub fn register_events(r: &mut Registry) {
     r.insert(cmd!(
         path: ["events", "tail"],
-        summary: "Foreground, line-mode follow of aoided's own events feed (the secrets-mirror's name-only lines, the #69 hand-edit watcher, and any future producer). Blocks until Ctrl-C. CLI-only — a follow-style verb makes no sense over MCP/A2A.",
+        summary: "Foreground, line-mode follow of aoided's own events feed (the secrets-mirror's name-only lines, the #69 hand-edit watcher, and any future producer). Blocks until Ctrl-C. CLI-only — a follow-style command makes no sense over MCP/A2A.",
         args: [],
         flags: [flag!("class", "string", "Only print events whose `class` matches (comma-separated; default: every class).")],
         gated: false,
@@ -114,7 +114,7 @@ pub fn register_events(r: &mut Registry) {
 }
 
 /// `a2a serve`, registered directly before `aoide-client`'s four `agent`
-/// verbs (the historical `a2a` group order).
+/// commands (the historical `a2a` group order).
 pub fn register_a2a_serve(r: &mut Registry) {
     r.insert(cmd!(
         path: ["a2a", "serve"],

@@ -57,7 +57,7 @@
 //!
 //! **Door policy is not reimplemented here** (`docs/architecture/AOIDED.md`'s
 //! "L2" section, "Policy: no new allowlist"): every command's
-//! own `inv.door` branch (a CLI-only admin verb's refusal, a gated command's
+//! own `inv.door` branch (a CLI-only admin command's refusal, a gated command's
 //! `gated: true`, `mcp.serve`/`a2a.serve`'s non-Cli metadata replies) runs
 //! exactly the same way it already does over MCP/A2A, since `dispatch` (the
 //! injected fn) is the SAME `cli::dispatch::dispatch` every other door
@@ -106,7 +106,7 @@
 //! hand edit.
 //!
 //! **The watcher is shared with the `dispatch` door, not tick-private
-//! (task #92 fix).** A dispatched session verb
+//! (task #92 fix).** A dispatched session command
 //! (`graph session start/end`/etc., arriving over `{"op":"dispatch"}`) runs
 //! the SAME `do_session_*` code the CLI runs and writes stage files exactly
 //! like the tick's own `reconcile_graph_projection`/`run_internal_reap`
@@ -117,10 +117,10 @@
 //! [`SharedHandEditWatcher`] (`Arc<Mutex<HandEditWatcher>>`) and hands the
 //! SAME instance to `accept_loop`/`handle_conn`; after every dispatched
 //! invocation (module doc's "Framing" `dispatch` op) — success or failure,
-//! regardless of which verb ran — [`rebaseline_stage_roster`] re-baselines
+//! regardless of which command ran — [`rebaseline_stage_roster`] re-baselines
 //! the WHOLE roster via [`crate::producers::HandEditWatcher::note_own_write`],
 //! the same call the tick's own reconcile fold already made. This is
-//! deliberately roster-wide rather than a per-verb "which files did this
+//! deliberately roster-wide rather than a per-command "which files did this
 //! path write" table (a drift trap this workstream already forbids
 //! elsewhere) — stat-ing six files is cheap, and a dispatch that wrote
 //! nothing just re-baselines to the state that was already there.
@@ -323,10 +323,10 @@ type SharedHandEditWatcher = Arc<Mutex<crate::producers::HandEditWatcher>>;
 
 /// Re-baseline every [`stage_roster`] file against its CURRENT on-disk state
 /// (module doc's task #92 note) — called once after every completed
-/// `dispatch` op, regardless of outcome or which verb ran, so the daemon's
+/// `dispatch` op, regardless of outcome or which command ran, so the daemon's
 /// own writes are folded into the watcher's baseline before the next tick's
 /// [`crate::producers::HandEditWatcher::sweep`] runs. Deliberately
-/// roster-wide rather than a per-verb "which files did this write" table:
+/// roster-wide rather than a per-command "which files did this write" table:
 /// six stats is cheap, and this is the exact call
 /// [`reconcile_graph_projection`]'s own caller already makes for the tick's
 /// two internal writers.
@@ -585,7 +585,7 @@ fn read_capped_line(reader: &mut BufReader<UnixStream>, cap: usize) -> Result<Op
 /// validation (that's the injected `dispatch` fn's own job, exactly as it
 /// is for a CLI/MCP-originated `Invocation`). `door` is always
 /// [`Door::Daemon`], never read off the wire — a caller cannot claim to be
-/// a different door for the per-verb policy checks `dispatch` runs (module
+/// a different door for the per-command policy checks `dispatch` runs (module
 /// doc's "Door policy is not reimplemented here").
 fn invocation_from_dispatch_request(req: &Value) -> Result<Invocation, String> {
     let path: Vec<String> = req
@@ -766,8 +766,8 @@ fn handle_conn(
                         // runs (module doc) — re-baseline the shared watcher
                         // BEFORE replying so the next tick's sweep never
                         // reports this write back as a hand edit. Runs
-                        // regardless of outcome/verb (module doc: roster-wide,
-                        // not a per-verb table).
+                        // regardless of outcome/command (module doc: roster-wide,
+                        // not a per-command table).
                         rebaseline_stage_roster(&watcher);
                         if write_json_line(&mut writer, &json!({"outcome": outcome})).is_err() {
                             return;
@@ -986,7 +986,7 @@ mod tests {
     /// A fixture [`DispatchFn`] proving [`handle_conn`]'s `dispatch` op wires
     /// the injected fn correctly (this module's own tests use a fixture, not
     /// a real registry, since the FULLY-ASSEMBLED registry only exists in
-    /// the `cli` crate above this one — real per-verb door-policy proof
+    /// the `cli` crate above this one — real per-command door-policy proof
     /// against that registry lives in `aoide-cli`'s own integration test,
     /// per this crate's own DI-seam invariant). Every other op ignores this
     /// fn entirely, so most tests below still never call it.
@@ -1149,8 +1149,8 @@ mod tests {
     /// `dispatch` (P-D4): builds the `Invocation` from `path`/`args`/`flags`
     /// literally, calls the injected fn, and replies `{"outcome": ...}` with
     /// the fn's own [`Outcome`] verbatim. This proves `handle_conn`'s WIRING
-    /// only — real per-verb door-policy proof (a CLI-only admin verb's
-    /// refusal, a gated verb's `gated: true`, `mcp.serve`/`a2a.serve`'s
+    /// only — real per-command door-policy proof (a CLI-only admin command's
+    /// refusal, a gated command's `gated: true`, `mcp.serve`/`a2a.serve`'s
     /// non-Cli replies, and the `"door":"daemon"` audit line) runs against
     /// the fully-assembled registry in `aoide-cli`'s own integration test
     /// (this crate's DI-seam invariant — the assembled registry doesn't

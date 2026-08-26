@@ -1,10 +1,10 @@
-//! The client domain's CLI verbs (CONTRACTS.md §6): `a2a agent
+//! The client domain's CLI commands (CONTRACTS.md §6): `a2a agent
 //! add|list|remove|send` (the outbound half — aoide DRIVES external A2A
 //! agents) and `adapter melete` (the neutral-event consumer).
 //!
 //! Moved from the root package's `src/commands/a2a.rs` + the client half of
 //! `src/commands/infra.rs` (Phase 9 restructure,
-//! docs/architecture/PACKAGE-LAYOUT.md): a domain's CLI verbs live with the
+//! docs/architecture/PACKAGE-LAYOUT.md): a domain's CLI commands live with the
 //! domain. The root package's `commands::all()` calls [`register_agents`]
 //! directly after `aoide_server::commands::register_a2a_serve` and
 //! [`register_post_graph`] directly before `aoide_conductor::commands::register`,
@@ -179,13 +179,13 @@ impl Drop for ScratchBodyFile {
 /// "binds method" claim not quite true: neither side was actually reading
 /// the real value a request was built/sent with, just re-asserting the
 /// same guess twice). Every call in this crate is genuinely a POST today
-/// (there is no other verb to thread), so this fix changes no byte of any
+/// (there is no other command to thread), so this fix changes no byte of any
 /// real request or the pinned `canonical_string` vectors (CONTRACTS.md
 /// §6) — it only removes the duplicated-literal drift hazard.
 const HTTP_METHOD: &str = "POST";
 
 /// One outbound JSON-RPC POST — the single body+optional-bearer transport
-/// every `peer` verb that calls a registered peer's A2A door now shares
+/// every `peer` command that calls a registered peer's A2A door now shares
 /// (`pull_one_peer`, `pull_peer_live`, `send_message_to_peer`, `handle_peer_spawn`).
 ///
 /// With no bearer, this is BYTE-IDENTICAL to how each of those three called
@@ -332,7 +332,7 @@ fn describe_result(resp: &Value) -> String {
     }
 }
 
-// ── The four `agent` verbs (client side, CONTRACTS.md §6) ────────────────────
+// ── The four `agent` commands (client side, CONTRACTS.md §6) ────────────────────
 
 /// `a2a agent add <url>` — fetch the AgentCard, parse it, register the agent.
 fn handle_agent_add(inv: &Invocation) -> Outcome {
@@ -444,7 +444,7 @@ fn handle_agent_remove(inv: &Invocation) -> Outcome {
 /// Task/Message. The outbound half of the bidirectional A2A link.
 ///
 /// `pub` (not just crate-local): `aoide-conduct`'s `screen send --agent`
-/// (Phase 5 of the `screen` verb family) calls this DIRECTLY — a same-process
+/// (Phase 5 of the `screen` command family) calls this DIRECTLY — a same-process
 /// function call via a synthesized `Invocation`, never a subprocess shell-out
 /// to `aoide a2a agent send` — so a captured screenshot's hand-off reuses this
 /// EXACT driver (curl transport, JSON-RPC body, error surfacing) instead of a
@@ -521,7 +521,7 @@ pub fn handle_agent_send(inv: &Invocation) -> Outcome {
     }))
 }
 
-// ── The seven `peer` verbs (CONTRACTS.md §7: same-network federation) ───────
+// ── The seven `peer` commands (CONTRACTS.md §7: same-network federation) ───────
 //
 // A peer is ANOTHER aoide instance, addressed by URL (topology-agnostic —
 // the protocol never cares whether that URL happens to resolve on the same
@@ -943,7 +943,7 @@ fn confirm_spawn(name: &str, text: &str) -> Result<bool, String> {
 }
 
 /// `peer spawn <name> [--yes] -- <text…>` (P-P5b, making PAIRING.md's
-/// headline spawn gate actually reachable from the CLI — before this verb,
+/// headline spawn gate actually reachable from the CLI — before this command,
 /// every client→peer function sent either a read (`aoide/graphSummary`) or
 /// an Inject (`send_message_to_peer`, always carrying a `contextId`); NONE
 /// emitted a spawn-shaped `message/send` — `context_id: None` — to a
@@ -1145,7 +1145,7 @@ fn handle_peer_status(_inv: &Invocation) -> Outcome {
     Outcome::ok(cmd, msg).with_data(json!({ "peers": rows }))
 }
 
-/// The seven `peer` verbs (CONTRACTS.md §7; `hub` is P-D5, `allow` is P-P3),
+/// The seven `peer` commands (CONTRACTS.md §7; `hub` is P-D5, `allow` is P-P3),
 /// registered as their own group.
 pub fn register_peers(r: &mut Registry) {
     r.insert(cmd!(
@@ -1242,7 +1242,7 @@ pub fn register_peers(r: &mut Registry) {
     ));
 }
 
-// ── The four `peer pair` verbs (P-P2, CONTRACTS.md §6 — the pairing
+// ── The four `peer pair` commands (P-P2, CONTRACTS.md §6 — the pairing
 // ── ceremony's wire + CLI ceremony) ──────────────────────────────────────
 //
 // `peer add`/`peer pair` are two SEPARATE paths onto the same registry
@@ -1256,11 +1256,11 @@ pub fn register_peers(r: &mut Registry) {
 // `aoide_storage::peer_store::upsert_paired_peer` — which ALSO stamps the
 // ceremony's own default `allows` (`["read","spawn"]`) the first time a
 // peer becomes verified (P-P3, PAIRING.md decision 5); editing that default
-// afterward is `peer allow <name> <cap> on|off`'s own separate verb
+// afterward is `peer allow <name> <cap> on|off`'s own separate command
 // (registered in `register_peers` above), never a second write site here.
 //
 // **Both humans confirm, for real (review-bounce Finding 2).** `peer pair
-// approve <id>` does double duty by DIRECTION, never a fifth verb (golden
+// approve <id>` does double duty by DIRECTION, never a fifth command (golden
 // stays 76): on an INBOUND id (this instance is the APPROVER) it is the
 // ORIGINAL approve flow — re-derive the SAS, confirm, deliver the callback,
 // commit. On an OUTBOUND id whose entry has reached
@@ -1270,7 +1270,7 @@ pub fn register_peers(r: &mut Registry) {
 // record instead — no wire call needed at this step, since the approver
 // already committed its own record before ever sending the callback.
 // `peer pair reject <id>` doubles the same way, and on an outbound id is
-// also the ceremony's missing ABORT verb: it removes the entry at EITHER
+// also the ceremony's missing ABORT command: it removes the entry at EITHER
 // outbound state, before or after the callback arrives.
 
 /// Prompt `y/N` on stderr and read ONE line from stdin, unhidden (a
@@ -1723,7 +1723,7 @@ fn approve_outbound(
 
 /// `peer pair reject <id>` — a clean refusal: removes the parked entry
 /// (whichever direction it's in — an OUTBOUND id at EITHER state is the
-/// ceremony's own missing ABORT verb, review-bounce Finding 2), no peer
+/// ceremony's own missing ABORT command, review-bounce Finding 2), no peer
 /// record on either end. Never notifies the other side (no wire call); an
 /// inbound rejection's counterpart outbound entry simply expires on its own
 /// timeout (PAIRING.md names no explicit reject-notification requirement,
@@ -1755,8 +1755,8 @@ fn handle_peer_pair_reject(inv: &Invocation) -> Outcome {
     }
 }
 
-/// The four `peer pair` verbs (P-P2), registered directly after the six
-/// legacy `peer` verbs — same-network federation's pairing ceremony joins
+/// The four `peer pair` commands (P-P2), registered directly after the six
+/// legacy `peer` commands — same-network federation's pairing ceremony joins
 /// the group it extends, nothing existing reorders.
 pub fn register_peer_pair(r: &mut Registry) {
     r.insert(cmd!(
@@ -1812,7 +1812,7 @@ fn handle_adapter_melete(_inv: &Invocation) -> Outcome {
     .with_data(status)
 }
 
-/// The four `agent` verbs, registered at the historical `a2a` position
+/// The four `agent` commands, registered at the historical `a2a` position
 /// (directly after `a2a serve`, which `aoide-server` registers).
 pub fn register_agents(r: &mut Registry) {
     r.insert(cmd!(
@@ -1856,7 +1856,7 @@ pub fn register_agents(r: &mut Registry) {
     ));
 }
 
-/// The post-`graph` client verb: `adapter melete` (registered directly
+/// The post-`graph` client command: `adapter melete` (registered directly
 /// before `conductor`, which `aoide-conductor` registers).
 pub fn register_post_graph(r: &mut Registry) {
     r.insert(cmd!(
@@ -1890,7 +1890,7 @@ mod tests {
     }
 
     // ── `handle_peer_allow` (P-P3) — pure file I/O, so unlike most `peer`
-    // ── verbs (network-touching, tested at `cli/tests/peer_connectivity.rs`'s
+    // ── commands (network-touching, tested at `cli/tests/peer_connectivity.rs`'s
     // ── `#[ignore]`'d integration layer) this one is directly unit-testable,
     // ── same reasoning `handle_peer_hub`'s own storage-layer tests already
     // ── rest on. ─────────────────────────────────────────────────────────────
@@ -2138,7 +2138,7 @@ mod tests {
     // unconfigured peer never even tries to connect. Every OTHER branch
     // (a real resolve, a broker-down failure) is exercised end-to-end in
     // `cli/tests/peer_connectivity.rs`, mirroring how every other `peer`
-    // verb in this file is tested at that integration layer rather than
+    // command in this file is tested at that integration layer rather than
     // here (this module carried zero unit tests before this task).
 
     #[test]

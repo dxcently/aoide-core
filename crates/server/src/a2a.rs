@@ -359,7 +359,7 @@ fn classify_token(expected: &str, presented: Option<&str>) -> TokenState {
 /// directly testable without a socket or a spawned process.
 ///
 /// One predicate guards two things (CONTRACTS.md §6 amendment, Phase G,
-/// 2026-08-20): the SPAWN arm of `message/send`, and the READ verbs
+/// 2026-08-20): the SPAWN arm of `message/send`, and the READ commands
 /// (`tasks/get`, `aoide/graphSummary`, `tasks/resubscribe`, `message/stream`).
 /// Before Phase G the reads were ungated even with a token set — harmless on
 /// loopback, but a whole-session-graph leak the moment the door faced a
@@ -845,7 +845,7 @@ fn spawn_inject_prompt(id: &str, prompt: &str) {
 /// thread, stdio nulled, and reaped on a parked thread (see below) — it
 /// stays parented to the long-lived `a2a serve` daemon for its whole life.
 /// `aoide-conduct`'s `graph spawn` (P2 of the conducted-agents plan) now
-/// generalizes exactly this detach/register/reap shape as its own verb; a
+/// generalizes exactly this detach/register/reap shape as its own command; a
 /// later phase can have this handler ride on it instead of hand-rolling the
 /// same mechanics here.
 ///
@@ -1022,7 +1022,7 @@ fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path, peer_name: &str) ->
 /// aoide is too old or isn't signing" — never confused with "never paired,"
 /// which still points at the pairing ceremony itself
 /// ([`spawn_refusal`]'s own doc comment carries the full message-selection
-/// table). Every OTHER arm this file gates (the read verbs' `token_authorized`,
+/// table). Every OTHER arm this file gates (the read commands' `token_authorized`,
 /// Inject's `effective_origin`/autogate coupling, the AgentCard GET) is
 /// UNCHANGED by P-P4 — signature headers strengthen IDENTITY resolution
 /// only, and only the Spawn arm's admission requirement moves; an unpaired
@@ -1290,7 +1290,7 @@ fn graph_summary(peer_name: &str, self_url: &str) -> Result<Value, (i64, String)
 // request` invocation, two sequential POSTs) that hands over the nonce the
 // commitment already fixed; B verifies it and only THEN has a SAS to show.
 // `aoide/pairApprove` is the REVERSE callback the APPROVER's own `peer pair
-// approve` verb (client crate) POSTs back to the REQUESTER once a human has
+// approve` command (client crate) POSTs back to the REQUESTER once a human has
 // confirmed the SAS — it does NOT commit A's own peer record by itself
 // (review-bounce Finding 2): it transitions A's outbound entry to
 // "awaiting confirm," and A's own operator still has to run `peer pair
@@ -1579,7 +1579,7 @@ fn handle_jsonrpc(req: &Value, ctx: &RequestCtx) -> Value {
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);
 
-    // Phase G (CONTRACTS.md §6 amendment, 2026-08-20): the read verbs are
+    // Phase G (CONTRACTS.md §6 amendment, 2026-08-20): the read commands are
     // token-gated by the SAME rule as spawn. Computed once; only bites when a
     // token is configured (off-path unchanged). `message/send` runs its own
     // classify internally (it needs the full TokenState for effective_origin),
@@ -1740,7 +1740,7 @@ fn stream_task<W: Write>(
     // `tasks/resubscribe` streams an existing task by id.
     //
     // Phase G (CONTRACTS.md §6 amendment, 2026-08-20): gate BOTH streaming
-    // reads by the same token rule as the one-shot verbs. When a token is
+    // reads by the same token rule as the one-shot commands. When a token is
     // configured and the caller lacks a valid one, resolution short-circuits
     // to `unauthorized()` BEFORE `message_send` runs — so an unauthenticated
     // `message/stream` neither injects nor spawns, it only receives the
@@ -3153,7 +3153,7 @@ mod tests {
 
     #[test]
     fn unknown_method_is_minus_32601() {
-        let req = json!({ "jsonrpc": "2.0", "id": 2, "method": "bogus/verb", "params": {} });
+        let req = json!({ "jsonrpc": "2.0", "id": 2, "method": "bogus/method", "params": {} });
         let resp = handle_jsonrpc(&req, &test_ctx(Path::new("/dev/null"), ""));
         assert_eq!(resp["error"]["code"], -32601);
     }
@@ -3194,7 +3194,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&stage);
     }
 
-    /// Phase G: the read verbs (`tasks/get`, `aoide/graphSummary`) are
+    /// Phase G: the read commands (`tasks/get`, `aoide/graphSummary`) are
     /// token-gated by the same rule as spawn. When a token IS configured, an
     /// absent or wrong bearer is a clean `-32005` BEFORE the read runs; a
     /// valid bearer passes through to the normal handler.
@@ -3260,7 +3260,7 @@ mod tests {
     }
 
     /// Phase G off-path: with NO token configured (today's default), the read
-    /// verbs stay open exactly as before — the gate only bites when armed.
+    /// commands stay open exactly as before — the gate only bites when armed.
     #[test]
     fn read_verbs_stay_open_when_no_token_is_configured() {
         let _guard = crate::env_lock().lock().unwrap();
@@ -3652,7 +3652,7 @@ mod tests {
     #[test]
     fn token_authorized_always_allows_when_no_token_is_configured() {
         // THE regression pin: `spawn_agent` alone (rebuild-time admission)
-        // still fully gates spawn, and the read verbs stay open, when no
+        // still fully gates spawn, and the read commands stay open, when no
         // token is set — Phase G adds a gate, it doesn't tighten the existing
         // off-path.
         for token_state in [TokenState::Absent, TokenState::Invalid, TokenState::Valid] {

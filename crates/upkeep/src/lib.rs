@@ -4,7 +4,7 @@
 //! polices the COMMITTED tree — the git-filtered store copy `nix` evaluates.
 //! It structurally cannot see anything gitignored or merely uncommitted:
 //! `result`, `state/`, an agent's stray file dropped at repo root a moment
-//! ago. That gap is this crate's whole charter, and its only verb is
+//! ago. That gap is this crate's whole charter, and its only command is
 //! `aoide soundcheck` (`commands::register`).
 //!
 //! **Report-only, forever — this is a binding correction, not a v0
