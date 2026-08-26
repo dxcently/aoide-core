@@ -62,10 +62,12 @@ never the inbound/serve half (that's `aoide-server`).
   unknown peer or an unknown capability with distinct taught errors, no
   network call (this instance's own `state/peers.json` is authoritative
   for its own `allows` grants) —
-  `confirm_sas`/`default_self_url` are this group's own local helpers: the
-  y/N confirmation prompt mirrors `aoide-secrets::client::
-  confirm_overwrite`'s exact idiom rather than importing it, since this
-  crate holds no dependency on that one). `handle_peer_pair_request` sends
+  `confirm_sas`/`default_self_url` are this group's own local helpers:
+  `confirm_sas` (like `confirm_spawn` below) is a thin wrapper around
+  `aoide_protocol::pick::confirm` (ONBOARD.md's prompt substrate section,
+  P-I1) rather than a hand-rolled stdin read — `inquire::Confirm` on a tty,
+  the identical `y/N` stdin read otherwise; the question text is unchanged,
+  `confirm` owns the `[y/N]` decoration now). `handle_peer_pair_request` sends
   the commitment and its reveal as two sequential POSTs in one invocation
   before ever computing a SAS. `handle_peer_pair_approve`
   dispatches by direction: on an INBOUND entry (`approve_inbound`) it
@@ -89,8 +91,10 @@ never the inbound/serve half (that's `aoide-server`).
   second name check. `handle_peer_discover`/`handle_peer_invite` (`peer
   discover [--secs N]`/`peer invite <name> [--secs N] [--yes]`) are thin
   wrappers around `discover::run_sweep`/`discover::resolve_invite_target`
-  above — `confirm_invite` is this pair's own local helper, the same
-  `confirm_sas`/`confirm_spawn` y/N idiom.
+  above — `confirm_invite` is this pair's own local helper, still the
+  original hand-rolled `y/N` stdin read `confirm_sas`/`confirm_spawn` used
+  to share before their P-I1 retrofit onto `aoide_protocol::pick::confirm`
+  above — out of that phase's own scope, not an oversight.
   `adapter melete` (`peer hub
   <name> [--clear]`, P-D5, designates at most one registered peer as the
   hub `aoide_storage::addr::resolve_with_hub` prefers as a last-resort

@@ -231,11 +231,13 @@ value for `db-prod` (input hidden):
 put secret `db-prod`
 ```
 
-— the prompt and the post-input newline print to STDERR (stdout stays
-clean for scripting), and the terminal's echo is disabled for the read
-(`client::read_hidden_line`, raw `libc::termios`, restored unconditionally
-afterward — even on a read error). A piped/redirected stdin
-(`printf %s hunter2 | aoide secrets put db-prod`, the original shape) is
+— the prompt prints to STDERR (stdout stays clean for scripting), and the
+terminal's echo is disabled for the read (`client::read_hidden_line` —
+P-I1: a thin wrapper around `aoide_protocol::pick::hidden_input`,
+`inquire::Password` with hidden display mode and no confirmation, since
+`inquire` lives in `aoide-protocol` only; before P-I1 this function
+disabled `ECHO` on stdin's own `libc::termios` by hand). A piped/redirected
+stdin (`printf %s hunter2 | aoide secrets put db-prod`, the original shape) is
 BYTE-IDENTICAL to before: `client::stdin_is_tty` is false in that case and
 `run_put` falls straight through the old `read_to_string` path.
 
@@ -1981,11 +1983,16 @@ Daemon/socket/CLI (P-V2, extended P-V3):
 ## What it consumes
 
 `aoide-protocol` (`Registry`/`Invocation`/`Outcome`/`Door`/`EventClass`/the
-audit helpers/the `cmd!`/`arg!`/`flag!` macros), `serde`/`serde_json`,
-`libc` (P-V3, new — `enroll::local_hostname`'s `gethostname(2)`, already a
-workspace dependency via `aoide-storage`, so nothing new in the lockfile;
-P-V4e reuses the same dependency for `client::stdin_is_tty`'s `isatty(2)`
-and `client::read_hidden_line`'s `tcgetattr`/`tcsetattr` — no new crate).
+audit helpers/the `cmd!`/`arg!`/`flag!` macros, and — P-I1 —
+`pick::hidden_input`, the interactive prompt substrate's password entry),
+`serde`/`serde_json`, `libc` (P-V3, new — `enroll::local_hostname`'s
+`gethostname(2)`, already a workspace dependency via `aoide-storage`, so
+nothing new in the lockfile; P-V4e reuses the same dependency for
+`client::stdin_is_tty`'s `isatty(2)`). `client::read_hidden_line`'s own
+hand-rolled `tcgetattr`/`tcsetattr` echo-disable (P-V4e) is retired at
+P-I1 — the raw-terminal handling now happens inside `inquire`'s
+`crossterm` backend, behind `pick::hidden_input`, and this crate's own
+`libc` usage is `isatty`/`gethostname` only.
 **Still zero ALGORITHMIC dependencies** — no `sha1`/`hmac`/`totp-lite`/
 `data-encoding` crate anywhere in this tree (this crate's `AGENTS.md`); the
 broker socket, the backend shell-out, the exec spawn, and `/dev/urandom`

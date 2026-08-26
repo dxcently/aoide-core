@@ -12,3 +12,10 @@ path = "src/lib.rs"
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Minimal feature set for the interactive prompt substrate (ONBOARD.md
+# decision 9): crossterm is the terminal backend inquire needs to render
+# anything at all on a tty; macros/one-liners/fuzzy are all convenience
+# surfaces this crate's Select/MultiSelect/Confirm/Password usage doesn't
+# touch (no fuzzy-filtered lists, no one-line compact rendering, no
+# prompt! macros), so they stay off.
+inquire = { version = "0.9.4", default-features = false, features = ["crossterm"] }

@@ -39,14 +39,15 @@
 //! straight through to the old `read_to_string` path, untouched. Only when
 //! stdin IS a terminal ([`stdin_is_tty`] true — `libc::isatty` on fd 0,
 //! already a dependency via `enroll::local_hostname`'s `gethostname`, no
-//! new crate) does [`read_hidden_line`] take over: it prints a prompt to
-//! STDERR (never stdout — stdout stays clean for scripting), clears
-//! `ECHO` on stdin's `termios` for the read, and restores the ORIGINAL
-//! termios afterward unconditionally — even on a read error — so a killed
-//! read can never leave the caller's shell echo-less. [`strip_one_trailing_newline`]
-//! is split out as its own pure function (module doc's "small seam"): the
-//! termios dance itself is not exercised by `cargo test` (this process's
-//! own stdin is never a tty in CI), but the trim logic it feeds is.
+//! new crate) does [`read_hidden_line`] take over, which prompts and hides
+//! input on STDERR (never stdout — stdout stays clean for scripting).
+//! **P-I1: the hiding mechanism is `aoide_protocol::pick::hidden_input`**
+//! (`inquire::Password`, ONBOARD.md's prompt substrate section) — this
+//! function used to clear `ECHO` on stdin's own `termios` by hand and
+//! restore it unconditionally afterward; that hand-rolled dance moved into
+//! `aoide-protocol`, the ONE crate this workspace lets depend on `inquire`
+//! directly, and `read_hidden_line`'s own name/signature/call sites are
+//! untouched by the move.
 //!
 //! **P-67: `run_put` warns and confirms before an overwrite.** The
 //! existence check is BROKER-SIDE — the client never fetches a value to
@@ -852,16 +853,19 @@ pub(crate) fn stdin_is_tty() -> bool {
 
 /// Strip exactly ONE trailing `\n`, never a blanket `.trim_end()` (same
 /// "exactly one, not a blanket trim" discipline `backend::fetch_value`'s
-/// module doc already holds for a backend's stdout) — a hidden-input read
-/// carries the newline the user's Enter key produced; this removes that
-/// one character and nothing else a pasted value might legitimately end
-/// with. Pure and total, so it is the "small seam" the tty path's own
-/// termios dance is tested through, per this module's own doc.
+/// module doc already holds for a backend's stdout) — a subprocess's own
+/// stdout line carries the newline its own `echo`/`printf` produced; this
+/// removes that one character and nothing else a pasted value might
+/// legitimately end with. Pure and total, so it stays independently unit
+/// tested with no tty involved.
 ///
 /// `pub(crate)`: `watch.rs`'s `--popup` zenity-entry reader trims its own
-/// dialog output through this SAME function (the "reach into the existing
-/// seam, never fork a second trim" discipline `stdin_is_tty`/
-/// `read_hidden_line` already established when `watch` needed them).
+/// dialog output through this SAME function — [`read_hidden_line`] no
+/// longer needs it itself (P-I1: `aoide_protocol::pick::hidden_input`
+/// hands back a value with no trailing newline to strip), but this stays
+/// the one seam any OTHER stdout-line trim in this crate reaches for
+/// (the "reach into the existing seam, never fork a second trim"
+/// discipline `stdin_is_tty` established alongside it).
 pub(crate) fn strip_one_trailing_newline(mut s: String) -> String {
     if s.ends_with('\n') {
         s.pop();
@@ -869,44 +873,19 @@ pub(crate) fn strip_one_trailing_newline(mut s: String) -> String {
     s
 }
 
-/// Read one line from stdin with terminal echo disabled — the tty half of
-/// [`run_put`]'s prompt (module doc). Restores the ORIGINAL termios
-/// unconditionally before returning, on the success path AND the error
-/// path alike, so a read that fails partway can never leave the caller's
-/// terminal echo-less. Prints the prompt AND the post-read newline to
-/// STDERR (never stdout, module doc) — the newline exists because the
-/// user's own Enter never reached the terminal with echo off, so without
-/// it the next line printed would glue onto the hidden input's line.
-///
-/// `pub(crate)`: `watch.rs`'s approve prompt reuses this VERBATIM for its
-/// own hidden TOTP-code read (the design's own requirement — the code must
-/// never touch argv, and this is the one place in the crate that already
-/// gets the termios dance right).
+/// Read one line of hidden input on the real terminal — the tty half of
+/// [`run_put`]'s prompt (module doc). Retrofit (ONBOARD.md's prompt
+/// substrate section, P-I1) onto `aoide_protocol::pick::hidden_input`
+/// (`inquire::Password`, hidden display mode, no confirmation — the
+/// crate's own AGENTS.md invariant that `inquire` never enters this crate
+/// directly holds: the dependency lives in `aoide-protocol` alone), which
+/// replaced the hand-rolled `libc::termios` echo-disable this function used
+/// to do itself. The name, `pub(crate)` visibility, and every call site are
+/// UNCHANGED — this is the one seam `run_put` and `watch.rs`'s approve
+/// prompt already reused VERBATIM, so retrofitting its body is the whole
+/// fix; neither caller needed an edit.
 pub(crate) fn read_hidden_line(prompt: &str) -> Result<String, String> {
-    use std::io::{BufRead, Write};
-    eprint!("{prompt}");
-    let _ = std::io::stderr().flush();
-
-    let mut term: libc::termios = unsafe { std::mem::zeroed() };
-    if unsafe { libc::tcgetattr(0, &mut term) } != 0 {
-        return Err("reading terminal attributes: tcgetattr failed".to_string());
-    }
-    let original = term;
-    term.c_lflag &= !libc::ECHO;
-    if unsafe { libc::tcsetattr(0, libc::TCSANOW, &term) } != 0 {
-        return Err("disabling terminal echo: tcsetattr failed".to_string());
-    }
-
-    let mut line = String::new();
-    let read_result = std::io::stdin().lock().read_line(&mut line);
-
-    // Always restore, even on a read error — never leave the terminal
-    // echo-less (module doc).
-    unsafe { libc::tcsetattr(0, libc::TCSANOW, &original) };
-    eprintln!();
-
-    read_result.map_err(|e| format!("reading value from stdin: {e}"))?;
-    Ok(strip_one_trailing_newline(line))
+    aoide_protocol::pick::hidden_input(prompt)
 }
 
 /// The non-tty "exists" refusal message (P-67) — a plain pure function so
@@ -1369,9 +1348,10 @@ mod tests {
 
     // ── P-V4e: `secrets put`'s tty prompt ───────────────────────────────
     //
-    // The termios dance itself (`read_hidden_line`) is not exercised here —
-    // `cargo test`'s own stdin is never a tty — so these cover exactly the
-    // "small seam" the module doc calls out: the pure trim logic, and that
+    // `read_hidden_line`'s own tty path (`aoide_protocol::pick::
+    // hidden_input`) is not exercised here — `cargo test`'s own stdin is
+    // never a tty — so these cover exactly the "small seam" the module doc
+    // calls out: `strip_one_trailing_newline`'s pure trim logic, and that
     // `stdin_is_tty` reads false (so `run_put` takes the untouched pipe
     // path) under this process's own non-tty stdin, same as every existing
     // `run_put`-adjacent test already implicitly relies on.

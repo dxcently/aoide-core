@@ -920,14 +920,23 @@
 - **`secrets put`'s stdin intake grew a tty branch at P-V4e**
   (`client::stdin_is_tty`/`client::read_hidden_line`) — when stdin is a
   terminal, `run_put` prompts on stderr and reads with echo disabled
-  (raw `libc::termios`, restored unconditionally, even on a read error)
-  instead of requiring a pipe. A piped/redirected stdin is BYTE-IDENTICAL
-  to before — `run_put`'s non-tty branch is the original `read_to_string`
-  call, untouched. Don't let the tty branch's prompt or trim logic leak
-  into the pipe branch "for consistency"; they are deliberately two
-  separate code paths with different contracts (a script's piped bytes
-  are the value verbatim; a human's typed line loses exactly one trailing
-  newline, `client::strip_one_trailing_newline`).
+  instead of requiring a pipe. **P-I1**: the echo-disable mechanism is
+  `aoide_protocol::pick::hidden_input` (`inquire::Password`) — before this
+  phase, `read_hidden_line` cleared `ECHO` on stdin's own `libc::termios`
+  by hand and restored it unconditionally, even on a read error; that
+  hand-rolled dance is retired, `read_hidden_line`'s name/signature/call
+  sites are unchanged. A piped/redirected stdin is BYTE-IDENTICAL to
+  before — `run_put`'s non-tty branch is the original `read_to_string`
+  call, untouched by either phase. Don't let the tty branch's prompt logic
+  leak into the pipe branch "for consistency"; they are deliberately two
+  separate code paths with different contracts (a script's piped bytes are
+  the value verbatim, never trimmed; a human's typed line comes back from
+  `hidden_input` with no trailing newline to strip at all — Enter submits
+  the prompt, it was never part of the value — unlike the OLD
+  `read_line`-based path, which needed `client::strip_one_trailing_newline`
+  to remove the one that key press produced — that function still exists
+  and is still exercised: `watch.rs`'s `--popup` zenity-entry reader is
+  its other reuse, untouched by this phase).
 - **`secrets put` warns and confirms before an overwrite, P-67 (this
   commit).** The wire's `put` op gained an optional `overwrite` bool
   (absent means `false`); `broker::put_gate` probes existence via

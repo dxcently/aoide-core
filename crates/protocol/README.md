@@ -52,8 +52,26 @@ other crate in this workspace sits above.
   its own id) keyed by harness name.
 - `bin` — sibling-binary resolution (`core_bin`/`rice_bin`; env override →
   sibling-of-`current_exe` → bare `PATH` name).
-- `pick`, `model`, `policy` — the numbered picker + tty gate, model context
-  ceilings, and the daemon's `Gate`/`Subscription` policy types.
+- `pick` — the interactive prompt substrate (ONBOARD.md's "Prompt substrate"
+  section, P-I1): `interactive`, the [`Door::Cli`] + tty gate a caller checks
+  BEFORE opening any prompt at all, and four entry points a caller reaches
+  for once it has — `choose`/`choose_many` (single/multi-select),
+  `confirm` (y/N), `hidden_input` (password entry). Each forks on whether
+  stdin/stdout are a capable terminal: a capable tty backs `choose`/
+  `choose_many`/`confirm` with `inquire::Select`/`MultiSelect`/`Confirm`,
+  and is the ONLY backend `hidden_input` (`inquire::Password`, no
+  confirmation, hidden display mode) has — everything else (piped,
+  redirected, or `TERM=dumb`, which reports as a real tty but by
+  convention cannot render ANSI) keeps the ORIGINAL hand-rolled
+  `BufRead`-driven core (`choose_reading`/`choose_many_reading`/
+  `confirm_reading`) byte-identical. `inquire` (crates.io, minimal
+  `crossterm`-only feature set) is this crate's own dependency, and stays
+  that way — every other crate reaches these four functions through this
+  seam, never `inquire` directly ("wrap, don't scatter"; the DAG-leaf
+  invariant below still holds, since `inquire` is a third-party crate, not
+  an `aoide-*` one).
+- `model`, `policy` — model context ceilings, and the daemon's
+  `Gate`/`Subscription` policy types.
 
 ## What it consumes
 

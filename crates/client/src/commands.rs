@@ -927,19 +927,16 @@ pub fn send_message_to_peer(
     Ok(parsed)
 }
 
-/// Prompt `y/N` on stderr before spawning on a peer — a LOCAL UX
-/// confirmation only (mirrors `confirm_sas`'s exact idiom), never a
-/// security gate: the remote door's own paired+signature+allows∋spawn
-/// check (PAIRING.md decision 6) is the sole authority either way.
+/// Prompt `y/N` before spawning on a peer — a LOCAL UX confirmation only
+/// (mirrors `confirm_sas`'s exact idiom), never a security gate: the remote
+/// door's own paired+signature+allows∋spawn check (PAIRING.md decision 6)
+/// is the sole authority either way. Retrofit onto `aoide_protocol::pick::
+/// confirm` (ONBOARD.md's prompt substrate section, P-I1): `inquire::
+/// Confirm` on a tty, the identical stdin `y/N` read otherwise — the
+/// question text itself is unchanged, `confirm` owns the `[y/N]` decoration
+/// now instead of this function.
 fn confirm_spawn(name: &str, text: &str) -> Result<bool, String> {
-    eprint!("spawn a new session on peer `{name}` — first turn: {text:?} — proceed? [y/N] ");
-    let _ = std::io::stderr().flush();
-    let mut line = String::new();
-    let read = std::io::stdin()
-        .lock()
-        .read_line(&mut line)
-        .map_err(|e| format!("reading confirmation from stdin: {e}"))?;
-    Ok(read > 0 && matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+    aoide_protocol::pick::confirm(&format!("spawn a new session on peer `{name}` — first turn: {text:?} — proceed?"))
 }
 
 /// `peer spawn <name> [--yes] -- <text…>` (P-P5b, making PAIRING.md's
@@ -1273,21 +1270,14 @@ pub fn register_peers(r: &mut Registry) {
 // also the ceremony's missing ABORT command: it removes the entry at EITHER
 // outbound state, before or after the callback arrives.
 
-/// Prompt `y/N` on stderr and read ONE line from stdin, unhidden (a
-/// confirmation code isn't sensitive) — mirrors `aoide-secrets::client::
-/// confirm_overwrite`'s exact idiom (a different crate; this crate has no
-/// dependency on that one to reuse the function directly). `true` only for
-/// `y`/`yes` (case-insensitive, trimmed); EOF or anything else defaults to
-/// `false` — the ceremony's own "never silently commit" stance.
+/// Confirm the pairing SAS code matches — `true` only for `y`/`yes`
+/// (case-insensitive), EOF or anything else `false` (the ceremony's own
+/// "never silently commit" stance). Retrofit onto `aoide_protocol::pick::
+/// confirm` (ONBOARD.md's prompt substrate section, P-I1) — `inquire::
+/// Confirm` on a tty, the identical stdin `y/N` read otherwise; the
+/// question text is unchanged, `confirm` owns the `[y/N]` decoration.
 fn confirm_sas(sas: &str, name: &str) -> Result<bool, String> {
-    eprint!("pairing request from `{name}` — confirmation code {sas} — do the codes match? [y/N] ");
-    let _ = std::io::stderr().flush();
-    let mut line = String::new();
-    let read = std::io::stdin()
-        .lock()
-        .read_line(&mut line)
-        .map_err(|e| format!("reading confirmation from stdin: {e}"))?;
-    Ok(read > 0 && matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+    aoide_protocol::pick::confirm(&format!("pairing request from `{name}` — confirmation code {sas} — do the codes match?"))
 }
 
 /// This instance's own default advertised A2A door URL — `--peer-name`'s

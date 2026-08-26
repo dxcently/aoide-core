@@ -6,6 +6,38 @@
   another `aoide-*` crate — that would create a cycle back into a door this
   crate is supposed to be beneath. If a type feels like it needs a
   domain-crate fact, the fact belongs in the caller, not here.
+- **`inquire` lives in THIS crate's `Cargo.toml` only** (ONBOARD.md decision
+  9, P-I1 — the second User-authorized break of the zero-new-deps
+  discipline, after ed25519-dalek). No other crate in the workspace may add
+  `inquire` as a direct dependency — every caller reaches `pick::choose`/
+  `choose_many`/`confirm`/`hidden_input` instead, never `inquire::*` types
+  directly (`cargo tree -i inquire` should always show exactly one direct
+  dependent: `aoide-protocol`). Keep the feature set minimal: `crossterm`
+  only (`default-features = false`) — the terminal backend `inquire`
+  cannot render anything without; `macros`/`one-liners`/`fuzzy` stay off
+  since nothing here needs a `prompt!` macro, compact one-line rendering,
+  or fuzzy-filtered lists. `inquire` must NEVER enter `aoided`, the secrets
+  broker daemon path, or any non-CLI-door code — prompting is a CLI-door
+  concern, the same boundary `pick::interactive`'s own `Door::Cli` check
+  already draws.
+- **The tty backend and the non-tty `*_reading` core are two independent
+  contracts — a change to one is never assumed to cover the other.**
+  `choose_reading`/`choose_many_reading`/`confirm_reading` are the
+  BufRead-injectable seam this module's own tests drive (piped/redirected
+  CLI stdio, and every non-CLI door) — their behavior is a contract every
+  existing caller (and `secrets put`'s piped e2e test) depends on
+  byte-for-byte; don't change their prompt text, retry count, or
+  default-selection rule as a side effect of a tty-side `inquire` change.
+  `tty_capable()` (not `stdio_is_terminal()` alone) is what routes between
+  the two — `TERM=dumb` reports as a real tty but, on Linux, `inquire`'s
+  `crossterm` backend does not consult `TERM` before emitting ANSI cursor
+  sequences (verified this phase, `tty_capable`'s own doc comment has the
+  source citation and the empirical `script`(1) transcript), so
+  `tty_capable()` is the ONE place that steers `TERM=dumb` onto the ANSI-free
+  fallback instead. Don't call `stdio_is_terminal()` directly from a new
+  `choose`/`choose_many`/`confirm`-shaped function "since it's simpler" —
+  that would silently reopen the `TERM=dumb` garbage this function exists
+  to close.
 - **Wire/schema shape is a published contract.** `registry`, `output::Outcome`,
   `wire`'s A2A/MCP payload shapes, and `state::canonical_state` are read by
   `schema --json` consumers outside this repo. A shape change is
