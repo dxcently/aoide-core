@@ -303,12 +303,14 @@ fn lyra_bin_if_resolved() -> Option<String> {
 /// process with inherited stdio so its own prompts/output reach this same
 /// terminal directly (`--harness` is deliberately NOT forwarded -- harness
 /// wiring is core's own job, decision 7, and lyra's half has no use for it).
-/// `lyra onboard` itself does not exist yet (P-I3 closes this gap) -- a
-/// spawn failure (e.g. `ENOENT`, the resolved binary lacking the `onboard`
-/// subcommand entirely) OR a nonzero exit both fall to the same tolerant
-/// "not available yet" note, never a hard onboard failure. If lyra isn't
-/// found at all, the returned line names no nix-shaped detail whatsoever
-/// (ONBOARD.md decision 3's "nothing nix-shaped is ever spoken").
+/// A spawn failure (e.g. `ENOENT`) OR a nonzero exit both fall to the same
+/// tolerant note rather than a hard onboard failure -- either could mean the
+/// resolved lyra binary predates this aoide and genuinely lacks `onboard`,
+/// OR a real failure inside `lyra onboard` itself; the note names the exit
+/// code (or spawn error) and states plainly that the desktop half was
+/// skipped, without guessing which case it was. If lyra isn't found at all,
+/// the returned line names no nix-shaped detail whatsoever (ONBOARD.md
+/// decision 3's "nothing nix-shaped is ever spoken").
 fn probe_and_delegate_lyra(inv: &Invocation) -> String {
     let Some(bin) = lyra_bin_if_resolved() else {
         return "lyra: not found (no AOIDE_RICE_BIN, no sibling binary, not on PATH) -- skipping the desktop half; core setup is complete".to_string();
@@ -327,10 +329,12 @@ fn probe_and_delegate_lyra(inv: &Invocation) -> String {
     match cmd.status() {
         Ok(status) if status.success() => format!("lyra onboard: done ({bin})"),
         Ok(status) => format!(
-            "lyra onboard not available yet (exited {}, likely no `onboard` subcommand yet -- P-I3 closes this) -- skipping the desktop half",
+            "lyra onboard failed (exited {}) -- the resolved lyra binary may be older than this aoide and lack the `onboard` subcommand, or the command itself failed; skipping the desktop half",
             status.code().map(|c| c.to_string()).unwrap_or_else(|| "via signal".to_string())
         ),
-        Err(e) => format!("lyra onboard not available yet ({e}) -- skipping the desktop half"),
+        Err(e) => format!(
+            "lyra onboard could not be run ({e}) -- the resolved lyra binary may be older than this aoide and lack the `onboard` subcommand, or spawning it failed; skipping the desktop half"
+        ),
     }
 }
 

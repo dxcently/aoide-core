@@ -12,8 +12,9 @@
 //! schema/mcp serve — root-coupled, see `commands/infra.rs`'s doc comment
 //! for why `mcp serve` is here despite not being named in the plan's group
 //! list), onboard (P-I3: the nix half of the onboarding flow — root-coupled
-//! like `meta`, appended right after it, mirroring exactly where core's own
-//! `onboard` sits in `crates/cli/src/commands/mod.rs::all()`), rice, draft,
+//! like `meta`, appended right after it: a root-level command, registered
+//! before `mcp.serve`, matching core's own relative placement of `onboard`
+//! in `crates/cli/src/commands/mod.rs::all()`), rice, draft,
 //! mode, cover, livery, rice-late stubs (declare/transpose only — NOT
 //! content/make/update, which stay core), shellbridge, quickshell, screen,
 //! herald, take. Core-only groups (graph, adapter melete, conductor, a2a
