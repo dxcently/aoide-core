@@ -648,8 +648,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // ── The three claude tests below exercise the skill-link pass, which
+    // ── resolves the LINK SOURCE by walking up from the cwd to the repo's
+    // ── own `.claude/skills/aoide` (`skill_source`). The package build's
+    // ── sandbox unpacks only `pkgs/aoide`, so no checkout exists above the
+    // ── cwd there — each probes and skips with a note, the same
+    // ── capability-probe pattern `aoide-secrets`' age-binary tests hold.
+    // ── Production needs no gate: `link_skill` already reports the
+    // ── condition as its taught `no-source` outcome. ─────────────────────
+
     #[test]
     fn claude_install_reports_present_and_preserves_the_document() {
+        if skill_source().is_none() {
+            eprintln!("skipping claude_install_reports_present_and_preserves_the_document: not inside an Aoide checkout (no .claude/skills/aoide above the cwd)");
+            return;
+        }
         let _g = aoide_test_support::env_lock().lock().unwrap();
         let _env = EnvSaver::capture(&["HOME"]);
         let root = unique_tmp("hooks-claude");
@@ -713,6 +726,10 @@ mod tests {
 
     #[test]
     fn claude_pointer_and_skill_install_and_are_idempotent() {
+        if skill_source().is_none() {
+            eprintln!("skipping claude_pointer_and_skill_install_and_are_idempotent: not inside an Aoide checkout (no .claude/skills/aoide above the cwd)");
+            return;
+        }
         let _g = aoide_test_support::env_lock().lock().unwrap();
         let _env = EnvSaver::capture(&["HOME"]);
         let root = unique_tmp("hooks-claude-skill");
@@ -759,6 +776,10 @@ mod tests {
 
     #[test]
     fn claude_skill_conflict_is_a_taught_refusal_never_an_overwrite() {
+        if skill_source().is_none() {
+            eprintln!("skipping claude_skill_conflict_is_a_taught_refusal_never_an_overwrite: not inside an Aoide checkout (no .claude/skills/aoide above the cwd)");
+            return;
+        }
         let _g = aoide_test_support::env_lock().lock().unwrap();
         let _env = EnvSaver::capture(&["HOME"]);
         let root = unique_tmp("hooks-claude-conflict");

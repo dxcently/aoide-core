@@ -1799,7 +1799,7 @@ fn handle_peer_discover(inv: &Invocation) -> Outcome {
     let swept = match crate::discover::run_sweep(secs) {
         Ok(s) => s,
         Err(e) => {
-            return Outcome::error(cmd, format!("listening for discovery beacons: {e}"))
+            return Outcome::error(cmd, crate::discover::describe_sweep_error(&e))
                 .with_data(json!({ "reason": "sweep-failed" }))
         }
     };
@@ -1899,7 +1899,7 @@ fn handle_peer_invite(inv: &Invocation) -> Outcome {
     let swept = match crate::discover::run_sweep(secs) {
         Ok(s) => s,
         Err(e) => {
-            return Outcome::error(cmd, format!("listening for discovery beacons: {e}"))
+            return Outcome::error(cmd, crate::discover::describe_sweep_error(&e))
                 .with_data(json!({ "reason": "sweep-failed" }))
         }
     };
@@ -2398,7 +2398,10 @@ mod tests {
     // must leave `state/peers.json` byte-identical to what it was before.
     // The genuine heard-a-real-beacon path is `cli/tests/
     // discovery_connectivity.rs`'s `#[ignore]`'d real-multicast test; this
-    // one runs every time (no network needed to bind+listen+time out).
+    // one runs wherever the network namespace can JOIN the multicast group
+    // at all (`discover::multicast_capable` — the nix build sandbox's
+    // loopback-only namespace refuses the join itself with ENODEV, not
+    // just delivery) and skips with a note where it can't.
 
     fn discover_inv(secs: &str) -> Invocation {
         Invocation {
@@ -2411,6 +2414,10 @@ mod tests {
 
     #[test]
     fn peer_discover_never_writes_peers_json_even_on_an_empty_sweep() {
+        if !crate::discover::multicast_capable() {
+            eprintln!("skipping peer_discover_never_writes_peers_json_even_on_an_empty_sweep: no multicast-capable interface in this network namespace");
+            return;
+        }
         with_peer_state("discover-no-write", || {
             // A pre-existing peer record must survive `peer discover`
             // completely untouched — the clearest possible proof discover
@@ -2431,6 +2438,10 @@ mod tests {
 
     #[test]
     fn peer_discover_never_writes_peers_json_from_an_entirely_empty_registry() {
+        if !crate::discover::multicast_capable() {
+            eprintln!("skipping peer_discover_never_writes_peers_json_from_an_entirely_empty_registry: no multicast-capable interface in this network namespace");
+            return;
+        }
         with_peer_state("discover-no-write-empty", || {
             let out = handle_peer_discover(&discover_inv("1"));
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");

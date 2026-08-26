@@ -30,7 +30,14 @@
 //! `peer_invite_tail_and_peer_pair_request_are_the_same_function_not_two_copies`,
 //! and `aoide-server::a2a::tests::resolve_discovery_advertise_*`
 //! respectively (the "test the socket layer behind a seam" half of the
-//! brief's own test list) — this file holds only the two tests that
+//! brief's own test list). The one shape in that list that still needs a
+//! real socket — the `peer_discover_*` no-write tests bind+join the group
+//! to reach `run_sweep`'s Ok path, though they need no real beacon — is
+//! probe-gated rather than `#[ignore]`'d: `aoide-client::discover::
+//! multicast_capable` attempts the same `join_multicast_v4` on a scratch
+//! socket, and the tests skip with a note where the join itself is
+//! refused (the sandbox's loopback-only namespace fails it with ENODEV).
+//! This file holds only the two tests that
 //! genuinely need a live network: the bare advertise→discover round trip
 //! above, and the full `peer invite`-drives-a-real-pairing-ceremony round
 //! trip below it. Both bind the ONE fixed beacon port

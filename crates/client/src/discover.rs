@@ -132,6 +132,60 @@ pub fn run_sweep(secs: u64) -> std::io::Result<SweepResult> {
     Ok(SweepResult { heard, dropped })
 }
 
+/// Whether this bind/`join_multicast_v4` failure means "this network
+/// namespace has no multicast-capable interface" rather than a genuine
+/// defect: ENODEV (the nix build sandbox's loopback-only namespace refuses
+/// the join itself, not just delivery — no `std::io::ErrorKind` maps to
+/// it, hence the raw errno), EADDRNOTAVAIL, or EPERM under a network
+/// lockdown.
+fn is_no_multicast_here(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::PermissionDenied
+    ) || e.raw_os_error() == Some(19) // ENODEV
+}
+
+/// Render one [`run_sweep`] I/O failure as the taught error line `peer
+/// discover`/`peer invite` print — one function, so the two handlers never
+/// drift apart. The case worth teaching is a multicast-less host
+/// ([`is_no_multicast_here`]): the bare errno reads as noise ("No such
+/// device"), so name the condition and what discovery actually needs
+/// instead of parroting the OS.
+pub fn describe_sweep_error(e: &std::io::Error) -> String {
+    if is_no_multicast_here(e) {
+        format!(
+            "listening for discovery beacons: this host has no multicast-capable network \
+             interface ({e}) — discovery listens on the LAN multicast group {}:{}, which a \
+             bare-loopback or sandboxed network namespace cannot join",
+            beacon::GROUP,
+            beacon::PORT
+        )
+    } else {
+        format!("listening for discovery beacons: {e}")
+    }
+}
+
+/// Test-only capability probe: can this network namespace join
+/// [`beacon::GROUP`] at all? Binds an ephemeral scratch socket (never
+/// [`beacon::PORT`] — the probe must not fight a real sweep for the fixed
+/// port) and attempts the same `join_multicast_v4` [`run_sweep`] performs.
+/// A [`is_no_multicast_here`] failure is "no multicast here" (the nix
+/// build sandbox); any OTHER join failure returns `true` so the real test
+/// runs and surfaces it rather than being silently skipped.
+#[cfg(test)]
+pub(crate) fn multicast_capable() -> bool {
+    let Ok(socket) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
+        return false;
+    };
+    let group: Ipv4Addr = beacon::GROUP
+        .parse()
+        .expect("aoide_storage::beacon::GROUP is a pinned, valid IPv4 literal");
+    match socket.join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED) {
+        Ok(()) => true,
+        Err(e) => !is_no_multicast_here(&e),
+    }
+}
+
 /// Why `peer invite <name>` can't proceed straight to the ceremony —
 /// mirrors the shape `handle_peer_pair_request`'s own refusals already
 /// take (a reason string plus the taught detail), kept as a typed enum
@@ -235,6 +289,28 @@ mod tests {
     fn resolve_invite_target_empty_sweep_is_also_a_no_match_with_an_empty_heard_list() {
         let err = resolve_invite_target(&[], "anyone").unwrap_err();
         assert_eq!(err, InviteResolveError::NoMatch { heard: vec![] });
+    }
+
+    #[test]
+    fn describe_sweep_error_teaches_the_no_multicast_condition_for_enodev() {
+        // ENODEV — what `join_multicast_v4` returns in a loopback-only
+        // network namespace (the nix build sandbox). Pure string logic, no
+        // socket: runs everywhere.
+        let e = std::io::Error::from_raw_os_error(19);
+        let msg = describe_sweep_error(&e);
+        assert!(msg.contains("no multicast-capable network interface"), "{msg}");
+        assert!(msg.contains(beacon::GROUP), "the taught line names the group: {msg}");
+        assert!(msg.contains("No such device"), "the raw OS error stays visible: {msg}");
+    }
+
+    #[test]
+    fn describe_sweep_error_passes_an_unrelated_error_through_untaught() {
+        // EADDRINUSE (the fixed port already bound) is a genuine local
+        // conflict, not a missing capability — no multicast lecture.
+        let e = std::io::Error::from_raw_os_error(98);
+        let msg = describe_sweep_error(&e);
+        assert!(msg.starts_with("listening for discovery beacons: "), "{msg}");
+        assert!(!msg.contains("multicast-capable"), "{msg}");
     }
 
     #[test]
