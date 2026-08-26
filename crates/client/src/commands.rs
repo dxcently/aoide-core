@@ -1377,7 +1377,15 @@ fn run_pair_request(cmd: &str, url: &str, name: &str, self_url: &str) -> Outcome
     let own_nonce = aoide_storage::pairing::random_hex(16);
     let commit = aoide_storage::pairing::derive_commit(&own_pubkey, &own_nonce);
 
-    let body = crate::peer::build_pair_request_body(&own_pubkey, &name, &commit, &self_url);
+    // The wire `name` is this instance's OWN self-claimed name — the
+    // approver records the requester under it verbatim (a2a.rs
+    // `pair_request`'s contract). `name` (the `--name` flag) stays purely
+    // this side's local nickname for the approver, recorded at
+    // `remember_outbound` below; sending it here instead made the approver
+    // file the requester under the requester's-nickname-for-the-approver
+    // (the live yomi↔sakaki ceremony's phantom-peer defect, 2026-08-26).
+    let self_name = aoide_storage::display::local_host_name();
+    let body = crate::peer::build_pair_request_body(&own_pubkey, &self_name, &commit, &self_url);
     let body_str = serde_json::to_string(&body).unwrap_or_default();
     let (code, resp_body) = match post_json(&url, &body_str, None, &[], 15) {
         Ok(v) => v,

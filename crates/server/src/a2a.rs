@@ -1382,7 +1382,8 @@ fn self_url(bind: &str, port: u16) -> String {
 
 /// `aoide/pairRequest` (CONTRACTS.md §6, P-P2): the pairing ceremony's
 /// bootstrap request. Box A POSTs `{pubkeyHex, name, commitHex, url}` — its
-/// own public key, its claimed local nickname for THIS instance, a
+/// own public key, its own SELF-CLAIMED instance name (A's
+/// `local_host_name` chain — the name THIS instance will record A under), a
 /// COMMITMENT to its own nonce (`aoide_storage::pairing::derive_commit`,
 /// never the nonce itself — module doc on `aoide_storage::pairing`, the
 /// commit-then-reveal fix), and its own advertised A2A door URL (so the

@@ -74,18 +74,22 @@ pub fn parse_graph_summary_response(resp: &Value, name: &str, fetched_at: &str) 
 // ── The pairing ceremony (P-P2, CONTRACTS.md §6) ─────────────────────────
 
 /// Build the JSON-RPC `aoide/pairRequest` body `peer pair request` POSTs to
-/// the approver's door: this instance's own public key, its claimed local
-/// nickname for the approver, a COMMITMENT to a fresh nonce (`commit_hex` —
+/// the approver's door: this instance's own public key, its own SELF-CLAIMED
+/// instance name (`aoide_storage::display::local_host_name`'s chain — the
+/// approver's `peer pair approve` records this instance under this exact
+/// name, so it must name THIS box, never the caller's nickname for the
+/// approver; the live yomi↔sakaki ceremony 2026-08-26 caught the crossed
+/// reading), a COMMITMENT to a fresh nonce (`commit_hex` —
 /// `aoide_storage::pairing::derive_commit(pubkey_hex, nonce_hex)`, the
 /// nonce itself stays local until [`build_pair_reveal_body`]'s follow-up
 /// call), and its own advertised A2A door URL (where the later reveal and
 /// approval callbacks are delivered). Pure.
-pub fn build_pair_request_body(pubkey_hex: &str, name: &str, commit_hex: &str, self_url: &str) -> Value {
+pub fn build_pair_request_body(pubkey_hex: &str, self_name: &str, commit_hex: &str, self_url: &str) -> Value {
     let req = JsonRpcRequest {
         jsonrpc: "2.0".to_string(),
         id: json!(1),
         method: "aoide/pairRequest".to_string(),
-        params: json!({ "pubkeyHex": pubkey_hex, "name": name, "commitHex": commit_hex, "url": self_url }),
+        params: json!({ "pubkeyHex": pubkey_hex, "name": self_name, "commitHex": commit_hex, "url": self_url }),
     };
     serde_json::to_value(&req).expect("JsonRpcRequest always serializes")
 }
