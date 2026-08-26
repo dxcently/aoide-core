@@ -1,4 +1,4 @@
-//! `hooks install` — the generic hook-installer verb: wire an agent harness's
+//! `hooks install` — the generic hook-installer command: wire an agent harness's
 //! settings file so its hook stream pipes into `graph session hook`, driven
 //! by the harness's profile (`aoide_protocol::agents::SettingsSpec` — path +
 //! format). The merge is text/structure-level and NEVER a clobber (the kimi
@@ -239,7 +239,7 @@ fn hooks_install(inv: &Invocation) -> Outcome {
     };
     let capture = inv.flag_present("capture");
     // A declaratively-wired harness (pi: the ~/.pi/agent/extensions/ file the
-    // NixOS dendrite manages) has no settings file for this verb to write —
+    // NixOS dendrite manages) has no settings file for this command to write —
     // report it as already wired instead of minting a file the harness never
     // reads.
     if profile.hook_settings.format == SettingsFormat::Declarative {

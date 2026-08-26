@@ -831,7 +831,7 @@ fn announce_reap(message: &str) -> bool {
         // 48px, and a picture is not what a one-line sweep report needs. The
         // sweep's mark is a GLYPH in the summary instead — 𓌳 (U+13333, the
         // Egyptian sickle), which costs no layout slot at all and reads as
-        // this verb and no other in the herald ledger. U+13333 and not its
+        // this command and no other in the herald ledger. U+13333 and not its
         // neighbour U+13334: the two are the same sign, and 13334 is the
         // variant drawn as a bare blade — 13333 is the one that keeps the
         // upright shaft, and a scythe with no handle is a knife. The shaft

@@ -1,4 +1,4 @@
-//! Shared verb/arg/error glue used by every handler-bearing `graph` submodule:
+//! Shared command/arg/error glue used by every handler-bearing `graph` submodule:
 //! positional/flag arg validation, the stage-error envelope, and the
 //! three-registry loader.
 

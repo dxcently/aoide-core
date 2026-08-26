@@ -1,8 +1,8 @@
-//! The conductor domain's one CLI verb: `conductor` — raise the interactive
+//! The conductor domain's one CLI command: `conductor` — raise the interactive
 //! terminal UI.
 //!
 //! Moved from the root package's `src/commands/infra.rs` (Phase 9
-//! restructure, docs/architecture/PACKAGE-LAYOUT.md): a domain's CLI verbs
+//! restructure, docs/architecture/PACKAGE-LAYOUT.md): a domain's CLI commands
 //! live with the domain. The root package's `commands::all()` calls
 //! [`register`] directly after `aoide_client::commands::register_post_graph`,
 //! so `schema --json` order never shifts.

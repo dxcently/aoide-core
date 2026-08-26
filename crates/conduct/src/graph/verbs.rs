@@ -1,4 +1,4 @@
-//! The read/manage verb handlers: `view`, `project add/remove/list`, `link`,
+//! The read/manage command handlers: `view`, `project add/remove/list`, `link`,
 //! `prune`, `emit`. Every mutation re-stages `graph.json` via
 //! [`super::doc::restage_graph`] so the read path never drifts.
 
@@ -81,7 +81,7 @@ pub fn project_add(inv: &Invocation) -> Outcome {
 
     // `--auto-resume` (P-D8, `docs/architecture/AOIDED.md`'s "L5"): opts this
     // project into the daemon's boot-time auto-resume sweep. Only ever sets
-    // it true here — no `project set`/`project edit` verb exists yet to flip
+    // it true here — no `project set`/`project edit` command exists yet to flip
     // it back (see this crate's own `AGENTS.md`).
     let auto_resume = inv.flag_present("auto-resume");
 
@@ -358,7 +358,7 @@ mod tests {
         // already ignore `a2a:*` ids — neither reads `peer_store` at all, so
         // a registered peer (with its own cache) sitting alongside real
         // sessions must never appear as a `link`/`prune` target and must
-        // never break either verb. This is the "confirm it, don't assume it
+        // never break either command. This is the "confirm it, don't assume it
         // generalizes for free" test the plan called for.
         let _guard = crate::env_lock().lock().unwrap();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
@@ -412,7 +412,7 @@ mod tests {
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         assert_eq!(out.data.as_ref().unwrap()["removed"], json!(["s2"]));
 
-        // The peer registry itself is untouched by either verb.
+        // The peer registry itself is untouched by either command.
         assert_eq!(aoide_storage::peer_store::load_peers().len(), 1);
 
         // And the resolved graph document still folds the peer in as its own

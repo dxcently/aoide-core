@@ -5,7 +5,7 @@
 //! `commands/graph.rs` follows for the rest of the `graph` domain.
 //!
 //! Moved-in position: registered LAST in `cli`'s `commands::all()` (the
-//! plan's B3/append-only precedent) — a new verb never reorders an
+//! plan's B3/append-only precedent) — a new command never reorders an
 //! existing `register()` call, only appends after it.
 
 use aoide_protocol::registry::{arg, cmd, flag, Registry};

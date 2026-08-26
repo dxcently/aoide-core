@@ -1,4 +1,4 @@
-//! `graph spawn` — the DETACHED verb that starts a headless conducted agent
+//! `graph spawn` — the DETACHED command that starts a headless conducted agent
 //! (P2 of the conducted-agents plan; P1 landed `conduct --headless`,
 //! a044bae). Unlike `graph wrap`/`conduct`, which block the calling process
 //! until the wrapped agent exits, `spawn` re-execs THIS SAME binary as
@@ -49,7 +49,7 @@ const REGISTRATION_POLL: Duration = Duration::from_millis(25);
 
 /// The command's basename — the agent-name default. Mirrors
 /// `conduct.rs::command_basename` / `session_store.rs::session_wrap`'s own
-/// copy: each `graph` verb that spawns a labelled agent keeps its own small
+/// copy: each `graph` command that spawns a labelled agent keeps its own small
 /// copy of this one-liner rather than sharing it across modules.
 fn command_basename(program: &str) -> String {
     std::path::Path::new(program)

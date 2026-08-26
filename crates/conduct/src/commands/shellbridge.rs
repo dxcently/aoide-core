@@ -1,8 +1,8 @@
-//! `shellbridge` — the stage bridge process's CLI verb.
+//! `shellbridge` — the stage bridge process's CLI command.
 //!
 //! Split out of `aoide-server`'s `commands::register_infra` (P-A2 of the
 //! binary-split workstream, docs/architecture/PACKAGE-LAYOUT.md): `daemon`
-//! stays a core verb, but `shellbridge` belongs with the graphical binary
+//! stays a core command, but `shellbridge` belongs with the graphical binary
 //! (`lyra`) alongside `rice`/`screen`/`herald`/`quickshell` — this module is
 //! what P-A4 points `lyra` at. The socket-loop implementation
 //! (`crate::shellbridge::run`) does NOT move; only this registration does.

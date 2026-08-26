@@ -24,7 +24,7 @@ use std::path::PathBuf;
 ///
 /// Widened from `pub(crate)` to `pub` at P-A1 of the binary-split
 /// workstream: `aoide-screen` (moved out of this crate) needs the same
-/// address comparison for its session-targeted verbs (`screen shot
+/// address comparison for its session-targeted commands (`screen shot
 /// --session`, `screen point --from-shot`, …).
 pub fn normalize_addr(addr: &str) -> String {
     let a = addr.trim();
@@ -224,7 +224,7 @@ pub fn focus_window(addr: &str) -> Result<(), FocusError> {
 /// counterpart to the CLI [`focus`]. shellbridge drives this on a roster
 /// row-click: QML sends only the sessionId (which every row already holds), and
 /// the DAEMON owns the id→window resolution, so a widget never carries a stale or
-/// empty address (the bug this fixes: the old socket verb took a window address,
+/// empty address (the bug this fixes: the old socket command took a window address,
 /// but the widgets passed a sessionId, so every tracked-row jump silently
 /// no-op'd as `window-not-found`). Prefers the exact `windowAddress` (which also
 /// brings its workspace forward); if that isn't resolved yet but the `workspace`
@@ -360,7 +360,7 @@ pub(in crate::graph) fn ancestry_parent(sessions: &[SessionRecord]) -> Option<St
 
 /// The full 3-tier parent-resolution precedence for a `wrap`/`conduct`/
 /// `spawn` registration (task #89) — `graph spawn` re-execs `conduct
-/// --headless`, so this single function backs all three verbs via
+/// --headless`, so this single function backs all three commands via
 /// `conduct`'s own call and `wrap`'s parallel one:
 ///
 ///   1. an explicit `--parent` flag wins outright (unchanged, pre-existing);

@@ -96,6 +96,6 @@ pub(crate) use self::window::hyprctl_clients;
 /// Widened from `pub(crate)` to `pub` at P-A1 of the binary-split
 /// workstream: `aoide-screen` (moved out of this crate) needs the same
 /// `0x`/case-tolerant window-address comparison its own session-targeted
-/// verbs (`screen shot --session`, `screen point --from-shot`, …) already
+/// commands (`screen shot --session`, `screen point --from-shot`, …) already
 /// relied on when they lived here.
 pub use self::window::normalize_addr;

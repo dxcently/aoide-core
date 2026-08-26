@@ -174,7 +174,7 @@ impl Registry {
 ///
 /// Moved from the root package's `src/registry.rs` (Phase 9 restructure,
 /// docs/architecture/PACKAGE-LAYOUT.md) so every domain crate's
-/// `commands::register()` can describe its own verbs; the `$crate::registry::*`
+/// `commands::register()` can describe its own commands; the `$crate::registry::*`
 /// expansions resolve identically inside THIS crate, which owns the types.
 #[macro_export]
 macro_rules! cmd {

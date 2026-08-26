@@ -1,5 +1,5 @@
 //! Shared `#[cfg(test)]` fixtures reused across the `graph` submodule test
-//! suites: session/project builders, `Invocation` constructors per verb
+//! suites: session/project builders, `Invocation` constructors per command
 //! family, a unique per-test stage dir, and the env-var save/restore guard.
 //! `pub(crate)` (not `pub(in crate::graph)`): the whole module is
 //! `#[cfg(test)]`-gated at its `mod testutil;` declaration in `graph.rs`, so

@@ -1,10 +1,10 @@
-//! The herald's CLI verb: `herald push`, dunst's `script` hook.
+//! The herald's CLI command: `herald push`, dunst's `script` hook.
 //!
-//! One verb, and a machine-facing one — a human never types it. dunst runs it
+//! One command, and a machine-facing one — a human never types it. dunst runs it
 //! per notification with the `DUNST_*` environment set (see
 //! `modules/dendrites/dunst.nix`), and it forwards the record to the
 //! shellbridge, which files it into `stage/herald.json` for the QML herald to
-//! draw. The reading side is the ledger file itself, not a verb.
+//! draw. The reading side is the ledger file itself, not a command.
 
 use aoide_protocol::cmd;
 use aoide_protocol::registry::Registry;

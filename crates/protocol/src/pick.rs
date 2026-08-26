@@ -1,5 +1,5 @@
 //! The hand-rolled numbered picker (§7 dual entrance, phase A8): one
-//! implementation of every verb that serves the User AND an agent, where a
+//! implementation of every command that serves the User AND an agent, where a
 //! bare invocation with no selecting flag opens on a real tty and a
 //! flag-driven or non-tty invocation never touches stdin at all.
 //!

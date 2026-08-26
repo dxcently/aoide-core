@@ -1,6 +1,6 @@
 //! `graph send` — the gated injection door — and the hook door (`graph
 //! session hook`) that maps Claude-Code hook payloads onto the session/
-//! sub-agent verbs. The one place untrusted agent-bound text and untrusted
+//! sub-agent commands. The one place untrusted agent-bound text and untrusted
 //! hook JSON both land, so every outcome is audited and a hook payload never
 //! propagates as anything but data.
 //!
@@ -456,7 +456,7 @@ fn audit_send(inv: &Invocation, status: &str, message: &str, text: &str) {
 ///   this door's `--yes`/pending/autogate machinery above is a LOCAL-socket
 ///   concept and does not apply to a remote delivery, which always attempts
 ///   the network send — exactly like the existing `a2a agent send`/`peer
-///   pull` verbs already do unconditionally).
+///   pull` commands already do unconditionally).
 ///
 /// With NEITHER flag, this is a usage error (same as before `--to` existed —
 /// `require_flag` below is untouched).
@@ -880,7 +880,7 @@ fn ignored_remote_flags(inv: &Invocation) -> Vec<&'static str> {
 /// Deliver `text` to ONE remote session on `peer`, resolved from `query`
 /// against `peer`'s CACHED graph (`state/peer-cache/<peer>.json`) — a live
 /// pull is deliberately NOT performed here (the plan's own call: the cache
-/// is the addressing source for `send`; `who` is the probe verb). No cache
+/// is the addressing source for `send`; `who` is the probe command). No cache
 /// at all (peer never pulled) is a clean error pointing at `peer pull`,
 /// never a silent auto-pull — a send should be predictable, not trigger a
 /// network fetch the user didn't ask for.
@@ -1112,7 +1112,7 @@ enum HookAction {
 /// the `session_id` is absent/empty. Pure over the decoded JSON so the mapping
 /// is unit-testable without touching stdin or the stage. The event vocabulary
 /// itself lives in the agent's profile (`hook_event_map`); this collapses the
-/// semantic classes onto the session verbs.
+/// semantic classes onto the session commands.
 fn map_hook(profile: &AgentProfile, payload: &Value) -> Option<HookAction> {
     let id = payload
         .get("session_id")
@@ -1804,15 +1804,15 @@ fn hook_profile_for(inv: &Invocation) -> Result<&'static AgentProfile, Outcome> 
 
 /// Internal-only flag key `session_hook`'s own P-D6 routing stamps onto a
 /// SYNTHETIC invocation before calling `daemon_dispatch` — never set by a
-/// real CLI/MCP/A2A caller, and never registered in this verb's own
+/// real CLI/MCP/A2A caller, and never registered in this command's own
 /// `flags:` list (`commands/graph.rs`), so it carries no schema surface.
 /// The daemon `dispatch` wire (`{"op":"dispatch","path":...,"args":...,
 /// "flags":...}`) has no channel for forwarding stdin bytes, and this door
-/// is the one session-write verb whose payload arrives THAT way rather than
+/// is the one session-write command whose payload arrives THAT way rather than
 /// through `path`/`args`/`flags` — smuggling the already-read payload
 /// through the existing `flags` map avoids inventing new wire framing
 /// (out of scope this phase, per the phase brief) while still making this
-/// verb routable: the DAEMON side sees this key present (its own
+/// command routable: the DAEMON side sees this key present (its own
 /// `invocation_from_dispatch_request` copies `flags` verbatim off the wire)
 /// and reads the payload from there instead of its own process's stdin,
 /// which is never the calling hook's own pipe.
@@ -1820,7 +1820,7 @@ const STDIN_PAYLOAD_FLAG: &str = "__daemon-stdin-payload";
 
 /// `graph session hook [--agent <name>]` — the hook door for agent harnesses.
 /// Reads ONE JSON object from stdin and maps it (through the selected agent
-/// profile) to the session verbs. Never exits non-zero for a payload problem
+/// profile) to the session commands. Never exits non-zero for a payload problem
 /// (see [`hook_for_profile`]); a bogus `--agent` is a plain CLI error.
 ///
 /// P-D6 routing (`docs/architecture/AOIDED.md`'s "L4"): stdin is read FIRST,

@@ -46,7 +46,7 @@ use std::collections::BTreeMap;
 
 /// Mint a fresh session id for a resurrected session — never the ledger
 /// entry's own id (ids are never recycled, `docs/architecture/AOIDED.md`'s
-/// invariant list, item 5). Same `<verb>-<pid>-<unixts>` shape `graph spawn`
+/// invariant list, item 5). Same `<command>-<pid>-<unixts>` shape `graph spawn`
 /// mints with (`spawn.rs::unix_ts`, reused rather than re-derived).
 fn mint_resurrected_id() -> String {
     format!("resurrect-{}-{}", std::process::id(), super::conduct::unix_ts())
@@ -289,7 +289,7 @@ mod tests {
 
     #[test]
     fn mint_resurrected_id_never_reuses_the_ledger_id() {
-        // Same `<verb>-<pid>-<unixts>` shape (and the same second-granularity
+        // Same `<command>-<pid>-<unixts>` shape (and the same second-granularity
         // caveat) as `graph spawn`'s/`conduct`'s own id minting — this only
         // asserts what P-D8 actually needs: it is never the OLD ledger id.
         for old_id in ["ledger-old-1", "resurrect-1-1"] {

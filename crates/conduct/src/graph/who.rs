@@ -357,7 +357,7 @@ fn node_json(n: &NodeView) -> Value {
 
 /// The testable core: everything `who` does EXCEPT choosing the real `pull`
 /// closure. Loads local stage state (real file I/O — sanctioned, same as
-/// every other `graph` verb) and `state/peers.json`/`peer-cache/` (also
+/// every other `graph` command) and `state/peers.json`/`peer-cache/` (also
 /// real file I/O), but the one network-shaped step — probing peers — goes
 /// through the injected `pull`, so a test never opens a socket.
 pub(super) fn who_with(inv: &Invocation, pull: PullFn) -> Outcome {

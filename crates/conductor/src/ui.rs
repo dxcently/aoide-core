@@ -107,7 +107,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// The status-line keymap hint per panel — Aoide cues only, the verbs this
+/// The status-line keymap hint per panel — Aoide cues only, the commands this
 /// frontend owns.
 fn keymap_hint(panel: Panel) -> &'static str {
     match panel {

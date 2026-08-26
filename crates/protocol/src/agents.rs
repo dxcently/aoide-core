@@ -99,7 +99,7 @@ pub struct PermissionKeys {
     pub deny: &'static str,
 }
 
-/// Where an agent's hook settings live (a later installer verb writes them;
+/// Where an agent's hook settings live (a later installer command writes them;
 /// today this is declarative only).
 pub struct SettingsSpec {
     /// Path relative to `$HOME` (claude: `.claude/settings.json`).

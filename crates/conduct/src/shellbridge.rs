@@ -38,7 +38,7 @@ pub fn socket_path() -> PathBuf {
 }
 
 /// One parsed inbound command from the socket wire (newline-delimited JSON).
-/// The wire shape is defined by ShellBridge.qml; the only verb today is the
+/// The wire shape is defined by ShellBridge.qml; the only command today is the
 /// session-jump `focuswindow`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BridgeCommand {
@@ -52,7 +52,7 @@ pub enum BridgeCommand {
     FocusSession { session_id: String },
     /// `{ "cmd": "power", "action": "lock|logout|suspend|hibernate|reboot|shutdown" }`
     /// — a system action from the Exodos powermenu (AoideExodos.qml). QML never
-    /// shells out; this verb is the gate through which the six endings reach
+    /// shells out; this command is the gate through which the six endings reach
     /// hyprlock / hyprctl / systemctl.
     Power { action: PowerAction },
     /// `{ "cmd": "ricemode" }` — a click on the bar's rice-mode cell
@@ -129,7 +129,7 @@ impl PowerAction {
 
     /// The program + args this action spawns. `lock` matches the existing
     /// `lock` shell alias (hyprlock); `logout` exits the compositor; the rest
-    /// are systemd verbs.
+    /// are systemd commands.
     fn command(self) -> (&'static str, &'static [&'static str]) {
         match self {
             Self::Lock => ("hyprlock", &[]),
@@ -1093,12 +1093,12 @@ mod tests {
             Some(BridgeCommand::RefreshUsage)
         );
         // No payload is expected or read — extra fields are simply ignored,
-        // and surrounding whitespace/newline is tolerated like every verb.
+        // and surrounding whitespace/newline is tolerated like every command.
         assert_eq!(
             parse_command("  {\"cmd\":\"refreshusage\"}\n"),
             Some(BridgeCommand::RefreshUsage)
         );
-        // A typo is NOT this verb (the gatekeeper rule — an unparsed verb goes
+        // A typo is NOT this command (the gatekeeper rule — an unparsed command goes
         // nowhere, the `{cmd:"powermenu"}` scar).
         assert_eq!(parse_command(r#"{"cmd":"refresh"}"#), None);
         assert_eq!(parse_command(r#"{"cmd":"usagerefresh"}"#), None);
@@ -1111,12 +1111,12 @@ mod tests {
             Some(BridgeCommand::RecheckSessions)
         );
         // No payload is expected or read — extra fields ignored, surrounding
-        // whitespace/newline tolerated like every verb.
+        // whitespace/newline tolerated like every command.
         assert_eq!(
             parse_command("  {\"cmd\":\"rechecksessions\"}\n"),
             Some(BridgeCommand::RecheckSessions)
         );
-        // A near-miss is NOT this verb — an unparsed cmd goes nowhere.
+        // A near-miss is NOT this command — an unparsed cmd goes nowhere.
         assert_eq!(parse_command(r#"{"cmd":"recheck"}"#), None);
         assert_eq!(parse_command(r#"{"cmd":"recheckSession"}"#), None);
     }
@@ -1245,7 +1245,7 @@ mod tests {
             rice_mode_toggle_default_song("declarative", Some("sonata")),
             Some("sonata".to_string())
         );
-        // Surrounding whitespace is trimmed, same tolerance as the wire verbs.
+        // Surrounding whitespace is trimmed, same tolerance as the wire commands.
         assert_eq!(
             rice_mode_toggle_default_song("declarative", Some("  sonata  ")),
             Some("sonata".to_string())
@@ -1278,7 +1278,7 @@ mod tests {
         assert_eq!(parse_command(r#"{"cmd":"focuswindow","address":""}"#), None);
         assert_eq!(parse_command(r#"{"cmd":"focuswindow","address":"   "}"#), None);
         assert_eq!(parse_command(r#"{"cmd":"focuswindow"}"#), None);
-        // Unknown verb → None.
+        // Unknown command → None.
         assert_eq!(parse_command(r#"{"cmd":"explode","address":"0x1"}"#), None);
         // Missing cmd → None.
         assert_eq!(parse_command(r#"{"address":"0x1"}"#), None);

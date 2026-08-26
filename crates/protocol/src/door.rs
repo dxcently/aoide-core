@@ -7,7 +7,7 @@
 //!
 //! [`run`] drives the standard loop (parse, render a parse error uniformly,
 //! else dispatch the matched command and render its [`Outcome`]) — but a
-//! command tree always has a handful of verbs that are NOT one-shot dispatch:
+//! command tree always has a handful of commands that are NOT one-shot dispatch:
 //! a raw-stdout tool, a long-running server launch, anything that needs to
 //! bypass the `Outcome` envelope entirely. Those are per-binary — the core
 //! `aoide` binary launches `mcp serve --stdio`/`a2a serve`/`conductor`,
@@ -17,7 +17,7 @@
 //! BEFORE the generic dispatch. `Some(code)` short-circuits with that exit
 //! code; `None` falls through to the uniform dispatch+render path. This is
 //! how one parser + one run loop serves binaries with different special-case
-//! verb sets without duplicating either.
+//! command sets without duplicating either.
 
 use crate::audit::Door;
 use crate::invocation::Invocation;

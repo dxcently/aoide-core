@@ -8,9 +8,9 @@
 //!     -> its harness fires a hook (claude: `Notification` carrying
 //!        `notification_type: permission_prompt`; kimi: `PermissionRequest`)
 //!     -> `graph session hook` maps it to the unconditional `awaiting` phase
-//!        and, from that arm only, spawns THIS verb detached
+//!        and, from that arm only, spawns THIS command detached
 //!     -> the summons is PUBLISHED into the herald ledger
-//!        (`stage/herald.json`, through the shellbridge) and this verb returns
+//!        (`stage/herald.json`, through the shellbridge) and this command returns
 //!     -> the QML herald draws it with two real buttons and the human clicks
 //!        one; the click rides back as `{"cmd":"heraldverdict", …}`
 //!     -> the daemon calls [`answer_summons`], which types the verdict through
@@ -18,7 +18,7 @@
 //!        called in-process, every outcome audited.
 //!
 //! ── Why the card moved to QML (2026-08-17) ──────────────────────────────
-//! This verb used to raise the card itself with `dunstify --wait` and block on
+//! This command used to raise the card itself with `dunstify --wait` and block on
 //! its exit. It could not offer two buttons: dunst has no per-region hit
 //! testing, so every drawn control fired the same window-wide left-click
 //! binding — a deny chip that approved. Deny had to ride the DISMISS gesture
@@ -167,7 +167,7 @@ pub(in crate::graph) fn answerable(conductable: Option<bool>, socket: Option<&st
 
 /// The opt-out for the automatic summons: `AOIDE_HERALD_PERMIT` in
 /// {0,false,no,off} silences it box-wide. Automatic desktop side effects get
-/// an off switch; the verb itself stays callable by hand either way.
+/// an off switch; the command itself stays callable by hand either way.
 pub(in crate::graph) fn summons_enabled(env_value: Option<&str>) -> bool {
     !matches!(
         env_value.map(str::trim),
@@ -175,7 +175,7 @@ pub(in crate::graph) fn summons_enabled(env_value: Option<&str>) -> bool {
     )
 }
 
-// ── The verb ────────────────────────────────────────────────────────────
+// ── The command ────────────────────────────────────────────────────────────
 
 /// Resolve the harness profile for a session record's `agent` field, falling
 /// back to claude the way every other hook consumer does. `pub(in

@@ -1,7 +1,7 @@
 //! The DAG computation: `build_graph` (the `graph.json` v0 document), the
 //! Unicode tree `render`, and the pure command cores (`would_cycle`,
-//! `prune_done`) the verb handlers wire I/O around. `restage_graph` is the
-//! write-side counterpart every mutating verb calls to keep `graph.json` a
+//! `prune_done`) the command handlers wire I/O around. `restage_graph` is the
+//! write-side counterpart every mutating command calls to keep `graph.json` a
 //! pure function of the registries.
 
 use super::model::{

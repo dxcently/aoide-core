@@ -5,7 +5,7 @@
 //! graph-domain logic.
 //!
 //! Moved from the root package's `src/commands/graph.rs` (Phase 9
-//! restructure, docs/architecture/PACKAGE-LAYOUT.md): a domain's CLI verbs
+//! restructure, docs/architecture/PACKAGE-LAYOUT.md): a domain's CLI commands
 //! live with the domain; the root package's `commands::all()` calls
 //! [`register`] at the exact historical position so `schema --json` order
 //! never shifts.
@@ -111,7 +111,7 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["graph", "session", "hook"],
-        summary: "Hook door for agent harnesses: read one hook JSON from stdin and map it to a session verb through the agent's profile (never exits non-zero for a payload problem).",
+        summary: "Hook door for agent harnesses: read one hook JSON from stdin and map it to a session command through the agent's profile (never exits non-zero for a payload problem).",
         args: [],
         flags: [flag!("agent", "string", "Agent harness the payload comes from: claude (default), kimi, or pi.")],
         gated: false,
@@ -219,7 +219,7 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["graph", "permit"],
-        summary: "Publish the herald's permission SUMMONS for a session blocked on a permission prompt. The card is filed into the herald ledger (stage/herald.json) and this verb RETURNS — the Quickshell herald draws it with real approve/deny buttons, and the click routes back through the shellbridge to type the verdict in. The hook door raises it automatically when a session goes `awaiting`. Only ever raised for a conductable session whose harness has verified prompt keys, and the verdict is only typed while the session is still awaiting.",
+        summary: "Publish the herald's permission SUMMONS for a session blocked on a permission prompt. The card is filed into the herald ledger (stage/herald.json) and this command RETURNS — the Quickshell herald draws it with real approve/deny buttons, and the click routes back through the shellbridge to type the verdict in. The hook door raises it automatically when a session goes `awaiting`. Only ever raised for a conductable session whose harness has verified prompt keys, and the verdict is only typed while the session is still awaiting.",
         args: [],
         flags: [
             flag!("id", "string", "Target session id (required); its socket is resolved from sessions.json."),

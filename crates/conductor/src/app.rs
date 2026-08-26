@@ -1223,7 +1223,7 @@ impl App {
     /// list the layout draws, so `j`/`k` can never point at a node that isn't on
     /// screen. Enter cues the selected session's window (the same
     /// dispatch-backed `graph focus` the roster uses); `e` emits, `p` prunes —
-    /// the two graph-wide verbs — so the visual view is not read-only.
+    /// the two graph-wide commands — so the visual view is not read-only.
     fn handle_graph_key(&mut self, key: KeyEvent) {
         let nodes = crate::graphview::node_order(self);
         match key.code {
@@ -2359,7 +2359,7 @@ mod tests {
         );
     }
 
-    // ── PENDING: verb spellings, id-as-position, re-list mechanics (P-C5) ─
+    // ── PENDING: command spellings, id-as-position, re-list mechanics (P-C5) ─
 
     static PENDING_TEST_LOCK: Mutex<()> = Mutex::new(());
     static PENDING_CALLS: Mutex<Vec<(String, Vec<String>)>> = Mutex::new(Vec::new());

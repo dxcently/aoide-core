@@ -1,4 +1,4 @@
-//! The session write door: session-registration verbs (`session start/phase/
+//! The session write door: session-registration commands (`session start/phase/
 //! end/wrap`), transcript "say"/title/model extraction, and the sub-agent
 //! node lifecycle (`do_subagent_*`). shellbridge only ever SEEDS empty
 //! sessions.json/hooks.json (its socket accept loop is future work), so
@@ -344,7 +344,7 @@ pub(in crate::graph) fn set_owner_activity(owner: &str, state: &str, activity: O
 // The transcript layout, locator, and JSONL extractors are agent-harness
 // knowledge: they live in the profile (`aoide_protocol::agents::TranscriptSpec`,
 // claude: `~/.claude/projects/<munge(cwd)>/<session_id>.jsonl`). The refresh
-// verbs below dispatch through the profile the hook door hands down.
+// commands below dispatch through the profile the hook door hands down.
 
 /// Publish a harness-reported context-window ceiling onto the session record
 /// (pi's extension reports its active model's `contextWindow` on every hook
@@ -1613,10 +1613,10 @@ mod tests {
             "kimi's nested wrap must parent under claude via ancestry, never the terminal"
         );
         // The nested wrap itself: headless (no window), conducted. Registered
-        // the same two-step way the real `session_conduct` verb does it —
+        // the same two-step way the real `session_conduct` command does it —
         // `do_session_start` first, then `stamp_headless` right after (see
         // `conduct.rs`'s own `headless_conduct_registration_stamps_the_
-        // permanent_headless_marker`, which exercises the REAL verb end to
+        // permanent_headless_marker`, which exercises the REAL command end to
         // end, discovery gate included; this test reuses the same
         // stage-writer `stamp_headless` calls, not a raw field literal, so
         // it stays honest about what actually gets written).
