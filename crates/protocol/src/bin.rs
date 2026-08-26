@@ -94,6 +94,19 @@ pub fn on_path(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Shared `PATH`-mutation lock for this crate's `on_path` regression tests.
+/// `bin::tests` and `agents::tests` (`agents::on_path` delegates straight
+/// into the function above) both mutate the real `PATH` env var, so they
+/// share ONE mutex rather than each guarding a different one
+/// (crates/AGENTS.md's "process-global env... must share ONE mutex or they
+/// race"). `pub(crate)`, not module-local: the whole reason this lives
+/// outside `mod tests` below.
+#[cfg(test)]
+pub(crate) fn path_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +180,40 @@ mod tests {
             let exe_dir = c.exe_dir.map(Path::new);
             let got = resolve(c.env_value, exe_dir, c.sibling_exists, c.name);
             assert_eq!(got, c.expect, "{}", c.label);
+        }
+    }
+
+    #[test]
+    fn on_path_finds_a_program_in_a_scoped_path_and_misses_a_name_that_is_not_there() {
+        let _guard = path_test_lock().lock().unwrap();
+        let saved = std::env::var_os("PATH");
+        let dir = std::env::temp_dir().join(format!("aoide_bin_on_path_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("definitely-there"), "").unwrap();
+        std::env::set_var("PATH", &dir);
+
+        assert!(on_path("definitely-there"));
+        assert!(!on_path("definitely-not-there"));
+
+        match saved {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn on_path_is_false_when_path_is_unset() {
+        let _guard = path_test_lock().lock().unwrap();
+        let saved = std::env::var_os("PATH");
+        std::env::remove_var("PATH");
+
+        assert!(!on_path("anything"));
+
+        match saved {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
         }
     }
 

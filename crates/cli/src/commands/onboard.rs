@@ -160,16 +160,29 @@ fn register_clone(root: &Path, door: Door) -> (Vec<String>, Vec<String>) {
     let root_song = root.join("song");
     match std::fs::symlink_metadata(&home_song) {
         Ok(meta) if meta.file_type().is_symlink() => {
-            let resolves = matches!(
-                (std::fs::canonicalize(&home_song), std::fs::canonicalize(&root_song)),
-                (Ok(l), Ok(s)) if l == s
-            );
+            // The exact-path compare catches a symlink correctly aimed at
+            // `root_song` whose target doesn't (yet) exist -- canonicalize
+            // fails on a dangling target, which would otherwise misreport a
+            // correctly-targeted link as "elsewhere" just because the read
+            // happened before `root/song` existed. The canonicalize fallback
+            // still catches an equivalent but differently-spelled target
+            // (relative vs absolute, a symlink chain) once it resolves.
+            let same_target = std::fs::read_link(&home_song).map(|t| t == root_song).unwrap_or(false);
+            let resolves = same_target
+                || matches!(
+                    (std::fs::canonicalize(&home_song), std::fs::canonicalize(&root_song)),
+                    (Ok(l), Ok(s)) if l == s
+                );
             if resolves {
                 notes.push(format!("~/song already links to {}", root_song.display()));
             } else {
+                let target = std::fs::read_link(&home_song)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "<unreadable>".to_string());
                 notes.push(format!(
-                    "{} is already a symlink elsewhere -- leaving it (remove it yourself to relink)",
-                    home_song.display()
+                    "{} is already a symlink to {target}, not to {} -- leaving it (remove it yourself to relink)",
+                    home_song.display(),
+                    root_song.display()
                 ));
             }
         }
@@ -318,5 +331,210 @@ fn probe_and_delegate_lyra(inv: &Invocation) -> String {
             status.code().map(|c| c.to_string()).unwrap_or_else(|| "via signal".to_string())
         ),
         Err(e) => format!("lyra onboard not available yet ({e}) -- skipping the desktop half"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aoide_test_support::{env_lock, unique_tmp, EnvSaver};
+
+    // ── register_clone: the ~/song symlink's never-clobber contract ─────
+
+    #[test]
+    fn register_clone_links_song_when_absent_and_is_idempotent_on_rerun() {
+        let _g = env_lock().lock().unwrap();
+        let _env = EnvSaver::capture(&["HOME", "AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("onboard-clone-fresh");
+        std::fs::create_dir_all(root.join("song")).unwrap();
+        let home = unique_tmp("onboard-clone-fresh-home");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("AOIDE_STAGE_DIR", home.join("Aoide/song/stage"));
+        let home_song = home.join("song");
+
+        let (changed, notes) = register_clone(&root, Door::Cli);
+        let meta = std::fs::symlink_metadata(&home_song).unwrap();
+        assert!(meta.file_type().is_symlink(), "~/song was not created as a symlink");
+        assert_eq!(
+            std::fs::canonicalize(&home_song).unwrap(),
+            std::fs::canonicalize(root.join("song")).unwrap()
+        );
+        assert!(notes.iter().any(|n| n.contains("linked") && n.contains("song")), "notes: {notes:?}");
+        assert!(changed.iter().any(|c| c.starts_with("~/song ->")), "changed: {changed:?}");
+
+        // Re-run: no-op, reported present, never re-listed as changed.
+        let (changed2, notes2) = register_clone(&root, Door::Cli);
+        assert!(notes2.iter().any(|n| n.contains("already links to")), "notes2: {notes2:?}");
+        assert!(
+            !changed2.iter().any(|c| c.starts_with("~/song ->")),
+            "a second run must not re-report the symlink as changed: {changed2:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn register_clone_leaves_a_wrong_target_symlink_alone_with_a_note() {
+        let _g = env_lock().lock().unwrap();
+        let _env = EnvSaver::capture(&["HOME", "AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("onboard-clone-wrong");
+        std::fs::create_dir_all(root.join("song")).unwrap();
+        let home = unique_tmp("onboard-clone-wrong-home");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("AOIDE_STAGE_DIR", home.join("Aoide/song/stage"));
+        let home_song = home.join("song");
+        let elsewhere = unique_tmp("onboard-clone-wrong-elsewhere");
+        std::os::unix::fs::symlink(&elsewhere, &home_song).unwrap();
+
+        let (changed, notes) = register_clone(&root, Door::Cli);
+        assert!(
+            notes.iter().any(|n| n.contains("is already a symlink to") && n.contains(&elsewhere.display().to_string())),
+            "notes: {notes:?}"
+        );
+        assert!(!changed.iter().any(|c| c.starts_with("~/song ->")));
+        assert_eq!(std::fs::read_link(&home_song).unwrap(), elsewhere, "the wrong link must survive untouched");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    #[test]
+    fn register_clone_leaves_a_regular_file_alone_with_a_note() {
+        let _g = env_lock().lock().unwrap();
+        let _env = EnvSaver::capture(&["HOME", "AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("onboard-clone-file");
+        std::fs::create_dir_all(root.join("song")).unwrap();
+        let home = unique_tmp("onboard-clone-file-home");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("AOIDE_STAGE_DIR", home.join("Aoide/song/stage"));
+        let home_song = home.join("song");
+        std::fs::write(&home_song, "not a symlink").unwrap();
+
+        let (changed, notes) = register_clone(&root, Door::Cli);
+        assert!(
+            notes.iter().any(|n| n.contains("already exists and is not a symlink")),
+            "notes: {notes:?}"
+        );
+        assert!(!changed.iter().any(|c| c.starts_with("~/song ->")));
+        assert_eq!(std::fs::read_to_string(&home_song).unwrap(), "not a symlink", "the file must survive untouched");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn register_clone_reports_a_dangling_but_correctly_targeted_link_as_already_linked() {
+        // The cosmetic fix: a symlink aimed at the RIGHT path whose target
+        // doesn't exist yet must not be misreported as "elsewhere" just
+        // because `canonicalize` can't resolve a dangling target.
+        let _g = env_lock().lock().unwrap();
+        let _env = EnvSaver::capture(&["HOME", "AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("onboard-clone-dangling");
+        // Deliberately no `root/song` directory yet -- the link below points
+        // at a path that does not exist on disk.
+        let home = unique_tmp("onboard-clone-dangling-home");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("AOIDE_STAGE_DIR", home.join("Aoide/song/stage"));
+        let home_song = home.join("song");
+        std::os::unix::fs::symlink(root.join("song"), &home_song).unwrap();
+
+        let (_changed, notes) = register_clone(&root, Door::Cli);
+        assert!(notes.iter().any(|n| n.contains("already links to")), "notes: {notes:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ── seed_songbook: create-once, never overwrite ──────────────────────
+
+    #[test]
+    fn seed_songbook_creates_preferences_once_then_leaves_it_untouched() {
+        let root = unique_tmp("onboard-seed");
+        std::fs::create_dir_all(root.join("song/songbook")).unwrap();
+        let path = root.join("song/songbook/preferences.md");
+
+        let (seeded, note) = seed_songbook(&root);
+        assert!(seeded);
+        assert!(note.contains("seeded"), "note: {note}");
+        let first = std::fs::read_to_string(&path).unwrap();
+        assert!(first.contains("Songbook Preferences"));
+
+        let (seeded2, note2) = seed_songbook(&root);
+        assert!(!seeded2);
+        assert!(note2.contains("already present"), "note2: {note2}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first, "a second run must never overwrite");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── resolve_harnesses: --harness parsing ─────────────────────────────
+
+    fn onboard_inv(flags: &[(&str, &str)]) -> Invocation {
+        Invocation {
+            path: vec!["onboard".to_string()],
+            args: vec![],
+            flags: flags.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            door: Door::Cli,
+        }
+    }
+
+    #[test]
+    fn resolve_harnesses_from_explicit_flag_preserves_given_order() {
+        let inv = onboard_inv(&[("harness", "kimi,claude")]);
+        assert_eq!(resolve_harnesses(&inv).unwrap(), vec!["kimi", "claude"]);
+    }
+
+    #[test]
+    fn resolve_harnesses_trims_whitespace_and_drops_empty_tokens() {
+        let inv = onboard_inv(&[("harness", " claude ,, kimi ")]);
+        assert_eq!(resolve_harnesses(&inv).unwrap(), vec!["claude", "kimi"]);
+    }
+
+    #[test]
+    fn resolve_harnesses_rejects_an_unknown_name() {
+        let inv = onboard_inv(&[("harness", "claude,bogus")]);
+        let err = resolve_harnesses(&inv).unwrap_err();
+        assert_eq!(err.status, Status::Usage);
+        assert!(err.message.contains("unknown harness `bogus`"), "message: {}", err.message);
+        assert!(err.message.contains("claude, kimi, pi"), "message: {}", err.message);
+    }
+
+    // ── checkout_root: the from-a-checkout detector ──────────────────────
+
+    #[test]
+    fn checkout_root_finds_the_repo_root_by_walking_up_to_the_skill_marker() {
+        let _g = env_lock().lock().unwrap();
+        let root = unique_tmp("onboard-checkout-found");
+        std::fs::create_dir_all(root.join(".claude/skills/aoide")).unwrap();
+        std::fs::write(root.join(".claude/skills/aoide/SKILL.md"), "").unwrap();
+        let nested = root.join("pkgs/aoide/crates/cli");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&nested).unwrap();
+        let found = checkout_root();
+        std::env::set_current_dir(&saved_cwd).unwrap();
+
+        assert_eq!(
+            found.map(|p| std::fs::canonicalize(p).unwrap()),
+            Some(std::fs::canonicalize(&root).unwrap())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_root_is_none_outside_a_checkout() {
+        let _g = env_lock().lock().unwrap();
+        let root = unique_tmp("onboard-checkout-missing");
+
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+        let found = checkout_root();
+        std::env::set_current_dir(&saved_cwd).unwrap();
+
+        assert!(found.is_none(), "found a checkout root where there is none: {found:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

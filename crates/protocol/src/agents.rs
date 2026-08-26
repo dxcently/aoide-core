@@ -1454,6 +1454,31 @@ mod tests {
     // ── the seam itself: dispatch pins ─────────────────────────────────────
 
     #[test]
+    fn on_path_reflects_the_profiles_launch_program_via_the_bin_probe() {
+        // Shares `bin`'s own PATH-mutation lock -- `on_path` delegates
+        // straight into `bin::on_path`, so a bin.rs test running
+        // concurrently would race the same real `PATH` env var otherwise.
+        let _guard = crate::bin::path_test_lock().lock().unwrap();
+        let saved = std::env::var_os("PATH");
+        let dir = std::env::temp_dir().join(format!("aoide_agents_on_path_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pi"), "").unwrap();
+        std::env::set_var("PATH", &dir);
+
+        assert!(on_path(&PI_PROFILE), "pi's launch program sits on the scoped PATH");
+
+        std::fs::remove_file(dir.join("pi")).unwrap();
+        assert!(!on_path(&PI_PROFILE), "pi's launch program no longer sits on PATH");
+
+        match saved {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn agent_profile_resolves_registered_agents_and_rejects_the_unknown() {
         let p = agent_profile("claude").expect("claude is registered");
         assert_eq!(p.name, "claude");
