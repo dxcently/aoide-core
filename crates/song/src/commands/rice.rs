@@ -47,7 +47,7 @@ pub fn register(r: &mut Registry) {
     ));
 }
 
-/// Resolve the `livery.json` a `rice` verb should act on:
+/// Resolve the `livery.json` a `rice` command should act on:
 ///
 /// * **no arg** — the staged notes (`<stage>/livery.json`) if present, else
 ///   a usage error (exit 2). We never lint with no file.
@@ -56,7 +56,7 @@ pub fn register(r: &mut Registry) {
 ///   `<song>/songbook/<name>/livery.json` (resolved through the same stage-dir
 ///   seam as `graph emit`, so an `AOIDE_STAGE_DIR` override relocates it too).
 ///
-/// The `livery` verb group (`commands/livery.rs`) re-implements this SAME rule
+/// The `livery` command group (`commands/livery.rs`) re-implements this SAME rule
 /// as its own `resolve_notes` with a `skip` offset (its `emit` takes the target
 /// first) — two implementations, one rule. Kept `pub(crate)` so that seam stays
 /// reachable crate-internally.
@@ -310,7 +310,7 @@ pub(crate) fn handle_rice_stage(inv: &Invocation) -> Outcome {
     // unvalidated `../../x` would let `rice stage` read any JSON-parseable
     // file on the box) AND gets written verbatim into the staged notes'
     // `"song"` field, which `current_staged_song()` later trusts for
-    // `draft`/`mode` verbs' own path-building. Reject it here, once, at the
+    // `draft`/`mode` commands' own path-building. Reject it here, once, at the
     // source.
     if !crate::compose::valid_song_name(&name) {
         return Outcome::error(

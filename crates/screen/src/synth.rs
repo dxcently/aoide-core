@@ -18,7 +18,7 @@
 //! missing from PATH) for work this crate can do directly with one
 //! already-open socket per call. The wire protocol
 //! (`wlr-virtual-pointer-unstable-v1`) is unchanged from what `wlrctl` used
-//! — this is a transport swap, not a behavior change; every verb in
+//! — this is a transport swap, not a behavior change; every command in
 //! `point.rs` produces the exact same motion/button/scroll events on the
 //! wire as before, modulo the scroll-magnitude divergence documented at
 //! [`WHEEL_VALUE`] below.
@@ -29,7 +29,7 @@
 //! `run_wlrctl_pointer`'s own one-shot-process lifecycle (a `wlrctl pointer
 //! move` process also connected, acted, and exited every single call) rather
 //! than introducing a new class of "stale connection" bug a persistent
-//! handle would invite; nothing in `point.rs`'s verbs calls `synthesize`
+//! handle would invite; nothing in `point.rs`'s commands calls `synthesize`
 //! often enough for the extra connect/bind cost to matter. **Exception**: a
 //! [`Seq`] with no [`Step`]s at all returns `Ok(())` before connecting to
 //! anything — see the empty-Seq short-circuit below.

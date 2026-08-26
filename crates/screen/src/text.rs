@@ -8,12 +8,12 @@
 //! NAME instead of picking a pixel off the image by eye.
 //!
 //! ── `--from-shot` means something DIFFERENT here (state it loudly) ────────
-//! Every other coordinate-taking `screen point` verb (`move`/`click`/
+//! Every other coordinate-taking `screen point` command (`move`/`click`/
 //! `drag`/`hover`) treats `--from-shot <capture>` as "the x/y I gave you are
 //! IMAGE pixels off that capture — convert them to screen space before
 //! moving" ([`super::point::resolve_from_shot_point`]). `screen point text`
 //! reuses the exact same FLAG NAME for consistency — an agent that has
-//! learned `--from-shot` from any other verb should not have to learn a
+//! learned `--from-shot` from any other command should not have to learn a
 //! second spelling — but the SEMANTICS diverge: here it names the OCR
 //! SOURCE (which sidecar's `ocr` block to search), never a coordinate space
 //! to convert out of. [`ocr::Word::bbox`] is already screen space (see
@@ -263,9 +263,9 @@ pub fn nth_in_range(nth: u32, available: usize) -> Result<usize, NthOutOfRange> 
 /// `--dry-run` is a pure read (safe to run live: resolves the match and
 /// reports its centre, no pointer motion at all). Past that point the
 /// handler crosses the pointer-synthesis boundary and is NOT unit-tested —
-/// same split every other click-capable verb in this file already draws
+/// same split every other click-capable command in this file already draws
 /// (khoa's Phase 2 brief, HARD RULE 5, still the rule here even though this
-/// verb isn't itself phase-gated: a live click must never run in a test).
+/// command isn't itself phase-gated: a live click must never run in a test).
 pub fn point_text(inv: &Invocation) -> Outcome {
     let cmd = "screen.point.text";
     let usage = || {

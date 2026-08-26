@@ -41,7 +41,7 @@
 //! and `ipc call` prints a returning function's value. So for THIS call, any
 //! output at all means it did not land. That invariant is why the check is
 //! narrow: it holds because the function is void, and a future non-void IPC
-//! verb would need its own success test rather than this one.
+//! command would need its own success test rather than this one.
 //!
 //! This matters more than it looks: quickshell's own file watcher only scans
 //! the TOP LEVEL of `run/qml/`, never `run/qml/songs/`, so a `rice stage`

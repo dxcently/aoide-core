@@ -314,7 +314,7 @@ fn run_hyprctl_json<T: serde::de::DeserializeOwned>(args: &[&str]) -> Result<T, 
     }
 }
 
-// ── Dispatch: the one WARP call (khoa, Phase 2 of the `screen` verb family)
+// ── Dispatch: the one WARP call (khoa, Phase 2 of the `screen` command family)
 //
 // Everything above this section is a `hyprctl -j` QUERY (read-only, typed
 // JSON out). `dispatch movecursor` is different in kind: it MUTATES the
@@ -327,7 +327,7 @@ fn run_hyprctl_json<T: serde::de::DeserializeOwned>(args: &[&str]) -> Result<T, 
 // This is a WARP, not synthesized motion — see `tools/pointer.sh`'s own
 // header on why a warp is normally the WRONG tool for pointer synthesis (no
 // `wl_pointer.motion` event, so hover never updates). `screen point`'s five
-// motion-synthesizing verbs (`move`/`click`/`drag`/`hover`/`scroll`,
+// motion-synthesizing commands (`move`/`click`/`drag`/`hover`/`scroll`,
 // `point.rs` — `drag`/`hover` added Phase B) go through the
 // pointer-synthesis boundary (`screen::synth`) instead and never call this.
 // `restore` is the one deliberate exception: returning to a previously-saved
@@ -465,12 +465,12 @@ pub(crate) fn hypr_error_outcome(cmd: &str, e: &HyprError) -> Outcome {
 // `hover` parks the pointer at a target for a settle window and reports what
 // changed on the desktop while it sat there — a tooltip or context menu
 // opening under a synthesized hover IS a new layer surface, so this delta is
-// the verb's whole output, not a side note (see `point::point_hover`'s own
+// the command's whole output, not a side note (see `point::point_hover`'s own
 // doc). Layers are identified by `(monitor, namespace)` TOGETHER (Opus's
 // Phase B review, F3 — namespace alone collapses two monitors that both
 // carry the same namespace, e.g. a per-monitor bar/dock, into one identity;
 // an appear/disappear on ONE monitor while the other still holds that
-// namespace would then report no change at all, exactly wrong for a verb
+// namespace would then report no change at all, exactly wrong for a command
 // whose entire output is the delta). Hyprland reissues layer surface
 // addresses freely, so `namespace` (paired with its monitor) is still the
 // stable half of the identity — `screen info` already treats bare namespace

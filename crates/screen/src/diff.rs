@@ -51,7 +51,7 @@
 //! without a real UI change vanishing under it — the same class of "measured
 //! headroom, not tuned to the exact boundary" reasoning `ocr.rs`'s own
 //! `MIN_CONFIDENCE` uses). Alpha (channel 3) is DELIBERATELY IGNORED: this
-//! verb's whole question is "did the UI change," and grim's own composited
+//! command's whole question is "did the UI change," and grim's own composited
 //! output has no meaningful per-pixel alpha variation to begin with (a
 //! captured region is always fully opaque on screen) — treating a stray
 //! alpha bit-flip as "changed" would be pure decode noise, not signal.
@@ -85,7 +85,7 @@ use std::path::{Path, PathBuf};
 /// after-shot, short enough not to make every diff feel slow. `0` is a valid
 /// override ("diff right now," the brief's own words) — bounds are
 /// `0..=MAX_SETTLE_MS`, not `1..=`, unlike `hover`'s settle window (a hover's
-/// settle IS the point of that verb; a diff's settle is a courtesy delay).
+/// settle IS the point of that command; a diff's settle is a courtesy delay).
 pub const DEFAULT_SETTLE_MS: u64 = 250;
 pub const MAX_SETTLE_MS: u64 = 60_000;
 
@@ -464,7 +464,7 @@ pub fn diff(inv: &Invocation) -> Outcome {
     // against — the after-sidecar shares the identical origin/scale by
     // construction, since `write_capture` was handed the same
     // `region`/`scale` above, but the before-sidecar is the one this whole
-    // verb was asked to explain). `image_rect_to_screen` (Phase E review,
+    // command was asked to explain). `image_rect_to_screen` (Phase E review,
     // LOW) both clamps the corner back inside the capture rect's own
     // interior and floors width/height to `.max(1)` — see its own doc.
     let changed_rect_screen = changed_rect_image
@@ -516,7 +516,7 @@ pub fn diff(inv: &Invocation) -> Outcome {
         // real files this invocation produced, not just the image (Phase E
         // review, NIT: mirrors `shot()`'s own "never lose track of what
         // actually landed" reporting for its one sidecar write, applied here
-        // to this verb's two).
+        // to this command's two).
         return Outcome::error(cmd, format!("diffed but failed to write sidecar: {e}"))
             .changed(vec![dest.to_string_lossy().into_owned(), sidecar_path.to_string_lossy().into_owned()])
             .with_data(json!({ "reason": "sidecar-write-failed", "path": sidecar_path.to_string_lossy() }));

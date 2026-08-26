@@ -1,7 +1,7 @@
 //! `aoide screen ocr <capture>` — tesseract OCR over a `screen shot` capture,
 //! writing per-word bounding boxes (converted to ABSOLUTE SCREEN
 //! coordinates) into the capture's own JSON sidecar. Phase 3 of the `screen`
-//! verb family — `capture.rs`'s `Sidecar::ocr` field has carried this file's
+//! command family — `capture.rs`'s `Sidecar::ocr` field has carried this file's
 //! output shape as an explicit `null` placeholder since phase 1
 //! (`capture.rs`'s own header), so this phase's only schema change is
 //! POPULATING that field, never adding a new one.

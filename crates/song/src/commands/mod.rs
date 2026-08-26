@@ -1,7 +1,7 @@
-//! The `rice`/`cover` command groups — the song domain's CLI verbs.
+//! The `rice`/`cover` command groups — the song domain's CLI commands.
 //!
 //! Moved from the root package's `src/commands/{rice,cover}.rs` (Phase 9
-//! restructure, docs/architecture/PACKAGE-LAYOUT.md): a domain's CLI verbs
+//! restructure, docs/architecture/PACKAGE-LAYOUT.md): a domain's CLI commands
 //! live with the domain. The root package's `commands::all()` calls each
 //! `register()` at the exact historical position so `schema --json` order
 //! never shifts (rice → draft → mode → cover → livery, keeping the whole

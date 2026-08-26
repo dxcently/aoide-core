@@ -1,5 +1,5 @@
 //! `aoide screen` — a read-only view onto the desktop for agents, plus
-//! passive capture. Phase 1 of the `screen` verb family: `screen info`
+//! passive capture. Phase 1 of the `screen` command family: `screen info`
 //! (monitors/cursor/workspace/clients/layers via typed `hyprctl -j` parses,
 //! `hypr.rs`) and `screen shot` (grim/slurp capture + a JSON sidecar,
 //! `capture.rs`) — Phase 4 extends `screen shot` with `--session`/`--window`
@@ -12,7 +12,7 @@
 //! reused as code (a bash prototype, not a library). Phase A of the
 //! pointer-emulation workstream (khoa, 2026-08-17) then replaced Phase 2's
 //! wlrctl shell-out with a native `zwlr_virtual_pointer_v1` backend
-//! (`synth.rs`) behind the same boundary — `point.rs`'s verbs are unchanged.
+//! (`synth.rs`) behind the same boundary — `point.rs`'s commands are unchanged.
 //! Phase B (khoa, same day) adds `screen point drag`/`screen point hover`
 //! and extends `click`/`scroll` (`--count`, a second scroll axis) — still
 //! `point.rs`/`hypr.rs`, no new module. Phase D (khoa, 2026-08-17) closes the
@@ -20,7 +20,7 @@
 //! model-friendly downscale with an exact inverse scale recorded in the
 //! sidecar) and `--cursor`, plus a full `desktop` snapshot embedded in every
 //! sidecar (`capture.rs`/`hypr.rs`); every coordinate-taking `screen point`
-//! verb gains `--from-shot <capture>` to consume image-space coordinates off
+//! command gains `--from-shot <capture>` to consume image-space coordinates off
 //! that same sidecar (`point.rs`) — still no new module, the loop closes
 //! entirely within `capture`/`hypr`/`point`. Phase E (khoa, 2026-08-17) adds
 //! `screen diff` (`diff.rs`) — mechanical act-verification: re-shoot a prior
@@ -68,10 +68,10 @@
 //! trait or a backend seam — plain module hygiene.
 
 pub mod capture;
-/// The `screen *` verbs' registry wiring (moved from
+/// The `screen *` commands' registry wiring (moved from
 /// `aoide-conduct`'s `commands/screen.rs` at P-A1) — thin registrations over
 /// this crate's domain modules; see its own header for the split from
-/// verb logic.
+/// command logic.
 pub mod commands;
 pub mod diff;
 pub mod hypr;

@@ -38,7 +38,7 @@
 //!   choice; `rice mode stage`/`rice mode declarative` are how you leave
 //!   `Draft` mode, explicitly, same as always).
 //!
-//! There used to be a fourth verb, `rice draft stage <name>` (copy-based:
+//! There used to be a fourth command, `rice draft stage <name>` (copy-based:
 //! read the draft, atomic-write it into the stage as a one-shot snapshot).
 //! It's gone — fully superseded by `rice mode draft`'s symlink routing, and
 //! keeping both would be two spellings of "go live with this draft" (the

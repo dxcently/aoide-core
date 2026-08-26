@@ -1,5 +1,5 @@
-//! `rice take` — the explicit snapshot verb, and the two mutator cores every
-//! later take verb (`rice back`, `rice take mark`, the auto-take hooks in
+//! `rice take` — the explicit snapshot command, and the two mutator cores every
+//! later take command (`rice back`, `rice take mark`, the auto-take hooks in
 //! `rice stage`/`cover set`) is built on
 //! (`references/fleshing-out-aoide-ricing.md` §5.2, phase A; the
 //! branch-from-any-mark ask this whole feature exists to answer).
@@ -123,7 +123,7 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["rice", "back"],
-        summary: "Revert the routed draft's live stage to an earlier take (--take N or --mark <letter>) and move the head cursor there — the NEXT write hangs off it, branching implicitly with no branch verb. Un-taken drift on the stage is snapshotted first so nothing is destroyed. Draft mode only. A bare `rice back` (neither flag) opens a numbered picker defaulting to the head's parent when run on a real CLI tty; off a tty (an agent door, or a script) it refuses with a usage error instead — flags/--json always bypass the picker either way.",
+        summary: "Revert the routed draft's live stage to an earlier take (--take N or --mark <letter>) and move the head cursor there — the NEXT write hangs off it, branching implicitly with no branch command. Un-taken drift on the stage is snapshotted first so nothing is destroyed. Draft mode only. A bare `rice back` (neither flag) opens a numbered picker defaulting to the head's parent when run on a real CLI tty; off a tty (an agent door, or a script) it refuses with a usage error instead — flags/--json always bypass the picker either way.",
         args: [],
         flags: [
             flag!("take", "int", "Take number to revert to."),
@@ -135,7 +135,7 @@ pub fn register(r: &mut Registry) {
     ));
 }
 
-/// The shared "must be routed into a draft" guard every take verb starts
+/// The shared "must be routed into a draft" guard every take command starts
 /// with: takes live inside `songbook/<song>/drafts/<draft>/takes/`
 /// ([`aoide_storage::takes::takes_dir`]), so nothing about them is
 /// resolvable outside `Draft` mode — a `Staging`/`Declarative` stage has no
@@ -272,7 +272,7 @@ pub(crate) fn snapshot_if_drifted_unlocked(cmd: &str, cause: &str) -> Result<Opt
     snapshot_unlocked(cmd, cause).map(Some)
 }
 
-/// `rice take` — the explicit snapshot verb (cause `"explicit"`). A bare
+/// `rice take` — the explicit snapshot command (cause `"explicit"`). A bare
 /// mint of whatever is currently staged in the routed draft; no selection,
 /// no comparison, no revert — `rice back` is where reverting
 /// and branching actually happen. This handler's own write is not folded
@@ -341,7 +341,7 @@ fn mark_letters_for(marks: &BTreeMap<String, u32>, take: u32) -> Vec<String> {
 /// **Orphans are swept in, never dropped.** `aoide_storage::takes` is deliberately tolerant of
 /// partial state (`list_takes` survives a half-written record, `load_head` falls back on a stale
 /// pointer) — a `parent` naming a take number that no longer exists on disk is exactly that kind
-/// of state, and `rice take list` is the verb someone uses to FIND a take to revert to, so a real
+/// of state, and `rice take list` is the command someone uses to FIND a take to revert to, so a real
 /// record that exists on disk must never render as nothing. The first pass walks outward from the
 /// `parent == None` roots via [`aoide_storage::takes::children`]; a second pass then sweeps every
 /// take number, ascending, that the first pass never reached and renders each as its own
@@ -448,7 +448,7 @@ fn render_node(
 /// `rice take list [--json]` — the tree, always in full. Fork 9 decided "whole tree by default"
 /// over an ancestry-only view, which killed the plan's originally-reserved `--all` flag outright
 /// (advisor verdict D5a): there is only one view now, so no flag selects it. Refuses outside
-/// `Draft` mode via [`resolve_draft`], the same guard every other take verb opens with — takes
+/// `Draft` mode via [`resolve_draft`], the same guard every other take command opens with — takes
 /// live inside a routed draft's `takes/`, nowhere else. An empty store (`Draft` mode entered,
 /// nothing ever taken yet) is `ok` with an empty `takes` array, never an error — the `rice draft
 /// list` precedent (`draft.rs::handle_draft_list`, no drafts found is `ok` too).
@@ -551,7 +551,7 @@ pub(crate) fn mark(cmd: &str, letter: &str, target: u32) -> Result<(u32, bool, O
     shellbridge::with_stage_lock(|| mark_unlocked(cmd, letter, target))
 }
 
-/// `rice take mark <letter> [--take N]` — the phase-A standalone verb
+/// `rice take mark <letter> [--take N]` — the phase-A standalone command
 /// (`references/fleshing-out-aoide-ricing.md` §5.2/§10: phase B's `rice
 /// score` `mark` step CALLS this later; it does not reimplement it, and
 /// this handler is not itself part of that state machine).
@@ -566,7 +566,7 @@ pub(crate) fn mark(cmd: &str, letter: &str, target: u32) -> Result<(u32, bool, O
 ///
 /// Dual-entrance per the project's rule: flags/`--json` only, no prompting,
 /// no stdin read ever — the interactive picker belongs to `rice back`'s
-/// bare-tty branch alone, never to this explicit verb.
+/// bare-tty branch alone, never to this explicit command.
 fn handle_rice_take_mark(inv: &Invocation) -> Outcome {
     let letter = match inv.args.first() {
         Some(l) => l.clone(),
@@ -768,7 +768,7 @@ fn resolve_base(
 /// [`resolve_draft`] gates on Draft mode, [`resolve_base`] picks the comparison base (see its own
 /// doc for the ancestral-mark default), and — only once a real base is in hand — the routed
 /// draft's CURRENT staged content is read via [`read_staged_content`], the same seam every other
-/// take verb in this file reads through: comparing against the stage is comparing against the
+/// take command in this file reads through: comparing against the stage is comparing against the
 /// live draft, exactly like [`snapshot_if_drifted_unlocked`]'s own drift check does.
 fn handle_rice_take_diff(inv: &Invocation) -> Outcome {
     let take_flag = match inv.flags.get("take") {
@@ -849,7 +849,7 @@ fn handle_rice_take_diff(inv: &Invocation) -> Outcome {
 // ── `rice take prune` — the pressure valve (phase A9, §7.1) ────────────────
 //
 // **Design note, since the plan leaves the exact combination un-spelled-out:**
-// every OTHER verb in this file draws a hard line between "a flag was given"
+// every OTHER command in this file draws a hard line between "a flag was given"
 // (act immediately, no prompt, no stdin) and "no flag was given" (the tty
 // picker, or off a tty, a refusal/report) — `rice back`'s `--take`/`--mark`
 // vs. its bare dual entrance is the precedent this mirrors exactly. Prune
@@ -1172,7 +1172,7 @@ fn render_prune_outcome(song: &str, draft: &str, result: PruneResult, plan: &Pru
 
 /// Act on a [`PrunePlan`] whose candidates were selected by a flag
 /// (`--older-than`/`--keep`/`--all-but-marks`) — executes immediately, no
-/// prompt, no stdin, exactly like every other flag-driven verb in this file.
+/// prompt, no stdin, exactly like every other flag-driven command in this file.
 /// An empty candidate set is still `Ok` ("nothing to prune"), never an
 /// error — the same "idempotent no-op is success" shape
 /// [`snapshot_if_drifted_unlocked`]'s no-drift case uses.
@@ -1224,7 +1224,7 @@ fn prune_picker(song: &str, draft: &str, plan: &PrunePlan) -> Outcome {
 /// `rice take prune [--older-than <Nd|Nh>] [--keep <N>] [--all-but-marks]
 /// [--force] [--json]` — the pressure valve (phase A9, §7.1). Flags are
 /// syntax-validated first (a malformed `--older-than`/`--keep` is a usage
-/// error before the draft is even resolved, mirroring every other verb's
+/// error before the draft is even resolved, mirroring every other command's
 /// flag-first-then-mode-check order in this file), then [`resolve_draft`]
 /// gates on Draft mode, then [`plan_prune`] computes the candidate set once.
 /// A selector flag present (`older-than`/`keep`/`all-but-marks`) acts at
@@ -1421,7 +1421,7 @@ fn back_unlocked(cmd: &str, take_flag: Option<u32>, mark_flag: Option<String>) -
     // file), so this writes the same seam `cover set` writes
     // (`commands/cover.rs::handle_cover_set`), never the draft directory's
     // own `cover.json` — that file is a `draft save`-time archive copy no
-    // write path maintains and no read path consumes (draft verbs are
+    // write path maintains and no read path consumes (draft commands are
     // save/list/drop only). A take minted with NO cover must not leave the
     // previous wallpaper lying on the stage — mirror `draft.rs`'s own
     // fork-time stale-cover removal (`rice.draft.save`'s `cover_src.is_file()`
@@ -1483,7 +1483,7 @@ fn back_unlocked(cmd: &str, take_flag: Option<u32>, mark_flag: Option<String>) -
     })
 }
 
-/// `rice back [--take N | --mark <letter>]` — the verb the branch-from-any-
+/// `rice back [--take N | --mark <letter>]` — the command the branch-from-any-
 /// mark ask lands on. Syntax-validates its flags BEFORE taking the lock (a
 /// malformed `--take`/`--mark` is a usage error regardless of draft state,
 /// so there is no reason to acquire anything to report it), then wraps
@@ -1926,7 +1926,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&stage);
     }
 
-    // ── `rice take mark` — the mark verb (phase A4) ─────────────────────
+    // ── `rice take mark` — the mark command (phase A4) ─────────────────────
     //
     // `inv()` (aoide_test_support) has no flags support, so a `--take N`
     // invocation is built by hand, same pattern `graph/permit.rs`'s and
@@ -2490,7 +2490,7 @@ mod tests {
 
     #[test]
     fn back_with_both_take_and_mark_given_take_wins() {
-        // No sibling verb has two co-present selectors, so the reviewer
+        // No sibling command has two co-present selectors, so the reviewer
         // ruled a silent `--take`-wins priority defensible but unpinned —
         // this test is the pin.
         let _g = aoide_test_support::env_lock().lock().unwrap();

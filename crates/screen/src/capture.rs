@@ -385,7 +385,7 @@ pub fn clamp_region(requested: hypr::Region, bounds: hypr::Region) -> Option<Res
 /// for any future backend behind [`capture_image`] alike (verified against
 /// grim empirically — see the executor's report). An image-DECODING
 /// dependency (`image`) did arrive in this workspace, with Phase E's `screen
-/// diff` verb (khoa, 2026-08-17, pointer-emulation workstream) — but
+/// diff` command (khoa, 2026-08-17, pointer-emulation workstream) — but
 /// decoding stays entirely out of the capture path: `screen::diff` is the
 /// one module that calls into it, this function still never does. Rounds to
 /// the nearest pixel.
@@ -645,7 +645,7 @@ pub fn transform_point(origin: hypr::Point, scale: f64, x: i64, y: i64) -> hypr:
 pub enum FromShotError {
     /// `(x, y)` lies outside the sidecar's own recorded image size (DEVICE
     /// pixels, `Sidecar::size` — not logical/screen pixels). The classic
-    /// failure this whole verb exists to catch: an agent read coordinates
+    /// failure this whole command exists to catch: an agent read coordinates
     /// off a DOWNSCALED shot (`--fit`/`--scale`) but reported them as if the
     /// image were full-resolution.
     OutOfBounds { x: i64, y: i64, image_w: i64, image_h: i64 },
@@ -762,7 +762,7 @@ pub struct CaptureRequest {
     /// workstream) — draw the composited cursor into the capture (grim
     /// `-c`). Opt-in, not the default: a composited cursor makes a PURE
     /// pointer move register as a pixel change to the upcoming screen-diff
-    /// verb, which would otherwise treat "nothing moved but the mouse" as
+    /// command, which would otherwise treat "nothing moved but the mouse" as
     /// "nothing changed."
     pub cursor: bool,
     pub dest: PathBuf,

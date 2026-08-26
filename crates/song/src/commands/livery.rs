@@ -1,5 +1,5 @@
 //! `livery emit` / `livery resolve` / `livery lint` — the native livery-engine
-//! verb group (LIVERY-MERGE.md Phase 1): the former standalone token CLI's
+//! command group (LIVERY-MERGE.md Phase 1): the former standalone token CLI's
 //! surface, native, inside aoide's `Invocation`/`Outcome` shell.
 //!
 //! The handlers carry the engine's raw byte output in `data["stdout"]` — the
@@ -56,10 +56,10 @@ pub fn register(r: &mut Registry) {
     ));
 }
 
-/// Resolve the livery file a `livery` verb should act on — the same seam as
+/// Resolve the livery file a `livery` command should act on — the same seam as
 /// `rice lint`, but RE-IMPLEMENTED here (not reusing
 /// `resolve_rice_notes` in `commands/rice.rs`): `resolve_notes` is the
-/// `livery`-local copy with a `skip` offset for the verb's own leading
+/// `livery`-local copy with a `skip` offset for the command's own leading
 /// positionals — two implementations, one resolution rule:
 ///
 /// * **no arg** — the staged notes (`<stage>/livery.json`) if present, else
@@ -68,7 +68,7 @@ pub fn register(r: &mut Registry) {
 /// * **otherwise the arg is a committed-song NAME** →
 ///   `<song>/songbook/<name>/livery.json`.
 ///
-/// `skip` offsets past the verb's own leading positionals (`livery emit`
+/// `skip` offsets past the command's own leading positionals (`livery emit`
 /// takes `<target>` first, so its livery name lives at args[1]).
 fn resolve_notes(inv: &Invocation, cmd: &str, skip: usize) -> Result<PathBuf, Outcome> {
     match inv.args.get(skip) {

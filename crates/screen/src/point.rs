@@ -1,10 +1,10 @@
-//! `aoide screen point <verb>` — pointer synthesis, ported from
-//! `tools/pointer.sh` (Phase 2 of the `screen` verb family; the script is
+//! `aoide screen point <command>` — pointer synthesis, ported from
+//! `tools/pointer.sh` (Phase 2 of the `screen` command family; the script is
 //! the BEHAVIORAL spec, read but not reused as code — a bash prototype, not
 //! a library, same relationship `capture.rs`/`hypr.rs` already have to it).
 //! Phase A of the pointer-emulation workstream (khoa, 2026-08-17) then
 //! swapped the transport behind [`synthesize`] from a `wlrctl` shell-out to
-//! a native `zwlr_virtual_pointer_v1` client (`screen::synth`) — every verb
+//! a native `zwlr_virtual_pointer_v1` client (`screen::synth`) — every command
 //! below behaves identically; only how the boundary is crossed changed.
 //!
 //! ── Why real motion, not a warp (measured; see `tools/pointer.sh`'s own
@@ -12,7 +12,7 @@
 //! `hyprctl dispatch movecursor` WARPS the cursor: it does not generate a
 //! `wl_pointer.motion` event inside a surface the pointer is already in, so
 //! hover states never change and no agent could ever verify one. The five
-//! motion-synthesizing verbs here (`move`/`click`/`drag`/`hover`/`scroll`)
+//! motion-synthesizing commands here (`move`/`click`/`drag`/`hover`/`scroll`)
 //! instead drive `zwlr_virtual_pointer_manager_v1`, entering Hyprland's
 //! normal input pipeline and producing genuine events. `restore` is the one
 //! deliberate exception — see [`super::hypr::dispatch_movecursor`]'s doc.
@@ -22,7 +22,7 @@
 //! ────────────────────────────────────────────────────────────────────────
 //! [`synth::synthesize`](super::synth::synthesize) is the ONLY place a
 //! Wayland client type is named anywhere in this crate (see that module's
-//! own header). Every verb in this file decides WHAT pointer action to
+//! own header). Every command in this file decides WHAT pointer action to
 //! synthesize (delta math, button choice, scroll notches) and hands down an
 //! already-assembled [`synth::Seq`](super::synth::Seq); `synthesize`
 //! decides HOW. [`PointerError`]'s reason codes stay backend-agnostic
@@ -33,7 +33,7 @@
 //! to) from the free-text detail string.
 //!
 //! ── NOT live-proven this phase (khoa's Phase 2 brief, explicit + HARD RULE
-//! 5; still true under Phase A's transport swap and Phase B's new verbs) ──
+//! 5; still true under Phase A's transport swap and Phase B's new commands) ──
 //! A human may be at this desk with the pointer physically "leased" to
 //! another agent while this phase is built. `move`/`click`/`drag`/`hover`/
 //! `scroll` all call [`synth::synthesize`](super::synth::synthesize), and
@@ -41,16 +41,16 @@
 //! six are executed live this phase, only unit-tested up to (never across)
 //! that boundary. `idle`/`save` are pure reads (never touch the
 //! pointer-synthesis boundary, never move anything) and ARE live-proven —
-//! see the executor's report. The usage-error paths of every verb
+//! see the executor's report. The usage-error paths of every command
 //! (missing/malformed args) return before touching hyprctl or the synthesis
-//! boundary at all, so those are live-proven too, for all eight verbs.
+//! boundary at all, so those are live-proven too, for all eight commands.
 //!
 //! ── Phase B of the pointer-emulation workstream (khoa, 2026-08-17) ───────
-//! Two new verbs, [`point_drag`]/[`point_hover`], plus `click --count` and a
+//! Two new commands, [`point_drag`]/[`point_hover`], plus `click --count` and a
 //! second `scroll` axis (`dx`). Same HARD RULE 5 as Phase A: neither new
-//! verb is executed live this phase either — `drag` and `hover` both cross
+//! command is executed live this phase either — `drag` and `hover` both cross
 //! the pointer-synthesis boundary, so they're unit-tested only up to it,
-//! same split as `move`/`click`/`scroll`. `drag` is the one verb in this
+//! same split as `move`/`click`/`scroll`. `drag` is the one command in this
 //! file that synthesizes a press AND a release in a SINGLE
 //! [`synth::synthesize`] call — see [`drag_seq`]'s doc on why that's not
 //! optional (the stuck-button safety contract this workstream's Phase A
@@ -166,7 +166,7 @@ impl Button {
             _ => None,
         }
     }
-    /// This verb's own canonical spelling — echoed back in `click`'s
+    /// This command's own canonical spelling — echoed back in `click`'s
     /// `Outcome` message/data (`{"button": ...}`), not fed to any backend
     /// (that's [`button_code`] now).
     pub fn as_str(self) -> &'static str {
@@ -297,7 +297,7 @@ pub fn parse_scroll_args(args: &[String]) -> Result<(i64, i64), String> {
     }
 }
 
-// ── Seq assembly — pure, one builder per verb, unit-tested directly. These
+// ── Seq assembly — pure, one builder per command, unit-tested directly. These
 // (plus button_code above) are the only functions that know the shape of a
 // synth::Seq; synth::synthesize itself only ever walks whatever Seq it's
 // handed. ───────────────────────────────────────────────────────────────
@@ -566,14 +566,14 @@ pub(crate) fn pointer_error_outcome(cmd: &str, e: &PointerError) -> Outcome {
 }
 
 // ── `--from-shot <capture>`: image-space coordinates on any coordinate-
-// taking `screen point` verb (khoa, 2026-08-17, Phase D of the pointer-
+// taking `screen point` command (khoa, 2026-08-17, Phase D of the pointer-
 // emulation workstream) ─────────────────────────────────────────────────
 //
 // Closes the model-space↔screen-space loop `screen shot --fit`/`--cursor`
 // opened: an agent that read a coordinate off a (possibly downscaled) shot
 // hands it straight to `move`/`click`/`drag`/`hover` as IMAGE pixels, and
 // this converts it to screen space via that capture's own sidecar BEFORE
-// any existing verb logic runs — the same "convert once, up front" shape
+// any existing command logic runs — the same "convert once, up front" shape
 // `Sidecar::image_point_to_screen` itself follows (bounds-check, then
 // scale-check, then transform).
 
@@ -683,7 +683,7 @@ fn wait_idle(need_n: u32, timeout_s: u64) -> Result<IdleResult, hypr::HyprError>
     Ok(IdleResult::Timeout)
 }
 
-// ── `aoide screen point <verb>` handlers ────────────────────────────────
+// ── `aoide screen point <command>` handlers ────────────────────────────────
 
 /// `aoide screen point move <x> <y>` — absolute move via real synthesized
 /// motion, verified on landing. See the module header for the full
@@ -1056,7 +1056,7 @@ pub const HOVER_MAX_SETTLE_MS: u64 = 10_000;
 /// `move`/`drag` use (drift refuses exactly as usual), sleeps
 /// `--settle-ms` (default [`HOVER_DEFAULT_SETTLE_MS`], bounds
 /// [`HOVER_MIN_SETTLE_MS`]..=[`HOVER_MAX_SETTLE_MS`]), snapshots again, and
-/// reports [`hypr::info_delta`] between the two. The delta IS the verb's
+/// reports [`hypr::info_delta`] between the two. The delta IS the command's
 /// purpose, not a side note: a tooltip or context menu opening under a
 /// synthesized hover is a new layer surface, and nothing else this crate
 /// does would ever notice that happened. NOT executed live this phase

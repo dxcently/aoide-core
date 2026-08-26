@@ -1,14 +1,14 @@
-//! `screen info` / `screen shot` / `screen point <verb>` — thin
+//! `screen info` / `screen shot` / `screen point <command>` — thin
 //! registrations over this crate's domain modules (Phase 1: info/shot;
-//! Phase 2: the six `screen point` verbs; Phase B of the pointer-emulation
+//! Phase 2: the six `screen point` commands; Phase B of the pointer-emulation
 //! workstream, the User 2026-08-17, adds `drag`/`hover` and extends `click`
-//! --count and `scroll` to two axes, for eight `screen point` verbs total;
+//! --count and `scroll` to two axes, for eight `screen point` commands total;
 //! Phase E, same day, adds `screen diff`; Phase F, same day, adds
-//! `screen point text`, for nine `screen point` verbs total). Handler
+//! `screen point text`, for nine `screen point` commands total). Handler
 //! bodies live in `crate::hypr`/`crate::capture`/`crate::point`/
 //! `crate::diff`/`crate::text`; this module only wires schema metadata to
 //! them — nothing here duplicates screen-domain logic (mirrors
-//! `aoide-conduct`'s `commands/graph.rs`'s own split of verbs from logic).
+//! `aoide-conduct`'s `commands/graph.rs`'s own split of commands from logic).
 //! Moved out of `aoide-conduct`'s `commands/screen.rs` at P-A1 of the
 //! binary-split workstream — same file, new crate root, `crate::screen::X`
 //! handler paths flattened to `crate::X` since this crate's domain modules
@@ -40,7 +40,7 @@ pub fn register(r: &mut Registry) {
             flag!("quality", "string", "JPEG quality 0-100 (default 80; ignored for png)."),
             flag!("scale", "string", "Output scale factor, e.g. 0.5 or 2 (default 1 — exactly 1:1 with the screen; mutually exclusive with --fit)."),
             flag!("fit", "string", "Downscale to fit inside WxH (e.g. 1280x800), never upscaling — a model-friendly frame with an exact scale factor recorded in the sidecar for --from-shot to invert (mutually exclusive with --scale)."),
-            flag!("cursor", "bool", "Draw the composited cursor into the capture (grim -c). Off by default: a drawn cursor registers as a pixel change to the screen-diff verb even on a pure pointer move."),
+            flag!("cursor", "bool", "Draw the composited cursor into the capture (grim -c). Off by default: a drawn cursor registers as a pixel change to the screen-diff command even on a pure pointer move."),
             flag!("out", "string", "Explicit destination path (else auto-named under the captures dir)."),
             flag!("comment", "string", "Free-text note stored in the capture's sidecar."),
         ],
@@ -49,11 +49,11 @@ pub fn register(r: &mut Registry) {
         handler: crate::shot,
     ));
 
-    // ── Phase 2: `screen point <verb>` — pointer synthesis via a native
+    // ── Phase 2: `screen point <command>` — pointer synthesis via a native
     // zwlr_virtual_pointer_v1 client (`screen::point`/`screen::synth`, the
     // latter added Phase A of the pointer-emulation workstream, replacing
     // an earlier wlrctl shell-out with the same on-wire behavior). See
-    // those modules' headers for the full design; nine verbs total (Phase B
+    // those modules' headers for the full design; nine commands total (Phase B
     // added `drag`/`hover`; Phase F added `text`) — seven
     // (move/click/drag/hover/scroll/restore/text) touch the
     // pointer-synthesis boundary or dispatch a warp and are NOT proven live
@@ -121,7 +121,7 @@ pub fn register(r: &mut Registry) {
         // point::HOVER_MIN_SETTLE_MS..=HOVER_MAX_SETTLE_MS — same
         // cross-reference discipline as `scroll`'s "+/-100" below
         // (`summary` is `&'static str`, can't embed the consts directly).
-        summary: "Move to (x,y) via the same move+verify path as `move`, hold for --settle-ms, then report what the desktop's layer surfaces and windows did while parked there (appeared/disappeared/retitled, snapshotted via hyprctl before and after) — a tooltip or menu opening IS a new layer surface, so this delta is the verb's whole purpose.",
+        summary: "Move to (x,y) via the same move+verify path as `move`, hold for --settle-ms, then report what the desktop's layer surfaces and windows did while parked there (appeared/disappeared/retitled, snapshotted via hyprctl before and after) — a tooltip or menu opening IS a new layer surface, so this delta is the command's whole purpose.",
         args: [
             arg!("x", "string", true, "Target X, Hyprland logical px (may be negative on a multi-monitor layout) — or IMAGE px when --from-shot is given."),
             arg!("y", "string", true, "Target Y."),
@@ -198,7 +198,7 @@ pub fn register(r: &mut Registry) {
             arg!("text", "string", true, "The word or phrase to find among the capture's OCR words (case-insensitive; quote a multi-word phrase as one argument — trailing unquoted words are refused, not silently dropped). OCR words carry whatever punctuation tesseract attached, e.g. \"Save:\" won't match a search for \"Save\" — if a word you can see isn't matching, check the capture's OCR text for stray punctuation."),
         ],
         flags: [
-            flag!("from-shot", "string", "REQUIRED. Path to a `screen shot` capture that has already been OCR'd (`screen ocr <capture>`) — the sidecar's ocr.words are the only source of text this verb searches."),
+            flag!("from-shot", "string", "REQUIRED. Path to a `screen shot` capture that has already been OCR'd (`screen ocr <capture>`) — the sidecar's ocr.words are the only source of text this command searches."),
             flag!("nth", "string", "1-based: which match to act on when more than one is found (ordered top-left-first, top row then left-to-right)."),
             flag!("button", "string", "left | right | middle (default left)."),
             flag!("dry-run", "bool", "Resolve the match and report its centre only — no pointer motion at all."),
@@ -300,7 +300,7 @@ mod tests {
         register(&mut r);
     }
 
-    // ── Phase 2: screen point <verb>; extended Phase B (drag/hover added,
+    // ── Phase 2: screen point <command>; extended Phase B (drag/hover added,
     // six → eight), Phase F (text added, eight → nine) ──────────────────────
 
     #[test]
@@ -397,7 +397,7 @@ mod tests {
 
     #[test]
     fn scroll_idle_save_restore_do_not_declare_a_from_shot_flag() {
-        // --from-shot only makes sense where a verb takes coordinate args —
+        // --from-shot only makes sense where a command takes coordinate args —
         // scroll/idle/save/restore don't, and shouldn't advertise it.
         let mut r = Registry::new();
         register(&mut r);

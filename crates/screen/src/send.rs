@@ -1,6 +1,6 @@
 //! `aoide screen send <capture> (--session <id> | --agent <name>)` — hand a
 //! `screen shot` capture (with its comment + OCR text) to another agent. THE
-//! PAYOFF of the `screen` verb family: capture → ocr → SEND.
+//! PAYOFF of the `screen` command family: capture → ocr → SEND.
 //!
 //! This is deliberately a THIN composer + router over two ALREADY-GATED
 //! doors, never a third injection path:
@@ -26,16 +26,16 @@
 //! the session-graph/capture domain and the outbound A2A driver (client) in
 //! the SAME function, and the alternative — reimplementing the curl/JSON-RPC
 //! send here, or moving `screen send`'s registration up to the `cli` crate
-//! out of step with every other `screen *` verb — would either fork a
+//! out of step with every other `screen *` command — would either fork a
 //! second ungated injection path or break the established "all `screen`
-//! verbs register together in `crate::commands`" pattern. So `conduct`'s
+//! commands register together in `crate::commands`" pattern. So `conduct`'s
 //! `Cargo.toml` grew an `aoide-client` dependency (one new edge; `client`
 //! has no dependency back on `conduct`, so it did not cycle) and
 //! `handle_agent_send` was bumped from crate-private to `pub` — a
 //! visibility-only change, its body untouched. P-A1 moved this whole module
 //! out of `conduct` into its own `aoide-screen` crate, which carries the
 //! same `aoide-client` edge onward (conduct's own copy of the edge stays,
-//! retained for the upcoming `who` presence verb — see conduct's
+//! retained for the upcoming `who` presence command — see conduct's
 //! `Cargo.toml` comment). Bends the charter's stated independence a little
 //! either way; flagged here rather than papered over.
 //!
