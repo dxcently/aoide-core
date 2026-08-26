@@ -6,15 +6,24 @@
   (root `AGENTS.md`) — adding either here reopens the exact boundary P-A4
   drew. If a paint feature seems to need the graph or A2A, that's a signal
   it belongs in core, not a reason to add the dependency here.
-- **Lyra's golden is independent of core's.** `registry.rs`'s snapshot (42
+- **Lyra's golden is independent of core's.** `registry.rs`'s snapshot (43
   paths) is its own list, not a subset check against `cli`'s 69 — the two
   evolve separately.
 - **`commands::all()`'s order is byte-stable**, same discipline as `cli`'s —
   append, never reorder (see `pkgs/aoide/crates/AGENTS.md`).
 - **May be nix-dependent — the one binary allowed to.** `song::widgets`'s
-  `nix eval` lives reachable from here; that dependency must never migrate
-  toward `aoide-cli` or any core crate (root `AGENTS.md`, "core is
+  `nix eval` and `commands::onboard`'s `nix eval`/`nix-instantiate` shell-outs
+  live reachable from here; that dependency must never migrate toward
+  `aoide-cli` or any core crate (root `AGENTS.md`, "core is
   nix-independent").
+- **`onboard`'s option derivation is DERIVED, never a hand-list.** Every
+  `aoide.*` option `aoide.nix` documents comes from `flake.nix`'s
+  `aoideOptions` output (`lib/options.nix`, `lib.evalModules` +
+  `lib.optionAttrSetToDocList`) — a new dendrite/facet option needs no edit
+  here or in `lib/options.nix`, it just appears on the next `lyra onboard`
+  run. The env-knob appendix (`ENV_KNOBS` in `commands/onboard.rs`) is the
+  ONE allowed hand-list, because env vars aren't module options and so
+  can't be derived the same way — keep it small.
 - **`shellbridge`/`herald` registration only, never the files.** The command
   registration lines for these live in lyra's `commands`; the implementation
   files stay in `aoide-conduct` (see that crate's charter-smudge note) —

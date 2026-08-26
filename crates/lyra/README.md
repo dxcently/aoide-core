@@ -12,11 +12,22 @@ are core `aoide` identity, root `AGENTS.md`).
 
 - `bin/lyra` — the binary entry point.
 - `dispatch`/`registry` — lyra's own argv parsing, dispatch, and golden
-  command-path snapshot (42 paths), independent of core's.
+  command-path snapshot (43 paths), independent of core's.
 - `guide` — `lyra guide`.
 - `commands` — lyra's `commands::all()`, pulling in `song`, `screen`, and
   `conduct`'s `shellbridge`/`herald` registration lines (the files stay in
-  `conduct`; only the registry lines are lyra's).
+  `conduct`; only the registry lines are lyra's), plus lyra's own root-
+  coupled `onboard` (below).
+- `commands::onboard` — `lyra onboard` (P-I3, docs/architecture/ONBOARD.md):
+  the nix half of the onboarding flow, reached only via `aoide onboard`'s
+  delegate spawn once `rice_bin()` resolves. Shells `nix eval --json
+  <checkout>#aoideOptions` (flake.nix/lib/options.nix — every `aoide.*`
+  option declared across `modules/{nucleus,facets,dendrites}`, derived, not
+  hand-listed) and renders `aoide.nix`: a nix module the user imports, every
+  option commented out at its default. Reruns over a previously-generated
+  file warn, back up to `<out>.bak`, and regenerate; a hand-written file at
+  the target path is refused, never overwritten. Never touches the user's
+  flake.
 - `run_lyra` — drives `aoide_protocol::door::run` with lyra's own registry/
   dispatcher and its own smaller `special` hook (`mcp serve --stdio`,
   `guide`/`schema`/`livery` raw output). Deliberately absent: `a2a serve`,
@@ -30,8 +41,9 @@ serve --stdio`'s door loop).
 
 ## How it composes
 
-42 command paths: rice/draft/mode/cover/livery/quickshell/screen/
+43 command paths: onboard/rice/draft/mode/cover/livery/quickshell/screen/
 shellbridge/herald/take — everything that paints, or that only a desktop
 needs. Never depends on `aoide-client`/`aoide-conductor` — no A2A client, no
-TUI; those stay core-only. May depend on Nix (`song::widgets`'s `nix eval`)
+TUI; those stay core-only. May depend on Nix (`song::widgets`'s `nix eval`,
+and now `commands::onboard`'s own `nix eval`/`nix-instantiate` shell-outs)
 — the one binary allowed to (root `AGENTS.md`, "core is nix-independent").

@@ -35,3 +35,9 @@ aoide-screen = { workspace = true }
 # — the same DI-seam consumer `aoide-cli` is, reading LYRA's own assembled
 # registry + dispatcher rather than core's.
 aoide-server = { workspace = true }
+
+[dev-dependencies]
+# `commands::onboard`'s scratch-dir tests (rerun semantics, checkout-root
+# walk-up) share the workspace rig (scratch dirs, EnvSaver, `env_lock`),
+# same dev-only edge `aoide-conduct`/`aoide-song` already carry.
+aoide-test-support = { workspace = true }
