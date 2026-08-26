@@ -101,7 +101,16 @@ pub fn run_sweep(secs: u64) -> std::io::Result<SweepResult> {
 
     let mut state: HashMap<String, Heard> = HashMap::new();
     let mut dropped = 0u32;
-    let deadline = Instant::now() + Duration::from_secs(secs);
+    // checked: `Instant + Duration` panics on overflow, and `secs` is
+    // operator input (`--secs`) — an absurd value earns an error, not a crash.
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(secs))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--secs is too large to make a deadline",
+            )
+        })?;
     let mut buf = [0u8; beacon::MAX_LINE_BYTES + 1];
     while Instant::now() < deadline {
         match socket.recv_from(&mut buf) {

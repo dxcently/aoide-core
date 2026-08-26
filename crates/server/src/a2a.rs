@@ -2606,12 +2606,16 @@ pub fn serve(
             Ok((kp, _)) => {
                 let fpr = kp.info().fingerprint;
                 let advertised_url = self_url(bind, port);
-                let _ = crate::discovery::spawn_advertiser(peer_name, &fpr, &advertised_url);
-                eprintln!(
-                    "aoide a2a discovery: advertising {advertised_url} on {}:{}",
-                    aoide_storage::beacon::GROUP,
-                    aoide_storage::beacon::PORT
-                );
+                // Gated on the spawn actually happening — a refused spawn
+                // already printed its own "continuing without" line, and an
+                // "advertising" claim right after it would be a lie.
+                if crate::discovery::spawn_advertiser(peer_name, &fpr, &advertised_url).is_some() {
+                    eprintln!(
+                        "aoide a2a discovery: advertising {advertised_url} on {}:{}",
+                        aoide_storage::beacon::GROUP,
+                        aoide_storage::beacon::PORT
+                    );
+                }
             }
             Err(e) => {
                 eprintln!(
