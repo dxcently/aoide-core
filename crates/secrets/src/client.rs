@@ -370,7 +370,7 @@ pub fn default_var_name(secret: &str) -> String {
 /// arrives here verbatim as positionals (that module's own doc).
 /// `secrets exec`'s own usage line — printed alongside every specific
 /// missing/malformed-argument message below, never a generic usage dump on
-/// its own (task: name WHICH flag is wrong AND show this verb's usage).
+/// its own (task: name WHICH flag is wrong AND show this command's usage).
 pub const EXEC_USAGE: &str = "usage: secrets exec --as <consumer> --secret <name>[:VAR] [--totp NNNNNN] -- <cmd>";
 
 pub fn parse_exec_args(inv: &Invocation) -> Result<ExecArgs, String> {
@@ -641,7 +641,7 @@ pub fn put(socket_path: &Path, secret: &str, value: &str, overwrite: bool) -> Re
 /// Task #79: whether [`admin_request`]'s CONNECT attempt hit "nothing is
 /// listening" (`io::ErrorKind::NotFound`: no socket file at all;
 /// `ConnectionRefused`: a stale socket file with nothing behind it) — the
-/// ONLY two cases `commands.rs`'s admin verbs fall back to their
+/// ONLY two cases `commands.rs`'s admin commands fall back to their
 /// direct-write path on ([`NoSocket`](AdminError::NoSocket)). Every other
 /// failure — a different connect error, a write/read failure, an
 /// unparseable reply, or the broker's own `{"ok":false}` domain denial
@@ -662,19 +662,19 @@ pub enum AdminError {
 
 /// Task #79: connect to `socket_path`, send ONE `{"op":"admin",...}`
 /// request (`req` already carries `op` and `verb` — every field
-/// `commands.rs`'s admin verbs need to send, this function adds none of
+/// `commands.rs`'s admin commands need to send, this function adds none of
 /// its own), read ONE reply line, and return the parsed reply `Value` on
 /// `{"ok":true}` — the caller (`commands.rs`) reads `message`/`changed`
 /// off it exactly the way it would from a [`crate::admin::AdminOutcome`]
 /// on the direct-write path, so the two paths report through the same
 /// shape. See [`AdminError`] for the fallback-vs-report split; this is the
-/// ONE place that split is decided; a new admin verb added later sends its
+/// ONE place that split is decided; a new admin command added later sends its
 /// own `req` through this SAME function, never a hand-rolled write/read
 /// pair.
 pub fn admin_request(socket_path: &Path, req: Value) -> Result<Value, AdminError> {
     let mut stream = connect_bounded(socket_path, CONNECT_TIMEOUT).map_err(|e| match e.kind() {
         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => AdminError::NoSocket,
-        _ => AdminError::Other(describe_connect_error(socket_path, &e, "aoide secrets <admin verb> ...")),
+        _ => AdminError::Other(describe_connect_error(socket_path, &e, "aoide secrets <admin command> ...")),
     })?;
 
     let mut line = req.to_string();

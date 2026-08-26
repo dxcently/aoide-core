@@ -180,7 +180,7 @@
 //! `requireTotp`** (P-V4c, deliberate): `secrets put` is CLI-only
 //! (`commands::handle_secrets_put`'s `require_cli` gate) and, in
 //! deployment, runs AS THE SECRETS UID's own operator (`sudo -u
-//! aoide-secrets aoide secrets put …`, same admin-verb precedent as
+//! aoide-secrets aoide secrets put …`, same admin-command precedent as
 //! `add`/`grant` — README's "Admin commands" section) — there is no separate
 //! "consumer" identity to authorize the way `resolve`'s agent-facing
 //! callers need, and a code check would be gating the secrets uid against
@@ -814,7 +814,7 @@ fn fetch_secret_value(secrets_home: &Path, secret: &str) -> Result<String, Strin
 /// own effective uid (`home::effective_uid()` — the operator/admin path:
 /// the broker process's own uid can always clear a parked ask, the same
 /// "this process's uid decides" precedent `home::admin_identity_check`
-/// already holds for the direct-home admin verbs). Pure — no I/O, so it's
+/// already holds for the direct-home admin commands). Pure — no I/O, so it's
 /// unit-tested directly with injected uids, no real socket/process needed.
 ///
 /// **Fail closed on any missing kernel fact — never fail open.** An
@@ -990,7 +990,7 @@ fn admin_gate(peer_uid: Option<u32>, secrets_home: &Path, verb: &str) -> Option<
 
 /// The `{op:"admin", verb:...}` op family (task #79): the live daemon
 /// becomes the single writer for `policy.json`/backend-store mutation, with
-/// the SAME eight verbs `commands.rs`'s direct-home CRUD quintet always
+/// the SAME eight commands `commands.rs`'s direct-home CRUD quintet always
 /// exposed (`add`/`rm`/`grant`/`revoke`/`set-totp`/`automate`/`expose`/
 /// `migrate`) — this function is the ONE place any of them executes over
 /// the socket, gated by [`admin_gate`] before a single byte of `policy.json`
@@ -1002,7 +1002,7 @@ fn admin_gate(peer_uid: Option<u32>, secrets_home: &Path, verb: &str) -> Option<
 /// function for the daemon-running case — see that file's rewritten
 /// section for what remains open: no daemon + two concurrent direct-write
 /// admin processes, since THAT case never reaches this function at all).
-/// Every verb's actual mutation lives in [`crate::admin`], never
+/// Every command's actual mutation lives in [`crate::admin`], never
 /// duplicated here — this function only parses the wire's typed fields
 /// into that module's typed arguments and shapes the reply; argument
 /// VALIDATION (name shape, `on`/`off` spelling) is `commands.rs`'s job on
@@ -1053,7 +1053,7 @@ fn handle_admin(secrets_home: &Path, req: &Value, peer: Option<crate::peercred::
             },
             "migrate" => {
                 let target = req.get("target").and_then(Value::as_str).unwrap_or("age").to_string();
-                // `audit_admin` below is deliberately verb-generic (no
+                // `audit_admin` below is deliberately command-generic (no
                 // structured source-backend field) — the real backend
                 // name, when `crate::admin::migrate` knew one, is already
                 // folded into `MigrateError`'s own message text.
@@ -1083,7 +1083,7 @@ fn handle_admin(secrets_home: &Path, req: &Value, peer: Option<crate::peercred::
 /// pre-existing generic per-command dispatch audit, plus `migrate`'s own
 /// richer `commands::audit_migrate` line, both entirely unchanged by this
 /// phase), so this is the one place a broker-routed admin mutation is ever
-/// recorded. Deliberately verb-generic (never a per-verb bespoke message
+/// recorded. Deliberately command-generic (never a per-command bespoke message
 /// the way `commands::audit_migrate`'s `source -> target` detail is) —
 /// `name` is empty when a request never got far enough to know one (a
 /// missing `verb`, an `admin_gate` refusal before any field was read).
@@ -4279,7 +4279,7 @@ mod tests {
     /// `a_hung_age_keygen_mint_no_longer_wedges_put_lock_forever`) already
     /// prove `wait_bounded` frees `put_lock` for `put_gate`'s own shell-outs
     /// — this proves the SAME bound applies through the admin socket op,
-    /// since that composition (admin verb -> `crate::admin` -> a hung
+    /// since that composition (admin command -> `crate::admin` -> a hung
     /// backend shell-out -> `put_lock`) was never exercised by those two.
     #[test]
     fn a_hung_admin_migrate_no_longer_wedges_put_lock_forever() {

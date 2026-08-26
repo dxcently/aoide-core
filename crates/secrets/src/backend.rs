@@ -159,7 +159,7 @@
 //! adding whichever built-in entry (`file`/`age`) is missing BY NAME and
 //! never touching an entry — built-in or custom — that's already there.
 //! `secrets migrate <name> [--backend <target>]` (`commands::
-//! handle_secrets_migrate`) is the per-secret companion: an admin verb that
+//! handle_secrets_migrate`) is the per-secret companion: an admin command that
 //! moves one secret's stored VALUE from its policy's current backend to a
 //! target one (default `age`) and flips the policy row, so an operator can
 //! actually act on a secret that's been sitting on a newly-backfilled

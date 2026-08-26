@@ -33,7 +33,7 @@
 //! [`secure_file`] is the matching per-file half, used by `store::
 //! save_policies` on `policy.json`.
 //!
-//! **This module also owns the admin-verb identity guard** (the
+//! **This module also owns the admin-command identity guard** (the
 //! yomi-strix incident, 2026-08-22): [`admin_identity_error`] is the pure
 //! decision for an EXISTING home (injected `euid`/`home_owner`,
 //! unit-testable without a real stat or a real process uid);
@@ -45,7 +45,7 @@
 //! the yomi-strix incident, just at creation time instead of a reown;
 //! found on review, P-V4f follow-up). [`admin_identity_check`] wires both
 //! to a real [`effective_uid`] and a real `std::fs::metadata(home)` — see
-//! that function's own doc. Every admin verb that reads/writes
+//! that function's own doc. Every admin command that reads/writes
 //! `policy.json`/`totp.secret` calls this BEFORE any such
 //! read-modify-write — `commands.rs`'s `require_admin_identity` for the
 //! policy-CRUD quintet, `enroll::run` directly for the one other
@@ -91,12 +91,12 @@ pub fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-/// The admin-verb identity guard's decision, PURE so it's testable with
+/// The admin-command identity guard's decision, PURE so it's testable with
 /// injected uids (`euid`/`home_owner`) rather than a real stat + a real
 /// process uid — see [`admin_identity_check`] for the live wiring.
 ///
 /// `None` when `euid` already owns `home` (the expected shape: an admin
-/// verb run as the broker user, or a test/dev host where one ordinary uid
+/// command run as the broker user, or a test/dev host where one ordinary uid
 /// created the home itself). `Some(message)` otherwise, naming the actual
 /// home path, the actual owning uid, and the corrective `sudo -u
 /// aoide-secrets` spelling — root gets an EXTRA clause spelling out why
@@ -160,7 +160,7 @@ pub fn admin_identity_error_for_missing_home(euid: u32, home: &Path, verb: &str)
 /// real owner). **When it does not exist yet — or its owner can't be
 /// stat'd at all — this falls to [`admin_identity_error_for_missing_home`]
 /// rather than passing unconditionally**: nothing has decided who the
-/// broker user is until the FIRST admin verb creates the home directory,
+/// broker user is until the FIRST admin command creates the home directory,
 /// but `store::save_policies`/`store::save_totp_secret` both
 /// `create_dir_all` it on that first write, so root reaching this point
 /// would CREATE a root-owned home — refused for that reason alone, a
@@ -175,12 +175,12 @@ pub fn admin_identity_check(home: &Path, verb: &str) -> Option<String> {
 /// Enrich a secrets-home FILE's I/O error into an actionable message — the
 /// POISONED-FILE case (this crate's `AGENTS.md`): [`admin_identity_check`]
 /// above already proves this process's euid owns the secrets HOME
-/// directory before an admin verb ever reads/writes a file inside it, but
+/// directory before an admin command ever reads/writes a file inside it, but
 /// an individual file (`policy.json`, `totp.secret`, `totp-replay.json`)
 /// can still be owned by a stale uid from a historical plain-`sudo` run
 /// that predates that guard — the exact "policy.json: Permission denied
 /// (os error 13)" the User hit live, with zero indication of WHY. Reached
-/// from every admin-verb load/save seam (`commands.rs`'s CRUD quintet,
+/// from every admin-command load/save seam (`commands.rs`'s CRUD quintet,
 /// `enroll::run`/`enroll::show`'s totp.secret/replay-ledger calls) so this
 /// diagnosis lives in exactly ONE place rather than a copy at each of the
 /// half-dozen call sites that used to just `format!("policy.json: {e}")`.

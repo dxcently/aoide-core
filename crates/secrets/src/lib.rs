@@ -2,7 +2,7 @@
 //! the pure logic — hand-rolled RFC 2104/3174/6238 TOTP, RFC 4648 base32,
 //! `otpauth://` URI construction, the single-use replay ledger, and
 //! policy-store types. P-V2 added the broker daemon, the unix-socket wire,
-//! and the client + admin CLI verbs: `aoide secrets serve`/`exec`/`add`/`rm`/
+//! and the client + admin CLI commands: `aoide secrets serve`/`exec`/`add`/`rm`/
 //! `grant`/`revoke`, registered into `aoide-cli`'s `Registry` via
 //! [`commands::register`] — `aoide-cli` has depended on this crate since
 //! P-V2.
@@ -29,7 +29,7 @@
 //! `{home}` template placeholder that makes it possible
 //! ([`backend::expand_template`]), an optional per-backend `set` template
 //! ([`backend::store_value`]), and the write half: a new `secrets put
-//! <name>` verb ([`commands::handle_secrets_put`], [`client::put`]/
+//! <name>` command ([`commands::handle_secrets_put`], [`client::put`]/
 //! [`client::run_put`], [`broker::handle_put`]/[`broker::put_gate`]/
 //! [`broker::audit_put`]) that reads a value from stdin and stores it
 //! through the named secret's backend — never gated by `requireTotp`, no

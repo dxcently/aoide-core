@@ -1,6 +1,6 @@
 //! `aoide secrets` — the secrets broker's CLI surface (Workstream SECRETS,
 //! P-V2, P-V3, P-V4c, P-V4e, P-N1, P-N2, P-N3, P-G2). Registers SIXTEEN
-//! verbs:
+//! commands:
 //!
 //! - `serve` — the long-running broker, special-cased at the entry point
 //!   exactly like `a2a serve`/`conductor` (`cli`'s `run_cli`): this
@@ -90,7 +90,7 @@
 //! - `expose` (P-N1) — `secrets expose <name> on|off` flips the policy's
 //!   new `remote` bit. Same admin gate, same idempotency discipline as
 //!   `automate`/`set-totp`. **NO behavior change today** — no non-local
-//!   entry point exists yet — this verb only lets an operator PRE-DECLARE a
+//!   entry point exists yet — this command only lets an operator PRE-DECLARE a
 //!   secret as remote-reachable ahead of one landing; see
 //!   `crate::policy::Policy::remote`'s own doc and this crate's `AGENTS.md`
 //!   for the invariant a future non-local door must hold.
@@ -124,7 +124,7 @@
 //! - `migrate` (P-G2, task #72) — `secrets migrate <name> [--backend
 //!   <target>]`: moves an EXISTING secret's stored VALUE from its policy's
 //!   current backend to a target backend (default `age`) and flips the
-//!   policy row. Admin verb, DIRECT-HOME — same `require_cli` +
+//!   policy row. Admin command, DIRECT-HOME — same `require_cli` +
 //!   `require_admin_identity` gate as `add`/`rm`/`grant`, never the
 //!   socket. See [`handle_secrets_migrate`]'s own doc and `README.md`'s
 //!   "Migrating a secret between backends" for the full ordering/removal
@@ -136,7 +136,7 @@
 //! `home::secrets_home()` resolves to, same as every other function here.
 //! `add` reads NO value at any point: the secrets broker never stores one, only a
 //! policy (backend name + key) pointing at where a value can be fetched
-//! from later. `put` is the one verb here whose stdin DOES carry a value —
+//! from later. `put` is the one command here whose stdin DOES carry a value —
 //! it never touches this crate's own storage directly, only the broker's
 //! `set` backend template, over the socket (`crate::broker::handle_put`'s
 //! module doc).
@@ -150,12 +150,12 @@
 //! secrets home — plain `sudo` (root, euid 0) is explicitly one of the
 //! refused cases, not a bypass, because root CAN write regardless of
 //! ownership, which is exactly what silently reowned `policy.json` to
-//! `root:root` and bricked the broker (and every later admin verb,
+//! `root:root` and bricked the broker (and every later admin command,
 //! including the correctly-spelled `sudo -u aoide-secrets` retry) in the
 //! field. `enroll`'s own write path (`enroll::run`) carries the same guard
 //! directly, since its actual work happens in `cli`'s `special` hook, not
 //! here — `enroll::show` (read-only, rotates nothing) does NOT carry it,
-//! and neither does `put`/`exec`: those are the socket-side operator verbs
+//! and neither does `put`/`exec`: those are the socket-side operator commands
 //! this guard was never meant to cover (`home.rs`'s module doc).
 
 use crate::home;
@@ -317,7 +317,7 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["secrets", "pending"],
-        summary: "List every parked TOTP-gated resolve waiting on a code (id, secret, consumer, requestedAt) — never a value. Operator-side over the socket, same as put/exec: CLI-only, but NOT an admin/euid verb (it only reads in-memory broker state, no policy.json write).",
+        summary: "List every parked TOTP-gated resolve waiting on a code (id, secret, consumer, requestedAt) — never a value. Operator-side over the socket, same as put/exec: CLI-only, but NOT an admin/euid command (it only reads in-memory broker state, no policy.json write).",
         args: [],
         flags: [],
         gated: false,
@@ -361,7 +361,7 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["secrets", "migrate"],
-        summary: "Move an EXISTING secret's stored value from its policy's current backend to a target backend (default `age`), then flip the policy's backend field. Admin verb, direct-home (mirrors add/rm/grant, not put/exec's socket round trip). Fetches via the current backend, stores via the target first, flips policy.json only after the new value is durably stored, then removes the old value LAST — only when the source backend is a built-in (file/age) whose value path this crate can derive on its own.",
+        summary: "Move an EXISTING secret's stored value from its policy's current backend to a target backend (default `age`), then flip the policy's backend field. Admin command, direct-home (mirrors add/rm/grant, not put/exec's socket round trip). Fetches via the current backend, stores via the target first, flips policy.json only after the new value is durably stored, then removes the old value LAST — only when the source backend is a built-in (file/age) whose value path this crate can derive on its own.",
         args: [arg!("name", "string", true, "The secret's nickname — must already have a policy (`secrets add` first).")],
         flags: [flag!("backend", "string", "The target backend to migrate onto. Defaults to `age` (the built-in age-encrypted store) when omitted.")],
         gated: false,
@@ -430,19 +430,19 @@ fn require_cli(inv: &Invocation, cmd: &str) -> Option<Outcome> {
         Door::Cli => None,
         _ => Some(Outcome::usage(
             cmd,
-            "secrets policy admin verbs (add/rm/grant/revoke) are CLI-only; run this from a terminal (not over this door)",
+            "secrets policy admin commands (add/rm/grant/revoke) are CLI-only; run this from a terminal (not over this door)",
         )),
     }
 }
 
 /// The yomi-strix incident's guard (2026-08-22, this crate's `AGENTS.md`/
-/// `home.rs`'s module doc): refuses an admin verb BEFORE it ever calls
+/// `home.rs`'s module doc): refuses an admin command BEFORE it ever calls
 /// `store::load_policies`/`store::save_policies` when this process's
 /// effective uid isn't the secrets home's owning uid — `plain sudo`
 /// (euid 0) is explicitly wrong, not a free pass, because root CAN write
 /// regardless of ownership, which is exactly what silently reowned
 /// `policy.json` to `root:root` and bricked the broker (and every
-/// subsequent admin verb, including the correctly-spelled `sudo -u
+/// subsequent admin command, including the correctly-spelled `sudo -u
 /// aoide-secrets` retry) in the field. Called immediately after
 /// [`require_cli`] in every handler below. `verb` is the bare verb word
 /// (`"add"`, not `"secrets.add"`) — it lands in the corrective `sudo -u
@@ -640,7 +640,7 @@ fn handle_secrets_put(inv: &Invocation) -> Outcome {
 }
 
 /// `secrets set-totp <name> on|off` — the direct replacement for the
-/// hand-edited `jq` one-liner against `policy.json` this verb exists to
+/// hand-edited `jq` one-liner against `policy.json` this command exists to
 /// retire. Same `require_cli` gate as the rest of the admin surface; an
 /// unknown secret name is a clean [`Outcome::error`], never a silent
 /// no-op. Idempotent (house rule 2 — "report exactly what changed"):
@@ -670,7 +670,7 @@ fn handle_secrets_set_totp(inv: &Invocation) -> Outcome {
 }
 
 /// `secrets automate <name> on|off | grant|revoke <consumer>` (P-N1) — the
-/// admin verb behind `crate::policy::Policy::automation`. Same
+/// admin command behind `crate::policy::Policy::automation`. Same
 /// `require_cli` + `require_admin_identity` gate, same idempotency
 /// discipline as `set-totp` above: a state already in place, or a
 /// consumer already granted/revoked, reports "unchanged" and never
@@ -755,7 +755,7 @@ fn handle_secrets_expose(inv: &Invocation) -> Outcome {
 /// `secrets pending` (P-N2) — CLI-only via the SAME [`require_cli`] gate as
 /// `put`/`exec`, but deliberately **NOT** [`require_admin_identity`]: this
 /// is the operator-side socket surface (task requirement — "like put/exec,
-/// NOT admin/euid verbs"), reading in-memory broker state over the socket
+/// NOT admin/euid commands"), reading in-memory broker state over the socket
 /// rather than `policy.json`, so the euid-ownership guard that protects
 /// `policy.json` writes doesn't apply here. The list `crate::client::
 /// pending` returns is value-free by construction (`PendingAsk` has no
@@ -862,12 +862,12 @@ fn handle_secrets_watch(inv: &Invocation) -> Outcome {
 /// `EventClass::Secret`, the SAME class every other value-adjacent line in
 /// this crate uses (`broker.rs`'s `audit_resolve`/`audit_put`/etc.), same
 /// "never the value, never the key" discipline. Unlike those, this call
-/// site lives here, not in `broker.rs`: migrate is a direct-home admin verb
+/// site lives here, not in `broker.rs`: migrate is a direct-home admin command
 /// (`handle_secrets_migrate`'s own doc) that never runs inside the broker
 /// daemon process, so there is no daemon-owned `audit.log` for it to also
 /// write to (that file is `0700` broker-uid and unreachable from an
 /// ordinary admin invocation anyway) — only the mirrored aoide log, the
-/// SAME `aoide_protocol::audit` call every admin verb's generic dispatch
+/// SAME `aoide_protocol::audit` call every admin command's generic dispatch
 /// audit already goes through, just with the richer, migrate-specific
 /// message this one extra line adds. `door` is the invocation's own door
 /// (always `Cli` in practice — `require_cli` already refused anything
@@ -891,10 +891,10 @@ fn audit_migrate(door: Door, name: &str, source: &str, target: &str, status: &st
 /// `secrets migrate <name> [--backend <target>]` (P-G2, task #72) — moves
 /// an EXISTING secret's stored value from its policy's CURRENT backend to
 /// a TARGET backend (default `age`, [`DEFAULT_BACKEND`]), then flips the
-/// policy's own `backend` field. Admin verb, same door + euid gate as
+/// policy's own `backend` field. Admin command, same door + euid gate as
 /// `add`/`rm`/`grant` (`require_cli` + `require_admin_identity`) — mirrors
 /// their DIRECT-HOME wire shape exactly: no socket round trip, the same
-/// `store::load_policies`/`save_policies` round trip every other CRUD verb
+/// `store::load_policies`/`save_policies` round trip every other CRUD command
 /// here already uses. The moved value exists ONLY as a local `String`
 /// inside this function, from [`crate::backend::fetch_value`]'s return to
 /// [`crate::backend::store_value`]'s own argument — never an `Outcome`
@@ -975,13 +975,13 @@ mod tests {
         // (`socket.rs`'s own module doc: hardcoded so an env-less client
         // shell finds the real deployed broker). On a box that happens to
         // be running a real `aoide secrets serve` (this crate's own dev/
-        // deployment host, `/run/aoide-secrets/secrets.sock`), an admin-verb
+        // deployment host, `/run/aoide-secrets/secrets.sock`), an admin-command
         // test that didn't override this would silently talk to THAT real
         // daemon instead of exercising the direct-write fallback these
         // tests exist to prove — never acceptable for a unit test to touch
         // live system state. Pointing at a path inside this SAME
         // never-existing tempdir guarantees `ENOENT` on every connect
-        // attempt, so every admin-verb test hermetically takes the
+        // attempt, so every admin-command test hermetically takes the
         // `AdminError::NoSocket` fallback branch, exactly like every one of
         // these tests behaved before task #79 introduced the socket path
         // at all.
@@ -1744,7 +1744,7 @@ mod tests {
         });
     }
 
-    /// The euid guard applies to the new verbs (task requirement): `/` is
+    /// The euid guard applies to the new commands (task requirement): `/` is
     /// stat-able on every Linux host and, on any non-root test runner, is
     /// owned by a DIFFERENT uid than this process's own euid — a real
     /// mismatch, not an injected one, proving `require_admin_identity` is

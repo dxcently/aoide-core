@@ -1,4 +1,4 @@
-//! Broker-callable admin-verb mutations (task #79) — the SAME
+//! Broker-callable admin-command mutations (task #79) — the SAME
 //! read-modify-write logic `commands.rs`'s direct-home CRUD quintet
 //! (`add`/`rm`/`grant`/`revoke`/`set-totp`/`automate`/`expose`/`migrate`)
 //! used to carry inline, extracted so `broker::handle_admin` can call it

@@ -42,7 +42,7 @@
 //! dependency edge; `client::pending`/`approve`/`dismiss` are already right
 //! here, and the code must never cross a process boundary as an argv token
 //! (`client`'s own module doc). A conductor pane, or any future graphical
-//! popup, stays a reasonable LATER addition as a consumer of this verb's
+//! popup, stays a reasonable LATER addition as a consumer of this command's
 //! `--json` stream — never a reason to duplicate this logic elsewhere.
 //!
 //! **Shape**: [`parse_notify_line`]/[`Queue`]/[`pick_next`]/
@@ -1135,7 +1135,7 @@ fn wait_for_follower(events_path: &Path, poll_interval: Duration) -> Result<Foll
     }
 }
 
-/// The full `aoide secrets watch` verb — foreground, blocks until Ctrl-C or
+/// The full `aoide secrets watch` command — foreground, blocks until Ctrl-C or
 /// (in the interactive/`--popup` loops) stdin EOF. `events_path`/
 /// `socket_path` are resolved ONCE by the caller and passed in (this
 /// crate's own `home`/`socket` resolution discipline, `AGENTS.md`) — this
