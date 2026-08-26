@@ -19,14 +19,14 @@
 
 ## Extension points
 
-- **A new `screen` verb** adds a `cmd!`/`register` entry in `commands.rs`,
+- **A new `screen` command** adds a `cmd!`/`register` entry in `commands.rs`,
   wired into `lyra`'s `commands::all()` only.
 - **A new coordinate-space source** (beyond `--from-shot`) extends `point`'s
   existing transform seam rather than adding a parallel one.
 
 ## Docs update required in the same commit
 
-- This `README.md` when a new module, verb family, or dependency lands.
+- This `README.md` when a new module, command family, or dependency lands.
 - `docs/architecture/PACKAGE-LAYOUT.md`'s charter-smudge note if the
   `conduct` back-reference changes shape.
 - `pkgs/aoide/crates/AGENTS.md` for cross-crate invariants — not restated

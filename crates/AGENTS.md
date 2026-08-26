@@ -50,9 +50,9 @@ across crates in the same process.
   members`, give it a `commands` module with `register(&mut Registry)`, wire
   that into the owning app crate's `commands::all()` (core → `cli`, paint →
   `lyra`), and add its golden README/AGENTS pair here.
-- **A new verb on an existing crate**: add a `cmd!`/`arg!`/`flag!` entry
+- **A new command on an existing crate**: add a `cmd!`/`arg!`/`flag!` entry
   (`aoide-protocol::registry`) inside that crate's own `commands` module;
-  the two app crates never need an edit for a verb that isn't moving
+  the two app crates never need an edit for a command that isn't moving
   binaries.
 
 ## What needs a docs update in the same commit

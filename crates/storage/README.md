@@ -195,7 +195,7 @@ cache (CONTRACTS.md §7). File-first by decision — no embedded database yet
   doc comment states the reasoning). `HEADER_PEER`/`HEADER_TIMESTAMP`/
   `HEADER_NONCE`/`HEADER_SIGNATURE` are the four wire header names — always
   present together or not at all, never independently optional.
-- `commands` — this crate's CLI verbs: `usage` (local token/cost rollup),
+- `commands` — this crate's CLI commands: `usage` (local token/cost rollup),
   `inbox list|read|clear` (the store above's CLI surface), and `identity`
   (the module above's CLI surface). `peer pair request|pending|approve|
   reject` lives in `aoide-client` instead (outbound transport crosses the

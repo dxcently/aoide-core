@@ -136,7 +136,7 @@
 - **The broker socket is the single writer for every admin CRUD mutation
   when a daemon is listening (task #79, built on #73's peer-cred gate) —
   direct-write-to-`policy.json` survives ONLY as the no-daemon fallback.**
-  `crate::admin` is the ONE module holding every verb's actual
+  `crate::admin` is the ONE module holding every command's actual
   read-modify-write logic (`add`/`rm`/`grant`/`revoke`/`set_totp`/
   `expose`/`automate_toggle`/`automate_consumer`/`migrate`) — typed
   arguments in, an `AdminOutcome{message,changed}` or `Err(String)` out, no
@@ -144,7 +144,7 @@
   serves two callers with two different gates: `commands.rs`'s direct-write
   fallback (reached only after `require_admin_identity` already passed) and
   `broker::handle_admin` (reached only after `admin_gate` already passed).
-  `commands.rs`'s admin verbs never read/write `policy.json` themselves any
+  `commands.rs`'s admin commands never read/write `policy.json` themselves any
   more — `admin_dispatch` is the ONE place that decides which path ran: it
   sends `{"op":"admin","verb":...}` over `client::admin_request` FIRST, and
   falls back to `require_admin_identity` + a direct `crate::admin` call
@@ -155,7 +155,7 @@
   bad admin-identity peer uid, "no policy for secret x", a poisoned
   `policy.json`): a live-but-sick daemon, or a daemon that correctly
   refused the request, must never be bypassed into a direct write racing
-  underneath it. Don't add a verb whose direct-write fallback re-derives
+  underneath it. Don't add a command whose direct-write fallback re-derives
   its own mutation logic instead of calling `crate::admin` — the whole
   point of this split is that ONE function's behavior is what BOTH paths
   give a caller, never two implementations that could drift.
@@ -177,7 +177,7 @@
   at all — the direct-write fallback still gets `commands.rs`'s
   pre-existing generic per-command dispatch audit, plus `migrate`'s own
   richer `audit_migrate` line, both unchanged by this phase). Don't drop
-  the `path` field from a new admin verb's `Outcome` "since it's obvious
+  the `path` field from a new admin command's `Outcome` "since it's obvious
   which one ran" — idempotency discipline (house rule 2) means reporting
   exactly what happened, and which of two genuinely different write paths
   executed is part of that.
@@ -268,15 +268,15 @@
   — the events feed can still miss a line (a truncation between polls, a
   process restart) in a way the broker's own in-memory `ParkRegistry`
   cannot.
-- **Every admin verb that reads/writes `policy.json`/`totp.secret` refuses
+- **Every admin command that reads/writes `policy.json`/`totp.secret` refuses
   the wrong effective uid BEFORE touching the file, never after** (P-V4f,
   the yomi-strix incident, 2026-08-22: plain `sudo aoide secrets add …`
   ran as euid 0, succeeded, and silently reowned `policy.json` to
-  `root:root`, bricking the broker and every later admin verb — including
+  `root:root`, bricking the broker and every later admin command — including
   the correctly-spelled `sudo -u aoide-secrets` retry — until a manual
-  `chown`). `home::admin_identity_error(euid, home_owner, home, verb)` is
+  `chown`). `home::admin_identity_error(euid, home_owner, home, command)` is
   the PURE decision (unit-tested on injected uids: matching, root-vs-owner,
-  an arbitrary mismatch); `home::admin_identity_check(home, verb)` wires it
+  an arbitrary mismatch); `home::admin_identity_check(home, command)` wires it
   to a real `std::fs::metadata(home)` stat and a real `home::effective_uid`
   (`libc::geteuid`, zero new deps — `libc` is already this crate's
   dependency). `commands::require_admin_identity` calls it right after
@@ -284,7 +284,7 @@
   `enroll::run` calls it directly (its real work happens from `cli`'s
   `special` hook, outside `commands.rs`'s own dispatch) — `enroll::show`
   does NOT carry it (read-only, nothing to corrupt), and neither does
-  `put`/`exec` (socket-side operator verbs the guard was never meant to
+  `put`/`exec` (socket-side operator commands the guard was never meant to
   cover). Root is explicitly a REFUSED case, not a bypass: root can always
   write regardless of file ownership, which is the exact mechanism that
   corrupted `policy.json` in the field. **A not-yet-existing secrets home
@@ -293,7 +293,7 @@
   the home on first write, so an unguarded root caller hitting a missing
   home would CREATE it `root:root` — the identical bricking symptom,
   just at creation time instead of a reown) — `home::
-  admin_identity_error_for_missing_home(euid, home, verb)` is that case's
+  admin_identity_error_for_missing_home(euid, home, command)` is that case's
   own PURE decision (root refused, any other uid passes), and
   `admin_identity_check` falls to it whenever the stat fails, rather than
   passing unconditionally. A non-root uid still creates its own fresh home
@@ -302,7 +302,7 @@
   home is refused. Don't add a second, differently-worded identity check
   elsewhere in this crate; these two pure functions plus
   `admin_identity_check`'s dispatch between them are the one gate, and a
-  new admin verb that touches `policy.json`/`totp.secret` calls it the
+  new admin command that touches `policy.json`/`totp.secret` calls it the
   same way.
 - **The automation gate can only ever RELAX `requireTotp`, never tighten
   it** (P-N1). `policy::totp_required(policy, consumer)` is the ONE
@@ -641,16 +641,16 @@
   changes a future default, never a past record... don't special-case an
   upgrade migration anywhere") — that invariant forbids `secrets add`'s
   default flip from silently rewriting an EXISTING policy; `secrets
-  migrate` is the opposite of silent: a named admin verb an operator runs
+  migrate` is the opposite of silent: a named admin command an operator runs
   on purpose, against a name they typed, gated by the same admin-identity
-  check every other CRUD verb holds. Don't wire anything (a startup hook,
+  check every other CRUD command holds. Don't wire anything (a startup hook,
   a `set-totp`/`automate`/`expose` side effect, `backfill_missing_backends`
   itself) to call migrate's logic automatically for any policy — every
   migration is a deliberate, one-secret, operator-typed command.
 - **`secrets migrate`'s value NEVER crosses a wire and lives ONLY as a
   local `String` inside `commands::handle_secrets_migrate` (P-G2, task
   #72).** Unlike `put`/`resolve`/`approve`, migrate is a DIRECT-HOME admin
-  verb (mirrors `add`/`rm`/`grant` exactly, `commands.rs`'s own door
+  command (mirrors `add`/`rm`/`grant` exactly, `commands.rs`'s own door
   taxonomy) — it never touches the broker's unix socket at all, so there
   is no wire reply to keep value-free the way `put`'s/`resolve`'s own
   replies must be; the discipline here is instead that the value never
@@ -691,7 +691,7 @@
   own "the only backend IMPLEMENTATIONS this crate supports" stance) —
   this function must never derive a path for a backend the crate doesn't
   actually seed and know the on-disk shape of.
-- **Every admin CRUD verb — `add`/`rm`/`grant`/`revoke`/`set-totp`/
+- **Every admin CRUD command — `add`/`rm`/`grant`/`revoke`/`set-totp`/
   `automate`/`expose`/`migrate` — routes through the LIVE BROKER FIRST
   (task #79), executed inside the SAME `broker::put_lock` critical section
   a `put` already runs under: one process, one writer, one lock guarding
@@ -707,7 +707,7 @@
   `automate_consumer`/`migrate` — the SAME logic the direct-write path
   calls, never duplicated) inside `put_lock`. This is what closes the
   TOCTOU the daemon-running case used to have: a `secrets migrate` (or any
-  other admin verb) racing a live `secrets put`/`secrets exec` against the
+  other admin command) racing a live `secrets put`/`secrets exec` against the
   same secret now serializes behind the identical lock, exactly the way two
   concurrent `put`s already did before this phase.
   **KNOWN LIMITATION, narrowed by task #79, deliberate, not fixed here:**
@@ -721,7 +721,7 @@
   other against the same secret still have no cross-process lock to
   serialize behind — a `static Mutex` is per-process memory, and there is
   no daemon process for either of them to route through in the first
-  place. This is now the ENTIRE remaining gap (was: any admin verb racing
+  place. This is now the ENTIRE remaining gap (was: any admin command racing
   the live daemon at all); closing it for real needs a genuine
   cross-process primitive (a file lock) this crate does not have today —
   out of scope here, flagged for whoever picks it up next. Don't paper over
@@ -862,7 +862,7 @@
   module beside `broker`, not a growth of `broker`'s own resolve path —
   see the plan's "Mesh sharing" section for the separate loopback channel.
 - **The admin-identity guard LANDED at P-V4f** — see the invariant above
-  for the shape; the next admin verb that touches `policy.json`/
+  for the shape; the next admin command that touches `policy.json`/
   `totp.secret` calls `commands::require_admin_identity` (or, if its real
   work lives outside `commands.rs`'s own dispatch the way `enroll::run`'s
   does, `home::admin_identity_check` directly) right after its `require_cli`
@@ -887,7 +887,7 @@
   `home::describe_home_file_error(home, file, &io_err)` is the ONE seam
   EVERY `policy.json`/`totp.secret`/`totp-replay.json`/`backends.json`
   load/save call site in this crate routes a `PermissionDenied` through —
-  not only the admin CRUD verbs (`commands.rs`'s CRUD quintet via its
+  not only the admin CRUD commands (`commands.rs`'s CRUD quintet via its
   local `policy_io_error` wrapper, `enroll::run`/`enroll::show` directly),
   but also the broker's own AGENT-facing gates (`broker::resolve_gate`/
   `put_gate`, reached by `secrets exec`/`put` — the primary agent-facing
@@ -901,7 +901,7 @@
   `chown aoide-secrets: ...` — this crate only ever learns uids, never a
   username, and `--reference` sidesteps needing one. Don't add a NEW
   policy.json/backends.json-adjacent read/write path that skips this seam
-  "because it's not an admin verb" — the broker gap this note replaces was
+  "because it's not an admin command" — the broker gap this note replaces was
   exactly that mistake. `client::describe_connect_error`
   is the client-side sibling: `resolve`/`put`'s `UnixStream::connect`
   failure maps `PermissionDenied` to "this session isn't in
@@ -915,7 +915,7 @@
   don't widen either match arm to a kind it hasn't been proven to mean.
   Client-side messages only — neither function self-invokes `sudo`/`sg`,
   and neither prompts interactively; they only print what to run. A new
-  admin-verb file or a new client socket op reuses these two functions
+  admin-command file or a new client socket op reuses these two functions
   rather than hand-rolling a third diagnosis.
 - **`secrets put`'s stdin intake grew a tty branch at P-V4e**
   (`client::stdin_is_tty`/`client::read_hidden_line`) — when stdin is a
@@ -950,7 +950,7 @@
   split living in that op's own client function — not a generic
   "confirm before mutation" middleware, since each op's own gate already
   knows its own state.
-- **Two per-secret policy gates + their admin verbs landed at P-N1.**
+- **Two per-secret policy gates + their admin commands landed at P-N1.**
   `Policy` gained `automation: {enabled, consumers[]}` and `remote: bool`,
   both `#[serde(default)]` so an existing `policy.json` predating this
   phase loads cleanly as automation-disabled/empty and `remote: false` —
@@ -971,7 +971,7 @@
   blocks the CONNECTION'S OWN THREAD on `park::wait_for_outcome`, which is
   why `serve`'s accept loop moved to thread-per-connection this phase
   (invariant above — a hard constraint, not a style choice). Three new
-  CLI-only, `require_cli`-but-NOT-`require_admin_identity` verbs complete
+  CLI-only, `require_cli`-but-NOT-`require_admin_identity` commands complete
   or refuse a parked ask over the socket, same operator-side-not-admin-side
   shape `put`/`exec` already draw: `secrets pending` (lists asks, never a
   value), `secrets approve <id> --totp <code>` (validates with the SAME
@@ -1201,7 +1201,7 @@
   with the flag omitted records. `pass`/`gopass`/`bw`/`sops` stay
   documentation-only presets, restated as an explicit crate stance
   (invariant above): `file`/`age` are the only backend IMPLEMENTATIONS
-  this crate supports. No new verb, no wire-op change, no golden-count
+  this crate supports. No new command, no wire-op change, no golden-count
   change — this phase is entirely inside the existing `add`/`put`
   surfaces.
 - **P-G1 review fix (task #70, this commit): `age`-NAMED is not the same
@@ -1236,7 +1236,7 @@
   custom) already present is ever touched. `secrets migrate <name>
   [--backend <target>]` (`commands::handle_secrets_migrate`, default
   target `age`, `commands::DEFAULT_BACKEND` reused) is the per-secret
-  companion: an admin verb (euid-guarded exactly like `add`/`rm`/`grant`,
+  companion: an admin command (euid-guarded exactly like `add`/`rm`/`grant`,
   direct-home, no socket) that fetches a secret's value via its policy's
   CURRENT backend and stores it via a TARGET backend, flips the policy
   row, and removes the old value when the source is a built-in with a
@@ -1330,7 +1330,7 @@ template, now given to a hung mint too).
 - `pkgs/aoide/crates/AGENTS.md` for cross-crate invariants (registry
   order, golden discipline, per-crate tests) — not restated here.
 - The workspace `Cargo.toml`'s `aoide-secrets` member comment and
-  `crates/cli/README.md`'s golden-path count when the verb set changes.
+  `crates/cli/README.md`'s golden-path count when the command set changes.
 - `CONTRACTS.md §3` (the core schema's command count) and its "Secrets
   wire" subsection (§4, the machine-consumer contract — P-V4c) when the
   wire shape (any op) or file layout changes; that subsection restates
@@ -1338,4 +1338,4 @@ template, now given to a hung mint too).
   module doc) for a reader who never opens this crate's Rust — update the
   crate docs FIRST, `CONTRACTS.md` follows in the same commit.
 - `lib/vmTest.nix`'s `cmd_count` tripwire and its nearby count-history
-  comment when the verb set changes (same commit as the golden snapshot).
+  comment when the command set changes (same commit as the golden snapshot).

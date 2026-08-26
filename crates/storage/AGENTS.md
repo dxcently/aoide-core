@@ -148,10 +148,10 @@
 
 - **A new durable record shape** adds a type to `records` and a read/write
   pair to `fs`/`stage`; existing consumers never touch raw file paths for it.
-- **A new CLI verb** (this crate has three groups today, `usage`, `inbox
+- **A new CLI command** (this crate has three groups today, `usage`, `inbox
   list|read|clear`, and `identity`) adds a `cmd!`/`register` entry in
   `commands.rs`, wired into the owning app crate's `commands::all()`. The
-  pairing ceremony's own CLI verbs (`peer pair *`) live in `aoide-client`
+  pairing ceremony's own CLI commands (`peer pair *`) live in `aoide-client`
   instead — this crate exposes the `pairing`/`peer_store` library only,
   since the ceremony needs outbound HTTP transport this crate never holds.
 

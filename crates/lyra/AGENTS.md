@@ -15,17 +15,17 @@
   `nix eval` lives reachable from here; that dependency must never migrate
   toward `aoide-cli` or any core crate (root `AGENTS.md`, "core is
   nix-independent").
-- **`shellbridge`/`herald` registration only, never the files.** The verb
+- **`shellbridge`/`herald` registration only, never the files.** The command
   registration lines for these live in lyra's `commands`; the implementation
   files stay in `aoide-conduct` (see that crate's charter-smudge note) —
   don't duplicate or move them here.
 
 ## Extension points
 
-- **A new paint verb** adds a `cmd!`/`register` entry in the owning domain
+- **A new paint command** adds a `cmd!`/`register` entry in the owning domain
   crate (`song`, `screen`, or `conduct` for shellbridge/herald), wired into
   lyra's `commands::all()`.
-- **A new special-cased verb** extends the `special` closure passed to
+- **A new special-cased command** extends the `special` closure passed to
   `aoide_protocol::door::run` in `run_lyra`.
 
 ## Docs update required in the same commit

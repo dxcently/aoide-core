@@ -28,7 +28,7 @@ the inbound half of the two-door contract (the outbound half is
   wire's `path`/`args`/`flags` and runs it through the injected `dispatch`
   fn, replying with one `{"outcome": <the full Outcome envelope>}` line.
   Door policy is not reimplemented here: every command's own `inv.door`
-  branch (a CLI-only admin verb's refusal, a gated command's `gated: true`,
+  branch (a CLI-only admin command's refusal, a gated command's `gated: true`,
   `mcp.serve`/`a2a.serve`'s non-Cli metadata reply) runs exactly as it
   already does over MCP/A2A, since the injected fn IS
   `cli::dispatch::dispatch` — no daemon-specific allowlist exists or is
@@ -60,10 +60,10 @@ the inbound half of the two-door contract (the outbound half is
   back as a hand edit. **The watcher itself is a single `Arc<Mutex<
   HandEditWatcher>>` (task #92), shared between the tick thread and
   `handle_conn`'s connection threads** — not tick-private: a dispatched
-  session verb (`graph session start/end`/etc., `{"op":"dispatch"}`) writes
+  session command (`graph session start/end`/etc., `{"op":"dispatch"}`) writes
   stage files on ITS OWN connection thread, not the tick's, so
   `rebaseline_stage_roster` re-baselines the WHOLE roster after every
-  completed dispatch (roster-wide, not a per-verb "which files did this
+  completed dispatch (roster-wide, not a per-command "which files did this
   write" table) before that connection's reply goes out — closing the
   window where the daemon's own routed write got reported back to itself as
   a hand edit one tick later.
@@ -224,11 +224,11 @@ the inbound half of the two-door contract (the outbound half is
   only (an immediately-delivered payload's bytes stay untouched, so an
   already-autogated peer's delivery is byte-identical to before this
   phase).
-- `commands` — this crate's CLI verbs: `daemon`, `shellbridge` (registration
+- `commands` — this crate's CLI commands: `daemon`, `shellbridge` (registration
   only — the files stay in `conduct`), `a2a serve`, `events tail` (P-D3,
   appended newest — CLI-only, the same door-policy shape `a2a serve`/
   `aoide_secrets::commands::handle_secrets_watch` already hold for a
-  foreground/blocking verb).
+  foreground/blocking command).
 
 ## What it consumes
 

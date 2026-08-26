@@ -18,7 +18,7 @@ core.
   "Nix-independence").
 - `ipc`, `lint`, `reap` — the song IPC surface, `rice lint`, and stale-song
   reaping.
-- `commands` — this crate's CLI verbs: `rice *`, `livery *`, `cover set`.
+- `commands` — this crate's CLI commands: `rice *`, `livery *`, `cover set`.
 
 ## What it consumes
 

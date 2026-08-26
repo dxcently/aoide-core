@@ -181,7 +181,7 @@
 //! (`commands::handle_secrets_put`'s `require_cli` gate) and, in
 //! deployment, runs AS THE SECRETS UID's own operator (`sudo -u
 //! aoide-secrets aoide secrets put …`, same admin-verb precedent as
-//! `add`/`grant` — README's "Admin verbs" section) — there is no separate
+//! `add`/`grant` — README's "Admin commands" section) — there is no separate
 //! "consumer" identity to authorize the way `resolve`'s agent-facing
 //! callers need, and a code check would be gating the secrets uid against
 //! itself. [`put_gate`] therefore checks ONLY that a policy exists for the

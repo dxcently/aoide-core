@@ -73,7 +73,7 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
 - `reap` — liveness reaping (`aoide graph reap`), sweeping sessions a
   `SIGKILL`'d terminal could never mark `done`. `reap_and_announce` (the
   registered CLI handler) routes through `daemon_dispatch` first like every
-  other session-write verb above; the toast-free `reap` underneath is what
+  other session-write command above; the toast-free `reap` underneath is what
   every in-crate caller and unit test calls directly, and what the
   daemon's own tick runs internally on its ~12s cadence — the systemd timer
   becomes a redundant backstop once a daemon is resident, never a second
@@ -98,10 +98,10 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   as defense in depth. See AGENTS.md's invariants for the full reasoning
   and every site that must agree: the discovery gate, the listener
   self-check, and the four historical backfill call sites.
-- `shellbridge`, `herald` — files only; their CLI verbs (registry lines)
+- `shellbridge`, `herald` — files only; their CLI commands (registry lines)
   moved to `lyra` at P-A2, but both stay resident here (see charter smudge
   below).
-- `commands` — this crate's CLI verbs: `graph *` (21 paths, including
+- `commands` — this crate's CLI commands: `graph *` (21 paths, including
   `graph resurrect`, P-D8), `conduct`, `hooks install`, `who`.
 - **The durable session ledger + resurrect (P-D8, `docs/architecture/
   AOIDED.md`'s "L5"):** `graph/doc.rs::ledger_session_exit` is the ONE
@@ -170,7 +170,7 @@ daemon_dispatch`, P-D6; see `client`'s own README for why that edge stays).
 
 `screen`, `server`, `conductor`, `cli`, and `lyra` all depend on it.
 **Charter smudge**: `shellbridge.rs`/`herald.rs` stay as FILES here even
-though their CLI verbs moved to `lyra` — `permit.rs` publishes summons
+though their CLI commands moved to `lyra` — `permit.rs` publishes summons
 through `herald`, and `conductor/ui.rs` reads the socket path `shellbridge`
 owns, so both are entangled with core
 (`docs/architecture/PACKAGE-LAYOUT.md`, "Charter exceptions").

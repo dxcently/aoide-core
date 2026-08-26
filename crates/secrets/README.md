@@ -4,7 +4,7 @@ Aoide's secrets broker (Workstream SECRETS — renamed from "vault" at P-V4b,
 `~/.claude/plans/functional-singing-boole.md`'s "Workstream VAULT — Fable
 architecture" section, still titled that in the plan's own historical text).
 P-V1 landed the pure logic; P-V2 added the broker
-daemon, the unix-socket wire, and the client + admin CLI verbs — `aoide
+daemon, the unix-socket wire, and the client + admin CLI commands — `aoide
 secrets serve`/`exec`/`add`/`rm`/`grant`/`revoke`, registered into
 `aoide-cli`'s `Registry`. P-V3 added `secrets enroll` and wired `requireTotp`
 live, plus the backend-preset docs below. P-V4 was deployment:
@@ -15,7 +15,7 @@ live, plus the backend-preset docs below. P-V4 was deployment:
 (plain `0600` files under the secrets home, expressed entirely through the
 template mechanism — see "Backend presets" below), a `{home}` template
 placeholder to make that possible, and the write half — an optional
-per-backend `set` template plus the new `secrets put <name>` verb (see
+per-backend `set` template plus the new `secrets put <name>` command (see
 "The write flow" below). **P-V4d fixed two deployment bugs the first live
 host (yomi-strix) surfaced**: the socket default now resolves to the real
 `/run/aoide-secrets/secrets.sock` with no env needed (`socket.rs`'s module
@@ -36,11 +36,11 @@ stdin is a terminal, instead of requiring a pipe — a piped/redirected stdin
 is unchanged. **P-V4f (this commit) fixes a THIRD live deployment bug**
 (yomi-strix, 2026-08-22): `sudo aoide secrets add …` (plain sudo — euid 0)
 used to succeed and silently reown `policy.json` to `root:root`, bricking
-the broker and every later admin verb (including the correctly-spelled
-`sudo -u aoide-secrets` retry) until a manual `chown`. Every admin verb
+the broker and every later admin command (including the correctly-spelled
+`sudo -u aoide-secrets` retry) until a manual `chown`. Every admin command
 that touches `policy.json`/`totp.secret` now refuses outright when the
 process's effective uid doesn't own the secrets home, before it ever reads
-or writes that file — see "Admin verbs" below and `AGENTS.md`'s matching
+or writes that file — see "Admin commands" below and `AGENTS.md`'s matching
 invariant for the exact shape. **P-67 (this commit) closes the live UX gap
 the User hit next**: `secrets put` used to silently overwrite an existing
 value. `put`'s wire op gained an optional `overwrite` field (P-V4c's `put`,
@@ -51,7 +51,7 @@ without `--force`, the refusal becomes a `y/N` confirmation instead of a
 hard stop. See "The write flow" below for the full flow and
 `CONTRACTS.md`'s "Secrets wire" subsection for the wire-compat notes.
 **P-N1 (this commit) adds two per-secret policy gates and their admin
-verbs**: `automation` (`{enabled, consumers[]}`) lets an operator name
+commands**: `automation` (`{enabled, consumers[]}`) lets an operator name
 consumers that resolve a `requireTotp`-gated secret WITHOUT a code —
 `secrets automate <name> on|off|grant|revoke` — while every other caller
 stays gated exactly as before (see "The automation gate" below,
@@ -83,7 +83,7 @@ phase chose (and the one it didn't), and the no-dedup decision.
 
 **`secrets watch` (this commit, tracker #71 Part 1) is the terminal
 completion surface P-N2's own doc named as its eventual consumer**: a
-foreground, line-mode verb that tail-follows the mirrored log, narrates
+foreground, line-mode command that tail-follows the mirrored log, narrates
 every P-N3 event, and — on a terminal — prompts inline for a parked ask
 (approve with a hidden code, dismiss, or ignore). `--json` emits one event
 object per line, the pickup point a future graphical popup (tracker #71
@@ -213,7 +213,7 @@ value).
 (deliberate): `secrets put` is CLI-only (`commands::handle_secrets_put`'s
 `require_cli` gate, same as the policy-admin quartet) and, in deployment,
 runs as the secrets uid's own operator (`sudo -u aoide-secrets aoide
-secrets put …`, same admin-verb precedent as `add`/`grant` — "Admin verbs"
+secrets put …`, same admin-command precedent as `add`/`grant` — "Admin commands"
 below) — there is no separate agent-facing "consumer" identity to
 authorize, and gating the secrets uid's own operator behind a TOTP code it
 would also have to hold is pointless ceremony, not defense in depth. The
@@ -359,7 +359,7 @@ alongside it:
   ask whose STAMPED `peerUid` matches its OWN connection's peer uid — the
   broker's own effective uid (the operator/admin path — the same "this
   process's uid decides" precedent `home::admin_identity_check` holds for
-  the direct-home admin verbs) may always dismiss any ask, regardless of
+  the direct-home admin commands) may always dismiss any ask, regardless of
   who parked it. A refused dismiss names BOTH uids and leaves the ask
   exactly where it was, dismissable by its rightful owner or the broker's
   own operator. `approve` stays OPEN to any local caller reaching the
@@ -402,11 +402,11 @@ Before this phase, `secrets add`/`rm`/`grant`/`revoke`/`set-totp`/
 `automate`/`expose`/`migrate` wrote `policy.json` DIRECTLY — a separate OS
 process from `secrets serve`, with no way to serialize against a live
 daemon's own `put_lock` (a `static Mutex` is per-process memory). Task #79
-makes the live daemon the SINGLE WRITER instead: every admin verb's CLI
+makes the live daemon the SINGLE WRITER instead: every admin command's CLI
 handler now tries the broker socket FIRST, sending
 `{"op":"admin","verb":"<verb>",...verb-specific fields}`; the broker
 executes the mutation inside the SAME `put_lock` critical section a `put`
-already runs under, so an admin verb racing a live `put`/`exec` against the
+already runs under, so an admin command racing a live `put`/`exec` against the
 same secret can no longer interleave. Direct-write-to-`policy.json`
 survives ONLY as the no-daemon fallback (`AGENTS.md`'s KNOWN LIMITATION —
 narrowed by this phase to exactly that one remaining case).
@@ -442,18 +442,18 @@ the broker's own `{"ok":false}` denial (a wrong peer uid, a domain error, a
 poisoned `policy.json`), is reported straight through as the command's
 result. A live-but-sick daemon (a permission error, a saturated accept
 backlog) is therefore never bypassed into a TOCTOU race against a direct
-write landing underneath it. Every admin verb's `Outcome` carries
+write landing underneath it. Every admin command's `Outcome` carries
 `data: {"path":"broker"}` or `{"path":"direct"}` naming which one actually
 ran, alongside the usual `message`/`changed` fields — idempotency
 discipline (house rule 2) extended to "which write path" as one more thing
 a caller is told exactly.
 
-`crate::admin` is the one module holding every verb's actual mutation
+`crate::admin` is the one module holding every command's actual mutation
 logic — typed arguments in, a message + changed-keys report out, no
 `Invocation`, no `Outcome`, no wire `Value` — so `commands.rs`'s
 direct-write fallback and `broker::handle_admin`'s socket path call the
 IDENTICAL functions, never two copies that could drift. The broker's own
-audit line for this op family, `broker::audit_admin`, is verb-generic and
+audit line for this op family, `broker::audit_admin`, is command-generic and
 name-only (never the value, matching every other audit line in this
 crate) — it is the ONLY audit record the socket path produces, since it
 never goes through `commands.rs`'s own per-command dispatch audit at all;
@@ -502,7 +502,7 @@ operator -> aoide secrets pending                          (a SEPARATE connectio
 **The value never exists anywhere until the ask resolves.** Parking stores
 only `{id, secret name, consumer, requestedAt}` — never a value, never a
 partial fetch — the SAME "never store or park a value" invariant every
-other verb in this crate holds (`AGENTS.md`). `approve` fetches fresh,
+other command in this crate holds (`AGENTS.md`). `approve` fetches fresh,
 through the backend, only after a code has already validated, then sends
 it down the channel the original `resolve` call is blocked reading —
 `approve`'s own wire reply to the operator carries no `value` field at all.
@@ -904,7 +904,7 @@ wall-clock delta itself. **Never in this shape, ever: a secret value** —
 same rule as every other wire/log shape in this crate.
 
 `aoide secrets watch` is CLI-only (`require_cli`, same door gate as
-`pending`/`approve`/`dismiss`) but NOT an admin/euid verb — it touches no
+`pending`/`approve`/`dismiss`) but NOT an admin/euid command — it touches no
 `policy.json`, only the broker-owned events feed (read-only, P-G4, task #77
 — see "Broker notifications" above) and the broker's in-memory registry
 over the existing socket ops. Socket errors while reconciling (the broker
@@ -1275,7 +1275,7 @@ backends for any other reason.
 ```
 operator -> aoide secrets migrate db-prod --backend age
          -> policy gate (same admin door as add/rm/grant: CLI-only,
-            euid-guarded — "Admin verbs" below)
+            euid-guarded — "Admin commands" below)
          -> fetch the value via the policy's CURRENT backend
          -> store it via the TARGET backend (may lazily mint the target's
             age identity, the SAME `backend::mint_age_identity_if_needed`
@@ -1287,7 +1287,7 @@ operator -> aoide secrets migrate db-prod --backend age
             actually removed
 ```
 
-**Admin verb — same socket-first, direct-write-fallback shape as
+**Admin command — same socket-first, direct-write-fallback shape as
 `add`/`rm`/`grant`** (task #79, "Admin mutations over the socket" above):
 `secrets migrate` tries the running broker's `{"op":"admin","verb":
 "migrate",...}` FIRST, executed inside the SAME `put_lock` critical section
@@ -1325,7 +1325,7 @@ completely untouched — this crate has no way to know where such a backend
 keeps its own bytes — and the success message says so plainly rather than
 silently doing nothing.
 
-**Idempotent and refusal-clean, matching this crate's other admin verbs**:
+**Idempotent and refusal-clean, matching this crate's other admin commands**:
 migrating a secret to the backend it's already on is a no-op that reports
 exactly that (house rule: report what changed, never `.changed(...)` on a
 write that never happened) — no fetch, no store, no policy write. A secret
@@ -1362,8 +1362,8 @@ unit, the same discipline `backend::mint_age_identity_if_needed`'s own
 
 **No cross-process lock ONLY when no daemon is running (KNOWN LIMITATION,
 narrowed by task #79, `AGENTS.md`).** When a broker IS listening, migrate
-(like every other admin verb) runs inside its `put_lock` and is fully
-serialized against a concurrent `put`/`exec`/another admin verb. The
+(like every other admin command) runs inside its `put_lock` and is fully
+serialized against a concurrent `put`/`exec`/another admin command. The
 remaining gap is the no-daemon case: the direct-write fallback is a
 separate OS process from any other admin invocation, with no cross-process
 primitive to serialize two of them racing the SAME secret concurrently —
@@ -1405,7 +1405,7 @@ forever, so this is right from day one, no oneshot detour; anchored to
 (`0750`), and `AOIDE_SECRETS_HOME`/`AOIDE_SECRETS_SOCKET` set explicitly.
 `aoide.secrets.members` (default `[]`) is the list of user names added to
 `aoide-secrets-access` — enable alone grants nobody access until a host names
-its operator here. No sudo rule is shipped; admin verbs run as the secrets
+its operator here. No sudo rule is shipped; admin commands run as the secrets
 user by hand (below). The service's `path` also carries `bash`+`coreutils`
 (sh/cat/mkdir/install for the built-in `file` backend's own templates — a
 systemd unit's default `PATH` carries no `sh`, so an un-hardened unit can
@@ -1416,7 +1416,7 @@ render succeeds — the first live enrollment attempt found it absent).
 **A regular agent-side consumer (`secrets exec`/`secrets put`) needs NO env
 set at all on a deployed host** as of P-V4d: `socket::socket_path()`'s own
 default now equals the module's `AOIDE_SECRETS_SOCKET` value, so a bare
-shell finds the right socket with zero exports. Only the admin verbs below
+shell finds the right socket with zero exports. Only the admin commands below
 still need an explicit `sudo -u aoide-secrets` invocation (sudo does not
 carry the caller's env).
 
@@ -1560,7 +1560,7 @@ WantedBy=multi-user.target
 `bind_socket` chmods the socket file inside it to `0660` regardless of
 which one provisioned the parent directory.
 
-### Admin verbs
+### Admin commands
 
 `secrets add|rm|grant|revoke|enroll|set-totp|automate|expose|migrate` mutate
 `policy.json`/`totp.secret` (and, for `migrate`, a backend's own value file)
@@ -1585,7 +1585,7 @@ sudo -u aoide-secrets aoide secrets migrate <name> [--backend <target>]  # defau
 
 `secrets set-totp <name> on|off` (P-V4e) flips an EXISTING policy's
 `requireTotp` bit directly, in place of hand-editing `policy.json` with a
-`jq` one-liner — the gap this verb exists to close. Idempotent: re-setting
+`jq` one-liner — the gap this command exists to close. Idempotent: re-setting
 the state a policy already has reports "unchanged" and writes nothing.
 
 `secrets automate <name> on|off` (P-N1) flips the policy's `automation.
@@ -1604,7 +1604,7 @@ change today**: no non-local entry point onto this broker exists yet, so
 the invariant it exists to enforce once one lands.
 
 **Running any of these as the wrong user is refused outright, before the
-verb ever touches `policy.json`/`totp.secret` (P-V4f).** A mismatched
+command ever touches `policy.json`/`totp.secret` (P-V4f).** A mismatched
 effective uid — root included, from a plain `sudo` — gets a message
 naming the actual home path, the actual owning uid, and the corrective
 spelling, e.g.:
@@ -1643,7 +1643,7 @@ historical plain-`sudo` run that predates the guard. `home::
 describe_home_file_error` is the ONE seam EVERY `policy.json`/
 `totp.secret`/`totp-replay.json`/`backends.json` load/save call site in
 this crate routes a `PermissionDenied` `io::Error` through — not only the
-admin CRUD verbs (`commands.rs`'s CRUD quintet via its `policy_io_error`
+admin CRUD commands (`commands.rs`'s CRUD quintet via its `policy_io_error`
 wrapper, `enroll::run`/`enroll::show`), but also the broker's own
 AGENT-facing gates (`broker::resolve_gate`/`put_gate`, reached by `secrets
 exec`/`put` — the primary agent-facing path, and the exact one the User
@@ -1787,7 +1787,7 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   both unit-tested on injected uids, and `admin_identity_check`'s live
   wiring to a real stat + a real `geteuid(2)` dispatching between them —
   see `AGENTS.md`'s matching invariant and
-  "Admin verbs" above. `describe_home_file_error` (this section's
+  "Admin commands" above. `describe_home_file_error` (this section's
   "POISONED-FILE case" above) is the sibling diagnosis for a FILE-level
   `PermissionDenied` the guard's own directory-level check can't catch —
   pure given an injected `io::Error`, unit-tested the same way.
@@ -1937,7 +1937,7 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   return type; `approve`/`dismiss` return `Result<(), String>` — neither
   arm of either can carry a value, since the wire replies they read never
   have one.
-- `commands` — `register(&mut Registry)`: FOURTEEN verbs, ALL CLI-only.
+- `commands` — `register(&mut Registry)`: FOURTEEN commands, ALL CLI-only.
   `serve`/`exec`/`enroll` are door-hint handlers (the real work happens in
   `cli`'s `special` hook, same pattern as `a2a serve`/`conductor`); `add`/
   `rm`/`grant`/`revoke`/`set-totp`/`automate`/`expose` are policy-CRUD
@@ -1950,7 +1950,7 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   the direct-write fallback ONLY (reached ONLY when nothing is listening,
   `client::AdminError::NoSocket`) right after `require_cli` — the wrong
   effective uid gets refused before the file is ever touched either way,
-  see "Admin verbs" and "Admin mutations over the socket" above. **`add`'s `--backend` flag is
+  see "Admin commands" and "Admin mutations over the socket" above. **`add`'s `--backend` flag is
   now OPTIONAL, defaulting to `age` when omitted (P-G1, task #70, DEFAULT
   FLIP)** — `handle_secrets_add`'s own `DEFAULT_BACKEND` constant; an
   explicit `--backend` still wins, and an ALREADY-recorded policy's
@@ -1969,7 +1969,7 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   only the broker's in-memory `ParkRegistry` over the socket, the same
   operator-side-but-not-admin-side distinction `put`/`exec` already draw.
 
-- `admin` (task #79) — the ONE module holding every admin verb's actual
+- `admin` (task #79) — the ONE module holding every admin command's actual
   mutation logic (`add`/`rm`/`grant`/`revoke`/`set_totp`/`expose`/
   `automate_toggle`/`automate_consumer`/`migrate`): typed arguments in, an
   `AdminOutcome{message,changed}` or `Err(String)` out, no `Invocation`, no
@@ -2003,7 +2003,7 @@ see `commands.rs`'s module doc; neither does `secrets set-totp`, P-V4e, nor
 `secrets automate`/`secrets expose`, P-N1, nor `secrets pending`/`secrets
 approve`/`secrets dismiss`, P-N2, for the same reason `put` doesn't — plain
 handlers, no value on the wire). The workspace `Cargo.toml`
-comment on the `aoide-secrets` member is kept current with the verb set in
+comment on the `aoide-secrets` member is kept current with the command set in
 the same commit as any change.
 
 ## Invariants held (see `AGENTS.md` for the full list)

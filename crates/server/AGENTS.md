@@ -50,24 +50,24 @@
   the shared test binary — don't fold a `thread::sleep`/signal check into
   one of the bounded functions "to save a caller the loop."
 - **`daemon::handle_conn`'s `dispatch` op (P-D4) adds no daemon-specific
-  policy, and never will.** Every per-verb door check that already runs
-  over MCP/A2A (a CLI-only admin verb's refusal, a gated command's
+  policy, and never will.** Every per-command door check that already runs
+  over MCP/A2A (a CLI-only admin command's refusal, a gated command's
   `gated: true`, `mcp.serve`/`a2a.serve`'s non-Cli metadata replies) runs
   IDENTICALLY over this door, because the injected `dispatch` fn IS
   `cli::dispatch::dispatch` — the same function, the same registry, the
   same `inv.door` branches. Don't add a daemon-specific allowlist or
   permission table here "for symmetry with MCP's tool list" —
   `docs/architecture/AOIDED.md`'s "L2" section names a daemon-door
-  allowlist a review-blocking violation; a new per-verb policy need is
+  allowlist a review-blocking violation; a new per-command policy need is
   proved by a failing test against the EXISTING handler's `inv.door`
   branch, never by a new table in this crate.
 - **`producers::HandEditWatcher` is ONE shared `Arc<Mutex<..>>` instance
   (`daemon::SharedHandEditWatcher`), not tick-private (task #92).** A
-  dispatched session verb writes stage files on `handle_conn`'s own
+  dispatched session command writes stage files on `handle_conn`'s own
   connection thread, never the tick thread, so `daemon::run_loop` hands the
   SAME watcher instance to `accept_loop`/`handle_conn` it ticks itself;
   `daemon::rebaseline_stage_roster` re-baselines the WHOLE roster after
-  every completed `dispatch` op, unconditionally — never a per-verb "which
+  every completed `dispatch` op, unconditionally — never a per-command "which
   files did this write" table (the same drift trap the door-policy
   invariant above already forbids). Don't reintroduce a tick-private
   `HandEditWatcher::new(..)` inside `run_loop`'s loop body or inside
@@ -196,7 +196,7 @@
   whose `allows` lacks `spawn` is told the exact `peer allow` fix; every
   other shape gets the original "pair first, then allow" message, now
   naming the signature requirement too. The door-wide bearer that gates
-  every OTHER arm (read verbs, the uniform-response guard, Inject's
+  every OTHER arm (read commands, the uniform-response guard, Inject's
   `effective_origin` coupling) is not consulted here at all. Signing
   itself never touches this crate — `aoide_storage::wire_auth` holds the
   canonical-string/verify logic, `aoide-client` holds the signer; this
@@ -255,7 +255,7 @@
 
 ## Extension points
 
-- **A new serve-side verb** (`daemon`, `shellbridge` registration, `a2a
+- **A new serve-side command** (`daemon`, `shellbridge` registration, `a2a
   serve`, `events tail`) adds a `cmd!`/`register` entry in `commands.rs`,
   wired into the owning app crate's `commands::all()` — core-only today
   (`daemon`/`a2a serve`/`events tail` are core identity, per root
@@ -270,7 +270,7 @@
 
 ## Docs update required in the same commit
 
-- This `README.md` when a new module or serve-side verb is added.
+- This `README.md` when a new module or serve-side command is added.
 - `CONTRACTS.md §6` when an A2A/MCP wire shape changes.
 - `CONTRACTS.md §3`'s "Daemon wire" subsection when the daemon socket's own
   wire shape changes (`ping`/`subscribe`/`dispatch`).

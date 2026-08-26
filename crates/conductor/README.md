@@ -17,7 +17,7 @@ weight, and conducting orchestration is Aoide's core identity (root
 - `graphview` — DAG layout + drawing.
 - `theme` — palette → `Style`, glyph vocabulary, small pure formatters.
 - `logtail` — the log-tail overlay for headless-session detail.
-- `commands` — this crate's one CLI verb, `conductor`.
+- `commands` — this crate's one CLI command, `conductor`.
 
 ## ROSTER: presence over this box + every registered peer (P-C4; selection + compose P-C5)
 

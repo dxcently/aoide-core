@@ -110,12 +110,12 @@
 - **`handle_peer_pair_reject` tries the inbound queue, THEN the outbound
   queue — never just one (P-P2).** An outbound entry at EITHER
   `OutboundState` aborts cleanly on reject; this is the ceremony's only
-  abort verb, so collapsing this back to inbound-only would leave a
+  abort command, so collapsing this back to inbound-only would leave a
   requester with no way to cancel a pairing it no longer wants.
 
 ## Extension points
 
-- **A new outbound A2A verb** adds a `cmd!`/`register` entry in
+- **A new outbound A2A command** adds a `cmd!`/`register` entry in
   `commands.rs`, wired into the owning app crate's `commands::all()`.
 - **A new adapter consumer** (beyond melete) gets its own module beside
   `adapter.rs`, built the same neutral-event-in/typed-event-out shape.
@@ -123,12 +123,12 @@
   calls `daemon::daemon_dispatch(inv)` as its own first line and returns
   early on `Some(outcome)` — the exact one-line prefix every P-D6 handler
   in `conduct` already uses; nothing in THIS crate changes for a new
-  routed verb, since `daemon_dispatch` is already generic over any
+  routed command, since `daemon_dispatch` is already generic over any
   `Invocation`.
 
 ## Docs update required in the same commit
 
-- This `README.md` when a new module or CLI verb group is added.
+- This `README.md` when a new module or CLI command group is added.
 - `CONTRACTS.md §6`/`§7` when an A2A or peer-federation wire shape changes.
 - `pkgs/aoide/crates/AGENTS.md` for cross-crate invariants — not restated
   here.

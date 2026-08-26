@@ -23,14 +23,14 @@
 - **A new root-coupled command** (one that must read the assembled
   registry) adds a case to `meta`/`infra`; anything else belongs in its
   domain crate's own `commands` module instead.
-- **A new special-cased verb** (bypassing the generic `Outcome` envelope)
+- **A new special-cased command** (bypassing the generic `Outcome` envelope)
   extends the `special` closure passed to `aoide_protocol::door::run` in
   `run_cli`.
 
 ## Docs update required in the same commit
 
 - This `README.md` when the command count, a root-coupled group, or a
-  special-cased verb changes.
+  special-cased command changes.
 - The golden snapshot in `registry.rs` when the command-path set changes.
 - `docs/architecture/PACKAGE-LAYOUT.md`/`CONTRACTS.md §3` when the
   core/lyra split itself shifts.

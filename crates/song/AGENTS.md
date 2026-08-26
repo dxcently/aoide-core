@@ -17,7 +17,7 @@
 
 ## Extension points
 
-- **A new `rice`/`livery`/`cover` verb** adds a `cmd!`/`register` entry in
+- **A new `rice`/`livery`/`cover` command** adds a `cmd!`/`register` entry in
   `commands/`, wired into `lyra`'s `commands::all()` only.
 - **A new emitter target** (stage/hyprctl/osc/file exist today) extends
   `livery::emit`, keeping the schema-validate → resolve → emit pipeline
@@ -25,7 +25,7 @@
 
 ## Docs update required in the same commit
 
-- This `README.md` when a new module or CLI verb group is added.
+- This `README.md` when a new module or CLI command group is added.
 - `docs/architecture/PACKAGE-LAYOUT.md`'s "song rices portably" note if the
   nix-independence boundary shifts.
 - `pkgs/aoide/crates/AGENTS.md` for cross-crate invariants — not restated

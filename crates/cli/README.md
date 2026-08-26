@@ -40,7 +40,7 @@ project/session graph (including `graph resurrect`, P-D8's ledger-backed
 session revival), A2A, peers (including the `peer hub` designation,
 P-D5, the `peer pair request|pending|approve|reject` pairing ceremony,
 P-P2, the `peer allow <name> <cap> on|off` closed-capability grant/
-revoke verb backing the A2A spawn arm's hard gate, P-P3, and `peer spawn
+revoke command backing the A2A spawn arm's hard gate, P-P3, and `peer spawn
 <name> -- <text…>`, P-P5b, the signed spawn-shaped `message/send` that
 actually reaches that gate), presence, the
 daemon, its own event bus (`events tail`), usage, hooks, the message

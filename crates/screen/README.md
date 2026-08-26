@@ -13,12 +13,12 @@ Paint-side — ships in `lyra`, not core.
 - `capture` — grim/slurp shot pipeline + sidecar; `write_capture` is the
   shared capture-to-sidecar tail `diff` reuses.
 - `hypr` — every Hyprland-specific `hyprctl -j` query.
-- `point`/`synth` — pointer verbs over the native wayland-protocol backend
+- `point`/`synth` — pointer commands over the native wayland-protocol backend
   (no `wlrctl` shell-out).
 - `ocr`/`text` — tesseract extraction and OCR-word-name click targeting.
 - `diff` — pixel-changed bounding box + `hypr::info_delta`, turning "did my
   click do anything?" into a measurement.
-- `commands` — this crate's CLI verbs (`screen info/shot/point/ocr/diff/…`).
+- `commands` — this crate's CLI commands (`screen info/shot/point/ocr/diff/…`).
 
 ## What it consumes
 
@@ -32,6 +32,6 @@ Only `lyra` depends on it — `screen` is graphical-binary surface, extracted
 out of `conduct` at P-A1 specifically so core stays headless-safe.
 **Charter smudge**: it reaches back into `aoide_conduct::graph` for
 session/graph symbols rather than duplicating them, because the
-*session*-addressed screen verbs were a natural continuation of `conduct`'s
+*session*-addressed screen commands were a natural continuation of `conduct`'s
 original charter even after the crate itself moved
 (`docs/architecture/PACKAGE-LAYOUT.md`).

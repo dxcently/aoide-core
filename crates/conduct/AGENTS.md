@@ -7,9 +7,9 @@
   (to `screen`) to keep this crate headless-safe. `cargo tree -p
   aoide-conduct` staying free of those deps is a standing gate.
 - **`shellbridge.rs`/`herald.rs` are a named, deliberate charter smudge.**
-  Their CLI verbs live in `lyra`; the files stay here because `permit.rs`
+  Their CLI commands live in `lyra`; the files stay here because `permit.rs`
   (this crate) publishes through `herald`, and `conductor/ui.rs` reads the
-  socket path `shellbridge` owns. Don't move the files to chase the verbs —
+  socket path `shellbridge` owns. Don't move the files to chase the commands —
   see `docs/architecture/PACKAGE-LAYOUT.md`'s "Charter exceptions" for the
   full reasoning before touching either.
 - **`normalize_addr` is `pub`, not `pub(crate)`, on purpose** — `screen`
@@ -186,8 +186,8 @@
 
 ## Extension points
 
-- **A new `graph`/`conduct`/`hooks` verb** adds a `cmd!`/`register` entry in
-  `commands/`, wired into `cli`'s `commands::all()` (this crate's verbs are
+- **A new `graph`/`conduct`/`hooks` command** adds a `cmd!`/`register` entry in
+  `commands/`, wired into `cli`'s `commands::all()` (this crate's commands are
   core, never `lyra`'s).
 - **A new hook event or harness profile** extends `aoide_protocol::agents`,
   not this crate — the harness-profile table lives one layer down.

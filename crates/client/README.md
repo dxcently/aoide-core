@@ -38,7 +38,7 @@ never the inbound/serve half (that's `aoide-server`).
   the graphSummary pair above them; the server-side handlers
   (`pair_request`/`pair_reveal`/`pair_approve_callback`) live in
   `aoide-server::a2a`, never duplicated here.
-- `commands` — this crate's CLI verbs: `a2a agent add/list/remove/send`,
+- `commands` — this crate's CLI commands: `a2a agent add/list/remove/send`,
   `peer add/list/remove/pull/status/hub/allow/spawn`, `peer pair request/
   pending/approve/reject` (P-P2, CONTRACTS.md §6/§7 —
   `handle_peer_allow` (`peer allow <name> <cap> on|off`, P-P3, `docs/
@@ -63,14 +63,14 @@ never the inbound/serve half (that's `aoide-server`).
   instance's own record directly on confirmation (decision 4's
   mutual confirmation, on both ends). `handle_peer_pair_reject` tries
   the inbound queue then the outbound queue, aborting an outbound entry at
-  any stage — the ceremony's abort verb.
+  any stage — the ceremony's abort command.
   `adapter melete` (`peer hub
   <name> [--clear]`, P-D5, designates at most one registered peer as the
   hub `aoide_storage::addr::resolve_with_hub` prefers as a last-resort
   remote target — `peer_store::set_hub`/`clear_hub` hold the invariants,
   this handler just reports which of set/moved/cleared/no-op happened);
   also exposes two
-  non-verb functions that are the `conduct → client` edge's crossing
+  non-command functions that are the `conduct → client` edge's crossing
   points: `pull_peer_live` (`who`'s live per-peer probe, read-only) and
   `send_message_to_peer` (`graph send --to <peer>/<query>`'s delivery,
   workstream C3 — POSTs `message/send` with an explicit `contextId` naming
@@ -143,7 +143,7 @@ rather than a second wire client written here).
 
 `conduct`, `screen`, `server` (dev-dependency only, for one round-trip
 test), and `cli` depend on it. **The `conduct → client` edge is intentional,
-not technical debt**: `conduct`'s `who` presence verb (workstream C2,
+not technical debt**: `conduct`'s `who` presence command (workstream C2,
 landed) calls this crate's `commands::pull_peer_live` for its live
 per-peer probe, `graph send --to`'s remote branch (workstream C3, landed)
 calls `commands::send_message_to_peer` to deliver, and (P-D6) every
