@@ -61,7 +61,7 @@ mod tests {
 
     /// Golden snapshot: the sorted list of every command path. Adding,
     /// removing, or renaming a command is a reviewable diff here — this is
-    /// lyra's own golden, independent of the core crate's 87/48-path one.
+    /// lyra's own golden, independent of the core crate's.
     #[test]
     fn command_paths_match_the_golden_snapshot() {
         let r = crate::commands::all();
