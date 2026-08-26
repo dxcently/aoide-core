@@ -138,6 +138,7 @@ mod tests {
             "peer.pair.request",
             "peer.pull",
             "peer.remove",
+            "peer.spawn",
             "peer.status",
             "schema",
             "soundcheck",

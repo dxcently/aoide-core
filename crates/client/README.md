@@ -39,8 +39,8 @@ never the inbound/serve half (that's `aoide-server`).
   (`pair_request`/`pair_reveal`/`pair_approve_callback`) live in
   `aoide-server::a2a`, never duplicated here.
 - `commands` — this crate's CLI verbs: `a2a agent add/list/remove/send`,
-  `peer add/list/remove/pull/status/hub/allow`, `peer pair request/pending/
-  approve/reject` (P-P2, CONTRACTS.md §6/§7 —
+  `peer add/list/remove/pull/status/hub/allow/spawn`, `peer pair request/
+  pending/approve/reject` (P-P2, CONTRACTS.md §6/§7 —
   `handle_peer_allow` (`peer allow <name> <cap> on|off`, P-P3, `docs/
   architecture/PAIRING.md` decision 5) is a thin wire around
   `aoide_storage::peer_store::set_peer_allow` — idempotent, refuses an
@@ -96,21 +96,41 @@ never the inbound/serve half (that's `aoide-server`).
   (`aoide_storage::identity::load_or_mint`), mints a nonce
   (`aoide_storage::pairing::random_hex(16)`, the same mint the pairing
   ceremony already uses), signs
-  `aoide_storage::wire_auth::canonical_string("POST",
+  `aoide_storage::wire_auth::canonical_string(HTTP_METHOD,
   aoide_storage::peer_store::url_path(&peer.url), timestamp, nonce, body)`
   with `aoide_storage::wire_auth::sign_hex`, and sends `X-Aoide-Peer` as
   `peer.name` (this instance's own local registry name for the
   counterpart — the pairing ceremony's single shared `name` value makes it
   identical to what the counterpart's own registry resolves back to this
-  instance). An unverified/unpaired peer gets an empty header list —
-  byte-identical to the pre-P-P4 transport. Wired into all three real
-  peer-POST call sites (`pull_one_peer`, `pull_peer_live`,
-  `send_message_to_peer`); the pairing ceremony's own three wire calls
-  stay unauthenticated by design and always pass an empty slice. `post_json`
-  threads `extra_headers` as plain `-H "<name>: <value>"` curl argv
-  literals in EITHER the bearer or no-bearer branch — unlike the bearer
-  token, nothing in a signature header is a secret worth hiding from
-  `/proc/<pid>/cmdline`.
+  instance). `HTTP_METHOD` (P-P5b, closing a P-P4 review finding) is the
+  ONE named constant `post_json`'s own `-X` argument reads too — before
+  this fix the two carried independent `"POST"` literals that merely
+  happened to agree; now there is exactly one value to drift from. An
+  unverified/unpaired peer gets an empty header list — byte-identical to
+  the pre-P-P4 transport. Wired into all four real peer-POST call sites
+  (`pull_one_peer`, `pull_peer_live`, `send_message_to_peer`,
+  `handle_peer_spawn` — P-P5b, the FIRST of the four to ever sign a
+  `contextId`-less, spawn-shaped body); the pairing ceremony's own three
+  wire calls stay unauthenticated by design and always pass an empty
+  slice. `post_json` threads `extra_headers` as plain `-H "<name>:
+  <value>"` curl argv literals in EITHER the bearer or no-bearer branch —
+  unlike the bearer token, nothing in a signature header is a secret worth
+  hiding from `/proc/<pid>/cmdline`.
+- **`handle_peer_spawn` (P-P5b, `peer spawn <name> [--yes] -- <text…>`)**
+  makes PAIRING.md's spawn gate actually reachable from the CLI. Builds
+  the exact spawn-shaped body `aoide-server::a2a::do_spawn` consumes —
+  `crate::wire::build_message_send_body(text, messageId, None)`,
+  `contextId` omitted, `<text…>` riding as the prompt `do_spawn` types
+  into the newly spawned session's first turn — and signs it via
+  `sign_headers_for_peer` above. Gates LOCALLY on exactly one question
+  (is `name` a registered, `verified` peer at all — an unsigned request
+  could never satisfy the remote's `PeerRung::Signature`-only requirement
+  regardless), refusing with a taught error naming `peer pair request`;
+  every OTHER refusal (`allows` lacking `spawn`, an unsigned-but-paired
+  caller, clock skew) is the remote door's own call, surfaced verbatim —
+  this handler never re-derives or second-guesses it. `--yes` skips only
+  a LOCAL `y`/`N` confirmation (`confirm_spawn`, mirroring `confirm_sas`'s
+  idiom) — no bearing on the remote gate, the sole security authority.
 
 ## What it consumes
 

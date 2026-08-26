@@ -206,7 +206,24 @@
   files_the_opening_turn_into_the_inbox`'s own doc comment) — the gate
   itself is proven via the pure `peer_may_spawn`/`spawn_admitted`/
   `spawn_refusal` predicates, `verify_signed_request`'s own dedicated test
-  section, and `message_send`'s REFUSAL branches only.
+  section, and `message_send`'s REFUSAL branches only. **P-P5b's own
+  `peer_spawn_signed_and_allowed_is_admitted_up_to_the_do_spawn_boundary`
+  holds the SAME line**: it drives a REAL ed25519 signature (via
+  `aoide_client::wire::build_message_send_body`, the dev-dependency edge)
+  through the REAL `verify_signed_request` → `spawn_admitted`, proving
+  admission all the way to (never through) the `do_spawn` call — the
+  refusal-side sibling (`peer_spawn_revoked_is_refused_...`) IS safe to
+  drive through the real `message_send` because a refusal never reaches
+  `do_spawn`. Don't "complete" the admitted-side test by calling
+  `message_send`/`do_spawn` themselves — that would be exactly the real
+  process spawn this precedent exists to avoid inside a `cargo test`
+  binary (`std::env::current_exe()` there is the TEST binary, not a real
+  `aoide`).
+  `verify_signed_request`'s canonical string now reads `&req.method` (the
+  request's own OBSERVED method), not a hardcoded `"POST"` literal (P-P5b,
+  closing a P-P4 review finding) — a genuine behavior no-op today (every
+  signed request is a POST), but the "binds method" claim above is now
+  structurally true, not merely coincidentally true.
 - **`do_inject`'s `from` attribution (P-P3 decision 7) is scoped to the
   QUEUED path only — never an immediately-delivered payload's bytes.**
   `session_send`'s own `from` mechanism also prefixes DELIVERED text

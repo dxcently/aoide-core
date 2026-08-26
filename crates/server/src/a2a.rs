@@ -2248,7 +2248,16 @@ fn verify_signed_request(req: &HttpRequest, now_epoch: i64) -> SignedRequestOutc
         );
     }
 
-    let canonical = aoide_storage::wire_auth::canonical_string("POST", &req.path, timestamp, nonce, &req.body);
+    // `&req.method` (P-P4 review finding 2), not a hardcoded `"POST"`
+    // literal: the OBSERVED method of THIS request, so the canonical
+    // string is genuinely bound to what arrived, not a re-typed assumption
+    // that happens to agree with it. Every real signed request today IS a
+    // POST (the client's own `HTTP_METHOD` constant — `aoide-client::
+    // commands` — never builds anything else), so this changes no byte of
+    // any existing signature's canonical string or the pinned vectors
+    // (CONTRACTS.md §6) — it only makes the module doc's "binds method"
+    // claim structurally true instead of coincidentally true.
+    let canonical = aoide_storage::wire_auth::canonical_string(&req.method, &req.path, timestamp, nonce, &req.body);
     if !aoide_storage::wire_auth::verify_signature_hex(pubkey_hex, canonical.as_bytes(), signature) {
         return SignedRequestOutcome::Refused(-32007, format!("signature verification failed for peer `{peer_name}`"));
     }
@@ -3045,6 +3054,30 @@ mod tests {
         assert_eq!(prompt, "hello there");
         assert_eq!(ctx, None);
         assert!(!spawn);
+    }
+
+    /// P-P5b (`peer spawn`): the exact body `handle_peer_spawn`
+    /// (`aoide-client::commands`) posts is
+    /// `aoide_client::wire::build_message_send_body(text, id, None)` — this
+    /// proves that shape routes all the way to `SendAction::Spawn`, carrying
+    /// the client's prompt text verbatim as the argument `do_spawn` would
+    /// type as the newly spawned session's first turn, against the SERVER's
+    /// own `parse_message_send_params`/`decide_send_action`, not a guessed
+    /// shape.
+    #[test]
+    fn build_message_send_body_routes_to_the_spawn_arm_exactly_as_do_spawn_expects() {
+        let body = aoide_client::wire::build_message_send_body("status check please", "mid-456", None);
+        let (prompt, ctx, spawn_asked) = parse_message_send_params(&body["params"]);
+        assert_eq!(prompt, "status check please");
+        assert_eq!(ctx, None, "no contextId — the Spawn signal `decide_send_action` reads");
+        assert!(!spawn_asked, "spawn is signaled by the ABSENT contextId, not the metadata flag — `peer spawn` never sets it");
+
+        let action = decide_send_action(ctx.as_deref(), spawn_asked, "claude", session_ref_lookup);
+        assert_eq!(
+            action,
+            SendAction::Spawn { agent_cmd: "claude".to_string() },
+            "routes to Spawn with `do_spawn`'s prompt arg equal to `prompt` above (\"status check please\")"
+        );
     }
 
     // ── `message/send` end-to-end via `handle_jsonrpc` — ERROR branches only.
@@ -3871,6 +3904,20 @@ mod tests {
         kp
     }
 
+    /// [`setup_signed_peer`]'s sibling with a controllable `allows` set —
+    /// P-P5b's own admission/revocation round-trip tests need a genuinely
+    /// paired+verified peer whose `allows` they choose, not the empty
+    /// default `setup_signed_peer` stamps.
+    fn setup_signed_peer_with_allows(peer_name: &str, allows: &[&str]) -> aoide_storage::identity::Keypair {
+        let (kp, _) = aoide_storage::identity::load_or_mint().unwrap();
+        let mut peer = fixture_peer(peer_name, "http://peer/", false);
+        peer.verified = true;
+        peer.pubkey = Some(kp.info().pubkey_hex);
+        peer.allows = allows.iter().map(|s| s.to_string()).collect();
+        aoide_storage::peer_store::save_peers(&[peer]).unwrap();
+        kp
+    }
+
     /// Build a signed [`HttpRequest`] for `path`/`body`, timestamped
     /// `ts_epoch` seconds since epoch, nonce `nonce` — the test-side mirror
     /// of `aoide-client`'s real wire builder, built directly against
@@ -4139,6 +4186,131 @@ mod tests {
         assert!(!nonce_is_replay(&tag, "n1"), "first use of a fresh (peer, nonce) pair is never a replay");
         assert!(nonce_is_replay(&tag, "n1"), "the SAME pair, reused, is a replay");
         assert!(!nonce_is_replay(&tag, "n2"), "a DIFFERENT nonce for the SAME peer tag is not a replay");
+    }
+
+    // ── P-P5b (`peer spawn`) — the real signed wire round trip ──────────────
+    //
+    // Both tests below build the SPAWN-SHAPED body via `aoide_client::wire::
+    // build_message_send_body(text, id, None)` — the exact function
+    // `aoide-client::commands::handle_peer_spawn` calls — and a REAL ed25519
+    // signature over it (`signed_request`, the same helper the P-P4 tests
+    // above use), so this is a genuine client-body + real-crypto round trip,
+    // not a hand-typed guess at either shape.
+
+    /// "A signed peer spawn is ADMITTED" (PAIRING.md's own live-gate
+    /// wording) — proven up to, but never through, `do_spawn`'s real
+    /// OS-level process spawn: `verify_signed_request` really verifies the
+    /// signature, and `spawn_admitted` — fed the EXACT resolution
+    /// `message_send` itself performs when `signed_peer_name` is `Some`
+    /// (the two-line `peers.iter().find(name).map(|p| (p,
+    /// PeerRung::Signature))`) — really admits it. This file's own
+    /// established discipline (see the doc comment atop the "Spawn gate
+    /// table" section above, and `spawn_inject_prompts_success_branch_
+    /// files_the_opening_turn_into_the_inbox`'s) is that NO test here drives
+    /// `do_spawn`'s real process spawn, because `std::env::current_exe()`
+    /// inside a `cargo test` binary is the TEST binary, not a real `aoide`
+    /// — calling `message_send`'s Spawn arm all the way through on the
+    /// ADMITTED path would do exactly that. `spawn_admitted` returning
+    /// `true` from a REAL verified signature is precisely the boundary
+    /// `do_spawn` would be invoked from (`message_send`'s own `if
+    /// spawn_admitted(resolved_peer) { do_spawn(...) }`); proving up to
+    /// it is this suite's documented choice, not a gap.
+    #[test]
+    fn peer_spawn_signed_and_allowed_is_admitted_up_to_the_do_spawn_boundary() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-peer-spawn-admitted-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::env::set_var("AOIDE_STATE_DIR", &root);
+
+        let kp = setup_signed_peer_with_allows("yomi-strix", &["read", "spawn"]);
+        let body = aoide_client::wire::build_message_send_body("status check please", "mid-spawn-1", None);
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+        let now = 1_800_000_000_i64;
+        let req = signed_request(&kp, "yomi-strix", "/", &body_bytes, now, &unique_nonce("admit"));
+
+        let signed_peer_name = match verify_signed_request(&req, now) {
+            SignedRequestOutcome::Verified(name) => name,
+            other => panic!("expected a REAL genuine signature to verify, got {other:?}"),
+        };
+        assert_eq!(signed_peer_name, "yomi-strix");
+
+        // The exact resolution `message_send` performs when `signed_peer_name`
+        // is `Some` — the SOLE resolution, no fallthrough to addr/token (P-P4).
+        let peers = aoide_storage::peer_store::load_peers();
+        let resolved = peers
+            .iter()
+            .find(|p| p.name == signed_peer_name)
+            .map(|p| (p, aoide_storage::peer_store::PeerRung::Signature));
+        assert!(spawn_admitted(resolved), "a genuinely signed, paired, spawn-allowed peer must be ADMITTED");
+        // The exact name that would flow into `do_spawn`'s `peer_name` arg,
+        // and hence into `origin: format!("peer:{name}")` — the wire-verified
+        // name, not a guess.
+        assert_eq!(resolved.unwrap().0.name, "yomi-strix");
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    /// The live-gate's other half (PAIRING.md: "a spawn refused for a peer
+    /// with spawn revoked") — same real signature round trip as above, but
+    /// SAFE to drive all the way through the REAL `message_send` (not just
+    /// `spawn_admitted`): a refusal never reaches `do_spawn`, matching this
+    /// file's "REFUSAL branches only" precedent for calling `message_send`
+    /// directly.
+    #[test]
+    fn peer_spawn_revoked_is_refused_through_the_real_message_send_wire_path() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-peer-spawn-revoked-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("AOIDE_STATE_DIR", root.join("state"));
+        std::env::set_var("AOIDE_STAGE_DIR", root.join("stage"));
+
+        // Paired, verified, spawn REVOKED — `allows` carries only "read".
+        let kp = setup_signed_peer_with_allows("yomi-strix", &["read"]);
+        let body = aoide_client::wire::build_message_send_body("status check please", "mid-spawn-2", None);
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+        let now = 1_800_000_000_i64;
+        let req = signed_request(&kp, "yomi-strix", "/", &body_bytes, now, &unique_nonce("revoked"));
+        let signed_peer_name = match verify_signed_request(&req, now) {
+            SignedRequestOutcome::Verified(name) => name,
+            other => panic!("expected a REAL genuine signature to verify, got {other:?}"),
+        };
+
+        let err = message_send(
+            &body["params"],
+            &root.join("log"),
+            "claude",
+            PeerOrigin::Loopback,
+            "",
+            None,
+            Some(signed_peer_name.as_str()),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, -32006, "genuinely signed and paired, but `spawn` was revoked from allows");
+        assert!(err.1.contains("peer allow"), "taught error must name the exact fix: {}", err.1);
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
     }
 
     #[test]

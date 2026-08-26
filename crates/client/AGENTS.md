@@ -28,6 +28,25 @@
   (`aoide/pairRequest`/`aoide/pairReveal`/`aoide/pairApprove`) always pass
   an empty header slice — they are unauthenticated by protocol design (see
   the P-P2 ceremony invariants below), not merely "not yet wired."
+- **`HTTP_METHOD` (P-P5b, closing a P-P4 review finding) is the ONE named
+  constant `post_json`'s `-X` argument AND `sign_headers_for_peer`'s
+  `canonical_string` call both read — never re-introduce a second
+  hardcoded `"POST"` literal at either site.** Before this fix the two
+  carried independent literals that merely happened to agree; if this
+  crate ever sends a non-POST request, thread the real method through
+  `HTTP_METHOD`'s call sites instead of adding a third guess.
+- **`handle_peer_spawn` (P-P5b, `peer spawn`) gates LOCALLY on exactly one
+  question — is the named peer a registered, `verified` entry at all —
+  and NOTHING else.** It is the FIRST production caller to sign a
+  `contextId`-less (spawn-shaped) body via `sign_headers_for_peer`. Every
+  refusal shape beyond "unknown/unpaired peer" (`allows` lacking `spawn`,
+  an unsigned-but-paired caller, clock skew) belongs to the REMOTE door's
+  own gate (`aoide-server::a2a::spawn_admitted`/`spawn_refusal`) —
+  surfaced verbatim from the JSON-RPC error, never re-derived or
+  duplicated here. Don't add a second local check for any of those; the
+  local refusal exists ONLY to save an obviously-doomed round trip (an
+  unsigned request can never resolve `PeerRung::Signature`), never to
+  second-guess the door's own authority (PAIRING.md decision 6).
 - **Forwarded event text from `adapter` is untrusted data**, same as root
   `AGENTS.md` house rule 4 — an adapter never lets forwarded text execute as
   a command.

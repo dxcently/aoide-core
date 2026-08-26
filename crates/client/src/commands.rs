@@ -169,9 +169,24 @@ impl Drop for ScratchBodyFile {
     }
 }
 
+/// The ONE HTTP method every real peer-POST call site in this file ever
+/// uses — a single named source [`post_json`]'s own `-X` argument AND
+/// [`sign_headers_for_peer`]'s signed canonical string both read, so the
+/// two can never drift apart (P-P4 review finding: the canonical string's
+/// `method` field used to be a SEPARATE hardcoded `"POST"` literal at each
+/// of those two sites — two independent literals that happened to agree,
+/// not one value threaded through — which left the wire-auth module doc's
+/// "binds method" claim not quite true: neither side was actually reading
+/// the real value a request was built/sent with, just re-asserting the
+/// same guess twice). Every call in this crate is genuinely a POST today
+/// (there is no other verb to thread), so this fix changes no byte of any
+/// real request or the pinned `canonical_string` vectors (CONTRACTS.md
+/// §6) — it only removes the duplicated-literal drift hazard.
+const HTTP_METHOD: &str = "POST";
+
 /// One outbound JSON-RPC POST — the single body+optional-bearer transport
 /// every `peer` verb that calls a registered peer's A2A door now shares
-/// (`pull_one_peer`, `pull_peer_live`, `send_message_to_peer`).
+/// (`pull_one_peer`, `pull_peer_live`, `send_message_to_peer`, `handle_peer_spawn`).
 ///
 /// With no bearer, this is BYTE-IDENTICAL to how each of those three called
 /// `run_curl`/`run_curl_with_timeout` directly before this task — the body
@@ -203,7 +218,7 @@ fn post_json(url: &str, body: &str, bearer: Option<&str>, extra_headers: &[(Stri
     let header_args: Vec<String> = extra_headers.iter().flat_map(|(k, v)| ["-H".to_string(), format!("{k}: {v}")]).collect();
     match bearer {
         None => {
-            let mut args: Vec<&str> = vec!["-X", "POST", "-H", "Content-Type: application/json"];
+            let mut args: Vec<&str> = vec!["-X", HTTP_METHOD, "-H", "Content-Type: application/json"];
             args.extend(header_args.iter().map(String::as_str));
             args.extend(["--data-binary", "@-", "--", url]);
             run_curl_with_timeout(timeout_secs, &args, Some(body))
@@ -212,7 +227,7 @@ fn post_json(url: &str, body: &str, bearer: Option<&str>, extra_headers: &[(Stri
             let scratch = ScratchBodyFile::write(body)?;
             let data_arg = scratch.arg();
             let header_line = format!("Authorization: Bearer {token}\n");
-            let mut args: Vec<&str> = vec!["-X", "POST", "-H", "Content-Type: application/json"];
+            let mut args: Vec<&str> = vec!["-X", HTTP_METHOD, "-H", "Content-Type: application/json"];
             args.extend(header_args.iter().map(String::as_str));
             args.extend(["-H", "@-", "--data-binary", &data_arg, "--", url]);
             run_curl_with_timeout(
@@ -240,8 +255,13 @@ fn post_json(url: &str, body: &str, bearer: Option<&str>, extra_headers: &[(Stri
 /// hoc — this is the exact string the server's own `HttpRequest.path` will
 /// carry, so client and server MUST agree byte-for-byte or every signature
 /// fails to verify), and signs
-/// `aoide_storage::wire_auth::canonical_string("POST", path, timestamp,
-/// nonce, body.as_bytes())` with THIS instance's own identity
+/// `aoide_storage::wire_auth::canonical_string(HTTP_METHOD, path, timestamp,
+/// nonce, body.as_bytes())` — [`HTTP_METHOD`], not a second hardcoded
+/// `"POST"` literal (P-P4 review finding 2: this function and
+/// [`post_json`] used to carry two INDEPENDENT `"POST"` literals that
+/// merely happened to agree; the canonical string's `method` field is now
+/// the exact value the request is actually sent with, not a re-typed
+/// guess) — with THIS instance's own identity
 /// (`aoide_storage::identity::load_or_mint()`) — never the peer's.
 ///
 /// `X-Aoide-Peer` carries `peer.name` — THIS instance's own LOCAL registry
@@ -273,7 +293,7 @@ fn sign_headers_for_peer(peer: &aoide_storage::peer_store::Peer, body: &str) -> 
     let path = aoide_storage::peer_store::url_path(&peer.url);
     let timestamp = aoide_storage::time::now_iso_utc();
     let nonce = aoide_storage::pairing::random_hex(16);
-    let canonical = aoide_storage::wire_auth::canonical_string("POST", &path, &timestamp, &nonce, body.as_bytes());
+    let canonical = aoide_storage::wire_auth::canonical_string(HTTP_METHOD, &path, &timestamp, &nonce, body.as_bytes());
     let signature = aoide_storage::wire_auth::sign_hex(&keypair, canonical.as_bytes());
     Ok(vec![
         (aoide_storage::wire_auth::HEADER_PEER.to_string(), peer.name.clone()),
@@ -501,7 +521,7 @@ pub fn handle_agent_send(inv: &Invocation) -> Outcome {
     }))
 }
 
-// ── The six `peer` verbs (CONTRACTS.md §7: same-network federation) ─────────
+// ── The seven `peer` verbs (CONTRACTS.md §7: same-network federation) ───────
 //
 // A peer is ANOTHER aoide instance, addressed by URL (topology-agnostic —
 // the protocol never cares whether that URL happens to resolve on the same
@@ -907,6 +927,162 @@ pub fn send_message_to_peer(
     Ok(parsed)
 }
 
+/// Prompt `y/N` on stderr before spawning on a peer — a LOCAL UX
+/// confirmation only (mirrors `confirm_sas`'s exact idiom), never a
+/// security gate: the remote door's own paired+signature+allows∋spawn
+/// check (PAIRING.md decision 6) is the sole authority either way.
+fn confirm_spawn(name: &str, text: &str) -> Result<bool, String> {
+    eprint!("spawn a new session on peer `{name}` — first turn: {text:?} — proceed? [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    let read = std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| format!("reading confirmation from stdin: {e}"))?;
+    Ok(read > 0 && matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+/// `peer spawn <name> [--yes] -- <text…>` (P-P5b, making PAIRING.md's
+/// headline spawn gate actually reachable from the CLI — before this verb,
+/// every client→peer function sent either a read (`aoide/graphSummary`) or
+/// an Inject (`send_message_to_peer`, always carrying a `contextId`); NONE
+/// emitted a spawn-shaped `message/send` — `context_id: None` — to a
+/// paired peer, so the server's `do_spawn` arm, fully built and
+/// fail-closed since P-P3/P-P4, could only ever be reached by a
+/// hand-crafted signed curl).
+///
+/// **The exact shape `aoide-server::a2a::do_spawn` consumes**
+/// (`decide_send_action`/`parse_message_send_params`, `a2a.rs`):
+/// `context_id: None` (or `spawn_asked`, but omitting `contextId`
+/// entirely is simpler and is exactly [`crate::wire::build_message_send_body`]'s
+/// existing `None` branch) routes to `SendAction::Spawn` REGARDLESS of
+/// `spawn_asked`; the message's `parts[].text` becomes the PROMPT
+/// `do_spawn` types as the newly spawned session's first turn
+/// (`spawn_inject_prompt`) — `<text…>` here is that prompt, NOT a
+/// remote-chosen executable: which agent runs is the PEER's own configured
+/// `aoide.a2a.spawnAgent`, never client-supplied (`do_spawn`'s own doc
+/// comment on `SessionRef`'s security model). Built via
+/// `crate::wire::build_message_send_body(text, message_id, None)` — the
+/// SAME builder `handle_agent_send` already drives an external A2A agent's
+/// own spawn arm with, so this is a proven shape, not a new invention.
+///
+/// **Signing**: [`sign_headers_for_peer`] — this is the FIRST production
+/// call site that ever signs a SPAWN-shaped POST (`context_id: None`);
+/// every earlier call site (`pull_one_peer`, `pull_peer_live`,
+/// `send_message_to_peer`) sends a read or an Inject. `peer.verified ==
+/// false` still yields an empty header slice exactly as it does for those
+/// three (unchanged behavior) — which is precisely why this function
+/// refuses an unpaired/unknown peer LOCALLY first (below): an unsigned
+/// spawn request can never satisfy the remote door's
+/// `PeerRung::Signature`-only gate (P-P4), so sending it anyway would only
+/// earn a confusing round trip and a generic refusal.
+///
+/// **The client NEVER gates on `allows` — only on "is this a VERIFIED
+/// local peer at all."** The local check below exists SOLELY to catch the
+/// obviously-doomed case (no verified peer → no identity to sign with →
+/// the remote can never resolve a `Signature` rung) with a clear, LOCAL
+/// taught error naming `peer pair request`. Every OTHER refusal shape —
+/// `allows` lacking `spawn`, clock skew, a revoked pairing — is the remote
+/// door's OWN call; this function never second-guesses it, and surfaces
+/// whatever JSON-RPC error the door returns VERBATIM (taught), per
+/// PAIRING.md decision 6: "the remote door's paired+signature+
+/// allows∋spawn gate is the authority."
+fn handle_peer_spawn(inv: &Invocation) -> Outcome {
+    let cmd = "peer.spawn";
+    const USAGE: &str = "usage: aoide peer spawn <name> [--yes] -- <text…>";
+    let name = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(n) => n.to_string(),
+        None => return Outcome::usage(cmd, USAGE),
+    };
+    let text = inv.args.get(1..).map(|rest| rest.join(" ")).unwrap_or_default();
+    if text.trim().is_empty() {
+        return Outcome::usage(cmd, USAGE);
+    }
+
+    let peers = aoide_storage::peer_store::load_peers();
+    let peer = match peers.iter().find(|p| p.name == name) {
+        Some(p) if p.verified => p.clone(),
+        Some(_) => {
+            return Outcome::error(
+                cmd,
+                format!(
+                    "peer `{name}` is registered but not paired — spawn requires a signed request \
+                     from a VERIFIED peer (docs/architecture/PAIRING.md decision 6); pair first with \
+                     `aoide peer pair request <url> --name {name}`"
+                ),
+            )
+            .with_data(json!({ "reason": "unpaired-peer", "name": name }));
+        }
+        None => {
+            return Outcome::error(
+                cmd,
+                format!(
+                    "no peer named `{name}` — spawn requires a paired peer; register and pair it \
+                     first with `aoide peer pair request <url> --name {name}`"
+                ),
+            )
+            .with_data(json!({ "reason": "unknown-peer", "name": name }));
+        }
+    };
+
+    if !inv.flag_present("yes") {
+        match confirm_spawn(&peer.name, &text) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Outcome::ok(cmd, format!("not confirmed — nothing sent to `{}`", peer.name))
+                    .with_data(json!({ "confirmed": false, "name": peer.name }))
+            }
+            Err(e) => return Outcome::error(cmd, e),
+        }
+    }
+
+    let message_id = gen_message_id();
+    let body = crate::wire::build_message_send_body(&text, &message_id, None);
+    let body_str = serde_json::to_string(&body).unwrap_or_default();
+    let bearer = match resolve_peer_bearer(&peer) {
+        Ok(b) => b,
+        Err(e) => return Outcome::error(cmd, e).with_data(json!({ "reason": "bearer-resolve-failed", "name": peer.name })),
+    };
+    let extra_headers = match sign_headers_for_peer(&peer, &body_str) {
+        Ok(h) => h,
+        Err(e) => return Outcome::error(cmd, e).with_data(json!({ "reason": "signing-failed", "name": peer.name })),
+    };
+    let (code, resp) = match post_json(&peer.url, &body_str, bearer.as_deref(), &extra_headers, 15) {
+        Ok(v) => v,
+        Err(e) => {
+            return Outcome::error(cmd, format!("spawning on `{}` at {}: {e}", peer.name, peer.url))
+                .with_data(json!({ "reason": "send-failed", "name": peer.name, "url": peer.url }))
+        }
+    };
+    if code != 200 {
+        return Outcome::error(cmd, format!("spawning on `{}` at {}: HTTP {code}", peer.name, peer.url))
+            .with_data(json!({
+                "reason": "send-http-error", "name": peer.name, "url": peer.url,
+                "httpCode": code, "body": resp,
+            }));
+    }
+    let parsed: Value = serde_json::from_str(&resp).unwrap_or(Value::Null);
+    // A JSON-RPC error still returns HTTP 200 (same discipline as
+    // `handle_agent_send`/`send_message_to_peer`) — the remote door's
+    // refusal (paired-but-unsigned, allows lacking spawn, skew, …)
+    // surfaces VERBATIM, never translated or second-guessed.
+    if let Some(err) = parsed.get("error") {
+        let detail = err
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("(no message)");
+        return Outcome::error(cmd, format!("peer `{}` refused the spawn: {detail}", peer.name))
+            .with_data(json!({ "reason": "peer-refused", "name": peer.name, "response": parsed }));
+    }
+    let session_id = parsed
+        .get("result")
+        .and_then(|r| r.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    Outcome::ok(cmd, format!("spawned on `{}` — remote session `{session_id}`", peer.name))
+        .with_data(json!({ "name": peer.name, "url": peer.url, "sessionId": session_id, "response": parsed }))
+}
+
 /// `peer pull [<name>]` — pull `aoide/graphSummary` from one (or, with no
 /// name, EVERY) registered peer. One peer being down must never break the
 /// command for the others — see [`pull_one_peer`].
@@ -1048,6 +1224,21 @@ pub fn register_peers(r: &mut Registry) {
         implemented: true,
         handler: handle_peer_allow,
         examples: ["peer allow yomi-strix spawn on", "peer allow yomi-strix spawn off"],
+    ));
+    r.insert(cmd!(
+        path: ["peer", "spawn"],
+        summary: "Spawn a session on a PAIRED peer's own configured agent — POSTs a signed, spawn-shaped message/send (contextId omitted) to the peer's A2A door; the peer's own paired+signature+allows∋spawn gate is the sole authority (docs/architecture/PAIRING.md decision 6), never gated locally beyond requiring a verified peer.",
+        args: [
+            arg!("name", "string", true, "The registered, PAIRED peer's name."),
+            arg!("text", "string", true, "The first turn typed into the newly spawned session — put it after `--` so its own words/flags pass through verbatim."),
+        ],
+        flags: [
+            flag!("yes", "bool", "Skip the local y/N confirmation (scripted use) — a LOCAL UX gate only; the remote door's own gate is unaffected."),
+        ],
+        gated: false,
+        implemented: true,
+        handler: handle_peer_spawn,
+        examples: ["peer spawn yomi-strix -- status check please"],
     ));
 }
 
@@ -1794,9 +1985,11 @@ mod tests {
             // The server verifies against the SAME path this instance's own
             // `peer_store::url_path` derives from `peer.url` — recomputing it
             // here, rather than hardcoding "/", proves the client and server
-            // sides stay bound to the one shared function.
+            // sides stay bound to the one shared function. Same reasoning for
+            // `HTTP_METHOD` (P-P4 review finding 2) over a second `"POST"`
+            // literal.
             let path = aoide_storage::peer_store::url_path(&peer.url);
-            let canonical = aoide_storage::wire_auth::canonical_string("POST", &path, &timestamp, &nonce, body.as_bytes());
+            let canonical = aoide_storage::wire_auth::canonical_string(HTTP_METHOD, &path, &timestamp, &nonce, body.as_bytes());
             assert!(
                 aoide_storage::wire_auth::verify_signature_hex(&info.pubkey_hex, canonical.as_bytes(), &signature),
                 "the signature must verify against this instance's own identity"
@@ -1805,7 +1998,7 @@ mod tests {
             // Tampering with the body must break verification — proves the
             // signature is actually bound to the body's digest, not just
             // structurally present.
-            let tampered = aoide_storage::wire_auth::canonical_string("POST", &path, &timestamp, &nonce, b"{\"tampered\":true}");
+            let tampered = aoide_storage::wire_auth::canonical_string(HTTP_METHOD, &path, &timestamp, &nonce, b"{\"tampered\":true}");
             assert!(!aoide_storage::wire_auth::verify_signature_hex(&info.pubkey_hex, tampered.as_bytes(), &signature));
         });
     }
@@ -1845,6 +2038,97 @@ mod tests {
                 handle_peer_allow(&allow_inv(&["yomi-strix", "spawn", "maybe"])).status,
                 aoide_protocol::output::Status::Usage
             );
+        });
+    }
+
+    // ── `handle_peer_spawn` (P-P5b) — the local refusal shapes are pure file
+    // ── I/O (unpaired/unknown), so unit-testable directly; the real signed
+    // ── network round trip lives at `cli/tests/peer_connectivity.rs`'s
+    // ── `#[ignore]`'d integration layer, same split `peer allow`'s own
+    // ── comment above documents. Whether the exact spawn-shaped body
+    // ── (`context_id: None`) matches `do_spawn`'s own contract is proven
+    // ── against the SERVER's real parser in `aoide-server::a2a`'s own test
+    // ── module (a dev-dependency on this crate exists specifically for that
+    // ── round trip — see this crate's `Cargo.toml`). ─────────────────────────
+
+    fn spawn_inv(args: &[&str], yes: bool) -> Invocation {
+        let mut flags = std::collections::BTreeMap::new();
+        if yes {
+            flags.insert("yes".to_string(), "true".to_string());
+        }
+        Invocation {
+            path: vec!["peer".to_string(), "spawn".to_string()],
+            args: args.iter().map(|s| s.to_string()).collect(),
+            flags,
+            door: aoide_protocol::Door::Cli,
+        }
+    }
+
+    #[test]
+    fn peer_spawn_refuses_an_unknown_peer_naming_pair_request() {
+        with_peer_state("spawn-unknown", || {
+            let out = handle_peer_spawn(&spawn_inv(&["nosuchpeer", "hello"], true));
+            assert_eq!(out.status, aoide_protocol::output::Status::Error);
+            assert_eq!(out.data.as_ref().unwrap()["reason"], "unknown-peer");
+            assert!(
+                out.message.contains("peer pair request"),
+                "taught error must name the pairing ceremony: {}",
+                out.message
+            );
+        });
+    }
+
+    #[test]
+    fn peer_spawn_refuses_a_registered_but_unpaired_peer_naming_pair_request() {
+        with_peer_state("spawn-unpaired", || {
+            // `verified: false` — registered via the legacy `peer add` escape,
+            // never paired. An unsigned request from this peer could never
+            // satisfy the remote door's `PeerRung::Signature`-only spawn gate
+            // (P-P4) — refused LOCALLY with a clear reason, never sent.
+            aoide_storage::peer_store::save_peers(&[fixture_peer(None)]).unwrap();
+            let out = handle_peer_spawn(&spawn_inv(&["yomi-strix", "hello"], true));
+            assert_eq!(out.status, aoide_protocol::output::Status::Error);
+            assert_eq!(out.data.as_ref().unwrap()["reason"], "unpaired-peer");
+            assert!(
+                out.message.contains("peer pair request"),
+                "taught error must name the pairing ceremony: {}",
+                out.message
+            );
+        });
+    }
+
+    #[test]
+    fn peer_spawn_reports_usage_on_a_missing_name_or_empty_text() {
+        with_peer_state("spawn-usage", || {
+            assert_eq!(handle_peer_spawn(&spawn_inv(&[], true)).status, aoide_protocol::output::Status::Usage);
+            assert_eq!(handle_peer_spawn(&spawn_inv(&["yomi-strix"], true)).status, aoide_protocol::output::Status::Usage);
+            assert_eq!(handle_peer_spawn(&spawn_inv(&["yomi-strix", "  "], true)).status, aoide_protocol::output::Status::Usage);
+        });
+    }
+
+    #[test]
+    fn peer_spawn_signs_the_exact_spawn_shaped_body_it_would_send() {
+        // "signs it (headers present)" — the FIRST production caller that
+        // ever signs a `context_id: None` (spawn-shaped) POST. Reuses
+        // `sign_headers_for_peer` directly against the SAME body
+        // `handle_peer_spawn` builds (`crate::wire::build_message_send_body`
+        // with `None`), rather than re-guessing the shape.
+        with_peer_state("spawn-signs", || {
+            let mut peer = fixture_peer(None);
+            peer.verified = true;
+            let body = crate::wire::build_message_send_body("do the thing", &gen_message_id(), None);
+            assert!(body["params"]["message"].get("contextId").is_none(), "spawn-shaped body carries no contextId");
+            let body_str = serde_json::to_string(&body).unwrap();
+            let headers = sign_headers_for_peer(&peer, &body_str).unwrap();
+            assert_eq!(headers.len(), 4, "all four X-Aoide-* headers present: {headers:?}");
+            for name in [
+                aoide_storage::wire_auth::HEADER_PEER,
+                aoide_storage::wire_auth::HEADER_TIMESTAMP,
+                aoide_storage::wire_auth::HEADER_NONCE,
+                aoide_storage::wire_auth::HEADER_SIGNATURE,
+            ] {
+                assert!(headers.iter().any(|(k, _)| k == name), "missing {name}: {headers:?}");
+            }
         });
     }
 
