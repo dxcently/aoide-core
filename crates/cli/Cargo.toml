@@ -33,7 +33,7 @@ aoide-storage = { workspace = true }
 aoide-conduct = { workspace = true }
 aoide-client = { workspace = true }
 aoide-server = { workspace = true }
-# `aoide-song`/`aoide-screen` (the rice/livery engine and the screen verb
+# `aoide-song`/`aoide-screen` (the rice/livery engine and the screen command
 # family) moved out of core's dependency list at P-A5 of the binary-split
 # workstream — the graphical bundle they back now lives ONLY in `crates/lyra`
 # (docs/architecture/PACKAGE-LAYOUT.md, CONTRACTS.md §3). Core is
@@ -44,7 +44,7 @@ aoide-server = { workspace = true }
 # `aoide conductor` — the interactive terminal frontend, its own crate
 # (Phase 6b restructure, docs/architecture/PACKAGE-LAYOUT.md).
 aoide-conductor = { workspace = true }
-# `aoide soundcheck` — the mechanical-integrity verb (working-tree half).
+# `aoide soundcheck` — the mechanical-integrity command (working-tree half).
 aoide-upkeep = { workspace = true }
 # `aoide secrets` — the secrets broker's CLI surface (Workstream SECRETS,
 # P-V2): `serve`/`exec`/`add`/`rm`/`grant`/`revoke`. New at P-V2 — the

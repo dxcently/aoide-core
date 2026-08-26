@@ -35,7 +35,7 @@ use daemon::Door;
 /// in `aoide_protocol::door::run` (Phase 3 restructure,
 /// docs/architecture/PACKAGE-LAYOUT.md) so a second binary (lyra, P-A4) can
 /// drive the same loop against its own registry without duplicating it; this
-/// crate supplies its own special-cased verbs via the `special` hook —
+/// crate supplies its own special-cased commands via the `special` hook —
 /// `mcp serve --stdio`, `a2a serve`, and `secrets serve` start servers,
 /// `secrets exec` resolves a secret and execs a command with it injected as an
 /// env var (`Stdio::inherit` throughout — the value can never cross the

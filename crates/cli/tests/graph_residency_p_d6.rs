@@ -1,5 +1,5 @@
 //! Integration proof for P-D6 — graph residency (`docs/architecture/
-//! AOIDED.md`'s "L4"): the stage-file bytes a routed session-write verb
+//! AOIDED.md`'s "L4"): the stage-file bytes a routed session-write command
 //! produces through a REAL resident daemon match the direct-path bytes for
 //! the identical input, and `graph reap` reaps a dead session over the
 //! socket exactly as it does directly.
@@ -128,7 +128,7 @@ fn session_start_inv(id: &str) -> Invocation {
     Invocation { path: vec!["graph".to_string(), "session".to_string(), "start".to_string()], args: vec![], flags, door: Door::Cli }
 }
 
-/// The phase's own first test requirement: "A routed verb round-trips
+/// The phase's own first test requirement: "A routed command round-trips
 /// through a test daemon and the projection file matches the direct-path
 /// bytes exactly." `graph session start` is dispatched twice, identically
 /// (same id/agent/cwd), once with `$AOIDE_DAEMON_SOCKET` pointed at nothing

@@ -87,7 +87,7 @@ Hooking any agent into the graph (the conductor + widgets render what you regist
      The door NEVER exits non-zero — safe inside any hook config.
      Install the wiring with `aoide hooks install <claude|kimi>` — an
      idempotent merge into the harness's settings file (never clobbers).
-  2. Explicit verbs (anything scriptable): `graph session start --id I
+  2. Explicit commands (anything scriptable): `graph session start --id I
      [--agent A --cwd D --parent P]` · `graph session phase --id I --phase P`
      · `graph session end --id I`. Phase vocabulary and how it renders:
      running ♪ (working) · waiting 𝄐 (turn over, human's move) · blocked 𝄐

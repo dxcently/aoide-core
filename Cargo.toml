@@ -61,11 +61,11 @@ aoide-server = { path = "crates/server" }
 aoide-song = { path = "crates/song" }
 aoide-conductor = { path = "crates/conductor" }
 aoide-test-support = { path = "crates/test-support" }
-# `aoide soundcheck` — the mechanical-integrity verb's WORKING-tree half
+# `aoide soundcheck` — the mechanical-integrity command's WORKING-tree half
 # (soundcheck design doc, FORK 3, advisor-confirmed new crate: repo hygiene
 # is not `aoide-storage`'s "durable session data" charter).
 aoide-upkeep = { path = "crates/upkeep" }
-# `aoide screen` — the screen verb family (info/shot/point/ocr/diff/send),
+# `aoide screen` — the screen command family (info/shot/point/ocr/diff/send),
 # extracted out of `aoide-conduct` at P-A1 of the binary-split workstream:
 # the sole home of this workspace's wayland-client/wayland-protocols-wlr/
 # image dependencies (see those entries above for the technical rationale).
@@ -112,10 +112,10 @@ sha2 = "0.11"
 # until the P-V4b rename — same crate, no split-brain): TOTP, policy
 # types, replay ledger, otpauth:// URI construction (P-V1); the
 # unix-socket broker daemon, the client `secrets exec`, and the admin CLI
-# verbs (P-V2); `secrets enroll` + the live requireTotp gate +
+# commands (P-V2); `secrets enroll` + the live requireTotp gate +
 # backend-preset docs (P-V3); the socket chmod'd 0660 on bind, deployed
 # via modules/nucleus/secrets.nix or the non-nix install path (P-V4 — no
-# new verb, binary stays nix-independent); the built-in `file` backend +
+# new command, binary stays nix-independent); the built-in `file` backend +
 # the write half, `secrets put` (P-V4c — golden +1); `secrets set-totp`,
 # `secrets enroll --show`, and a tty-hidden-input prompt for `secrets put`
 # (P-V4e — golden +1, only `set-totp` is a new path); the per-secret

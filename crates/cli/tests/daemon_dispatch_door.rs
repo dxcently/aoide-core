@@ -8,7 +8,7 @@
 //!
 //! `aoide-server`'s own `daemon.rs` unit tests (`cargo test -p aoide-server`)
 //! prove `handle_conn`'s WIRING with a fixture registry/dispatch fn — they
-//! cannot prove real per-verb policy, since the fully-assembled registry
+//! cannot prove real per-command policy, since the fully-assembled registry
 //! only exists in THIS crate (the DI-seam invariant both crates' docs
 //! state). This file is that proof, one connection per test, no fixed
 //! sleeps — every wait below is either a bounded connect-retry or a single
@@ -94,7 +94,7 @@ fn cleanup(socket_path: &Path, events_path: &Path) {
     std::fs::remove_file(events_path).ok();
 }
 
-/// A plain, implemented, ungated verb (`guide`) dispatches over the daemon
+/// A plain, implemented, ungated command (`guide`) dispatches over the daemon
 /// door exactly as it does over CLI/MCP, and the single audit log gains a
 /// `"door":"daemon"` record for it — `cli::dispatch::dispatch` appends this
 /// on every call, door included, so this is the SAME code path every other
@@ -122,7 +122,7 @@ fn a_plain_verb_dispatches_and_audits_door_daemon() {
     std::fs::remove_file(&audit_log).ok();
 }
 
-/// A CLI-only secrets admin verb (`secrets add`) refuses over the daemon
+/// A CLI-only secrets admin command (`secrets add`) refuses over the daemon
 /// door with the SAME door-hint `Outcome` it already returns over MCP/A2A —
 /// `secrets::commands::require_cli` is the ONE gate, unedited by this
 /// phase, and it returns before `store::load_policies`/`save_policies` is
@@ -197,7 +197,7 @@ fn a_gated_verb_returns_gated_true() {
 
 /// `mcp.serve`/`a2a.serve` never start a server inside the daemon process —
 /// both handlers' non-Cli branch just reports how to raise the real thing,
-/// and `run_cli`'s special-cased launch path (the ONLY place either verb
+/// and `run_cli`'s special-cased launch path (the ONLY place either command
 /// actually blocks) is never reached from `serve_daemon`'s plain `dispatch`
 /// call.
 #[test]

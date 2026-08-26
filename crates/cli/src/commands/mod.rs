@@ -1,7 +1,7 @@
 //! Command groups — each DOMAIN crate contributes its entries to a
 //! [`crate::registry::Registry`] via its own `commands::register(&mut
 //! Registry)` function (Phase 9 restructure,
-//! docs/architecture/PACKAGE-LAYOUT.md: a domain's CLI verbs live with the
+//! docs/architecture/PACKAGE-LAYOUT.md: a domain's CLI commands live with the
 //! domain). Only the root-coupled groups stay here: `meta` (guide/schema —
 //! reads the assembled registry), `stubs` (not-implemented placeholders with
 //! no domain yet), and `infra` (`mcp serve` — reads the assembled registry's
@@ -22,7 +22,7 @@ use crate::registry::Registry;
 /// (CONTRACTS.md §7, slotted directly after the `a2a agent` group it's the
 /// same-network-federation sibling of — nothing EXISTING moves, so the
 /// historical table above it is still untouched), usage, hooks install,
-/// soundcheck (the mechanical-integrity verb's WORKING-tree half,
+/// soundcheck (the mechanical-integrity command's WORKING-tree half,
 /// `aoide-upkeep`; report-only, forever — see its own module doc for the
 /// finding format and why the COMMITTED-tree half lives in `nix flake
 /// check` instead), who (live presence over sessions + registered peers,
@@ -31,8 +31,8 @@ use crate::registry::Registry;
 /// serve/exec/add/rm/grant/revoke (appended newest — Workstream SECRETS's
 /// broker daemon + client + admin CLI surface, P-V2), events tail
 /// (appended newest — the aoided event bus's own terminal-reachable follow
-/// verb, P-D3, `docs/architecture/AOIDED.md`'s "L1" section), identity
-/// (this instance's ed25519 identity show verb, P-P1 of the pairing
+/// command, P-D3, `docs/architecture/AOIDED.md`'s "L1" section), identity
+/// (this instance's ed25519 identity show command, P-P1 of the pairing
 /// workstream), peer pair request/pending/approve/reject (appended newest —
 /// the pairing ceremony's CLI half, P-P2, `docs/architecture/PAIRING.md`).
 ///
@@ -60,13 +60,13 @@ pub fn all() -> Registry {
     aoide_client::commands::register_agents(&mut r); // a2a agent add/list/remove/send (CONTRACTS.md §6)
     aoide_client::commands::register_peers(&mut r); // peer add/list/remove/pull/status — same-network federation (CONTRACTS.md §7, appended newest)
     aoide_storage::commands::register(&mut r); // usage — local token/cost rollup (CONTRACTS.md §4)
-    aoide_conduct::commands::hooks::register(&mut r); // hooks install — the hook-installer verb
+    aoide_conduct::commands::hooks::register(&mut r); // hooks install — the hook-installer command
     aoide_upkeep::commands::register(&mut r); // soundcheck — mechanical-integrity WORKING-tree sweep, report-only
     aoide_conduct::commands::who::register(&mut r); // who — live presence over sessions + registered peers (messaging workstream C2)
     aoide_storage::commands::register_inbox(&mut r); // inbox list/read/clear — durable per-host message store (messaging workstream C6, appended newest)
     aoide_secrets::commands::register(&mut r); // secrets serve/exec/add/rm/grant/revoke — the secrets broker (Workstream SECRETS P-V2, appended newest)
-    aoide_server::commands::register_events(&mut r); // events tail — aoided's own feed follow verb (P-D3, appended newest)
-    aoide_storage::commands::register_identity(&mut r); // identity — this instance's ed25519 identity show verb (pairing workstream P-P1, appended newest)
+    aoide_server::commands::register_events(&mut r); // events tail — aoided's own feed follow command (P-D3, appended newest)
+    aoide_storage::commands::register_identity(&mut r); // identity — this instance's ed25519 identity show command (pairing workstream P-P1, appended newest)
     aoide_client::commands::register_peer_pair(&mut r); // peer pair request/pending/approve/reject — the pairing ceremony's CLI half (P-P2, appended newest)
 
     r

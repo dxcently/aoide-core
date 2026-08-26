@@ -6,7 +6,7 @@
 //! seam cannot sever, since that registry only exists here. Everything else
 //! that used to live in this file moved with its domain: `daemon` +
 //! `shellbridge` + `a2a serve` → `aoide-server`, `adapter melete` +
-//! the four `a2a agent` verbs → `aoide-client`, `conductor` →
+//! the four `a2a agent` commands → `aoide-client`, `conductor` →
 //! `aoide-conductor`. `mcp serve --stdio`'s real execution path stays
 //! special-cased in `lib.rs::run_cli` (unchanged).
 

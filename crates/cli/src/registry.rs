@@ -17,7 +17,7 @@
 //! docs/architecture/PACKAGE-LAYOUT.md) and are re-exported here so every
 //! existing `crate::registry::*` caller is untouched. The `cmd!`/`arg!`/`flag!`
 //! macros moved there too (Phase 9 restructure) so every domain crate's
-//! `commands::register()` can describe its own verbs — they expand to
+//! `commands::register()` can describe its own commands — they expand to
 //! `$crate::registry::Command { .. }` literals resolved inside the protocol
 //! crate, and are re-exported here under the same names.
 

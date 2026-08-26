@@ -28,7 +28,7 @@ aoide-song = { workspace = true }
 # implementations stay in `aoide-conduct`; see those modules' own doc
 # comments, P-A2).
 aoide-conduct = { workspace = true }
-# screen info/shot/point/ocr/diff/send — the whole `screen` verb family
+# screen info/shot/point/ocr/diff/send — the whole `screen` command family
 # (P-A1).
 aoide-screen = { workspace = true }
 # `mcp serve --stdio`'s real server loop (`aoide_server::mcp::serve_stdio`)
