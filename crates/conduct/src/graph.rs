@@ -13,6 +13,7 @@
 //! restructure, docs/architecture/PACKAGE-LAYOUT.md); the root module is now
 //! a pure re-export shim onto this crate.
 
+mod carry;
 mod common;
 mod conduct;
 mod doc;
@@ -64,6 +65,10 @@ pub use self::spawn::session_spawn;
 // `daemon.rs`), called in-process the same way `run_internal_reap` calls
 // `crate::reap::reap_and_announce`.
 pub use self::resurrect::session_resurrect;
+// `graph session carry` (P-C2, durable-sessions plan): the mark that lets a
+// project's whole carried set be resurrected together — see
+// `graph/carry.rs`'s module doc.
+pub use self::carry::session_carry;
 pub use self::manage::{emit, link, project_add, project_list, project_remove, prune, view};
 // `aoide who` (messaging/presence plan, P-C2): live presence over this
 // box's own sessions plus every registered peer — see `graph/who.rs`'s

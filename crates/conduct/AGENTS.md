@@ -32,7 +32,12 @@
   `docs/architecture/AOIDED.md`'s "L4").** `graph session start/phase/end`,
   `graph session hook`, and `reap::reap_and_announce` all follow this exact
   one-line prefix. A new session-write handler joins the family the same
-  way — see `client`'s own `AGENTS.md` extension-point note.
+  way — see `client`'s own `AGENTS.md` extension-point note. **`graph/
+  carry.rs`'s `session_carry` is a deliberate exception, not an oversight:**
+  `state/carry.json` is not a `song/stage/` file, so it has no L4 residency
+  to route through — don't add a `daemon_dispatch` prefix "for consistency"
+  with the family above; that would put a second writer on a file the carry
+  store's own single-writer atomic-write discipline assumes has one.
 - **`reap` (toast-free) and `reap_and_announce` (the registered CLI/daemon
   handler) are deliberately two functions, not one.** `reap_and_announce`
   spawns a REAL `notify-send` on the live desktop whenever the sweep

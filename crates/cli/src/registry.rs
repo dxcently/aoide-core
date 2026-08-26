@@ -112,6 +112,7 @@ mod tests {
             "graph.reap",
             "graph.resurrect",
             "graph.send",
+            "graph.session.carry",
             "graph.session.end",
             "graph.session.hook",
             "graph.session.phase",

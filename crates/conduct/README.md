@@ -70,6 +70,17 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   session's first turn is typed before that session has a `SessionRecord`
   at all, so it can't reach `deliver_local` and files itself instead — see
   `aoide_storage::inbox`'s module doc for the full two-writer reasoning.
+- **The carry mark (P-C2, durable-sessions plan):** `graph/carry.rs`'s
+  `session_carry` (`graph session carry on|off [--self | --id <id>]`) is the
+  command over `aoide_storage::carry`'s store (`state/carry.json`) — a
+  session id marked DURABLE, so a project's whole carried set can later be
+  resurrected together. Unlike every other `graph session *` handler in this
+  crate, it takes no stage lock and does not route through `daemon_dispatch`:
+  `carry.json` is not a `song/stage/` file, so it sits entirely outside the
+  L4 dual-writer surface. `--id` targets any session id, live or not — no
+  roster lookup gates the write, which is what makes the mark flippable
+  post-mortem off a bare ledger id; bare and `--self` both resolve the
+  target from `$AOIDE_SESSION_ID`.
 - `reap` — liveness reaping (`aoide graph reap`), sweeping sessions a
   `SIGKILL`'d terminal could never mark `done`. `reap_and_announce` (the
   registered CLI handler) routes through `daemon_dispatch` first like every
@@ -101,8 +112,9 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
 - `shellbridge`, `herald` — files only; their CLI commands (registry lines)
   moved to `lyra` at P-A2, but both stay resident here (see charter smudge
   below).
-- `commands` — this crate's CLI commands: `graph *` (21 paths, including
-  `graph resurrect`, P-D8), `conduct`, `hooks install`, `who`.
+- `commands` — this crate's CLI commands: `graph *` (22 paths, including
+  `graph resurrect`, P-D8, and `graph session carry`, P-C2), `conduct`,
+  `hooks install`, `who`.
 - **The durable session ledger + resurrect (P-D8, `docs/architecture/
   AOIDED.md`'s "L5"):** `graph/doc.rs::ledger_session_exit` is the ONE
   shared call both `session_store.rs::do_session_end_inner` (a clean

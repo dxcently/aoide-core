@@ -285,4 +285,27 @@ pub fn register(r: &mut Registry) {
         implemented: true,
         handler: crate::graph::session_conduct,
     ));
+    // ── graph session carry: the durable mark (durable-sessions plan, P-C2) ──
+    // Registered here, at the END of `register` — not beside the other
+    // `graph session *` entries above — because registration order is
+    // load-bearing (`crates/AGENTS.md`, "Registry order is load-bearing") and
+    // this command landed after every entry above it. The golden test sorts
+    // before comparing, so this costs nothing there; `schema --json` order is
+    // what the append-only rule protects.
+    r.insert(cmd!(
+        path: ["graph", "session", "carry"],
+        summary: "Mark or unmark a session as durable in state/carry.json, so a project's whole carried set can later be resurrected together. Bare and --self both resolve the target from $AOIDE_SESSION_ID; --id targets any session id directly, including one already gone from the roster — no roster lookup gates the write, which is what makes the mark flippable post-mortem.",
+        args: [arg!("state", "string", true, "The carry state to set: `on` or `off`.")],
+        flags: [
+            flag!("self", "bool", "Target this session, resolved from $AOIDE_SESSION_ID (the default when neither --self nor --id is given)."),
+            flag!("id", "string", "Target session id directly (mutually exclusive with --self); no roster lookup gates it, so a dead id is a valid target."),
+        ],
+        gated: false,
+        implemented: true,
+        handler: crate::graph::session_carry,
+        examples: [
+            "graph session carry on --self",
+            "graph session carry off --id <session-id>",
+        ],
+    ));
 }
