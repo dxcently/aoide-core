@@ -976,14 +976,14 @@ fn handle_put(secrets_home: &Path, events_path: &Path, req: &Value, peer: Option
 /// `None` — the ucred read failed) is refused outright, the SAME
 /// fail-closed default [`dismiss_authorized`] holds: there is no uid to
 /// compare, so the safe answer is refusal, never a permissive fallback.
-fn admin_gate(peer_uid: Option<u32>, secrets_home: &Path, verb: &str) -> Option<String> {
+fn admin_gate(peer_uid: Option<u32>, secrets_home: &Path, subcommand: &str) -> Option<String> {
     let broker_euid = crate::home::effective_uid();
     match peer_uid {
-        Some(uid) => crate::home::admin_identity_error(uid, broker_euid, secrets_home, verb),
+        Some(uid) => crate::home::admin_identity_error(uid, broker_euid, secrets_home, subcommand),
         None => Some(format!(
-            "secrets {verb} over the broker socket must come from an IDENTIFIED connection — this connection's \
+            "secrets {subcommand} over the broker socket must come from an IDENTIFIED connection — this connection's \
              peer uid could not be determined (SO_PEERCRED read failed), so it is refused the same way a \
-             mismatched uid would be. Run: sudo -u aoide-secrets aoide secrets {verb} ..."
+             mismatched uid would be. Run: sudo -u aoide-secrets aoide secrets {subcommand} ..."
         )),
     }
 }
@@ -1012,11 +1012,11 @@ fn admin_gate(peer_uid: Option<u32>, secrets_home: &Path, verb: &str) -> Option<
 /// never a second usage-error vocabulary grown here.
 fn handle_admin(secrets_home: &Path, req: &Value, peer: Option<crate::peercred::PeerCred>) -> Value {
     let peer_uid = peer.map(|p| p.uid);
-    let Some(verb) = req.get("verb").and_then(Value::as_str) else {
+    let Some(subcommand) = req.get("verb").and_then(Value::as_str) else {
         return json!({"ok": false, "error": "malformed request: `verb` is required"});
     };
-    if let Some(reason) = admin_gate(peer_uid, secrets_home, verb) {
-        audit_admin(secrets_home, verb, "", false, Some(&reason), peer_uid);
+    if let Some(reason) = admin_gate(peer_uid, secrets_home, subcommand) {
+        audit_admin(secrets_home, subcommand, "", false, Some(&reason), peer_uid);
         return json!({"ok": false, "error": reason});
     }
 
@@ -1037,7 +1037,7 @@ fn handle_admin(secrets_home: &Path, req: &Value, peer: Option<crate::peercred::
         // acquires+releases internally, `handle_put` audits only after it
         // returns).
         let _guard = put_lock().lock().unwrap_or_else(|e| e.into_inner());
-        match verb {
+        match subcommand {
             "add" => crate::admin::add(secrets_home, &name, &str_field("backend"), &str_field("key"), bool_field("requireTotp"), strs_field("consumers")),
             "rm" => crate::admin::rm(secrets_home, &name),
             "grant" => crate::admin::grant(secrets_home, &name, &str_field("consumer")),
@@ -1067,11 +1067,11 @@ fn handle_admin(secrets_home: &Path, req: &Value, peer: Option<crate::peercred::
 
     match result {
         Ok(outcome) => {
-            audit_admin(secrets_home, verb, &name, true, None, peer_uid);
+            audit_admin(secrets_home, subcommand, &name, true, None, peer_uid);
             json!({"ok": true, "message": outcome.message, "changed": outcome.changed})
         }
         Err(e) => {
-            audit_admin(secrets_home, verb, &name, false, Some(&e), peer_uid);
+            audit_admin(secrets_home, subcommand, &name, false, Some(&e), peer_uid);
             json!({"ok": false, "error": e})
         }
     }
@@ -1087,11 +1087,11 @@ fn handle_admin(secrets_home: &Path, req: &Value, peer: Option<crate::peercred::
 /// the way `commands::audit_migrate`'s `source -> target` detail is) —
 /// `name` is empty when a request never got far enough to know one (a
 /// missing `verb`, an `admin_gate` refusal before any field was read).
-fn audit_admin(secrets_home: &Path, verb: &str, name: &str, granted: bool, reason: Option<&String>, peer_uid: Option<u32>) {
+fn audit_admin(secrets_home: &Path, subcommand: &str, name: &str, granted: bool, reason: Option<&String>, peer_uid: Option<u32>) {
     let record = json!({
         "ts": aoide_protocol::audit::now_secs(),
         "op": "admin",
-        "verb": verb,
+        "verb": subcommand,
         "name": name,
         "peerUid": peer_uid,
         "granted": granted,
@@ -1104,14 +1104,14 @@ fn audit_admin(secrets_home: &Path, verb: &str, name: &str, granted: bool, reaso
     let status = if granted { "granted" } else { "denied" };
     let puid = peer_uid_display(peer_uid);
     let message = match reason {
-        Some(r) => format!("admin {verb} `{name}` (peer uid {puid}): {status} ({r})"),
-        None => format!("admin {verb} `{name}` (peer uid {puid}): {status}"),
+        Some(r) => format!("admin {subcommand} `{name}` (peer uid {puid}): {status} ({r})"),
+        None => format!("admin {subcommand} `{name}` (peer uid {puid}): {status}"),
     };
     let _ = aoide_protocol::audit(
         &aoide_protocol::default_audit_log(),
         aoide_protocol::Door::Daemon,
         aoide_protocol::EventClass::Secret,
-        &format!("secrets.admin.{verb}"),
+        &format!("secrets.admin.{subcommand}"),
         status,
         &message,
     );

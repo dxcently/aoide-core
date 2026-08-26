@@ -3199,7 +3199,7 @@ mod tests {
     /// absent or wrong bearer is a clean `-32005` BEFORE the read runs; a
     /// valid bearer passes through to the normal handler.
     #[test]
-    fn read_verbs_are_token_gated_when_a_token_is_configured() {
+    fn read_commands_are_token_gated_when_a_token_is_configured() {
         let _guard = crate::env_lock().lock().unwrap();
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = std::env::temp_dir().join(format!(
@@ -3262,7 +3262,7 @@ mod tests {
     /// Phase G off-path: with NO token configured (today's default), the read
     /// commands stay open exactly as before — the gate only bites when armed.
     #[test]
-    fn read_verbs_stay_open_when_no_token_is_configured() {
+    fn read_commands_stay_open_when_no_token_is_configured() {
         let _guard = crate::env_lock().lock().unwrap();
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = std::env::temp_dir().join(format!(

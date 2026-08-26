@@ -304,17 +304,17 @@ mod tests {
     // six → eight), Phase F (text added, eight → nine) ──────────────────────
 
     #[test]
-    fn all_nine_point_verbs_are_registered_and_implemented_with_json() {
+    fn all_nine_point_commands_are_registered_and_implemented_with_json() {
         let mut r = Registry::new();
         register(&mut r);
-        for verb in ["move", "click", "scroll", "idle", "save", "restore", "drag", "hover", "text"] {
+        for command in ["move", "click", "scroll", "idle", "save", "restore", "drag", "hover", "text"] {
             let c = r
-                .get(&["screen".to_string(), "point".to_string(), verb.to_string()])
-                .unwrap_or_else(|| panic!("screen point {verb} not registered"));
-            assert!(c.implemented, "screen point {verb} not marked implemented");
+                .get(&["screen".to_string(), "point".to_string(), command.to_string()])
+                .unwrap_or_else(|| panic!("screen point {command} not registered"));
+            assert!(c.implemented, "screen point {command} not marked implemented");
             assert!(
                 c.flags.iter().any(|f| f.name == "json"),
-                "screen point {verb} missing --json"
+                "screen point {command} missing --json"
             );
         }
     }
@@ -401,11 +401,11 @@ mod tests {
         // scroll/idle/save/restore don't, and shouldn't advertise it.
         let mut r = Registry::new();
         register(&mut r);
-        for verb in ["scroll", "idle", "save", "restore"] {
-            let c = r.get(&["screen".to_string(), "point".to_string(), verb.to_string()]).unwrap();
+        for command in ["scroll", "idle", "save", "restore"] {
+            let c = r.get(&["screen".to_string(), "point".to_string(), command.to_string()]).unwrap();
             assert!(
                 !c.flags.iter().any(|f| f.name == "from-shot"),
-                "screen point {verb} should not declare --from-shot"
+                "screen point {command} should not declare --from-shot"
             );
         }
     }

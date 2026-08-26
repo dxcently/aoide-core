@@ -25,7 +25,7 @@ mod session_store;
 mod spawn;
 #[cfg(test)]
 pub(crate) mod testutil;
-mod verbs;
+mod manage;
 mod who;
 mod window;
 
@@ -64,7 +64,7 @@ pub use self::spawn::session_spawn;
 // `daemon.rs`), called in-process the same way `run_internal_reap` calls
 // `crate::reap::reap_and_announce`.
 pub use self::resurrect::session_resurrect;
-pub use self::verbs::{emit, link, project_add, project_list, project_remove, prune, view};
+pub use self::manage::{emit, link, project_add, project_list, project_remove, prune, view};
 // `aoide who` (messaging/presence plan, P-C2): live presence over this
 // box's own sessions plus every registered peer — see `graph/who.rs`'s
 // module doc for the probe/filter design. `glyph` (the node-presence

@@ -352,7 +352,7 @@ mod tests {
     use crate::graph::testutil::*;
 
     #[test]
-    fn local_only_verbs_ignore_peer_ids_exactly_like_a2a_ids_today() {
+    fn local_only_commands_ignore_peer_ids_exactly_like_a2a_ids_today() {
         // CONTRACTS.md §7: `link`/`prune` (and, by the same construction,
         // `focus`/`reap`) must keep ignoring `peer:*` ids exactly as they
         // already ignore `a2a:*` ids — neither reads `peer_store` at all, so

@@ -1273,7 +1273,7 @@ mod tests {
     }
 
     #[test]
-    fn register_inbox_wires_all_three_verbs() {
+    fn register_inbox_wires_all_three_commands() {
         let mut r = Registry::new();
         register_inbox(&mut r);
         let paths: Vec<String> = r.commands().map(|c| c.dotted()).collect();
@@ -1285,7 +1285,7 @@ mod tests {
     // ── `aoide identity` ─────────────────────────────────────────────────────
 
     #[test]
-    fn register_identity_wires_the_verb() {
+    fn register_identity_wires_the_command() {
         let mut r = Registry::new();
         register_identity(&mut r);
         let paths: Vec<String> = r.commands().map(|c| c.dotted()).collect();

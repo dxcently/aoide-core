@@ -444,11 +444,12 @@ fn require_cli(inv: &Invocation, cmd: &str) -> Option<Outcome> {
 /// `policy.json` to `root:root` and bricked the broker (and every
 /// subsequent admin command, including the correctly-spelled `sudo -u
 /// aoide-secrets` retry) in the field. Called immediately after
-/// [`require_cli`] in every handler below. `verb` is the bare verb word
-/// (`"add"`, not `"secrets.add"`) — it lands in the corrective `sudo -u
-/// aoide-secrets aoide secrets <verb> ...` spelling the refusal teaches.
-fn require_admin_identity(cmd: &str, verb: &str) -> Option<Outcome> {
-    home::admin_identity_check(&home::secrets_home(), verb).map(|msg| Outcome::error(cmd, msg))
+/// [`require_cli`] in every handler below. `subcommand` is the bare
+/// command word (`"add"`, not `"secrets.add"`) — it lands in the
+/// corrective `sudo -u aoide-secrets aoide secrets <subcommand> ...`
+/// spelling the refusal teaches.
+fn require_admin_identity(cmd: &str, subcommand: &str) -> Option<Outcome> {
+    home::admin_identity_check(&home::secrets_home(), subcommand).map(|msg| Outcome::error(cmd, msg))
 }
 
 /// `secrets add`'s backend when `--backend` is omitted (P-G1, task #70 —
@@ -474,12 +475,12 @@ const DEFAULT_BACKEND: &str = "age";
 /// paths report through the same [`crate::admin::AdminOutcome`] fields.
 fn admin_dispatch(
     cmd: &str,
-    verb: &str,
+    subcommand: &str,
     mut fields: serde_json::Map<String, serde_json::Value>,
     direct: impl FnOnce() -> Result<crate::admin::AdminOutcome, String>,
 ) -> Outcome {
     fields.insert("op".to_string(), json!("admin"));
-    fields.insert("verb".to_string(), json!(verb));
+    fields.insert("verb".to_string(), json!(subcommand));
     match crate::client::admin_request(&crate::socket::socket_path(), serde_json::Value::Object(fields)) {
         Ok(reply) => {
             let message = reply.get("message").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
@@ -495,7 +496,7 @@ fn admin_dispatch(
             outcome
         }
         Err(crate::client::AdminError::NoSocket) => {
-            if let Some(hint) = require_admin_identity(cmd, verb) {
+            if let Some(hint) = require_admin_identity(cmd, subcommand) {
                 return hint;
             }
             match direct() {
@@ -570,23 +571,23 @@ fn handle_secrets_rm(inv: &Invocation) -> Outcome {
 /// Shared shape behind `grant`/`revoke`: both take `<name> <consumer>` and
 /// differ only in `want_listed` (`true` pushes the consumer if absent,
 /// `false` removes it if present — [`crate::admin::grant`]/[`crate::admin::
-/// revoke`]'s own job). `verb` names the bare word for the wire request and
-/// [`require_admin_identity`]'s corrective spelling.
-fn edit_consumer(inv: &Invocation, cmd: &str, verb: &str, usage: &str, want_listed: bool) -> Outcome {
+/// revoke`]'s own job). `subcommand` names the bare word for the wire
+/// request and [`require_admin_identity`]'s corrective spelling.
+fn edit_consumer(inv: &Invocation, cmd: &str, subcommand: &str, usage: &str, want_listed: bool) -> Outcome {
     if let Some(hint) = require_cli(inv, cmd) {
         return hint;
     }
     let Some(name) = inv.args.first().cloned() else {
-        return Outcome::usage(cmd, format!("secrets {verb}: missing <name> — {usage}"));
+        return Outcome::usage(cmd, format!("secrets {subcommand}: missing <name> — {usage}"));
     };
     let Some(consumer) = inv.args.get(1).cloned() else {
-        return Outcome::usage(cmd, format!("secrets {verb}: missing <consumer> — {usage}"));
+        return Outcome::usage(cmd, format!("secrets {subcommand}: missing <consumer> — {usage}"));
     };
     let fields = serde_json::Map::from_iter([
         ("name".to_string(), json!(name.clone())),
         ("consumer".to_string(), json!(consumer.clone())),
     ]);
-    admin_dispatch(cmd, verb, fields, || {
+    admin_dispatch(cmd, subcommand, fields, || {
         let home = home::secrets_home();
         if want_listed {
             crate::admin::grant(&home, &name, &consumer)

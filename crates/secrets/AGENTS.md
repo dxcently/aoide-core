@@ -274,9 +274,9 @@
   ran as euid 0, succeeded, and silently reowned `policy.json` to
   `root:root`, bricking the broker and every later admin command — including
   the correctly-spelled `sudo -u aoide-secrets` retry — until a manual
-  `chown`). `home::admin_identity_error(euid, home_owner, home, command)` is
+  `chown`). `home::admin_identity_error(euid, home_owner, home, subcommand)` is
   the PURE decision (unit-tested on injected uids: matching, root-vs-owner,
-  an arbitrary mismatch); `home::admin_identity_check(home, command)` wires it
+  an arbitrary mismatch); `home::admin_identity_check(home, subcommand)` wires it
   to a real `std::fs::metadata(home)` stat and a real `home::effective_uid`
   (`libc::geteuid`, zero new deps — `libc` is already this crate's
   dependency). `commands::require_admin_identity` calls it right after
@@ -293,7 +293,7 @@
   the home on first write, so an unguarded root caller hitting a missing
   home would CREATE it `root:root` — the identical bricking symptom,
   just at creation time instead of a reown) — `home::
-  admin_identity_error_for_missing_home(euid, home, command)` is that case's
+  admin_identity_error_for_missing_home(euid, home, subcommand)` is that case's
   own PURE decision (root refused, any other uid passes), and
   `admin_identity_check` falls to it whenever the stat fails, rather than
   passing unconditionally. A non-root uid still creates its own fresh home

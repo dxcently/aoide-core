@@ -261,8 +261,8 @@ mod tests {
             "names it a group: {}",
             err.message
         );
-        for verb in ["graph project add", "graph project remove", "graph project list"] {
-            assert!(err.message.contains(verb), "lists {verb}: {}", err.message);
+        for command in ["graph project add", "graph project remove", "graph project list"] {
+            assert!(err.message.contains(command), "lists {command}: {}", err.message);
         }
         assert!(err.message.contains("aoide --help"), "{}", err.message);
     }

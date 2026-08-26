@@ -1206,13 +1206,13 @@ impl App {
     /// `pending_sel` pointing past the end. A no-op on an empty list
     /// (nothing selected to resolve) rather than a panic; the door itself
     /// (not this frontend) is what rejects a malformed entry.
-    fn resolve_pending(&mut self, verb: &'static str) {
+    fn resolve_pending(&mut self, command: &'static str) {
         let rows = self.pending_rows();
         let Some(row) = rows.get(self.pending_sel) else {
             return;
         };
         let id = row.id.clone();
-        self.dispatch(&["graph", "pending", verb], &[id]);
+        self.dispatch(&["graph", "pending", command], &[id]);
         let n = self.pending_rows().len();
         if self.pending_sel >= n.max(1) {
             self.pending_sel = n.saturating_sub(1);

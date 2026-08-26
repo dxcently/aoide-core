@@ -100,7 +100,7 @@ fn cleanup(socket_path: &Path, events_path: &Path) {
 /// on every call, door included, so this is the SAME code path every other
 /// door's audit line comes from (`cli/src/dispatch.rs`).
 #[test]
-fn a_plain_verb_dispatches_and_audits_door_daemon() {
+fn a_plain_command_dispatches_and_audits_door_daemon() {
     let (stream, socket_path, events_path) = start_daemon("plain");
     let mut writer = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);
@@ -141,7 +141,7 @@ fn a_plain_verb_dispatches_and_audits_door_daemon() {
 /// (`AOIDE_SECRETS_HOME` is process-global) and restored via `EnvSaver` so
 /// a panic mid-test can't leak the override into a later test.
 #[test]
-fn a_cli_only_secrets_admin_verb_refuses_with_the_door_hint_and_mutates_nothing_on_disk() {
+fn a_cli_only_secrets_admin_command_refuses_with_the_door_hint_and_mutates_nothing_on_disk() {
     let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let _saver = aoide_test_support::EnvSaver::capture(&["AOIDE_SECRETS_HOME"]);
     let scratch_home = short_tmp("secadmin-home");
@@ -182,7 +182,7 @@ fn a_cli_only_secrets_admin_verb_refuses_with_the_door_hint_and_mutates_nothing_
 /// `gated: true` over the daemon door exactly as `cli::dispatch::dispatch`
 /// always marks it — admission stays the user's, on every door.
 #[test]
-fn a_gated_verb_returns_gated_true() {
+fn a_gated_command_returns_gated_true() {
     let (stream, socket_path, events_path) = start_daemon("gated");
     let mut writer = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);

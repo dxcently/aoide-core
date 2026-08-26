@@ -1279,7 +1279,7 @@ mod tests {
     use super::*;
     use crate::graph::model::merged_sessions;
     use crate::graph::testutil::*;
-    use crate::graph::verbs::{project_add, view};
+    use crate::graph::manage::{project_add, view};
     // The reaper moved to `crate::reap`; its tests still live here (they
     // lean on session-lifecycle fixtures/helpers this module owns).
     use crate::reap::{effective_live_addresses, is_session_dead, reap};

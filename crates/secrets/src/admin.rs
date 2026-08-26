@@ -178,8 +178,8 @@ pub fn automate_consumer(home: &Path, name: &str, consumer: &str, want_listed: b
     };
     let already_listed = policy.automation.consumers.iter().any(|c| c == consumer);
     if want_listed == already_listed {
-        let verb = if want_listed { "already lists" } else { "does not list" };
-        return Ok(AdminOutcome::unchanged(format!("secret `{name}` automation {verb} consumer `{consumer}` — unchanged")));
+        let phrase = if want_listed { "already lists" } else { "does not list" };
+        return Ok(AdminOutcome::unchanged(format!("secret `{name}` automation {phrase} consumer `{consumer}` — unchanged")));
     }
     if want_listed {
         policy.automation.consumers.push(consumer.to_string());
@@ -187,8 +187,8 @@ pub fn automate_consumer(home: &Path, name: &str, consumer: &str, want_listed: b
         policy.automation.consumers.retain(|c| c != consumer);
     }
     store::save_policies(home, &policies).map_err(|e| policy_io_error(home, e))?;
-    let verb = if want_listed { "now lists" } else { "no longer lists" };
-    Ok(AdminOutcome::changed(format!("secret `{name}` automation {verb} consumer `{consumer}`"), format!("policy:{name}")))
+    let phrase = if want_listed { "now lists" } else { "no longer lists" };
+    Ok(AdminOutcome::changed(format!("secret `{name}` automation {phrase} consumer `{consumer}`"), format!("policy:{name}")))
 }
 
 /// A refused [`migrate`] carries its message PLUS the source backend name,

@@ -104,7 +104,7 @@ pub fn effective_uid() -> u32 {
 /// which is exactly what silently reowns `policy.json` to `root:root` and
 /// bricks the broker (the yomi-strix incident, 2026-08-22, this guard
 /// exists to make impossible).
-pub fn admin_identity_error(euid: u32, home_owner: u32, home: &Path, verb: &str) -> Option<String> {
+pub fn admin_identity_error(euid: u32, home_owner: u32, home: &Path, subcommand: &str) -> Option<String> {
     if euid == home_owner {
         return None;
     }
@@ -116,8 +116,8 @@ pub fn admin_identity_error(euid: u32, home_owner: u32, home: &Path, verb: &str)
         format!("uid {euid}")
     };
     Some(format!(
-        "secrets {verb} must run as the broker user (uid {home_owner}, the owner of {}) — this process is running as {running_as}. \
-         Run: sudo -u aoide-secrets aoide secrets {verb} ...",
+        "secrets {subcommand} must run as the broker user (uid {home_owner}, the owner of {}) — this process is running as {running_as}. \
+         Run: sudo -u aoide-secrets aoide secrets {subcommand} ...",
         home.display()
     ))
 }
@@ -139,15 +139,15 @@ pub fn admin_identity_error(euid: u32, home_owner: u32, home: &Path, verb: &str)
 /// be the one to create the secrets home, full stop; first-time
 /// provisioning belongs to the broker's own systemd unit
 /// (`StateDirectory=`) or an explicit `sudo -u aoide-secrets` invocation.
-pub fn admin_identity_error_for_missing_home(euid: u32, home: &Path, verb: &str) -> Option<String> {
+pub fn admin_identity_error_for_missing_home(euid: u32, home: &Path, subcommand: &str) -> Option<String> {
     if euid != 0 {
         return None;
     }
     Some(format!(
-        "secrets {verb} must run as the broker user, not root — {} does not exist yet, and root creating it \
+        "secrets {subcommand} must run as the broker user, not root — {} does not exist yet, and root creating it \
          would leave policy.json/totp.secret owned root:root, bricking the broker before it even starts. \
          First-time provisioning belongs to the broker's own service (systemd's StateDirectory) or an explicit \
-         `sudo -u aoide-secrets` run. Run: sudo -u aoide-secrets aoide secrets {verb} ...",
+         `sudo -u aoide-secrets` run. Run: sudo -u aoide-secrets aoide secrets {subcommand} ...",
         home.display()
     ))
 }
@@ -165,10 +165,10 @@ pub fn admin_identity_error_for_missing_home(euid: u32, home: &Path, verb: &str)
 /// `create_dir_all` it on that first write, so root reaching this point
 /// would CREATE a root-owned home — refused for that reason alone, a
 /// non-root uid still passes through to create it itself.
-pub fn admin_identity_check(home: &Path, verb: &str) -> Option<String> {
+pub fn admin_identity_check(home: &Path, subcommand: &str) -> Option<String> {
     match std::fs::metadata(home) {
-        Ok(meta) => admin_identity_error(effective_uid(), meta.uid(), home, verb),
-        Err(_) => admin_identity_error_for_missing_home(effective_uid(), home, verb),
+        Ok(meta) => admin_identity_error(effective_uid(), meta.uid(), home, subcommand),
+        Err(_) => admin_identity_error_for_missing_home(effective_uid(), home, subcommand),
     }
 }
 

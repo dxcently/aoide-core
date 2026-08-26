@@ -375,11 +375,11 @@ fn handle_agent_add(inv: &Invocation) -> Outcome {
         return Outcome::error(cmd, format!("writing the agent registry: {e}"))
             .with_data(json!({ "reason": "registry-write-failed" }));
     }
-    let verb = if replaced { "updated" } else { "registered" };
+    let word = if replaced { "updated" } else { "registered" };
     Outcome::ok(
         cmd,
         format!(
-            "{verb} A2A agent `{}` → {} ({} total)",
+            "{word} A2A agent `{}` → {} ({} total)",
             agent.name,
             agent.url,
             agents.len()
@@ -1637,11 +1637,11 @@ fn approve_inbound(
     let _ = aoide_storage::pairing::take_inbound(id, now_epoch);
 
     use aoide_storage::peer_store::PairChange;
-    let verb = match change {
+    let word = match change {
         PairChange::Inserted => "paired with",
         PairChange::Updated => "re-paired with",
     };
-    Outcome::ok(cmd, format!("{verb} `{}` (code {sas}) — verified", entry.name))
+    Outcome::ok(cmd, format!("{word} `{}` (code {sas}) — verified", entry.name))
         .changed(vec![aoide_storage::peer_store::peers_path().to_string_lossy().into_owned()])
         .with_data(json!({ "confirmed": true, "sas": sas, "peer": entry.name, "pubkeyHex": entry.pubkey_hex, "direction": "inbound" }))
 }
@@ -1712,11 +1712,11 @@ fn approve_outbound(
     let _ = aoide_storage::pairing::take_outbound(id, now_epoch);
 
     use aoide_storage::peer_store::PairChange;
-    let verb = match change {
+    let word = match change {
         PairChange::Inserted => "paired with",
         PairChange::Updated => "re-paired with",
     };
-    Outcome::ok(cmd, format!("{verb} `{}` (code {sas}) — verified", entry.name))
+    Outcome::ok(cmd, format!("{word} `{}` (code {sas}) — verified", entry.name))
         .changed(vec![aoide_storage::peer_store::peers_path().to_string_lossy().into_owned()])
         .with_data(json!({ "confirmed": true, "sas": sas, "peer": entry.name, "pubkeyHex": entry.pubkey_hex, "direction": "outbound" }))
 }
