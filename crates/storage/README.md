@@ -135,6 +135,18 @@ cache (CONTRACTS.md §7). File-first by decision — no embedded database yet
   crate's own `records`/`ledger` section, and CONTRACTS.md's pending-queue
   note); nothing may ever gate on it without upgrading it to an
   authenticated channel first (task #63's lane).
+- `carry` — the carry mark (durable-sessions plan, P-C1): `state/carry.json`,
+  the set of session ids marked durable so a project's whole carried set can
+  be resurrected together (`graph session carry on|off`, a later phase).
+  Mirrors `a2a_store` exactly — `load_carry`/`save_carry` tolerate a
+  missing/corrupt file as empty and write atomically via `fs::atomic_write`
+  (not `atomic_write_private`: a session id is the same class of data
+  `sessions.json`/`a2a-agents.json` already keep at default mode).
+  `set_carried`/`is_carried` are pure list operations; `set_carried` returns
+  whether the carried/not-carried TRANSITION changed, and separately
+  refreshes `markedAt` on every `on` call including a re-mark of an
+  already-carried id. Store only for now — no command or consumer is wired
+  to it yet.
 - `takes` — the per-draft take store behind `rice back`/`rice take`.
 - `petname`/`display` — the adjective-noun petname mint and its
   render-time-only display grammar.

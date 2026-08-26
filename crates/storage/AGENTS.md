@@ -143,6 +143,19 @@
   transient mismatch is recoverable without restarting the whole
   ceremony, and "untouched" is simpler to reason about than "re-parked
   with the same content."
+- **`carry::set_carried`'s return value is the on/off TRANSITION, not
+  "did anything on disk change" (P-C1, durable-sessions plan).** Re-marking
+  an already-carried id refreshes `marked_at` in place and returns `false`;
+  unmarking an absent id is a no-op and also returns `false`. Don't fold the
+  timestamp refresh into the return value — the later `graph session carry`
+  command reports this bool verbatim as `changed`, and a `markedAt` bump
+  reported as a state change would be misleading (nothing about carried/not
+  actually flipped).
+- **`carry.json` is written via plain `fs::atomic_write`, never
+  `atomic_write_private` — deliberate, not an oversight.** It holds session
+  ids, the same class of data `sessions.json`/`a2a-agents.json` already keep
+  at default mode; `atomic_write_private` stays reserved for the
+  identity/secret lane above.
 - **`beacon` never writes `peer_store`, and never will (P-P6).** It reaches
   into `peer_store` for exactly one READ (`valid_peer_name`, so the
   beacon's `name` shares the same nickname shape check every other

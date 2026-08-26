@@ -67,10 +67,18 @@
 //! `aoide-server::discovery`'s send side and `aoide-client::discover`'s
 //! listen side), and no write path into `peer_store` either: discovery
 //! grants nothing, by design.
+//!
+//! `carry` (durable-sessions plan, P-C1) holds `state/carry.json`, the set
+//! of session ids marked durable so a project's whole carried set can be
+//! resurrected together. Store only for now — mirrors `a2a_store`'s
+//! shape and discipline exactly (tolerate-missing/corrupt-as-empty,
+//! `fs::atomic_write`, pure list mutations); no command or consumer is
+//! wired to it yet.
 
 pub mod a2a_store;
 pub mod addr;
 pub mod beacon;
+pub mod carry;
 pub mod commands;
 pub mod display;
 pub mod edits;
