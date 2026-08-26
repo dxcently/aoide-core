@@ -1438,6 +1438,15 @@ pub fn known_agents() -> &'static [&'static str] {
     &["claude", "kimi", "pi"]
 }
 
+/// Is this profile's launch program discoverable on `PATH`? Onboard's own
+/// harness preselection (ONBOARD.md decision 7: the multi-select picker
+/// preselects every harness already on `PATH`) — the `AgentProfile`-shaped
+/// wrapper over `bin::on_path`. A profile with an empty `launch` slice is
+/// never on `PATH` by definition.
+pub fn on_path(profile: &AgentProfile) -> bool {
+    profile.launch.first().is_some_and(|program| crate::bin::on_path(program))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

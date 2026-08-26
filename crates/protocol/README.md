@@ -49,9 +49,16 @@ other crate in this workspace sits above.
   vocabulary, model ceilings, transcript layout, the hook-settings and
   skills-directory locations, and — P-D7 — the argv that launches a harness
   fresh and, where verified, the argv that resumes a prior session of it by
-  its own id) keyed by harness name.
+  its own id) keyed by harness name. `on_path` (P-I2, ONBOARD.md decision
+  7) is the `AgentProfile`-shaped wrapper over `bin::on_path`, over the
+  profile's own `launch` program name — onboard's harness-picker
+  preselection.
 - `bin` — sibling-binary resolution (`core_bin`/`rice_bin`; env override →
-  sibling-of-`current_exe` → bare `PATH` name).
+  sibling-of-`current_exe` → bare `PATH` name), plus `on_path` (P-I2,
+  ONBOARD.md decision 3): the proactive `PATH` probe the resolver's own
+  bare-name tier deliberately leaves for `Command::spawn` to resolve at
+  exec time — the caller onboard's own lyra probe needs, checked BEFORE
+  spawning rather than caught as an `ENOENT` after.
 - `pick` — the interactive prompt substrate (ONBOARD.md's "Prompt substrate"
   section, P-I1): `interactive`, the [`Door::Cli`] + tty gate a caller checks
   BEFORE opening any prompt at all, and four entry points a caller reaches

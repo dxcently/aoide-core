@@ -15,6 +15,11 @@
 - **`normalize_addr` is `pub`, not `pub(crate)`, on purpose** — `screen`
   reaches it directly rather than duplicating it. Don't narrow it back
   without checking that dependency first.
+- **`commands::hooks::skill_source` is `pub`, not `pub(crate)`, on purpose**
+  (P-I2, ONBOARD.md decision 10) — `aoide-cli`'s `onboard` reaches it
+  directly for its from-a-checkout refusal (the only repo-root detector in
+  the tree) rather than re-deriving the walk-up. Don't narrow it back
+  without checking that dependency first.
 - **A killed terminal never self-reports `done`.** `reap` is the only
   sanctioned sweep of dead sessions; don't add a second liveness mechanism.
   Reaping now also runs IN the daemon's own tick (P-D6, ~12s cadence) when

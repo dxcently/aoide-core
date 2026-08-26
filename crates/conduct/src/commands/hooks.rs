@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 pub fn register(r: &mut Registry) {
     r.insert(cmd!(
         path: ["hooks", "install"],
-        summary: "Wire an agent harness's settings file to pipe its hooks into `graph session hook` (idempotent merge; never clobbers existing config).",
+        summary: "Wire an agent harness's settings file to pipe its hooks into `graph session hook`, and symlink the repo's skill directory into the harness's skills dir when it has one (idempotent merge; never clobbers existing config or an unrelated file at the link path).",
         args: [arg!("agent", "string", true, "Agent harness to wire up (claude | kimi | pi).")],
         flags: [flag!("capture", "bool", "TEMPORARY debugging: wrap the hook command to tee raw payloads to ~/Aoide/state/<agent>-hooks.jsonl. Capture entries coexist with the plain ones (installing without --capture replaces nothing); remove them manually when done.")],
         gated: false,
@@ -159,7 +159,14 @@ enum SkillLink {
 /// install` has no repo-locating pattern to reuse (its door commands resolve
 /// `aoide` from PATH), so the invoking checkout IS the source — the
 /// documented assumption; run the command from inside the repo to link.
-fn skill_source() -> Option<PathBuf> {
+///
+/// `pub`, not `pub(crate)` (crates/AGENTS.md's "widen it, don't fork it"):
+/// `onboard`'s own from-a-checkout refusal (ONBOARD.md decision 10) reaches
+/// this exact walk-up rather than duplicating it — the only repo-root
+/// detector in the tree, so `onboard` climbs three parents off its result
+/// (`aoide/skills/.claude` back to the checkout root) instead of a second
+/// probe.
+pub fn skill_source() -> Option<PathBuf> {
     let mut dir = std::env::current_dir().ok()?;
     loop {
         let cand = dir.join(SKILL_REPO_PATH);

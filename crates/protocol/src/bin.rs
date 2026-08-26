@@ -77,6 +77,23 @@ pub fn rice_bin() -> String {
     resolve_bin("AOIDE_RICE_BIN", "lyra")
 }
 
+/// Is `name` a program discoverable on `PATH`? The proactive probe the tier
+/// logic above deliberately skips: tier 3 (the bare name) is left for
+/// `Command::spawn` to resolve at exec time rather than checked here, but a
+/// caller that needs to know BEFORE spawning has nowhere else in the tree to
+/// ask — every existing PATH-adjacent check (`aoide-secrets`' age-binary
+/// probe) is a spawn-failure/ENOENT catch instead. Onboard's own lyra probe
+/// (ONBOARD.md decision 3) is the first caller: `rice_bin()`'s tier-1/2
+/// results are already trusted by the resolver itself (env unconditionally,
+/// the sibling only after its own `exists()` check), so this only needs
+/// calling on a bare-name result. `agents::on_path` is the other caller,
+/// over an `AgentProfile`'s own `launch` program name.
+pub fn on_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

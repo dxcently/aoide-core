@@ -10,9 +10,10 @@
   `schema.rs` table order; `schema --json` and the MCP tool list must never
   reorder. Append new `register()` calls, never reorder existing ones — see
   `pkgs/aoide/crates/AGENTS.md`.
-- **`meta`/`stubs`/`infra` stay here, not in a domain crate.** They exist
-  because they read the fully-ASSEMBLED registry (tool count, schema dump) —
-  a domain crate can't do that without depending on this crate, which would
+- **`meta`/`stubs`/`onboard`/`infra` stay here, not in a domain crate.** They
+  exist because they read the fully-ASSEMBLED registry (tool count, schema
+  dump, `onboard`'s own call into `hooks.install` and the closing guide) — a
+  domain crate can't do that without depending on this crate, which would
   invert the DAG.
 - **Nix-independent.** No nix shell-outs, no NixOS assumption, anywhere in
   this crate or what it depends on (root `AGENTS.md`, "core is
@@ -21,8 +22,10 @@
 ## Extension points
 
 - **A new root-coupled command** (one that must read the assembled
-  registry) adds a case to `meta`/`infra`; anything else belongs in its
-  domain crate's own `commands` module instead.
+  registry) adds a case to `meta`/`infra`, or its own dedicated module
+  (`onboard`'s precedent) when the command is substantial enough to warrant
+  one; anything else belongs in its domain crate's own `commands` module
+  instead.
 - **A new special-cased command** (bypassing the generic `Outcome` envelope)
   extends the `special` closure passed to `aoide_protocol::door::run` in
   `run_cli`.

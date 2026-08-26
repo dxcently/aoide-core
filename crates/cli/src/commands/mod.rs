@@ -4,19 +4,23 @@
 //! docs/architecture/PACKAGE-LAYOUT.md: a domain's CLI commands live with the
 //! domain). Only the root-coupled groups stay here: `meta` (guide/schema —
 //! reads the assembled registry), `stubs` (not-implemented placeholders with
-//! no domain yet), and `infra` (`mcp serve` — reads the assembled registry's
-//! tool count). [`all`] assembles every contribution in the exact order that
+//! no domain yet), `onboard` (the first-boot flow, P-I2 — reads the
+//! assembled registry too, to call `hooks.install` and render the closing
+//! guide), and `infra` (`mcp serve` — reads the assembled registry's tool
+//! count). [`all`] assembles every contribution in the exact order that
 //! reproduces the historical `schema.rs` table order (see `registry.rs`
 //! module docs for why that order is load-bearing).
 
 mod infra;
 mod meta;
+mod onboard;
 mod stubs;
 
 use crate::registry::Registry;
 
 /// Build the full command registry, in the historical `schema --json` order:
-/// guide, schema, content(stub x5), make(stub), update(stub), onboard(stub),
+/// guide, schema, content(stub x5), make(stub), update(stub), onboard (P-I2:
+/// the first-boot flow, real as of this commit — stub count 8->7),
 /// mcp serve, daemon, graph(x15) + conduct, adapter melete, conductor, a2a
 /// serve + agent add/list/remove, peer add/list/remove/pull/status
 /// (CONTRACTS.md §7, slotted directly after the `a2a agent` group it's the
@@ -50,7 +54,7 @@ pub fn all() -> Registry {
     stubs::register_content(&mut r); // content register/propose/approve/ingest/query
     stubs::register_make(&mut r); // make
     stubs::register_update(&mut r); // update
-    stubs::register_onboard(&mut r); // onboard
+    onboard::register(&mut r); // onboard (P-I2: core's shell-only half, real as of this commit)
     infra::register_mcp(&mut r); // mcp serve (root-coupled: reads this assembled registry)
     aoide_server::commands::register_infra(&mut r); // daemon
     aoide_conduct::commands::graph::register(&mut r); // graph x15 + conduct

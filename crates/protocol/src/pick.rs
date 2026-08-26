@@ -102,15 +102,17 @@ pub fn interactive(door: Door) -> bool {
 /// that only wants to preview the layout (or assert its exact text in a
 /// test) can call it directly. One row per line, numbered from 1 (never 0 —
 /// the number a User types is the number a User sees), with `(default)`
-/// appended to whichever row `default` names, if any. An out-of-range
-/// `default` (a caller bug — an index past the end of `rows`) marks nothing
-/// rather than panicking; the callers here already guard against that
-/// before it reaches this function, but the guard belongs to them, not to a
-/// pure renderer.
-pub fn render_rows(rows: &[String], default: Option<usize>) -> String {
+/// appended to every row named in `default` — a slice rather than one index
+/// since [`choose_many`]'s onboard consumer (ONBOARD.md decision 7) can
+/// preselect several rows at once ([`choose`]'s own single-select callers
+/// pass a 0-or-1-element slice). An out-of-range index in `default` (a
+/// caller bug — past the end of `rows`) marks nothing rather than panicking;
+/// the callers here already guard against that before it reaches this
+/// function, but the guard belongs to them, not to a pure renderer.
+pub fn render_rows(rows: &[String], default: &[usize]) -> String {
     let mut out = String::new();
     for (i, row) in rows.iter().enumerate() {
-        let marker = if default == Some(i) { " (default)" } else { "" };
+        let marker = if default.contains(&i) { " (default)" } else { "" };
         out.push_str(&format!("  {}) {row}{marker}\n", i + 1));
     }
     out
@@ -154,7 +156,7 @@ fn choose_reading(reader: &mut dyn BufRead, prompt: &str, rows: &[String], defau
     }
     let default = default.filter(|&d| d < rows.len());
 
-    print!("{}", render_rows(rows, default));
+    print!("{}", render_rows(rows, &default.into_iter().collect::<Vec<_>>()));
     let hint = match default {
         Some(d) => format!("{prompt} [1-{}, Enter for {}, q to abort]: ", rows.len(), d + 1),
         None => format!("{prompt} [1-{}, q to abort]: ", rows.len()),
@@ -190,21 +192,23 @@ fn choose_reading(reader: &mut dyn BufRead, prompt: &str, rows: &[String], defau
 /// one. Every token must resolve via [`parse_index`] for the whole line to
 /// count as valid; one bad token invalidates the entire attempt (a partial
 /// selection that silently drops the token nobody could tell they mistyped
-/// is worse than asking again). Empty input selects `[default]` — a single-
-/// element selection — when a default is set, mirroring [`choose_reading`]'s
-/// own empty-input rule; aborts otherwise.
+/// is worse than asking again). `default` is a SET of preselected rows
+/// (widened from a single `Option<usize>` for onboard's harness picker,
+/// ONBOARD.md decision 7 — several harnesses can sit on `PATH` at once):
+/// empty input selects the whole set when it's non-empty, mirroring
+/// [`choose_reading`]'s own empty-input rule; aborts when `default` is empty.
 fn choose_many_reading(
     reader: &mut dyn BufRead,
     prompt: &str,
     rows: &[String],
-    default: Option<usize>,
+    default: &[usize],
 ) -> Option<Vec<usize>> {
     if rows.is_empty() {
         return None;
     }
-    let default = default.filter(|&d| d < rows.len());
+    let default: Vec<usize> = default.iter().copied().filter(|&d| d < rows.len()).collect();
 
-    print!("{}", render_rows(rows, default));
+    print!("{}", render_rows(rows, &default));
     let hint = format!("{prompt} [comma-separated 1-{}, q to abort]: ", rows.len());
 
     for attempt in 0..2 {
@@ -220,7 +224,7 @@ fn choose_many_reading(
             return None;
         }
         if trimmed.is_empty() {
-            return default.map(|d| vec![d]);
+            return if default.is_empty() { None } else { Some(default.clone()) };
         }
 
         let tokens: Vec<&str> = trimmed.split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty()).collect();
@@ -283,11 +287,14 @@ fn choose_tty(prompt: &str, rows: &[String], default: Option<usize>) -> Option<u
 }
 
 /// Open a multi-select picker on the real terminal — `rice take prune`'s
-/// picker (phase A9, §7.1) is the in-plan consumer this exists for. Same
-/// shape as [`choose`]; see [`choose_many_reading`] for the non-tty
+/// picker (phase A9, §7.1) and onboard's harness picker (ONBOARD.md
+/// decision 7) are the in-plan consumers this exists for. Same shape as
+/// [`choose`]; `default` is a SET of preselected rows (widened at the
+/// onboard phase — `rice take prune` passes `&[]`, onboard preselects every
+/// harness found on `PATH`). See [`choose_many_reading`] for the non-tty
 /// list-parsing and abort rules, [`choose_many_tty`] for the tty backend
 /// (ONBOARD.md decision 9).
-pub fn choose_many(prompt: &str, rows: &[String], default: Option<usize>) -> Option<Vec<usize>> {
+pub fn choose_many(prompt: &str, rows: &[String], default: &[usize]) -> Option<Vec<usize>> {
     if tty_capable() {
         return choose_many_tty(prompt, rows, default);
     }
@@ -298,19 +305,18 @@ pub fn choose_many(prompt: &str, rows: &[String], default: Option<usize>) -> Opt
 
 /// The `inquire::MultiSelect`-backed tty half of [`choose_many`] — same
 /// empty-rows/out-of-range-default/abort contract as [`choose_tty`], one
-/// selection widened to many. Empty input on the non-tty side selects
-/// `[default]` as a single-element list ([`choose_many_reading`]'s own
-/// doc); `MultiSelect::with_default` reproduces that by pre-checking the
-/// same one row, so Enter with nothing toggled still submits it.
-fn choose_many_tty(prompt: &str, rows: &[String], default: Option<usize>) -> Option<Vec<usize>> {
+/// selection widened to many, several defaults instead of one. Empty input
+/// on the non-tty side selects the whole `default` set ([`choose_many_reading`]'s
+/// own doc); `MultiSelect::with_default` reproduces that by pre-checking the
+/// same rows, so Enter with nothing toggled still submits them.
+fn choose_many_tty(prompt: &str, rows: &[String], default: &[usize]) -> Option<Vec<usize>> {
     if rows.is_empty() {
         return None;
     }
-    let default = default.filter(|&d| d < rows.len());
-    let default_indices = default.map(|d| vec![d]);
+    let default: Vec<usize> = default.iter().copied().filter(|&d| d < rows.len()).collect();
     let mut multi = MultiSelect::new(prompt, rows.to_vec());
-    if let Some(ref d) = default_indices {
-        multi = multi.with_default(d);
+    if !default.is_empty() {
+        multi = multi.with_default(&default);
     }
     match multi.raw_prompt_skippable() {
         Ok(Some(picked)) => Some(picked.into_iter().map(|lo| lo.index).collect()),
@@ -417,7 +423,7 @@ mod tests {
 
     #[test]
     fn render_rows_numbers_from_one_and_marks_the_default() {
-        let out = render_rows(&rows3(), Some(1));
+        let out = render_rows(&rows3(), &[1]);
         assert_eq!(
             out,
             "  1) 0004  drift\n  2) 0002  stage [A] (default)\n  3) 0001  explicit\n"
@@ -425,17 +431,29 @@ mod tests {
     }
 
     #[test]
-    fn render_rows_marks_nothing_when_default_is_none_or_out_of_range() {
-        assert_eq!(render_rows(&rows3(), None), "  1) 0004  drift\n  2) 0002  stage [A]\n  3) 0001  explicit\n");
+    fn render_rows_marks_every_row_in_a_multi_default_set() {
+        // Onboard's harness picker (ONBOARD.md decision 7) preselects every
+        // harness found on PATH at once -- the whole reason this widened
+        // from one index to a slice.
+        let out = render_rows(&rows3(), &[0, 2]);
         assert_eq!(
-            render_rows(&rows3(), Some(99)),
+            out,
+            "  1) 0004  drift (default)\n  2) 0002  stage [A]\n  3) 0001  explicit (default)\n"
+        );
+    }
+
+    #[test]
+    fn render_rows_marks_nothing_when_default_is_empty_or_out_of_range() {
+        assert_eq!(render_rows(&rows3(), &[]), "  1) 0004  drift\n  2) 0002  stage [A]\n  3) 0001  explicit\n");
+        assert_eq!(
+            render_rows(&rows3(), &[99]),
             "  1) 0004  drift\n  2) 0002  stage [A]\n  3) 0001  explicit\n"
         );
     }
 
     #[test]
     fn render_rows_is_empty_for_an_empty_list() {
-        assert_eq!(render_rows(&[], None), "");
+        assert_eq!(render_rows(&[], &[]), "");
     }
 
     // ── parse_index: boundaries, correct by inspection, now pinned ──────
@@ -530,28 +548,39 @@ mod tests {
     #[test]
     fn choose_many_parses_a_comma_and_space_separated_list() {
         let mut input = io::Cursor::new(b"1, 3\n".to_vec());
-        let picked = choose_many_reading(&mut input, "prune which takes?", &rows3(), None);
+        let picked = choose_many_reading(&mut input, "prune which takes?", &rows3(), &[]);
         assert_eq!(picked, Some(vec![0, 2]));
     }
 
     #[test]
     fn choose_many_empty_input_selects_the_default_as_a_single_element() {
         let mut input = io::Cursor::new(b"\n".to_vec());
-        let picked = choose_many_reading(&mut input, "prune which takes?", &rows3(), Some(2));
+        let picked = choose_many_reading(&mut input, "prune which takes?", &rows3(), &[2]);
         assert_eq!(picked, Some(vec![2]));
+    }
+
+    #[test]
+    fn choose_many_empty_input_selects_every_default_when_several_are_set() {
+        // Onboard's harness picker (ONBOARD.md decision 7): several
+        // harnesses can sit on PATH at once, and Enter should wire all of
+        // them, not just one -- the case that forced `default` to widen
+        // from `Option<usize>` to `&[usize]`.
+        let mut input = io::Cursor::new(b"\n".to_vec());
+        let picked = choose_many_reading(&mut input, "which harnesses?", &rows3(), &[0, 2]);
+        assert_eq!(picked, Some(vec![0, 2]));
     }
 
     #[test]
     fn choose_many_q_aborts() {
         let mut input = io::Cursor::new(b"q\n".to_vec());
-        let picked = choose_many_reading(&mut input, "prune which takes?", &rows3(), None);
+        let picked = choose_many_reading(&mut input, "prune which takes?", &rows3(), &[]);
         assert_eq!(picked, None);
     }
 
     #[test]
     fn choose_many_one_bad_token_invalidates_the_whole_line_then_reprompts_once() {
         let mut input = io::Cursor::new(b"1,nope\n2\n".to_vec());
-        let picked = choose_many_reading(&mut input, "prune which takes?", &rows3(), None);
+        let picked = choose_many_reading(&mut input, "prune which takes?", &rows3(), &[]);
         assert_eq!(picked, Some(vec![1]), "the retry line is read fresh, not merged with the bad one");
     }
 

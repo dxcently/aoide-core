@@ -96,16 +96,3 @@ pub fn register_update(r: &mut Registry) {
         handler: unimplemented,
     ));
 }
-
-/// `onboard` — first-boot flow.
-pub fn register_onboard(r: &mut Registry) {
-    r.insert(cmd!(
-        path: ["onboard"],
-        summary: "First-boot flow: register the clone, seed songbook, print the guide.",
-        args: [],
-        flags: [],
-        gated: false,
-        implemented: false,
-        handler: unimplemented,
-    ));
-}

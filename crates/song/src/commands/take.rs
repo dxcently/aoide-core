@@ -1206,7 +1206,7 @@ fn prune_picker(song: &str, draft: &str, plan: &PrunePlan) -> Outcome {
     let marks = takes::load_marks(song, draft);
     let rows: Vec<String> = plan.candidates.iter().map(|t| prune_row(t, &marks)).collect();
     let prompt = format!("prune which take(s) for {song}/{draft}?");
-    match pick::choose_many(&prompt, &rows, None) {
+    match pick::choose_many(&prompt, &rows, &[]) {
         Some(indices) => {
             let doomed: Vec<u32> = indices.iter().filter_map(|&i| plan.candidates.get(i)).map(|t| t.take).collect();
             match prune(song, draft, &doomed) {

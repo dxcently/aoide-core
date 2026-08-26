@@ -18,11 +18,15 @@ correspondence").
   `guide`/`schema` raw output).
 - `registry` — the golden command-path snapshot test (80 paths).
 - `guide` — `aoide guide`, the onboarding tier map.
-- `commands` — the three root-coupled groups that must read the ASSEMBLED
+- `commands` — the root-coupled groups that must read the ASSEMBLED
   registry: `meta` (guide/schema), `stubs` (not-yet-implemented
-  placeholders), `infra` (`mcp serve`'s tool-count reporting). Every other
-  command group lives in its domain crate and is pulled in here by
-  `commands::all()`.
+  placeholders), `onboard` (`aoide onboard`, P-I2 — the first-boot flow:
+  registers the clone, seeds the songbook, wires harness hooks by calling
+  the already-registered `hooks.install` handler directly off the registry,
+  probes for `lyra` and delegates the nix half to `lyra onboard` as a child
+  process when it resolves, prints the closing guide), `infra` (`mcp
+  serve`'s tool-count reporting). Every other command group lives in its
+  domain crate and is pulled in here by `commands::all()`.
 - `a2a`/`mcp`/`daemon`/`graph`/`output` — thin root-level wiring over the
   matching domain crate for the two binaries' entry points.
 
