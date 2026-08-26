@@ -291,7 +291,7 @@ pub fn run_cli(argv: &[String]) -> i32 {
 
         // `guide` in text mode prints the full onboarding rather than a summary.
         if inv.path == ["guide"] && !json {
-            print!("{}", guide::GUIDE);
+            print!("{}", guide::render(dispatch::registry()));
             return Some(output::exit::OK);
         }
 

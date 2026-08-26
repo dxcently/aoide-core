@@ -3,7 +3,6 @@
 //! own assembled registry rather than core's.
 
 use crate::dispatch::Invocation;
-use crate::guide::GUIDE;
 use crate::output::Outcome;
 use crate::registry::{cmd, Registry};
 use serde_json::{json, Value};
@@ -30,7 +29,8 @@ pub fn register(r: &mut Registry) {
 }
 
 fn handle_guide(_inv: &Invocation) -> Outcome {
-    Outcome::ok("guide", "printed lyra's tier-0 onboarding").with_data(json!({ "text": GUIDE }))
+    let text = crate::guide::render(crate::dispatch::registry());
+    Outcome::ok("guide", "printed lyra's tier-0 onboarding").with_data(json!({ "text": text }))
 }
 
 fn handle_schema(_inv: &Invocation) -> Outcome {
