@@ -313,6 +313,70 @@ mod tests {
         assert!(!msg.contains("multicast-capable"), "{msg}");
     }
 
+    /// Real UDP multicast round trip, probe-gated exactly like `multicast_
+    /// capable`'s other callers (`commands::tests::peer_discover_*`) — skips
+    /// cleanly in the nix build sandbox (ENODEV on the join) but RUNS by
+    /// default in a dev shell or on a real box, unlike `crates/cli/tests/
+    /// discovery_connectivity.rs`'s heavier `#[ignore]`'d round trip, which
+    /// needs an explicit `--ignored` flag nobody passes in routine use.
+    ///
+    /// This is the shape of test that would have caught task #98: a sender
+    /// that mirrors `aoide-server::discovery::send_once` exactly (a fresh
+    /// ephemeral socket, `UdpSocket::bind(("0.0.0.0", 0))`, no interface
+    /// pinning — the real production send path, not a loopback shortcut)
+    /// racing against this crate's own `run_sweep` on the SAME real network
+    /// stack. Loopback-only round trips (this file's other tests, and the
+    /// P-P6 test plan's original "beacon round-trip on loopback multicast"
+    /// note) can never catch a host firewall dropping inbound UDP on a
+    /// physical interface, because loopback traffic never reaches a
+    /// per-interface firewall rule at all — see `docs/architecture/
+    /// PAIRING.md`'s "Discovery" section for the diagnosis this test now
+    /// stands guard for.
+    #[test]
+    fn run_sweep_hears_a_beacon_sent_over_the_real_network_stack() {
+        if !multicast_capable() {
+            eprintln!(
+                "skipping run_sweep_hears_a_beacon_sent_over_the_real_network_stack: no \
+                 multicast-capable interface in this network namespace (the nix build sandbox)"
+            );
+            return;
+        }
+
+        let sent = beacon::build("test-sender", "aa:bb:cc:dd:ee:ff:00:11", "http://test-sender:8710/");
+        let line = beacon::encode(&sent).expect("a well-formed test beacon always encodes");
+
+        // A background sender racing `run_sweep`'s listen window below —
+        // resent on a short tick since we don't know exactly when the sweep
+        // starts listening, mirroring `send_once`'s own fresh-socket-per-send
+        // shape rather than holding one open.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sender_stop = stop.clone();
+        let sender = std::thread::spawn(move || {
+            while !sender_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(socket) = UdpSocket::bind(("0.0.0.0", 0)) {
+                    let _ = socket.send_to(line.as_bytes(), (beacon::GROUP, beacon::PORT));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        let result = run_sweep(3).expect("a network namespace that just passed multicast_capable must not fail to bind/join");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        sender.join().expect("sender thread must not panic");
+
+        assert_eq!(result.dropped, 0, "every sent line is well-formed and must validate: {result:?}");
+        assert!(
+            result.heard.iter().any(|h| h.beacon == sent),
+            "expected to hear the beacon actually sent over the real network stack in this \
+             sweep window; got {:?} — on a real box (not the nix build sandbox) this means the \
+             beacon never made it from sender to listener. Check the host firewall for inbound \
+             UDP {} before suspecting the socket code (docs/architecture/PAIRING.md's \
+             \"Discovery\" section covers the diagnosis)",
+            result.heard,
+            beacon::PORT
+        );
+    }
+
     #[test]
     fn resolve_invite_target_ambiguous_when_two_fingerprints_share_a_name() {
         let heard = vec![
