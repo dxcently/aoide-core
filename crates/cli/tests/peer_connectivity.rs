@@ -367,6 +367,48 @@ fn peer_remove_rejects_a_path_traversal_name_before_touching_the_cache_file() {
     std::env::remove_var("AOIDE_AUDIT_LOG");
 }
 
+/// `peer rm <name>` is a PARSER-LEVEL alias for `peer remove <name>`
+/// (`aoide_protocol::door::ALIASES`) — never a second registered command.
+/// Proves the alias end to end against the REAL registry: `door::parse`
+/// resolves `peer rm ghost` to the canonical `peer.remove` path and hands it
+/// the same `ghost` arg, dispatch actually runs `handle_peer_remove` (its
+/// `unknown-peer` refusal is the tell — a parser bug that left `rm`
+/// unresolved would fail as `unknown command`, not reach this handler at
+/// all), and `schema --json` never grows a second `peer.rm` entry — the
+/// alias is invisible to the schema, the golden snapshot, and every other
+/// consumer of the registry.
+#[test]
+fn peer_rm_is_a_parser_alias_for_peer_remove_and_never_a_second_schema_entry() {
+    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let root = unique_root("rm-alias");
+    let _stage = setup_env(&root);
+
+    let (inv, _json) = aoide_protocol::door::parse(
+        &["peer".to_string(), "rm".to_string(), "ghost".to_string()],
+        Door::Cli,
+        "aoide",
+        registry(),
+    )
+    .expect("`peer rm ghost` must parse — the alias resolves to a real command path");
+    assert_eq!(inv.path, vec!["peer", "remove"], "resolves to the CANONICAL path, never its own `peer.rm` path");
+    assert_eq!(inv.args, vec!["ghost"]);
+
+    let out = dispatch(&inv);
+    assert_eq!(out.command, "peer.remove", "dispatch actually ran the `peer remove` handler");
+    assert_eq!(out.status, Status::Error);
+    assert_eq!(out.data.unwrap()["reason"], "unknown-peer");
+
+    let dotted: Vec<String> = registry().commands().map(|c| c.dotted()).collect();
+    assert!(dotted.iter().any(|p| p == "peer.remove"), "peer.remove must still be registered");
+    assert!(!dotted.iter().any(|p| p == "peer.rm"), "the alias must never become a second schema entry");
+
+    let _ = std::fs::remove_dir_all(&root);
+    std::env::remove_var("AOIDE_STAGE_DIR");
+    std::env::remove_var("AOIDE_STATE_DIR");
+    std::env::remove_var("XDG_RUNTIME_DIR");
+    std::env::remove_var("AOIDE_AUDIT_LOG");
+}
+
 // ── The pairing ceremony's CLI half (P-P2) ───────────────────────────────
 
 #[test]

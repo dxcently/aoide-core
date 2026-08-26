@@ -32,7 +32,11 @@ other crate in this workspace sits above.
 - `door` — the hand-rolled parse → dispatch → render run loop (`run`),
   parameterized by a `special` hook so each binary's one-shot exceptions
   (`mcp serve --stdio`, `a2a serve`, `conductor`, `guide`/`schema` raw
-  output) don't fork the loop itself.
+  output) don't fork the loop itself. `parse` also resolves CLI-only
+  ergonomic shorthands (`ALIASES`, e.g. `peer rm` for `peer remove`) to
+  their canonical path before the greedy match runs, so a shorthand is
+  never a second registered command — the registry, `schema --json`, and
+  every golden snapshot see only the canonical spelling.
 - `feed` — the append-only JSON-lines feed primitive: `FeedWriter` (append
   one JSON object per line, capped and truncated-in-place rather than
   rotated) and `Follower` (tail one file from EOF, delta-reads only,

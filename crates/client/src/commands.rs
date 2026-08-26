@@ -264,17 +264,30 @@ fn post_json(url: &str, body: &str, bearer: Option<&str>, extra_headers: &[(Stri
 /// guess) — with THIS instance's own identity
 /// (`aoide_storage::identity::load_or_mint()`) — never the peer's.
 ///
-/// `X-Aoide-Peer` carries `peer.name` — THIS instance's own LOCAL registry
-/// name for `peer`, not a separate self-identity string. The pairing
-/// ceremony (P-P2, `handle_peer_pair_request`) mints exactly ONE name per
-/// pairing relationship and threads it through three places identically:
-/// the wire `pairRequest.name` param, this instance's own `park_outbound`
-/// record, and (via `upsert_paired_peer` on the far end) the far end's
-/// registry entry naming THIS instance — so, on either side of an already-
-/// completed pairing, the local `Peer.name` for the counterpart is always
-/// the exact string the counterpart's own registry resolves back to THIS
-/// instance. There is no separate "self-name" field anywhere in
-/// `peer_store::Peer` to invent one for.
+/// `X-Aoide-Peer` carries THIS instance's own SELF name
+/// (`aoide_storage::display::local_host_name()`) — never `peer.name`, which
+/// is only this side's local nickname for the counterpart and carries no
+/// meaning to the far end. Each instance identifies itself by its own self
+/// name on every wire call that claims an identity: the pairing ceremony's
+/// `pairRequest.name` (`run_pair_request`, same `local_host_name()` chain
+/// the discovery beacon and `graphSummary` also use) and this header both
+/// say "this is who I am," so both must carry the same value. The far end
+/// registers and resolves the caller BY THAT SELF NAME
+/// (`aoide-server::a2a::verify_signed_request` looks up
+/// `peers.iter().find(|p| p.name == peer_name)` against the name it recorded
+/// at pairing time) — `--name`/`peer.name` stay purely a local label this
+/// instance uses to refer to the counterpart, never an identity claim that
+/// crosses the wire. (Sending `peer.name` here was the live yomi↔sakaki
+/// ceremony's second defect, 2026-08-26: e78999f fixed the pairing wire name
+/// but left this header sending the old local-nickname value, so the far
+/// end's lookup failed with "unknown peer" for every signed request after a
+/// successful pair.)
+///
+/// Known limitation (task #63): because the far end resolves the caller BY
+/// NAME, renaming a peer locally on the far end breaks inbound signed
+/// requests from it — the name has to still match what was recorded at pair
+/// time. Resolving identity by public key instead (the signature already
+/// proves the key) is the durable fix and belongs to task #63, not here.
 ///
 /// Returns `Err` only on a genuine identity-load failure (a corrupt or
 /// unwritable `state/identity/` — the same failure shape
@@ -296,7 +309,7 @@ fn sign_headers_for_peer(peer: &aoide_storage::peer_store::Peer, body: &str) -> 
     let canonical = aoide_storage::wire_auth::canonical_string(HTTP_METHOD, &path, &timestamp, &nonce, body.as_bytes());
     let signature = aoide_storage::wire_auth::sign_hex(&keypair, canonical.as_bytes());
     Ok(vec![
-        (aoide_storage::wire_auth::HEADER_PEER.to_string(), peer.name.clone()),
+        (aoide_storage::wire_auth::HEADER_PEER.to_string(), aoide_storage::display::local_host_name()),
         (aoide_storage::wire_auth::HEADER_TIMESTAMP.to_string(), timestamp),
         (aoide_storage::wire_auth::HEADER_NONCE.to_string(), nonce),
         (aoide_storage::wire_auth::HEADER_SIGNATURE.to_string(), signature),
@@ -2188,7 +2201,7 @@ mod tests {
                     .map(|(_, v)| v.clone())
                     .unwrap_or_else(|| panic!("missing header {name}: {headers:?}"))
             };
-            assert_eq!(get(aoide_storage::wire_auth::HEADER_PEER), peer.name);
+            assert_eq!(get(aoide_storage::wire_auth::HEADER_PEER), aoide_storage::display::local_host_name());
             let timestamp = get(aoide_storage::wire_auth::HEADER_TIMESTAMP);
             let nonce = get(aoide_storage::wire_auth::HEADER_NONCE);
             let signature = get(aoide_storage::wire_auth::HEADER_SIGNATURE);
@@ -2213,6 +2226,34 @@ mod tests {
             // structurally present.
             let tampered = aoide_storage::wire_auth::canonical_string(HTTP_METHOD, &path, &timestamp, &nonce, b"{\"tampered\":true}");
             assert!(!aoide_storage::wire_auth::verify_signature_hex(&info.pubkey_hex, tampered.as_bytes(), &signature));
+        });
+    }
+
+    #[test]
+    fn sign_headers_for_peer_sends_this_instances_own_self_name_not_the_peer_nickname() {
+        // Live yomi<->sakaki defect, 2026-08-26: e78999f fixed the pairing
+        // wire name (`run_pair_request`) but left THIS header sending
+        // `peer.name` — this instance's local nickname for the counterpart
+        // — instead of its own self name, so the far end's
+        // `verify_signed_request` lookup (`peers.iter().find(|p| p.name ==
+        // peer_name)`) failed with "unknown peer" for every signed request
+        // after an otherwise-successful pair. `fixture_peer`'s name
+        // ("yomi-strix") deliberately stands in for "this side's nickname
+        // for the counterpart," distinct from whatever this test process's
+        // own `local_host_name()` resolves to, so a regression back to
+        // `peer.name.clone()` fails this assertion.
+        with_peer_state("sign-self-name", || {
+            let mut peer = fixture_peer(None);
+            peer.name = "this-sides-nickname-for-the-approver".to_string();
+            peer.verified = true;
+            let headers = sign_headers_for_peer(&peer, "{}").unwrap();
+            let sent = headers
+                .iter()
+                .find(|(k, _)| k == aoide_storage::wire_auth::HEADER_PEER)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("missing {}: {headers:?}", aoide_storage::wire_auth::HEADER_PEER));
+            assert_eq!(sent, aoide_storage::display::local_host_name(), "must carry this instance's own self name");
+            assert_ne!(sent, peer.name, "must never carry the local nickname for the counterpart");
         });
     }
 

@@ -25,6 +25,24 @@ use crate::output::{exit, Outcome};
 use crate::registry::{Command, Registry};
 use std::collections::BTreeMap;
 
+/// CLI-only ergonomic shorthands for a canonical command path, resolved HERE
+/// — before the greedy path match below — so a shorthand never becomes a
+/// second registered command: the registry, `schema --json`, and every
+/// golden snapshot see only the canonical path. Add a row here for a new
+/// shorthand, never a second `register()` call for the same command.
+const ALIASES: &[(&[&str], &[&str])] = &[(&["peer", "rm"], &["peer", "remove"])];
+
+/// Rewrite a leading alias prefix of `positionals` to its canonical form, in
+/// place. A no-op when no alias prefix matches (the common case).
+fn resolve_aliases(positionals: &mut Vec<String>) {
+    for (from, to) in ALIASES {
+        if positionals.len() >= from.len() && positionals.iter().zip(*from).all(|(p, f)| p == f) {
+            positionals.splice(0..from.len(), to.iter().map(|s| s.to_string()));
+            return;
+        }
+    }
+}
+
 /// All known command paths (from the registry), longest-first for greedy match.
 fn known_paths(registry: &Registry) -> Vec<Vec<String>> {
     let mut paths: Vec<Vec<String>> = registry
@@ -115,6 +133,8 @@ pub fn parse(argv: &[String], door: Door, bin_name: &str, registry: &Registry) -
             Err(usage_root(registry, bin_name))
         };
     }
+
+    resolve_aliases(&mut positionals);
 
     // Greedy longest-prefix match of positionals against known command paths.
     let paths = known_paths(registry);
@@ -606,6 +626,18 @@ mod tests {
             handler: noop,
             available: || true,
         });
+        r.insert(Command {
+            path: &["peer", "remove"],
+            summary: "Deregister a peer.",
+            args: &[Arg { name: "name", ty: "string", required: true, description: "Peer name." }],
+            flags: &[JSON_FLAG],
+            gated: false,
+            implemented: true,
+            exit_codes: (),
+            examples: &[],
+            handler: noop,
+            available: || true,
+        });
         r
     }
 
@@ -666,6 +698,22 @@ mod tests {
         let (inv, _) = parse(&argv(&["graph", "session", "start", "--id", "start"]), Door::Cli, "aoide", &reg).unwrap();
         assert_eq!(inv.path, vec!["graph", "session", "start"]);
         assert_eq!(inv.flags.get("id").map(String::as_str), Some("start"));
+    }
+
+    /// `peer rm <name>` is an ergonomic alias for `peer remove <name>`,
+    /// resolved at the parser level (`ALIASES`/`resolve_aliases`) — the
+    /// invocation it produces must be byte-identical to typing the canonical
+    /// path out, and the trailing arg (the peer name) must survive the
+    /// rewrite untouched.
+    #[test]
+    fn peer_rm_is_a_parser_level_alias_for_peer_remove() {
+        let reg = test_registry();
+        let (aliased, _) = parse(&argv(&["peer", "rm", "alice"]), Door::Cli, "aoide", &reg).unwrap();
+        let (canonical, _) = parse(&argv(&["peer", "remove", "alice"]), Door::Cli, "aoide", &reg).unwrap();
+        assert_eq!(aliased.path, vec!["peer", "remove"], "the alias resolves to the CANONICAL path, never a `peer.rm` path of its own");
+        assert_eq!(aliased.path, canonical.path);
+        assert_eq!(aliased.args, canonical.args);
+        assert_eq!(aliased.args, vec!["alice"]);
     }
 
     #[test]
