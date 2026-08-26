@@ -68,6 +68,7 @@ pub fn all() -> Registry {
     aoide_server::commands::register_events(&mut r); // events tail — aoided's own feed follow command (P-D3, appended newest)
     aoide_storage::commands::register_identity(&mut r); // identity — this instance's ed25519 identity show command (pairing workstream P-P1, appended newest)
     aoide_client::commands::register_peer_pair(&mut r); // peer pair request/pending/approve/reject — the pairing ceremony's CLI half (P-P2, appended newest)
+    aoide_client::commands::register_peer_discovery(&mut r); // peer discover/invite — the LAN discovery beacon's CLI half (P-P6, appended newest)
 
     r
 }

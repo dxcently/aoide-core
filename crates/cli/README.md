@@ -16,7 +16,7 @@ correspondence").
   hook (`mcp serve --stdio`, `a2a serve`, `secrets serve`, `secrets exec`,
   `secrets enroll`, `secrets watch`, `events tail`, `conductor`,
   `guide`/`schema` raw output).
-- `registry` — the golden command-path snapshot test (78 paths).
+- `registry` — the golden command-path snapshot test (80 paths).
 - `guide` — `aoide guide`, the onboarding tier map.
 - `commands` — the three root-coupled groups that must read the ASSEMBLED
   registry: `meta` (guide/schema), `stubs` (not-yet-implemented
@@ -35,14 +35,16 @@ depends on it.
 
 ## How it composes
 
-78 command paths (core's headless-capable, agent-orchestration surface: the
+80 command paths (core's headless-capable, agent-orchestration surface: the
 project/session graph (including `graph resurrect`, P-D8's ledger-backed
 session revival), A2A, peers (including the `peer hub` designation,
 P-D5, the `peer pair request|pending|approve|reject` pairing ceremony,
 P-P2, the `peer allow <name> <cap> on|off` closed-capability grant/
-revoke command backing the A2A spawn arm's hard gate, P-P3, and `peer spawn
+revoke command backing the A2A spawn arm's hard gate, P-P3, `peer spawn
 <name> -- <text…>`, P-P5b, the signed spawn-shaped `message/send` that
-actually reaches that gate), presence, the
+actually reaches that gate, and `peer discover [--secs N]`/`peer invite
+<name> [--secs N] [--yes]`, P-P6, the LAN discovery beacon's read-only
+sweep and its sugar-over-the-ceremony invite), presence, the
 daemon, its own event bus (`events tail`), usage, hooks, the message
 inbox, the secrets broker, this instance's own `identity` (P-P1 of the
 pairing workstream, `docs/architecture/PAIRING.md`)).

@@ -14,10 +14,21 @@
 //! daemon_dispatch` is the connect-or-`None` client every session-write
 //! handler in `aoide-conduct` tries first, over the resident `aoided`'s
 //! own control socket.
+//!
+//! `discover` (P-P6, `docs/architecture/PAIRING.md`'s "Discovery
+//! (advertise-but-locked)" section) is the discovery beacon's LISTEN half —
+//! `peer discover`/`peer invite`'s shared multicast sweep, dedupe-by-
+//! fingerprint fold, and (for `peer invite`) the pure heard-set resolution
+//! its ambiguous/absent-name refusal is built on. The SEND half
+//! (`a2a serve`'s own advertise thread) lives in `aoide-server::discovery`
+//! instead — this crate is outbound-only, and joining a multicast group to
+//! LISTEN is the client-side action here, mirroring every other `peer *`
+//! command's shape.
 
 pub mod adapter;
 pub mod commands;
 pub mod daemon;
+pub mod discover;
 pub mod peer;
 pub mod wire;
 

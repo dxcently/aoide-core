@@ -252,6 +252,28 @@
   before both the streaming and the plain-JSON-RPC dispatch branches —
   don't duplicate that call inside `route`/`stream_task`/`handle_jsonrpc`;
   they only ever receive the already-computed `signed_peer_name`.
+- **`a2a::self_url(bind, port)` is the ONE formula the AgentCard's `url`
+  field, `route`'s own `aoide/graphSummary` handling, and the discovery
+  beacon's `url` field all call — never a second inline
+  `format!("http://{bind}:{port}/")` (P-P6).** Before this phase the first
+  two independently carried the same literal that merely happened to
+  agree (the exact shape the `HTTP_METHOD` precedent already warns
+  against, `client/AGENTS.md`); a third call site (the beacon) made
+  copying it again the wrong move. A future change to how the advertised
+  door URL is derived (a public-hostname override, a reverse-proxy
+  prefix, …) touches this one function and every caller inherits it.
+- **`discovery::spawn_advertiser` is called from EXACTLY one place —
+  `a2a::serve`, gated on `resolve_discovery_advertise`, before the accept
+  loop starts (P-P6).** It is never called from `handle_connection`, a
+  per-request path, or anywhere else — one thread per `a2a serve`
+  process, for that process's whole lifetime, mirroring how `--bind`/
+  `--port` are resolved once at launch and held unchanged. Don't gate a
+  SECOND call site on the same env/flag "for redundancy"; a duplicate
+  advertiser thread would just double the beacon rate for no benefit and
+  complicate the "off means no thread at all" proof
+  (`resolve_discovery_advertise`'s own pure tests are what make that
+  provable without a real socket — see that function's test module
+  comment).
 
 ## Extension points
 

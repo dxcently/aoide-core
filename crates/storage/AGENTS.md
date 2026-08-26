@@ -143,6 +143,20 @@
   transient mismatch is recoverable without restarting the whole
   ceremony, and "untouched" is simpler to reason about than "re-parked
   with the same content."
+- **`beacon` never writes `peer_store`, and never will (P-P6).** It reaches
+  into `peer_store` for exactly one READ (`valid_peer_name`, so the
+  beacon's `name` shares the same nickname shape check every other
+  peer-name field on the wire already holds to) — don't add a write path
+  here "for convenience": discovery grants nothing is the whole point of
+  the feature (`docs/architecture/PAIRING.md`'s "Discovery
+  (advertise-but-locked)" section), and a write site in the ONE module
+  every hearer's validation funnels through would be exactly the kind of
+  quiet erosion that invariant depends on never happening. `GROUP`/`PORT`/
+  `MAX_LINE_BYTES`/the `v` version constant are the wire contract, pinned
+  by CONTRACTS.md §6's "Discovery beacon" subsection — a change to any of
+  them needs a matching CONTRACTS update in the same commit, the same
+  discipline `wire_auth`'s canonical string and `pairing::derive_sas`
+  already hold above.
 
 ## Extension points
 

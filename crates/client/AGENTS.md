@@ -112,6 +112,33 @@
   `OutboundState` aborts cleanly on reject; this is the ceremony's only
   abort command, so collapsing this back to inbound-only would leave a
   requester with no way to cancel a pairing it no longer wants.
+- **`run_pair_request` (P-P6) is the ONLY body of `handle_peer_pair_request`
+  past its own `<url>`/`--name`/`--self-url` parsing, and `handle_peer_invite`
+  calls the SAME function — never a second copy.** `peer invite`'s own doc
+  and CONTRACTS.md §6's "Discovery beacon" subsection both promise `peer
+  invite` "runs the ceremony," and this is what makes that literally true
+  rather than aspirational: a future change to the ceremony's wire calls,
+  its outbound-parking shape, or its SAS derivation touches ONE function
+  and both callers inherit it identically. `run_pair_request` does NOT
+  re-validate its `name` argument (`valid_peer_name`) — that check stays in
+  `handle_peer_pair_request` alone, since only a CLI-typed `--name` needs
+  it; `handle_peer_invite`'s `name` already came off a beacon
+  `aoide_storage::beacon::parse_and_validate` validated before it was ever
+  displayed. Don't move the `valid_peer_name` check INTO `run_pair_request`
+  "for symmetry" — it would just re-run a check that has already passed on
+  the invite path, for no benefit, and would misattribute a `peer.invite`
+  usage error to a check that only ever fires for the OTHER caller in
+  practice.
+- **`discover`'s `run_sweep`/`resolve_invite_target` never touch
+  `peer_store` for writing, and `handle_peer_discover`/`handle_peer_invite`
+  must not either (P-P6).** Discovery grants nothing
+  (`docs/architecture/PAIRING.md`'s "Discovery (advertise-but-locked)"
+  section) — the only peer-record write path in this crate is, and stays,
+  `run_pair_request`'s `park_outbound` plus `handle_peer_pair_approve`'s
+  `upsert_paired_peer` calls. A future `peer discover`/`peer invite` edit
+  that seems to want a registry write (e.g. "remember what was last
+  discovered") belongs in a NEW, explicitly-named cache, never folded into
+  `state/peers.json` itself.
 
 ## Extension points
 

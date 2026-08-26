@@ -224,6 +224,23 @@ the inbound half of the two-door contract (the outbound half is
   only (an immediately-delivered payload's bytes stay untouched, so an
   already-autogated peer's delivery is byte-identical to before this
   phase).
+- `discovery` — the discovery beacon's ADVERTISE half (P-P6,
+  `docs/architecture/PAIRING.md`'s "Discovery (advertise-but-locked)"
+  section, CONTRACTS.md §6's "Discovery beacon" subsection). `a2a::serve`
+  calls `spawn_advertiser` exactly once, at launch, ONLY when
+  `a2a::resolve_discovery_advertise` (`--discovery-advertise`/
+  `AOIDE_DISCOVERY_ADVERTISE`, mirroring `resolve_bind_port`'s own
+  precedence) says on — off by default, no thread, no socket, no identity
+  file touched at all otherwise. Each tick (~30s, jittered) binds a fresh
+  ephemeral UDP socket, sends one `aoide_storage::beacon` line to the
+  fixed multicast group+port, and drops the socket — fire-and-forget, no
+  connection state held between ticks. Fallible spawn
+  (`thread::Builder::spawn`, `daemon.rs`'s discipline, not `a2a.rs`'s own
+  plain `thread::spawn` for connection handlers — that one is reserved for
+  a NEW socket-based door, not a background worker thread) — a refused OS
+  thread costs discovery only, never the door. The RECEIVE half
+  (`peer discover`/`peer invite`'s multicast sweep) lives in
+  `aoide-client::discover` instead; this crate stays inbound/serve-only.
 - `commands` — this crate's CLI commands: `daemon`, `shellbridge` (registration
   only — the files stay in `conduct`), `a2a serve`, `events tail` (P-D3,
   appended newest — CLI-only, the same door-policy shape `a2a serve`/

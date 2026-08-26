@@ -1358,6 +1358,24 @@ fn handle_peer_pair_request(inv: &Invocation) -> Outcome {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(default_self_url);
 
+    run_pair_request(cmd, &url, &name, &self_url)
+}
+
+/// The requester's half of the ceremony, shared verbatim by
+/// `handle_peer_pair_request` (a CLI-typed `<url>`/`--name`, validated
+/// above) AND `handle_peer_invite` (P-P6 — a `url`/`name` already lifted
+/// straight off an already-validated, already-confirmed discovery beacon,
+/// so it needs no SECOND `valid_peer_name` check here). Extracted so
+/// `peer invite` reaches the SAME ceremony code `peer pair request` does —
+/// never a copy (PAIRING.md: "sugar over the ceremony, nothing more").
+/// Everything from here down is unchanged from the pre-P-P6 shape of
+/// `handle_peer_pair_request`: mint-or-load this instance's identity, mint
+/// a fresh nonce, POST `aoide/pairRequest` carrying a COMMITMENT to that
+/// nonce (never the nonce itself), then immediately POST `aoide/pairReveal`
+/// with the nonce the commitment already fixed; only once both calls
+/// succeed does this instance derive its own SAS and remember the outbound
+/// request.
+fn run_pair_request(cmd: &str, url: &str, name: &str, self_url: &str) -> Outcome {
     let (kp, _) = match aoide_storage::identity::load_or_mint() {
         Ok(v) => v,
         Err(e) => {
@@ -1422,8 +1440,8 @@ fn handle_peer_pair_request(inv: &Invocation) -> Outcome {
     let requested_at = aoide_storage::time::now_iso_utc();
     let outbound = aoide_storage::pairing::OutboundPairingRequest {
         id: ack.id.clone(),
-        url: url.clone(),
-        name: name.clone(),
+        url: url.to_string(),
+        name: name.to_string(),
         pubkey_hex: ack.pubkey_hex.clone(),
         requester_nonce_hex: own_nonce,
         approver_nonce_hex: ack.nonce_hex.clone(),
@@ -1755,6 +1773,173 @@ fn handle_peer_pair_reject(inv: &Invocation) -> Outcome {
     }
 }
 
+/// `peer discover [--secs N] [--json]` (P-P6, `docs/architecture/
+/// PAIRING.md`'s "Discovery (advertise-but-locked)" section): joins the
+/// fixed multicast group, listens `--secs` seconds (default
+/// `discover::DEFAULT_SWEEP_SECS`, ~4), and prints every DISTINCT
+/// fingerprint heard — name, fingerprint, url, first/last heard, and how
+/// many times (`discover::run_sweep`'s own dedupe-by-fingerprint fold).
+/// **Read-only** — this command never writes `state/peers.json`; the
+/// pairing ceremony is the only thing that ever registers a peer.
+/// Malformed beacons are dropped and counted, never echoed raw (house
+/// rule 4) — `dropped` in the JSON data is a bare total, nothing more
+/// specific about what was wrong with any one of them.
+fn handle_peer_discover(inv: &Invocation) -> Outcome {
+    let cmd = "peer.discover";
+    let secs = match parse_secs_flag(inv) {
+        Ok(n) => n,
+        Err(()) => {
+            return Outcome::usage(
+                cmd,
+                "usage: aoide peer discover [--secs N] [--json] — --secs must be a positive integer",
+            )
+        }
+    };
+
+    let swept = match crate::discover::run_sweep(secs) {
+        Ok(s) => s,
+        Err(e) => {
+            return Outcome::error(cmd, format!("listening for discovery beacons: {e}"))
+                .with_data(json!({ "reason": "sweep-failed" }))
+        }
+    };
+
+    let heard: Vec<Value> = swept
+        .heard
+        .iter()
+        .map(|h| {
+            json!({
+                "name": h.beacon.name,
+                "fpr": h.beacon.fpr,
+                "url": h.beacon.url,
+                "firstHeard": h.first_heard,
+                "lastHeard": h.last_heard,
+                "count": h.count,
+            })
+        })
+        .collect();
+
+    let message = if swept.heard.is_empty() {
+        format!("heard no discovery beacons in {secs}s ({} malformed dropped)", swept.dropped)
+    } else {
+        format!(
+            "heard {} distinct instance{} in {secs}s ({} malformed dropped)",
+            swept.heard.len(),
+            if swept.heard.len() == 1 { "" } else { "s" },
+            swept.dropped
+        )
+    };
+    Outcome::ok(cmd, message).with_data(json!({ "heard": heard, "dropped": swept.dropped, "secs": secs }))
+}
+
+/// `--secs`'s shared parse for `peer discover`/`peer invite`: absent or
+/// unparsable-but-absent-equivalent defaults to
+/// `discover::DEFAULT_SWEEP_SECS`; present-but-not-a-positive-integer is a
+/// usage error (`Err(())`, the caller renders its own exact usage string)
+/// rather than silently falling back — a typo'd `--secs` should never
+/// quietly listen for the default window instead of what the operator
+/// actually asked for.
+fn parse_secs_flag(inv: &Invocation) -> Result<u64, ()> {
+    match inv.flags.get("secs") {
+        None => Ok(crate::discover::DEFAULT_SWEEP_SECS),
+        Some(s) => match s.parse::<u64>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(()),
+        },
+    }
+}
+
+/// Prompt `y/N` on stderr before running the pairing ceremony against a
+/// discovered peer — a LOCAL UX confirmation only (mirrors
+/// `confirm_spawn`/`confirm_sas`'s exact idiom), never a security gate:
+/// the ceremony's own SAS confirmation (both operators, both ends) is the
+/// sole authority either way.
+fn confirm_invite(name: &str, fpr: &str, url: &str) -> Result<bool, String> {
+    eprint!("invite `{name}` ({url}, fingerprint {fpr}) to pair — proceed? [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    let read = std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| format!("reading confirmation from stdin: {e}"))?;
+    Ok(read > 0 && matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+/// `peer invite <name> [--secs N] [--yes] [--json]` (P-P6, PAIRING.md's own
+/// "sugar over the ceremony, nothing more" framing): runs its OWN discover
+/// sweep (never reuses a previous one — a beacon is only ever as fresh as
+/// the sweep that heard it), resolves `<name>` against the heard set
+/// (`discover::resolve_invite_target`), and on EXACTLY one match runs the
+/// SAME [`run_pair_request`] core `peer pair request` itself calls —
+/// reused, never copied (this is what "reaches the same code path"
+/// actually means here: both handlers bottom out in the identical
+/// function, not two functions that merely look alike). Zero or multiple
+/// matches refuse with a taught error listing every name that WAS heard
+/// (never raw beacon content — house rule 4; only already-validated
+/// `name`s ever reach this point). `--yes` skips only the LOCAL
+/// proceed-confirm (`confirm_invite`), exactly `peer spawn`'s own `--yes`
+/// idiom — the ceremony's OWN SAS confirmation (both operators, both ends)
+/// is untouched and still runs.
+fn handle_peer_invite(inv: &Invocation) -> Outcome {
+    let cmd = "peer.invite";
+    let name = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(n) => n.to_string(),
+        None => return Outcome::usage(cmd, "usage: aoide peer invite <name> [--secs N] [--yes] [--json]"),
+    };
+    let secs = match parse_secs_flag(inv) {
+        Ok(n) => n,
+        Err(()) => {
+            return Outcome::usage(
+                cmd,
+                "usage: aoide peer invite <name> [--secs N] [--yes] [--json] — --secs must be a positive integer",
+            )
+        }
+    };
+
+    let swept = match crate::discover::run_sweep(secs) {
+        Ok(s) => s,
+        Err(e) => {
+            return Outcome::error(cmd, format!("listening for discovery beacons: {e}"))
+                .with_data(json!({ "reason": "sweep-failed" }))
+        }
+    };
+
+    let hit = match crate::discover::resolve_invite_target(&swept.heard, &name) {
+        Ok(h) => h,
+        Err(crate::discover::InviteResolveError::NoMatch { heard }) => {
+            return Outcome::error(
+                cmd,
+                format!(
+                    "heard no beacon named `{name}` in {secs}s — heard: {}",
+                    if heard.is_empty() { "(none)".to_string() } else { heard.join(", ") }
+                ),
+            )
+            .with_data(json!({ "reason": "no-match", "name": name, "heard": heard }));
+        }
+        Err(crate::discover::InviteResolveError::Ambiguous { heard }) => {
+            return Outcome::error(
+                cmd,
+                format!("heard multiple beacons named `{name}` — ambiguous; heard: {}", heard.join(", ")),
+            )
+            .with_data(json!({ "reason": "ambiguous", "name": name, "heard": heard }));
+        }
+    };
+
+    if !inv.flag_present("yes") {
+        match confirm_invite(&hit.beacon.name, &hit.beacon.fpr, &hit.beacon.url) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Outcome::ok(cmd, format!("not confirmed — nothing sent to `{}`", hit.beacon.name))
+                    .with_data(json!({ "confirmed": false, "name": hit.beacon.name }))
+            }
+            Err(e) => return Outcome::error(cmd, e),
+        }
+    }
+
+    let self_url = default_self_url();
+    run_pair_request(cmd, &hit.beacon.url, &hit.beacon.name, &self_url)
+}
+
 /// The four `peer pair` commands (P-P2), registered directly after the six
 /// legacy `peer` commands — same-network federation's pairing ceremony joins
 /// the group it extends, nothing existing reorders.
@@ -1799,6 +1984,36 @@ pub fn register_peer_pair(r: &mut Registry) {
         gated: false,
         implemented: true,
         handler: handle_peer_pair_reject,
+    ));
+}
+
+/// `peer discover`/`peer invite` (P-P6, `docs/architecture/PAIRING.md`'s
+/// "Discovery (advertise-but-locked)" section), registered directly after
+/// `register_peer_pair` — discovery is sugar OVER the ceremony that group
+/// already owns, never a parallel mechanism, so it joins the group it
+/// extends the same way `register_peer_pair` itself did for the six
+/// legacy `peer` commands.
+pub fn register_peer_discovery(r: &mut Registry) {
+    r.insert(cmd!(
+        path: ["peer", "discover"],
+        summary: "Listen for discovery beacons on the LAN multicast group and print every distinct instance heard (name, fingerprint, url) — read-only, never writes state/peers.json.",
+        args: [],
+        flags: [flag!("secs", "int", "How many seconds to listen (default ~4).")],
+        gated: false,
+        implemented: true,
+        handler: handle_peer_discover,
+    ));
+    r.insert(cmd!(
+        path: ["peer", "invite"],
+        summary: "Discover <name> on the LAN and, on exactly one match, run the pairing ceremony (peer pair request) against its advertised url.",
+        args: [arg!("name", "string", true, "The instance name to look for among heard discovery beacons.")],
+        flags: [
+            flag!("secs", "int", "How many seconds to listen (default ~4)."),
+            flag!("yes", "bool", "Skip the interactive y/N proceed confirmation (scripted use) — the ceremony's own SAS confirmation is untouched."),
+        ],
+        gated: false,
+        implemented: true,
+        handler: handle_peer_invite,
     ));
 }
 
@@ -2173,5 +2388,100 @@ mod tests {
         let a = ScratchBodyFile::write("a").unwrap();
         let b = ScratchBodyFile::write("b").unwrap();
         assert_ne!(a.0, b.0);
+    }
+
+    // ── `peer discover` — discovery grants nothing (P-P6). ───────────────────
+    //
+    // `run_sweep` needs a real socket (bind + multicast join), so this can't
+    // be a fully pure test — but it does NOT need a real BEACON to prove the
+    // one invariant that matters here: a 1s sweep that hears nothing still
+    // must leave `state/peers.json` byte-identical to what it was before.
+    // The genuine heard-a-real-beacon path is `cli/tests/
+    // discovery_connectivity.rs`'s `#[ignore]`'d real-multicast test; this
+    // one runs every time (no network needed to bind+listen+time out).
+
+    fn discover_inv(secs: &str) -> Invocation {
+        Invocation {
+            path: vec!["peer".to_string(), "discover".to_string()],
+            args: vec![],
+            flags: [("secs".to_string(), secs.to_string())].into_iter().collect(),
+            door: aoide_protocol::Door::Cli,
+        }
+    }
+
+    #[test]
+    fn peer_discover_never_writes_peers_json_even_on_an_empty_sweep() {
+        with_peer_state("discover-no-write", || {
+            // A pre-existing peer record must survive `peer discover`
+            // completely untouched — the clearest possible proof discover
+            // never took a write path into `state/peers.json` at all.
+            aoide_storage::peer_store::save_peers(&[fixture_peer(None)]).unwrap();
+            let before = aoide_storage::peer_store::load_peers();
+
+            let out = handle_peer_discover(&discover_inv("1"));
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
+
+            let after = aoide_storage::peer_store::load_peers();
+            assert_eq!(before.len(), after.len());
+            assert_eq!(before[0].name, after[0].name);
+            assert_eq!(before[0].verified, after[0].verified);
+            assert_eq!(before[0].added_at, after[0].added_at);
+        });
+    }
+
+    #[test]
+    fn peer_discover_never_writes_peers_json_from_an_entirely_empty_registry() {
+        with_peer_state("discover-no-write-empty", || {
+            let out = handle_peer_discover(&discover_inv("1"));
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
+            assert!(
+                aoide_storage::peer_store::load_peers().is_empty(),
+                "discover must never create state/peers.json out of nothing"
+            );
+        });
+    }
+
+    // ── `peer invite` bottoms out in the exact same `run_pair_request`
+    // ── `peer pair request` runs (P-P6) — proven directly by calling it
+    // ── through both entry points against the SAME unreachable door and
+    // ── asserting byte-identical outcomes, rather than trusting that the
+    // ── two call sites merely look alike. The genuine end-to-end proof
+    // ── (a real discovered beacon resolving to a real second door that
+    // ── actually parks an outbound pairing request) lives in `cli/tests/
+    // ── discovery_connectivity.rs`'s `#[ignore]`'d real-network test —
+    // ── this one needs no network at all, since an unreachable loopback
+    // ── port fails identically (and fast) through either call site. ─────────
+
+    #[test]
+    fn peer_invite_tail_and_peer_pair_request_are_the_same_function_not_two_copies() {
+        with_peer_state("invite-shares-run-pair-request", || {
+            // Port 1 is reserved and never listened on in practice — an
+            // immediate, deterministic connection refusal either way.
+            let url = "http://127.0.0.1:1/";
+            let name = "unreachable-invite-target";
+            let self_url = default_self_url();
+
+            // `handle_peer_pair_request`'s own documented tail.
+            let direct = run_pair_request("peer.pair.request", url, name, &self_url);
+            // The literal call `handle_peer_invite` makes on its single-match
+            // branch (`run_pair_request(cmd, &hit.beacon.url, &hit.beacon.name, &self_url)`),
+            // reproduced here with the same arguments a real `Heard` would
+            // supply, under `peer.invite`'s own command name.
+            let via_invite = run_pair_request("peer.invite", url, name, &self_url);
+
+            assert_eq!(direct.status, aoide_protocol::output::Status::Error, "{direct:?}");
+            assert_eq!(direct.command, "peer.pair.request");
+            assert_eq!(via_invite.status, direct.status);
+            assert_eq!(via_invite.command, "peer.invite");
+            // Same failure MESSAGE from both call sites (the `cmd` argument
+            // never rides the message text itself, only `Outcome::command`)
+            // — proves it is one function's error path taken twice under two
+            // different labels, not two independently drifting
+            // implementations that merely happen to agree today.
+            assert_eq!(
+                via_invite.message, direct.message,
+                "peer invite and peer pair request must produce an identical failure message here"
+            );
+        });
     }
 }

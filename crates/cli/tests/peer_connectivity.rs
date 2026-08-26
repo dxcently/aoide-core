@@ -137,6 +137,7 @@ fn peer_add_and_pull_round_trip_over_real_http_between_two_loopback_instances() 
             "",
             "",
             Path::new("/tmp/aoide-a2a-peer-connectivity-unused.sock"),
+            false,
             registry(),
         );
     });
@@ -262,6 +263,7 @@ fn peer_add_against_an_unreachable_url_never_registers_and_pull_of_a_down_peer_m
             "",
             "",
             Path::new("/tmp/aoide-a2a-peer-connectivity-unused.sock"),
+            false,
             registry(),
         );
     });

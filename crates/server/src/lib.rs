@@ -29,6 +29,7 @@
 pub mod a2a;
 pub mod commands;
 pub mod daemon;
+pub mod discovery;
 pub mod events;
 pub mod mcp;
 pub mod producers;

@@ -38,9 +38,24 @@ never the inbound/serve half (that's `aoide-server`).
   the graphSummary pair above them; the server-side handlers
   (`pair_request`/`pair_reveal`/`pair_approve_callback`) live in
   `aoide-server::a2a`, never duplicated here.
+- `discover` — the discovery beacon's LISTEN half (P-P6,
+  `docs/architecture/PAIRING.md`'s "Discovery (advertise-but-locked)"
+  section): `run_sweep(secs)` joins `aoide_storage::beacon::GROUP`/`PORT`,
+  listens for a bounded window, validates every line heard
+  (`aoide_storage::beacon::parse_and_validate`), and folds survivors into a
+  `SweepResult` deduped by fingerprint, freshest wins (`fold_heard`, pure,
+  unit-tested with no socket at all — the same pure-fold/impure-socket
+  split `aoide-server::a2a`'s own `route`/`handle_connection` holds).
+  `resolve_invite_target(heard, name)` is the same shape one layer up:
+  `peer invite`'s zero/one/many-match resolution against an already-swept
+  result, also pure. This crate's send-side counterpart
+  (`a2a serve`'s own advertise thread) lives in `aoide-server::discovery`
+  instead — sending is the door-owning process's own job; listening is
+  this crate's outbound-facing action, the same "outbound only" charter
+  every other module here holds.
 - `commands` — this crate's CLI commands: `a2a agent add/list/remove/send`,
-  `peer add/list/remove/pull/status/hub/allow/spawn`, `peer pair request/
-  pending/approve/reject` (P-P2, CONTRACTS.md §6/§7 —
+  `peer add/list/remove/pull/status/hub/allow/spawn/discover/invite`,
+  `peer pair request/pending/approve/reject` (P-P2, CONTRACTS.md §6/§7 —
   `handle_peer_allow` (`peer allow <name> <cap> on|off`, P-P3, `docs/
   architecture/PAIRING.md` decision 5) is a thin wire around
   `aoide_storage::peer_store::set_peer_allow` — idempotent, refuses an
@@ -64,6 +79,18 @@ never the inbound/serve half (that's `aoide-server`).
   mutual confirmation, on both ends). `handle_peer_pair_reject` tries
   the inbound queue then the outbound queue, aborting an outbound entry at
   any stage — the ceremony's abort command.
+  **`run_pair_request(cmd, url, name, self_url)` (P-P6) is
+  `handle_peer_pair_request`'s own body, extracted so `peer invite` reaches
+  it too — reused, never copied.** `handle_peer_pair_request` still owns
+  every bit of `<url>`/`--name`/`--self-url` parsing and the
+  `valid_peer_name` check (a CLI-typed name needs it); `handle_peer_invite`
+  calls straight into `run_pair_request` with a `url`/`name` already lifted
+  off an already-validated, already-confirmed discovery beacon, needing no
+  second name check. `handle_peer_discover`/`handle_peer_invite` (`peer
+  discover [--secs N]`/`peer invite <name> [--secs N] [--yes]`) are thin
+  wrappers around `discover::run_sweep`/`discover::resolve_invite_target`
+  above — `confirm_invite` is this pair's own local helper, the same
+  `confirm_sas`/`confirm_spawn` y/N idiom.
   `adapter melete` (`peer hub
   <name> [--clear]`, P-D5, designates at most one registered peer as the
   hub `aoide_storage::addr::resolve_with_hub` prefers as a last-resort

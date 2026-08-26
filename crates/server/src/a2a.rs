@@ -220,6 +220,29 @@ pub fn resolve_bearer_secret(inv: &Invocation) -> String {
         .unwrap_or_default()
 }
 
+/// Resolve whether THIS `a2a serve` process advertises a discovery beacon
+/// (P-P6, `docs/architecture/PAIRING.md`'s "Discovery (advertise-but-locked)"
+/// section): `--discovery-advertise` flag (bare presence, no value — the
+/// same shape `--stdio`/`--all`/`--windowed` already hold elsewhere in this
+/// tree) → `AOIDE_DISCOVERY_ADVERTISE` env, truthy in
+/// `{1,true,yes,all}` (the exact vocabulary `aoide-conduct::graph::send`'s
+/// own `AOIDE_CONDUCT_AUTOGATE` already established — one truthy-env
+/// convention, not a second one invented here) → **OFF by default**
+/// (PAIRING.md: "off by default" — no beacon, ever, until an operator opts
+/// in explicitly). Mirrors [`resolve_spawn_agent`]/[`resolve_token_file`]'s
+/// exact flag-then-env-then-default precedence shape, the idiomatic knob
+/// home this door already established for every other operator-facing
+/// toggle.
+pub fn resolve_discovery_advertise(inv: &Invocation) -> bool {
+    if inv.flag_present("discovery-advertise") {
+        return true;
+    }
+    matches!(
+        std::env::var("AOIDE_DISCOVERY_ADVERTISE").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("all")
+    )
+}
+
 /// Resolve this instance's `aoide/graphSummary` `instance.name` (CONTRACTS.md
 /// §7): `--peer-name` flag → `AOIDE_A2A_PEER_NAME` env (set by the
 /// `aoide-a2a` systemd unit, mirroring `resolve_bind_port`/
@@ -431,7 +454,7 @@ pub fn agent_card_from_commands<'a>(
         // lowercase-kebab TaskStates. v1.0's `interfaces`-array + top-level
         // `id` card form is a later, additive follow-on — not this.
         protocol_version: Some("0.3.0".to_string()),
-        url: Some(format!("http://{bind}:{port}/")),
+        url: Some(self_url(bind, port)),
         // Phase C: the server now serves `message/stream` + `tasks/resubscribe`
         // over Server-Sent Events, so streaming is advertised true.
         capabilities: Some(AgentCapabilities { streaming: true }),
@@ -1346,6 +1369,15 @@ fn valid_commit_hex(s: &str) -> bool {
 /// anything genuinely malformed when a callback actually fires). Pure.
 fn valid_callback_url(s: &str) -> bool {
     !s.is_empty() && s.len() <= 2048 && s.contains("://")
+}
+
+/// The door URL THIS `a2a serve` process is actually answering on, derived
+/// from `bind`/`port` — the ONE formula both [`route`]'s own
+/// `aoide/graphSummary` handling and the discovery beacon (P-P6) build
+/// their `self_url`/`url` from, factored out so a future change to how the
+/// advertised URL is derived can't drift between the two call sites.
+fn self_url(bind: &str, port: u16) -> String {
+    format!("http://{bind}:{port}/")
 }
 
 /// `aoide/pairRequest` (CONTRACTS.md §6, P-P2): the pairing ceremony's
@@ -2347,7 +2379,7 @@ fn route(
                     Some("aoide/pairApprove") => "aoide/pairApprove",
                     _ => "rpc",
                 };
-                let self_url = format!("http://{bind}:{port}/");
+                let self_url = self_url(bind, port);
                 let ctx = RequestCtx {
                     audit_log,
                     spawn_agent,
@@ -2526,6 +2558,18 @@ impl Drop for ConnGuard {
 /// handler threads, a new connection gets a fast `503` written directly
 /// (no handler thread spawned, no `BufReader`/parse work done) rather than
 /// growing the thread count without limit.
+///
+/// `discovery_advertise` (P-P6, [`resolve_discovery_advertise`]) gates the
+/// ONE thing this function does besides the accept loop itself: when
+/// `true`, it lazily mints/loads this instance's own P-P1 identity (the
+/// same `identity::load_or_mint` `aoide identity` calls — discipline named
+/// in PAIRING.md's own "Discovery" section) and starts the beacon
+/// advertise thread (`discovery::spawn_advertiser`) before ever entering
+/// the loop below. A failure loading identity here is logged and
+/// discovery is skipped — it never fails the door itself; `false` (the
+/// default) starts no thread at all and touches no identity file,
+/// matching the brief's own "provable via the thread not spawning" test
+/// shape.
 //
 // TODO(a2a-hardening): chunked Transfer-Encoding and extra systemd
 // sandboxing (aoide-a2a.service) are deliberately out of scope for this
@@ -2539,6 +2583,7 @@ pub fn serve(
     expected_token: &str,
     bearer_secret: &str,
     secrets_socket: &Path,
+    discovery_advertise: bool,
     registry: &'static Registry,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind((bind, port))?;
@@ -2548,6 +2593,35 @@ pub fn serve(
         secrets_socket: secrets_socket.to_path_buf(),
         file_token: expected_token.to_string(),
     };
+
+    // Discovery advertising (P-P6) — off unless the operator opted in
+    // (`resolve_discovery_advertise`, checked by the caller). The join
+    // handle is deliberately dropped: dropping a `JoinHandle` detaches
+    // nothing extra (the thread already runs independent of it), and this
+    // function itself never returns until the process exits, so there is
+    // no later point to join it against anyway (module doc's "clean
+    // shutdown needs no signal" note).
+    if discovery_advertise {
+        match aoide_storage::identity::load_or_mint() {
+            Ok((kp, _)) => {
+                let fpr = kp.info().fingerprint;
+                let advertised_url = self_url(bind, port);
+                let _ = crate::discovery::spawn_advertiser(peer_name, &fpr, &advertised_url);
+                eprintln!(
+                    "aoide a2a discovery: advertising {advertised_url} on {}:{}",
+                    aoide_storage::beacon::GROUP,
+                    aoide_storage::beacon::PORT
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "aoide a2a discovery: loading this instance's identity: {e} — \
+                     continuing without discovery advertising"
+                );
+            }
+        }
+    }
+
     for incoming in listener.incoming() {
         let mut stream = match incoming {
             Ok(s) => s,
@@ -5671,6 +5745,56 @@ mod tests {
         match saved {
             Some(v) => std::env::set_var("AOIDE_A2A_PEER_NAME", v),
             None => std::env::remove_var("AOIDE_A2A_PEER_NAME"),
+        }
+    }
+
+    // ── `resolve_discovery_advertise` (P-P6) — off unless a flag or a
+    // ── truthy env explicitly opts in. This is the ENTIRE gate `serve`
+    // ── checks before ever calling `discovery::spawn_advertiser` — proving
+    // ── this function returns `false` on a bare/absent env, with no flag,
+    // ── IS proving "the thread doesn't spawn" without any real thread,
+    // ── socket, or sleep involved (the brief's own "provable via the
+    // ── thread not spawning, not via sleeping" shape). ──────────────────
+
+    #[test]
+    fn resolve_discovery_advertise_is_off_by_default() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_DISCOVERY_ADVERTISE").ok();
+        std::env::remove_var("AOIDE_DISCOVERY_ADVERTISE");
+
+        let inv = Invocation { path: vec![], args: vec![], flags: std::collections::BTreeMap::new(), door: Door::Cli };
+        assert!(!resolve_discovery_advertise(&inv), "no flag, no env — discovery stays off");
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_DISCOVERY_ADVERTISE", v),
+            None => std::env::remove_var("AOIDE_DISCOVERY_ADVERTISE"),
+        }
+    }
+
+    #[test]
+    fn resolve_discovery_advertise_honors_the_flag_and_the_truthy_env_vocabulary() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_DISCOVERY_ADVERTISE").ok();
+
+        let mut flags = std::collections::BTreeMap::new();
+        flags.insert("discovery-advertise".to_string(), String::new());
+        let flag_inv = Invocation { path: vec![], args: vec![], flags, door: Door::Cli };
+        std::env::remove_var("AOIDE_DISCOVERY_ADVERTISE");
+        assert!(resolve_discovery_advertise(&flag_inv), "bare flag presence turns it on");
+
+        let no_flag_inv = Invocation { path: vec![], args: vec![], flags: std::collections::BTreeMap::new(), door: Door::Cli };
+        for truthy in ["1", "true", "yes", "all"] {
+            std::env::set_var("AOIDE_DISCOVERY_ADVERTISE", truthy);
+            assert!(resolve_discovery_advertise(&no_flag_inv), "`{truthy}` must be truthy");
+        }
+        for not_truthy in ["0", "false", "no", "", "TRUE", "garbage"] {
+            std::env::set_var("AOIDE_DISCOVERY_ADVERTISE", not_truthy);
+            assert!(!resolve_discovery_advertise(&no_flag_inv), "`{not_truthy}` must NOT be truthy");
+        }
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_DISCOVERY_ADVERTISE", v),
+            None => std::env::remove_var("AOIDE_DISCOVERY_ADVERTISE"),
         }
     }
 

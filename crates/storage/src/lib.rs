@@ -57,9 +57,20 @@
 //! yielded only by the server's own request-verification flow (never by
 //! `peer_store::resolve_peer`, which has no access to the raw HTTP request
 //! a signature needs).
+//!
+//! `beacon` (P-P6, `docs/architecture/PAIRING.md`'s "Discovery
+//! (advertise-but-locked)" section) is the newest: the one-JSON-line
+//! `{v, name, fpr, url}` wire format an `a2a serve` process may emit on a
+//! fixed UDP multicast group+port, and the validation `aoide peer
+//! discover`/`peer invite` apply to every line heard before trusting it.
+//! Pure wire format and validators only — no socket I/O lives here (that's
+//! `aoide-server::discovery`'s send side and `aoide-client::discover`'s
+//! listen side), and no write path into `peer_store` either: discovery
+//! grants nothing, by design.
 
 pub mod a2a_store;
 pub mod addr;
+pub mod beacon;
 pub mod commands;
 pub mod display;
 pub mod edits;
