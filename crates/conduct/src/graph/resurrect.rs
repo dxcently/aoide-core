@@ -8,13 +8,19 @@
 //! Selection: resolve `--project <x>` against `projects.json` by exact name,
 //! read every ledger line whose `cwd` anchors to it (the SAME longest-
 //! path-prefix rule `graph emit`'s `anchor_for` uses — reused, never
-//! re-derived), then pick candidates — the single most recent by default,
-//! every anchored entry with `--all`, or one specific ledger `sessionId`
-//! with `--id`. Each candidate is filtered through its harness's
-//! `AgentProfile.resume_args` (`aoide_protocol::agents`): `None` (an
-//! unregistered agent, or a harness whose resume argv has never been
-//! verified) skips that candidate with a taught message naming the harness,
-//! never a guessed invocation.
+//! re-derived), then pick candidates. `--all` widens to every anchored
+//! entry; `--id` narrows to one specific ledger `sessionId`; bare (neither
+//! flag) resumes the project's WHOLE carried set (`state/carry.json`,
+//! durable-sessions plan P-C4) — every anchored entry currently marked
+//! durable, minus any id already alive in `sessions.json`, deduped by
+//! `sessionId` keeping the newest `endedAt` (an append-only ledger can hold
+//! more than one exit for the same carried id once it has been resurrected
+//! and exited again). `--all` and `--id` are unchanged escapes: both widen
+//! or narrow past the carried set regardless of the mark. Each candidate is
+//! filtered through its harness's `AgentProfile.resume_args`
+//! (`aoide_protocol::agents`): `None` (an unregistered agent, or a harness
+//! whose resume argv has never been verified) skips that candidate with a
+//! taught message naming the harness, never a guessed invocation.
 //!
 //! A resurrected session is ALWAYS a fresh `sessionId` — ids are never
 //! recycled — spawned via the windowed path ([`super::spawn::session_spawn`]
@@ -38,7 +44,7 @@
 //! `--id` that names no anchored ledger entry) are `Outcome::usage`/`error`.
 
 use super::common::{require_flag, stage_error};
-use super::model::{load_stage, projects_path, sessions_path, ProjectsFile};
+use super::model::{load_stage, projects_path, sessions_path, ProjectsFile, SessionsFile};
 use super::session_store::stamp_resumed_from;
 use super::spawn::session_spawn;
 use aoide_protocol::agents::agent_profile;
@@ -163,6 +169,52 @@ fn resurrect_one(
     }));
 }
 
+/// Bare-mode selection (no `--all`/`--id`, decision 6 of the durable-sessions
+/// plan): `anchored` narrowed to the project's WHOLE carried set, not just
+/// its single most recent entry. Three steps, in order:
+///
+/// 1. keep only entries whose `sessionId` is in `state/carry.json`
+///    (`aoide_storage::carry::is_carried`);
+/// 2. drop any id that is already alive (non-`done`) in `sessions.json` —
+///    the daemon's old `has_live` skip moves HERE, per-id instead of
+///    per-project, so one live terminal no longer suppresses the rest of a
+///    multi-session carried set (`server/src/daemon.rs`'s
+///    `run_boot_auto_resume`, which now calls this unconditionally);
+/// 3. dedup by `sessionId`, keeping the entry with the latest `endedAt` — a
+///    carried id that was resurrected and exited again appears twice in the
+///    append-only ledger.
+fn carried_selection(
+    anchored: Vec<aoide_storage::ledger::LedgerEntry>,
+) -> Vec<aoide_storage::ledger::LedgerEntry> {
+    let carried = aoide_storage::carry::load_carry();
+    let sessions: SessionsFile = load_stage(&sessions_path()).unwrap_or_default();
+    let live: std::collections::HashSet<&str> = sessions
+        .sessions
+        .iter()
+        .filter(|s| s.state != "done")
+        .map(|s| s.session_id.as_str())
+        .collect();
+
+    let mut newest: BTreeMap<String, aoide_storage::ledger::LedgerEntry> = BTreeMap::new();
+    for e in anchored {
+        if !aoide_storage::carry::is_carried(&carried, &e.session_id) {
+            continue;
+        }
+        if live.contains(e.session_id.as_str()) {
+            continue;
+        }
+        let ended = aoide_storage::time::parse_iso_utc(&e.ended_at).unwrap_or(0);
+        let keep = match newest.get(&e.session_id) {
+            Some(existing) => ended > aoide_storage::time::parse_iso_utc(&existing.ended_at).unwrap_or(0),
+            None => true,
+        };
+        if keep {
+            newest.insert(e.session_id.clone(), e);
+        }
+    }
+    newest.into_values().collect()
+}
+
 /// `aoide graph resurrect --project <name> [--all | --id <ledgerSessionId>]`.
 pub fn session_resurrect(inv: &Invocation) -> Outcome {
     let cmd = "graph.resurrect";
@@ -209,15 +261,17 @@ pub fn session_resurrect(inv: &Invocation) -> Outcome {
         });
         v
     } else {
-        anchored
-            .into_iter()
-            .max_by_key(|e| aoide_storage::time::parse_iso_utc(&e.ended_at).unwrap_or(0))
-            .into_iter()
-            .collect()
+        carried_selection(anchored)
     };
 
     if selected.is_empty() {
-        return Outcome::ok(cmd, format!("no resumable session found for project `{name}`"))
+        let bare = inv.flags.get("id").is_none() && !inv.flag_present("all");
+        let msg = if bare {
+            format!("carried set is empty for project `{name}` — nothing to resurrect")
+        } else {
+            format!("no resumable session found for project `{name}`")
+        };
+        return Outcome::ok(cmd, msg)
             .with_data(json!({ "project": name, "resurrected": [], "skipped": [], "failed": [] }));
     }
 
@@ -252,6 +306,7 @@ pub fn session_resurrect(inv: &Invocation) -> Outcome {
 mod tests {
     use super::*;
     use crate::graph::testutil::*;
+    use super::super::model::write_stage;
 
     fn set_ledger(entries: &[aoide_storage::ledger::LedgerEntry]) {
         for e in entries {
@@ -336,6 +391,12 @@ mod tests {
             &proj_path,
             "2026-08-20T01:00:00Z",
         )]);
+        // Bare selection is carried-set-driven (P-C4) — mark the entry so it
+        // is even a candidate; the point of this test is the harness skip,
+        // not the selection width.
+        let mut carried = Vec::new();
+        aoide_storage::carry::set_carried(&mut carried, "ledger-unknown-harness", true);
+        aoide_storage::carry::save_carry(&carried).unwrap();
 
         let out = session_resurrect(&flag_invocation(&["graph", "resurrect"], &[("project", "proj")]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
@@ -375,6 +436,12 @@ mod tests {
         std::env::remove_var("DISPLAY");
 
         set_ledger(&[ledger_entry("ledger-old-2", "claude", &proj_path, "2026-08-20T01:00:00Z")]);
+        // Bare selection is carried-set-driven (P-C4) — mark the entry so it
+        // is even a candidate; the point of this test is the failure
+        // handling, not the selection width.
+        let mut carried = Vec::new();
+        aoide_storage::carry::set_carried(&mut carried, "ledger-old-2", true);
+        aoide_storage::carry::save_carry(&carried).unwrap();
 
         let out = session_resurrect(&flag_invocation(&["graph", "resurrect"], &[("project", "proj")]));
         assert_eq!(
@@ -522,7 +589,16 @@ mod tests {
         assert!(aoide_storage::carry::is_carried(&after_first, &first_new_id));
         assert!(!aoide_storage::carry::is_carried(&after_first, "ledger-idem"));
 
-        let second = session_resurrect(&flag_invocation(&["graph", "resurrect"], &[("project", "proj")]));
+        // Bare selection no longer re-picks `ledger-idem` (P-C4): its mark
+        // already moved to `first_new_id` above. `--id` is the unchanged
+        // escape that narrows to one entry regardless of the mark (the
+        // append-only ledger still holds the line), so it is what re-drives
+        // the same candidate a second time here — the point of THIS test is
+        // `resurrect_one`'s transfer idempotency, not bare-mode selection.
+        let second = session_resurrect(&flag_invocation(
+            &["graph", "resurrect"],
+            &[("project", "proj"), ("id", "ledger-idem")],
+        ));
         assert_eq!(second.status, aoide_protocol::output::Status::Ok, "msg: {}", second.message);
         let second_new_id =
             second.data.as_ref().unwrap()["resurrected"][0]["sessionId"].as_str().unwrap().to_string();
@@ -571,8 +647,11 @@ mod tests {
         assert_eq!(out.status, aoide_protocol::output::Status::Usage);
     }
 
+    /// `--all` and `--id` are unchanged escapes (P-C4's own scope line): both
+    /// widen or narrow past the carried set regardless of the mark — neither
+    /// entry below is ever carried, and both still resolve.
     #[test]
-    fn all_widens_to_every_anchored_entry_and_id_narrows_to_one() {
+    fn all_widens_to_every_anchored_entry_and_id_narrows_to_one_regardless_of_the_mark() {
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
         let (root, proj_path) = setup("resurrect-all-id");
@@ -580,25 +659,20 @@ mod tests {
         // Two resumable-shaped entries (unresolved harness, so both land in
         // `skipped` rather than needing a real spawn) — proves the SELECTION
         // width, independent of the spawn mechanics already covered above.
+        // Neither is carried: --all and --id must not care.
         set_ledger(&[
             ledger_entry("ledger-a", "no-such-harness", &proj_path, "2026-08-20T01:00:00Z"),
             ledger_entry("ledger-b", "no-such-harness", &proj_path, "2026-08-20T02:00:00Z"),
         ]);
 
-        // Default (no --all/--id): only the single most recent (ledger-b).
-        let out = session_resurrect(&flag_invocation(&["graph", "resurrect"], &[("project", "proj")]));
-        let skipped = out.data.as_ref().unwrap()["skipped"].as_array().unwrap().clone();
-        assert_eq!(skipped.len(), 1, "default must pick exactly the most recent: {skipped:?}");
-        assert_eq!(skipped[0]["sessionId"], "ledger-b");
-
-        // --all: both.
+        // --all: both, carried or not.
         let out = session_resurrect(&flag_invocation(
             &["graph", "resurrect"],
             &[("project", "proj"), ("all", "true")],
         ));
         assert_eq!(out.data.as_ref().unwrap()["skipped"].as_array().unwrap().len(), 2);
 
-        // --id: exactly the named one, even though it is not the newest.
+        // --id: exactly the named one, uncarried and not the newest.
         let out = session_resurrect(&flag_invocation(
             &["graph", "resurrect"],
             &[("project", "proj"), ("id", "ledger-a")],
@@ -606,6 +680,126 @@ mod tests {
         let skipped = out.data.as_ref().unwrap()["skipped"].as_array().unwrap().clone();
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0]["sessionId"], "ledger-a");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── P-C4: bare selection drives off the carried set ─────────────────────
+
+    /// The headline case: three carried, two uncarried, all five anchored to
+    /// the same project — bare `--project` resurrects exactly the three.
+    #[test]
+    fn bare_default_resurrects_exactly_the_carried_set() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
+        let (root, proj_path) = setup("resurrect-carried-set");
+
+        set_ledger(&[
+            ledger_entry("carried-1", "no-such-harness", &proj_path, "2026-08-20T01:00:00Z"),
+            ledger_entry("carried-2", "no-such-harness", &proj_path, "2026-08-20T02:00:00Z"),
+            ledger_entry("carried-3", "no-such-harness", &proj_path, "2026-08-20T03:00:00Z"),
+            ledger_entry("uncarried-1", "no-such-harness", &proj_path, "2026-08-20T04:00:00Z"),
+            ledger_entry("uncarried-2", "no-such-harness", &proj_path, "2026-08-20T05:00:00Z"),
+        ]);
+        let mut carried = Vec::new();
+        for id in ["carried-1", "carried-2", "carried-3"] {
+            aoide_storage::carry::set_carried(&mut carried, id, true);
+        }
+        aoide_storage::carry::save_carry(&carried).unwrap();
+
+        let out = session_resurrect(&flag_invocation(&["graph", "resurrect"], &[("project", "proj")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let skipped = out.data.as_ref().unwrap()["skipped"].as_array().unwrap().clone();
+        let mut ids: Vec<&str> = skipped.iter().map(|s| s["sessionId"].as_str().unwrap()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["carried-1", "carried-2", "carried-3"], "skipped: {skipped:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A carried id still live in `sessions.json` (non-`done`) is excluded —
+    /// the daemon's old per-project `has_live` skip moved down to here,
+    /// per-id (P-C4's own scope line).
+    #[test]
+    fn bare_default_excludes_a_carried_id_still_live_in_the_roster() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
+        let (root, proj_path) = setup("resurrect-carried-live");
+
+        set_ledger(&[
+            ledger_entry("carried-alive", "no-such-harness", &proj_path, "2026-08-20T01:00:00Z"),
+            ledger_entry("carried-dead", "no-such-harness", &proj_path, "2026-08-20T02:00:00Z"),
+        ]);
+        let mut carried = Vec::new();
+        aoide_storage::carry::set_carried(&mut carried, "carried-alive", true);
+        aoide_storage::carry::set_carried(&mut carried, "carried-dead", true);
+        aoide_storage::carry::save_carry(&carried).unwrap();
+
+        // `carried-alive` is still in the roster, non-`done`.
+        write_stage(
+            &sessions_path(),
+            &SessionsFile {
+                schema_version: "0".into(),
+                sessions: vec![session("carried-alive", &proj_path, "working", "2026-08-20T01:00:00Z", None)],
+            },
+        )
+        .unwrap();
+
+        let out = session_resurrect(&flag_invocation(&["graph", "resurrect"], &[("project", "proj")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let skipped = out.data.as_ref().unwrap()["skipped"].as_array().unwrap().clone();
+        assert_eq!(skipped.len(), 1, "skipped: {skipped:?}");
+        assert_eq!(skipped[0]["sessionId"], "carried-dead");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An empty carried set is an `ok` no-op with an honest message — never
+    /// silently treated as "nothing to do" without saying why.
+    #[test]
+    fn bare_default_is_an_ok_no_op_when_the_carried_set_is_empty() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
+        let (root, proj_path) = setup("resurrect-carried-empty");
+
+        // An anchored entry exists, but nothing is carried.
+        set_ledger(&[ledger_entry("uncarried-only", "no-such-harness", &proj_path, "2026-08-20T01:00:00Z")]);
+
+        let out = session_resurrect(&flag_invocation(&["graph", "resurrect"], &[("project", "proj")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(out.data.as_ref().unwrap()["resurrected"].as_array().unwrap().len(), 0);
+        assert!(
+            out.message.contains("carried set is empty"),
+            "message must say WHY, not just no-op silently: {}",
+            out.message
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A carried id that exited, was resurrected, and exited again appears
+    /// twice in the append-only ledger — the dedup keeps the newest
+    /// `endedAt`, so only one candidate is ever selected.
+    #[test]
+    fn bare_default_dedups_a_repeated_carried_id_keeping_the_newest_ended_at() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
+        let (root, proj_path) = setup("resurrect-carried-dedup");
+
+        // Same sessionId, two ledger lines (append-only, both legal): an
+        // earlier exit and a later re-exit.
+        set_ledger(&[
+            ledger_entry("repeated-id", "no-such-harness", &proj_path, "2026-08-20T01:00:00Z"),
+            ledger_entry("repeated-id", "no-such-harness", &proj_path, "2026-08-20T09:00:00Z"),
+        ]);
+        let mut carried = Vec::new();
+        aoide_storage::carry::set_carried(&mut carried, "repeated-id", true);
+        aoide_storage::carry::save_carry(&carried).unwrap();
+
+        let out = session_resurrect(&flag_invocation(&["graph", "resurrect"], &[("project", "proj")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let skipped = out.data.as_ref().unwrap()["skipped"].as_array().unwrap().clone();
+        assert_eq!(skipped.len(), 1, "the repeated id must be deduped to one candidate: {skipped:?}");
 
         let _ = std::fs::remove_dir_all(&root);
     }

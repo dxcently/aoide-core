@@ -99,15 +99,22 @@ the inbound half of the two-door contract (the outbound half is
   re-derived, that function's own doc names this exact caller — so a
   `Restart=on-failure` restart within the SAME boot is a no-op, and only a
   real reboot (a changed epoch) reopens the guard. On a fresh boot, for
-  every `autoResume` project (`projects.json`, P-D8) with no live
-  (non-`done`) session anchored to it (`aoide_conduct::graph::anchor_for`),
-  calls `aoide_conduct::graph::session_resurrect` in-process
-  (`Door::Daemon`) — the identical command core `graph resurrect --project`
-  runs over the CLI, the same in-process-call pattern `run_internal_reap`
-  already uses for `graph reap`. That function never hard-errors on a
-  per-candidate spawn failure; a headless host's taught "no
-  `$AOIDE_TERMINAL`" error is only `eprintln!`'d here, never propagated —
-  the tick/loop itself is never at risk.
+  EVERY `autoResume` project (`projects.json`, P-D8) — unconditionally, no
+  liveness check here — calls `aoide_conduct::graph::session_resurrect`
+  in-process (`Door::Daemon`) — the identical command core `graph resurrect
+  --project` runs over the CLI, the same in-process-call pattern
+  `run_internal_reap` already uses for `graph reap`. Liveness lives one
+  layer down: `session_resurrect`'s own bare-mode selection
+  (`carried_selection`, durable-sessions plan P-C4) drops any carried id
+  already alive in `sessions.json` per candidate before spawning anything,
+  so a project where every carried session is already live resolves to the
+  empty-set `Outcome::ok` no-op rather than being skipped wholesale — a
+  per-project skip here would have suppressed reviving a multi-session
+  carried set's other, actually-dead members over one live terminal. That
+  function never hard-errors on a per-candidate spawn failure either; a
+  headless host's taught "no `$AOIDE_TERMINAL`" error is only
+  `eprintln!`'d here, never propagated — the tick/loop itself is never at
+  risk.
 - `events` — `tail`, the blocking loop behind `aoide events tail` (P-D3):
   follows the daemon's own events feed with a `Follower` and prints every
   line whose `class` passes an (optional, comma-separated) filter, `--json`

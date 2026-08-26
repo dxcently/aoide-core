@@ -432,19 +432,25 @@ fn epoch_already_fired(marker_contents: Option<&str>, current_epoch: i64) -> boo
 /// stripped container) means "never fire", the same safe direction
 /// `boot_epoch`'s own doc states for the pre-boot-ghost reap signal.
 ///
-/// For each `autoResume` project (`projects.json`) with no live
-/// (non-`done`) session anchored to it (the same `anchor_for` longest-
-/// prefix rule `graph emit` uses), resurrects its single most recent
-/// resumable ledger entry by calling `aoide_conduct::graph::
-/// session_resurrect` directly, in-process, `Door::Daemon` — the SAME
-/// command core `graph resurrect --project` runs over the CLI, the exact
-/// pattern [`run_internal_reap`] already uses for `graph reap`. That
-/// function never hard-errors on a per-candidate spawn failure (its own
-/// module doc): a headless host's taught "no `$AOIDE_TERMINAL`" error
-/// lands in its `failed` array and this function only logs it — the
-/// caller (`run_loop`) never sees an `Err` and the tick loop is never at
-/// risk, satisfying "a headless host's windowed spawn degrades gracefully,
-/// never crashes the tick/loop."
+/// For every `autoResume` project (`projects.json`), calls
+/// `aoide_conduct::graph::session_resurrect` directly, in-process,
+/// `Door::Daemon`, UNCONDITIONALLY — the SAME command core `graph resurrect
+/// --project` runs over the CLI, the exact pattern [`run_internal_reap`]
+/// already uses for `graph reap`. There is no live-session skip here: that
+/// used to gate on the whole project (any non-`done` session anchored to it
+/// suppressed the call entirely), which was wrong for a multi-session
+/// carried set — one live terminal would have suppressed resuming the
+/// project's other carried sessions. The skip is now per-CANDIDATE, inside
+/// `session_resurrect`'s own bare-mode selection (durable-sessions plan
+/// P-C4, `resurrect.rs`'s `carried_selection`): an already-alive id is
+/// dropped from the carried set before anything is spawned, so a project
+/// where every carried session is already live resolves to the empty-set
+/// `Outcome::ok` no-op. `session_resurrect` never hard-errors on a
+/// per-candidate spawn failure either (its own module doc): a headless
+/// host's taught "no `$AOIDE_TERMINAL`" error lands in its `failed` array
+/// and this function only logs it — the caller (`run_loop`) never sees an
+/// `Err` and the tick loop is never at risk, satisfying "a headless host's
+/// windowed spawn degrades gracefully, never crashes the tick/loop."
 fn run_boot_auto_resume() {
     let Some(epoch) = aoide_conduct::reap::boot_epoch() else { return };
     let marker = auto_resume_marker_path();
@@ -455,17 +461,9 @@ fn run_boot_auto_resume() {
 
     let projects: aoide_storage::records::ProjectsFile =
         aoide_storage::stage::load_stage(&aoide_storage::stage::projects_path()).unwrap_or_default();
-    let sessions: aoide_storage::records::SessionsFile =
-        aoide_storage::stage::load_stage(&aoide_storage::stage::sessions_path()).unwrap_or_default();
 
-    for (idx, p) in projects.projects.iter().enumerate() {
+    for p in &projects.projects {
         if !p.auto_resume {
-            continue;
-        }
-        let has_live = sessions.sessions.iter().any(|s| {
-            s.state != "done" && aoide_conduct::graph::anchor_for(&s.cwd, &projects.projects) == Some(idx)
-        });
-        if has_live {
             continue;
         }
         let mut inv = internal_invocation(&["graph", "resurrect"]);
@@ -1527,6 +1525,104 @@ mod tests {
         let after = std::fs::read_to_string(&marker).unwrap();
         assert_eq!(after, pre_written, "a guarded call must leave the marker byte-identical");
 
+        restore_stage_and_state(&stage, &state, saved_stage, saved_state);
+    }
+
+    /// The case the OLD per-project `has_live` skip suppressed (P-C4,
+    /// durable-sessions plan): a project carrying a live session AND a
+    /// carried-but-dead ledger entry. The daemon loop no longer checks
+    /// liveness at all — it calls `session_resurrect` for every `autoResume`
+    /// project unconditionally, and the per-id live exclusion happens INSIDE
+    /// `resurrect.rs`'s own bare-mode selection. Proven the same way
+    /// `resurrect.rs`'s own carry-transfer test does: `AOIDE_TERMINAL=true`
+    /// makes the windowed spawn succeed (`Status::Ok`) without a real
+    /// terminal, so a successful resurrect transfers the carry mark off the
+    /// old id — if `run_boot_auto_resume` had skipped this project (the old
+    /// behaviour), the mark would still be sitting on `carried-dead`
+    /// afterward.
+    #[test]
+    fn run_boot_auto_resume_fires_for_a_project_with_one_live_and_one_carried_dead_session() {
+        let (_guard, stage, state, saved_stage, saved_state) = isolated_stage_and_state();
+        let saved_terminal = std::env::var("AOIDE_TERMINAL").ok();
+        let saved_wayland = std::env::var("WAYLAND_DISPLAY").ok();
+        let saved_runtime = std::env::var("XDG_RUNTIME_DIR").ok();
+        let saved_audit = std::env::var("AOIDE_AUDIT_LOG").ok();
+        std::env::set_var("AOIDE_TERMINAL", "true");
+        std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+        std::env::set_var("XDG_RUNTIME_DIR", &state);
+        std::env::set_var("AOIDE_AUDIT_LOG", state.join("log"));
+
+        let proj_path = stage.to_string_lossy().to_string();
+        let pf = aoide_storage::records::ProjectsFile {
+            schema_version: "0".to_string(),
+            projects: vec![aoide_storage::records::Project {
+                name: "proj".to_string(),
+                path: proj_path.clone(),
+                auto_resume: true,
+                ..Default::default()
+            }],
+        };
+        aoide_storage::stage::write_stage(&aoide_storage::stage::projects_path(), &pf).unwrap();
+
+        // One live (non-`done`) session anchored to the project — exactly
+        // the shape that used to suppress the whole project.
+        let sf = aoide_storage::records::SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![aoide_storage::records::SessionRecord {
+                session_id: "live-1".to_string(),
+                agent: "claude".to_string(),
+                cwd: proj_path.clone(),
+                state: "working".to_string(),
+                started_at: "2026-08-20T00:00:00Z".to_string(),
+                ..Default::default()
+            }],
+        };
+        aoide_storage::stage::write_stage(&aoide_storage::stage::sessions_path(), &sf).unwrap();
+
+        // A carried-but-dead ledger entry, anchored to the same project.
+        let entry = aoide_storage::ledger::LedgerEntry {
+            v: 0,
+            session_id: "carried-dead".to_string(),
+            agent: "claude".to_string(),
+            harness_session_id: Some("carried-dead".to_string()),
+            cwd: proj_path,
+            started_at: "2026-08-20T00:00:00Z".to_string(),
+            ended_at: "2026-08-20T01:00:00Z".to_string(),
+            ..Default::default()
+        };
+        aoide_storage::ledger::append_ledger_entry(&entry).unwrap();
+
+        let mut carried = Vec::new();
+        aoide_storage::carry::set_carried(&mut carried, "carried-dead", true);
+        aoide_storage::carry::save_carry(&carried).unwrap();
+
+        run_boot_auto_resume();
+
+        let after = aoide_storage::carry::load_carry();
+        assert!(
+            !aoide_storage::carry::is_carried(&after, "carried-dead"),
+            "`carried-dead` must have been resurrected (its mark transferred) despite a live \
+             session anchored to the same project — the exact case the old per-project \
+             `has_live` skip would have suppressed"
+        );
+        assert_eq!(after.len(), 1, "the mark moved to exactly one fresh id — the set size is unchanged");
+
+        match saved_terminal {
+            Some(v) => std::env::set_var("AOIDE_TERMINAL", v),
+            None => std::env::remove_var("AOIDE_TERMINAL"),
+        }
+        match saved_wayland {
+            Some(v) => std::env::set_var("WAYLAND_DISPLAY", v),
+            None => std::env::remove_var("WAYLAND_DISPLAY"),
+        }
+        match saved_runtime {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+        match saved_audit {
+            Some(v) => std::env::set_var("AOIDE_AUDIT_LOG", v),
+            None => std::env::remove_var("AOIDE_AUDIT_LOG"),
+        }
         restore_stage_and_state(&stage, &state, saved_stage, saved_state);
     }
 

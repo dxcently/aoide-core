@@ -136,13 +136,25 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   never two independently-written appenders, so a given session
   contributes exactly one ledger line regardless of which path retired it.
   `graph/resurrect.rs::session_resurrect` (`graph resurrect --project
-  <name> [--all | --id <ledgerSessionId>]`) reads that ledger, anchors
+  <name> [--all | --id <ledgerSessionId>]`) reads that ledger and anchors
   entries to a project by the SAME `anchor_for` longest-prefix rule `graph
-  emit` uses, filters to harnesses with a verified `AgentProfile.
-  resume_args` (`aoide_protocol::agents` — a harness with none is skipped
-  with a taught message naming it, never a guessed invocation), and spawns
-  each survivor via the windowed path (`graph/spawn.rs`, P-D7) with the
-  harness's own resume argv and `--cwd` set to the ledger entry's own cwd.
+  emit` uses. Selection then branches on the flags: `--all` widens to every
+  anchored entry, `--id` narrows to one specific `sessionId`, and bare
+  (neither flag) resumes the project's WHOLE carried set
+  (`aoide_storage::carry`, `state/carry.json`, durable-sessions plan P-C4) —
+  `carried_selection` keeps only anchored entries currently marked durable,
+  drops any id already alive (non-`done`) in `sessions.json`, and dedups by
+  `sessionId` keeping the entry with the newest `endedAt` (a carried id that
+  was resurrected and exited again appears twice in the append-only
+  ledger). `--all` and `--id` are unchanged escapes: both widen or narrow
+  past the carried set regardless of the mark. An empty bare-mode selection
+  is an honest `Outcome::ok` no-op naming the carried set as empty, never a
+  silent success. Every surviving candidate is then filtered to harnesses
+  with a verified `AgentProfile.resume_args` (`aoide_protocol::agents` — a
+  harness with none is skipped with a taught message naming it, never a
+  guessed invocation), and spawned via the windowed path (`graph/spawn.rs`,
+  P-D7) with the harness's own resume argv and `--cwd` set to the ledger
+  entry's own cwd.
   A resurrected session is ALWAYS a fresh `sessionId` — ids are never
   recycled — and gets stamped `resumedFrom` (`session_store.rs::
   stamp_resumed_from`) naming the ledger entry it continues; `build_graph`

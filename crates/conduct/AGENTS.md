@@ -52,6 +52,17 @@
   must never start carrying it, and a failed spawn must leave the old id
   exactly as it was. Don't split the add and the drop across two
   `save_carry` calls, and don't drop the check that the old id was carried.
+- **Bare `graph resurrect --project` selects the carried set, not a single
+  "most recent" entry (P-C4, durable-sessions plan).** `resurrect.rs`'s
+  `carried_selection` is the one place that reads `sessions.json` for
+  liveness — the daemon's boot sweep (`aoide-server`'s `daemon.rs`) no
+  longer runs its own liveness check before calling `session_resurrect`; it
+  calls unconditionally for every `autoResume` project and relies on this
+  function to drop already-alive ids per candidate. Don't reintroduce a
+  project-wide liveness gate in the daemon loop — a multi-session carried
+  set needs the exclusion done per id, not per project, or one live
+  terminal suppresses reviving the rest of the set. `--all` and `--id` stay
+  exactly as they were: neither consults the carry mark at all.
 - **`reap` (toast-free) and `reap_and_announce` (the registered CLI/daemon
   handler) are deliberately two functions, not one.** `reap_and_announce`
   spawns a REAL `notify-send` on the live desktop whenever the sweep
