@@ -146,6 +146,12 @@ pub struct AgentProfile {
     pub model_ceiling: fn(Option<&str>) -> u64,
     pub transcript: TranscriptSpec,
     pub hook_settings: SettingsSpec,
+    /// Where this harness discovers installable skills — a directory of
+    /// `<skill-name>/SKILL.md` packages — relative to `$HOME` (claude:
+    /// `.claude/skills`). `None` for a harness with no skills-directory
+    /// concept (or none verified): `hooks install` then skips its skill
+    /// link with a taught message instead of guessing a path.
+    pub skills_dir: Option<&'static str>,
     /// argv that launches this harness fresh (claude: `&["claude"]`) — the
     /// program name plus any args every invocation needs, BEFORE a caller's
     /// own extra args (e.g. `--resume` or a task prompt) are appended.
@@ -658,6 +664,8 @@ pub static CLAUDE_PROFILE: AgentProfile = AgentProfile {
         relative_path: ".claude/settings.json",
         format: SettingsFormat::Json,
     },
+    // Claude Code loads personal skills from `~/.claude/skills/<name>/SKILL.md`.
+    skills_dir: Some(".claude/skills"),
     launch: &["claude"],
     // `claude --resume <id>` is documented/well-known CLI behaviour, named
     // verbatim in this field's own doc comment in `docs/architecture/
@@ -1060,6 +1068,9 @@ pub static KIMI_PROFILE: AgentProfile = AgentProfile {
         relative_path: ".kimi-code/config.toml",
         format: SettingsFormat::Toml,
     },
+    // No skills-directory concept verified for Kimi Code — never a guessed
+    // path; `hooks install` skips the skill link with a taught message.
+    skills_dir: None,
     launch: &["kimi"],
     // Verified 2026-08-25 against the real installed `kimi` binary — the
     // exact 0.31.1 build `pkgs/kimi-code/default.nix` pins (`kimi --version`
@@ -1378,6 +1389,9 @@ pub static PI_PROFILE: AgentProfile = AgentProfile {
         relative_path: ".pi/agent/extensions/aoide-pi-session.ts",
         format: SettingsFormat::Declarative,
     },
+    // pi's extension surface is declarative (see `hook_settings`); it has no
+    // skills directory.
+    skills_dir: None,
     launch: &["pi"],
     // Verified 2026-08-25 by ACTUALLY RESUMING a session with the real
     // installed `pi` binary (the `pi-coding-agent` package
@@ -1548,6 +1562,7 @@ mod tests {
         assert_eq!((CLAUDE_PROFILE.model_ceiling)(None), 200_000);
         assert_eq!(CLAUDE_PROFILE.hook_settings.relative_path, ".claude/settings.json");
         assert_eq!(CLAUDE_PROFILE.hook_settings.format, SettingsFormat::Json);
+        assert_eq!(CLAUDE_PROFILE.skills_dir, Some(".claude/skills"));
     }
 
     // ── the kimi profile ───────────────────────────────────────────────────
@@ -1606,6 +1621,9 @@ mod tests {
         assert_eq!(ceil(None), 200_000);
         assert_eq!(KIMI_PROFILE.hook_settings.relative_path, ".kimi-code/config.toml");
         assert_eq!(KIMI_PROFILE.hook_settings.format, SettingsFormat::Toml);
+        // No skills dir verified for kimi — a guessed path would make
+        // `hooks install` mint a directory the harness never reads.
+        assert_eq!(KIMI_PROFILE.skills_dir, None);
     }
 
     #[test]
@@ -1867,6 +1885,7 @@ mod tests {
             ".pi/agent/extensions/aoide-pi-session.ts"
         );
         assert_eq!(PI_PROFILE.hook_settings.format, SettingsFormat::Declarative);
+        assert_eq!(PI_PROFILE.skills_dir, None);
     }
 
     #[test]

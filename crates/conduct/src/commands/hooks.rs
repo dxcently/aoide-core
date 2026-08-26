@@ -1,14 +1,28 @@
-//! `hooks install` — the generic hook-installer command: wire an agent harness's
-//! settings file so its hook stream pipes into `graph session hook`, driven
-//! by the harness's profile (`aoide_protocol::agents::SettingsSpec` — path +
-//! format). The merge is text/structure-level and NEVER a clobber (the kimi
+//! `hooks install` — the generic hook-installer command: wire an agent harness
+//! to Aoide, driven by the harness's profile (`aoide_protocol::agents`). It
+//! writes three things:
+//!
+//! 1. The `graph session hook` entries — one per hook event — into the
+//!    profile's settings file (`SettingsSpec` — path + format).
+//! 2. The `SessionStart` onboarding pointer ([`POINTER_CMD`], the same bare
+//!    `printf` one-liner the repo's own `.claude/settings.json` carries),
+//!    keyed independently of the graph entries.
+//! 3. A symlink of the repo's skill directory (`.claude/skills/aoide`, found
+//!    by walking up from the cwd — the invoking checkout IS the source) into
+//!    the profile's `skills_dir`. A profile with no skills directory skips
+//!    with a taught message; an existing non-matching file/link is a refusal,
+//!    never an overwrite.
+//!
+//! The merge is text/structure-level and NEVER a clobber (the kimi
 //! config holds providers/credentials; the claude settings are hand-written),
 //! idempotent (the second run reports zero added), and reports exactly what
-//! changed. `--capture` is temporary debugging: the same entries with the
-//! command wrapped to tee raw payloads to `~/Aoide/state/<agent>-hooks.jsonl`
+//! changed. `--capture` is temporary debugging: the same graph entries with
+//! the command wrapped to tee raw payloads to `~/Aoide/state/<agent>-hooks.jsonl`
 //! (NOT `~/Aoide/log` — that path is the audit log FILE) — a DISTINCT
 //! idempotency key, so capture entries coexist with plain ones
 //! (installing without `--capture` replaces nothing) and are removed manually.
+//! The pointer and skill link are mode-independent: a `--capture` run neither
+//! duplicates nor replaces them.
 
 use aoide_protocol::Invocation;
 use aoide_protocol::output::Outcome;
@@ -28,6 +42,26 @@ pub fn register(r: &mut Registry) {
         handler: hooks_install,
     ));
 }
+
+/// The SessionStart onboarding pointer — byte-for-byte the one-liner the
+/// repo's own `.claude/settings.json` carries: a bare `printf` that exits 0
+/// with no `aoide` on PATH, pointing a fresh session at the onboarding route
+/// (the skill, `AGENTS.md`, `docs/agent/`, `aoide guide`). Shared as ONE
+/// constant so the installed entry can never drift from the repo's wording
+/// by a retype.
+const POINTER_CMD: &str = "printf 'Aoide onboarding: run `aoide guide`; read AGENTS.md, then docs/agent/README.md (read order) and docs/agent/session.md (session checklist). Command ground truth: `aoide schema --json`.\\n'";
+
+/// The pointer's idempotency key: any SessionStart entry whose command
+/// carries this marker counts as the pointer, whatever its exact wording —
+/// so a hand-edited pointer is respected, never duplicated or clobbered.
+const POINTER_MARKER: &str = "Aoide onboarding:";
+
+/// The pointer's label in the `added`/`present` report arrays (the graph
+/// entries are labelled by event name).
+const POINTER_LABEL: &str = "onboarding-pointer";
+
+/// The skill directory shipped in the repo, relative to the checkout root.
+const SKILL_REPO_PATH: &str = ".claude/skills/aoide";
 
 /// The hook events wired per harness: the nine core events both profiles map,
 /// plus kimi's dedicated needs-input event (claude signals that via
@@ -103,6 +137,99 @@ struct InstallReport {
     present: Vec<&'static str>,
 }
 
+/// What the skill-link pass did (or why it didn't).
+enum SkillLink {
+    /// Created the symlink: (link, source).
+    Linked(PathBuf, PathBuf),
+    /// The link already exists and resolves to the repo skill — a no-op.
+    Present(PathBuf),
+    /// The profile has no skills directory (kimi) — skipped with a taught
+    /// message, exactly like the Declarative settings short-circuit.
+    NoSkillsDir,
+    /// Not invoked from inside an Aoide checkout, so there is no source to
+    /// link — hooks still install; the skill is skipped with a taught message.
+    NoSource,
+    /// Something else already sits at the link path — a refusal (taught
+    /// message), never an overwrite.
+    Conflict(PathBuf, String),
+}
+
+/// Locate the invoking checkout's skill directory: walk up from the cwd to
+/// the first directory holding `.claude/skills/aoide/SKILL.md`. `hooks
+/// install` has no repo-locating pattern to reuse (its door commands resolve
+/// `aoide` from PATH), so the invoking checkout IS the source — the
+/// documented assumption; run the command from inside the repo to link.
+fn skill_source() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let cand = dir.join(SKILL_REPO_PATH);
+        if cand.join("SKILL.md").is_file() {
+            return Some(cand);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Link the repo's skill directory into the profile's skills directory as
+/// `<skills_dir>/aoide`. Idempotent (an existing correct link is a no-op) and
+/// never-clobbering (anything else at the path is a refusal).
+fn link_skill(profile: &AgentProfile) -> Result<SkillLink, String> {
+    let Some(rel) = profile.skills_dir else {
+        return Ok(SkillLink::NoSkillsDir);
+    };
+    let Some(source) = skill_source() else {
+        return Ok(SkillLink::NoSource);
+    };
+    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
+    let link = PathBuf::from(home).join(rel).join("aoide");
+    match std::fs::symlink_metadata(&link) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            // Canonicalize both sides so `Present` means "resolves to the
+            // same directory", however the link was spelled. A dangling link
+            // canonicalizes to Err and lands in the conflict arm.
+            let resolves = matches!(
+                (std::fs::canonicalize(&link), std::fs::canonicalize(&source)),
+                (Ok(l), Ok(s)) if l == s
+            );
+            if resolves {
+                Ok(SkillLink::Present(link))
+            } else {
+                let target = std::fs::read_link(&link)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "<unreadable>".to_string());
+                Ok(SkillLink::Conflict(
+                    link.clone(),
+                    format!(
+                        "{} is already a symlink to {target}, not to {} — refusing to overwrite it; remove it yourself to relink",
+                        link.display(),
+                        source.display()
+                    ),
+                ))
+            }
+        }
+        Ok(_) => Ok(SkillLink::Conflict(
+            link.clone(),
+            format!(
+                "{} already exists and is not a symlink to the repo skill — refusing to overwrite it; move it aside to let `hooks install` link {}",
+                link.display(),
+                source.display()
+            ),
+        )),
+        Err(_) => {
+            if let Some(parent) = link.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+            }
+            std::os::unix::fs::symlink(&source, &link).map_err(|e| {
+                format!("cannot link {} -> {}: {e}", link.display(), source.display())
+            })?;
+            Ok(SkillLink::Linked(link, source))
+        }
+    }
+}
+
 /// Escape a value for a TOML basic string (the capture command embeds `"`).
 fn toml_basic(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
@@ -141,6 +268,26 @@ fn install_toml(path: &Path, profile: &AgentProfile, capture: bool) -> Result<In
         out.push_str(&format!(
             "[[hooks]]\nevent = \"{evt}\"\ncommand = \"{}\"\ntimeout = 5\n",
             toml_basic(&door_command(profile, capture))
+        ));
+    }
+    // The onboarding pointer: one SessionStart entry, keyed on its marker —
+    // mode-independent, so plain and `--capture` runs share the one entry.
+    let has_pointer = out.split("[[hooks]]").skip(1).any(|block| {
+        block.contains("event = \"SessionStart\"") && block.contains(POINTER_MARKER)
+    });
+    if has_pointer {
+        report.present.push(POINTER_LABEL);
+    } else {
+        report.added.push(POINTER_LABEL);
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "[[hooks]]\nevent = \"SessionStart\"\ncommand = \"{}\"\ntimeout = 5\n",
+            toml_basic(POINTER_CMD)
         ));
     }
     if !report.added.is_empty() {
@@ -205,6 +352,42 @@ fn install_json(path: &Path, profile: &AgentProfile, capture: bool) -> Result<In
         } ] });
         hooks
             .entry(evt)
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .expect("event entry is an array")
+            .push(group);
+    }
+    // The onboarding pointer: one SessionStart entry, keyed on its marker —
+    // mode-independent, so plain and `--capture` runs share the one entry.
+    let has_pointer = hooks
+        .get("SessionStart")
+        .and_then(Value::as_array)
+        .map(|groups| {
+            groups.iter().any(|g| {
+                g.get("hooks")
+                    .and_then(Value::as_array)
+                    .map(|hs| {
+                        hs.iter().any(|h| {
+                            h.get("command")
+                                .and_then(Value::as_str)
+                                .map(|c| c.contains(POINTER_MARKER))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    if has_pointer {
+        report.present.push(POINTER_LABEL);
+    } else {
+        report.added.push(POINTER_LABEL);
+        let group = json!({ "hooks": [ {
+            "type": "command",
+            "command": POINTER_CMD,
+        } ] });
+        hooks
+            .entry("SessionStart")
             .or_insert_with(|| json!([]))
             .as_array_mut()
             .expect("event entry is an array")
@@ -279,31 +462,80 @@ fn hooks_install(inv: &Invocation) -> Outcome {
             let _ = std::fs::create_dir_all(PathBuf::from(home).join("Aoide/state"));
         }
     }
-    let changed = !report.added.is_empty();
-    let message = if changed {
+    // The skill link, after the settings merge (a skill refusal must not
+    // block the hook wiring, and the report below carries both outcomes).
+    let skill = match link_skill(profile) {
+        Ok(s) => s,
+        Err(e) => {
+            return Outcome::error(cmd, e).with_data(json!({
+                "reason": "skill-unlinkable",
+                "agent": profile.name,
+                "added": report.added,
+                "present": report.present,
+            }))
+        }
+    };
+    if let SkillLink::Conflict(link, taught) = &skill {
+        return Outcome::error(cmd, taught.clone()).with_data(json!({
+            "reason": "skill-link-conflict",
+            "agent": profile.name,
+            "skill_link": link.to_string_lossy(),
+            "added": report.added,
+            "present": report.present,
+        }));
+    }
+    let (skill_status, skill_note): (&str, String) = match &skill {
+        SkillLink::Linked(link, source) => (
+            "linked",
+            format!("skill linked: {} -> {}", link.display(), source.display()),
+        ),
+        SkillLink::Present(link) => (
+            "present",
+            format!("skill already linked ({})", link.display()),
+        ),
+        SkillLink::NoSkillsDir => (
+            "no-skills-dir",
+            format!(
+                "{} has no skills directory; skill not linked",
+                profile.name
+            ),
+        ),
+        SkillLink::NoSource => (
+            "no-source",
+            format!(
+                "not inside an Aoide checkout (no {SKILL_REPO_PATH} above the cwd); skill not linked — run from the repo to link it"
+            ),
+        ),
+        SkillLink::Conflict(..) => unreachable!("returned above"),
+    };
+    let skill_linked = matches!(skill, SkillLink::Linked(..));
+    let changed = !report.added.is_empty() || skill_linked;
+    let message = if report.added.is_empty() {
         format!(
-            "installed {} hook(s) for {} → {}",
-            report.added.len(),
+            "all {} hooks already installed for {} ({}); {skill_note}",
+            report.present.len(),
             profile.name,
             path.display()
         )
     } else {
         format!(
-            "all {} hooks already installed for {} ({})",
-            report.present.len(),
+            "installed {} hook(s) for {} → {}; {skill_note}",
+            report.added.len(),
             profile.name,
             path.display()
         )
     };
     let out = Outcome::ok(cmd, message);
     let out = if changed {
-        out.changed(
-            report
-                .added
-                .iter()
-                .map(|e| format!("hook installed: {e} ({})", profile.name))
-                .collect::<Vec<String>>(),
-        )
+        let mut changes: Vec<String> = report
+            .added
+            .iter()
+            .map(|e| format!("hook installed: {e} ({})", profile.name))
+            .collect();
+        if skill_linked {
+            changes.push(format!("skill linked ({})", profile.name));
+        }
+        out.changed(changes)
     } else {
         out
     };
@@ -312,6 +544,7 @@ fn hooks_install(inv: &Invocation) -> Outcome {
         "settings": path.to_string_lossy(),
         "added": report.added,
         "present": report.present,
+        "skill": skill_status,
         "capture": capture,
         "changed": changed,
     }))
@@ -351,18 +584,24 @@ mod tests {
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         let data = out.data.unwrap();
         assert_eq!(data["changed"], true);
-        assert_eq!(data["added"].as_array().unwrap().len(), 10);
+        // 10 graph events + the onboarding pointer.
+        assert_eq!(data["added"].as_array().unwrap().len(), 11);
         assert_eq!(data["settings"], json!(path.to_string_lossy()));
+        // kimi has no skills directory — the skill pass short-circuits.
+        assert_eq!(data["skill"], "no-skills-dir");
+        assert!(out.message.contains("kimi has no skills directory"), "msg: {}", out.message);
 
         let text = std::fs::read_to_string(&path).unwrap();
         // The user's content survived, above the appended blocks.
         assert!(text.starts_with("default_model = \"kimi-code/k3-256k\""));
-        assert_eq!(text.matches("[[hooks]]").count(), 10);
+        assert_eq!(text.matches("[[hooks]]").count(), 11);
         for evt in ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop",
                     "SubagentStart", "SubagentStop", "SessionEnd", "Notification", "PermissionRequest"] {
             assert!(text.contains(&format!("event = \"{evt}\"")), "event: {evt}");
         }
         assert!(text.contains("command = \"aoide graph session hook --agent kimi\""));
+        // Exactly one pointer entry.
+        assert_eq!(text.matches(POINTER_MARKER).count(), 1);
         // ONLY the three fields per entry — a `matcher` would break kimi's load.
         assert!(!text.contains("matcher"));
 
@@ -371,7 +610,7 @@ mod tests {
         let data2 = out2.data.unwrap();
         assert_eq!(data2["changed"], false);
         assert_eq!(data2["added"], json!([]));
-        assert_eq!(data2["present"].as_array().unwrap().len(), 10);
+        assert_eq!(data2["present"].as_array().unwrap().len(), 11);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -385,13 +624,16 @@ mod tests {
         std::env::set_var("KIMI_CODE_HOME", root.join("kimi"));
         std::env::set_var("HOME", &root);
 
-        hooks_install(&install_inv("kimi", false)); // plain first
+        hooks_install(&install_inv("kimi", false)); // plain first (adds the pointer too)
         let out = hooks_install(&install_inv("kimi", true)); // capture is a distinct key
         let data = out.data.unwrap();
         assert_eq!(data["changed"], true);
+        // The 10 capture events only — the pointer is mode-independent and
+        // already present from the plain run, so `--capture` left it alone.
         assert_eq!(data["added"].as_array().unwrap().len(), 10);
         let text = std::fs::read_to_string(root.join("kimi/config.toml")).unwrap();
-        assert_eq!(text.matches("[[hooks]]").count(), 20, "plain + capture coexist");
+        assert_eq!(text.matches("[[hooks]]").count(), 21, "plain + pointer + capture coexist");
+        assert_eq!(text.matches(POINTER_MARKER).count(), 1);
         assert!(text.contains("tee -a \\\"$HOME/Aoide/state/kimi-hooks.jsonl\\\" | aoide graph session hook --agent kimi"));
         // The capture log dir was created.
         assert!(root.join("Aoide/state").is_dir());
@@ -425,15 +667,26 @@ mod tests {
                 "command": "a=$(command -v aoide) || exit 0; \"$a\" graph session hook >/dev/null 2>&1; exit 0"
             } ] } ]));
         }
+        // The pointer entry too (the real hand-written file carries it), so a
+        // fully-wired file stays byte-identical below.
+        hooks.get_mut("SessionStart").unwrap().as_array_mut().unwrap().push(
+            json!({ "hooks": [ { "type": "command", "command": POINTER_CMD } ] }),
+        );
         let doc = json!({ "model": "sonnet", "hooks": hooks, "theme": "auto" });
         std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap() + "\n").unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
+        // And the skill already correctly linked.
+        let skills = root.join(".claude/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::os::unix::fs::symlink(skill_source().unwrap(), skills.join("aoide")).unwrap();
 
         let out = hooks_install(&install_inv("claude", false));
         let data = out.data.unwrap();
-        assert_eq!(data["changed"], false);
+        assert_eq!(data["changed"], false, "msg: {}", out.message);
         assert_eq!(data["added"], json!([]));
-        assert_eq!(data["present"].as_array().unwrap().len(), 9);
+        // 9 graph events + the pointer.
+        assert_eq!(data["present"].as_array().unwrap().len(), 10);
+        assert_eq!(data["skill"], "present");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "untouched when complete");
 
         // A missing event gets exactly one new entry, in the existing shape,
@@ -454,6 +707,86 @@ mod tests {
         // And the full set is present again on a third run.
         let out3 = hooks_install(&install_inv("claude", false));
         assert_eq!(out3.data.unwrap()["changed"], false);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_pointer_and_skill_install_and_are_idempotent() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _env = EnvSaver::capture(&["HOME"]);
+        let root = unique_tmp("hooks-claude-skill");
+        std::env::set_var("HOME", &root);
+        let path = root.join(".claude/settings.json");
+
+        // Fresh install: 9 graph events + the pointer, and the skill linked.
+        let out = hooks_install(&install_inv("claude", false));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.unwrap();
+        assert_eq!(data["changed"], true);
+        assert_eq!(data["added"].as_array().unwrap().len(), 10);
+        assert!(data["added"].as_array().unwrap().contains(&json!(POINTER_LABEL)));
+        assert_eq!(data["skill"], "linked");
+
+        // The pointer entry is the shared constant, in its own group.
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let session_start = doc["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(session_start.len(), 2, "graph entry + pointer entry");
+        assert_eq!(session_start[1]["hooks"][0]["command"], POINTER_CMD);
+
+        // The symlink resolves to the invoking checkout's skill directory.
+        let link = root.join(".claude/skills/aoide");
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(
+            std::fs::canonicalize(&link).unwrap(),
+            std::fs::canonicalize(skill_source().unwrap()).unwrap()
+        );
+        assert!(link.join("SKILL.md").is_file());
+
+        // Second run: zero added, pointer and link reported present, settings
+        // byte-identical.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let out2 = hooks_install(&install_inv("claude", false));
+        let data2 = out2.data.unwrap();
+        assert_eq!(data2["changed"], false);
+        assert_eq!(data2["added"], json!([]));
+        assert_eq!(data2["present"].as_array().unwrap().len(), 10);
+        assert_eq!(data2["skill"], "present");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_skill_conflict_is_a_taught_refusal_never_an_overwrite() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _env = EnvSaver::capture(&["HOME"]);
+        let root = unique_tmp("hooks-claude-conflict");
+        std::env::set_var("HOME", &root);
+        let link = root.join(".claude/skills/aoide");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+
+        // A regular file where the link belongs: refuse, teach, leave it.
+        std::fs::write(&link, "someone else's skill").unwrap();
+        let out = hooks_install(&install_inv("claude", false));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
+        assert!(out.message.contains("refusing to overwrite"), "msg: {}", out.message);
+        assert!(out.message.contains(&link.display().to_string()), "msg: {}", out.message);
+        let data = out.data.unwrap();
+        assert_eq!(data["reason"], "skill-link-conflict");
+        // The hooks themselves DID merge before the refusal — reported.
+        assert_eq!(data["added"].as_array().unwrap().len(), 10);
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "someone else's skill");
+
+        // A symlink to somewhere else: same refusal, naming both targets.
+        std::fs::remove_file(&link).unwrap();
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        let out2 = hooks_install(&install_inv("claude", false));
+        assert_eq!(out2.status, aoide_protocol::output::Status::Error);
+        assert!(out2.message.contains("already a symlink to"), "msg: {}", out2.message);
+        assert_eq!(std::fs::read_link(&link).unwrap(), elsewhere, "link untouched");
 
         let _ = std::fs::remove_dir_all(&root);
     }

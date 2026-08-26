@@ -46,9 +46,10 @@ other crate in this workspace sits above.
   folds onto and every reader trusts verbatim.
 - `wire` — typed A2A-JSON-RPC and MCP payload shapes.
 - `agents` — `agent_profile`, the per-harness knowledge table (hook
-  vocabulary, model ceilings, transcript layout, and — P-D7 — the argv that
-  launches a harness fresh and, where verified, the argv that resumes a
-  prior session of it by its own id) keyed by harness name.
+  vocabulary, model ceilings, transcript layout, the hook-settings and
+  skills-directory locations, and — P-D7 — the argv that launches a harness
+  fresh and, where verified, the argv that resumes a prior session of it by
+  its own id) keyed by harness name.
 - `bin` — sibling-binary resolution (`core_bin`/`rice_bin`; env override →
   sibling-of-`current_exe` → bare `PATH` name).
 - `pick`, `model`, `policy` — the numbered picker + tty gate, model context
