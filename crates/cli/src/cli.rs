@@ -207,6 +207,28 @@ mod tests {
         assert_eq!(inv.args, vec!["claude", "-p"]);
     }
 
+    // The position-aware check has a converse hazard (#48): a flag placed
+    // BEFORE the final path segment, whose value collides with that segment's
+    // name. `graph session --id start` used to parse SILENTLY as
+    // path=`graph.session.start`, flags={id:"true"} — the value swallowed as
+    // a path segment, the flag mis-booleaned — because `start` really is the
+    // next segment of `graph session start`. The token reads both ways, so
+    // the parser refuses the ordering loudly instead of guessing. Internal
+    // self-exec sites (`do_spawn` in server/src/a2a.rs, graph/spawn.rs,
+    // graph/permit.rs) always spell the full leaf path before any flag, so
+    // none of them can reach this error.
+    #[test]
+    fn a_flag_before_the_full_path_colliding_with_a_leaf_name_fails_loudly() {
+        let err = parse(&argv(&["graph", "session", "--id", "start"]), Door::Cli).unwrap_err();
+        assert_eq!(err.status, Status::Usage, "ambiguous ordering → exit 2");
+        assert!(err.message.contains("`--id start`"), "names the flag+value: {}", err.message);
+        assert!(
+            err.message.contains("aoide graph session start --id <value>"),
+            "suggests the flags-after-path spelling: {}",
+            err.message
+        );
+    }
+
     // No CLI-internal aliases (khoa, 2026-08-14): each command has exactly one
     // spelling. Retired names are plain unknown commands, same as a typo.
     #[test]

@@ -79,10 +79,21 @@ pub fn parse(argv: &[String], door: Door, bin_name: &str, registry: &Registry) -
                 flags.insert("json".into(), "true".into());
             } else {
                 // Peek: if the next token is a value (not a flag), consume it.
-                if i + 1 < argv.len()
-                    && !argv[i + 1].starts_with("--")
-                    && !is_command_token(&argv[i + 1], &positionals, registry)
-                {
+                if i + 1 < argv.len() && !argv[i + 1].starts_with("--") {
+                    if is_command_token(&argv[i + 1], &positionals, registry) {
+                        // The token reads both ways: this flag's value, or the
+                        // next segment of a command path still being spelled
+                        // (`graph session --id start` vs `graph session start
+                        // --id …`). Neither reading is safe to pick silently —
+                        // refuse loudly, naming both.
+                        return Err(ambiguous_flag_outcome(
+                            name,
+                            &argv[i + 1],
+                            &positionals,
+                            registry,
+                            bin_name,
+                        ));
+                    }
                     flags.insert(name.to_string(), argv[i + 1].clone());
                     i += 1;
                 } else {
@@ -313,30 +324,79 @@ fn signature(c: &Command) -> String {
     sig
 }
 
-/// Is this token part of a command path (so a preceding `--flag` should be
-/// treated as a bare boolean rather than consuming it)?
+/// Is this token part of a command path (so a preceding `--flag` must not
+/// silently consume it as a value)?
 ///
 /// Flag-position-aware (khoa, 2026-08-20): `prior` is the positionals already
 /// collected by the time the parser reaches this token — i.e. how much of a
 /// command path has been built so far, interleaved with whatever flags came
 /// before it. A token only continues a command path if some REGISTERED path
 /// agrees with `prior` exactly up to `prior.len()` and has `tok` as its very
-/// next segment. This is a strict refinement of the old "does `tok` match
-/// ANY command's first segment" check, which ignored position entirely: a
-/// value like `a2a` (a real group's first segment) or `shell` collided with
-/// `--agent a2a` / `--agent shell` no matter where in argv it sat, because
-/// nothing about the check depended on what came before it. Requiring `tok`
-/// to be the exact next segment of a path that already agrees with `prior`
-/// means a flag's value can never be mistaken for a command token unless the
-/// invocation is ACTUALLY still mid-way through spelling out a longer
-/// command path — which a flag's value never is, by construction (a flag
-/// always trails the command path it belongs to, never sits inside it).
+/// next segment. This is NOT a strict refinement of the old "does `tok`
+/// match ANY command's first segment" check — the two compare the token at
+/// different depths (any path's first segment vs. the segment after
+/// `prior`), so for a non-empty `prior` each accepts tokens the other
+/// rejects. What the position-aware form fixes is the first-segment
+/// collision the old check suffered anywhere in argv: a value like `a2a` (a
+/// real group's first segment) or `shell` broke `--agent a2a` /
+/// `--agent shell` even with the command path fully spelled before the
+/// flag. What it cannot fix is the converse ordering — a flag placed BEFORE
+/// the path is complete, whose value matches the path's next segment
+/// (`graph session --id start`): the token genuinely reads both ways, and
+/// no yes/no answer here picks correctly. `parse` refuses that ordering
+/// loudly ([`ambiguous_flag_outcome`]) instead of guessing.
 fn is_command_token(tok: &str, prior: &[String], registry: &Registry) -> bool {
     registry.commands().any(|c| {
         c.path.len() > prior.len()
             && c.path[..prior.len()].iter().zip(prior).all(|(a, b)| *a == b)
             && c.path[prior.len()] == tok
     })
+}
+
+/// The usage error for a flag whose value collides with the next segment of
+/// a command path still being spelled (`graph session --id start`, where
+/// `graph session start` is a registered command). The token reads both ways
+/// and the parser refuses to pick silently: name the flag, the ambiguous
+/// value, and the unambiguous spelling(s).
+fn ambiguous_flag_outcome(
+    flag: &str,
+    value: &str,
+    prior: &[String],
+    registry: &Registry,
+    bin_name: &str,
+) -> Outcome {
+    // A registered command the value would continue — `is_command_token` just
+    // matched one, so a witness always exists (any one makes the suggestion
+    // concrete; the fallback is unreachable belt-and-braces).
+    let full = registry
+        .commands()
+        .find(|c| {
+            c.path.len() > prior.len()
+                && c.path[..prior.len()].iter().zip(prior).all(|(a, b)| *a == b)
+                && c.path[prior.len()] == value
+        })
+        .map(|c| c.path.join(" "))
+        .unwrap_or_else(|| {
+            prior.iter().map(String::as_str).chain([value]).collect::<Vec<_>>().join(" ")
+        });
+    let mut m = format!(
+        "ambiguous: `--{flag} {value}` sits before the command path is complete — \
+         `{value}` could be the flag's value or the next command-path segment (`{full}`)\
+         \n\ndid you mean:\
+         \n  {bin_name} {full} --{flag} <value>  (flags after the full command path)"
+    );
+    // Offer the `--flag=value` spelling only when `prior` is itself a
+    // complete registered command — otherwise that spelling just errors too.
+    if registry.get(prior).is_some() {
+        m.push_str(&format!(
+            "\n  {bin_name} {} --{flag}={value}  (`{value}` as the flag's value)",
+            prior.join(" ")
+        ));
+    }
+    m.push_str(&format!("\n\nrun '{bin_name} --help' for the full command list"));
+    let mut continued = prior.to_vec();
+    continued.push(value.to_string());
+    Outcome::usage(continued.join("."), m)
 }
 
 /// One-line blurbs for the KNOWN command groups, keyed by first path
@@ -534,6 +594,18 @@ mod tests {
             handler: noop,
             available: || true,
         });
+        r.insert(Command {
+            path: &["graph", "session", "start"],
+            summary: "Register a running session.",
+            args: &[],
+            flags: &[JSON_FLAG, Flag { name: "id", ty: "string", description: "Session id." }],
+            gated: false,
+            implemented: true,
+            exit_codes: (),
+            examples: &[],
+            handler: noop,
+            available: || true,
+        });
         r
     }
 
@@ -562,6 +634,38 @@ mod tests {
         let (inv, _) = parse(&argv(&["graph", "view", "--focus", "session:x"]), Door::Cli, "aoide", &reg).unwrap();
         assert_eq!(inv.path, vec!["graph", "view"]);
         assert_eq!(inv.flags.get("focus").map(String::as_str), Some("session:x"));
+    }
+
+    /// Regression (#48): a flag placed BEFORE the final path segment, whose
+    /// value collides with that segment's name. `graph session --id start`
+    /// used to parse SILENTLY as path=`graph.session.start`,
+    /// flags={id:"true"} — the value swallowed as a path segment, the flag
+    /// mis-booleaned. The ordering is genuinely ambiguous, so it must be a
+    /// loud usage error naming the flag, the value, and the unambiguous
+    /// spelling.
+    #[test]
+    fn a_flag_before_the_full_path_whose_value_collides_with_a_segment_fails_loudly() {
+        let reg = test_registry();
+        let err = parse(&argv(&["graph", "session", "--id", "start"]), Door::Cli, "aoide", &reg).unwrap_err();
+        assert_eq!(err.status, Status::Usage, "ambiguous ordering → exit 2");
+        assert_eq!(err.render(false).1, exit::USAGE);
+        assert!(err.message.contains("`--id start`"), "names the flag+value: {}", err.message);
+        assert!(err.message.contains("`graph session start`"), "names the colliding command: {}", err.message);
+        assert!(
+            err.message.contains("aoide graph session start --id <value>"),
+            "suggests the flags-after-path spelling: {}",
+            err.message
+        );
+    }
+
+    /// The same value AFTER the full command path is not ambiguous — nothing
+    /// extends `graph session start`, so `--id start` binds normally.
+    #[test]
+    fn the_colliding_value_after_the_full_path_still_binds_as_a_flag_value() {
+        let reg = test_registry();
+        let (inv, _) = parse(&argv(&["graph", "session", "start", "--id", "start"]), Door::Cli, "aoide", &reg).unwrap();
+        assert_eq!(inv.path, vec!["graph", "session", "start"]);
+        assert_eq!(inv.flags.get("id").map(String::as_str), Some("start"));
     }
 
     #[test]
