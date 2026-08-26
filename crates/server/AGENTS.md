@@ -224,6 +224,46 @@
   closing a P-P4 review finding) — a genuine behavior no-op today (every
   signed request is a POST), but the "binds method" claim above is now
   structurally true, not merely coincidentally true.
+- **`message_send`'s Inject arm feeds `should_deliver_now` through
+  `origin_for_inject` first (P-S6, CONTRACTS.md §6's "Peer authentication
+  today" standing paragraph) — a VERIFIED signature strips
+  `PeerOrigin::Loopback`'s automatic auto-deliver pass, whatever the
+  connection's own address looks like, UNLESS that peer's own signature
+  rung is itself autogate-marked.** An ssh `-L` forward (or any other
+  loopback-terminating proxy) delivers a tunneled peer's packets from its
+  own end's sshd, so `classify_origin` sees loopback for a tunneled request
+  exactly like a genuinely local caller — `origin_for_inject(origin,
+  signed_peer_name.is_some() && !sig_autogate)` closes that gap by coercing
+  the origin fed to `should_deliver_now` to `PeerOrigin::Unknown` for a
+  signed, NON-autogate peer (reusing that variant's existing fail-safe arm,
+  the same move `effective_origin` already makes for an invalid door-wide
+  token — no fourth `PeerOrigin` kind). **The `!sig_autogate` guard is not
+  optional plumbing — `should_deliver_now(PeerOrigin::Unknown, _)` ignores
+  `autogate_match` entirely (unconditional `false`, see that function's own
+  match arm and `uniform_response_guard_never_fires_for_a_per_peer_
+  autogated_token`'s doc comment for the existing pin), so coercing an
+  autogate-marked signed peer's origin to `Unknown` would make it
+  UN-deliverable, the opposite of the restoration this phase owes.** An
+  UNSIGNED request is completely untouched: `origin_for_inject` is the
+  identity function when its `signed` argument is `false`, so a genuinely
+  local caller's loopback trust is exactly as before this phase. The
+  like-for-like half: `autogate_match` folds in a THIRD signal,
+  `sig_autogate` — `resolved_peer` matched via `PeerRung::Signature` whose
+  own `Peer.autogate` is `true` — alongside the existing
+  `ip_autogate`/`token_autogate`, computed AFTER `resolved_peer` now (moved
+  down from before it) so this fold can read it; an operator who already
+  marked a peer auto-deliver keeps that behavior once it starts signing,
+  riding the ordinary Loopback/Remote arms (which DO consult
+  `autogate_match`) instead of the coercion. Don't gate this on
+  `token_configured`/`TokenState` — that's `effective_origin`'s own,
+  separate question (an invalid DOOR-WIDE bearer); this narrowing fires on
+  `signed_peer_name`/`sig_autogate` alone, unconditionally. Tests:
+  `signed_inject_from_a_non_autogate_peer_on_a_loopback_connection_is_held_pending`
+  is the actual regression pin (the exact hole a tunnel would otherwise
+  open); `signed_inject_from_an_autogate_peer_on_a_loopback_connection_still_auto_delivers`
+  is the restoration; `origin_for_inject_is_the_identity_function_when_unsigned`
+  and `origin_for_inject_downgrades_loopback_once_the_request_is_signed`
+  pin the pure predicate directly.
 - **`do_inject`'s `from` attribution (P-P3 decision 7) is scoped to the
   QUEUED path only — never an immediately-delivered payload's bytes.**
   `session_send`'s own `from` mechanism also prefixes DELIVERED text

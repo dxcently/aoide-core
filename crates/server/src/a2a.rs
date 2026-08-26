@@ -418,6 +418,47 @@ fn effective_origin(origin: PeerOrigin, token_configured: bool, token_state: Tok
     }
 }
 
+// ── Signed requests outrank loopback (CONTRACTS.md §6 amendment, 2026-08-26) ─
+//
+// An ssh `-L` port-forward delivers a tunneled peer's packets from the FAR
+// box's own sshd, so `classify_origin` sees loopback for every tunneled
+// request regardless of who is really on the other end — the same proxy
+// ambiguity `effective_origin` above already resolves for a door-wide
+// token, now reachable without any token configured at all. A request
+// carrying a per-request signature that [`verify_signed_request`] already
+// verified is, by construction, a REMOTE peer: [`origin_for_inject`] below
+// strips `PeerOrigin::Loopback`'s free pass from it before `should_deliver_
+// now` ever runs.
+
+/// The origin [`should_deliver_now`]'s Inject decision actually sees, once a
+/// verified per-request signature is factored in. Pure.
+///
+/// `signed_non_autogate` is `true` only when the caller both ran the request
+/// through [`verify_signed_request`] AND resolved it to a peer the operator
+/// has NOT marked auto-deliver (`message_send` computes exactly
+/// `signed_peer_name.is_some() && !sig_autogate`). Such a caller is a remote
+/// peer by construction, so it loses `PeerOrigin::Loopback`'s free pass:
+/// coerced to [`PeerOrigin::Unknown`], reusing that variant's existing
+/// fail-safe arm rather than inventing a fourth origin kind — exactly the
+/// move [`effective_origin`] already makes for an invalid door-wide token.
+///
+/// The exemption is load-bearing, not a convenience:
+/// `should_deliver_now(PeerOrigin::Unknown, _)` ignores `autogate_match`
+/// entirely, so coercing a signature-rung autogate peer would leave it
+/// permanently undeliverable. It keeps riding the ordinary Loopback/Remote
+/// arms, which do consult `autogate_match`.
+///
+/// `false` therefore covers two callers: an unsigned request (`origin`
+/// passes through unchanged, so the unsigned path stays byte-identical) and
+/// an autogate-marked signed peer.
+fn origin_for_inject(origin: PeerOrigin, signed_non_autogate: bool) -> PeerOrigin {
+    if signed_non_autogate {
+        PeerOrigin::Unknown
+    } else {
+        origin
+    }
+}
+
 // ── AgentCard (derived from the command registry, CONTRACTS.md §6) ──────────
 
 /// Build the AgentCard from any iterator of registry commands — factored out
@@ -1083,34 +1124,28 @@ fn message_send(
     let token_configured = !expected_token.is_empty();
     let token_state = classify_token(expected_token, presented_token);
 
-    // Autogate signals hoisted ABOVE the send-action decision: the uniform-
-    // response guard below needs them BEFORE `decide_send_action` even runs,
-    // and the Inject arm further down still needs them AFTER — one
+    // Peer resolution hoisted ABOVE the send-action decision: the uniform-
+    // response guard below needs the autogate signals BEFORE
+    // `decide_send_action` even runs, and the Inject arm further down still
+    // needs both the autogate signals AND `resolved_peer` AFTER — one
     // `load_peers()` per `message_send` call, not two. Values and their
     // meaning are unchanged from before this amendment; only WHEN they're
     // computed moved.
     let peers = aoide_storage::peer_store::load_peers();
-    let ip_autogate = match origin {
-        PeerOrigin::Remote(ip) => aoide_storage::peer_store::is_autogated_peer_addr(&peers, ip),
-        PeerOrigin::Loopback | PeerOrigin::Unknown => false,
-    };
-    let token_autogate = presented_token
-        .map(|t| aoide_storage::peer_store::is_autogated_peer_token(&peers, t))
-        .unwrap_or(false);
-    let autogate_match = ip_autogate || token_autogate;
 
     // The caller's resolved peer IDENTITY, PLUS which rung resolved it
     // (P-P3, PAIRING.md decision 6/7) — deliberately a SEPARATE question
-    // from `ip_autogate`/`token_autogate` above (which fold ONLY over
-    // `autogate`-marked peers, for the unrelated "skip the pending queue"
-    // question): `resolve_peer` looks at EVERY registered peer, autogate or
-    // not. Used two ways below, DELIBERATELY UNEQUALLY: the Inject arm, when
-    // it queues, stamps EITHER rung onto `pending.json`'s `from` field for
-    // attribution only (never a gate — see `do_inject`'s own doc comment);
-    // the Spawn arm's `spawn_admitted` below requires specifically the
-    // TOKEN rung — a bare address match must never itself authorize
-    // launching a process attributed to the matched peer (2026-08-25
-    // narrowing, see `spawn_admitted`'s own doc comment).
+    // from `ip_autogate`/`token_autogate`/`sig_autogate` below (which fold
+    // ONLY over `autogate`-marked peers, for the unrelated "skip the
+    // pending queue" question): `resolve_peer` looks at EVERY registered
+    // peer, autogate or not. Used two ways below, DELIBERATELY UNEQUALLY:
+    // the Inject arm, when it queues, stamps EITHER rung onto
+    // `pending.json`'s `from` field for attribution only (never a gate —
+    // see `do_inject`'s own doc comment); the Spawn arm's `spawn_admitted`
+    // below requires specifically the SIGNATURE rung — neither a bare
+    // address nor a bare token match must ever itself authorize launching a
+    // process attributed to the matched peer (2026-08-25 narrowing, see
+    // `spawn_admitted`'s own doc comment).
     let addr = match origin {
         PeerOrigin::Remote(ip) => Some(ip),
         PeerOrigin::Loopback | PeerOrigin::Unknown => None,
@@ -1133,6 +1168,25 @@ fn message_send(
         None => aoide_storage::peer_store::resolve_peer(&peers, addr, presented_token),
     };
 
+    // Autogate signals — computed AFTER `resolved_peer` (P-S6) so the new
+    // signature rung can join `ip_autogate`/`token_autogate` in the same
+    // fold: `resolved_peer` matched via `PeerRung::Signature` whose own
+    // `autogate` flag is set is the like-for-like restoration for a peer
+    // the operator already marked auto-deliver, now that a verified
+    // signature no longer rides `PeerOrigin::Loopback`'s free pass (see
+    // `origin_for_inject`). `ip_autogate`/`token_autogate` are unchanged
+    // from before this amendment.
+    let ip_autogate = match origin {
+        PeerOrigin::Remote(ip) => aoide_storage::peer_store::is_autogated_peer_addr(&peers, ip),
+        PeerOrigin::Loopback | PeerOrigin::Unknown => false,
+    };
+    let token_autogate = presented_token
+        .map(|t| aoide_storage::peer_store::is_autogated_peer_token(&peers, t))
+        .unwrap_or(false);
+    let sig_autogate =
+        matches!(resolved_peer, Some((peer, aoide_storage::peer_store::PeerRung::Signature)) if peer.autogate);
+    let autogate_match = ip_autogate || token_autogate || sig_autogate;
+
     // Uniform-response guard (see the amendment above) — mirrors
     // `decide_send_action`'s OWN `spawn_asked`/`context_id` split exactly
     // (`context_id.is_some() && !spawn_asked` is that function's "past this
@@ -1154,7 +1208,22 @@ fn message_send(
 
     match decide_send_action(context_id.as_deref(), spawn_asked, spawn_agent, session_ref_lookup) {
         SendAction::Inject { session_id } => {
-            let eff_origin = effective_origin(origin, token_configured, token_state);
+            // `should_deliver_now(PeerOrigin::Unknown, _)` is unconditionally
+            // `false` — it ignores `autogate_match` entirely (the SAME
+            // fail-safe arm `effective_origin`'s own token coercion already
+            // rides: see `uniform_response_guard_never_fires_for_a_per_peer_
+            // autogated_token`'s doc comment for the pin). So the
+            // `origin_for_inject` downgrade must NOT fire for a signed peer
+            // that is ITSELF signature-rung autogate-marked — that peer
+            // needs `should_deliver_now`'s ordinary Loopback/Remote arms
+            // (which DO consult `autogate_match`) to keep delivering, the
+            // like-for-like restoration `sig_autogate` exists for. A signed,
+            // non-autogate peer has no such exemption: it gets the downgrade
+            // unconditionally, which is the narrowing itself.
+            let eff_origin = origin_for_inject(
+                effective_origin(origin, token_configured, token_state),
+                signed_peer_name.is_some() && !sig_autogate,
+            );
             let deliver_now = should_deliver_now(eff_origin, autogate_match);
             // The `from` attribution rides ONLY the QUEUED path (P-P3
             // decision 7: "pending-queue entries a peer's send creates").
@@ -3718,6 +3787,35 @@ mod tests {
     }
 
     #[test]
+    fn origin_for_inject_is_the_identity_function_when_unsigned() {
+        // The untouched, pre-P-S6 path: no signature headers on the request
+        // at all, so `origin` passes through byte-identical — the hard
+        // "loopback is unchanged for local callers" regression pin holds by
+        // construction here, same as `effective_origin`'s own off-path.
+        for origin in [PeerOrigin::Loopback, PeerOrigin::Remote("10.0.0.5".parse().unwrap()), PeerOrigin::Unknown] {
+            assert_eq!(origin_for_inject(origin, false), origin);
+        }
+    }
+
+    #[test]
+    fn origin_for_inject_downgrades_loopback_once_the_request_is_signed() {
+        // The P-S6 narrowing itself: a verified per-request signature is by
+        // construction a REMOTE peer (an ssh tunnel makes it LOOK loopback
+        // to `peer_addr()`), so it loses Loopback's free pass — coerced to
+        // `Unknown`, `should_deliver_now`'s existing fail-safe arm, not a
+        // fourth `PeerOrigin` kind.
+        assert_eq!(origin_for_inject(PeerOrigin::Loopback, true), PeerOrigin::Unknown);
+        // A signed request was never trusted by origin anyway for these two
+        // — proving the downgrade is total, not loopback-specific plumbing
+        // that happens to skip the others.
+        assert_eq!(
+            origin_for_inject(PeerOrigin::Remote("10.0.0.5".parse().unwrap()), true),
+            PeerOrigin::Unknown
+        );
+        assert_eq!(origin_for_inject(PeerOrigin::Unknown, true), PeerOrigin::Unknown);
+    }
+
+    #[test]
     fn classify_token_is_absent_valid_or_invalid() {
         assert_eq!(classify_token("s3cr3t", None), TokenState::Absent);
         assert_eq!(classify_token("s3cr3t", Some("s3cr3t")), TokenState::Valid);
@@ -5342,6 +5440,170 @@ mod tests {
         let got = acc.join().unwrap();
         assert_eq!(String::from_utf8(got).unwrap(), "token-identified send\n");
         assert!(result.is_ok());
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    // ── Signed requests outrank loopback for Inject (P-S6, CONTRACTS.md §6 ──
+    // ── amendment 2026-08-26) ─────────────────────────────────────────────
+    //
+    // An ssh `-L` tunnel makes a remote peer's request arrive at
+    // `peer_addr()` looking exactly like a genuinely local caller — the top
+    // risk the ssh-transport lane's plan names explicitly. These two tests
+    // are the pin: a signed, non-autogate peer over a LOOPBACK connection
+    // must NOT get the free pass a real local caller gets (this is the
+    // regression a tunnel would otherwise introduce), while a signed,
+    // autogate-marked peer over the same loopback connection keeps
+    // delivering (the like-for-like restoration — narrowing must not cost
+    // an already-trusted peer its existing behavior).
+
+    #[test]
+    fn signed_inject_from_a_non_autogate_peer_on_a_loopback_connection_is_held_pending() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-sig-loop-pending-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_STATE_DIR", root.join("state"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        // Paired, verified, NOT autogate-marked — a signed send from this
+        // peer must queue, never auto-deliver, whatever the connection's
+        // own origin looks like.
+        let mut signed_peer = fixture_peer("tunneled-peer", "http://10.0.0.9:8710/", false);
+        signed_peer.verified = true;
+        aoide_storage::peer_store::save_peers(&[signed_peer]).unwrap();
+
+        let id = "sig-loop-pending-tgt";
+        let socket = aoide_conduct::graph::conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        // Nothing must ever connect here — a wrongly-delivered send would.
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![conductable_session(id, &socket)],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let audit_log = root.join("log");
+        let params = serde_json::json!({
+            "message": { "parts": [{ "kind": "text", "text": "tunneled send" }], "contextId": id }
+        });
+        // The defect this pin closes: an ssh `-L` forward makes a tunneled
+        // peer's connection classify as `PeerOrigin::Loopback`
+        // (`classify_origin`, `peer_addr()`) exactly like this. Before the
+        // P-S6 narrowing, `should_deliver_now(Loopback, _)` was
+        // unconditionally `true`, so this would have auto-delivered.
+        let result = message_send(&params, &audit_log, "", PeerOrigin::Loopback, "", None, Some("tunneled-peer"));
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(listener.accept().is_err(), "a signed, non-autogate peer's send must never touch the socket, loopback or not");
+
+        let pending: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(stage.join("pending.json")).unwrap()).unwrap();
+        let entries = pending["pending"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "the send is held pending, not dropped");
+        assert_eq!(entries[0]["from"], "peer:tunneled-peer");
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
+    fn signed_inject_from_an_autogate_peer_on_a_loopback_connection_still_auto_delivers() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-sig-loop-autogate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_STATE_DIR", root.join("state"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        // Paired, verified, AND autogate-marked — the operator already
+        // trusted this peer to skip the pending queue; the P-S6 narrowing
+        // must not cost it that.
+        let mut signed_peer = fixture_peer("trusted-tunneled-peer", "http://10.0.0.9:8710/", true);
+        signed_peer.verified = true;
+        aoide_storage::peer_store::save_peers(&[signed_peer]).unwrap();
+
+        let id = "sig-loop-autogate-tgt";
+        let socket = aoide_conduct::graph::conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![conductable_session(id, &socket)],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+
+        let audit_log = root.join("log");
+        let params = serde_json::json!({
+            "message": { "parts": [{ "kind": "text", "text": "trusted tunneled send" }], "contextId": id }
+        });
+        let result = message_send(
+            &params,
+            &audit_log,
+            "",
+            PeerOrigin::Loopback,
+            "",
+            None,
+            Some("trusted-tunneled-peer"),
+        );
+        let got = acc.join().unwrap();
+        assert_eq!(
+            String::from_utf8(got).unwrap(),
+            "trusted tunneled send\n",
+            "an autogate-marked peer's signed send still auto-delivers through a loopback-classified connection"
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let pending_path = stage.join("pending.json");
+        if pending_path.exists() {
+            let pending: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&pending_path).unwrap()).unwrap();
+            assert!(pending["pending"].as_array().map(Vec::is_empty).unwrap_or(true), "a delivered send never queues");
+        }
 
         let _ = std::fs::remove_dir_all(&root);
         match saved_stage {
