@@ -115,9 +115,14 @@ never the inbound/serve half (that's `aoide-server`).
   shape `aoide_conduct::graph::who::PullFn` holds for its own live-probe
   seam, re-derived rather than imported) so every reuse/stale/timeout/
   early-exit/reap branch is unit-tested with a fake spawn (an innocuous
-  real `sleep`/`sh` child, never `ssh` — one fake overrides its own
+  real `sleep`/`bash` child, never `ssh` — one fake overrides its own
   `argv[0]` to `"ssh"`, `CommandExt::arg0`, purely so `looks_like_our_ssh`
-  can be exercised against a genuine, killable process) — the one
+  can be exercised against a genuine, killable process; the `bash` fixture
+  runs an all-builtin `-c "while :; do :; done"` rather than shelling out
+  to `sleep`, so a shell that would otherwise replace itself via an
+  exec-tail-call for a single external command — observed breaking
+  `argv[0]` preservation in the nix build sandbox's check phase, though
+  not in the dev shell — never gets the chance) — the one
   `#[ignore]`'d real-ssh proof lives at `cli/tests/tunnel_ssh.rs` instead,
   the same "real bytes, not a mock, but sandboxed-build-unsafe" shape
   `peer_connectivity.rs` already holds.

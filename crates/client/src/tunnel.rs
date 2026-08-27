@@ -510,25 +510,60 @@ mod tests {
         })
     }
 
-    /// A genuine child (`sh -c sleep <n>`, no `ssh` binary involved) whose
+    /// A genuine child (`bash -c "read …"`, no `ssh` binary involved) whose
     /// `/proc/<pid>/cmdline` nonetheless reads EXACTLY like this record's
     /// own `ssh … -L <local_port>:<remote_host>:<remote_port> …` —
     /// `argv[0]` overridden to `"ssh"` via the `CommandExt::arg0` unix
     /// extension (Linux echoes whatever `argv[0]` an `execve` was given
     /// back through `/proc/<pid>/cmdline`, regardless of which binary
     /// actually ran), plus the exact `-L` spec string as a harmless extra
-    /// positional parameter `sh` never reads. This is what lets
+    /// positional parameter the script never reads.
+    ///
+    /// **Sandbox fix (review): a builtin busy-loop, not `sleep`, and
+    /// `bash`, not `sh`.** The original fixture ran `sh -c "sleep <n>"` —
+    /// green in the dev shell but deterministic-fail in the nix build
+    /// sandbox's check phase, `looks_like_our_ssh` false there even though
+    /// the child was genuinely alive: some shell in that environment's
+    /// `sh` resolution was, one way or another, discarding the
+    /// caller-supplied `argv[0]` before this process's own
+    /// `/proc/<pid>/cmdline` was ever read. Two independent hardenings,
+    /// either one alone would have covered this fixture's actual failure
+    /// mode, kept together since neither carries a downside: (1) the `-c`
+    /// script is `while :; do :; done` — `:`/`while` are shell BUILTINS,
+    /// never a separate program the shell could hand off to via an
+    /// exec-replaces-self optimization the way `sleep` (a real external
+    /// binary) could — a builtin-only script never gives a shell a reason
+    /// to replace its own process image, so the `-c` invocation's own
+    /// `argv[0]` can never be discarded out from under it, in ANY shell,
+    /// ANY environment. This ALSO means the child blocks with no
+    /// dependency on a pipe or file descriptor this process holds open —
+    /// load-bearing, since both call sites below immediately `drop` their
+    /// own `Child` handle to mirror "no `Child` in this process at all,
+    /// only the pid on disk" (a `read`-on-piped-stdin design would EOF and
+    /// exit the instant that handle dropped, closing this side of the
+    /// pipe). (2) `bash`, named explicitly rather than resolved via a bare
+    /// `sh` PATH lookup — `sh` is the one name a build sandbox is most
+    /// likely to alias/wrap specially for legacy shebang compatibility;
+    /// `bash` is the actual interpreter underneath either way (confirmed:
+    /// this environment's own `sh` is itself a `bin/sh -> bash` symlink),
+    /// so naming it directly loses nothing while sidestepping whatever
+    /// indirection is specific to the bare `sh` name. This is what lets
     /// `looks_like_our_ssh` — and therefore `kill_if_still_our_ssh`/
     /// `terminate_pid` — be exercised against a REAL, killable, genuinely
-    /// alive process, with no real `ssh` anywhere in this test binary.
-    fn spawn_fake_ssh_argv(local_port: u16, remote_host: &str, remote_port: u16, sleep_secs: u32) -> Result<Child, String> {
+    /// alive process, with no real `ssh` anywhere in this test binary; a
+    /// spin loop's brief CPU cost is negligible — every caller kills it
+    /// within the same test, well under a second.
+    fn spawn_fake_ssh_argv(local_port: u16, remote_host: &str, remote_port: u16) -> Result<Child, String> {
         let spec = format!("{local_port}:{remote_host}:{remote_port}");
-        Command::new("sh")
+        Command::new("bash")
             .arg0("ssh")
             .arg("-c")
-            .arg(format!("sleep {sleep_secs}"))
+            .arg("while :; do :; done")
             .arg("aoide-test-marker")
             .arg(spec)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("test fake ssh-argv spawn: {e}"))
     }
@@ -616,7 +651,7 @@ mod tests {
                 l.local_addr().unwrap().port()
                 // dropped: nothing listens here
             };
-            let old_child = spawn_fake_ssh_argv(dead_port, "127.0.0.1", 8710, 30).unwrap();
+            let old_child = spawn_fake_ssh_argv(dead_port, "127.0.0.1", 8710).unwrap();
             let old_pid = old_child.id();
             // No `.wait()` on `old_child` — the record (not this handle)
             // is what `open_or_reuse_with` acts on, the same shape a
@@ -728,7 +763,7 @@ mod tests {
     fn close_on_a_same_process_child_actually_reaps_it_leaving_no_zombie() {
         with_temp_runtime_dir("close-reaps", || {
             let local_port = free_local_port().unwrap();
-            let child = spawn_fake_ssh_argv(local_port, "127.0.0.1", 8710, 30).unwrap();
+            let child = spawn_fake_ssh_argv(local_port, "127.0.0.1", 8710).unwrap();
             let pid = child.id();
             // Dropped with no `.wait()` — exactly the shape
             // `open_or_reuse_with`'s own success path leaves behind (the
