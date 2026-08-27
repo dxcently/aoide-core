@@ -612,8 +612,23 @@ fn deliver_local(inv: &Invocation, id: &str) -> Outcome {
     // ALREADY-LOADED roster (`file.sessions`) resolves one, never the raw id
     // — `attributed_sender` itself (the raw id) is what `record_pending` and
     // `audit_send` still see, unaffected by this mapping.
+    //
+    // A send ATTRIBUTED TO THE TARGET ITSELF (`--from <target-id>`, or a
+    // genuine env self-send) is never prefixed: "from yourself:" attributes
+    // nothing, and the one caller that legitimately produces this shape —
+    // `graph resurrect`'s restore delivery, putting a session's own prior
+    // bytes back at its own prompt — needs those bytes verbatim (a prefixed
+    // re-exec is a shell syntax error; a prefixed preload is a line no human
+    // typed). Note this keys off the ATTRIBUTED sender, not the gate's
+    // env-resolved `is_self_send` — restore is delivered from another
+    // session's env, which is exactly why it was mis-prefixed. Not a gate
+    // widening: attribution was already caller-asserted (`--from ""` is the
+    // documented explicit-anonymous form that also skips the prefix), and
+    // the audit line still records the attributed sender either way.
+    let attributed_to_target = attributed_sender.as_deref() == Some(id.as_str());
     let prefix_sender = attributed_sender
         .as_deref()
+        .filter(|_| !attributed_to_target)
         .map(|s| display_sender(s, &file.sessions));
     if let Some(prefix) = provenance_prefix(prefix_sender.as_deref(), &text) {
         payload = format!("{prefix}{payload}");
@@ -2441,6 +2456,75 @@ mod tests {
             "the title carries no provenance prefix"
         );
         assert_eq!(out.data.as_ref().unwrap()["title"], "fix the reaper");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A send ATTRIBUTED TO THE TARGET ITSELF (`--from <target-id>`) delivers
+    /// its bytes verbatim — no provenance prefix. This is `graph resurrect`'s
+    /// restore-delivery shape: the session's own prior bytes going back to
+    /// its own prompt. Pinned against the live P-C7 finding, where the
+    /// restored re-exec arrived as `from quiet-birch (…1892): /run/…/sleep
+    /// 900` and bash threw a syntax error instead of restoring anything.
+    #[test]
+    fn a_send_attributed_to_the_target_itself_is_delivered_unprefixed() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+
+        let root = unique_stage("send-self-attr");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        // The delivering process is some OTHER session — exactly restore's
+        // shape: the daemon (or the resurrecting operator's shell) delivers,
+        // but the bytes belong to the target. `--from` must beat this env.
+        std::env::set_var("AOIDE_SESSION_ID", "the-resurrector");
+
+        let id = "self-attr-target";
+        let socket = conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        do_session_start(
+            id,
+            Some("shell"),
+            Some("/w"),
+            None,
+            None,
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+            None,
+        );
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+
+        let out = session_send(&send_invocation(
+            &["echo", "hello"],
+            &[("id", id), ("from", id), ("yes", "true")],
+        ));
+        let got = acc.join().unwrap();
+
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(
+            String::from_utf8(got).unwrap(),
+            "echo hello",
+            "self-attributed bytes arrive verbatim — no prefix, no submit key"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

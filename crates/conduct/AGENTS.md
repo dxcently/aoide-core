@@ -219,6 +219,20 @@
   `--submit` to the preload branch by changing one call site's argument —
   don't introduce one. A stale `rm -rf` sitting in `typed` and firing itself
   at boot, unattended, is the failure this separation exists to prevent.
+- **Restore delivery is SELF-ATTRIBUTED (`--from <new-id>`), and
+  `send.rs`'s self-attribution rule delivers such bytes verbatim — both
+  halves stay, together (P-C7 live finding #2).** `graph send` prefixes a
+  delivered payload with `from <sender>: ` for attribution; restore rides
+  `graph send`, so the live soak's resurrected re-exec arrived as `from
+  quiet-birch (…1892): /run/…/sleep 900` — a bash syntax error — and the
+  preload as a line no human typed. The fix keys off the ATTRIBUTED sender
+  (`resolve_sender`, i.e. `--from`), never the gate's env-resolved
+  `is_self_send`: restore is delivered from ANOTHER session's env, which is
+  exactly how it got mis-prefixed. Removing the `from` flag from either
+  `restore_delivery` branch, or the `attributed_to_target` suppression in
+  `deliver_local`, silently reintroduces the corruption. Not a gate
+  widening: `--from ""` (explicit anonymous) already skipped the prefix,
+  and the audit line records the attributed sender either way.
 - **A recorded foreground of `sudo …` is never re-exec'd (P-C6, orchestrator
   ruling on durable-sessions plan open knob 5).** `resurrect.rs::
   is_sudo_argv` is the one, narrow, named check — `argv[0]`'s basename

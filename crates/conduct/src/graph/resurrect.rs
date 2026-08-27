@@ -195,6 +195,11 @@ fn restore_delivery(door: aoide_protocol::Door, new_id: &str, restore: &RestoreS
         }
         let mut flags = BTreeMap::new();
         flags.insert("id".to_string(), new_id.to_string());
+        // Attributed to the target ITSELF: these are the session's own prior
+        // bytes going back to its own prompt, and send's self-attribution
+        // rule delivers them verbatim — a provenance prefix would turn the
+        // re-exec into a shell syntax error (live P-C7 finding).
+        flags.insert("from".to_string(), new_id.to_string());
         flags.insert("yes".to_string(), "true".to_string());
         flags.insert("submit".to_string(), "true".to_string());
         return Some(Invocation {
@@ -211,6 +216,10 @@ fn restore_delivery(door: aoide_protocol::Door, new_id: &str, restore: &RestoreS
     let typed = restore.typed.as_ref()?;
     let mut flags = BTreeMap::new();
     flags.insert("id".to_string(), new_id.to_string());
+    // Self-attributed for the same verbatim-bytes reason as the re-exec
+    // branch above: the preloaded line must be exactly what the operator
+    // typed, or Enter runs something else.
+    flags.insert("from".to_string(), new_id.to_string());
     flags.insert("yes".to_string(), "true".to_string());
     Some(Invocation {
         path: vec!["graph".to_string(), "send".to_string()],
@@ -612,6 +621,11 @@ mod tests {
             .expect("an idle restore with a typed line must construct a send");
         assert_eq!(inv.flags.get("yes").map(String::as_str), Some("true"));
         assert!(!inv.flags.contains_key("submit"), "the no-submit path must never carry `submit`: {:?}", inv.flags);
+        // Self-attributed (`--from <new-id>`): send's self-attribution rule
+        // then delivers the bytes verbatim — without this, the preload came
+        // back as `from <sender>: echo hello`, a line no human typed
+        // (live P-C7 finding).
+        assert_eq!(inv.flags.get("from").map(String::as_str), Some("new-id"));
         assert_eq!(inv.args, vec!["echo hello".to_string()]);
     }
 
@@ -631,6 +645,9 @@ mod tests {
             .expect("a working restore with argv must construct a send");
         assert_eq!(inv.flags.get("yes").map(String::as_str), Some("true"));
         assert_eq!(inv.flags.get("submit").map(String::as_str), Some("true"));
+        // Self-attributed for the same verbatim-bytes reason as the preload
+        // pin above — a prefixed re-exec is a shell syntax error.
+        assert_eq!(inv.flags.get("from").map(String::as_str), Some("new-id"));
         assert_eq!(inv.args, vec!["nvim notes.md".to_string()]);
     }
 
