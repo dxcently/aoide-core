@@ -11,7 +11,7 @@
 //! identically to a typed command. Reads reuse the pure graph functions and the
 //! stage-file loaders. There is no second copy of any command's logic here.
 //!
-//! The SESSIONS panel walks a flattened row model ([`App::dag_rows`]): project
+//! The SESSION panel walks a flattened row model ([`App::dag_rows`]): project
 //! group headers interleaved with their session subtrees, one selection index
 //! over the lot. Headers are first-class rows — fold/unfold, project remove and
 //! link all act on whatever the cursor is on, so the DAG is managed from within
@@ -32,17 +32,17 @@ use std::sync::mpsc;
 use std::time::{Instant, SystemTime};
 
 /// The seven panels, in Tab / 1-7 order. `Graph` is the visual DAG (the new hero
-/// view — nodes/edges laid out and drawn); `Sessions` is the collapsible roster
+/// view — nodes/edges laid out and drawn); `Session` is the collapsible roster
 /// (the terminal-sessions view, keyed off [`App::dag_rows`]). The two are
 /// deliberately distinct lenses on the same data: `Graph` shows the *shape* of
-/// the DAG, `Sessions` the *state* of each terminal. `Roster` (messaging/
+/// the DAG, `Session` the *state* of each terminal. `Roster` (messaging/
 /// presence plan, P-C4) and `Pending` (P-C5) are later additions — each
 /// appended last so no earlier key ever shifts (registry append-only
 /// discipline, `pkgs/aoide/crates/AGENTS.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
     Graph,
-    Sessions,
+    Session,
     Projects,
     Log,
     Status,
@@ -53,7 +53,7 @@ pub enum Panel {
 impl Panel {
     pub const ALL: [Panel; 7] = [
         Panel::Graph,
-        Panel::Sessions,
+        Panel::Session,
         Panel::Projects,
         Panel::Log,
         Panel::Status,
@@ -63,7 +63,7 @@ impl Panel {
     pub fn title(self) -> &'static str {
         match self {
             Panel::Graph => "DAG",
-            Panel::Sessions => "SESSIONS",
+            Panel::Session => "SESSION",
             Panel::Projects => "PROJECTS",
             Panel::Log => "LOG",
             Panel::Status => "STATUS",
@@ -133,7 +133,7 @@ pub const UNANCHORED: &str = "(unanchored)";
 /// How many ticks (~500 ms each) a newly-appeared session stays marked fresh.
 pub const FRESH_TICKS: u8 = 4;
 
-/// One row of the SESSIONS panel's flattened DAG: a project group header or a
+/// One row of the SESSION panel's flattened DAG: a project group header or a
 /// session line with its tree-branch prefix pre-walked. One `Vec<DagRow>` is the
 /// single source of truth for both rendering and key handling, so the cursor
 /// can never point at something the screen isn't showing.
@@ -191,7 +191,7 @@ pub const ROSTER_THROTTLE: std::time::Duration = std::time::Duration::from_secs(
 /// --json`'s `nodes[].sessions[]` (`conduct/src/graph/who.rs::node_json`),
 /// never re-derived: `label`/`state` are exactly the strings `who` already
 /// computed (display-grammar label, canonical state vocabulary), so
-/// `theme::state_glyph`/`state_style` — the SAME glyph mapping the SESSIONS
+/// `theme::state_glyph`/`state_style` — the SAME glyph mapping the SESSION
 /// panel already paints — apply unchanged.
 #[derive(Debug, Clone, Default)]
 pub struct RosterSession {
@@ -275,7 +275,7 @@ pub struct App {
     /// Selected node in the DAG (Graph) panel (indexes the preorder node list
     /// [`crate::graphview::node_order`] the layout walks).
     pub graph_sel: usize,
-    /// Selected row in the SESSIONS panel (indexes [`App::dag_rows`]).
+    /// Selected row in the SESSION panel (indexes [`App::dag_rows`]).
     pub dag_sel: usize,
     /// Selected row in the PROJECTS panel.
     pub proj_sel: usize,
@@ -290,7 +290,7 @@ pub struct App {
     pub last_outcome: Option<Outcome>,
     /// Any active inline prompt.
     pub input: Option<Input>,
-    /// Group names currently folded shut in the SESSIONS panel.
+    /// Group names currently folded shut in the SESSION panel.
     pub folded: HashSet<String>,
     /// Terminal-watcher: session id → remaining fresh ticks. A session lands
     /// here when it first appears after launch and drops out a few beats later.
@@ -1158,7 +1158,7 @@ impl App {
         }
         match self.panel {
             Panel::Graph => self.handle_graph_key(key),
-            Panel::Sessions => self.handle_dag_key(key),
+            Panel::Session => self.handle_dag_key(key),
             Panel::Projects => self.handle_projects_key(key),
             Panel::Roster => self.handle_roster_key(key),
             Panel::Pending => self.handle_pending_key(key),
@@ -1830,7 +1830,7 @@ mod tests {
         let mut rec = session("s1", "/tmp", "running", None);
         rec.log_path = Some(log.to_string_lossy().into_owned());
         let mut app = App::for_test(Vec::new(), vec![rec], Vec::new());
-        app.panel = Panel::Sessions;
+        app.panel = Panel::Session;
         app.dag_sel = 1; // row 0 is the `(unanchored)` group header
 
         app.handle_key(KeyEvent::from(KeyCode::Enter));
@@ -1853,7 +1853,7 @@ mod tests {
             // fixture) — so this is the unchanged branch.
             let rec = session("s1", "/tmp", "running", None);
             let mut app = App::for_test(Vec::new(), vec![rec], Vec::new());
-            app.panel = Panel::Sessions;
+            app.panel = Panel::Session;
             app.dag_sel = 1;
 
             app.handle_key(KeyEvent::from(KeyCode::Enter));
@@ -2033,7 +2033,7 @@ mod tests {
             ROSTER_CALLS.store(0, Ordering::SeqCst);
 
             let mut app = App::for_test_with_dispatch(counting_who_dispatch);
-            app.panel = Panel::Sessions; // NOT the roster pane
+            app.panel = Panel::Session; // NOT the roster pane
 
             app.poll_refresh();
 

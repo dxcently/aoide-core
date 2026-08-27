@@ -1,7 +1,7 @@
 # aoide-conductor
 
 `aoide conductor` — the interactive terminal frontend over the trunk: a
-ratatui/crossterm TUI with seven panels (DAG, SESSIONS, PROJECTS, LOG,
+ratatui/crossterm TUI with seven panels (DAG, SESSION, PROJECTS, LOG,
 STATUS, ROSTER, PENDING). Core, never `lyra` — pure Rust, no system-closure
 weight, and conducting orchestration is Aoide's core identity (root
 `AGENTS.md`).
@@ -37,7 +37,7 @@ Unicode-roster vocabulary (`conduct/src/graph/who.rs`'s private `glyph`
 helper — same three glyphs, independently drawn here since that helper
 isn't public); session glyphs reuse the conductor's existing musical-note
 set (`theme::state_glyph`) since `who` classifies sessions off the
-identical state vocabulary the SESSIONS panel already reads.
+identical state vocabulary the SESSION panel already reads.
 
 `who` performs a LIVE network probe of every registered peer (~2s/peer,
 parallel) on every invocation, so this pane throttles: it re-dispatches at

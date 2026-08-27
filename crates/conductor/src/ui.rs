@@ -11,7 +11,7 @@
 //! headless and assert on the buffer (see the tests below).
 //!
 //! Two of the seven panels are the expansion this port carries: `DAG` (the
-//! visual graph, drawn by [`crate::graphview`]) and `SESSIONS` (the
+//! visual graph, drawn by [`crate::graphview`]) and `SESSION` (the
 //! terminal roster, now split into a scrolling list + a live detail card with a
 //! focus affordance). The other three — PROJECTS, LOG, STATUS — are ports of the
 //! originals. `ROSTER` (messaging/presence plan, P-C4; selection + compose
@@ -114,7 +114,7 @@ fn keymap_hint(panel: Panel) -> &'static str {
         Panel::Graph => {
             "j/k walk · g/G ends · Enter jump · p prune · Tab panel · ? help · q quit"
         }
-        Panel::Sessions => {
+        Panel::Session => {
             "j/k select · Enter jump/fold · h/l fold · L link · a add · d rm · p prune · ? help · q quit"
         }
         Panel::Projects => "j/k select · a add · d remove · Tab panel · ? help · q quit",
@@ -156,7 +156,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(block, area);
     match app.panel {
         Panel::Graph => graphview::render(f, inner, app, app.graph_sel),
-        Panel::Sessions => draw_sessions(f, inner, app),
+        Panel::Session => draw_sessions(f, inner, app),
         Panel::Projects => draw_projects(f, inner, app),
         Panel::Log => draw_log(f, inner, app),
         Panel::Status => draw_status_panel(f, inner, app),
@@ -165,7 +165,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-// ── [1] SESSIONS — the roster + a live detail card ──────────────────────────
+// ── [1] SESSION — the roster + a live detail card ───────────────────────────
 
 fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
     let rows = app.dag_rows();
@@ -645,7 +645,7 @@ fn palette_summary<'a>(app: &App) -> Line<'a> {
 // widened it to `pub` for exactly this (P-C4 review nits; no forked copy
 // here); session glyphs are the conductor's existing musical-note set
 // (`theme::state_glyph`) applied to `who`'s canonical `state` string — the
-// SAME mapping the SESSIONS panel paints, since `who` classifies sessions
+// SAME mapping the SESSION panel paints, since `who` classifies sessions
 // off the identical vocabulary. Staleness wording ("last seen") is also
 // `who`'s own — `render_nodes` in `who.rs` says it first; this pane matches
 // rather than inventing "as of".
@@ -821,7 +821,7 @@ fn draw_log_tail(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(block, rect);
 
     // The path line reuses `theme::shorten_cwd`'s "last two components" rule
-    // (the same one the SESSIONS panel's cwd row already applies) rather than
+    // (the same one the SESSION panel's cwd row already applies) rather than
     // painting the raw absolute path unbounded: `Paragraph` has no wrap here,
     // so an unshortened path longer than the overlay's inner width is
     // silently clipped by the terminal buffer with no ellipsis — on a deep
@@ -850,7 +850,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     let help: &[&str] = &[
         "",
         "  Tab / Shift-Tab   cycle panels",
-        "  1 2 3 4 5 6 7     DAG / SESSIONS / PROJECTS / LOG / STATUS / ROSTER / PENDING",
+        "  1 2 3 4 5 6 7     DAG / SESSION / PROJECTS / LOG / STATUS / ROSTER / PENDING",
         "  j / k  ↓ / ↑      move selection",
         "",
         "  DAG (the visual graph)",
@@ -861,7 +861,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         "    p                prune done sessions (also restages graph.json)",
         "    ◆ project  ● session   ⟨tag⟩ read-only tag",
         "",
-        "  SESSIONS",
+        "  SESSION",
         "    Enter            cue window · tail the log if headless",
         "    Esc / q          close the log tail (Enter also closes it)",
         "    h / l            fold / unfold the group",
@@ -1035,8 +1035,8 @@ mod tests {
             }],
             vec![session("s1", "/home/k/Aoide", "running", None)],
         );
-        let out = render_panel(&app, Panel::Sessions, 100, 30);
-        assert!(out.contains("SESSIONS"), "panel title");
+        let out = render_panel(&app, Panel::Session, 100, 30);
+        assert!(out.contains("SESSION"), "panel title");
         assert!(out.contains("◆ aoide"), "group header");
         assert!(out.contains("[1/1]"), "live/total badge");
         assert!(out.contains("s1") && out.contains("claude"), "session row");
@@ -1062,7 +1062,7 @@ mod tests {
             vec![rec],
         );
         app.dag_sel = 1; // row 0 is the ◆ aoide group header; row 1 is the session
-        let out = render_panel(&app, Panel::Sessions, 100, 30);
+        let out = render_panel(&app, Panel::Session, 100, 30);
         assert!(
             out.contains("doing   ▸ Editing ui.rs"),
             "activity line rendered in detail card"
@@ -1086,7 +1086,7 @@ mod tests {
             vec![rec],
         );
         app.dag_sel = 1; // row 0 is the ◆ aoide group header; row 1 is the session
-        let out = render_panel(&app, Panel::Sessions, 100, 30);
+        let out = render_panel(&app, Panel::Session, 100, 30);
         assert!(
             out.contains("log     /home/k/Aoide/state/sessions/s1.log   started s1"),
             "log path line keeps started alongside the path: {out}"
@@ -1112,7 +1112,7 @@ mod tests {
             vec![session("s1", "/home/k/Aoide", "running", None)],
         );
         app.dag_sel = 1; // row 0 is the ◆ aoide group header; row 1 is the session
-        let out = render_panel(&app, Panel::Sessions, 100, 30);
+        let out = render_panel(&app, Panel::Session, 100, 30);
         assert!(
             out.contains("window  0xs1   started s1"),
             "a windowed session's detail line is byte-identical to before: {out}"
@@ -1144,7 +1144,7 @@ mod tests {
         );
         // Row 0 is the ◆ aoide group header; row 1 is `root`, row 2 is `kid`.
         app.dag_sel = 2;
-        let out = render_panel(&app, Panel::Sessions, 100, 30);
+        let out = render_panel(&app, Panel::Session, 100, 30);
         assert!(
             out.contains("⟐claude-sonnet-5"),
             "root agent's model tag on its roster row: {out}"
@@ -1345,7 +1345,7 @@ mod tests {
         // happened to be that run (settled diagnosis: "TMPDIR
         // PATH-LENGTH-SENSITIVE"). The fix shortens the painted path to
         // its last two components (`theme::shorten_cwd`, the same rule
-        // SESSIONS already applies to a cwd), which is bounded by
+        // SESSION already applies to a cwd), which is bounded by
         // component count rather than by ancestor depth. This test pins
         // that fix with a deliberately deep, DETERMINISTIC prefix — two
         // 60-character directory names — so the deep-tree case is

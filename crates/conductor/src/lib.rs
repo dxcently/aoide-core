@@ -25,7 +25,7 @@
 //!   * [`graphview`] lays out and draws the visual DAG; [`theme`] carries the
 //!     palette → `Style`, the glyph vocabulary, and the small pure formatters.
 //!
-//! The seven panels: DAG (the visual graph), SESSIONS (the terminal roster),
+//! The seven panels: DAG (the visual graph), SESSION (the terminal roster),
 //! PROJECTS, LOG, STATUS, ROSTER (presence — this box plus every registered
 //! peer, messaging/presence plan P-C4; selection + compose P-C5), PENDING
 //! (held `graph send`/A2A entries, approve/deny, P-C5). The event stream is
@@ -203,7 +203,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Tab => app.next_panel(),
         KeyCode::BackTab => app.prev_panel(),
         KeyCode::Char('1') => app.select_panel(Panel::Graph),
-        KeyCode::Char('2') => app.select_panel(Panel::Sessions),
+        KeyCode::Char('2') => app.select_panel(Panel::Session),
         KeyCode::Char('3') => app.select_panel(Panel::Projects),
         KeyCode::Char('4') => app.select_panel(Panel::Log),
         KeyCode::Char('5') => app.select_panel(Panel::Status),

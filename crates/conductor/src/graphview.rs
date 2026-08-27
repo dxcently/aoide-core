@@ -1,6 +1,6 @@
 //! The DAG panel — a VISUAL, laid-out graph of the project/session DAG.
 //!
-//! Where the SESSIONS roster reads the DAG as an indented list (state at a
+//! Where the SESSION roster reads the DAG as an indented list (state at a
 //! glance), this view draws its *shape*: a layered left-to-right graph, one
 //! column per depth (projects in column 0, the sessions they anchor in column
 //! 1, spawned children in column 2+), nodes wired with box-drawing edges.
