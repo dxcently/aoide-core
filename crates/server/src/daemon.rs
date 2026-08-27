@@ -371,7 +371,7 @@ fn reconcile_graph_projection(changed_files: &[String]) -> Option<PathBuf> {
     if !changed_files.iter().any(|f| f == "sessions.json" || f == "hooks.json") {
         return None;
     }
-    let _ = aoide_conduct::graph::emit(&internal_invocation(&["graph", "emit"]));
+    let _ = aoide_conduct::graph::restage_graph();
     Some(aoide_storage::stage::graph_path())
 }
 
@@ -1366,7 +1366,7 @@ mod tests {
     }
 
     /// `sessions.json` (or `hooks.json`) among the changed files DOES
-    /// trigger a reconcile — `aoide_conduct::graph::emit` re-derives
+    /// trigger a reconcile — `aoide_conduct::graph::restage_graph` re-derives
     /// `graph.json` from CURRENT stage content, the same internal function
     /// every reconcile call reaches, no forked logic.
     #[test]

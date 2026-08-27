@@ -44,7 +44,7 @@ pub mod producers;
 /// sibling note for the full story):** the first call in the WHOLE test
 /// binary also stamps `AOIDE_STAGE_DIR` to a fresh, private tempdir, unless
 /// a test already set one. `daemon::run_loop`'s tick now WRITES through
-/// `aoide_conduct::graph::emit`/`aoide_conduct::reap::reap_and_announce`
+/// `aoide_conduct::graph::restage_graph`/`aoide_conduct::reap::reap_and_announce`
 /// (`docs/architecture/AOIDED.md`'s "L4") — a `run_loop` test spawns that
 /// tick loop on a background thread it never joins (by design, so the test
 /// itself can return once its own assertion is proven), so that thread

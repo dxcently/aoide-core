@@ -17,7 +17,7 @@ pub use aoide_conduct::graph::{
 };
 pub use aoide_conduct::graph::{session_hook, session_send};
 pub use aoide_conduct::graph::{session_end, session_phase, session_start};
-pub use aoide_conduct::graph::{emit, link, project_add, project_list, project_remove, prune, view};
+pub use aoide_conduct::graph::{link, project_add, project_list, project_remove, prune, view};
 // `graph resurrect` (P-D8, `docs/architecture/AOIDED.md`'s "L5") — see this
 // crate's own `AGENTS.md`/README for the golden-count bump this landed with.
 pub use aoide_conduct::graph::session_resurrect;

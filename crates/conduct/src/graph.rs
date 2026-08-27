@@ -70,7 +70,7 @@ pub use self::resurrect::session_resurrect;
 // project's whole carried set be resurrected together — see
 // `graph/carry.rs`'s module doc.
 pub use self::carry::session_carry;
-pub use self::manage::{emit, link, project_add, project_list, project_remove, prune, view};
+pub use self::manage::{link, project_add, project_list, project_remove, prune, view};
 // `aoide who` (messaging/presence plan, P-C2): live presence over this
 // box's own sessions plus every registered peer — see `graph/who.rs`'s
 // module doc for the probe/filter design. `glyph` (the node-presence
@@ -93,7 +93,8 @@ pub use self::session_store::now_iso_utc;
 // `use crate::graph::{...}`" section) — never reached from root, so they stay
 // `pub(crate)`.
 pub(crate) use self::common::stage_error;
-pub(crate) use self::doc::{drop_sessions, ledger_session_exit, prune_done, restage_graph};
+pub(crate) use self::doc::{drop_sessions, ledger_session_exit, prune_done};
+pub use self::doc::restage_graph;
 pub(crate) use self::model::{hooks_path, STAGE_GRAPH_VERSION};
 pub(crate) use self::session_store::{
     lineage_of, refresh_subagent_says, refresh_transcript_fields, upsert_hook,

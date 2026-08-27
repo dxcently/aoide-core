@@ -1,11 +1,11 @@
 //! The read/manage command handlers: `view`, `project add/remove/list`, `link`,
-//! `prune`, `emit`. Every mutation re-stages `graph.json` via
+//! `prune`. Every mutation re-stages `graph.json` via
 //! [`super::doc::restage_graph`] so the read path never drifts.
 
 use super::common::{load_inputs, require_args, stage_error};
 use super::doc::{build_graph, prune_done, render, restage_graph, would_cycle};
 use super::model::{
-    graph_path, hooks_path, load_stage, projects_path, sessions_path, sorted_projects,
+    hooks_path, load_stage, projects_path, sessions_path, sorted_projects,
     write_stage, HooksFile, Project, ProjectsFile, SessionsFile, STAGE_GRAPH_VERSION,
 };
 use aoide_protocol::Invocation;
@@ -317,39 +317,6 @@ pub fn prune(_inv: &Invocation) -> Outcome {
     .with_data(json!({ "removed": removed, "clearedParents": cleared }))
 }
 
-/// Stage the resolved DAG for Quickshell hot-reload (atomic write) —
-/// internal-only now. The CLI command was deleted (`restage_graph` already
-/// runs at every project/session mutation site, and `graph prune` is the
-/// blessed manual resync); this function survives as `aoide-server`'s own
-/// out-of-band reconciliation call (`daemon.rs::reconcile_graph_projection`),
-/// which needs a re-derive reachable from outside this crate — `restage_graph`
-/// itself is `pub(crate)`.
-pub fn emit(_inv: &Invocation) -> Outcome {
-    let (p, s, h) = match load_inputs("graph.emit") {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let doc = build_graph(&p.projects, &s.sessions, &h.hooks);
-    let path = graph_path();
-    if let Err(e) = write_stage(&path, &doc) {
-        return stage_error("graph.emit", e);
-    }
-    let (n, e) = (
-        doc["nodes"].as_array().map_or(0, Vec::len),
-        doc["edges"].as_array().map_or(0, Vec::len),
-    );
-    Outcome::ok(
-        "graph.emit",
-        format!("staged graph.json ({n} node(s), {e} edge(s))"),
-    )
-    .changed([path.to_string_lossy().into_owned()])
-    .with_data(json!({
-        "path": path.to_string_lossy(),
-        "nodes": n,
-        "edges": e,
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,7 +435,7 @@ mod tests {
         let view = view(&invocation(&["graph", "view"], &[]));
         assert_eq!(&staged, view.data.as_ref().unwrap());
 
-        // A fresh emit would stage the very same document (idempotent).
+        // A fresh restage would produce the very same document (idempotent).
         let (p, s, h) = load_inputs("test").unwrap();
         assert_eq!(staged, build_graph(&p.projects, &s.sessions, &h.hooks));
 

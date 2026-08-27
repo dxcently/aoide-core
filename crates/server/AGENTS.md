@@ -99,7 +99,7 @@
 - **This crate's own `env_lock()` (`lib.rs`)'s first call in a test binary
   also floors `$AOIDE_STAGE_DIR` at a fresh private tempdir, unless a test
   already set one (P-D6 safety net).** `daemon::run_loop`'s tick now
-  WRITES through `aoide_conduct::graph::emit`/`aoide_conduct::reap::
+  WRITES through `aoide_conduct::graph::restage_graph`/`aoide_conduct::reap::
   reap_and_announce`; a `run_loop` test spawns that tick loop on a
   background thread it deliberately never joins (so the test itself can
   return once its own assertion holds), so that thread keeps ticking for

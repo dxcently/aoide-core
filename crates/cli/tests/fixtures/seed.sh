@@ -64,7 +64,7 @@ mkdir -p "$(dirname "$LOG")"
 cat > "$LOG" <<'JSON'
 {"ts":1753520400,"door":"cli","class":"audit","command":"graph.view","status":"ok","message":"6 node(s), 2 edge(s)"}
 {"ts":1753520460,"door":"daemon","class":"audit","command":"shellbridge","status":"started","message":"shellbridge skeleton online; stage files seeded"}
-{"ts":1753520520,"door":"cli","class":"audit","command":"graph.prune","status":"ok","message":"nothing to prune (no `done` sessions)"}
+{"ts":1753520520,"door":"cli","class":"audit","command":"graph.prune","status":"ok","message":"pruned 1 session(s); cleared 0 orphaned parent link(s)"}
 {"ts":1753520580,"door":"cli","class":"audit","command":"rice.gen","status":"not-implemented","message":"walking-skeleton stub"}
 JSON
 

@@ -568,7 +568,10 @@ pub(crate) fn ledger_session_exit(rec: &SessionRecord, ended_at: &str) {
 /// manual resync) would compute. Every mutation of projects/sessions calls this, so the staged
 /// graph is always a pure function of the registries — the staged doc can no
 /// longer go stale behind a `project add`/`remove`/`link`/`prune`.
-pub(crate) fn restage_graph() -> Result<PathBuf, String> {
+/// `pub`, not `pub(crate)`: `aoide-server`'s
+/// `daemon::reconcile_graph_projection` calls this directly to re-derive
+/// after an out-of-band hand edit — the one cross-crate consumer.
+pub fn restage_graph() -> Result<PathBuf, String> {
     let p: ProjectsFile = load_stage(&projects_path())?;
     let s: SessionsFile = load_stage(&sessions_path())?;
     let h: HooksFile = load_stage(&hooks_path())?;
