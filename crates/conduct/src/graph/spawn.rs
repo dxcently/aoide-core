@@ -32,8 +32,8 @@ use super::conduct::{conduct_socket_path, unix_ts};
 use super::model::{load_stage, sessions_path, SessionsFile};
 use super::send::session_send;
 use aoide_protocol::output::{Outcome, Status};
-use aoide_storage::carry::{load_carry, save_carry, set_carried};
 use aoide_protocol::Invocation;
+use aoide_storage::undying::{load_undying, save_undying, set_undying};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::os::unix::process::CommandExt;
@@ -319,11 +319,11 @@ fn wait_for(path: &std::path::Path, budget: Duration) -> bool {
 }
 
 /// `aoide spawn [--agent <name>] [--parent <sessionId>] [--id <id>]
-/// [--prompt <text>] [--windowed] [--carry] -- <command …>` — spawn
+/// [--prompt <text>] [--windowed] [--undying] -- <command …>` — spawn
 /// `<command>` as a conducted session that OUTLIVES this call (headless by
 /// default, or in a real terminal with `--windowed`), wait briefly for it to
 /// register, and return `{ sessionId, agent, socket, logPath, registered,
-/// prompt, windowed, carried }`.
+/// prompt, windowed, undying }`.
 ///
 /// Ordering mirrors `conduct`/`wrap`: the re-exec'd `conduct` child (headless
 /// or, under `--windowed`, running inside the just-opened terminal) spawns
@@ -459,17 +459,17 @@ pub fn session_spawn(inv: &Invocation) -> Outcome {
         (None, None)
     };
 
-    // `--carry`: mark the spawned session durable, once registration has
+    // `--undying`: mark the spawned session durable, once registration has
     // actually succeeded (P-C3, durable-sessions plan) — an unregistered id
     // has no live session behind it, so there is nothing durable to mark
-    // yet. Best-effort: a `carry.json` write failure must not fail an
+    // yet. Best-effort: an `undying.json` write failure must not fail an
     // otherwise-successful spawn, the same posture the prompt injection
     // below takes toward its own delivery failures.
-    let carry_flag = inv.flag_present("carry");
-    let carried = if carry_flag && registered {
-        let mut list = load_carry();
-        set_carried(&mut list, &id, true);
-        let _ = save_carry(&list);
+    let undying_flag = inv.flag_present("undying");
+    let undying = if undying_flag && registered {
+        let mut list = load_undying();
+        set_undying(&mut list, &id, true);
+        let _ = save_undying(&list);
         true
     } else {
         false
@@ -510,8 +510,8 @@ pub fn session_spawn(inv: &Invocation) -> Outcome {
     if prompt_result == "delivered" {
         changed.push(format!("session {id}: prompt injected"));
     }
-    if carried {
-        changed.push(format!("session {id}: carried"));
+    if undying {
+        changed.push(format!("session {id}: undying"));
     }
 
     let data = json!({
@@ -522,7 +522,7 @@ pub fn session_spawn(inv: &Invocation) -> Outcome {
         "registered": registered,
         "prompt": prompt_result,
         "windowed": windowed,
-        "carried": carried,
+        "undying": undying,
     });
 
     Outcome::ok(
@@ -658,12 +658,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// `--carry` (P-C3, durable-sessions plan): once the headless child
-    /// actually registers, the spawned id lands in `state/carry.json` — the
-    /// headless arm exercises this with no terminal needed, asserting on the
-    /// carry store directly, never on a process.
+    /// `--undying` (P-C3, durable-sessions plan): once the headless child
+    /// actually registers, the spawned id lands in `state/undying.json` —
+    /// the headless arm exercises this with no terminal needed, asserting on
+    /// the undying store directly, never on a process.
     #[test]
-    fn carry_flag_marks_the_spawned_id_once_registered() {
+    fn undying_flag_marks_the_spawned_id_once_registered() {
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
@@ -673,7 +673,7 @@ mod tests {
             "AOIDE_CONDUCT_SPAWN_EXE",
         ]);
 
-        let root = unique_stage("spawn-carry-on");
+        let root = unique_stage("spawn-undying-on");
         let stage = root.join("stage");
         let state = root.join("state");
         std::fs::create_dir_all(&stage).unwrap();
@@ -683,33 +683,33 @@ mod tests {
         std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
         std::env::set_var("AOIDE_CONDUCT_SPAWN_EXE", built_aoide_bin());
 
-        let id = "spawn-carry-on";
+        let id = "spawn-undying-on";
         let out = session_spawn(&spawn_invocation(
             &["sh", "-c", "sleep 1"],
-            &[("id", id), ("carry", "true")],
+            &[("id", id), ("undying", "true")],
         ));
 
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         let data = out.data.as_ref().unwrap();
         assert_eq!(data["registered"], true, "data: {data}");
-        assert_eq!(data["carried"], true, "data: {data}");
+        assert_eq!(data["undying"], true, "data: {data}");
         assert!(
-            out.changed.iter().any(|c| c.contains("carried")),
+            out.changed.iter().any(|c| c.contains("undying")),
             "changed: {:?}",
             out.changed
         );
         assert!(
-            aoide_storage::carry::is_carried(&aoide_storage::carry::load_carry(), id),
-            "carry.json must mark the spawned id"
+            aoide_storage::undying::is_undying(&aoide_storage::undying::load_undying(), id),
+            "undying.json must mark the spawned id"
         );
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The opposite proof: without `--carry`, a spawn — even a successfully
+    /// The opposite proof: without `--undying`, a spawn — even a successfully
     /// registered one — must mark nothing.
     #[test]
-    fn without_carry_flag_a_spawn_marks_nothing() {
+    fn without_undying_flag_a_spawn_marks_nothing() {
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
@@ -719,7 +719,7 @@ mod tests {
             "AOIDE_CONDUCT_SPAWN_EXE",
         ]);
 
-        let root = unique_stage("spawn-carry-off");
+        let root = unique_stage("spawn-undying-off");
         let stage = root.join("stage");
         let state = root.join("state");
         std::fs::create_dir_all(&stage).unwrap();
@@ -729,14 +729,14 @@ mod tests {
         std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
         std::env::set_var("AOIDE_CONDUCT_SPAWN_EXE", built_aoide_bin());
 
-        let id = "spawn-carry-off";
+        let id = "spawn-undying-off";
         let out = session_spawn(&spawn_invocation(&["sh", "-c", "sleep 1"], &[("id", id)]));
 
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
-        assert_eq!(out.data.as_ref().unwrap()["carried"], false);
+        assert_eq!(out.data.as_ref().unwrap()["undying"], false);
         assert!(
-            aoide_storage::carry::load_carry().is_empty(),
-            "no --carry flag must mark nothing"
+            aoide_storage::undying::load_undying().is_empty(),
+            "no --undying flag must mark nothing"
         );
 
         let _ = std::fs::remove_dir_all(&root);

@@ -68,16 +68,22 @@
 //! listen side), and no write path into `peer_store` either: discovery
 //! grants nothing, by design.
 //!
-//! `carry` (durable-sessions plan, P-C1) holds `state/carry.json`, the set
-//! of session ids marked durable so a project's whole carried set can be
-//! resurrected together. Store only for now — mirrors `peer_store`'s
+//! `undying` (durable-sessions plan, P-C1; renamed from "carry" at
+//! command-defrag lane U1, 2026-08-27) holds `state/undying.json`, the set
+//! of session ids marked durable so a project's whole undying set can be
+//! resurrected together (`session undying on|off`). Mirrors `peer_store`'s
 //! shape and discipline exactly (tolerate-missing/corrupt-as-empty,
-//! `fs::atomic_write`, pure list mutations); no command or consumer is
-//! wired to it yet.
+//! `fs::atomic_write`, pure list mutations), plus a one-shot migration off
+//! the pre-rename `state/carry.json` — see its own module doc.
+//!
+//! `manifest` (command-defrag lane U1, same phase) holds `.aoide/
+//! project.json`, a project's own committed-adjacent SESSION SPECS — the
+//! host-scoped seam a later phase's bare-clone `resurrect` walks up to find
+//! (`manifest::walk_up`), distinct in every way from `undying`'s host-local
+//! live-id marks. See its own module doc for the full contrast.
 
 pub mod addr;
 pub mod beacon;
-pub mod carry;
 pub mod commands;
 pub mod display;
 pub mod edits;
@@ -86,6 +92,7 @@ pub mod git;
 pub mod identity;
 pub mod inbox;
 pub mod ledger;
+pub mod manifest;
 pub mod mode;
 pub mod pairing;
 pub mod peer_store;
@@ -95,6 +102,7 @@ pub mod session;
 pub mod stage;
 pub mod takes;
 pub mod time;
+pub mod undying;
 pub mod wire_auth;
 
 /// A crate-wide lock serialising every test that mutates process-global env

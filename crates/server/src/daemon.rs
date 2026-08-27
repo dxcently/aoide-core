@@ -442,12 +442,12 @@ fn epoch_already_fired(marker_contents: Option<&str>, current_epoch: i64) -> boo
 /// already uses for `session reap`. There is no live-session skip here: that
 /// used to gate on the whole project (any non-`done` session anchored to it
 /// suppressed the call entirely), which was wrong for a multi-session
-/// carried set — one live terminal would have suppressed resuming the
-/// project's other carried sessions. The skip is now per-CANDIDATE, inside
+/// undying set — one live terminal would have suppressed resuming the
+/// project's other undying sessions. The skip is now per-CANDIDATE, inside
 /// `session_resurrect`'s own bare-mode selection (durable-sessions plan
-/// P-C4, `resurrect.rs`'s `carried_selection`): an already-alive id is
-/// dropped from the carried set before anything is spawned, so a project
-/// where every carried session is already live resolves to the empty-set
+/// P-C4, `resurrect.rs`'s `undying_selection`): an already-alive id is
+/// dropped from the undying set before anything is spawned, so a project
+/// where every undying session is already live resolves to the empty-set
 /// `Outcome::ok` no-op. `session_resurrect` never hard-errors on a
 /// per-candidate spawn failure either (its own module doc): a headless
 /// host's taught "no `$AOIDE_TERMINAL`" error lands in its `failed` array
@@ -1532,19 +1532,19 @@ mod tests {
     }
 
     /// The case the OLD per-project `has_live` skip suppressed (P-C4,
-    /// durable-sessions plan): a project carrying a live session AND a
-    /// carried-but-dead ledger entry. The daemon loop no longer checks
+    /// durable-sessions plan): a project carrying a live session AND an
+    /// undying-but-dead ledger entry. The daemon loop no longer checks
     /// liveness at all — it calls `session_resurrect` for every `autoResume`
     /// project unconditionally, and the per-id live exclusion happens INSIDE
     /// `resurrect.rs`'s own bare-mode selection. Proven the same way
-    /// `resurrect.rs`'s own carry-transfer test does: `AOIDE_TERMINAL=true`
+    /// `resurrect.rs`'s own undying-transfer test does: `AOIDE_TERMINAL=true`
     /// makes the windowed spawn succeed (`Status::Ok`) without a real
-    /// terminal, so a successful resurrect transfers the carry mark off the
+    /// terminal, so a successful resurrect transfers the undying mark off the
     /// old id — if `run_boot_auto_resume` had skipped this project (the old
     /// behaviour), the mark would still be sitting on `carried-dead`
     /// afterward.
     #[test]
-    fn run_boot_auto_resume_fires_for_a_project_with_one_live_and_one_carried_dead_session() {
+    fn run_boot_auto_resume_fires_for_a_project_with_one_live_and_one_undying_dead_session() {
         let (_guard, stage, state, saved_stage, saved_state) = isolated_stage_and_state();
         let saved_terminal = std::env::var("AOIDE_TERMINAL").ok();
         let saved_wayland = std::env::var("WAYLAND_DISPLAY").ok();
@@ -1595,15 +1595,15 @@ mod tests {
         };
         aoide_storage::ledger::append_ledger_entry(&entry).unwrap();
 
-        let mut carried = Vec::new();
-        aoide_storage::carry::set_carried(&mut carried, "carried-dead", true);
-        aoide_storage::carry::save_carry(&carried).unwrap();
+        let mut undying = Vec::new();
+        aoide_storage::undying::set_undying(&mut undying, "carried-dead", true);
+        aoide_storage::undying::save_undying(&undying).unwrap();
 
         run_boot_auto_resume();
 
-        let after = aoide_storage::carry::load_carry();
+        let after = aoide_storage::undying::load_undying();
         assert!(
-            !aoide_storage::carry::is_carried(&after, "carried-dead"),
+            !aoide_storage::undying::is_undying(&after, "carried-dead"),
             "`carried-dead` must have been resurrected (its mark transferred) despite a live \
              session anchored to the same project — the exact case the old per-project \
              `has_live` skip would have suppressed"

@@ -33,36 +33,37 @@
   `session hook`, and `reap::reap_and_announce` all follow this exact
   one-line prefix. A new session-write handler joins the family the same
   way — see `client`'s own `AGENTS.md` extension-point note. **`graph/
-  carry.rs`'s `session_carry`, `graph/spawn.rs`'s `--carry` mark, and
-  `graph/resurrect.rs`'s carry transfer are a deliberate exception, not an
-  oversight:** `state/carry.json` is not a `state/stage/` file, so none of the
-  three has L4 residency to route through — don't add a `daemon_dispatch`
+  undying.rs`'s `session_undying`, `graph/spawn.rs`'s `--undying` mark, and
+  `graph/resurrect.rs`'s undying transfer are a deliberate exception, not an
+  oversight:** `state/undying.json` is not a `state/stage/` file, so none of
+  the three has L4 residency to route through — don't add a `daemon_dispatch`
   prefix to any of them "for consistency" with the family above; that would
-  put an extra writer on a file the carry store's own atomic-write CRUD
+  put an extra writer on a file the undying store's own atomic-write CRUD
   already lets multiple call sites share safely (each call is load-mutate-
   save on the whole set, never a partial write).
-- **The carry transfer is one `save_carry` call, never two.** `resurrect.rs`'s
-  `resurrect_one` adds the new id and drops the old one in the SAME
-  in-memory `Vec<CarriedSession>` before writing — the new id goes in first,
-  so a crash between the in-memory edit and the write leaves the OLD id
-  carried (the next sweep retries it) rather than leaving neither carried
-  (silent loss). The transfer only fires when the old id was actually
-  carried (`is_carried` gates it) and only when the spawn reached
-  `Status::Ok` — an ordinary `--all`/`--id` revive of an uncarried session
-  must never start carrying it, and a failed spawn must leave the old id
-  exactly as it was. Don't split the add and the drop across two
-  `save_carry` calls, and don't drop the check that the old id was carried.
-- **Bare `resurrect --project` selects the carried set, not a single
+- **The undying transfer is one `save_undying` call, never two.**
+  `resurrect.rs`'s `resurrect_one` adds the new id and drops the old one in
+  the SAME in-memory `Vec<UndyingSession>` before writing — the new id goes
+  in first, so a crash between the in-memory edit and the write leaves the
+  OLD id undying (the next sweep retries it) rather than leaving neither
+  undying (silent loss). The transfer only fires when the old id was
+  actually undying (`is_undying` gates it) and only when the spawn reached
+  `Status::Ok` — an ordinary `--all`/`--id` revive of a not-undying session
+  must never start marking it undying, and a failed spawn must leave the old
+  id exactly as it was. Don't split the add and the drop across two
+  `save_undying` calls, and don't drop the check that the old id was
+  undying.
+- **Bare `resurrect --project` selects the undying set, not a single
   "most recent" entry (P-C4, durable-sessions plan).** `resurrect.rs`'s
-  `carried_selection` is the one place that reads `sessions.json` for
+  `undying_selection` is the one place that reads `sessions.json` for
   liveness — the daemon's boot sweep (`aoide-server`'s `daemon.rs`) no
   longer runs its own liveness check before calling `session_resurrect`; it
   calls unconditionally for every `autoResume` project and relies on this
   function to drop already-alive ids per candidate. Don't reintroduce a
-  project-wide liveness gate in the daemon loop — a multi-session carried
+  project-wide liveness gate in the daemon loop — a multi-session undying
   set needs the exclusion done per id, not per project, or one live
   terminal suppresses reviving the rest of the set. `--all` and `--id` stay
-  exactly as they were: neither consults the carry mark at all.
+  exactly as they were: neither consults the undying mark at all.
 - **`reap` (toast-free) and `reap_and_announce` (the registered CLI/daemon
   handler) are deliberately two functions, not one.** `reap_and_announce`
   spawns a REAL `notify-send` on the live desktop whenever the sweep

@@ -1,17 +1,19 @@
-//! `session carry on|off [--self | --id <id>]` — mark or unmark a
-//! session DURABLE, so a project's whole carried set can later be
-//! resurrected together (`resurrect`, a later phase of the
-//! durable-sessions plan; `CONTRACTS.md`'s `state/carry.json` section).
+//! `session undying on|off [--self | --id <id>]` — mark or unmark a
+//! session DURABLE, so a project's whole undying set can later be
+//! resurrected together (`resurrect`, `CONTRACTS.md`'s `state/undying.json`
+//! section).
 //!
-//! P-C2 of that plan: the command only, over the store `aoide_storage::carry`
-//! already provides (P-C1, landed) — no reimplementation of the store's CRUD
-//! here. This handler writes ONLY `state/carry.json`: unlike every other
-//! `session *` handler in this module, it takes no stage lock and does
-//! not route through `aoide_client::daemon::daemon_dispatch` — `carry.json`
-//! is not a `state/stage/` file, so it sits entirely outside the L4
-//! dual-writer surface (a second writer there would defeat the store's own
-//! single-writer atomic-write discipline; see `carry.rs`'s own module doc in
-//! `aoide-storage`).
+//! Prototyped under the name "carry" (task #96, `graph session carry`);
+//! this is the shipped rename (command-defrag lane U1, 2026-08-27) — the
+//! command only, over the store `aoide_storage::undying` already provides
+//! (P-C1, landed) — no reimplementation of the store's CRUD here. This
+//! handler writes ONLY `state/undying.json`: unlike every other `session *`
+//! handler in this module, it takes no stage lock and does not route
+//! through `aoide_client::daemon::daemon_dispatch` — `undying.json` is not a
+//! `state/stage/` file, so it sits entirely outside the L4 dual-writer
+//! surface (a second writer there would defeat the store's own
+//! single-writer atomic-write discipline; see `undying.rs`'s own module doc
+//! in `aoide-storage`).
 //!
 //! `--id` targets ANY session id, including one that has already left the
 //! roster — no roster lookup gates the write. That is the whole point of the
@@ -24,10 +26,10 @@ use super::model::{load_stage, sessions_path, SessionsFile};
 use super::model::write_stage;
 use aoide_protocol::output::Outcome;
 use aoide_protocol::Invocation;
-use aoide_storage::carry::{load_carry, save_carry, set_carried};
+use aoide_storage::undying::{load_undying, save_undying, set_undying};
 use serde_json::json;
 
-/// `aoide session carry (on|off) [--self | --id <id>] [--json]`.
+/// `aoide session undying (on|off) [--self | --id <id>] [--json]`.
 ///
 /// Target resolution: `--id <id>` names any session id directly; otherwise
 /// `--self` (or a bare invocation, the same default) reads
@@ -36,9 +38,9 @@ use serde_json::json;
 /// and `--id` together is a usage error; neither an `--id` nor a resolvable
 /// `$AOIDE_SESSION_ID` is likewise a usage error naming both — never a
 /// silent no-op.
-pub fn session_carry(inv: &Invocation) -> Outcome {
-    let cmd = "session.carry";
-    let usage = "usage: aoide session carry (on|off) [--self | --id <id>] [--json]";
+pub fn session_undying(inv: &Invocation) -> Outcome {
+    let cmd = "session.undying";
+    let usage = "usage: aoide session undying (on|off) [--self | --id <id>] [--json]";
 
     let args = match require_args(inv, &["on|off"]) {
         Ok(a) => a,
@@ -51,7 +53,7 @@ pub fn session_carry(inv: &Invocation) -> Outcome {
             return Outcome::usage(
                 cmd,
                 format!(
-                    "`{other}` is not a carry state — the only two are `on` and `off`\n{usage}"
+                    "`{other}` is not an undying state — the only two are `on` and `off`\n{usage}"
                 ),
             );
         }
@@ -75,7 +77,7 @@ pub fn session_carry(inv: &Invocation) -> Outcome {
                 return Outcome::usage(
                     cmd,
                     format!(
-                        "no session to carry: pass --self (reads $AOIDE_SESSION_ID) or \
+                        "no session to mark undying: pass --self (reads $AOIDE_SESSION_ID) or \
                          --id <id> — neither was given and $AOIDE_SESSION_ID is unset\n{usage}"
                     ),
                 );
@@ -83,10 +85,10 @@ pub fn session_carry(inv: &Invocation) -> Outcome {
         },
     };
 
-    let mut carried = load_carry();
-    let transitioned = set_carried(&mut carried, &id, on);
-    if let Err(e) = save_carry(&carried) {
-        return Outcome::error(cmd, format!("failed to write carry.json: {e}"));
+    let mut undying = load_undying();
+    let transitioned = set_undying(&mut undying, &id, on);
+    if let Err(e) = save_undying(&undying) {
+        return Outcome::error(cmd, format!("failed to write undying.json: {e}"));
     }
 
     // Presence in the roster is INFORMATIONAL only — never a gate on the
@@ -96,12 +98,12 @@ pub fn session_carry(inv: &Invocation) -> Outcome {
         .map(|f| f.sessions.iter().any(|s| s.session_id == id))
         .unwrap_or(false);
 
-    let verb = if on { "carried" } else { "not carried" };
+    let verb = if on { "undying" } else { "not undying" };
     let mut out = Outcome::ok(cmd, format!("`{id}` is now {verb}"));
     if transitioned {
         out = out.changed(vec![format!("{id}: {verb}")]);
     }
-    out.with_data(json!({ "sessionId": id, "carried": on, "live": live }))
+    out.with_data(json!({ "sessionId": id, "undying": on, "live": live }))
 }
 
 #[cfg(test)]
@@ -123,9 +125,9 @@ mod tests {
         root
     }
 
-    fn carry_invocation(args: &[&str], flags: &[(&str, &str)]) -> Invocation {
+    fn undying_invocation(args: &[&str], flags: &[(&str, &str)]) -> Invocation {
         Invocation {
-            path: vec!["session".into(), "carry".into()],
+            path: vec!["session".into(), "undying".into()],
             args: args.iter().map(|s| s.to_string()).collect(),
             flags: flags.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             door: aoide_protocol::Door::Cli,
@@ -133,22 +135,22 @@ mod tests {
     }
 
     #[test]
-    fn on_then_off_round_trips_through_the_carry_store() {
+    fn on_then_off_round_trips_through_the_undying_store() {
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
-        let root = setup("carry-roundtrip");
+        let root = setup("undying-roundtrip");
 
-        let on = session_carry(&carry_invocation(&["on"], &[("id", "sess-1")]));
+        let on = session_undying(&undying_invocation(&["on"], &[("id", "sess-1")]));
         assert_eq!(on.status, Status::Ok, "msg: {}", on.message);
-        assert_eq!(on.data.as_ref().unwrap()["carried"], true);
-        assert_eq!(on.changed, vec!["sess-1: carried".to_string()]);
-        assert!(aoide_storage::carry::is_carried(&aoide_storage::carry::load_carry(), "sess-1"));
+        assert_eq!(on.data.as_ref().unwrap()["undying"], true);
+        assert_eq!(on.changed, vec!["sess-1: undying".to_string()]);
+        assert!(aoide_storage::undying::is_undying(&aoide_storage::undying::load_undying(), "sess-1"));
 
-        let off = session_carry(&carry_invocation(&["off"], &[("id", "sess-1")]));
+        let off = session_undying(&undying_invocation(&["off"], &[("id", "sess-1")]));
         assert_eq!(off.status, Status::Ok, "msg: {}", off.message);
-        assert_eq!(off.data.as_ref().unwrap()["carried"], false);
-        assert_eq!(off.changed, vec!["sess-1: not carried".to_string()]);
-        assert!(!aoide_storage::carry::is_carried(&aoide_storage::carry::load_carry(), "sess-1"));
+        assert_eq!(off.data.as_ref().unwrap()["undying"], false);
+        assert_eq!(off.changed, vec!["sess-1: not undying".to_string()]);
+        assert!(!aoide_storage::undying::is_undying(&aoide_storage::undying::load_undying(), "sess-1"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -157,13 +159,13 @@ mod tests {
     fn bare_invocation_defaults_to_the_ambient_session_id() {
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
-        let root = setup("carry-bare-env");
+        let root = setup("undying-bare-env");
         std::env::set_var("AOIDE_SESSION_ID", "env-sess");
 
-        let out = session_carry(&carry_invocation(&["on"], &[]));
+        let out = session_undying(&undying_invocation(&["on"], &[]));
         assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["sessionId"], "env-sess");
-        assert!(aoide_storage::carry::is_carried(&aoide_storage::carry::load_carry(), "env-sess"));
+        assert!(aoide_storage::undying::is_undying(&aoide_storage::undying::load_undying(), "env-sess"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -172,10 +174,10 @@ mod tests {
     fn explicit_self_flag_reads_the_same_ambient_session_id() {
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
-        let root = setup("carry-self-flag");
+        let root = setup("undying-self-flag");
         std::env::set_var("AOIDE_SESSION_ID", "self-sess");
 
-        let out = session_carry(&carry_invocation(&["on"], &[("self", "true")]));
+        let out = session_undying(&undying_invocation(&["on"], &[("self", "true")]));
         assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["sessionId"], "self-sess");
 
@@ -189,15 +191,15 @@ mod tests {
     fn id_marks_a_session_absent_from_the_roster() {
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
-        let root = setup("carry-post-mortem");
+        let root = setup("undying-post-mortem");
         // sessions.json stays empty for this test — the id below is never in it.
 
-        let out = session_carry(&carry_invocation(&["on"], &[("id", "long-dead-id")]));
+        let out = session_undying(&undying_invocation(&["on"], &[("id", "long-dead-id")]));
         assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
         let data = out.data.as_ref().unwrap();
-        assert_eq!(data["carried"], true);
+        assert_eq!(data["undying"], true);
         assert_eq!(data["live"], false, "the id must never be required to be in the roster");
-        assert!(aoide_storage::carry::is_carried(&aoide_storage::carry::load_carry(), "long-dead-id"));
+        assert!(aoide_storage::undying::is_undying(&aoide_storage::undying::load_undying(), "long-dead-id"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -206,14 +208,14 @@ mod tests {
     fn live_reports_true_for_an_id_still_in_the_roster() {
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
-        let root = setup("carry-live-true");
+        let root = setup("undying-live-true");
         let file = SessionsFile {
             schema_version: "0".into(),
             sessions: vec![session("live-id", "/w", "working", "1", None)],
         };
         write_stage(&sessions_path(), &file).unwrap();
 
-        let out = session_carry(&carry_invocation(&["on"], &[("id", "live-id")]));
+        let out = session_undying(&undying_invocation(&["on"], &[("id", "live-id")]));
         assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["live"], true);
 
@@ -224,10 +226,10 @@ mod tests {
     fn no_id_and_no_env_is_a_usage_error_naming_both() {
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
-        let root = setup("carry-no-target");
+        let root = setup("undying-no-target");
         std::env::remove_var("AOIDE_SESSION_ID");
 
-        let out = session_carry(&carry_invocation(&["on"], &[]));
+        let out = session_undying(&undying_invocation(&["on"], &[]));
         assert_eq!(out.status, Status::Usage);
         assert!(out.message.contains("--self"), "msg: {}", out.message);
         assert!(out.message.contains("--id"), "msg: {}", out.message);
@@ -237,14 +239,14 @@ mod tests {
 
     #[test]
     fn self_and_id_together_is_a_usage_error() {
-        let out = session_carry(&carry_invocation(&["on"], &[("self", "true"), ("id", "sess-1")]));
+        let out = session_undying(&undying_invocation(&["on"], &[("self", "true"), ("id", "sess-1")]));
         assert_eq!(out.status, Status::Usage);
         assert!(out.message.contains("mutually exclusive"), "msg: {}", out.message);
     }
 
     #[test]
     fn an_unknown_positional_word_is_a_usage_error_naming_both_states() {
-        let out = session_carry(&carry_invocation(&["maybe"], &[("id", "sess-1")]));
+        let out = session_undying(&undying_invocation(&["maybe"], &[("id", "sess-1")]));
         assert_eq!(out.status, Status::Usage);
         assert!(out.message.contains("on"), "msg: {}", out.message);
         assert!(out.message.contains("off"), "msg: {}", out.message);
@@ -252,27 +254,27 @@ mod tests {
 
     #[test]
     fn missing_positional_is_a_usage_error() {
-        let out = session_carry(&carry_invocation(&[], &[("id", "sess-1")]));
+        let out = session_undying(&undying_invocation(&[], &[("id", "sess-1")]));
         assert_eq!(out.status, Status::Usage);
     }
 
     /// A re-mark (already-on, marked on again) is not a TRANSITION —
-    /// `changed` stays empty, matching `set_carried`'s own idempotency
-    /// contract (`aoide_storage::carry`).
+    /// `changed` stays empty, matching `set_undying`'s own idempotency
+    /// contract (`aoide_storage::undying`).
     #[test]
     fn a_remark_is_ok_but_reports_no_transition() {
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
-        let root = setup("carry-remark");
+        let root = setup("undying-remark");
 
-        let first = session_carry(&carry_invocation(&["on"], &[("id", "sess-1")]));
+        let first = session_undying(&undying_invocation(&["on"], &[("id", "sess-1")]));
         assert_eq!(first.status, Status::Ok);
         assert!(!first.changed.is_empty());
 
-        let second = session_carry(&carry_invocation(&["on"], &[("id", "sess-1")]));
+        let second = session_undying(&undying_invocation(&["on"], &[("id", "sess-1")]));
         assert_eq!(second.status, Status::Ok);
         assert!(second.changed.is_empty(), "a re-mark is not a transition: {:?}", second.changed);
-        assert_eq!(second.data.as_ref().unwrap()["carried"], true);
+        assert_eq!(second.data.as_ref().unwrap()["undying"], true);
 
         let _ = std::fs::remove_dir_all(&root);
     }

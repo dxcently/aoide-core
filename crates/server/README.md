@@ -107,12 +107,12 @@ the inbound half of the two-door contract (the outbound half is
   --project` runs over the CLI, the same in-process-call pattern
   `run_internal_reap` already uses for `session reap`. Liveness lives one
   layer down: `session_resurrect`'s own bare-mode selection
-  (`carried_selection`, durable-sessions plan P-C4) drops any carried id
+  (`undying_selection`, durable-sessions plan P-C4) drops any undying id
   already alive in `sessions.json` per candidate before spawning anything,
-  so a project where every carried session is already live resolves to the
+  so a project where every undying session is already live resolves to the
   empty-set `Outcome::ok` no-op rather than being skipped wholesale — a
   per-project skip here would have suppressed reviving a multi-session
-  carried set's other, actually-dead members over one live terminal. That
+  undying set's other, actually-dead members over one live terminal. That
   function never hard-errors on a per-candidate spawn failure either; a
   headless host's taught "no `$AOIDE_TERMINAL`" error is only
   `eprintln!`'d here, never propagated — the tick/loop itself is never at

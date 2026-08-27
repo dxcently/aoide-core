@@ -173,19 +173,48 @@
   transient mismatch is recoverable without restarting the whole
   ceremony, and "untouched" is simpler to reason about than "re-parked
   with the same content."
-- **`carry::set_carried`'s return value is the on/off TRANSITION, not
+- **`undying::set_undying`'s return value is the on/off TRANSITION, not
   "did anything on disk change" (P-C1, durable-sessions plan).** Re-marking
-  an already-carried id refreshes `marked_at` in place and returns `false`;
+  an already-undying id refreshes `marked_at` in place and returns `false`;
   unmarking an absent id is a no-op and also returns `false`. Don't fold the
-  timestamp refresh into the return value — the later `session carry`
+  timestamp refresh into the return value — the `session undying`
   command reports this bool verbatim as `changed`, and a `markedAt` bump
-  reported as a state change would be misleading (nothing about carried/not
+  reported as a state change would be misleading (nothing about undying/not
   actually flipped).
-- **`carry.json` is written via plain `fs::atomic_write`, never
+- **`undying.json` is written via plain `fs::atomic_write`, never
   `atomic_write_private` — deliberate, not an oversight.** It holds session
   ids, the same class of data `sessions.json`/`peers.json` already keep
   at default mode; `atomic_write_private` stays reserved for the
   identity/secret lane above.
+- **`undying`'s legacy-migration check runs on every `load_undying` call,
+  not behind a process-wide `Once` — deliberate, not an oversight
+  (command-defrag lane U1, 2026-08-27).** Unlike
+  `fs::migrate_conducting_stage` (six files, hot-path-called, worth a
+  one-time guard), this migration moves ONE small file and its own check is
+  a single `exists()` stat that becomes a guaranteed no-op the instant the
+  legacy `carry.json` is gone — cheap enough to run unconditionally, and
+  simpler to test (no cross-test `Once` state to isolate). Don't add a
+  `Once` guard here "for consistency" with `fs.rs` — that would reintroduce
+  exactly the test-ordering fragility a per-call idempotent check avoids.
+- **`manifest::save_manifest` validates EVERY `SessionSpec.dir` before
+  writing anything, never partially (command-defrag lane U1).** The
+  absolute-path check runs over the whole `sessions` vec first; a rejection
+  returns `Err` before `.aoide/` is even created, let alone
+  `project.json` written — a manifest is committed and meant to move across
+  clones/hosts, so an absolute `dir` is a bug in the caller, not a value
+  this store should ever persist even once.
+- **`manifest`'s `.aoide/.gitignore` is written ONLY when absent — never
+  "helpfully" refreshed or reconciled on a later `save_manifest`.** An
+  operator who hand-edited it (to un-ignore something, or to commit the
+  directory on purpose) keeps their own content forever; `ensure_self_
+  gitignore` is a create-if-absent, not a template sync.
+- **`manifest::walk_up` never falls through a corrupt nearest manifest to an
+  ancestor's.** The NEAREST `.aoide/project.json` (git-style, same
+  precedent `.git` discovery sets) is the only one ever consulted — if
+  `load_manifest` narrates it unreadable, `walk_up` returns `None` right
+  there rather than continuing to search upward for a "better" one. Don't
+  add a fallback-to-parent path; a broken nearest manifest is a bug to
+  surface, not paper over with a stale grandparent's specs.
 - **`beacon` never writes `peer_store`, and never will (P-P6).** It reaches
   into `peer_store` for exactly one READ (`valid_peer_name`, so the
   beacon's `name` shares the same nickname shape check every other

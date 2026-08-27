@@ -167,7 +167,7 @@ pub fn register(r: &mut Registry) {
             flag!("prompt", "string", "A first turn to inject once the session registers (skipped, honestly reported, if it never does)."),
             flag!("windowed", "bool", "Open a real terminal (from $AOIDE_TERMINAL, a whitespace-split argv with a `{cmd}` placeholder) instead of a detached headless child. A bare `{cmd}` splices the conducted argv as separate arguments (`kitty -e {cmd}`); a quote-wrapped `'{cmd}'` joins it shell-quoted into one word for `sh -c` templates (`foot sh -c '{cmd}'`). Taught errors when unset, or when no display is present."),
             flag!("cwd", "string", "Working directory for the spawned child (default: this process's own cwd) — for --windowed, the terminal emulator's own cwd, which its own shell inherits."),
-            flag!("carry", "bool", "Mark the spawned session durable in state/carry.json once it registers (no-op if it never does) — the same mark `session carry on` sets, so this project's whole carried set can later be resurrected together."),
+            flag!("undying", "bool", "Mark the spawned session durable in state/undying.json once it registers (no-op if it never does) — the same mark `session undying on` sets, so this project's whole undying set can later be resurrected together."),
         ],
         gated: false,
         implemented: true,
@@ -176,7 +176,7 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["resurrect"],
-        summary: "Revive resumable sessions off the durable ledger (state/session-ledger.jsonl): resolves --project by exact name, anchors ledger entries to it (longest-prefix, same rule the bare `graph` render uses), then selects. Bare (no --all/--id) resumes the project's WHOLE carried set (state/carry.json, `session carry on|off`) minus any id already alive; --all widens to every anchored entry; --id narrows to one. Each candidate resolves through two arms: a harness with a verified resume argv spawns windowed running `<harness> --resume <id>`; a conducted TERMINAL (no harness profile, but a captured `restore` snapshot) spawns windowed running its login shell, then — once registered — either re-execs its last foreground command (`--yes --submit`, only when it was demonstrably running one, and never for a recorded `sudo …`) or preloads its last typed-but-unsubmitted line into the new prompt (`--yes`, deliberately never `--submit` — nothing runs without a human keystroke) or delivers nothing if it was idle with no typed line. Neither arm resolving is skipped with a taught message. The revived session always mints a NEW sessionId (ids are never recycled) and is stamped resumedFrom, rendered as a `resumed` graph edge; a carried old id transfers its mark onto the new one. A windowed-spawn failure (no $AOIDE_TERMINAL / no display) is folded into `failed` rather than erroring the command, so a headless host degrades gracefully.",
+        summary: "Revive resumable sessions off the durable ledger (state/session-ledger.jsonl): resolves --project by exact name, anchors ledger entries to it (longest-prefix, same rule the bare `graph` render uses), then selects. Bare (no --all/--id) resumes the project's WHOLE undying set (state/undying.json, `session undying on|off`) minus any id already alive; --all widens to every anchored entry; --id narrows to one. Each candidate resolves through two arms: a harness with a verified resume argv spawns windowed running `<harness> --resume <id>`; a conducted TERMINAL (no harness profile, but a captured `restore` snapshot) spawns windowed running its login shell, then — once registered — either re-execs its last foreground command (`--yes --submit`, only when it was demonstrably running one, and never for a recorded `sudo …`) or preloads its last typed-but-unsubmitted line into the new prompt (`--yes`, deliberately never `--submit` — nothing runs without a human keystroke) or delivers nothing if it was idle with no typed line. Neither arm resolving is skipped with a taught message. The revived session always mints a NEW sessionId (ids are never recycled) and is stamped resumedFrom, rendered as a `resumed` graph edge; an undying old id transfers its mark onto the new one. A windowed-spawn failure (no $AOIDE_TERMINAL / no display) is folded into `failed` rather than erroring the command, so a headless host degrades gracefully.",
         args: [],
         flags: [
             flag!("project", "string", "Project name to resurrect a session for (required); resolved against projects.json by exact name."),
@@ -292,7 +292,8 @@ pub fn register(r: &mut Registry) {
         implemented: true,
         handler: crate::graph::session_conduct,
     ));
-    // ── session carry: the durable mark (durable-sessions plan, P-C2) ──
+    // ── session undying: the durable mark (durable-sessions plan, P-C2;
+    // renamed from "carry" at command-defrag lane U1, 2026-08-27) ──
     // Registered here, at the END of `register` — not beside the other
     // `session *` entries above — because registration order is load-bearing
     // (`crates/AGENTS.md`, "Registry order is load-bearing") and this command
@@ -300,19 +301,19 @@ pub fn register(r: &mut Registry) {
     // comparing, so this costs nothing there; `schema --json` order is what
     // the append-only rule protects.
     r.insert(cmd!(
-        path: ["session", "carry"],
-        summary: "Mark or unmark a session as durable in state/carry.json, so a project's whole carried set can later be resurrected together. Bare and --self both resolve the target from $AOIDE_SESSION_ID; --id targets any session id directly, including one already gone from the roster — no roster lookup gates the write, which is what makes the mark flippable post-mortem.",
-        args: [arg!("state", "string", true, "The carry state to set: `on` or `off`.")],
+        path: ["session", "undying"],
+        summary: "Mark or unmark a session as durable in state/undying.json, so a project's whole undying set can later be resurrected together. Bare and --self both resolve the target from $AOIDE_SESSION_ID; --id targets any session id directly, including one already gone from the roster — no roster lookup gates the write, which is what makes the mark flippable post-mortem.",
+        args: [arg!("state", "string", true, "The undying state to set: `on` or `off`.")],
         flags: [
             flag!("self", "bool", "Target this session, resolved from $AOIDE_SESSION_ID (the default when neither --self nor --id is given)."),
             flag!("id", "string", "Target session id directly (mutually exclusive with --self); no roster lookup gates it, so a dead id is a valid target."),
         ],
         gated: false,
         implemented: true,
-        handler: crate::graph::session_carry,
+        handler: crate::graph::session_undying,
         examples: [
-            "session carry on --self",
-            "session carry off --id <session-id>",
+            "session undying on --self",
+            "session undying off --id <session-id>",
         ],
     ));
 }

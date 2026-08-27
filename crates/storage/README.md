@@ -160,18 +160,36 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   `aoide-conduct` is the sole writer (its PTY tick, ~1 Hz) and the sole
   reader of `typed`'s raw keystroke stream — this crate only holds the
   shape, never the capture logic.
-- `carry` — the carry mark (durable-sessions plan, P-C1): `state/carry.json`,
-  the set of session ids marked durable so a project's whole carried set can
-  be resurrected together (`session carry on|off`, a later phase).
-  Mirrors `peer_store` exactly — `load_carry`/`save_carry` tolerate a
-  missing/corrupt file as empty and write atomically via `fs::atomic_write`
-  (not `atomic_write_private`: a session id is the same class of data
+- `undying` — the undying mark (durable-sessions plan, P-C1; renamed from
+  "carry" at command-defrag lane U1, 2026-08-27): `state/undying.json`, the
+  set of session ids marked durable so a project's whole undying set can be
+  resurrected together (`session undying on|off`). Mirrors `peer_store`
+  exactly — `load_undying`/`save_undying` tolerate a missing/corrupt file as
+  empty and write atomically via `fs::atomic_write` (not
+  `atomic_write_private`: a session id is the same class of data
   `sessions.json`/`peers.json` already keep at default mode).
-  `set_carried`/`is_carried` are pure list operations; `set_carried` returns
-  whether the carried/not-carried TRANSITION changed, and separately
+  `set_undying`/`is_undying` are pure list operations; `set_undying` returns
+  whether the undying/not-undying TRANSITION changed, and separately
   refreshes `markedAt` on every `on` call including a re-mark of an
-  already-carried id. Store only for now — no command or consumer is wired
-  to it yet.
+  already-undying id. `load_undying` also folds in a one-shot migration off
+  the pre-rename `state/carry.json`, idempotent by construction (a cheap
+  `exists()` check, no process-wide `Once` needed for a single file) —
+  narrated, never a clobber of a fresher `undying.json`.
+- `manifest` — a project's own `.aoide/project.json` (v0, command-defrag
+  lane U1): committed-adjacent SESSION SPECS (`{host, dir, agent, command?}`,
+  `dir` always PROJECT-RELATIVE, never a session id or timestamp), so a bare
+  clone can still tell `resurrect` what sessions a project wants brought up.
+  Distinct from `undying` in every way that matters — see this module's own
+  doc for the full contrast. `load_manifest`/`save_manifest` are this
+  project root's read/write pair (missing file → `None`; unreadable/corrupt
+  → narrated then `None`; `save_manifest` refuses an absolute `dir` in any
+  spec BEFORE writing anything). `.aoide/` self-ignores on first
+  `save_manifest` into a project root (`.gitignore` seeded with `*\n`,
+  never overwritten if one already exists) — the manifest is host-local by
+  decision, not something meant to sync via git. `walk_up` is the pure,
+  explicit-`start`-argument discovery seam a later phase's bare `resurrect`
+  calls: git-style nearest-wins search up through parent directories,
+  stopping at the filesystem root.
 - `takes` — the per-draft take store behind `rice back`/`rice take`.
 - `petname`/`display` — the adjective-noun petname mint and its
   render-time-only display grammar.

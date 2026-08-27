@@ -10,13 +10,13 @@
 //! path-prefix rule bare `graph`'s `anchor_for` uses — reused, never
 //! re-derived), then pick candidates. `--all` widens to every anchored
 //! entry; `--id` narrows to one specific ledger `sessionId`; bare (neither
-//! flag) resumes the project's WHOLE carried set (`state/carry.json`,
+//! flag) resumes the project's WHOLE undying set (`state/undying.json`,
 //! durable-sessions plan P-C4) — every anchored entry currently marked
 //! durable, minus any id already alive in `sessions.json`, deduped by
 //! `sessionId` keeping the newest `endedAt` (an append-only ledger can hold
-//! more than one exit for the same carried id once it has been resurrected
+//! more than one exit for the same undying id once it has been resurrected
 //! and exited again). `--all` and `--id` are unchanged escapes: both widen
-//! or narrow past the carried set regardless of the mark. Each candidate is
+//! or narrow past the undying set regardless of the mark. Each candidate is
 //! filtered through its harness's `AgentProfile.resume_args`
 //! (`aoide_protocol::agents`): `None` (an unregistered agent, or a harness
 //! whose resume argv has never been verified) skips that candidate with a
@@ -29,7 +29,7 @@
 //! the new record is stamped `resumedFrom` (`stamp_resumed_from`), naming the
 //! ledger entry's own `sessionId` — `build_graph` projects that as a
 //! `resumed` edge beside `spawned`/`anchors` (CONTRACTS.md §4). If the old id
-//! was carried (`state/carry.json`, durable-sessions plan P-C3), the mark
+//! was undying (`state/undying.json`, durable-sessions plan P-C3), the mark
 //! transfers onto the new id in the same step — never left on the now-dead
 //! old id, which would double-resurrect on the next sweep.
 //!
@@ -285,26 +285,26 @@ fn resurrect_one(
     // `session_spawn` already spent its own registration budget.
     stamp_resumed_from(&new_id, &c.entry.session_id);
 
-    // Carry transfer (P-C3, durable-sessions plan): if the OLD id was
+    // Undying transfer (P-C3, durable-sessions plan): if the OLD id was
     // durable, move the mark onto the fresh one rather than leaving it
     // behind — a mark left on a ledger id would double-resurrect on the next
-    // sweep once P-C4 selects off the carried set. A no-op when the old id
-    // was never carried at all (this resurrect did not originate from the
-    // carried set), so an ordinary `--all`/`--id` revive never starts
-    // carrying sessions nobody marked.
+    // sweep once P-C4 selects off the undying set. A no-op when the old id
+    // was never undying at all (this resurrect did not originate from the
+    // undying set), so an ordinary `--all`/`--id` revive never starts
+    // marking sessions undying that nobody marked.
     //
     // Both mutations land in ONE in-memory vector before the SINGLE
-    // `save_carry` write below — mark the new id BEFORE dropping the old
+    // `save_undying` write below — mark the new id BEFORE dropping the old
     // one, so a crash between the two in-memory edits and the write is
     // impossible, and a crash right before the write leaves the OLD id
-    // still carried (retry-safe) rather than neither (silent loss). Also
+    // still undying (retry-safe) rather than neither (silent loss). Also
     // idempotent: re-running this on an already-transferred pair finds the
-    // old id no longer carried and writes nothing.
-    let mut carried = aoide_storage::carry::load_carry();
-    if aoide_storage::carry::is_carried(&carried, &c.entry.session_id) {
-        aoide_storage::carry::set_carried(&mut carried, &new_id, true);
-        aoide_storage::carry::set_carried(&mut carried, &c.entry.session_id, false);
-        let _ = aoide_storage::carry::save_carry(&carried);
+    // old id no longer undying and writes nothing.
+    let mut undying = aoide_storage::undying::load_undying();
+    if aoide_storage::undying::is_undying(&undying, &c.entry.session_id) {
+        aoide_storage::undying::set_undying(&mut undying, &new_id, true);
+        aoide_storage::undying::set_undying(&mut undying, &c.entry.session_id, false);
+        let _ = aoide_storage::undying::save_undying(&undying);
     }
 
     // Post-spawn restore delivery (P-C6, durable-sessions plan) — only for a
@@ -350,23 +350,23 @@ fn resurrect_one(
 }
 
 /// Bare-mode selection (no `--all`/`--id`, decision 6 of the durable-sessions
-/// plan): `anchored` narrowed to the project's WHOLE carried set, not just
+/// plan): `anchored` narrowed to the project's WHOLE undying set, not just
 /// its single most recent entry. Three steps, in order:
 ///
-/// 1. keep only entries whose `sessionId` is in `state/carry.json`
-///    (`aoide_storage::carry::is_carried`);
+/// 1. keep only entries whose `sessionId` is in `state/undying.json`
+///    (`aoide_storage::undying::is_undying`);
 /// 2. drop any id that is already alive (non-`done`) in `sessions.json` —
 ///    the daemon's old `has_live` skip moves HERE, per-id instead of
 ///    per-project, so one live terminal no longer suppresses the rest of a
-///    multi-session carried set (`server/src/daemon.rs`'s
+///    multi-session undying set (`server/src/daemon.rs`'s
 ///    `run_boot_auto_resume`, which now calls this unconditionally);
 /// 3. dedup by `sessionId`, keeping the entry with the latest `endedAt` — a
-///    carried id that was resurrected and exited again appears twice in the
+///    undying id that was resurrected and exited again appears twice in the
 ///    append-only ledger.
-fn carried_selection(
+fn undying_selection(
     anchored: Vec<aoide_storage::ledger::LedgerEntry>,
 ) -> Vec<aoide_storage::ledger::LedgerEntry> {
-    let carried = aoide_storage::carry::load_carry();
+    let undying = aoide_storage::undying::load_undying();
     let sessions: SessionsFile = load_stage(&sessions_path()).unwrap_or_default();
     let live: std::collections::HashSet<&str> = sessions
         .sessions
@@ -377,7 +377,7 @@ fn carried_selection(
 
     let mut newest: BTreeMap<String, aoide_storage::ledger::LedgerEntry> = BTreeMap::new();
     for e in anchored {
-        if !aoide_storage::carry::is_carried(&carried, &e.session_id) {
+        if !aoide_storage::undying::is_undying(&undying, &e.session_id) {
             continue;
         }
         if live.contains(e.session_id.as_str()) {
@@ -441,13 +441,13 @@ pub fn session_resurrect(inv: &Invocation) -> Outcome {
         });
         v
     } else {
-        carried_selection(anchored)
+        undying_selection(anchored)
     };
 
     if selected.is_empty() {
         let bare = inv.flags.get("id").is_none() && !inv.flag_present("all");
         let msg = if bare {
-            format!("carried set is empty for project `{name}` — nothing to resurrect")
+            format!("undying set is empty for project `{name}` — nothing to resurrect")
         } else {
             format!("no resumable session found for project `{name}`")
         };
@@ -695,12 +695,12 @@ mod tests {
             &proj_path,
             "2026-08-20T01:00:00Z",
         )]);
-        // Bare selection is carried-set-driven (P-C4) — mark the entry so it
+        // Bare selection is undying-set-driven (P-C4) — mark the entry so it
         // is even a candidate; the point of this test is the harness skip,
         // not the selection width.
-        let mut carried = Vec::new();
-        aoide_storage::carry::set_carried(&mut carried, "ledger-unknown-harness", true);
-        aoide_storage::carry::save_carry(&carried).unwrap();
+        let mut undying = Vec::new();
+        aoide_storage::undying::set_undying(&mut undying, "ledger-unknown-harness", true);
+        aoide_storage::undying::save_undying(&undying).unwrap();
 
         let out = session_resurrect(&flag_invocation(&["resurrect"], &[("project", "proj")]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
@@ -740,12 +740,12 @@ mod tests {
         std::env::remove_var("DISPLAY");
 
         set_ledger(&[ledger_entry("ledger-old-2", "claude", &proj_path, "2026-08-20T01:00:00Z")]);
-        // Bare selection is carried-set-driven (P-C4) — mark the entry so it
+        // Bare selection is undying-set-driven (P-C4) — mark the entry so it
         // is even a candidate; the point of this test is the failure
         // handling, not the selection width.
-        let mut carried = Vec::new();
-        aoide_storage::carry::set_carried(&mut carried, "ledger-old-2", true);
-        aoide_storage::carry::save_carry(&carried).unwrap();
+        let mut undying = Vec::new();
+        aoide_storage::undying::set_undying(&mut undying, "ledger-old-2", true);
+        aoide_storage::undying::save_undying(&undying).unwrap();
 
         let out = session_resurrect(&flag_invocation(&["resurrect"], &[("project", "proj")]));
         assert_eq!(
@@ -767,15 +767,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A successful resurrect of a CARRIED old id transfers the mark: the
-    /// new id ends up carried, the old id does not, and an unrelated carried
+    /// A successful resurrect of a UNDYING old id transfers the mark: the
+    /// new id ends up undying, the old id does not, and an unrelated undying
     /// id already in the set is left exactly as it was (P-C3, durable-
     /// sessions plan). `AOIDE_TERMINAL=true` is enough to make the windowed
     /// spawn itself succeed (`Status::Ok`) without a real terminal — `true`
-    /// exits 0 the instant it's exec'd; the point of this test is the carry
+    /// exits 0 the instant it's exec'd; the point of this test is the undying
     /// transfer, not registration, which `resurrect_one` never gates it on.
     #[test]
-    fn a_successful_resurrect_transfers_the_carry_mark_from_old_to_new() {
+    fn a_successful_resurrect_transfers_the_undying_mark_from_old_to_new() {
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
@@ -786,16 +786,16 @@ mod tests {
             "WAYLAND_DISPLAY",
             "DISPLAY",
         ]);
-        let (root, proj_path) = setup("resurrect-carry-transfer");
+        let (root, proj_path) = setup("resurrect-undying-transfer");
         std::env::set_var("AOIDE_TERMINAL", "true");
         std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
 
-        set_ledger(&[ledger_entry("ledger-carried", "claude", &proj_path, "2026-08-20T01:00:00Z")]);
+        set_ledger(&[ledger_entry("ledger-undying", "claude", &proj_path, "2026-08-20T01:00:00Z")]);
 
-        let mut carried = Vec::new();
-        aoide_storage::carry::set_carried(&mut carried, "ledger-carried", true);
-        aoide_storage::carry::set_carried(&mut carried, "unrelated-id", true);
-        aoide_storage::carry::save_carry(&carried).unwrap();
+        let mut undying = Vec::new();
+        aoide_storage::undying::set_undying(&mut undying, "ledger-undying", true);
+        aoide_storage::undying::set_undying(&mut undying, "unrelated-id", true);
+        aoide_storage::undying::save_undying(&undying).unwrap();
 
         let out = session_resurrect(&flag_invocation(&["resurrect"], &[("project", "proj")]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
@@ -804,26 +804,26 @@ mod tests {
         assert_eq!(resurrected.len(), 1, "data: {data}");
         let new_id = resurrected[0]["sessionId"].as_str().unwrap().to_string();
 
-        let carried = aoide_storage::carry::load_carry();
-        assert!(aoide_storage::carry::is_carried(&carried, &new_id), "the new id must be carried");
+        let undying = aoide_storage::undying::load_undying();
+        assert!(aoide_storage::undying::is_undying(&undying, &new_id), "the new id must be undying");
         assert!(
-            !aoide_storage::carry::is_carried(&carried, "ledger-carried"),
-            "the old id must no longer be carried"
+            !aoide_storage::undying::is_undying(&undying, "ledger-undying"),
+            "the old id must no longer be undying"
         );
         assert!(
-            aoide_storage::carry::is_carried(&carried, "unrelated-id"),
-            "an unrelated carried id must be left untouched"
+            aoide_storage::undying::is_undying(&undying, "unrelated-id"),
+            "an unrelated undying id must be left untouched"
         );
-        assert_eq!(carried.len(), 2, "exactly one id moves — the set's size is unchanged");
+        assert_eq!(undying.len(), 2, "exactly one id moves — the set's size is unchanged");
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The failure half of the same rule: a spawn that never even reaches
     /// `Status::Ok` (the headless-host taught error, no `$AOIDE_TERMINAL`)
-    /// must leave the old id carried, so the next sweep retries it.
+    /// must leave the old id undying, so the next sweep retries it.
     #[test]
-    fn a_failed_resurrect_leaves_the_old_id_carried() {
+    fn a_failed_resurrect_leaves_the_old_id_undying() {
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
@@ -834,25 +834,25 @@ mod tests {
             "WAYLAND_DISPLAY",
             "DISPLAY",
         ]);
-        let (root, proj_path) = setup("resurrect-carry-failed");
+        let (root, proj_path) = setup("resurrect-undying-failed");
         std::env::remove_var("AOIDE_TERMINAL");
         std::env::remove_var("WAYLAND_DISPLAY");
         std::env::remove_var("DISPLAY");
 
-        set_ledger(&[ledger_entry("ledger-carried-fail", "claude", &proj_path, "2026-08-20T01:00:00Z")]);
+        set_ledger(&[ledger_entry("ledger-undying-fail", "claude", &proj_path, "2026-08-20T01:00:00Z")]);
 
-        let mut carried = Vec::new();
-        aoide_storage::carry::set_carried(&mut carried, "ledger-carried-fail", true);
-        aoide_storage::carry::save_carry(&carried).unwrap();
+        let mut undying = Vec::new();
+        aoide_storage::undying::set_undying(&mut undying, "ledger-undying-fail", true);
+        aoide_storage::undying::save_undying(&undying).unwrap();
 
         let out = session_resurrect(&flag_invocation(&["resurrect"], &[("project", "proj")]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["failed"].as_array().unwrap().len(), 1);
 
-        let carried = aoide_storage::carry::load_carry();
+        let undying = aoide_storage::undying::load_undying();
         assert!(
-            aoide_storage::carry::is_carried(&carried, "ledger-carried-fail"),
-            "a failed resurrect must leave the old id carried so the next sweep retries it"
+            aoide_storage::undying::is_undying(&undying, "ledger-undying-fail"),
+            "a failed resurrect must leave the old id undying so the next sweep retries it"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -860,8 +860,8 @@ mod tests {
 
     /// Re-running a resurrect against the same (append-only, so still
     /// selectable) ledger entry after it has already transferred must not
-    /// carry the SECOND new id or touch the set again — the transfer step
-    /// only fires when the old id is currently carried, and by the second
+    /// mark the SECOND new id undying or touch the set again — the transfer step
+    /// only fires when the old id is currently undying, and by the second
     /// call it no longer is.
     #[test]
     fn transfer_is_idempotent_when_the_pair_has_already_transferred() {
@@ -875,23 +875,23 @@ mod tests {
             "WAYLAND_DISPLAY",
             "DISPLAY",
         ]);
-        let (root, proj_path) = setup("resurrect-carry-idempotent");
+        let (root, proj_path) = setup("resurrect-undying-idempotent");
         std::env::set_var("AOIDE_TERMINAL", "true");
         std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
 
         set_ledger(&[ledger_entry("ledger-idem", "claude", &proj_path, "2026-08-20T01:00:00Z")]);
 
-        let mut carried = Vec::new();
-        aoide_storage::carry::set_carried(&mut carried, "ledger-idem", true);
-        aoide_storage::carry::save_carry(&carried).unwrap();
+        let mut undying = Vec::new();
+        aoide_storage::undying::set_undying(&mut undying, "ledger-idem", true);
+        aoide_storage::undying::save_undying(&undying).unwrap();
 
         let first = session_resurrect(&flag_invocation(&["resurrect"], &[("project", "proj")]));
         assert_eq!(first.status, aoide_protocol::output::Status::Ok, "msg: {}", first.message);
         let first_new_id =
             first.data.as_ref().unwrap()["resurrected"][0]["sessionId"].as_str().unwrap().to_string();
-        let after_first = aoide_storage::carry::load_carry();
-        assert!(aoide_storage::carry::is_carried(&after_first, &first_new_id));
-        assert!(!aoide_storage::carry::is_carried(&after_first, "ledger-idem"));
+        let after_first = aoide_storage::undying::load_undying();
+        assert!(aoide_storage::undying::is_undying(&after_first, &first_new_id));
+        assert!(!aoide_storage::undying::is_undying(&after_first, "ledger-idem"));
 
         // Bare selection no longer re-picks `ledger-idem` (P-C4): its mark
         // already moved to `first_new_id` above. `--id` is the unchanged
@@ -907,10 +907,10 @@ mod tests {
         let second_new_id =
             second.data.as_ref().unwrap()["resurrected"][0]["sessionId"].as_str().unwrap().to_string();
 
-        let after_second = aoide_storage::carry::load_carry();
+        let after_second = aoide_storage::undying::load_undying();
         assert!(
-            !aoide_storage::carry::is_carried(&after_second, &second_new_id),
-            "the old id was no longer carried, so nothing transfers to the second new id"
+            !aoide_storage::undying::is_undying(&after_second, &second_new_id),
+            "the old id was no longer undying, so nothing transfers to the second new id"
         );
         assert_eq!(
             after_second, after_first,
@@ -952,8 +952,8 @@ mod tests {
     }
 
     /// `--all` and `--id` are unchanged escapes (P-C4's own scope line): both
-    /// widen or narrow past the carried set regardless of the mark — neither
-    /// entry below is ever carried, and both still resolve.
+    /// widen or narrow past the undying set regardless of the mark — neither
+    /// entry below is ever undying, and both still resolve.
     #[test]
     fn all_widens_to_every_anchored_entry_and_id_narrows_to_one_regardless_of_the_mark() {
         let _guard = crate::env_lock().lock().unwrap();
@@ -963,20 +963,20 @@ mod tests {
         // Two resumable-shaped entries (unresolved harness, so both land in
         // `skipped` rather than needing a real spawn) — proves the SELECTION
         // width, independent of the spawn mechanics already covered above.
-        // Neither is carried: --all and --id must not care.
+        // Neither is undying: --all and --id must not care.
         set_ledger(&[
             ledger_entry("ledger-a", "no-such-harness", &proj_path, "2026-08-20T01:00:00Z"),
             ledger_entry("ledger-b", "no-such-harness", &proj_path, "2026-08-20T02:00:00Z"),
         ]);
 
-        // --all: both, carried or not.
+        // --all: both, undying or not.
         let out = session_resurrect(&flag_invocation(
             &["resurrect"],
             &[("project", "proj"), ("all", "true")],
         ));
         assert_eq!(out.data.as_ref().unwrap()["skipped"].as_array().unwrap().len(), 2);
 
-        // --id: exactly the named one, uncarried and not the newest.
+        // --id: exactly the named one, not undying and not the newest.
         let out = session_resurrect(&flag_invocation(
             &["resurrect"],
             &[("project", "proj"), ("id", "ledger-a")],
@@ -988,63 +988,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // ── P-C4: bare selection drives off the carried set ─────────────────────
+    // ── P-C4: bare selection drives off the undying set ─────────────────────
 
-    /// The headline case: three carried, two uncarried, all five anchored to
+    /// The headline case: three undying, two not undying, all five anchored to
     /// the same project — bare `--project` resurrects exactly the three.
     #[test]
-    fn bare_default_resurrects_exactly_the_carried_set() {
+    fn bare_default_resurrects_exactly_the_undying_set() {
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
-        let (root, proj_path) = setup("resurrect-carried-set");
+        let (root, proj_path) = setup("resurrect-undying-set");
 
         set_ledger(&[
-            ledger_entry("carried-1", "no-such-harness", &proj_path, "2026-08-20T01:00:00Z"),
-            ledger_entry("carried-2", "no-such-harness", &proj_path, "2026-08-20T02:00:00Z"),
-            ledger_entry("carried-3", "no-such-harness", &proj_path, "2026-08-20T03:00:00Z"),
-            ledger_entry("uncarried-1", "no-such-harness", &proj_path, "2026-08-20T04:00:00Z"),
-            ledger_entry("uncarried-2", "no-such-harness", &proj_path, "2026-08-20T05:00:00Z"),
+            ledger_entry("undying-1", "no-such-harness", &proj_path, "2026-08-20T01:00:00Z"),
+            ledger_entry("undying-2", "no-such-harness", &proj_path, "2026-08-20T02:00:00Z"),
+            ledger_entry("undying-3", "no-such-harness", &proj_path, "2026-08-20T03:00:00Z"),
+            ledger_entry("not-undying-1", "no-such-harness", &proj_path, "2026-08-20T04:00:00Z"),
+            ledger_entry("not-undying-2", "no-such-harness", &proj_path, "2026-08-20T05:00:00Z"),
         ]);
-        let mut carried = Vec::new();
-        for id in ["carried-1", "carried-2", "carried-3"] {
-            aoide_storage::carry::set_carried(&mut carried, id, true);
+        let mut undying = Vec::new();
+        for id in ["undying-1", "undying-2", "undying-3"] {
+            aoide_storage::undying::set_undying(&mut undying, id, true);
         }
-        aoide_storage::carry::save_carry(&carried).unwrap();
+        aoide_storage::undying::save_undying(&undying).unwrap();
 
         let out = session_resurrect(&flag_invocation(&["resurrect"], &[("project", "proj")]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         let skipped = out.data.as_ref().unwrap()["skipped"].as_array().unwrap().clone();
         let mut ids: Vec<&str> = skipped.iter().map(|s| s["sessionId"].as_str().unwrap()).collect();
         ids.sort();
-        assert_eq!(ids, vec!["carried-1", "carried-2", "carried-3"], "skipped: {skipped:?}");
+        assert_eq!(ids, vec!["undying-1", "undying-2", "undying-3"], "skipped: {skipped:?}");
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A carried id still live in `sessions.json` (non-`done`) is excluded —
+    /// A undying id still live in `sessions.json` (non-`done`) is excluded —
     /// the daemon's old per-project `has_live` skip moved down to here,
     /// per-id (P-C4's own scope line).
     #[test]
-    fn bare_default_excludes_a_carried_id_still_live_in_the_roster() {
+    fn bare_default_excludes_an_undying_id_still_live_in_the_roster() {
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
-        let (root, proj_path) = setup("resurrect-carried-live");
+        let (root, proj_path) = setup("resurrect-undying-live");
 
         set_ledger(&[
-            ledger_entry("carried-alive", "no-such-harness", &proj_path, "2026-08-20T01:00:00Z"),
-            ledger_entry("carried-dead", "no-such-harness", &proj_path, "2026-08-20T02:00:00Z"),
+            ledger_entry("undying-alive", "no-such-harness", &proj_path, "2026-08-20T01:00:00Z"),
+            ledger_entry("undying-dead", "no-such-harness", &proj_path, "2026-08-20T02:00:00Z"),
         ]);
-        let mut carried = Vec::new();
-        aoide_storage::carry::set_carried(&mut carried, "carried-alive", true);
-        aoide_storage::carry::set_carried(&mut carried, "carried-dead", true);
-        aoide_storage::carry::save_carry(&carried).unwrap();
+        let mut undying = Vec::new();
+        aoide_storage::undying::set_undying(&mut undying, "undying-alive", true);
+        aoide_storage::undying::set_undying(&mut undying, "undying-dead", true);
+        aoide_storage::undying::save_undying(&undying).unwrap();
 
-        // `carried-alive` is still in the roster, non-`done`.
+        // `undying-alive` is still in the roster, non-`done`.
         write_stage(
             &sessions_path(),
             &SessionsFile {
                 schema_version: "0".into(),
-                sessions: vec![session("carried-alive", &proj_path, "working", "2026-08-20T01:00:00Z", None)],
+                sessions: vec![session("undying-alive", &proj_path, "working", "2026-08-20T01:00:00Z", None)],
             },
         )
         .unwrap();
@@ -1053,27 +1053,27 @@ mod tests {
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         let skipped = out.data.as_ref().unwrap()["skipped"].as_array().unwrap().clone();
         assert_eq!(skipped.len(), 1, "skipped: {skipped:?}");
-        assert_eq!(skipped[0]["sessionId"], "carried-dead");
+        assert_eq!(skipped[0]["sessionId"], "undying-dead");
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// An empty carried set is an `ok` no-op with an honest message — never
+    /// An empty undying set is an `ok` no-op with an honest message — never
     /// silently treated as "nothing to do" without saying why.
     #[test]
-    fn bare_default_is_an_ok_no_op_when_the_carried_set_is_empty() {
+    fn bare_default_is_an_ok_no_op_when_the_undying_set_is_empty() {
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
-        let (root, proj_path) = setup("resurrect-carried-empty");
+        let (root, proj_path) = setup("resurrect-undying-empty");
 
-        // An anchored entry exists, but nothing is carried.
-        set_ledger(&[ledger_entry("uncarried-only", "no-such-harness", &proj_path, "2026-08-20T01:00:00Z")]);
+        // An anchored entry exists, but nothing is undying.
+        set_ledger(&[ledger_entry("not-undying-only", "no-such-harness", &proj_path, "2026-08-20T01:00:00Z")]);
 
         let out = session_resurrect(&flag_invocation(&["resurrect"], &[("project", "proj")]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["resurrected"].as_array().unwrap().len(), 0);
         assert!(
-            out.message.contains("carried set is empty"),
+            out.message.contains("undying set is empty"),
             "message must say WHY, not just no-op silently: {}",
             out.message
         );
@@ -1081,14 +1081,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A carried id that exited, was resurrected, and exited again appears
+    /// A undying id that exited, was resurrected, and exited again appears
     /// twice in the append-only ledger — the dedup keeps the newest
     /// `endedAt`, so only one candidate is ever selected.
     #[test]
-    fn bare_default_dedups_a_repeated_carried_id_keeping_the_newest_ended_at() {
+    fn bare_default_dedups_a_repeated_undying_id_keeping_the_newest_ended_at() {
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
-        let (root, proj_path) = setup("resurrect-carried-dedup");
+        let (root, proj_path) = setup("resurrect-undying-dedup");
 
         // Same sessionId, two ledger lines (append-only, both legal): an
         // earlier exit and a later re-exit.
@@ -1096,9 +1096,9 @@ mod tests {
             ledger_entry("repeated-id", "no-such-harness", &proj_path, "2026-08-20T01:00:00Z"),
             ledger_entry("repeated-id", "no-such-harness", &proj_path, "2026-08-20T09:00:00Z"),
         ]);
-        let mut carried = Vec::new();
-        aoide_storage::carry::set_carried(&mut carried, "repeated-id", true);
-        aoide_storage::carry::save_carry(&carried).unwrap();
+        let mut undying = Vec::new();
+        aoide_storage::undying::set_undying(&mut undying, "repeated-id", true);
+        aoide_storage::undying::save_undying(&undying).unwrap();
 
         let out = session_resurrect(&flag_invocation(&["resurrect"], &[("project", "proj")]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);

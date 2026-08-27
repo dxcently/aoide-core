@@ -44,8 +44,8 @@ pub struct Project {
 /// A conducted TERMINAL's continuously-captured restore snapshot (P-C5,
 /// durable-sessions plan) — what the shell was doing at the last ~1 Hz PTY
 /// tick (`aoide-conduct`'s `conduct_refresh_shell`/`restore_snapshot`), so a
-/// LATER phase's `graph resurrect` can bring a carried terminal back to more
-/// than a bare cwd. Captured continuously in the live `conduct` process and
+/// LATER phase's `graph resurrect` can bring an undying terminal back to
+/// more than a bare cwd. Captured continuously in the live `conduct` process and
 /// carried on the record change-only, exactly like `cwd`/`activity`/`state`
 /// — never computed at reap time: by the time a sweep condemns a session its
 /// process is already gone (that is the signal it reaped on), so a `/proc`

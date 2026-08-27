@@ -19,7 +19,7 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   (`STDIN_PAYLOAD_FLAG`) rather than growing the daemon wire a stdin
   channel — the daemon-side handler reads that flag first and never
   touches its own stdin.
-- `graph/spawn.rs` — `spawn [--windowed] [--carry]` (P-D7,
+- `graph/spawn.rs` — `spawn [--windowed] [--undying]` (P-D7,
   `docs/architecture/AOIDED.md`'s "L5"): the child is always `aoide conduct
   -- <agent cmd>`, built by the ONE shared `build_conduct_args` (`--headless`
   aside) — headless by default (detaches, re-execs this same binary), or,
@@ -32,8 +32,8 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   `foot sh -c '{cmd}'`) — pure, unit-tested, never a real terminal spawned in
   a test. Taught errors, no process ever touched: no `$AOIDE_TERMINAL` set,
   or neither `$WAYLAND_DISPLAY` nor `$DISPLAY` present (a headless host,
-  steered back to plain `spawn`). `--carry` (P-C3, durable-sessions
-  plan) marks the spawned id in `state/carry.json` once — and only once —
+  steered back to plain `spawn`). `--undying` (P-C3, durable-sessions
+  plan) marks the spawned id in `state/undying.json` once — and only once —
   the registration wait actually succeeds; an id that never registers has no
   live session behind it, so nothing is marked.
 - `graph/send.rs`'s `session hook` stamps `SessionRecord.
@@ -73,24 +73,25 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   session's first turn is typed before that session has a `SessionRecord`
   at all, so it can't reach `deliver_local` and files itself instead — see
   `aoide_storage::inbox`'s module doc for the full two-writer reasoning.
-- **The carry mark (P-C2/P-C3, durable-sessions plan):** `graph/carry.rs`'s
-  `session_carry` (`session carry on|off [--self | --id <id>]`) is the
-  command over `aoide_storage::carry`'s store (`state/carry.json`) — a
-  session id marked DURABLE, so a project's whole carried set can later be
+- **The undying mark (P-C2/P-C3, durable-sessions plan; renamed from "carry"
+  at command-defrag lane U1, 2026-08-27):** `graph/undying.rs`'s
+  `session_undying` (`session undying on|off [--self | --id <id>]`) is the
+  command over `aoide_storage::undying`'s store (`state/undying.json`) — a
+  session id marked DURABLE, so a project's whole undying set can later be
   resurrected together. Unlike every other `session *` handler in this
   crate, it takes no stage lock and does not route through `daemon_dispatch`:
-  `carry.json` is not a `state/stage/` file, so it sits entirely outside the
-  L4 dual-writer surface. `--id` targets any session id, live or not — no
-  roster lookup gates the write, which is what makes the mark flippable
+  `undying.json` is not a `state/stage/` file, so it sits entirely outside
+  the L4 dual-writer surface. `--id` targets any session id, live or not —
+  no roster lookup gates the write, which is what makes the mark flippable
   post-mortem off a bare ledger id; bare and `--self` both resolve the
   target from `$AOIDE_SESSION_ID`. Two more sites touch the same store:
-  `spawn --carry` marks at birth (above), and `graph/resurrect.rs`'s
-  `resurrect_one` moves the mark from an old, carried ledger id onto its
+  `spawn --undying` marks at birth (above), and `graph/resurrect.rs`'s
+  `resurrect_one` moves the mark from an old, undying ledger id onto its
   freshly spawned replacement — new id added, old id dropped, in ONE
-  `save_carry` call, only when the spawn actually reached `Status::Ok` and
-  only when the old id was carried to begin with. The new id is added
+  `save_undying` call, only when the spawn actually reached `Status::Ok` and
+  only when the old id was undying to begin with. The new id is added
   BEFORE the old one is dropped in the shared in-memory vector, so a crash
-  between that edit and the write leaves the OLD id carried (retryable)
+  between that edit and the write leaves the OLD id undying (retryable)
   rather than neither (silent loss) — the same bias a failed spawn gets
   deliberately, by never touching the store at all.
 - `reap` — liveness reaping (`aoide session reap`), sweeping sessions a
@@ -143,16 +144,17 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   entries to a project by the SAME `anchor_for` longest-prefix rule bare
   `graph` uses. Selection then branches on the flags: `--all` widens to every
   anchored entry, `--id` narrows to one specific `sessionId`, and bare
-  (neither flag) resumes the project's WHOLE carried set
-  (`aoide_storage::carry`, `state/carry.json`, durable-sessions plan P-C4) —
-  `carried_selection` keeps only anchored entries currently marked durable,
-  drops any id already alive (non-`done`) in `sessions.json`, and dedups by
-  `sessionId` keeping the entry with the newest `endedAt` (a carried id that
-  was resurrected and exited again appears twice in the append-only
-  ledger). `--all` and `--id` are unchanged escapes: both widen or narrow
-  past the carried set regardless of the mark. An empty bare-mode selection
-  is an honest `Outcome::ok` no-op naming the carried set as empty, never a
-  silent success. Every surviving candidate then resolves through TWO arms
+  (neither flag) resumes the project's WHOLE undying set
+  (`aoide_storage::undying`, `state/undying.json`, durable-sessions plan
+  P-C4) — `undying_selection` keeps only anchored entries currently marked
+  durable, drops any id already alive (non-`done`) in `sessions.json`, and
+  dedups by `sessionId` keeping the entry with the newest `endedAt` (an
+  undying id that was resurrected and exited again appears twice in the
+  append-only ledger). `--all` and `--id` are unchanged escapes: both widen
+  or narrow past the undying set regardless of the mark. An empty bare-mode
+  selection is an honest `Outcome::ok` no-op naming the undying set as
+  empty, never a silent success. Every surviving candidate then resolves
+  through TWO arms
   (`resolve_candidate`, P-C6): the harness arm, unchanged, filters to
   harnesses with a verified `AgentProfile.resume_args`
   (`aoide_protocol::agents`); a candidate the harness arm finds nothing for
