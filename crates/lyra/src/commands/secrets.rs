@@ -168,6 +168,18 @@ fn run_ask_dialog(
     result
 }
 
+/// The scratch directory a generated QML file lands in — `$XDG_RUNTIME_DIR`
+/// when set (a per-user, tmpfs-backed, already-`0700` directory systemd
+/// provisions on every graphical session — the SAME per-user privacy bound
+/// `aoide-secrets`' own `RuntimeDirectory` relies on), else `std::env::
+/// temp_dir()`. Only ever display data (a secret NAME, never a value), but
+/// this crate's sibling 0600s everything it writes on principle
+/// (`aoide_secrets::store`'s own `secure_file`) — matching that here costs
+/// nothing and there is no reason not to.
+fn scratch_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
+}
+
 fn write_temp_qml(
     secret: &str,
     consumer: &str,
@@ -175,22 +187,78 @@ fn write_temp_qml(
     reason: Option<&str>,
     from_line: Option<&str>,
 ) -> std::io::Result<PathBuf> {
-    let path = std::env::temp_dir().join(format!(
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let path = scratch_dir().join(format!(
         "aoide-secrets-ask-{}-{}.qml",
         std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()
     ));
-    std::fs::write(&path, render_qml(secret, consumer, seconds, reason, from_line))?;
+    // `0600` from creation — `mode()` sets the CREATE-time mode, still
+    // subject to umask, so this also matches `secure_file`'s own
+    // belt-and-suspenders `set_permissions` afterward rather than trusting
+    // the mode bit alone against a permissive umask.
+    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?;
+    file.write_all(render_qml(secret, consumer, seconds, reason, from_line).as_bytes())?;
+    drop(file);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     Ok(path)
 }
 
+/// Spawn `quickshell -p <qml_path>` — [`Command::pre_exec`] arms
+/// `PR_SET_PDEATHSIG` on the child BEFORE it execs into `quickshell`, so a
+/// killed `lyra secrets ask` process can never orphan its own dialog window
+/// (module doc's "Orphan prevention" section has the full ownership-chain
+/// reasoning this function is the implementation of).
 fn spawn_quickshell(quickshell_cmd: &str, qml_path: &std::path::Path) -> std::io::Result<Child> {
-    Command::new(quickshell_cmd)
-        .args(["-p", &qml_path.to_string_lossy()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
+    use std::os::unix::process::CommandExt;
+
+    // Captured in THIS (the lyra) process, before fork — `pre_exec`'s own
+    // closure runs AFTER fork, so `libc::getpid()` there would return the
+    // CHILD's own pid, not the parent's; this value has to cross the fork
+    // as a captured local.
+    let parent_pid = unsafe { libc::getpid() };
+
+    let mut cmd = Command::new(quickshell_cmd);
+    cmd.args(["-p", &qml_path.to_string_lossy()]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+
+    // SAFETY: this closure runs in the forked CHILD, strictly between
+    // `fork()` and `execve()` — the exact narrow window POSIX allows only
+    // async-signal-safe calls in (no allocation, no locks, nothing Rust's
+    // own runtime needs touched). `prctl`/`getppid`/`_exit` are bare
+    // syscalls, all three async-signal-safe.
+    unsafe {
+        cmd.pre_exec(move || {
+            // `PR_SET_PDEATHSIG` arranges for the KERNEL to send `SIGKILL`
+            // to THIS process (about to become `quickshell`) the moment its
+            // own parent thread — this `lyra` process — dies, for ANY
+            // reason, including `aoide_secrets::watch`'s own SIGKILL on the
+            // expiry/kill-by-pid path. That signal is untrappable, so this
+            // crate's own best-effort cleanup (`spawn_and_wait_for_marker`'s
+            // `child.kill()`) can never be relied on to run first when the
+            // KILL lands on `lyra`, not on `quickshell` directly — this is
+            // the mechanism that actually closes the window in that case.
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The standard TOCTOU close: if the parent ALREADY died in the
+            // window between `fork()` and this line running, this process
+            // has already been reparented (to a subreaper, or pid 1) by the
+            // time it observes it — a death signal armed AFTER that
+            // reparenting never fires, since the kernel only delivers it
+            // relative to the CURRENT parent at signal-delivery time, not
+            // the one that existed at `fork()`. Exiting here instead of
+            // proceeding into `execve()` is what closes that gap: no
+            // quickshell process is ever left to orphan in the first place.
+            if libc::getppid() != parent_pid {
+                libc::_exit(1);
+            }
+            Ok(())
+        });
+    }
+
+    cmd.spawn()
 }
 
 fn spawn_and_wait_for_marker(quickshell_cmd: &str, qml_path: &std::path::Path) -> Result<AskResult, String> {
@@ -242,12 +310,42 @@ fn parse_marker_line(line: &str) -> Option<AskResult> {
     }
 }
 
-/// Escape a string for embedding inside a QML double-quoted string literal —
-/// backslash and double-quote only (every value this function ever escapes
-/// is plain display text: a secret/consumer name, a free-text reason, a
-/// pre-formatted origin line -- never markup, never QML source).
+/// Escape a string for embedding inside a QML double-quoted string literal.
+/// Every value this function escapes is UNTRUSTED display text — a
+/// `--reason`/`--from` value is self-asserted/best-effort in origin
+/// (`aoide_secrets`' own `AGENTS.md` honesty note, extended here: `comm` in
+/// particular is PROCESS-CONTROLLED text ANY process can set to anything
+/// via `prctl(PR_SET_NAME, ...)`), so this function's whole job is making
+/// sure that text can never end its own string literal early, whatever it
+/// contains. Backslash and double-quote are the classic pair, but QML's
+/// strings are JavaScript strings underneath: a bare, un-escaped newline or
+/// carriage return inside one is a SYNTAX ERROR (breaks the file across
+/// lines, likely landing outside any string at all by the time the parser
+/// resumes), and U+2028/U+2029 (LINE SEPARATOR/PARAGRAPH SEPARATOR) are
+/// treated as line terminators INSIDE a JS string literal even though they
+/// look like ordinary printable characters — both must be escaped for the
+/// exact same reason `\n`/`\r` are. Every other C0 control character (tab
+/// included) is escaped too, on the same "never let raw control bytes reach
+/// generated source" principle. See `render_qml_embeds_a_hostile_reason_
+/// safely_escaped`/`qml_escape_neutralizes_every_dangerous_character` for
+/// the fault this closes: an unescaped newline in a `reason` used to break
+/// the generated file, and the dialog never rendered at all.
 fn qml_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c == '\u{2028}' || c == '\u{2029}' || (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Render the dialog's QML — six individually-boxed digit inputs
@@ -528,6 +626,82 @@ mod tests {
     }
 
     #[test]
+    fn qml_escape_neutralizes_every_dangerous_character() {
+        // Backslash/quote (the classic pair) plus every character that is
+        // dangerous specifically because QML strings are JS strings
+        // underneath: raw newline/CR (breaks the file across physical
+        // lines), tab, U+2028/U+2029 (JS line terminators even inside a
+        // string literal, despite looking like ordinary printable glyphs),
+        // and the remaining C0 control range.
+        let hostile = "back\\slash quote\" nl\n cr\r tab\t ls\u{2028} ps\u{2029} null\u{0000} esc\u{001b}";
+        let escaped = qml_escape(hostile);
+
+        assert!(!escaped.chars().any(|c| c.is_control()), "no raw control character may survive escaping: {escaped:?}");
+
+        // Every backslash/quote in the ESCAPED output must be part of one
+        // of this function's own escape sequences (`\\`, `\"`, `\n`, `\r`,
+        // `\t`, or `\u XXXX`) — strip each of those forms in turn and
+        // nothing bare should remain.
+        let mut stripped = escaped.clone();
+        let mut i = 0;
+        let mut out = String::new();
+        let chars: Vec<char> = stripped.chars().collect();
+        while i < chars.len() {
+            if chars[i] == '\\' && i + 1 < chars.len() {
+                match chars[i + 1] {
+                    '\\' | '"' | 'n' | 'r' | 't' => {
+                        i += 2;
+                        continue;
+                    }
+                    'u' if i + 5 < chars.len() && chars[i + 2..i + 6].iter().all(|c| c.is_ascii_hexdigit()) => {
+                        i += 6;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            out.push(chars[i]);
+            i += 1;
+        }
+        stripped = out;
+        assert!(!stripped.contains('"'), "an unescaped quote survived: {escaped:?}");
+        assert!(!stripped.contains('\\'), "an unescaped backslash survived: {escaped:?}");
+    }
+
+    #[test]
+    fn qml_escape_is_the_identity_on_ordinary_text() {
+        assert_eq!(qml_escape("sudo nixos-rebuild switch"), "sudo nixos-rebuild switch");
+        assert_eq!(qml_escape("khoa · bash (pid 123) @ yomi-strix"), "khoa · bash (pid 123) @ yomi-strix");
+    }
+
+    #[test]
+    fn render_qml_embeds_a_hostile_reason_safely_escaped() {
+        // The exact fault this test closes: an unescaped newline in
+        // `reason` used to split the generated file across physical lines
+        // mid-string-literal, and the dialog never rendered at all. Also
+        // carries a literal QML/JS injection ATTEMPT (`"]; Qt.quit(); //`)
+        // — proving it lands as inert escaped text, never as source.
+        let hostile = "normal\n\"]; Qt.quit(); //\u{2028}end\"";
+        let qml = render_qml("db-prod", "claude", 1, Some(hostile), None);
+        let escaped = qml_escape(hostile);
+
+        let expected_line = format!("for: \\\"{escaped}\\\"");
+        assert!(qml.contains(&expected_line), "expected the fully-escaped reason inline, got:\n{qml}");
+
+        // The reason's own `Text { ... }` block must stay on ONE physical
+        // source line — proof the embedded newline/LS never reintroduced a
+        // raw line break into the file.
+        let line = qml.lines().find(|l| l.contains("for: \\\"")).expect("the reason line must exist as ONE physical line");
+        assert!(line.trim_end().ends_with('}'), "the reason's Text {{}} block must close on the same physical line: {line:?}");
+
+        // The rest of the template must be completely unaffected —
+        // structural markers appear exactly as many times as the
+        // non-hostile-input tests already pin.
+        assert_eq!(qml.matches("model: 3").count(), 2);
+        assert_eq!(qml.matches("function submitIfComplete()").count(), 1);
+    }
+
+    #[test]
     fn render_qml_carries_six_boxes_a_dash_and_no_hardcoded_dialog_chrome() {
         let qml = render_qml("db-prod", "claude", 1, None, None);
         // Two `Repeater { model: 3 ... }` groups (each instantiated three
@@ -688,6 +862,15 @@ mod tests {
         assert_ne!(a, b, "two calls must never collide on the same scratch path");
         std::fs::remove_file(&a).unwrap();
         std::fs::remove_file(&b).unwrap();
+    }
+
+    #[test]
+    fn write_temp_qml_is_owner_only_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = write_temp_qml("db-prod", "claude", 42, None, None).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the generated QML must be owner-only, got {mode:o}");
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

@@ -28,6 +28,40 @@
   registration lines for these live in lyra's `commands`; the implementation
   files stay in `aoide-conduct` (see that crate's charter-smudge note) —
   don't duplicate or move them here.
+- **`commands::secrets::spawn_quickshell` arms `PR_SET_PDEATHSIG` on the
+  quickshell child BEFORE it execs — this is what actually closes an ask
+  dialog when `lyra secrets ask` itself is killed, not this process's own
+  cleanup code (review fix, this commit; the ownership chain, since it
+  crosses this crate and `aoide-secrets`, is documented in BOTH crates'
+  `AGENTS.md`, this bullet is this crate's half).** `aoide_secrets::watch`'s
+  own near-expiry/resolved-elsewhere kill path (`run_entry_dialog`'s
+  `child.kill()`) sends `SIGKILL` to the `lyra` PROCESS it spawned — `SIGKILL`
+  is UNTRAPPABLE, so `spawn_and_wait_for_marker`'s own best-effort
+  `child.kill()` on the quickshell grandchild NEVER RUNS in that case (the
+  `lyra` process is dead before its own code gets a chance to). Without
+  `PR_SET_PDEATHSIG`, that grandchild — quickshell, with a live window open —
+  would simply be reparented to a subreaper (or pid 1) and keep running
+  forever: the exact "orphaned window left open" failure mode `aoide-
+  secrets`' own `AGENTS.md` names as the reason `run_zenity_entry`/
+  `run_lyra_entry` hold the child's EXACT pid at all. `PR_SET_PDEATHSIG`
+  makes the KERNEL deliver `SIGKILL` to the quickshell process itself the
+  instant its parent (`lyra`) dies for ANY reason — no cooperation from
+  either process's own code required at the moment of death. Armed inside
+  `Command::pre_exec` (runs in the forked child, strictly between `fork()`
+  and `execve()` — only async-signal-safe calls belong in that closure:
+  `prctl`/`getppid`/`_exit`, nothing that allocates or locks) with the
+  standard TOCTOU close: `getppid()` re-checked against the parent pid
+  captured BEFORE `fork()`, exiting immediately if they differ (the parent
+  already died in the fork/prctl window, so a signal armed now would never
+  fire, and executing into quickshell anyway would silently orphan it the
+  same way). Don't drop this from a future `spawn_quickshell` rewrite "since
+  `spawn_and_wait_for_marker` already kills the child" — that cleanup only
+  runs when the FUNCTION returns normally, never when the whole process is
+  killed out from under it. Live-verified (this commit): opened a dialog,
+  `kill -9`'d the `lyra` pid, confirmed via `pgrep quickshell` that the
+  dialog's own quickshell process was gone within the same second — no
+  polling, no timeout, the kernel delivered it synchronously with the
+  parent's death.
 
 ## Extension points
 

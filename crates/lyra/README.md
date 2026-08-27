@@ -50,7 +50,20 @@ are core `aoide` identity, root `AGENTS.md`).
   NAME — zero new Cargo dependencies (the same feature-detection posture
   `aoide-secrets`' own `zenity`/`qrencode` shell-outs already hold); it is
   simply assumed present here, since `lyra` itself is fundamentally built on
-  Quickshell already.
+  Quickshell already. Review fixes (this commit): `spawn_quickshell` arms
+  `PR_SET_PDEATHSIG` (`libc::prctl`, already a workspace dependency via
+  `aoide-secrets`' own `peercred`/`enroll` — no new one added for this) so a
+  killed `lyra secrets ask` can never orphan its own dialog window — see
+  `AGENTS.md`'s own invariant for the full ownership-chain reasoning and the
+  live SIGKILL verification. `qml_escape` now escapes every C0 control
+  character, `\n`/`\r`/`\t`, and U+2028/U+2029 (JS line terminators even
+  inside a string literal) alongside backslash/quote — a `reason`/`origin`
+  value (untrusted, self-asserted/process-controlled text) containing a raw
+  newline used to break the generated QML file's own string literal and the
+  dialog never rendered at all. The generated QML lands under
+  `$XDG_RUNTIME_DIR` when set (else `temp_dir()`), written `0600` from
+  creation — matching `aoide-secrets`' own `store::secure_file` discipline,
+  even though this file only ever holds display data.
 
 ## What it consumes
 

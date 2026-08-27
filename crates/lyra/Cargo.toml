@@ -21,6 +21,12 @@ path = "src/lib.rs"
 
 [dependencies]
 serde_json = { workspace = true }
+# `commands::secrets`'s own `spawn_quickshell` (P3) — `PR_SET_PDEATHSIG` via
+# `libc::prctl` so a killed `lyra secrets ask` never orphans its quickshell
+# window (that module's own doc). Already a workspace dependency
+# (`aoide-secrets`' `peercred`/`enroll` modules), so this is an existing-dep
+# reuse, not a new one.
+libc = { workspace = true }
 aoide-protocol = { workspace = true }
 # rice/draft/mode/cover/livery/quickshell/take — the whole `rice` family.
 aoide-song = { workspace = true }
