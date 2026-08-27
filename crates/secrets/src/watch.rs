@@ -13,14 +13,34 @@
 //! confined to seven named modules" invariant) — `broker`/`client`/`store`/
 //! `backend`/`enroll` are the other five.
 //!
-//! **`--popup` (tracker #71 Part 2, this commit)** swaps the tty prompt for
-//! a `zenity --entry --hide-text` dialog on each parked ask — the CHILD's
-//! own stdout pipe carries the typed code straight into [`client::approve`],
-//! never argv (`Command::new`'s args carry only prompt TEXT, never the
-//! code). `zenity` is a runtime shell-out declared BY NAME (the plugin
-//! philosophy, root `AGENTS.md` house rule 7) — zero new Cargo dependencies,
-//! same feature-detection shape `enroll::render_qr` already uses for
-//! `qrencode`. Popups are UNLOCK-GATED ([`locked_state`]: `loginctl
+//! **`--popup` (tracker #71 Part 2)** swaps the tty prompt for a code-entry
+//! dialog on each parked ask — the CHILD's own stdout pipe carries the typed
+//! code straight into [`client::approve`], never argv (`Command::new`'s args
+//! carry only prompt TEXT/identifiers, never the code). The entry is VISIBLE
+//! (a TOTP code is a 30-second secret, not a password — nothing is gained by
+//! hiding digits the operator is about to read off an authenticator anyway).
+//! **P3 (this commit) adds a second dialog binary ahead of zenity's own:**
+//! [`resolve_lyra_bin`] checks whether `lyra` resolves to a real executable
+//! (`aoide_protocol::bin::rice_bin` + `on_path`, the SAME two-tier check
+//! `cli::commands::onboard::lyra_bin_if_resolved` already runs — this crate
+//! cannot depend on `aoide-cli`, so the three-line "is it actually there"
+//! wrapper is repeated here rather than imported, the shared part
+//! (`aoide-protocol::bin`'s resolver itself) is not duplicated) and, when it
+//! does, spawns `lyra secrets ask --secret <name> --consumer <who> --seconds
+//! <n>` instead of `zenity --entry` — [`spawn_lyra_entry`]/
+//! [`spawn_zenity_entry`] share the identical output contract (code on
+//! stdout + exit 0 = approved; the literal [`DISMISS_LABEL`] on stdout +
+//! exit 1 = dismissed; anything else non-zero = cancelled) through the same
+//! [`run_entry_dialog`] wait/parse loop, so [`popup_loop`]'s result handling
+//! and its kill-by-pid expiry path never need to know which binary answered.
+//! **Presence of `lyra` IS the choice — no new env flag exists to pick
+//! between them** (the plugin philosophy, root `AGENTS.md` house rule 7):
+//! absent, `--popup` falls back to zenity exactly as before this phase.
+//! `zenity` remains a runtime shell-out declared BY NAME (zero new Cargo
+//! dependencies, same feature-detection shape `enroll::render_qr` already
+//! uses for `qrencode`); [`run`]'s own startup gate now refuses to enter
+//! `--popup` only when NEITHER binary is available. Popups are
+//! UNLOCK-GATED ([`locked_state`]: `loginctl
 //! LockedHint` OR'd with a `/proc` scan for a named locker process, default
 //! `hyprlock` — `AOIDE_SECRETS_LOCKER` overrides it; the design doc verified
 //! hyprlock cannot set `LockedHint`, so the `/proc` half is load-bearing,
@@ -627,23 +647,43 @@ pub enum ZenityResult {
 
 fn spawn_zenity_entry(zenity_cmd: &str, title: &str, text: &str) -> std::io::Result<Child> {
     Command::new(zenity_cmd)
-        .args(["--entry", "--hide-text", "--title", title, "--text", text, "--extra-button", DISMISS_LABEL])
+        .args(["--entry", "--title", title, "--text", text, "--extra-button", DISMISS_LABEL])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
 }
 
-/// Run one zenity code-entry dialog to completion, polling every 200ms
+/// `lyra secrets ask`'s own argv (P3) — `--secret`/`--consumer`/`--seconds`
+/// only, the same "identifiers and TEXT only, never a code" argv discipline
+/// `spawn_zenity_entry` already holds. `lyra_cmd` is a path/name parameter,
+/// never a hardcoded `Command::new("lyra")`, matching `spawn_zenity_entry`'s
+/// own shape so this module's tests can stand in a fake shim for either
+/// binary without a `PATH` mutation.
+fn spawn_lyra_entry(lyra_cmd: &str, secret: &str, consumer: &str, seconds: u64) -> std::io::Result<Child> {
+    Command::new(lyra_cmd)
+        .args(["secrets", "ask", "--secret", secret, "--consumer", consumer, "--seconds", &seconds.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+}
+
+/// Run one code-entry dialog CHILD to completion, polling every 200ms
 /// between the dialog's own exit and `should_cancel()` — the mechanism
 /// behind [`ZenityResult::CancelledExternally`] (module doc): `should_cancel`
 /// is the caller's own "is this ask still in the queue?" check, so an ask
 /// that resolves on another terminal while this dialog sits open gets its
 /// EXACT child killed via the `Child` handle this function already holds
 /// (never a re-derived pid, never a name match) rather than left orphaned
-/// on screen for an ask that no longer exists.
-fn run_zenity_entry(zenity_cmd: &str, title: &str, text: &str, mut should_cancel: impl FnMut() -> bool) -> ZenityResult {
-    let mut child = match spawn_zenity_entry(zenity_cmd, title, text) {
+/// on screen for an ask that no longer exists. Generic over HOW the child
+/// was spawned (`spawn` is called exactly once, inside here, so a failed
+/// spawn is still reported as [`ZenityResult::SpawnError`]) — this is the
+/// ONE place either dialog binary's exit status/stdout is parsed, so
+/// `zenity`'s and `lyra`'s output CONTRACT (module doc) staying identical is
+/// what makes sharing this loop correct, not incidental.
+fn run_entry_dialog(spawn: impl FnOnce() -> std::io::Result<Child>, mut should_cancel: impl FnMut() -> bool) -> ZenityResult {
+    let mut child = match spawn() {
         Ok(c) => c,
         Err(e) => return ZenityResult::SpawnError(e.to_string()),
     };
@@ -677,6 +717,38 @@ fn run_zenity_entry(zenity_cmd: &str, title: &str, text: &str, mut should_cancel
     }
 }
 
+fn run_zenity_entry(zenity_cmd: &str, title: &str, text: &str, should_cancel: impl FnMut() -> bool) -> ZenityResult {
+    run_entry_dialog(|| spawn_zenity_entry(zenity_cmd, title, text), should_cancel)
+}
+
+fn run_lyra_entry(lyra_cmd: &str, secret: &str, consumer: &str, seconds: u64, should_cancel: impl FnMut() -> bool) -> ZenityResult {
+    run_entry_dialog(|| spawn_lyra_entry(lyra_cmd, secret, consumer, seconds), should_cancel)
+}
+
+/// The dialog CHOICE itself (module doc's P3 section): `lyra_cmd` present
+/// means it already resolved to a real executable ([`resolve_lyra_bin`]'s
+/// own job, done ONCE by the caller — never re-checked here), so this
+/// function never re-derives that fact, only branches on it. Both arms end
+/// up in [`run_entry_dialog`] through the SAME `should_cancel` closure the
+/// caller built once — the choice changes which child is spawned, nothing
+/// about how its result is read back.
+#[allow(clippy::too_many_arguments)]
+fn run_ask_dialog(
+    lyra_cmd: Option<&str>,
+    zenity_cmd: &str,
+    secret: &str,
+    consumer: &str,
+    seconds: u64,
+    title: &str,
+    text: &str,
+    should_cancel: impl FnMut() -> bool,
+) -> ZenityResult {
+    match lyra_cmd {
+        Some(lyra) => run_lyra_entry(lyra, secret, consumer, seconds, should_cancel),
+        None => run_zenity_entry(zenity_cmd, title, text, should_cancel),
+    }
+}
+
 /// A brief `zenity --error`, shown after a wrong code (design doc: "show a
 /// brief zenity --error ... and re-offer"). Blocks until the user closes it
 /// — deliberately no `--timeout`, so the message is never dismissed before
@@ -698,14 +770,39 @@ fn zenity_available(zenity_cmd: &str) -> bool {
     Command::new(zenity_cmd).arg("--version").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok()
 }
 
+/// P3's dialog choice: is a REAL `lyra` executable resolvable right now?
+/// Mirrors `cli::commands::onboard::lyra_bin_if_resolved`'s exact env-tier/
+/// sibling-tier/bare-name-on-`PATH` check byte for byte (module doc: this
+/// crate cannot depend on `aoide-cli`, so the three-line "is it actually
+/// there" wrapper is repeated here rather than imported — the shared part,
+/// `aoide-protocol::bin`'s resolver itself, is not duplicated). `rice_bin`'s
+/// own env/sibling tiers are already trusted (both return a path containing
+/// `/`, or the env override verbatim); only its bare-name fallback
+/// (`"lyra"`, left for `Command::spawn` to resolve at exec time) needs a
+/// `PATH` probe of our own before this crate treats it as "resolved."
+fn resolve_lyra_bin() -> Option<String> {
+    let bin = aoide_protocol::bin::rice_bin();
+    let resolved = bin.contains('/') || aoide_protocol::bin::on_path(&bin);
+    resolved.then_some(bin)
+}
+
 /// The `--popup` loop — main thread only, mirrors [`prompt_loop`]'s own
-/// shape (pick the next un-ignored ask, act, repeat) but drives a zenity
-/// dialog instead of reading `[a]`/`[d]`/`[i]` from stdin. `ignored` is the
-/// SAME "Cancel/close stops re-prompting for THIS ask, this session only"
-/// semantics `[i]` holds in [`prompt_loop`] (design doc: "Cancel/close =
-/// IGNORE") — without it, a cancelled dialog would reopen every ~200ms
-/// forever.
-fn popup_loop(socket_path: &Path, queue: &Arc<Mutex<Queue>>, out_lock: &Arc<Mutex<()>>, zenity_cmd: &str, locker_process: &str) {
+/// shape (pick the next un-ignored ask, act, repeat) but drives a dialog
+/// instead of reading `[a]`/`[d]`/`[i]` from stdin — `lyra` when
+/// [`resolve_lyra_bin`] found one, `zenity` otherwise ([`run_ask_dialog`]).
+/// `ignored` is the SAME "Cancel/close stops re-prompting for THIS ask, this
+/// session only" semantics `[i]` holds in [`prompt_loop`] (design doc:
+/// "Cancel/close = IGNORE") — without it, a cancelled dialog would reopen
+/// every ~200ms forever.
+#[allow(clippy::too_many_arguments)]
+fn popup_loop(
+    socket_path: &Path,
+    queue: &Arc<Mutex<Queue>>,
+    out_lock: &Arc<Mutex<()>>,
+    zenity_cmd: &str,
+    lyra_cmd: Option<&str>,
+    locker_process: &str,
+) {
     let mut ignored: HashSet<String> = HashSet::new();
     let mut spawn_backoff = SPAWN_BACKOFF_INITIAL;
     let mut spawn_failing = false;
@@ -736,8 +833,9 @@ fn popup_loop(socket_path: &Path, queue: &Arc<Mutex<Queue>>, out_lock: &Arc<Mute
             PopupAction::Show => {}
         }
 
+        let seconds = ask.remaining(now).max(0) as u64;
         let title = format!("aoide \u{b7} {}", ask.secret);
-        let text = format!("code for `{}` \u{2190} {} \u{00b7} {}s left", ask.secret, ask.consumer, ask.remaining(now).max(0));
+        let text = format!("code for `{}` \u{2190} {} \u{00b7} {}s left", ask.secret, ask.consumer, seconds);
 
         let cancel_queue = Arc::clone(queue);
         let cancel_id = ask.id.clone();
@@ -748,7 +846,7 @@ fn popup_loop(socket_path: &Path, queue: &Arc<Mutex<Queue>>, out_lock: &Arc<Mute
         // `POPUP_KILL_LOCKOUT_SECS` of expiry — `popup_loop`'s own arm below
         // tells the two apart afterward by re-checking whether the ask is
         // still in the queue.
-        let result = run_zenity_entry(zenity_cmd, &title, &text, || {
+        let result = run_ask_dialog(lyra_cmd, zenity_cmd, &ask.secret, &ask.consumer, seconds, &title, &text, || {
             cancel_queue.lock().unwrap_or_else(|e| e.into_inner()).get(&cancel_id).is_none()
                 || popup_kill_already_open(&cancel_ask, unix_now())
         });
@@ -757,7 +855,7 @@ fn popup_loop(socket_path: &Path, queue: &Arc<Mutex<Queue>>, out_lock: &Arc<Mute
             spawn_failing = false;
             spawn_backoff = SPAWN_BACKOFF_INITIAL;
             let _g = out_lock.lock().unwrap_or_else(|e| e.into_inner());
-            println!("  aoide secrets watch --popup: zenity is spawning again \u{2014} backoff cleared");
+            println!("  aoide secrets watch --popup: the dialog is spawning again \u{2014} backoff cleared");
         }
 
         match result {
@@ -784,7 +882,12 @@ fn popup_loop(socket_path: &Path, queue: &Arc<Mutex<Queue>>, out_lock: &Arc<Mute
                         Err(e) => println!("  \u{2717} invalid or already-used code \u{2014} the ask is STILL PARKED, nothing was spent ({e})"),
                     }
                 }
-                if approved.is_err() {
+                // The wrong-code error dialog is zenity-specific (no `lyra
+                // secrets ask` error surface exists — P3's brief covers the
+                // entry dialog only); on the lyra path the ask simply stays
+                // parked and the next poll reopens its `lyra secrets ask`
+                // entry dialog fresh, same as any other re-prompt.
+                if approved.is_err() && lyra_cmd.is_none() {
                     zenity_error_dialog(
                         zenity_cmd,
                         &format!("invalid code for `{}` \u{2014} the ask is still parked, try again", ask.secret),
@@ -1145,14 +1248,17 @@ fn wait_for_follower(events_path: &Path, poll_interval: Duration) -> Result<Foll
 /// see module doc for why). `json_mode` forces narration-only regardless of
 /// tty (module doc); `popup_mode` (`--popup`, mutually exclusive with
 /// `json_mode` — `commands::handle_secrets_watch` refuses the combination
-/// before this function is ever called) swaps the tty prompt for a zenity
-/// dialog and runs regardless of whether stdin is a terminal. See
-/// [`select_mode`] for the exact precedence between the three.
+/// before this function is ever called) swaps the tty prompt for a dialog —
+/// `lyra secrets ask` when [`resolve_lyra_bin`] finds one, `zenity`
+/// otherwise (module doc's P3 section) — and runs regardless of whether
+/// stdin is a terminal. See [`select_mode`] for the exact precedence between
+/// the three.
 pub fn run(socket_path: &Path, events_path: &Path, json_mode: bool, popup_mode: bool) -> i32 {
-    if popup_mode && !zenity_available(ZENITY_CMD) {
+    let lyra_cmd = resolve_lyra_bin();
+    if popup_mode && lyra_cmd.is_none() && !zenity_available(ZENITY_CMD) {
         eprintln!(
-            "aoide secrets watch --popup: `zenity` not found on PATH \u{2014} install zenity, or run \
-             `aoide secrets watch` (without --popup) instead"
+            "aoide secrets watch --popup: neither `lyra` nor `zenity` was found \u{2014} install \
+             one of them, or run `aoide secrets watch` (without --popup) instead"
         );
         return 1;
     }
@@ -1188,7 +1294,7 @@ pub fn run(socket_path: &Path, events_path: &Path, json_mode: bool, popup_mode: 
 
     match mode {
         Mode::Popup => {
-            popup_loop(socket_path, &queue, &out_lock, ZENITY_CMD, &locker_process_name());
+            popup_loop(socket_path, &queue, &out_lock, ZENITY_CMD, lyra_cmd.as_deref(), &locker_process_name());
             0
         }
         Mode::InteractiveTty => {
@@ -1852,6 +1958,122 @@ mod tests {
         // collide with the write/exec race the lock exists to serialize.
         let result = run_zenity_entry("/no/such/aoide-secrets-watch-zenity-shim", "t", "x", || false);
         assert!(matches!(result, ZenityResult::SpawnError(_)), "expected SpawnError, got {result:?}");
+    }
+
+    /// P1: the entry dialog is VISIBLE — a TOTP code is a 30-second secret,
+    /// not a password, and `--hide-text` was dropped from
+    /// `spawn_zenity_entry`'s own argv. Pins the exact argv a real `zenity`
+    /// would receive by having the shim log its own `"$@"` before answering,
+    /// rather than trusting `spawn_zenity_entry`'s source to stay in sync
+    /// with this test by inspection alone.
+    #[test]
+    fn spawn_zenity_entry_argv_has_no_hide_text() {
+        let _guard = shim_lock();
+        let shim = write_shim("argv-visible", "#!/bin/sh\necho \"$@\" > \"$(dirname \"$0\")/argv.log\"\necho 654321\nexit 0\n");
+        let result = run_zenity_entry(shim.to_str().unwrap(), "aoide \u{b7} db-prod", "code for `db-prod`", || false);
+        assert!(matches!(result, ZenityResult::Approved(ref c) if c == "654321"), "expected Approved(\"654321\"), got {result:?}");
+        let argv = std::fs::read_to_string(shim.parent().unwrap().join("argv.log")).unwrap();
+        assert!(!argv.contains("--hide-text"), "argv must not carry --hide-text, got: {argv}");
+        assert!(argv.contains("--entry"), "argv should still carry --entry, got: {argv}");
+        remove_shim(&shim);
+    }
+
+    /// P3: `lyra secrets ask --secret <name> --consumer <who> --seconds <n>`
+    /// is the exact argv `spawn_lyra_entry` sends — pinned the same way the
+    /// zenity argv test above pins `--hide-text`'s absence.
+    #[test]
+    fn spawn_lyra_entry_argv_matches_the_documented_contract() {
+        let _guard = shim_lock();
+        let shim = write_shim("lyra-argv", "#!/bin/sh\necho \"$@\" > \"$(dirname \"$0\")/argv.log\"\necho 111222\nexit 0\n");
+        let result = run_lyra_entry(shim.to_str().unwrap(), "db-prod", "claude", 42, || false);
+        assert!(matches!(result, ZenityResult::Approved(ref c) if c == "111222"), "expected Approved(\"111222\"), got {result:?}");
+        let argv = std::fs::read_to_string(shim.parent().unwrap().join("argv.log")).unwrap();
+        assert_eq!(argv.trim(), "secrets ask --secret db-prod --consumer claude --seconds 42");
+        remove_shim(&shim);
+    }
+
+    /// P3: when a `lyra` binary resolves, [`run_ask_dialog`] spawns IT, not
+    /// zenity — proven by handing it a deliberately bogus `zenity_cmd` path
+    /// alongside a real lyra shim: if the dispatch ever fell through to
+    /// zenity by mistake, this would come back `SpawnError`, not `Approved`.
+    #[test]
+    fn run_ask_dialog_prefers_lyra_when_it_resolves() {
+        let _guard = shim_lock();
+        let lyra_shim = write_shim("dialog-lyra", "#!/bin/sh\necho lyra-picked\nexit 0\n");
+        let result = run_ask_dialog(
+            Some(lyra_shim.to_str().unwrap()),
+            "/no/such/aoide-secrets-watch-zenity-shim",
+            "db-prod",
+            "claude",
+            42,
+            "t",
+            "x",
+            || false,
+        );
+        assert!(matches!(result, ZenityResult::Approved(ref c) if c == "lyra-picked"), "expected the lyra shim's own output, got {result:?}");
+        remove_shim(&lyra_shim);
+    }
+
+    /// P3: with no `lyra` resolved, [`run_ask_dialog`] falls back to zenity
+    /// exactly as before this phase.
+    #[test]
+    fn run_ask_dialog_falls_back_to_zenity_when_lyra_is_absent() {
+        let _guard = shim_lock();
+        let zenity_shim = write_shim("dialog-zenity", "#!/bin/sh\necho zenity-picked\nexit 0\n");
+        let result = run_ask_dialog(None, zenity_shim.to_str().unwrap(), "db-prod", "claude", 42, "t", "x", || false);
+        assert!(matches!(result, ZenityResult::Approved(ref c) if c == "zenity-picked"), "expected the zenity shim's own output, got {result:?}");
+        remove_shim(&zenity_shim);
+    }
+
+    /// P1: `run()`'s own startup reconcile (`reconcile_once`, called before
+    /// the tail thread ever spawns — module doc, the same call site the live
+    /// incident this phase's brief cites traced back to a watcher that
+    /// simply wasn't RUNNING, not to a missing reconcile) surfaces an ask
+    /// that was already parked before this watcher process started, using
+    /// nothing but a fake broker answering ONE `pending` request — the exact
+    /// call `reconcile_once` makes, never the tail/events-feed path at all.
+    #[test]
+    fn reconcile_once_surfaces_an_ask_already_pending_at_startup() {
+        let dir = std::env::temp_dir().join(format!(
+            "aoide-secrets-watch-reconcile-startup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("secrets.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+
+        let server = thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut reader = std::io::BufReader::new(&stream);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                let reply = json!({
+                    "ok": true,
+                    "pending": [{
+                        "id": "preexisting-1",
+                        "secret": "db-prod",
+                        "consumer": "claude",
+                        "requestedAt": 100,
+                        "peerUid": Value::Null,
+                    }]
+                });
+                let _ = writeln!(&stream, "{reply}");
+            }
+        });
+
+        let queue = Mutex::new(Queue::new());
+        reconcile_once(&sock_path, &queue);
+        server.join().unwrap();
+
+        let q = queue.lock().unwrap_or_else(|e| e.into_inner());
+        let ask = q.get("preexisting-1").expect("a pre-existing pending ask must be reconciled into the queue at startup");
+        assert_eq!(ask.secret, "db-prod");
+        assert_eq!(ask.consumer, "claude");
+        assert!(ask.estimated, "an ask reconciled with no prior `parked` event has an ESTIMATED timeout");
+        drop(q);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Proves the "kill by its EXACT pid" mechanism (module doc,

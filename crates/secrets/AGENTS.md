@@ -1142,6 +1142,43 @@
   string" — go through the same parameterized functions
   (`spawn_zenity_entry`/`run_zenity_entry`/`zenity_available`) so a future
   test can fake it the same way.
+- **The entry dialog is VISIBLE, and `lyra` is a SECOND feature-detected
+  dialog binary ahead of zenity's own (this commit, P3).** `--hide-text` is
+  gone from `spawn_zenity_entry`'s argv — a TOTP code is a 30-second secret
+  the operator is about to read off an authenticator, not a password worth
+  hiding; don't re-add it "for consistency with a password prompt," this
+  crate's own tty path (`client::read_hidden_line`) hides ADMIN input like
+  `secrets put`'s value, never a short-lived code. `watch::resolve_lyra_bin`
+  decides whether `lyra secrets ask --secret <name> --consumer <who>
+  --seconds <n>` replaces `zenity --entry` for a given dialog — it mirrors
+  `cli::commands::onboard::lyra_bin_if_resolved`'s exact env-tier/
+  sibling-tier/bare-name-on-`PATH` check (`aoide_protocol::bin::rice_bin` +
+  `on_path`) rather than importing it, since this crate cannot depend on
+  `aoide-cli` (no cross-crate copying invariant, `pkgs/aoide/crates/
+  AGENTS.md` — only the THREE-LINE "is it actually there" wrapper is
+  repeated; the resolver itself, `aoide-protocol::bin`, is not). **Presence
+  of `lyra` IS the choice — no `AOIDE_SECRETS_*` env var, no CLI flag, picks
+  between them** (plugin philosophy, root `AGENTS.md` house rule 7): don't
+  add one "for an operator who wants zenity even with lyra installed" without
+  a real complaint driving it, the same "wait for the field" posture this
+  crate's other UX knobs were all born from. `watch::spawn_lyra_entry`/
+  `watch::spawn_zenity_entry` are BOTH thin `Command::new(bin).args([...])`
+  builders feeding the SAME `watch::run_entry_dialog` wait/parse loop — this
+  is what makes the CONTRACT load-bearing rather than incidental: `lyra
+  secrets ask` (P3, `crates/lyra`) MUST print the code on stdout with exit 0
+  on submit, the literal string `Dismiss ask` on stdout with exit 1 on
+  dismiss, and any other non-zero exit for a bare cancel — byte-identical to
+  zenity's own `--extra-button` contract — because `run_entry_dialog` and
+  `popup_loop`'s kill-by-pid expiry path never branch on which binary
+  answered. Don't let a future `lyra secrets ask` change (a new flag, a
+  different exit code for some case) drift from this contract without
+  updating it here AND in `README.md`'s "Popup mode" section in the same
+  commit — the two binaries are interchangeable ONLY as long as this holds.
+  `run`'s own startup gate (`zenity_available`/`resolve_lyra_bin`) now
+  refuses to enter `--popup` only when NEITHER binary is available — `lyra`
+  resolved alone is sufficient, `zenity` missing in that case is simply
+  never consulted (mirrors the "the env tier is trusted unconditionally"
+  reasoning `resolve_lyra_bin`'s own doc comment gives).
 - **P-N4 (task #76) closes three popup gaps the field/an Opus-judge review
   found, all landed together, none touching the `--json` machine feed
   (byte-stable throughout).** (1) **The near-expiry policy is now TWO

@@ -942,28 +942,53 @@ with no visible options would be confusing on its own).
 ## Popup mode (`secrets watch --popup`, tracker #71 Part 2)
 
 `aoide secrets watch --popup` is the same watcher loop, `--json` and the
-socket ops unchanged, with one swap: a parked ask surfaces as a
-`zenity --entry --hide-text` dialog instead of the terminal's `[a]`/`[d]`/
-`[i]` prompt — the terminal path (narration, `pending`/`approve`/`dismiss`
-from ANOTHER window) still works exactly as before, `--popup` only changes
-how THIS process itself offers to complete an ask.
+socket ops unchanged, with one swap: a parked ask surfaces as a code-entry
+dialog instead of the terminal's `[a]`/`[d]`/`[i]` prompt — the terminal path
+(narration, `pending`/`approve`/`dismiss` from ANOTHER window) still works
+exactly as before, `--popup` only changes how THIS process itself offers to
+complete an ask. The entry is VISIBLE, digits and all — a TOTP code is a
+30-second secret the operator is about to read off an authenticator, not a
+password worth hiding.
+
+**Two dialog binaries, one output contract (P3).** `watch::resolve_lyra_bin`
+checks whether `lyra` resolves to a real executable (`aoide-protocol`'s own
+sibling-binary resolver, `rice_bin`, plus a `PATH` probe on its bare-name
+fallback — the SAME check `aoide onboard`'s own "is lyra enabled" test
+already runs); when it does, each parked ask opens `lyra secrets ask
+--secret <name> --consumer <who> --seconds <n>` — a small quickshell window
+with six individually-boxed digit inputs (`XXX-XXX`), autofocus, auto-advance,
+and paste-to-fill (`crates/lyra`'s own docs) — instead of a `zenity --entry`
+dialog. **Presence of `lyra` IS the choice** (the plugin philosophy, root
+`AGENTS.md` house rule 7) — no flag exists to pick between them, and there is
+nothing to configure: `lyra` absent falls back to `zenity` exactly as this
+mode has always worked. Both binaries obey the IDENTICAL output contract —
+code on stdout + exit 0 = approved; the literal string `Dismiss ask` on
+stdout + exit 1 = dismissed; anything else non-zero = cancelled — so
+`watch.rs`'s result parsing and its kill-by-pid expiry path (below) never
+need to know which one answered.
 
 ```
 $ aoide secrets watch --popup
 watching secret events — ^C to leave (parked asks stay parked)
   19:06:02  parked      db-prod → claude   ask 3f2a-3   times out in 5m00s
-[a zenity --entry --hide-text dialog opens: "code for `db-prod` ← claude · 287s left",
- with an extra "Dismiss ask" button beside OK/Cancel]
+[with lyra resolved: `lyra secrets ask --secret db-prod --consumer claude --seconds 287`
+ opens six boxed digit inputs, grouped XXX-XXX, submitting once all six are filled;
+ without it: a zenity --entry dialog opens, "code for `db-prod` ← claude · 287s left",
+ with an extra "Dismiss ask" button beside OK/Cancel — both show the digits as typed]
 ```
 
 - **The typed code rides the CHILD's own stdout pipe straight into
-  `client::approve` — never argv.** `zenity`'s own argv (`Command::new`'s
-  `args`) carries only the dialog's TITLE and TEXT, both name-only (secret
-  name, consumer, remaining seconds) — never a code, never a value. Grep
-  the spawn call yourself (`watch::spawn_zenity_entry`) if in doubt.
-- **Wrong code**: a brief `zenity --error` shows, then the SAME ask's entry
-  dialog re-opens — the ask stays parked, the replay ledger unburned, same
-  as the tty path's own wrong-code retry.
+  `client::approve` — never argv.** Neither binary's own argv (`Command::
+  new`'s `args`) carries anything but identifiers and prompt TEXT (secret
+  name, consumer, remaining seconds) — never a code, never a value. Grep the
+  spawn calls yourself (`watch::spawn_zenity_entry`/`watch::spawn_lyra_entry`)
+  if in doubt.
+- **Wrong code**: on the zenity path, a brief `zenity --error` shows, then
+  the SAME ask's entry dialog re-opens; on the lyra path there is no separate
+  error surface (P3's scope is the entry dialog only) — the ask simply stays
+  parked and the next poll reopens `lyra secrets ask` fresh. Either way the
+  ask stays parked, the replay ledger unburned, same as the tty path's own
+  wrong-code retry.
 - **Cancel/close the dialog = IGNORE** (same session-only semantics as the
   tty prompt's `[i]`) — the ask stays parked, completable from any other
   terminal. The dialog's extra **"Dismiss ask" button** maps to
@@ -1037,26 +1062,29 @@ watching secret events — ^C to leave (parked asks stay parked)
   ever drives a dialog. A tight automation loop firing many `released`
   events therefore narrates a scrolling terminal, never a toast storm of
   dialogs.
-- **`zenity` is a runtime shell-out declared BY NAME — zero new Cargo
-  dependencies** (the plugin philosophy, root `AGENTS.md` house rule 7;
-  same feature-detection shape `enroll::render_qr` already uses for
-  `qrencode`). Missing at `--popup` startup: a taught error naming BOTH
-  fixes (`install zenity`, or drop `--popup` and run plain `secrets
-  watch`), clean exit 1 — checked once, before the tail thread or the
-  socket reconcile ever starts.
+- **Both `lyra` and `zenity` are runtime shell-outs declared BY NAME — zero
+  new Cargo dependencies** (the plugin philosophy, root `AGENTS.md` house
+  rule 7; the same feature-detection shape `enroll::render_qr` already uses
+  for `qrencode`). `run`'s own startup gate refuses to even ENTER `--popup`
+  only when NEITHER resolves: a taught error naming both fixes (install
+  `lyra` or `zenity`, or drop `--popup` and run plain `secrets watch`),
+  clean exit 1 — checked once, before the tail thread or the socket
+  reconcile ever starts. `lyra` resolved alone is sufficient; `zenity`
+  missing in that case is simply never consulted.
 - **`--popup` works over a non-tty stdin** (dialogs replace prompts, so
   there's nothing for stdin to drive) — **`--popup`+`--json` is a usage
   error** (`commands::handle_secrets_watch`, before `watch::run` is ever
   reached): the two modes both own "how a parked ask gets completed" and
   can't both drive it.
-- **`watch::run`'s zenity spawn path takes the binary name as a
-  parameter** (`watch::ZENITY_CMD` in production, `"zenity"`) rather than
-  hardcoding `Command::new("zenity")` — this is what lets this crate's own
-  tests stand in a fake shim script (a tempdir executable that echoes a
-  fixed code, or a fixed exit code) WITHOUT mutating `PATH` (unlike
-  `enroll::render_qr`'s older PATH-shim test, which needs `env_lock`
-  because `PATH` is process-global); see `watch.rs`'s own test section for
-  the exact shape.
+- **Both dialog spawn paths take the binary name as a parameter**
+  (`watch::ZENITY_CMD`/`"zenity"` in production for one, `watch::
+  resolve_lyra_bin`'s own result for the other) rather than hardcoding
+  `Command::new("zenity")`/`Command::new("lyra")` — this is what lets this
+  crate's own tests stand in a fake shim script (a tempdir executable that
+  echoes a fixed code, or a fixed exit code) for EITHER binary WITHOUT
+  mutating `PATH` (unlike `enroll::render_qr`'s older PATH-shim test, which
+  needs `env_lock` because `PATH` is process-global); see `watch.rs`'s own
+  test section for the exact shape.
 
 ## TOTP enrollment (`secrets enroll`, P-V3)
 
