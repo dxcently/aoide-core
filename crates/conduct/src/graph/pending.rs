@@ -1,4 +1,4 @@
-//! `graph pending list|approve|deny` — the pending queue's OTHER half.
+//! `session pending list|approve|deny` — the pending queue's OTHER half.
 //!
 //! `state/stage/pending.json` is where [`super::send::session_send`] parks a
 //! held injection when the gate doesn't authorise immediate delivery (no
@@ -11,16 +11,16 @@
 //! no TUI/QML/auto-approval/allowlist here (YAGNI; those are later phases).
 //!
 //! `approve` does NOT open a second injection path. It re-synthesizes the
-//! exact `aoide graph send --id <id> --yes -- <text>` invocation the held
+//! exact `aoide send --id <id> --yes -- <text>` invocation the held
 //! entry represents and calls [`super::send::session_send`] directly,
-//! in-process — the SAME one gated injection door `graph permit`'s
+//! in-process — the SAME one gated injection door `session permit`'s
 //! `type_verdict` already goes through (`permit.rs`). `deny` never calls it
 //! at all.
 //!
 //! Resolving either way REMOVES the entry from `pending.json` (under the
 //! stage lock) rather than flipping a persisted "resolved" flag — the
-//! resolution record is the audit line (`graph.pending.approve` /
-//! `graph.pending.deny`), exactly where every other outcome in this door
+//! resolution record is the audit line (`session.pending.approve` /
+//! `session.pending.deny`), exactly where every other outcome in this door
 //! already lives. Nothing here keeps a resolved-entry archive nobody asked
 //! for.
 //!
@@ -188,10 +188,10 @@ fn entry_view(
     (json, line)
 }
 
-/// `graph pending list [--json]` — enumerate every held entry in
+/// `session pending list [--json]` — enumerate every held entry in
 /// `pending.json`. Never errors on an empty or missing queue.
 pub fn pending_list(_inv: &Invocation) -> Outcome {
-    let cmd = "graph.pending.list";
+    let cmd = "session.pending.list";
     let arr = match load_pending_array() {
         Ok(a) => a,
         Err(e) => return stage_error(cmd, e),
@@ -278,23 +278,23 @@ fn parse_id(cmd: &str, raw: &str) -> Result<usize, Outcome> {
         Outcome::usage(
             cmd,
             format!(
-                "`{raw}` is not a pending id — ids are the position shown by `graph pending list` (e.g. 0)"
+                "`{raw}` is not a pending id — ids are the position shown by `session pending list` (e.g. 0)"
             ),
         )
         .with_data(json!({ "reason": "bad-id", "id": raw }))
     })
 }
 
-/// `graph pending approve <id> [--json]` — approve one held entry: re-drive
+/// `session pending approve <id> [--json]` — approve one held entry: re-drive
 /// it through [`super::send::session_send`] with `--yes` (the one injection
 /// door, in-process, no shell-out — see the module doc), then remove it from
 /// the queue. The entry is taken OFF the queue before injection is attempted
-/// (matching `graph send`'s own "every outcome is audited, nothing pending
+/// (matching `send`'s own "every outcome is audited, nothing pending
 /// forever" posture) — if delivery then fails (the target session died while
 /// queued, say), that failure is reported plainly rather than silently
 /// re-queued; the human re-sends by hand if the target is still reachable.
 pub fn pending_approve(inv: &Invocation) -> Outcome {
-    let cmd = "graph.pending.approve";
+    let cmd = "session.pending.approve";
     let args = match require_args(inv, &["id"]) {
         Ok(a) => a,
         Err(o) => return o,
@@ -345,7 +345,7 @@ pub fn pending_approve(inv: &Invocation) -> Outcome {
     // -trips the exact original text through `session_send`'s own
     // `inv.args.join(" ")`, whitespace and all.
     let inner = super::send::session_send(&Invocation {
-        path: vec!["graph".to_string(), "send".to_string()],
+        path: vec!["send".to_string()],
         args: vec![text.clone()],
         flags,
         door: inv.door,
@@ -386,10 +386,10 @@ pub fn pending_approve(inv: &Invocation) -> Outcome {
         }))
 }
 
-/// `graph pending deny <id> [--json]` — reject one held entry: remove it from
+/// `session pending deny <id> [--json]` — reject one held entry: remove it from
 /// the queue, inject nothing, one audit line.
 pub fn pending_deny(inv: &Invocation) -> Outcome {
-    let cmd = "graph.pending.deny";
+    let cmd = "session.pending.deny";
     let args = match require_args(inv, &["id"]) {
         Ok(a) => a,
         Err(o) => return o,
@@ -470,7 +470,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = pending_list(&pending_invocation(&["graph", "pending", "list"], &[]));
+        let out = pending_list(&pending_invocation(&["session", "pending", "list"], &[]));
         assert_eq!(out.status, Status::Ok, "a malformed entry must not fail the whole list");
         let data = out.data.unwrap();
         let arr = data["pending"].as_array().unwrap();
@@ -542,7 +542,7 @@ mod tests {
             .expect("every minted session carries a petname (P2)");
         let host = aoide_storage::display::local_host_name();
 
-        let out = pending_list(&pending_invocation(&["graph", "pending", "list"], &[]));
+        let out = pending_list(&pending_invocation(&["session", "pending", "list"], &[]));
         assert_eq!(out.status, Status::Ok);
         let data = out.data.unwrap();
         let arr = data["pending"].as_array().unwrap();
@@ -617,7 +617,7 @@ mod tests {
             buf
         });
 
-        let out = pending_approve(&pending_invocation(&["graph", "pending", "approve"], &["0"]));
+        let out = pending_approve(&pending_invocation(&["session", "pending", "approve"], &["0"]));
         let got = acc.join().unwrap();
 
         assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
@@ -687,7 +687,7 @@ mod tests {
             let _ = conn.read_to_end(&mut buf);
             buf
         });
-        let out = pending_approve(&pending_invocation(&["graph", "pending", "approve"], &["0"]));
+        let out = pending_approve(&pending_invocation(&["session", "pending", "approve"], &["0"]));
         let _ = acc.join().unwrap();
         assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
 
@@ -738,7 +738,7 @@ mod tests {
         assert_eq!(queued.data.as_ref().unwrap()["state"], "pending");
 
         // `from` is visible in `list` BEFORE approve.
-        let listed = pending_list(&pending_invocation(&["graph", "pending", "list"], &[]));
+        let listed = pending_list(&pending_invocation(&["session", "pending", "list"], &[]));
         let arr = listed.data.unwrap()["pending"].as_array().unwrap().clone();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["from"], "sender-a", "the queuer is visible before approval");
@@ -753,7 +753,7 @@ mod tests {
             let _ = conn.read_to_end(&mut buf);
             buf
         });
-        let approved = pending_approve(&pending_invocation(&["graph", "pending", "approve"], &["0"]));
+        let approved = pending_approve(&pending_invocation(&["session", "pending", "approve"], &["0"]));
         let got = acc.join().unwrap();
         assert_eq!(approved.status, Status::Ok, "msg: {}", approved.message);
         assert_eq!(
@@ -805,7 +805,7 @@ mod tests {
         let queued = session_send(&send_invocation(&["do", "the", "thing"], &[("id", id), ("submit", "true")]));
         assert_eq!(queued.data.as_ref().unwrap()["state"], "pending");
 
-        let listed = pending_list(&pending_invocation(&["graph", "pending", "list"], &[]));
+        let listed = pending_list(&pending_invocation(&["session", "pending", "list"], &[]));
         let arr = listed.data.unwrap()["pending"].as_array().unwrap().clone();
         assert_eq!(arr[0]["from"], Value::Null, "queued with no attribution");
 
@@ -819,7 +819,7 @@ mod tests {
             let _ = conn.read_to_end(&mut buf);
             buf
         });
-        let approved = pending_approve(&pending_invocation(&["graph", "pending", "approve"], &["0"]));
+        let approved = pending_approve(&pending_invocation(&["session", "pending", "approve"], &["0"]));
         let got = acc.join().unwrap();
         assert_eq!(approved.status, Status::Ok, "msg: {}", approved.message);
         assert_eq!(
@@ -871,7 +871,7 @@ mod tests {
         )
         .unwrap();
 
-        let listed = pending_list(&pending_invocation(&["graph", "pending", "list"], &[]));
+        let listed = pending_list(&pending_invocation(&["session", "pending", "list"], &[]));
         assert_eq!(listed.status, Status::Ok);
         let arr = listed.data.unwrap()["pending"].as_array().unwrap().clone();
         assert_eq!(arr.len(), 1);
@@ -884,7 +884,7 @@ mod tests {
             let _ = conn.read_to_end(&mut buf);
             buf
         });
-        let approved = pending_approve(&pending_invocation(&["graph", "pending", "approve"], &["0"]));
+        let approved = pending_approve(&pending_invocation(&["session", "pending", "approve"], &["0"]));
         let got = acc.join().unwrap();
         assert_eq!(approved.status, Status::Ok, "msg: {}", approved.message);
         assert_eq!(
@@ -933,7 +933,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = pending_deny(&pending_invocation(&["graph", "pending", "deny"], &["0"]));
+        let out = pending_deny(&pending_invocation(&["session", "pending", "deny"], &["0"]));
         assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["injected"], false);
 
@@ -965,22 +965,22 @@ mod tests {
         )
         .unwrap();
 
-        let out = pending_approve(&pending_invocation(&["graph", "pending", "approve"], &["0"]));
+        let out = pending_approve(&pending_invocation(&["session", "pending", "approve"], &["0"]));
         assert_eq!(out.status, Status::Error, "a malformed entry cannot be approved");
         assert_eq!(out.data.unwrap()["reason"], "pending-entry-unresolvable");
         // Left exactly where it was — a failed resolve must not destroy it.
         assert_eq!(load_pending_array().unwrap().len(), 1);
 
-        let out = pending_deny(&pending_invocation(&["graph", "pending", "deny"], &["0"]));
+        let out = pending_deny(&pending_invocation(&["session", "pending", "deny"], &["0"]));
         assert_eq!(out.status, Status::Error, "a malformed entry cannot be denied either");
         assert_eq!(load_pending_array().unwrap().len(), 1, "still there");
 
         // An out-of-range index is the same clean error, not a panic.
-        let out = pending_approve(&pending_invocation(&["graph", "pending", "approve"], &["9"]));
+        let out = pending_approve(&pending_invocation(&["session", "pending", "approve"], &["9"]));
         assert_eq!(out.status, Status::Error);
 
         // A non-numeric id is a usage error.
-        let out = pending_deny(&pending_invocation(&["graph", "pending", "deny"], &["not-a-number"]));
+        let out = pending_deny(&pending_invocation(&["session", "pending", "deny"], &["not-a-number"]));
         assert_eq!(out.status, Status::Usage);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -991,7 +991,7 @@ mod tests {
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
         let root = setup("pnd-ok");
-        let out = pending_list(&pending_invocation(&["graph", "pending", "list"], &[]));
+        let out = pending_list(&pending_invocation(&["session", "pending", "list"], &[]));
         assert_eq!(out.status, Status::Ok);
         assert_eq!(out.data.unwrap()["pending"].as_array().unwrap().len(), 0);
         assert!(out.message.contains("0 pending"));

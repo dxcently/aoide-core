@@ -2,7 +2,7 @@
 //! to Aoide, driven by the harness's profile (`aoide_protocol::agents`). It
 //! writes three things:
 //!
-//! 1. The `graph session hook` entries — one per hook event — into the
+//! 1. The `session hook` entries — one per hook event — into the
 //!    profile's settings file (`SettingsSpec` — path + format).
 //! 2. The `SessionStart` onboarding pointer ([`POINTER_CMD`], the same bare
 //!    `printf` one-liner the repo's own `.claude/settings.json` carries),
@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 pub fn register(r: &mut Registry) {
     r.insert(cmd!(
         path: ["hooks", "install"],
-        summary: "Wire an agent harness's settings file to pipe its hooks into `graph session hook`, and symlink the repo's skill directory into the harness's skills dir when it has one (idempotent merge; never clobbers existing config or an unrelated file at the link path).",
+        summary: "Wire an agent harness's settings file to pipe its hooks into `session hook`, and symlink the repo's skill directory into the harness's skills dir when it has one (idempotent merge; never clobbers existing config or an unrelated file at the link path).",
         args: [arg!("agent", "string", true, "Agent harness to wire up (claude | kimi | pi).")],
         flags: [flag!("capture", "bool", "TEMPORARY debugging: wrap the hook command to tee raw payloads to ~/Aoide/state/<agent>-hooks.jsonl. Capture entries coexist with the plain ones (installing without --capture replaces nothing); remove them manually when done.")],
         gated: false,
@@ -94,19 +94,19 @@ fn events_for(profile: &AgentProfile) -> Vec<&'static str> {
 fn door_command(profile: &AgentProfile, capture: bool) -> String {
     if capture {
         format!(
-            "sh -c 'tee -a \"$HOME/Aoide/state/{}-hooks.jsonl\" | aoide graph session hook --agent {}'",
+            "sh -c 'tee -a \"$HOME/Aoide/state/{}-hooks.jsonl\" | aoide session hook --agent {}'",
             profile.name, profile.name
         )
     } else {
         match profile.hook_settings.format {
             SettingsFormat::Json => {
-                r#"a=$(command -v aoide) || exit 0; "$a" graph session hook >/dev/null 2>&1; exit 0"#
+                r#"a=$(command -v aoide) || exit 0; "$a" session hook >/dev/null 2>&1; exit 0"#
                     .to_string()
             }
-            SettingsFormat::Toml => format!("aoide graph session hook --agent {}", profile.name),
+            SettingsFormat::Toml => format!("aoide session hook --agent {}", profile.name),
             // Unreachable for the declarative profiles — `hooks_install`
             // short-circuits before any door command is built.
-            SettingsFormat::Declarative => format!("aoide graph session hook --agent {}", profile.name),
+            SettingsFormat::Declarative => format!("aoide session hook --agent {}", profile.name),
         }
     }
 }
@@ -115,7 +115,7 @@ fn door_command(profile: &AgentProfile, capture: bool) -> String {
 /// `--capture` entries are distinguished by the capture log marker, so the two
 /// coexist and neither install clobbers the other.
 fn matches_mode(command: &str, capture: bool) -> bool {
-    command.contains("graph session hook") && command.contains("-hooks.jsonl") == capture
+    command.contains("session hook") && command.contains("-hooks.jsonl") == capture
 }
 
 /// Resolve the settings file to merge into: kimi honours `KIMI_CODE_HOME` (its
@@ -606,7 +606,7 @@ mod tests {
                     "SubagentStart", "SubagentStop", "SessionEnd", "Notification", "PermissionRequest"] {
             assert!(text.contains(&format!("event = \"{evt}\"")), "event: {evt}");
         }
-        assert!(text.contains("command = \"aoide graph session hook --agent kimi\""));
+        assert!(text.contains("command = \"aoide session hook --agent kimi\""));
         // Exactly one pointer entry.
         assert_eq!(text.matches(POINTER_MARKER).count(), 1);
         // ONLY the three fields per entry — a `matcher` would break kimi's load.
@@ -641,7 +641,7 @@ mod tests {
         let text = std::fs::read_to_string(root.join("kimi/config.toml")).unwrap();
         assert_eq!(text.matches("[[hooks]]").count(), 21, "plain + pointer + capture coexist");
         assert_eq!(text.matches(POINTER_MARKER).count(), 1);
-        assert!(text.contains("tee -a \\\"$HOME/Aoide/state/kimi-hooks.jsonl\\\" | aoide graph session hook --agent kimi"));
+        assert!(text.contains("tee -a \\\"$HOME/Aoide/state/kimi-hooks.jsonl\\\" | aoide session hook --agent kimi"));
         // The capture log dir was created.
         assert!(root.join("Aoide/state").is_dir());
 
@@ -684,7 +684,7 @@ mod tests {
         for evt in events {
             hooks.insert(evt.to_string(), json!([{ "hooks": [ {
                 "type": "command",
-                "command": "a=$(command -v aoide) || exit 0; \"$a\" graph session hook >/dev/null 2>&1; exit 0"
+                "command": "a=$(command -v aoide) || exit 0; \"$a\" session hook >/dev/null 2>&1; exit 0"
             } ] } ]));
         }
         // The pointer entry too (the real hand-written file carries it), so a
@@ -723,7 +723,7 @@ mod tests {
         assert_eq!(merged["theme"], "auto");
         let stop_cmd = &merged["hooks"]["Stop"][0]["hooks"][0];
         assert_eq!(stop_cmd["type"], "command");
-        assert!(stop_cmd["command"].as_str().unwrap().contains("graph session hook"));
+        assert!(stop_cmd["command"].as_str().unwrap().contains("session hook"));
         // And the full set is present again on a third run.
         let out3 = hooks_install(&install_inv("claude", false));
         assert_eq!(out3.data.unwrap()["changed"], false);

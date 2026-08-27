@@ -105,13 +105,13 @@ fn app_loads_recomputes_selects_and_dispatches_against_the_tempdir() {
     assert_eq!(app.dag_sel, n_rows - 1, "selection clamps at the last row");
     app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
     assert!(app.dag_sel < n_rows, "selection stays in bounds");
-    // ── dispatch: `graph prune` drops the `done` session `b` and audits it ──
+    // ── dispatch: `session prune` drops the `done` session `b` and audits it ──
     app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
     let outcome = app
         .last_outcome
         .as_ref()
         .expect("prune produced an outcome");
-    assert_eq!(outcome.command, "graph.prune");
+    assert_eq!(outcome.command, "session.prune");
     // state reloaded after dispatch: only session `a` remains.
     assert_eq!(app.sessions.len(), 1, "done session pruned");
     assert_eq!(app.sessions[0].session_id, "a");
@@ -119,24 +119,24 @@ fn app_loads_recomputes_selects_and_dispatches_against_the_tempdir() {
     // ── the dispatch wrote an audit line into the tempdir log ──
     let log = std::fs::read_to_string(&audit).expect("audit log written to tempdir");
     assert!(
-        log.contains("graph.prune"),
+        log.contains("session.prune"),
         "prune recorded in the audit log"
     );
 
     // ── the LOG panel picks up the freshly-written audit line ──
     app.reload_all();
     assert!(
-        app.log.iter().any(|l| l.command == "graph.prune"),
+        app.log.iter().any(|l| l.command == "session.prune"),
         "LOG tail includes the prune record"
     );
 
     // ── project add via dispatch lands on disk + in state ──
-    // (The path must be a real absolute dir — `graph project add` rejects
+    // (The path must be a real absolute dir — `project add` rejects
     // relative/nonexistent paths now — so a subdir of the tempdir stands in.)
     let newproj_dir = stage.join("newproj");
     std::fs::create_dir_all(&newproj_dir).unwrap();
     app.dispatch(
-        &["graph", "project", "add"],
+        &["project", "add"],
         &["newproj".to_string(), newproj_dir.to_string_lossy().into_owned()],
     );
     assert!(

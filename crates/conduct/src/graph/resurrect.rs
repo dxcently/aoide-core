@@ -1,4 +1,4 @@
-//! `graph resurrect --project <x>` — revive a project's most recently-ended
+//! `resurrect --project <x>` — revive a project's most recently-ended
 //! resumable session off the durable ledger (P-D8, `docs/architecture/
 //! AOIDED.md`'s "L5 — harness summoning" section). The same command core
 //! also backs the daemon's own boot-time auto-resume trigger
@@ -7,7 +7,7 @@
 //!
 //! Selection: resolve `--project <x>` against `projects.json` by exact name,
 //! read every ledger line whose `cwd` anchors to it (the SAME longest-
-//! path-prefix rule `graph view`'s `anchor_for` uses — reused, never
+//! path-prefix rule bare `graph`'s `anchor_for` uses — reused, never
 //! re-derived), then pick candidates. `--all` widens to every anchored
 //! entry; `--id` narrows to one specific ledger `sessionId`; bare (neither
 //! flag) resumes the project's WHOLE carried set (`state/carry.json`,
@@ -92,7 +92,7 @@ use std::collections::BTreeMap;
 
 /// Mint a fresh session id for a resurrected session — never the ledger
 /// entry's own id (ids are never recycled, `docs/architecture/AOIDED.md`'s
-/// invariant list, item 5). Same `<command>-<pid>-<unixts>` shape `graph spawn`
+/// invariant list, item 5). Same `<command>-<pid>-<unixts>` shape `spawn`
 /// mints with (`spawn.rs::unix_ts`, reused rather than re-derived).
 fn mint_resurrected_id() -> String {
     format!("resurrect-{}-{}", std::process::id(), super::conduct::unix_ts())
@@ -203,7 +203,7 @@ fn restore_delivery(door: aoide_protocol::Door, new_id: &str, restore: &RestoreS
         flags.insert("yes".to_string(), "true".to_string());
         flags.insert("submit".to_string(), "true".to_string());
         return Some(Invocation {
-            path: vec!["graph".to_string(), "send".to_string()],
+            path: vec!["send".to_string()],
             args: vec![argv.join(" ")],
             flags,
             door,
@@ -222,7 +222,7 @@ fn restore_delivery(door: aoide_protocol::Door, new_id: &str, restore: &RestoreS
     flags.insert("from".to_string(), new_id.to_string());
     flags.insert("yes".to_string(), "true".to_string());
     Some(Invocation {
-        path: vec!["graph".to_string(), "send".to_string()],
+        path: vec!["send".to_string()],
         args: vec![typed.clone()],
         flags,
         door,
@@ -260,7 +260,7 @@ fn resurrect_one(
         flags.insert("cwd".to_string(), c.entry.cwd.clone());
     }
     let spawn_inv = Invocation {
-        path: vec!["graph".to_string(), "spawn".to_string()],
+        path: vec!["spawn".to_string()],
         args: argv,
         flags,
         door,
@@ -310,7 +310,7 @@ fn resurrect_one(
     // Post-spawn restore delivery (P-C6, durable-sessions plan) — only for a
     // TERMINAL candidate (a `restore` snapshot present) whose spawn actually
     // registered: an unregistered session has no live pty to deliver into,
-    // the same posture `graph spawn --prompt` already takes toward its own
+    // the same posture `spawn --prompt` already takes toward its own
     // injection. `restore_delivery` is pure and decides the whole shape; the
     // `submit` key on its returned flags (never present on the preload
     // shape) is what this reads back to report which branch fired.
@@ -395,9 +395,9 @@ fn carried_selection(
     newest.into_values().collect()
 }
 
-/// `aoide graph resurrect --project <name> [--all | --id <ledgerSessionId>]`.
+/// `aoide resurrect --project <name> [--all | --id <ledgerSessionId>]`.
 pub fn session_resurrect(inv: &Invocation) -> Outcome {
-    let cmd = "graph.resurrect";
+    let cmd = "resurrect";
     let name = match require_flag(inv, "project") {
         Ok(v) => v,
         Err(o) => return o,
@@ -408,7 +408,7 @@ pub fn session_resurrect(inv: &Invocation) -> Outcome {
         Err(e) => return stage_error(cmd, e),
     };
     let Some(target_idx) = projects.projects.iter().position(|p| p.name == name) else {
-        return Outcome::error(cmd, format!("no project named `{name}` — register it first with `graph project add`"))
+        return Outcome::error(cmd, format!("no project named `{name}` — register it first with `project add`"))
             .with_data(json!({ "reason": "unknown-project", "project": name }));
     };
 
@@ -544,7 +544,7 @@ mod tests {
         std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
         let proj_path = root.to_str().unwrap().to_string();
         let out = crate::graph::project_add(&invocation(
-            &["graph", "project", "add"],
+            &["project", "add"],
             &["proj", &proj_path],
         ));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
@@ -564,7 +564,7 @@ mod tests {
     #[test]
     fn mint_resurrected_id_never_reuses_the_ledger_id() {
         // Same `<command>-<pid>-<unixts>` shape (and the same second-granularity
-        // caveat) as `graph spawn`'s/`conduct`'s own id minting — this only
+        // caveat) as `spawn`'s/`conduct`'s own id minting — this only
         // asserts what P-D8 actually needs: it is never the OLD ledger id.
         for old_id in ["ledger-old-1", "resurrect-1-1"] {
             let minted = mint_resurrected_id();
@@ -702,7 +702,7 @@ mod tests {
         aoide_storage::carry::set_carried(&mut carried, "ledger-unknown-harness", true);
         aoide_storage::carry::save_carry(&carried).unwrap();
 
-        let out = session_resurrect(&flag_invocation(&["graph", "resurrect"], &[("project", "proj")]));
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[("project", "proj")]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         let data = out.data.as_ref().unwrap();
         assert_eq!(data["resurrected"].as_array().unwrap().len(), 0);
@@ -747,7 +747,7 @@ mod tests {
         aoide_storage::carry::set_carried(&mut carried, "ledger-old-2", true);
         aoide_storage::carry::save_carry(&carried).unwrap();
 
-        let out = session_resurrect(&flag_invocation(&["graph", "resurrect"], &[("project", "proj")]));
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[("project", "proj")]));
         assert_eq!(
             out.status,
             aoide_protocol::output::Status::Ok,
@@ -797,7 +797,7 @@ mod tests {
         aoide_storage::carry::set_carried(&mut carried, "unrelated-id", true);
         aoide_storage::carry::save_carry(&carried).unwrap();
 
-        let out = session_resurrect(&flag_invocation(&["graph", "resurrect"], &[("project", "proj")]));
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[("project", "proj")]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         let data = out.data.as_ref().unwrap();
         let resurrected = data["resurrected"].as_array().unwrap();
@@ -845,7 +845,7 @@ mod tests {
         aoide_storage::carry::set_carried(&mut carried, "ledger-carried-fail", true);
         aoide_storage::carry::save_carry(&carried).unwrap();
 
-        let out = session_resurrect(&flag_invocation(&["graph", "resurrect"], &[("project", "proj")]));
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[("project", "proj")]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["failed"].as_array().unwrap().len(), 1);
 
@@ -885,7 +885,7 @@ mod tests {
         aoide_storage::carry::set_carried(&mut carried, "ledger-idem", true);
         aoide_storage::carry::save_carry(&carried).unwrap();
 
-        let first = session_resurrect(&flag_invocation(&["graph", "resurrect"], &[("project", "proj")]));
+        let first = session_resurrect(&flag_invocation(&["resurrect"], &[("project", "proj")]));
         assert_eq!(first.status, aoide_protocol::output::Status::Ok, "msg: {}", first.message);
         let first_new_id =
             first.data.as_ref().unwrap()["resurrected"][0]["sessionId"].as_str().unwrap().to_string();
@@ -900,7 +900,7 @@ mod tests {
         // the same candidate a second time here — the point of THIS test is
         // `resurrect_one`'s transfer idempotency, not bare-mode selection.
         let second = session_resurrect(&flag_invocation(
-            &["graph", "resurrect"],
+            &["resurrect"],
             &[("project", "proj"), ("id", "ledger-idem")],
         ));
         assert_eq!(second.status, aoide_protocol::output::Status::Ok, "msg: {}", second.message);
@@ -926,7 +926,7 @@ mod tests {
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
         let (root, _proj_path) = setup("resurrect-empty");
 
-        let out = session_resurrect(&flag_invocation(&["graph", "resurrect"], &[("project", "proj")]));
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[("project", "proj")]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["resurrected"].as_array().unwrap().len(), 0);
 
@@ -939,7 +939,7 @@ mod tests {
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
         let (root, _proj_path) = setup("resurrect-unknown-project");
 
-        let out = session_resurrect(&flag_invocation(&["graph", "resurrect"], &[("project", "nope")]));
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[("project", "nope")]));
         assert_eq!(out.status, aoide_protocol::output::Status::Error);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -947,7 +947,7 @@ mod tests {
 
     #[test]
     fn missing_project_flag_is_a_usage_error() {
-        let out = session_resurrect(&flag_invocation(&["graph", "resurrect"], &[]));
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[]));
         assert_eq!(out.status, aoide_protocol::output::Status::Usage);
     }
 
@@ -971,14 +971,14 @@ mod tests {
 
         // --all: both, carried or not.
         let out = session_resurrect(&flag_invocation(
-            &["graph", "resurrect"],
+            &["resurrect"],
             &[("project", "proj"), ("all", "true")],
         ));
         assert_eq!(out.data.as_ref().unwrap()["skipped"].as_array().unwrap().len(), 2);
 
         // --id: exactly the named one, uncarried and not the newest.
         let out = session_resurrect(&flag_invocation(
-            &["graph", "resurrect"],
+            &["resurrect"],
             &[("project", "proj"), ("id", "ledger-a")],
         ));
         let skipped = out.data.as_ref().unwrap()["skipped"].as_array().unwrap().clone();
@@ -1011,7 +1011,7 @@ mod tests {
         }
         aoide_storage::carry::save_carry(&carried).unwrap();
 
-        let out = session_resurrect(&flag_invocation(&["graph", "resurrect"], &[("project", "proj")]));
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[("project", "proj")]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         let skipped = out.data.as_ref().unwrap()["skipped"].as_array().unwrap().clone();
         let mut ids: Vec<&str> = skipped.iter().map(|s| s["sessionId"].as_str().unwrap()).collect();
@@ -1049,7 +1049,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = session_resurrect(&flag_invocation(&["graph", "resurrect"], &[("project", "proj")]));
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[("project", "proj")]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         let skipped = out.data.as_ref().unwrap()["skipped"].as_array().unwrap().clone();
         assert_eq!(skipped.len(), 1, "skipped: {skipped:?}");
@@ -1069,7 +1069,7 @@ mod tests {
         // An anchored entry exists, but nothing is carried.
         set_ledger(&[ledger_entry("uncarried-only", "no-such-harness", &proj_path, "2026-08-20T01:00:00Z")]);
 
-        let out = session_resurrect(&flag_invocation(&["graph", "resurrect"], &[("project", "proj")]));
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[("project", "proj")]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["resurrected"].as_array().unwrap().len(), 0);
         assert!(
@@ -1100,7 +1100,7 @@ mod tests {
         aoide_storage::carry::set_carried(&mut carried, "repeated-id", true);
         aoide_storage::carry::save_carry(&carried).unwrap();
 
-        let out = session_resurrect(&flag_invocation(&["graph", "resurrect"], &[("project", "proj")]));
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[("project", "proj")]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         let skipped = out.data.as_ref().unwrap()["skipped"].as_array().unwrap().clone();
         assert_eq!(skipped.len(), 1, "the repeated id must be deduped to one candidate: {skipped:?}");

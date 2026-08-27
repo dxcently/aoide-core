@@ -107,7 +107,7 @@
 //!
 //! **The watcher is shared with the `dispatch` door, not tick-private
 //! (task #92 fix).** A dispatched session command
-//! (`graph session start/end`/etc., arriving over `{"op":"dispatch"}`) runs
+//! (`session start/end`/etc., arriving over `{"op":"dispatch"}`) runs
 //! the SAME `do_session_*` code the CLI runs and writes stage files exactly
 //! like the tick's own `reconcile_graph_projection`/`run_internal_reap`
 //! calls do — but on `handle_conn`'s own connection thread, not the tick
@@ -147,12 +147,12 @@
 //! ## Graph residency: reconcile + reap in the tick (P-D6)
 //!
 //! `docs/architecture/AOIDED.md`'s "L4 — graph residency": the session-write
-//! family (`graph session start/phase/end/hook`) and `graph reap` now try
+//! family (`session start/phase/end/hook`) and `session reap` now try
 //! this daemon's own `dispatch` op FIRST (`aoide_client::daemon::
 //! daemon_dispatch`, the client-side half) before falling back to their
 //! pre-existing direct stage-write path — so while a daemon is resident,
 //! most mutations already land here, through the SAME registered handler
-//! `graph session start`/etc. run directly (no logic forks: `dispatch` IS
+//! `session start`/etc. run directly (no logic forks: `dispatch` IS
 //! `cli::dispatch::dispatch`, the same fn injected here since P-D2).
 //!
 //! Two things this daemon does NOT get for free from that alone:
@@ -160,18 +160,18 @@
 //! - **An out-of-band write** (the direct-path fallback firing because this
 //!   daemon was briefly down, or a genuine hand edit) changes
 //!   `sessions.json`/`hooks.json` with nobody having run a manual resync
-//!   (`graph prune`) afterward — [`HandEditWatcher::sweep`] already detects
+//!   (`session prune`) afterward — [`HandEditWatcher::sweep`] already detects
 //!   the mtime change; [`reconcile_graph_projection`] is the ACTION this
 //!   phase wires into that seam (the module doc above names it as reserved
 //!   for exactly this): re-derive `graph.json` via `aoide_conduct::graph::
 //!   emit` — an internal-only function now (the CLI command was retired;
-//!   `graph prune` is the blessed manual resync, and `restage_graph` already
+//!   `session prune` is the blessed manual resync, and `restage_graph` already
 //!   covers every mutation site). There is no separate daemon-held
 //!   roster to conflict with — the files ARE the truth at every instant, so
 //!   re-deriving from CURRENT content on the very next tick (≤ ~1s) is
 //!   "newest write wins" by construction.
 //! - **The liveness sweep** the ~12s systemd timer drives by firing
-//!   `aoide graph reap` (now itself routed once a daemon is resident) gets
+//!   `aoide session reap` (now itself routed once a daemon is resident) gets
 //!   a REDUNDANT internal backstop here too — [`run_internal_reap`] calls
 //!   the SAME `aoide_conduct::reap::reap_and_announce` handler directly, on
 //!   [`REAP_EVERY_TICKS`]' own ~12s cadence, so the sweep keeps running even
@@ -357,7 +357,7 @@ fn internal_invocation(path: &[&str]) -> Invocation {
 /// P-D6 fold: given the base filenames [`HandEditWatcher::sweep`] just
 /// reported changed, re-derive `graph.json` (via `aoide_conduct::graph::
 /// emit`, an internal-only function now — the CLI command was retired in
-/// favor of `graph prune`) when `sessions.json` or
+/// favor of `session prune`) when `sessions.json` or
 /// `hooks.json` was among them — module doc's "Graph residency" explains
 /// why re-deriving from CURRENT content is the whole fold (no separate
 /// daemon-held roster exists to conflict with). A no-op (returns `None`,
@@ -383,7 +383,7 @@ fn reconcile_graph_projection(changed_files: &[String]) -> Option<PathBuf> {
 const REAP_EVERY_TICKS: u64 = 12;
 
 /// P-D6's in-daemon liveness sweep: calls `aoide_conduct::reap::
-/// reap_and_announce` directly — the identical handler `graph reap` (routed
+/// reap_and_announce` directly — the identical handler `session reap` (routed
 /// or direct) runs — so the timer becomes a redundant backstop once a
 /// daemon is resident (module doc's "Graph residency"). Cheap on a quiet
 /// pass (`reap`'s own doc: "a stage WRITE only when something was actually
@@ -392,7 +392,7 @@ const REAP_EVERY_TICKS: u64 = 12;
 /// harmless on a quiet pass (re-stamping an UNCHANGED file's own current
 /// state is idempotent), and correct on a changed one.
 fn run_internal_reap() {
-    let _ = aoide_conduct::reap::reap_and_announce(&internal_invocation(&["graph", "reap"]));
+    let _ = aoide_conduct::reap::reap_and_announce(&internal_invocation(&["session", "reap"]));
 }
 
 /// Where [`run_boot_auto_resume`] remembers which boot it last fired
@@ -437,9 +437,9 @@ fn epoch_already_fired(marker_contents: Option<&str>, current_epoch: i64) -> boo
 ///
 /// For every `autoResume` project (`projects.json`), calls
 /// `aoide_conduct::graph::session_resurrect` directly, in-process,
-/// `Door::Daemon`, UNCONDITIONALLY — the SAME command core `graph resurrect
+/// `Door::Daemon`, UNCONDITIONALLY — the SAME command core `resurrect
 /// --project` runs over the CLI, the exact pattern [`run_internal_reap`]
-/// already uses for `graph reap`. There is no live-session skip here: that
+/// already uses for `session reap`. There is no live-session skip here: that
 /// used to gate on the whole project (any non-`done` session anchored to it
 /// suppressed the call entirely), which was wrong for a multi-session
 /// carried set — one live terminal would have suppressed resuming the
@@ -469,7 +469,7 @@ fn run_boot_auto_resume() {
         if !p.auto_resume {
             continue;
         }
-        let mut inv = internal_invocation(&["graph", "resurrect"]);
+        let mut inv = internal_invocation(&["resurrect"]);
         inv.flags.insert("project".to_string(), p.name.clone());
         let out = aoide_conduct::graph::session_resurrect(&inv);
         if out.status != aoide_protocol::output::Status::Ok {
@@ -1394,7 +1394,7 @@ mod tests {
     }
 
     /// [`run_internal_reap`] calls the SAME `aoide_conduct::reap::
-    /// reap_and_announce` handler `graph reap` runs — a smoke test that it
+    /// reap_and_announce` handler `session reap` runs — a smoke test that it
     /// runs cleanly (never panics) against an empty roster; `reap`'s own
     /// exhaustive liveness-predicate coverage lives in `aoide-conduct`,
     /// this crate only proves the daemon-tick WIRING calls it.

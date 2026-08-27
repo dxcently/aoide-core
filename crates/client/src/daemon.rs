@@ -216,7 +216,7 @@ mod tests {
         let _guard = crate::env_lock().lock().unwrap();
         let saved = std::env::var("AOIDE_DAEMON_SOCKET").ok();
         std::env::set_var("AOIDE_DAEMON_SOCKET", short_tmp("dead"));
-        let out = daemon_dispatch(&inv(&["graph", "session", "start"], Door::Cli));
+        let out = daemon_dispatch(&inv(&["session", "start"], Door::Cli));
         assert!(out.is_none(), "a dead socket must fall back, not error");
         match saved {
             Some(v) => std::env::set_var("AOIDE_DAEMON_SOCKET", v),
@@ -240,7 +240,7 @@ mod tests {
         });
         let saved = std::env::var("AOIDE_DAEMON_SOCKET").ok();
         std::env::set_var("AOIDE_DAEMON_SOCKET", &socket_path);
-        let out = daemon_dispatch(&inv(&["graph", "session", "start"], Door::Daemon));
+        let out = daemon_dispatch(&inv(&["session", "start"], Door::Daemon));
         assert!(out.is_none(), "Door::Daemon must never route further");
         match saved {
             Some(v) => std::env::set_var("AOIDE_DAEMON_SOCKET", v),
@@ -266,8 +266,8 @@ mod tests {
                 json!({})
             });
             assert_eq!(req["op"], "dispatch");
-            assert_eq!(req["path"][0], "graph");
-            let outcome = Outcome::ok("graph.session.start", "started session `t1`");
+            assert_eq!(req["path"][0], "session");
+            let outcome = Outcome::ok("session.start", "started session `t1`");
             let reply = json!({ "outcome": outcome });
             let mut line = reply.to_string();
             line.push('\n');
@@ -276,7 +276,7 @@ mod tests {
 
         let saved = std::env::var("AOIDE_DAEMON_SOCKET").ok();
         std::env::set_var("AOIDE_DAEMON_SOCKET", &socket_path);
-        let out = daemon_dispatch(&inv(&["graph", "session", "start"], Door::Cli));
+        let out = daemon_dispatch(&inv(&["session", "start"], Door::Cli));
         match saved {
             Some(v) => std::env::set_var("AOIDE_DAEMON_SOCKET", v),
             None => std::env::remove_var("AOIDE_DAEMON_SOCKET"),
@@ -285,7 +285,7 @@ mod tests {
 
         let out = out.expect("a live listener must answer Some(outcome)");
         assert_eq!(out.status, Status::Ok);
-        assert_eq!(out.command, "graph.session.start");
+        assert_eq!(out.command, "session.start");
         assert!(out.message.contains("t1"));
 
         std::fs::remove_file(&socket_path).ok();
@@ -305,7 +305,7 @@ mod tests {
 
         let saved = std::env::var("AOIDE_DAEMON_SOCKET").ok();
         std::env::set_var("AOIDE_DAEMON_SOCKET", &socket_path);
-        let out = daemon_dispatch(&inv(&["graph", "session", "start"], Door::Cli));
+        let out = daemon_dispatch(&inv(&["session", "start"], Door::Cli));
         match saved {
             Some(v) => std::env::set_var("AOIDE_DAEMON_SOCKET", v),
             None => std::env::remove_var("AOIDE_DAEMON_SOCKET"),
@@ -322,17 +322,17 @@ mod tests {
 
     #[test]
     fn parse_dispatch_reply_extracts_the_outcome() {
-        let outcome = Outcome::ok("graph.reap", "nothing to reap");
+        let outcome = Outcome::ok("session.reap", "nothing to reap");
         let reply = json!({ "outcome": outcome }).to_string();
-        let out = parse_dispatch_reply(&inv(&["graph", "reap"], Door::Cli), &reply).unwrap();
+        let out = parse_dispatch_reply(&inv(&["session", "reap"], Door::Cli), &reply).unwrap();
         assert_eq!(out.status, Status::Ok);
-        assert_eq!(out.command, "graph.reap");
+        assert_eq!(out.command, "session.reap");
     }
 
     #[test]
     fn parse_dispatch_reply_on_an_op_level_refusal_is_an_error_outcome() {
         let reply = json!({ "ok": false, "error": "malformed request: not valid JSON" }).to_string();
-        let out = parse_dispatch_reply(&inv(&["graph", "reap"], Door::Cli), &reply).unwrap();
+        let out = parse_dispatch_reply(&inv(&["session", "reap"], Door::Cli), &reply).unwrap();
         assert_eq!(out.status, Status::Error);
         assert!(out.message.contains("ok"));
     }

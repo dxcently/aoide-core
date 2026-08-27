@@ -148,7 +148,7 @@ fn register_clone(root: &Path, door: Door) -> (Vec<String>, Vec<String>) {
     let mut notes = Vec::new();
 
     let out = crate::graph::project_add(&Invocation {
-        path: vec!["graph".into(), "project".into(), "add".into()],
+        path: vec!["project".into(), "add".into()],
         args: vec!["aoide".into(), root.display().to_string()],
         flags: BTreeMap::new(),
         door,

@@ -64,6 +64,16 @@ pub struct Command {
     /// the A2A AgentCard (CONTRACTS.md §6) is the first one — can filter to
     /// only the commands that are live, without a second command inventory.
     pub implemented: bool,
+    /// Hook-plumbing, not an operator command — a harness's own hook payload
+    /// drives it (`session start/phase/end/hook`), never a human typing it
+    /// directly. Additive field (CONTRACTS.md §3), same discipline as
+    /// `implemented`/`examples` before it: skipped when `false` so an
+    /// ordinary command's schema stays byte-identical to before this field
+    /// existed. `guide.rs`'s human listing skips `internal` commands; the
+    /// schema/MCP/A2A doors still enumerate them — this hides noise from a
+    /// person, not capability from a consumer.
+    #[serde(skip_serializing_if = "is_false")]
+    pub internal: bool,
     #[serde(rename = "exitCodes", serialize_with = "exit_codes")]
     pub exit_codes: (),
     /// Invocation examples shown by `<cmd> --help` (the human door only —
@@ -99,6 +109,13 @@ pub struct Schema {
     #[serde(rename = "stageNotesVersion")]
     pub stage_notes_version: &'static str,
     pub commands: Vec<Command>,
+}
+
+/// `serde(skip_serializing_if)` predicate for `internal` — skip the key
+/// entirely when false, so a non-internal command's schema is byte-identical
+/// to before the field existed.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// The canonical exit-code map, identical for every command (CONTRACTS.md §3).
@@ -199,6 +216,7 @@ macro_rules! cmd {
             flags: &[$crate::registry::JSON_FLAG, $($flag),*],
             gated: $gated,
             implemented: $impl,
+            internal: false,
             exit_codes: (),
             examples: &[$($ex),*],
             handler: $handler,
@@ -221,6 +239,7 @@ macro_rules! cmd {
             flags: &[$crate::registry::JSON_FLAG, $($flag),*],
             gated: $gated,
             implemented: $impl,
+            internal: false,
             exit_codes: (),
             examples: &[],
             handler: $handler,

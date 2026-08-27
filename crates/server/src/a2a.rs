@@ -24,7 +24,7 @@
 //!
 //! A forwarded A2A message's TEXT is untrusted DATA, never executed as a
 //! command — `message/send`'s inject path types it into a target session
-//! exactly like `graph send` (in fact it reuses
+//! exactly like `send` (in fact it reuses
 //! [`aoide_conduct::graph::session_send`] for that), and its spawn path never
 //! runs a client-supplied command: it only ever launches the
 //! operator-configured `aoide.a2a.spawnAgent` executable (a rebuild-gated nix
@@ -609,10 +609,10 @@ fn task_get(task_id: &str) -> Result<Value, (i64, String)> {
 // user's admission, made once at rebuild time, not per-request. This bounds
 // what an external A2A client can do to: (1) task the ALREADY-configured
 // agent with a prompt (never a command), or (2) steer an EXISTING conductable
-// session the same way `graph send` would. If `spawnAgent` is unset (the
+// session the same way `send` would. If `spawnAgent` is unset (the
 // default), spawning is simply unavailable — a structured error, not a
 // silent no-op. There is deliberately no interactive per-request gate (unlike
-// `graph send`'s pending/--yes/autogate dance): a JSON-RPC request/response
+// `send`'s pending/--yes/autogate dance): a JSON-RPC request/response
 // cannot block on a human clicking "approve" mid-request, so the gate is
 // moved entirely to rebuild time, plus the standing loopback bind + the
 // Door::A2a audit trail on every inject/spawn/error.
@@ -754,7 +754,7 @@ fn session_ref_lookup(id: &str) -> Option<SessionRef> {
 
 /// Deliver into a KNOWN, conductable session: reuse
 /// [`aoide_conduct::graph::session_send`] (the same gated injection door
-/// `graph send` uses) rather than reimplementing the socket write or its
+/// `send` uses) rather than reimplementing the socket write or its
 /// pending-queue.
 ///
 /// `deliver_now` decides whether `--yes` is forced:
@@ -764,7 +764,7 @@ fn session_ref_lookup(id: &str) -> Option<SessionRef> {
 ///   turn, not a keystroke), `--yes` (deliver now, don't queue).
 /// - `false` (a non-loopback, non-autogated connection — CONTRACTS.md §6
 ///   amendment, 2026-08-14) OMITS `--yes` entirely: `session_send`'s own
-///   gate then does exactly what a local ungated `graph send` does — writes
+///   gate then does exactly what a local ungated `send` does — writes
 ///   `pending.json` and reports `delivered:false`, never touching the
 ///   socket. No pending-queue logic is reimplemented here.
 ///
@@ -791,8 +791,8 @@ fn submitted_task(session_id: &str) -> Value {
 /// `tasks/get`/the SSE stream reflect the real session state once/if a
 /// human approves and delivers it.
 /// **Messaging plan P-C6, `state/inbox.json`**: this function files NO inbox
-/// entry of its own. It builds a `graph send --id` [`Invocation`] and calls
-/// [`session_send`] just like `graph send` itself does — and since this
+/// entry of its own. It builds a `send --id` [`Invocation`] and calls
+/// [`session_send`] just like `send` itself does — and since this
 /// invocation never carries a `--to` flag, `session_send` can only ever
 /// reach its LOCAL branch (`deliver_local`), which is one of the two places
 /// a delivered message gets filed (`aoide_conduct::graph::send::deliver_local`
@@ -821,8 +821,8 @@ fn do_inject(
     flags.insert("audit-log".to_string(), audit_log.to_string_lossy().into_owned());
     // The resolved peer's identity (P-P3, PAIRING.md decision 7), when the
     // caller resolved to one (`aoide_storage::peer_store::resolve_peer` —
-    // ATTRIBUTION, not a gate, same posture `graph send --from` already
-    // documents): rides straight into `graph send`'s own EXISTING `--from`
+    // ATTRIBUTION, not a gate, same posture `send --from` already
+    // documents): rides straight into `send`'s own EXISTING `--from`
     // flag, so a peer-driven send that lands in `pending.json` carries
     // `"from": "peer:<name>"` through the exact same field a local
     // `--from`/`AOIDE_SESSION_ID` attribution already populates — no second
@@ -831,7 +831,7 @@ fn do_inject(
         flags.insert("from".to_string(), f.to_string());
     }
     let inv = Invocation {
-        path: vec!["graph".to_string(), "send".to_string()],
+        path: vec!["send".to_string()],
         args: vec![prompt.to_string()],
         flags,
         door: Door::A2a,
@@ -860,7 +860,7 @@ fn do_inject(
 /// proving the production socket-write path; here, actually driving it). A
 /// missed connect after the retry budget is tolerated: the session still
 /// exists and is `conductable`, just without its opening turn typed in — a
-/// client can always follow up with a plain `graph send`/another
+/// client can always follow up with a plain `send`/another
 /// `message/send`.
 ///
 /// **Deliberately a RAW socket write, not `session_send`/`deliver_local`.**
@@ -908,7 +908,7 @@ fn spawn_inject_prompt(id: &str, prompt: &str) {
 /// (`std::env::current_exe()`), `setsid`'d so it survives this handler
 /// thread, stdio nulled, and reaped on a parked thread (see below) — it
 /// stays parented to the long-lived `a2a serve` daemon for its whole life.
-/// `aoide-conduct`'s `graph spawn` (P2 of the conducted-agents plan) now
+/// `aoide-conduct`'s `spawn` (P2 of the conducted-agents plan) now
 /// generalizes exactly this detach/register/reap shape as its own command; a
 /// later phase can have this handler ride on it instead of hand-rolling the
 /// same mechanics here.
@@ -1344,7 +1344,7 @@ fn spawn_refusal(resolved: Option<(&aoide_storage::peer_store::Peer, aoide_stora
 
 /// `aoide/graphSummary` (CONTRACTS.md §7): wrap the EXISTING resolved
 /// `graph.json` v0 document ([`resolve_graph_document`], the exact same
-/// function `graph view` builds its document with) in the
+/// function bare `graph` builds its document with) in the
 /// federation envelope. No new graph vocabulary — `graph` below is that
 /// document verbatim.
 fn graph_summary(peer_name: &str, self_url: &str) -> Result<Value, (i64, String)> {
@@ -2957,6 +2957,7 @@ mod tests {
             flags: &[],
             gated: false,
             implemented: true,
+            internal: false,
             exit_codes: (),
             examples: &[],
             handler: fake_handler,
@@ -2969,6 +2970,7 @@ mod tests {
             flags: &[],
             gated: false,
             implemented: false,
+            internal: false,
             exit_codes: (),
             examples: &[],
             handler: fake_handler,
@@ -3087,7 +3089,7 @@ mod tests {
     #[test]
     fn decide_send_action_known_but_not_conductable_is_an_error() {
         // Registered but not conductable (no control socket) — same shape as
-        // `graph send`'s own `not-conductable` rejection.
+        // `send`'s own `not-conductable` rejection.
         let action = decide_send_action(Some("plain"), false, "claude", |_| {
             Some(SessionRef { conductable: false, has_socket: false })
         });
@@ -4664,12 +4666,12 @@ mod tests {
 
         // Audited through the single Door::A2a log, "pending" status — every
         // outcome (queued/auto-delivered/error) routes through the SAME
-        // audit path `graph send` already uses (`conduct::graph::send::
+        // audit path `send` already uses (`conduct::graph::send::
         // audit_send`), never a second logging path.
         let log = std::fs::read_to_string(&audit_log).unwrap_or_default();
         assert!(log.contains("\"door\":\"a2a\""), "audited through Door::A2a: {log}");
         assert!(log.contains("\"status\":\"pending\""), "audited as pending: {log}");
-        assert!(log.contains("graph.send"), "reuses graph send's own audit command label: {log}");
+        assert!(log.contains("send"), "reuses send's own audit command label: {log}");
 
         let _ = std::fs::remove_dir_all(&root);
         match saved_stage {
@@ -6085,7 +6087,7 @@ mod tests {
         assert_eq!(resp["instance"]["url"], "http://127.0.0.1:8710/");
         assert!(resp["instance"]["emittedAt"].as_str().unwrap().ends_with('Z'));
         // `graph` is EXACTLY what `resolve_graph_document` (the same function
-        // `graph view` uses) produces — no second vocabulary.
+        // bare `graph` uses) produces — no second vocabulary.
         assert_eq!(resp["graph"], resolve_graph_document().unwrap());
         assert_eq!(resp["graph"]["schemaVersion"], "0");
         assert!(resp["graph"]["nodes"].is_array());

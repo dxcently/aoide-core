@@ -420,7 +420,7 @@ fn superseded_agent_duplicates(
 ///   * a window with only tombstones keeps exactly the NEWEST (`startedAt`,
 ///     then the id as a stable final tiebreak) — the agent that actually just
 ///     finished, whose done pose the widgets deliberately show until
-///     `graph prune` sweeps it. Its predecessors are as superseded as they
+///     `session prune` sweeps it. Its predecessors are as superseded as they
 ///     would be beside a live one.
 /// So this never empties a window's roster entry, and never leaves two.
 ///
@@ -544,7 +544,7 @@ fn pre_boot_ghosts(
 /// minted from that call, and it owns no process, window or transcript of its
 /// own. `doomed_subagent_descendants` (in `graph/doc.rs`) is the primary
 /// cleanup and takes the sub-agents down with a parent that ends HERE — but a
-/// parent that left through another door (`graph prune` on its own schedule,
+/// parent that left through another door (`session prune` on its own schedule,
 /// or an earlier pass that cleared the dangling link) leaves the sub-agent as
 /// a parentless root node, and there it sits for its full staleness band
 /// (2h mid-turn, 72h at rest) still claiming to be working.
@@ -729,7 +729,7 @@ pub(crate) fn decay_stopped_sessions(
     decayed
 }
 
-/// `graph reap` — the automatic liveness sweep. Marks every DEAD (killed,
+/// `session reap` — the automatic liveness sweep. Marks every DEAD (killed,
 /// orphaned) session `done` (and its hook record), then reuses [`prune_done`] to
 /// drop them + clear orphaned parent links, re-staging `graph.json` atomically.
 /// Cheap: one `hyprctl` call + a stage read, and a stage WRITE only when
@@ -740,7 +740,7 @@ pub(crate) fn decay_stopped_sessions(
 /// it: it is a subprocess call (real wall-clock cost, and a hung `hyprctl`
 /// would otherwise hang indefinitely) that touches no stage file, so it needs
 /// none of the lock's atomicity — holding the lock across it would block
-/// every other stage writer (`graph send`, session-start/end, hook updates,
+/// every other stage writer (`send`, session-start/end, hook updates,
 /// …) for as long as it runs. The window-liveness signal is already treated
 /// as a best-effort, racy-by-nature snapshot throughout this module (see
 /// `effective_live_addresses`'s transient-read grace), so gathering it a
@@ -772,7 +772,7 @@ pub fn reap(inv: &Invocation) -> Outcome {
     outcome
 }
 
-/// The `graph reap` COMMAND — [`reap`], plus the desktop toast that says what it
+/// The `session reap` COMMAND — [`reap`], plus the desktop toast that says what it
 /// did. Registered as the command handler while `reap` itself stays toast-free,
 /// so every in-crate caller (and every unit test) gets the sweep without
 /// spawning notifiers.
@@ -796,7 +796,7 @@ pub fn reap(inv: &Invocation) -> Outcome {
 /// tries the resident daemon's `dispatch` op first — daemon up, the sweep
 /// (and its toast) run IN the daemon against its own roster; daemon down,
 /// this falls back to the direct sweep below byte-identically. The ~12s
-/// systemd timer keeps firing `aoide graph reap` either way; once a daemon
+/// systemd timer keeps firing `aoide session reap` either way; once a daemon
 /// is resident this makes the timer a redundant backstop rather than the
 /// mechanism (the daemon's own tick also runs this same reap internally —
 /// `aoide_server::daemon::run_loop`).
@@ -910,7 +910,7 @@ fn reap_inner(
     gathered_addrs: Option<HashSet<String>>,
     window_owners: Option<HashMap<String, u32>>,
 ) -> Outcome {
-    let cmd = "graph.reap";
+    let cmd = "session.reap";
     let mut s_file: SessionsFile = match load_stage(&sessions_path()) {
         Ok(f) => f,
         Err(e) => return stage_error(cmd, e),
@@ -933,7 +933,7 @@ fn reap_inner(
     // This session's hook record's `updatedAt` — the exact timestamp
     // `decay_stopped_sessions` below reads for the `stopped` clock, mirrored
     // here as evidence for the third signal too: a foreign-harness/headless
-    // session (no window, no pid, no transcript — the `graph session start`
+    // session (no window, no pid, no transcript — the `session start`
     // recipe) that fires hooks on its own cadence is proven alive by THIS
     // timestamp even when its `startedAt` is old and no transcript exists.
     let hook_seen: HashMap<&str, Option<i64>> = h_file
@@ -1030,7 +1030,7 @@ fn reap_inner(
     // `superseded_done_siblings`). Kept OUT of `reaped` deliberately — these
     // records are already `done`, so there is nothing to reap, and folding them
     // in would trip the `prune_done` call below into sweeping every unrelated
-    // `done` record on the desktop, which stays `graph prune`'s job.
+    // `done` record on the desktop, which stays `session prune`'s job.
     let superseded_done = superseded_done_siblings(&s_file.sessions);
 
     // Orphaned hook records: a `hooks.json` entry whose sessionId matches NO
@@ -1118,7 +1118,7 @@ fn reap_inner(
 
     // Prune only when something was actually reaped — a decay-only pass must not
     // start sweeping pre-existing `done` records out from under the widgets (that
-    // stays `graph prune`'s job, on its own schedule).
+    // stays `session prune`'s job, on its own schedule).
     let (removed, mut cleared) = if reaped.is_empty() {
         (Vec::new(), Vec::new())
     } else {
@@ -1489,7 +1489,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = reap(&crate::graph::testutil::invocation(&["graph", "reap"], &[]));
+        let out = reap(&crate::graph::testutil::invocation(&["session", "reap"], &[]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         assert_eq!(
             out.data.unwrap()["reaped"],
@@ -1547,7 +1547,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = reap(&crate::graph::testutil::invocation(&["graph", "reap"], &[]));
+        let out = reap(&crate::graph::testutil::invocation(&["session", "reap"], &[]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         let data = out.data.unwrap();
         let mut orphans: Vec<String> = data["orphanHooks"]
@@ -1890,7 +1890,7 @@ mod tests {
         .unwrap();
 
         // A QUIET pass — nothing to reap — still refreshes the living.
-        let out = reap(&crate::graph::testutil::invocation(&["graph", "reap"], &[]));
+        let out = reap(&crate::graph::testutil::invocation(&["session", "reap"], &[]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
         let got = &s2.sessions[0];
@@ -1943,7 +1943,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = reap(&crate::graph::testutil::invocation(&["graph", "reap"], &[]));
+        let out = reap(&crate::graph::testutil::invocation(&["session", "reap"], &[]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         let data = out.data.unwrap();
         assert_eq!(data["reaped"], json!([]), "nothing here is liveness-dead");
@@ -2007,7 +2007,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = reap(&crate::graph::testutil::invocation(&["graph", "reap"], &[]));
+        let out = reap(&crate::graph::testutil::invocation(&["session", "reap"], &[]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         let reaped: Vec<String> = out.data.as_ref().unwrap()["reaped"]
             .as_array()

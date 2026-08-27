@@ -1,15 +1,15 @@
 # aoide-conduct
 
 Aoide's session core: the PTY multiplexer (`aoide conduct`), the session DAG
-(`aoide graph`), Claude-Code hook plumbing, and liveness reaping. Makes
+(bare `aoide graph`), Claude-Code hook plumbing, and liveness reaping. Makes
 every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
 — aoide's headline"). Core, never `lyra` — headless-safe by construction.
 
 ## Named seams (what it exposes)
 
 - **Graph residency (P-D6, `docs/architecture/AOIDED.md`'s "L4")**: the
-  session-write family — `graph session start/phase/end`, `graph session
-  hook`, and `graph reap` (below) — each try `aoide_client::daemon::
+  session-write family — `session start/phase/end`, `session
+  hook`, and `session reap` (below) — each try `aoide_client::daemon::
   daemon_dispatch(inv)` FIRST and fall back to their pre-existing direct
   stage-write path byte-identically on `None`. The daemon executes the
   SAME registered handler code (its `dispatch` fn IS `cli::dispatch::
@@ -19,7 +19,7 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   (`STDIN_PAYLOAD_FLAG`) rather than growing the daemon wire a stdin
   channel — the daemon-side handler reads that flag first and never
   touches its own stdin.
-- `graph/spawn.rs` — `graph spawn [--windowed] [--carry]` (P-D7,
+- `graph/spawn.rs` — `spawn [--windowed] [--carry]` (P-D7,
   `docs/architecture/AOIDED.md`'s "L5"): the child is always `aoide conduct
   -- <agent cmd>`, built by the ONE shared `build_conduct_args` (`--headless`
   aside) — headless by default (detaches, re-execs this same binary), or,
@@ -32,23 +32,23 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   `foot sh -c '{cmd}'`) — pure, unit-tested, never a real terminal spawned in
   a test. Taught errors, no process ever touched: no `$AOIDE_TERMINAL` set,
   or neither `$WAYLAND_DISPLAY` nor `$DISPLAY` present (a headless host,
-  steered back to plain `graph spawn`). `--carry` (P-C3, durable-sessions
+  steered back to plain `spawn`). `--carry` (P-C3, durable-sessions
   plan) marks the spawned id in `state/carry.json` once — and only once —
   the registration wait actually succeeds; an id that never registers has no
   live session behind it, so nothing is marked.
-- `graph/send.rs`'s `graph session hook` stamps `SessionRecord.
+- `graph/send.rs`'s `session hook` stamps `SessionRecord.
   harness_session_id` (P-D7) from the raw hook payload's own `session_id`
   on every event that carries one, mapped-to-an-action or not — see
   `CONTRACTS.md`'s `sessions.json` entry for the full field contract.
 - `graph` — the session DAG: build/merge/send/spawn/wrap, `normalize_addr`
   (widened to `pub` at P-A1 so `screen` could reach it without duplicating
   it), `SessionRecord`/`SessionsFile`/`load_stage`/`write_stage`. `--id`
-  accepts a bare session id OR the exact `session:<id>` form `graph view
+  accepts a bare session id OR the exact `session:<id>` form bare `graph
   --json` emits for a node id (a known prefix stripped before matching,
-  same discipline `focus_session` already used) — `graph
-  view`'s own emitted contract is unchanged, only what `--id`/`--to` accept
+  same discipline `focus_session` already used) — bare `graph`'s own
+  emitted contract is unchanged, only what `--id`/`--to` accept
   as input widened; an id with any OTHER prefix still errors as unknown,
-  unchanged. `graph send` gained `--to <target>` (messaging plan P-C3, mutually exclusive
+  unchanged. `send` gained `--to <target>` (messaging plan P-C3, mutually exclusive
   with `--id`): resolves via `aoide_storage::addr::resolve` (itself
   `session:`-prefix-tolerant on its exact-id tier) against local
   sessions + registered peers — a LOCAL match re-drives the exact `--id`
@@ -74,17 +74,17 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   at all, so it can't reach `deliver_local` and files itself instead — see
   `aoide_storage::inbox`'s module doc for the full two-writer reasoning.
 - **The carry mark (P-C2/P-C3, durable-sessions plan):** `graph/carry.rs`'s
-  `session_carry` (`graph session carry on|off [--self | --id <id>]`) is the
+  `session_carry` (`session carry on|off [--self | --id <id>]`) is the
   command over `aoide_storage::carry`'s store (`state/carry.json`) — a
   session id marked DURABLE, so a project's whole carried set can later be
-  resurrected together. Unlike every other `graph session *` handler in this
+  resurrected together. Unlike every other `session *` handler in this
   crate, it takes no stage lock and does not route through `daemon_dispatch`:
   `carry.json` is not a `state/stage/` file, so it sits entirely outside the
   L4 dual-writer surface. `--id` targets any session id, live or not — no
   roster lookup gates the write, which is what makes the mark flippable
   post-mortem off a bare ledger id; bare and `--self` both resolve the
   target from `$AOIDE_SESSION_ID`. Two more sites touch the same store:
-  `graph spawn --carry` marks at birth (above), and `graph/resurrect.rs`'s
+  `spawn --carry` marks at birth (above), and `graph/resurrect.rs`'s
   `resurrect_one` moves the mark from an old, carried ledger id onto its
   freshly spawned replacement — new id added, old id dropped, in ONE
   `save_carry` call, only when the spawn actually reached `Status::Ok` and
@@ -93,7 +93,7 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   between that edit and the write leaves the OLD id carried (retryable)
   rather than neither (silent loss) — the same bias a failed spawn gets
   deliberately, by never touching the store at all.
-- `reap` — liveness reaping (`aoide graph reap`), sweeping sessions a
+- `reap` — liveness reaping (`aoide session reap`), sweeping sessions a
   `SIGKILL`'d terminal could never mark `done`. `reap_and_announce` (the
   registered CLI handler) routes through `daemon_dispatch` first like every
   other session-write command above; the toast-free `reap` underneath is what
@@ -124,18 +124,21 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
 - `shellbridge`, `herald` — files only; their CLI commands (registry lines)
   moved to `lyra` at P-A2, but both stay resident here (see charter smudge
   below).
-- `commands` — this crate's CLI commands: `graph *` (19 paths, including
-  `graph resurrect`, P-D8, and `graph session carry`, P-C2), `conduct`,
-  `hooks install`, `who`.
+- `commands` — this crate's CLI commands: 19 paths registered in one
+  `register()` call (`conduct/src/commands/graph.rs`, still that file's name
+  post-cutover) — the `graph` family narrowed at task #101 R1 to the bare
+  render plus `graph link`, while `send`/`spawn`/`resurrect` went bare and
+  `session *`/`project *` promoted to their own top-level groups — plus
+  `conduct`, `hooks install`, `who`.
 - **The durable session ledger + resurrect (P-D8, `docs/architecture/
   AOIDED.md`'s "L5"):** `graph/doc.rs::ledger_session_exit` is the ONE
   shared call both `session_store.rs::do_session_end_inner` (a clean
-  `graph session end`) and `reap.rs::reap_inner` (every id its `reaped` set
+  `session end`) and `reap.rs::reap_inner` (every id its `reaped` set
   collects) route through to append one `aoide_storage::ledger::
   LedgerEntry` line at the exact instant a session leaves the roster —
   never two independently-written appenders, so a given session
   contributes exactly one ledger line regardless of which path retired it.
-  `graph/resurrect.rs::session_resurrect` (`graph resurrect --project
+  `graph/resurrect.rs::session_resurrect` (`resurrect --project
   <name> [--all | --id <ledgerSessionId>]`) reads that ledger and anchors
   entries to a project by the SAME `anchor_for` longest-prefix rule `graph
   view` uses. Selection then branches on the flags: `--all` widens to every
@@ -218,7 +221,7 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   same seam `stamp_headless` uses. `graph/conduct.rs::session_conduct`
   reads it off the `AOIDE_SESSION_ORIGIN` env var `aoide-server`'s
   `a2a::do_spawn` sets on the child it launches; a locally-launched
-  `conduct` (a plain terminal, `graph spawn`, etc.) never has that env var
+  `conduct` (a plain terminal, `spawn`, etc.) never has that env var
   set, so `origin` stays absent. No `graph.json` projection (like
   `headless`/`hookAncestry`, consumed internally, not rendered) —
   `doc.rs::ledger_session_exit` is the ONE place it surfaces, projected
@@ -242,7 +245,7 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
 
 `aoide-protocol`, `aoide-storage`, `aoide-client` (`who`'s live per-peer
 probe calls `aoide_client::commands::pull_peer_live` — the peer-pull
-transport `peer pull` itself uses, workstream C2; `graph send --to`'s
+transport `peer pull` itself uses, workstream C2; `send --to`'s
 remote branch calls `aoide_client::commands::send_message_to_peer`,
 workstream C3; every session-write handler calls `aoide_client::daemon::
 daemon_dispatch`, P-D6; see `client`'s own README for why that edge stays).

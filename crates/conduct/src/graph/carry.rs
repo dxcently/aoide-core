@@ -1,12 +1,12 @@
-//! `graph session carry on|off [--self | --id <id>]` — mark or unmark a
+//! `session carry on|off [--self | --id <id>]` — mark or unmark a
 //! session DURABLE, so a project's whole carried set can later be
-//! resurrected together (`graph resurrect`, a later phase of the
+//! resurrected together (`resurrect`, a later phase of the
 //! durable-sessions plan; `CONTRACTS.md`'s `state/carry.json` section).
 //!
 //! P-C2 of that plan: the command only, over the store `aoide_storage::carry`
 //! already provides (P-C1, landed) — no reimplementation of the store's CRUD
 //! here. This handler writes ONLY `state/carry.json`: unlike every other
-//! `graph session *` handler in this module, it takes no stage lock and does
+//! `session *` handler in this module, it takes no stage lock and does
 //! not route through `aoide_client::daemon::daemon_dispatch` — `carry.json`
 //! is not a `state/stage/` file, so it sits entirely outside the L4
 //! dual-writer surface (a second writer there would defeat the store's own
@@ -27,7 +27,7 @@ use aoide_protocol::Invocation;
 use aoide_storage::carry::{load_carry, save_carry, set_carried};
 use serde_json::json;
 
-/// `aoide graph session carry (on|off) [--self | --id <id>] [--json]`.
+/// `aoide session carry (on|off) [--self | --id <id>] [--json]`.
 ///
 /// Target resolution: `--id <id>` names any session id directly; otherwise
 /// `--self` (or a bare invocation, the same default) reads
@@ -37,8 +37,8 @@ use serde_json::json;
 /// `$AOIDE_SESSION_ID` is likewise a usage error naming both — never a
 /// silent no-op.
 pub fn session_carry(inv: &Invocation) -> Outcome {
-    let cmd = "graph.session.carry";
-    let usage = "usage: aoide graph session carry (on|off) [--self | --id <id>] [--json]";
+    let cmd = "session.carry";
+    let usage = "usage: aoide session carry (on|off) [--self | --id <id>] [--json]";
 
     let args = match require_args(inv, &["on|off"]) {
         Ok(a) => a,

@@ -130,7 +130,7 @@ pub(crate) fn conduct_invocation(args: &[&str], flags: &[(&str, &str)]) -> Invoc
 }
 pub(crate) fn spawn_invocation(args: &[&str], flags: &[(&str, &str)]) -> Invocation {
     Invocation {
-        path: vec!["graph".into(), "spawn".into()],
+        path: vec!["spawn".into()],
         args: args.iter().map(|s| s.to_string()).collect(),
         flags: flags
             .iter()
@@ -141,7 +141,7 @@ pub(crate) fn spawn_invocation(args: &[&str], flags: &[(&str, &str)]) -> Invocat
 }
 pub(crate) fn send_invocation(args: &[&str], flags: &[(&str, &str)]) -> Invocation {
     Invocation {
-        path: vec!["graph".into(), "send".into()],
+        path: vec!["send".into()],
         args: args.iter().map(|s| s.to_string()).collect(),
         flags: flags
             .iter()

@@ -1,4 +1,4 @@
-//! `graph permit` — the herald's permission SUMMONS: publish one persistent,
+//! `session permit` — the herald's permission SUMMONS: publish one persistent,
 //! visually distinct card for an agent session blocked on a permission prompt,
 //! and type the human's answer back into the session when it arrives.
 //!
@@ -7,7 +7,7 @@
 //!   agent hits its permission prompt
 //!     -> its harness fires a hook (claude: `Notification` carrying
 //!        `notification_type: permission_prompt`; kimi: `PermissionRequest`)
-//!     -> `graph session hook` maps it to the unconditional `awaiting` phase
+//!     -> `session hook` maps it to the unconditional `awaiting` phase
 //!        and, from that arm only, spawns THIS command detached
 //!     -> the summons is PUBLISHED into the herald ledger
 //!        (`stage/herald.json`, through the shellbridge) and this command returns
@@ -196,7 +196,7 @@ pub(in crate::graph) fn profile_for_agent(agent: &str) -> &'static AgentProfile 
 /// The ledger id of the card standing for one session's summons.
 ///
 /// The mapping lives HERE and nowhere else, because two sides depend on it
-/// disagreeing about nothing: `graph permit` files the card under this id, and
+/// disagreeing about nothing: `session permit` files the card under this id, and
 /// the shellbridge takes it down under the same one after a verdict — but a
 /// verdict is addressed to the SESSION, so one of the two has to convert.
 pub fn summons_card_id(session_id: &str) -> String {
@@ -257,7 +257,7 @@ fn type_verdict(inv: &Invocation, id: &str, key: &str) -> Outcome {
         flags.insert("audit-log".to_string(), log.clone());
     }
     crate::graph::session_send(&Invocation {
-        path: vec!["graph".to_string(), "send".to_string()],
+        path: vec!["send".to_string()],
         args: vec![key.to_string()],
         flags,
         door: inv.door,
@@ -273,7 +273,7 @@ fn type_verdict(inv: &Invocation, id: &str, key: &str) -> Outcome {
 /// typed into, so answering in the terminal while the card stands is never
 /// typed over.
 pub fn answer_summons(id: &str, verdict: &str) -> Outcome {
-    let cmd = "graph.permit";
+    let cmd = "session.permit";
     let Some(verdict) = Verdict::from_wire(verdict) else {
         return Outcome::error(cmd, format!("`{verdict}` is not a verdict"))
             .with_data(json!({ "injected": false, "reason": "bad-verdict", "id": id }));
@@ -326,7 +326,7 @@ pub fn answer_summons(id: &str, verdict: &str) -> Outcome {
     // `type_verdict` falls back to the default log, which is where every other
     // daemon-side audit line already goes.
     let inv = Invocation {
-        path: vec!["graph".to_string(), "permit".to_string()],
+        path: vec!["session".to_string(), "permit".to_string()],
         args: vec![],
         flags: BTreeMap::new(),
         door: aoide_protocol::Door::Daemon,
@@ -348,14 +348,14 @@ pub fn answer_summons(id: &str, verdict: &str) -> Outcome {
         .with_data(with(json!({ "injected": true, "key": key })))
 }
 
-/// `aoide graph permit --id <id> [--tool <name>] [--what <text>]` — publish the
+/// `aoide session permit --id <id> [--tool <name>] [--what <text>]` — publish the
 /// permission summons for a conducted session.
 ///
 /// Returns as soon as the card is filed. The human's answer arrives later,
 /// through the QML herald's buttons and [`answer_summons`] — so unlike the old
 /// dunstify path, nothing here blocks for as long as the card stands.
 pub fn session_permit(inv: &Invocation) -> Outcome {
-    let cmd = "graph.permit";
+    let cmd = "session.permit";
     let id = match require_flag(inv, "id") {
         Ok(v) => v,
         Err(o) => return o,
@@ -427,7 +427,7 @@ pub fn session_permit(inv: &Invocation) -> Outcome {
         }))
 }
 
-/// Spawn `graph permit` DETACHED for a session that just went `awaiting` on a
+/// Spawn `session permit` DETACHED for a session that just went `awaiting` on a
 /// permission prompt — the hook door's one call site. Best-effort and silent
 /// by design: the hook runs inside a live agent session under a short timeout,
 /// so it must never block on the card, never inherit its stdio, and never turn
@@ -450,7 +450,7 @@ pub(in crate::graph) fn spawn_summons(id: &str, what: Option<&str>) {
     if exe.file_name().and_then(|n| n.to_str()) != Some("aoide") {
         return;
     }
-    let mut args = vec!["graph".to_string(), "permit".to_string(), "--id".to_string(), id.to_string()];
+    let mut args = vec!["session".to_string(), "permit".to_string(), "--id".to_string(), id.to_string()];
     if let Some(w) = what.map(str::trim).filter(|w| !w.is_empty()) {
         args.push("--what".to_string());
         args.push(w.to_string());
@@ -635,7 +635,7 @@ mod tests {
     #[test]
     fn permit_without_an_id_is_a_usage_error() {
         let out = session_permit(&Invocation {
-            path: vec!["graph".into(), "permit".into()],
+            path: vec!["session".into(), "permit".into()],
             args: vec![],
             flags: BTreeMap::new(),
             door: aoide_protocol::Door::Cli,
@@ -660,7 +660,7 @@ mod tests {
             let mut flags = BTreeMap::new();
             flags.insert("id".to_string(), id.to_string());
             Invocation {
-                path: vec!["graph".into(), "permit".into()],
+                path: vec!["session".into(), "permit".into()],
                 args: vec![],
                 flags,
                 door: aoide_protocol::Door::Cli,

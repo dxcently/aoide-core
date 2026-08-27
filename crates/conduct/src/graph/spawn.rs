@@ -1,4 +1,4 @@
-//! `graph spawn` — the DETACHED command that starts a headless conducted agent
+//! `spawn` — the DETACHED command that starts a headless conducted agent
 //! (P2 of the conducted-agents plan; P1 landed `conduct --headless`,
 //! a044bae). Unlike `conduct`, which blocks the calling process
 //! until the wrapped agent exits, `spawn` re-execs THIS SAME binary as
@@ -7,7 +7,7 @@
 //! use), detaches it into its own session (`setsid`, stdio nulled) so it
 //! OUTLIVES this call, waits briefly for it to register its control socket,
 //! and returns immediately either way. An optional `--prompt` is then
-//! injected through the ONE gated injection door (`graph send`, re-driven the
+//! injected through the ONE gated injection door (`send`, re-driven the
 //! same way `graph/pending.rs::pending_approve` re-drives an approved entry)
 //! — never a direct socket write.
 //!
@@ -61,8 +61,8 @@ fn command_basename(program: &str) -> String {
 
 /// Resolve the binary to re-exec as the headless conducted child.
 ///
-/// In production this is always the running `aoide` binary itself — `graph
-/// spawn` only ever executes AS that binary's own dispatch, so
+/// In production this is always the running `aoide` binary itself — `spawn`
+/// only ever executes AS that binary's own dispatch, so
 /// `current_exe()` is correct live, exactly like `server/src/a2a.rs`'s
 /// `do_spawn`. Under `cargo test -p aoide-conduct`, though, `current_exe()`
 /// resolves to the unit-test harness binary, which has NO CLI dispatcher at
@@ -81,7 +81,7 @@ fn spawn_exe() -> std::io::Result<PathBuf> {
 }
 
 /// Build the `conduct` subcommand's own argv — the ONE command-construction
-/// path shared by the headless (`graph spawn`) and windowed (`graph spawn
+/// path shared by the headless (`spawn`) and windowed (`spawn
 /// --windowed`) branches, the `--headless` flag aside: `["conduct",
 /// ("--headless",)? "--agent", agent, "--id", id, ("--parent", parent)?,
 /// "--", <command…>]`. Registration, the control socket, and the
@@ -118,8 +118,8 @@ fn build_conduct_args(
 /// exec'd differs between the two callers. `cwd`, when given, becomes the
 /// spawned process's own working directory (P-D8): for the windowed branch
 /// that is the TERMINAL EMULATOR's cwd, which every terminal this codebase
-/// targets starts its own shell/child in by default — the mechanism `graph
-/// resurrect` relies on to reopen a revived agent in its original project
+/// targets starts its own shell/child in by default — the mechanism
+/// `resurrect` relies on to reopen a revived agent in its original project
 /// directory without a `--cwd` flag on `conduct`/`session_conduct` itself
 /// (that process derives its OWN `cwd` from `std::env::current_dir()` at
 /// registration, so setting the terminal's cwd here is sufficient). `None`
@@ -215,7 +215,7 @@ fn shell_join(argv: &[String]) -> String {
 /// Parse `$AOIDE_TERMINAL`'s raw string into a real argv, splicing `cmd` in
 /// for a `{cmd}` placeholder token per the module doc above. Pure: no env
 /// access, no process spawn — directly unit-testable, and the seam
-/// `graph spawn --windowed`'s own tests stop at (never a real terminal in a
+/// `spawn --windowed`'s own tests stop at (never a real terminal in a
 /// test).
 pub(crate) fn build_terminal_argv(template: &str, cmd: &[String]) -> Vec<String> {
     let tokens: Vec<&str> = template.split_whitespace().collect();
@@ -255,7 +255,7 @@ fn terminal_template() -> Result<String, Outcome> {
     match std::env::var("AOIDE_TERMINAL") {
         Ok(t) if !t.trim().is_empty() => Ok(t),
         _ => Err(Outcome::error(
-            "graph.spawn",
+            "spawn",
             "no terminal configured — set $AOIDE_TERMINAL, e.g. AOIDE_TERMINAL=\"kitty -e {cmd}\" (argv splice) or AOIDE_TERMINAL=\"foot sh -c '{cmd}'\" (quoted: joined into one shell word)",
         )
         .with_data(json!({ "reason": "no-terminal-template" }))),
@@ -273,7 +273,7 @@ fn require_display() -> Result<(), Outcome> {
         Ok(())
     } else {
         Err(
-            Outcome::error("graph.spawn", "headless host — use `graph spawn` without `--windowed`")
+            Outcome::error("spawn", "headless host — use `spawn` without `--windowed`")
                 .with_data(json!({ "reason": "headless-host" })),
         )
     }
@@ -318,7 +318,7 @@ fn wait_for(path: &std::path::Path, budget: Duration) -> bool {
     }
 }
 
-/// `aoide graph spawn [--agent <name>] [--parent <sessionId>] [--id <id>]
+/// `aoide spawn [--agent <name>] [--parent <sessionId>] [--id <id>]
 /// [--prompt <text>] [--windowed] [--carry] -- <command …>` — spawn
 /// `<command>` as a conducted session that OUTLIVES this call (headless by
 /// default, or in a real terminal with `--windowed`), wait briefly for it to
@@ -334,13 +334,13 @@ fn wait_for(path: &std::path::Path, budget: Duration) -> bool {
 /// `--windowed` pre-flights against two taught errors before ever touching a
 /// process: no `$AOIDE_TERMINAL` set, and no live display
 /// (`$WAYLAND_DISPLAY`/`$DISPLAY` both absent — a headless host, told to use
-/// plain `graph spawn` instead).
+/// plain `spawn` instead).
 pub fn session_spawn(inv: &Invocation) -> Outcome {
-    let cmd = "graph.spawn";
+    let cmd = "spawn";
     if inv.args.is_empty() {
         return Outcome::usage(
             cmd,
-            "usage: aoide graph spawn [--agent <name>] [--parent <sessionId>] [--id <id>] [--prompt <text>] [--windowed] -- <command …>",
+            "usage: aoide spawn [--agent <name>] [--parent <sessionId>] [--id <id>] [--prompt <text>] [--windowed] -- <command …>",
         );
     }
     let program = inv.args[0].clone();
@@ -412,11 +412,11 @@ pub fn session_spawn(inv: &Invocation) -> Outcome {
     // THIS call, but a new session does NOT reparent it — this process is
     // still its parent and still owes it a `wait()`, or the kernel keeps its
     // exit status around as a zombie for as long as THIS process lives. A
-    // short-lived CLI invocation of `graph spawn` exits right after returning
+    // short-lived CLI invocation of `spawn` exits right after returning
     // below, at which point the (still-running) child reparents to
     // init/a subreaper and gets collected there regardless of whether this
     // thread ever ran — but a caller that stays up far longer (an
-    // orchestrator driving `graph spawn` the same way `server/src/a2a.rs`'s
+    // orchestrator driving `spawn` the same way `server/src/a2a.rs`'s
     // `do_spawn` drives `conduct`) would otherwise leak one zombie per spawn
     // for as long as it kept running. Parking the wait on its own thread is
     // correct — and cheap — either way, so it is unconditional here rather
@@ -489,7 +489,7 @@ pub fn session_spawn(inv: &Invocation) -> Outcome {
             flags.insert("yes".to_string(), "true".to_string());
             flags.insert("submit".to_string(), "true".to_string());
             let inner = session_send(&Invocation {
-                path: vec!["graph".to_string(), "send".to_string()],
+                path: vec!["send".to_string()],
                 args: vec![text.clone()],
                 flags,
                 door: inv.door,

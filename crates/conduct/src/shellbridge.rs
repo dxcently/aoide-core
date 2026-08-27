@@ -469,10 +469,10 @@ fn dispatch_usage_refresh() {
     });
 }
 
-/// Pure decision: did one finished `aoide graph reap --json` actually run the
+/// Pure decision: did one finished `aoide session reap --json` actually run the
 /// sweep? Judged on the CLI's own JSON envelope `status`, NOT the exit code
 /// alone — the same "success is the real output, not the exit status" rule
-/// [`classify_usage_refresh`] follows. `aoide graph reap` prints
+/// [`classify_usage_refresh`] follows. `aoide session reap` prints
 /// `{"status":"ok",…,"message":"…"}` and exits 0 on every real pass, INCLUDING
 /// a no-op "nothing to reap (all sessions live)" one — a quiet sweep is a
 /// successful sweep, not a failure — and an error envelope (or a non-zero exit)
@@ -490,13 +490,13 @@ fn classify_recheck(exited_ok: bool, stdout: &str, stderr: &str) -> Result<Strin
             }
         };
         return Err(if said.is_empty() {
-            "`aoide graph reap` exited nonzero with no message".to_string()
+            "`aoide session reap` exited nonzero with no message".to_string()
         } else {
             said.to_string()
         });
     }
     let v: Value = serde_json::from_str(stdout.trim())
-        .map_err(|_| "`aoide graph reap --json` printed no parseable envelope".to_string())?;
+        .map_err(|_| "`aoide session reap --json` printed no parseable envelope".to_string())?;
     let message = v
         .get("message")
         .and_then(Value::as_str)
@@ -504,14 +504,14 @@ fn classify_recheck(exited_ok: bool, stdout: &str, stderr: &str) -> Result<Strin
         .to_string();
     match v.get("status").and_then(Value::as_str) {
         Some("ok") => Ok(message),
-        Some(other) => Err(format!("`aoide graph reap` reported status {other}: {message}")),
-        None => Err("`aoide graph reap --json` output had no status field".to_string()),
+        Some(other) => Err(format!("`aoide session reap` reported status {other}: {message}")),
+        None => Err("`aoide session reap --json` output had no status field".to_string()),
     }
 }
 
 /// Dispatch ONE session recheck: exec the core `aoide` binary
 /// (`daemon::bin::core_bin()`, protocol's sibling resolver — never a bare
-/// `"aoide"` relying on PATH alone) as `aoide graph reap --announce --json`
+/// `"aoide"` relying on PATH alone) as `aoide session reap --announce --json`
 /// — the liveness/rehook sweep (reap dead sessions, decay `stopped` →
 /// `idle`, prune orphaned hook records, refresh every live agent's
 /// transcript fields) the ~12s `aoide-graph-reap.timer` runs periodically —
@@ -525,7 +525,7 @@ fn classify_recheck(exited_ok: bool, stdout: &str, stderr: &str) -> Result<Strin
 /// unless they actually changed the roster (see `reap::reap_and_announce`). The
 /// notification is raised by the child, not here — this thread only audits.
 ///
-/// Runs on a DETACHED thread. `graph reap` shells out to `hyprctl clients -j`
+/// Runs on a DETACHED thread. `session reap` shells out to `hyprctl clients -j`
 /// for window liveness; that is normally instant, but a hung compositor query
 /// must never freeze the single-threaded accept loop (session-jumps, power,
 /// ricemode all queue behind one recheck click). So this SPAWNS and returns
@@ -539,7 +539,7 @@ fn classify_recheck(exited_ok: bool, stdout: &str, stderr: &str) -> Result<Strin
 fn dispatch_recheck_sessions() {
     std::thread::spawn(|| {
         let result = match std::process::Command::new(daemon::bin::core_bin())
-            .args(["graph", "reap", "--announce", "--json"])
+            .args(["session", "reap", "--announce", "--json"])
             .output()
         {
             Ok(out) => classify_recheck(
@@ -547,7 +547,7 @@ fn dispatch_recheck_sessions() {
                 &String::from_utf8_lossy(&out.stdout),
                 &String::from_utf8_lossy(&out.stderr),
             ),
-            Err(e) => Err(format!("spawning `aoide graph reap`: {e}")),
+            Err(e) => Err(format!("spawning `aoide session reap`: {e}")),
         };
         let (event, detail) = match result {
             Ok(msg) => ("recheck", msg),
@@ -899,7 +899,7 @@ fn handle_conn(stream: UnixStream) {
             // on here, unlike the arms above.
             Some(BridgeCommand::RefreshUsage) => dispatch_usage_refresh(),
             // Fire-and-forget, same posture: dispatch_recheck_sessions re-execs
-            // `aoide graph reap` on a detached thread and audits its own outcome
+            // `aoide session reap` on a detached thread and audits its own outcome
             // (the sweep shells out to hyprctl, which must never block the accept
             // loop). The gadgets refresh off the resulting stage writes.
             Some(BridgeCommand::RecheckSessions) => dispatch_recheck_sessions(),
@@ -1127,7 +1127,7 @@ mod tests {
     fn classify_recheck_ok_envelope_returns_its_message() {
         let s = classify_recheck(
             true,
-            r#"{"status":"ok","command":"graph.reap","message":"reaped 1 dead session(s); dropped 1 total; decayed 0 stopped → idle; cleared 0 orphaned parent link(s); dropped 2 orphaned hook record(s)"}"#,
+            r#"{"status":"ok","command":"session.reap","message":"reaped 1 dead session(s); dropped 1 total; decayed 0 stopped → idle; cleared 0 orphaned parent link(s); dropped 2 orphaned hook record(s)"}"#,
             "",
         );
         assert!(s.is_ok());
@@ -1141,7 +1141,7 @@ mod tests {
         // failure (the whole point of judging the envelope, not just exit 0).
         let s = classify_recheck(
             true,
-            r#"{"status":"ok","command":"graph.reap","message":"nothing to reap (all sessions live)"}"#,
+            r#"{"status":"ok","command":"session.reap","message":"nothing to reap (all sessions live)"}"#,
             "",
         );
         assert_eq!(s, Ok("nothing to reap (all sessions live)".to_string()));
@@ -1152,7 +1152,7 @@ mod tests {
         // A real stage read/write failure exits 0-in-shape but reports "error".
         let s = classify_recheck(
             true,
-            r#"{"status":"error","command":"graph.reap","message":"could not write sessions.json: permission denied"}"#,
+            r#"{"status":"error","command":"session.reap","message":"could not write sessions.json: permission denied"}"#,
             "",
         );
         assert!(s.is_err());

@@ -32,12 +32,14 @@ Orient through four tiers, in order:
   Tier 3 — network MCP: enabled by the USER only, never by an agent.
 
 Conducting (aoide's headline): command another session with
-  aoide graph send --id <id> [--submit] [--yes] -- <text>
+  aoide send --id <id> [--submit] [--yes] -- <text>
 (held PENDING by default; --yes or an autogate policy delivers).
 
-Command surface — every group this binary registered at boot, with its
-command count (a stub is registered but not yet implemented; `aoide
-schema --json` is the exact tree):
+Command surface — every OPERATOR group this binary registered at boot, with
+its command count (a stub is registered but not yet implemented; hook-
+plumbing commands a harness drives, never a human — `session start/phase/
+end/hook` — are omitted here but still live in `aoide schema --json`, the
+exact full tree):
 ";
 
 const TAIL: &str = "\
@@ -64,10 +66,14 @@ forms: conducting, agent hooking, the rice loop). With no repo in view,
 /// derived from `r` — in the binary, always `dispatch::registry()`, the
 /// instance assembled at boot. Group = first path segment; rows keep
 /// registry order (the byte-stable order `schema --json` and the MCP tool
-/// list contract on).
+/// list contract on). `internal` commands (task #101 R1: hook-plumbing a
+/// harness drives, never a human typing it — `session start/phase/end/
+/// hook`) are skipped from this HUMAN listing entirely — they still appear
+/// in `schema --json`/the MCP tool list/the A2A AgentCard, since `internal`
+/// hides noise from a person, not capability from another door.
 pub fn render(r: &Registry) -> String {
     let mut groups: Vec<(&str, usize, usize)> = Vec::new();
-    for c in r.commands() {
+    for c in r.commands().filter(|c| !c.internal) {
         let name = c.path[0];
         match groups.iter_mut().find(|(g, _, _)| *g == name) {
             Some(entry) => {
@@ -100,9 +106,14 @@ mod tests {
     /// P-O3's gate: the printed total is DERIVED, so adding a command
     /// changes the guide with zero edits here. The golden snapshot test in
     /// `registry.rs` pins the registry to the golden path list; this pins
-    /// the guide's total to the registry.
+    /// the guide's total to the registry — MINUS `internal` commands,
+    /// deliberately (task #101 R1): `render` skips hook-plumbing from the
+    /// human listing on purpose, so the printed total is the OPERATOR
+    /// surface, not the full registry count. A future internal command
+    /// changes this test's count without changing the golden snapshot in
+    /// `registry.rs`, which still pins the full path set.
     #[test]
-    fn guide_total_equals_the_registry_path_count() {
+    fn guide_total_equals_the_registry_path_count_minus_internal() {
         let r = crate::dispatch::registry();
         let text = super::render(r);
         let line = text
@@ -118,15 +129,34 @@ mod tests {
             .unwrap()
             .parse()
             .expect("Total line starts with a number");
-        assert_eq!(
-            printed,
-            r.commands().count(),
-            "guide total drifted from the registry:\n{text}"
+        let operator_commands = r.commands().filter(|c| !c.internal).count();
+        assert!(
+            operator_commands < r.commands().count(),
+            "the hook-plumbing family must exist so this test proves the skip, not a no-op"
         );
-        let stubs = r.commands().filter(|c| !c.implemented).count();
+        assert_eq!(
+            printed, operator_commands,
+            "guide total drifted from the registry's non-internal commands:\n{text}"
+        );
+        let stubs = r.commands().filter(|c| !c.internal && !c.implemented).count();
         assert!(
             line.contains(&format!("({stubs} stub")),
             "guide stub tally drifted from the registry: {line}"
         );
+    }
+
+    /// The hook-plumbing family itself never appears in the human listing —
+    /// not as a row, not folded into another group's count.
+    #[test]
+    fn internal_commands_never_appear_in_the_guide_text() {
+        let r = crate::dispatch::registry();
+        let text = super::render(r);
+        for internal_cmd in r.commands().filter(|c| c.internal) {
+            assert!(
+                !text.contains(&internal_cmd.dotted()),
+                "internal command `{}` leaked into the human guide:\n{text}",
+                internal_cmd.dotted()
+            );
+        }
     }
 }

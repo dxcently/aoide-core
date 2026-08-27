@@ -24,13 +24,13 @@
   sanctioned sweep of dead sessions; don't add a second liveness mechanism.
   Reaping now also runs IN the daemon's own tick (P-D6, ~12s cadence) when
   one is resident — that is the SAME sweep (`reap`), not a second one; the
-  ~12s systemd timer's own `graph reap` becomes a redundant backstop, never
+  ~12s systemd timer's own `session reap` becomes a redundant backstop, never
   a third mechanism.
 - **Every session-write handler routes through `aoide_client::daemon::
   daemon_dispatch(inv)` FIRST, as its own first line, falling back to its
   pre-existing direct stage-write path byte-identically on `None` (P-D6,
-  `docs/architecture/AOIDED.md`'s "L4").** `graph session start/phase/end`,
-  `graph session hook`, and `reap::reap_and_announce` all follow this exact
+  `docs/architecture/AOIDED.md`'s "L4").** `session start/phase/end`,
+  `session hook`, and `reap::reap_and_announce` all follow this exact
   one-line prefix. A new session-write handler joins the family the same
   way — see `client`'s own `AGENTS.md` extension-point note. **`graph/
   carry.rs`'s `session_carry`, `graph/spawn.rs`'s `--carry` mark, and
@@ -52,7 +52,7 @@
   must never start carrying it, and a failed spawn must leave the old id
   exactly as it was. Don't split the add and the drop across two
   `save_carry` calls, and don't drop the check that the old id was carried.
-- **Bare `graph resurrect --project` selects the carried set, not a single
+- **Bare `resurrect --project` selects the carried set, not a single
   "most recent" entry (P-C4, durable-sessions plan).** `resurrect.rs`'s
   `carried_selection` is the one place that reads `sessions.json` for
   liveness — the daemon's boot sweep (`aoide-server`'s `daemon.rs`) no
@@ -68,11 +68,11 @@
   spawns a REAL `notify-send` on the live desktop whenever the sweep
   changed anything (or `--announce` is passed) — every in-crate caller and
   unit test calls the bare `reap` instead, and MUST keep doing so; a test
-  that dispatches the real `graph reap` command path (proving daemon/socket
+  that dispatches the real `session reap` command path (proving daemon/socket
   routing, not sweep logic) reaches `reap_and_announce` for real and has to
   neutralize `notify-send` itself (e.g. blanking `$PATH` for that one call)
   rather than letting a test fire a real toast on the machine running it.
-- **A session's exit — a clean `graph session end` OR a `reap` sweep — MUST
+- **A session's exit — a clean `session end` OR a `reap` sweep — MUST
   append exactly one line to the durable session ledger, through the SAME
   shared call (P-D8, `docs/architecture/AOIDED.md`'s "L5").**
   `graph/doc.rs::ledger_session_exit` is that one call;
@@ -130,7 +130,7 @@
     (the shellbridge event listener), `graph/window.rs::ensure_session_window`,
     and the two `discover_window()` call sites in `graph/send.rs`'s hook
     Start handling. Miss the discovery gate, the self-check, OR any one of
-    the four backfill sites, and a nested `conduct --headless`/`graph spawn`
+    the four backfill sites, and a nested `conduct --headless`/`spawn`
     re-acquires the ENCLOSING terminal's window — which is exactly what made
     the same-window eviction (below) treat an agent and its own headless
     grandchild as stale twins, and (via `reap`'s dedup pass, next bullet)
@@ -171,7 +171,7 @@
   what the edit did. A line running past `TYPED_LINE_CAP` poisons for the
   same reason: a clipped line is wrong text, not a short one. **Bytes
   arriving over an INJECTION connection poison too (`feed_injected`), and
-  that is a live finding, not caution:** `graph send` prefixes a delivered
+  that is a live finding, not caution:** `send` prefixes a delivered
   payload with its provenance, so the P-C7 soak captured a `typed` of
   `from quiet-birch (…1892): echo hello` — a line no human composed, which
   would not even run if preloaded. Don't restore the old "injection
@@ -221,9 +221,9 @@
   at boot, unattended, is the failure this separation exists to prevent.
 - **Restore delivery is SELF-ATTRIBUTED (`--from <new-id>`), and
   `send.rs`'s self-attribution rule delivers such bytes verbatim — both
-  halves stay, together (P-C7 live finding #2).** `graph send` prefixes a
+  halves stay, together (P-C7 live finding #2).** `send` prefixes a
   delivered payload with `from <sender>: ` for attribution; restore rides
-  `graph send`, so the live soak's resurrected re-exec arrived as `from
+  `send`, so the live soak's resurrected re-exec arrived as `from
   quiet-birch (…1892): /run/…/sleep 900` — a bash syntax error — and the
   preload as a line no human typed. The fix keys off the ATTRIBUTED sender
   (`resolve_sender`, i.e. `--from`), never the gate's env-resolved
@@ -270,7 +270,7 @@
   successful live probe refresh the cache as a side effect.
 - **`send::deliver_local`'s success path is ONE of exactly TWO inbox-filing
   calls in the whole tree — never a third.** Every consumer that delivers
-  into an ALREADY-REGISTERED session's socket (`graph send --id`, `--to`
+  into an ALREADY-REGISTERED session's socket (`send --id`, `--to`
   resolving local, `pending approve`'s re-drive, `aoide-server`'s A2A
   `do_inject`) reaches it through `session_send`; do NOT add a second
   `aoide_storage::inbox::receive` call for any of those — `do_inject` in
@@ -283,7 +283,7 @@
   (see `aoide_storage::inbox`'s module doc for the full two-writer
   reasoning).
 - **`graph/spawn.rs`'s `build_conduct_args` is the ONE place the `aoide
-  conduct -- <agent cmd>` argv gets built (P-D7).** Both `graph spawn`
+  conduct -- <agent cmd>` argv gets built (P-D7).** Both `spawn`
   launch modes — headless (default) and `--windowed` (execs a real terminal
   from `$AOIDE_TERMINAL` instead of detaching) — call it, `--headless`
   aside; do NOT hand-roll a second argv builder for the windowed path, or

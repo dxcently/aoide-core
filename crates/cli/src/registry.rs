@@ -48,19 +48,46 @@ mod tests {
         let r = crate::commands::all();
         let with = r
             .commands()
-            .find(|c| c.dotted() == "graph.project.add")
-            .expect("graph project add carries examples");
+            .find(|c| c.dotted() == "project.add")
+            .expect("project add carries examples");
         let v = serde_json::to_value(with).unwrap();
-        assert_eq!(v["examples"][0], "graph project add aoide ~/Aoide");
+        assert_eq!(v["examples"][0], "project add aoide ~/Aoide");
 
         let without = r
             .commands()
-            .find(|c| c.dotted() == "graph.prune")
-            .expect("graph prune carries none");
+            .find(|c| c.dotted() == "session.prune")
+            .expect("session prune carries none");
         let v = serde_json::to_value(without).unwrap();
         assert!(
             v.get("examples").is_none(),
             "no examples → no key (byte-identical schema): {v}"
+        );
+    }
+
+    /// `internal` is additive (CONTRACTS.md §3), same discipline `examples`
+    /// carries above: a non-internal command's schema stays byte-identical
+    /// to before the field existed (no `internal` key at all), while the
+    /// hook-plumbing family (task #101 R1) carries `"internal":true`.
+    #[test]
+    fn internal_key_is_absent_unless_the_command_is_hook_plumbing() {
+        let r = crate::commands::all();
+        let hook_cmd = r
+            .commands()
+            .find(|c| c.dotted() == "session.start")
+            .expect("session start is the hook-plumbing family");
+        assert!(hook_cmd.internal, "session.start is marked internal");
+        let v = serde_json::to_value(hook_cmd).unwrap();
+        assert_eq!(v["internal"], true);
+
+        let operator_cmd = r
+            .commands()
+            .find(|c| c.dotted() == "graph")
+            .expect("bare graph is an ordinary operator command");
+        assert!(!operator_cmd.internal);
+        let v = serde_json::to_value(operator_cmd).unwrap();
+        assert!(
+            v.get("internal").is_none(),
+            "non-internal command carries no `internal` key at all: {v}"
         );
     }
 
@@ -82,6 +109,14 @@ mod tests {
         let mut got: Vec<String> = r.commands().map(|c| c.dotted()).collect();
         got.sort();
 
+        // The R1 graph-prefix cutover (task #101, Lane R) renamed 18 of the 19
+        // former `graph.*` spellings in place — same 73-count, no aliases:
+        // `graph.view` -> bare `graph` (the render; `graph.link` alone
+        // survives the family), `graph.send`/`graph.spawn`/`graph.resurrect`
+        // -> bare `send`/`spawn`/`resurrect`, `graph.session.*`/`graph.permit`/
+        // `graph.pending.*`/`graph.reap`/`graph.prune` -> `session.*`,
+        // `graph.project.*` -> `project.*`. See `conduct/src/commands/
+        // graph.rs`'s module doc for the full table.
         let mut expected: Vec<&str> = vec![
             "a2a.serve",
             "adapter.melete",
@@ -94,25 +129,8 @@ mod tests {
             "content.register",
             "daemon",
             "events.tail",
+            "graph",
             "graph.link",
-            "graph.pending.approve",
-            "graph.pending.deny",
-            "graph.pending.list",
-            "graph.permit",
-            "graph.project.add",
-            "graph.project.list",
-            "graph.project.remove",
-            "graph.prune",
-            "graph.reap",
-            "graph.resurrect",
-            "graph.send",
-            "graph.session.carry",
-            "graph.session.end",
-            "graph.session.hook",
-            "graph.session.phase",
-            "graph.session.start",
-            "graph.spawn",
-            "graph.view",
             "guide",
             "hooks.install",
             "identity",
@@ -135,10 +153,11 @@ mod tests {
             "peer.remove",
             "peer.spawn",
             "peer.status",
+            "project.add",
+            "project.list",
+            "project.remove",
+            "resurrect",
             "schema",
-            "soundcheck",
-            "update",
-            "usage",
             "secrets.add",
             "secrets.approve",
             "secrets.automate",
@@ -155,6 +174,22 @@ mod tests {
             "secrets.serve",
             "secrets.set-totp",
             "secrets.watch",
+            "send",
+            "session.carry",
+            "session.end",
+            "session.hook",
+            "session.pending.approve",
+            "session.pending.deny",
+            "session.pending.list",
+            "session.permit",
+            "session.phase",
+            "session.prune",
+            "session.reap",
+            "session.start",
+            "soundcheck",
+            "spawn",
+            "update",
+            "usage",
             "who",
         ];
         expected.sort();

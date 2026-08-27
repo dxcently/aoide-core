@@ -1,10 +1,10 @@
-//! `graph send` — the gated injection door — and the hook door (`graph
-//! session hook`) that maps Claude-Code hook payloads onto the session/
+//! `send` — the gated injection door — and the hook door (`session hook`)
+//! that maps Claude-Code hook payloads onto the session/
 //! sub-agent commands. The one place untrusted agent-bound text and untrusted
 //! hook JSON both land, so every outcome is audited and a hook payload never
 //! propagates as anything but data.
 //!
-//! `graph send` has two ways to name a target (messaging plan P-C3):
+//! `send` has two ways to name a target (messaging plan P-C3):
 //! `--id <id>` (the original, unchanged) or `--to <target>` (resolved via
 //! `aoide_storage::addr::resolve`, mutually exclusive with `--id` — see
 //! [`session_send`]). A LOCAL `--to` match re-drives the exact `--id` path
@@ -40,7 +40,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 
-// ── `graph send`: the gated injection door ──────────────────────────────────
+// ── `send`: the gated injection door ──────────────────────────────────
 
 /// A pending (unapproved) injection, staged for the conductor to surface for a
 /// one-key approve/deny. Written atomically to `state/stage/pending.json`.
@@ -195,8 +195,8 @@ fn send_gate(yes: bool, sender_is_parent: bool, is_sibling: bool) -> SendGate {
     }
 }
 
-/// Does this injected text NAME the node? A `graph send` steer is a task, so it
-/// renames; a bare KEYSTROKE answer is not. `graph permit` types a single digit
+/// Does this injected text NAME the node? A `send` steer is a task, so it
+/// renames; a bare KEYSTROKE answer is not. `session permit` types a single digit
 /// to answer a permission prompt (and a human answering a numbered prompt by
 /// hand types the same thing), and letting that overwrite the node's title with
 /// `1` would erase the one label the dock and the graph tree identify the
@@ -237,7 +237,7 @@ fn sanitize_sender(raw: &str) -> String {
 /// **ATTRIBUTION, NOT SECURITY.** Neither source is proof of identity: `--from`
 /// is a plain CLI flag any same-user process can set to whatever string it
 /// likes, and `AOIDE_SESSION_ID` is an ordinary env var any same-user process
-/// can export before calling `graph send` — both are trivially spoofable by
+/// can export before calling `send` — both are trivially spoofable by
 /// anyone who can already run `aoide` as this user. This exists so a
 /// receiving agent and the audit log can see who CLAIMS to have sent a
 /// message, not to gate delivery on that claim (the gate in [`send_gate`] is
@@ -282,7 +282,7 @@ fn provenance_prefix(sender: Option<&str>, text: &str) -> Option<String> {
 
 /// Map a resolved+sanitized sender id to its TERSE provenance DISPLAY form —
 /// `<petname> (…<tail4>)` (petnames plan P3's grammar, minus host/role: the
-/// composer prefix stays deliberately narrower than the full `graph view`/
+/// composer prefix stays deliberately narrower than the full bare `graph`/
 /// pending-list grammar) — when `sender` resolves against `sessions` (the
 /// caller's ALREADY-LOADED roster, no second read) to a record carrying a
 /// minted petname. Falls back to `sender` unchanged for an unknown sender or
@@ -361,7 +361,7 @@ fn set_session_title(id: &str, title: &str) -> Result<(), String> {
 
 /// Name a session from its FIRST user prompt — set the `title` slot only when it
 /// is still empty, so the opening prompt names the session and later prompts do
-/// not rename it (a deliberate `graph send` steer still overwrites via
+/// not rename it (a deliberate `send` steer still overwrites via
 /// [`set_session_title`] — that IS a rename). Under the stage lock (this runs on
 /// every UserPromptSubmit hook, concurrent with conduct ticks). No-op for an
 /// unregistered id. Re-stages only when it wrote.
@@ -414,7 +414,7 @@ fn audit_send(inv: &Invocation, status: &str, message: &str, text: &str) {
             ts: super::conduct::unix_ts(),
             door: inv.door,
             class: aoide_protocol::EventClass::Audit,
-            command: "graph.send".to_string(),
+            command: "send".to_string(),
             status: status.to_string(),
             message,
             untrusted_data: Some(text.to_string()),
@@ -422,7 +422,7 @@ fn audit_send(inv: &Invocation, status: &str, message: &str, text: &str) {
     );
 }
 
-/// `aoide graph send (--id <id> | --to <target>) [--submit] [--yes] -- <text
+/// `aoide send (--id <id> | --to <target>) [--submit] [--yes] -- <text
 /// …>` — the one injection door, with two ways to name the target (messaging
 /// plan P-C3 added `--to`; mutually exclusive with `--id`, checked before
 /// either resolves).
@@ -464,7 +464,7 @@ fn audit_send(inv: &Invocation, status: &str, message: &str, text: &str) {
 /// With NEITHER flag, this is a usage error (same as before `--to` existed —
 /// `require_flag` below is untouched).
 pub fn session_send(inv: &Invocation) -> Outcome {
-    let cmd = "graph.send";
+    let cmd = "send";
     let to = inv
         .flags
         .get("to")
@@ -474,7 +474,7 @@ pub fn session_send(inv: &Invocation) -> Outcome {
     if to.is_some() && id_present {
         return Outcome::usage(
             cmd,
-            "usage: aoide graph send (--id <id> | --to <target>) [--submit] [--yes] -- <text …> \
+            "usage: aoide send (--id <id> | --to <target>) [--submit] [--yes] -- <text …> \
              — --id and --to are mutually exclusive",
         );
     }
@@ -488,7 +488,7 @@ pub fn session_send(inv: &Invocation) -> Outcome {
     if inv.args.is_empty() {
         return Outcome::usage(
             cmd,
-            "usage: aoide graph send --id <id> [--submit] [--yes] -- <text …>",
+            "usage: aoide send --id <id> [--submit] [--yes] -- <text …>",
         );
     }
     deliver_local(inv, &id)
@@ -501,8 +501,8 @@ pub fn session_send(inv: &Invocation) -> Outcome {
 /// below is byte-identical to the pre-P-C3 function body (no `&id`/`id`
 /// reference-vs-owned churn to review).
 fn deliver_local(inv: &Invocation, id: &str) -> Outcome {
-    let cmd = "graph.send";
-    // Accept the exact `session:<id>` form `graph view --json` emits for a
+    let cmd = "send";
+    // Accept the exact `session:<id>` form `graph --json` emits for a
     // node id, so a copy-pasted id round-trips through `--id` — mirrors
     // `focus_session`'s identical `session:` stripping (window.rs). Only this
     // known prefix is special-cased; anything else passes through untouched
@@ -560,7 +560,7 @@ fn deliver_local(inv: &Invocation, id: &str) -> Outcome {
     // both sides of the comparison) — but it is not a sibling relationship at
     // all, it is a session talking to itself. `AOIDE_SESSION_ID` is exported
     // into every conducted child's own env, so an unguarded predicate here
-    // would let a prompt-injected `graph send --id "$AOIDE_SESSION_ID" --submit
+    // would let a prompt-injected `send --id "$AOIDE_SESSION_ID" --submit
     // -- <text>` self-deliver text straight back into its own input stream,
     // bypassing approval entirely — a gate WIDENING, not a convenience. Excluded
     // before the predicate ever runs.
@@ -597,7 +597,7 @@ fn deliver_local(inv: &Invocation, id: &str) -> Outcome {
     // Deliver: connect + write the payload (+ the target's own submit
     // keystroke on --submit, decided from the ORIGINAL text before any
     // prefix). Resolved from `rec.agent` through the SAME profile lookup
-    // `graph permit` uses (`profile_for_agent`, promoted `pub(in
+    // `session permit` uses (`profile_for_agent`, promoted `pub(in
     // crate::graph)` in permit.rs) — an unregistered/empty agent falls back
     // to claude's `\n`, exactly as that lookup already does; no second
     // resolver. The provenance prefix (see [`provenance_prefix`]) is then
@@ -619,7 +619,7 @@ fn deliver_local(inv: &Invocation, id: &str) -> Outcome {
     // A send ATTRIBUTED TO THE TARGET ITSELF (`--from <target-id>`, or a
     // genuine env self-send) is never prefixed: "from yourself:" attributes
     // nothing, and the one caller that legitimately produces this shape —
-    // `graph resurrect`'s restore delivery, putting a session's own prior
+    // `resurrect`'s restore delivery, putting a session's own prior
     // bytes back at its own prompt — needs those bytes verbatim (a prefixed
     // re-exec is a shell syntax error; a prefixed preload is a line no human
     // typed). Note this keys off the ATTRIBUTED sender, not the gate's
@@ -662,7 +662,7 @@ fn deliver_local(inv: &Invocation, id: &str) -> Outcome {
     // covers every route a message takes to land here: a direct `--id`
     // send, a `--to <local target>` (re-drives this exact function), a
     // `pending approve` re-drive, AND the A2A server's `do_inject`
-    // (`crates/server/src/a2a.rs`) — `do_inject` builds a `graph send --id`
+    // (`crates/server/src/a2a.rs`) — `do_inject` builds a `send --id`
     // invocation and calls `session_send` too, which for a same-box
     // `contextId` can only ever reach THIS branch (it never sets `--to`).
     // See `aoide_storage::inbox`'s module doc for the full reasoning and
@@ -731,11 +731,11 @@ fn deliver_local(inv: &Invocation, id: &str) -> Outcome {
 /// `aoide_storage::addr`'s own "ambiguity is an error, never first-match"
 /// rule in its home context, restated here for send specifically).
 fn session_send_to(inv: &Invocation, target: &str) -> Outcome {
-    let cmd = "graph.send";
+    let cmd = "send";
     if inv.args.is_empty() {
         return Outcome::usage(
             cmd,
-            "usage: aoide graph send --to <target> [--submit] [--yes] -- <text …>",
+            "usage: aoide send --to <target> [--submit] [--yes] -- <text …>",
         );
     }
     let text = inv.args.join(" ");
@@ -926,7 +926,7 @@ fn ignored_remote_flags(inv: &Invocation) -> Vec<&'static str> {
 /// for the same reason). Authenticated cross-host provenance is #51's
 /// scope, not this phase's (messaging plan, "Verified facts").
 fn deliver_remote(inv: &Invocation, peer: &aoide_storage::peer_store::Peer, query: &str) -> Outcome {
-    let cmd = "graph.send";
+    let cmd = "send";
     let text = inv.args.join(" ");
     // `--submit`/`--yes` are accepted-but-unused for a remote send (see this
     // function's own doc) — a caller who habitually passes them gets no
@@ -1524,7 +1524,7 @@ fn hook_ensure_session(profile: &AgentProfile, payload: &Value, id: &str) {
 }
 
 fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
-    let cmd = "graph.session.hook";
+    let cmd = "session.hook";
     let noop = |reason: &str| {
         Outcome::ok(cmd, format!("no-op ({reason})"))
             .with_data(json!({ "action": "none", "reason": reason }))
@@ -1671,7 +1671,7 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
                 do_subagent_spawn(&sp.sub_id, &owner, &sp.name, &sp.agent_type, true);
             }
             set_owner_activity(&owner, "working", activity.as_deref());
-            Outcome::ok("graph.session.hook", format!("tool start → {owner}"))
+            Outcome::ok("session.hook", format!("tool start → {owner}"))
         }
         HookAction::ToolEnd {
             session,
@@ -1686,7 +1686,7 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
             // The tool finished; the owner is still in its turn (working) but no
             // longer running that tool — clear its `activity`.
             set_owner_activity(&owner, "working", None);
-            Outcome::ok("graph.session.hook", format!("tool end → {owner}"))
+            Outcome::ok("session.hook", format!("tool end → {owner}"))
         }
         HookAction::SubRekey {
             session,
@@ -1702,7 +1702,7 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
             // activity, exactly as a normal tool boundary would.
             set_owner_activity(&owner, "working", None);
             Outcome::ok(
-                "graph.session.hook",
+                "session.hook",
                 format!("subagent rekey {from_sub_id} → {to_sub_id}"),
             )
         }
@@ -1714,11 +1714,11 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
         } => {
             hook_ensure_session(profile, &payload, &session);
             do_subagent_spawn(&sub_id, &session, &agent_type, &agent_type, create);
-            Outcome::ok("graph.session.hook", format!("subagent {sub_id}"))
+            Outcome::ok("session.hook", format!("subagent {sub_id}"))
         }
         HookAction::SubEnd { sub_id } => {
             do_subagent_end(&sub_id);
-            Outcome::ok("graph.session.hook", format!("subagent end {sub_id}"))
+            Outcome::ok("session.hook", format!("subagent end {sub_id}"))
         }
         HookAction::End { id } => do_session_end(&id),
     };
@@ -1813,7 +1813,7 @@ fn hook_profile_for(inv: &Invocation) -> Result<&'static AgentProfile, Outcome> 
         .unwrap_or(CLAUDE_PROFILE.name);
     agent_profile(name).ok_or_else(|| {
         Outcome::error(
-            "graph.session.hook",
+            "session.hook",
             format!("unknown agent `{name}` (known: {})", known_agents().join(", ")),
         )
         .with_data(json!({ "reason": "unknown-agent", "agent": name, "known": known_agents() }))
@@ -1836,7 +1836,7 @@ fn hook_profile_for(inv: &Invocation) -> Result<&'static AgentProfile, Outcome> 
 /// which is never the calling hook's own pipe.
 const STDIN_PAYLOAD_FLAG: &str = "__daemon-stdin-payload";
 
-/// `graph session hook [--agent <name>]` — the hook door for agent harnesses.
+/// `session hook [--agent <name>]` — the hook door for agent harnesses.
 /// Reads ONE JSON object from stdin and maps it (through the selected agent
 /// profile) to the session commands. Never exits non-zero for a payload problem
 /// (see [`hook_for_profile`]); a bogus `--agent` is a plain CLI error.
@@ -2025,7 +2025,7 @@ mod tests {
         // An audit line for the delivery was written.
         let log = std::fs::read_to_string(root.join("log")).unwrap_or_default();
         assert!(
-            log.contains("graph.send") && log.contains("delivered"),
+            log.contains("send") && log.contains("delivered"),
             "audit log carries the delivered send: {log}"
         );
 
@@ -2033,7 +2033,7 @@ mod tests {
     }
     #[test]
     fn send_id_accepts_the_session_prefix_graph_view_emits() {
-        // `graph view --json` emits node ids as `session:<id>` (doc.rs's
+        // `graph --json` emits node ids as `session:<id>` (doc.rs's
         // `render`); an agent copying that field verbatim into `--id`
         // must resolve to the exact same session a bare `--id` would.
         let _guard = crate::env_lock().lock().unwrap();
@@ -2078,7 +2078,7 @@ mod tests {
             buf
         });
 
-        // The exact id `graph view --json` would emit for this session.
+        // The exact id `graph --json` would emit for this session.
         let prefixed = format!("session:{id}");
         let out = session_send(&send_invocation(
             &["hi", "there"],
@@ -2088,7 +2088,7 @@ mod tests {
 
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["delivered"], true);
-        // The resolved id reported back is the BARE id — `graph view`'s own
+        // The resolved id reported back is the BARE id — bare `graph`'s own
         // emitted contract is untouched, but the resolved target is the same
         // session a bare `--id` would have hit.
         assert_eq!(out.data.as_ref().unwrap()["id"], id);
@@ -2223,7 +2223,7 @@ mod tests {
     }
     #[test]
     fn a_keystroke_answer_is_delivered_but_never_renames_the_node() {
-        // `graph permit` types a bare verdict digit through this door; a title
+        // `session permit` types a bare verdict digit through this door; a title
         // of `1` would erase the only label the dock identifies the session by.
         assert!(names_the_node("hello world"));
         assert!(names_the_node("fix the auth test"));
@@ -2317,7 +2317,7 @@ mod tests {
         assert_eq!(provenance_prefix(None, "hello world"), None);
         // A keystroke/verdict payload (no letters) is never prefixed, even
         // with a sender resolved — this is the regression that matters most:
-        // `graph permit`'s bare digit must reach the socket byte-identical.
+        // `session permit`'s bare digit must reach the socket byte-identical.
         assert_eq!(provenance_prefix(Some("orch"), "1"), None);
         assert_eq!(provenance_prefix(Some("orch"), "3\n"), None);
         assert_eq!(provenance_prefix(Some("orch"), "  2  "), None);
@@ -2464,7 +2464,7 @@ mod tests {
     }
 
     /// A send ATTRIBUTED TO THE TARGET ITSELF (`--from <target-id>`) delivers
-    /// its bytes verbatim — no provenance prefix. This is `graph resurrect`'s
+    /// its bytes verbatim — no provenance prefix. This is `resurrect`'s
     /// restore-delivery shape: the session's own prior bytes going back to
     /// its own prompt. Pinned against the live P-C7 finding, where the
     /// restored re-exec arrived as `from quiet-birch (…1892): /run/…/sleep
@@ -2533,7 +2533,7 @@ mod tests {
     }
     #[test]
     fn a_permit_shaped_keystroke_is_delivered_with_no_prefix_even_with_a_sender() {
-        // The regression that matters most: `graph permit`'s bare-digit
+        // The regression that matters most: `session permit`'s bare-digit
         // verdict (or a hand-typed answer of the same shape) must reach the
         // socket as EXACTLY the digit + newline — a provenance prefix here
         // would corrupt the keystroke the target's TUI is waiting to read.
@@ -2728,7 +2728,7 @@ mod tests {
     fn send_yes_to_an_unregistered_agent_defaults_to_newline_submit() {
         // An unregistered ("shell") or empty agent string falls back to the
         // claude profile's `\n` — the same fallback `profile_for_agent`
-        // already applies for `graph permit`.
+        // already applies for `session permit`.
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
@@ -3818,7 +3818,7 @@ mod tests {
         );
 
         let log = std::fs::read_to_string(root.join("log")).unwrap_or_default();
-        assert!(log.contains("graph.send"), "audit line written even on a failed remote delivery: {log}");
+        assert!(log.contains("send"), "audit line written even on a failed remote delivery: {log}");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5050,16 +5050,16 @@ mod tests {
     #[test]
     fn hook_agent_flag_selects_the_profile_or_errors() {
         // No flag → the claude default.
-        let inv = flag_invocation(&["graph", "session", "hook"], &[]);
+        let inv = flag_invocation(&["session", "hook"], &[]);
         assert_eq!(hook_profile_for(&inv).unwrap().name, "claude");
         // --agent kimi → the kimi profile.
-        let inv = flag_invocation(&["graph", "session", "hook"], &[("agent", "kimi")]);
+        let inv = flag_invocation(&["session", "hook"], &[("agent", "kimi")]);
         assert_eq!(hook_profile_for(&inv).unwrap().name, "kimi");
         // --agent pi → the pi profile.
-        let inv = flag_invocation(&["graph", "session", "hook"], &[("agent", "pi")]);
+        let inv = flag_invocation(&["session", "hook"], &[("agent", "pi")]);
         assert_eq!(hook_profile_for(&inv).unwrap().name, "pi");
         // --agent bogus → a structured error (exit 1, reason + the known list).
-        let inv = flag_invocation(&["graph", "session", "hook"], &[("agent", "bogus")]);
+        let inv = flag_invocation(&["session", "hook"], &[("agent", "bogus")]);
         let out = match hook_profile_for(&inv) {
             Err(o) => o,
             Ok(p) => panic!("bogus agent resolved to {}", p.name),

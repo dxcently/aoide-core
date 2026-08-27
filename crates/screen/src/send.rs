@@ -6,7 +6,7 @@
 //! door, never a second injection path: it composes the message, then calls
 //! [`aoide_conduct::graph::session_send`] DIRECTLY (a same-process function
 //! call via a synthesized [`Invocation`] — never a subprocess shell-out to
-//! `aoide graph send`). That function is `aoide graph send`'s own handler:
+//! `aoide send`). That function is `aoide send`'s own handler:
 //! HELD pending approval by default, `--yes` (or autogate) delivers, every
 //! outcome audited. `screen send` inherits ALL of that for free — no second
 //! gate exists anywhere in this file.
@@ -154,7 +154,7 @@ fn wrap(ctx: &SendCtx, kind: &'static str, target: &str, message: &str, state: &
 /// flag on `screen send` — a handed-off capture is a complete message meant
 /// to be acted on the instant it's approved (like pressing Enter after
 /// pasting text to a colleague), not partial text left sitting in the
-/// target's prompt. `aoide graph send` itself keeps the raw `--submit` knob
+/// target's prompt. `aoide send` itself keeps the raw `--submit` knob
 /// for anyone who needs that choice; `screen send` doesn't add a second one
 /// (YAGNI).
 fn send_to_session(inv: &Invocation, ctx: &SendCtx, id: &str, message: &str, yes: bool, audit_log: Option<&str>) -> Outcome {
@@ -168,7 +168,7 @@ fn send_to_session(inv: &Invocation, ctx: &SendCtx, id: &str, message: &str, yes
         flags.insert("audit-log".to_string(), log.to_string());
     }
     let sub_inv = Invocation {
-        path: vec!["graph".to_string(), "send".to_string()],
+        path: vec!["send".to_string()],
         args: vec![message.to_string()],
         flags,
         door: inv.door,

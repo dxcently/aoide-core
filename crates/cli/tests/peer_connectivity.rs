@@ -111,13 +111,13 @@ fn peer_add_and_pull_round_trip_over_real_http_between_two_loopback_instances() 
 
     // Seed a real, checkable node on the (shared, single-process) stage
     // BEFORE peer B starts serving, so B's FIRST graphSummary response
-    // carries it. (The path must be a real absolute dir — `graph project
+    // carries it. (The path must be a real absolute dir — `project
     // add` rejects anything else now — so it lives under this test's own
     // `root` and is removed with it.)
     let remote = root.join("remote");
     std::fs::create_dir_all(&remote).unwrap();
     let seed = dispatch(&cli_invocation(
-        &["graph", "project", "add"],
+        &["project", "add"],
         &["aoide-remote", remote.to_str().unwrap()],
         &[],
     ));
@@ -184,16 +184,16 @@ fn peer_add_and_pull_round_trip_over_real_http_between_two_loopback_instances() 
     let local = root.join("local");
     std::fs::create_dir_all(&local).unwrap();
     let mutate = dispatch(&cli_invocation(
-        &["graph", "project", "add"],
+        &["project", "add"],
         &["local-only", local.to_str().unwrap()],
         &[],
     ));
     assert_eq!(mutate.status, Status::Ok);
 
-    // The fold: `graph view --json`'s resolved document now carries BOTH
+    // The fold: `graph --json`'s resolved document now carries BOTH
     // local projects PLUS a `peer:yomi-strix` root node whose `children`
     // reflect the OLD (pre-mutation) snapshot only.
-    let view_out = dispatch(&cli_invocation(&["graph", "view"], &[], &[("json", "true")]));
+    let view_out = dispatch(&cli_invocation(&["graph"], &[], &[("json", "true")]));
     assert_eq!(view_out.status, Status::Ok);
     let doc = view_out.data.as_ref().unwrap();
     let nodes = doc["nodes"].as_array().unwrap();
@@ -309,7 +309,7 @@ fn peer_add_against_an_unreachable_url_never_registers_and_pull_of_a_down_peer_m
 
     // And the fold shows both: `good-peer` fresh with children, `flaky`
     // stale with none — never a crash, never a silently-dropped peer.
-    let view_out = dispatch(&cli_invocation(&["graph", "view"], &[], &[("json", "true")]));
+    let view_out = dispatch(&cli_invocation(&["graph"], &[], &[("json", "true")]));
     let nodes = view_out.data.as_ref().unwrap()["nodes"].as_array().unwrap();
     let good_node = nodes.iter().find(|n| n["id"] == "peer:good").unwrap();
     assert_eq!(good_node["state"], "fresh");

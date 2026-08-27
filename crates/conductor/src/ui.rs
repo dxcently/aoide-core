@@ -20,7 +20,7 @@
 //! throttled, backgrounded `who` dispatch (`app`'s "ROSTER" section covers
 //! the threading; this file only paints what `App::roster_flat_rows` hands
 //! it) — plus, since P-C5, selection and an `s`-to-compose affordance.
-//! PENDING is held `graph send`/A2A entries from `graph pending list`, a
+//! PENDING is held `send`/A2A entries from `session pending list`, a
 //! synchronous local read (`app`'s "PENDING" section) with `a`/`d`
 //! approve/deny.
 
@@ -731,8 +731,8 @@ fn roster_row_item<'a>(row: &crate::app::RosterRow, pal: &crate::app::Palette) -
 
 // ── [6] PENDING ──────────────────────────────────────────────────────────
 
-/// Held `graph send` / A2A entries (messaging/presence plan, P-C5) — rows
-/// from `graph pending list --json`, dispatched through the same injected
+/// Held `send` / A2A entries (messaging/presence plan, P-C5) — rows
+/// from `session pending list --json`, dispatched through the same injected
 /// `DispatchFn` as every other pane, never re-derived. `a`/`d` approve/deny
 /// the selected row; `id` in each row is an ARRAY POSITION, not a stable id
 /// (`conduct/src/graph/pending.rs`'s module doc), so [`App`] always re-lists
@@ -876,7 +876,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         "    r forces a refresh; auto-probes every ~15s while the pane is",
         "    open. ● online  ◐ unreachable  ○ never-pulled",
         "",
-        "  PENDING: j/k select · a approve · d deny — held graph send/A2A",
+        "  PENDING: j/k select · a approve · d deny — held send/A2A",
         "    entries; resolving always re-lists (ids are positions, not",
         "    stable — they shift the moment any entry resolves)",
         "",
@@ -1216,7 +1216,7 @@ mod tests {
                 ts: 1,
                 door: "cli".into(),
                 class: "audit".into(),
-                command: "graph.prune".into(),
+                command: "session.prune".into(),
                 status: "ok".into(),
                 message: "staged".into(),
             },
@@ -1230,7 +1230,7 @@ mod tests {
             },
         ];
         let out = render_panel(&app, Panel::Log, 100, 20);
-        assert!(out.contains("graph.prune") && out.contains("graph.focus"));
+        assert!(out.contains("session.prune") && out.contains("graph.focus"));
         assert!(out.contains("cli"), "door column visible");
     }
 
@@ -1506,7 +1506,7 @@ mod tests {
                 },
             ],
         });
-        aoide_protocol::output::Outcome::ok("graph.pending.list", "3 pending").with_data(data)
+        aoide_protocol::output::Outcome::ok("session.pending.list", "3 pending").with_data(data)
     }
 
     #[test]
@@ -1541,7 +1541,7 @@ mod tests {
         let mut a = App::for_test(vec![], vec![], vec![]);
         a.panel = Panel::Pending;
         a.pending = Some(
-            aoide_protocol::output::Outcome::ok("graph.pending.list", "0 pending")
+            aoide_protocol::output::Outcome::ok("session.pending.list", "0 pending")
                 .with_data(serde_json::json!({ "pending": [] })),
         );
 

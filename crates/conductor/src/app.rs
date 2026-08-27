@@ -120,7 +120,7 @@ pub enum InputKind {
     },
     /// Compose a message to `target` (messaging/presence plan, P-C5) — opened
     /// by `s` on a selected ROSTER session row, pre-labeled with the row's own
-    /// display-grammar label. Submitting dispatches `graph send --to <target>
+    /// display-grammar label. Submitting dispatches `send --to <target>
     /// --yes -- <text>` ([`App::handle_input_key`]'s `Enter` arm).
     Compose {
         target: String,
@@ -245,7 +245,7 @@ pub enum RosterRow {
     Empty,
 }
 
-/// One row of the PENDING panel — reshaped straight from `graph pending
+/// One row of the PENDING panel — reshaped straight from `session pending
 /// list --json`'s `data.pending[]` (`conduct/src/graph/pending.rs::entry_view`),
 /// never re-derived: `id` is the entry's ARRAY POSITION, not a stable id (see
 /// that module's doc) — `App`'s a/d handlers must always re-list immediately
@@ -314,7 +314,7 @@ pub struct App {
     roster_rx: Option<mpsc::Receiver<Outcome>>,
     /// Selected row in the ROSTER panel (indexes [`App::roster_flat_rows`]).
     pub roster_sel: usize,
-    /// The PENDING panel's cache — last `graph pending list` [`Outcome`]. No
+    /// The PENDING panel's cache — last `session pending list` [`Outcome`]. No
     /// throttle metadata (unlike [`RosterCache`]): a local file read refreshes
     /// synchronously on the same cadence every other local pane uses (see
     /// [`App::refresh_pending`]).
@@ -802,9 +802,9 @@ impl App {
         }
     }
 
-    // ── PENDING: `graph pending list` through the dispatcher (P-C5) ─────────
+    // ── PENDING: `session pending list` through the dispatcher (P-C5) ─────────
     //
-    // Unlike ROSTER's `who`, `graph pending list` is a local file read (no
+    // Unlike ROSTER's `who`, `session pending list` is a local file read (no
     // network) — refreshing it costs one JSON parse of `state/stage/pending.json`,
     // not a ~2s-per-peer probe. So there is no throttle window and no
     // background thread here: [`App::refresh_pending`] runs synchronously,
@@ -812,13 +812,13 @@ impl App {
     // what makes "re-list after every resolve" true) and from
     // [`App::poll_pending`] every tick while the pane is visible.
 
-    /// Refresh `self.pending` via the injected dispatcher — `graph pending
+    /// Refresh `self.pending` via the injected dispatcher — `session pending
     /// list`'s malformed-entry detection and display-grammar rendering stay
     /// in `conduct::graph::pending` (`crates/AGENTS.md`'s "no cross-crate
     /// copying"); this only reshapes the JSON it already computed.
     fn refresh_pending(&mut self) {
         let inv = Invocation {
-            path: vec!["graph".to_string(), "pending".to_string(), "list".to_string()],
+            path: vec!["session".to_string(), "pending".to_string(), "list".to_string()],
             args: Vec::new(),
             flags: BTreeMap::from([("json".to_string(), "true".to_string())]),
             door: Door::Cli,
@@ -839,7 +839,7 @@ impl App {
         }
     }
 
-    /// The PENDING panel's rows, parsed from the cached `graph pending list`
+    /// The PENDING panel's rows, parsed from the cached `session pending list`
     /// [`Outcome`] (never re-derived). `id` is each entry's ARRAY POSITION —
     /// see [`PendingRow`]'s doc — so a caller must re-fetch (which
     /// [`App::dispatch`] already does via `reload_all`) before trusting a
@@ -868,7 +868,7 @@ impl App {
 
     /// A one-line status for the pane header — mirrors [`App::roster_status`]'s
     /// non-`Ok` surfacing (P-C4 review nit, same rule here): a failed
-    /// `graph pending list` (a corrupt `pending.json` file, not a malformed
+    /// `session pending list` (a corrupt `pending.json` file, not a malformed
     /// individual entry — that lists fine with `state: "malformed"`) must not
     /// silently render as an empty, all-clear queue.
     pub fn pending_status(&self) -> String {
@@ -1041,14 +1041,14 @@ impl App {
     /// outcome for the status line, and refresh live state (an action likely
     /// wrote a stage file + an audit line). This is the ONLY way the conductor
     /// mutates anything — and it fires on the keypress itself, not on the next
-    /// tick, so an action (`p` → `graph prune` → a re-drawn roster) lands
+    /// tick, so an action (`p` → `session prune` → a re-drawn roster) lands
     /// instantly.
     pub fn dispatch(&mut self, path: &[&str], args: &[String]) {
         self.dispatch_with_flags(path, args, BTreeMap::new());
     }
 
     /// Like [`App::dispatch`] but with flags — the compose flow (P-C5) needs
-    /// `--to`/`--yes` on `graph send`, which plain positional args can't
+    /// `--to`/`--yes` on `send`, which plain positional args can't
     /// carry. Kept as a separate method rather than widening `dispatch`'s
     /// signature so the six existing flag-less call sites stay untouched.
     pub fn dispatch_with_flags(&mut self, path: &[&str], args: &[String], flags: BTreeMap<String, String>) {
@@ -1194,7 +1194,7 @@ impl App {
     /// `s` on a selected ROSTER session row opens the compose prompt
     /// ([`InputKind::Compose`]), pre-labeled with the row's own
     /// display-grammar label — the exact string `who` already computed and
-    /// the exact string `graph send --to <target>` resolves back to a
+    /// the exact string `send --to <target>` resolves back to a
     /// session (petname, tail4, host/role/petname — whatever `who` rendered).
     /// A no-op on a node-header or empty-node row: there is no session to
     /// address, and the frontend never invents one.
@@ -1249,7 +1249,7 @@ impl App {
             return;
         };
         let id = row.id.clone();
-        self.dispatch(&["graph", "pending", command], &[id]);
+        self.dispatch(&["session", "pending", command], &[id]);
         let n = self.pending_rows().len();
         if self.pending_sel >= n.max(1) {
             self.pending_sel = n.saturating_sub(1);
@@ -1289,7 +1289,7 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('p') => self.dispatch(&["graph", "prune"], &[]),
+            KeyCode::Char('p') => self.dispatch(&["session", "prune"], &[]),
             _ => {}
         }
     }
@@ -1337,7 +1337,7 @@ impl App {
                 if let Some(DagRow::Group { name, .. }) = rows.get(self.dag_sel) {
                     if name != UNANCHORED {
                         let name = name.clone();
-                        self.dispatch(&["graph", "project", "remove"], &[name]);
+                        self.dispatch(&["project", "remove"], &[name]);
                     }
                 }
             }
@@ -1356,7 +1356,7 @@ impl App {
                     });
                 }
             }
-            KeyCode::Char('p') => self.dispatch(&["graph", "prune"], &[]),
+            KeyCode::Char('p') => self.dispatch(&["session", "prune"], &[]),
             _ => {}
         }
     }
@@ -1407,11 +1407,11 @@ impl App {
             KeyCode::Char('d') => {
                 let sorted = sorted_project_names(&self.projects);
                 if let Some(name) = sorted.get(self.proj_sel).cloned() {
-                    self.dispatch(&["graph", "project", "remove"], &[name]);
+                    self.dispatch(&["project", "remove"], &[name]);
                 }
             }
             // r: resurrect the focused project's most recent resumable
-            // session off the durable ledger (P-D8, `graph resurrect
+            // session off the durable ledger (P-D8, `resurrect
             // --project <name>`) — the one new project-scoped action this
             // phase adds, so it lands beside `a`/`d` in the panel that is
             // already the projects list's own home. `r` is unclaimed here
@@ -1423,7 +1423,7 @@ impl App {
                 if let Some(name) = sorted.get(self.proj_sel).cloned() {
                     let mut flags = BTreeMap::new();
                     flags.insert("project".to_string(), name);
-                    self.dispatch_with_flags(&["graph", "resurrect"], &[], flags);
+                    self.dispatch_with_flags(&["resurrect"], &[], flags);
                 }
             }
             _ => {}
@@ -1474,7 +1474,7 @@ impl App {
                                 .map(|p| p.to_string_lossy().into_owned())
                                 .unwrap_or_default();
                         }
-                        self.dispatch(&["graph", "project", "add"], &[name, path]);
+                        self.dispatch(&["project", "add"], &[name, path]);
                     }
                 }
                 InputKind::Link { child } => {
@@ -1506,7 +1506,7 @@ impl App {
                     let mut flags = BTreeMap::new();
                     flags.insert("to".to_string(), target);
                     flags.insert("yes".to_string(), "true".to_string());
-                    self.dispatch_with_flags(&["graph", "send"], &[text], flags);
+                    self.dispatch_with_flags(&["send"], &[text], flags);
                 }
             },
             _ => {
@@ -1516,7 +1516,7 @@ impl App {
     }
 }
 
-/// Is a session past its final barline? (the state `graph prune` sweeps and the
+/// Is a session past its final barline? (the state `session prune` sweeps and the
 /// `[live/total]` badge excludes from `live`.)
 ///
 /// Delegates to [`graph::canonical_state`] rather than sniffing substrings, so
@@ -2290,7 +2290,7 @@ mod tests {
             .lock()
             .unwrap()
             .push((inv.path.clone(), inv.args.clone(), inv.flags.clone()));
-        Outcome::ok("graph.send", "delivered")
+        Outcome::ok("send", "delivered")
     }
 
     #[test]
@@ -2321,8 +2321,8 @@ mod tests {
             let calls = COMPOSE_CALLS.lock().unwrap();
             let send_call = calls
                 .iter()
-                .find(|(path, ..)| path == &vec!["graph".to_string(), "send".to_string()])
-                .expect("a graph send dispatch was recorded");
+                .find(|(path, ..)| path == &vec!["send".to_string()])
+                .expect("a send dispatch was recorded");
             assert_eq!(send_call.1, vec!["hi".to_string()], "text rides as a single positional arg");
             let mut expected_flags = BTreeMap::new();
             expected_flags.insert("to".to_string(), "sakaki/root/brave-otter (…s1)".to_string());
@@ -2354,7 +2354,7 @@ mod tests {
             .lock()
             .unwrap()
             .push((inv.path.clone(), inv.args.clone(), inv.flags.clone()));
-        Outcome::ok("graph.resurrect", "resurrected 1 session")
+        Outcome::ok("resurrect", "resurrected 1 session")
     }
 
     #[test]
@@ -2376,15 +2376,15 @@ mod tests {
         // `dispatch_with_flags` also calls `reload_all()` right after, which
         // fires its own dispatches (who/graph view/…) through the SAME
         // injected fn — filter to the resurrect call specifically, same as
-        // `compose_builds_the_exact_expected_invocation` does for `graph.send`.
+        // `compose_builds_the_exact_expected_invocation` does for `send`.
         let calls = RESURRECT_CALLS.lock().unwrap();
         let resurrect_calls: Vec<_> = calls
             .iter()
-            .filter(|(path, ..)| path == &vec!["graph".to_string(), "resurrect".to_string()])
+            .filter(|(path, ..)| path == &vec!["resurrect".to_string()])
             .collect();
         assert_eq!(resurrect_calls.len(), 1, "exactly one resurrect dispatch fired");
         let (path, args, flags) = resurrect_calls[0];
-        assert_eq!(path, &vec!["graph".to_string(), "resurrect".to_string()]);
+        assert_eq!(path, &vec!["resurrect".to_string()]);
         assert!(args.is_empty(), "the project rides as a flag, not a positional arg");
         let mut expected_flags = BTreeMap::new();
         expected_flags.insert("project".to_string(), "melete".to_string());
@@ -2415,7 +2415,7 @@ mod tests {
     static PENDING_CALLS: Mutex<Vec<(String, Vec<String>)>> = Mutex::new(Vec::new());
     static PENDING_QUEUE: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new()); // (sessionId, text)
 
-    /// A fake `graph pending list|approve|deny` over `PENDING_QUEUE` — proves
+    /// A fake `session pending list|approve|deny` over `PENDING_QUEUE` — proves
     /// the dispatch-order and re-list mechanics without touching real stage
     /// files. `list` renders whatever is currently in the queue (so a
     /// caller's own re-list after approve/deny sees the shrunk array,
@@ -2424,7 +2424,7 @@ mod tests {
         let path = inv.path.join(".");
         PENDING_CALLS.lock().unwrap().push((path.clone(), inv.args.clone()));
         match path.as_str() {
-            "graph.pending.list" => {
+            "session.pending.list" => {
                 let q = PENDING_QUEUE.lock().unwrap();
                 let pending: Vec<Value> = q
                     .iter()
@@ -2437,10 +2437,10 @@ mod tests {
                     })
                     .collect();
                 let n = pending.len();
-                Outcome::ok("graph.pending.list", format!("{n} pending"))
+                Outcome::ok("session.pending.list", format!("{n} pending"))
                     .with_data(json!({ "pending": pending }))
             }
-            "graph.pending.approve" | "graph.pending.deny" => {
+            "session.pending.approve" | "session.pending.deny" => {
                 let idx: usize = inv.args[0].parse().unwrap_or(usize::MAX);
                 let mut q = PENDING_QUEUE.lock().unwrap();
                 if idx < q.len() {
@@ -2471,8 +2471,8 @@ mod tests {
 
             let calls = PENDING_CALLS.lock().unwrap();
             let last_two = &calls[calls.len() - 2..];
-            assert_eq!(last_two[0], ("graph.pending.approve".to_string(), vec!["0".to_string()]));
-            assert_eq!(last_two[1], ("graph.pending.list".to_string(), Vec::<String>::new()));
+            assert_eq!(last_two[0], ("session.pending.approve".to_string(), vec!["0".to_string()]));
+            assert_eq!(last_two[1], ("session.pending.list".to_string(), Vec::<String>::new()));
             drop(calls);
 
             // Positions shifted: s1 (was index 1) is now at index 0.
@@ -2498,8 +2498,8 @@ mod tests {
 
             let calls = PENDING_CALLS.lock().unwrap();
             let last_two = &calls[calls.len() - 2..];
-            assert_eq!(last_two[0], ("graph.pending.deny".to_string(), vec!["0".to_string()]));
-            assert_eq!(last_two[1], ("graph.pending.list".to_string(), Vec::<String>::new()));
+            assert_eq!(last_two[0], ("session.pending.deny".to_string(), vec!["0".to_string()]));
+            assert_eq!(last_two[1], ("session.pending.list".to_string(), Vec::<String>::new()));
             drop(calls);
 
             let rows = app.pending_rows();
@@ -2550,7 +2550,7 @@ mod tests {
         assert!(app.pending_rows().is_empty());
         // Neither key dispatched an approve/deny — nothing was selected.
         let calls = PENDING_CALLS.lock().unwrap();
-        assert!(calls.iter().all(|(p, _)| p == "graph.pending.list"));
+        assert!(calls.iter().all(|(p, _)| p == "session.pending.list"));
     }
 
     #[test]

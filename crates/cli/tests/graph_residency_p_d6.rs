@@ -1,7 +1,7 @@
 //! Integration proof for P-D6 — graph residency (`docs/architecture/
 //! AOIDED.md`'s "L4"): the stage-file bytes a routed session-write command
 //! produces through a REAL resident daemon match the direct-path bytes for
-//! the identical input, and `graph reap` reaps a dead session over the
+//! the identical input, and `session reap` reaps a dead session over the
 //! socket exactly as it does directly.
 //!
 //! Companion to `daemon_dispatch_door.rs` (P-D4's door-POLICY proof: same
@@ -125,12 +125,12 @@ fn session_start_inv(id: &str) -> Invocation {
     flags.insert("id".to_string(), id.to_string());
     flags.insert("agent".to_string(), "claude".to_string());
     flags.insert("cwd".to_string(), "/tmp/p-d6-cwd".to_string());
-    Invocation { path: vec!["graph".to_string(), "session".to_string(), "start".to_string()], args: vec![], flags, door: Door::Cli }
+    Invocation { path: vec!["session".to_string(), "start".to_string()], args: vec![], flags, door: Door::Cli }
 }
 
 /// The phase's own first test requirement: "A routed command round-trips
 /// through a test daemon and the projection file matches the direct-path
-/// bytes exactly." `graph session start` is dispatched twice, identically
+/// bytes exactly." `session start` is dispatched twice, identically
 /// (same id/agent/cwd), once with `$AOIDE_DAEMON_SOCKET` pointed at nothing
 /// (the direct fallback runs) and once pointed at a REAL, freshly-started
 /// daemon (the routed path runs, and the WRITE itself happens on the
@@ -173,7 +173,7 @@ fn routed_session_start_produces_byte_identical_sessions_json_to_the_direct_path
     assert_eq!(routed_outcome.status, aoide_protocol::output::Status::Ok, "{routed_outcome:?}");
 
     // `do_session_start` mints a random whimsical `petname` (no `--petname`
-    // flag exists to pin it — `graph session start`'s flag set is
+    // flag exists to pin it — `session start`'s flag set is
     // id/agent/cwd/window/parent only) whenever a session has none yet, so
     // it is the ONE field expected to differ between ANY two `start` calls
     // for the same id, daemon routing or not — normalized to a fixed
@@ -226,9 +226,9 @@ fn routed_session_start_produces_byte_identical_sessions_json_to_the_direct_path
 /// — "an already-`done` session is prune's job, not a reap" — its sweep
 /// filters `state != "done"` before ever consulting `is_session_dead`.
 ///
-/// Dispatches `graph reap` at a live daemon exactly as a real terminal
+/// Dispatches `session reap` at a live daemon exactly as a real terminal
 /// would. The daemon's own `serve_daemon` runs the SAME `graph::reap::
-/// reap_and_announce` handler `graph reap` always runs (no daemon-specific
+/// reap_and_announce` handler `session reap` always runs (no daemon-specific
 /// reap logic exists — this phase's own "no logic forks" rule) — the write
 /// happens on the daemon's accept thread, and by the time `dispatch` returns
 /// here the socket reply already carries its result, so reading
@@ -262,7 +262,7 @@ fn graph_reap_over_the_socket_reaps_a_dead_pid_session() {
     let before = std::fs::read_to_string(dir.join("sessions.json")).unwrap();
     assert!(before.contains("pd6-reap-target"), "fixture must be present before reap: {before}");
 
-    // Now route `graph reap` at a REAL daemon. `graph reap`'s registered
+    // Now route `session reap` at a REAL daemon. `session reap`'s registered
     // handler is `reap_and_announce`, not the toast-free `reap` every
     // in-crate unit test calls (`reap.rs`'s own doc: "`reap` itself stays
     // toast-free, so every in-crate caller... gets the sweep without
@@ -280,7 +280,7 @@ fn graph_reap_over_the_socket_reaps_a_dead_pid_session() {
     std::env::set_var("AOIDE_DAEMON_SOCKET", &daemon_socket);
     std::env::set_var("PATH", "/nonexistent-aoide-test-empty-bin-dir");
 
-    let reap_out = dispatch(&Invocation { path: vec!["graph".to_string(), "reap".to_string()], args: vec![], flags: BTreeMap::new(), door: Door::Cli });
+    let reap_out = dispatch(&Invocation { path: vec!["session".to_string(), "reap".to_string()], args: vec![], flags: BTreeMap::new(), door: Door::Cli });
     assert_eq!(reap_out.status, aoide_protocol::output::Status::Ok, "{reap_out:?}");
 
     let after = std::fs::read_to_string(dir.join("sessions.json")).unwrap();
@@ -293,7 +293,7 @@ fn graph_reap_over_the_socket_reaps_a_dead_pid_session() {
     std::fs::remove_file(&daemon_socket).ok();
 }
 
-/// Task #92 regression: `graph session start`, ROUTED through a resident
+/// Task #92 regression: `session start`, ROUTED through a resident
 /// daemon's `{"op":"dispatch"}`, must never make the #69 hand-edit watcher
 /// (`aoide-server`'s `producers::HandEditWatcher`, ticked by `run_loop`)
 /// report the daemon's OWN write back to itself as a `hand-edit` event on a
@@ -322,7 +322,7 @@ fn dispatched_session_start_produces_no_false_hand_edit_event() {
     let (daemon_socket, events_path) = start_run_loop("hand-edit");
     std::env::set_var("AOIDE_DAEMON_SOCKET", &daemon_socket);
 
-    // Routed `graph session start` — the write happens on the daemon's own
+    // Routed `session start` — the write happens on the daemon's own
     // accept thread (same as `routed_session_start_...` above), exactly the
     // write task #92 mis-reported.
     let outcome = dispatch(&session_start_inv("pd92-hand-edit"));

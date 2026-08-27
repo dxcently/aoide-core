@@ -81,7 +81,7 @@ pub(crate) fn lineage_of(id: &str, sessions: &[SessionRecord]) -> HashSet<String
     out
 }
 
-/// Core of `graph session start`: cycle-check a parent, UPSERT, re-stage.
+/// Core of `session start`: cycle-check a parent, UPSERT, re-stage.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::graph) fn do_session_start(
     id: &str,
@@ -112,7 +112,7 @@ fn do_session_start_inner(
     title: Option<&str>,
     pid: Option<u32>,
 ) -> Outcome {
-    let cmd = "graph.session.start";
+    let cmd = "session.start";
     let mut file: SessionsFile = match load_stage(&sessions_path()) {
         Ok(f) => f,
         Err(e) => return stage_error(cmd, e),
@@ -401,7 +401,7 @@ pub(in crate::graph) fn set_session_log_path(id: &str, path: &str) {
 
 /// Stamp `hookAncestry` — up to 8 ancestor pids of the hook-firing process,
 /// self-first — on a session record, ONCE, at its own SessionStart/self-heal
-/// registration (`graph session hook`'s two Start-shaped call sites in
+/// registration (`session hook`'s two Start-shaped call sites in
 /// `send.rs`). A later `wrap`/`conduct`/`spawn` registration with no
 /// explicit `--parent` walks ITS OWN `/proc` ancestry and looks for a live
 /// agent whose `hookAncestry` intersects it — the automatic-parenting seam
@@ -513,7 +513,7 @@ pub(in crate::graph) fn stamp_origin(id: &str, origin: &str) {
 /// [`ensure_session_ceiling`]/[`set_session_log_path`]: change-only, and a
 /// silent no-op for an unknown id. No `restage_graph()` — like
 /// `hookAncestry`/`headless`, this field is consumed internally (a future
-/// `graph resurrect` reader, P-D8) rather than rendered, so stamping it must
+/// `resurrect` reader, P-D8) rather than rendered, so stamping it must
 /// not churn the widget-facing `graph.json`.
 pub(in crate::graph) fn stamp_harness_session_id(id: &str, harness_session_id: &str) {
     if harness_session_id.is_empty() {
@@ -544,7 +544,7 @@ pub(in crate::graph) fn stamp_harness_session_id(id: &str, harness_session_id: &
 /// RENDERED, not only held for internal use — the conductor needs to see the
 /// edge without a second manual resync. Change-only; a silent no-op for an
 /// unknown id (the windowed spawn's own terminal may not have registered by
-/// the time `graph resurrect` gets here — an honest no-op, never a crash).
+/// the time `resurrect` gets here — an honest no-op, never a crash).
 pub(in crate::graph) fn stamp_resumed_from(id: &str, resumed_from: &str) {
     if resumed_from.is_empty() {
         return;
@@ -932,7 +932,7 @@ pub(in crate::graph) fn do_subagent_rekey(from_sub_id: &str, to_sub_id: &str) {
     });
 }
 
-/// Core of `graph session phase`: UPSERT the hook record (audit), land the
+/// Core of `session phase`: UPSERT the hook record (audit), land the
 /// canonical live state on sessions.json (the widget file), re-stage. The whole
 /// load-modify-write is serialised against every other stage writer by the
 /// stage lock (its inner helpers stay lock-free — the lock is not re-entrant).
@@ -940,7 +940,7 @@ pub(in crate::graph) fn do_session_phase(id: &str, phase: &str) -> Outcome {
     with_stage_lock(|| do_session_phase_inner(id, phase))
 }
 fn do_session_phase_inner(id: &str, phase: &str) -> Outcome {
-    let cmd = "graph.session.phase";
+    let cmd = "session.phase";
     let mut file: HooksFile = match load_stage(&hooks_path()) {
         Ok(f) => f,
         Err(e) => return stage_error(cmd, e),
@@ -982,7 +982,7 @@ pub(in crate::graph) fn do_session_phase_if(id: &str, phase: &str, expected: &st
     with_stage_lock(|| do_session_phase_if_inner(id, phase, expected))
 }
 fn do_session_phase_if_inner(id: &str, phase: &str, expected: &str) -> Outcome {
-    let cmd = "graph.session.phase";
+    let cmd = "session.phase";
     let mut file: HooksFile = match load_stage(&hooks_path()) {
         Ok(f) => f,
         Err(e) => return stage_error(cmd, e),
@@ -1036,13 +1036,13 @@ fn do_session_phase_if_inner(id: &str, phase: &str, expected: &str) -> Outcome {
         }))
 }
 
-/// Core of `graph session end`: mark the session `done` (and its hook phase
+/// Core of `session end`: mark the session `done` (and its hook phase
 /// `done`), re-stage. An unknown id is an ok no-op (matching `project remove`).
 pub(in crate::graph) fn do_session_end(id: &str) -> Outcome {
     with_stage_lock(|| do_session_end_inner(id))
 }
 fn do_session_end_inner(id: &str) -> Outcome {
-    let cmd = "graph.session.end";
+    let cmd = "session.end";
     let mut s_file: SessionsFile = match load_stage(&sessions_path()) {
         Ok(f) => f,
         Err(e) => return stage_error(cmd, e),
@@ -1116,7 +1116,7 @@ fn do_session_end_inner(id: &str) -> Outcome {
         .with_data(json!({ "sessionId": id, "file": sessions_path().to_string_lossy() }))
 }
 
-/// `graph session start --id <id> [--agent --cwd --window --parent]` — UPSERT a
+/// `session start --id <id> [--agent --cwd --window --parent]` — UPSERT a
 /// running session record (idempotent; startedAt preserved on re-start).
 ///
 /// P-D6 graph residency (`docs/architecture/AOIDED.md`'s "L4"): tries the
@@ -1145,7 +1145,7 @@ pub fn session_start(inv: &Invocation) -> Outcome {
     )
 }
 
-/// `graph session phase --id <id> --phase <phase>` — UPSERT the live hook phase.
+/// `session phase --id <id> --phase <phase>` — UPSERT the live hook phase.
 ///
 /// P-D6 routing (see [`session_start`]'s own doc for the full contract).
 pub fn session_phase(inv: &Invocation) -> Outcome {
@@ -1163,7 +1163,7 @@ pub fn session_phase(inv: &Invocation) -> Outcome {
     do_session_phase(&id, &phase)
 }
 
-/// `graph session end --id <id>` — mark the session done (ok no-op if unknown).
+/// `session end --id <id>` — mark the session done (ok no-op if unknown).
 ///
 /// P-D6 routing (see [`session_start`]'s own doc for the full contract).
 pub fn session_end(inv: &Invocation) -> Outcome {
@@ -1297,14 +1297,14 @@ mod tests {
 
         // A phantom claude registers on a window first (the old, un-ended id).
         session_start(&flag_invocation(
-            &["graph", "session", "start"],
+            &["session", "start"],
             &[("id", "old"), ("agent", "claude"), ("cwd", "/p"), ("window", "0xWIN")],
         ));
         // A NEW claude registers on the SAME window (the real re-id after a
         // compact/resume) — this must retire "old" immediately, no grace, no
         // waiting on the reaper.
         session_start(&flag_invocation(
-            &["graph", "session", "start"],
+            &["session", "start"],
             &[("id", "new"), ("agent", "claude"), ("cwd", "/p"), ("window", "0xWIN")],
         ));
 
@@ -1317,7 +1317,7 @@ mod tests {
         // NEVER evict it — that is the normal "shell hosts claude" pairing, not a
         // duplicate. Re-seed "old" as a fresh agent, then register a shell.
         session_start(&flag_invocation(
-            &["graph", "session", "start"],
+            &["session", "start"],
             &[("id", "again", ), ("agent", "claude"), ("cwd", "/p"), ("window", "0xWIN2")],
         ));
         do_session_start(
@@ -1367,7 +1367,7 @@ mod tests {
         // kimi's SessionStart hook fires inside the conducted child:
         // agent-kind, SAME window, parent = the wrapper id (threaded via
         // AOIDE_SESSION_ID). Before the host carve-outs this registration
-        // evicted the wrapper — `graph send --id conduct-1` then failed
+        // evicted the wrapper — `send --id conduct-1` then failed
         // "unknown session" and the session could never be commanded.
         do_session_start(
             "kimi-hook-1",
@@ -1443,7 +1443,7 @@ mod tests {
         let my_ancestry = crate::graph::window::pid_ancestry(std::process::id() as i32);
         stamp_hook_ancestry("claude", &[my_ancestry[1]]);
 
-        // Part 3 — automatic parenting: `graph spawn`'s own re-exec'd
+        // Part 3 — automatic parenting: `spawn`'s own re-exec'd
         // `conduct --headless` for kimi carries no explicit `--parent`. The
         // ancestry walk must resolve to claude, not fall through to an env
         // fallback that would carry the TERMINAL's id (the "spawned wraps
@@ -1578,11 +1578,11 @@ mod tests {
         let proj = stage.join("proj");
         std::fs::create_dir_all(proj.join("sub")).unwrap();
         project_add(&invocation(
-            &["graph", "project", "add"],
+            &["project", "add"],
             &["aoide", proj.to_str().unwrap()],
         ));
         let out = session_start(&flag_invocation(
-            &["graph", "session", "start"],
+            &["session", "start"],
             &[("id", "s1"), ("cwd", proj.join("sub").to_str().unwrap())],
         ));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
@@ -1606,12 +1606,12 @@ mod tests {
         assert!(staged["edges"].as_array().unwrap().iter().any(|e| {
             e["from"] == "project:aoide" && e["to"] == "session:s1" && e["kind"] == "anchors"
         }));
-        let view = view(&invocation(&["graph", "view"], &[]));
+        let view = view(&invocation(&["graph"], &[]));
         assert_eq!(&staged, view.data.as_ref().unwrap());
 
         // Re-start updates the agent but preserves startedAt and never dupes.
         session_start(&flag_invocation(
-            &["graph", "session", "start"],
+            &["session", "start"],
             &[("id", "s1"), ("agent", "melete")],
         ));
         let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
@@ -1632,14 +1632,14 @@ mod tests {
         let stage = unique_stage("sess-cycle");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
-        session_start(&flag_invocation(&["graph", "session", "start"], &[("id", "a")]));
+        session_start(&flag_invocation(&["session", "start"], &[("id", "a")]));
         session_start(&flag_invocation(
-            &["graph", "session", "start"],
+            &["session", "start"],
             &[("id", "b"), ("parent", "a")],
         ));
         // a parented under b would close b→a→…: refused (exit 1), no mutation.
         let out = session_start(&flag_invocation(
-            &["graph", "session", "start"],
+            &["session", "start"],
             &[("id", "a"), ("parent", "b")],
         ));
         assert_eq!(out.status, aoide_protocol::output::Status::Error);
@@ -1661,7 +1661,7 @@ mod tests {
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
         let out = session_end(&flag_invocation(
-            &["graph", "session", "end"],
+            &["session", "end"],
             &[("id", "ghost")],
         ));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
@@ -1689,11 +1689,11 @@ mod tests {
         std::env::set_var("AOIDE_STATE_DIR", &state);
 
         session_start(&flag_invocation(
-            &["graph", "session", "start"],
+            &["session", "start"],
             &[("id", "end-ledger-1"), ("agent", "claude"), ("cwd", "/w")],
         ));
         let out = session_end(&flag_invocation(
-            &["graph", "session", "end"],
+            &["session", "end"],
             &[("id", "end-ledger-1")],
         ));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
@@ -1710,7 +1710,7 @@ mod tests {
         // set the write loop iterates, so the second call is a genuine no-op
         // for the ledger, same as it already is for sessions.json.
         let _ = session_end(&flag_invocation(
-            &["graph", "session", "end"],
+            &["session", "end"],
             &[("id", "end-ledger-1")],
         ));
         let lines2 = aoide_storage::ledger::read_ledger().unwrap();
@@ -1726,7 +1726,7 @@ mod tests {
         let stage = unique_stage("sess-log-path");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
-        session_start(&flag_invocation(&["graph", "session", "start"], &[("id", "s")]));
+        session_start(&flag_invocation(&["session", "start"], &[("id", "s")]));
 
         set_session_log_path("s", "/home/khoa/Aoide/state/sessions/s.log");
         let s: SessionsFile = load_stage(&sessions_path()).unwrap();
@@ -1765,7 +1765,7 @@ mod tests {
         // one-time `AOIDE_DAEMON_SOCKET` isolation stamp (`lib.rs`'s own
         // doc) so a real resident daemon on this box is never reached.
         let _guard = crate::env_lock().lock().unwrap();
-        let out = session_start(&flag_invocation(&["graph", "session", "start"], &[]));
+        let out = session_start(&flag_invocation(&["session", "start"], &[]));
         assert_eq!(out.status, aoide_protocol::output::Status::Usage);
         assert_eq!(out.render(false).1, aoide_protocol::output::exit::USAGE);
     }
@@ -1918,7 +1918,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = reap(&invocation(&["graph", "reap"], &[]));
+        let out = reap(&invocation(&["session", "reap"], &[]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         let data = out.data.unwrap();
         assert_eq!(data["reaped"], json!(["killed"]));
@@ -1944,7 +1944,7 @@ mod tests {
             .all(|n| n["id"] != "session:killed"));
 
         // Idempotent + never non-zero: a second sweep finds nothing to reap.
-        let again = reap(&invocation(&["graph", "reap"], &[]));
+        let again = reap(&invocation(&["session", "reap"], &[]));
         assert_eq!(again.status, aoide_protocol::output::Status::Ok);
         assert_eq!(again.data.unwrap()["reaped"], json!([]));
 
@@ -1990,7 +1990,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = reap(&invocation(&["graph", "reap"], &[]));
+        let out = reap(&invocation(&["session", "reap"], &[]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
 
         let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
@@ -2033,7 +2033,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = reap(&invocation(&["graph", "reap"], &[]));
+        let out = reap(&invocation(&["session", "reap"], &[]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         assert_eq!(
             out.data.unwrap()["reaped"],

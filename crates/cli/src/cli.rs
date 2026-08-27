@@ -32,11 +32,12 @@ mod tests {
 
     #[test]
     fn help_flag_prints_subcommand_usage_at_exit_zero() {
-        let err = parse(&argv(&["graph", "view", "--help"]), Door::Cli).unwrap_err();
+        // Bare `graph` (ex-`graph view`, task #101 R1) is the DAG render.
+        let err = parse(&argv(&["graph", "--help"]), Door::Cli).unwrap_err();
         assert_eq!(err.status, Status::Ok, "--help is informational, exit 0");
         assert_eq!(err.render(false).1, exit::OK);
         assert!(
-            err.message.contains("usage: aoide graph view"),
+            err.message.contains("usage: aoide graph"),
             "usage names the subcommand: {}",
             err.message
         );
@@ -56,7 +57,7 @@ mod tests {
 
     #[test]
     fn unknown_flag_is_a_usage_error_naming_the_offender() {
-        let err = parse(&argv(&["graph", "view", "--bogus"]), Door::Cli).unwrap_err();
+        let err = parse(&argv(&["graph", "--bogus"]), Door::Cli).unwrap_err();
         assert_eq!(err.status, Status::Usage, "unknown flag → exit 2");
         assert_eq!(err.render(false).1, exit::USAGE);
         assert!(
@@ -70,16 +71,15 @@ mod tests {
     fn a_valued_unknown_flag_is_still_rejected() {
         // `--nope value` — the value is consumed by the heuristic, but the flag
         // is still unrecognised and must fail loudly.
-        let err = parse(&argv(&["graph", "view", "--nope", "x"]), Door::Cli).unwrap_err();
+        let err = parse(&argv(&["graph", "--nope", "x"]), Door::Cli).unwrap_err();
         assert_eq!(err.status, Status::Usage);
         assert!(err.message.contains("--nope"));
     }
 
     #[test]
     fn known_flags_still_parse() {
-        let (inv, _) =
-            parse(&argv(&["graph", "view", "--focus", "session:x"]), Door::Cli).unwrap();
-        assert_eq!(inv.path, vec!["graph", "view"]);
+        let (inv, _) = parse(&argv(&["graph", "--focus", "session:x"]), Door::Cli).unwrap();
+        assert_eq!(inv.path, vec!["graph"]);
         assert_eq!(inv.flags.get("focus").map(String::as_str), Some("session:x"));
 
         // `--json` and the universal `--audit-log` are always accepted.
@@ -209,21 +209,21 @@ mod tests {
 
     // The position-aware check has a converse hazard (#48): a flag placed
     // BEFORE the final path segment, whose value collides with that segment's
-    // name. `graph session --id start` used to parse SILENTLY as
-    // path=`graph.session.start`, flags={id:"true"} — the value swallowed as
-    // a path segment, the flag mis-booleaned — because `start` really is the
-    // next segment of `graph session start`. The token reads both ways, so
-    // the parser refuses the ordering loudly instead of guessing. Internal
-    // self-exec sites (`do_spawn` in server/src/a2a.rs, graph/spawn.rs,
-    // graph/permit.rs) always spell the full leaf path before any flag, so
-    // none of them can reach this error.
+    // name. `session --id start` used to parse SILENTLY (pre-R1, this was
+    // `graph session --id start`) as path=`session.start`, flags={id:"true"}
+    // — the value swallowed as a path segment, the flag mis-booleaned —
+    // because `start` really is the next segment of `session start`. The
+    // token reads both ways, so the parser refuses the ordering loudly
+    // instead of guessing. Internal self-exec sites (`do_spawn` in
+    // server/src/a2a.rs, graph/spawn.rs, graph/permit.rs) always spell the
+    // full leaf path before any flag, so none of them can reach this error.
     #[test]
     fn a_flag_before_the_full_path_colliding_with_a_leaf_name_fails_loudly() {
-        let err = parse(&argv(&["graph", "session", "--id", "start"]), Door::Cli).unwrap_err();
+        let err = parse(&argv(&["session", "--id", "start"]), Door::Cli).unwrap_err();
         assert_eq!(err.status, Status::Usage, "ambiguous ordering → exit 2");
         assert!(err.message.contains("`--id start`"), "names the flag+value: {}", err.message);
         assert!(
-            err.message.contains("aoide graph session start --id <value>"),
+            err.message.contains("aoide session start --id <value>"),
             "suggests the flags-after-path spelling: {}",
             err.message
         );
@@ -256,9 +256,10 @@ mod tests {
     fn root_help_groups_commands_and_carries_summaries() {
         let err = parse(&argv(&["--help"]), Door::Cli).unwrap_err();
         // Grouped by first path segment, each line carrying its summary.
-        assert!(err.message.contains("graph —"), "grouped with a blurb: {}", err.message);
+        // `project` promoted out from under `graph` at R1 — its own group now.
+        assert!(err.message.contains("project —"), "grouped with a blurb: {}", err.message);
         assert!(
-            err.message.contains("graph project add <name> [<path>]"),
+            err.message.contains("project add <name> [<path>]"),
             "arg signature on the line: {}",
             err.message
         );
@@ -276,14 +277,16 @@ mod tests {
 
     #[test]
     fn a_partial_path_lists_its_subgroup_instead_of_crying_unknown() {
-        let err = parse(&argv(&["graph", "project"]), Door::Cli).unwrap_err();
+        // `project` (ex-`graph project`) has no bare command of its own, only
+        // the three children below — `project` alone must list the group.
+        let err = parse(&argv(&["project"]), Door::Cli).unwrap_err();
         assert_eq!(err.status, Status::Usage);
         assert!(
             err.message.contains("is a command group"),
             "names it a group: {}",
             err.message
         );
-        for command in ["graph project add", "graph project remove", "graph project list"] {
+        for command in ["project add", "project remove", "project list"] {
             assert!(err.message.contains(command), "lists {command}: {}", err.message);
         }
         assert!(err.message.contains("aoide --help"), "{}", err.message);
@@ -291,15 +294,16 @@ mod tests {
 
     #[test]
     fn root_help_is_terse_detail_lives_behind_per_command_help() {
-        // `graph reap`'s summary tail never reaches the root list…
+        // `session reap`'s (ex-`graph reap`) summary tail never reaches the
+        // root list…
         let root = parse(&argv(&["--help"]), Door::Cli).unwrap_err();
         assert!(
             !root.message.contains("pid-only liveness"),
             "the root list stays GNU-terse: {}",
             root.message
         );
-        // …but `graph reap --help` keeps the full prose.
-        let full = parse(&argv(&["graph", "reap", "--help"]), Door::Cli).unwrap_err();
+        // …but `session reap --help` keeps the full prose.
+        let full = parse(&argv(&["session", "reap", "--help"]), Door::Cli).unwrap_err();
         assert!(
             full.message.contains("pid-only liveness"),
             "per-command --help keeps the full prose: {}",
@@ -307,13 +311,20 @@ mod tests {
         );
     }
 
+    // The R1 graph-prefix cutover left a bare `graph` (the render) alongside
+    // `graph link` — a typo of `link` (`graph lnk`) exercises the SAME
+    // did-you-mean path the old `graph vie` regression covered, and doubles
+    // as a boundary proof: `graph lnk` must not silently resolve as the
+    // zero-arg bare `graph` render with `lnk` as an ignored stray arg (see
+    // `aoide_protocol::door`'s zero-arg-overflow check) — it must reach the
+    // unknown-command/did-you-mean path instead.
     #[test]
     fn a_typo_gets_a_did_you_mean_suggestion() {
-        let err = parse(&argv(&["graph", "vie"]), Door::Cli).unwrap_err();
+        let err = parse(&argv(&["graph", "lnk"]), Door::Cli).unwrap_err();
         assert_eq!(err.status, Status::Usage);
-        assert!(err.message.contains("unknown command: `graph vie`"), "{}", err.message);
+        assert!(err.message.contains("unknown command: `graph lnk`"), "{}", err.message);
         assert!(
-            err.message.contains("did you mean:\n  aoide graph view"),
+            err.message.contains("did you mean:\n  aoide graph link"),
             "suggests the nearest command: {}",
             err.message
         );
@@ -322,15 +333,15 @@ mod tests {
 
     #[test]
     fn help_on_a_command_with_examples_shows_them() {
-        let err = parse(&argv(&["graph", "project", "add", "--help"]), Door::Cli).unwrap_err();
+        let err = parse(&argv(&["project", "add", "--help"]), Door::Cli).unwrap_err();
         assert_eq!(err.status, Status::Ok);
         assert!(
-            err.message.contains("examples:\n  aoide graph project add aoide ~/Aoide"),
+            err.message.contains("examples:\n  aoide project add aoide ~/Aoide"),
             "the examples section renders: {}",
             err.message
         );
         // A command WITHOUT examples carries no empty section.
-        let bare = parse(&argv(&["graph", "prune", "--help"]), Door::Cli).unwrap_err();
+        let bare = parse(&argv(&["session", "prune", "--help"]), Door::Cli).unwrap_err();
         assert!(!bare.message.contains("examples:"), "{}", bare.message);
     }
 }

@@ -174,6 +174,24 @@ pub fn parse(argv: &[String], door: Door, bin_name: &str, registry: &Registry) -
 
     let args = positionals[path.len()..].to_vec();
 
+    // A matched command that declares NO positional args of its own must not
+    // silently swallow leftover positionals as ignored input. Without this,
+    // a parent path that is ALSO a registered leaf (`graph` render, alongside
+    // the longer `graph link`) would let an unregistered child like `graph
+    // nonsense` resolve as the bare parent with a stray arg the handler just
+    // ignores, instead of surfacing `nonsense` as the unrecognised segment it
+    // is. Only fires when `c.args` is empty — commands that declare at least
+    // one positional (`conduct`, `graph spawn`, `graph send`, …) intentionally
+    // consume everything past their first required arg verbatim, and must
+    // keep doing so.
+    if !args.is_empty() {
+        if let Some(c) = command_for(&path, registry) {
+            if c.args.is_empty() {
+                return Err(unknown_command_outcome(&positionals, registry, bin_name));
+            }
+        }
+    }
+
     Ok((
         Invocation {
             path,
@@ -426,7 +444,9 @@ fn ambiguous_flag_outcome(
 fn group_blurb(group: &str) -> Option<&'static str> {
     Some(match group {
         "rice" => "the self-ricing loop: compose → mode stage → mode draft → declare",
-        "graph" => "the project/session DAG — conducting other terminals",
+        "graph" => "the project/session DAG — bare render + link, the read/analysis lens",
+        "session" => "session lifecycle and hook plumbing for a conducted terminal",
+        "project" => "project anchor roots for the session DAG",
         "screen" => "screen capture, OCR, and pointer control",
         "a2a" => "Agent-to-Agent server and agent registry",
         "peer" => "same-network host federation",
@@ -597,6 +617,40 @@ mod tests {
             flags: &[JSON_FLAG, Flag { name: "focus", ty: "string", description: "Focus a node." }],
             gated: false,
             implemented: true,
+            internal: false,
+            exit_codes: (),
+            examples: &[],
+            handler: noop,
+            available: || true,
+        });
+        // A bare parent path (`graph`) that is ALSO the prefix of a longer,
+        // separately-registered sibling (`graph link`) — the R1 graph-prefix
+        // cutover shape: `graph` renders, `graph link` records an edge, and
+        // the two must coexist without either shadowing the other.
+        r.insert(Command {
+            path: &["graph"],
+            summary: "Render the project/session graph.",
+            args: &[],
+            flags: &[JSON_FLAG],
+            gated: false,
+            implemented: true,
+            internal: false,
+            exit_codes: (),
+            examples: &[],
+            handler: noop,
+            available: || true,
+        });
+        r.insert(Command {
+            path: &["graph", "link"],
+            summary: "Record a spawned-by edge.",
+            args: &[
+                Arg { name: "child", ty: "string", required: true, description: "Child session id." },
+                Arg { name: "parent", ty: "string", required: true, description: "Parent session id." },
+            ],
+            flags: &[JSON_FLAG],
+            gated: false,
+            implemented: true,
+            internal: false,
             exit_codes: (),
             examples: &[],
             handler: noop,
@@ -609,6 +663,7 @@ mod tests {
             flags: &[JSON_FLAG],
             gated: false,
             implemented: true,
+            internal: false,
             exit_codes: (),
             examples: &[],
             handler: noop,
@@ -621,6 +676,7 @@ mod tests {
             flags: &[JSON_FLAG, Flag { name: "id", ty: "string", description: "Session id." }],
             gated: false,
             implemented: true,
+            internal: false,
             exit_codes: (),
             examples: &[],
             handler: noop,
@@ -633,6 +689,7 @@ mod tests {
             flags: &[JSON_FLAG],
             gated: false,
             implemented: true,
+            internal: false,
             exit_codes: (),
             examples: &[],
             handler: noop,
@@ -698,6 +755,66 @@ mod tests {
         let (inv, _) = parse(&argv(&["graph", "session", "start", "--id", "start"]), Door::Cli, "aoide", &reg).unwrap();
         assert_eq!(inv.path, vec!["graph", "session", "start"]);
         assert_eq!(inv.flags.get("id").map(String::as_str), Some("start"));
+    }
+
+    /// The R1 graph-prefix cutover shape: a bare parent path (`graph`) that
+    /// is ALSO a registered leaf, coexisting with a longer sibling (`graph
+    /// link`) that extends the same first segment. Longest-match must prefer
+    /// the 2-segment path over the 1-segment one when both are spelled out,
+    /// and the bare path must still resolve to itself when nothing follows.
+    #[test]
+    fn a_bare_parent_path_and_a_longer_sibling_subcommand_coexist() {
+        let reg = test_registry();
+
+        let (inv, _) = parse(&argv(&["graph", "link", "c1", "p1"]), Door::Cli, "aoide", &reg).unwrap();
+        assert_eq!(inv.path, vec!["graph", "link"], "the longer sibling wins over the bare parent");
+        assert_eq!(inv.args, vec!["c1", "p1"]);
+
+        let (inv, json) = parse(&argv(&["graph"]), Door::Cli, "aoide", &reg).unwrap();
+        assert_eq!(inv.path, vec!["graph"]);
+        assert!(inv.args.is_empty());
+        assert!(!json);
+
+        let (inv, json) = parse(&argv(&["graph", "--json"]), Door::Cli, "aoide", &reg).unwrap();
+        assert_eq!(inv.path, vec!["graph"]);
+        assert!(json);
+    }
+
+    /// The boundary this coexistence creates: an unregistered CHILD of the
+    /// zero-arg bare parent must not silently resolve as the parent with a
+    /// stray ignored positional — it must be a loud unknown-command error,
+    /// same as any other typo. `graph` declares no positional args (unlike
+    /// `conduct`/`graph spawn`/`graph send`, which intentionally consume
+    /// everything after their first required arg), so this is the ONE case
+    /// where leftover positionals must reject rather than pass through.
+    #[test]
+    fn an_unregistered_child_of_a_zero_arg_parent_is_a_loud_unknown_command() {
+        let reg = test_registry();
+        let err = parse(&argv(&["graph", "nonsense"]), Door::Cli, "aoide", &reg).unwrap_err();
+        assert_eq!(
+            err.status,
+            Status::Usage,
+            "must not silently resolve to the bare parent with a stray positional"
+        );
+        assert!(
+            err.message.contains("unknown command: `graph nonsense`"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// A command that DOES declare a positional arg (`graph link`, two
+    /// required args) is unaffected by the zero-arg overflow check above —
+    /// its own declared args still bind normally, and a command like
+    /// `conduct`/`graph spawn` that deliberately consumes MORE than its one
+    /// declared arg (the wrapped command's own argv) must keep doing so. The
+    /// zero-arg registry check must never fire for a command with `args`.
+    #[test]
+    fn a_command_declaring_positional_args_is_unaffected_by_the_zero_arg_check() {
+        let reg = test_registry();
+        let (inv, _) = parse(&argv(&["graph", "project", "add", "aoide", "extra"]), Door::Cli, "aoide", &reg).unwrap();
+        assert_eq!(inv.path, vec!["graph", "project", "add"]);
+        assert_eq!(inv.args, vec!["aoide", "extra"]);
     }
 
     /// `peer rm <name>` is an ergonomic alias for `peer remove <name>`,
