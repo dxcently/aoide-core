@@ -28,9 +28,10 @@
 //! nix anywhere in this path — a terminal emulator is a shell concern, never
 //! `lyra`'s.
 
-use super::conduct::{conduct_socket_path, unix_ts};
+use super::conduct::{captures_like_a_shell, conduct_socket_path, unix_ts};
 use super::model::{load_stage, sessions_path, SessionsFile};
 use super::send::session_send;
+use super::undying::nothing_to_restore_warning;
 use aoide_protocol::output::{Outcome, Status};
 use aoide_protocol::Invocation;
 use aoide_storage::undying::{load_undying, save_undying, set_undying};
@@ -474,6 +475,14 @@ pub fn session_spawn(inv: &Invocation) -> Outcome {
     } else {
         false
     };
+    // Same nothing-to-restore warning `session undying on` carries
+    // (`undying.rs::nothing_to_restore_warning`, task #100): `program` (this
+    // function's own, not a roster read-back) is the WRAPPED command
+    // `captures_like_a_shell` decides on directly, no race against the
+    // conducted child's own first refresh tick.
+    let undying_warning = undying
+        .then(|| nothing_to_restore_warning(&agent, captures_like_a_shell(&program)))
+        .flatten();
 
     // `--prompt`: only after registration succeeded, through the one gated
     // injection door (`session_send`, `--yes --submit`, in-process) — the
@@ -525,15 +534,17 @@ pub fn session_spawn(inv: &Invocation) -> Outcome {
         "undying": undying,
     });
 
-    Outcome::ok(
-        cmd,
-        format!(
-            "`{agent}` spawned {mode} (session `{id}`){}",
-            if registered { "" } else { " — not yet registered" }
-        ),
-    )
-    .changed(changed)
-    .with_data(data)
+    let mut message = format!(
+        "`{agent}` spawned {mode} (session `{id}`){}",
+        if registered { "" } else { " — not yet registered" }
+    );
+    if let Some(warning) = &undying_warning {
+        message = format!("{message} — {warning}");
+    }
+
+    Outcome::ok(cmd, message)
+        .changed(changed)
+        .with_data(data)
 }
 
 #[cfg(test)]

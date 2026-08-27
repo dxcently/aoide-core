@@ -94,6 +94,20 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   between that edit and the write leaves the OLD id undying (retryable)
   rather than neither (silent loss) — the same bias a failed spawn gets
   deliberately, by never touching the store at all.
+  **The nothing-to-restore warning (task #100):** both mark sites — `session
+  undying on` and `spawn --undying` — carry `undying.rs::
+  nothing_to_restore_warning(agent, has_capture)` into their own Outcome
+  MESSAGE (never a log line) whenever a session is marked undying with
+  neither arm `resurrect.rs::resolve_candidate` tries able to resolve it
+  later: no restore capture (`has_capture`, the P-C5 snapshot above) and no
+  registered harness `AgentProfile.resume_args`. `spawn --undying` computes
+  `has_capture` directly off the command it just built
+  (`captures_like_a_shell`, no race against the conducted child's own first
+  tick); `session undying on --id <id>` reads it off the LIVE roster
+  record's own `restore` field, and stays silent for an id absent from the
+  roster (no live signal to warn from, the same posture `live` already
+  takes) or when marking OFF (a future restore is no longer promised
+  either way, so there is nothing to warn about).
 - **The undying picker (U3, command-defrag lane U):** `graph/session_pick.rs`'s
   `session_pick` is bare `session`'s handler — a parent command registered
   alongside `session.*` the same way bare `graph` sits alongside `graph
@@ -298,8 +312,21 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   including an empty selection — the boot-sweep postmortem's own finding
   that an early return must never silently skip the audit line a full run
   gets.
-- **Terminal restore capture (P-C5, durable-sessions plan):**
-  `graph/conduct.rs`'s PTY tick (`conduct_refresh_shell`, ~1 Hz, the same
+- **Terminal restore capture (P-C5, durable-sessions plan) — gated on the
+  WRAPPED COMMAND, never the agent label (task #100).**
+  `session_conduct`'s `is_shell` (everything below this bullet: the ~1 Hz
+  refresh tick, `typed_capture_active`'s buffer, the restore snapshot) comes
+  from `captures_like_a_shell(&program)` — `program`'s own basename against
+  `bash`/`zsh`/`fish`/`sh`, never `agent == "shell"`. `agent` is a caller-
+  chosen label (`--agent <name>`, or the command's own basename by default)
+  that can disagree with what actually execs on the pty; the P-C7 soak's
+  live finding was exactly that gap — `spawn --agent soak-a -- bash` ran a
+  real interactive shell whose record never ticked, because its label
+  wasn't the literal string `"shell"`. kitty.nix's own terminal wrapper
+  needs no special case here: it always execs the resolved login shell
+  explicitly as the conducted command, so its basename lands in the same
+  set any other shell invocation does. `graph/conduct.rs`'s PTY tick
+  (`conduct_refresh_shell`, ~1 Hz, the same
   tick that drives `cwd`/`activity`/`state`) also builds a
   `RestoreSnapshot` (`restore_snapshot`, pure, mirrors `shell_snapshot`'s
   injected-lookup shape) and lands it on the record change-only through

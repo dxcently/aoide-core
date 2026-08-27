@@ -31,6 +31,31 @@ fn command_basename(program: &str) -> String {
         .unwrap_or_else(|| program.to_string())
 }
 
+/// The interactive-shell basenames the P-C5 refresh/capture path (cwd
+/// tracking, working/idle state, foreground argv, the restore snapshot, and
+/// `typed_capture_active`'s buffer) treats as "this is a shell to watch".
+const SHELL_BASENAMES: &[&str] = &["bash", "zsh", "fish", "sh"];
+
+/// Shell-likeness derived from the WRAPPED COMMAND, never the roster display
+/// name (P-C5 follow-up, task #100 — the P-C7 soak's live finding: `spawn
+/// --agent soak-a -- bash` ran a real interactive shell whose roster record
+/// never ticked, because the old gate compared `agent == "shell"` and a
+/// caller is free to label a shell anything it likes). `agent` is a label a
+/// caller chooses (`--agent <name>`, or the command's own basename by
+/// default) — it names WHO is being conducted, not WHAT kind of process it
+/// wraps, and the two can disagree on purpose (a soak harness, an
+/// experiment, a differently-named shell wrapper). `program` is what
+/// actually execs on the pty; only ITS basename can answer "does this have
+/// a readline prompt to tick/reconstruct". This covers kitty.nix's own
+/// terminal wrapper for free: it always execs the resolved login shell
+/// explicitly (`$SHELL`/passwd/`/bin/sh`, `<login_shell> -l`) as the
+/// conducted command, so its basename lands in [`SHELL_BASENAMES`] the same
+/// way any other bash/zsh/fish/sh invocation does — no separate "bare
+/// spawn" case to special-case here.
+pub(in crate::graph) fn captures_like_a_shell(program: &str) -> bool {
+    SHELL_BASENAMES.contains(&command_basename(program).as_str())
+}
+
 pub(in crate::graph) fn unix_ts() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1125,7 +1150,7 @@ pub fn session_conduct(inv: &Invocation) -> Outcome {
         listener.as_ref(),
         &mut child,
         &id,
-        agent == "shell",
+        captures_like_a_shell(&program),
         !headless,
         &mut sink,
     );
@@ -1478,6 +1503,40 @@ mod tests {
         assert!(!typed_capture_active(false, false));
     }
     #[test]
+    fn captures_like_a_shell_reads_the_wrapped_argv_never_the_agent_label() {
+        // The task #100 defect, table-driven: shell-likeness is a property of
+        // WHAT is being conducted (the wrapped command's basename), never of
+        // WHO it is labelled as (`--agent <name>`). `spawn --agent soak-a --
+        // bash` is a real interactive shell that must tick the same as a
+        // plain `bash` conduct — the old `agent == "shell"` gate missed
+        // exactly this case.
+        let cases: &[(&str, bool)] = &[
+            ("bash", true),
+            ("zsh", true),
+            ("fish", true),
+            ("sh", true),
+            ("/bin/bash", true),
+            ("/usr/bin/zsh", true),
+            ("/run/current-system/sw/bin/fish", true),
+            ("claude", false),
+            ("kimi", false),
+            ("pi", false),
+            ("cargo", false),
+            ("/usr/bin/vim", false),
+            // A shell-shaped binary named something else entirely still
+            // reads by its OWN basename, not any caller-chosen label — this
+            // function never sees `--agent` at all.
+            ("bashful", false),
+        ];
+        for (program, expected) in cases {
+            assert_eq!(
+                captures_like_a_shell(program),
+                *expected,
+                "captures_like_a_shell({program:?}) should be {expected}"
+            );
+        }
+    }
+    #[test]
     fn typed_line_buffer_accumulates_plain_text() {
         let mut tb = TypedLineBuffer::new();
         tb.feed(b"cargo");
@@ -1662,6 +1721,43 @@ mod tests {
         let rec = s.sessions.iter().find(|r| r.session_id == "conduct-fail").unwrap();
         assert_eq!(rec.state, "done");
         assert_eq!(rec.agent, "sevens");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    /// The task #100 defect, end to end: `spawn --agent soak-a -- bash` (the
+    /// P-C7 soak's live shape) conducts a REAL shell under a caller-chosen
+    /// agent label that is not the literal string `"shell"`. Under the old
+    /// `agent == "shell"` gate this session's roster record never ticked at
+    /// all — `restore` stayed `None` forever, so a later `resurrect` had
+    /// nothing beyond a default cwd. The gate now reads the wrapped
+    /// command's own basename, so this session gets captured regardless of
+    /// what it is labelled.
+    #[test]
+    fn a_shell_conducted_under_a_non_shell_agent_label_still_gets_captured() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR"]);
+
+        let root = unique_stage("conduct-non-shell-label");
+        let stage = root.join("stage");
+        let state = root.join("state");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+
+        let out = session_conduct(&conduct_invocation(
+            &["sh", "-c", "sleep 1"],
+            &[("id", "conduct-non-shell-label"), ("agent", "soak-a")],
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let rec = s.sessions.iter().find(|r| r.session_id == "conduct-non-shell-label").unwrap();
+        assert_eq!(rec.agent, "soak-a", "the display label stays whatever the caller chose");
+        assert!(
+            rec.restore.is_some(),
+            "a real shell must be captured regardless of its agent label — restore was never populated"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

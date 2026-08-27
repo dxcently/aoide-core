@@ -339,6 +339,28 @@
   the wrong binary (a collapsed `argv[0]`) or a truncated one; don't share
   the two even though they both start from the same `/proc` read
   (`parse_cmdline` is the pure split they DO share).
+- **Shell-likeness is derived from the WRAPPED COMMAND, never the display
+  name (task #100, the P-C7 soak's live finding).** `session_conduct`'s
+  `is_shell` — which gates the ENTIRE P-C5 refresh/capture path (cwd
+  tracking, working/idle state, foreground argv, the restore snapshot, and
+  `typed_capture_active`'s buffer below) — comes from `conduct.rs::
+  captures_like_a_shell(&program)`: `program`'s own basename (what actually
+  execs on the pty) against `bash`/`zsh`/`fish`/`sh`. It is NOT `agent ==
+  "shell"` — `agent` is a caller-chosen label (`--agent <name>`, or the
+  command's own basename by default) that can disagree with what is
+  actually conducted on purpose (a soak harness, an experiment). `spawn
+  --agent soak-a -- bash` is the exact live shape that broke under the old
+  string compare: a real interactive shell whose roster record never
+  ticked, because its label wasn't the literal string `"shell"` — marking
+  it undying yielded a ledger entry with `restore: null`, so resurrect
+  reopened nothing but a default cwd. Don't widen this back to a name
+  compare "for simplicity" — a caller is always free to label a shell
+  anything it likes, and the capture path must not depend on that choice.
+  kitty.nix's own terminal wrapper needs no separate case: it always execs
+  the resolved login shell explicitly as the conducted command, so its
+  basename satisfies the predicate the same way any other shell invocation
+  does. `undying.rs::nothing_to_restore_warning` is the mark-time corollary
+  — see its own bullet below.
 - **`typed_capture_active` gates the `TypedLineBuffer`'s existence, not just
   its output (P-C5).** A headless conduct never reads stdin at all
   (`read_stdin == false`, unconditionally — no controlling tty), so it has
@@ -389,6 +411,23 @@
   `restore`-less shell entry (predating P-C5) still hits the pre-existing
   taught skip; don't widen the gate to bare `agent == "shell"`, which would
   resolve a candidate this crate has no captured facts about.
+- **The nothing-to-restore warning fires at MARK time, not at resurrect
+  time (task #100).** `undying.rs::nothing_to_restore_warning(agent,
+  has_capture)` mirrors `resolve_candidate`'s own two arms — a registered
+  harness `AgentProfile.resume_args`, or `has_capture` (this session's own
+  P-C5 restore snapshot, gated by `captures_like_a_shell` above) — and both
+  mark sites (`spawn --undying`, `session undying on --id <id>`) append its
+  text onto their own Outcome MESSAGE, never a log line, whenever NEITHER
+  arm would resolve. `spawn --undying` computes `has_capture` directly off
+  the command it just built (no roster read-back, no race against the
+  conducted child's own first refresh tick); `session undying on` reads it
+  off the LIVE roster record's `restore` field and stays silent for an id
+  absent from the roster (no live signal to warn from — same posture `live`
+  already takes) and for `off` (a future restore isn't promised either way,
+  so there is nothing to warn about). Don't move this check to resurrect
+  time "to simplify" — the whole point is the operator finds out BEFORE the
+  undying set is relied on, not after a later resurrect silently restores
+  nothing.
 - **`hookAncestry` is stamped ONCE, at a hook session's own registration,
   never touched again.** `session_store::stamp_hook_ancestry` is the only
   writer (change-only: it refuses to overwrite an already-populated

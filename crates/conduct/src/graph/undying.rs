@@ -23,7 +23,7 @@
 use super::common::require_args;
 use super::model::{load_stage, sessions_path, SessionsFile};
 #[cfg(test)]
-use super::model::write_stage;
+use super::model::{write_stage, RestoreSnapshot, SessionRecord};
 use aoide_protocol::output::Outcome;
 use aoide_protocol::Invocation;
 use aoide_storage::undying::{load_undying, save_undying, set_undying};
@@ -94,16 +94,58 @@ pub fn session_undying(inv: &Invocation) -> Outcome {
     // Presence in the roster is INFORMATIONAL only — never a gate on the
     // write above, which must succeed for a dead id exactly the same way it
     // does for a live one (the post-mortem case this command exists for).
-    let live = load_stage::<SessionsFile>(&sessions_path())
-        .map(|f| f.sessions.iter().any(|s| s.session_id == id))
-        .unwrap_or(false);
+    // Reused below for the nothing-to-restore warning: a record found here
+    // is the only signal this command has about what `id` actually is.
+    let record = load_stage::<SessionsFile>(&sessions_path())
+        .ok()
+        .and_then(|f| f.sessions.into_iter().find(|s| s.session_id == id));
+    let live = record.is_some();
 
     let verb = if on { "undying" } else { "not undying" };
-    let mut out = Outcome::ok(cmd, format!("`{id}` is now {verb}"));
+    let mut message = format!("`{id}` is now {verb}");
+    // Only worth warning on the way TO undying — turning it off never
+    // promises a future restore. A dead/unknown id (not in the roster) has
+    // no live signal to warn from either; silent there, same as `live`
+    // above.
+    if on {
+        if let Some(rec) = &record {
+            if let Some(warning) = nothing_to_restore_warning(&rec.agent, rec.restore.is_some()) {
+                message = format!("{message} — {warning}");
+            }
+        }
+    }
+    let mut out = Outcome::ok(cmd, message);
     if transitioned {
         out = out.changed(vec![format!("{id}: {verb}")]);
     }
     out.with_data(json!({ "sessionId": id, "undying": on, "live": live }))
+}
+
+/// Whether `graph resurrect` will find anything beyond the bare spec to
+/// restore for a session marked undying — the same two arms
+/// `resurrect.rs::resolve_candidate` tries, mirrored here at MARK time
+/// (task #100 follow-up to P-C6): the harness arm (`agent_profile(agent)`
+/// carrying a verified `resume_args`) and the terminal arm (`has_capture` —
+/// whether this session's own P-C5 restore snapshot was ever populated,
+/// which `conduct.rs::captures_like_a_shell` now gates on the WRAPPED
+/// command, never the agent label). Neither present means a later
+/// resurrect has nothing to work with but the spec itself — worth telling
+/// the operator NOW, at mark time, rather than only discovering it silently
+/// at a resurrect that restores nothing.
+pub(in crate::graph) fn nothing_to_restore_warning(agent: &str, has_capture: bool) -> Option<String> {
+    if has_capture {
+        return None;
+    }
+    if aoide_protocol::agents::agent_profile(agent)
+        .and_then(|p| p.resume_args)
+        .is_some()
+    {
+        return None;
+    }
+    Some(format!(
+        "warning: `{agent}` has no restore capture and no verified resume flag — \
+         resurrect will have nothing beyond the spec to restore for this session"
+    ))
 }
 
 #[cfg(test)]
@@ -275,6 +317,157 @@ mod tests {
         assert_eq!(second.status, Status::Ok);
         assert!(second.changed.is_empty(), "a re-mark is not a transition: {:?}", second.changed);
         assert_eq!(second.data.as_ref().unwrap()["undying"], true);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── nothing_to_restore_warning (task #100) ──────────────────────────
+
+    /// The gate itself, table-driven: `has_capture` short-circuits
+    /// regardless of agent, a registered harness profile's `resume_args`
+    /// short-circuits regardless of capture, and only the neither case
+    /// warns — the same two arms `resurrect.rs::resolve_candidate` tries.
+    #[test]
+    fn nothing_to_restore_warning_fires_only_when_neither_arm_resolves() {
+        let cases: &[(&str, bool, bool)] = &[
+            // (agent, has_capture, expect_warning)
+            ("claude", false, false), // harness arm: registered resume_args.
+            ("kimi", false, false),
+            ("pi", false, false),
+            ("shell", true, false), // terminal arm: capture ran.
+            ("soak-a", true, false), // an overridden label with real capture.
+            ("claude", true, false), // both arms present is still no warning.
+            ("shell", false, true), // task #100's exact live shape: neither arm.
+            ("soak-a", false, true),
+            ("codex", false, true),
+        ];
+        for (agent, has_capture, expect_warning) in cases {
+            let got = nothing_to_restore_warning(agent, *has_capture);
+            assert_eq!(
+                got.is_some(),
+                *expect_warning,
+                "nothing_to_restore_warning({agent:?}, {has_capture}) = {got:?}"
+            );
+        }
+    }
+
+    /// `session undying on --id <id>` surfaces the warning in the command's
+    /// own Outcome message (not a log line) when the target session has
+    /// neither capture nor a resumable harness profile — the P-C7 soak's
+    /// exact live shape, reached through `--agent soak-a -- bash` and then
+    /// marked undying.
+    #[test]
+    fn marking_a_captureless_non_harness_session_undying_warns_in_the_message() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
+        let root = setup("undying-warn-neither-arm");
+        let file = SessionsFile {
+            schema_version: "0".into(),
+            sessions: vec![SessionRecord {
+                agent: "soak-a".into(),
+                restore: None,
+                ..session("soak-sess", "/w", "working", "1", None)
+            }],
+        };
+        write_stage(&sessions_path(), &file).unwrap();
+
+        let out = session_undying(&undying_invocation(&["on"], &[("id", "soak-sess")]));
+        assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
+        assert!(
+            out.message.contains("warning:"),
+            "a session with no capture and no resumable profile must warn: {}",
+            out.message
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Silent otherwise: a session with real capture is never warned about,
+    /// even under a caller-chosen agent label a profile lookup would miss.
+    #[test]
+    fn marking_a_captured_session_undying_is_silent() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
+        let root = setup("undying-warn-captured");
+        let file = SessionsFile {
+            schema_version: "0".into(),
+            sessions: vec![SessionRecord {
+                agent: "soak-a".into(),
+                restore: Some(RestoreSnapshot {
+                    cwd: Some("/w".into()),
+                    idle: true,
+                    argv: None,
+                    typed: None,
+                }),
+                ..session("captured-sess", "/w", "working", "1", None)
+            }],
+        };
+        write_stage(&sessions_path(), &file).unwrap();
+
+        let out = session_undying(&undying_invocation(&["on"], &[("id", "captured-sess")]));
+        assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
+        assert!(!out.message.contains("warning:"), "msg: {}", out.message);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Silent for a registered harness even with no capture — the harness
+    /// arm (`agent_profile("claude").resume_args`) resolves instead.
+    #[test]
+    fn marking_a_harness_session_undying_is_silent_even_without_capture() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
+        let root = setup("undying-warn-harness");
+        let file = SessionsFile {
+            schema_version: "0".into(),
+            sessions: vec![session("claude-sess", "/w", "working", "1", None)], // agent: "claude", restore: None.
+        };
+        write_stage(&sessions_path(), &file).unwrap();
+
+        let out = session_undying(&undying_invocation(&["on"], &[("id", "claude-sess")]));
+        assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
+        assert!(!out.message.contains("warning:"), "msg: {}", out.message);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Turning it OFF never warns, even for a session neither arm could
+    /// ever resolve — the warning is only about a FUTURE resurrect, which
+    /// `off` no longer promises at all.
+    #[test]
+    fn marking_undying_off_never_warns() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
+        let root = setup("undying-warn-off");
+        let file = SessionsFile {
+            schema_version: "0".into(),
+            sessions: vec![SessionRecord {
+                agent: "soak-a".into(),
+                restore: None,
+                ..session("soak-sess-off", "/w", "working", "1", None)
+            }],
+        };
+        write_stage(&sessions_path(), &file).unwrap();
+
+        let out = session_undying(&undying_invocation(&["off"], &[("id", "soak-sess-off")]));
+        assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
+        assert!(!out.message.contains("warning:"), "msg: {}", out.message);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A dead/unknown id (absent from the roster) has no live signal to
+    /// warn from — silent, the same posture `live` already takes.
+    #[test]
+    fn marking_an_unrostered_id_undying_never_warns() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
+        let root = setup("undying-warn-unrostered");
+        // sessions.json stays empty — the id below is never in it.
+
+        let out = session_undying(&undying_invocation(&["on"], &[("id", "long-dead-id")]));
+        assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
+        assert!(!out.message.contains("warning:"), "msg: {}", out.message);
 
         let _ = std::fs::remove_dir_all(&root);
     }
