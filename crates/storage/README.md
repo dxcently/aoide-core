@@ -45,7 +45,18 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   reasoning. `fs::repo_root` is GONE (its one caller, `aoide-upkeep`'s
   `soundcheck`, now reads `fs::flake_root` directly — a runtime root is not
   a repo, so deriving a checkout path from stage-dir parentage stopped
-  making sense the moment the two could diverge).
+  making sense the moment the two could diverge). `fs::song_templates_dir`
+  (L-C3, same lane) is a THIRD, sibling path seam alongside `root`/
+  `flake_root`: the shipped SCORE TEMPLATES dir a repo-less host's `rice
+  compose --from <song>` and `aoide-song::widgets`'s registry/manifest
+  regeneration both fall back to when `songbook_dir`/`flake_root` have
+  nothing. Two tiers — `$AOIDE_SONG_TEMPLATES` (absolute-wins, same
+  discipline as every override above), else a sibling of `current_exe()`'s
+  directory (`<exe_dir>/../share/lyra/songbook`, gated on that directory
+  actually existing) — the same shape `aoide_protocol::bin`'s sibling-binary
+  resolver uses, applied to a directory instead of an executable. Returns
+  `None` (never a default that might not exist) when neither resolves; the
+  caller turns that into a taught error naming both locations.
 - `session` — pure session/hook upsert operations.
 - `peer_store` — the peer-federation registry + pull cache (CONTRACTS.md §7).
   `Peer` carries two independent, opposite-direction credential fields:

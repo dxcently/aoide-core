@@ -480,6 +480,76 @@ pub fn flake_root() -> std::path::PathBuf {
     aoide_protocol::aoide_home().join("Aoide")
 }
 
+/// Pure tier logic for [`song_templates_dir`] — the same two-tier shape
+/// `aoide_protocol::bin`'s sibling-binary resolver uses (env override, then
+/// a sibling of `current_exe()`'s directory gated on its OWN existence
+/// check), applied to a directory instead of an executable, so the tier
+/// decision is testable without a real `current_exe()`/filesystem probe.
+/// `exe_dir` is `current_exe()`'s parent (`None` if that call failed);
+/// `sibling_is_dir` stands in for the real `Path::is_dir()` check
+/// [`song_templates_dir`] performs.
+fn resolve_song_templates_dir(
+    env_value: Option<&str>,
+    exe_dir: Option<&std::path::Path>,
+    sibling_is_dir: bool,
+) -> Option<std::path::PathBuf> {
+    if let Some(dir) = env_value {
+        let p = std::path::PathBuf::from(dir);
+        if p.is_absolute() {
+            return Some(p);
+        }
+    }
+    let dir = exe_dir?;
+    if sibling_is_dir {
+        Some(dir.join("..").join("share").join("lyra").join("songbook"))
+    } else {
+        None
+    }
+}
+
+/// The shipped SCORE TEMPLATES dir (L-C3, lyra-carrier lane, task #107):
+/// `<templates>/<song>/livery.json` is what `rice compose --from <song>`
+/// (`aoide-song`'s `commands::rice`) falls back to reading when
+/// [`songbook_dir`] has nothing yet for that song — the ordinary case on a
+/// repo-less host, which has no `$AOIDE_FLAKE_ROOT` checkout to have
+/// composed FROM in the first place. `<templates>` also carries prebaked
+/// `manifest.json`/`registry.json` (`aoide-song::widgets`'s own fallback,
+/// baked at nix build time by `lib/songbook.nix` — the SAME generator
+/// [`flake_root`]'s `nix eval` path calls at runtime on a checkout host) for
+/// the same repo-less case.
+///
+/// Two tiers, tried in order, absolute-path-wins discipline matching every
+/// other override in this file:
+///   1. `$AOIDE_SONG_TEMPLATES` — trusted unconditionally once it resolves
+///      to an absolute path, no existence check (same as [`root`]/
+///      [`flake_root`]). The tier a nix unit sets, wired onto every unit
+///      that already carries `$AOIDE_ROOT`/`$AOIDE_FLAKE_ROOT`
+///      (`modules/nucleus/{aoided,shellbridge,secrets,melete-adapter}.nix`)
+///      — a store-path boundary sibling resolution cannot cross.
+///   2. the sibling of `current_exe()`'s directory,
+///      `<exe_dir>/../share/lyra/songbook` — ONLY if that directory
+///      actually exists (mirrors `aoide_protocol::bin`'s own tier-2 rule:
+///      handing back a path that isn't there only moves the failure
+///      downstream for no benefit). What a non-nix tarball install
+///      (`bin/lyra` + `share/lyra/songbook/` sitting beside it) uses; on a
+///      NixOS host this tier is never actually reached, since tier 1 is
+///      always set there.
+///
+/// `None` when neither resolves — this function has no opinion on error
+/// text (same as every other pure resolver here); the caller turns that
+/// into a taught error naming both locations it checked.
+pub fn song_templates_dir() -> Option<std::path::PathBuf> {
+    let env_value = std::env::var("AOIDE_SONG_TEMPLATES").ok();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+    let sibling_is_dir = exe_dir
+        .as_deref()
+        .map(|dir| dir.join("..").join("share").join("lyra").join("songbook"))
+        .is_some_and(|p| p.is_dir());
+    resolve_song_templates_dir(env_value.as_deref(), exe_dir.as_deref(), sibling_is_dir)
+}
+
 /// The committed-song directory: `<song>/songbook/<name>/`.
 ///
 /// Shares [`song_dir`]'s `AOIDE_STAGE_DIR`-relative resolution, so a test that
@@ -1067,6 +1137,90 @@ mod tests {
         match saved_flake {
             Some(v) => std::env::set_var("AOIDE_FLAKE_ROOT", v),
             None => std::env::remove_var("AOIDE_FLAKE_ROOT"),
+        }
+    }
+
+    // ── `song_templates_dir` (L-C3, lyra-carrier lane, task #107) ──────────
+
+    #[test]
+    fn song_templates_tiers_resolve_in_order() {
+        // Pure tier logic — no real env/filesystem, mirroring
+        // `aoide_protocol::bin::tiers_resolve_in_order`'s table shape for
+        // the same two-tier resolver applied to a directory.
+        let cases: &[(&str, Option<&str>, Option<&str>, bool, Option<&str>)] = &[
+            (
+                "env wins even when a sibling dir exists",
+                Some("/opt/custom/songbook"),
+                Some("/usr/bin"),
+                true,
+                Some("/opt/custom/songbook"),
+            ),
+            (
+                "env wins over the no-sibling case too",
+                Some("/opt/custom/songbook"),
+                None,
+                false,
+                Some("/opt/custom/songbook"),
+            ),
+            (
+                "a relative env value is ignored, falls through to the sibling",
+                Some("relative/songbook"),
+                Some("/usr/bin"),
+                true,
+                Some("/usr/bin/../share/lyra/songbook"),
+            ),
+            (
+                "sibling used only when it actually exists",
+                None,
+                Some("/usr/bin"),
+                true,
+                Some("/usr/bin/../share/lyra/songbook"),
+            ),
+            (
+                "sibling absent (not a dir) resolves to nothing",
+                None,
+                Some("/usr/bin"),
+                false,
+                None,
+            ),
+            ("no exe dir and no env resolves to nothing", None, None, false, None),
+        ];
+
+        for (label, env_value, exe_dir, sibling_is_dir, expect) in cases {
+            let got = resolve_song_templates_dir(*env_value, exe_dir.map(std::path::Path::new), *sibling_is_dir);
+            assert_eq!(got, expect.map(std::path::PathBuf::from), "{label}");
+        }
+    }
+
+    #[test]
+    fn song_templates_dir_honors_an_absolute_env_override() {
+        // The impure public wrapper: an absolute `$AOIDE_SONG_TEMPLATES`
+        // wins outright regardless of whatever `current_exe()`'s own
+        // sibling resolves to in this test binary (which never has a real
+        // `share/lyra/songbook` beside it).
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_SONG_TEMPLATES").ok();
+
+        std::env::set_var("AOIDE_SONG_TEMPLATES", "/tmp/aoide-song-templates-test");
+        assert_eq!(
+            song_templates_dir(),
+            Some(std::path::PathBuf::from("/tmp/aoide-song-templates-test"))
+        );
+
+        // Empty/relative values are ignored, same discipline as every other
+        // override in this file — falls through to the sibling tier, which
+        // resolves to `None` for this test binary.
+        std::env::set_var("AOIDE_SONG_TEMPLATES", "");
+        assert_eq!(song_templates_dir(), None);
+        std::env::set_var("AOIDE_SONG_TEMPLATES", "relative/templates");
+        assert_eq!(song_templates_dir(), None);
+
+        std::env::remove_var("AOIDE_SONG_TEMPLATES");
+        assert_eq!(song_templates_dir(), None);
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_SONG_TEMPLATES", v),
+            None => std::env::remove_var("AOIDE_SONG_TEMPLATES"),
         }
     }
 

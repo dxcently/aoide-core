@@ -46,6 +46,19 @@
   aoided}.rs`, `crates/lyra/src/bin/lyra.rs`) — a test may call it directly
   too (it is a plain idempotent function, no `Once`/env-isolation dance
   needed, unlike `migrate_conducting_stage`'s own test suite).
+- **`fs::song_templates_dir` returns `Option`, never a default (L-C3,
+  lyra-carrier lane, task #107) — don't "helpfully" fall back to a
+  hardcoded path when both tiers miss.** Unlike `root`/`flake_root` (always
+  resolvable — a runtime path or a checkout path always HAS a default,
+  even if nothing lives there yet), a templates dir with no baked
+  `manifest.json`/`registry.json` is not useful to hand back silently; the
+  caller (`aoide-song`'s `commands::rice`/`widgets`) is the one that knows
+  how to phrase the taught error naming both locations it checked. Don't
+  add a `$HOME`-derived third tier here "for consistency" — the two tiers
+  mirror `aoide_protocol::bin`'s sibling-binary resolver on purpose, and
+  that resolver has no such fallback either (its own tier 3, the bare name,
+  only exists because `Command::spawn` can resolve it off `PATH` at exec
+  time — there is no equivalent for a directory).
 - **`takes`/`mode` are a deliberate charter smudge, not an oversight.** Don't
   "clean them up" into a paint-adjacent crate without re-reading
   `docs/architecture/PACKAGE-LAYOUT.md`'s "Charter exceptions" note — `mode`
