@@ -93,7 +93,12 @@
   confirm dialog) — `DISMISS_LABEL` is `aoide-secrets`' own zenity/lyra
   dialogs' label specifically; a new ceremony with its own wording defines
   its own constant beside its own caller, the same way `feed`'s record
-  shape stays the caller's contract, never this module's.
+  shape stays the caller's contract, never this module's. **`run_entry_dialog`
+  takes its dismiss label as a PARAMETER, not a constant it reads
+  internally** — the whole reason two ceremonies can share one loop with
+  two different labels; don't collapse it back to reading `DISMISS_LABEL`
+  directly, that would make every OTHER caller's own label
+  unreachable again.
 
 ## Extension points
 
