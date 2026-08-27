@@ -115,7 +115,7 @@ pub struct InboxFile {
 }
 
 /// `~/Aoide/state/inbox.json` — durable, per-host, NOT song-scoped (same
-/// tier as `usage.json`/`a2a-agents.json`, never reset by a stage reseed).
+/// tier as `usage.json`/`peers.json`, never reset by a stage reseed).
 pub fn inbox_path() -> PathBuf {
     state_dir().join("inbox.json")
 }

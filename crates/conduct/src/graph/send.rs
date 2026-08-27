@@ -455,8 +455,8 @@ fn audit_send(inv: &Invocation, status: &str, message: &str, text: &str) {
 ///   RECEIVING peer's job**, done inside its own `message_send` Inject arm;
 ///   this door's `--yes`/pending/autogate machinery above is a LOCAL-socket
 ///   concept and does not apply to a remote delivery, which always attempts
-///   the network send — exactly like the existing `a2a agent send`/`peer
-///   pull` commands already do unconditionally).
+///   the network send — exactly like the existing `peer pull` command
+///   already does unconditionally).
 ///
 /// With NEITHER flag, this is a usage error (same as before `--to` existed —
 /// `require_flag` below is untouched).
@@ -904,7 +904,7 @@ fn ignored_remote_flags(inv: &Invocation) -> Vec<&'static str> {
 /// `--yes`/pending/autogate (`send_gate`, `record_pending`) are a
 /// LOCAL-SOCKET concept: they decide whether THIS process writes to a
 /// socket it owns. A remote send is always ATTEMPTED over the network,
-/// exactly like `a2a agent send`/`peer pull` already do unconditionally.
+/// exactly like `peer pull` already does unconditionally.
 /// The RECEIVING peer's own `message_send` Inject arm
 /// (`aoide-server::a2a::message_send` → `do_inject`) is where the real gate
 /// lives: it decides deliver-now vs. hold-pending off ITS OWN peer-trust

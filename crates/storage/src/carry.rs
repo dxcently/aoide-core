@@ -4,7 +4,7 @@
 //! `state/carry.json` section).
 //!
 //! Store only (P-C1 of the durable-sessions plan) — no command, no consumer
-//! wired yet. Mirrors `a2a_store.rs`'s shape and discipline exactly: a
+//! wired yet. Mirrors `peer_store.rs`'s shape and discipline exactly: a
 //! `schemaVersion` container, tolerate-missing/corrupt-as-empty on read,
 //! `fs::atomic_write` on write, pure list mutations for the CRUD so it's
 //! unit-testable off disk.
@@ -35,7 +35,7 @@ pub struct CarryRegistry {
 }
 
 /// The carry file path: `state/carry.json` — the same gitignored
-/// root-runtime `state/` dir `a2a-agents.json`/`usage.json` live in
+/// root-runtime `state/` dir `peers.json`/`usage.json` live in
 /// (CONTRACTS.md), NOT `song/stage/`: a carry mark is durable operator
 /// state, never staged rehearsal state.
 pub fn carry_path() -> std::path::PathBuf {
@@ -43,7 +43,7 @@ pub fn carry_path() -> std::path::PathBuf {
 }
 
 /// Read the carried set, tolerating a missing/corrupt/wrong-shape file as
-/// empty — never an error, the same discipline `a2a_store::load_agents`
+/// empty — never an error, the same discipline `peer_store::load_peers`
 /// holds. A mark set on an id that never produced a ledger line is inert,
 /// not an error condition, so an unreadable file is simply "nothing
 /// carried."
@@ -58,7 +58,7 @@ pub fn load_carry() -> Vec<CarriedSession> {
 
 /// Atomic-write the carried set (v0 shape) back to `state/carry.json`.
 /// Plain [`atomic_write`], not `atomic_write_private` — `carry.json` holds
-/// session ids, the same class of data `sessions.json`/`a2a-agents.json`
+/// session ids, the same class of data `sessions.json`/`peers.json`
 /// already keep at default mode; `atomic_write_private` is reserved for the
 /// identity/secret lane (`identity.rs`).
 pub fn save_carry(carried: &[CarriedSession]) -> Result<(), String> {

@@ -21,11 +21,6 @@ aoide-storage = { workspace = true }
 # same-process function call, never a subprocess shell-out) so it inherits
 # that command's own hold/gate/audit behavior for free.
 aoide-conduct = { workspace = true }
-# `screen send --agent` calls `aoide_client::commands::handle_agent_send`
-# directly — the same JSON-RPC `message/send` driver `aoide a2a agent send`
-# uses (moved here verbatim from conduct's own former edge; see
-# `send.rs`'s module header for the full story).
-aoide-client = { workspace = true }
 libc = { workspace = true }
 # `screen::synth`'s pointer-synthesis backend (Phase A of the
 # pointer-emulation workstream) — see the workspace manifest's own comment on

@@ -1,43 +1,15 @@
-//! `aoide screen send <capture> (--session <id> | --agent <name>)` — hand a
-//! `screen shot` capture (with its comment + OCR text) to another agent. THE
-//! PAYOFF of the `screen` command family: capture → ocr → SEND.
+//! `aoide screen send <capture> --session <id>` — hand a `screen shot`
+//! capture (with its comment + OCR text) to another session. THE PAYOFF of
+//! the `screen` command family: capture → ocr → SEND.
 //!
-//! This is deliberately a THIN composer + router over two ALREADY-GATED
-//! doors, never a third injection path:
-//!
-//!   * `--session <id>` composes the message, then calls
-//!     [`aoide_conduct::graph::session_send`] DIRECTLY (a same-process function call
-//!     via a synthesized [`Invocation`] — never a subprocess shell-out to
-//!     `aoide graph send`). That function is `aoide graph send`'s own
-//!     handler: HELD pending approval by default, `--yes` (or autogate)
-//!     delivers, every outcome audited. `screen send --session` inherits ALL
-//!     of that for free — no second gate exists anywhere in this file.
-//!   * `--agent <name>` composes the message, then calls
-//!     [`aoide_client::commands::handle_agent_send`] DIRECTLY, again via a
-//!     synthesized `Invocation` — the exact same JSON-RPC `message/send`
-//!     driver `aoide a2a agent send` uses.
-//!
-//! ── The cross-crate seam (khoa's brief, 2026-08-16; this module + its
-//! `aoide-client` edge moved crate at P-A1 of the binary-split workstream,
-//! 2026-08-21) ─────────────────────────────────────────────────────────────
-//! `aoide-conduct` did not originally depend on `aoide-client` —
-//! PACKAGE-LAYOUT.md's charter table has them as independent leaves,
-//! combined only at `cli` (the DAG sink). `screen send --agent` needs BOTH
-//! the session-graph/capture domain and the outbound A2A driver (client) in
-//! the SAME function, and the alternative — reimplementing the curl/JSON-RPC
-//! send here, or moving `screen send`'s registration up to the `cli` crate
-//! out of step with every other `screen *` command — would either fork a
-//! second ungated injection path or break the established "all `screen`
-//! commands register together in `crate::commands`" pattern. So `conduct`'s
-//! `Cargo.toml` grew an `aoide-client` dependency (one new edge; `client`
-//! has no dependency back on `conduct`, so it did not cycle) and
-//! `handle_agent_send` was bumped from crate-private to `pub` — a
-//! visibility-only change, its body untouched. P-A1 moved this whole module
-//! out of `conduct` into its own `aoide-screen` crate, which carries the
-//! same `aoide-client` edge onward (conduct's own copy of the edge stays,
-//! retained for the upcoming `who` presence command — see conduct's
-//! `Cargo.toml` comment). Bends the charter's stated independence a little
-//! either way; flagged here rather than papered over.
+//! This is deliberately a THIN composer + router over an ALREADY-GATED
+//! door, never a second injection path: it composes the message, then calls
+//! [`aoide_conduct::graph::session_send`] DIRECTLY (a same-process function
+//! call via a synthesized [`Invocation`] — never a subprocess shell-out to
+//! `aoide graph send`). That function is `aoide graph send`'s own handler:
+//! HELD pending approval by default, `--yes` (or autogate) delivers, every
+//! outcome audited. `screen send` inherits ALL of that for free — no second
+//! gate exists anywhere in this file.
 //!
 //! ── A2A attachment: DEFERRED ─────────────────────────────────────────────
 //! Real binary attachment (A2A `FilePart`) is NOT built here — see the
@@ -51,30 +23,6 @@ use aoide_protocol::Invocation;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-
-// ── Pure: which target was asked for ────────────────────────────────────
-
-/// Which single target `--session`/`--agent` resolved to — mirrors
-/// `capture.rs`'s own `resolve_region_source` mutual-exclusion shape (one
-/// flag wins; zero or two is a usage error), just two-way instead of
-/// five-way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TargetKind {
-    Session,
-    Agent,
-}
-
-/// Resolve the mutually-exclusive `--session`/`--agent` pair. `Err` carries
-/// the exact usage-error text for the call site — never a silent precedence
-/// pick between them.
-fn resolve_target_kind(has_session: bool, has_agent: bool) -> Result<TargetKind, &'static str> {
-    match (has_session, has_agent) {
-        (false, false) => Err("exactly one of --session/--agent is required (got neither)"),
-        (true, true) => Err("--session and --agent are mutually exclusive (pick exactly one)"),
-        (true, false) => Ok(TargetKind::Session),
-        (false, true) => Ok(TargetKind::Agent),
-    }
-}
 
 // ── Pure: message composition (the exhaustively-tested core) ───────────────
 
@@ -172,23 +120,21 @@ fn read_sidecar(capture: &Path) -> SidecarRead {
 
 /// The pieces of `send()`'s own state neither router needs to re-derive —
 /// threaded through as one reference instead of four loose parameters
-/// (keeps `send_to_session`/`send_to_agent`/`wrap` under clippy's
-/// too-many-arguments threshold without losing any of the fields).
+/// (keeps `send_to_session`/`wrap` under clippy's too-many-arguments
+/// threshold without losing any of the fields).
 struct SendCtx<'a> {
     cmd: &'a str,
     path: &'a Path,
     sidecar_status: &'static str,
 }
 
-/// Wrap an inner [`Outcome`] (from [`aoide_conduct::graph::session_send`] or
-/// [`aoide_client::commands::handle_agent_send`]) into `screen.send`'s own
-/// envelope. The inner `status`/`message`/`changed` ride through UNCHANGED —
-/// a failed delivery is never silently reported as ok — `data` is relabelled
-/// with what a `screen send` caller actually wants (target/composed
-/// message/delivery state/sidecar-enrichment status), and the entire inner
-/// payload nests at `data.inner` so nothing the underlying door reported (a
-/// session's `title`/`gate`, an agent's `url`/`messageId`/`response`) is
-/// ever lost.
+/// Wrap an inner [`Outcome`] (from [`aoide_conduct::graph::session_send`])
+/// into `screen.send`'s own envelope. The inner `status`/`message`/`changed`
+/// ride through UNCHANGED — a failed delivery is never silently reported as
+/// ok — `data` is relabelled with what a `screen send` caller actually
+/// wants (target/composed message/delivery state/sidecar-enrichment
+/// status), and the entire inner payload nests at `data.inner` so nothing
+/// the underlying door reported (a session's `title`/`gate`) is ever lost.
 fn wrap(ctx: &SendCtx, kind: &'static str, target: &str, message: &str, state: &'static str, inner: Outcome) -> Outcome {
     Outcome::new(ctx.cmd, inner.status, inner.message.clone())
         .changed(inner.changed.clone())
@@ -240,34 +186,17 @@ fn send_to_session(inv: &Invocation, ctx: &SendCtx, id: &str, message: &str, yes
     wrap(ctx, "session", id, message, state, inner)
 }
 
-/// Route `--agent <name>`: synthesize the `Invocation` `aoide a2a agent send
-/// <name> <message>` would parse into, and call
-/// [`aoide_client::commands::handle_agent_send`] directly. A2A has no
-/// pending/hold concept (unlike the session gate) — a successful call always
-/// means "posted now."
-fn send_to_agent(inv: &Invocation, ctx: &SendCtx, name: &str, message: &str) -> Outcome {
-    let sub_inv = Invocation {
-        path: vec!["a2a".to_string(), "agent".to_string(), "send".to_string()],
-        args: vec![name.to_string(), message.to_string()],
-        flags: BTreeMap::new(),
-        door: inv.door,
-    };
-    let inner = aoide_client::commands::handle_agent_send(&sub_inv);
-    let state: &'static str = if inner.status == Status::Ok { "sent-to-agent" } else { "error" };
-    wrap(ctx, "agent", name, message, state, inner)
-}
-
 // ── `aoide screen send` ─────────────────────────────────────────────────
 
-/// `aoide screen send <capture> (--session <id> | --agent <name>) [--comment
-/// "text"] [--yes] [--json]` — see the module header for the full design.
+/// `aoide screen send <capture> --session <id> [--comment "text"] [--yes]
+/// [--json]` — see the module header for the full design.
 pub fn send(inv: &Invocation) -> Outcome {
     let cmd = "screen.send";
     let usage = |msg: &str| {
         Outcome::usage(
             cmd,
             format!(
-                "{msg} — usage: aoide {} <capture> (--session <id> | --agent <name>) [--comment \"text\"] [--yes] [--json]",
+                "{msg} — usage: aoide {} <capture> --session <id> [--comment \"text\"] [--yes] [--json]",
                 inv.path.join(" ")
             ),
         )
@@ -278,20 +207,9 @@ pub fn send(inv: &Invocation) -> Outcome {
     };
     let capture_path = PathBuf::from(capture_arg);
 
-    let has_session = inv.flags.contains_key("session");
-    let has_agent = inv.flags.contains_key("agent");
-    let kind = match resolve_target_kind(has_session, has_agent) {
-        Ok(k) => k,
-        Err(msg) => return usage(msg),
-    };
-    let (session_id, agent_name) = match kind {
-        TargetKind::Session => (inv.flags.get("session").cloned().unwrap_or_default(), String::new()),
-        TargetKind::Agent => (String::new(), inv.flags.get("agent").cloned().unwrap_or_default()),
-    };
-    if (kind == TargetKind::Session && session_id.is_empty())
-        || (kind == TargetKind::Agent && agent_name.is_empty())
-    {
-        return usage("the target flag's value must not be empty");
+    let session_id = inv.flags.get("session").cloned().unwrap_or_default();
+    if session_id.is_empty() {
+        return usage("--session <id> is required");
     }
 
     if !capture_path.is_file() {
@@ -316,10 +234,7 @@ pub fn send(inv: &Invocation) -> Outcome {
     let audit_log = inv.flags.get("audit-log").cloned();
 
     let ctx = SendCtx { cmd, path: &abs_path, sidecar_status: sidecar.tag() };
-    match kind {
-        TargetKind::Session => send_to_session(inv, &ctx, &session_id, &message, yes, audit_log.as_deref()),
-        TargetKind::Agent => send_to_agent(inv, &ctx, &agent_name, &message),
-    }
+    send_to_session(inv, &ctx, &session_id, &message, yes, audit_log.as_deref())
 }
 
 #[cfg(test)]
@@ -334,16 +249,6 @@ mod tests {
             flags: flags.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             door: Door::Cli,
         }
-    }
-
-    // ── resolve_target_kind: the mutual-exclusion matrix ────────────────
-
-    #[test]
-    fn target_kind_requires_exactly_one_of_session_or_agent() {
-        assert_eq!(resolve_target_kind(false, false), Err("exactly one of --session/--agent is required (got neither)"));
-        assert_eq!(resolve_target_kind(true, true), Err("--session and --agent are mutually exclusive (pick exactly one)"));
-        assert_eq!(resolve_target_kind(true, false), Ok(TargetKind::Session));
-        assert_eq!(resolve_target_kind(false, true), Ok(TargetKind::Agent));
     }
 
     // ── compose_message: all four presence combinations, exhaustively ───
@@ -491,17 +396,10 @@ mod tests {
     }
 
     #[test]
-    fn send_with_neither_target_is_a_usage_error() {
+    fn send_with_no_session_flag_is_a_usage_error() {
         let out = send(&test_invocation(&["/tmp/whatever.png"], &[]));
         assert_eq!(out.status, Status::Usage);
-        assert!(out.message.contains("neither"), "{}", out.message);
-    }
-
-    #[test]
-    fn send_with_both_targets_is_a_usage_error() {
-        let out = send(&test_invocation(&["/tmp/whatever.png"], &[("session", "s1"), ("agent", "a1")]));
-        assert_eq!(out.status, Status::Usage);
-        assert!(out.message.contains("mutually exclusive"), "{}", out.message);
+        assert!(out.message.contains("--session"), "{}", out.message);
     }
 
     #[test]
@@ -515,37 +413,6 @@ mod tests {
         let out = send(&test_invocation(&["/nonexistent/path/shot.png"], &[("session", "s1")]));
         assert_eq!(out.status, Status::Error);
         assert_eq!(out.data.as_ref().unwrap()["reason"], "capture-not-found");
-    }
-
-    // ── send(): unknown agent — a clean, network-free error path ────────
-    // Proves the --agent route really reaches `handle_agent_send` (an
-    // unregistered name fails BEFORE that function ever touches curl/the
-    // network, so this is deterministic and fast — see that function's own
-    // body: the registry lookup is the very first thing it does).
-
-    #[test]
-    fn send_to_an_unregistered_agent_is_a_clean_error_no_network_touched() {
-        let _guard = crate::env_lock().lock().unwrap();
-        let _env = aoide_test_support::EnvSaver::capture(&["AOIDE_STATE_DIR"]);
-        let root = aoide_test_support::unique_tmp("screen-send-unknown-agent");
-        // Steer aoide-storage's state dir (a2a_store::agents_path ==
-        // state_dir().join("a2a-agents.json"), and state_dir() prefers
-        // $AOIDE_STATE_DIR when it's an ABSOLUTE path — unique_tmp's root
-        // always is) into the scratch root, so this can never see a REAL
-        // registered agent from the actual rig's state/a2a-agents.json.
-        std::env::set_var("AOIDE_STATE_DIR", &root);
-
-        let capture = tmp_capture("unknown-agent");
-        std::fs::write(&capture, b"fake").unwrap();
-
-        let out = send(&test_invocation(&[capture.to_str().unwrap()], &[("agent", "nonexistent-agent")]));
-        assert_eq!(out.status, Status::Error, "msg: {}", out.message);
-        assert_eq!(out.data.as_ref().unwrap()["inner"]["reason"], "unknown-agent");
-        assert_eq!(out.data.as_ref().unwrap()["target"]["kind"], "agent");
-        assert_eq!(out.data.as_ref().unwrap()["state"], "error");
-
-        let _ = std::fs::remove_file(&capture);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ── send(): the safety-critical gate proof — --session WITHOUT --yes

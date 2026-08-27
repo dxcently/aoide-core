@@ -1,21 +1,20 @@
-//! The client domain's CLI commands (CONTRACTS.md §6): `a2a agent
-//! add|list|remove|send` (the outbound half — aoide DRIVES external A2A
-//! agents) and `adapter melete` (the neutral-event consumer).
+//! The client domain's CLI commands: `peer add|list|remove|allow|hub|pull|
+//! status` and `peer pair request|pending|approve|reject` +
+//! `peer discover|invite` (CONTRACTS.md §7, same-network federation and its
+//! pairing ceremony) and `adapter melete` (the neutral-event consumer).
 //!
 //! Moved from the root package's `src/commands/a2a.rs` + the client half of
 //! `src/commands/infra.rs` (Phase 9 restructure,
 //! docs/architecture/PACKAGE-LAYOUT.md): a domain's CLI commands live with the
-//! domain. The root package's `commands::all()` calls [`register_agents`]
+//! domain. The root package's `commands::all()` calls [`register_peers`]
 //! directly after `aoide_server::commands::register_a2a_serve` and
 //! [`register_post_graph`] directly before `aoide_conductor::commands::register`,
 //! so `schema --json` order never shifts.
 //!
-//! The registry lives in `state/a2a-agents.json` (`aoide_storage::a2a_store`)
-//! and folds into the session DAG as `kind:"a2a"` nodes
-//! (`graph/doc.rs::build_graph`). These endpoints are external and carry NO
-//! local credential, so a plain curl (url/body in argv or stdin) is fine;
-//! SSRF isn't guarded: the url is the user's own CLI argument, a
-//! user-initiated fetch.
+//! A peer is another aoide instance, addressed by URL and verified via its
+//! AgentCard before registration (`aoide_storage::peer_store`); registered
+//! peers fold into the session DAG as `kind:"peer"` nodes
+//! (`graph/doc.rs::build_graph`).
 
 use aoide_protocol::output::Outcome;
 use aoide_protocol::registry::{arg, cmd, flag, Registry};
@@ -44,7 +43,7 @@ fn run_curl(extra: &[&str], stdin_body: Option<&str>) -> Result<(u16, String), S
 /// presence probe, workstream C2) which needs a much shorter per-peer bound
 /// (~2s) than every other curl call site here — those all keep calling
 /// [`run_curl`] unchanged, so this refactor is a pure internal split, not a
-/// behavior change for `peer pull`/`a2a agent add`/etc.
+/// behavior change for `peer pull`/`peer add`/etc.
 fn run_curl_with_timeout(
     timeout_secs: u64,
     extra: &[&str],
@@ -326,233 +325,23 @@ fn gen_message_id() -> String {
     format!("aoide-{}-{}", std::process::id(), nanos)
 }
 
-/// A short human summary of a `message/send` reply (a Task or a Message).
-fn describe_result(resp: &Value) -> String {
-    let Some(result) = resp.get("result") else {
-        return "reply received".to_string();
-    };
-    if let Some(state) = result
-        .get("status")
-        .and_then(|s| s.get("state"))
-        .and_then(Value::as_str)
-    {
-        let id = result.get("id").and_then(Value::as_str).unwrap_or("");
-        return format!("task {id} [{state}]");
-    }
-    match result.get("kind").and_then(Value::as_str) {
-        Some(kind) => format!("{kind} reply"),
-        None => "reply received".to_string(),
-    }
-}
-
-// ── The four `agent` commands (client side, CONTRACTS.md §6) ────────────────────
-
-/// `a2a agent add <url>` — fetch the AgentCard, parse it, register the agent.
-fn handle_agent_add(inv: &Invocation) -> Outcome {
-    let cmd = "a2a.agent.add";
-    let url = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        Some(u) => u.to_string(),
-        None => return Outcome::usage(cmd, "usage: aoide a2a agent add <url> [--json]"),
-    };
-    let card_url = crate::wire::resolve_card_url(&url);
-    let (code, body) = match run_curl(&["--", &card_url], None) {
-        Ok(v) => v,
-        Err(e) => {
-            return Outcome::error(cmd, format!("fetching AgentCard {card_url}: {e}"))
-                .with_data(json!({ "reason": "fetch-failed", "url": card_url }))
-        }
-    };
-    if code != 200 {
-        return Outcome::error(cmd, format!("fetching AgentCard {card_url}: HTTP {code}"))
-            .with_data(json!({ "reason": "fetch-http-error", "url": card_url, "httpCode": code }));
-    }
-    let card: Value = match serde_json::from_str(&body) {
-        Ok(v) => v,
-        Err(e) => {
-            return Outcome::error(cmd, format!("parsing AgentCard {card_url}: {e}"))
-                .with_data(json!({ "reason": "card-unparseable", "url": card_url }))
-        }
-    };
-    let now = aoide_storage::time::now_iso_utc();
-    let agent = match crate::wire::parse_agent_card(&card, &card_url, &now) {
-        Ok(a) => a,
-        Err(e) => {
-            return Outcome::error(cmd, format!("invalid AgentCard {card_url}: {e}"))
-                .with_data(json!({ "reason": "card-invalid", "url": card_url }))
-        }
-    };
-    let mut agents = aoide_storage::a2a_store::load_agents();
-    let replaced = agents.iter().any(|a| a.name == agent.name);
-    aoide_storage::a2a_store::upsert_agent(&mut agents, agent.clone());
-    if let Err(e) = aoide_storage::a2a_store::save_agents(&agents) {
-        return Outcome::error(cmd, format!("writing the agent registry: {e}"))
-            .with_data(json!({ "reason": "registry-write-failed" }));
-    }
-    let word = if replaced { "updated" } else { "registered" };
-    Outcome::ok(
-        cmd,
-        format!(
-            "{word} A2A agent `{}` → {} ({} total)",
-            agent.name,
-            agent.url,
-            agents.len()
-        ),
-    )
-    .changed(vec![aoide_storage::a2a_store::agents_path().to_string_lossy().into_owned()])
-    .with_data(json!({ "agent": agent, "count": agents.len(), "replaced": replaced }))
-}
-
-/// `a2a agent list` — the registered agents (name · url · description).
-fn handle_agent_list(_inv: &Invocation) -> Outcome {
-    let cmd = "a2a.agent.list";
-    let agents = aoide_storage::a2a_store::load_agents();
-    let msg = if agents.is_empty() {
-        "no external A2A agents registered".to_string()
-    } else {
-        let lines: Vec<String> = agents
-            .iter()
-            .map(|a| {
-                if a.description.is_empty() {
-                    format!("{} · {}", a.name, a.url)
-                } else {
-                    format!("{} · {} · {}", a.name, a.url, a.description)
-                }
-            })
-            .collect();
-        format!(
-            "{} registered A2A agent(s):\n{}",
-            agents.len(),
-            lines.join("\n")
-        )
-    };
-    Outcome::ok(cmd, msg).with_data(json!({ "agents": agents, "count": agents.len() }))
-}
-
-/// `a2a agent remove <name>` — drop the named agent (idempotent).
-fn handle_agent_remove(inv: &Invocation) -> Outcome {
-    let cmd = "a2a.agent.remove";
-    let name = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        Some(n) => n.to_string(),
-        None => return Outcome::usage(cmd, "usage: aoide a2a agent remove <name> [--json]"),
-    };
-    let mut agents = aoide_storage::a2a_store::load_agents();
-    if !aoide_storage::a2a_store::remove_agent(&mut agents, &name) {
-        return Outcome::ok(cmd, format!("no A2A agent named `{name}` (nothing to remove)"))
-            .with_data(json!({ "removed": false, "name": name, "count": agents.len() }));
-    }
-    if let Err(e) = aoide_storage::a2a_store::save_agents(&agents) {
-        return Outcome::error(cmd, format!("writing the agent registry: {e}"))
-            .with_data(json!({ "reason": "registry-write-failed" }));
-    }
-    Outcome::ok(
-        cmd,
-        format!("removed A2A agent `{name}` ({} remaining)", agents.len()),
-    )
-    .changed(vec![aoide_storage::a2a_store::agents_path().to_string_lossy().into_owned()])
-    .with_data(json!({ "removed": true, "name": name, "count": agents.len() }))
-}
-
-/// `a2a agent send <name> <message>` — DRIVE a registered external agent: POST
-/// a JSON-RPC `message/send` to its endpoint and report the returned
-/// Task/Message. The outbound half of the bidirectional A2A link.
-///
-/// `pub` (not just crate-local): `aoide-conduct`'s `screen send --agent`
-/// (Phase 5 of the `screen` command family) calls this DIRECTLY — a same-process
-/// function call via a synthesized `Invocation`, never a subprocess shell-out
-/// to `aoide a2a agent send` — so a captured screenshot's hand-off reuses this
-/// EXACT driver (curl transport, JSON-RPC body, error surfacing) instead of a
-/// second one. Visibility-only change; the body is untouched.
-pub fn handle_agent_send(inv: &Invocation) -> Outcome {
-    let cmd = "a2a.agent.send";
-    let name = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        Some(n) => n.to_string(),
-        None => return Outcome::usage(cmd, "usage: aoide a2a agent send <name> <message> [--json]"),
-    };
-    let message = match inv.args.get(1).filter(|s| !s.is_empty()) {
-        Some(m) => m.to_string(),
-        None => return Outcome::usage(cmd, "usage: aoide a2a agent send <name> <message> [--json]"),
-    };
-    let agents = aoide_storage::a2a_store::load_agents();
-    let agent = match agents.iter().find(|a| a.name == name) {
-        Some(a) => a.clone(),
-        None => {
-            return Outcome::error(
-                cmd,
-                format!("no A2A agent named `{name}` — register it first with `aoide a2a agent add <url>`"),
-            )
-            .with_data(json!({ "reason": "unknown-agent", "name": name }))
-        }
-    };
-    let message_id = gen_message_id();
-    // `context_id: None` — this drives an unrelated registered A2A agent,
-    // which has no notion of an aoide sessionId (that's `send_message_to_peer`
-    // below, P-C3's peer-targeted path).
-    let body = crate::wire::build_message_send_body(&message, &message_id, None);
-    let body_str = serde_json::to_string(&body).unwrap_or_default();
-    let (code, resp) = match run_curl(
-        &[
-            "-X",
-            "POST",
-            "-H",
-            "Content-Type: application/json",
-            "--data-binary",
-            "@-",
-            "--",
-            &agent.url,
-        ],
-        Some(&body_str),
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            return Outcome::error(cmd, format!("driving `{name}` at {}: {e}", agent.url))
-                .with_data(json!({ "reason": "send-failed", "name": name, "url": agent.url }))
-        }
-    };
-    if code != 200 {
-        return Outcome::error(cmd, format!("driving `{name}` at {}: HTTP {code}", agent.url))
-            .with_data(json!({
-                "reason": "send-http-error", "name": name, "url": agent.url,
-                "httpCode": code, "body": resp,
-            }));
-    }
-    let parsed: Value = serde_json::from_str(&resp).unwrap_or(Value::Null);
-    // A JSON-RPC error still returns HTTP 200 — surface it as an error Outcome.
-    if let Some(err) = parsed.get("error") {
-        let detail = err
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("(no message)");
-        return Outcome::error(cmd, format!("agent `{name}` returned an error: {detail}"))
-            .with_data(json!({ "reason": "agent-error", "name": name, "response": parsed }));
-    }
-    Outcome::ok(
-        cmd,
-        format!("sent to `{name}` at {} — {}", agent.url, describe_result(&parsed)),
-    )
-    .with_data(json!({
-        "name": name, "url": agent.url, "messageId": message_id, "response": parsed,
-    }))
-}
-
 // ── The seven `peer` commands (CONTRACTS.md §7: same-network federation) ───────
 //
 // A peer is ANOTHER aoide instance, addressed by URL (topology-agnostic —
 // the protocol never cares whether that URL happens to resolve on the same
 // loopback host, a LAN, or a tailnet; it's just a URL). `peer add` verifies
-// by fetching the peer's AgentCard first (mirrors `a2a agent add`'s
-// verification-before-registering pattern exactly); `peer pull` calls the
-// NEW `aoide/graphSummary` method (`aoide-server::a2a::graph_summary`) and
-// caches the result; `build_graph` (`aoide-conduct`) folds a fresh cache in
-// as a `peer:<name>` root node. The registry lives in `state/peers.json`
-// (`aoide_storage::peer_store`), mirroring `state/a2a-agents.json` — external
-// registry-style state, not song-scoped rehearsal state.
+// by fetching the peer's AgentCard first, before registering anything;
+// `peer pull` calls the NEW `aoide/graphSummary` method
+// (`aoide-server::a2a::graph_summary`) and caches the result; `build_graph`
+// (`aoide-conduct`) folds a fresh cache in as a `peer:<name>` root node. The
+// registry lives in `state/peers.json` (`aoide_storage::peer_store`) —
+// external registry-style state, not song-scoped rehearsal state.
 
 /// `peer add <name> <url> [--autogate]` — verify the peer by fetching its
-/// AgentCard first (mirrors `a2a agent add`'s verification-before-registering
-/// pattern above exactly), then register `name` → `url`. Unlike `a2a agent
-/// add`'s upsert-replace-on-readd, a duplicate `name` is rejected cleanly —
-/// CONTRACTS.md §7's explicit divergence (a peer's local nickname should
-/// never be silently repointed at a different URL by a second `add`).
+/// AgentCard first, then register `name` → `url`. A duplicate `name` is
+/// rejected cleanly — CONTRACTS.md §7's explicit stance (a peer's local
+/// nickname should never be silently repointed at a different URL by a
+/// second `add`).
 fn handle_peer_add(inv: &Invocation) -> Outcome {
     let cmd = "peer.add";
     let name = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -659,11 +448,10 @@ fn handle_peer_list(_inv: &Invocation) -> Outcome {
 
 /// `peer remove <name>` — deregister; a MISSING name is a clean error, not
 /// idempotent-silent (following `rice draft drop <name>`'s precedent: a
-/// missing target is a real mistake worth surfacing, unlike `a2a agent
-/// remove`'s tolerate-missing stance — CONTRACTS.md §7 calls this out
-/// explicitly as the deliberately different one). Also drops the peer's
-/// cache file, if any, so a re-added-under-the-same-name peer never starts
-/// from a stale leftover.
+/// missing target is a real mistake worth surfacing — CONTRACTS.md §7 calls
+/// this stance out explicitly). Also drops the peer's cache file, if any,
+/// so a re-added-under-the-same-name peer never starts from a stale
+/// leftover.
 fn handle_peer_remove(inv: &Invocation) -> Outcome {
     let cmd = "peer.remove";
     let name = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -894,9 +682,8 @@ pub fn pull_peer_live(peer: &aoide_storage::peer_store::Peer, timeout_secs: u64)
     Ok(entry.graph.unwrap_or_else(|| json!({ "nodes": [], "edges": [] })))
 }
 
-/// POST a `message/send` to a PEER (not a registered A2A agent — see
-/// [`handle_agent_send`]) with an explicit `contextId` naming the REMOTE
-/// session to inject into. `graph send --to <peer>/<query>` (`aoide-conduct`,
+/// POST a `message/send` to a PEER with an explicit `contextId` naming the
+/// REMOTE session to inject into. `graph send --to <peer>/<query>` (`aoide-conduct`,
 /// workstream C3) resolves `query` against the peer's cached graph to that
 /// one remote sessionId, then drives THIS function — the transport lives
 /// here (not duplicated in `conduct`) for the same reason [`pull_peer_live`]
@@ -904,8 +691,8 @@ pub fn pull_peer_live(peer: &aoide_storage::peer_store::Peer, timeout_secs: u64)
 /// edge.
 ///
 /// Same `run_curl` transport and 15s timeout every other `message/send`
-/// call site in this file uses (`handle_agent_send`) — this is a real
-/// delivery, not `who`'s short-timeout presence probe, so it does NOT reuse
+/// call site in this file uses — this is a real delivery, not `who`'s
+/// short-timeout presence probe, so it does NOT reuse
 /// [`pull_peer_live`]'s tighter bound. Returns the parsed JSON-RPC response
 /// on a 200 with no `error` member; any transport/HTTP/JSON-RPC failure is
 /// `Err` with a plain message the caller (`aoide-conduct`) can surface and
@@ -927,9 +714,8 @@ pub fn send_message_to_peer(
     }
     let parsed: Value =
         serde_json::from_str(&resp).map_err(|e| format!("unparseable response: {e}"))?;
-    // A JSON-RPC error still returns HTTP 200 (same discipline as
-    // `handle_agent_send`'s own check) — surface it as an `Err`, not a
-    // silently-`Ok`'d error envelope.
+    // A JSON-RPC error still returns HTTP 200 — surface it as an `Err`, not
+    // a silently-`Ok`'d error envelope.
     if let Some(err) = parsed.get("error") {
         let detail = err
             .get("message")
@@ -973,8 +759,8 @@ fn confirm_spawn(name: &str, text: &str) -> Result<bool, String> {
 /// `aoide.a2a.spawnAgent`, never client-supplied (`do_spawn`'s own doc
 /// comment on `SessionRef`'s security model). Built via
 /// `crate::wire::build_message_send_body(text, message_id, None)` — the
-/// SAME builder `handle_agent_send` already drives an external A2A agent's
-/// own spawn arm with, so this is a proven shape, not a new invention.
+/// SAME builder every other `message/send` call site in this file uses, so
+/// this is a proven shape, not a new invention.
 ///
 /// **Signing**: [`sign_headers_for_peer`] — this is the FIRST production
 /// call site that ever signs a SPAWN-shaped POST (`context_id: None`);
@@ -1073,9 +859,9 @@ fn handle_peer_spawn(inv: &Invocation) -> Outcome {
     }
     let parsed: Value = serde_json::from_str(&resp).unwrap_or(Value::Null);
     // A JSON-RPC error still returns HTTP 200 (same discipline as
-    // `handle_agent_send`/`send_message_to_peer`) — the remote door's
-    // refusal (paired-but-unsigned, allows lacking spawn, skew, …)
-    // surfaces VERBATIM, never translated or second-guessed.
+    // `send_message_to_peer`) — the remote door's refusal (paired-but-
+    // unsigned, allows lacking spawn, skew, …) surfaces VERBATIM, never
+    // translated or second-guessed.
     if let Some(err) = parsed.get("error") {
         let detail = err
             .get("message")
@@ -2036,50 +1822,6 @@ fn handle_adapter_melete(_inv: &Invocation) -> Outcome {
         "melete-adapter skeleton self-check complete",
     )
     .with_data(status)
-}
-
-/// The four `agent` commands, registered at the historical `a2a` position
-/// (directly after `a2a serve`, which `aoide-server` registers).
-pub fn register_agents(r: &mut Registry) {
-    r.insert(cmd!(
-        path: ["a2a", "agent", "add"],
-        summary: "Register an external A2A agent (by AgentCard URL) as a node in the session DAG.",
-        args: [arg!("url", "string", true, "The external agent's AgentCard URL (or origin — the well-known path is appended).")],
-        flags: [],
-        gated: false,
-        implemented: true,
-        handler: handle_agent_add,
-    ));
-    r.insert(cmd!(
-        path: ["a2a", "agent", "list"],
-        summary: "List registered external A2A agents.",
-        args: [],
-        flags: [],
-        gated: false,
-        implemented: true,
-        handler: handle_agent_list,
-    ));
-    r.insert(cmd!(
-        path: ["a2a", "agent", "remove"],
-        summary: "Unregister an external A2A agent.",
-        args: [arg!("name", "string", true, "The registered agent's name.")],
-        flags: [],
-        gated: false,
-        implemented: true,
-        handler: handle_agent_remove,
-    ));
-    r.insert(cmd!(
-        path: ["a2a", "agent", "send"],
-        summary: "Drive a registered external A2A agent: POST a JSON-RPC message/send and report the returned Task/Message.",
-        args: [
-            arg!("name", "string", true, "The registered agent's name."),
-            arg!("message", "string", true, "The message text to send."),
-        ],
-        flags: [],
-        gated: false,
-        implemented: true,
-        handler: handle_agent_send,
-    ));
 }
 
 /// The post-`graph` client command: `adapter melete` (registered directly

@@ -1,9 +1,9 @@
 //! aoide-storage — Aoide's durable session data (Phase 3a restructure,
 //! docs/architecture/PACKAGE-LAYOUT.md): the stage-file record shapes
 //! (`records`), atomic stage I/O (`fs`, `stage`), time formatting (`time`),
-//! the pure session/hook upsert ops (`session`), the client-side A2A agent
-//! roster (`a2a_store`), the staging/declarative mode marker (`mode`), and
-//! the peer-federation registry + pull cache (`peer_store`, CONTRACTS.md §7).
+//! the pure session/hook upsert ops (`session`), the staging/declarative
+//! mode marker (`mode`), and the peer-federation registry + pull cache
+//! (`peer_store`, CONTRACTS.md §7).
 //!
 //! Extracted from root `src/` (`shellbridge.rs`, `graph/model.rs`,
 //! `graph/session_store.rs`, `conductor/theme.rs`, `a2a.rs`) following the
@@ -70,12 +70,11 @@
 //!
 //! `carry` (durable-sessions plan, P-C1) holds `state/carry.json`, the set
 //! of session ids marked durable so a project's whole carried set can be
-//! resurrected together. Store only for now — mirrors `a2a_store`'s
+//! resurrected together. Store only for now — mirrors `peer_store`'s
 //! shape and discipline exactly (tolerate-missing/corrupt-as-empty,
 //! `fs::atomic_write`, pure list mutations); no command or consumer is
 //! wired to it yet.
 
-pub mod a2a_store;
 pub mod addr;
 pub mod beacon;
 pub mod carry;

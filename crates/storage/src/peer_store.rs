@@ -3,12 +3,10 @@
 //! `state/peer-cache/<name>.json` (v0) — the last-pulled `aoide/graphSummary`
 //! response per peer (CONTRACTS.md §7).
 //!
-//! Mirrors `a2a_store.rs`'s exact shape/discipline (same `state/` dir, same
-//! tolerate-missing reads, same atomic writes) rather than the literal
-//! `song/stage/` location the originating plan sketched — a peer roster is
-//! account/global external-registry state, not song-scoped rehearsal state,
-//! exactly like `state/a2a-agents.json`; see CONTRACTS.md §7's note on this
-//! judgment call.
+//! Lives under `state/` (tolerate-missing reads, atomic writes) rather than
+//! the literal `song/stage/` location the originating plan sketched — a peer
+//! roster is account/global external-registry state, not song-scoped
+//! rehearsal state; see CONTRACTS.md §7's note on this judgment call.
 //!
 //! `aoide-server`'s A2A door (inbound, the non-loopback pending-gate fix)
 //! and `aoide-client`'s `peer` commands (outbound, the pull/fold side) both
@@ -155,15 +153,14 @@ pub struct PeerRegistry {
     pub peers: Vec<Peer>,
 }
 
-/// The registry path: `state/peers.json` (CONTRACTS.md §7), mirroring
-/// `a2a_store::agents_path`'s sibling `state/a2a-agents.json` exactly.
+/// The registry path: `state/peers.json` (CONTRACTS.md §7).
 pub fn peers_path() -> std::path::PathBuf {
     state_dir().join("peers.json")
 }
 
 /// Read the registry, tolerating a missing/corrupt/wrong-shape file as an
 /// empty list — an absent file is simply "no peers registered", never an
-/// error (mirrors `a2a_store::load_agents`).
+/// error.
 pub fn load_peers() -> Vec<Peer> {
     match std::fs::read_to_string(peers_path()) {
         Ok(raw) => serde_json::from_str::<PeerRegistry>(&raw)
@@ -186,10 +183,9 @@ pub fn save_peers(peers: &[Peer]) -> Result<(), String> {
     atomic_write(&path, &body).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Insert a NEW peer by `name`. Unlike `a2a_store::upsert_agent` (dedupe /
-/// replace on re-add), `peer add` rejects a duplicate name cleanly — returns
-/// `false` (nothing inserted) when the name is already registered. Pure list
-/// mutation, so the CRUD is unit-testable off disk.
+/// Insert a NEW peer by `name`. `peer add` rejects a duplicate name cleanly
+/// — returns `false` (nothing inserted) when the name is already
+/// registered. Pure list mutation, so the CRUD is unit-testable off disk.
 pub fn insert_peer(peers: &mut Vec<Peer>, peer: Peer) -> bool {
     if peers.iter().any(|p| p.name == peer.name) {
         return false;
@@ -728,8 +724,8 @@ mod tests {
         let mut peers: Vec<Peer> = Vec::new();
         assert!(insert_peer(&mut peers, fixture_peer("alpha", "http://a/", false)));
         assert_eq!(peers.len(), 1);
-        // Re-adding the same name is rejected outright — unlike a2a_store's
-        // upsert-replace, `peer add` never silently overwrites.
+        // Re-adding the same name is rejected outright — `peer add` never
+        // silently overwrites.
         assert!(!insert_peer(&mut peers, fixture_peer("alpha", "http://a-new/", true)));
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].url, "http://a/", "the original entry is untouched");

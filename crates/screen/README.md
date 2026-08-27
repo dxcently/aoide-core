@@ -23,8 +23,8 @@ Paint-side — ships in `lyra`, not core.
 ## What it consumes
 
 `aoide-protocol`, `aoide-storage`, `aoide-conduct` (7 session-graph symbols,
-including `normalize_addr`), `aoide-client`. Carries this workspace's only
-heavy deps: `wayland-client`, `wayland-protocols-wlr`, `image`.
+including `normalize_addr`). Carries this workspace's only heavy deps:
+`wayland-client`, `wayland-protocols-wlr`, `image`.
 
 ## How it composes
 

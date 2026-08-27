@@ -83,10 +83,6 @@ mod tests {
         got.sort();
 
         let mut expected: Vec<&str> = vec![
-            "a2a.agent.add",
-            "a2a.agent.list",
-            "a2a.agent.remove",
-            "a2a.agent.send",
             "a2a.serve",
             "adapter.melete",
             "conduct",

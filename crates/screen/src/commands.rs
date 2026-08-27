@@ -249,20 +249,19 @@ pub fn register(r: &mut Registry) {
 
     // ── Phase 5: `screen send <capture>` — hand a capture (+ comment + OCR
     // text) to another agent (`screen::send`). The payoff of the family:
-    // capture → ocr → SEND. Routes through the SAME two already-gated doors
-    // `graph send`/`a2a agent send` use — see that module's header.
+    // capture → ocr → SEND. Routes through the SAME already-gated door
+    // `graph send` uses — see that module's header.
 
     r.insert(cmd!(
         path: ["screen", "send"],
-        summary: "Hand a `screen shot` capture to another agent: compose a message from its absolute path plus a comment and OCR text (read from the sidecar, or overridden by --comment), then deliver it to a conducted session (--session, via the SAME held-pending-by-default gate `graph send` uses — --yes authorizes delivery) or a registered external A2A agent (--agent, via the SAME message/send driver `a2a agent send` uses — delivers immediately, no hold). --session and --agent are mutually exclusive; exactly one is required.",
+        summary: "Hand a `screen shot` capture to another agent: compose a message from its absolute path plus a comment and OCR text (read from the sidecar, or overridden by --comment), then deliver it to a conducted session (--session, via the SAME held-pending-by-default gate `graph send` uses — --yes authorizes delivery). --session is required.",
         args: [
             arg!("capture", "string", true, "Path to an existing capture image (its sidecar `<name>.json`, if present, enriches the message with its stored comment and any OCR text)."),
         ],
         flags: [
-            flag!("session", "string", "Deliver to this conducted session id (mutually exclusive with --agent; HELD pending approval unless --yes)."),
-            flag!("agent", "string", "Deliver to this registered external A2A agent's name (mutually exclusive with --session; delivers immediately)."),
+            flag!("session", "string", "Deliver to this conducted session id (required; HELD pending approval unless --yes)."),
             flag!("comment", "string", "Override the sidecar's stored comment for this send."),
-            flag!("yes", "bool", "Authorize delivery to a --session target now (irrelevant to --agent, which always delivers immediately)."),
+            flag!("yes", "bool", "Authorize delivery to the --session target now."),
         ],
         gated: false,
         implemented: true,
@@ -474,7 +473,7 @@ mod tests {
         assert!(c.flags.iter().any(|f| f.name == "json"));
         assert_eq!(c.args.iter().map(|a| a.name).collect::<Vec<_>>(), vec!["capture"]);
         assert!(c.args[0].required, "the capture path is required, not optional");
-        for name in ["session", "agent", "comment", "yes"] {
+        for name in ["session", "comment", "yes"] {
             assert!(c.flags.iter().any(|f| f.name == name), "missing --{name}");
         }
     }

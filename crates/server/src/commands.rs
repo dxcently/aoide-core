@@ -7,7 +7,7 @@
 //! domain. The root package's `commands::all()` calls [`register_infra`]
 //! directly after its own root-coupled `mcp serve` registration and
 //! [`register_a2a_serve`] directly before
-//! `aoide_client::commands::register_agents`, so `schema --json` order never
+//! `aoide_client::commands::register_peers`, so `schema --json` order never
 //! shifts.
 //!
 //! `shellbridge` moved out at P-A2 of the binary-split workstream

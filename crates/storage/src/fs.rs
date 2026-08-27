@@ -60,7 +60,7 @@ pub fn state_dir() -> std::path::PathBuf {
 ///
 /// Under [`state_dir`], not [`stage_dir`]: a capture is a DURABLE artifact a
 /// caller asked for and keeps around (like `state/usage.json`,
-/// `state/a2a-agents.json`) — never song-scoped, never reset by a `rice
+/// `state/peers.json`) — never song-scoped, never reset by a `rice
 /// mode`/stage-reseed the way live rehearsal state is. One-line rationale:
 /// lean state, not stage — captures persist, stage doesn't.
 pub fn captures_dir() -> std::path::PathBuf {

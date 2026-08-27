@@ -34,7 +34,7 @@
 //!
 //! Extracted from root `src/a2a.rs` (Phase 4c restructure,
 //! docs/architecture/PACKAGE-LAYOUT.md) — this is the SERVER half only. The
-//! CLIENT half (the external-agent registry, AgentCard parsing, the outbound
+//! CLIENT half (the peer registry, AgentCard URL resolution, the outbound
 //! request builder) stays in root/`aoide-client`/`aoide-storage`, unchanged
 //! from Phase 4a/4b.
 //!
@@ -7085,26 +7085,6 @@ mod tests {
         assert_eq!(status, 200);
         let served: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(served, expected);
-    }
-
-    /// The client's own `parse_agent_card` still accepts the stripped shape
-    /// — enrollment (`aoide a2a agent add`) survives against a
-    /// token-protected server, it just gets an empty `description` (the
-    /// known accepted consequence, CONTRACTS.md §6 2026-08-20 amendment;
-    /// closing it is #47 Phase H, not this one).
-    #[test]
-    fn parse_agent_card_accepts_the_stripped_card() {
-        let full = agent_card_from_commands(Registry::new().commands(), "127.0.0.1", 8710);
-        let stripped = stripped_card(&full);
-        let agent = aoide_client::wire::parse_agent_card(
-            &stripped,
-            "http://127.0.0.1:8710/.well-known/agent-card.json",
-            "NOW",
-        )
-        .expect("stripped card still has a name; enrollment must not fail");
-        assert_eq!(agent.name, "aoide");
-        assert_eq!(agent.url, "http://127.0.0.1:8710/");
-        assert_eq!(agent.description, "", "stripped card carries no description field to read");
     }
 
     // ── task #84: inbound bearer resolved via the secrets broker ────────────

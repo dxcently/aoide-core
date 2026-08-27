@@ -150,11 +150,9 @@ pub struct SessionRecord {
     pub activity: Option<String>,
     /// What KIND of thing this record is, published so the widgets never infer
     /// it from the agent string: `agent` (a Claude/agent session), `shell` (a
-    /// conducted terminal), `subagent` (a Task the agent spawned — a leaf of
-    /// the conductor tree), or `a2a` (CONTRACTS.md §6 — an external A2A agent
-    /// folded into the session DAG, client side, via `aoide a2a agent add`).
-    /// Additive/v0-safe (absent on a legacy record; readers fall back to
-    /// agent!="shell").
+    /// conducted terminal), or `subagent` (a Task the agent spawned — a leaf
+    /// of the conductor tree). Additive/v0-safe (absent on a legacy record;
+    /// readers fall back to agent!="shell").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     /// The agent's latest *words* — a one-line tail of the session's Claude Code

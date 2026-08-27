@@ -9,13 +9,12 @@
 //! deserialize a REMOTE peer's card in the v1.0 `interfaces[]` form
 //! (`interfaces` is additive/optional here for that reason), though today
 //! only the OUTBOUND build side (`a2a.rs::agent_card_from_commands`) uses
-//! this type directly — `a2a.rs::parse_agent_card`'s field-by-field
-//! extraction (incl. the flat-url-vs-interfaces-array fallback) stays hand
-//! rolled over the raw `Value`, deliberately: a remote AgentCard is
-//! attacker-influenced input (any A2A peer an operator registers), and a
-//! single mistyped/extra field on it should degrade one field, not fail an
-//! all-or-nothing `Deserialize` for the whole card the way a struct with
-//! non-`Value`-typed fields would.
+//! this type directly — a fetched remote card (`peer add`'s verification
+//! fetch) is only ever checked for well-formed JSON, never deserialized
+//! field-by-field through this struct: a remote AgentCard is
+//! attacker-influenced input (any peer an operator registers), and a
+//! single mistyped/extra field on it should never fail an all-or-nothing
+//! `Deserialize` for the whole card.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

@@ -22,10 +22,9 @@ use crate::registry::Registry;
 /// guide, schema, content(stub x5), make(stub), update(stub), onboard (P-I2:
 /// the first-boot flow, real as of this commit — stub count 8->7),
 /// mcp serve, daemon, graph(x15) + conduct, adapter melete, conductor, a2a
-/// serve + agent add/list/remove, peer add/list/remove/pull/status
-/// (CONTRACTS.md §7, slotted directly after the `a2a agent` group it's the
-/// same-network-federation sibling of — nothing EXISTING moves, so the
-/// historical table above it is still untouched), usage, hooks install,
+/// serve, peer add/list/remove/pull/status (CONTRACTS.md §7,
+/// same-network federation — nothing EXISTING moves, so the historical table
+/// above it is still untouched), usage, hooks install,
 /// soundcheck (the mechanical-integrity command's WORKING-tree half,
 /// `aoide-upkeep`; report-only, forever — see its own module doc for the
 /// finding format and why the COMMITTED-tree half lives in `nix flake
@@ -61,7 +60,6 @@ pub fn all() -> Registry {
     aoide_client::commands::register_post_graph(&mut r); // adapter melete
     aoide_conductor::commands::register(&mut r); // conductor
     aoide_server::commands::register_a2a_serve(&mut r); // a2a serve
-    aoide_client::commands::register_agents(&mut r); // a2a agent add/list/remove/send (CONTRACTS.md §6)
     aoide_client::commands::register_peers(&mut r); // peer add/list/remove/pull/status — same-network federation (CONTRACTS.md §7, appended newest)
     aoide_storage::commands::register(&mut r); // usage — local token/cost rollup (CONTRACTS.md §4)
     aoide_conduct::commands::hooks::register(&mut r); // hooks install — the hook-installer command

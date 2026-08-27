@@ -163,7 +163,7 @@
   actually flipped).
 - **`carry.json` is written via plain `fs::atomic_write`, never
   `atomic_write_private` — deliberate, not an oversight.** It holds session
-  ids, the same class of data `sessions.json`/`a2a-agents.json` already keep
+  ids, the same class of data `sessions.json`/`peers.json` already keep
   at default mode; `atomic_write_private` stays reserved for the
   identity/secret lane above.
 - **`beacon` never writes `peer_store`, and never will (P-P6).** It reaches

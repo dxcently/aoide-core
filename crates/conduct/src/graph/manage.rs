@@ -352,14 +352,14 @@ mod tests {
     use crate::graph::testutil::*;
 
     #[test]
-    fn local_only_commands_ignore_peer_ids_exactly_like_a2a_ids_today() {
+    fn local_only_commands_ignore_peer_ids() {
         // CONTRACTS.md §7: `link`/`prune` (and, by the same construction,
-        // `focus`/`reap`) must keep ignoring `peer:*` ids exactly as they
-        // already ignore `a2a:*` ids — neither reads `peer_store` at all, so
-        // a registered peer (with its own cache) sitting alongside real
-        // sessions must never appear as a `link`/`prune` target and must
-        // never break either command. This is the "confirm it, don't assume it
-        // generalizes for free" test the plan called for.
+        // `focus`/`reap`) must keep ignoring `peer:*` ids — neither reads
+        // `peer_store` at all, so a registered peer (with its own cache)
+        // sitting alongside real sessions must never appear as a
+        // `link`/`prune` target and must never break either command. This
+        // is the "confirm it, don't assume it generalizes for free" test
+        // the plan called for.
         let _guard = crate::env_lock().lock().unwrap();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();

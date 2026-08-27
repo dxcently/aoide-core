@@ -2,9 +2,10 @@
 
 ## Invariants
 
-- **Outbound only.** This crate is the CLIENT half of A2A — message
-  building/sending, agent registration, the melete adapter. The serve/listen
-  half lives in `aoide-server` and must never migrate here.
+- **Outbound only.** This crate is the CLIENT half of A2A — peer
+  registration/messaging, the pairing ceremony's CLI half, the melete
+  adapter. The serve/listen half lives in `aoide-server` and must never
+  migrate here.
 - **The `conduct → client` edge is load-bearing, not a smell.** `conduct`'s
   presence projection (`who`, workstream C2, landed) calls this crate's
   `commands::pull_peer_live` for its live per-peer probe. Don't "heal" it

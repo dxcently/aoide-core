@@ -112,7 +112,6 @@ dependencies = [
 name = "aoide-screen"
 version = "0.0.1"
 dependencies = [
- "aoide-client",
  "aoide-conduct",
  "aoide-protocol",
  "aoide-storage",

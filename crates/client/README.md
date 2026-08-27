@@ -22,8 +22,8 @@ never the inbound/serve half (that's `aoide-server`).
   immediately — the reentrancy guard that stops a handler running INSIDE
   the daemon (because a remote caller's request just landed) from trying
   to connect to itself.
-- `wire` — client-side A2A JSON-RPC message builders/parsers
-  (`build_message_send_body` and siblings).
+- `wire` — client-side A2A JSON-RPC message builders
+  (`build_message_send_body` and `resolve_card_url`).
 - `adapter` — the melete neutral-event adapter (consumes events, stays
   agnostic of any one downstream agent's shape).
 - `peer` — peer-federation client half (CONTRACTS.md §7), joined at P-P2 by
@@ -53,7 +53,7 @@ never the inbound/serve half (that's `aoide-server`).
   instead — sending is the door-owning process's own job; listening is
   this crate's outbound-facing action, the same "outbound only" charter
   every other module here holds.
-- `commands` — this crate's CLI commands: `a2a agent add/list/remove/send`,
+- `commands` — this crate's CLI commands:
   `peer add/list/remove/pull/status/hub/allow/spawn/discover/invite`,
   `peer pair request/pending/approve/reject` (P-P2, CONTRACTS.md §6/§7 —
   `handle_peer_allow` (`peer allow <name> <cap> on|off`, P-P3, `docs/
@@ -165,8 +165,8 @@ never the inbound/serve half (that's `aoide-server`).
 
 ## What it consumes
 
-`aoide-protocol` and `aoide-storage` (the client-side agent roster and peer
-cache persist through `storage`), and `aoide-secrets` (task #84 — outbound
+`aoide-protocol` and `aoide-storage` (the peer registry and pull cache
+persist through `storage`), and `aoide-secrets` (task #84 — outbound
 per-peer bearer resolve, `aoide_secrets::client::resolve_bounded`, reused
 rather than a second wire client written here).
 

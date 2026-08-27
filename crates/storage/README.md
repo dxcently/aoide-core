@@ -1,10 +1,10 @@
 # aoide-storage
 
 Durable session data + memory persistence: stage-file record shapes, atomic
-stage I/O, session/hook upsert ops, the client-side A2A agent roster, the
-staging/declarative mode marker, and the peer-federation registry + pull
-cache (CONTRACTS.md §7). File-first by decision — no embedded database yet
-(`docs/architecture/PACKAGE-LAYOUT.md`, "storage backend" open question).
+stage I/O, session/hook upsert ops, the staging/declarative mode marker, and
+the peer-federation registry + pull cache (CONTRACTS.md §7). File-first by
+decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
+"storage backend" open question).
 
 ## Named seams (what it exposes)
 
@@ -12,7 +12,6 @@ cache (CONTRACTS.md §7). File-first by decision — no embedded database yet
   read/write I/O every stage consumer (this crate's own `commands`, `conduct`,
   `song`, `conductor`) goes through instead of touching JSON on disk directly.
 - `session` — pure session/hook upsert operations.
-- `a2a_store` — the client-side A2A agent roster.
 - `peer_store` — the peer-federation registry + pull cache (CONTRACTS.md §7).
   `Peer` carries two independent, opposite-direction credential fields:
   `tokenFile` (inbound — what a peer presents TO US, read from a local
@@ -151,10 +150,10 @@ cache (CONTRACTS.md §7). File-first by decision — no embedded database yet
 - `carry` — the carry mark (durable-sessions plan, P-C1): `state/carry.json`,
   the set of session ids marked durable so a project's whole carried set can
   be resurrected together (`graph session carry on|off`, a later phase).
-  Mirrors `a2a_store` exactly — `load_carry`/`save_carry` tolerate a
+  Mirrors `peer_store` exactly — `load_carry`/`save_carry` tolerate a
   missing/corrupt file as empty and write atomically via `fs::atomic_write`
   (not `atomic_write_private`: a session id is the same class of data
-  `sessions.json`/`a2a-agents.json` already keep at default mode).
+  `sessions.json`/`peers.json` already keep at default mode).
   `set_carried`/`is_carried` are pure list operations; `set_carried` returns
   whether the carried/not-carried TRANSITION changed, and separately
   refreshes `markedAt` on every `on` call including a re-mark of an
