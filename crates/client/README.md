@@ -97,20 +97,28 @@ never the inbound/serve half (that's `aoide-server`).
   any record, and surfaces a taught error naming the ssh target and the
   one-time manual `authorized_keys` step; aoide never writes that file for
   anyone. `close(session_id, key)` SIGTERMs the recorded pid and removes
-  the record, idempotent on a record already gone; before signaling
-  anything it checks `/proc/<pid>/cmdline` actually names `ssh` carrying
-  this exact `-L` spec (`looks_like_our_ssh`, wrapped as
-  `kill_if_still_our_ssh`, shared with the stale-reopen path above) — a pid
-  an earlier `aoide` invocation recorded may have been recycled by the OS
-  to an unrelated process by the time anything acts on it, and a pid alone
-  is never enough to justify a signal. Once a kill IS justified,
-  `terminate_pid` reaps with a real `waitpid(pid, WNOHANG)` poll before
-  ever falling back to a `/proc` poll — required whenever `open` and
-  `close` (or a stale reopen) share a process, since that pid genuinely IS
-  this process's own child and nothing else will ever collect it; `ECHILD`
-  (the ordinary cross-invocation case) falls back to the `/proc` poll, same
-  as always. `close_all_for_session(session_id)` closes every tunnel
-  recorded for that session, best-effort across all of them. The actual
+  the record ONLY once that pid is confirmed gone, idempotent on a record
+  already gone; before signaling anything it checks `/proc/<pid>/cmdline`
+  actually names `ssh` carrying this exact `-L` spec (`looks_like_our_ssh`,
+  wrapped as `kill_if_still_our_ssh`, shared with the stale-reopen path
+  above) — a pid an earlier `aoide` invocation recorded may have been
+  recycled by the OS to an unrelated process by the time anything acts on
+  it, and a pid alone is never enough to justify a signal.
+  `kill_if_still_our_ssh` returns whether the pid is now safe to forget
+  (never alive, never ours, or ours and confirmed dead) versus still alive
+  and still ours — a stubborn/hung child that survives `terminate_pid`'s
+  bounded `SIGTERM`+wait keeps its record on disk instead of losing it,
+  so `aoide-conduct::reap::sweep_orphan_tunnels`'s own backstop can still
+  find and retry it once the session leaves the roster (review finding,
+  task #104: dropping the record on a mere kill ATTEMPT made a survivor
+  permanently untrackable). Once a kill IS justified, `terminate_pid` reaps
+  with a real `waitpid(pid, WNOHANG)` poll before ever falling back to a
+  `/proc` poll — required whenever `open` and `close` (or a stale reopen)
+  share a process, since that pid genuinely IS this process's own child and
+  nothing else will ever collect it; `ECHILD` (the ordinary
+  cross-invocation case) falls back to the `/proc` poll, same as always.
+  `close_all_for_session(session_id)` closes every tunnel recorded for that
+  session, best-effort across all of them. The actual
   spawn is an injected closure internally (the same `Arc<dyn Fn(...)>`
   shape `aoide_conduct::graph::who::PullFn` holds for its own live-probe
   seam, re-derived rather than imported) so every reuse/stale/timeout/

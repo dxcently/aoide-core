@@ -10,8 +10,11 @@
 //! answers is reused as-is (no second `ssh`); anything else is stale (dead
 //! pid, or a live process nothing is listening through) and is discarded in
 //! favor of a freshly spawned forward. `close`/`close_all_for_session` tear
-//! a forward down and remove its record; P-S5 wires the session-end fast
-//! path and the reaper's orphan-collecting backstop on top of these two.
+//! a forward down and remove its record once the pid is CONFIRMED gone — a
+//! child that survives the bounded kill keeps its record on disk instead,
+//! so the name stays findable rather than becoming an untracked survivor;
+//! P-S5 wires the session-end fast path and the reaper's orphan-collecting
+//! backstop (which retries exactly such a survivor) on top of these two.
 //!
 //! **The recycled-pid decision (`close`).** A record's `pid` was proven
 //! alive by an earlier `aoide` invocation, possibly a long time ago — the
@@ -172,12 +175,31 @@ fn open_or_reuse_with(
 }
 
 /// Tear down the forward recorded for `(session_id, key)` and remove its
-/// record. Idempotent on a record that is already gone. See the module
-/// doc's "recycled-pid decision" for why a live pid is signaled ONLY after
-/// [`looks_like_our_ssh`] confirms it is still this record's own child.
+/// record — but ONLY once [`kill_if_still_our_ssh`] confirms the pid is
+/// actually gone. Idempotent on a record that is already gone. See the
+/// module doc's "recycled-pid decision" for why a live pid is signaled ONLY
+/// after [`looks_like_our_ssh`] confirms it is still this record's own
+/// child.
+///
+/// A child that survives [`terminate_pid`]'s bounded `SIGTERM`+wait (a
+/// stubborn or hung `ssh`) is NOT untracked here: the record is left in
+/// place instead of being dropped, so the pid stays a name something can
+/// still find. `close`/`close_all_for_session`/the reaper can only ever act
+/// on a pid they load FROM a record (module doc, "recycled-pid decision") —
+/// dropping the record on a mere kill ATTEMPT, rather than a confirmed
+/// death, would make the survivor permanently invisible to everything,
+/// including `aoide-conduct::reap::sweep_orphan_tunnels`'s own backstop.
+/// That backstop already re-collects a roster-less record on its own
+/// (`orphan_tunnel_candidates`'s settle window, P-S5) once this session
+/// leaves the roster, so no new field is needed to mark a kept record for
+/// retry — leaving it on disk is the whole mechanism.
 pub fn close(session_id: &str, key: &str) -> Result<(), String> {
     if let Some(rec) = aoide_storage::tunnel::load(session_id, key) {
-        kill_if_still_our_ssh(rec.pid, rec.local_port, rec.remote_port);
+        if !kill_if_still_our_ssh(rec.pid, rec.local_port, rec.remote_port) {
+            // Still alive and still ours — leave the record for a later
+            // close/sweep to retry, per the doc above.
+            return Ok(());
+        }
     }
     aoide_storage::tunnel::remove(session_id, key)
 }
@@ -255,10 +277,20 @@ fn looks_like_our_ssh(pid: u32, local_port: u16, remote_port: u16) -> bool {
 /// sits above `aoide-client` in the crate DAG (`client/AGENTS.md`, "the
 /// `conduct -> client` edge is load-bearing"), so the reaper reuses this
 /// verbatim rather than re-implementing process-killing a second time.
-pub fn kill_if_still_our_ssh(pid: u32, local_port: u16, remote_port: u16) {
+///
+/// Returns whether `pid` is now safe to forget — `true` when it was never
+/// alive, was never actually this record's `ssh` (the recycled-pid case:
+/// nothing here was ours to track in the first place), or WAS ours and is
+/// now confirmed dead by [`terminate_pid`]'s bounded wait; `false` only when
+/// it was confirmed ours and is STILL alive once that bound elapses (a
+/// stubborn or hung child). [`close`] uses this to decide whether a record
+/// may be dropped or must be kept for a later retry.
+pub fn kill_if_still_our_ssh(pid: u32, local_port: u16, remote_port: u16) -> bool {
     if proc_exists(pid) && looks_like_our_ssh(pid, local_port, remote_port) {
         terminate_pid(pid);
+        return !proc_exists(pid);
     }
+    true
 }
 
 /// `SIGTERM` a pid already confirmed (by the caller) to be this record's
@@ -568,6 +600,41 @@ mod tests {
             .map_err(|e| format!("test fake ssh-argv spawn: {e}"))
     }
 
+    /// Same shape and same sandbox-safety reasoning as
+    /// [`spawn_fake_ssh_argv`] (a builtin-only `-c` script, `argv[0]`
+    /// overridden to `"ssh"` via `CommandExt::arg0`, `bash` named directly)
+    /// — but traps `SIGTERM` away first, and only AFTER installing the trap
+    /// writes `ready_marker` (`:` and `>` are shell builtins too, so this
+    /// stays exec-free). The fixture for
+    /// `close_keeps_the_record_when_the_child_survives_the_bounded_kill`:
+    /// real `ssh` never ignores `SIGTERM`, but `terminate_pid` only ever
+    /// sends one, so a stubborn/hung real child is the case this proves
+    /// `close` no longer mishandles. The marker exists so the TEST can wait
+    /// for the trap to actually be live before ever signaling the child —
+    /// without it, a signal sent the instant after `spawn()` returns could
+    /// race the child's own `trap` builtin and kill it the ordinary way,
+    /// making the test flaky rather than proving anything.
+    fn spawn_fake_ssh_argv_ignoring_sigterm(
+        local_port: u16,
+        remote_host: &str,
+        remote_port: u16,
+        ready_marker: &std::path::Path,
+    ) -> Result<Child, String> {
+        let spec = format!("{local_port}:{remote_host}:{remote_port}");
+        let script = format!("trap '' TERM; : > {:?}; while :; do :; done", ready_marker);
+        Command::new("bash")
+            .arg0("ssh")
+            .arg("-c")
+            .arg(&script)
+            .arg("aoide-test-marker")
+            .arg(spec)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("test fake ssh-argv (SIGTERM-immune) spawn: {e}"))
+    }
+
     // ── open_or_reuse: reuse ────────────────────────────────────────────
 
     #[test]
@@ -783,6 +850,78 @@ mod tests {
             let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
             assert!(r < 0, "a second waitpid on an already-reaped child must fail — nothing left to reap: r={r}");
             assert!(!proc_exists(pid), "the child must be fully gone, not lingering as a zombie");
+        });
+    }
+
+    /// Task #104: `close` used to `SIGTERM` the recorded pid via
+    /// `kill_if_still_our_ssh` and then unconditionally remove the record,
+    /// whether or not the process was actually confirmed dead. A child that
+    /// survives `terminate_pid`'s bounded `SIGTERM`+wait (real `ssh` never
+    /// does; this fixture traps `SIGTERM` away to force the worst case)
+    /// then lost its record on that path — `sweep_orphan_tunnels`/
+    /// `list_records` only ever walk EXISTING records, so the survivor
+    /// became permanently invisible to the reaper, a resident daemon by
+    /// omission. Pins the fix both ways: the record survives `close` while
+    /// the child is still alive, and a LATER `close` — once the child is
+    /// actually gone — finally removes it, proving the kept record really
+    /// is retryable and not just permanently stuck either.
+    #[test]
+    fn close_keeps_the_record_when_the_child_survives_the_bounded_kill() {
+        with_temp_runtime_dir("close-survivor", || {
+            let local_port = free_local_port().unwrap();
+            let ready_marker = std::env::temp_dir()
+                .join(format!("aoide-client-tunnel-close-survivor-ready-{}", std::process::id()));
+            let _ = std::fs::remove_file(&ready_marker);
+
+            let child =
+                spawn_fake_ssh_argv_ignoring_sigterm(local_port, "127.0.0.1", 8710, &ready_marker).unwrap();
+            let pid = child.id();
+            // No `.wait()` — the record, not this handle, is what `close`
+            // acts on (the same cross-invocation shape every other fixture
+            // here uses).
+            drop(child);
+
+            // Wait for the marker the script writes only AFTER its `trap`
+            // has run — see the fixture's own doc for why this, not a fixed
+            // sleep, is what actually closes the signal race.
+            let ready_deadline = Instant::now() + Duration::from_secs(2);
+            while !ready_marker.exists() && Instant::now() < ready_deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(ready_marker.exists(), "the fixture child never reported its trap as installed");
+            let _ = std::fs::remove_file(&ready_marker);
+
+            aoide_storage::tunnel::save(&fixture("sess-k", "sakaki", pid, local_port)).unwrap();
+            assert!(proc_exists(pid), "the fixture child must be alive before close runs");
+
+            assert!(
+                close("sess-k", "sakaki").is_ok(),
+                "a stubborn child must never turn close into an error"
+            );
+
+            assert!(
+                proc_exists(pid),
+                "the fixture traps SIGTERM on purpose — it must still be alive after close's bounded kill"
+            );
+            assert!(
+                aoide_storage::tunnel::load("sess-k", "sakaki").is_some(),
+                "a survivor's record must stay on disk for a later retry, never silently dropped"
+            );
+
+            // Force the child dead (SIGKILL cannot be trapped) and reap it
+            // with a real, blocking `waitpid` so no zombie is left behind —
+            // this process IS its parent, the same reason `terminate_pid`
+            // itself does a real `wait(2)` in the same-process case.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            let mut status: libc::c_int = 0;
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+            assert!(!proc_exists(pid), "a fully reaped pid must not exist under /proc");
+
+            assert!(close("sess-k", "sakaki").is_ok());
+            assert!(
+                aoide_storage::tunnel::load("sess-k", "sakaki").is_none(),
+                "once the child is confirmed gone, a later close must finally remove the record"
+            );
         });
     }
 
