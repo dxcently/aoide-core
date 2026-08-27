@@ -1731,6 +1731,185 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Shared setup for the two survival/prune tests below: a templates dir
+    /// with `sonata` (the compose `--from` default) but a deliberately EMPTY
+    /// baked manifest.json/registry.json (`{}`) — the whole point of both
+    /// tests is what happens to a song that is NOT in the frozen baseline at
+    /// all, so `sonata` itself never needs to appear in either file. Returns
+    /// `(root, stage, run_qml)`; callers still set `AOIDE_STAGE_DIR`/
+    /// `AOIDE_FLAKE_ROOT`/`AOIDE_SONG_TEMPLATES` themselves and own
+    /// `remove_dir_all(&root)`.
+    fn templates_fallback_tmp(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let (root, stage, run_qml) = widget_sync_tmp(tag);
+        std::fs::create_dir_all(&run_qml).unwrap();
+
+        let templated_sonata = root.join("templates").join("sonata");
+        std::fs::create_dir_all(&templated_sonata).unwrap();
+        std::fs::write(
+            templated_sonata.join("livery.json"),
+            r##"{ "schemaVersion":"0",
+                "palette": {"bg":"#0b1021","fg":"#c8d3f5","accent":"#82aaff","urgent":"#ff757f"} }"##,
+        )
+        .unwrap();
+        std::fs::write(root.join("templates").join("manifest.json"), r#"{}"#).unwrap();
+        std::fs::write(root.join("templates").join("registry.json"), r#"{}"#).unwrap();
+
+        let flake_root = root.join("no-flake");
+        std::fs::create_dir_all(&flake_root).unwrap();
+
+        (root, stage, run_qml, flake_root)
+    }
+
+    /// Composes `name` from the shared `sonata` template, adds a single
+    /// widget slot (`<name>.qml`, `.widgets` entry `{"kind":"dock","order":
+    /// 0}`), then stages it — the same two-call sequence a real repo-less
+    /// host's operator drives. Panics on any non-Ok `Outcome` (helper, not
+    /// the test itself).
+    fn compose_and_stage(name: &str) {
+        let compose_out = handle_rice_compose(&inv(&["rice", "compose"], &[name]));
+        assert_eq!(compose_out.status, Status::Ok, "compose {name}: {:?}", compose_out.data);
+
+        let song_dir = shellbridge::songbook_dir(name);
+        std::fs::create_dir_all(song_dir.join("widgets")).unwrap();
+        std::fs::write(song_dir.join("widgets").join(format!("{name}.qml")), "// widget\n")
+            .unwrap();
+        std::fs::write(
+            song_dir.join("livery.json"),
+            format!(
+                r##"{{ "schemaVersion":"0",
+                    "palette": {{"bg":"#0b1021","fg":"#c8d3f5","accent":"#82aaff","urgent":"#ff757f"}},
+                    "widgets": {{"{name}":{{"kind":"dock","order":0}}}} }}"##
+            ),
+        )
+        .unwrap();
+
+        let stage_out = handle_rice_stage(&inv(&["rice", "stage"], &[name]));
+        assert_eq!(stage_out.status, Status::Ok, "stage {name}: {:?}", stage_out.data);
+    }
+
+    #[test]
+    fn stage_from_templates_preserves_a_sibling_composed_songs_entry_across_regens() {
+        // The MUST-FIX regression this test exists for: composing+staging a
+        // SECOND song on a repo-less host must not drop the FIRST song's
+        // manifest/registry entry — neither is in the frozen baked baseline
+        // (both are runtime-composed), so a bare baseline-plus-current-song
+        // write would silently lose whichever song isn't the one just
+        // staged. `eval_songbook_from_templates`'s overlay layer is the fix:
+        // it copies the EXISTING on-disk entries for any song that still has
+        // a songbook directory before patching in the currently-staged
+        // song's own fresh entry.
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_FLAKE_ROOT",
+            "AOIDE_SONG_TEMPLATES",
+            crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR,
+        ]);
+        std::env::remove_var(crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR);
+        let (root, stage, run_qml, flake_root) = templates_fallback_tmp("templates-survival");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_FLAKE_ROOT", &flake_root);
+        std::env::set_var("AOIDE_SONG_TEMPLATES", root.join("templates"));
+
+        compose_and_stage("alpha");
+        compose_and_stage("beta");
+
+        let manifest: Value = serde_json::from_str(
+            &std::fs::read_to_string(run_qml.join("songs").join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest["alpha"],
+            json!({ "alpha": { "owner": "alpha", "file": "alpha.qml" } }),
+            "alpha's manifest entry survives staging beta afterward: {manifest:?}"
+        );
+        assert_eq!(
+            manifest["beta"],
+            json!({ "beta": { "owner": "beta", "file": "beta.qml" } }),
+            "beta's own fresh entry is present too: {manifest:?}"
+        );
+
+        let registry: Value = serde_json::from_str(
+            &std::fs::read_to_string(run_qml.join("songs").join("registry.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            registry["alpha"],
+            json!({ "alpha": { "kind": "dock", "order": 0 } }),
+            "alpha's registry entry survives staging beta afterward: {registry:?}"
+        );
+        assert_eq!(
+            registry["beta"],
+            json!({ "beta": { "kind": "dock", "order": 0 } }),
+            "beta's own fresh entry is present too: {registry:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stage_from_templates_prunes_a_composed_songs_entry_once_its_songbook_dir_is_gone() {
+        // The other half of the same fix: the overlay must NOT keep an
+        // immortal stale key. Once a composed song's songbook directory is
+        // removed, the next regen for a DIFFERENT song must drop it — it is
+        // in neither the frozen baseline nor the on-disk overlay's
+        // surviving set.
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_FLAKE_ROOT",
+            "AOIDE_SONG_TEMPLATES",
+            crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR,
+        ]);
+        std::env::remove_var(crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR);
+        let (root, stage, run_qml, flake_root) = templates_fallback_tmp("templates-prune");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_FLAKE_ROOT", &flake_root);
+        std::env::set_var("AOIDE_SONG_TEMPLATES", root.join("templates"));
+
+        compose_and_stage("alpha");
+        compose_and_stage("beta");
+
+        // alpha's songbook dir is gone — simulating a deleted/never-declared
+        // composed song.
+        std::fs::remove_dir_all(shellbridge::songbook_dir("alpha")).unwrap();
+
+        // Re-stage beta: nothing about beta itself changed, but the regen
+        // this triggers must re-check every overlay candidate's existence.
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["beta"]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+
+        let manifest: Value = serde_json::from_str(
+            &std::fs::read_to_string(run_qml.join("songs").join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            manifest.get("alpha").is_none(),
+            "alpha's manifest entry is pruned once its songbook dir is gone: {manifest:?}"
+        );
+        assert_eq!(
+            manifest["beta"],
+            json!({ "beta": { "owner": "beta", "file": "beta.qml" } }),
+            "beta's own entry is unaffected: {manifest:?}"
+        );
+
+        let registry: Value = serde_json::from_str(
+            &std::fs::read_to_string(run_qml.join("songs").join("registry.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            registry.get("alpha").is_none(),
+            "alpha's registry entry is pruned once its songbook dir is gone: {registry:?}"
+        );
+        assert_eq!(
+            registry["beta"],
+            json!({ "beta": { "kind": "dock", "order": 0 } }),
+            "beta's own entry is unaffected: {registry:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn stage_entry_refuses_and_syncs_nothing_while_declarative_locked() {
         let _g = aoide_test_support::env_lock().lock().unwrap();

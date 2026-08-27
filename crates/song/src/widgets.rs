@@ -32,7 +32,9 @@
 //! shape — a shape `StagingEngine.qml`'s `has()` cannot look up, so every
 //! widget for that one song would render nothing, no error anywhere.
 //! Whole-file regeneration from nix can't reproduce that failure mode: every
-//! song's entry, staged or not, comes from the same eval every time.
+//! song's entry, staged or not, comes from the same eval every time (a
+//! CHECKOUT host's committed songbook is stable across calls, so "every
+//! song" and "every committed song nix can see" are the same set).
 //!
 //! Mirrors the nix build's own per-song widget carry
 //! (`modules/facets/quickshell/default.nix`'s `quickshellConfig`
@@ -47,12 +49,24 @@
 //! `flake_root()/flake.nix` first and, when absent, never shells to `nix` at
 //! all: it reads the SHIPPED, prebaked `manifest.json`/`registry.json` from
 //! [`aoide_storage::fs::song_templates_dir`] (`pkgs/lyra-songbook`, baked at
-//! nix build time by the SAME `lib/songbook.nix` generator) as the baseline
-//! for every other committed song, and patches in the CURRENTLY-staged
-//! song's own entry from a direct, nix-free directory scan
-//! ([`scan_own_entry`]) — the only shape `rice compose` can ever produce
-//! (it never writes a `_widgets/` shelf, so there is no borrowed-ownership
-//! case to resolve without nix).
+//! nix build time by the SAME `lib/songbook.nix` generator) as the BASELINE.
+//! Unlike a checkout host, a repo-less host's OTHER composed songs are not
+//! inside that baseline at all (they live only in the runtime songbook, and
+//! the baked templates freeze whatever the package build saw) — a bare
+//! baseline-plus-current-song write would silently drop every OTHER
+//! previously-staged song's entry on the very next `rice stage` call. So
+//! [`eval_songbook_from_templates`] OVERLAYS the EXISTING on-disk manifest/
+//! registry's entries for any song that still has a directory in the host
+//! songbook (a composed song survives a regen it isn't part of; a song
+//! whose directory was removed is pruned — never an immortal stale key) on
+//! top of the baked baseline, THEN patches in the CURRENTLY-staged song's
+//! own entry from a direct, nix-free directory scan ([`scan_own_entry`]) —
+//! the only shape `rice compose` can ever produce (it never writes a
+//! `_widgets/` shelf, so there is no borrowed-ownership case to resolve
+//! without nix). This self-heals the staged song on every call and
+//! preserves every other still-live song's entry in between — not the
+//! checkout path's "every song, every call" (there is no whole-songbook
+//! eval to lean on here).
 
 use std::path::Path;
 
@@ -153,9 +167,10 @@ pub(crate) const SONGBOOK_EVAL_FIXTURE_VAR: &str = "AOIDE_SONGBOOK_EVAL_FIXTURE"
 ///
 /// On a REPO-LESS host (no `flake.nix` at `flake_root()`, L-C3,
 /// lyra-carrier lane, task #107): `nix` is never invoked at all — routes to
-/// [`eval_songbook_from_templates`] instead, which reads the shipped/env
-/// templates dir's prebaked `manifest.json`/`registry.json` and patches in
-/// `name`'s own freshly-scanned entry.
+/// [`eval_songbook_from_templates`] instead, which merges the shipped/env
+/// templates dir's prebaked baseline, the EXISTING on-disk file's entries
+/// for every still-live song, and `name`'s own freshly-scanned entry (see
+/// that function's own doc for the merge order).
 ///
 /// Returns the WHOLE `{ manifest, registry }` payload; callers pick the
 /// half they need. On any failure (nix missing, eval error, unparseable or
@@ -164,9 +179,14 @@ pub(crate) const SONGBOOK_EVAL_FIXTURE_VAR: &str = "AOIDE_SONGBOOK_EVAL_FIXTURE"
 /// which a caller could mistake for "the songbook is genuinely empty" and
 /// write out.
 ///
+/// `run_qml` is threaded through only for the templates path (it reads the
+/// CURRENT `run_qml/songs/{manifest,registry}.json` there to preserve other
+/// songs' entries) — the checkout-host `nix eval` path below ignores it
+/// entirely, since a fresh whole-songbook eval needs no prior on-disk state.
+///
 /// [`SONGBOOK_EVAL_FIXTURE_VAR`] short-circuits BOTH paths above for tests —
 /// see that constant's own doc.
-fn eval_songbook(name: &str) -> Result<SongbookEval, WidgetSyncErr> {
+fn eval_songbook(name: &str, run_qml: &Path) -> Result<SongbookEval, WidgetSyncErr> {
     #[cfg(test)]
     if let Ok(path) = std::env::var(SONGBOOK_EVAL_FIXTURE_VAR) {
         let bytes = std::fs::read(&path).map_err(|e| WidgetSyncErr {
@@ -187,7 +207,7 @@ fn eval_songbook(name: &str) -> Result<SongbookEval, WidgetSyncErr> {
     // the shell-out first and catching the failure after the fact; the
     // nix-eval path below stays exactly as it was for a real checkout host.
     if !flake_root.join("flake.nix").is_file() {
-        return eval_songbook_from_templates(name, &flake_root);
+        return eval_songbook_from_templates(name, &flake_root, run_qml);
     }
 
     let flake_ref = format!("{}#songbookManifest", flake_root.to_string_lossy());
@@ -218,24 +238,47 @@ fn eval_songbook(name: &str) -> Result<SongbookEval, WidgetSyncErr> {
 }
 
 /// The offline fallback for [`eval_songbook`] on a repo-less host (no flake
-/// at `flake_root()`, just checked by the caller): read the SHIPPED,
-/// prebaked `manifest.json`/`registry.json` from
-/// [`aoide_storage::fs::song_templates_dir`] — nix build time already
-/// computed them via the SAME `lib/songbook.nix` generator the checkout-host
-/// `nix eval` path calls at runtime (`pkgs/lyra-songbook/default.nix`) — as
-/// the baseline for every OTHER committed song, then overwrite `name`'s own
-/// entry with a fresh, nix-free scan of its ACTUAL committed songbook
-/// directory ([`scan_own_entry`]). A song composed at runtime (`rice
-/// compose`) is never itself in the baked templates, and even a template
-/// song staged again picks up a local edit this way — the same "self-heals
-/// every call" posture the real nix-eval path holds (module doc, "Whole-file
-/// regeneration from nix can't reproduce that failure mode").
+/// at `flake_root()`, just checked by the caller). Three layers, in order,
+/// each overwriting the last:
 ///
-/// `flake_root` is threaded through only for the error message (naming both
-/// locations checked), never read from here otherwise.
+///   1. **Baseline**: the SHIPPED, prebaked `manifest.json`/`registry.json`
+///      from [`aoide_storage::fs::song_templates_dir`] — nix build time
+///      already computed them via the SAME `lib/songbook.nix` generator the
+///      checkout-host `nix eval` path calls at runtime
+///      (`pkgs/lyra-songbook/default.nix`). Authoritative for every shipped,
+///      read-only song; frozen at package-build time, so it never reflects a
+///      song composed at RUNTIME.
+///   2. **Overlay**: [`overlay_surviving_entries`] copies every entry from
+///      the EXISTING on-disk `run_qml/songs/{manifest,registry}.json` whose
+///      song still has a directory in the host songbook on top of the
+///      baseline. This is the fix for the hazard a bare
+///      baseline-plus-current-song write would otherwise reproduce: without
+///      it, staging song B after having staged song A would silently drop
+///      A's entry (A is in neither the frozen baseline nor B's own scan) —
+///      `StagingEngine.qml` would then fall back to resolving A's widgets
+///      against a DIFFERENT song's slot, no error anywhere. A song whose
+///      songbook directory was since removed is NOT overlaid — its entry is
+///      pruned rather than kept immortal.
+///   3. **Patch**: `name`'s own entry, from a fresh, nix-free scan of its
+///      ACTUAL committed songbook directory ([`scan_own_entry`]) — always
+///      wins over both the baseline and the overlay, so THIS call's song is
+///      never served stale. A template song staged again picks up a local
+///      edit this way too.
+///
+/// Net effect: this self-heals the CURRENTLY-staged song on every call and
+/// preserves every other still-live song's entry in between — not the
+/// checkout path's "every song, every call" (there is no whole-songbook eval
+/// to lean on here; see the module doc).
+///
+/// `flake_root` is threaded through only for error messages (naming both
+/// locations checked), never read from here otherwise. `run_qml` is where
+/// the overlay step's EXISTING on-disk files live (`run_qml/songs/
+/// {manifest,registry}.json`) — the same tree [`regenerate_manifest`]/
+/// [`sync_song_registry`] write the merged result back into.
 fn eval_songbook_from_templates(
     name: &str,
     flake_root: &Path,
+    run_qml: &Path,
 ) -> Result<SongbookEval, WidgetSyncErr> {
     let Some(templates) = aoide_storage::fs::song_templates_dir() else {
         return Err(WidgetSyncErr {
@@ -317,11 +360,19 @@ fn eval_songbook_from_templates(
         });
     }
 
+    // Layer 2: overlay the EXISTING on-disk entries for every song that
+    // still has a directory in the host songbook — see this function's own
+    // doc for why (composed songs live outside the frozen baseline).
+    overlay_surviving_entries(&mut manifest, &run_qml.join("songs").join("manifest.json"));
+    overlay_surviving_entries(&mut registry, &run_qml.join("songs").join("registry.json"));
+
+    // Layer 3: patch — `name`'s own entry always wins over both the
+    // baseline and the overlay.
     let (own_manifest, own_registry) = scan_own_entry(name)?;
     let manifest_obj = manifest.as_object_mut().expect("checked is_object above");
     // Only songs with at least one slot appear in manifest.json (the same
     // asymmetry `lib/songbook.nix`'s own comment documents) — an empty scan
-    // removes any stale templated entry for `name` rather than writing `{}`.
+    // removes any stale entry for `name` rather than writing `{}`.
     match own_manifest.as_object() {
         Some(m) if !m.is_empty() => {
             manifest_obj.insert(name.to_string(), own_manifest);
@@ -336,6 +387,41 @@ fn eval_songbook_from_templates(
     registry_obj.insert(name.to_string(), own_registry);
 
     Ok(SongbookEval { manifest, registry })
+}
+
+/// Layer 2 of [`eval_songbook_from_templates`]'s merge: copy every entry
+/// from the EXISTING on-disk file at `existing_path` into `target` (already
+/// validated as a JSON object by the caller) — but ONLY for a song that
+/// still has a directory under [`aoide_storage::fs::songbook_dir`] in the
+/// host songbook. A song whose directory was since removed is silently
+/// skipped, which is the prune: its entry has nowhere to survive from (not
+/// in the frozen baseline, not in the on-disk overlay), so it simply isn't
+/// present in the merged result — never an immortal stale key.
+///
+/// A missing or corrupt `existing_path` is treated as "nothing to overlay"
+/// (the same "tolerate as empty" posture `undying::load_undying`/
+/// `peer_store`'s own loaders hold for their files) — this is a best-effort
+/// preservation layer over what's already on disk, not a durable store of
+/// its own; the baseline and the layer-3 patch are what makes every call
+/// correct regardless of what this step finds.
+fn overlay_surviving_entries(target: &mut serde_json::Value, existing_path: &Path) {
+    let Ok(raw) = std::fs::read_to_string(existing_path) else {
+        return;
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return;
+    };
+    let Some(existing_obj) = parsed.as_object() else {
+        return;
+    };
+    let target_obj = target
+        .as_object_mut()
+        .expect("eval_songbook_from_templates already validated `target` is an object");
+    for (song, entry) in existing_obj {
+        if aoide_storage::fs::songbook_dir(song).is_dir() {
+            target_obj.insert(song.clone(), entry.clone());
+        }
+    }
 }
 
 /// `name`'s own manifest/registry entry, computed directly from its
@@ -579,11 +665,15 @@ fn scan_slot_names(src: &Path) -> Result<Vec<String>, WidgetSyncErr> {
 }
 
 /// Regenerate `run_qml/songs/manifest.json` WHOLE from [`eval_songbook`] —
-/// every committed song's owner-map entry, replacing the file outright
-/// (preserve-nothing: the eval is total, so a stale or malformed entry for
-/// ANY song, not just the one being staged, self-heals on every call).
+/// every committed song's owner-map entry, replacing the file outright. On
+/// a checkout host the eval is total: a stale or malformed entry for ANY
+/// song, not just the one being staged, self-heals on every call. On a
+/// repo-less host [`eval_songbook_from_templates`]'s three-layer merge
+/// self-heals the STAGED song's own entry on every call and preserves every
+/// other still-live song's entry from the file this write is about to
+/// replace (see that function's own doc).
 fn regenerate_manifest(name: &str, run_qml: &Path, changed: &mut Vec<String>) -> Result<(), WidgetSyncErr> {
-    let eval = eval_songbook(name)?;
+    let eval = eval_songbook(name, run_qml)?;
     let manifest_path = run_qml.join("songs").join("manifest.json");
     let body = serde_json::to_string_pretty(&eval.manifest).unwrap_or_default() + "\n";
     let existing = std::fs::read_to_string(&manifest_path).ok();
@@ -599,10 +689,11 @@ fn regenerate_manifest(name: &str, run_qml: &Path, changed: &mut Vec<String>) ->
 
 /// Regenerate `run/qml/songs/registry.json` WHOLE from [`eval_songbook`] —
 /// the second call site of the one generator (see the module doc's "one
-/// generator, invoked twice"). Same preserve-nothing posture as
-/// [`regenerate_manifest`]: every committed song's registry entry comes
-/// from THIS eval, every time, so a stale entry for any song self-heals
-/// regardless of which song is being staged.
+/// generator, invoked twice"). Same posture as [`regenerate_manifest`]: a
+/// checkout host's eval is total (every committed song's registry entry
+/// comes from THIS eval, every time); a repo-less host's merge self-heals
+/// the staged song and preserves every other still-live song's entry from
+/// the file this write is about to replace.
 ///
 /// Clean-skips (`Ok`, empty `changed`) when no `run/qml` runtime tree is
 /// deployed at all — mirrors [`sync_song_widgets`]'s own not-yet-switched
@@ -617,7 +708,7 @@ pub fn sync_song_registry(name: &str) -> Result<RegistrySyncOk, WidgetSyncErr> {
         });
     }
 
-    let eval = eval_songbook(name)?;
+    let eval = eval_songbook(name, &run_qml)?;
     let registry_path = run_qml.join("songs").join("registry.json");
     let body = serde_json::to_string_pretty(&eval.registry).unwrap_or_default() + "\n";
     let existing = std::fs::read_to_string(&registry_path).ok();
