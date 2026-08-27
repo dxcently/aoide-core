@@ -3,7 +3,7 @@ name = "aoide-client"
 version.workspace = true
 edition = "2021"
 license = "MIT"
-description = "Aoide outbound: the peer-federation client (add/list/remove/pull/status), A2A wire builders, and the melete neutral-event adapter."
+description = "Aoide outbound: the peer-federation client (add/list/remove/pull/status), A2A wire builders, the melete neutral-event adapter, and the Melete MCP client (melete status/graph/call)."
 
 [lib]
 name = "aoide_client"

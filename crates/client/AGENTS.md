@@ -60,6 +60,57 @@
 - **Forwarded event text from `adapter` is untrusted data**, same as root
   `AGENTS.md` house rule 4 — an adapter never lets forwarded text execute as
   a command.
+- **`mcp_client`'s `AOIDE_MELETE_URL`/`AOIDE_MELETE_TOKEN` are a deliberate
+  choice, not an oversight — don't "fix" them onto `peer_store` (M2, task
+  #14).** `aoide_storage::peer_store::Peer` (url + `bearer_secret`,
+  resolved through the secrets broker) models AOIDE-TO-AOIDE federation —
+  AgentCard-verified, signed, per-peer `allows` — over aoide's OWN wire
+  protocol; Melete is a third-party claude.ai service speaking plain MCP,
+  never an aoide peer, so that shape doesn't fit. The `usage` verb's `live`
+  block (`aoide_storage::commands::fetch_live_usage`) is the closer
+  precedent — a single, external, bearer-authenticated endpoint — but its
+  token rides a LOCAL FILE Claude Code itself already maintains; aoide has
+  no equivalent on-disk source for a Melete url/token, and inventing one
+  is explicitly out of scope for M2. Both env vars are read FRESH on every
+  call (never cached) and unconfigured is a structured `Outcome::error`
+  naming both var names — never a silent degrade, never an invented
+  credential. The eventual live wiring (most likely a secrets-broker-
+  resolved secret, mirroring `peer add --bearer-secret`) is a KNOWN future
+  step, not something to backfill speculatively here.
+- **Every `melete` verb is `Door::Cli`-only, not just `melete call` (M2,
+  task #14) — match `aoide-secrets`' BLANKET family gate, not its
+  per-command one.** `aoide-secrets` gates its entire command family
+  `Door::Cli`-only (`require_cli`, called from nearly every one of its
+  handlers, including read-only ones like `secrets pending`) because its
+  whole surface touches secret material; `melete`'s whole surface sends a
+  live bearer token outward and can trigger real action, the same risk
+  class, so `handle_melete_status`/`handle_melete_graph` gate identically
+  to `handle_melete_call`, not just the one that obviously mutates. A new
+  `melete` verb gates the same way by default; carving out an exception
+  needs the same justification `aoide-secrets` would need for one of its
+  own.
+- **`mcp_client::call` reads a Melete response defensively off a raw
+  `Value` — never forces it through `aoide_protocol::wire::mcp`'s
+  `InitializeResult`/`ToolCallResult` structs.** Those describe AOIDE's
+  own guarantees as an MCP *server* (e.g. "always exactly one text content
+  block") — promises Melete never made this client. `parse_response_body`
+  parses plain JSON first, then defensively as an SSE-framed (`data: `-
+  line) body per streamable-HTTP MCP; `extract_result` reads `result`/
+  `error` off the parsed `Value` with `.get()`, never a strict
+  deserialize. A future edit that "cleans this up" by typing the response
+  strictly would turn an unexpected-but-valid Melete reply shape into a
+  hard parse failure instead of the taught error the untyped path
+  produces today.
+- **`mcp_client` makes exactly ONE POST per verb — no `initialize`-then-
+  session-id handshake is threaded into `graph`/`call` (M2, task #14).**
+  Documented as an ASSUMPTION (this crate's module doc), not a proven
+  wire fact — Melete's connector is treated as a stateless-per-request
+  bearer-token API, the minimal shape the three verbs need. If a live
+  integration later proves Melete requires a real MCP session
+  (`Mcp-Session-Id` carried from `initialize` into subsequent calls),
+  thread it through `mcp_client::call` centrally — every verb already
+  funnels through that one function — rather than adding a per-verb
+  workaround.
 - **`daemon::daemon_dispatch` is outbound too, not an exception to "outbound
   only."** It is the CLIENT side of the fourth door (P-D6): a routed
   handler in `conduct`/`server` calling OUT to the resident `aoided`'s
@@ -335,6 +386,13 @@
   `commands.rs`, wired into the owning app crate's `commands::all()`.
 - **A new adapter consumer** (beyond melete) gets its own module beside
   `adapter.rs`, built the same neutral-event-in/typed-event-out shape.
+- **A new Melete tool** needs NO new command — `melete call <tool>
+  --args <json>` already reaches any tool name by construction (M2, task
+  #14's whole point: immune to Melete's own tool-list drift). Only a tool
+  worth a FIRST-CLASS verb (its own parsed args, its own state-dir write —
+  `melete graph`'s own shape) earns a new `cmd!` entry in `mcp_client.rs`,
+  built the same `resolve_config` → `require_cli` → `mcp_client::call`
+  pipeline the existing three already share.
 - **A new session-write handler that should route through the daemon**
   calls `daemon::daemon_dispatch(inv)` as its own first line and returns
   early on `Some(outcome)` — the exact one-line prefix every P-D6 handler

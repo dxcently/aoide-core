@@ -186,6 +186,9 @@ const HTTP_METHOD: &str = "POST";
 /// One outbound JSON-RPC POST — the single body+optional-bearer transport
 /// every `peer` command that calls a registered peer's A2A door now shares
 /// (`pull_one_peer`, `pull_peer_live`, `send_message_to_peer`, `handle_peer_spawn`).
+/// Widened to `pub(crate)` (M2, task #14) so `mcp_client`'s Melete calls
+/// reuse this SAME transport rather than hand-rolling a second one — still
+/// not exported past this crate.
 ///
 /// With no bearer, this is BYTE-IDENTICAL to how each of those three called
 /// `run_curl`/`run_curl_with_timeout` directly before this task — the body
@@ -213,7 +216,7 @@ const HTTP_METHOD: &str = "POST";
 /// peers, the pairing-ceremony wire methods themselves) passes `&[]`,
 /// making this parameter's addition byte-identical-when-empty by
 /// construction.
-fn post_json(url: &str, body: &str, bearer: Option<&str>, extra_headers: &[(String, String)], timeout_secs: u64) -> Result<(u16, String), String> {
+pub(crate) fn post_json(url: &str, body: &str, bearer: Option<&str>, extra_headers: &[(String, String)], timeout_secs: u64) -> Result<(u16, String), String> {
     let header_args: Vec<String> = extra_headers.iter().flat_map(|(k, v)| ["-H".to_string(), format!("{k}: {v}")]).collect();
     match bearer {
         None => {

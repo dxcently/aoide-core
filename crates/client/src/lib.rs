@@ -31,11 +31,18 @@
 //! through when a `--via`/`Peer.via` transport marker is present.
 //! `aoide_storage::tunnel` (P-S2) owns the record's shape and every pure
 //! helper around it; this module owns the child process.
+//!
+//! `mcp_client` (M2, task #14) is the Melete MCP client: `melete
+//! status|graph|call` speak MCP (JSON-RPC 2.0 over HTTP POST) over
+//! `commands::post_json`, the SAME curl transport `peer` already uses — no
+//! new outbound protocol stack, just a new method vocabulary over the
+//! existing one.
 
 pub mod adapter;
 pub mod commands;
 pub mod daemon;
 pub mod discover;
+pub mod mcp_client;
 pub mod pair_watch;
 pub mod peer;
 pub mod tunnel;

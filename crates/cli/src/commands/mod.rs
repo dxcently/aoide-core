@@ -45,7 +45,9 @@ use crate::registry::Registry;
 /// command paths now live ONLY in `crates/lyra/src/commands/mod.rs::all()`
 /// (docs/architecture/PACKAGE-LAYOUT.md, CONTRACTS.md §3). Core's golden
 /// went 87 -> 48 in the same commit; nothing else in this list moved or
-/// reordered.
+/// reordered. `melete status/graph/call` (M2, task #14, appended newest —
+/// the Melete MCP client, `aoide_client::mcp_client`'s own module doc) took
+/// the golden count 75 -> 78.
 pub fn all() -> Registry {
     let mut r = Registry::new();
 
@@ -71,6 +73,7 @@ pub fn all() -> Registry {
     aoide_storage::commands::register_identity(&mut r); // identity — this instance's ed25519 identity show command (pairing workstream P-P1, appended newest)
     aoide_client::commands::register_peer_pair(&mut r); // peer pair request/pending/approve/reject — the pairing ceremony's CLI half (P-P2, appended newest)
     aoide_client::commands::register_peer_discovery(&mut r); // peer discover/invite — the LAN discovery beacon's CLI half (P-P6, appended newest)
+    aoide_client::mcp_client::register_melete(&mut r); // melete status/graph/call — the Melete MCP client (M2, task #14, appended newest)
 
     r
 }

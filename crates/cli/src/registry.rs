@@ -120,7 +120,9 @@ mod tests {
         // `session` — the undying picker (U3, command-defrag lane U) — a
         // parent command alongside `session.*` the same way bare `graph`
         // sits alongside `graph.link`: reached 74. Bumped by 1 more for
-        // `peer.pair.watch` (P-P5): reached 75.
+        // `peer.pair.watch` (P-P5): reached 75. Bumped by 3 for `melete
+        // status`/`melete graph`/`melete call` (M2, task #14) — the Melete
+        // MCP client, `aoide_client::mcp_client` — reached 78.
         let mut expected: Vec<&str> = vec![
             "a2a.serve",
             "adapter.melete",
@@ -143,6 +145,9 @@ mod tests {
             "inbox.read",
             "make",
             "mcp.serve",
+            "melete.call",
+            "melete.graph",
+            "melete.status",
             "onboard",
             "peer.add",
             "peer.allow",

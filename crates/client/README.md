@@ -26,6 +26,36 @@ never the inbound/serve half (that's `aoide-server`).
   (`build_message_send_body` and `resolve_card_url`).
 - `adapter` — the melete neutral-event adapter (consumes events, stays
   agnostic of any one downstream agent's shape).
+- `mcp_client` (M2, task #14) — the Melete MCP client: `melete
+  status|graph|call`. Not the same thing as `adapter`'s melete consumer
+  above — `adapter` consumes aoide's OWN outbound neutral event stream
+  INTO melete; `mcp_client` is the reverse direction, aoide calling OUT to
+  Melete's own MCP connector (Melete's stated "only machine surface").
+  Speaks MCP (JSON-RPC 2.0 over HTTP POST — `initialize`/`tools/list`/
+  `tools/call`) over `commands::post_json` (widened `pub(crate)` for this),
+  the SAME curl transport `peer` already uses — zero new Cargo dependency,
+  TLS comes free with curl. `melete status` runs `initialize` and reports
+  reachability plus `serverInfo`/`protocolVersion`; `melete graph` calls
+  the `graph_view` tool and writes the snapshot to `state/melete-graph.json`
+  (`aoide_storage::fs::state_dir()` — never a hardcoded path); `melete call
+  <tool> [--args <json>]` is a generic gated `tools/call` passthrough
+  (`job_status`/`run_code_task`/`schedule_*`/`stop_run`/`steer_run`/…) —
+  deliberately no per-tool verbs, so a change to Melete's own tool list
+  never needs a matching aoide release. The connector's endpoint/token ride
+  `AOIDE_MELETE_URL`/`AOIDE_MELETE_TOKEN` (env-only, read fresh per call,
+  the token never touching argv or disk) rather than `peer_store` — Melete
+  is a third-party MCP service, never an aoide peer, so the AgentCard-
+  verified/signed federation shape doesn't fit; unconfigured is a
+  structured, taught `Outcome::error` naming both vars, never an invented
+  credential. All three verbs are `Door::Cli`-only, matching
+  `aoide-secrets`' own blanket stance for its whole command family: every
+  call sends a live bearer token outward and `call` can trigger real,
+  possibly cost-incurring action, so the family is refused over MCP/A2A/
+  Daemon wholesale rather than gating only the consequential verb.
+  A response is read defensively off a raw `Value` (never forced through
+  `aoide_protocol::wire::mcp`'s server-side result structs) and, failing a
+  plain-JSON parse, as an SSE-framed (`data: `-line) body — Melete is
+  assumed to be a streamable-HTTP MCP server, so either shape must parse.
 - `peer` — peer-federation client half (CONTRACTS.md §7), joined at P-P2 by
   the pairing ceremony's own wire builders/parsers:
   `build_pair_request_body`/`parse_pair_request_response` (the requester's
