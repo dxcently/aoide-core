@@ -704,3 +704,88 @@ fn peer_pair_approve_on_an_outbound_entry_awaiting_confirm_commits_with_yes() {
     std::env::remove_var("XDG_RUNTIME_DIR");
     std::env::remove_var("AOIDE_AUDIT_LOG");
 }
+
+/// Review finding (P-S4 follow-up): a plain re-pair with NO `--via` must
+/// never wipe a `via` a previous ceremony (e.g. `peer invite`) already
+/// recorded — `set_peer_via` is only called at all when the entry names
+/// one, mirroring `upsert_paired_peer`'s own "untouched unless this call
+/// names a change" stance for `autogate`/`tokenFile`/`bearerSecret`/`hub`/
+/// `allows`. Seeds `box-b` already paired WITH a `via` (as if a prior
+/// `peer invite` had run), then re-pairs it through an outbound entry
+/// carrying `via: None` — the re-pair's own pubkey/url land as usual, but
+/// the existing `via` must survive untouched.
+#[test]
+fn peer_pair_approve_on_an_outbound_entry_with_no_via_leaves_a_previously_recorded_via_untouched() {
+    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let root = unique_root("pair-approve-outbound-preserves-via");
+    let _stage = setup_env(&root);
+
+    // box-b is already a VERIFIED peer carrying a via from an earlier
+    // ceremony (`peer invite`'s own src_addr-derived default, in
+    // practice) — this re-pair must not touch it.
+    aoide_storage::peer_store::save_peers(&[aoide_storage::peer_store::Peer {
+        name: "box-b".to_string(),
+        url: "http://old-b/".to_string(),
+        autogate: false,
+        token_file: None,
+        bearer_secret: None,
+        hub: false,
+        pubkey: Some("oldkey".repeat(8)),
+        verified: true,
+        allows: vec!["read".to_string(), "spawn".to_string()],
+        via: Some("ssh://khoa@previously-recorded".to_string()),
+        added_at: "2026-08-14T00:00:00Z".to_string(),
+    }])
+    .unwrap();
+
+    let (kp, _) = aoide_storage::identity::load_or_mint().unwrap();
+    let own_pubkey = kp.info().pubkey_hex;
+
+    let now = aoide_storage::time::now_iso_utc();
+    let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
+    let expires = aoide_storage::pairing::expires_at_from(now_epoch);
+    let entry = aoide_storage::pairing::OutboundPairingRequest {
+        id: "mnop1234".to_string(),
+        url: "http://new-b/".to_string(),
+        name: "box-b".to_string(),
+        pubkey_hex: "e".repeat(64),
+        requester_nonce_hex: "f".repeat(32),
+        approver_nonce_hex: "1".repeat(32),
+        requested_at: now.clone(),
+        expires_at: expires,
+        state: aoide_storage::pairing::OutboundState::AwaitingApproval,
+        // The re-pair itself carries NO via — a plain `peer pair request`
+        // with no `--via` this time.
+        via: None,
+    };
+    aoide_storage::pairing::park_outbound(entry).unwrap();
+    let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
+    aoide_storage::pairing::mark_outbound_awaiting_confirm("mnop1234", &"e".repeat(64), now_epoch).unwrap();
+
+    let expected_sas = aoide_storage::pairing::derive_sas(&own_pubkey, &"e".repeat(64), &"f".repeat(32), &"1".repeat(32));
+
+    let out = dispatch(&cli_invocation(&["peer", "pair", "approve"], &["mnop1234"], &[("yes", "true")]));
+    assert_eq!(out.status, Status::Ok, "{}", out.message);
+    let data = out.data.unwrap();
+    assert_eq!(data["sas"], expected_sas);
+
+    let peers = aoide_storage::peer_store::load_peers();
+    assert_eq!(peers.len(), 1);
+    // The re-pair's own fields DID land (pubkey/url replace on every
+    // re-pair, per upsert_paired_peer's own contract) —
+    assert_eq!(peers[0].url, "http://new-b/");
+    assert_eq!(peers[0].pubkey.as_deref(), Some("e".repeat(64).as_str()));
+    // — but the via from the EARLIER ceremony survives this via-less
+    // re-pair untouched, never silently cleared.
+    assert_eq!(
+        peers[0].via.as_deref(),
+        Some("ssh://khoa@previously-recorded"),
+        "a via-less re-pair must never wipe a previously-recorded via"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    std::env::remove_var("AOIDE_STAGE_DIR");
+    std::env::remove_var("AOIDE_STATE_DIR");
+    std::env::remove_var("XDG_RUNTIME_DIR");
+    std::env::remove_var("AOIDE_AUDIT_LOG");
+}

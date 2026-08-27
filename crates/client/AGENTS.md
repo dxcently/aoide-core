@@ -203,13 +203,22 @@
   `waitpid` there would leave a real zombie. `ECHILD` (the ordinary
   cross-invocation case — an earlier `aoide` run parented the child, not
   this process) falls back to the `/proc` poll, same as always.
-- **Every cross-box POST resolves its dial url through `resolve_dial_url`
-  (P-S4) — never `post_json(&peer.url, …)` or `post_json(&some_raw_url, …)`
-  directly.** `post_json_to_peer(peer, …)` (a registered `Peer`) and
-  `post_json_via(logical_url, via, tunnel_key, …)` (a ceremony call with no
-  `Peer` record yet) are the only two entry points; `commands::post_json`
-  itself is UNCHANGED by this phase and must stay that way — dial
-  resolution is a wrapper in FRONT of it, not a rewrite of it. **The
+- **Every cross-box network call resolves its dial url through
+  `resolve_dial_url` (P-S4) — not just the signed POSTs, and never
+  `post_json(&peer.url, …)`/`post_json(&some_raw_url, …)`/`run_curl(&["--",
+  &some_raw_url], …)` directly.** `post_json_to_peer(peer, …)` (a
+  registered `Peer`) and `post_json_via(logical_url, via, tunnel_key, …)`
+  (a ceremony call with no `Peer` record yet) are the two entry points for
+  a POST; `commands::post_json` itself is UNCHANGED by this phase and must
+  stay that way — dial resolution is a wrapper in FRONT of it, not a
+  rewrite of it. **`handle_peer_add`'s AgentCard fetch is a GET and was
+  missed on first landing (review finding) — it now calls
+  `resolve_dial_url` directly before its own `run_curl`, same as any other
+  call.** Any FUTURE cross-box network call — POST or otherwise — needs the
+  same funnel in front of it; a call site added without checking this
+  invariant against the full list below (`grep -n 'run_curl\|post_json'`
+  in this file) is exactly how the AgentCard fetch was missed the first
+  time. **The
   identity guarantee is load-bearing:** `via: None` must return the
   logical url byte-for-byte, and `resolve_dial_url`'s tunnel-key/path
   handling must never diverge from `aoide_storage::tunnel::dial_url`'s own

@@ -569,9 +569,29 @@ fn handle_peer_add(inv: &Invocation) -> Outcome {
     }
 
     // Verify: fetch the peer's AgentCard BEFORE registering anything — a
-    // peer that fails this fetch never gets added.
+    // peer that fails this fetch never gets added. This is the ONLY
+    // network call `peer add` ever makes, so it must dial through the
+    // tunnel exactly like every other cross-box call when `--via` is
+    // given (review finding, P-S4 follow-up): a loopback-bound door
+    // reachable ONLY through the tunnel — precisely the scenario `--via`
+    // exists for — used to fail verification here before the peer was
+    // ever registered, making the flag dead weight on `add`. `card_url`
+    // stays the LOGICAL url for display and for the peer record below;
+    // `resolve_dial_url` (this module's own P-S4 funnel) rewrites the
+    // fetch target's authority when a via is present, preserving its
+    // `.well-known/agent-card.json` path verbatim — no signing is
+    // involved either way (a card fetch is a plain GET, never a signed
+    // request), so there is no canonical-string path to keep in sync
+    // here, unlike the signed peer calls this funnel also serves.
     let card_url = crate::wire::resolve_card_url(&url);
-    let (code, body) = match run_curl(&["--", &card_url], None) {
+    let fetch_url = match resolve_dial_url(&card_url, via.as_ref(), &name) {
+        Ok(u) => u,
+        Err(e) => {
+            return Outcome::error(cmd, format!("opening a tunnel to verify peer AgentCard at {card_url}: {e}"))
+                .with_data(json!({ "reason": "tunnel-failed", "url": card_url }))
+        }
+    };
+    let (code, body) = match run_curl(&["--", &fetch_url], None) {
         Ok(v) => v,
         Err(e) => {
             return Outcome::error(cmd, format!("verifying peer AgentCard at {card_url}: {e}"))
@@ -1838,11 +1858,19 @@ fn approve_outbound(
     // `--via`) rode the parked entry here — commit it onto the peer record
     // in the SAME write as the pairing commit above, via the sibling
     // writer (`set_peer_via`'s own doc on why it's separate from
-    // `upsert_paired_peer`'s signature). `entry.via` is `None` for a plain
-    // `peer pair request` with no `--via` — clears/leaves-absent, exactly
-    // today's behavior.
-    if let Err(e) = aoide_storage::peer_store::set_peer_via(&mut peers, &entry.name, entry.via.as_deref()) {
-        return Outcome::error(cmd, format!("recording the peer's transport marker: {e}"));
+    // `upsert_paired_peer`'s signature). ONLY when `entry.via` is `Some`
+    // (review fix, P-S4 follow-up) — a plain re-pair with no `--via` must
+    // LEAVE a previously-recorded via (e.g. one `peer invite` set) exactly
+    // as it was, the same "untouched unless this call names a change"
+    // stance `upsert_paired_peer` itself already holds for `autogate`/
+    // `tokenFile`/`bearerSecret`/`hub`/`allows` on re-pairing; calling
+    // `set_peer_via` unconditionally with `None` would silently WIPE that
+    // marker as a side effect of an unrelated re-pair, never a deliberate
+    // clear.
+    if let Some(via) = entry.via.as_deref() {
+        if let Err(e) = aoide_storage::peer_store::set_peer_via(&mut peers, &entry.name, Some(via)) {
+            return Outcome::error(cmd, format!("recording the peer's transport marker: {e}"));
+        }
     }
     if let Err(e) = aoide_storage::peer_store::save_peers(&peers) {
         return Outcome::error(cmd, format!("writing the peer registry: {e}"));
@@ -2853,6 +2881,136 @@ mod tests {
             let out = handle_peer_add(&inv);
             assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{out:?}");
             assert!(aoide_storage::peer_store::load_peers().is_empty(), "an invalid --via registers nothing");
+        });
+    }
+
+    /// Both `AOIDE_STATE_DIR` (peers.json) and `XDG_RUNTIME_DIR` (tunnel
+    /// records) under ONE `env_lock` acquisition — `with_peer_state` and
+    /// `with_temp_runtime_dir` each lock it themselves, so nesting them
+    /// would deadlock (a plain `std::sync::Mutex` is not reentrant).
+    fn with_peer_state_and_temp_runtime_dir<T>(tag: &str, f: impl FnOnce() -> T) -> T {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_runtime = std::env::var("XDG_RUNTIME_DIR").ok();
+        let saved_session = std::env::var("AOIDE_SESSION_ID").ok();
+        let state_dir = std::env::temp_dir().join(format!("aoide-client-add-via-state-{tag}-{}", std::process::id()));
+        let runtime_dir = std::env::temp_dir().join(format!("aoide-client-add-via-runtime-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        let _ = std::fs::remove_dir_all(&runtime_dir);
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        std::env::set_var("AOIDE_STATE_DIR", &state_dir);
+        std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        let out = f();
+
+        let _ = std::fs::remove_dir_all(&state_dir);
+        let _ = std::fs::remove_dir_all(&runtime_dir);
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+        match saved_runtime {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+        match saved_session {
+            Some(v) => std::env::set_var("AOIDE_SESSION_ID", v),
+            None => std::env::remove_var("AOIDE_SESSION_ID"),
+        }
+        out
+    }
+
+    /// A real (but entirely local, no external binary) HTTP/1.1 responder:
+    /// loops accepting connections and answering each with a fixed 200
+    /// JSON response, until the returned listener is dropped. Looping
+    /// (rather than a one-shot `accept`) matters here: `resolve_dial_url`'s
+    /// own REUSE check (`open_or_reuse`'s `probe_port`) makes a bare TCP
+    /// connect-then-drop against this same port BEFORE the real `curl` GET
+    /// ever runs — a one-shot responder would have its single `accept()`
+    /// consumed by that silent probe connection, leaving curl's later,
+    /// genuine request to hang unanswered until its own `--max-time`. A
+    /// connection that sends no bytes before closing (the probe) reads as
+    /// an immediate EOF here and is simply skipped; the loop is ready
+    /// again immediately after. Returns the bound listener (keep it
+    /// alive — dropping it is what ends the loop) and its port.
+    fn spawn_fake_card_server(body: &'static str) -> (std::net::TcpListener, u16) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepter = listener.try_clone().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            loop {
+                let Ok((mut stream, _)) = accepter.accept() else { break };
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    // A bare probe connect-then-drop (no bytes ever sent) —
+                    // nothing to answer; loop back for the next accept.
+                    continue;
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (listener, port)
+    }
+
+    /// Review finding, P-S4 follow-up: `peer add`'s AgentCard verification
+    /// is its ONE network call, and used to dial `peer.url` directly even
+    /// when `--via` was given — exactly the scenario `--via` exists for (a
+    /// loopback-bound door reachable only through the tunnel) would fail
+    /// verification and never get registered. Proven end to end with a
+    /// REAL `curl` GET (no mock) reaching a REAL local HTTP responder
+    /// through a REUSED tunnel record (P-S3's seam, no real ssh anywhere):
+    /// the peer's logical url names an RFC 2606 `.invalid` host that can
+    /// never resolve, so the fetch can only have succeeded by going
+    /// through the rewritten `127.0.0.1:<port>` target the seeded record
+    /// names — an `Ok` outcome here is the proof. The recorded `peer.url`
+    /// must still be the LOGICAL url, never the rewritten one.
+    #[test]
+    fn handle_peer_add_with_a_valid_via_verifies_the_agentcard_through_the_tunnel_and_records_the_logical_url() {
+        with_peer_state_and_temp_runtime_dir("add-valid-via", || {
+            let (listener, port) = spawn_fake_card_server(r#"{"name":"fake-agent"}"#);
+
+            let session_id = tunnel_session_id();
+            aoide_storage::tunnel::save(&aoide_storage::tunnel::TunnelRecord {
+                schema_version: aoide_storage::tunnel::TUNNEL_VERSION.to_string(),
+                session_id,
+                key: "sakaki".to_string(),
+                ssh_target: "ssh://sakaki".to_string(),
+                local_port: port,
+                remote_host: "127.0.0.1".to_string(),
+                remote_port: 8710,
+                pid: std::process::id(),
+                opened_at: "2026-08-27T00:00:00Z".to_string(),
+            })
+            .unwrap();
+
+            let logical_url = "http://sakaki-unresolvable-host.invalid:8710/";
+            let inv = Invocation {
+                path: vec!["peer".to_string(), "add".to_string()],
+                args: vec!["sakaki".to_string(), logical_url.to_string()],
+                flags: [("via".to_string(), "ssh://sakaki".to_string())].into_iter().collect(),
+                door: aoide_protocol::Door::Cli,
+            };
+            let out = handle_peer_add(&inv);
+            assert_eq!(
+                out.status,
+                aoide_protocol::output::Status::Ok,
+                "the fetch must have gone through the tunnel — the logical host cannot resolve at all: {out:?}"
+            );
+
+            let peers = aoide_storage::peer_store::load_peers();
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].url, logical_url, "the recorded peer.url stays LOGICAL, never the rewritten dial url");
+            assert_eq!(peers[0].via.as_deref(), Some("ssh://sakaki"));
+
+            drop(listener);
         });
     }
 

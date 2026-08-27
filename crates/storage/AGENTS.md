@@ -114,6 +114,12 @@
   set `Peer.via` via a raw `Peer { .. }` literal anywhere outside
   `peer_store.rs` itself, and don't fold it into `upsert_paired_peer`
   without first checking every one of that function's existing callers.
+  **A caller passing `None` must mean "nothing to say," never "clear
+  it"** — `approve_outbound` (`aoide-client`) only calls `set_peer_via` at
+  all when the ceremony resolved an actual via; a re-pair that named none
+  leaves a previously-recorded `via` (e.g. one `peer invite` set) exactly
+  as it was, the same untouched-unless-named stance `upsert_paired_peer`
+  itself holds for `autogate`/`tokenFile`/`bearerSecret`/`hub`/`allows`.
 - **`pairing`'s request ids are deliberately NOT `state/stage/pending.json`'s
   array-position ids.** A pairing correlation must survive the requester's
   CLI process exiting and an async `aoide/pairApprove` callback arriving

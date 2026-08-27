@@ -145,8 +145,19 @@ never the inbound/serve half (that's `aoide-server`).
   `aoide_storage::tunnel::parse_via`) is a FLAG on `peer.add`/
   `peer.invite`/`peer.pair.request`/`peer.spawn` — never a new command
   path — parsed by the shared `parse_via_flag` (absent is `None`,
-  malformed is a usage error, the same `parse_secs_flag` stance). The
-  session id a tunnel opens under (`tunnel_session_id`) is
+  malformed is a usage error, the same `parse_secs_flag` stance).
+  **`peer add`'s AgentCard verification (its ONE network call) dials
+  through `resolve_dial_url` too when `--via` is given** — the review
+  finding this needed fixing for: the exact scenario `--via` exists for (a
+  loopback-bound door reachable only through the tunnel) used to fail
+  verification, before the peer was ever registered, making the flag dead
+  weight on `add`. The fetch target is the REWRITTEN url (its path —
+  `/.well-known/agent-card.json` — preserved verbatim by the same funnel);
+  the recorded `Peer.url` stays the LOGICAL url either way. No signing is
+  involved (a card fetch is a plain GET), so there is no canonical-string
+  path to keep in sync here, unlike the signed peer calls this funnel also
+  serves.
+  The session id a tunnel opens under (`tunnel_session_id`) is
   `AOIDE_SESSION_ID` when a conducted session set it, else a
   process-scoped `pid-<pid>` fallback (K3) — **P-S4 stops at resolving and
   passing that key through; it does not close anything.** Every tunnel
