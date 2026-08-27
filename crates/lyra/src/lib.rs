@@ -68,6 +68,43 @@ pub fn run_lyra(argv: &[String]) -> i32 {
             return Some(output::exit::OK);
         }
 
+        // `secrets ask` (P3) speaks zenity's own output contract, not the
+        // generic `Outcome` envelope — `crates/lyra/src/commands/secrets.rs`'s
+        // module doc: `aoide_secrets::watch::spawn_lyra_entry` reads this
+        // process's stdout expecting EXACTLY the typed code (exit 0), the
+        // literal string `Dismiss ask` (exit 1), or nothing (any other
+        // non-zero exit) — never a JSON envelope, `--json` included, since
+        // the caller spawning this process is never passing that flag and a
+        // human running it by hand gets the identical zenity-shaped output
+        // either way.
+        if inv.path == ["secrets", "ask"] {
+            let outcome = dispatch::dispatch(inv);
+            let result = outcome.data.as_ref().and_then(|d| d.get("result")).and_then(|r| r.as_str());
+            return Some(match result {
+                Some("approved") => {
+                    let code = outcome.data.as_ref().and_then(|d| d.get("code")).and_then(|c| c.as_str()).unwrap_or("");
+                    println!("{code}");
+                    output::exit::OK
+                }
+                Some("dismissed") => {
+                    println!("Dismiss ask");
+                    output::exit::ERROR
+                }
+                Some("cancelled") => output::exit::ERROR,
+                _ => {
+                    // A usage error (bad/missing flags) or a domain error
+                    // (quickshell failed to spawn) — reported on stderr,
+                    // same posture every other CLI usage/error path holds.
+                    eprintln!("{}", outcome.message);
+                    if outcome.status == output::Status::Usage {
+                        output::exit::USAGE
+                    } else {
+                        output::exit::ERROR
+                    }
+                }
+            });
+        }
+
         // `livery emit` / `livery resolve` / `livery lint` print the
         // engine's raw byte output in text mode, NOT the outcome envelope —
         // same posture as `schema` above. `--json` keeps the structured

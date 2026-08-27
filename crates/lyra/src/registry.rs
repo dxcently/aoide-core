@@ -4,8 +4,9 @@
 //!
 //! Golden snapshot: the sorted list of every command path lyra registers.
 //! Mirrors `aoide-cli`'s `registry.rs` test module — same invariant checks,
-//! lyra's own 43-path bundle (P-A4 minted 42; P-I3's `onboard` took it to
-//! 43 — see `commands/mod.rs::all()` for the assembly order).
+//! lyra's own 44-path bundle (P-A4 minted 42; P-I3's `onboard` took it to
+//! 43; P3's `secrets ask` took it to 44 — see `commands/mod.rs::all()` for
+//! the assembly order).
 
 pub use aoide_protocol::registry::*;
 
@@ -111,11 +112,12 @@ mod tests {
             "screen.point.text",
             "screen.send",
             "screen.shot",
+            "secrets.ask",
             "shellbridge",
         ];
         expected.sort();
 
         assert_eq!(got, expected, "command path set drifted from lyra's golden snapshot");
-        assert_eq!(got.len(), 43, "lyra's golden path count");
+        assert_eq!(got.len(), 44, "lyra's golden path count");
     }
 }

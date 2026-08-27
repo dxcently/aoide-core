@@ -12,7 +12,7 @@ are core `aoide` identity, root `AGENTS.md`).
 
 - `bin/lyra` — the binary entry point.
 - `dispatch`/`registry` — lyra's own argv parsing, dispatch, and golden
-  command-path snapshot (43 paths), independent of core's.
+  command-path snapshot (44 paths), independent of core's.
 - `guide` — `lyra guide`.
 - `commands` — lyra's `commands::all()`, pulling in `song`, `screen`, and
   `conduct`'s `shellbridge`/`herald` registration lines (the files stay in
@@ -30,8 +30,27 @@ are core `aoide` identity, root `AGENTS.md`).
   flake.
 - `run_lyra` — drives `aoide_protocol::door::run` with lyra's own registry/
   dispatcher and its own smaller `special` hook (`mcp serve --stdio`,
-  `guide`/`schema`/`livery` raw output). Deliberately absent: `a2a serve`,
-  `conductor`.
+  `guide`/`schema`/`livery`/`secrets ask` raw output). Deliberately absent:
+  `a2a serve`, `conductor`.
+- `commands::secrets` — `lyra secrets ask` (P3): the rice-shaped code-entry
+  dialog `aoide secrets watch --popup` spawns in place of `zenity --entry`
+  once it resolves (`aoide_secrets::watch::resolve_lyra_bin`). Writes a
+  generated QML file to a scratch temp path and spawns `quickshell -p
+  <path>` as a genuinely standalone process — the first command in this
+  crate to do that (`song::commands::quickshell`'s own `quickshell reload`
+  only ever sends IPC into an ALREADY-running instance). Speaks zenity's own
+  output contract byte for byte (code on stdout + exit 0; `Dismiss ask` on
+  stdout + exit 1; else non-zero) so `aoide-secrets`' own dialog-result
+  parsing never needs to know which binary answered — see that crate's
+  `watch.rs` module doc and this crate's own `commands/secrets.rs` module
+  doc for the full mechanism, including the two live-quickshell findings
+  (`console.log` lands on stdout, not stderr; a bare `Window {}` tiles under
+  Hyprland unless it also declares a fixed-size hint) neither doc repeats
+  from the other. `quickshell` itself is a runtime shell-out declared BY
+  NAME — zero new Cargo dependencies (the same feature-detection posture
+  `aoide-secrets`' own `zenity`/`qrencode` shell-outs already hold); it is
+  simply assumed present here, since `lyra` itself is fundamentally built on
+  Quickshell already.
 
 ## What it consumes
 
@@ -41,9 +60,9 @@ serve --stdio`'s door loop).
 
 ## How it composes
 
-43 command paths: onboard/rice/draft/mode/cover/livery/quickshell/screen/
-shellbridge/herald/take — everything that paints, or that only a desktop
-needs. Never depends on `aoide-client`/`aoide-conductor` — no A2A client, no
+44 command paths: onboard/rice/draft/mode/cover/livery/quickshell/screen/
+shellbridge/herald/take/secrets ask — everything that paints, or that only a
+desktop needs. Never depends on `aoide-client`/`aoide-conductor` — no A2A client, no
 TUI; those stay core-only. May depend on Nix (`song::widgets`'s `nix eval`,
 and now `commands::onboard`'s own `nix eval`/`nix-instantiate` shell-outs)
 — the one binary allowed to (root `AGENTS.md`, "core is nix-independent").
