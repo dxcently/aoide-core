@@ -240,16 +240,16 @@
   partial close here** — the real lifecycle (session-end fast path, reaper
   backstop, for both key shapes) is P-S5's, landed all at once or not at
   all.
-- **P-S6 has not landed — a tunneled request is POSSIBLE, not SAFE,
-  against a real peer.** Every request delivered through an ssh forward
-  reaches the far A2A door as `PeerOrigin::Loopback`
-  (`aoide-server::a2a::classify_origin`), which today carries an
-  unconditional Inject delivery free pass. This module's job stops at
-  making the tunnel work; narrowing that free pass so a verified signature
-  is required for loopback-sourced auto-delivery is `aoide-server`'s job,
-  tracked as the ssh-transport plan's P-S6, and is a REQUIRED phase, not
-  optional hardening — do not treat `--via`/`Peer.via` as safe to recommend
-  for a real cross-box pair until it lands.
+- **A tunneled request is safe against a real peer, not merely possible.**
+  Every request delivered through an ssh forward reaches the far A2A door
+  as `PeerOrigin::Loopback` (`aoide-server::a2a::classify_origin`), which
+  carries an unconditional Inject delivery free pass for an UNSIGNED
+  request. This module makes the tunnel work; `aoide-server` narrows that
+  free pass (`origin_for_inject`, CONTRACTS.md §6) so a verified per-request
+  signature never rides Loopback's trust, with a like-for-like
+  signature-rung autogate restoring delivery for a peer the operator
+  already marked auto-deliver. `--via`/`Peer.via` are safe to recommend for
+  a real cross-box pair.
 - **The self-invite guard (`discover::is_self_target`) runs BEFORE the
   proceed-confirm and BEFORE the ceremony, in `handle_peer_invite`, never
   inside `run_pair_request` (P-S1).** `run_pair_request` is shared with

@@ -170,12 +170,13 @@ never the inbound/serve half (that's `aoide-server`).
   function behave inconsistently by caller. The real lifecycle — the
   session-end fast path and the reaper's orphan-collecting backstop, for
   BOTH key shapes — is P-S5's job, not started here.
-  **P-S6 (narrowing the A2A door's loopback trust so a tunneled request
-  cannot silently auto-deliver) has not landed.** Every tunneled request
-  reaches the far door as `PeerOrigin::Loopback`
-  (`aoide-server::a2a::classify_origin`), which today gets an
-  unconditional delivery free pass — this phase makes tunneled delivery
-  POSSIBLE, not safe to use against a real peer, until P-S6 lands.
+  Every tunneled request reaches the far door as `PeerOrigin::Loopback`
+  (`aoide-server::a2a::classify_origin`), which carries an unconditional
+  delivery free pass for an UNSIGNED request. `aoide-server::a2a` narrows
+  that free pass for a request carrying a verified per-request signature
+  (`origin_for_inject`, CONTRACTS.md §6) — a signed caller is a remote peer
+  by construction and never rides Loopback's trust, so tunneled delivery is
+  safe against a real, non-autogate peer, not merely possible.
 - `commands` — this crate's CLI commands:
   `peer add/remove/pull/status/hub/allow/spawn/discover/invite`,
   `peer pair request/pending/approve/reject` (P-P2, CONTRACTS.md §6/§7 —
