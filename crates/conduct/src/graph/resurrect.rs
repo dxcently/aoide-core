@@ -102,9 +102,11 @@
 //! `aoide_storage::manifest::SessionSpec`) resolves independently, same
 //! per-candidate isolation the flag-mode loop already holds: a spec whose
 //! `host` is not this host's own name
-//! (`aoide_storage::display::local_host_name`) is skipped with a note —
-//! remote summoning is a later phase (U4), never guessed here. A local
-//! spec's `dir` resolves through `aoide_storage::manifest::
+//! (`aoide_storage::display::local_host_name`) is [`summon_remote`]'s job
+//! (U4, command-defrag lane U) — summoned through the peer door rather than
+//! skipped, see that function's own doc for the local refusal shapes, the
+//! reused signed-spawn wire, and the cwd limitation this phase lands with.
+//! A local spec's `dir` resolves through `aoide_storage::manifest::
 //! resolve_spec_dir` (the containment guard — a `..`-laden `dir` is
 //! refused, never silently resolved outside the project root).
 //!
@@ -124,14 +126,21 @@
 //! — the SAME windowed [`session_spawn`] path every other resurrect
 //! candidate spawns through, never a forked launch mechanism. An agent
 //! with neither a `command` nor a registered profile is a taught
-//! `failed[]` entry, never a guessed argv. Every row of the outcome — both
-//! buckets [`resurrect_one`] can push into as well as this loop's own
-//! `skipped-remote`/`failed`/`clean-spawned` rows — carries a
+//! `failed[]` entry, never a guessed argv. A spec whose `host` names a
+//! DIFFERENT box is [`summon_remote`]'s job (U4) rather than this loop's
+//! own local match — see that function's doc. Every row of the outcome —
+//! both buckets [`resurrect_one`] can push into as well as this loop's own
+//! `summoned-remote`/`failed`/`clean-spawned` rows — carries a
 //! `disposition` key, stamped after the fact where `resurrect_one` itself
 //! doesn't know it is being called from manifest mode.
 //!
 //! **Manifest-revived sessions are marked undying (orchestrator design
-//! ruling, U2 review round 1).** Once a spawn from EITHER path actually
+//! ruling, U2 review round 1) — LOCAL revivals only.** [`summon_remote`]'s
+//! own rows never reach this: the resurrected id lives on the PEER, and
+//! `state/undying.json` is host-local runtime state naming ids that live on
+//! THIS host (the same reasoning U3's picker already holds toward a peer
+//! row's mark — it writes a manifest spec, never touches `undying.json`
+//! for an id it doesn't own). Once a spawn from EITHER local path actually
 //! lands a row in `resurrected` (which only happens past `Status::Ok`, the
 //! same gate `resurrect_one`'s own pre-existing undying TRANSFER block
 //! reads off, never `registered` — a live terminal registering is a fact
@@ -681,13 +690,7 @@ fn resurrect_from_manifest(
 
     for spec in &manifest.sessions {
         if spec.host != this_host {
-            skipped.push(json!({
-                "host": spec.host,
-                "dir": spec.dir,
-                "agent": spec.agent,
-                "disposition": "skipped-remote",
-                "reason": "remote spec — summoned in U4's door path, skipped locally",
-            }));
+            summon_remote(spec, &mut resurrected, &mut failed, &mut changed);
             continue;
         }
 
@@ -771,6 +774,156 @@ fn resurrect_from_manifest(
     }));
     audit_resurrect(inv, "ok", &out.message);
     out
+}
+
+/// A manifest spec whose `host` names a DIFFERENT box: summoned through the
+/// peer door rather than skipped (U4, command-defrag lane U — landing the
+/// U2/U3 module doc's own "remote summoning is a later phase" note).
+/// `spec.host` resolves against `state/peers.json` the exact same way U3's
+/// picker WRITES it (`{host: <peer name>, dir, agent}`, `CONTRACTS.md`'s
+/// `.aoide/project.json` section) — a peer NICKNAME, not a literal DNS/OS
+/// hostname. Three local refusals, all landing in `failed[]` — never
+/// `skipped[]`, since this spec was tried and refused, not given up on —
+/// before the wire is ever touched:
+/// - no peer named `spec.host` at all — taught, names `peer add`;
+/// - a registered but UNVERIFIED peer — the same local-only refusal
+///   `aoide-client::commands::handle_peer_spawn` already holds (an
+///   unsigned request can never satisfy the remote door's `Signature`-rung
+///   spawn gate, P-P4/PAIRING.md decision 6): refused HERE rather than
+///   earning a doomed round trip;
+/// - neither a `command` nor a registered `AgentProfile::launch` default
+///   for `spec.agent` ([`summon_text`]) — the same taught gap
+///   [`clean_spawn_from_spec`] refuses locally, mirrored here since there
+///   is no argv to build a prompt from either.
+///
+/// Past those three, this reuses [`aoide_client::commands::spawn_on_peer`]
+/// VERBATIM — the identical signed spawn-shaped `message/send`
+/// (`context_id: None`) `aoide peer spawn` drives (the `conduct` → `client`
+/// edge this crate's `Cargo.toml` already documents for `who`, extended to
+/// this tenant) — never a re-implementation of the wire, never a shell-out
+/// to the `aoide` CLI. No confirm prompt: unlike `peer spawn`'s interactive
+/// `--yes` gate, a manifest spec IS the operator's own standing
+/// declaration — the identical posture U2's local clean-spawn already
+/// takes toward a spec's own `command`, never re-asked at revival time.
+/// **Which AGENT actually runs is the PEER's own configured
+/// `aoide.a2a.spawnAgent`, never chosen here** — [`summon_text`]'s result
+/// only ever becomes that agent's first typed turn
+/// (`aoide-server::a2a::do_spawn`'s `spawn_inject_prompt`), the same
+/// security model `handle_peer_spawn`'s own doc states; `spec.agent` is
+/// informational on the remote leg, unlike the local leg where it picks
+/// the actual harness. Every remaining refusal — unreachable peer, the
+/// remote door's own gate/autogate/allow-set refusal — surfaces VERBATIM
+/// into `failed[]` as `spawn_on_peer`'s own `Err` text; per-spec isolation
+/// holds exactly as every other row in this loop already does.
+///
+/// **The cwd limitation (design note, U4).** The spawn wire carries NO
+/// working-directory field at all — `decide_send_action`/`do_spawn`
+/// (`aoide-server::a2a`) take only a prompt and the pre-configured
+/// `spawn_agent` executable, nothing else — so `spec.dir` cannot be pushed
+/// onto the peer through this call; it is not silently dropped so much as
+/// never representable on this wire version. A spec wanting a specific
+/// directory on the peer must say so inside its own `command`
+/// (`git -C <absolute path on the peer> …`) — an honest limitation, never
+/// a guessed `--cwd` the wire has nowhere to carry. Adding a wire field is
+/// a LATER phase's job: the fleet's doors run older binaries this phase
+/// must stay compatible with, so the wire itself is never touched here.
+fn summon_remote(
+    spec: &aoide_storage::manifest::SessionSpec,
+    resurrected: &mut Vec<serde_json::Value>,
+    failed: &mut Vec<serde_json::Value>,
+    changed: &mut Vec<String>,
+) {
+    let peers = aoide_storage::peer_store::load_peers();
+    let peer = match peers.iter().find(|p| p.name == spec.host) {
+        Some(p) if p.verified => p.clone(),
+        Some(_) => {
+            failed.push(json!({
+                "host": spec.host, "dir": spec.dir, "agent": spec.agent,
+                "disposition": "failed",
+                "reason": format!(
+                    "peer `{}` is registered but not paired — summoning requires a signed \
+                     request from a VERIFIED peer; pair first with `aoide peer pair request \
+                     <url> --name {}`",
+                    spec.host, spec.host
+                ),
+            }));
+            return;
+        }
+        None => {
+            failed.push(json!({
+                "host": spec.host, "dir": spec.dir, "agent": spec.agent,
+                "disposition": "failed",
+                "reason": format!(
+                    "host `{}` is not a registered peer — `aoide peer add {} <url>` (then pair it) first",
+                    spec.host, spec.host
+                ),
+            }));
+            return;
+        }
+    };
+
+    let Some(text) = summon_text(spec) else {
+        failed.push(json!({
+            "host": spec.host, "dir": spec.dir, "agent": spec.agent,
+            "disposition": "failed",
+            "reason": format!(
+                "no `command` given and no registered default launch for agent `{}` — add a `command` to the spec",
+                spec.agent
+            ),
+        }));
+        return;
+    };
+
+    match aoide_client::commands::spawn_on_peer(&peer, &text) {
+        Ok(resp) => {
+            let session_id = resp
+                .get("result")
+                .and_then(|r| r.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            changed.push(format!(
+                "session {session_id}: summoned on peer `{}` (manifest spec, agent {})",
+                spec.host, spec.agent
+            ));
+            resurrected.push(json!({
+                "sessionId": session_id,
+                "host": spec.host,
+                "agent": spec.agent,
+                "disposition": "summoned-remote",
+                "response": resp,
+            }));
+        }
+        Err(e) => {
+            failed.push(json!({
+                "host": spec.host, "dir": spec.dir, "agent": spec.agent,
+                "disposition": "failed",
+                "reason": format!("summoning on peer `{}`: {e}", spec.host),
+            }));
+        }
+    }
+}
+
+/// The text a remote summon injects as the peer's newly spawned session's
+/// first turn — the spec's own `command` VERBATIM when given (unlike
+/// [`clean_spawn_from_spec`]'s LOCAL argv, this never whitespace-splits it:
+/// there is no argv on this wire, only one prompt string, so splitting and
+/// rejoining would only risk collapsing whitespace the operator wrote on
+/// purpose), else the agent's registered
+/// [`aoide_protocol::agents::AgentProfile::launch`] default joined back
+/// into one line (the same fallback U2's local clean-spawn already
+/// applies, mirrored here since the wire wants a string, not a `Vec`).
+/// `None` when neither exists — the caller turns that into a taught
+/// `failed[]` entry, never a guessed prompt.
+fn summon_text(spec: &aoide_storage::manifest::SessionSpec) -> Option<String> {
+    if let Some(command) = &spec.command {
+        return Some(command.clone());
+    }
+    let profile = agent_profile(&spec.agent)?;
+    if profile.launch.is_empty() {
+        return None;
+    }
+    Some(profile.launch.join(" "))
 }
 
 /// A manifest spec with no enriching ledger match: clean-spawn it windowed
@@ -861,6 +1014,37 @@ mod tests {
     fn set_ledger(entries: &[aoide_storage::ledger::LedgerEntry]) {
         for e in entries {
             aoide_storage::ledger::append_ledger_entry(e).unwrap();
+        }
+    }
+
+    /// A peer registered via the legacy `peer add` escape, never paired —
+    /// same `verified: false` shape `send.rs`'s own `test_peer` fixture
+    /// uses, named here for the summon tests' own local-refusal case.
+    fn unpaired_peer(name: &str) -> aoide_storage::peer_store::Peer {
+        aoide_storage::peer_store::Peer {
+            name: name.to_string(),
+            url: "http://127.0.0.1:9/".to_string(),
+            autogate: false,
+            token_file: None,
+            bearer_secret: None,
+            hub: false,
+            pubkey: None,
+            verified: false,
+            allows: Vec::new(),
+            added_at: "2026-08-27T00:00:00Z".to_string(),
+        }
+    }
+
+    /// A `verified: true` peer at the given `url` — enough for
+    /// `summon_remote`'s local gate to pass and `spawn_on_peer`'s own
+    /// signing to proceed (signing only needs THIS instance's own identity,
+    /// never the peer's `pubkey` — `sign_headers_for_peer`'s own doc), so
+    /// no real pairing ceremony is needed to exercise the wire.
+    fn verified_peer(name: &str, url: &str) -> aoide_storage::peer_store::Peer {
+        aoide_storage::peer_store::Peer {
+            verified: true,
+            url: url.to_string(),
+            ..unpaired_peer(name)
         }
     }
 
@@ -1712,14 +1896,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A spec whose `host` is not this host's own name is skipped locally,
-    /// never guessed at — remote summoning is U4's job.
+    /// U4: a spec whose `host` is not this host's own name is SUMMONED, not
+    /// skipped — but "no peer named that host at all" is the first local
+    /// refusal `summon_remote` holds, before the wire is ever touched. Lands
+    /// in `failed[]` (never `skipped[]` — this spec was tried and refused),
+    /// taught to name `peer add`.
     #[test]
-    fn bare_mode_skips_a_remote_spec_with_a_taught_note() {
+    fn bare_mode_remote_summon_fails_taught_against_an_unregistered_host() {
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
         let (root, cwd) = setup_manifest(
-            "resurrect-manifest-remote",
+            "resurrect-manifest-remote-unknown",
             vec![manifest_spec("some-other-host", ".", "claude", None)],
         );
 
@@ -1727,13 +1914,170 @@ mod tests {
         drop(cwd);
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         let data = out.data.as_ref().unwrap();
-        let skipped = data["skipped"].as_array().unwrap();
-        assert_eq!(skipped.len(), 1, "data: {data}");
-        assert_eq!(skipped[0]["disposition"], "skipped-remote");
-        assert_eq!(skipped[0]["host"], "some-other-host");
-        assert!(skipped[0]["reason"].as_str().unwrap().contains("U4"), "reason: {}", skipped[0]["reason"]);
+        assert_eq!(data["skipped"].as_array().unwrap().len(), 0, "an unknown-host remote spec is FAILED, not skipped: {data}");
+        let failed = data["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 1, "data: {data}");
+        assert_eq!(failed[0]["disposition"], "failed");
+        assert_eq!(failed[0]["host"], "some-other-host");
+        assert!(
+            failed[0]["reason"].as_str().unwrap().contains("peer add"),
+            "reason must teach `peer add`: {}",
+            failed[0]["reason"]
+        );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The second local refusal: a peer registered via the legacy `peer
+    /// add` escape but never paired (`verified: false`) can never satisfy
+    /// the remote door's `Signature`-rung spawn gate — refused LOCALLY,
+    /// same posture `aoide-client::commands::handle_peer_spawn` already
+    /// holds toward its own CLI callers.
+    #[test]
+    fn bare_mode_remote_summon_fails_taught_against_an_unverified_peer() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
+        let (root, cwd) = setup_manifest(
+            "resurrect-manifest-remote-unverified",
+            vec![manifest_spec("sakaki", ".", "claude", None)],
+        );
+        aoide_storage::peer_store::save_peers(&[unpaired_peer("sakaki")]).unwrap();
+
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[]));
+        drop(cwd);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.as_ref().unwrap();
+        let failed = data["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 1, "data: {data}");
+        assert_eq!(failed[0]["disposition"], "failed");
+        assert!(
+            failed[0]["reason"].as_str().unwrap().contains("peer pair request"),
+            "reason must teach the pairing ceremony: {}",
+            failed[0]["reason"]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The third local refusal: a verified peer, but nothing to summon it
+    /// WITH — no `command` and no registered default launch for the spec's
+    /// agent. Proven with a genuinely unreachable peer URL (port 9, the
+    /// same discard-port fixture `send.rs`'s own remote-delivery tests use)
+    /// to prove the wire is never even touched — the refusal must fire
+    /// before `spawn_on_peer` gets a chance to fail for a DIFFERENT reason.
+    #[test]
+    fn bare_mode_remote_summon_fails_taught_with_nothing_to_summon() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
+        let (root, cwd) = setup_manifest(
+            "resurrect-manifest-remote-no-command",
+            vec![manifest_spec("sakaki", ".", "no-such-harness", None)],
+        );
+        aoide_storage::peer_store::save_peers(&[verified_peer("sakaki", "http://127.0.0.1:9/")]).unwrap();
+
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[]));
+        drop(cwd);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.as_ref().unwrap();
+        let failed = data["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 1, "data: {data}");
+        assert!(
+            failed[0]["reason"].as_str().unwrap().contains("no-such-harness"),
+            "reason must name the agent: {}",
+            failed[0]["reason"]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A verified, reachable-address peer with nothing listening at all
+    /// (port 9, same discard-port fixture `send.rs`'s remote-delivery
+    /// tests already rely on) — `spawn_on_peer`'s own connection failure
+    /// surfaces VERBATIM into `failed[]`, never turned into a hard
+    /// `Outcome::error` (per-spec isolation holds even past the local
+    /// refusals).
+    #[test]
+    fn bare_mode_remote_summon_fails_taught_when_the_peer_is_unreachable() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
+        let (root, cwd) = setup_manifest(
+            "resurrect-manifest-remote-unreachable",
+            vec![manifest_spec("sakaki", ".", "claude", Some("git -C /home/khoa/Aoide pull --ff-only"))],
+        );
+        aoide_storage::peer_store::save_peers(&[verified_peer("sakaki", "http://127.0.0.1:9/")]).unwrap();
+
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[]));
+        drop(cwd);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.as_ref().unwrap();
+        assert_eq!(data["resurrected"].as_array().unwrap().len(), 0, "data: {data}");
+        let failed = data["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 1, "the closed loopback port refuses the POST: {data}");
+        assert_eq!(failed[0]["disposition"], "failed");
+        assert_eq!(failed[0]["host"], "sakaki");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Local and remote specs in ONE manifest resolve independently — a
+    /// remote spec refused locally (unknown host) never poisons a sibling
+    /// LOCAL spec's own clean-spawn in the same invocation, the same
+    /// per-spec isolation every other row in this loop already holds.
+    #[test]
+    fn bare_mode_local_and_remote_specs_isolate_in_one_manifest() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG",
+            "AOIDE_TERMINAL", "WAYLAND_DISPLAY", "DISPLAY",
+        ]);
+        let this_host = aoide_storage::display::local_host_name();
+        let (root, cwd) = setup_manifest(
+            "resurrect-manifest-mixed",
+            vec![
+                manifest_spec("some-other-host", ".", "claude", None),
+                manifest_spec(&this_host, ".", "claude", None),
+            ],
+        );
+        std::env::set_var("AOIDE_TERMINAL", "true");
+        std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[]));
+        drop(cwd);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.as_ref().unwrap();
+        let failed = data["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 1, "data: {data}");
+        assert_eq!(failed[0]["host"], "some-other-host");
+        let resurrected = data["resurrected"].as_array().unwrap();
+        assert_eq!(resurrected.len(), 1, "the LOCAL spec must still clean-spawn: {data}");
+        assert_eq!(resurrected[0]["disposition"], "clean-spawned");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// [`summon_text`] pinned directly, no I/O: a spec's own `command`
+    /// wins verbatim (never whitespace-split — there is no argv on the
+    /// remote wire, only one prompt string), a `command`-less spec falls to
+    /// the agent's registered default launch joined back into one line, and
+    /// an agent with neither yields `None` rather than a guessed prompt.
+    #[test]
+    fn summon_text_prefers_the_specs_own_command_verbatim_over_a_default_launch() {
+        let spec = manifest_spec("sakaki", ".", "claude", Some("echo  two  spaces"));
+        assert_eq!(summon_text(&spec).as_deref(), Some("echo  two  spaces"));
+    }
+
+    #[test]
+    fn summon_text_falls_to_the_agents_default_launch_joined_into_one_line() {
+        let spec = manifest_spec("sakaki", ".", "claude", None);
+        let text = summon_text(&spec).expect("a registered agent must fall to its default launch");
+        assert!(!text.is_empty());
+        assert!(!text.contains('\u{0}'), "sanity: a real command string");
+    }
+
+    #[test]
+    fn summon_text_is_none_for_an_unregistered_agent_with_no_command() {
+        let spec = manifest_spec("sakaki", ".", "no-such-harness", None);
+        assert!(summon_text(&spec).is_none());
     }
 
     /// A `dir` that normalizes outside the project root is rejected into

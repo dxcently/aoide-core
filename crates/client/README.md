@@ -147,21 +147,30 @@ never the inbound/serve half (that's `aoide-server`).
   <value>"` curl argv literals in EITHER the bearer or no-bearer branch —
   unlike the bearer token, nothing in a signature header is a secret worth
   hiding from `/proc/<pid>/cmdline`.
-- **`handle_peer_spawn` (P-P5b, `peer spawn <name> [--yes] -- <text…>`)**
-  makes PAIRING.md's spawn gate actually reachable from the CLI. Builds
-  the exact spawn-shaped body `aoide-server::a2a::do_spawn` consumes —
-  `crate::wire::build_message_send_body(text, messageId, None)`,
-  `contextId` omitted, `<text…>` riding as the prompt `do_spawn` types
-  into the newly spawned session's first turn — and signs it via
-  `sign_headers_for_peer` above. Gates LOCALLY on exactly one question
-  (is `name` a registered, `verified` peer at all — an unsigned request
-  could never satisfy the remote's `PeerRung::Signature`-only requirement
-  regardless), refusing with a taught error naming `peer pair request`;
-  every OTHER refusal (`allows` lacking `spawn`, an unsigned-but-paired
-  caller, clock skew) is the remote door's own call, surfaced verbatim —
-  this handler never re-derives or second-guesses it. `--yes` skips only
-  a LOCAL `y`/`N` confirmation (`confirm_spawn`, mirroring `confirm_sas`'s
-  idiom) — no bearing on the remote gate, the sole security authority.
+- **`spawn_on_peer(peer, text) -> Result<Value, String>`** is the wire-level
+  seam for a spawn-shaped `message/send` — builds
+  `crate::wire::build_message_send_body(text, messageId, None)` (`contextId`
+  omitted, `<text>` riding as the prompt `aoide-server::a2a::do_spawn` types
+  into the newly spawned session's first turn), signs it via
+  `sign_headers_for_peer` above, and posts it. Mirrors
+  `send_message_to_peer`/`pull_peer_live`'s own `Result`-not-`Outcome`
+  shape (the caller builds its own `Outcome`/audit line). Two callers:
+  **`handle_peer_spawn` (P-P5b, `peer spawn <name> [--yes] -- <text…>`)**
+  makes PAIRING.md's spawn gate reachable from the CLI — gates LOCALLY on
+  exactly one question (is `name` a registered, `verified` peer at all — an
+  unsigned request could never satisfy the remote's `PeerRung::Signature`
+  -only requirement regardless), refusing with a taught error naming `peer
+  pair request`, then confirms (`--yes` skips only this LOCAL `y`/`N`
+  prompt, `confirm_spawn`, mirroring `confirm_sas`'s idiom) before calling
+  `spawn_on_peer` and shaping the `Outcome`. **`aoide-conduct`'s manifest
+  remote-summon path** (U4, command-defrag lane U — `graph::resurrect::
+  summon_remote`, the `conduct` → `client` edge documented in `conduct`'s
+  own `Cargo.toml`) calls `spawn_on_peer` directly, no confirm: a manifest
+  spec is itself the operator's standing declaration. Either way, every
+  OTHER refusal (`allows` lacking `spawn`, an unsigned-but-paired caller,
+  clock skew, an unreachable peer) is the remote door's — or the
+  transport's — own call, surfaced verbatim as `spawn_on_peer`'s `Err`;
+  neither caller re-derives or second-guesses it.
 
 ## What it consumes
 

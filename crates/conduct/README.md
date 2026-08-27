@@ -243,8 +243,14 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   caller: a flag WAS given, no walk was ever attempted). Each spec
   (`{host, dir, agent, command?}`) resolves independently, one spec's
   failure never aborting the rest: a spec whose `host` isn't this host's
-  own name (`aoide_storage::display::local_host_name`) is skipped (remote
-  summoning is U4); a local spec's `dir` resolves through
+  own name (`aoide_storage::display::local_host_name`) is SUMMONED through
+  the peer door (U4, `summon_remote` — resolves `host` against
+  `state/peers.json` by peer NICKNAME, refuses locally into `failed[]` for
+  an unregistered or unverified peer or nothing to summon with, then calls
+  `aoide_client::commands::spawn_on_peer` — the same signed spawn-shaped
+  `message/send` `aoide peer spawn` drives, never a re-implementation; the
+  wire carries no cwd, so a spec wanting a specific remote directory says
+  so inside its own `command`); a local spec's `dir` resolves through
   `aoide_storage::manifest::resolve_spec_dir` (the containment guard — a
   `..`-laden `dir` is refused, never resolved outside the project root;
   lexical only, so a symlink INSIDE the project pointing outside it still
@@ -261,12 +267,14 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   `session_spawn` windowed path every other candidate spawns through, never
   a forked launch mechanism. An agent with neither is a taught `failed[]`
   entry. Every row of the outcome carries a `disposition`
-  (`revived-from-ledger`/`clean-spawned`/`skipped-remote`/`skipped`/
+  (`revived-from-ledger`/`clean-spawned`/`summoned-remote`/`skipped`/
   `failed`) — including a row `resurrect_one` itself pushed, stamped after
   the fact since that function has no idea it's being called from manifest
   mode (review fix, U2 round 1: those rows used to carry no `disposition`
-  at all). **Manifest-revived sessions are marked undying** (orchestrator
-  design ruling, U2 round 1), both paths, once their spawn reaches
+  at all). **Manifest-revived sessions are marked undying, LOCAL revivals
+  only** (orchestrator design ruling, U2 round 1) — a remote summon's id
+  lives on the peer, never marked here — both LOCAL paths, once their spawn
+  reaches
   `Status::Ok` (`mark_manifest_revival_undying`, its own
   `load_undying`/`set_undying`/`save_undying` call — not a flag threaded
   into `spawn`, and never gated on live registration, which this crate's

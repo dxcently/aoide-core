@@ -36,18 +36,27 @@
   carried independent literals that merely happened to agree; if this
   crate ever sends a non-POST request, thread the real method through
   `HTTP_METHOD`'s call sites instead of adding a third guess.
-- **`handle_peer_spawn` (P-P5b, `peer spawn`) gates LOCALLY on exactly one
-  question — is the named peer a registered, `verified` entry at all —
-  and NOTHING else.** It is the FIRST production caller to sign a
-  `contextId`-less (spawn-shaped) body via `sign_headers_for_peer`. Every
-  refusal shape beyond "unknown/unpaired peer" (`allows` lacking `spawn`,
-  an unsigned-but-paired caller, clock skew) belongs to the REMOTE door's
-  own gate (`aoide-server::a2a::spawn_admitted`/`spawn_refusal`) —
-  surfaced verbatim from the JSON-RPC error, never re-derived or
-  duplicated here. Don't add a second local check for any of those; the
-  local refusal exists ONLY to save an obviously-doomed round trip (an
-  unsigned request can never resolve `PeerRung::Signature`), never to
-  second-guess the door's own authority (PAIRING.md decision 6).
+- **`spawn_on_peer` is the ONE place that builds and sends a spawn-shaped
+  `message/send` — never re-implement it at a second call site.** Extracted
+  (U4, command-defrag lane U) from `handle_peer_spawn` so `aoide-conduct`'s
+  manifest remote-summon path (`graph::resurrect::summon_remote`) could
+  reuse the exact same signed wire call rather than shelling out to the
+  `aoide` CLI or hand-rolling a second `post_json`/`sign_headers_for_peer`
+  pairing. It is the FIRST production seam to sign a `contextId`-less
+  (spawn-shaped) body via `sign_headers_for_peer`. `handle_peer_spawn`
+  (P-P5b, `peer spawn`) gates LOCALLY on exactly one question before
+  calling it — is the named peer a registered, `verified` entry at all —
+  and NOTHING else; `summon_remote` gates on the SAME question (plus
+  "is there anything to summon with" — its own concern, no wire involved)
+  before calling it too. Every refusal shape beyond "unknown/unpaired peer"
+  (`allows` lacking `spawn`, an unsigned-but-paired caller, clock skew, an
+  unreachable peer) belongs to the REMOTE door's own gate
+  (`aoide-server::a2a::spawn_admitted`/`spawn_refusal`) or the transport —
+  surfaced verbatim as `spawn_on_peer`'s `Err`, never re-derived or
+  duplicated at either call site. Don't add a second local check for any of
+  those; the local refusal exists ONLY to save an obviously-doomed round
+  trip (an unsigned request can never resolve `PeerRung::Signature`), never
+  to second-guess the door's own authority (PAIRING.md decision 6).
 - **Forwarded event text from `adapter` is untrusted data**, same as root
   `AGENTS.md` house rule 4 — an adapter never lets forwarded text execute as
   a command.

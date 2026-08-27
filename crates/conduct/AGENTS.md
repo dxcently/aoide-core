@@ -98,17 +98,40 @@
   snapshots each bucket's length before calling it and stamps
   `"revived-from-ledger"`/`"skipped"`/`"failed"` onto whichever ONE grew
   afterward (`resurrect_one` always pushes into exactly one, never zero,
-  never two, per call) — this loop's OWN pushes (`skipped-remote`,
-  `clean_spawn_from_spec`'s `clean-spawned`/`failed`) already carry theirs
-  inline. Don't add a new `resurrect_one`/`clean_spawn_from_spec` push path
+  never two, per call) — this loop's OWN pushes (`summon_remote`'s
+  `summoned-remote`/`failed`, `clean_spawn_from_spec`'s
+  `clean-spawned`/`failed`) already carry theirs inline. Don't add a new
+  `resurrect_one`/`clean_spawn_from_spec`/`summon_remote` push path
   without also covering it here — an un-stamped row is exactly the defect
   a consumer filtering the outcome by `disposition` would silently drop.
+- **A remote spec (`host` != this host) is `summon_remote`'s job, not a
+  skip (U4, command-defrag lane U).** It resolves `spec.host` against
+  `state/peers.json` by peer NICKNAME (the same nickname U3's picker writes
+  a spec's `host` as), refuses LOCALLY into `failed[]` — never `skipped[]`
+  — for an unregistered peer, a registered-but-unverified one (mirrors
+  `aoide-client::commands::handle_peer_spawn`'s own local gate: an unsigned
+  request can never satisfy the remote door's `Signature`-rung spawn gate),
+  or nothing to summon with (`summon_text` returns `None`), THEN calls
+  `aoide_client::commands::spawn_on_peer` — never re-implement that wire
+  call here, never shell out to the `aoide` CLI; the `conduct` → `client`
+  edge is documented in `conduct`'s own `Cargo.toml`. `summon_text` never
+  whitespace-splits a spec's `command` (there is no argv on this wire, only
+  one prompt string) — don't reuse `clean_spawn_from_spec`'s split/rejoin
+  logic here, it would collapse whitespace the operator wrote on purpose.
+  The wire carries no cwd: don't add a `--cwd`-shaped field to the spawn
+  request to compensate — that is a later phase's wire change, gated on the
+  fleet's doors all running a binary new enough to read it.
 - **Manifest-revived sessions are marked undying unconditionally, gated on
   `Status::Ok` alone — never on live registration (orchestrator design
-  ruling, U2 round 1).** `mark_manifest_revival_undying` is called from
-  `resurrect_from_manifest` itself, right after EITHER path (enrichment via
-  `resurrect_one`, clean-spawn via `clean_spawn_from_spec`) lands a row in
-  `resurrected` — which by construction only happens past `Status::Ok`.
+  ruling, U2 round 1) — LOCAL paths only.** `mark_manifest_revival_undying`
+  is called from `resurrect_from_manifest` itself, right after EITHER LOCAL
+  path (enrichment via `resurrect_one`, clean-spawn via
+  `clean_spawn_from_spec`) lands a row in `resurrected` — which by
+  construction only happens past `Status::Ok`. `summon_remote`'s own rows
+  never reach this call: the resurrected id lives on the peer, and
+  `state/undying.json` only ever names ids that live on THIS host — don't
+  route a `summoned-remote` row through `mark_manifest_revival_undying`,
+  it would mark an id this host has no authority over.
   This is its OWN `load_undying`/`set_undying`/`save_undying` call, NOT a
   `--undying` flag threaded into the shared `spawn` invocation: gating on
   `registered` (what `aoide spawn --undying` itself gates on) would make

@@ -761,6 +761,49 @@ fn confirm_spawn(name: &str, text: &str) -> Result<bool, String> {
 /// whatever JSON-RPC error the door returns VERBATIM (taught), per
 /// PAIRING.md decision 6: "the remote door's paired+signature+
 /// allows∋spawn gate is the authority."
+/// The wire-level twin of [`send_message_to_peer`] for the SPAWN shape:
+/// `context_id: None` routes `aoide-server::a2a::do_spawn` to spawn the
+/// peer's own configured `aoide.a2a.spawnAgent` and inject `text` as that
+/// session's first turn (`spawn_inject_prompt`) — never a client-chosen
+/// agent or argv (see [`handle_peer_spawn`]'s own doc on the security
+/// model this enforces). Extracted so this is the ONE place that builds and
+/// sends a spawn-shaped `message/send`: [`handle_peer_spawn`] (the CLI's
+/// confirm-then-send wrapper, unchanged in shape) AND `aoide-conduct`'s
+/// manifest remote-summon path (U4, command-defrag lane U — a manifest spec
+/// whose `host` names a registered peer drives this directly, with no
+/// confirm: the manifest is itself the operator's standing declaration, the
+/// same posture U2's local clean-spawn already takes toward a spec's own
+/// `command`) call into. Returns the parsed JSON-RPC response on a 200 with
+/// no `error` member; any transport/HTTP/JSON-RPC failure is `Err` with a
+/// plain message the caller surfaces and audits directly — the same
+/// `Result`-not-`Outcome` shape [`send_message_to_peer`]/[`pull_peer_live`]
+/// hold, for the same reason (the caller builds its own `Outcome`).
+pub fn spawn_on_peer(peer: &aoide_storage::peer_store::Peer, text: &str) -> Result<Value, String> {
+    let message_id = gen_message_id();
+    let body = crate::wire::build_message_send_body(text, &message_id, None);
+    let body_str = serde_json::to_string(&body).unwrap_or_default();
+    let bearer = resolve_peer_bearer(peer)?;
+    let extra_headers = sign_headers_for_peer(peer, &body_str)?;
+    let (code, resp) = post_json(&peer.url, &body_str, bearer.as_deref(), &extra_headers, 15)?;
+    if code != 200 {
+        return Err(format!("HTTP {code}"));
+    }
+    let parsed: Value =
+        serde_json::from_str(&resp).map_err(|e| format!("unparseable response: {e}"))?;
+    // A JSON-RPC error still returns HTTP 200 (same discipline as
+    // `send_message_to_peer`) — the remote door's refusal (paired-but-
+    // unsigned, allows lacking spawn, skew, …) surfaces VERBATIM, never
+    // translated or second-guessed.
+    if let Some(err) = parsed.get("error") {
+        let detail = err
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("(no message)");
+        return Err(format!("peer returned an error: {detail}"));
+    }
+    Ok(parsed)
+}
+
 fn handle_peer_spawn(inv: &Invocation) -> Outcome {
     let cmd = "peer.spawn";
     const USAGE: &str = "usage: aoide peer spawn <name> [--yes] -- <text…>";
@@ -810,51 +853,19 @@ fn handle_peer_spawn(inv: &Invocation) -> Outcome {
         }
     }
 
-    let message_id = gen_message_id();
-    let body = crate::wire::build_message_send_body(&text, &message_id, None);
-    let body_str = serde_json::to_string(&body).unwrap_or_default();
-    let bearer = match resolve_peer_bearer(&peer) {
-        Ok(b) => b,
-        Err(e) => return Outcome::error(cmd, e).with_data(json!({ "reason": "bearer-resolve-failed", "name": peer.name })),
-    };
-    let extra_headers = match sign_headers_for_peer(&peer, &body_str) {
-        Ok(h) => h,
-        Err(e) => return Outcome::error(cmd, e).with_data(json!({ "reason": "signing-failed", "name": peer.name })),
-    };
-    let (code, resp) = match post_json(&peer.url, &body_str, bearer.as_deref(), &extra_headers, 15) {
-        Ok(v) => v,
-        Err(e) => {
-            return Outcome::error(cmd, format!("spawning on `{}` at {}: {e}", peer.name, peer.url))
-                .with_data(json!({ "reason": "send-failed", "name": peer.name, "url": peer.url }))
+    match spawn_on_peer(&peer, &text) {
+        Ok(parsed) => {
+            let session_id = parsed
+                .get("result")
+                .and_then(|r| r.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            Outcome::ok(cmd, format!("spawned on `{}` — remote session `{session_id}`", peer.name))
+                .with_data(json!({ "name": peer.name, "url": peer.url, "sessionId": session_id, "response": parsed }))
         }
-    };
-    if code != 200 {
-        return Outcome::error(cmd, format!("spawning on `{}` at {}: HTTP {code}", peer.name, peer.url))
-            .with_data(json!({
-                "reason": "send-http-error", "name": peer.name, "url": peer.url,
-                "httpCode": code, "body": resp,
-            }));
+        Err(e) => Outcome::error(cmd, format!("spawning on `{}` at {}: {e}", peer.name, peer.url))
+            .with_data(json!({ "reason": "spawn-failed", "name": peer.name, "url": peer.url })),
     }
-    let parsed: Value = serde_json::from_str(&resp).unwrap_or(Value::Null);
-    // A JSON-RPC error still returns HTTP 200 (same discipline as
-    // `send_message_to_peer`) — the remote door's refusal (paired-but-
-    // unsigned, allows lacking spawn, skew, …) surfaces VERBATIM, never
-    // translated or second-guessed.
-    if let Some(err) = parsed.get("error") {
-        let detail = err
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("(no message)");
-        return Outcome::error(cmd, format!("peer `{}` refused the spawn: {detail}", peer.name))
-            .with_data(json!({ "reason": "peer-refused", "name": peer.name, "response": parsed }));
-    }
-    let session_id = parsed
-        .get("result")
-        .and_then(|r| r.get("id"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    Outcome::ok(cmd, format!("spawned on `{}` — remote session `{session_id}`", peer.name))
-        .with_data(json!({ "name": peer.name, "url": peer.url, "sessionId": session_id, "response": parsed }))
 }
 
 /// `peer pull [<name>]` — pull `aoide/graphSummary` from one (or, with no
