@@ -81,6 +81,17 @@
 //! host-scoped seam a later phase's bare-clone `resurrect` walks up to find
 //! (`manifest::walk_up`), distinct in every way from `undying`'s host-local
 //! live-id marks. See its own module doc for the full contrast.
+//!
+//! `tunnel` (ssh-transport lane, P-S2) is the newest: the ssh tunnel
+//! registry a cross-box client action opens to reach a peer whose door is
+//! not otherwise routable — `tunnel-<sessionId>-<key>.json` records under
+//! `$XDG_RUNTIME_DIR/aoide/`, mirroring `aoide-conduct`'s own
+//! `session-<id>.sock` convention (re-derived here, not imported — this
+//! crate sits below `conduct` in the DAG). Pure wire-parsing (`parse_via`,
+//! `dial_url`) and record CRUD only; the ssh child process itself lives in
+//! `aoide-client::tunnel` (P-S3), the same split this crate already holds
+//! between `peer_store` (storage) and `commands` (client) for peer
+//! transport.
 
 pub mod addr;
 pub mod beacon;
@@ -102,6 +113,7 @@ pub mod session;
 pub mod stage;
 pub mod takes;
 pub mod time;
+pub mod tunnel;
 pub mod undying;
 pub mod wire_auth;
 

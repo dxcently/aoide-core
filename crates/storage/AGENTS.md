@@ -230,6 +230,39 @@
   discipline `wire_auth`'s canonical string and `pairing::derive_sas`
   already hold above.
 
+- **A tunnel record is RUNTIME state, never versioned, never a credential
+  (ssh-transport lane, P-S2).** `tunnel-<sessionId>-<key>.json` lives under
+  `$XDG_RUNTIME_DIR/aoide/`, never `state/` — it exists only to prove an ssh
+  child is still alive and to let a later action reuse it, and it holds
+  nothing an attacker could authenticate with (a pid, two local ports, the
+  `--via` string it was opened for). It still writes at `0600`
+  (`fs::atomic_write_private`) as a matter of this crate's private-file
+  discipline, the same way `undying.json` deliberately does NOT — don't read
+  that as the record carrying a secret; it doesn't, and it must never grow
+  one (no key material, no bearer token) without re-opening this decision.
+- **`tunnel::dial_url`'s path half MUST come from `peer_store::url_path`,
+  never a second, independently-written cut of the same url.** The
+  ssh-transport plan's §0.4 is the reason: `sign_headers_for_peer`
+  (`aoide-client`) signs a canonical string built from the URL's path only,
+  so a dial url's authority can be rewritten to `127.0.0.1:<local port>`
+  with zero effect on what gets signed PROVIDED the path is copied verbatim.
+  A future edit that hardcodes `/` or re-parses the path independently would
+  silently break every signed call through a tunnel with an opaque
+  `-32007` on the far end — `dial_url_never_invents_a_path_it_asserts_
+  against_url_path_directly` (`tunnel.rs`) pins this directly, not just by
+  eyeballing the two functions' output.
+- **`tunnel::record_path`'s two id checks are deliberately DIFFERENT
+  strictness, not an oversight.** `key` reuses `peer_store::valid_peer_name`
+  verbatim (it names a peer or a `--via` target, the same nickname shape
+  everywhere else on the wire). `sessionId` uses this module's own looser
+  `is_safe_id` — a session id is not an operator-typed nickname (the default
+  shape is `conduct-<pid>-<unix ts>`, and `aoide conduct --id <id>` lets an
+  operator override it), so it can't hold to `valid_peer_name`'s
+  lowercase-alnum-hyphen shape without rejecting real ids. Don't unify the
+  two checks "for consistency" — `is_safe_id` still refuses every traversal
+  shape `valid_peer_name` does (empty, `..`, `/`, a leading `.`), which is
+  the actual invariant both exist to hold.
+
 ## Extension points
 
 - **A new durable record shape** adds a type to `records` and a read/write

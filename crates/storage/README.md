@@ -196,6 +196,37 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   stopping at the filesystem root — a lexical walk, never realpath-resolving
   (a manifest reached through a symlinked directory is still found; the walk
   never resumes from the symlink's own target ancestry).
+- `tunnel` — the ssh tunnel registry (ssh-transport lane, P-S2,
+  `docs/architecture/PAIRING.md`'s forthcoming Transport section): a cross-box
+  client action that cannot reach a peer's loopback-bound door directly opens
+  an ssh `-L` forward and records it at `$XDG_RUNTIME_DIR/aoide/tunnel-
+  <sessionId>-<key>.json` (`TUNNEL_VERSION` "0"), the same runtime-dir
+  convention `aoide_conduct::graph::conduct_socket_path` resolves its own
+  `session-<id>.sock` into — re-derived here (`runtime_dir`), not imported,
+  since this crate sits below `conduct` in the DAG. `parse_via` reads a
+  `--via`/`Peer.via` marker (`ssh://[user@]host[:port]`, `ssh` scheme only,
+  user and port both optional, a present port bounded `1..=65535`) into a
+  `Via`; `default_via` builds one directly from an observed IP + login with
+  no string round trip. `dial_url` rewrites a logical peer url's authority to
+  `127.0.0.1:<local port>` while preserving BOTH the scheme and the PATH
+  verbatim — the path half delegates to `peer_store::url_path` rather than
+  re-deriving it, since `sign_headers_for_peer`'s canonical string
+  (`aoide-client`) is bound to that exact same path; a divergent cut here
+  would make every signed call through the tunnel fail on the far end with an
+  opaque `-32007`. `record_path` refuses a traversal-shaped `sessionId` or
+  `key` before either ever reaches a path join — `key` through
+  `peer_store::valid_peer_name`, `sessionId` through this module's own looser
+  `is_safe_id` (a session id is not an operator-typed nickname, so it can't
+  reuse `valid_peer_name` verbatim). `save`/`load`/`remove` are the CRUD
+  (`atomic_write_private`, `0600` — module doc's own note on why a
+  non-secret record still gets that discipline); `list_records` scans only
+  `tunnel-*.json` names, the same `sweep_orphan_sockets` scoping
+  (`aoide-conduct::reap`) that lets a sibling convention's files
+  (`session-*.sock`, `aoided.sock`) share the same runtime directory without
+  ever being mis-parsed. No process is ever spawned here — the ssh child
+  itself lives in `aoide-client::tunnel` (P-S3), the same `peer_store`
+  (storage) / `commands` (client) split this crate already holds for peer
+  transport.
 - `takes` — the per-draft take store behind `rice back`/`rice take`.
 - `petname`/`display` — the adjective-noun petname mint and its
   render-time-only display grammar.
