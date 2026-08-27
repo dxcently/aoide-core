@@ -199,8 +199,10 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
 - `tunnel` — the ssh tunnel registry (ssh-transport lane, P-S2,
   `docs/architecture/PAIRING.md`'s forthcoming Transport section): a cross-box
   client action that cannot reach a peer's loopback-bound door directly opens
-  an ssh `-L` forward and records it at `$XDG_RUNTIME_DIR/aoide/tunnel-
-  <sessionId>-<key>.json` (`TUNNEL_VERSION` "0"), the same runtime-dir
+  an ssh `-L` forward and records it at `$XDG_RUNTIME_DIR/aoide/tunnel/
+  <sessionId>/<key>.json` (`TUNNEL_VERSION` "0" — two path levels, since
+  both components may carry `-` and a flat joined name could collide two
+  distinct pairs onto one record), the same runtime-dir
   convention `aoide_conduct::graph::conduct_socket_path` resolves its own
   `session-<id>.sock` into — re-derived here (`runtime_dir`), not imported,
   since this crate sits below `conduct` in the DAG. `parse_via` reads a
@@ -219,8 +221,10 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   `is_safe_id` (a session id is not an operator-typed nickname, so it can't
   reuse `valid_peer_name` verbatim). `save`/`load`/`remove` are the CRUD
   (`atomic_write_private`, `0600` — module doc's own note on why a
-  non-secret record still gets that discipline); `list_records` scans only
-  `tunnel-*.json` names, the same `sweep_orphan_sockets` scoping
+  non-secret record still gets that discipline; `load` additionally
+  refuses a record whose own fields name a different pair than the path it
+  was read from); `list_records` walks only `tunnel/*/*.json`, the same
+  `sweep_orphan_sockets` scoping
   (`aoide-conduct::reap`) that lets a sibling convention's files
   (`session-*.sock`, `aoided.sock`) share the same runtime directory without
   ever being mis-parsed. No process is ever spawned here — the ssh child

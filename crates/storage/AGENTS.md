@@ -231,8 +231,10 @@
   already hold above.
 
 - **A tunnel record is RUNTIME state, never versioned, never a credential
-  (ssh-transport lane, P-S2).** `tunnel-<sessionId>-<key>.json` lives under
-  `$XDG_RUNTIME_DIR/aoide/`, never `state/` — it exists only to prove an ssh
+  (ssh-transport lane, P-S2).** `tunnel/<sessionId>/<key>.json` lives under
+  `$XDG_RUNTIME_DIR/aoide/`, never `state/` — two path LEVELS, because both
+  components may contain `-` and a flat joined filename let two distinct
+  pairs collide on one record. It exists only to prove an ssh
   child is still alive and to let a later action reuse it, and it holds
   nothing an attacker could authenticate with (a pid, two local ports, the
   `--via` string it was opened for). It still writes at `0600`

@@ -44,7 +44,7 @@ use crate::fs::atomic_write_private;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// `tunnel-<sessionId>-<key>.json` schema version (v0).
+/// `tunnel/<sessionId>/<key>.json` schema version (v0).
 pub const TUNNEL_VERSION: &str = "0";
 
 /// One open (or recently open) ssh tunnel, as persisted at
@@ -127,15 +127,37 @@ pub fn parse_via(spec: &str) -> Result<Via, String> {
         }
         None => (None, rest),
     };
-    let (host, port) = match host_port.rsplit_once(':') {
-        Some((h, p)) => {
-            let port = p.parse::<u16>().ok().filter(|n| *n >= 1).ok_or_else(|| {
-                format!("`{spec}` is not a valid --via target: port must be 1..=65535, got `{p}`")
-            })?;
-            (h, Some(port))
+    // A bracketed IPv6 host owns every colon inside its brackets — split
+    // the optional port only AFTER the closing bracket, so `ssh://[::1]`
+    // parses as a portless host instead of misreading `1]` as a port.
+    let (host, port) = if let Some(rest6) = host_port.strip_prefix('[') {
+        let Some((h6, after)) = rest6.split_once(']') else {
+            return Err(format!("`{spec}` is not a valid --via target: unclosed `[` in host"));
+        };
+        match after.strip_prefix(':') {
+            Some(p) => {
+                let port = p.parse::<u16>().ok().filter(|n| *n >= 1).ok_or_else(|| {
+                    format!("`{spec}` is not a valid --via target: port must be 1..=65535, got `{p}`")
+                })?;
+                (format!("[{h6}]"), Some(port))
+            }
+            None if after.is_empty() => (format!("[{h6}]"), None),
+            None => {
+                return Err(format!("`{spec}` is not a valid --via target: trailing `{after}` after host"));
+            }
         }
-        None => (host_port, None),
+    } else {
+        match host_port.rsplit_once(':') {
+            Some((h, p)) => {
+                let port = p.parse::<u16>().ok().filter(|n| *n >= 1).ok_or_else(|| {
+                    format!("`{spec}` is not a valid --via target: port must be 1..=65535, got `{p}`")
+                })?;
+                (h.to_string(), Some(port))
+            }
+            None => (host_port.to_string(), None),
+        }
     };
+    let host = host.as_str();
     if host.is_empty() {
         return Err(format!("`{spec}` is not a valid --via target: empty host"));
     }
@@ -161,10 +183,19 @@ pub fn default_via(ip: &str, user: &str) -> Via {
 /// extraction to [`crate::peer_store::url_path`] rather than re-deriving
 /// it, so a dial url's path and a signature's canonical-string path can
 /// never drift apart from two independent implementations of the same cut.
-pub fn dial_url(logical_url: &str, local_port: u16) -> String {
-    let scheme = logical_url.trim().split_once("://").map(|(s, _)| s).unwrap_or("http");
-    let path = crate::peer_store::url_path(logical_url);
-    format!("{scheme}://127.0.0.1:{local_port}{path}")
+/// A string with no `scheme://` at all is REFUSED rather than defaulted —
+/// inventing a scheme (and with it url_path's bare-`/` fallback) would
+/// dial a guessed url on a malformed input instead of failing loudly.
+pub fn dial_url(logical_url: &str, local_port: u16) -> Result<String, String> {
+    let trimmed = logical_url.trim();
+    let Some((scheme, _)) = trimmed.split_once("://") else {
+        return Err(format!("`{logical_url}` is not a url — cannot rewrite its authority for a tunnel dial"));
+    };
+    if scheme.is_empty() {
+        return Err(format!("`{logical_url}` has an empty scheme — cannot rewrite its authority for a tunnel dial"));
+    }
+    let path = crate::peer_store::url_path(trimmed);
+    Ok(format!("{scheme}://127.0.0.1:{local_port}{path}"))
 }
 
 /// Is `id` safe to join onto a filesystem path with no further checking? A
@@ -197,7 +228,12 @@ fn runtime_dir() -> PathBuf {
 }
 
 /// The path a tunnel record for `(session_id, key)` lives at:
-/// `$XDG_RUNTIME_DIR/aoide/tunnel-<sessionId>-<key>.json`. Refuses either
+/// `$XDG_RUNTIME_DIR/aoide/tunnel/<sessionId>/<key>.json`. Two path
+/// LEVELS, not a joined filename: both components may legitimately contain
+/// `-`, so a flat `tunnel-<session>-<key>.json` made (`"a"`, `"b-c"`) and
+/// (`"a-b"`, `"c"`) collide on one file — with `save` overwriting and
+/// P-S3's kill-by-record aimed at whichever pair got there second. The
+/// directory boundary is the unambiguous separator. Refuses either
 /// component before any path join is attempted — `key` through
 /// [`crate::peer_store::valid_peer_name`] (it names a peer or a `--via`
 /// target, the same nickname shape everywhere else on the wire), and
@@ -211,7 +247,7 @@ pub fn record_path(session_id: &str, key: &str) -> Result<PathBuf, String> {
     if !crate::peer_store::valid_peer_name(key) {
         return Err(format!("`{key}` is not a valid tunnel key"));
     }
-    Ok(runtime_dir().join(format!("tunnel-{session_id}-{key}.json")))
+    Ok(runtime_dir().join("tunnel").join(session_id).join(format!("{key}.json")))
 }
 
 /// Atomic-write `record` to its own [`record_path`], at `0600`
@@ -232,7 +268,15 @@ pub fn save(record: &TunnelRecord) -> Result<(), String> {
 pub fn load(session_id: &str, key: &str) -> Option<TunnelRecord> {
     let path = record_path(session_id, key).ok()?;
     let raw = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw).ok()
+    let rec: TunnelRecord = serde_json::from_str(&raw).ok()?;
+    // Belt-and-suspenders against any path/record mismatch (a hand-moved
+    // file, a future layout change): the record's own identity fields are
+    // the authority, and a record that does not name this exact pair is
+    // treated as absent rather than acted on.
+    if rec.session_id != session_id || rec.key != key {
+        return None;
+    }
+    Some(rec)
 }
 
 /// Remove the tunnel record for `(session_id, key)`. Idempotent on a file
@@ -260,19 +304,25 @@ pub fn remove(session_id: &str, key: &str) -> Result<(), String> {
 /// exists to clean up, not a reason for a caller like `list` to fail
 /// outright.
 pub fn list_records() -> Vec<TunnelRecord> {
-    let Ok(entries) = std::fs::read_dir(runtime_dir()) else {
+    let Ok(sessions) = std::fs::read_dir(runtime_dir().join("tunnel")) else {
         return Vec::new();
     };
     let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.starts_with("tunnel-") || !name.ends_with(".json") {
+    for session_entry in sessions.flatten() {
+        if !session_entry.path().is_dir() {
             continue;
         }
-        let Ok(raw) = std::fs::read_to_string(entry.path()) else { continue };
-        if let Ok(rec) = serde_json::from_str::<TunnelRecord>(&raw) {
-            out.push(rec);
+        let Ok(entries) = std::fs::read_dir(session_entry.path()) else { continue };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.ends_with(".json") {
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(entry.path()) else { continue };
+            if let Ok(rec) = serde_json::from_str::<TunnelRecord>(&raw) {
+                out.push(rec);
+            }
         }
     }
     out
@@ -391,9 +441,9 @@ mod tests {
 
     #[test]
     fn dial_url_preserves_the_path_verbatim() {
-        assert_eq!(dial_url("http://h:8710/rpc", 41234), "http://127.0.0.1:41234/rpc");
-        assert_eq!(dial_url("http://h:8710/", 41234), "http://127.0.0.1:41234/");
-        assert_eq!(dial_url("https://h:8710/a/b?x=1", 9), "https://127.0.0.1:9/a/b");
+        assert_eq!(dial_url("http://h:8710/rpc", 41234).unwrap(), "http://127.0.0.1:41234/rpc");
+        assert_eq!(dial_url("http://h:8710/", 41234).unwrap(), "http://127.0.0.1:41234/");
+        assert_eq!(dial_url("https://h:8710/a/b?x=1", 9).unwrap(), "https://127.0.0.1:9/a/b");
     }
 
     #[test]
@@ -404,7 +454,7 @@ mod tests {
         for logical in ["http://h:8710/rpc", "http://h:8710/", "http://h:8710", "http://h:8710/a/b/c"]
         {
             let expected_path = crate::peer_store::url_path(logical);
-            let dial = dial_url(logical, 5555);
+            let dial = dial_url(logical, 5555).unwrap();
             assert!(
                 dial.ends_with(&expected_path) && dial == format!("http://127.0.0.1:5555{expected_path}"),
                 "dial_url({logical}) = {dial}, expected path {expected_path}"
@@ -416,7 +466,56 @@ mod tests {
     fn dial_url_handles_the_bare_authority_case() {
         // No path at all in the logical url → url_path's own "/" default,
         // never a dial_url-local hardcode of the same string.
-        assert_eq!(dial_url("http://h:8710", 1), "http://127.0.0.1:1/");
+        assert_eq!(dial_url("http://h:8710", 1).unwrap(), "http://127.0.0.1:1/");
+    }
+
+    /// A string that is not a url at all is refused, never defaulted into a
+    /// guessed `http://127.0.0.1:<p>/` dial — the plan's "refuses to invent
+    /// a path" case, structural since the review made the signature Result.
+    #[test]
+    fn dial_url_refuses_a_non_url() {
+        assert!(dial_url("not a url", 5555).is_err());
+        assert!(dial_url("://missing-scheme", 5555).is_err());
+    }
+
+    /// Two (session, key) pairs whose flat concatenation would collide
+    /// resolve to DISTINCT paths under the two-level layout — the review's
+    /// medium-high finding, pinned.
+    #[test]
+    fn record_path_never_collides_on_hyphenated_components() {
+        with_temp_runtime_dir("path-collide", || {
+            let a = record_path("a", "b-c").unwrap();
+            let b = record_path("a-b", "c").unwrap();
+            assert_ne!(a, b);
+        });
+    }
+
+    /// A record whose content names a different pair than the path it was
+    /// read from is treated as absent — load's belt-and-suspenders check.
+    #[test]
+    fn load_refuses_a_record_naming_a_different_pair() {
+        with_temp_runtime_dir("load-mismatch", || {
+            let mut rec = fixture("conduct-1-2", "sakaki");
+            rec.session_id = "somebody-else".to_string();
+            let path = record_path("conduct-1-2", "sakaki").unwrap();
+            atomic_write_private(&path, serde_json::to_string(&rec).unwrap().as_bytes()).unwrap();
+            assert!(load("conduct-1-2", "sakaki").is_none());
+        });
+    }
+
+    /// IPv6 hosts keep their brackets and their colons: a portless
+    /// bracketed host parses whole, a ported one splits only after `]`,
+    /// and Display round-trips both.
+    #[test]
+    fn parse_via_handles_bracketed_ipv6_hosts() {
+        let bare = parse_via("ssh://[::1]").unwrap();
+        assert_eq!(bare.host, "[::1]");
+        assert_eq!(bare.port, None);
+        let ported = parse_via("ssh://khoa@[fe80::1]:2222").unwrap();
+        assert_eq!(ported.host, "[fe80::1]");
+        assert_eq!(ported.port, Some(2222));
+        assert_eq!(parse_via(&ported.to_string()).unwrap(), ported);
+        assert!(parse_via("ssh://[::1").is_err());
     }
 
     // ── record_path (traversal refusal) ─────────────────────────────────
@@ -425,8 +524,8 @@ mod tests {
     fn record_path_builds_the_expected_shape() {
         with_temp_runtime_dir("path-shape", || {
             let p = record_path("conduct-1-2", "sakaki").unwrap();
-            assert_eq!(p.file_name().unwrap().to_str().unwrap(), "tunnel-conduct-1-2-sakaki.json");
-            assert_eq!(p.parent().unwrap().file_name().unwrap(), "aoide");
+            assert_eq!(p.file_name().unwrap().to_str().unwrap(), "sakaki.json");
+            assert!(p.parent().unwrap().ends_with("aoide/tunnel/conduct-1-2"));
         });
     }
 
@@ -507,8 +606,11 @@ mod tests {
             let dir = runtime_dir();
             std::fs::write(dir.join("session-conduct-9-9.sock"), b"").unwrap();
             std::fs::write(dir.join("aoided.sock"), b"").unwrap();
-            std::fs::write(dir.join("tunnel-not-json.txt"), b"stray").unwrap();
-            std::fs::write(dir.join("not-a-tunnel-at-all.json"), b"{}").unwrap();
+            // A stray FILE directly under tunnel/ (not a session dir) and a
+            // non-json stray inside a real session dir — both ignored.
+            std::fs::write(dir.join("tunnel").join("stray-file"), b"stray").unwrap();
+            std::fs::write(dir.join("tunnel").join("conduct-1-2").join("notes.txt"), b"stray")
+                .unwrap();
 
             let mut sessions: Vec<String> =
                 list_records().into_iter().map(|r| r.session_id).collect();
@@ -534,7 +636,8 @@ mod tests {
         with_temp_runtime_dir("list-corrupt-entry", || {
             save(&fixture("conduct-1-2", "sakaki")).unwrap();
             let dir = runtime_dir();
-            std::fs::write(dir.join("tunnel-broken-thing.json"), b"{ not json").unwrap();
+            std::fs::write(dir.join("tunnel").join("conduct-1-2").join("broken.json"), b"{ not json")
+                .unwrap();
 
             let sessions: Vec<String> = list_records().into_iter().map(|r| r.session_id).collect();
             assert_eq!(sessions, vec!["conduct-1-2".to_string()]);
