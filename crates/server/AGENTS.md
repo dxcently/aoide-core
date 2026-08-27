@@ -171,6 +171,17 @@
   again with no state to reconcile. Don't reintroduce a peer-store write
   in this function, and don't drop/re-park the entry on a mismatch — both
   would commit or destroy state no human on this end confirmed.
+- **`emit_pairing_event` (P-P5) fires ONLY from an Ok arm, never from a
+  mismatch or unknown-id arm, and its `payload` carries fields BY NAME
+  ONLY.** Add a fourth call site the same way — never widen the payload
+  builder to pass a parsed struct wholesale, and never add `sas`/
+  `pubkey*`/`nonce*`/`commit*` to the by-name list; a watcher re-derives
+  the SAS locally from `aoide_storage::pairing::list_inbound`/
+  `list_outbound`; this feed line is a trigger only. `a2a serve` opens
+  its own `FeedWriter` onto `aoided`'s events file rather than routing
+  through the daemon process (they're separate processes) — don't thread
+  a socket call through here to "unify" the two writers; the cap-truncate
+  race that creates is already accepted (module doc, CONTRACTS.md §6).
 - **`message_send`'s Spawn arm gates on `spawn_admitted`, which requires a
   resolved, paired, spawn-allowed peer identified via its OWN PER-REQUEST
   SIGNATURE — never a bare token, and never the address rung (P-P3

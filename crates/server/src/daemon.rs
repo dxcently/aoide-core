@@ -252,8 +252,11 @@ pub fn run(log_path: PathBuf) -> serde_json::Value {
 
 /// The events feed's byte cap (module doc's "The events feed") — ephemeral
 /// cues on tmpfs, not the unbounded audit trail (`aoide_protocol::audit`,
-/// unchanged, on a different path entirely).
-const EVENTS_CAP_BYTES: u64 = 1024 * 1024;
+/// unchanged, on a different path entirely). `pub(crate)` (P-P5) so
+/// `a2a.rs`'s own `FeedWriter` — a second, separate-process writer onto
+/// the SAME feed file (module doc's "the resident daemon", two-writer
+/// note) — shares the exact cap rather than re-literalling it.
+pub(crate) const EVENTS_CAP_BYTES: u64 = 1024 * 1024;
 
 /// A single request line's byte cap (module doc's "Framing" — the
 /// KNOWN-LIMITATION note there explains why this check is only exact for a

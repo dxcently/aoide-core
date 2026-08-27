@@ -190,6 +190,24 @@ the inbound half of the two-door contract (the outbound half is
   instance's own operator confirms the SAS a second time. All three audit
   via the existing `Door::A2a` audit sink (`a2a.pairRequest`/
   `a2a.pairReveal`/`a2a.pairApprove`), same as every other A2A method.
+  **The pairing events feed (P-P5, CONTRACTS.md §6's "Pairing events feed"
+  subsection)** — `emit_pairing_event`, called from the Ok arms of
+  `pair_request` (`pair-parked`), `pair_reveal` (`pair-revealed`), and
+  `pair_approve_callback` (`pair-awaiting-confirm`), never from a mismatch
+  or unknown-id arm. `a2a serve` is a separate process from `aoided`, so
+  it opens its OWN `aoide_protocol::feed::FeedWriter` onto the SAME
+  `crate::daemon::events_path`/`EVENTS_CAP_BYTES`-capped feed file `aoided`
+  already writes through — two independent writers sharing one
+  truncate-in-place file, so a cap-truncate race at the 1 MiB boundary can
+  lose a line; accepted, because this feed is ephemeral cues and the audit
+  log above (already written at all three call sites) is the durable
+  record. Every emitted record is `class: "gate"`, `source: "a2a-door"`,
+  and a `payload` carrying `id`/`name`/`originAddr`/`url`/`direction` BY
+  NAME ONLY — never a SAS, pubkey, nonce, or commitment; a watcher
+  re-derives the SAS locally from `aoide_storage::pairing::list_inbound`/
+  `list_outbound`, so this line is only ever a trigger, never trusted
+  data. Best-effort throughout (`FeedWriter::append`'s own posture) — an
+  unwritable events path never fails the ceremony.
   **The Spawn arm's gate (P-P3, narrowed again by P-P4, PAIRING.md
   decision 6 + the wire-authentication section)** —
   `message_send`'s `SendAction::Spawn` arm no longer consults

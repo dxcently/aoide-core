@@ -1449,6 +1449,47 @@ fn self_url(bind: &str, port: u16) -> String {
     format!("http://{bind}:{port}/")
 }
 
+/// Best-effort emit onto aoided's own events feed for one of the three
+/// pairing-ceremony milestones (P-P5, CONTRACTS.md §6's "Pairing events
+/// feed" subsection): `pair-parked`, `pair-revealed`,
+/// `pair-awaiting-confirm`. Never `?`, never panics — the posture
+/// `aoide_secrets::broker::emit_notify` already holds, because a
+/// notification write must never fail or block the ceremony itself
+/// ([`FeedWriter::append`] is already best-effort internally; this
+/// wrapper's own job is only to resolve the path and shape the record).
+///
+/// `a2a serve` is a SEPARATE process from `aoided` (module doc's DI-seam
+/// note — this crate has no dependency on the resident daemon's runtime,
+/// only its path/cap resolvers), so it opens its OWN [`FeedWriter`] onto
+/// the SAME `$XDG_RUNTIME_DIR/aoide/events.jsonl` `aoided` already writes
+/// through (`crate::daemon::events_path`) rather than routing through the
+/// daemon process. Two independent writers sharing one capped,
+/// truncate-in-place file means a cap-truncate race at the 1 MiB boundary
+/// can lose a line — accepted, because the feed is ephemeral cues, not
+/// the durable record (that stays the audit log, already written at every
+/// one of these three call sites); the watcher's actual authority is
+/// `aoide_storage::pairing::list_inbound`/`list_outbound`, and this feed
+/// line is only ever a trigger to re-check them, never itself trusted
+/// data.
+///
+/// `payload` carries fields BY NAME ONLY (`id`, `name`, `originAddr`,
+/// `url`, `direction`) — never a SAS, pubkey, nonce, or commitment; the
+/// watcher re-derives the SAS locally from its own identity plus
+/// `list_inbound`/`list_outbound`, so nothing secret-shaped ever needs to
+/// ride this line.
+fn emit_pairing_event(kind: &str, payload: Value) {
+    let events_path = crate::daemon::events_path(&crate::daemon::socket_path());
+    let feed = aoide_protocol::feed::FeedWriter::new(events_path, crate::daemon::EVENTS_CAP_BYTES, 0o600);
+    feed.append(&json!({
+        "v": 0,
+        "ts": aoide_protocol::audit::now_secs(),
+        "class": serde_json::to_value(EventClass::Gate).unwrap_or_else(|_| json!("gate")),
+        "kind": kind,
+        "source": "a2a-door",
+        "payload": payload,
+    }));
+}
+
 /// `aoide/pairRequest` (CONTRACTS.md §6, P-P2): the pairing ceremony's
 /// bootstrap request. Box A POSTs `{pubkeyHex, name, commitHex, url}` — its
 /// own public key, its own SELF-CLAIMED instance name (A's
@@ -1527,6 +1568,17 @@ fn pair_request(params: &Value, origin: PeerOrigin, audit_log: &Path) -> Result<
         ),
     );
 
+    emit_pairing_event(
+        "pair-parked",
+        json!({
+            "id": entry.id,
+            "name": entry.name,
+            "originAddr": entry.origin_addr,
+            "url": entry.url,
+            "direction": "inbound",
+        }),
+    );
+
     Ok(json!({
         "id": entry.id,
         "pubkeyHex": info.pubkey_hex,
@@ -1567,6 +1619,16 @@ fn pair_reveal(params: &Value, audit_log: &Path) -> Result<Value, (i64, String)>
                 "a2a.pairReveal",
                 "ok",
                 &format!("pairing request `{id}` revealed — commitment verified (claimed name `{}`)", entry.name),
+            );
+            emit_pairing_event(
+                "pair-revealed",
+                json!({
+                    "id": entry.id,
+                    "name": entry.name,
+                    "originAddr": entry.origin_addr,
+                    "url": entry.url,
+                    "direction": "inbound",
+                }),
             );
             Ok(json!({ "ok": true }))
         }
@@ -1632,6 +1694,15 @@ fn pair_approve_callback(params: &Value, audit_log: &Path) -> Result<Value, (i64
                 "a2a.pairApprove",
                 "awaiting-confirm",
                 &format!("pairing with `{}` approved by the peer — awaiting this instance's own confirm", entry.name),
+            );
+            emit_pairing_event(
+                "pair-awaiting-confirm",
+                json!({
+                    "id": entry.id,
+                    "name": entry.name,
+                    "url": entry.url,
+                    "direction": "outbound",
+                }),
             );
             Ok(json!({ "ok": true, "name": entry.name }))
         }
@@ -6517,6 +6588,277 @@ mod tests {
         assert_eq!(listed.len(), 1, "the entry is still parked, awaiting THIS instance's own confirm");
         assert_eq!(listed[0].state, aoide_storage::pairing::OutboundState::AwaitingConfirm);
 
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+    }
+
+    // ── P-P5: the pairing events feed (`emit_pairing_event`) ────────────
+
+    /// Save/restore `AOIDE_DAEMON_EVENTS` alongside the existing
+    /// `AOIDE_STATE_DIR`/`AOIDE_STAGE_DIR` pair, mirroring `act_as`'s own
+    /// save/restore shape one level up — this env var is what redirects
+    /// [`emit_pairing_event`]'s `crate::daemon::events_path` resolution
+    /// onto a tempfile instead of the real runtime dir, under the same
+    /// `env_lock` every test in this module already holds.
+    fn set_events_path(p: &std::path::Path) -> Option<String> {
+        let saved = std::env::var("AOIDE_DAEMON_EVENTS").ok();
+        std::env::set_var("AOIDE_DAEMON_EVENTS", p);
+        saved
+    }
+    fn restore_events_path(saved: Option<String>) {
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_DAEMON_EVENTS", v),
+            None => std::env::remove_var("AOIDE_DAEMON_EVENTS"),
+        }
+    }
+
+    #[test]
+    fn pair_request_emits_one_gate_classed_parked_line() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-pairevent-parked-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        act_as(&root, "b");
+        let events_path = root.join("events.jsonl");
+        let saved_events = set_events_path(&events_path);
+        let audit_log = root.join("log");
+
+        let commit = aoide_storage::pairing::derive_commit(&"a".repeat(64), &"c".repeat(32));
+        let params = json!({ "pubkeyHex": "a".repeat(64), "name": "box-a", "commitHex": commit, "url": "http://box-a:8710/" });
+        pair_request(&params, PeerOrigin::Remote("10.0.0.5".parse().unwrap()), &audit_log).unwrap();
+
+        let feed = std::fs::read_to_string(&events_path).unwrap();
+        let lines: Vec<&str> = feed.lines().collect();
+        assert_eq!(lines.len(), 1, "exactly one line: {feed}");
+        let rec: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(rec["class"], "gate");
+        assert_eq!(rec["kind"], "pair-parked");
+        assert_eq!(rec["source"], "a2a-door");
+        assert_eq!(rec["payload"]["name"], "box-a");
+        assert_eq!(rec["payload"]["originAddr"], "10.0.0.5");
+        assert_eq!(rec["payload"]["url"], "http://box-a:8710/");
+        assert_eq!(rec["payload"]["direction"], "inbound");
+
+        restore_events_path(saved_events);
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+    }
+
+    #[test]
+    fn pairing_feed_lines_never_carry_a_sas_pubkey_nonce_or_commitment() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-pairevent-nosecrets-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        act_as(&root, "b");
+        let events_path = root.join("events.jsonl");
+        let saved_events = set_events_path(&events_path);
+        let audit_log = root.join("log");
+
+        let requester_pubkey = "a".repeat(64);
+        let requester_nonce = "c".repeat(32);
+        let commit = aoide_storage::pairing::derive_commit(&requester_pubkey, &requester_nonce);
+        let params = json!({ "pubkeyHex": requester_pubkey, "name": "box-a", "commitHex": commit, "url": "http://box-a:8710/" });
+        let resp = pair_request(&params, PeerOrigin::Loopback, &audit_log).unwrap();
+        let id = resp["id"].as_str().unwrap().to_string();
+        let approver_nonce = resp["nonceHex"].as_str().unwrap().to_string();
+        pair_reveal(&json!({ "id": id, "nonceHex": requester_nonce }), &audit_log).unwrap();
+
+        let feed = std::fs::read_to_string(&events_path).unwrap();
+        assert!(!feed.is_empty());
+        // No field named sas/pubkey/pubkeyHex/nonce/nonceHex/commit/commitHex
+        // anywhere on the feed, AND the actual hex values never ride it —
+        // both checks, per the plan (a field-name check alone would miss a
+        // renamed-but-still-secret field slipping through).
+        for banned_field in ["sas", "pubkey", "pubkeyHex", "nonce", "nonceHex", "commit", "commitHex"] {
+            assert!(!feed.contains(banned_field), "feed line named a forbidden field `{banned_field}`: {feed}");
+        }
+        for secret_value in [&requester_pubkey, &requester_nonce, &approver_nonce, &commit] {
+            assert!(!feed.contains(secret_value.as_str()), "feed line carried a secret hex value: {feed}");
+        }
+
+        restore_events_path(saved_events);
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+    }
+
+    #[test]
+    fn pair_reveal_emits_revealed_on_ok_and_nothing_on_a_mismatch() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-pairevent-reveal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        act_as(&root, "b");
+        let events_path = root.join("events.jsonl");
+        let saved_events = set_events_path(&events_path);
+        let audit_log = root.join("log");
+
+        // `pair_request` itself already emits `pair-parked`, so "nothing on
+        // a mismatch" is checked as "no NEW line", not "the feed stays
+        // empty" — the feed already carries that one line by this point.
+        let commit = aoide_storage::pairing::derive_commit(&"a".repeat(64), &"c".repeat(32));
+        let params = json!({ "pubkeyHex": "a".repeat(64), "name": "box-a", "commitHex": commit, "url": "http://a/" });
+        let id = pair_request(&params, PeerOrigin::Loopback, &audit_log).unwrap()["id"].as_str().unwrap().to_string();
+        let lines_before_mismatch = std::fs::read_to_string(&events_path).unwrap().lines().count();
+        assert_eq!(lines_before_mismatch, 1, "pair_request's own pair-parked line");
+        let _ = pair_reveal(&json!({ "id": id, "nonceHex": "d".repeat(32) }), &audit_log).unwrap_err();
+        let lines_after_mismatch = std::fs::read_to_string(&events_path).unwrap().lines().count();
+        assert_eq!(lines_after_mismatch, lines_before_mismatch, "a reveal mismatch must emit nothing");
+
+        // Now a genuine ok reveal: exactly one `pair-revealed` line.
+        let commit2 = aoide_storage::pairing::derive_commit(&"b".repeat(64), &"e".repeat(32));
+        let params2 = json!({ "pubkeyHex": "b".repeat(64), "name": "box-c", "commitHex": commit2, "url": "http://c/" });
+        let id2 = pair_request(&params2, PeerOrigin::Loopback, &audit_log).unwrap()["id"].as_str().unwrap().to_string();
+        pair_reveal(&json!({ "id": id2, "nonceHex": "e".repeat(32) }), &audit_log).unwrap();
+
+        let feed = std::fs::read_to_string(&events_path).unwrap();
+        let kinds: Vec<String> = feed.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()["kind"].as_str().unwrap().to_string()).collect();
+        assert_eq!(
+            kinds,
+            vec!["pair-parked".to_string(), "pair-parked".to_string(), "pair-revealed".to_string()],
+            "the second `pair_request` parks its own line before its `pair_reveal` adds the third"
+        );
+
+        restore_events_path(saved_events);
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+    }
+
+    #[test]
+    fn pair_approve_callback_emits_awaiting_confirm_on_ok_and_nothing_on_a_pubkey_mismatch() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-pairevent-approve-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        act_as(&root, "a");
+        let events_path = root.join("events.jsonl");
+        let saved_events = set_events_path(&events_path);
+        let now_epoch = aoide_storage::time::parse_iso_utc(&now_iso_utc()).unwrap();
+        aoide_storage::pairing::park_outbound(aoide_storage::pairing::OutboundPairingRequest {
+            id: "deadbeef".to_string(),
+            url: "http://box-b/".to_string(),
+            name: "box-b".to_string(),
+            pubkey_hex: "b".repeat(64),
+            requester_nonce_hex: "c".repeat(32),
+            approver_nonce_hex: "d".repeat(32),
+            requested_at: now_iso_utc(),
+            expires_at: aoide_storage::pairing::expires_at_from(now_epoch),
+            state: aoide_storage::pairing::OutboundState::AwaitingApproval,
+            via: None,
+        })
+        .unwrap();
+        let audit_log = root.join("log");
+
+        // Mismatch first: nothing on the feed, entry untouched.
+        let _ = pair_approve_callback(&json!({ "id": "deadbeef", "pubkeyHex": "c".repeat(64) }), &audit_log).unwrap_err();
+        assert!(!events_path.exists(), "a pubkey mismatch must emit nothing");
+
+        // Now the matching callback: exactly one `pair-awaiting-confirm` line.
+        pair_approve_callback(&json!({ "id": "deadbeef", "pubkeyHex": "b".repeat(64) }), &audit_log).unwrap();
+        let feed = std::fs::read_to_string(&events_path).unwrap();
+        let lines: Vec<&str> = feed.lines().collect();
+        assert_eq!(lines.len(), 1, "{feed}");
+        let rec: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(rec["kind"], "pair-awaiting-confirm");
+        assert_eq!(rec["class"], "gate");
+        assert_eq!(rec["source"], "a2a-door");
+        assert_eq!(rec["payload"]["name"], "box-b");
+        assert_eq!(rec["payload"]["direction"], "outbound");
+
+        restore_events_path(saved_events);
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+    }
+
+    /// P-P5: an unwritable events path must never fail the ceremony itself
+    /// — same precedent as `aoide_secrets::broker`'s
+    /// `resolve_still_succeeds_when_the_events_feed_path_is_unwritable`.
+    /// Root ignores directory permissions too, so this skips under a root
+    /// test runner, same precedent.
+    #[test]
+    fn pair_request_still_succeeds_when_the_events_path_is_unwritable() {
+        if aoide_secrets::home::effective_uid() == 0 {
+            return;
+        }
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-pairevent-unwritable-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        act_as(&root, "b");
+
+        let ro_dir = root.join("events-ro-dir");
+        std::fs::create_dir_all(&ro_dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let events_path = ro_dir.join("events.jsonl");
+        let saved_events = set_events_path(&events_path);
+        let audit_log = root.join("log");
+
+        let commit = aoide_storage::pairing::derive_commit(&"a".repeat(64), &"c".repeat(32));
+        let params = json!({ "pubkeyHex": "a".repeat(64), "name": "box-a", "commitHex": commit, "url": "http://a/" });
+        let resp = pair_request(&params, PeerOrigin::Loopback, &audit_log);
+
+        std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(resp.is_ok(), "the ceremony must succeed even when the events feed is unwritable: {resp:?}");
+        assert!(!events_path.exists(), "the feed file must never have been created under a read-only parent");
+
+        restore_events_path(saved_events);
         let _ = std::fs::remove_dir_all(&root);
         match saved_state {
             Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
