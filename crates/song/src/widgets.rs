@@ -40,6 +40,19 @@
 //! `widgets/` tree is copied unfiltered (helper components, asset subdirs,
 //! `.gitkeep`, everything), while the manifest only ever lists top-level
 //! lowercase-kebab `.qml` files as slots.
+//!
+//! **L-C3 (repo-less hosts, lyra-carrier lane, task #107):** the `nix eval`
+//! shell-out above needs a real flake checkout at `flake_root()` — a host
+//! with no `~/Aoide` clone has none. [`eval_songbook`] checks for
+//! `flake_root()/flake.nix` first and, when absent, never shells to `nix` at
+//! all: it reads the SHIPPED, prebaked `manifest.json`/`registry.json` from
+//! [`aoide_storage::fs::song_templates_dir`] (`pkgs/lyra-songbook`, baked at
+//! nix build time by the SAME `lib/songbook.nix` generator) as the baseline
+//! for every other committed song, and patches in the CURRENTLY-staged
+//! song's own entry from a direct, nix-free directory scan
+//! ([`scan_own_entry`]) — the only shape `rice compose` can ever produce
+//! (it never writes a `_widgets/` shelf, so there is no borrowed-ownership
+//! case to resolve without nix).
 
 use std::path::Path;
 
@@ -123,8 +136,9 @@ pub struct RegistrySyncOk {
 #[cfg(test)]
 pub(crate) const SONGBOOK_EVAL_FIXTURE_VAR: &str = "AOIDE_SONGBOOK_EVAL_FIXTURE";
 
-/// One `nix eval --json` shell-out against the `songbookManifest` flake
-/// output (`flake.nix`), which wraps `lib/songbook.nix` — the SAME function
+/// On a CHECKOUT host (`flake_root()` names a real flake): one `nix eval
+/// --json` shell-out against the `songbookManifest` flake output
+/// (`flake.nix`), which wraps `lib/songbook.nix` — the SAME function
 /// `modules/facets/quickshell/default.nix`'s `quickshellConfig` derivation
 /// calls at build time. Evaluates against
 /// [`aoide_storage::fs::flake_root`] (the git checkout, not the relocatable
@@ -137,15 +151,22 @@ pub(crate) const SONGBOOK_EVAL_FIXTURE_VAR: &str = "AOIDE_SONGBOOK_EVAL_FIXTURE"
 /// edit made moments ago must be reflected immediately — never served from
 /// a cache keyed on a state that's since changed.
 ///
+/// On a REPO-LESS host (no `flake.nix` at `flake_root()`, L-C3,
+/// lyra-carrier lane, task #107): `nix` is never invoked at all — routes to
+/// [`eval_songbook_from_templates`] instead, which reads the shipped/env
+/// templates dir's prebaked `manifest.json`/`registry.json` and patches in
+/// `name`'s own freshly-scanned entry.
+///
 /// Returns the WHOLE `{ manifest, registry }` payload; callers pick the
 /// half they need. On any failure (nix missing, eval error, unparseable or
-/// incomplete output) returns `Err` with nix's own message where available
-/// — never a default/empty value, which a caller could mistake for "the
-/// songbook is genuinely empty" and write out.
+/// incomplete output, or the templates-path equivalents) returns `Err` with
+/// the underlying message where available — never a default/empty value,
+/// which a caller could mistake for "the songbook is genuinely empty" and
+/// write out.
 ///
-/// [`SONGBOOK_EVAL_FIXTURE_VAR`] short-circuits this whole shell-out for
-/// tests — see that constant's own doc.
-fn eval_songbook() -> Result<SongbookEval, WidgetSyncErr> {
+/// [`SONGBOOK_EVAL_FIXTURE_VAR`] short-circuits BOTH paths above for tests —
+/// see that constant's own doc.
+fn eval_songbook(name: &str) -> Result<SongbookEval, WidgetSyncErr> {
     #[cfg(test)]
     if let Ok(path) = std::env::var(SONGBOOK_EVAL_FIXTURE_VAR) {
         let bytes = std::fs::read(&path).map_err(|e| WidgetSyncErr {
@@ -158,6 +179,17 @@ fn eval_songbook() -> Result<SongbookEval, WidgetSyncErr> {
     }
 
     let flake_root = aoide_storage::fs::flake_root();
+
+    // L-C3 (lyra-carrier lane, task #107): a repo-less host has no flake at
+    // `flake_root()` at all — shelling `nix eval` there would just fail
+    // loudly (or hang on a missing `nix` binary) for no benefit. Route
+    // straight to the shipped/env templates fallback instead of attempting
+    // the shell-out first and catching the failure after the fact; the
+    // nix-eval path below stays exactly as it was for a real checkout host.
+    if !flake_root.join("flake.nix").is_file() {
+        return eval_songbook_from_templates(name, &flake_root);
+    }
+
     let flake_ref = format!("{}#songbookManifest", flake_root.to_string_lossy());
 
     let output = std::process::Command::new("nix")
@@ -183,6 +215,174 @@ fn eval_songbook() -> Result<SongbookEval, WidgetSyncErr> {
     }
 
     parse_songbook_eval(&output.stdout, &flake_ref)
+}
+
+/// The offline fallback for [`eval_songbook`] on a repo-less host (no flake
+/// at `flake_root()`, just checked by the caller): read the SHIPPED,
+/// prebaked `manifest.json`/`registry.json` from
+/// [`aoide_storage::fs::song_templates_dir`] — nix build time already
+/// computed them via the SAME `lib/songbook.nix` generator the checkout-host
+/// `nix eval` path calls at runtime (`pkgs/lyra-songbook/default.nix`) — as
+/// the baseline for every OTHER committed song, then overwrite `name`'s own
+/// entry with a fresh, nix-free scan of its ACTUAL committed songbook
+/// directory ([`scan_own_entry`]). A song composed at runtime (`rice
+/// compose`) is never itself in the baked templates, and even a template
+/// song staged again picks up a local edit this way — the same "self-heals
+/// every call" posture the real nix-eval path holds (module doc, "Whole-file
+/// regeneration from nix can't reproduce that failure mode").
+///
+/// `flake_root` is threaded through only for the error message (naming both
+/// locations checked), never read from here otherwise.
+fn eval_songbook_from_templates(
+    name: &str,
+    flake_root: &Path,
+) -> Result<SongbookEval, WidgetSyncErr> {
+    let Some(templates) = aoide_storage::fs::song_templates_dir() else {
+        return Err(WidgetSyncErr {
+            error: format!(
+                "no flake checkout at {} (no `flake.nix`) and no shipped song templates dir \
+                 found either ($AOIDE_SONG_TEMPLATES is unset, and no `share/lyra/songbook` \
+                 sits beside this binary) — regenerating manifest.json/registry.json needs \
+                 one of the two",
+                flake_root.display()
+            ),
+            target: flake_root.to_string_lossy().into_owned(),
+        });
+    };
+
+    let manifest_path = templates.join("manifest.json");
+    let registry_path = templates.join("registry.json");
+    if !manifest_path.is_file() || !registry_path.is_file() {
+        return Err(WidgetSyncErr {
+            error: format!(
+                "no flake checkout at {} (no `flake.nix`) and the templates dir at {} has no \
+                 baked manifest.json/registry.json — set $AOIDE_FLAKE_ROOT to a real checkout, \
+                 or $AOIDE_SONG_TEMPLATES to a directory shipping both",
+                flake_root.display(),
+                templates.display()
+            ),
+            target: templates.to_string_lossy().into_owned(),
+        });
+    }
+
+    // A `_widgets/` shelf (borrowed/composed widget ownership) can only be
+    // resolved by `composeSong` in the nix evaluator (module doc, "only
+    // `composeSong`... resolves ownership") — `rice compose` never writes
+    // one, so this is an honest gap, not a silently-wrong guess.
+    let shelf_dir = aoide_storage::fs::songbook_dir(name).join("_widgets");
+    if shelf_dir.is_dir() {
+        return Err(WidgetSyncErr {
+            error: format!(
+                "`{name}` has a `_widgets/` shelf (borrowed/composed widget ownership) — \
+                 resolving that requires `nix eval` against a real flake checkout, which this \
+                 repo-less host doesn't have (checked {}); set $AOIDE_FLAKE_ROOT to a checkout",
+                flake_root.display()
+            ),
+            target: shelf_dir.to_string_lossy().into_owned(),
+        });
+    }
+
+    let manifest_bytes = std::fs::read(&manifest_path).map_err(|e| WidgetSyncErr {
+        error: format!(
+            "failed to read shipped templates manifest.json at {}: {e}",
+            manifest_path.display()
+        ),
+        target: manifest_path.to_string_lossy().into_owned(),
+    })?;
+    let registry_bytes = std::fs::read(&registry_path).map_err(|e| WidgetSyncErr {
+        error: format!(
+            "failed to read shipped templates registry.json at {}: {e}",
+            registry_path.display()
+        ),
+        target: registry_path.to_string_lossy().into_owned(),
+    })?;
+
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&manifest_bytes).map_err(|e| WidgetSyncErr {
+            error: format!("shipped templates manifest.json is not valid JSON: {e}"),
+            target: manifest_path.to_string_lossy().into_owned(),
+        })?;
+    let mut registry: serde_json::Value =
+        serde_json::from_slice(&registry_bytes).map_err(|e| WidgetSyncErr {
+            error: format!("shipped templates registry.json is not valid JSON: {e}"),
+            target: registry_path.to_string_lossy().into_owned(),
+        })?;
+    if !manifest.is_object() || !registry.is_object() {
+        return Err(WidgetSyncErr {
+            error: "shipped templates manifest.json/registry.json must both be JSON objects \
+                    keyed by song name — refusing to write a malformed manifest.json/\
+                    registry.json"
+                .to_string(),
+            target: templates.to_string_lossy().into_owned(),
+        });
+    }
+
+    let (own_manifest, own_registry) = scan_own_entry(name)?;
+    let manifest_obj = manifest.as_object_mut().expect("checked is_object above");
+    // Only songs with at least one slot appear in manifest.json (the same
+    // asymmetry `lib/songbook.nix`'s own comment documents) — an empty scan
+    // removes any stale templated entry for `name` rather than writing `{}`.
+    match own_manifest.as_object() {
+        Some(m) if !m.is_empty() => {
+            manifest_obj.insert(name.to_string(), own_manifest);
+        }
+        _ => {
+            manifest_obj.remove(name);
+        }
+    }
+    let registry_obj = registry.as_object_mut().expect("checked is_object above");
+    // registry.json keeps EVERY committed song, `{}` when it declares
+    // nothing — always inserted, never conditionally removed.
+    registry_obj.insert(name.to_string(), own_registry);
+
+    Ok(SongbookEval { manifest, registry })
+}
+
+/// `name`'s own manifest/registry entry, computed directly from its
+/// committed songbook directory with no nix involved — the same "no
+/// `_widgets/` shelf" formula `lib/songbook.nix`'s `songMeta` uses per song
+/// (owner is always the song itself, `file` is always `<slot>.qml`; the
+/// registry falls back to `livery.json`'s `.widgets // {}`). `rice compose`
+/// never writes a `_widgets/` shelf, so this is the ONLY shape a freshly
+/// composed song can ever have — [`eval_songbook_from_templates`] checks for
+/// a shelf and refuses before ever calling this.
+fn scan_own_entry(name: &str) -> Result<(serde_json::Value, serde_json::Value), WidgetSyncErr> {
+    let song_dir = aoide_storage::fs::songbook_dir(name);
+
+    let widgets_dir = song_dir.join("widgets");
+    let manifest_entry = if widgets_dir.is_dir() {
+        let slots = scan_slot_names(&widgets_dir)?;
+        let mut m = serde_json::Map::new();
+        for slot in slots {
+            m.insert(
+                slot.clone(),
+                serde_json::json!({ "owner": name, "file": format!("{slot}.qml") }),
+            );
+        }
+        serde_json::Value::Object(m)
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
+    };
+
+    let livery_path = song_dir.join("livery.json");
+    let registry_entry = if livery_path.is_file() {
+        let raw = std::fs::read_to_string(&livery_path).map_err(|e| WidgetSyncErr {
+            error: e.to_string(),
+            target: livery_path.to_string_lossy().into_owned(),
+        })?;
+        let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| WidgetSyncErr {
+            error: format!("{}'s livery.json is not valid JSON: {e}", song_dir.display()),
+            target: livery_path.to_string_lossy().into_owned(),
+        })?;
+        parsed
+            .get("widgets")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()))
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
+    };
+
+    Ok((manifest_entry, registry_entry))
 }
 
 /// Shared validation for [`eval_songbook`]'s payload, whichever of the two
@@ -272,7 +472,7 @@ pub fn sync_song_widgets(name: &str) -> Result<WidgetSyncOk, WidgetSyncErr> {
     let body_file_count = changed.len();
     let bodies_changed = body_file_count > 0;
 
-    regenerate_manifest(&run_qml, &mut changed)?;
+    regenerate_manifest(name, &run_qml, &mut changed)?;
 
     let note = if !bodies_changed {
         "widget bodies already current".to_string()
@@ -382,8 +582,8 @@ fn scan_slot_names(src: &Path) -> Result<Vec<String>, WidgetSyncErr> {
 /// every committed song's owner-map entry, replacing the file outright
 /// (preserve-nothing: the eval is total, so a stale or malformed entry for
 /// ANY song, not just the one being staged, self-heals on every call).
-fn regenerate_manifest(run_qml: &Path, changed: &mut Vec<String>) -> Result<(), WidgetSyncErr> {
-    let eval = eval_songbook()?;
+fn regenerate_manifest(name: &str, run_qml: &Path, changed: &mut Vec<String>) -> Result<(), WidgetSyncErr> {
+    let eval = eval_songbook(name)?;
     let manifest_path = run_qml.join("songs").join("manifest.json");
     let body = serde_json::to_string_pretty(&eval.manifest).unwrap_or_default() + "\n";
     let existing = std::fs::read_to_string(&manifest_path).ok();
@@ -417,7 +617,7 @@ pub fn sync_song_registry(name: &str) -> Result<RegistrySyncOk, WidgetSyncErr> {
         });
     }
 
-    let eval = eval_songbook()?;
+    let eval = eval_songbook(name)?;
     let registry_path = run_qml.join("songs").join("registry.json");
     let body = serde_json::to_string_pretty(&eval.registry).unwrap_or_default() + "\n";
     let existing = std::fs::read_to_string(&registry_path).ok();

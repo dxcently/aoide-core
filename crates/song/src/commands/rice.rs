@@ -495,6 +495,43 @@ pub(crate) fn handle_rice_stage(inv: &Invocation) -> Outcome {
     }))
 }
 
+/// Resolve `--from <song>`'s source `livery.json` for `rice compose`
+/// (L-C3, lyra-carrier lane, task #107): the host songbook
+/// (`songbook_dir(from)`) first — same precedence every other `--from`
+/// consumer here already holds — else the shipped/env templates dir
+/// (`<templates>/<from>/livery.json`,
+/// [`aoide_storage::fs::song_templates_dir`]), so a repo-less host's `rice
+/// compose` still has something to copy from. `Err` names BOTH locations
+/// checked, never just the one that happened to be tried last.
+fn resolve_from_notes_path(from: &str) -> Result<PathBuf, String> {
+    let songbook_notes = shellbridge::songbook_notes(from);
+    if songbook_notes.is_file() {
+        return Ok(songbook_notes);
+    }
+
+    match shellbridge::song_templates_dir() {
+        Some(templates) => {
+            let templated_notes = templates.join(from).join("livery.json");
+            if templated_notes.is_file() {
+                Ok(templated_notes)
+            } else {
+                Err(format!(
+                    "--from song `{from}` not found: checked the songbook at {} and the \
+                     shipped templates at {}",
+                    songbook_notes.display(),
+                    templated_notes.display(),
+                ))
+            }
+        }
+        None => Err(format!(
+            "--from song `{from}` not found: checked the songbook at {} — no shipped templates \
+             dir either ($AOIDE_SONG_TEMPLATES is unset, and no `share/lyra/songbook` sits \
+             beside this binary)",
+            songbook_notes.display(),
+        )),
+    }
+}
+
 /// `rice compose <name> [--from <song>] [--force]` — scaffold a new
 /// committed song under `song/songbook/<name>/` by copying an existing
 /// song's notes.
@@ -571,14 +608,20 @@ fn handle_rice_compose(inv: &Invocation) -> Outcome {
         }));
     }
 
-    let from_notes_path = shellbridge::songbook_notes(&from);
+    let from_notes_path = match resolve_from_notes_path(&from) {
+        Ok(p) => p,
+        Err(msg) => {
+            return Outcome::error("rice.compose", msg)
+                .with_data(json!({ "reason": "from-song-not-found", "from": from }));
+        }
+    };
     let raw_notes = match std::fs::read_to_string(&from_notes_path) {
         Ok(s) => s,
         Err(e) => {
             return Outcome::error(
                 "rice.compose",
                 format!(
-                    "--from song `{from}` not found: cannot read {} ({e})",
+                    "--from song `{from}`'s notes at {} could not be read: {e}",
                     from_notes_path.display()
                 ),
             )
@@ -1516,6 +1559,178 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // ── manifest/registry regeneration on a repo-less host (L-C3, task #107) ──
+    //
+    // No `$AOIDE_SONGBOOK_EVAL_FIXTURE` in any of the three tests below —
+    // that fixture short-circuits `eval_songbook` unconditionally (its own
+    // doc), which would prove nothing about the templates fallback these
+    // tests exist to exercise. Instead `$AOIDE_FLAKE_ROOT` is pinned to a
+    // bare scratch dir with no `flake.nix`, so `eval_songbook`'s own
+    // `flake_root.join("flake.nix").is_file()` check is false and it must
+    // route to the templates path — if the code incorrectly still shelled
+    // out to `nix eval` against that bare dir, these tests would see an
+    // Error/no-op instead of the merged-data assertions below, not a silent
+    // pass.
+
+    #[test]
+    fn stage_regenerates_manifest_and_registry_from_templates_on_a_repo_less_host() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_FLAKE_ROOT",
+            "AOIDE_SONG_TEMPLATES",
+            crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR,
+        ]);
+        std::env::remove_var(crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR);
+        let (root, stage, run_qml) = widget_sync_tmp("stage-templates-fallback");
+
+        // `moonlight`'s own committed songbook dir — a widgets/ slot plus a
+        // livery.json `.widgets` block, the ONLY shape `rice compose` ever
+        // produces (no `_widgets/` shelf).
+        let song = root.join("aoide").join("song").join("songbook").join("moonlight");
+        std::fs::create_dir_all(song.join("widgets")).unwrap();
+        std::fs::write(song.join("widgets").join("bar.qml"), "// bar\n").unwrap();
+        std::fs::write(
+            song.join("livery.json"),
+            r##"{ "schemaVersion":"0",
+                "palette": {"bg":"#0b1021","fg":"#c8d3f5","accent":"#82aaff","urgent":"#ff757f"},
+                "widgets": {"bar":{"kind":"dock","order":0}} }"##,
+        )
+        .unwrap();
+
+        let flake_root = root.join("no-flake"); // exists, but no flake.nix inside
+        std::fs::create_dir_all(&flake_root).unwrap();
+
+        // The shipped templates dir: prebaked manifest.json/registry.json
+        // carrying only ANOTHER song's entry — the baseline every OTHER
+        // committed song's entry must survive from.
+        let templates = root.join("templates");
+        std::fs::create_dir_all(&templates).unwrap();
+        std::fs::write(
+            templates.join("manifest.json"),
+            r#"{"fugue":{"other":{"owner":"fugue","file":"other.qml"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(templates.join("registry.json"), r#"{"fugue":{}}"#).unwrap();
+
+        std::fs::create_dir_all(&run_qml).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_FLAKE_ROOT", &flake_root);
+        std::env::set_var("AOIDE_SONG_TEMPLATES", &templates);
+
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+
+        let manifest: Value = serde_json::from_str(
+            &std::fs::read_to_string(run_qml.join("songs").join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest["fugue"],
+            json!({ "other": { "owner": "fugue", "file": "other.qml" } }),
+            "the templated baseline entry for another song survives: {manifest:?}"
+        );
+        assert_eq!(
+            manifest["moonlight"],
+            json!({ "bar": { "owner": "moonlight", "file": "bar.qml" } }),
+            "the freshly-composed song's own entry comes from a direct scan: {manifest:?}"
+        );
+
+        let registry: Value = serde_json::from_str(
+            &std::fs::read_to_string(run_qml.join("songs").join("registry.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(registry["fugue"], json!({}), "the templated baseline registry entry survives");
+        assert_eq!(
+            registry["moonlight"],
+            json!({ "bar": { "kind": "dock", "order": 0 } }),
+            "the freshly-composed song's own registry entry comes from its own livery.json: {registry:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stage_refuses_a_shelf_song_via_templates_without_a_real_checkout() {
+        // A `_widgets/` shelf needs `composeSong` in the nix evaluator to
+        // resolve borrowed ownership (module doc, "only `composeSong`...
+        // resolves ownership") — the templates fallback cannot do that, so
+        // it must refuse with a taught error rather than guess. `rice
+        // compose` never writes a shelf, so this only bites a hand-authored
+        // one on a repo-less host.
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_FLAKE_ROOT",
+            "AOIDE_SONG_TEMPLATES",
+            crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR,
+        ]);
+        std::env::remove_var(crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR);
+        let (root, stage, run_qml) = widget_sync_tmp("stage-templates-shelf-refused");
+
+        let song = root.join("aoide").join("song").join("songbook").join("sonata");
+        std::fs::create_dir_all(song.join("_widgets")).unwrap();
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
+
+        let flake_root = root.join("no-flake");
+        std::fs::create_dir_all(&flake_root).unwrap();
+
+        let templates = root.join("templates");
+        std::fs::create_dir_all(&templates).unwrap();
+        std::fs::write(templates.join("manifest.json"), r#"{}"#).unwrap();
+        std::fs::write(templates.join("registry.json"), r#"{}"#).unwrap();
+
+        std::fs::create_dir_all(&run_qml).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_FLAKE_ROOT", &flake_root);
+        std::env::set_var("AOIDE_SONG_TEMPLATES", &templates);
+
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["sonata"]));
+        assert_eq!(out.status, Status::Error, "{:?}", out.data);
+        assert!(
+            out.message.contains("_widgets") && out.message.contains("nix"),
+            "the taught error explains a shelf needs a real nix checkout: {}",
+            out.message
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stage_teaches_both_checked_locations_when_neither_flake_nor_templates_exist() {
+        // A host with neither a real flake checkout nor a templates dir
+        // gets a taught error, not a panic (L-C3's own requirement).
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_FLAKE_ROOT",
+            "AOIDE_SONG_TEMPLATES",
+            crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR,
+        ]);
+        std::env::remove_var(crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR);
+        std::env::remove_var("AOIDE_SONG_TEMPLATES");
+        let (root, stage, run_qml) = widget_sync_tmp("stage-templates-neither");
+
+        let song = root.join("aoide").join("song").join("songbook").join("moonlight");
+        std::fs::create_dir_all(&song).unwrap();
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
+
+        let flake_root = root.join("no-flake");
+        std::fs::create_dir_all(&flake_root).unwrap();
+
+        std::fs::create_dir_all(&run_qml).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_FLAKE_ROOT", &flake_root);
+
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["moonlight"]));
+        assert_eq!(out.status, Status::Error, "{:?}", out.data);
+        assert!(
+            out.message.contains("flake") && out.message.contains("templates"),
+            "taught error naming both locations, not a panic: {}",
+            out.message
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn stage_entry_refuses_and_syncs_nothing_while_declarative_locked() {
         let _g = aoide_test_support::env_lock().lock().unwrap();
@@ -1726,8 +1941,13 @@ mod tests {
 
     #[test]
     fn compose_missing_from_song_is_error() {
+        // Neither location has it (L-C3, task #107): no songbook entry, and
+        // `AOIDE_SONG_TEMPLATES` unset with no real `share/lyra/songbook`
+        // beside the test binary — `song_templates_dir()` resolves to
+        // `None`. Taught error naming both, never a panic.
         let _g = aoide_test_support::env_lock().lock().unwrap();
-        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SONG_TEMPLATES"]);
+        std::env::remove_var("AOIDE_SONG_TEMPLATES");
         let root = unique_tmp("compose-nofrom");
         let stage = root.join("stage");
         std::fs::create_dir_all(&stage).unwrap();
@@ -1737,6 +1957,74 @@ mod tests {
         assert_eq!(out.status, Status::Error);
         assert_eq!(out.render(false).1, aoide_protocol::output::exit::ERROR);
         assert_eq!(out.data.unwrap()["reason"], "from-song-not-found");
+        assert!(
+            out.message.contains("songbook") && out.message.contains("templates"),
+            "the taught error names both locations checked: {}",
+            out.message
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn compose_falls_back_to_the_templates_dir_when_the_songbook_has_nothing() {
+        // Resolution ladder, tier 2 (L-C3, task #107): `songbook_dir(from)`
+        // absent, `$AOIDE_SONG_TEMPLATES` set and has it — the repo-less
+        // host case. Compose TO still always writes the HOST songbook
+        // (under the runtime root), never the templates dir itself.
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SONG_TEMPLATES"]);
+        let root = unique_tmp("compose-templates-fallback");
+        let stage = root.join("stage");
+        let templates = root.join("templates");
+        let templated_song = templates.join("sonata");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&templated_song).unwrap();
+        std::fs::write(templated_song.join("livery.json"), VALID_NOTES).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_SONG_TEMPLATES", &templates);
+
+        let out = handle_rice_compose(&inv(&["rice", "compose"], &["moonlight"]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+
+        // Written under the HOST songbook (the runtime root), not the
+        // templates dir — compose TO never targets templates.
+        let target = root.join("songbook").join("moonlight");
+        assert!(target.join("livery.json").is_file());
+        let mirrored = std::fs::read_to_string(target.join("livery.json")).unwrap();
+        assert_eq!(mirrored, VALID_NOTES, "livery.json mirrors the TEMPLATED --from exactly");
+        assert!(
+            !templates.join("moonlight").exists(),
+            "compose never writes into the templates dir itself"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn compose_prefers_the_songbook_over_the_templates_dir_when_both_have_the_song() {
+        // Resolution ladder, tier ordering: `songbook_dir(from)` wins even
+        // when `$AOIDE_SONG_TEMPLATES` ALSO has an entry for the same name —
+        // the templates dir is a fallback, never a shadow.
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SONG_TEMPLATES"]);
+        let root = unique_tmp("compose-templates-precedence");
+        let stage = root.join("stage");
+        let songbook_song = root.join("songbook").join("sonata");
+        let templates = root.join("templates");
+        let templated_song = templates.join("sonata");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&songbook_song).unwrap();
+        std::fs::create_dir_all(&templated_song).unwrap();
+        std::fs::write(songbook_song.join("livery.json"), VALID_NOTES).unwrap();
+        std::fs::write(templated_song.join("livery.json"), NOTES_WITH_WINDOW).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_SONG_TEMPLATES", &templates);
+
+        let out = handle_rice_compose(&inv(&["rice", "compose"], &["moonlight"]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+
+        let target = root.join("songbook").join("moonlight");
+        let mirrored = std::fs::read_to_string(target.join("livery.json")).unwrap();
+        assert_eq!(mirrored, VALID_NOTES, "the HOST songbook entry wins over the templated one");
         let _ = std::fs::remove_dir_all(&root);
     }
 
