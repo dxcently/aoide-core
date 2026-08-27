@@ -374,6 +374,30 @@
   Don't fold the "no manifest" case into a hard command failure — a picker
   confirm can genuinely be half-local, half-peer, and the local half's
   success must never be held hostage to the peer half's missing manifest.
+- **A peer row's cwd that `peer_spec_dir` cannot relativize under the
+  project root has NO savable fallback — it is REJECTED before it ever
+  reaches `manifest.sessions`, never the raw absolute cwd (review round 1,
+  U3).** `save_manifest` refuses the WHOLE batch if ANY spec carries an
+  absolute `dir`; a raw-cwd fallback here would therefore not merely write
+  an inferior spec, it would silently fail the save for every OTHER
+  legitimate peer change queued in the SAME confirm while `changed[]` still
+  reported them all as persisted (the exact defect this bullet's own review
+  round caught). Don't reintroduce a `(dir, relativized)`-shaped fallback —
+  `peer_spec_dir` returns `Option<String>`, `None` means "no spec, skip
+  with a taught reason," full stop. Correspondingly, `apply_diff`'s
+  `changed[]` for the peer path is populated ONLY after `save_manifest`
+  returns `Ok` — a failed save folds every pending peer change for that
+  confirm into `skipped[]` instead, never a false `changed` entry for a
+  write that never landed. `build_rows`' own peer pre-check goes through
+  the SAME `peer_spec_dir` relativization for the identical reason: a raw
+  cwd compared straight against a manifest spec's (always project-relative)
+  `dir` can never match, which would silently show an already-undying peer
+  session as unmarked.
+- **Unmarking a peer row removes EVERY spec matching `{host, dir, agent}`,
+  not just the first (`Vec::retain`, never a single `Vec::remove` by
+  position).** A hand-duplicated entry in `.aoide/project.json` (an
+  operator who edited the file directly) is cleaned up in one unmark, not
+  one confirm per copy — don't narrow this back to a first-match removal.
 - **`who` is a projection, never a store.** It must never write
   `state/peer-cache/<name>.json` — `build_graph`'s own fold (`doc.rs`) is
   the ONLY writer of that cache. `who`'s live probe reads straight off the

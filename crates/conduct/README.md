@@ -120,9 +120,15 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   against the CURRENT project via the exact same `walk_up` `resurrect`'s
   bare mode already uses, U2, and NEVER auto-created: no manifest above cwd
   reports every peer mark/unmark in that confirm as `skipped[]`, while any
-  local rows in the SAME confirm still land. See `CONTRACTS.md`'s
-  `.aoide/project.json` section for the exact spec-derivation and dedupe
-  rules.
+  local rows in the SAME confirm still land. A peer cwd that cannot be
+  relativized under the project root (review round 1's fix) is likewise
+  rejected BEFORE it ever touches `manifest.sessions` — never a raw-cwd
+  fallback, which `save_manifest`'s own whole-batch validation would refuse
+  outright, silently sinking every other legitimate peer change in the same
+  confirm; `changed[]` only ever names what the save actually persisted.
+  Unmarking removes EVERY spec matching `{host, dir, agent}`, not just the
+  first. See `CONTRACTS.md`'s `.aoide/project.json` section for the exact
+  spec-derivation and dedupe rules.
 - `reap` — liveness reaping (`aoide session reap`), sweeping sessions a
   `SIGKILL`'d terminal could never mark `done`. `reap_and_announce` (the
   registered CLI handler) routes through `daemon_dispatch` first like every

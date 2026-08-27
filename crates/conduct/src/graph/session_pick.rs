@@ -60,13 +60,25 @@
 //! the CURRENT project's own root when the peer session's cwd literally
 //! starts with that same root string (the plausible real case — the same
 //! project checked out at the same path on more than one host, e.g. every
-//! `~/Aoide` box already named in the fleet), else the raw cwd, taught as
-//! such — never a guessed cross-host relativization; `resolve_spec_dir`
-//! (U2) is the read-side containment guard for whatever ends up here, this
-//! function only ever WRITES a `dir`, purely lexical, no filesystem access.
-//! An identical spec already present is a no-op, reported as such
-//! ([`manifest_has_spec`]); unmarking removes the matching spec if one
-//! exists, otherwise a no-op the same way.
+//! `~/Aoide` box already named in the fleet); a cwd that does NOT lie under
+//! the root has no savable spec at all — `aoide_storage::manifest::
+//! save_manifest` refuses the WHOLE batch on any absolute `dir`, so a raw-cwd
+//! fallback would not merely write an inferior spec, it would silently drop
+//! every OTHER legitimate peer change in the same confirm (review round 1's
+//! finding). That row is therefore REJECTED before it ever reaches
+//! `manifest.sessions` — `skipped[]` with a taught reason, same as the
+//! no-manifest-at-all case — never a guessed cross-host relativization.
+//! `resolve_spec_dir` (U2) is the read-side containment guard for whatever
+//! ends up here; this function only ever computes a `dir` to WRITE, purely
+//! lexical, no filesystem access. An identical spec already present is a
+//! no-op, reported as such ([`manifest_has_spec`]); unmarking removes EVERY
+//! spec matching `{host, dir, agent}` (`Vec::retain`, not a first-match
+//! removal — a hand-duplicated entry is cleaned up in one unmark, not one
+//! per copy), otherwise a no-op the same way. The manifest write itself is
+//! ALL-OR-NOTHING per confirm: `changed[]` only ever names what
+//! `save_manifest` actually persisted — a failed save (the validation
+//! refusal above, or a plain I/O error) folds every pending peer change for
+//! that confirm into `skipped[]` instead, never a false `changed` entry.
 
 use super::model::{merged_sessions, resolved_parent, HookRecord, SessionRecord};
 use super::who::{sessions_from_graph, SessionView};
@@ -107,18 +119,33 @@ fn manifest_has_spec(manifest: &Manifest, host: &str, dir: &str, agent: &str) ->
 }
 
 /// Resolve a peer spec's `dir` — see the module doc's "Peer marks" section.
-/// Returns the dir alongside whether it actually relativized (the caller
-/// folds `false` into a taught note in the outcome, never silently). Purely
-/// lexical (`Path::strip_prefix`, a string-prefix operation over `Path`
-/// components) — no filesystem access, no realpath, matching
-/// `resolve_spec_dir`/`walk_up`'s own "LEXICAL, not realpath" discipline
+/// `None` when `peer_cwd` does not lie under `project_root` at all: there is
+/// no savable spec for it (`save_manifest` refuses the WHOLE batch on any
+/// absolute `dir`), so the caller MUST reject that row before it ever
+/// touches `manifest.sessions` — never fall back to the raw cwd (review
+/// round 1's finding: a raw-cwd fallback here would silently sink every
+/// OTHER legitimate peer change queued in the same confirm). Purely lexical
+/// (`Path::strip_prefix`, a string-prefix operation over `Path` components)
+/// — no filesystem access, no realpath, matching `resolve_spec_dir`/
+/// `walk_up`'s own "LEXICAL, not realpath" discipline
 /// (`aoide_storage::manifest`).
-fn peer_spec_dir(project_root: &Path, peer_cwd: &str) -> (String, bool) {
+fn peer_spec_dir(project_root: &Path, peer_cwd: &str) -> Option<String> {
     match Path::new(peer_cwd).strip_prefix(project_root) {
-        Ok(rel) if rel.as_os_str().is_empty() => (".".to_string(), true),
-        Ok(rel) => (rel.to_string_lossy().into_owned(), true),
-        Err(_) => (peer_cwd.to_string(), false),
+        Ok(rel) if rel.as_os_str().is_empty() => Some(".".to_string()),
+        Ok(rel) => Some(rel.to_string_lossy().into_owned()),
+        Err(_) => None,
     }
+}
+
+/// The taught reason a peer row's cwd cannot be resolved into a savable
+/// manifest `dir` — shared by [`build_rows`]'s pre-check (silently, via
+/// `None`) and [`apply_diff`]'s own reject-before-push (out loud, via
+/// `skipped[]`), so the wording lives in exactly one place.
+fn peer_cwd_unsavable_reason(peer: &str, cwd: &str, verb: &str) -> String {
+    format!(
+        "{peer}: cannot {verb} — peer cwd `{cwd}` is not under the local project root — \
+         write the spec by hand with a project-relative dir, or wait for the remote mapping (U4)"
+    )
 }
 
 /// Build every picker row — pure, given already-loaded inputs (module doc's
@@ -126,17 +153,23 @@ fn peer_spec_dir(project_root: &Path, peer_cwd: &str) -> (String, bool) {
 /// `peers` is `(registered peer, that peer's cached sessions)` — the caller
 /// derives the second element via [`sessions_from_graph`] over
 /// `peer_store::load_peer_cache`, never a live probe; `undying` is
-/// `aoide_storage::undying::load_undying`'s result; `manifest` is the
-/// CURRENT project's manifest, if `walk_up` found one (`None` when it
+/// `aoide_storage::undying::load_undying`'s result; `project` is the
+/// CURRENT project's root + manifest, if `walk_up` found one (`None` when it
 /// didn't — every peer row's `undying` then reads `false`, since there is
-/// nowhere for a peer mark to have been recorded).
+/// nowhere for a peer mark to have been recorded). A peer row's pre-check
+/// goes through the SAME [`peer_spec_dir`] relativization [`apply_diff`]
+/// uses to WRITE — a raw absolute cwd never matches a manifest spec (specs
+/// are always project-relative), so comparing the unrelativized cwd against
+/// `spec.dir` would silently under-report an already-undying peer session as
+/// unmarked; a cwd `peer_spec_dir` can't place under the root reads `false`
+/// here too, the same as no manifest at all.
 pub(super) fn build_rows(
     host: &str,
     locals: &[SessionRecord],
     hooks: &[HookRecord],
     undying: &[UndyingSession],
     peers: &[(Peer, Vec<SessionView>)],
-    manifest: Option<&Manifest>,
+    project: Option<(&Path, &Manifest)>,
 ) -> Vec<PickerRow> {
     let merged = merged_sessions(locals, hooks);
     let ids: HashSet<&str> = merged.iter().map(|s| s.session_id.as_str()).collect();
@@ -161,7 +194,9 @@ pub(super) fn build_rows(
             if sv.state == "done" {
                 continue;
             }
-            let on = manifest.is_some_and(|m| manifest_has_spec(m, &peer.name, &sv.cwd, &sv.agent));
+            let on = project.is_some_and(|(root, m)| {
+                peer_spec_dir(root, &sv.cwd).is_some_and(|dir| manifest_has_spec(m, &peer.name, &dir, &sv.agent))
+            });
             rows.push(PickerRow {
                 label: format!("{}  {}  {}{}", sv.label, sv.agent, sv.state, if on { "  [undying]" } else { "" }),
                 target: RowTarget::Peer { peer: peer.name.clone(), cwd: sv.cwd.clone(), agent: sv.agent.clone() },
@@ -252,10 +287,23 @@ pub(super) fn apply_diff(
             }
             Some((root, base_manifest)) => {
                 let mut manifest = base_manifest.clone();
+                // (peer, dir, on) for every row that actually MUTATED
+                // `manifest.sessions` in-memory below — recorded as
+                // `changed` only once `save_manifest` (below) confirms the
+                // write actually landed; a no-op (already present / already
+                // absent) or a rejected cwd never enters this list at all.
+                let mut pending: Vec<(String, String, bool)> = Vec::new();
+
                 for (i, on) in &peer_touched {
                     if let RowTarget::Peer { peer, cwd, agent } = &rows[*i].target {
-                        let (dir, relativized) = peer_spec_dir(root, cwd);
-                        let note = if relativized { String::new() } else { " (raw cwd — outside the current project root)".to_string() };
+                        let dir = match peer_spec_dir(root, cwd) {
+                            Some(d) => d,
+                            None => {
+                                let verb = if *on { "mark" } else { "unmark" };
+                                skipped.push(peer_cwd_unsavable_reason(peer, cwd, verb));
+                                continue;
+                            }
+                        };
                         if *on {
                             if manifest_has_spec(&manifest, peer, &dir, agent) {
                                 skipped.push(format!("{peer}/{dir}: already undying (no-op)"));
@@ -266,21 +314,43 @@ pub(super) fn apply_diff(
                                     agent: agent.clone(),
                                     command: None,
                                 });
-                                changed.push(format!("{peer}/{dir}: undying (manifest){note}"));
+                                pending.push((peer.clone(), dir, true));
                             }
                         } else {
                             let before = manifest.sessions.len();
+                            // `retain` drops EVERY entry matching
+                            // `{host, dir, agent}`, not just the first — a
+                            // hand-duplicated spec is cleaned up in one
+                            // unmark, never left with a surviving copy.
                             manifest.sessions.retain(|s| !(s.host == *peer && s.dir == dir && s.agent == *agent));
                             if manifest.sessions.len() < before {
-                                changed.push(format!("{peer}/{dir}: not undying (manifest){note}"));
+                                pending.push((peer.clone(), dir, false));
                             } else {
                                 skipped.push(format!("{peer}/{dir}: not undying already (no-op)"));
                             }
                         }
                     }
                 }
-                if let Err(e) = manifest::save_manifest(root, &manifest) {
-                    skipped.push(format!("manifest write failed: {e}"));
+
+                if !pending.is_empty() {
+                    match manifest::save_manifest(root, &manifest) {
+                        Ok(()) => {
+                            for (peer, dir, on) in pending {
+                                changed.push(format!("{peer}/{dir}: {} (manifest)", if on { "undying" } else { "not undying" }));
+                            }
+                        }
+                        Err(e) => {
+                            // The whole batch failed together (`save_manifest`
+                            // validates before writing anything) — every
+                            // pending change reports as skipped, never a
+                            // false `changed` entry for a write that never
+                            // landed.
+                            for (peer, dir, on) in pending {
+                                let verb = if on { "mark" } else { "unmark" };
+                                skipped.push(format!("{peer}/{dir}: {verb} not saved — manifest write failed: {e}"));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -338,9 +408,9 @@ pub fn session_pick(inv: &Invocation) -> Outcome {
 
     let cwd = std::env::current_dir().unwrap_or_default();
     let manifest_hit = manifest::walk_up(&cwd);
-    let manifest_ref = manifest_hit.as_ref().map(|(_, m)| m);
+    let project_ref = manifest_hit.as_ref().map(|(root, m)| (root.as_path(), m));
 
-    let rows = build_rows(&host, &s.sessions, &h.hooks, &undying, &peer_sessions, manifest_ref);
+    let rows = build_rows(&host, &s.sessions, &h.hooks, &undying, &peer_sessions, project_ref);
     if rows.is_empty() {
         return Outcome::ok(cmd, "no sessions to pick from — nothing local, no peer-cached sessions");
     }
@@ -430,9 +500,17 @@ mod tests {
 
     #[test]
     fn build_rows_peer_row_reads_undying_off_a_matching_manifest_spec() {
-        let peers = vec![(peer("yomi"), vec![peer_session("p1", "working", "/home/x/Aoide", "claude")])];
-        let manifest = Manifest { version: 0, sessions: vec![spec("yomi", "/home/x/Aoide", "claude")] };
-        let rows = build_rows("sakaki", &[], &[], &[], &peers, Some(&manifest));
+        // The manifest spec's `dir` is project-relative ("pkgs/aoide"), the
+        // peer row's cwd is the raw absolute path -- `build_rows` must
+        // relativize the cwd through the SAME `peer_spec_dir` `apply_diff`
+        // writes through before comparing, or an already-undying peer
+        // session would never show pre-checked (the bug review round 1
+        // caught: comparing the raw cwd straight against `spec.dir` can
+        // never match, since specs are always project-relative).
+        let root = PathBuf::from("/home/x/Aoide");
+        let peers = vec![(peer("yomi"), vec![peer_session("p1", "working", "/home/x/Aoide/pkgs/aoide", "claude")])];
+        let manifest = Manifest { version: 0, sessions: vec![spec("yomi", "pkgs/aoide", "claude")] };
+        let rows = build_rows("sakaki", &[], &[], &[], &peers, Some((&root, &manifest)));
         assert_eq!(rows.len(), 1);
         assert!(rows[0].undying, "the manifest spec's host/dir/agent match the peer row exactly");
     }
@@ -442,6 +520,56 @@ mod tests {
         let peers = vec![(peer("yomi"), vec![peer_session("p1", "working", "/home/x/Aoide", "claude")])];
         let rows = build_rows("sakaki", &[], &[], &[], &peers, None);
         assert!(!rows[0].undying);
+    }
+
+    #[test]
+    fn build_rows_peer_row_is_not_undying_when_its_cwd_falls_outside_the_project_root() {
+        // A manifest exists, and even carries a spec for this peer/agent --
+        // but the row's cwd cannot be relativized under the local project
+        // root at all, so there is no `dir` to compare against, and the row
+        // must read `false` the same way a missing manifest does (never a
+        // panic, never a raw-cwd comparison that happens to work by luck).
+        let root = PathBuf::from("/home/x/Aoide");
+        let peers = vec![(peer("yomi"), vec![peer_session("p1", "working", "/home/alice/elsewhere", "claude")])];
+        let manifest = Manifest { version: 0, sessions: vec![spec("yomi", ".", "claude")] };
+        let rows = build_rows("sakaki", &[], &[], &[], &peers, Some((&root, &manifest)));
+        assert!(!rows[0].undying);
+    }
+
+    // ── build_rows: default-index alignment across local+peer rows ───────
+
+    #[test]
+    fn build_rows_default_indices_align_across_local_and_peer_concatenation() {
+        // Locals come first, peers after (module doc's "Rows" section) --
+        // `session_pick`'s own `default` (fed to `choose_many`) is built by
+        // filtering `rows.iter().enumerate()` AFTER this concatenation, so a
+        // caller must be able to trust that a peer row's position accounts
+        // for every local row ahead of it. Two locals (one undying), one
+        // peer undying, one peer not -- the undying set must land on
+        // exactly the right indices in the FINAL four-row list.
+        let root = PathBuf::from("/home/x/Aoide");
+        let locals = vec![session("s1", "/x", "working", "1", None), session("s2", "/x", "working", "2", None)];
+        let local_undying = vec![UndyingSession { session_id: "s1".to_string(), marked_at: "t".to_string() }];
+        let peers = vec![(
+            peer("yomi"),
+            vec![
+                peer_session("p1", "working", "/home/x/Aoide/pkgs/aoide", "claude"),
+                peer_session("p2", "working", "/home/x/Aoide/pkgs/lyra", "codex"),
+            ],
+        )];
+        let manifest = Manifest { version: 0, sessions: vec![spec("yomi", "pkgs/aoide", "claude")] };
+
+        let rows = build_rows("sakaki", &locals, &[], &local_undying, &peers, Some((&root, &manifest)));
+        assert_eq!(rows.len(), 4);
+        let default: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| r.undying).map(|(i, _)| i).collect();
+
+        // s1 (index 0) and p1 (index 2, the first peer row -- "pkgs/aoide"
+        // matches the manifest spec) are undying; s2 (1) and p2 (3,
+        // "pkgs/lyra", no matching spec) are not.
+        assert_eq!(default, vec![0, 2]);
+        assert!(matches!(&rows[0].target, RowTarget::Local { session_id } if session_id == "s1"));
+        assert!(matches!(&rows[2].target, RowTarget::Peer { cwd, .. } if cwd.ends_with("pkgs/aoide")));
+        assert!(!rows[3].undying);
     }
 
     // ── diff_selection: pure index diff against current state ────────────
@@ -473,30 +601,31 @@ mod tests {
         assert!(unmark.is_empty());
     }
 
-    // ── peer_spec_dir: lexical relativization, with an honest fallback ───
+    // ── peer_spec_dir: lexical relativization, no unsavable fallback ─────
 
     #[test]
     fn peer_spec_dir_relativizes_under_the_project_root() {
         let root = PathBuf::from("/home/khoa/Aoide");
-        let (dir, relativized) = peer_spec_dir(&root, "/home/khoa/Aoide/pkgs/aoide");
-        assert_eq!(dir, "pkgs/aoide");
-        assert!(relativized);
+        let dir = peer_spec_dir(&root, "/home/khoa/Aoide/pkgs/aoide");
+        assert_eq!(dir, Some("pkgs/aoide".to_string()));
     }
 
     #[test]
     fn peer_spec_dir_is_dot_when_the_cwd_is_the_root_itself() {
         let root = PathBuf::from("/home/khoa/Aoide");
-        let (dir, relativized) = peer_spec_dir(&root, "/home/khoa/Aoide");
-        assert_eq!(dir, ".");
-        assert!(relativized);
+        let dir = peer_spec_dir(&root, "/home/khoa/Aoide");
+        assert_eq!(dir, Some(".".to_string()));
     }
 
     #[test]
-    fn peer_spec_dir_falls_back_to_the_raw_cwd_outside_the_root() {
+    fn peer_spec_dir_is_none_outside_the_root_never_a_raw_cwd_fallback() {
+        // Review round 1's finding: a raw-cwd fallback here would produce a
+        // spec `save_manifest` refuses on sight (absolute `dir`), sinking
+        // every OTHER legitimate peer change queued in the same confirm.
+        // There is no savable fallback -- `None` is the whole answer.
         let root = PathBuf::from("/home/khoa/Aoide");
-        let (dir, relativized) = peer_spec_dir(&root, "/home/alice/dev/Aoide/pkgs/aoide");
-        assert_eq!(dir, "/home/alice/dev/Aoide/pkgs/aoide", "raw cwd, unchanged");
-        assert!(!relativized);
+        let dir = peer_spec_dir(&root, "/home/alice/dev/Aoide/pkgs/aoide");
+        assert_eq!(dir, None);
     }
 
     // ── manifest_has_spec: the dedupe key ─────────────────────────────────
@@ -648,6 +777,72 @@ mod tests {
             assert_eq!(result.changed, vec!["loc-1: undying".to_string()]);
             assert_eq!(result.skipped.len(), 1);
             assert!(result.skipped[0].contains("no project manifest"), "{}", result.skipped[0]);
+        });
+    }
+
+    /// The end-to-end mixed-batch proof (review round 1's own ask): one
+    /// local toggle, one peer row whose cwd relativizes cleanly, and one
+    /// peer row whose cwd falls outside the project root, all marked in the
+    /// SAME confirm. The local mark and the valid peer spec must both land;
+    /// the invalid peer row must be rejected BEFORE ever touching
+    /// `manifest.sessions` (never a batch-wide `save_manifest` refusal that
+    /// silently drops the valid spec too — the exact review-round-1 defect)
+    /// — and `changed`/`skipped` must match disk state exactly, not merely
+    /// look plausible.
+    #[test]
+    fn apply_diff_mixed_batch_local_plus_valid_peer_plus_unsavable_peer() {
+        with_temp_state_dir("mixed-batch", || {
+            let root = std::env::temp_dir().join(format!("aoide-session-pick-mixed-batch-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+
+            let rows = vec![
+                PickerRow { label: "local".into(), target: RowTarget::Local { session_id: "loc-1".into() }, undying: false },
+                PickerRow {
+                    label: "valid peer".into(),
+                    target: RowTarget::Peer {
+                        peer: "yomi".to_string(),
+                        cwd: root.join("pkgs/aoide").to_string_lossy().into_owned(),
+                        agent: "claude".to_string(),
+                    },
+                    undying: false,
+                },
+                PickerRow {
+                    label: "unsavable peer".into(),
+                    target: RowTarget::Peer {
+                        peer: "yomi".to_string(),
+                        cwd: "/home/alice/elsewhere".to_string(),
+                        agent: "claude".to_string(),
+                    },
+                    undying: false,
+                },
+            ];
+            let base = Manifest::default();
+            let result = apply_diff(&rows, &[0, 1, 2], &[], Some(&(root.clone(), base)));
+
+            // Disk state: the local mark landed, the valid peer spec
+            // persisted, and NOTHING from the unsavable row ever reached
+            // the manifest.
+            assert!(undying::is_undying(&undying::load_undying(), "loc-1"));
+            let loaded = manifest::load_manifest(&root).expect("manifest must exist -- the valid spec persisted");
+            assert_eq!(loaded.sessions.len(), 1, "only the valid peer spec was ever written: {:?}", loaded.sessions);
+            assert!(manifest_has_spec(&loaded, "yomi", "pkgs/aoide", "claude"));
+
+            // Report state matches disk exactly.
+            assert_eq!(
+                result.changed,
+                vec!["loc-1: undying".to_string(), "yomi/pkgs/aoide: undying (manifest)".to_string()],
+                "{:?}",
+                result.changed
+            );
+            assert_eq!(result.skipped.len(), 1, "{:?}", result.skipped);
+            assert!(
+                result.skipped[0].contains("is not under the local project root"),
+                "{}",
+                result.skipped[0]
+            );
+
+            let _ = std::fs::remove_dir_all(&root);
         });
     }
 
