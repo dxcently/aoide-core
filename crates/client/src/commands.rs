@@ -2334,10 +2334,11 @@ mod tests {
 
             // `handle_peer_pair_request`'s own documented tail.
             let direct = run_pair_request("peer.pair.request", url, name, &self_url);
-            // The literal call `handle_peer_invite` makes on its single-match
-            // branch (`run_pair_request(cmd, &hit.beacon.url, &hit.beacon.name, &self_url)`),
-            // reproduced here with the same arguments a real `Heard` would
-            // supply, under `peer.invite`'s own command name.
+            // The same ceremony tail `handle_peer_invite` reaches on its
+            // single-match branch — since P-S1 it composes an OBSERVED dial
+            // url first (`invite_dial_url`) and passes that instead of the
+            // beacon's claim, but the tail function is still this one;
+            // reproduced here under `peer.invite`'s own command name.
             let via_invite = run_pair_request("peer.invite", url, name, &self_url);
 
             assert_eq!(direct.status, aoide_protocol::output::Status::Error, "{direct:?}");

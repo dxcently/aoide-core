@@ -54,6 +54,10 @@ pub const DEFAULT_SWEEP_SECS: u64 = 4;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Heard {
     pub beacon: Beacon,
+    /// Always a dotted-quad IPv4 literal today: `run_sweep` binds
+    /// `Ipv4Addr::UNSPECIFIED`, so `recv_from` can never yield a v6
+    /// source. A future v6 sweep must also teach `invite_dial_url` to
+    /// bracket the host before flipping that bind.
     pub src_addr: String,
     pub first_heard: String,
     pub last_heard: String,
@@ -292,9 +296,14 @@ fn is_loopback_host(host: &str) -> bool {
 /// composed dial url's host is a bare loopback literal, or matches the
 /// host of one of `own_urls` (this instance's own known advertised
 /// url(s), e.g. `default_self_url()`) — the "the observed source address
-/// IS this box" case. Pure: `own_fpr`/`own_urls` are passed in rather than
-/// loaded here so this stays testable with no identity file or env
-/// dependency.
+/// IS this box" case. The `own_urls` arm compares `host:port`
+/// authorities, so a second aoide on the SAME box at a different port is
+/// correctly NOT self; today `default_self_url()` is hostname-shaped
+/// while a dial host is always an observed IP, so this arm only bites
+/// once the self url carries a routable address (the K1 change riding
+/// P-S4) — the fingerprint and loopback checks carry the guard until
+/// then. Pure: `own_fpr`/`own_urls` are passed in rather than loaded
+/// here so this stays testable with no identity file or env dependency.
 pub fn is_self_target(beacon_fpr: &str, own_fpr: &str, dial_url: &str, own_urls: &[String]) -> bool {
     if !beacon_fpr.is_empty() && beacon_fpr == own_fpr {
         return true;
@@ -561,6 +570,19 @@ mod tests {
             "aa:aa:aa:aa:aa:aa:aa:aa",
             "bb:bb:bb:bb:bb:bb:bb:bb",
             "http://yomi-strix:8710/",
+            &["http://yomi-strix:8710/".to_string()]
+        ));
+    }
+
+    /// A second aoide on the SAME box at a DIFFERENT port is a legitimate
+    /// peer, never self — url_host carries the port, so the authorities
+    /// genuinely differ and the own-url arm must not fire.
+    #[test]
+    fn is_self_target_false_for_the_same_host_on_a_different_port() {
+        assert!(!is_self_target(
+            "aa:aa:aa:aa:aa:aa:aa:aa",
+            "bb:bb:bb:bb:bb:bb:bb:bb",
+            "http://yomi-strix:9710/",
             &["http://yomi-strix:8710/".to_string()]
         ));
     }
