@@ -124,7 +124,7 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
 - `shellbridge`, `herald` — files only; their CLI commands (registry lines)
   moved to `lyra` at P-A2, but both stay resident here (see charter smudge
   below).
-- `commands` — this crate's CLI commands: `graph *` (22 paths, including
+- `commands` — this crate's CLI commands: `graph *` (19 paths, including
   `graph resurrect`, P-D8, and `graph session carry`, P-C2), `conduct`,
   `hooks install`, `who`.
 - **The durable session ledger + resurrect (P-D8, `docs/architecture/

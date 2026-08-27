@@ -1249,8 +1249,8 @@ impl App {
     /// Keys for the DAG (Graph) panel. Navigation walks the same preorder node
     /// list the layout draws, so `j`/`k` can never point at a node that isn't on
     /// screen. Enter cues the selected session's window (the same
-    /// [`App::cue_session`] focus jump the roster uses); `e` emits, `p` prunes —
-    /// the two graph-wide commands — so the visual view is not read-only.
+    /// [`App::cue_session`] focus jump the roster uses); `p` prunes — the one
+    /// graph-wide command — so the visual view is not read-only.
     fn handle_graph_key(&mut self, key: KeyEvent) {
         let nodes = crate::graphview::node_order(self);
         match key.code {
@@ -1850,6 +1850,18 @@ mod tests {
             assert!(
                 app.last_outcome.is_some(),
                 "windowed Enter still focuses the session"
+            );
+
+            // The focus jump calls `graph::focus_session` DIRECTLY (no
+            // registry dispatch since the `graph focus` command was deleted),
+            // hand-rolling its audit record — pin that the record actually
+            // lands with the dispatcher's shape, so the single-audit-log
+            // invariant holds without a CLI command behind it.
+            let audit = std::fs::read_to_string(std::env::var("AOIDE_AUDIT_LOG").unwrap())
+                .expect("cue_session wrote an audit line");
+            assert!(
+                audit.contains("\"command\":\"graph.focus\""),
+                "hand-rolled audit record names graph.focus: {audit}"
             );
         });
     }

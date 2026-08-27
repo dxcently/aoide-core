@@ -304,7 +304,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, sel: usize) {
             Line::from(""),
             Line::from("  Seed a stage tree:  pkgs/aoide/tests/fixtures/seed.sh $AOIDE_STAGE_DIR")
                 .style(theme::dim()),
-            Line::from("  Then re-open the conductor, or press e to emit the graph.")
+            Line::from("  Then re-open the conductor — every stage mutation restages the graph.")
                 .style(theme::dim()),
         ];
         f.render_widget(Paragraph::new(lines), area);
