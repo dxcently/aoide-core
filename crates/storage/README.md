@@ -162,7 +162,7 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   shape, never the capture logic.
 - `carry` — the carry mark (durable-sessions plan, P-C1): `state/carry.json`,
   the set of session ids marked durable so a project's whole carried set can
-  be resurrected together (`graph session carry on|off`, a later phase).
+  be resurrected together (`session carry on|off`, a later phase).
   Mirrors `peer_store` exactly — `load_carry`/`save_carry` tolerate a
   missing/corrupt file as empty and write atomically via `fs::atomic_write`
   (not `atomic_write_private`: a session id is the same class of data
@@ -179,18 +179,18 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   inverting `display::session_label`'s grammar to turn a typed query back
   into a local session id or a deferred `peer/<rest>` remote query. Zero
   I/O, agnostic of any call site — `aoide who` (`aoide-conduct::graph::who`,
-  C2) and `graph send --to` (`aoide-conduct::graph::send`, C3) both call
+  C2) and `send --to` (`aoide-conduct::graph::send`, C3) both call
   `resolve` directly. `resolve_with_hub` (P-D5) composes it with the hub
   preference (`peer_store::Peer.hub`): a hub-designated peer is offered as
   one last, least-specific `Remote` candidate only on `resolve`'s own
   `NotFound` — every earlier precedence tier is untouched. As of P-D5 it is
-  a tested library function only; `graph send --to`'s live call site still
+  a tested library function only; `send --to`'s live call site still
   calls plain `resolve` (the same "land the function, wire a caller later"
   order this module's own tier-5 `peer/<rest>` grammar went through).
 - `inbox` — the durable per-host message store (messaging plan P-C6,
   `state/inbox.json`, CONTRACTS.md §4): every message that lands in a local
   session, filed by `conduct`'s `deliver_local` success path — the ONE
-  writer that covers a direct `graph send`, a `--to` local resolve, a
+  writer that covers a direct `send`, a `--to` local resolve, a
   `pending approve` re-drive, AND the A2A server's `do_inject` (which
   reaches `deliver_local` through the same `session_send` door). Capped at
   200, oldest-drop, atomic writes (`herald::LEDGER_CAP`'s fold-and-cap

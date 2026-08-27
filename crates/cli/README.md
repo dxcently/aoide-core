@@ -39,8 +39,8 @@ depends on it.
 
 ## How it composes
 
-80 command paths (core's headless-capable, agent-orchestration surface: the
-project/session graph (including `graph resurrect`, P-D8's ledger-backed
+73 command paths (core's headless-capable, agent-orchestration surface: the
+project/session graph (including `resurrect`, its ledger-backed
 session revival), A2A, peers (including the `peer hub` designation,
 P-D5, the `peer pair request|pending|approve|reject` pairing ceremony,
 P-P2, the `peer allow <name> <cap> on|off` closed-capability grant/

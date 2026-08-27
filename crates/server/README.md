@@ -60,7 +60,7 @@ the inbound half of the two-door contract (the outbound half is
   back as a hand edit. **The watcher itself is a single `Arc<Mutex<
   HandEditWatcher>>` (task #92), shared between the tick thread and
   `handle_conn`'s connection threads** — not tick-private: a dispatched
-  session command (`graph session start/end`/etc., `{"op":"dispatch"}`) writes
+  session command (`session start/end`/etc., `{"op":"dispatch"}`) writes
   stage files on ITS OWN connection thread, not the tick's, so
   `rebaseline_stage_roster` re-baselines the WHOLE roster after every
   completed dispatch (roster-wide, not a per-command "which files did this
@@ -72,13 +72,13 @@ the inbound half of the two-door contract (the outbound half is
   more things every iteration: `reconcile_graph_projection(changed_files)`
   re-derives `state/stage/graph.json` (via `aoide_conduct::graph::restage_graph`,
   the same function every project/session mutation site already calls — the
-  `graph emit` CLI command was retired in favor of `graph prune` — no forked
+  `graph emit` CLI command was retired in favor of the resync now spelled `session prune` — no forked
   logic) whenever `sessions.json`/`hooks.json` is among the
   files the sweep just reported changed, so an out-of-band write (the
   direct-fallback CLI path, or a hand edit) is folded into the projection
   on the very next tick rather than waiting for the next dispatch to touch
   it; `run_internal_reap` calls the SAME `aoide_conduct::reap::
-  reap_and_announce` `graph reap` always runs, every `REAP_EVERY_TICKS`
+  reap_and_announce` `session reap` always runs, every `REAP_EVERY_TICKS`
   (12) ticks (~12s, matching the systemd timer's own cadence), re-baselining
   `HandEditWatcher` via `note_own_write` for whatever it touched so its own
   sweep is never mistaken for a hand edit next tick. Neither producer keeps
@@ -86,7 +86,7 @@ the inbound half of the two-door contract (the outbound half is
   the stage files fresh, so "fold in the newest write" falls directly out
   of "the file on disk is the single source of truth at every instant";
   `daemon::handle_conn`'s `dispatch` op is also how a REMOTE `graph
-  session start/phase/end/hook`/`graph reap` call actually executes once
+  session start/phase/end/hook`/`session reap` call actually executes once
   routed here — `internal_invocation` builds the same shape of
   `Invocation { door: Door::Daemon, .. }` for the tick's own internal
   calls, so the tick's writes and a routed client's writes go through
@@ -103,9 +103,9 @@ the inbound half of the two-door contract (the outbound half is
   real reboot (a changed epoch) reopens the guard. On a fresh boot, for
   EVERY `autoResume` project (`projects.json`, P-D8) — unconditionally, no
   liveness check here — calls `aoide_conduct::graph::session_resurrect`
-  in-process (`Door::Daemon`) — the identical command core `graph resurrect
+  in-process (`Door::Daemon`) — the identical command core `resurrect
   --project` runs over the CLI, the same in-process-call pattern
-  `run_internal_reap` already uses for `graph reap`. Liveness lives one
+  `run_internal_reap` already uses for `session reap`. Liveness lives one
   layer down: `session_resurrect`'s own bare-mode selection
   (`carried_selection`, durable-sessions plan P-C4) drops any carried id
   already alive in `sessions.json` per candidate before spawning anything,
@@ -128,7 +128,7 @@ the inbound half of the two-door contract (the outbound half is
   in `aoide-client`. Two `message/send` arms, two different relationships to
   the inbox (messaging plan P-C6, `state/inbox.json`): `do_inject` (Inject,
   an EXISTING session) delivers through `aoide_conduct::graph::session_send`
-  — the same door `graph send` uses — which is where a delivered message
+  — the same door `send` uses — which is where a delivered message
   gets filed; `do_inject` itself files no entry of its own, since its
   Invocation can only ever reach `session_send`'s LOCAL branch (see
   `do_inject`'s doc comment). `do_spawn` (Spawn, a BRAND-NEW session) types

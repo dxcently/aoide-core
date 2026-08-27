@@ -103,7 +103,7 @@ never the inbound/serve half (that's `aoide-server`).
   also exposes two
   non-command functions that are the `conduct → client` edge's crossing
   points: `pull_peer_live` (`who`'s live per-peer probe, read-only) and
-  `send_message_to_peer` (`graph send --to <peer>/<query>`'s delivery,
+  `send_message_to_peer` (`send --to <peer>/<query>`'s delivery,
   workstream C3 — POSTs `message/send` with an explicit `contextId` naming
   the resolved remote session). **Outbound bearer presentation (task
   #84)**: `peer add --bearer-secret <name>` records a per-peer
@@ -176,9 +176,9 @@ rather than a second wire client written here).
 test), and `cli` depend on it. **The `conduct → client` edge is intentional,
 not technical debt**: `conduct`'s `who` presence command (workstream C2,
 landed) calls this crate's `commands::pull_peer_live` for its live
-per-peer probe, `graph send --to`'s remote branch (workstream C3, landed)
+per-peer probe, `send --to`'s remote branch (workstream C3, landed)
 calls `commands::send_message_to_peer` to deliver, and (P-D6) every
-session-write handler (`graph session start/phase/end/hook`, `graph reap`)
+session-write handler (`session start/phase/end/hook`, `session reap`)
 calls `daemon::daemon_dispatch` first — the edge stays even though the
 original reason (`screen/send.rs`) moved out to the `screen` crate at P-A1
 (`docs/architecture/PACKAGE-LAYOUT.md`, "Verified facts").
