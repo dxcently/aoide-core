@@ -1745,6 +1745,7 @@ mod tests {
             harness_session_id: None,
             resumed_from: None,
             origin: None,
+            restore: None,
             extra: Map::new(),
         }
     }

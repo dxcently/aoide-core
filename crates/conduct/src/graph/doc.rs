@@ -551,6 +551,13 @@ pub(crate) fn drop_sessions(
 /// eprintln'd and swallowed, never propagated onto the caller's own
 /// stage-write success — same posture as every other best-effort side
 /// channel in this crate (the reap toast, the transcript refresh).
+/// `restore` (P-C5, durable-sessions plan) is projected verbatim off the
+/// live record — never re-derived here, and never a `/proc` read: by the
+/// time either roster-exit path calls this, the process this line is about
+/// may already be gone (`reap_inner` in particular calls it AFTER setting
+/// `state = "done"`), so the record's own `restore` snapshot, captured
+/// continuously by the PTY tick while the session was alive, is the only
+/// honest source.
 pub(crate) fn ledger_session_exit(rec: &SessionRecord, ended_at: &str) {
     let entry = aoide_storage::ledger::LedgerEntry {
         v: 0,
@@ -564,6 +571,7 @@ pub(crate) fn ledger_session_exit(rec: &SessionRecord, ended_at: &str) {
         ended_at: ended_at.to_string(),
         resumed_from: rec.resumed_from.clone(),
         origin: rec.origin.clone(),
+        restore: rec.restore.clone(),
     };
     if let Err(e) = aoide_storage::ledger::append_ledger_entry(&entry) {
         eprintln!(
@@ -1218,5 +1226,51 @@ mod tests {
             out.contains(&format!("● {host}/root/sess-legacy-full-id  claude  idle")),
             "legacy record degrades to host/role/full-id, never a truncated fake: {out}"
         );
+    }
+    #[test]
+    fn ledger_session_exit_projects_restore_verbatim_even_after_state_done() {
+        // P-C5 (durable-sessions plan): `reap_inner` overwrites `state` to
+        // "done" BEFORE calling this function — `restore.idle` must survive
+        // that mutation untouched, since it is its OWN field, never read
+        // back off `state`. This test pins the projection directly against
+        // `ledger_session_exit`, independent of which roster-exit path
+        // called it.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STATE_DIR"]);
+        let state = unique_stage("ledger-restore");
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+
+        let mut rec = session("term-1", "/home/khoa/Aoide", "idle", "2026-01-01T00:00:00Z", None);
+        rec.restore = Some(aoide_storage::records::RestoreSnapshot {
+            cwd: Some("/home/khoa/Aoide".into()),
+            idle: true,
+            argv: None,
+            typed: Some("echo hi".into()),
+        });
+        rec.state = "done".to_string(); // the reap-path ordering hazard this field survives.
+
+        ledger_session_exit(&rec, "2026-01-01T01:00:00Z");
+
+        let lines = aoide_storage::ledger::read_ledger().unwrap();
+        let mine: Vec<_> = lines.iter().filter(|l| l.session_id == "term-1").collect();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].restore, rec.restore);
+
+        let _ = std::fs::remove_dir_all(&state);
+    }
+    #[test]
+    fn ledger_session_exit_writes_explicit_null_when_no_restore() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STATE_DIR"]);
+        let state = unique_stage("ledger-restore-null");
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+
+        let rec = session("agent-1", "/w", "done", "2026-01-01T00:00:00Z", None);
+        ledger_session_exit(&rec, "2026-01-01T01:00:00Z");
+
+        let raw = std::fs::read_to_string(aoide_storage::ledger::session_ledger_path()).unwrap();
+        assert!(raw.contains("\"restore\":null"), "line: {raw}");
+
+        let _ = std::fs::remove_dir_all(&state);
     }
 }

@@ -41,6 +41,53 @@ pub struct Project {
     pub auto_resume: bool,
 }
 
+/// A conducted TERMINAL's continuously-captured restore snapshot (P-C5,
+/// durable-sessions plan) — what the shell was doing at the last ~1 Hz PTY
+/// tick (`aoide-conduct`'s `conduct_refresh_shell`/`restore_snapshot`), so a
+/// LATER phase's `graph resurrect` can bring a carried terminal back to more
+/// than a bare cwd. Captured continuously in the live `conduct` process and
+/// carried on the record change-only, exactly like `cwd`/`activity`/`state`
+/// — never computed at reap time: by the time a sweep condemns a session its
+/// process is already gone (that is the signal it reaped on), so a `/proc`
+/// read there returns nothing, every time, for the exact case this exists
+/// for. Embedded identically on both `SessionRecord.restore` (additive,
+/// `skip_serializing_if`) and `aoide_storage::ledger::LedgerEntry.restore`
+/// (always serializes, per that file's own closed-historical-record
+/// discipline) — this struct's own fields never use `skip_serializing_if`,
+/// so a populated snapshot reads the same complete shape in either home.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct RestoreSnapshot {
+    /// The shell's live working directory at the last tick. `None` when
+    /// unreadable (a permissions edge case, or the process exited mid-read).
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Whether the pty's foreground process group was the bare shell itself
+    /// (`fg <= 0 || fg == shell_pid`, the same predicate `shell_snapshot`
+    /// computes for `state`) — kept as ITS OWN field rather than read back
+    /// off `state` later: the reap sweep overwrites `state` to `"done"`
+    /// BEFORE its ledger write, so idleness is unrecoverable from `state` by
+    /// then.
+    #[serde(default)]
+    pub idle: bool,
+    /// RAW, uncollapsed, unclipped `argv` off `/proc/<fg>/cmdline`
+    /// (`proc_argv`) — never `proc_command`'s basename-collapsed,
+    /// 48-char-truncated DISPLAY label, which would re-exec the wrong or a
+    /// truncated binary. `None` while `idle` (no foreground process to
+    /// capture) or when `/proc` is unreadable.
+    #[serde(default)]
+    pub argv: Option<Vec<String>>,
+    /// The reconstructed unsubmitted prompt line — REFUSAL-based, never a
+    /// guess: `Some` only for a clean, unedited keystroke run since the last
+    /// submit; any readline-editing byte (an escape sequence, `^R`, Tab,
+    /// `^U`/`^W`) or invalid UTF-8 poisons it to `None` instead. Only ever
+    /// populated when `idle` is true — a shell mid-command has no prompt
+    /// line to reconstruct. A silently WRONG `typed` would put text the
+    /// operator never composed one keystroke from running; `None` is a
+    /// fully acceptable product of this capture, a guess is not.
+    #[serde(default)]
+    pub typed: Option<String>,
+}
+
 /// One session record (`song/stage/sessions.json`, written by shellbridge).
 /// `parentSessionId` is the optional additive spawned-by edge; `extra`
 /// round-trips any fields this version does not know about.
@@ -271,6 +318,16 @@ pub struct SessionRecord {
     /// projects it verbatim into the durable session ledger on exit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// Additive/v0-safe (P-C5, durable-sessions plan): a conducted SHELL's
+    /// continuously-captured restore snapshot (`RestoreSnapshot`, above) —
+    /// cwd/idle/argv/typed off the PTY tick. Absent for every non-shell
+    /// session and every legacy record predating this field; readers must
+    /// tolerate both forms and round-trip fields they do not know.
+    /// Consumed internally (`doc.rs::ledger_session_exit`'s projection into
+    /// the durable ledger's own `restore`) rather than rendered into
+    /// `graph.json`, like `headless`/`hookAncestry`/`origin` above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore: Option<RestoreSnapshot>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -617,5 +674,38 @@ mod tests {
         let legacy: SessionRecord =
             serde_json::from_str(r#"{ "sessionId": "s", "windowAddress": "0x1" }"#).unwrap();
         assert_eq!(legacy.petname, None);
+    }
+    #[test]
+    fn session_record_restore_round_trips_and_stays_absent_when_unset() {
+        // serde: `restore` serialises as a nested object when Some, and is
+        // skipped (skip_serializing_if) when None — additive/v0-safe on the
+        // wire, matching the `petname`/`logPath` fields' contract above.
+        let mut rec = SessionRecord {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        rec.restore = Some(RestoreSnapshot {
+            cwd: Some("/home/khoa/Aoide".into()),
+            idle: true,
+            argv: None,
+            typed: Some("cargo test -p aoide-conduct".into()),
+        });
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("\"restore\":{"), "serialised: {json}");
+        assert!(json.contains("\"typed\":\"cargo test -p aoide-conduct\""), "serialised: {json}");
+        let back: SessionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.restore, rec.restore);
+
+        // A record with no restore omits the key entirely (no null noise) and
+        // a legacy record with no `restore` field parses to None.
+        let bare = SessionRecord {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        let bare_json = serde_json::to_string(&bare).unwrap();
+        assert!(!bare_json.contains("restore"), "serialised: {bare_json}");
+        let legacy: SessionRecord =
+            serde_json::from_str(r#"{ "sessionId": "s", "windowAddress": "0x1" }"#).unwrap();
+        assert_eq!(legacy.restore, None);
     }
 }

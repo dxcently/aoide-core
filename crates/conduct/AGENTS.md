@@ -157,6 +157,48 @@
   its own lineage. Both carve-outs must move together: widening or
   narrowing `lineage_of` changes both call sites at once, by construction —
   don't let one drift from the other with a hand-rolled duplicate.
+- **`typed` is REFUSAL-based, never best-effort reconstruction (P-C5,
+  durable-sessions plan) — the single most important invariant in this
+  crate's restore capture.** Readline editing (arrow keys, `^R` history
+  search, Tab completion, `^U`/`^W` kills) means the raw keystroke stream
+  written into the pty master is NOT the shell's prompt buffer the moment
+  any of it happens — a byte-for-byte replay would be WRONG, not merely
+  lossy, and a silently wrong `typed` puts text the operator never composed
+  one keystroke from running (a LATER phase preloads it into a resurrected
+  terminal's own prompt). `conduct.rs::TypedLineBuffer::feed` POISONS the
+  current line to `None` on any byte below `0x20` other than `\r`/`\n`
+  (which submit-clear it instead), or `0x7f` — never attempts to interpret
+  what the edit did. A line running past `TYPED_LINE_CAP` poisons for the
+  same reason: a clipped line is wrong text, not a short one. `typed()`
+  additionally refuses non-UTF-8 and an empty line. Don't widen the clear
+  set past `\r`/`\n`, don't let overflow truncate instead of refusing, and
+  don't try to make a poisoned line recoverable by inspecting WHICH control
+  byte fired — the whole point is that `None` is a fully acceptable product
+  of this capture and a guess is not.
+- **`RestoreSnapshot.idle` is captured as its OWN field, never inferred
+  from `state` (P-C5).** `reap.rs`'s sweep assigns `s.state = "done"`
+  BEFORE calling `ledger_session_exit` — by the time the ledger line is
+  written, the pre-exit idle/working state is already gone from `state`.
+  `restore_snapshot` computes `idle` off the SAME `fg <= 0 || fg ==
+  shell_pid` predicate `shell_snapshot` uses for `state`, but stores it
+  independently, so a later reader (the ledger, and eventually a resurrect
+  consumer) never has to reconstruct it from a field the reap path has
+  already overwritten.
+- **`proc_argv` and `proc_command` are deliberately two functions, never
+  merged (P-C5).** `proc_command` is a DISPLAY label — it basename-
+  collapses `argv[0]` and truncates at 48 chars — built for the roster's
+  `activity` column. `proc_argv` is a re-exec CANDIDATE — raw, uncollapsed,
+  unclipped `/proc/<pid>/cmdline` — built for `RestoreSnapshot.argv`, which
+  a later phase re-execs. Reusing `proc_command` for `argv` would re-exec
+  the wrong binary (a collapsed `argv[0]`) or a truncated one; don't share
+  the two even though they both start from the same `/proc` read
+  (`parse_cmdline` is the pure split they DO share).
+- **`typed_capture_active` gates the `TypedLineBuffer`'s existence, not just
+  its output (P-C5).** A headless conduct never reads stdin at all
+  (`read_stdin == false`, unconditionally — no controlling tty), so it has
+  no typed line, ever; don't "helpfully" instantiate the buffer anyway and
+  rely on `restore_snapshot`'s idle-gate to hide it — the buffer must not
+  exist for a session that structurally cannot have a prompt to reconstruct.
 - **`hookAncestry` is stamped ONCE, at a hook session's own registration,
   never touched again.** `session_store::stamp_hook_ancestry` is the only
   writer (change-only: it refuses to overwrite an already-populated

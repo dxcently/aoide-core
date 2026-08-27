@@ -18,6 +18,7 @@
 //! state; readers tolerate a partial trailing line same as any other
 //! append-only log this codebase writes).
 
+use crate::records::RestoreSnapshot;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
@@ -58,6 +59,17 @@ pub struct LedgerEntry {
     /// closed-historical-record discipline every other field here holds.
     #[serde(rename = "origin", default)]
     pub origin: Option<String>,
+    /// Projected verbatim from `SessionRecord.restore` (P-C5,
+    /// durable-sessions plan) — a conducted terminal's continuously-captured
+    /// cwd/idle/argv/typed at the exact instant it left the roster, `None`
+    /// for every non-shell session and every entry predating this field.
+    /// Always serializes (never `skip_serializing_if`), same
+    /// closed-historical-record discipline every other field here holds —
+    /// including `RestoreSnapshot`'s OWN fields when this is `Some`, so a
+    /// populated `restore` reads the same complete shape here as it does on
+    /// the live record.
+    #[serde(default)]
+    pub restore: Option<RestoreSnapshot>,
 }
 
 /// The ledger's path: `state/session-ledger.jsonl`, under
@@ -138,6 +150,12 @@ mod tests {
             ended_at: "2026-08-24T01:00:00Z".to_string(),
             resumed_from: None,
             origin: Some("peer:yomi-strix".to_string()),
+            restore: Some(RestoreSnapshot {
+                cwd: Some("/home/khoa/Aoide".to_string()),
+                idle: true,
+                argv: None,
+                typed: Some("cargo test -p aoide-conduct".to_string()),
+            }),
         };
         append_ledger_entry(&entry).unwrap();
 
@@ -147,9 +165,34 @@ mod tests {
         assert_eq!(back[0].harness_session_id.as_deref(), Some("h1"));
         assert_eq!(back[0].resumed_from, None);
         assert_eq!(back[0].origin.as_deref(), Some("peer:yomi-strix"));
+        assert_eq!(back[0].restore, entry.restore);
 
         std::env::remove_var("AOIDE_STATE_DIR");
         let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn restore_absent_serializes_as_explicit_null_never_omitted() {
+        // Risk #7 (durable-sessions plan, P-C5): `restore` must serialize
+        // unconditionally like every other `LedgerEntry` field — a
+        // `skip_serializing_if` here would silently violate the closed-
+        // historical-record discipline `CONTRACTS.md` fixes for this file.
+        let entry = LedgerEntry {
+            session_id: "s1".to_string(),
+            ..Default::default()
+        };
+        let line = serde_json::to_string(&entry).unwrap();
+        assert!(line.contains("\"restore\":null"), "serialised: {line}");
+    }
+
+    #[test]
+    fn an_old_line_with_no_restore_key_parses_as_none() {
+        // A ledger line written before this field existed has no `restore`
+        // key at all — `#[serde(default)]` must still parse it, not fail
+        // the whole line (which `read_ledger` would otherwise silently skip).
+        let old_line = r#"{"v":0,"sessionId":"s0","agent":"claude","cwd":"/x","startedAt":"2026-01-01T00:00:00Z","endedAt":"2026-01-01T01:00:00Z"}"#;
+        let entry: LedgerEntry = serde_json::from_str(old_line).unwrap();
+        assert_eq!(entry.restore, None);
     }
 
     #[test]

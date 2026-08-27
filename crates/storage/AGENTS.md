@@ -68,6 +68,16 @@
   Don't add a "compact the ledger" or "delete old entries" path without
   re-reading `docs/architecture/AOIDED.md`'s "L5" — the design leans on
   this file staying a complete, permanent record.
+- **`RestoreSnapshot`'s own fields never carry `skip_serializing_if`, in
+  EITHER of its two homes (P-C5, durable-sessions plan).** The type is
+  embedded on both `SessionRecord.restore` (additive, the outer
+  `Option<RestoreSnapshot>` DOES skip when `None`) and
+  `LedgerEntry.restore` (always present, possibly `null`) — but once a
+  snapshot is `Some`, its own `cwd`/`idle`/`argv`/`typed` fields always
+  serialize in both places, so a populated `restore` reads the identical
+  complete shape whichever file it came from. Adding `skip_serializing_if`
+  to one of `RestoreSnapshot`'s own fields would make the two homes diverge
+  in shape for no reason — don't.
 - **`peer_store::upsert_paired_peer` is the ONE write site for `Peer.pubkey`/
   `Peer.verified` (P-P2).** `peer add` never sets either field; a caller
   wanting to record a verified key relationship goes through this function,

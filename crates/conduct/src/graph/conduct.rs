@@ -7,7 +7,8 @@
 
 use super::doc::restage_graph;
 use super::model::{
-    canonical_state, load_stage, sessions_path, write_stage, SessionsFile, STAGE_GRAPH_VERSION,
+    canonical_state, load_stage, sessions_path, write_stage, RestoreSnapshot, SessionsFile,
+    STAGE_GRAPH_VERSION,
 };
 use super::session_store::{do_session_end, do_session_start, set_session_log_path, stamp_headless, stamp_origin};
 use super::window::{discover_window_address, resolve_registration_parent};
@@ -361,11 +362,7 @@ fn proc_command(pid: i32) -> Option<String> {
         }
     };
     if let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) {
-        let argv: Vec<String> = raw
-            .split(|b| *b == 0)
-            .filter(|p| !p.is_empty())
-            .map(|p| String::from_utf8_lossy(p).into_owned())
-            .collect();
+        let argv = parse_cmdline(&raw);
         if let Some(friendly) = friendly_editor_command(&argv) {
             return Some(clip(&friendly));
         }
@@ -377,6 +374,34 @@ fn proc_command(pid: i32) -> Option<String> {
         .ok()
         .map(|c| clip(c.trim()))
         .filter(|c| !c.is_empty())
+}
+
+/// Pure NUL-split of a raw `/proc/<pid>/cmdline` buffer into argv — split out
+/// of [`proc_command`]/[`proc_argv`] so the split itself is unit-testable
+/// against a synthesized buffer without a real `/proc` read. Empty segments
+/// (a trailing NUL, or two in a row) are dropped.
+fn parse_cmdline(raw: &[u8]) -> Vec<String> {
+    raw.split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect()
+}
+
+/// RAW `argv` off `/proc/<pid>/cmdline` — the actual invocation, uncollapsed
+/// and UNCLIPPED, unlike [`proc_command`]'s DISPLAY label (basename-collapsed
+/// `argv[0]`, 48-char-truncated). A restore snapshot's `argv` must be an
+/// exact re-exec candidate, not a shortened label — reusing `proc_command`
+/// here would re-exec the wrong binary or a truncated one. `None` when
+/// `/proc/<pid>/cmdline` is unreadable (the process already gone, a
+/// permissions edge case) or empty.
+pub(in crate::graph) fn proc_argv(pid: i32) -> Option<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let argv = parse_cmdline(&raw);
+    if argv.is_empty() {
+        None
+    } else {
+        Some(argv)
+    }
 }
 
 /// Just the process's `comm` (e.g. `bash`) — the label for an idle shell sitting
@@ -422,7 +447,8 @@ fn sudo_awaiting(fg_is_sudo: bool, fg_has_children: Option<bool>, booster_recent
 /// Update a conducted session's live shell fields — `cwd`, `activity` (the
 /// current foreground command, or cleared), `state` (idle at the prompt,
 /// working while a command runs, or forced `awaiting` while blocked on
-/// `sudo`), and `needsSudo` — CHANGE-ONLY, under the stage lock, and re-stage
+/// `sudo`), `needsSudo`, and `restore` (the P-C5 continuous capture snapshot,
+/// see [`RestoreSnapshot`]) — CHANGE-ONLY, under the stage lock, and re-stage
 /// graph.json only when it actually wrote. Called ~1 Hz from conduct's PTY
 /// tick for SHELL sessions (an agent's state/activity come from hooks, so
 /// conduct never drives those). No-op for an unregistered id.
@@ -432,6 +458,7 @@ fn do_session_refresh(
     activity: Option<&str>,
     state: &str,
     needs_sudo: bool,
+    restore: RestoreSnapshot,
 ) {
     with_stage_lock(|| {
         let mut file: SessionsFile = match load_stage(&sessions_path()) {
@@ -464,6 +491,10 @@ fn do_session_refresh(
             let want = if needs_sudo { Some(true) } else { None };
             if s.needs_sudo != want {
                 s.needs_sudo = want;
+                changed = true;
+            }
+            if s.restore.as_ref() != Some(&restore) {
+                s.restore = Some(restore.clone());
                 changed = true;
             }
         }
@@ -534,10 +565,47 @@ fn shell_snapshot(
     (state, activity, needs_sudo)
 }
 
+/// Pure resolution of a conducted shell's P-C5 restore snapshot from the pty
+/// foreground pgid — mirrors [`shell_snapshot`]'s shape exactly (injected
+/// `argv_of` lookup, pure, unit-tested). `idle` reuses the SAME `fg <= 0 ||
+/// fg == shell_pid` predicate `shell_snapshot` computes for `state` — kept as
+/// its own field here rather than read back off `state` later, since the
+/// reap sweep overwrites `state` to `"done"` before its ledger write.
+/// `argv` is `None` while idle (no foreground process to capture) and RAW
+/// (uncollapsed, unclipped) `/proc/<fg>/cmdline` otherwise — never
+/// `proc_command`'s DISPLAY label, which would re-exec the wrong or a
+/// truncated binary. `typed` is gated to `idle` HERE, structurally, rather
+/// than trusted to the caller: a shell mid-command has no prompt line to
+/// reconstruct, so any `typed` the caller passes while working is dropped.
+fn restore_snapshot(
+    fg: i32,
+    shell_pid: i32,
+    cwd: Option<String>,
+    typed: Option<String>,
+    argv_of: impl Fn(i32) -> Option<Vec<String>>,
+) -> RestoreSnapshot {
+    let idle = fg <= 0 || fg == shell_pid;
+    RestoreSnapshot {
+        cwd,
+        idle,
+        argv: if idle { None } else { argv_of(fg) },
+        typed: if idle { typed } else { None },
+    }
+}
+
 /// One conduct-tick refresh for a SHELL session: read the pty's foreground
 /// process group and the live cwd, and push cwd + the current command + the
-/// idle/working state via [`shell_snapshot`].
-fn conduct_refresh_shell(id: &str, master: RawFd, shell_pid: i32, booster_recent: bool) {
+/// idle/working state via [`shell_snapshot`], plus the P-C5 restore snapshot
+/// via [`restore_snapshot`]. `typed` comes from `conduct_multiplex`'s own
+/// typed-line buffer (`None` for a headless session, which never reads
+/// stdin) — this function has no access to the keystroke stream itself.
+fn conduct_refresh_shell(
+    id: &str,
+    master: RawFd,
+    shell_pid: i32,
+    booster_recent: bool,
+    typed: Option<String>,
+) {
     let fg = unsafe { libc::tcgetpgrp(master) };
     let cwd = cwd_for(fg, shell_pid, proc_cwd);
     let (state, activity, needs_sudo) = shell_snapshot(
@@ -548,7 +616,8 @@ fn conduct_refresh_shell(id: &str, master: RawFd, shell_pid: i32, booster_recent
         proc_command,
         proc_has_children,
     );
-    do_session_refresh(id, cwd.as_deref(), activity.as_deref(), state, needs_sudo);
+    let restore = restore_snapshot(fg, shell_pid, cwd.clone(), typed, proc_argv);
+    do_session_refresh(id, cwd.as_deref(), activity.as_deref(), state, needs_sudo, restore);
 }
 
 /// True iff the `[sudo] password for` prompt appears at the start of a line in
@@ -562,6 +631,79 @@ fn scan_for_sudo_prompt(chunk: &[u8]) -> bool {
         .windows(NEEDLE.len())
         .enumerate()
         .any(|(i, w)| w == NEEDLE && (i == 0 || chunk[i - 1] == b'\n' || chunk[i - 1] == b'\r'))
+}
+
+/// Cap on the P-C5 typed-line buffer, bytes.
+const TYPED_LINE_CAP: usize = 4096;
+
+/// The P-C5 typed-but-unsubmitted prompt-line buffer, reconstructed from the
+/// raw keystroke stream written into the pty master — from BOTH real stdin
+/// and injection connections (`conduct_multiplex`'s two write sites both
+/// `feed` it the same way, since both land in the SAME shell readline
+/// buffer). REFUSAL-based, not reconstruction-based: readline editing (arrow
+/// keys, `^R` history search, Tab completion, `^U`/`^W` kills) means the
+/// keystroke stream is no longer the prompt buffer, so replaying it verbatim
+/// would be WRONG, not merely lossy — a silently wrong `typed` puts text the
+/// operator never composed one keystroke from running. Any control byte
+/// below `0x20` other than the two that SUBMIT the line (`\r`/`\n`), or
+/// `0x7f` (DEL), POISONS the buffer for the current line; `\r`/`\n`
+/// themselves CLEAR it (submitted) and lift any earlier poison, since the
+/// NEXT line starts clean. `typed()` additionally refuses non-UTF-8 and an
+/// empty line. Scoped to one CONDUCT process's lifetime — never persisted,
+/// never read back after the fact (see the module's own P-C5 note on why a
+/// `/proc` snapshot can't recover this).
+struct TypedLineBuffer {
+    buf: Vec<u8>,
+    poisoned: bool,
+}
+impl TypedLineBuffer {
+    fn new() -> Self {
+        TypedLineBuffer { buf: Vec::new(), poisoned: false }
+    }
+    /// Feed bytes written to the master. A line that runs past
+    /// `TYPED_LINE_CAP` POISONS rather than truncating: a clipped line is
+    /// wrong text, not merely short, and this buffer's whole contract is to
+    /// refuse the cases it cannot reconstruct exactly. The buffer stops
+    /// growing at the cap either way, so it never grows unbounded, and a
+    /// later `\r`/`\n` still clears normally.
+    fn feed(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            match b {
+                b'\r' | b'\n' => {
+                    self.buf.clear();
+                    self.poisoned = false;
+                }
+                0x7f => self.poisoned = true,
+                b if b < 0x20 => self.poisoned = true,
+                _ => {
+                    if self.buf.len() < TYPED_LINE_CAP {
+                        self.buf.push(b);
+                    } else {
+                        self.poisoned = true;
+                    }
+                }
+            }
+        }
+    }
+    /// The current line, or `None` when poisoned, empty (nothing typed since
+    /// the last submit), or not valid UTF-8.
+    fn typed(&self) -> Option<String> {
+        if self.poisoned || self.buf.is_empty() {
+            return None;
+        }
+        std::str::from_utf8(&self.buf).ok().map(str::to_string)
+    }
+}
+
+/// Whether a P-C5 typed-line buffer should even be instantiated: only an
+/// INTERACTIVE shell (`is_shell && read_stdin`) has a real readline prompt to
+/// reconstruct. A headless conduct never reads stdin at all
+/// (`read_stdin == false`, unconditionally — there is no controlling tty to
+/// read from), so it has no typed line, ever; a non-shell (an agent harness)
+/// has no shell prompt to begin with. Pure so the gating itself is
+/// unit-testable without spawning anything.
+fn typed_capture_active(is_shell: bool, read_stdin: bool) -> bool {
+    is_shell && read_stdin
 }
 
 /// The single-thread `poll()` multiplexer. Shuttles: real stdin → master (you
@@ -601,8 +743,17 @@ fn conduct_multiplex(
     // even if `tcgetpgrp` hasn't caught `sudo` as the foreground pgid yet.
     let mut sudo_prompt_seen_at: Option<std::time::Instant> = None;
     const SUDO_BOOSTER_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+    // P-C5: the typed-line buffer only exists for an interactive shell — a
+    // headless conduct never reads stdin (no prompt line to reconstruct) and
+    // an agent harness has no shell prompt at all.
+    let mut typed_buf = if typed_capture_active(is_shell, read_stdin) {
+        Some(TypedLineBuffer::new())
+    } else {
+        None
+    };
     if is_shell {
-        conduct_refresh_shell(id, master, shell_pid, false); // stamp initial cwd/state now.
+        let typed = typed_buf.as_ref().and_then(|b| b.typed());
+        conduct_refresh_shell(id, master, shell_pid, false, typed); // stamp initial cwd/state now.
     }
 
     loop {
@@ -639,7 +790,8 @@ fn conduct_multiplex(
             let booster_recent = sudo_prompt_seen_at
                 .map(|t| t.elapsed() < SUDO_BOOSTER_WINDOW)
                 .unwrap_or(false);
-            conduct_refresh_shell(id, master, shell_pid, booster_recent);
+            let typed = typed_buf.as_ref().and_then(|b| b.typed());
+            conduct_refresh_shell(id, master, shell_pid, booster_recent, typed);
             last_tick = std::time::Instant::now();
         }
 
@@ -685,7 +837,11 @@ fn conduct_multiplex(
                     libc::read(stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
                 };
                 if n > 0 {
-                    write_all_fd(master, &buf[..n as usize]);
+                    let n = n as usize;
+                    if let Some(tb) = typed_buf.as_mut() {
+                        tb.feed(&buf[..n]);
+                    }
+                    write_all_fd(master, &buf[..n]);
                 } else {
                     stdin_eof = true; // our own stdin closed; keep bridging the rest.
                 }
@@ -719,7 +875,13 @@ fn conduct_multiplex(
                 let n =
                     unsafe { libc::read(c, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
                 if n > 0 {
-                    write_all_fd(master, &buf[..n as usize]);
+                    let n = n as usize;
+                    // Injection bytes land in the SAME readline buffer real
+                    // stdin does (P-C5) — both count as typed the same way.
+                    if let Some(tb) = typed_buf.as_mut() {
+                        tb.feed(&buf[..n]);
+                    }
+                    write_all_fd(master, &buf[..n]);
                     still.push(c);
                 } else {
                     unsafe {
@@ -731,7 +893,11 @@ fn conduct_multiplex(
                     let n =
                         unsafe { libc::read(c, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
                     if n > 0 {
-                        write_all_fd(master, &buf[..n as usize]);
+                        let n = n as usize;
+                        if let Some(tb) = typed_buf.as_mut() {
+                            tb.feed(&buf[..n]);
+                        }
+                        write_all_fd(master, &buf[..n]);
                     } else {
                         break;
                     }
@@ -1219,6 +1385,167 @@ mod tests {
         assert_eq!(cwd_for(0, SHELL_PID, lookup), Some("/home/khoa".to_string()));
     }
     #[test]
+    fn parse_cmdline_splits_on_nul_and_drops_empty_segments() {
+        // A synthesized raw `/proc/<pid>/cmdline` buffer: NUL-separated,
+        // trailing NUL included (the kernel's real shape).
+        let raw = b"nvim\0notes.md\0";
+        assert_eq!(parse_cmdline(raw), vec!["nvim".to_string(), "notes.md".to_string()]);
+        // Two NULs in a row (an empty argv element) never produces an empty
+        // string in the output.
+        let raw2 = b"cargo\0\0test\0";
+        assert_eq!(parse_cmdline(raw2), vec!["cargo".to_string(), "test".to_string()]);
+        assert_eq!(parse_cmdline(b""), Vec::<String>::new());
+    }
+    #[test]
+    fn proc_argv_is_none_for_an_unreadable_pid() {
+        // A pid this large cannot exist as a real process on this box — the
+        // `/proc/<pid>/cmdline` read fails, and `proc_argv` must degrade to
+        // `None` rather than propagate the error. No process spawned.
+        assert_eq!(proc_argv(i32::MAX), None);
+    }
+    #[test]
+    fn restore_snapshot_idle_at_prompt_yields_no_argv() {
+        const SHELL_PID: i32 = 100;
+        let snap = restore_snapshot(
+            SHELL_PID,
+            SHELL_PID,
+            Some("/home/khoa/Aoide".to_string()),
+            Some("cargo test".to_string()),
+            |_| panic!("argv_of should not be consulted at the bare prompt"),
+        );
+        assert!(snap.idle);
+        assert_eq!(snap.argv, None);
+        assert_eq!(snap.cwd.as_deref(), Some("/home/khoa/Aoide"));
+        // `typed` passes through unchanged while idle.
+        assert_eq!(snap.typed.as_deref(), Some("cargo test"));
+    }
+    #[test]
+    fn restore_snapshot_working_yields_full_uncollapsed_argv_and_drops_typed() {
+        const SHELL_PID: i32 = 100;
+        const FG_PID: i32 = 200;
+        let snap = restore_snapshot(
+            FG_PID,
+            SHELL_PID,
+            Some("/home/khoa/Aoide".to_string()),
+            // A stale typed buffer from before the foreground command started
+            // — must be dropped, never leak through while a command runs.
+            Some("leftover".to_string()),
+            |pid| {
+                assert_eq!(pid, FG_PID);
+                Some(vec!["nvim".to_string(), "--cmd".to_string(), "lua x=1".to_string()])
+            },
+        );
+        assert!(!snap.idle);
+        assert_eq!(
+            snap.argv,
+            Some(vec!["nvim".to_string(), "--cmd".to_string(), "lua x=1".to_string()])
+        );
+        assert_eq!(snap.typed, None, "a shell mid-command has no prompt line to reconstruct");
+    }
+    #[test]
+    fn typed_capture_active_gates_on_shell_and_stdin() {
+        // Only an interactive shell has a real readline prompt to capture.
+        assert!(typed_capture_active(true, true));
+        // A headless conduct never reads stdin — no typed line, ever, even
+        // for a conducted shell.
+        assert!(!typed_capture_active(true, false));
+        // A non-shell (agent harness) has no shell prompt at all, headless
+        // or not.
+        assert!(!typed_capture_active(false, true));
+        assert!(!typed_capture_active(false, false));
+    }
+    #[test]
+    fn typed_line_buffer_accumulates_plain_text() {
+        let mut tb = TypedLineBuffer::new();
+        tb.feed(b"cargo");
+        tb.feed(b" test");
+        assert_eq!(tb.typed().as_deref(), Some("cargo test"));
+    }
+    #[test]
+    fn typed_line_buffer_injection_bytes_accumulate_the_same_as_stdin() {
+        // Two separate `feed` calls, standing in for one real-stdin read and
+        // one injection-connection read landing in the same buffer.
+        let mut tb = TypedLineBuffer::new();
+        tb.feed(b"echo ");
+        tb.feed(b"hello"); // as if this half arrived over the injection socket.
+        assert_eq!(tb.typed().as_deref(), Some("echo hello"));
+    }
+    #[test]
+    fn typed_line_buffer_carriage_return_and_newline_both_clear() {
+        let mut tb = TypedLineBuffer::new();
+        tb.feed(b"echo hi\r");
+        assert_eq!(tb.typed(), None, "a submitted line is empty, not the old text");
+        tb.feed(b"next line\n");
+        assert_eq!(tb.typed(), None);
+        tb.feed(b"third");
+        assert_eq!(tb.typed().as_deref(), Some("third"));
+    }
+    #[test]
+    fn typed_line_buffer_escape_byte_poisons_the_line() {
+        // An ESC (0x1b) — the lead byte of every arrow-key/cursor escape
+        // sequence — means the keystroke stream is no longer the prompt
+        // buffer. Refuse, don't guess.
+        let mut tb = TypedLineBuffer::new();
+        tb.feed(b"echo hi");
+        tb.feed(&[0x1b, b'[', b'A']); // an up-arrow sequence.
+        assert_eq!(tb.typed(), None);
+        // The poison holds even if more plain text follows on the SAME line.
+        tb.feed(b"more");
+        assert_eq!(tb.typed(), None);
+        // Submitting clears the poison — the NEXT line starts clean.
+        tb.feed(b"\n");
+        tb.feed(b"clean");
+        assert_eq!(tb.typed().as_deref(), Some("clean"));
+    }
+    #[test]
+    fn typed_line_buffer_ctrl_u_poisons_the_line() {
+        // ^U (0x15) — a readline line-kill — is exactly the "keystroke stream
+        // isn't the prompt buffer anymore" case this mechanism exists for.
+        let mut tb = TypedLineBuffer::new();
+        tb.feed(b"garbage");
+        tb.feed(&[0x15]);
+        assert_eq!(tb.typed(), None);
+    }
+    #[test]
+    fn typed_line_buffer_del_byte_poisons_the_line() {
+        let mut tb = TypedLineBuffer::new();
+        tb.feed(b"oops");
+        tb.feed(&[0x7f]); // backspace/DEL.
+        assert_eq!(tb.typed(), None);
+    }
+    #[test]
+    fn typed_line_buffer_tab_completion_poisons_the_line() {
+        let mut tb = TypedLineBuffer::new();
+        tb.feed(b"carg");
+        tb.feed(&[0x09]); // Tab — completion may rewrite the whole line.
+        assert_eq!(tb.typed(), None);
+    }
+    #[test]
+    fn typed_line_buffer_overflow_poisons_rather_than_truncating() {
+        let mut tb = TypedLineBuffer::new();
+        // Well past TYPED_LINE_CAP — must not panic or grow unbounded, and
+        // must refuse: a clipped line is WRONG text, not merely short, and
+        // handing back a prefix would be exactly the silent guess this
+        // buffer exists to avoid.
+        tb.feed(&[b'x'; 5000]);
+        assert_eq!(tb.typed(), None, "an overflowed line must never yield a truncated prefix");
+        // Submitting clears the poison — the NEXT line starts clean.
+        tb.feed(b"\n");
+        tb.feed(b"ok");
+        assert_eq!(tb.typed().as_deref(), Some("ok"));
+    }
+    #[test]
+    fn typed_line_buffer_invalid_utf8_yields_none() {
+        let mut tb = TypedLineBuffer::new();
+        tb.feed(&[0xff, 0xfe]); // not valid UTF-8, and not a poisoning byte.
+        assert_eq!(tb.typed(), None);
+    }
+    #[test]
+    fn typed_line_buffer_empty_line_yields_none() {
+        let tb = TypedLineBuffer::new();
+        assert_eq!(tb.typed(), None);
+    }
+    #[test]
     fn conduct_injects_socket_bytes_into_the_child() {
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "XDG_RUNTIME_DIR"]);
@@ -1458,40 +1785,53 @@ mod tests {
         )
         .unwrap();
 
+        let idle_restore = RestoreSnapshot { cwd: Some("/proj".into()), idle: true, argv: None, typed: None };
+        let working_restore = RestoreSnapshot {
+            cwd: Some("/proj".into()),
+            idle: false,
+            argv: Some(vec!["cargo".into(), "test".into()]),
+            typed: None,
+        };
+
         // At the prompt: idle, no activity, cwd tracked.
-        do_session_refresh("sh", Some("/proj"), None, "idle", false);
+        do_session_refresh("sh", Some("/proj"), None, "idle", false, idle_restore.clone());
         let s: SessionsFile = load_stage(&sessions_path()).unwrap();
         assert_eq!(s.sessions[0].state, "idle");
         assert_eq!(s.sessions[0].cwd, "/proj");
         assert_eq!(s.sessions[0].activity, None);
         assert_eq!(s.sessions[0].needs_sudo, None);
+        assert_eq!(s.sessions[0].restore, Some(idle_restore.clone()));
 
-        // A foreground command: working + the command as activity.
-        do_session_refresh("sh", Some("/proj"), Some("cargo test"), "working", false);
+        // A foreground command: working + the command as activity, and the
+        // restore snapshot's raw argv persists change-only alongside it.
+        do_session_refresh(
+            "sh", Some("/proj"), Some("cargo test"), "working", false, working_restore.clone(),
+        );
         let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
         assert_eq!(s2.sessions[0].state, "working");
         assert_eq!(s2.sessions[0].activity.as_deref(), Some("cargo test"));
         assert_eq!(s2.sessions[0].needs_sudo, None);
+        assert_eq!(s2.sessions[0].restore, Some(working_restore));
 
         // Blocked on sudo: state=awaiting and needsSudo=true, regardless of the
         // `state` string passed in (the caller already resolves the force in
         // `conduct_refresh_shell`, but do_session_refresh itself just persists
         // both fields change-only).
-        do_session_refresh("sh", Some("/proj"), Some("sudo"), "awaiting", true);
+        do_session_refresh("sh", Some("/proj"), Some("sudo"), "awaiting", true, idle_restore.clone());
         let s3: SessionsFile = load_stage(&sessions_path()).unwrap();
         assert_eq!(s3.sessions[0].state, "awaiting");
         assert_eq!(s3.sessions[0].needs_sudo, Some(true));
 
         // The prompt clears: needs_sudo=false CLEARS the field back to None
         // (never left as Some(false)) — change-only, so the key disappears.
-        do_session_refresh("sh", Some("/proj"), None, "idle", false);
+        do_session_refresh("sh", Some("/proj"), None, "idle", false, idle_restore.clone());
         let s4: SessionsFile = load_stage(&sessions_path()).unwrap();
         assert_eq!(s4.sessions[0].needs_sudo, None);
         let raw = std::fs::read_to_string(sessions_path()).unwrap();
         assert!(!raw.contains("needsSudo"), "cleared key must be absent: {raw}");
 
         // An unknown id is a safe no-op (never panics, never inserts).
-        do_session_refresh("nope", Some("/x"), Some("x"), "working", false);
+        do_session_refresh("nope", Some("/x"), Some("x"), "working", false, idle_restore);
         let s5: SessionsFile = load_stage(&sessions_path()).unwrap();
         assert_eq!(s5.sessions.len(), 1);
 

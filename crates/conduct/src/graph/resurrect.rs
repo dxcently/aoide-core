@@ -332,6 +332,7 @@ mod tests {
             ended_at: ended_at.to_string(),
             resumed_from: None,
             origin: None,
+            restore: None,
         }
     }
 

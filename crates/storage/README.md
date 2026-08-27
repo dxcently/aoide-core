@@ -135,6 +135,19 @@ cache (CONTRACTS.md §7). File-first by decision — no embedded database yet
   crate's own `records`/`ledger` section, and CONTRACTS.md's pending-queue
   note); nothing may ever gate on it without upgrading it to an
   authenticated channel first (task #63's lane).
+  `records::RestoreSnapshot`/`SessionRecord.restore`/`LedgerEntry.restore`
+  (P-C5, durable-sessions plan) are a conducted TERMINAL's continuously-
+  captured `{cwd, idle, argv, typed}` snapshot — the SAME `RestoreSnapshot`
+  type embedded on both, `origin`'s "additive live field, always-serialized
+  ledger field" shape again, except `RestoreSnapshot`'s OWN fields never use
+  `skip_serializing_if` in EITHER home, so a populated snapshot reads the
+  identical complete shape whichever file it's read from. `idle` is its own
+  field rather than inferred from `state`, deliberately: the reap sweep
+  overwrites `state` to `"done"` before its ledger write, so idleness would
+  otherwise be unrecoverable by the time `ledger_session_exit` runs.
+  `aoide-conduct` is the sole writer (its PTY tick, ~1 Hz) and the sole
+  reader of `typed`'s raw keystroke stream — this crate only holds the
+  shape, never the capture logic.
 - `carry` — the carry mark (durable-sessions plan, P-C1): `state/carry.json`,
   the set of session ids marked durable so a project's whole carried set can
   be resurrected together (`graph session carry on|off`, a later phase).
