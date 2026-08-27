@@ -27,23 +27,39 @@
   ~12s systemd timer's own `session reap` becomes a redundant backstop, never
   a third mechanism.
 - **`reap` collects two kinds of leavings a killed session left in
-  `$XDG_RUNTIME_DIR/aoide`, not one.** `sweep_orphan_sockets` and
-  `sweep_orphan_tunnels` (ssh-transport lane P-S5) are the SAME sweep pass
-  (`reap_inner`), modeled on each other line for line: only a roster-less,
-  settled candidate is ever touched, and a candidate whose session IS still
-  live is spared outright regardless of what a pid/port probe would say. The
-  tunnel sweep has one extra step the socket sweep never needed — an
-  orphaned record's `ssh -N` child may still be alive, so it is signaled
-  through `aoide_client::tunnel::kill_if_still_our_ssh` (never re-implemented
-  here; `aoide-conduct` sits above `aoide-client` in the crate DAG and reuses
-  it verbatim) before the record is unlinked. **Nothing about a tunnel may
-  become a resident daemon:** `session_store::do_session_end` closes a
-  session's own tunnels on its clean exit (`aoide_client::tunnel::
-  close_all_for_session`, the fast path, run AFTER the stage lock releases
-  since it may block on a real `waitpid`); `sweep_orphan_tunnels` is only the
-  backstop for the session that never got to run that exit path. A new
-  leaving-kind under this same runtime directory joins the sweep the same
-  way — never a separate cleanup mechanism.
+  `$XDG_RUNTIME_DIR/aoide`, not one.** `sweep_orphan_sockets` and the
+  ssh-transport lane's tunnel sweep are the SAME sweep pass conceptually:
+  only a roster-less, settled candidate is ever touched, and a candidate
+  whose session IS still live is spared outright regardless of what a
+  pid/port probe would say. **The two are NOT symmetric about the stage
+  lock, on purpose.** `sweep_orphan_sockets` runs entirely inside
+  `with_stage_lock` (`reap_inner`) because unlinking a leftover socket file
+  is cheap. A tunnel candidate's `ssh -N` child may still be alive, and
+  signaling it (`aoide_client::tunnel::kill_if_still_our_ssh` →
+  `terminate_pid`'s bounded `SIGTERM` + `waitpid`/`/proc` poll) can take up
+  to ~1s PER candidate — doing that under `.stage.lock` would serialize
+  every other stage writer (hooks, the ~1Hz conduct ticks, the window
+  listener, `session start`/`end`, `send`) for as long as it takes. So the
+  tunnel sweep is split: `reap_inner` only GATHERS candidates under the lock
+  (`orphan_tunnel_candidates` — roster/settle checks against already-loaded
+  state, no process signaling), and `reap` runs the KILL half
+  (`sweep_orphan_tunnels`, never re-implemented here; `aoide-conduct` sits
+  above `aoide-client` in the crate DAG and reuses `kill_if_still_our_ssh`
+  verbatim) AFTER `with_stage_lock` returns, folding the result into the
+  same `Outcome` the lock-held pass already built (the `gathered_addrs`/
+  `window_owners` split `reap` already holds for its own pre-lock window
+  gather is the same shape, mirrored on the other side of the lock instead).
+  **Any new candidate-collector that must probe or signal a live process
+  belongs on the post-lock side of this same split — never inside
+  `reap_inner` "for consistency" with the socket sweep.** Nothing about a
+  tunnel may become a resident daemon either way:
+  `session_store::do_session_end` closes a session's own tunnels on its
+  clean exit (`aoide_client::tunnel::close_all_for_session`, the fast path,
+  likewise run AFTER the stage lock releases since it may block on a real
+  `waitpid`); the reaper's tunnel sweep is only the backstop for the session
+  that never got to run that exit path. A new leaving-kind under this same
+  runtime directory joins the sweep the same way — never a separate cleanup
+  mechanism.
 - **Every session-write handler routes through `aoide_client::daemon::
   daemon_dispatch(inv)` FIRST, as its own first line, falling back to its
   pre-existing direct stage-write path byte-identically on `None` (P-D6,

@@ -673,42 +673,32 @@ fn sweep_orphan_sockets(live_ids: &HashSet<&str>, now_epoch: i64) -> Vec<String>
     swept
 }
 
-/// Unlink (and, when still alive, kill) the ssh tunnels left behind by
-/// sessions that are no longer on the roster, and return the
-/// `<sessionId>/<key>` pairs swept — [`sweep_orphan_sockets`]'s exact shape,
-/// one crate DAG hop further down: a tunnel record is `aoide-storage`'s
-/// (`aoide_storage::tunnel`), and the pid it names is `aoide-client`'s to
-/// signal (`aoide_client::tunnel::kill_if_still_our_ssh`) — this sweep never
-/// re-implements either, it only decides WHICH records qualify.
+/// GATHER phase of the ssh tunnel sweep — the half that runs INSIDE
+/// `with_stage_lock`, alongside `reap_inner`'s other roster reads. Decides
+/// WHICH tunnel records qualify as orphans (roster-less and settled) and
+/// returns them for [`sweep_orphan_tunnels`] to act on; touches only
+/// already-loaded state and a handful of file stats, nothing that can block
+/// for any real duration — see that function's own doc for why the KILL
+/// half must never run in here.
 ///
-/// `aoide-client::tunnel::open_or_reuse` makes a session's tunnel
-/// PERSISTENT for as long as that session lives (reused, never re-spawned,
-/// across every later cross-box call in the same session) and
-/// `do_session_end`'s fast path (`graph/session_store.rs`) already closes
-/// every tunnel a session opened on its own clean exit — this sweep is the
-/// SUPER+Q/SIGKILL backstop for the session that never got to run that exit
-/// path, the same relationship [`sweep_orphan_sockets`] holds with a killed
-/// `conduct`'s control socket. Left uncollected, the orphaned `ssh -N` child
-/// is exactly the resident-daemon shape the lane's design forbids.
-///
-/// Three guards, mirroring [`sweep_orphan_sockets`] line for line:
+/// Two guards, mirroring [`sweep_orphan_sockets`]:
 ///   * a record whose `sessionId` IS on the roster is skipped outright,
-///     whatever its pid probe would say — a live session's tunnel is never
-///     this sweep's business;
+///     whatever its pid probe would later say — a live session's tunnel is
+///     never this sweep's business;
 ///   * [`TUNNEL_SETTLE_SECS`] off the record FILE's own mtime spares an
 ///     infant record from the moment between the forward answering and
-///     `open_or_reuse` finishing its write;
-///   * a record whose file cannot be resolved or stat'd (a mid-write,
-///     torn-directory, or permission edge) is skipped, never treated as a
-///     hard error — `aoide_storage::tunnel::list_records` already holds this
-///     same tolerate-and-continue discipline for a record that fails to
-///     parse at all, and this sweep must never abort the rest of the
-///     directory over one unreadable entry.
-/// A dead pid costs nothing extra: `kill_if_still_our_ssh`'s own liveness
-/// check already turns the kill into a no-op, so both the dead-pid and the
-/// alive-pid branches converge on the same unconditional unlink below.
-fn sweep_orphan_tunnels(live_ids: &HashSet<&str>, now_epoch: i64) -> Vec<String> {
-    let mut swept = Vec::new();
+///     `open_or_reuse` finishing its write.
+/// A record whose file cannot be resolved or stat'd (a mid-write,
+/// torn-directory, or permission edge) is skipped, never treated as a hard
+/// error — `aoide_storage::tunnel::list_records` already holds this same
+/// tolerate-and-continue discipline for a record that fails to parse at
+/// all, and this pass must never abort the rest of the directory over one
+/// unreadable entry.
+fn orphan_tunnel_candidates(
+    live_ids: &HashSet<&str>,
+    now_epoch: i64,
+) -> Vec<aoide_storage::tunnel::TunnelRecord> {
+    let mut candidates = Vec::new();
     for rec in aoide_storage::tunnel::list_records() {
         if live_ids.contains(rec.session_id.as_str()) {
             continue;
@@ -724,6 +714,40 @@ fn sweep_orphan_tunnels(live_ids: &HashSet<&str>, now_epoch: i64) -> Vec<String>
         if !settled {
             continue;
         }
+        candidates.push(rec);
+    }
+    candidates
+}
+
+/// KILL phase of the ssh tunnel sweep — unlink (and, when still alive,
+/// kill) every candidate [`orphan_tunnel_candidates`] gathered, and return
+/// the `<sessionId>/<key>` pairs actually swept.
+///
+/// **Deliberately called OUTSIDE `with_stage_lock`, unlike
+/// [`sweep_orphan_sockets`].** A candidate's pid may still be a live `ssh`
+/// child, and `kill_if_still_our_ssh` → `terminate_pid` does a bounded
+/// `SIGTERM` + `waitpid`/`/proc` poll that can take up to ~1s PER kill —
+/// the exact cost `do_session_end` (`graph/session_store.rs`) already
+/// avoids paying under the lock for its own tunnel close. `.stage.lock` is
+/// a cross-process flock every other stage writer (hooks, the ~1Hz conduct
+/// ticks, the window listener, `session start`/`end`, `send`) blocks on;
+/// running N of these kills inside it would serialize the whole desktop
+/// for up to N seconds. The socket sweep never faces this because unlinking
+/// a leftover file has no comparable cost — a real asymmetry between the
+/// two sweeps, not an inconsistency. `orphan_tunnel_candidates` above is
+/// the only part that needs the lock (reading the roster mid-sweep), so
+/// that is all `reap_inner` runs under it; `reap` calls this function
+/// afterward, once the lock is already released.
+///
+/// A dead pid costs nothing extra: `kill_if_still_our_ssh`'s own liveness
+/// check already turns the kill into a no-op, so both the dead-pid and the
+/// alive-pid candidates converge on the same unconditional unlink below. A
+/// candidate whose record fails to remove (already gone, a permission
+/// edge) is simply not reported swept — never a hard error, and never
+/// counted as removed when it wasn't.
+fn sweep_orphan_tunnels(candidates: Vec<aoide_storage::tunnel::TunnelRecord>) -> Vec<String> {
+    let mut swept = Vec::new();
+    for rec in candidates {
         if proc_exists(rec.pid) {
             aoide_client::tunnel::kill_if_still_our_ssh(rec.pid, rec.local_port, rec.remote_port);
         }
@@ -834,8 +858,31 @@ pub fn reap(inv: &Invocation) -> Outcome {
         Some((addrs, owners)) => (Some(addrs), Some(owners)),
         None => (None, None),
     };
-    let mut outcome =
+    let (mut outcome, tunnel_candidates) =
         aoide_storage::fs::with_stage_lock(move || reap_inner(inv, gathered_addrs, window_owners));
+    // Finish the ssh tunnel sweep OUTSIDE the stage lock — `reap_inner` only
+    // GATHERED the candidates under it (`orphan_tunnel_candidates`); this is
+    // the KILL half (`sweep_orphan_tunnels`'s own doc has the full reasoning
+    // for why it must never run inside `with_stage_lock`). Folded into
+    // `changed` here, same as the reaped/dropped/decayed lines, so a
+    // tunnel-only pass still toasts on `reap_and_announce`'s "did anything
+    // change" check.
+    let swept_tunnels = sweep_orphan_tunnels(tunnel_candidates);
+    if !swept_tunnels.is_empty() {
+        outcome.message = format!(
+            "{}; unlinked {} orphaned tunnel(s)",
+            outcome.message,
+            swept_tunnels.len()
+        );
+        outcome.changed.extend(
+            swept_tunnels
+                .iter()
+                .map(|id| format!("unlinked orphaned ssh tunnel {id} (session gone)")),
+        );
+        if let Some(data) = outcome.data.as_mut() {
+            data["orphanTunnels"] = json!(swept_tunnels);
+        }
+    }
     // The refresh is reported but deliberately NOT folded into `changed`: that
     // vec is the sweep's ledger (what entered or left the roster), and it is
     // what decides whether the timer toasts. An agent merely speaking must not
@@ -987,19 +1034,24 @@ fn refresh_live_agents() -> Vec<String> {
     }
     refreshed
 }
+/// Returns the sweep's `Outcome` PLUS the ssh tunnel candidates gathered
+/// under the stage lock (`orphan_tunnel_candidates`) — this function never
+/// kills or unlinks any of them itself. `reap` (the only caller) finishes
+/// that work AFTER `with_stage_lock` returns; see `sweep_orphan_tunnels`'s
+/// own doc for why the kill phase must never run in here.
 fn reap_inner(
     _inv: &Invocation,
     gathered_addrs: Option<HashSet<String>>,
     window_owners: Option<HashMap<String, u32>>,
-) -> Outcome {
+) -> (Outcome, Vec<aoide_storage::tunnel::TunnelRecord>) {
     let cmd = "session.reap";
     let mut s_file: SessionsFile = match load_stage(&sessions_path()) {
         Ok(f) => f,
-        Err(e) => return stage_error(cmd, e),
+        Err(e) => return (stage_error(cmd, e), Vec::new()),
     };
     let mut h_file: HooksFile = match load_stage(&hooks_path()) {
         Ok(f) => f,
-        Err(e) => return stage_error(cmd, e),
+        Err(e) => return (stage_error(cmd, e), Vec::new()),
     };
 
     let now_epoch = std::time::SystemTime::now()
@@ -1157,10 +1209,12 @@ fn reap_inner(
     };
 
     // The ssh tunnels dead sessions left in `$XDG_RUNTIME_DIR/aoide/tunnel`
-    // (see `sweep_orphan_tunnels`) — computed against the SAME surviving
-    // roster the socket sweep just used, for the same "collected on the pass
-    // that reaped it, not the next one" reason.
-    let orphan_tunnels = {
+    // — GATHERED only (`orphan_tunnel_candidates`), against the SAME
+    // surviving roster the socket sweep just used, for the same "collected
+    // on the pass that reaped it, not the next one" reason. The kill phase
+    // (`sweep_orphan_tunnels`) runs AFTER this whole function returns and
+    // the stage lock is released — see that function's doc for why.
+    let tunnel_candidates = {
         let dead: HashSet<&str> = reaped.iter().map(String::as_str).collect();
         let surviving: HashSet<&str> = s_file
             .sessions
@@ -1168,7 +1222,7 @@ fn reap_inner(
             .map(|s| s.session_id.as_str())
             .filter(|id| !dead.contains(id))
             .collect();
-        sweep_orphan_tunnels(&surviving, now_epoch)
+        orphan_tunnel_candidates(&surviving, now_epoch)
     };
 
     // Age out the warm `stopped` badge: a turn that ended more than an hour ago is
@@ -1183,17 +1237,20 @@ fn reap_inner(
         && orphan_hooks.is_empty()
         && superseded_done.is_empty()
         && orphan_sockets.is_empty()
-        && orphan_tunnels.is_empty()
+        && tunnel_candidates.is_empty()
     {
-        return Outcome::ok(cmd, "nothing to reap (all sessions live)").with_data(json!({
-            "reaped": [],
-            "decayed": [],
-            "orphanHooks": [],
-            "supersededDone": [],
-            "orphanSockets": [],
-            "orphanTunnels": [],
-            "hyprctlAvailable": hyprctl_available,
-        }));
+        return (
+            Outcome::ok(cmd, "nothing to reap (all sessions live)").with_data(json!({
+                "reaped": [],
+                "decayed": [],
+                "orphanHooks": [],
+                "supersededDone": [],
+                "orphanSockets": [],
+                "orphanTunnels": [],
+                "hyprctlAvailable": hyprctl_available,
+            })),
+            Vec::new(),
+        );
     }
 
     // Mark each reaped session done in BOTH files, then let prune_done drop them
@@ -1264,10 +1321,10 @@ fn reap_inner(
         h_file.schema_version = STAGE_GRAPH_VERSION.to_string();
     }
     if let Err(e) = write_stage(&sessions_path(), &s_file) {
-        return stage_error(cmd, e);
+        return (stage_error(cmd, e), Vec::new());
     }
     if let Err(e) = write_stage(&hooks_path(), &h_file) {
-        return stage_error(cmd, e);
+        return (stage_error(cmd, e), Vec::new());
     }
 
     let mut changed: Vec<String> = reaped
@@ -1299,27 +1356,27 @@ fn reap_inner(
             .iter()
             .map(|id| format!("unlinked orphaned control socket of {id} (nothing listening)")),
     );
-    changed.extend(
-        orphan_tunnels
-            .iter()
-            .map(|id| format!("unlinked orphaned ssh tunnel {id} (session gone)")),
-    );
+    // No `orphan_tunnels` entry here: the candidates above are only GATHERED
+    // at this point, not yet killed/unlinked. `reap` appends the real
+    // swept-tunnel lines to `changed` (and the message, and `data.
+    // orphanTunnels`) once it has run `sweep_orphan_tunnels` on
+    // `tunnel_candidates` OUTSIDE the stage lock this function returns
+    // under.
     match restage_graph() {
         Ok(g) => changed.push(g.to_string_lossy().into_owned()),
-        Err(e) => return stage_error(cmd, e),
+        Err(e) => return (stage_error(cmd, e), Vec::new()),
     }
-    Outcome::ok(
+    let outcome = Outcome::ok(
         cmd,
         format!(
-            "reaped {} dead session(s); dropped {} total; decayed {} stopped → idle; cleared {} orphaned parent link(s); dropped {} orphaned hook record(s); dropped {} superseded session(s); unlinked {} orphaned socket(s); unlinked {} orphaned tunnel(s)",
+            "reaped {} dead session(s); dropped {} total; decayed {} stopped → idle; cleared {} orphaned parent link(s); dropped {} orphaned hook record(s); dropped {} superseded session(s); unlinked {} orphaned socket(s)",
             reaped.len(),
             removed.len(),
             decayed.len(),
             cleared.len(),
             orphan_hooks.len(),
             superseded_done.len(),
-            orphan_sockets.len(),
-            orphan_tunnels.len()
+            orphan_sockets.len()
         ),
     )
     .changed(changed)
@@ -1331,9 +1388,10 @@ fn reap_inner(
         "orphanHooks": orphan_hooks,
         "supersededDone": superseded_done,
         "orphanSockets": orphan_sockets,
-        "orphanTunnels": orphan_tunnels,
+        "orphanTunnels": Vec::<String>::new(),
         "hyprctlAvailable": hyprctl_available,
-    }))
+    }));
+    (outcome, tunnel_candidates)
 }
 
 #[cfg(test)]
@@ -2457,7 +2515,13 @@ mod tests {
     /// one crate DAG hop down: fake `TunnelRecord`s (no real `ssh` anywhere —
     /// the P-S3 test seam this sweep leans on is `aoide_client::tunnel`'s own
     /// pid/cmdline checks, exercised here only through pids that either don't
-    /// exist or are this very test process, never a spawned child).
+    /// exist or are this very test process, never a spawned child). Exercises
+    /// both halves of the GATHER/KILL split (P-S5 review): `orphan_tunnel_
+    /// candidates` decides which records qualify with no lock held here
+    /// either (this test never touches the stage), and `sweep_orphan_tunnels`
+    /// then acts on exactly that candidate list — the same two calls `reap`
+    /// makes across its `with_stage_lock` boundary, just with no lock in
+    /// between since this test has no stage files to guard.
     #[test]
     fn orphan_ssh_tunnels_are_swept_only_when_roster_less_and_settled() {
         use std::os::unix::ffi::OsStrExt;
@@ -2522,7 +2586,22 @@ mod tests {
         backdate(&alive_nonssh_path);
 
         let live: HashSet<&str> = ["alive-session"].into_iter().collect();
-        let mut swept = sweep_orphan_tunnels(&live, now);
+        let candidates = orphan_tunnel_candidates(&live, now);
+        let mut candidate_ids: Vec<String> = candidates
+            .iter()
+            .map(|r| format!("{}/{}", r.session_id, r.key))
+            .collect();
+        candidate_ids.sort();
+        assert_eq!(
+            candidate_ids,
+            vec![
+                "gone-alive-pid/peer-d".to_string(),
+                "gone-session/peer-a".to_string(),
+            ],
+            "the GATHER phase alone already excludes the live and infant records",
+        );
+
+        let mut swept = sweep_orphan_tunnels(candidates);
         swept.sort();
         assert_eq!(
             swept,
