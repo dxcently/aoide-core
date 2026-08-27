@@ -59,11 +59,12 @@ pub use self::session_store::{session_end, session_phase, session_start, session
 // waiting on the agent's own lifetime — see `graph/spawn.rs`'s module doc.
 pub use self::spawn::session_spawn;
 // `graph resurrect` (P-D8, `docs/architecture/AOIDED.md`'s "L5"): revives a
-// project's most recently-ended resumable session off the durable ledger,
-// via the windowed spawn path — see `graph/resurrect.rs`'s module doc. Also
-// the daemon's own boot-time auto-resume trigger (`aoide-server`'s
-// `daemon.rs`), called in-process the same way `run_internal_reap` calls
-// `crate::reap::reap_and_announce`.
+// project's carried set (or `--all`/`--id`) off the durable ledger, via the
+// windowed spawn path, resolving each candidate through a harness or a
+// terminal arm and delivering its restore snapshot — see
+// `graph/resurrect.rs`'s module doc. Also the daemon's own boot-time
+// auto-resume trigger (`aoide-server`'s `daemon.rs`), called in-process the
+// same way `run_internal_reap` calls `crate::reap::reap_and_announce`.
 pub use self::resurrect::session_resurrect;
 // `graph session carry` (P-C2, durable-sessions plan): the mark that lets a
 // project's whole carried set be resurrected together — see

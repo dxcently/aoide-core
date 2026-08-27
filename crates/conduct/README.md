@@ -149,12 +149,19 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   ledger). `--all` and `--id` are unchanged escapes: both widen or narrow
   past the carried set regardless of the mark. An empty bare-mode selection
   is an honest `Outcome::ok` no-op naming the carried set as empty, never a
-  silent success. Every surviving candidate is then filtered to harnesses
-  with a verified `AgentProfile.resume_args` (`aoide_protocol::agents` — a
-  harness with none is skipped with a taught message naming it, never a
-  guessed invocation), and spawned via the windowed path (`graph/spawn.rs`,
-  P-D7) with the harness's own resume argv and `--cwd` set to the ledger
-  entry's own cwd.
+  silent success. Every surviving candidate then resolves through TWO arms
+  (`resolve_candidate`, P-C6): the harness arm, unchanged, filters to
+  harnesses with a verified `AgentProfile.resume_args`
+  (`aoide_protocol::agents`); a candidate the harness arm finds nothing for
+  falls to the TERMINAL arm — a `restore` snapshot present (P-C5) means it
+  is a conducted shell, not a harness, so it resolves `[<login shell>, "-l"]`
+  (`login_shell`, the same `$SHELL` → passwd → `/bin/sh` order
+  `modules/dendrites/kitty.nix`'s own wrapper uses) rather than a
+  `--resume <id>` no shell could ever honor. A candidate neither arm
+  resolves is skipped with a taught message naming it, never a guessed
+  invocation. Every resolved candidate spawns via the windowed path
+  (`graph/spawn.rs`, P-D7) with its resolved argv and `--cwd` set to the
+  ledger entry's own cwd.
   A resurrected session is ALWAYS a fresh `sessionId` — ids are never
   recycled — and gets stamped `resumedFrom` (`session_store.rs::
   stamp_resumed_from`) naming the ledger entry it continues; `build_graph`
@@ -166,6 +173,19 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   auto-resume trigger (`aoide-server`'s `daemon.rs`) call this exact
   command core in-process without ever risking its own tick on a
   headless box.
+  **Post-spawn restore delivery (P-C6):** once a terminal candidate's spawn
+  actually registers, `restore_delivery` decides what — if anything — lands
+  in the new pty, through `send::session_send` in-process, never a
+  direct socket write. Working (`idle: false`) with a foreground `argv`
+  re-execs it (`--yes --submit`) — EXCEPT when `argv[0]`'s basename is
+  `sudo` (`is_sudo_argv`, the orchestrator's ruling on durable-sessions
+  plan open knob 5): a privileged command is never re-exec'd unattended, so
+  only the cwd restores. Idle (`idle: true`) with a clean `typed` line
+  preloads it (`--yes`, and — permanently — no `--submit`): the text sits
+  in the new prompt until a human presses Enter, never running itself. Idle
+  with no `typed` delivers nothing; a terminal reopened at its own cwd is
+  already the complete answer. See AGENTS.md for why the two branches are
+  never unified behind a shared boolean parameter.
 - **Terminal restore capture (P-C5, durable-sessions plan):**
   `graph/conduct.rs`'s PTY tick (`conduct_refresh_shell`, ~1 Hz, the same
   tick that drives `cwd`/`activity`/`state`) also builds a

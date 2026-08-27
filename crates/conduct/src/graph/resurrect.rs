@@ -42,14 +42,51 @@
 //! tick) instead of treating a headless box as a command failure. Only
 //! genuine USAGE problems (`--project` missing, an unknown project name, an
 //! `--id` that names no anchored ledger entry) are `Outcome::usage`/`error`.
+//!
+//! **Candidate resolution, two arms (P-C6, durable-sessions plan):**
+//! [`resolve_candidate`] tries the harness arm FIRST —
+//! `AgentProfile.resume_args` off `aoide_protocol::agents` — and only when
+//! that yields nothing does it try the TERMINAL arm: a ledger entry carrying
+//! a `restore` snapshot (P-C5) is a conducted shell, not a harness, so it
+//! reopens as `[<login shell>, "-l"]` — the exact argv `kitty.nix`'s own
+//! wrapper execs — rather than a `--resume <id>` nobody could ever verify. A
+//! candidate with neither hits the pre-existing taught skip.
+//!
+//! **Post-spawn delivery into a resurrected terminal (decision 8):** once a
+//! terminal candidate's spawn actually registers, its `restore` snapshot
+//! decides what — if anything — lands in the new pty, through
+//! [`super::send::session_send`], never a direct socket write:
+//! - **not idle, with a foreground `argv`** — the session was demonstrably
+//!   RUNNING something when it left. Re-exec it, `--yes --submit` and all:
+//!   the never-auto-run rule below covers the typed-but-unsubmitted case,
+//!   not a command already in flight. EXCEPT when `argv[0]`'s basename is
+//!   `sudo` (orchestrator ruling, open knob 5 — asked twice, unanswered,
+//!   default taken and flagged): a privileged foreground command is never
+//!   re-exec'd unattended — at best it hangs on a password prompt nobody is
+//!   watching, at worst it silently re-runs something destructive. The cwd
+//!   still restores; nothing is delivered.
+//! - **idle, with a clean `typed` line** — preload it with `--yes` and,
+//!   deliberately, NEVER `--submit`. The text sits in the new prompt until a
+//!   human presses Enter. **This is the whole safety invariant this phase
+//!   exists to hold: the no-submit path must never grow a `--submit`, and
+//!   the two branches above must never be unified behind a shared boolean
+//!   parameter** — [`restore_delivery`] hardcodes each branch's flag map
+//!   inline rather than threading a `submit: bool` through one "deliver"
+//!   helper, precisely so a later refactor can't flip one into the other by
+//!   accident. A stale `rm -rf` sitting in `typed` and firing itself at boot
+//!   is the failure this shape prevents.
+//! - **idle, with no `typed`** — nothing is delivered. A terminal reopened
+//!   at its own cwd is already the correct, complete answer.
 
 use super::common::{require_flag, stage_error};
 use super::model::{load_stage, projects_path, sessions_path, ProjectsFile, SessionsFile};
+use super::send::session_send;
 use super::session_store::stamp_resumed_from;
 use super::spawn::session_spawn;
 use aoide_protocol::agents::agent_profile;
-use aoide_protocol::output::Outcome;
+use aoide_protocol::output::{Outcome, Status};
 use aoide_protocol::Invocation;
+use aoide_storage::records::RestoreSnapshot;
 use serde_json::json;
 use std::collections::BTreeMap;
 
@@ -71,11 +108,116 @@ struct Candidate {
 }
 
 fn resolve_candidate(entry: aoide_storage::ledger::LedgerEntry) -> Candidate {
-    let resume_argv = agent_profile(&entry.agent).and_then(|p| p.resume_args).map(|f| {
+    let harness_argv = agent_profile(&entry.agent).and_then(|p| p.resume_args).map(|f| {
         let harness_id = entry.harness_session_id.as_deref().unwrap_or(&entry.session_id);
         f(harness_id)
     });
+    if harness_argv.is_some() {
+        return Candidate { entry, resume_argv: harness_argv };
+    }
+    // Harness arm found nothing — try the TERMINAL arm (P-C6, durable-
+    // sessions plan). `agent == "shell"` is never a harness — it has no
+    // session id to `--resume` and no profile row (`agents.rs`'s own module
+    // doc refuses a guessed `SHELL_PROFILE` for exactly this reason) — what
+    // it carries instead is a `restore` snapshot (P-C5). `Some(restore)` is
+    // the whole test for "is this even a terminal candidate"; a `restore`
+    // -less entry (predating P-C5, or a harness this box has never
+    // verified) falls through to the pre-existing taught skip below.
+    let resume_argv = entry.restore.is_some().then(|| vec![login_shell(), "-l".to_string()]);
     Candidate { entry, resume_argv }
+}
+
+/// The login shell a resurrected terminal candidate re-opens with `-l` —
+/// reconstructing exactly what `modules/dendrites/kitty.nix`'s own wrapper
+/// execs (`:70,72`, `<login_shell> -l`), same three-step resolution order
+/// (`kitty.nix:49-55`): `$SHELL` if set and executable, else the passwd
+/// entry for this uid if executable, else `/bin/sh`. Not a pure function —
+/// it reads the environment, the passwd database, and the filesystem — so
+/// it stays a thin, unmocked helper the same way `spawn.rs`'s own
+/// `terminal_template`/`require_display` do; nothing downstream needs to
+/// know WHY a shell was chosen, only which one.
+fn login_shell() -> String {
+    if let Ok(shell) = std::env::var("SHELL") {
+        if is_executable_file(&shell) {
+            return shell;
+        }
+    }
+    if let Some(shell) = passwd_login_shell() {
+        if is_executable_file(&shell) {
+            return shell;
+        }
+    }
+    "/bin/sh".to_string()
+}
+
+fn is_executable_file(path: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+}
+
+/// The shell field of this uid's own passwd entry, via `getent` — the same
+/// lookup `kitty.nix`'s `getent passwd "$(id -u)" | cut -d: -f7` performs.
+fn passwd_login_shell() -> Option<String> {
+    let uid = unsafe { libc::getuid() };
+    let out = std::process::Command::new("getent").arg("passwd").arg(uid.to_string()).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()?.trim_end().split(':').nth(6).map(str::to_string)
+}
+
+/// The narrow, named check behind the sudo refusal (orchestrator ruling,
+/// durable-sessions plan open knob 5): match ONLY `argv[0]`'s basename being
+/// exactly `sudo`, nothing cleverer — no `doas`/`pkexec` guessing, no
+/// argument inspection.
+fn is_sudo_argv(argv: &[String]) -> bool {
+    argv.first()
+        .and_then(|a| std::path::Path::new(a).file_name())
+        .and_then(|n| n.to_str())
+        == Some("sudo")
+}
+
+/// What, if anything, to deliver into a freshly-resurrected terminal once it
+/// registers — pure, no process, no socket, so this decision and its exact
+/// `Invocation` flag map are directly unit-testable apart from
+/// `resurrect_one`'s real spawn. See the module doc's safety-invariant
+/// paragraph: the two branches below are never unified behind a shared
+/// boolean parameter — each hardcodes its own flag map inline.
+fn restore_delivery(door: aoide_protocol::Door, new_id: &str, restore: &RestoreSnapshot) -> Option<Invocation> {
+    if !restore.idle {
+        // Branch one — demonstrably RUNNING something when the session
+        // left. Re-exec it, Enter and all: never for `sudo` (`is_sudo_argv`)
+        // — an unattended password prompt in a terminal nobody is watching
+        // is not a restore.
+        let argv = restore.argv.as_ref()?;
+        if is_sudo_argv(argv) {
+            return None;
+        }
+        let mut flags = BTreeMap::new();
+        flags.insert("id".to_string(), new_id.to_string());
+        flags.insert("yes".to_string(), "true".to_string());
+        flags.insert("submit".to_string(), "true".to_string());
+        return Some(Invocation {
+            path: vec!["graph".to_string(), "send".to_string()],
+            args: vec![argv.join(" ")],
+            flags,
+            door,
+        });
+    }
+    // Branch two — idle, with a clean, unpoisoned typed line. Preload it and
+    // NOTHING else: `--yes`, and — permanently — no `--submit`. This flag
+    // map must never gain a `submit` key; that omission is the entire
+    // mechanism behind "preload, never auto-run".
+    let typed = restore.typed.as_ref()?;
+    let mut flags = BTreeMap::new();
+    flags.insert("id".to_string(), new_id.to_string());
+    flags.insert("yes".to_string(), "true".to_string());
+    Some(Invocation {
+        path: vec!["graph".to_string(), "send".to_string()],
+        args: vec![typed.clone()],
+        flags,
+        door,
+    })
 }
 
 /// Spawn one candidate via the windowed path and fold the outcome into
@@ -155,17 +297,46 @@ fn resurrect_one(
         aoide_storage::carry::set_carried(&mut carried, &c.entry.session_id, false);
         let _ = aoide_storage::carry::save_carry(&carried);
     }
+
+    // Post-spawn restore delivery (P-C6, durable-sessions plan) — only for a
+    // TERMINAL candidate (a `restore` snapshot present) whose spawn actually
+    // registered: an unregistered session has no live pty to deliver into,
+    // the same posture `graph spawn --prompt` already takes toward its own
+    // injection. `restore_delivery` is pure and decides the whole shape; the
+    // `submit` key on its returned flags (never present on the preload
+    // shape) is what this reads back to report which branch fired.
+    let restore_result = if !registered {
+        "skipped-unregistered".to_string()
+    } else {
+        match c.entry.restore.as_ref().and_then(|r| restore_delivery(door, &new_id, r)) {
+            None => "none".to_string(),
+            Some(inv) => {
+                let submit = inv.flags.contains_key("submit");
+                let inner = session_send(&inv);
+                if inner.status == Status::Ok {
+                    if submit { "reexec".to_string() } else { "preload".to_string() }
+                } else {
+                    format!("failed: {}", inner.message)
+                }
+            }
+        }
+    };
+
     changed.push(format!(
         "session {new_id}: resurrected from {} ({}){}",
         c.entry.session_id,
         c.entry.agent,
         if registered { "" } else { " (not yet registered)" }
     ));
+    if restore_result == "reexec" || restore_result == "preload" {
+        changed.push(format!("session {new_id}: restore {restore_result}"));
+    }
     resurrected.push(json!({
         "sessionId": new_id,
         "resumedFrom": c.entry.session_id,
         "agent": c.entry.agent,
         "registered": registered,
+        "restoreDelivery": restore_result,
     }));
 }
 
@@ -336,6 +507,19 @@ mod tests {
         }
     }
 
+    /// Same fixture as `ledger_entry`, with an explicit `restore` block —
+    /// the terminal-arm tests need to control it directly rather than
+    /// always getting `None`.
+    fn ledger_entry_with_restore(
+        session_id: &str,
+        agent: &str,
+        cwd: &str,
+        ended_at: &str,
+        restore: Option<RestoreSnapshot>,
+    ) -> aoide_storage::ledger::LedgerEntry {
+        aoide_storage::ledger::LedgerEntry { restore, ..ledger_entry(session_id, agent, cwd, ended_at) }
+    }
+
     /// Common env scaffolding every test below needs: an isolated stage +
     /// state dir, a registered project anchored at that dir. Returns the
     /// project's own absolute path (also the anchor every ledger fixture
@@ -378,6 +562,108 @@ mod tests {
             assert_ne!(minted, old_id, "a resurrected session must never reuse the ledger id");
             assert!(minted.starts_with("resurrect-"), "id: {minted}");
         }
+    }
+
+    /// The terminal arm (P-C6): a `restore`-bearing `shell` entry has no
+    /// harness profile at all (`agent_profile("shell")` is `None`, same as
+    /// any unregistered name) — the harness arm skips it exactly like
+    /// `a_no_resume_args_harness_is_skipped_with_a_taught_message` proves for
+    /// an unknown harness, but the terminal arm picks it up right after,
+    /// resolving `[<login shell>, "-l"]` rather than leaving it skipped.
+    #[test]
+    fn resolve_candidate_terminal_arm_resolves_a_restore_bearing_shell_entry_the_harness_arm_skips() {
+        let entry = ledger_entry_with_restore(
+            "ledger-terminal",
+            "shell",
+            "/home/khoa/Aoide",
+            "2026-08-20T01:00:00Z",
+            Some(RestoreSnapshot { cwd: Some("/home/khoa/Aoide".into()), idle: true, argv: None, typed: None }),
+        );
+        let candidate = resolve_candidate(entry);
+        let argv = candidate.resume_argv.expect("the terminal arm must resolve a restore-bearing shell entry");
+        assert_eq!(argv.len(), 2, "argv: {argv:?}");
+        assert_eq!(argv[1], "-l", "argv: {argv:?}");
+        assert!(!argv[0].is_empty(), "the login shell must not resolve to an empty string");
+    }
+
+    /// A `shell` entry with NO `restore` block (predating P-C5, or a harness
+    /// this box has never verified) must still hit the pre-existing taught
+    /// skip — the terminal arm's whole gate is `Some(restore)`, never bare
+    /// `agent == "shell"`.
+    #[test]
+    fn resolve_candidate_restore_less_shell_entry_still_hits_the_taught_skip() {
+        let entry = ledger_entry_with_restore("ledger-no-restore", "shell", "/home/khoa/Aoide", "2026-08-20T01:00:00Z", None);
+        let candidate = resolve_candidate(entry);
+        assert!(candidate.resume_argv.is_none(), "a restore-less shell entry must still be skipped");
+    }
+
+    /// The preload path's flag map, pinned directly — no process, no socket.
+    /// `--yes` is present; `--submit` must NEVER be, on pain of violating
+    /// the whole "preload, never auto-run" invariant this phase exists for.
+    #[test]
+    fn preload_delivery_carries_yes_and_never_submit() {
+        let restore = RestoreSnapshot {
+            cwd: Some("/home/khoa/Aoide".into()),
+            idle: true,
+            argv: None,
+            typed: Some("echo hello".to_string()),
+        };
+        let inv = restore_delivery(aoide_protocol::Door::Daemon, "new-id", &restore)
+            .expect("an idle restore with a typed line must construct a send");
+        assert_eq!(inv.flags.get("yes").map(String::as_str), Some("true"));
+        assert!(!inv.flags.contains_key("submit"), "the no-submit path must never carry `submit`: {:?}", inv.flags);
+        assert_eq!(inv.args, vec!["echo hello".to_string()]);
+    }
+
+    /// The re-exec path's flag map, pinned directly — no process, no socket.
+    /// It carries BOTH `--yes` and `--submit`: the session was demonstrably
+    /// running this when it left, which is a different case from a typed
+    /// -but-unsubmitted line.
+    #[test]
+    fn reexec_delivery_carries_yes_and_submit() {
+        let restore = RestoreSnapshot {
+            cwd: Some("/home/khoa/Aoide".into()),
+            idle: false,
+            argv: Some(vec!["nvim".to_string(), "notes.md".to_string()]),
+            typed: None,
+        };
+        let inv = restore_delivery(aoide_protocol::Door::Daemon, "new-id", &restore)
+            .expect("a working restore with argv must construct a send");
+        assert_eq!(inv.flags.get("yes").map(String::as_str), Some("true"));
+        assert_eq!(inv.flags.get("submit").map(String::as_str), Some("true"));
+        assert_eq!(inv.args, vec!["nvim notes.md".to_string()]);
+    }
+
+    /// Idle with a null `typed` (a poisoned or never-populated line) must
+    /// construct no send at all — a bare cwd restore is already the correct,
+    /// complete answer, never a guess.
+    #[test]
+    fn idle_with_null_typed_constructs_no_send_at_all() {
+        let restore = RestoreSnapshot { cwd: Some("/home/khoa/Aoide".into()), idle: true, argv: None, typed: None };
+        assert!(restore_delivery(aoide_protocol::Door::Daemon, "new-id", &restore).is_none());
+    }
+
+    /// The orchestrator ruling (open knob 5): a recorded foreground of
+    /// `sudo …` re-execs nothing and delivers nothing — only the cwd
+    /// restores. Covers both the narrow named check directly and the
+    /// delivery decision that consults it.
+    #[test]
+    fn sudo_foreground_is_never_reexeced() {
+        assert!(is_sudo_argv(&["sudo".to_string(), "reboot".to_string()]));
+        assert!(is_sudo_argv(&["/usr/bin/sudo".to_string(), "-i".to_string()]), "basename match must see through a full path");
+        assert!(!is_sudo_argv(&["sudo-ish".to_string()]), "must match the exact basename, nothing cleverer");
+        assert!(!is_sudo_argv(&[]));
+
+        let restore = RestoreSnapshot {
+            cwd: Some("/home/khoa/Aoide".into()),
+            idle: false,
+            argv: Some(vec!["sudo".to_string(), "systemctl".to_string(), "restart".to_string(), "aoided".to_string()]),
+            typed: None,
+        };
+        assert!(
+            restore_delivery(aoide_protocol::Door::Daemon, "new-id", &restore).is_none(),
+            "a recorded sudo foreground must never be re-exec'd"
+        );
     }
 
     #[test]

@@ -199,6 +199,36 @@
   no typed line, ever; don't "helpfully" instantiate the buffer anyway and
   rely on `restore_snapshot`'s idle-gate to hide it — the buffer must not
   exist for a session that structurally cannot have a prompt to reconstruct.
+- **A restored terminal's preloaded line NEVER runs itself (P-C6, durable-
+  sessions plan) — the consumption-side twin of `typed`'s own capture-side
+  refusal above, and this crate's single most important resurrect
+  invariant.** `resurrect.rs::restore_delivery` hardcodes two branches, each
+  building its OWN `session_send` flag map inline, and MUST NEVER be
+  collapsed into one "deliver" helper parameterized by a `submit: bool`: the
+  re-exec branch (a demonstrably RUNNING foreground command) carries `--yes
+  --submit`; the preload branch (an idle session's clean `typed` line)
+  carries `--yes` and PERMANENTLY omits `submit` from its flag map. A shared
+  boolean parameter is exactly the shape that lets a later refactor add
+  `--submit` to the preload branch by changing one call site's argument —
+  don't introduce one. A stale `rm -rf` sitting in `typed` and firing itself
+  at boot, unattended, is the failure this separation exists to prevent.
+- **A recorded foreground of `sudo …` is never re-exec'd (P-C6, orchestrator
+  ruling on durable-sessions plan open knob 5).** `resurrect.rs::
+  is_sudo_argv` is the one, narrow, named check — `argv[0]`'s basename
+  exactly `sudo`, nothing cleverer (no `doas`/`pkexec` guessing, no argument
+  inspection) — `restore_delivery` consults before ever building a re-exec
+  invocation. Re-running a privileged command unattended at boot is not a
+  restore: at best it hangs forever on a password prompt nobody is
+  watching, at worst it silently re-runs something destructive. The cwd
+  still restores; only the delivery is refused.
+- **The terminal candidate arm is gated on `entry.restore.is_some()`, never
+  on `agent == "shell"` (P-C6).** `resolve_candidate` tries the harness arm
+  first (`AgentProfile.resume_args`, unchanged) and only falls to the
+  terminal arm — `[<login shell>, "-l"]` via `login_shell` — when the
+  harness arm found nothing AND a `restore` snapshot is present. A
+  `restore`-less shell entry (predating P-C5) still hits the pre-existing
+  taught skip; don't widen the gate to bare `agent == "shell"`, which would
+  resolve a candidate this crate has no captured facts about.
 - **`hookAncestry` is stamped ONCE, at a hook session's own registration,
   never touched again.** `session_store::stamp_hook_ancestry` is the only
   writer (change-only: it refuses to overwrite an already-populated

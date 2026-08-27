@@ -7,7 +7,8 @@
 //! moment a session leaves the roster (a clean `graph session end` or a
 //! `graph reap` sweep — `aoide-conduct`'s `graph::ledger_session_exit` is the
 //! ONE call both routes share, never a second writer). `graph resurrect`
-//! reads it back to find a project's most recently-ended resumable session.
+//! reads it back to find a project's resumable sessions — by default the
+//! ones marked durable in [`crate::carry`], newest line per id.
 //!
 //! Append-only and UNCAPPED, unlike [`crate::fs`]'s stage files or
 //! `aoide_protocol::feed::FeedWriter`'s truncate-at-cap feeds: this is
