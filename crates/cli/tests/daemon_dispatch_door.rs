@@ -51,11 +51,34 @@ fn read_one_line(reader: &mut impl BufRead) -> Value {
     serde_json::from_str(line.trim()).unwrap_or_else(|e| panic!("reply line not JSON: {e}: {line:?}"))
 }
 
+/// Floor `$AOIDE_STAGE_DIR`/`$AOIDE_STATE_DIR` at a fresh private tempdir
+/// once per test binary, unless a test already set them — the same safety
+/// net `aoide-server`'s `env_lock()` carries, re-derived here because this
+/// binary starts a REAL daemon whose `HandEditWatcher`/boot-resume paths
+/// eagerly resolve `conducting_stage_dir()`, and (post-S1) that first
+/// resolution MIGRATES the operator's real `~/Aoide/song/stage` when no
+/// override is set (the exact production-state mutation
+/// `conduct/src/lib.rs`'s own floor was built after being burned by).
+fn floor_stage_env() {
+    static FLOOR: std::sync::Once = std::sync::Once::new();
+    FLOOR.call_once(|| {
+        let base = short_tmp("env-floor");
+        let _ = std::fs::create_dir_all(&base);
+        if std::env::var_os("AOIDE_STAGE_DIR").is_none() {
+            std::env::set_var("AOIDE_STAGE_DIR", base.join("stage"));
+        }
+        if std::env::var_os("AOIDE_STATE_DIR").is_none() {
+            std::env::set_var("AOIDE_STATE_DIR", base.join("state"));
+        }
+    });
+}
+
 /// Start a REAL `serve_daemon` — the real assembled `registry()`/`dispatch`
 /// this crate's own `bin/aoided.rs` injects, not a fixture — on a fresh
 /// short-path socket, and return a connected client stream plus both paths
 /// (removed by each test at the end).
 fn start_daemon(tag: &str) -> (UnixStream, PathBuf, PathBuf) {
+    floor_stage_env();
     let socket_path = short_tmp(tag).with_extension("sock");
     let events_path = short_tmp(&format!("{tag}-events")).with_extension("jsonl");
     let sp = socket_path.clone();

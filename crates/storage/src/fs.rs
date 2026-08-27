@@ -135,7 +135,15 @@ fn migrate_conducting_stage(new_dir: &std::path::Path) {
     if old_dir == new_dir || !old_dir.exists() {
         return;
     }
-    if std::fs::create_dir_all(new_dir).is_err() {
+    if let Err(e) = std::fs::create_dir_all(new_dir) {
+        // Loud, not fatal: readers treat a missing file as an empty
+        // registry, so a silently skipped migration would look like the
+        // operator's sessions/projects vanished. Narrate the real cause.
+        eprintln!(
+            "aoide: cannot create {} ({e}) — conducting stage files remain at {}",
+            new_dir.display(),
+            old_dir.display()
+        );
         return;
     }
 
@@ -157,8 +165,24 @@ fn migrate_conducting_stage(new_dir: &std::path::Path) {
         if !src.exists() || dst.exists() {
             continue;
         }
-        if std::fs::rename(&src, &dst).is_err() && std::fs::copy(&src, &dst).is_ok() {
+        if std::fs::rename(&src, &dst).is_ok() {
+            continue;
+        }
+        // Cross-filesystem fallback: copy into a temp sibling and rename it
+        // into place, so a crash mid-copy never leaves a truncated `dst`
+        // that the existence check above would forever treat as migrated.
+        let tmp = new_dir.join(format!(".{name}.migrate-tmp"));
+        let copied = std::fs::copy(&src, &tmp).is_ok() && std::fs::rename(&tmp, &dst).is_ok();
+        if copied {
             let _ = std::fs::remove_file(&src);
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+            eprintln!(
+                "aoide: stage migration could not move {} to {} — \
+                 conducting state stays at the old path for this file",
+                src.display(),
+                dst.display()
+            );
         }
     }
 
