@@ -62,6 +62,23 @@
   dialog's own quickshell process was gone within the same second — no
   polling, no timeout, the kernel delivered it synchronously with the
   parent's death.
+- **`commands::secrets::EXIT_INFRA_FAILURE` (exit `3`) is RESERVED for "the
+  dialog infrastructure itself broke" and must NEVER collide with `0`
+  (approved) or `1` (dismissed/cancelled) — live-incident fix, this commit,
+  that constant's own doc has the full incident.** Every internal-failure
+  path in `commands::secrets` (a `quickshell` spawn error, `AskResult::
+  Failed` — `spawn_and_wait_for_marker`'s own case for a marker-less exit)
+  routes through `handle_secrets_ask`'s `"failed"` outcome tag, which
+  `lib.rs`'s `special` hook is the ONE place that maps onto this exit code
+  PLUS an `eprintln!` naming what happened. Don't add a new internal-failure
+  case that falls through to the generic `_` arm (now USAGE-only,
+  `lib.rs`'s own comment) or reuses `output::exit::ERROR` — either would
+  silently reintroduce the exact incident this exists to close: `aoide-
+  secrets`' own `watch::run_entry_dialog` (the OTHER side of this contract,
+  no shared Rust type — this crate must never depend on `aoide-secrets` or
+  vice versa, root `AGENTS.md`'s core/paint boundary, so both sides
+  duplicate the literal `3` in their own doc comments) reads exit `1` as a
+  bare user cancel, never as a failure worth retrying.
 
 ## Extension points
 

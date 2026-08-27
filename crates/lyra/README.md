@@ -40,8 +40,9 @@ are core `aoide` identity, root `AGENTS.md`).
   crate to do that (`song::commands::quickshell`'s own `quickshell reload`
   only ever sends IPC into an ALREADY-running instance). Speaks zenity's own
   output contract byte for byte (code on stdout + exit 0; `Dismiss ask` on
-  stdout + exit 1; else non-zero) so `aoide-secrets`' own dialog-result
-  parsing never needs to know which binary answered — see that crate's
+  stdout + exit 1; a bare cancel, exit 1 with nothing on stdout) so
+  `aoide-secrets`' own dialog-result parsing never needs to know which
+  binary answered — see that crate's
   `watch.rs` module doc and this crate's own `commands/secrets.rs` module
   doc for the full mechanism, including the two live-quickshell findings
   (`console.log` lands on stdout, not stderr; a bare `Window {}` tiles under
@@ -64,6 +65,23 @@ are core `aoide` identity, root `AGENTS.md`).
   `$XDG_RUNTIME_DIR` when set (else `temp_dir()`), written `0600` from
   creation — matching `aoide-secrets`' own `store::secure_file` discipline,
   even though this file only ever holds display data.
+
+  A second live-incident fix (this commit): a deployed popup watcher chose
+  this dialog for a real ask, `spawn_quickshell` ENOENT'd (`quickshell`
+  missing from the unit's own `PATH`, fixed nix-side), and the ask sat
+  parked with nothing on screen and nothing in the journal —
+  `handle_secrets_ask`'s error path used to map onto the SAME exit code
+  (`1`) zenity's own cancel contract already uses, so `aoide-secrets` had no
+  way to tell "the dialog couldn't even open" apart from "the user pressed
+  Esc." `commands::secrets::EXIT_INFRA_FAILURE` (exit `3`) is the fix:
+  reserved for exactly this case (a spawn failure, or the NEW
+  `AskResult::Failed` — `spawn_and_wait_for_marker`'s own case for
+  "quickshell's stdout closed without ever printing a result marker,"
+  never silently folded into `Cancelled`), with an `eprintln!` (`lib.rs`'s
+  `special` hook) naming what failed. `aoide-secrets` now inherits this
+  process's stderr straight through to its own (that crate's own doc), so
+  the message reaches the journal directly, and retries the SAME ask
+  through zenity immediately rather than leaving it undialoged.
 
 ## What it consumes
 

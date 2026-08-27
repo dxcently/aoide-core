@@ -72,11 +72,19 @@ pub fn run_lyra(argv: &[String]) -> i32 {
         // generic `Outcome` envelope — `crates/lyra/src/commands/secrets.rs`'s
         // module doc: `aoide_secrets::watch::spawn_lyra_entry` reads this
         // process's stdout expecting EXACTLY the typed code (exit 0), the
-        // literal string `Dismiss ask` (exit 1), or nothing (any other
-        // non-zero exit) — never a JSON envelope, `--json` included, since
-        // the caller spawning this process is never passing that flag and a
-        // human running it by hand gets the identical zenity-shaped output
-        // either way.
+        // literal string `Dismiss ask` (exit 1), or a bare cancel (exit 1,
+        // nothing on stdout) — never a JSON envelope, `--json` included,
+        // since the caller spawning this process is never passing that flag
+        // and a human running it by hand gets the identical zenity-shaped
+        // output either way. `"failed"` (live-incident fix, this commit) is
+        // the ONE addition on top of that contract: `commands::secrets::
+        // EXIT_INFRA_FAILURE`'s own doc has the full incident (a killed
+        // dialog silently treated as a user Cancel) this distinct exit code
+        // and this `eprintln!` both exist to close — `stdout stays EMPTY on
+        // this path (the code/`Dismiss ask` contract is unaffected), the
+        // failure reason goes to STDERR, which `aoide_secrets::watch`'s own
+        // `spawn_lyra_entry` now inherits straight through to the journal
+        // (that crate's own doc on why).
         if inv.path == ["secrets", "ask"] {
             let outcome = dispatch::dispatch(inv);
             let result = outcome.data.as_ref().and_then(|d| d.get("result")).and_then(|r| r.as_str());
@@ -91,16 +99,18 @@ pub fn run_lyra(argv: &[String]) -> i32 {
                     output::exit::ERROR
                 }
                 Some("cancelled") => output::exit::ERROR,
+                Some("failed") => {
+                    eprintln!("aoide lyra secrets ask: {}", outcome.message);
+                    commands::secrets::EXIT_INFRA_FAILURE
+                }
                 _ => {
-                    // A usage error (bad/missing flags) or a domain error
-                    // (quickshell failed to spawn) — reported on stderr,
-                    // same posture every other CLI usage/error path holds.
+                    // A usage error (bad/missing flags) — the ONLY case left
+                    // that reaches this arm now that `"failed"` has its own
+                    // (`handle_secrets_ask` tags every domain-error path
+                    // `"failed"` explicitly) — reported on stderr, same
+                    // posture every other CLI usage path holds.
                     eprintln!("{}", outcome.message);
-                    if outcome.status == output::Status::Usage {
-                        output::exit::USAGE
-                    } else {
-                        output::exit::ERROR
-                    }
+                    output::exit::USAGE
                 }
             });
         }

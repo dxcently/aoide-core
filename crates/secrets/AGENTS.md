@@ -1199,6 +1199,36 @@
   visibility into `lyra`'s own process tree (no pid, no process-group
   handle) to kill a grandchild it never held even a handle to; the fix has
   to live where the grandchild is actually spawned.
+- **A `lyra` infrastructure failure is NEVER folded into `ZenityResult::
+  Cancelled` — it gets its own variant, its own reserved exit code, and an
+  IMMEDIATE zenity retry for the same ask (live-incident fix, this commit —
+  `watch.rs`'s own module doc has the full incident).** `lyra secrets ask`
+  reserves exit `3` (`aoide_lyra::commands::secrets::EXIT_INFRA_FAILURE`,
+  that constant's own doc carries the matching half of this same incident)
+  for "the dialog infrastructure itself broke" — `run_entry_dialog` checks
+  `status.code() == Some(LYRA_INFRA_FAILURE_EXIT)` BEFORE falling through to
+  `Cancelled`, returning `ZenityResult::DialogFailure` instead. Don't widen
+  `Cancelled`'s own match arm to "catch" this case "since it's still a
+  non-zero exit" — that collapse is EXACTLY the original incident (a killed
+  dialog silently read as a user Cancel, the ask sitting parked with no
+  operator-visible signal until its own timeout). `run_ask_dialog` reacts to
+  `SpawnError`/`DialogFailure` from a `lyra` attempt by retrying the SAME
+  ask through `zenity` immediately (`zenity_available` permitting) — never
+  leaving the ask with no dialog attempt at all just because the fancy
+  surface broke (plugin philosophy, root `AGENTS.md` house rule 7). A
+  `lyra`-failed ask that still has no fallback available (or whose fallback
+  also failed) is deliberately NEVER added to `popup_loop`'s own `ignored`
+  set — `Queue::reconcile`'s 30s tick has NO opinion on that set at all (it
+  only syncs which asks EXIST, never re-drives a dialog attempt), so
+  `popup_loop`'s own loop, backed off by the pre-existing `spawn_backoff`
+  mechanism, is what actually keeps retrying such an ask. Don't add an
+  `ignored.insert(...)` to either failure arm "since it already got its
+  retry" — that would silently strand the ask exactly the way the original
+  incident did, one layer up. `spawn_lyra_entry` now inherits `lyra`'s own
+  stderr (was `Stdio::null()`) specifically so `lyra`'s own failure
+  `eprintln!`s reach the journal at all — don't revert that to a piped or
+  null stream "to keep stdout/stderr symmetric with zenity's own spawn";
+  zenity has no equivalent internal-failure-narration contract to preserve.
 - **A parked ask carries an OPTIONAL "context block" — `reason` (free-text,
   self-asserted) and `origin` (best-effort, kernel-traced) — for a popup/
   prompt surface to show WHY and FROM WHERE an ask exists, not just which

@@ -1031,6 +1031,24 @@ watching secret events — ^C to leave (parked asks stay parked)
   — the kernel kills it the instant `lyra` dies, no cooperation needed from
   either process at that moment. See `crates/lyra/AGENTS.md`'s own note for
   the full mechanism; this crate's `AGENTS.md` has the matching half.
+- **A `lyra` infrastructure failure narrates and falls back to zenity —
+  never a silent parked ask (live-incident fix, this commit).** The
+  deployed popup watcher unit chose the `lyra` dialog for a real ask,
+  `lyra`'s own `quickshell` spawn ENOENT'd, and the ask sat parked with
+  nothing on screen and nothing in the journal until it timed out.
+  `watch::spawn_lyra_entry` now inherits `lyra`'s own stderr straight
+  through to this process's own (`lyra secrets ask`'s failures land in the
+  journal directly); `lyra secrets ask` reserves exit `3`
+  (`aoide_lyra::commands::secrets::EXIT_INFRA_FAILURE`) for "the dialog
+  infrastructure itself broke," never colliding with zenity's own cancel
+  code (`1`); and `watch::run_ask_dialog` retries the SAME ask through
+  zenity immediately on either a `lyra` spawn error or an exit-3 — the
+  plugin philosophy's fancy-surface-degrades-to-the-plain-one rule, not a
+  reason to leave the ask undialoged. A genuine user cancel (`lyra` exiting
+  1 with no marker line) is UNCHANGED — narrated as `[i]`gnore, same as
+  always, never retried. See `watch.rs`'s own module doc for the full
+  mechanism (all three parts: narration, the reserved exit code, the
+  fallback).
 - **Wrong code**: on the zenity path, a brief `zenity --error` shows, then
   the SAME ask's entry dialog re-opens; on the lyra path there is no separate
   error surface (P3's scope is the entry dialog only) — the ask simply stays

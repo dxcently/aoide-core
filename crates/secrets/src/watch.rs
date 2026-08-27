@@ -57,6 +57,53 @@
 //! handle_secrets_watch`) — the two modes both own "how a parked ask is
 //! completed," and can't both drive it.
 //!
+//! **A dialog-child lifecycle failure must NEVER be silent (this commit,
+//! live-incident fix).** The deployed popup watcher unit had
+//! `AOIDE_RICE_BIN` set, chose the `lyra` dialog for a real parked ask, and
+//! `lyra`'s own `quickshell` spawn ENOENT'd (`quickshell` wasn't on the
+//! unit's own `PATH` — fixed nix-side, `modules/nucleus/secrets.nix`). On
+//! screen: nothing. In the journal: nothing after the `parked` line — the
+//! ask sat parked until its own timeout with no operator-visible signal at
+//! all, the exact "invisible failure" shape this crate keeps re-learning
+//! (P-V4d/P-G4's own incidents, this module's history). Three parts close
+//! it:
+//! 1. **Narration.** [`spawn_lyra_entry`] now inherits `lyra`'s own stderr
+//!    (was `Stdio::null()`) rather than discarding it — `lyra secrets
+//!    ask`'s own failure `eprintln!`s (`crates/lyra/src/lib.rs`'s `special`
+//!    hook) land directly in THIS process's stderr, which the deployed unit
+//!    already routes to the journal (`StandardError = "journal"`,
+//!    `modules/nucleus/secrets.nix`). [`popup_loop`] adds its OWN
+//!    `eprintln!` alongside it, naming the ask id and which binary failed —
+//!    the two together give an operator both the specific cause (from
+//!    `lyra`'s own line) and the consequence (from this crate's).
+//! 2. **A distinct exit code.** `lyra secrets ask` reserves exit `3`
+//!    (`aoide_lyra::commands::secrets::EXIT_INFRA_FAILURE`, that constant's
+//!    own doc has the matching half of this incident) for "the dialog
+//!    infrastructure itself failed" — NEVER folded into zenity's own
+//!    cancel code (`1`), which is what let the original incident's ask get
+//!    silently `ignore`d as if the user had pressed Esc.
+//!    [`run_entry_dialog`] checks for this code BEFORE falling through to
+//!    its own `Cancelled` case, returning [`ZenityResult::DialogFailure`]
+//!    instead — that variant's own doc has the exact check.
+//! 3. **Fallback, not abandonment.** [`popup_loop`] reacts to a `lyra`
+//!    `SpawnError`/`DialogFailure` by immediately retrying the SAME ask
+//!    through `zenity` instead ([`zenity_available`] permitting) — the
+//!    plugin philosophy's whole point (root `AGENTS.md` house rule 7) is
+//!    that the fancy surface degrades to the plain one, not that a fancy-
+//!    surface failure leaves the ask stranded. If that fallback ALSO fails
+//!    (or `zenity` isn't available either), the ask is narrated and left
+//!    parked — but NEVER added to `ignored`, so `popup_loop`'s own loop
+//!    keeps re-offering it on every later iteration (backed off by
+//!    [`SPAWN_BACKOFF_INITIAL`]/[`next_spawn_backoff`], the SAME mechanism
+//!    a `SpawnError` already used before this phase). **This loop, not the
+//!    30-second `reconcile` tick, is what retries a failed dialog** —
+//!    `Queue::reconcile` only ever syncs which asks EXIST against the
+//!    broker's own truth; it has no opinion on `popup_loop`'s local
+//!    `ignored` set or on re-driving a dialog attempt. Don't let a future
+//!    change insert a `lyra`-failed ask into `ignored` "since it already
+//!    got its one retry" — that would silently re-introduce this exact
+//!    incident's own failure mode, just one layer up.
+//!
 //! **Why this crate, not a conductor pane.** Reaching the broker from
 //! `aoide-conductor` would add a NEW `aoide-conductor` → `aoide-secrets`
 //! dependency edge; `client::pending`/`approve`/`dismiss` are already right
@@ -717,10 +764,24 @@ fn next_spawn_backoff(current: Duration) -> Duration {
     current.saturating_mul(2).min(SPAWN_BACKOFF_MAX)
 }
 
-/// Outcome of one `zenity --entry --hide-text` round trip — never a bare
-/// `Result`, since "the user closed it" and "a wrong code" and "spawning it
-/// failed" are three different things the caller must react to
-/// differently.
+/// The `lyra secrets ask` exit code that means "the dialog infrastructure
+/// itself failed" — NEVER a user action, never collapsed into
+/// [`ZenityResult::Cancelled`] (module doc's live-incident section has the
+/// full story). Mirrors `aoide_lyra::commands::secrets::EXIT_INFRA_FAILURE`
+/// byte for byte; there is no shared Rust type to enforce that agreement
+/// (this crate must never depend on `aoide-lyra` — root `AGENTS.md`'s core/
+/// paint boundary), so both constants carry this SAME comment pointing at
+/// the other file. `zenity` itself never produces this code in practice
+/// (its own real exit codes are `0`/`1`/a `--timeout`-only `5`-ish range,
+/// none of which this crate ever passes `--timeout` to trigger anyway), so
+/// checking for it unconditionally in [`run_entry_dialog`] — regardless of
+/// which binary answered — is safe.
+const LYRA_INFRA_FAILURE_EXIT: i32 = 3;
+
+/// Outcome of one code-entry dialog round trip — never a bare `Result`,
+/// since "the user closed it," "a wrong code," "spawning it failed," and
+/// "the dialog infrastructure itself broke" are four different things the
+/// caller must react to differently.
 #[derive(Debug)]
 pub enum ZenityResult {
     /// Exit 0 — the code the user typed, trimmed of exactly the one
@@ -737,8 +798,18 @@ pub enum ZenityResult {
     /// elsewhere) WHILE the dialog sat open; the child was killed by its
     /// exact pid before this returned.
     CancelledExternally,
-    /// The `zenity` process could not be spawned or waited on at all.
+    /// The dialog process could not be spawned or waited on at all (an
+    /// `io::Error` from `Command::spawn`/`Child::try_wait`).
     SpawnError(String),
+    /// The dialog process spawned and ran, but exited signaling
+    /// [`LYRA_INFRA_FAILURE_EXIT`] (`lyra secrets ask` only — module doc's
+    /// live-incident section) — a genuine infrastructure failure, never a
+    /// user action. The `String` names the exit status only (this
+    /// function's own stdout/stderr split: `lyra`'s stderr is INHERITED
+    /// straight to this process's own, `spawn_lyra_entry`'s own doc, so its
+    /// actual failure detail already reached the journal directly and does
+    /// not need to be re-captured and re-printed here).
+    DialogFailure(String),
 }
 
 /// `--no-markup` (this commit, review fix): `--text` is built by
@@ -794,7 +865,16 @@ fn spawn_lyra_entry(
     if let Some(f) = from_line {
         cmd.args(["--from", f]);
     }
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+    // `stderr(Stdio::inherit())` — this commit, live-incident fix (module
+    // doc): `lyra secrets ask` narrates its OWN failures on stderr
+    // (`crates/lyra/src/lib.rs`'s `special` hook, the `"failed"` arm), and
+    // that text used to be discarded outright (`Stdio::null()`) rather than
+    // ever reaching an operator. Inheriting means it lands directly in THIS
+    // process's own stderr — which the deployed unit already routes to the
+    // journal (`StandardError = "journal"`) — with no capture/re-print step
+    // needed here. `stdout` stays piped (the code/`Dismiss ask` contract);
+    // `stdin` stays null (never an interactive child).
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()
 }
 
 /// Run one code-entry dialog CHILD to completion, polling every 200ms
@@ -828,6 +908,12 @@ fn run_entry_dialog(spawn: impl FnOnce() -> std::io::Result<Child>, mut should_c
                     ZenityResult::Approved(out)
                 } else if out == DISMISS_LABEL {
                     ZenityResult::Dismissed
+                } else if status.code() == Some(LYRA_INFRA_FAILURE_EXIT) {
+                    // Checked BEFORE falling through to `Cancelled` — the
+                    // ONE branch point this whole distinction exists for
+                    // (module doc's live-incident section, `ZenityResult::
+                    // DialogFailure`'s own doc).
+                    ZenityResult::DialogFailure(format!("dialog child exited with status {status}"))
                 } else {
                     ZenityResult::Cancelled
                 };
@@ -869,10 +955,25 @@ fn run_lyra_entry(
 /// up in [`run_entry_dialog`] through the SAME `should_cancel` closure the
 /// caller built once — the choice changes which child is spawned, nothing
 /// about how its result is read back.
+///
+/// **Fallback on a `lyra` infrastructure failure (this commit, live-
+/// incident fix — module doc's own section has the full story).** A `lyra`
+/// attempt that comes back `SpawnError`/`DialogFailure` is retried, ONCE,
+/// immediately, through `zenity` for the SAME ask — [`zenity_available`]
+/// permitting — rather than leaving the ask with no dialog at all (the
+/// plugin philosophy's whole point, root `AGENTS.md` house rule 7: the
+/// fancy surface degrades to the plain one). Both the fallback attempt and
+/// the "no fallback possible" case narrate on stderr, naming the ask id and
+/// which binary failed — [`popup_loop`]'s own caller-side narration
+/// (spawn-backoff bookkeeping, the `spawn_failing` flag) still applies on
+/// top of whatever this function returns; it has no reason to know a
+/// fallback happened underneath it, since the RESULT is what it reacts to
+/// either way.
 #[allow(clippy::too_many_arguments)]
 fn run_ask_dialog(
     lyra_cmd: Option<&str>,
     zenity_cmd: &str,
+    ask_id: &str,
     secret: &str,
     consumer: &str,
     seconds: u64,
@@ -880,11 +981,27 @@ fn run_ask_dialog(
     text: &str,
     reason: Option<&str>,
     from_line: Option<&str>,
-    should_cancel: impl FnMut() -> bool,
+    mut should_cancel: impl FnMut() -> bool,
 ) -> ZenityResult {
-    match lyra_cmd {
-        Some(lyra) => run_lyra_entry(lyra, secret, consumer, seconds, reason, from_line, should_cancel),
-        None => run_zenity_entry(zenity_cmd, title, text, should_cancel),
+    let Some(lyra) = lyra_cmd else {
+        return run_zenity_entry(zenity_cmd, title, text, should_cancel);
+    };
+    let result = run_lyra_entry(lyra, secret, consumer, seconds, reason, from_line, &mut should_cancel);
+    match &result {
+        ZenityResult::SpawnError(e) | ZenityResult::DialogFailure(e) => {
+            eprintln!(
+                "aoide secrets watch --popup: lyra secrets ask failed for ask {ask_id}: {e} \u{2014} falling back to zenity for this ask"
+            );
+            if zenity_available(zenity_cmd) {
+                run_zenity_entry(zenity_cmd, title, text, should_cancel)
+            } else {
+                eprintln!(
+                    "aoide secrets watch --popup: zenity is not available either \u{2014} ask {ask_id} stays parked, will retry"
+                );
+                result
+            }
+        }
+        _ => result,
     }
 }
 
@@ -1002,6 +1119,7 @@ fn popup_loop(
         let result = run_ask_dialog(
             lyra_cmd,
             zenity_cmd,
+            &ask.id,
             &ask.secret,
             &ask.consumer,
             seconds,
@@ -1015,7 +1133,7 @@ fn popup_loop(
             },
         );
 
-        if !matches!(result, ZenityResult::SpawnError(_)) && spawn_failing {
+        if !matches!(result, ZenityResult::SpawnError(_) | ZenityResult::DialogFailure(_)) && spawn_failing {
             spawn_failing = false;
             spawn_backoff = SPAWN_BACKOFF_INITIAL;
             let _g = out_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -1050,7 +1168,18 @@ fn popup_loop(
                 // secrets ask` error surface exists — P3's brief covers the
                 // entry dialog only); on the lyra path the ask simply stays
                 // parked and the next poll reopens its `lyra secrets ask`
-                // entry dialog fresh, same as any other re-prompt.
+                // entry dialog fresh, same as any other re-prompt. KNOWN
+                // IMPRECISION (this commit's own fallback addition): this
+                // still checks the STATIC `lyra_cmd.is_none()` choice, not
+                // "did `run_ask_dialog` actually fall back to zenity for
+                // THIS attempt" — a wrong code entered through a
+                // lyra-failed-then-fell-back-to-zenity dialog won't get this
+                // retry dialog either, same as an ordinary lyra attempt
+                // wouldn't. Narrow enough (two failures compounding: lyra's
+                // own infra failure, then a wrong code on the fallback) not
+                // to chase further here; a future fix would need
+                // `run_ask_dialog` to report which binary actually answered,
+                // not just the result.
                 if approved.is_err() && lyra_cmd.is_none() {
                     zenity_error_dialog(
                         zenity_cmd,
@@ -1093,12 +1222,23 @@ fn popup_loop(
                     println!("  ask {} resolved elsewhere while its popup was open \u{2014} closing the dialog", ask.id);
                 }
             }
-            ZenityResult::SpawnError(e) => {
+            // `SpawnError`/`DialogFailure` land here ONLY when `run_ask_dialog`'s
+            // own fallback (module doc's live-incident section) already
+            // ran and either wasn't possible (`zenity_available` was
+            // false) or itself failed — the SPECIFIC cause (which binary,
+            // which error) was already `eprintln!`'d there and, for a
+            // `lyra` failure, on `lyra`'s own inherited stderr too
+            // (`spawn_lyra_entry`'s doc). This arm's only job is the
+            // shared backoff bookkeeping so a persistently broken dialog
+            // binary doesn't busy-loop every ~200ms — deliberately
+            // binary-agnostic wording, since by the time either variant
+            // reaches here the specific failure is already on record.
+            ZenityResult::SpawnError(e) | ZenityResult::DialogFailure(e) => {
                 if !spawn_failing {
                     spawn_failing = true;
                     let _g = out_lock.lock().unwrap_or_else(|e2| e2.into_inner());
-                    println!(
-                        "  aoide secrets watch --popup: spawning zenity for ask {}: {e} \u{2014} backing off, retrying up to every {}s",
+                    eprintln!(
+                        "  aoide secrets watch --popup: ask {} has no working dialog right now ({e}) \u{2014} backing off, retrying up to every {}s",
                         ask.id,
                         SPAWN_BACKOFF_MAX.as_secs()
                     );
@@ -2317,6 +2457,7 @@ mod tests {
         let result = run_ask_dialog(
             Some(lyra_shim.to_str().unwrap()),
             "/no/such/aoide-secrets-watch-zenity-shim",
+            "ask-1",
             "db-prod",
             "claude",
             42,
@@ -2336,9 +2477,112 @@ mod tests {
     fn run_ask_dialog_falls_back_to_zenity_when_lyra_is_absent() {
         let _guard = shim_lock();
         let zenity_shim = write_shim("dialog-zenity", "#!/bin/sh\necho zenity-picked\nexit 0\n");
-        let result = run_ask_dialog(None, zenity_shim.to_str().unwrap(), "db-prod", "claude", 42, "t", "x", None, None, || false);
+        let result =
+            run_ask_dialog(None, zenity_shim.to_str().unwrap(), "ask-1", "db-prod", "claude", 42, "t", "x", None, None, || false);
         assert!(matches!(result, ZenityResult::Approved(ref c) if c == "zenity-picked"), "expected the zenity shim's own output, got {result:?}");
         remove_shim(&zenity_shim);
+    }
+
+    // ── live-incident fix: lyra infra failures narrate + fall back ───────
+
+    /// A `lyra` that ENOENTs (the exact live incident — `quickshell` missing
+    /// from the deployed unit's own `PATH`, module doc) must not leave the
+    /// ask undialoged: `run_ask_dialog` retries it through zenity
+    /// immediately, and the FINAL result is whatever that zenity attempt
+    /// produced. (Asserting the `eprintln!` narration itself would need
+    /// process-wide stderr fd redirection, which would corrupt `cargo
+    /// test`'s own output capture for every OTHER test running in parallel
+    /// — the functional fallback behavior pinned here is the reliable,
+    /// safe-to-test half; the narration calls themselves are unconditional
+    /// and reviewable directly in `run_ask_dialog`'s source.)
+    #[test]
+    fn run_ask_dialog_falls_back_to_zenity_when_lyra_fails_to_spawn() {
+        let _guard = shim_lock();
+        let zenity_shim = write_shim("fallback-spawn-error", "#!/bin/sh\necho fallback-code\nexit 0\n");
+        let result = run_ask_dialog(
+            Some("/no/such/aoide-secrets-watch-lyra-shim"),
+            zenity_shim.to_str().unwrap(),
+            "ask-1",
+            "db-prod",
+            "claude",
+            42,
+            "t",
+            "x",
+            None,
+            None,
+            || false,
+        );
+        assert!(matches!(result, ZenityResult::Approved(ref c) if c == "fallback-code"), "expected the zenity fallback's own output, got {result:?}");
+        remove_shim(&zenity_shim);
+    }
+
+    /// A `lyra` that spawns, runs, and exits `EXIT_INFRA_FAILURE` (3) — a
+    /// `quickshell` crash, a QML load error, anything short of a genuine
+    /// user action — gets the SAME immediate zenity fallback as a spawn
+    /// failure. Distinguishes this from a genuine cancel (exit 1, the next
+    /// test): only exit 3 triggers the fallback.
+    #[test]
+    fn run_ask_dialog_falls_back_to_zenity_when_lyra_exits_infra_failure() {
+        let _guard = shim_lock();
+        let lyra_shim = write_shim("infra-failure", "#!/bin/sh\nexit 3\n");
+        let zenity_shim = write_shim("fallback-infra-failure", "#!/bin/sh\necho fallback-code-2\nexit 0\n");
+        let result = run_ask_dialog(
+            Some(lyra_shim.to_str().unwrap()),
+            zenity_shim.to_str().unwrap(),
+            "ask-2",
+            "db-prod",
+            "claude",
+            42,
+            "t",
+            "x",
+            None,
+            None,
+            || false,
+        );
+        assert!(matches!(result, ZenityResult::Approved(ref c) if c == "fallback-code-2"), "expected the zenity fallback's own output, got {result:?}");
+        remove_shim(&lyra_shim);
+        remove_shim(&zenity_shim);
+    }
+
+    /// The other half of the SAME distinction, at the `run_entry_dialog`
+    /// level directly (no fallback involved) — exit 3 with no stdout must
+    /// be read as `DialogFailure`, never `Cancelled`.
+    #[test]
+    fn run_entry_dialog_reads_exit_three_as_dialog_failure_not_cancelled() {
+        let _guard = shim_lock();
+        let shim = write_shim("bare-exit-three", "#!/bin/sh\nexit 3\n");
+        let result = run_entry_dialog(|| spawn_lyra_entry(shim.to_str().unwrap(), "t", "m", 1, None, None), || false);
+        assert!(matches!(result, ZenityResult::DialogFailure(_)), "expected DialogFailure, got {result:?}");
+        remove_shim(&shim);
+    }
+
+    /// The genuine-cancel control case: `lyra` exits 1 with NO stdout (a
+    /// bare Esc/close, `AskResult::Cancelled`'s own contract) must be read
+    /// as `Cancelled` and must NOT trigger a zenity fallback — proven by
+    /// pointing `zenity_cmd` at a path that does not exist: if the fallback
+    /// wrongly fired, the result would come back `SpawnError` instead of
+    /// `Cancelled`. This is the "today's behavior for an actual user
+    /// action stays exactly as it was" pin the live-incident fix must not
+    /// regress.
+    #[test]
+    fn run_ask_dialog_genuine_lyra_cancel_is_not_retried_via_zenity() {
+        let _guard = shim_lock();
+        let lyra_shim = write_shim("genuine-cancel", "#!/bin/sh\nexit 1\n");
+        let result = run_ask_dialog(
+            Some(lyra_shim.to_str().unwrap()),
+            "/no/such/aoide-secrets-watch-zenity-shim-never-invoked",
+            "ask-3",
+            "db-prod",
+            "claude",
+            42,
+            "t",
+            "x",
+            None,
+            None,
+            || false,
+        );
+        assert!(matches!(result, ZenityResult::Cancelled), "a genuine cancel must never fall back, got {result:?}");
+        remove_shim(&lyra_shim);
     }
 
     /// P1: `run()`'s own startup reconcile (`reconcile_once`, called before

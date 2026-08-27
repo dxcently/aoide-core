@@ -14,12 +14,21 @@
 //! reason the two binaries are interchangeable
 //! (`aoide_secrets::watch::run_entry_dialog`'s own doc):** the typed code on
 //! stdout with exit 0 on submit; the literal string `Dismiss ask` on stdout
-//! with exit 1 on dismiss; any other non-zero exit (Esc, window closed, a
-//! spawn failure) for a bare cancel. `watch.rs`'s result parsing and its
-//! kill-by-pid expiry path never know which binary answered — don't change
-//! this contract here without updating `crates/secrets/src/watch.rs`'s
-//! module doc AND `crates/secrets/README.md`'s "Popup mode" section in the
-//! SAME commit.
+//! with exit 1 on dismiss; a bare Esc/window-close for exit 1 with no
+//! stdout at all (a genuine user cancel). `watch.rs`'s result parsing and
+//! its kill-by-pid expiry path never know which binary answered — don't
+//! change this contract here without updating
+//! `crates/secrets/src/watch.rs`'s module doc AND `crates/secrets/
+//! README.md`'s "Popup mode" section in the SAME commit.
+//!
+//! **[`EXIT_INFRA_FAILURE`] (exit 3) is the ONE reservation on top of that
+//! contract (this commit, live-incident fix — see this constant's own doc
+//! for the full incident).** A spawn failure or a quickshell that exits
+//! without ever completing the ask is NOT a user cancel and must never be
+//! silently treated as one — it exits 3 instead of colliding with zenity's
+//! own cancel code (1), and `watch::run_entry_dialog` on the OTHER side of
+//! this contract checks for exactly this code before falling through to its
+//! own `Cancelled` case.
 //!
 //! **The QML is paint only (root `AGENTS.md` house rule 7's "delete every
 //! `.qml`" test) — the capability (entering a TOTP code) stays reachable
@@ -107,6 +116,32 @@ const RESULT_MARKER: &str = "AOIDE_SECRETS_ASK_RESULT:";
 /// own `ZENITY_CMD` constant holds.
 const QUICKSHELL_CMD: &str = "quickshell";
 
+/// The live incident this constant exists to close (this commit): the
+/// deployed popup watcher unit had `AOIDE_RICE_BIN` set, chose this dialog,
+/// and `spawn_quickshell` ENOENT'd (`quickshell` wasn't on the unit's own
+/// `PATH` — fixed nix-side, `modules/nucleus/secrets.nix`). On screen:
+/// nothing. In the journal: nothing after the `parked` line. Root cause,
+/// the CORE half this constant fixes: `handle_secrets_ask`'s error path
+/// returned a plain `Outcome::error`, which `lib.rs`'s `special` hook
+/// mapped to `output::exit::ERROR` — the SAME exit code (1) zenity's own
+/// contract already uses for a bare user Cancel. `watch::run_entry_dialog`
+/// (the shared reader on the OTHER side of this contract, `aoide-secrets`)
+/// had no way to tell "lyra couldn't even open the dialog" apart from "the
+/// user pressed Esc," so the ask was silently `ignore`d and sat parked
+/// until its own timeout — the exact "invisible failure" shape this crate
+/// keeps re-learning. `3` is arbitrary but deliberate: zenity's own real
+/// exit codes are `0` (OK), `1` (Cancel/closed), and roughly `5`-ish for a
+/// `--timeout` (a flag this command never passes, but the low single digits
+/// are the range zenity itself occupies) — `3` sits clear of all of them.
+/// Every internal failure this command can produce (`AskResult::Failed`,
+/// this file's `run_ask_dialog`'s own `Err(String)` path) exits with this
+/// code AND an `eprintln!` naming what happened (`lib.rs`'s `special` hook,
+/// the `"failed"` arm) — stdout carries nothing, keeping the "code or
+/// `Dismiss ask`, nothing else" half of the contract intact. Don't reuse
+/// `output::exit::ERROR`/`USAGE` for a NEW internal-failure case that needs
+/// this same distinction — this is the one reserved code for exactly that.
+pub const EXIT_INFRA_FAILURE: i32 = 3;
+
 fn handle_secrets_ask(inv: &Invocation) -> Outcome {
     let cmd = "secrets.ask";
     if inv.door != Door::Cli {
@@ -130,23 +165,39 @@ fn handle_secrets_ask(inv: &Invocation) -> Outcome {
         }
         Ok(AskResult::Dismissed) => Outcome::ok(cmd, "dismissed").with_data(json!({ "result": "dismissed" })),
         Ok(AskResult::Cancelled) => Outcome::ok(cmd, "cancelled").with_data(json!({ "result": "cancelled" })),
-        Err(e) => Outcome::error(cmd, e),
+        // `"failed"` — a NEW tag, distinct from `"cancelled"` (`EXIT_INFRA_
+        // FAILURE`'s own doc has the full incident this exists to close):
+        // `lib.rs`'s `special` hook is the ONE place that reads it and maps
+        // it onto the reserved exit code + an `eprintln!`.
+        Ok(AskResult::Failed(reason)) => Outcome::error(cmd, reason).with_data(json!({ "result": "failed" })),
+        Err(e) => Outcome::error(cmd, e).with_data(json!({ "result": "failed" })),
     }
 }
 
-/// The three shapes this command's own `console.log` marker line can carry —
-/// mirrors `aoide_secrets::watch::ZenityResult` in spirit (never a bare
-/// `Result`: "the user closed it," "explicitly dismissed," and "typed a
-/// full code" are three different things the caller reacts to differently),
-/// minus the zenity-only `SpawnError`/`CancelledExternally` variants this
-/// command has no equivalent of (a `quickshell` spawn failure is reported
-/// straight through as an `Err(String)` instead — module doc's own doc
-/// comment on why nothing here waits for an external kill signal).
+/// The four shapes this command's own `console.log` marker line (or its
+/// absence) can carry — mirrors `aoide_secrets::watch::ZenityResult` in
+/// spirit (never a bare `Result`: "the user closed it," "explicitly
+/// dismissed," "typed a full code," and "the dialog infrastructure itself
+/// failed" are four different things the caller reacts to differently).
+/// `Failed` is additive (this commit, `EXIT_INFRA_FAILURE`'s own doc) —
+/// `spawn_and_wait_for_marker` returns it when quickshell's stdout pipe
+/// closes WITHOUT ever printing a recognized marker line (a crash, a QML
+/// load error, anything short of the three deliberate outcomes the
+/// template's own `console.log` calls cover) — never silently folded into
+/// `Cancelled`, which is reserved for an ACTUAL user action (Esc, the
+/// window's close button, both of which the QML itself marks with a
+/// `CANCEL` line before quickshell exits). A `quickshell` SPAWN failure
+/// (the binary itself missing) is still reported straight through as an
+/// `Err(String)` from `run_ask_dialog` instead of this variant — the
+/// distinction doesn't matter to `handle_secrets_ask`, which maps BOTH onto
+/// the identical `"failed"` outcome tag, but it matters to this module's own
+/// tests (`run_ask_dialog_reports_...` vs `run_ask_dialog_treats_a_marker...`).
 #[derive(Debug, PartialEq, Eq)]
 enum AskResult {
     Approved(String),
     Dismissed,
     Cancelled,
+    Failed(String),
 }
 
 /// Write the generated QML, spawn `quickshell -p <path>`, read its stdout
@@ -283,11 +334,24 @@ fn spawn_and_wait_for_marker(quickshell_cmd: &str, qml_path: &std::path::Path) -
     // Whichever way the loop ended -- a marker was found, or the pipe
     // closed on its own (quickshell crashed, or exited some other way) --
     // the process must never be left running (module doc: `Qt.quit()`
-    // alone does not end it).
+    // alone does not end it). Captured for the `None` arm below: a
+    // marker-less exit's own status is worth naming in the failure message
+    // (`AGENTS.md`'s narration invariant), not just "something went wrong."
     let _ = child.kill();
-    let _ = child.wait();
+    let status = child.wait();
 
-    Ok(found.unwrap_or(AskResult::Cancelled))
+    match found {
+        Some(result) => Ok(result),
+        // The stdout pipe closed with NO recognized marker line at all --
+        // NEVER folded into `Cancelled` (`AskResult::Failed`'s own doc: a
+        // real Esc/close always emits a `CANCEL` marker FIRST, so its
+        // absence here means quickshell crashed, the QML failed to load, or
+        // something else genuinely broke, not that the user acted).
+        None => Ok(AskResult::Failed(match status {
+            Ok(status) => format!("quickshell exited ({status}) without ever completing the ask -- no result marker was seen on its stdout"),
+            Err(e) => format!("quickshell's exit status could not be read after its stdout closed: {e}"),
+        })),
+    }
 }
 
 /// Pure and total: finds [`RESULT_MARKER`] as a SUBSTRING rather than
@@ -822,13 +886,27 @@ mod tests {
     }
 
     #[test]
-    fn run_ask_dialog_returns_cancelled_when_the_shim_never_prints_a_marker() {
-        // Stands in for the "quickshell never exits on its own" case
-        // (module doc): the shim exits WITHOUT a marker line, closing its
-        // stdout pipe -- `spawn_and_wait_for_marker`'s read loop ends and
-        // falls back to `Cancelled`, exactly as an Esc/close would.
+    fn run_ask_dialog_returns_failed_when_the_shim_never_prints_a_marker() {
+        // The live incident this test pins (`AskResult::Failed`'s own doc,
+        // `EXIT_INFRA_FAILURE`'s own doc): a marker-less exit is NEVER a
+        // silent `Cancelled` -- a real Esc/close always emits a `CANCEL`
+        // line first, so its total absence means quickshell crashed or the
+        // QML failed to load, not that the user acted.
         let _guard = shim_lock();
         let shim = write_shim("silent", "#!/bin/sh\nexit 0\n");
+        let result = run_ask_dialog(shim.to_str().unwrap(), "db-prod", "claude", 42, None, None).unwrap();
+        assert!(matches!(result, AskResult::Failed(_)), "expected Failed, got {result:?}");
+        remove_shim(&shim);
+    }
+
+    #[test]
+    fn run_ask_dialog_genuine_cancel_via_the_cancel_marker_is_still_cancelled_not_failed() {
+        // The other half of the same distinction: a CANCEL marker (the
+        // QML's own Esc/close path) must still map to `Cancelled`, never to
+        // `Failed` -- the absence of ANY marker is the failure signal, not
+        // the presence of this specific one.
+        let _guard = shim_lock();
+        let shim = write_shim("real-cancel", "#!/bin/sh\necho AOIDE_SECRETS_ASK_RESULT:CANCEL\nexit 0\n");
         let result = run_ask_dialog(shim.to_str().unwrap(), "db-prod", "claude", 42, None, None).unwrap();
         assert_eq!(result, AskResult::Cancelled);
         remove_shim(&shim);
