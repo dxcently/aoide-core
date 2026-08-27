@@ -13,21 +13,27 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Default audit-log path (mirrors `aoide.auditLog`, BUILD.md option table).
 ///
 /// Resolution order: `$AOIDE_AUDIT_LOG` (set by the systemd unit) → derived
-/// from `$AOIDE_USER`/`$HOME` as `/home/<user>/Aoide/log`.
+/// as `$AOIDE_ROOT/log` (L-C2, task #107; `$AOIDE_ROOT` default
+/// `<home>/.aoide` — see `aoide_storage::fs::root`'s own doc for the full
+/// path-model note). Duplicated rather than shared with that function
+/// deliberately: this crate sits BELOW `aoide-storage` in the dependency
+/// graph, so it cannot call it without a cycle; [`aoide_home`] is the one
+/// piece already common to both.
 pub fn default_audit_log() -> PathBuf {
     if let Ok(explicit) = std::env::var("AOIDE_AUDIT_LOG") {
         if !explicit.is_empty() {
             return PathBuf::from(explicit);
         }
     }
-    // `aoide.auditLog` defaults to `/home/<user>/Aoide/log`.
-    if let Ok(user) = std::env::var("AOIDE_USER") {
-        if !user.is_empty() {
-            return Path::new("/home").join(&user).join("Aoide").join("log");
+    if let Ok(dir) = std::env::var("AOIDE_ROOT") {
+        if !dir.is_empty() {
+            let p = PathBuf::from(&dir);
+            if p.is_absolute() {
+                return p.join("log");
+            }
         }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/khoa".into());
-    Path::new(&home).join("Aoide").join("log")
+    aoide_home().join(".aoide").join("log")
 }
 
 /// The audit-log path in effect for one invocation (flag override →

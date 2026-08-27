@@ -96,6 +96,7 @@ dependencies = [
  "aoide-screen",
  "aoide-server",
  "aoide-song",
+ "aoide-storage",
  "aoide-test-support",
  "libc",
  "serde_json",

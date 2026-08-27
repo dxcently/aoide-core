@@ -48,7 +48,7 @@ pub fn register(r: &mut Registry) {
 const CLASSES: [&str; 3] = ["unrecognized", "orphan-tracked", "clutter"];
 
 fn handle_soundcheck(_inv: &Invocation) -> Outcome {
-    let root = aoide_storage::fs::repo_root();
+    let root = aoide_storage::fs::flake_root();
 
     let mut findings = Vec::new();
     findings.extend(scan::unrecognized_root_entries(&root));
@@ -110,8 +110,9 @@ mod tests {
     }
 
     /// A fixture repo carrying one planted finding from EACH of C1/C2/C3, and
-    /// point `AOIDE_STAGE_DIR` (hence `repo_root()`) at it. Returns the root
-    /// so callers can inspect the tree further.
+    /// point `AOIDE_FLAKE_ROOT` (hence `flake_root()`, soundcheck's checkout
+    /// seam since L-C2) at it. Returns the root so callers can inspect the
+    /// tree further.
     fn plant_fixture() -> std::path::PathBuf {
         let root = unique_tmp("upkeep-cmd-fixture");
         run_git(&root, &["init", "-q"]);
@@ -135,15 +136,14 @@ mod tests {
         // C3 clutter: a root symlink into /nix/store.
         std::os::unix::fs::symlink("/nix/store/abc123-aoide-0.0.0", root.join("result")).unwrap();
 
-        std::fs::create_dir_all(root.join("song").join("stage")).unwrap();
-        std::env::set_var("AOIDE_STAGE_DIR", root.join("song").join("stage"));
+        std::env::set_var("AOIDE_FLAKE_ROOT", &root);
         root
     }
 
     #[test]
     fn a_fixture_with_one_finding_per_class_reports_all_three_and_fails_on_the_errors() {
         let _g = env_lock().lock().unwrap();
-        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let _s = EnvSaver::capture(&["AOIDE_FLAKE_ROOT"]);
         let root = plant_fixture();
 
         let out = handle_soundcheck(&inv(&["soundcheck"], &[]));
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn a_clean_tree_exits_ok_with_zero_findings() {
         let _g = env_lock().lock().unwrap();
-        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let _s = EnvSaver::capture(&["AOIDE_FLAKE_ROOT"]);
         let root = unique_tmp("upkeep-cmd-clean");
         run_git(&root, &["init", "-q"]);
         run_git(&root, &["config", "user.email", "test@example.invalid"]);
@@ -195,8 +195,7 @@ mod tests {
         std::fs::write(root.join("README.md"), "committed\n").unwrap();
         run_git(&root, &["add", "README.md"]);
         run_git(&root, &["commit", "-q", "-m", "init"]);
-        std::fs::create_dir_all(root.join("song").join("stage")).unwrap();
-        std::env::set_var("AOIDE_STAGE_DIR", root.join("song").join("stage"));
+        std::env::set_var("AOIDE_FLAKE_ROOT", &root);
 
         let out = handle_soundcheck(&inv(&["soundcheck"], &[]));
         assert_eq!(out.status, Status::Ok);
@@ -216,10 +215,9 @@ mod tests {
         // degrade to no findings (`scan`'s own graceful-degrade contract);
         // the filesystem-only check (C3) still runs.
         let _g = env_lock().lock().unwrap();
-        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let _s = EnvSaver::capture(&["AOIDE_FLAKE_ROOT"]);
         let root = unique_tmp("upkeep-cmd-not-a-repo");
-        std::fs::create_dir_all(root.join("song").join("stage")).unwrap();
-        std::env::set_var("AOIDE_STAGE_DIR", root.join("song").join("stage"));
+        std::env::set_var("AOIDE_FLAKE_ROOT", &root);
 
         let out = handle_soundcheck(&inv(&["soundcheck"], &[]));
         assert_eq!(out.status, Status::Ok);
@@ -230,7 +228,7 @@ mod tests {
     #[test]
     fn stable_ids_never_collide_across_findings_in_the_same_run() {
         let _g = env_lock().lock().unwrap();
-        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let _s = EnvSaver::capture(&["AOIDE_FLAKE_ROOT"]);
         let root = plant_fixture();
         // A second clutter symlink, so this run carries >1 finding of the
         // SAME class too — the collision surface the id rule exists for.

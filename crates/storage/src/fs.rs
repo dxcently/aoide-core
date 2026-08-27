@@ -7,21 +7,196 @@
 //! untouched. The socket-loop code (`socket_path`, `BridgeCommand`,
 //! `parse_command`, `run`) stays in root `shellbridge.rs` — it moves in
 //! Phase 3b (conduct extraction).
+//!
+//! **Runtime root (L-C2, lyra-carrier lane, task #107):** every path below
+//! `song/stage/`, `state/`, `run/qml/`, and `song/songbook/` composed under
+//! it hangs off ONE root, [`root`] — `$AOIDE_ROOT` (absolute-path-wins),
+//! default `<home>/.aoide`, nix-free. `~/Aoide` is no longer the runtime
+//! root on any host; it demotes to purely the dev git checkout, reached
+//! through the separate [`flake_root`] seam (`$AOIDE_FLAKE_ROOT`, default
+//! `<home>/Aoide`). [`migrate_root_once`] moves a pre-L-C2 host's
+//! `~/Aoide/{song/stage,state,log}` trees into the new root's equivalents —
+//! one-shot and idempotent, but deliberately NOT wired into [`root`]'s own
+//! resolution (see that function's doc for why): the three real binaries'
+//! `main()` call it explicitly, once, at process start.
 
 use std::io::Write;
 
-/// The live-state stage directory: `~/Aoide/song/stage/`.
+/// The runtime root every stage/state/run tree hangs off: `$AOIDE_ROOT`
+/// (absolute-path-wins, same discipline as every other override here),
+/// default [`default_root`] (`<home>/.aoide`) — core code default, no nix
+/// required. Every OTHER path in this file (`stage_dir`, `state_dir`, and
+/// everything derived from them) composes from here now instead of
+/// `aoide_protocol::aoide_home().join("Aoide")` directly, so a single
+/// override relocates the whole tree at once.
+///
+/// **Deliberately pure — no migration side effect on this path**, unlike
+/// [`conducting_stage_dir`]'s own S1 precedent. `stage_dir`/`state_dir`
+/// (and this function transitively) are reached by [`with_stage_lock`],
+/// the SHARED lock primitive nearly every stage-file writer across the
+/// whole workspace routes through regardless of which file it's actually
+/// touching (`with_stage_lock`'s own doc: it always locks `stage_dir()`,
+/// even for a `conducting_stage_dir`-domain caller) — a live incident
+/// during this lane's own development proved that a `state_dir()`-only
+/// test (`inbox` command tests, overriding only `$AOIDE_STATE_DIR`) still
+/// reaches `stage_dir()`'s fallback through `with_stage_lock`, and would
+/// have silently driven a real migration against the operator's actual
+/// `$HOME` the first time such a test ran unguarded. `conducting_stage_dir`
+/// has no such shared low-level caller, which is why hanging a migration
+/// off ITS resolution is safe while hanging one off `root`'s is not. See
+/// [`migrate_root_once`]'s own doc for where the migration actually runs.
+pub fn root() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("AOIDE_ROOT") {
+        let p = std::path::PathBuf::from(&dir);
+        if p.is_absolute() {
+            return p;
+        }
+    }
+    default_root()
+}
+
+/// `$AOIDE_ROOT`'s own default, `<home>/.aoide` — factored out of [`root`]
+/// so [`migrate_root_once`] can name its OWN migration target without
+/// hardcoding the literal twice.
+fn default_root() -> std::path::PathBuf {
+    aoide_protocol::aoide_home().join(".aoide")
+}
+
+/// One-shot, idempotent move of the pre-L-C2 `~/Aoide/{song/stage,state,log}`
+/// trees into the new `$AOIDE_ROOT` default (`<home>/.aoide`). `pub`: the
+/// three real binaries call this ONCE, early in their own `main()` —
+/// `crates/cli/src/bin/aoide.rs`, `crates/cli/src/bin/aoided.rs`,
+/// `crates/lyra/src/bin/lyra.rs` — never from a library getter (see
+/// [`root`]'s own doc for the incident that settled this). Safe to call
+/// more than once (each piece is a plain exists-and-absent check, same
+/// idempotency [`migrate_dir`]/[`migrate_file`] already give
+/// [`migrate_conducting_stage`]) and safe to call from a test directly —
+/// nothing here is gated behind a process-wide `Once`, unlike
+/// `MIGRATE_CONDUCTING_STAGE_ONCE`, because nothing here is reachable
+/// except by an explicit call.
+///
+/// Each of the three pieces is gated on ITS OWN env override being unset —
+/// `$AOIDE_STAGE_DIR` for `song/stage`, `$AOIDE_STATE_DIR` for `state`,
+/// `$AOIDE_AUDIT_LOG` for `log` — independently of one another, so a host
+/// (or test) that relocated only one tree never has ITS sibling moved out
+/// from under it.
+pub fn migrate_root_once() {
+    let old_root = aoide_protocol::aoide_home().join("Aoide");
+    let new_root = default_root();
+    if old_root == new_root {
+        return;
+    }
+
+    if std::env::var("AOIDE_STAGE_DIR").is_err() {
+        migrate_dir(&old_root.join("song").join("stage"), &new_root.join("song").join("stage"));
+    }
+    if std::env::var("AOIDE_STATE_DIR").is_err() {
+        migrate_dir(&old_root.join("state"), &new_root.join("state"));
+    }
+    if std::env::var("AOIDE_AUDIT_LOG").is_err() {
+        migrate_file(&old_root.join("log"), &new_root.join("log"));
+    }
+}
+
+/// Move `old` → `new` wholesale: a no-op unless `old` exists AND `new` is
+/// absent (never clobbers a tree that already migrated, or one seeded fresh
+/// at the new root). `rename` first (same filesystem, the common case); a
+/// cross-filesystem rename falls back to a recursive copy, removed from the
+/// source only once the copy fully lands — a crash mid-copy leaves `old`
+/// intact rather than a half-moved tree with `new` looking "done." Narrates
+/// failure, never panics — a botched migration must not take boot down with
+/// it, and the pre-migration path stays usable in the meantime.
+fn migrate_dir(old: &std::path::Path, new: &std::path::Path) {
+    if !old.exists() || new.exists() {
+        return;
+    }
+    let Some(parent) = new.parent() else { return };
+    if let Err(e) = std::fs::create_dir_all(parent) {
+        eprintln!(
+            "aoide: cannot create {} ({e}) — {} stays at the pre-L-C2 root",
+            parent.display(),
+            old.display()
+        );
+        return;
+    }
+    if std::fs::rename(old, new).is_ok() {
+        return;
+    }
+    let tmp = new.with_extension(format!("migrate-tmp.{}", std::process::id()));
+    if copy_dir_recursive(old, &tmp).is_ok() && std::fs::rename(&tmp, new).is_ok() {
+        let _ = std::fs::remove_dir_all(old);
+    } else {
+        let _ = std::fs::remove_dir_all(&tmp);
+        eprintln!(
+            "aoide: could not migrate {} to {} — staying at the pre-L-C2 root",
+            old.display(),
+            new.display()
+        );
+    }
+}
+
+/// Move one file `old` → `new` — the single-file counterpart to
+/// [`migrate_dir`], for the audit log (a flat file, not a directory).
+/// Same no-clobber/no-panic discipline.
+fn migrate_file(old: &std::path::Path, new: &std::path::Path) {
+    if !old.exists() || new.exists() {
+        return;
+    }
+    let Some(parent) = new.parent() else { return };
+    if let Err(e) = std::fs::create_dir_all(parent) {
+        eprintln!(
+            "aoide: cannot create {} ({e}) — {} stays at the pre-L-C2 root",
+            parent.display(),
+            old.display()
+        );
+        return;
+    }
+    if std::fs::rename(old, new).is_ok() {
+        return;
+    }
+    if std::fs::copy(old, new).is_ok() {
+        let _ = std::fs::remove_file(old);
+    } else {
+        eprintln!(
+            "aoide: could not migrate {} to {} — staying at the pre-L-C2 root",
+            old.display(),
+            new.display()
+        );
+    }
+}
+
+/// Recursive directory copy for [`migrate_dir`]'s cross-filesystem fallback:
+/// every file and subdir, symlinks preserved as symlinks (never followed).
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let dst_path = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&entry.path(), &dst_path)?;
+        } else if file_type.is_symlink() {
+            let target = std::fs::read_link(entry.path())?;
+            std::os::unix::fs::symlink(target, &dst_path)?;
+        } else {
+            std::fs::copy(entry.path(), &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// The live-state stage directory: `$AOIDE_ROOT/song/stage/` (default
+/// `~/.aoide/song/stage/`).
 ///
 /// **Contract seam (CONTRACTS.md §4):** the systemd unit
-/// (`modules/nucleus/shellbridge.nix`) sets `AOIDE_STAGE_DIR=%h/Aoide/song/stage`
-/// on the service — that env var wins when set to an absolute path, so the
-/// daemon and the CLI door always agree on where the stage tree lives. The
-/// fallback below derives the same `~/Aoide/song/stage` from
-/// `aoide_protocol::aoide_home()`, so on the default layout the two paths
-/// coincide; the override only matters when the unit relocates the stage (or
-/// a test/smoke run points elsewhere). A relative or empty value is ignored
-/// (we never resolve a runtime path against an arbitrary cwd). Every stage
-/// reader/writer routes through here.
+/// (`modules/nucleus/shellbridge.nix`) sets `AOIDE_STAGE_DIR` on the
+/// service — that env var wins when set to an absolute path, so the daemon
+/// and the CLI door always agree on where the stage tree lives. The
+/// fallback below derives `$AOIDE_ROOT/song/stage` from [`root`], so on the
+/// default layout the two paths coincide; the override only matters when
+/// the unit relocates the stage (or a test/smoke run points elsewhere). A
+/// relative or empty value is ignored (we never resolve a runtime path
+/// against an arbitrary cwd). Every stage reader/writer routes through here.
 pub fn stage_dir() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("AOIDE_STAGE_DIR") {
         let p = std::path::PathBuf::from(&dir);
@@ -29,22 +204,19 @@ pub fn stage_dir() -> std::path::PathBuf {
             return p;
         }
     }
-    aoide_protocol::aoide_home()
-        .join("Aoide")
-        .join("song")
-        .join("stage")
+    root().join("song").join("stage")
 }
 
-/// The account/usage runtime state directory: `~/Aoide/state/`.
+/// The account/usage runtime state directory: `$AOIDE_ROOT/state/` (default
+/// `~/.aoide/state/`).
 ///
-/// A NEW gitignored root-runtime dir (CONTRACTS.md §2), sibling to
-/// `song/stage/` but explicitly NOT song-scoped — account/global runtime like
+/// A gitignored root-runtime dir (CONTRACTS.md §2), sibling to `song/stage/`
+/// but explicitly NOT song-scoped — account/global runtime like
 /// `state/usage.json` lives here, never under `song/`. Resolution mirrors
 /// [`stage_dir`]: prefer `$AOIDE_STATE_DIR` when set to an **absolute** path,
-/// else derive `~/Aoide/state` from `$AOIDE_USER`/`$HOME` via
-/// `aoide_protocol::aoide_home`. A relative or empty override is ignored —
-/// same discipline as the stage dir, so a runtime path is never resolved
-/// against an arbitrary cwd.
+/// else derive `$AOIDE_ROOT/state` from [`root`]. A relative or empty
+/// override is ignored — same discipline as the stage dir, so a runtime
+/// path is never resolved against an arbitrary cwd.
 pub fn state_dir() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("AOIDE_STATE_DIR") {
         let p = std::path::PathBuf::from(&dir);
@@ -52,10 +224,11 @@ pub fn state_dir() -> std::path::PathBuf {
             return p;
         }
     }
-    aoide_protocol::aoide_home().join("Aoide").join("state")
+    root().join("state")
 }
 
-/// The CONDUCTING stage directory: `~/Aoide/state/stage/` — sessions.json,
+/// The CONDUCTING stage directory: `$AOIDE_ROOT/state/stage/` (default
+/// `~/.aoide/state/stage/`) — sessions.json,
 /// hooks.json, projects.json, graph.json, pending.json, herald.json (the
 /// broker-owned roster [`crate::inbox`]'s doc calls the "L4 dual-writer
 /// surface", mirrored by `server/src/daemon.rs::stage_roster`). Split from
@@ -195,7 +368,7 @@ fn migrate_conducting_stage(new_dir: &std::path::Path) {
     }
 }
 
-/// Screen-capture artifacts: `~/Aoide/state/captures/` (`aoide screen shot`,
+/// Screen-capture artifacts: `$AOIDE_ROOT/state/captures/` (`aoide screen shot`,
 /// PACKAGE-LAYOUT.md Phase-1 `screen` command family).
 ///
 /// Under [`state_dir`], not [`stage_dir`]: a capture is a DURABLE artifact a
@@ -207,7 +380,7 @@ pub fn captures_dir() -> std::path::PathBuf {
     state_dir().join("captures")
 }
 
-/// Headless-conduct transcripts: `~/Aoide/state/sessions/` (one
+/// Headless-conduct transcripts: `$AOIDE_ROOT/state/sessions/` (one
 /// `<sessionId>.log` per headless `aoide conduct` session — the pty-master
 /// mirror `logPath` on the session record points into).
 ///
@@ -219,7 +392,7 @@ pub fn session_logs_dir() -> std::path::PathBuf {
     state_dir().join("sessions")
 }
 
-/// Saved pointer position: `~/Aoide/state/pointer-pos.json` (`aoide screen
+/// Saved pointer position: `$AOIDE_ROOT/state/pointer-pos.json` (`aoide screen
 /// point save`/`restore`, Phase 2 of the `screen` command family).
 ///
 /// Under [`state_dir`], not [`stage_dir`] — same reasoning as
@@ -233,7 +406,8 @@ pub fn pointer_state_file() -> std::path::PathBuf {
     state_dir().join("pointer-pos.json")
 }
 
-/// The song tree root (`~/Aoide/song/`) — the parent of the stage dir.
+/// The song tree root (`$AOIDE_ROOT/song/`, default `~/.aoide/song/`) — the
+/// parent of the stage dir.
 ///
 /// The stage tree is `<song>/stage`; committed songs live under
 /// `<song>/songbook/<name>/` and cover art in the shared library
@@ -250,18 +424,16 @@ pub fn song_dir() -> std::path::PathBuf {
         .unwrap_or(stage)
 }
 
-/// The live-deployed QML tree the desktop shell reads from: `<Aoide>/run/qml/`
-/// — a sibling of the song tree ([`song_dir`]), NOT under `stage/`.
+/// The live-deployed QML tree the desktop shell reads from:
+/// `$AOIDE_ROOT/run/qml/` (default `~/.aoide/run/qml/`) — a sibling of the
+/// song tree ([`song_dir`]), NOT under `stage/`.
 ///
 /// Mirrors [`song_dir`]'s own derivation exactly: `song_dir` takes
 /// [`stage_dir`]'s parent to reach the song tree root; this takes
-/// `song_dir`'s parent (the `Aoide` root that `song/`, `state/`, and now
-/// `run/` all sit under) and joins `run/qml`. So an `$AOIDE_STAGE_DIR`
-/// override still relocates this seam — it rides the same env var, one
-/// level further up — without a separate `$AOIDE_RUN_DIR`. Not yet used by
-/// any Phase A caller (a later phase's widget-carry write path is the first
-/// consumer); the helper + its precedence test land now so the seam exists
-/// before anything depends on it.
+/// `song_dir`'s parent (the runtime root that `song/`, `state/`, and `run/`
+/// all sit under) and joins `run/qml`. So an `$AOIDE_STAGE_DIR` override
+/// still relocates this seam — it rides the same env var, one level further
+/// up — without a separate `$AOIDE_RUN_DIR`.
 pub fn run_qml_dir() -> std::path::PathBuf {
     let song = song_dir();
     song.parent()
@@ -269,42 +441,25 @@ pub fn run_qml_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| song.join("run").join("qml"))
 }
 
-/// The Aoide repo root: `~/Aoide` — the same root [`run_qml_dir`] takes as
-/// `song/`'s sibling, one level up from where [`song_dir`] resolves.
-///
-/// Mirrors [`run_qml_dir`]'s own derivation exactly (`song_dir().parent()`),
-/// so an `$AOIDE_STAGE_DIR` override relocates this too — `aoide soundcheck`
-/// (`aoide-upkeep`, the mechanical-integrity command) scans the WORKING tree
-/// starting here, and a test pointing the stage dir at a scratch tree gets an
-/// isolated fake repo root alongside it for free, same as every other seam in
-/// this file. Consequence, flagged once: `soundcheck` always inspects the ONE
-/// `~/Aoide` checkout this env resolves to, never an arbitrary cwd — there is
-/// no `--root` flag.
-pub fn repo_root() -> std::path::PathBuf {
-    let song = song_dir();
-    song.parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or(song)
-}
-
 /// The Aoide FLAKE root: the git checkout `nix eval` shells out against
-/// (`crate::widgets`'s songbook manifest/registry regeneration, C4/W3).
+/// (`crate::widgets`'s songbook manifest/registry regeneration, C4/W3) —
+/// and, since L-C2, the ONLY seam any repo-coupled feature (`rice declare`'s
+/// commit-in step, `aoide soundcheck`, a future hand-edit watcher) reaches
+/// the checkout through. Default `<home>/Aoide` — this is the ONE place
+/// that spelling still means anything; every runtime tree in this file
+/// hangs off [`root`] (default `<home>/.aoide`) instead.
 ///
-/// Deliberately NOT derived from [`stage_dir`]/[`repo_root`] the way every
-/// other path in this file is: those are relocatable per-test so a scratch
-/// tmp dir can stand in for `~/Aoide`'s RUNTIME trees (`song/stage`,
-/// `run/qml`) without a real flake anywhere in sight. The committed
-/// songbook `nix eval` reads (`song/songbook/`, `lib/song.nix`,
-/// `flake.nix`) is not a runtime tree — it is the one git checkout on disk,
-/// so relocating it per-test would mean fabricating a working flake (with
-/// its own `flake.lock`) in every test that touches `rice stage`, for no
-/// reason: on the DEFAULT layout `flake_root` and `repo_root` already
-/// coincide (both resolve to `~/Aoide`), so this only diverges from
-/// `repo_root` under an `$AOIDE_STAGE_DIR` test override — exactly the case
-/// where a real flake should NOT be expected to exist at the relocated
-/// path. `$AOIDE_FLAKE_ROOT` (absolute-path-wins, same precedence as every
-/// other override here) exists for the one caller that DOES want to point
-/// at a different flake checkout — a fixture flake, or a second clone.
+/// Deliberately NOT derived from [`stage_dir`]/[`root`] the way every other
+/// path in this file is: those are relocatable per-test so a scratch tmp
+/// dir can stand in for the RUNTIME trees (`song/stage`, `run/qml`) without
+/// a real flake anywhere in sight. The committed songbook `nix eval` reads
+/// (`song/songbook/`, `lib/song.nix`, `flake.nix`) is not a runtime tree —
+/// it is the one git checkout on disk, so relocating it per-test would mean
+/// fabricating a working flake (with its own `flake.lock`) in every test
+/// that touches `rice stage`, for no reason. `$AOIDE_FLAKE_ROOT`
+/// (absolute-path-wins, same precedence as every other override here)
+/// exists for the one caller that DOES want to point at a different flake
+/// checkout — a fixture flake, or a second clone.
 pub fn flake_root() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("AOIDE_FLAKE_ROOT") {
         let p = std::path::PathBuf::from(&dir);
@@ -714,6 +869,29 @@ pub fn seed_if_absent(path: &std::path::Path, empty_body: &str, key: &str) -> Op
 mod tests {
     use super::*;
 
+    /// Save/restore `AOIDE_ROOT`, mirroring every other single-var guard in
+    /// this module — the standard way a test proves `stage_dir`/`song_dir`/
+    /// etc. compose correctly off [`root`] without depending on the REAL
+    /// machine's actual `$HOME` (`root()` is pure — see its own doc — so
+    /// this is about test determinism/portability, not a safety guard
+    /// against a side effect).
+    struct RootEnvGuard(Option<String>);
+    impl RootEnvGuard {
+        fn set(scratch: &std::path::Path) -> Self {
+            let saved = std::env::var("AOIDE_ROOT").ok();
+            std::env::set_var("AOIDE_ROOT", scratch);
+            RootEnvGuard(saved)
+        }
+    }
+    impl Drop for RootEnvGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("AOIDE_ROOT", v),
+                None => std::env::remove_var("AOIDE_ROOT"),
+            }
+        }
+    }
+
     #[test]
     fn stage_dir_honors_absolute_env_override() {
         // `stage_dir()` reads process-global env; the crate-wide lock serialises
@@ -725,16 +903,20 @@ mod tests {
         assert_eq!(stage_dir(), std::path::PathBuf::from("/tmp/aoide-test-stage"));
 
         // Empty and relative values are ignored — we fall back, never resolve a
-        // runtime path against an arbitrary cwd.
+        // runtime path against an arbitrary cwd. `AOIDE_ROOT` pinned to a
+        // scratch dir (see `RootEnvGuard`'s doc) so the assertion below is
+        // deterministic across machines rather than depending on this box's
+        // actual `$HOME`.
+        let _root = RootEnvGuard::set(std::path::Path::new("/tmp/aoide-test-root"));
         std::env::set_var("AOIDE_STAGE_DIR", "");
         assert!(stage_dir().is_absolute());
-        assert!(stage_dir().ends_with("Aoide/song/stage"));
+        assert_eq!(stage_dir(), std::path::PathBuf::from("/tmp/aoide-test-root/song/stage"));
         std::env::set_var("AOIDE_STAGE_DIR", "relative/stage");
-        assert!(stage_dir().ends_with("Aoide/song/stage"));
+        assert_eq!(stage_dir(), std::path::PathBuf::from("/tmp/aoide-test-root/song/stage"));
 
-        // Absent → the aoide_home()-derived fallback.
+        // Absent → falls back to `$AOIDE_ROOT/song/stage`.
         std::env::remove_var("AOIDE_STAGE_DIR");
-        assert!(stage_dir().ends_with("Aoide/song/stage"));
+        assert_eq!(stage_dir(), std::path::PathBuf::from("/tmp/aoide-test-root/song/stage"));
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
@@ -756,10 +938,16 @@ mod tests {
             std::path::PathBuf::from("/tmp/aoide-song-test/songbook/moonlight/livery.json")
         );
 
-        // On the default layout the song tree is `~/Aoide/song`.
+        // With `AOIDE_STAGE_DIR` absent, the song tree composes off
+        // `$AOIDE_ROOT/song` (`RootEnvGuard` keeps this off `root()`'s real
+        // fallback — see its doc).
+        let _root = RootEnvGuard::set(std::path::Path::new("/tmp/aoide-song-test-root"));
         std::env::remove_var("AOIDE_STAGE_DIR");
-        assert!(song_dir().ends_with("Aoide/song"));
-        assert!(songbook_notes("x").ends_with("Aoide/song/songbook/x/livery.json"));
+        assert_eq!(song_dir(), std::path::PathBuf::from("/tmp/aoide-song-test-root/song"));
+        assert_eq!(
+            songbook_notes("x"),
+            std::path::PathBuf::from("/tmp/aoide-song-test-root/song/songbook/x/livery.json")
+        );
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
@@ -785,12 +973,20 @@ mod tests {
             std::path::PathBuf::from("/tmp/aoide-drafts-test/songbook/sonata/drafts/neon-night")
         );
 
-        // On the default layout: `~/Aoide/song/stage` → songbook_dir("x") =
-        // `~/Aoide/song/songbook/x` → song_drafts_dir("x") =
-        // `~/Aoide/song/songbook/x/drafts`.
+        // With `AOIDE_STAGE_DIR` absent: `$AOIDE_ROOT/song/stage` →
+        // songbook_dir("x") = `$AOIDE_ROOT/song/songbook/x` →
+        // song_drafts_dir("x") = `$AOIDE_ROOT/song/songbook/x/drafts`
+        // (`RootEnvGuard` keeps this off `root()`'s real fallback).
+        let _root = RootEnvGuard::set(std::path::Path::new("/tmp/aoide-drafts-test-root"));
         std::env::remove_var("AOIDE_STAGE_DIR");
-        assert!(song_drafts_dir("x").ends_with("Aoide/song/songbook/x/drafts"));
-        assert!(draft_dir("x", "y").ends_with("Aoide/song/songbook/x/drafts/y"));
+        assert_eq!(
+            song_drafts_dir("x"),
+            std::path::PathBuf::from("/tmp/aoide-drafts-test-root/song/songbook/x/drafts")
+        );
+        assert_eq!(
+            draft_dir("x", "y"),
+            std::path::PathBuf::from("/tmp/aoide-drafts-test-root/song/songbook/x/drafts/y")
+        );
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
@@ -801,7 +997,7 @@ mod tests {
     #[test]
     fn run_qml_dir_resolves_as_a_sibling_of_song_under_the_stage_override() {
         // Mirrors `song_tree_resolves_under_the_stage_override` above: the
-        // override's tmp root plays the role of the real `~/Aoide/` root, its
+        // override's tmp root plays the role of the runtime root, its
         // child the role of `song/`, so `run/qml` lands as THAT root's sibling
         // `run/qml`, one level up from where `song_dir()` resolves.
         let _guard = crate::env_lock().lock().unwrap();
@@ -814,44 +1010,13 @@ mod tests {
             "run/qml is a sibling of song_dir(), not under stage/"
         );
 
-        // On the default layout: `~/Aoide/song/stage` → song_dir() = `~/Aoide/song`
-        // → run_qml_dir() = `~/Aoide/run/qml`.
+        // With `AOIDE_STAGE_DIR` absent: `$AOIDE_ROOT/song/stage` →
+        // song_dir() = `$AOIDE_ROOT/song` → run_qml_dir() =
+        // `$AOIDE_ROOT/run/qml` (`RootEnvGuard` keeps this off `root()`'s
+        // real fallback).
+        let _root = RootEnvGuard::set(std::path::Path::new("/tmp/aoide-run-qml-test-root"));
         std::env::remove_var("AOIDE_STAGE_DIR");
-        assert!(run_qml_dir().ends_with("Aoide/run/qml"));
-        assert!(!run_qml_dir().ends_with("Aoide/song/run/qml"), "not nested under song/");
-
-        match saved {
-            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
-            None => std::env::remove_var("AOIDE_STAGE_DIR"),
-        }
-    }
-
-    #[test]
-    fn repo_root_resolves_as_the_grandparent_of_stage_dir_and_honors_its_override() {
-        // Mirrors `run_qml_dir_resolves_as_a_sibling_of_song_under_the_stage_override`:
-        // the override's tmp root plays the role of the real `~/Aoide/` root,
-        // its child the role of `song/`, so `repo_root()` lands on that root
-        // itself — one level up from where `song_dir()` resolves, same as
-        // `run_qml_dir`'s own `Aoide` root.
-        let _guard = crate::env_lock().lock().unwrap();
-        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
-
-        // `song_dir` peels one level (stage → its parent); `repo_root` peels
-        // ANOTHER (song_dir → its parent) — so the override needs a `song/`
-        // segment between the repo root and `stage` to land on a real root,
-        // same shape the default layout itself uses (`<root>/song/stage`).
-        std::env::set_var("AOIDE_STAGE_DIR", "/tmp/aoide-repo-root-test/song/stage");
-        assert_eq!(
-            repo_root(),
-            std::path::PathBuf::from("/tmp/aoide-repo-root-test"),
-            "repo_root is song_dir's parent, not song_dir itself"
-        );
-
-        // On the default layout: `~/Aoide/song/stage` → song_dir() = `~/Aoide/song`
-        // → repo_root() = `~/Aoide`.
-        std::env::remove_var("AOIDE_STAGE_DIR");
-        assert!(repo_root().ends_with("Aoide"));
-        assert!(!repo_root().ends_with("Aoide/song"), "one level above song_dir, not song_dir itself");
+        assert_eq!(run_qml_dir(), std::path::PathBuf::from("/tmp/aoide-run-qml-test-root/run/qml"));
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
@@ -1156,9 +1321,12 @@ mod tests {
             std::path::PathBuf::from("/tmp/aoide-captures-test/state/captures")
         );
 
-        // On the default layout: `~/Aoide/state` → captures_dir() = `~/Aoide/state/captures`.
+        // With `AOIDE_STATE_DIR` absent: `$AOIDE_ROOT/state` →
+        // captures_dir() = `$AOIDE_ROOT/state/captures` (`RootEnvGuard` keeps
+        // this deterministic across machines, see its doc).
+        let _root = RootEnvGuard::set(std::path::Path::new("/tmp/aoide-captures-test-root"));
         std::env::remove_var("AOIDE_STATE_DIR");
-        assert!(captures_dir().ends_with("Aoide/state/captures"));
+        assert_eq!(captures_dir(), std::path::PathBuf::from("/tmp/aoide-captures-test-root/state/captures"));
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
@@ -1177,8 +1345,14 @@ mod tests {
             std::path::PathBuf::from("/tmp/aoide-pointer-test/state/pointer-pos.json")
         );
 
+        // `RootEnvGuard` keeps this deterministic across machines — see its
+        // doc.
+        let _root = RootEnvGuard::set(std::path::Path::new("/tmp/aoide-pointer-test-root"));
         std::env::remove_var("AOIDE_STATE_DIR");
-        assert!(pointer_state_file().ends_with("Aoide/state/pointer-pos.json"));
+        assert_eq!(
+            pointer_state_file(),
+            std::path::PathBuf::from("/tmp/aoide-pointer-test-root/state/pointer-pos.json")
+        );
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
@@ -1191,17 +1365,26 @@ mod tests {
     const CORE_STAGE_FILE_NAMES: &[&str] =
         &["sessions.json", "hooks.json", "projects.json", "graph.json", "pending.json", "herald.json"];
 
-    /// Save/restore the four env vars every migration test pins, so a test
+    /// Save/restore the five env vars every migration test pins, so a test
     /// that panics mid-body still leaves the crate's env in whatever shape
     /// the NEXT test expects (the same discipline every other `AOIDE_*`
-    /// override test in this module already holds, widened to the one extra
-    /// var — `HOME` — the migration path additionally depends on through
-    /// [`stage_dir`]/[`state_dir`]'s own `aoide_protocol::aoide_home`).
+    /// override test in this module already holds, widened to `HOME` and
+    /// `AOIDE_ROOT` — [`stage_dir`]/[`state_dir`] depend on the former
+    /// through `aoide_protocol::aoide_home`/[`root`], and several tests
+    /// below pin the latter explicitly to `<home>/.aoide` right after
+    /// redirecting `HOME` so `stage_dir`/`state_dir` resolve the SAME shape
+    /// [`root`]'s own default would, without depending on whichever branch
+    /// of `root()` gets exercised). `[migrate_conducting_stage]` is what
+    /// these tests exist to exercise, not [`migrate_root_once`] (which has
+    /// its own, simpler direct-call tests below — see its doc for why it
+    /// needs no `Once`/env-isolation dance at all).
     struct MigrationEnvGuard {
         home: Option<String>,
         user: Option<String>,
         stage: Option<String>,
         state: Option<String>,
+        root: Option<String>,
+        audit_log: Option<String>,
     }
     impl MigrationEnvGuard {
         fn capture_and_clear() -> Self {
@@ -1210,10 +1393,14 @@ mod tests {
                 user: std::env::var("AOIDE_USER").ok(),
                 stage: std::env::var("AOIDE_STAGE_DIR").ok(),
                 state: std::env::var("AOIDE_STATE_DIR").ok(),
+                root: std::env::var("AOIDE_ROOT").ok(),
+                audit_log: std::env::var("AOIDE_AUDIT_LOG").ok(),
             };
             std::env::remove_var("AOIDE_USER");
             std::env::remove_var("AOIDE_STAGE_DIR");
             std::env::remove_var("AOIDE_STATE_DIR");
+            std::env::remove_var("AOIDE_ROOT");
+            std::env::remove_var("AOIDE_AUDIT_LOG");
             g
         }
     }
@@ -1235,6 +1422,14 @@ mod tests {
                 Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
                 None => std::env::remove_var("AOIDE_STATE_DIR"),
             }
+            match &self.root {
+                Some(v) => std::env::set_var("AOIDE_ROOT", v),
+                None => std::env::remove_var("AOIDE_ROOT"),
+            }
+            match &self.audit_log {
+                Some(v) => std::env::set_var("AOIDE_AUDIT_LOG", v),
+                None => std::env::remove_var("AOIDE_AUDIT_LOG"),
+            }
         }
     }
 
@@ -1245,8 +1440,9 @@ mod tests {
         let home = std::env::temp_dir().join(format!("aoide-migrate-basic-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::env::set_var("HOME", &home);
+        std::env::set_var("AOIDE_ROOT", home.join(".aoide"));
 
-        let old_dir = stage_dir(); // `<home>/Aoide/song/stage`, unset-override fallback
+        let old_dir = stage_dir(); // `<home>/.aoide/song/stage` via the pinned `AOIDE_ROOT`
         let new_dir = state_dir().join("stage");
         std::fs::create_dir_all(&old_dir).unwrap();
         for name in CORE_STAGE_FILE_NAMES {
@@ -1271,6 +1467,7 @@ mod tests {
         let home = std::env::temp_dir().join(format!("aoide-migrate-idempotent-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::env::set_var("HOME", &home);
+        std::env::set_var("AOIDE_ROOT", home.join(".aoide"));
 
         let old_dir = stage_dir();
         let new_dir = state_dir().join("stage");
@@ -1300,6 +1497,7 @@ mod tests {
         let home = std::env::temp_dir().join(format!("aoide-migrate-no-clobber-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::env::set_var("HOME", &home);
+        std::env::set_var("AOIDE_ROOT", home.join(".aoide"));
 
         let old_dir = stage_dir();
         let new_dir = state_dir().join("stage");
@@ -1327,6 +1525,7 @@ mod tests {
         let home = std::env::temp_dir().join(format!("aoide-migrate-rice-untouched-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::env::set_var("HOME", &home);
+        std::env::set_var("AOIDE_ROOT", home.join(".aoide"));
 
         let old_dir = stage_dir();
         let new_dir = state_dir().join("stage");
@@ -1352,12 +1551,15 @@ mod tests {
 
     /// The one test in this binary that resolves [`conducting_stage_dir`]
     /// itself with no `$AOIDE_STAGE_DIR` override — proving the Once-guarded
-    /// wiring end to end, not just [`migrate_conducting_stage`] in isolation.
-    /// [`MIGRATE_CONDUCTING_STAGE_ONCE`] fires at most once for the whole
-    /// test binary, so this must be the ONLY call site in this module that
-    /// reaches [`conducting_stage_dir`]'s fallback branch — every other
-    /// migration test above calls [`migrate_conducting_stage`] directly to
-    /// stay independent of that one-shot guard.
+    /// S1 wiring end to end, not just [`migrate_conducting_stage`] in
+    /// isolation. [`MIGRATE_CONDUCTING_STAGE_ONCE`] fires at most once for
+    /// the whole test binary, so this must be the ONLY call site in this
+    /// module that reaches [`conducting_stage_dir`]'s fallback branch —
+    /// every other migration test above calls [`migrate_conducting_stage`]
+    /// directly to stay independent of that one-shot guard. `AOIDE_ROOT` is
+    /// STILL pinned here (unlike the dedicated `root()` wiring test below):
+    /// this test's job is S1's Once, not L-C2's — [`migrate_root_once`] gets
+    /// its own isolated proof.
     #[test]
     fn conducting_stage_dir_resolves_under_state_and_migrates_on_first_call() {
         let _guard = crate::env_lock().lock().unwrap();
@@ -1365,19 +1567,199 @@ mod tests {
         let home = std::env::temp_dir().join(format!("aoide-migrate-wiring-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::env::set_var("HOME", &home);
+        std::env::set_var("AOIDE_ROOT", home.join(".aoide"));
 
-        let old_dir = home.join("Aoide").join("song").join("stage");
+        let old_dir = stage_dir();
         std::fs::create_dir_all(&old_dir).unwrap();
         std::fs::write(old_dir.join("graph.json"), "pre-existing-graph").unwrap();
 
         let dir = conducting_stage_dir();
-        assert!(dir.ends_with("Aoide/state/stage"));
+        assert_eq!(dir, home.join(".aoide").join("state").join("stage"));
         assert_eq!(
             std::fs::read_to_string(dir.join("graph.json")).unwrap(),
             "pre-existing-graph",
             "conducting_stage_dir()'s own resolution must have driven the migration"
         );
 
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ── `root()` / the L-C2 `~/Aoide` → `$AOIDE_ROOT` migration ────────────
+
+    #[test]
+    fn root_honors_absolute_env_override_and_falls_back_to_the_dotaoide_default() {
+        // `root()` is pure (see its own doc) — safe to exercise every branch
+        // directly, no migration side effect to worry about. `RootEnvGuard`
+        // is skipped here on purpose: this test's whole point IS the
+        // unset/empty/relative fallback shape.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_root = std::env::var("AOIDE_ROOT").ok();
+        let saved_home = std::env::var("HOME").ok();
+        let saved_user = std::env::var("AOIDE_USER").ok();
+
+        std::env::set_var("AOIDE_ROOT", "/tmp/aoide-root-test");
+        assert_eq!(root(), std::path::PathBuf::from("/tmp/aoide-root-test"));
+
+        // Empty and relative values are ignored — falls back to the default,
+        // same discipline every other override in this module holds.
+        // `$HOME` pinned to a scratch dir so the assertion is deterministic
+        // across machines, not because `root()` has anything to protect —
+        // it never touches disk.
+        let home = std::env::temp_dir().join(format!("aoide-root-default-{}", std::process::id()));
+        std::env::remove_var("AOIDE_USER");
+        std::env::set_var("HOME", &home);
+
+        std::env::set_var("AOIDE_ROOT", "");
+        assert_eq!(root(), home.join(".aoide"));
+        std::env::set_var("AOIDE_ROOT", "relative/root");
+        assert_eq!(root(), home.join(".aoide"));
+        std::env::remove_var("AOIDE_ROOT");
+        assert_eq!(root(), home.join(".aoide"));
+
+        match saved_root {
+            Some(v) => std::env::set_var("AOIDE_ROOT", v),
+            None => std::env::remove_var("AOIDE_ROOT"),
+        }
+        match saved_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match saved_user {
+            Some(v) => std::env::set_var("AOIDE_USER", v),
+            None => std::env::remove_var("AOIDE_USER"),
+        }
+    }
+
+    /// [`migrate_root_once`] is a plain function, not gated behind a
+    /// process-wide `Once` (see its own doc for why) — every test below
+    /// calls it directly and is independent of every other.
+    #[test]
+    fn migrate_root_once_moves_every_pre_lc2_tree() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = MigrationEnvGuard::capture_and_clear();
+        let home = std::env::temp_dir().join(format!("aoide-migrate-root-basic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("HOME", &home);
+
+        let old_stage = home.join("Aoide").join("song").join("stage");
+        let old_state = home.join("Aoide").join("state");
+        let old_log = home.join("Aoide").join("log");
+        std::fs::create_dir_all(&old_stage).unwrap();
+        std::fs::write(old_stage.join("livery.json"), "rice-palette").unwrap();
+        std::fs::create_dir_all(old_state.join("captures")).unwrap();
+        std::fs::write(old_state.join("captures").join("shot.png"), "pixels").unwrap();
+        std::fs::create_dir_all(&home.join("Aoide")).unwrap();
+        std::fs::write(&old_log, "audit-line\n").unwrap();
+
+        migrate_root_once();
+
+        let new_root = home.join(".aoide");
+        assert_eq!(
+            std::fs::read_to_string(new_root.join("song").join("stage").join("livery.json")).unwrap(),
+            "rice-palette"
+        );
+        assert_eq!(
+            std::fs::read_to_string(new_root.join("state").join("captures").join("shot.png")).unwrap(),
+            "pixels"
+        );
+        assert_eq!(std::fs::read_to_string(new_root.join("log")).unwrap(), "audit-line\n");
+        assert!(!old_stage.exists(), "the old song/stage tree must have moved");
+        assert!(!old_state.exists(), "the old state tree must have moved");
+        assert!(!old_log.exists(), "the old log file must have moved");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn migrate_root_once_second_run_is_a_no_op() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = MigrationEnvGuard::capture_and_clear();
+        let home = std::env::temp_dir().join(format!("aoide-migrate-root-idempotent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("HOME", &home);
+
+        let old_stage = home.join("Aoide").join("song").join("stage");
+        std::fs::create_dir_all(&old_stage).unwrap();
+        std::fs::write(old_stage.join("livery.json"), "first-boot").unwrap();
+
+        migrate_root_once();
+        let new_stage = home.join(".aoide").join("song").join("stage");
+        assert_eq!(std::fs::read_to_string(new_stage.join("livery.json")).unwrap(), "first-boot");
+        assert!(!old_stage.exists());
+
+        // Second call: nothing left at the old path — must run cleanly and
+        // change nothing.
+        migrate_root_once();
+        assert_eq!(
+            std::fs::read_to_string(new_stage.join("livery.json")).unwrap(),
+            "first-boot",
+            "a second migration pass must be a pure no-op"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn migrate_root_once_never_clobbers_a_newer_new_root_tree() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = MigrationEnvGuard::capture_and_clear();
+        let home = std::env::temp_dir().join(format!("aoide-migrate-root-no-clobber-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("HOME", &home);
+
+        let old_stage = home.join("Aoide").join("song").join("stage");
+        let new_stage = home.join(".aoide").join("song").join("stage");
+        std::fs::create_dir_all(&old_stage).unwrap();
+        std::fs::create_dir_all(&new_stage).unwrap();
+        // A STALE old-root file alongside a NEWER new-root file already in
+        // place — the newer one wins, the stale old one is left for
+        // inspection rather than silently destroyed.
+        std::fs::write(old_stage.join("livery.json"), "stale").unwrap();
+        std::fs::write(new_stage.join("livery.json"), "fresh").unwrap();
+
+        migrate_root_once();
+
+        assert_eq!(std::fs::read_to_string(new_stage.join("livery.json")).unwrap(), "fresh");
+        assert_eq!(std::fs::read_to_string(old_stage.join("livery.json")).unwrap(), "stale");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn migrate_root_once_respects_each_pieces_own_override() {
+        // `$AOIDE_STAGE_DIR` set (relocating song/stage elsewhere) must leave
+        // the pre-L-C2 song/stage tree untouched, even though `$AOIDE_STATE_DIR`
+        // and `$AOIDE_AUDIT_LOG` are both absent and DO migrate — each piece
+        // is gated on its OWN override independently (see `migrate_root_once`'s
+        // own doc).
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = MigrationEnvGuard::capture_and_clear();
+        let home = std::env::temp_dir().join(format!("aoide-migrate-root-piecewise-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("HOME", &home);
+        std::env::set_var("AOIDE_STAGE_DIR", "/tmp/aoide-migrate-root-piecewise-elsewhere");
+
+        let old_stage = home.join("Aoide").join("song").join("stage");
+        let old_state = home.join("Aoide").join("state");
+        std::fs::create_dir_all(&old_stage).unwrap();
+        std::fs::write(old_stage.join("livery.json"), "untouched").unwrap();
+        std::fs::create_dir_all(&old_state).unwrap();
+        std::fs::write(old_state.join("usage.json"), "moves").unwrap();
+
+        migrate_root_once();
+
+        assert_eq!(
+            std::fs::read_to_string(old_stage.join("livery.json")).unwrap(),
+            "untouched",
+            "AOIDE_STAGE_DIR override must keep the old song/stage tree in place"
+        );
+        assert!(!old_state.exists(), "AOIDE_STATE_DIR absent — the state tree DOES migrate");
+        assert_eq!(
+            std::fs::read_to_string(home.join(".aoide").join("state").join("usage.json")).unwrap(),
+            "moves"
+        );
+
+        std::env::remove_var("AOIDE_STAGE_DIR");
         let _ = std::fs::remove_dir_all(&home);
     }
 }

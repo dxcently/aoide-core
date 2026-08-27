@@ -17,6 +17,11 @@ use aoide::daemon;
 use aoide::dispatch;
 
 fn main() {
+    // One-shot, idempotent `~/Aoide` → `$AOIDE_ROOT` migration (L-C2, task
+    // #107) — see `aoide_storage::fs::root`'s own doc for why this runs
+    // here, explicitly, rather than hanging off a path getter.
+    aoide_storage::fs::migrate_root_once();
+
     // Allow `aoided --audit-log <path>`; else use the aoide.auditLog default.
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let log = argv

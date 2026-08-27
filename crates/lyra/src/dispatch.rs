@@ -87,13 +87,15 @@ mod tests {
     }
 
     #[test]
-    fn not_implemented_command_carries_the_stub_envelope_and_gate() {
-        // `rice declare` is gated + not implemented — same walking-skeleton
-        // stub core carries, registered via lyra's own `stubs::register_rice_late`.
-        let out = dispatch(&inv(&["rice", "declare"], &["dusk"]));
+    fn not_implemented_command_carries_the_stub_envelope() {
+        // `rice transpose` is still a walking-skeleton stub, registered via
+        // lyra's own `stubs::register_rice_late` — `rice declare`'s sibling
+        // graduated to a real handler at L-C2 (task #107), see
+        // `commands/stubs.rs`'s own module doc.
+        let out = dispatch(&inv(&["rice", "transpose"], &["dusk", "midnight"]));
         assert_eq!(out.status, Status::NotImplemented);
         assert_eq!(out.render(false).1, crate::output::exit::NOT_IMPLEMENTED);
-        assert!(out.gated, "rice.declare is a gated command");
+        assert!(!out.gated, "rice.transpose is not a gated command");
         assert_eq!(out.data.unwrap()["args"][0], "dusk");
     }
 

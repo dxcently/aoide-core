@@ -25,6 +25,27 @@
   turn this into a periodic or unconditional re-sync; a second boot with
   both a old-path leftover and a populated new path should leave the new
   path exactly as it is.
+- **`fs::migrate_root_once` is `pub` and deliberately NOT wired into any
+  path getter (L-C2, lyra-carrier lane, task #107) — don't "fix" this by
+  hanging it off `fs::root`'s no-override fallback the way
+  `migrate_conducting_stage` hangs off `conducting_stage_dir`'s.** `root`/
+  `stage_dir`/`state_dir` are reached by `with_stage_lock`, the SHARED lock
+  primitive nearly every stage-file writer across the whole workspace
+  routes through regardless of which file it is actually touching
+  (`with_stage_lock`'s own doc: it always locks `stage_dir()`, even for a
+  `conducting_stage_dir`-domain caller) — a real incident during this
+  lane's own development proved that an ordinary `state_dir()`-only test
+  (overriding only `$AOIDE_STATE_DIR`, never anticipating a need to touch
+  `$AOIDE_STAGE_DIR` too) still reaches `stage_dir()`'s fallback through
+  `with_stage_lock`, and would silently drive a real migration against the
+  operator's actual `$HOME` the first time such a test ran unguarded.
+  `conducting_stage_dir` has no such shared low-level caller, which is why
+  ITS migration is safe to hang off its own resolution while `root`'s is
+  not. The three real binaries call `migrate_root_once()` once, explicitly,
+  at the top of their own `main()` instead (`crates/cli/src/bin/{aoide,
+  aoided}.rs`, `crates/lyra/src/bin/lyra.rs`) — a test may call it directly
+  too (it is a plain idempotent function, no `Once`/env-isolation dance
+  needed, unlike `migrate_conducting_stage`'s own test suite).
 - **`takes`/`mode` are a deliberate charter smudge, not an oversight.** Don't
   "clean them up" into a paint-adjacent crate without re-reading
   `docs/architecture/PACKAGE-LAYOUT.md`'s "Charter exceptions" note — `mode`

@@ -11,12 +11,17 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
 - `records`/`fs`/`stage` — the stage-file record shapes and atomic
   read/write I/O every stage consumer (this crate's own `commands`, `conduct`,
   `song`, `conductor`) goes through instead of touching JSON on disk directly.
-  `fs` resolves TWO stage roots, not one (command-defrag lane S1,
-  2026-08-27, CONTRACTS.md §4): `stage_dir` — unchanged, `song/stage/`,
+  Every runtime tree `fs` resolves hangs off ONE root, `fs::root` —
+  `$AOIDE_ROOT` (absolute-path-wins), default `<home>/.aoide`, nix-free
+  (L-C2, lyra-carrier lane, task #107) — EXCEPT `fs::flake_root`, which
+  stays pinned to the dev git checkout (`$AOIDE_FLAKE_ROOT`, default
+  `<home>/Aoide`) since that is not a runtime tree. `fs` resolves TWO stage
+  roots off that one root, not one (command-defrag lane S1, 2026-08-27,
+  CONTRACTS.md §4): `stage_dir` — unchanged, `$AOIDE_ROOT/song/stage/`,
   rice/paint (`livery.json`/`mode.json`, lyra's tree) — and
-  `conducting_stage_dir` — new, `state/stage/`, core orchestration state
-  (`stage`'s own four path helpers, plus `aoide-conduct`'s
-  `herald::herald_path`/`graph::pending_path`). Both honor
+  `conducting_stage_dir` — new, `$AOIDE_ROOT/state/stage/`, core
+  orchestration state (`stage`'s own four path helpers, plus
+  `aoide-conduct`'s `herald::herald_path`/`graph::pending_path`). Both honor
   `$AOIDE_STAGE_DIR` (absolute-path-wins) as one combined override, same as
   before the split; `conducting_stage_dir`'s own no-override fallback is
   `state_dir().join("stage")` instead of `stage_dir`'s `song/stage`.
@@ -24,6 +29,23 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   drives `fs::migrate_conducting_stage`: a one-shot, idempotent move of the
   six core files off their pre-split `song/stage/` location, never
   clobbering a fresher `state/stage/` file and never touching a rice file.
+  `fs::migrate_root_once` is the SIBLING one-shot migration for the L-C2
+  root move itself (a pre-L-C2 host's `~/Aoide/{song/stage,state,log}` into
+  the new root's equivalents) — deliberately NOT wired into `fs::root`'s own
+  resolution the way `migrate_conducting_stage` is wired into
+  `conducting_stage_dir`'s: `root`/`stage_dir`/`state_dir` are reached by
+  `with_stage_lock`, the shared lock primitive nearly every stage-file
+  writer across the whole workspace routes through regardless of which file
+  it is actually touching, so hanging a migration off that path made an
+  ordinary `state_dir()`-only test capable of silently migrating the
+  operator's real `$HOME` (a live incident during this lane's own
+  development). `migrate_root_once` is `pub` and idempotent instead — the
+  three real binaries (`aoide`, `aoided`, `lyra`) call it once, explicitly,
+  at the top of their own `main()`; see `fs::root`'s own doc for the full
+  reasoning. `fs::repo_root` is GONE (its one caller, `aoide-upkeep`'s
+  `soundcheck`, now reads `fs::flake_root` directly — a runtime root is not
+  a repo, so deriving a checkout path from stage-dir parentage stopped
+  making sense the moment the two could diverge).
 - `session` — pure session/hook upsert operations.
 - `peer_store` — the peer-federation registry + pull cache (CONTRACTS.md §7).
   `Peer` carries two independent, opposite-direction credential fields:

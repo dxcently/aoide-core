@@ -28,6 +28,10 @@ serde_json = { workspace = true }
 # reuse, not a new one.
 libc = { workspace = true }
 aoide-protocol = { workspace = true }
+# `bin/lyra.rs`'s boot-time `migrate_root_once` call, and `rice declare`'s
+# copy step (L-C2, task #107) — both reach `fs::` directly rather than
+# through `aoide-song`'s own re-derived paths.
+aoide-storage = { workspace = true }
 # rice/draft/mode/cover/livery/quickshell/take — the whole `rice` family.
 aoide-song = { workspace = true }
 # shellbridge, herald — registration only (the socket-loop/ledger
