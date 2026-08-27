@@ -125,7 +125,7 @@ mod tests {
 
     fn carry_invocation(args: &[&str], flags: &[(&str, &str)]) -> Invocation {
         Invocation {
-            path: vec!["graph".into(), "session".into(), "carry".into()],
+            path: vec!["session".into(), "carry".into()],
             args: args.iter().map(|s| s.to_string()).collect(),
             flags: flags.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             door: aoide_protocol::Door::Cli,

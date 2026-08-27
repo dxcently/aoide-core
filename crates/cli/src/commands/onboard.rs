@@ -136,7 +136,7 @@ fn checkout_root() -> Option<PathBuf> {
 
 /// "register the clone" (ONBOARD.md's stub-summary contract, decision 1):
 /// two shell-only, idempotent acts the wiki already documents as onboard's
-/// job. `graph.project.add`'s own schema example (`graph project add aoide
+/// job. `project.add`'s own schema example (`project add aoide
 /// ~/Aoide`) is the existing "register X as known" mechanism this reuses
 /// rather than inventing a new marker file or state format; Song-Anatomy.md/
 /// Song-Vocabulary.md/Clone-and-Run.md all separately state "onboard links

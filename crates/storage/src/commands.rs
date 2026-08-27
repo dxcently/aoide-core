@@ -640,7 +640,7 @@ pub fn register_inbox(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["inbox", "clear"],
-        summary: "Empty the message inbox. Unconditional — matches graph.prune's precedent (no --yes, no gate): the command name is the whole blast radius, nothing selective to confirm.",
+        summary: "Empty the message inbox. Unconditional — matches session.prune's precedent (no --yes, no gate): the command name is the whole blast radius, nothing selective to confirm.",
         args: [],
         flags: [],
         gated: false,

@@ -140,8 +140,8 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   contributes exactly one ledger line regardless of which path retired it.
   `graph/resurrect.rs::session_resurrect` (`resurrect --project
   <name> [--all | --id <ledgerSessionId>]`) reads that ledger and anchors
-  entries to a project by the SAME `anchor_for` longest-prefix rule `graph
-  view` uses. Selection then branches on the flags: `--all` widens to every
+  entries to a project by the SAME `anchor_for` longest-prefix rule bare
+  `graph` uses. Selection then branches on the flags: `--all` widens to every
   anchored entry, `--id` narrows to one specific `sessionId`, and bare
   (neither flag) resumes the project's WHOLE carried set
   (`aoide_storage::carry`, `state/carry.json`, durable-sessions plan P-C4) —
