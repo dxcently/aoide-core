@@ -122,7 +122,7 @@ rustPlatform.buildRustPackage {
   ];
 
   meta = {
-    description = "Aoide CLI + daemon — an API that happens to be typeable (agent-first NixOS desktop control).";
+    description = "Aoide tracks and conducts terminal and agent sessions, collaborating across agents and hosts with the human in the loop.";
     mainProgram = "aoide";
     license = lib.licenses.mit;
   };

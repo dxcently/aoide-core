@@ -14,13 +14,14 @@ use crate::registry::Registry;
 const HEAD: &str = "\
 Aoide — how to drive it (aoide guide · tier-0 onboarding)
 
-Identity: `aoide`/`aoided` is the ORCHESTRATION CORE — the bridges and APIs
-between terminal, shell, system, and OS; any agent with a shell is fully
-capable, no MCP required, and every terminal is a conductable, tracked
-session by default. Painting is a separate binary's job: `lyra` owns the
-rice loop, screen, herald, and Quickshell surfaces — `lyra guide` orients
-there. A capability reachable with only a shell is Aoide; one that draws
-is lyra.
+Identity: Aoide tracks and conducts terminal and agent sessions. Sessions
+collaborate across agents and across hosts, with the human in the loop —
+and become the parts you build larger systems out of. Any agent with a
+shell is fully capable, no MCP required, and every terminal is a
+conductable, tracked session by default. Painting is a separate binary's
+job: `lyra` owns the rice loop, screen, herald, and Quickshell surfaces —
+`lyra guide` orients there. A capability reachable with only a shell is
+Aoide; one that draws is lyra.
 
 Orient through four tiers, in order:
   Tier 0 — onboarding: this text; in the Aoide repo, root `AGENTS.md` +
