@@ -94,18 +94,18 @@ mod tests {
 
     #[test]
     fn double_dash_ends_flag_parsing_for_the_wrapped_command() {
-        // `graph wrap --agent codex -- codex --model x`: aoide takes --agent,
+        // `conduct --agent codex -- codex --model x`: aoide takes --agent,
         // the child keeps --model untouched (and even a --json after -- is
         // the CHILD's, not ours).
         let (inv, json) = parse(
             &argv(&[
-                "graph", "wrap", "--agent", "codex", "--", "codex", "--model", "x", "--json",
+                "conduct", "--agent", "codex", "--", "codex", "--model", "x", "--json",
             ]),
             Door::Cli,
         )
         .unwrap();
         assert!(!json);
-        assert_eq!(inv.path, vec!["graph", "wrap"]);
+        assert_eq!(inv.path, vec!["conduct"]);
         assert_eq!(inv.flags.get("agent").map(String::as_str), Some("codex"));
         assert_eq!(inv.args, vec!["codex", "--model", "x", "--json"]);
         assert!(!inv.flags.contains_key("model"));
@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn agent_value_shell_is_consumed_as_a_flag_value_not_treated_as_a_command() {
         let (inv, _) = parse(
-            &argv(&["graph", "wrap", "--agent", "shell", "--", "bash", "-c", "true"]),
+            &argv(&["conduct", "--agent", "shell", "--", "bash", "-c", "true"]),
             Door::Cli,
         )
         .unwrap();

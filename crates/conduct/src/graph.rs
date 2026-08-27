@@ -53,9 +53,9 @@ pub use self::model::{
 pub use self::pending::{pending_approve, pending_deny, pending_list};
 pub use self::permit::{answer_summons, session_permit, summons_card_id};
 pub use self::send::{pending_path, session_hook, session_send};
-pub use self::session_store::{session_end, session_phase, session_start, session_wrap};
+pub use self::session_store::{session_end, session_phase, session_start};
 // `graph spawn` (P2 of the conducted-agents plan): the detached sibling of
-// `conduct`/`wrap` that re-execs `conduct --headless` and returns without
+// `conduct` that re-execs `conduct --headless` and returns without
 // waiting on the agent's own lifetime — see `graph/spawn.rs`'s module doc.
 pub use self::spawn::session_spawn;
 // `graph resurrect` (P-D8, `docs/architecture/AOIDED.md`'s "L5"): revives a

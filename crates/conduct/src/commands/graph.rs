@@ -119,20 +119,6 @@ pub fn register(r: &mut Registry) {
         handler: crate::graph::session_hook,
     ));
     r.insert(cmd!(
-        path: ["graph", "wrap"],
-        summary: "Run ANY agent command as a registered session: spawn with inherited stdio, register running, wait, end. Exports AOIDE_SESSION_ID so the child can self-report phases; exit mirrors the child (0 ok, 1 otherwise; real code in data.exitCode).",
-        args: [arg!("command", "string", true, "The wrapped command and its args — put them after `--` so the child's own flags pass through verbatim.")],
-        flags: [
-            flag!("agent", "string", "Agent name for the roster (default: the command's basename)."),
-            flag!("parent", "string", "Spawning session id — records the spawned-by edge."),
-            flag!("id", "string", "Session id override (default wrap-<pid>-<unixts>)."),
-        ],
-        gated: false,
-        implemented: true,
-        handler: crate::graph::session_wrap,
-        examples: ["graph wrap --agent codex -- codex --model x"],
-    ));
-    r.insert(cmd!(
         path: ["graph", "spawn"],
         summary: "Spawn ANY agent command as a DETACHED conducted session that outlives this call — headless by default (re-execs `conduct --headless`), or in a real terminal with --windowed (execs $AOIDE_TERMINAL running the same conducted command) — waits briefly for it to register its control socket, and returns. Exports AOIDE_SESSION_ID to the child same as `conduct`/`wrap`. An optional --prompt is injected through the one gated injection door (`graph send --yes --submit`) once registration succeeds; skipped (honestly reported) if it never does.",
         args: [arg!("command", "string", true, "The wrapped command and its args — put them after `--` so the child's own flags pass through verbatim.")],
@@ -274,7 +260,7 @@ pub fn register(r: &mut Registry) {
     // ── conduct: the PTY-backed conductable wrap (concepts/Conductor-Channel) ─
     r.insert(cmd!(
         path: ["conduct"],
-        summary: "Run an agent command on its own PTY as a CONDUCTABLE session: like `graph wrap` (spawn, register running, wait, end, exit mirrored, AOIDE_SESSION_ID exported) but with a controlling tty + a per-session control socket, so `graph send` can type into the running agent while its TUI runs undisturbed.",
+        summary: "Run an agent command on its own PTY as a CONDUCTABLE session: spawn, register running, wait, end (exit mirrored, AOIDE_SESSION_ID exported), with a controlling tty + a per-session control socket, so `graph send` can type into the running agent while its TUI runs undisturbed.",
         args: [arg!("command", "string", true, "The wrapped command and its args — put them after `--` so the child's own flags pass through verbatim.")],
         flags: [
             flag!("agent", "string", "Agent name for the roster (default: the command's basename)."),

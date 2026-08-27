@@ -117,17 +117,6 @@ pub(crate) fn invocation(path: &[&str], args: &[&str]) -> Invocation {
         door: aoide_protocol::Door::Cli,
     }
 }
-pub(crate) fn wrap_invocation(args: &[&str], flags: &[(&str, &str)]) -> Invocation {
-    Invocation {
-        path: vec!["graph".into(), "wrap".into()],
-        args: args.iter().map(|s| s.to_string()).collect(),
-        flags: flags
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect(),
-        door: aoide_protocol::Door::Cli,
-    }
-}
 pub(crate) fn conduct_invocation(args: &[&str], flags: &[(&str, &str)]) -> Invocation {
     Invocation {
         path: vec!["conduct".into()],

@@ -1,6 +1,6 @@
 //! `graph spawn` — the DETACHED command that starts a headless conducted agent
 //! (P2 of the conducted-agents plan; P1 landed `conduct --headless`,
-//! a044bae). Unlike `graph wrap`/`conduct`, which block the calling process
+//! a044bae). Unlike `conduct`, which blocks the calling process
 //! until the wrapped agent exits, `spawn` re-execs THIS SAME binary as
 //! `conduct --headless … -- <command …>` (the same `std::env::current_exe()`
 //! self-re-exec idiom `server/src/a2a.rs`'s `do_spawn` and `shellbridge.rs`
@@ -14,7 +14,7 @@
 //! `--parent`, when given, passes straight through as `conduct`'s own
 //! `--parent` flag (`session_conduct` already reads `inv.flags.get("parent")`
 //! and threads it into `do_session_start` — no re-implementation needed
-//! here, unlike `graph wrap`, which registers the session itself in-process).
+//! here).
 //!
 //! `--windowed` (P-D7) is the sibling launch mode: instead of detaching a
 //! headless `conduct --headless` child, it execs a real terminal (its
@@ -49,9 +49,9 @@ const REGISTRATION_BUDGET: Duration = Duration::from_millis(3000);
 const REGISTRATION_POLL: Duration = Duration::from_millis(25);
 
 /// The command's basename — the agent-name default. Mirrors
-/// `conduct.rs::command_basename` / `session_store.rs::session_wrap`'s own
-/// copy: each `graph` command that spawns a labelled agent keeps its own small
-/// copy of this one-liner rather than sharing it across modules.
+/// `conduct.rs::command_basename`'s own copy: each `graph` command that
+/// spawns a labelled agent keeps its own small copy of this one-liner rather
+/// than sharing it across modules.
 fn command_basename(program: &str) -> String {
     std::path::Path::new(program)
         .file_name()

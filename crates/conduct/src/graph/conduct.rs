@@ -1,4 +1,4 @@
-//! `aoide conduct` — the PTY-backed, controllable sibling of `graph wrap`: its
+//! `aoide conduct` — the PTY-backed, controllable conducted session: its
 //! own PTY + controlling tty, a per-session injection socket, and the raw
 //! `poll()` multiplexer that shuttles stdin/stdout/injections. The unsafe libc
 //! here is confined to `spawn_on_pty`, the raw-mode guard, the winsize
@@ -946,7 +946,7 @@ fn conduct_multiplex(
 }
 
 /// `aoide conduct [--agent A] [--parent P] [--id I] -- <command …>` — the
-/// PTY-backed, controllable sibling of `graph wrap`. Same registration semantics
+/// PTY-backed, controllable conducted session. Registration semantics
 /// (spawn FIRST so a failed exec registers no ghost; running → done; exit
 /// mirrored, real code in `data.exitCode`; `AOIDE_SESSION_ID` exported) PLUS: its
 /// own PTY + controlling tty, a per-session injection socket, the

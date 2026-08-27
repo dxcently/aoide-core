@@ -73,7 +73,7 @@ pub fn parse(argv: &[String], door: Door, bin_name: &str, registry: &Registry) -
     while i < argv.len() {
         let a = &argv[i];
         // A bare `--` ends flag parsing: everything after it is positional,
-        // verbatim — the wrapped-command seam (`graph wrap -- codex --model x`
+        // verbatim — the wrapped-command seam (`conduct -- codex --model x`
         // must not have the child's flags eaten as aoide's).
         if a == "--" {
             positionals.extend(argv[i + 1..].iter().cloned());
