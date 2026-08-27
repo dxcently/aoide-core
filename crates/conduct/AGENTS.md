@@ -169,7 +169,14 @@
   current line to `None` on any byte below `0x20` other than `\r`/`\n`
   (which submit-clear it instead), or `0x7f` — never attempts to interpret
   what the edit did. A line running past `TYPED_LINE_CAP` poisons for the
-  same reason: a clipped line is wrong text, not a short one. `typed()`
+  same reason: a clipped line is wrong text, not a short one. **Bytes
+  arriving over an INJECTION connection poison too (`feed_injected`), and
+  that is a live finding, not caution:** `graph send` prefixes a delivered
+  payload with its provenance, so the P-C7 soak captured a `typed` of
+  `from quiet-birch (…1892): echo hello` — a line no human composed, which
+  would not even run if preloaded. Don't restore the old "injection
+  accumulates like stdin" reading; injected text reaching the same readline
+  buffer is precisely why the line stops being reconstructable. `typed()`
   additionally refuses non-UTF-8 and an empty line. Don't widen the clear
   set past `\r`/`\n`, don't let overflow truncate instead of refusing, and
   don't try to make a poisoned line recoverable by inspecting WHICH control

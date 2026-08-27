@@ -685,6 +685,26 @@ impl TypedLineBuffer {
             }
         }
     }
+    /// Feed bytes that arrived over an INJECTION connection rather than the
+    /// operator's own stdin. They reach the same readline buffer, so the
+    /// line stops being reconstructable — but they are not what anyone
+    /// TYPED, and `graph send` prefixes a delivered payload with its
+    /// provenance (`from <petname> (…tail): `), so replaying them would
+    /// preload a line no human composed and that would not even run. The
+    /// line is poisoned instead. A `\r`/`\n` still ends it, so an injection
+    /// that submits leaves the NEXT line clean rather than poisoning
+    /// everything after it.
+    fn feed_injected(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            match b {
+                b'\r' | b'\n' => {
+                    self.buf.clear();
+                    self.poisoned = false;
+                }
+                _ => self.poisoned = true,
+            }
+        }
+    }
     /// The current line, or `None` when poisoned, empty (nothing typed since
     /// the last submit), or not valid UTF-8.
     fn typed(&self) -> Option<String> {
@@ -876,10 +896,12 @@ fn conduct_multiplex(
                     unsafe { libc::read(c, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
                 if n > 0 {
                     let n = n as usize;
-                    // Injection bytes land in the SAME readline buffer real
-                    // stdin does (P-C5) — both count as typed the same way.
+                    // Injected bytes reach the same readline buffer, but
+                    // they are not what anyone TYPED — and a delivered
+                    // payload carries its provenance prefix, so replaying
+                    // them would preload a line no human composed.
                     if let Some(tb) = typed_buf.as_mut() {
-                        tb.feed(&buf[..n]);
+                        tb.feed_injected(&buf[..n]);
                     }
                     write_all_fd(master, &buf[..n]);
                     still.push(c);
@@ -895,7 +917,7 @@ fn conduct_multiplex(
                     if n > 0 {
                         let n = n as usize;
                         if let Some(tb) = typed_buf.as_mut() {
-                            tb.feed(&buf[..n]);
+                            tb.feed_injected(&buf[..n]);
                         }
                         write_all_fd(master, &buf[..n]);
                     } else {
@@ -1462,13 +1484,23 @@ mod tests {
         assert_eq!(tb.typed().as_deref(), Some("cargo test"));
     }
     #[test]
-    fn typed_line_buffer_injection_bytes_accumulate_the_same_as_stdin() {
-        // Two separate `feed` calls, standing in for one real-stdin read and
-        // one injection-connection read landing in the same buffer.
+    fn typed_line_buffer_injected_bytes_poison_rather_than_accumulate() {
+        // Found in the P-C7 live soak: `graph send` prefixes a delivered
+        // payload with its provenance, so an injected line captured as
+        // "typed" read `from quiet-birch (…1892): echo hello` — a line no
+        // human composed, which would not even run if preloaded. Injection
+        // reaches the same readline buffer as stdin, so the line is no
+        // longer reconstructable either way. Refuse it.
         let mut tb = TypedLineBuffer::new();
         tb.feed(b"echo ");
-        tb.feed(b"hello"); // as if this half arrived over the injection socket.
-        assert_eq!(tb.typed().as_deref(), Some("echo hello"));
+        tb.feed_injected(b"from quiet-birch (...1892): hello");
+        assert_eq!(tb.typed(), None, "an injected line is never reported as typed");
+
+        // A submitting injection still ends the line, so the NEXT one starts
+        // clean rather than inheriting the poison forever.
+        tb.feed_injected(b"\n");
+        tb.feed(b"mine");
+        assert_eq!(tb.typed().as_deref(), Some("mine"));
     }
     #[test]
     fn typed_line_buffer_carriage_return_and_newline_both_clear() {
