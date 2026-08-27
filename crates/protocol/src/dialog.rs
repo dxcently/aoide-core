@@ -203,10 +203,21 @@ pub enum DialogResult {
 /// spawn is still reported as [`DialogResult::SpawnError`]) — this is the
 /// ONE place any dialog binary's exit status/stdout is parsed, so every
 /// dialog binary sharing this loop must share its output CONTRACT (exit
-/// 0 = typed value on stdout, exit 1 + [`DISMISS_LABEL`] on stdout =
-/// dismissed, exit 1 + empty stdout = cancelled, [`LYRA_INFRA_FAILURE_EXIT`]
-/// = infrastructure failure).
-pub fn run_entry_dialog(spawn: impl FnOnce() -> std::io::Result<Child>, mut should_cancel: impl FnMut() -> bool) -> DialogResult {
+/// 0 = typed value on stdout, exit 1 + `dismiss_label` on stdout =
+/// dismissed, exit 1 + anything else on stdout (including empty) =
+/// cancelled, [`LYRA_INFRA_FAILURE_EXIT`] = infrastructure failure).
+///
+/// `dismiss_label` is a PARAMETER, not [`DISMISS_LABEL`] read internally —
+/// two different ceremonies share this loop with two different extra-
+/// button labels (`aoide-secrets`' own dialogs pass [`DISMISS_LABEL`]
+/// itself; P-P5's pairing confirm dialog passes its own distinct
+/// `"Reject request"` label) and the loop must compare against whichever
+/// one the caller's own dialog was actually built with.
+pub fn run_entry_dialog(
+    spawn: impl FnOnce() -> std::io::Result<Child>,
+    dismiss_label: &str,
+    mut should_cancel: impl FnMut() -> bool,
+) -> DialogResult {
     let mut child = match spawn() {
         Ok(c) => c,
         Err(e) => return DialogResult::SpawnError(e.to_string()),
@@ -222,7 +233,7 @@ pub fn run_entry_dialog(spawn: impl FnOnce() -> std::io::Result<Child>, mut shou
                 let out = strip_one_trailing_newline(raw);
                 return if status.success() {
                     DialogResult::Approved(out)
-                } else if out == DISMISS_LABEL {
+                } else if out == dismiss_label {
                     DialogResult::Dismissed
                 } else if status.code() == Some(LYRA_INFRA_FAILURE_EXIT) {
                     // Checked BEFORE falling through to `Cancelled` — the

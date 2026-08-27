@@ -760,7 +760,7 @@ fn spawn_lyra_entry(
 // here, since they know which secrets-specific binary/argv to spawn.
 
 fn run_zenity_entry(zenity_cmd: &str, title: &str, text: &str, should_cancel: impl FnMut() -> bool) -> ZenityResult {
-    run_entry_dialog(|| spawn_zenity_entry(zenity_cmd, title, text), should_cancel)
+    run_entry_dialog(|| spawn_zenity_entry(zenity_cmd, title, text), DISMISS_LABEL, should_cancel)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -773,7 +773,7 @@ fn run_lyra_entry(
     from_line: Option<&str>,
     should_cancel: impl FnMut() -> bool,
 ) -> ZenityResult {
-    run_entry_dialog(|| spawn_lyra_entry(lyra_cmd, secret, consumer, seconds, reason, from_line), should_cancel)
+    run_entry_dialog(|| spawn_lyra_entry(lyra_cmd, secret, consumer, seconds, reason, from_line), DISMISS_LABEL, should_cancel)
 }
 
 /// The dialog CHOICE itself (module doc's P3 section): `lyra_cmd` present
@@ -2332,7 +2332,7 @@ mod tests {
     fn run_entry_dialog_reads_exit_three_as_dialog_failure_not_cancelled() {
         let _guard = shim_lock();
         let shim = write_shim("bare-exit-three", "#!/bin/sh\nexit 3\n");
-        let result = run_entry_dialog(|| spawn_lyra_entry(shim.to_str().unwrap(), "t", "m", 1, None, None), || false);
+        let result = run_entry_dialog(|| spawn_lyra_entry(shim.to_str().unwrap(), "t", "m", 1, None, None), DISMISS_LABEL, || false);
         assert!(matches!(result, ZenityResult::DialogFailure(_)), "expected DialogFailure, got {result:?}");
         remove_shim(&shim);
     }
