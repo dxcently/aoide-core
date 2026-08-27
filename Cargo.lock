@@ -96,6 +96,7 @@ dependencies = [
  "aoide-server",
  "aoide-song",
  "aoide-test-support",
+ "libc",
  "serde_json",
 ]
 
