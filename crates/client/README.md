@@ -45,14 +45,29 @@ never the inbound/serve half (that's `aoide-server`).
   (`aoide_storage::beacon::parse_and_validate`), and folds survivors into a
   `SweepResult` deduped by fingerprint, freshest wins (`fold_heard`, pure,
   unit-tested with no socket at all — the same pure-fold/impure-socket
-  split `aoide-server::a2a`'s own `route`/`handle_connection` holds).
-  `resolve_invite_target(heard, name)` is the same shape one layer up:
-  `peer invite`'s zero/one/many-match resolution against an already-swept
-  result, also pure. This crate's send-side counterpart
-  (`a2a serve`'s own advertise thread) lives in `aoide-server::discovery`
-  instead — sending is the door-owning process's own job; listening is
-  this crate's outbound-facing action, the same "outbound only" charter
-  every other module here holds.
+  split `aoide-server::a2a`'s own `route`/`handle_connection` holds). Each
+  `Heard` carries the packet's `src_addr` alongside its `beacon` (P-S1) —
+  the beacon's own `url` is what the advertiser CLAIMS (useless for a
+  loopback-bound door, since it always reads `http://127.0.0.1:<port>/`
+  regardless of who hears it); `src_addr` is what this process actually
+  OBSERVED the packet arrive from. `Beacon` itself is CONTRACTS-pinned wire
+  shape and never gains this field — `src_addr` lives only on `Heard`,
+  local-only and unpinned. `invite_dial_url(beacon_url, src_addr)` composes
+  `peer invite`'s ceremony dial target from that observation: it swaps only
+  the host, preserving scheme/port/path verbatim from `beacon_url` (the
+  path preservation matters — `sign_headers_for_peer` signs over the path,
+  never the host), and refuses a non-`http`/`https` scheme or a malformed
+  authority. `is_self_target(beacon_fpr, own_fpr, dial_url, own_urls)` is
+  the self-invite guard: true when the heard fingerprint is this instance's
+  own, or when the composed dial target is loopback or matches one of this
+  instance's own known urls. `resolve_invite_target(heard, name)` is the
+  same shape one layer up: `peer invite`'s zero/one/many-match resolution
+  against an already-swept result, also pure, and returns the whole `Heard`
+  so `src_addr` reaches `peer invite` for free. This crate's send-side
+  counterpart (`a2a serve`'s own advertise thread) lives in
+  `aoide-server::discovery` instead — sending is the door-owning process's
+  own job; listening is this crate's outbound-facing action, the same
+  "outbound only" charter every other module here holds.
 - `commands` — this crate's CLI commands:
   `peer add/remove/pull/status/hub/allow/spawn/discover/invite`,
   `peer pair request/pending/approve/reject` (P-P2, CONTRACTS.md §6/§7 —
@@ -94,7 +109,15 @@ never the inbound/serve half (that's `aoide-server`).
   above — `confirm_invite` is this pair's own local helper, still the
   original hand-rolled `y/N` stdin read `confirm_sas`/`confirm_spawn` used
   to share before their P-I1 retrofit onto `aoide_protocol::pick::confirm`
-  above — out of that phase's own scope, not an oversight.
+  above — out of that phase's own scope, not an oversight; it now shows
+  both the beacon's advertised `url` and its observed `src_addr` side by
+  side, so an operator sees the substitution before it happens.
+  `handle_peer_invite` composes its ceremony dial target with
+  `discover::invite_dial_url(hit.beacon.url, hit.src_addr)` rather than
+  dialing `hit.beacon.url` verbatim, and refuses before dialing anything
+  when `discover::is_self_target` says the resolved target is this
+  instance's own door (P-S1) — `peer discover`'s own JSON `heard` rows
+  gain a `srcAddr` field alongside `url` for the same reason.
   `adapter melete` (`peer hub
   <name> [--clear]`, P-D5, designates at most one registered peer as the
   hub `aoide_storage::addr::resolve_with_hub` prefers as a last-resort

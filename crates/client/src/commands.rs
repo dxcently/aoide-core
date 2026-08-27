@@ -1612,13 +1612,17 @@ fn handle_peer_pair_reject(inv: &Invocation) -> Outcome {
 /// PAIRING.md`'s "Discovery (advertise-but-locked)" section): joins the
 /// fixed multicast group, listens `--secs` seconds (default
 /// `discover::DEFAULT_SWEEP_SECS`, ~4), and prints every DISTINCT
-/// fingerprint heard — name, fingerprint, url, first/last heard, and how
-/// many times (`discover::run_sweep`'s own dedupe-by-fingerprint fold).
-/// **Read-only** — this command never writes `state/peers.json`; the
-/// pairing ceremony is the only thing that ever registers a peer.
-/// Malformed beacons are dropped and counted, never echoed raw (house
-/// rule 4) — `dropped` in the JSON data is a bare total, nothing more
-/// specific about what was wrong with any one of them.
+/// fingerprint heard — name, fingerprint, url, `srcAddr`, first/last heard,
+/// and how many times (`discover::run_sweep`'s own dedupe-by-fingerprint
+/// fold). `url` is the beacon's own CLAIM (a loopback-bound advertiser's
+/// `url` reads `http://127.0.0.1:<port>/` no matter who hears it);
+/// `srcAddr` is the packet's actual source address, an OBSERVATION this
+/// process made directly (P-S1) — the two are shown side by side precisely
+/// so an operator can see them disagree. **Read-only** — this command
+/// never writes `state/peers.json`; the pairing ceremony is the only thing
+/// that ever registers a peer. Malformed beacons are dropped and counted,
+/// never echoed raw (house rule 4) — `dropped` in the JSON data is a bare
+/// total, nothing more specific about what was wrong with any one of them.
 fn handle_peer_discover(inv: &Invocation) -> Outcome {
     let cmd = "peer.discover";
     let secs = match parse_secs_flag(inv) {
@@ -1647,6 +1651,7 @@ fn handle_peer_discover(inv: &Invocation) -> Outcome {
                 "name": h.beacon.name,
                 "fpr": h.beacon.fpr,
                 "url": h.beacon.url,
+                "srcAddr": h.src_addr,
                 "firstHeard": h.first_heard,
                 "lastHeard": h.last_heard,
                 "count": h.count,
@@ -1688,9 +1693,12 @@ fn parse_secs_flag(inv: &Invocation) -> Result<u64, ()> {
 /// discovered peer — a LOCAL UX confirmation only (mirrors
 /// `confirm_spawn`/`confirm_sas`'s exact idiom), never a security gate:
 /// the ceremony's own SAS confirmation (both operators, both ends) is the
-/// sole authority either way.
-fn confirm_invite(name: &str, fpr: &str, url: &str) -> Result<bool, String> {
-    eprint!("invite `{name}` ({url}, fingerprint {fpr}) to pair — proceed? [y/N] ");
+/// sole authority either way. Shows BOTH `url` (the beacon's own
+/// advertised claim) and `src_addr` (the packet's OBSERVED source address,
+/// P-S1) so the operator sees the substitution `invite_dial_url` is about
+/// to make, not just its result.
+fn confirm_invite(name: &str, fpr: &str, url: &str, src_addr: &str) -> Result<bool, String> {
+    eprint!("invite `{name}` (advertised {url}, observed at {src_addr}, fingerprint {fpr}) to pair — proceed? [y/N] ");
     let _ = std::io::stderr().flush();
     let mut line = String::new();
     let read = std::io::stdin()
@@ -1711,10 +1719,17 @@ fn confirm_invite(name: &str, fpr: &str, url: &str) -> Result<bool, String> {
 /// function, not two functions that merely look alike). Zero or multiple
 /// matches refuse with a taught error listing every name that WAS heard
 /// (never raw beacon content — house rule 4; only already-validated
-/// `name`s ever reach this point). `--yes` skips only the LOCAL
-/// proceed-confirm (`confirm_invite`), exactly `peer spawn`'s own `--yes`
-/// idiom — the ceremony's OWN SAS confirmation (both operators, both ends)
-/// is untouched and still runs.
+/// `name`s ever reach this point). The ceremony url dialed is composed
+/// from the hit's OBSERVED source address, not its advertised `url`
+/// (`discover::invite_dial_url`, P-S1) — a loopback-bound advertiser's
+/// `url` is useless as a dial target for anyone but itself. Before
+/// dialing, the SELF-INVITE GUARD (`discover::is_self_target`) refuses
+/// when the heard fingerprint is this instance's own, or when the composed
+/// dial target resolves to this instance's own door — the "you just
+/// invited yourself" case owed here because this is where the target is
+/// chosen. `--yes` skips only the LOCAL proceed-confirm (`confirm_invite`),
+/// exactly `peer spawn`'s own `--yes` idiom — the ceremony's OWN SAS
+/// confirmation (both operators, both ends) is untouched and still runs.
 fn handle_peer_invite(inv: &Invocation) -> Outcome {
     let cmd = "peer.invite";
     let name = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -1760,8 +1775,35 @@ fn handle_peer_invite(inv: &Invocation) -> Outcome {
         }
     };
 
+    let dial_url = match crate::discover::invite_dial_url(&hit.beacon.url, &hit.src_addr) {
+        Ok(u) => u,
+        Err(e) => {
+            return Outcome::error(cmd, format!("composing a dial target for `{}`: {e}", hit.beacon.name))
+                .with_data(json!({ "reason": "dial-url-invalid", "name": hit.beacon.name, "beaconUrl": hit.beacon.url, "srcAddr": hit.src_addr }))
+        }
+    };
+
+    let self_url = default_self_url();
+    let own_fpr = match aoide_storage::identity::load_or_mint() {
+        Ok((kp, _)) => kp.info().fingerprint,
+        Err(e) => {
+            return Outcome::error(cmd, format!("loading this instance's identity: {e}"))
+                .with_data(json!({ "reason": "identity-io-failed" }))
+        }
+    };
+    if crate::discover::is_self_target(&hit.beacon.fpr, &own_fpr, &dial_url, &[self_url.clone()]) {
+        return Outcome::error(
+            cmd,
+            format!(
+                "`{}` resolves to this instance's own door (fingerprint {own_fpr}) — refusing to invite yourself",
+                hit.beacon.name
+            ),
+        )
+        .with_data(json!({ "reason": "self-invite", "name": hit.beacon.name, "fpr": own_fpr, "dialUrl": dial_url }));
+    }
+
     if !inv.flag_present("yes") {
-        match confirm_invite(&hit.beacon.name, &hit.beacon.fpr, &hit.beacon.url) {
+        match confirm_invite(&hit.beacon.name, &hit.beacon.fpr, &hit.beacon.url, &hit.src_addr) {
             Ok(true) => {}
             Ok(false) => {
                 return Outcome::ok(cmd, format!("not confirmed — nothing sent to `{}`", hit.beacon.name))
@@ -1771,8 +1813,7 @@ fn handle_peer_invite(inv: &Invocation) -> Outcome {
         }
     }
 
-    let self_url = default_self_url();
-    run_pair_request(cmd, &hit.beacon.url, &hit.beacon.name, &self_url)
+    run_pair_request(cmd, &dial_url, &hit.beacon.name, &self_url)
 }
 
 /// The four `peer pair` commands (P-P2), registered directly after the six
@@ -1831,7 +1872,7 @@ pub fn register_peer_pair(r: &mut Registry) {
 pub fn register_peer_discovery(r: &mut Registry) {
     r.insert(cmd!(
         path: ["peer", "discover"],
-        summary: "Listen for discovery beacons on the LAN multicast group and print every distinct instance heard (name, fingerprint, url) — read-only, never writes state/peers.json.",
+        summary: "Listen for discovery beacons on the LAN multicast group and print every distinct instance heard (name, fingerprint, url, and the observed source address) — read-only, never writes state/peers.json.",
         args: [],
         flags: [flag!("secs", "int", "How many seconds to listen (default ~4).")],
         gated: false,

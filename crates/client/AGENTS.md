@@ -149,6 +149,29 @@
   that seems to want a registry write (e.g. "remember what was last
   discovered") belongs in a NEW, explicitly-named cache, never folded into
   `state/peers.json` itself.
+- **A beacon's `url` is a CLAIM; a `Heard`'s `src_addr` is an OBSERVATION —
+  never swap which one is trusted (P-S1).** `url` is whatever the
+  advertiser put on the wire (a loopback-bound door always claims
+  `http://127.0.0.1:<port>/`, useless as a dial target for anyone but
+  itself); `src_addr` is the UDP packet's actual source IP, captured by
+  THIS process's own socket, never sent by the advertiser and never
+  believed to be anything but what was measured. `invite_dial_url` reads
+  the host from `src_addr` and everything else (scheme, port, path) from
+  `url` — it is a targeted substitution, not a preference for one field
+  wholesale over the other, and `Beacon` itself never grows a `src_addr`
+  field (the wire shape is CONTRACTS-pinned; the observation belongs on
+  `Heard`, which is local-only and unpinned). Do not add a "trust the
+  advertised url instead" fallback or flag — an advertiser that wants its
+  advertised url dialed can bind its door somewhere routable; guessing
+  which of the two the operator meant is not this code's job.
+- **The self-invite guard (`discover::is_self_target`) runs BEFORE the
+  proceed-confirm and BEFORE the ceremony, in `handle_peer_invite`, never
+  inside `run_pair_request` (P-S1).** `run_pair_request` is shared with
+  `handle_peer_pair_request`, whose `<url>` a human typed and is entitled
+  to point at their own door on purpose (loopback testing, a self-pair
+  smoke test); only the DISCOVERED path needs the "you just invited
+  yourself" refusal, because only there does the target come from an
+  automated resolution the operator didn't type by hand.
 
 ## Extension points
 
