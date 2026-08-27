@@ -176,20 +176,26 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   `exists()` check, no process-wide `Once` needed for a single file) —
   narrated, never a clobber of a fresher `undying.json`.
 - `manifest` — a project's own `.aoide/project.json` (v0, command-defrag
-  lane U1): committed-adjacent SESSION SPECS (`{host, dir, agent, command?}`,
-  `dir` always PROJECT-RELATIVE, never a session id or timestamp), so a bare
-  clone can still tell `resurrect` what sessions a project wants brought up.
-  Distinct from `undying` in every way that matters — see this module's own
-  doc for the full contrast. `load_manifest`/`save_manifest` are this
-  project root's read/write pair (missing file → `None`; unreadable/corrupt
-  → narrated then `None`; `save_manifest` refuses an absolute `dir` in any
-  spec BEFORE writing anything). `.aoide/` self-ignores on first
-  `save_manifest` into a project root (`.gitignore` seeded with `*\n`,
-  never overwritten if one already exists) — the manifest is host-local by
-  decision, not something meant to sync via git. `walk_up` is the pure,
-  explicit-`start`-argument discovery seam a later phase's bare `resurrect`
+  lane U1): host-local SESSION SPECS (`{host, dir, agent, command?}`, `dir`
+  always PROJECT-RELATIVE, never a session id or timestamp), so `resurrect`
+  (U2) can bring a project's intended sessions up on the host that conducts
+  them without a `projects.json` registration first. Distinct from
+  `undying` in every way that matters except one — both are host-local,
+  neither committed; see this module's own doc for the full contrast.
+  `load_manifest`/`save_manifest` are this project root's read/write pair
+  (missing file → `None`; unreadable/corrupt → narrated then `None`;
+  `save_manifest` refuses an absolute `dir` in any spec BEFORE writing
+  anything). `.aoide/` self-ignores on first `save_manifest` into a project
+  root (`.gitignore` seeded with `*\n`, never overwritten if one already
+  exists) — the manifest never syncs via git the way the project's own
+  source does. `resolve_spec_dir` (U2) is the read-side containment guard:
+  joins a spec's `dir` onto the project root and normalizes LEXICALLY,
+  refusing any `..` that would resolve outside the root. `walk_up` is the
+  pure, explicit-`start`-argument discovery seam `resurrect`'s bare mode
   calls: git-style nearest-wins search up through parent directories,
-  stopping at the filesystem root.
+  stopping at the filesystem root — a lexical walk, never realpath-resolving
+  (a manifest reached through a symlinked directory is still found; the walk
+  never resumes from the symlink's own target ancestry).
 - `takes` — the per-draft take store behind `rice back`/`rice take`.
 - `petname`/`display` — the adjective-noun petname mint and its
   render-time-only display grammar.

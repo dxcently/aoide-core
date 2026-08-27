@@ -64,6 +64,37 @@
   set needs the exclusion done per id, not per project, or one live
   terminal suppresses reviving the rest of the set. `--all` and `--id` stay
   exactly as they were: neither consults the undying mark at all.
+- **Bare `resurrect` (no `--project`/`--all`/`--id` at all) tries a project
+  MANIFEST before anything else (U2, command-defrag lane U).**
+  `resurrect.rs`'s `session_resurrect` walks up from cwd
+  (`aoide_storage::manifest::walk_up`) and, on a hit, hands the whole
+  outcome to `resurrect_from_manifest` — never falls through to
+  `require_flag(inv, "project")` in that case. Any of the three flags
+  present routes straight past the manifest check to the pre-existing
+  flag-mode path unchanged; the two modes are mutually exclusive by
+  construction, not by an explicit guard someone could accidentally widen.
+  Don't make the manifest check consult `projects.json` — the whole point
+  is that a manifest is self-sufficient on a host that has never registered
+  the project at all.
+- **The enrichment rule is a hard ordering: the manifest decides WHAT
+  exists, the ledger decides HOW (the User's own design decision, U2).**
+  `resurrect_from_manifest` never invents a candidate the manifest didn't
+  name, and never lets the ledger override which specs get considered —
+  it only ever enriches a spec that's already there, picking the NEWEST
+  ledger entry whose `cwd`/`agent` match (host is never compared again at
+  this point: a spec's `host` mismatch already skipped it earlier in the
+  same loop, and the ledger itself is host-local state that is never
+  synced, so every remaining entry IS this host's). A match reuses
+  `resolve_candidate`/`resurrect_one` VERBATIM — don't fork a second
+  harness/terminal-arm resolver for the manifest path. No match
+  clean-spawns via `clean_spawn_from_spec`, which reuses `session_spawn`'s
+  own windowed path — don't hand-roll a second spawn call here either.
+- **`resolve_spec_dir` (`aoide_storage::manifest`, U2) is the ONLY
+  place a manifest spec's `dir` becomes a filesystem path.** It refuses,
+  never clamps, a `..` that would resolve outside the project root after
+  LEXICAL normalization — don't resolve a spec's `dir` by hand (a bare
+  `project_root.join(dir)`) anywhere else; that would silently reopen the
+  containment hole this function exists to close.
 - **`reap` (toast-free) and `reap_and_announce` (the registered CLI/daemon
   handler) are deliberately two functions, not one.** `reap_and_announce`
   spawns a REAL `notify-send` on the live desktop whenever the sweep
@@ -315,6 +346,17 @@
 
 ## Extension points
 
+- **`resurrect` writes exactly ONE audit line per invocation
+  (`audit_resurrect`, U2) — never zero, never one per candidate/spec.**
+  Every return past a pure usage/stage-file miss (an unresolved project
+  name, an unresolved `--id`, an empty selection, the final per-candidate
+  or per-spec loop outcome, in either mode) calls it once; a pure
+  `require_flag`/`stage_error` early exit does not, the same posture
+  `send.rs`'s `audit_send`/`pending.rs`'s `audit_pending` already hold
+  toward their own early exits. The gate-6 finding this closes: an empty
+  bare-mode selection used to return before ever reaching an audit call at
+  all — don't reintroduce a return path between "a real decision was made"
+  and the `audit_resurrect` call that reports it.
 - **A new `graph`/`conduct`/`hooks` command** adds a `cmd!`/`register` entry in
   `commands/`, wired into `cli`'s `commands::all()` (this crate's commands are
   core, never `lyra`'s).

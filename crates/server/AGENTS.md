@@ -129,12 +129,12 @@
 - **`run_boot_auto_resume`'s per-project loop carries no liveness check of
   its own (P-C4, durable-sessions plan).** It used to skip a whole project
   when ANY non-`done` session anchored to it; that was wrong for a
-  multi-session carried set, since one live terminal would suppress
+  multi-session undying set, since one live terminal would suppress
   reviving the rest. The skip moved into `aoide_conduct::graph::
   session_resurrect`'s own bare-mode selection, per candidate — this loop
   now just calls it unconditionally for every `autoResume` project. Don't
   put a project-wide `has_live`-shaped check back here; if a project's
-  entire carried set is already alive, `session_resurrect` itself resolves
+  entire undying set is already alive, `session_resurrect` itself resolves
   to the empty-set `Outcome::ok` no-op.
 
 - **`pair_request`/`pair_reveal`/`pair_approve_callback` (P-P2) are

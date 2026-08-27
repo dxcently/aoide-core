@@ -191,6 +191,33 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   with no `typed` delivers nothing; a terminal reopened at its own cwd is
   already the complete answer. See AGENTS.md for why the two branches are
   never unified behind a shared boolean parameter.
+  **Bare-manifest mode (U2, command-defrag lane U):** `resurrect` with NONE
+  of `--project`/`--all`/`--id` walks up from cwd
+  (`aoide_storage::manifest::walk_up`) for the nearest `.aoide/
+  project.json` and, if found, revives THAT manifest's specs directly
+  (`resurrect_from_manifest`) — self-sufficient, no `projects.json`
+  registration read or required. Not found, the command falls through to
+  the flag-mode path above, whose usage error then names both misses. Any
+  of the three flags routes straight past the manifest check, unchanged —
+  mutually exclusive with bare-manifest mode by construction. Each spec
+  (`{host, dir, agent, command?}`) resolves independently, one spec's
+  failure never aborting the rest: a spec whose `host` isn't this host's
+  own name (`aoide_storage::display::local_host_name`) is skipped (remote
+  summoning is U4); a local spec's `dir` resolves through
+  `aoide_storage::manifest::resolve_spec_dir` (the containment guard — a
+  `..`-laden `dir` is refused, never resolved outside the project root).
+  **The enrichment rule (the User's design decision):** the manifest
+  decides WHAT exists, the ledger decides HOW — the newest entry in THIS
+  HOST's own session ledger whose `cwd`/`agent` match the spec revives
+  through the exact SAME `resolve_candidate`/`resurrect_one` path `--id`
+  drives; no match clean-spawns instead (`clean_spawn_from_spec`), windowed,
+  the spec's own `command` when given else the agent's registered
+  `AgentProfile::launch` default — the same `session_spawn` windowed path
+  every other candidate spawns through, never a forked launch mechanism. An
+  agent with neither is a taught `failed[]` entry. Every outcome (both
+  modes) is audited exactly once (`audit_resurrect`), including an empty
+  selection — the boot-sweep postmortem's own finding that an early return
+  must never silently skip the audit line a full run gets.
 - **Terminal restore capture (P-C5, durable-sessions plan):**
   `graph/conduct.rs`'s PTY tick (`conduct_refresh_shell`, ~1 Hz, the same
   tick that drives `cwd`/`activity`/`state`) also builds a

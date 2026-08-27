@@ -1,18 +1,20 @@
-//! `.aoide/project.json` (v0) — a project's own committed-adjacent SESSION
-//! SPECS (command-defrag lane U1, 2026-08-27), so `resurrect` can bring up a
-//! project's intended sessions from a bare clone that has never run `aoide`
-//! before and so has no `state/undying.json` marks of its own (U2, a later
-//! phase, is this module's first consumer).
+//! `.aoide/project.json` (v0) — a project's own SESSION SPECS
+//! (command-defrag lane U1, 2026-08-27), so `resurrect` can bring up a
+//! project's intended sessions on the host that conducts them (U2, a later
+//! phase, is this module's first consumer) — self-sufficient, with no
+//! `projects.json` registration required first.
 //!
-//! Distinct from [`crate::undying`] in every way that matters: `undying`
-//! marks LIVE session IDS durable on ONE host (`state/undying.json`,
-//! gitignored runtime state, outside any project); this file lives INSIDE a
-//! project root, IS meant to be committed (it lives beside the project, not
-//! under `state/`), and names the SHAPE of sessions a project wants — never
-//! a session id, never a timestamp, nothing host-specific except each spec's
-//! own `host` field. A project can hold both: an `undying` mark survives a
-//! session's exit on the host that ran it; a `project.json` spec survives a
-//! `git clone` onto a host that has never run anything.
+//! Distinct from [`crate::undying`] in every way that matters except one:
+//! both are HOST-LOCAL, neither is committed. `undying` marks LIVE session
+//! IDS durable on ONE host (`state/undying.json`, gitignored runtime state,
+//! outside any project); this file lives INSIDE a project root (beside the
+//! project, not under `state/`) and names the SHAPE of sessions a project
+//! wants — never a session id, never a timestamp, nothing host-specific
+//! except each spec's own `host` field — but it is JUST as host-local:
+//! `.aoide/` self-ignores (below), so this file never leaves the host it
+//! was written on by way of git. A project can hold both: an `undying`
+//! mark and a `project.json` spec each name intent that only ever means
+//! anything on the host that wrote it.
 //!
 //! `.aoide/` self-ignores on first write ([`ensure_self_gitignore`]) — the
 //! manifest is a deliberately HOST-LOCAL decision (one focused host owns the
@@ -27,21 +29,27 @@ use std::path::{Path, PathBuf};
 pub const MANIFEST_VERSION: u32 = 0;
 
 /// One session a project wants brought up. `dir` is PROJECT-RELATIVE,
-/// always — never an absolute path (a manifest is meant to be portable
-/// across clones/hosts; an absolute `dir` would only ever be correct on the
-/// one host it was written on). No session id, no timestamp: those are
-/// exactly the two fields [`crate::undying::UndyingSession`] carries and
-/// this type deliberately does not — a spec names WHAT to bring up, not
-/// which past invocation it was.
+/// always — never an absolute path: this file is host-local (module doc),
+/// but even on the ONE host it lives on, the project directory itself can
+/// still move (a re-clone elsewhere, a rename) — a relative `dir` keeps
+/// resolving correctly against whatever root `resurrect`'s own `walk_up`
+/// finds it beside, where an absolute one would silently stop being
+/// correct the moment the project moved even once. No session id, no
+/// timestamp: those are exactly the two fields
+/// [`crate::undying::UndyingSession`] carries and this type deliberately
+/// does not — a spec names WHAT to bring up, not which past invocation it
+/// was.
 ///
-/// No `#[serde(deny_unknown_fields)]`, deliberately: a manifest is
-/// committed, so it can be read by an older `aoide` build than the one that
-/// wrote it. An unrecognized field is silently preserved-by-omission on
-/// read (dropped, not round-tripped) rather than refused — the same
-/// forward-tolerance every other additive stage/state shape in this crate
-/// holds (`records::SessionRecord`'s own additive fields, for one), applied
-/// at the whole-struct level instead of field-by-field since this type has
-/// no reason to ever grow a `#[serde(default)]` straggler of its own.
+/// No `#[serde(deny_unknown_fields)]`, deliberately: a manifest persists on
+/// disk indefinitely, host-local, never rewritten wholesale — it must stay
+/// readable across an `aoide` upgrade or downgrade on that same host, not
+/// only the exact build that wrote it. An unrecognized field is silently
+/// preserved-by-omission on read (dropped, not round-tripped) rather than
+/// refused — the same forward-tolerance every other additive stage/state
+/// shape in this crate holds (`records::SessionRecord`'s own additive
+/// fields, for one), applied at the whole-struct level instead of
+/// field-by-field since this type has no reason to ever grow a
+/// `#[serde(default)]` straggler of its own.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionSpec {
     pub host: String,
@@ -117,9 +125,10 @@ fn ensure_self_gitignore(aoide_dir: &Path) -> Result<(), String> {
 /// Atomic-write `manifest` to `<project_root>/.aoide/project.json`, creating
 /// `.aoide/` (and its self-ignoring `.gitignore`, see
 /// [`ensure_self_gitignore`]) on first use. Refuses BEFORE writing anything
-/// if any [`SessionSpec::dir`] is absolute — a manifest is meant to be
-/// portable across clones/hosts, and an absolute `dir` would silently stop
-/// being correct the moment it is read on a different checkout.
+/// if any [`SessionSpec::dir`] is absolute — this file is host-local (module
+/// doc), but the project directory it sits beside can still move on that
+/// same host (a re-clone elsewhere, a rename), and an absolute `dir` would
+/// silently stop being correct the moment it did.
 pub fn save_manifest(project_root: &Path, manifest: &Manifest) -> Result<(), String> {
     for spec in &manifest.sessions {
         if Path::new(&spec.dir).is_absolute() {
@@ -154,6 +163,15 @@ pub fn save_manifest(project_root: &Path, manifest: &Manifest) -> Result<(), Str
 /// consulted even if the nearest one turns out to be unreadable
 /// ([`load_manifest`] already narrates that case); this never silently
 /// falls through to a grandparent's manifest instead.
+///
+/// LEXICAL, not realpath: each step is a bare `Path::parent()`, never a
+/// `readlink`/`canonicalize` call. The per-level existence check
+/// (`manifest_path(&dir).is_file()`) still follows a symlinked directory
+/// component transparently (ordinary `stat` semantics), so a manifest
+/// reachable through one is still found — what does NOT happen is
+/// resuming the walk from a symlink's TARGET's own real ancestry once
+/// past it; the walk continues from the path exactly as spelled, the same
+/// way a shell's logical `..` does after `cd`-ing through a symlink.
 pub fn walk_up(start: &Path) -> Option<(PathBuf, Manifest)> {
     let mut dir = if start.is_absolute() {
         start.to_path_buf()
@@ -166,6 +184,56 @@ pub fn walk_up(start: &Path) -> Option<(PathBuf, Manifest)> {
         }
         dir = dir.parent()?.to_path_buf();
     }
+}
+
+/// Join a spec's own `dir` onto `project_root` and normalize the result
+/// LEXICALLY — no filesystem access, so this resolves correctly even before
+/// the directory exists (a manifest names sessions to bring UP, which may
+/// not have run yet). Refuses, rather than silently clamping, any `dir`
+/// that would resolve outside `project_root` after normalization — a
+/// `..`-laden spec must never escape the project root it was declared in,
+/// whatever a bare lexical join might otherwise compute. `resurrect`'s
+/// (U2, command-defrag lane U) spec-selection is this guard's first caller.
+///
+/// Tracks how many real (`Normal`) components have been pushed past
+/// `project_root` so a `ParentDir` can only ever pop back down to the root,
+/// never through it: a `..` while that count is already zero is refused
+/// outright rather than popping `project_root` itself. `CurDir` (`.`) is a
+/// no-op; an absolute `dir` (a `RootDir`/`Prefix` component) is refused the
+/// same way [`save_manifest`] already refuses one at write time — this is
+/// the read-time twin of that same invariant, needed because a manifest can
+/// be hand-edited or written by a future version this build has never
+/// validated.
+pub fn resolve_spec_dir(project_root: &Path, dir: &str) -> Result<PathBuf, String> {
+    use std::path::Component;
+
+    let mut resolved = project_root.to_path_buf();
+    let mut depth: usize = 0;
+    for component in Path::new(dir).components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(seg) => {
+                resolved.push(seg);
+                depth += 1;
+            }
+            Component::ParentDir => {
+                if depth == 0 {
+                    return Err(format!(
+                        "session spec dir `{dir}` escapes the project root `{}` — rejected",
+                        project_root.display()
+                    ));
+                }
+                resolved.pop();
+                depth -= 1;
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "session spec dir `{dir}` is absolute — project.json's `dir` must be PROJECT-RELATIVE"
+                ));
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -358,6 +426,80 @@ mod tests {
         let (found_root, manifest) = walk_up(&deeper).unwrap();
         assert_eq!(found_root, nested, "the nearer manifest must win, not the ancestor's");
         assert_eq!(manifest.sessions[0].host, "near");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── `resolve_spec_dir`: the containment guard ────────────────────────
+
+    #[test]
+    fn resolve_spec_dir_joins_an_ordinary_relative_dir() {
+        let root = PathBuf::from("/home/khoa/Aoide");
+        assert_eq!(
+            resolve_spec_dir(&root, "crates/aoide").unwrap(),
+            root.join("crates/aoide")
+        );
+    }
+
+    #[test]
+    fn resolve_spec_dir_dot_resolves_to_the_root_itself() {
+        let root = PathBuf::from("/home/khoa/Aoide");
+        assert_eq!(resolve_spec_dir(&root, ".").unwrap(), root);
+    }
+
+    #[test]
+    fn resolve_spec_dir_a_parent_segment_that_stays_inside_the_root_resolves() {
+        let root = PathBuf::from("/home/khoa/Aoide");
+        // a/../b nets out to <root>/b — never leaves the root at any point
+        // a real filesystem walk would take, so the lexical guard allows it.
+        assert_eq!(resolve_spec_dir(&root, "a/../b").unwrap(), root.join("b"));
+    }
+
+    #[test]
+    fn resolve_spec_dir_rejects_a_leading_escape() {
+        let root = PathBuf::from("/home/khoa/Aoide");
+        let err = resolve_spec_dir(&root, "../escape").expect_err("a leading .. must escape and be refused");
+        assert!(err.contains("escapes"), "error must teach: {err}");
+    }
+
+    #[test]
+    fn resolve_spec_dir_rejects_an_escape_buried_past_a_deeper_prefix() {
+        let root = PathBuf::from("/home/khoa/Aoide");
+        // One real component pushed (a), then two `..` — the second pops
+        // past the root, not just back to it.
+        let err = resolve_spec_dir(&root, "a/../../escape")
+            .expect_err("a dir that pops past the root after a deeper prefix must be refused");
+        assert!(err.contains("escapes"), "error must teach: {err}");
+    }
+
+    #[test]
+    fn resolve_spec_dir_rejects_an_absolute_dir() {
+        let root = PathBuf::from("/home/khoa/Aoide");
+        let err = resolve_spec_dir(&root, "/etc/passwd").expect_err("an absolute dir must be refused");
+        assert!(err.contains("PROJECT-RELATIVE") || err.contains("absolute"), "error must teach: {err}");
+    }
+
+    /// The lexical-not-realpath note, proven: a manifest at `root/real`
+    /// reached through a symlink `root/link -> root/real` is still found
+    /// (the `is_file` check follows the symlink), and the returned root is
+    /// the AS-WALKED `root/link`, never a `canonicalize`d `root/real` — the
+    /// walk never resolves the symlink to keep climbing from its target.
+    #[test]
+    fn walk_up_finds_a_manifest_through_a_symlinked_directory_without_resolving_it() {
+        let root = temp_dir("walk-up-symlink");
+        let real = root.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        save_manifest(&real, &Manifest { version: MANIFEST_VERSION, sessions: vec![spec("yomi", ".", "claude")] })
+            .unwrap();
+
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let nested = link.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let (found_root, manifest) = walk_up(&nested).expect("must find the manifest through the symlink");
+        assert_eq!(found_root, link, "the walk returns the AS-WALKED path, never a resolved realpath");
+        assert_eq!(manifest.sessions[0].host, "yomi");
 
         let _ = std::fs::remove_dir_all(&root);
     }

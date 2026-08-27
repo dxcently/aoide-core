@@ -77,6 +77,47 @@
 //!   is the failure this shape prevents.
 //! - **idle, with no `typed`** — nothing is delivered. A terminal reopened
 //!   at its own cwd is already the correct, complete answer.
+//!
+//! **Bare-manifest mode (U2, command-defrag lane U).** `resurrect` with
+//! NONE of `--project`/`--all`/`--id` given walks UP from cwd
+//! (`aoide_storage::manifest::walk_up`) for the nearest `.aoide/
+//! project.json` and, if found, revives THAT manifest's specs directly —
+//! [`resurrect_from_manifest`] — instead of the flag-mode selection above.
+//! The manifest is SELF-SUFFICIENT: no `projects.json` registration is
+//! read or required. Not found, the command falls through to the ordinary
+//! flag-mode path, whose usage error then names both misses (no manifest
+//! above cwd, no flag given) rather than just the flag. `--project`/
+//! `--all`/`--id` are UNCHANGED escapes that ignore the manifest entirely —
+//! mutually exclusive with bare-manifest mode by construction, since any
+//! one of them present routes straight to the pre-existing flag-mode path.
+//!
+//! Each manifest spec (`{host, dir, agent, command?}`,
+//! `aoide_storage::manifest::SessionSpec`) resolves independently, same
+//! per-candidate isolation the flag-mode loop already holds: a spec whose
+//! `host` is not this host's own name
+//! (`aoide_storage::display::local_host_name`) is skipped with a note —
+//! remote summoning is a later phase (U4), never guessed here. A local
+//! spec's `dir` resolves through `aoide_storage::manifest::
+//! resolve_spec_dir` (the containment guard — a `..`-laden `dir` is
+//! refused, never silently resolved outside the project root).
+//!
+//! **The enrichment rule (the User's design decision, U2): the manifest
+//! decides WHAT exists; the ledger decides HOW.** The newest entry in THIS
+//! HOST's own `state/session-ledger.jsonl` whose `cwd`/`agent` match the
+//! resolved `dir`/the spec's `agent` (host is implicit — the ledger is
+//! host-local state, never synced, and only a same-host spec reaches this
+//! match at all) is revived through the exact SAME [`resolve_candidate`]/
+//! [`resurrect_one`] path `--id` drives — its harness resume args or
+//! terminal restore snapshot, exactly as if the operator had named that
+//! ledger entry directly. No match — the ordinary case for a spec this
+//! host has never actually run, e.g. straight off a fresh checkout — falls
+//! to a CLEAN windowed spawn instead ([`clean_spawn_from_spec`]): the
+//! spec's own `command` when given, else the agent's registered
+//! `AgentProfile::launch` default (`aoide_protocol::agents::agent_profile`)
+//! — the SAME windowed [`session_spawn`] path every other resurrect
+//! candidate spawns through, never a forked launch mechanism. An agent
+//! with neither a `command` nor a registered profile is a taught
+//! `failed[]` entry, never a guessed argv.
 
 use super::common::{require_flag, stage_error};
 use super::model::{load_stage, projects_path, sessions_path, ProjectsFile, SessionsFile};
@@ -89,6 +130,7 @@ use aoide_protocol::Invocation;
 use aoide_storage::records::RestoreSnapshot;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::path::Path;
 
 /// Mint a fresh session id for a resurrected session — never the ledger
 /// entry's own id (ids are never recycled, `docs/architecture/AOIDED.md`'s
@@ -395,12 +437,65 @@ fn undying_selection(
     newest.into_values().collect()
 }
 
-/// `aoide resurrect --project <name> [--all | --id <ledgerSessionId>]`.
+/// One audit line per `resurrect` invocation, carrying the decision's own
+/// counts/message — the boot-sweep postmortem's own finding (gate-6): an
+/// early empty-selection return must audit exactly like a full run does,
+/// never silently skip it. Mirrors `send.rs`'s `audit_send`/`pending.rs`'s
+/// `audit_pending` shape, minus `untrusted_data` (a resurrect decision
+/// carries no forwarded text to wrap). Deliberately NOT called from a pure
+/// usage/stage-file miss (a missing flag, an unreadable `projects.json`/
+/// ledger) — the same posture `audit_send` already holds toward its own
+/// `require_flag`/`stage_error` early exits; this covers every point past
+/// that where `resurrect` has actually made — or attempted — a revival
+/// decision.
+fn audit_resurrect(inv: &Invocation, status: &str, message: &str) {
+    let log = aoide_protocol::audit_log_path(inv);
+    let _ = aoide_protocol::append_audit(
+        &log,
+        &aoide_protocol::AuditRecord {
+            ts: aoide_protocol::audit::now_secs(),
+            door: inv.door,
+            class: aoide_protocol::EventClass::Audit,
+            command: "resurrect".to_string(),
+            status: status.to_string(),
+            message: message.to_string(),
+            untrusted_data: None,
+        },
+    );
+}
+
+/// `aoide resurrect [--project <name> [--all | --id <ledgerSessionId>]]`.
+///
+/// Bare (none of the three flags): try the manifest first
+/// ([`resurrect_from_manifest`], U2's own module-doc paragraph) — found, it
+/// owns the whole outcome; not found, falls through to the flag-mode path
+/// below, whose `require_flag` miss now teaches both misses at once. Any of
+/// `--project`/`--all`/`--id` present routes straight past the manifest
+/// check to the pre-existing flag-mode selection, unchanged.
 pub fn session_resurrect(inv: &Invocation) -> Outcome {
     let cmd = "resurrect";
+    let flag_mode = inv.flags.contains_key("project") || inv.flags.contains_key("id") || inv.flag_present("all");
+    if !flag_mode {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+        if let Some((root, manifest)) = aoide_storage::manifest::walk_up(&cwd) {
+            return resurrect_from_manifest(inv, &root, &manifest);
+        }
+    }
+
     let name = match require_flag(inv, "project") {
         Ok(v) => v,
-        Err(o) => return o,
+        Err(_) => {
+            let cwd = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "?".to_string());
+            return Outcome::usage(
+                cmd,
+                format!(
+                    "no .aoide/project.json above `{cwd}` and no --project/--all/--id given — \
+                     run inside a project with a manifest, or pass --project <name>"
+                ),
+            );
+        }
     };
 
     let projects: ProjectsFile = match load_stage(&projects_path()) {
@@ -408,8 +503,10 @@ pub fn session_resurrect(inv: &Invocation) -> Outcome {
         Err(e) => return stage_error(cmd, e),
     };
     let Some(target_idx) = projects.projects.iter().position(|p| p.name == name) else {
-        return Outcome::error(cmd, format!("no project named `{name}` — register it first with `project add`"))
+        let out = Outcome::error(cmd, format!("no project named `{name}` — register it first with `project add`"))
             .with_data(json!({ "reason": "unknown-project", "project": name }));
+        audit_resurrect(inv, "error", &out.message);
+        return out;
     };
 
     let ledger = match aoide_storage::ledger::read_ledger() {
@@ -425,11 +522,13 @@ pub fn session_resurrect(inv: &Invocation) -> Outcome {
         match anchored.into_iter().find(|e| &e.session_id == id) {
             Some(e) => vec![e],
             None => {
-                return Outcome::error(
+                let out = Outcome::error(
                     cmd,
                     format!("no ledger entry `{id}` anchored to project `{name}`"),
                 )
                 .with_data(json!({ "reason": "unknown-ledger-id", "project": name, "id": id }));
+                audit_resurrect(inv, "error", &out.message);
+                return out;
             }
         }
     } else if inv.flag_present("all") {
@@ -451,6 +550,7 @@ pub fn session_resurrect(inv: &Invocation) -> Outcome {
         } else {
             format!("no resumable session found for project `{name}`")
         };
+        audit_resurrect(inv, "ok", &msg);
         return Outcome::ok(cmd, msg)
             .with_data(json!({ "project": name, "resurrected": [], "skipped": [], "failed": [] }));
     }
@@ -463,7 +563,7 @@ pub fn session_resurrect(inv: &Invocation) -> Outcome {
         resurrect_one(inv.door, resolve_candidate(e), &mut resurrected, &mut skipped, &mut failed, &mut changed);
     }
 
-    Outcome::ok(
+    let out = Outcome::ok(
         cmd,
         format!(
             "project `{name}`: resurrected {}, skipped {}, failed {}",
@@ -479,7 +579,187 @@ pub fn session_resurrect(inv: &Invocation) -> Outcome {
         "skipped": skipped,
         "failed": failed,
         "sessionsFile": sessions_path().to_string_lossy(),
-    }))
+    }));
+    audit_resurrect(inv, "ok", &out.message);
+    out
+}
+
+/// U2's bare-manifest mode: `resurrect` with no `--project`/`--all`/`--id`
+/// found `.aoide/project.json` walking up from cwd — revive its specs
+/// directly. See this module's own doc for the enrichment rule and the
+/// remote-skip/containment-guard steps; this function is the loop that
+/// applies them per spec, one failure never aborting the rest (same
+/// posture the flag-mode candidate loop above already holds).
+fn resurrect_from_manifest(
+    inv: &Invocation,
+    root: &Path,
+    manifest: &aoide_storage::manifest::Manifest,
+) -> Outcome {
+    let cmd = "resurrect";
+    let this_host = aoide_storage::display::local_host_name();
+    let ledger = match aoide_storage::ledger::read_ledger() {
+        Ok(v) => v,
+        Err(e) => return stage_error(cmd, e.to_string()),
+    };
+
+    let mut resurrected: Vec<serde_json::Value> = Vec::new();
+    let mut skipped: Vec<serde_json::Value> = Vec::new();
+    let mut failed: Vec<serde_json::Value> = Vec::new();
+    let mut changed: Vec<String> = Vec::new();
+
+    for spec in &manifest.sessions {
+        if spec.host != this_host {
+            skipped.push(json!({
+                "host": spec.host,
+                "dir": spec.dir,
+                "agent": spec.agent,
+                "disposition": "skipped-remote",
+                "reason": "remote spec — summoned in U4's door path, skipped locally",
+            }));
+            continue;
+        }
+
+        let dir = match aoide_storage::manifest::resolve_spec_dir(root, &spec.dir) {
+            Ok(p) => p,
+            Err(e) => {
+                failed.push(json!({
+                    "host": spec.host, "dir": spec.dir, "agent": spec.agent,
+                    "disposition": "failed", "reason": e,
+                }));
+                continue;
+            }
+        };
+        let dir_str = dir.to_string_lossy().into_owned();
+
+        // Enrichment (the module doc's own rule): the newest ledger entry
+        // whose cwd/agent match this spec — host is implicit, a spec whose
+        // host didn't match this one already skipped above, and the ledger
+        // itself is host-local state that is never synced.
+        let matched = ledger
+            .iter()
+            .filter(|e| e.cwd == dir_str && e.agent == spec.agent)
+            .max_by_key(|e| aoide_storage::time::parse_iso_utc(&e.ended_at).unwrap_or(0));
+
+        match matched {
+            Some(entry) => {
+                let before = resurrected.len();
+                resurrect_one(
+                    inv.door,
+                    resolve_candidate(entry.clone()),
+                    &mut resurrected,
+                    &mut skipped,
+                    &mut failed,
+                    &mut changed,
+                );
+                if resurrected.len() > before {
+                    if let Some(last) = resurrected.last_mut() {
+                        last["disposition"] = json!("revived-from-ledger");
+                    }
+                }
+            }
+            None => clean_spawn_from_spec(inv.door, spec, &dir_str, &mut resurrected, &mut failed, &mut changed),
+        }
+    }
+
+    let out = Outcome::ok(
+        cmd,
+        format!(
+            "manifest at `{}`: resurrected {}, skipped {}, failed {}",
+            root.display(),
+            resurrected.len(),
+            skipped.len(),
+            failed.len(),
+        ),
+    )
+    .changed(changed)
+    .with_data(json!({
+        "manifestRoot": root.to_string_lossy(),
+        "resurrected": resurrected,
+        "skipped": skipped,
+        "failed": failed,
+        "sessionsFile": sessions_path().to_string_lossy(),
+    }));
+    audit_resurrect(inv, "ok", &out.message);
+    out
+}
+
+/// A manifest spec with no enriching ledger match: clean-spawn it windowed
+/// — the spec's own `command` when given (whitespace-split into argv; no
+/// shell-quote awareness, the same naive tokenizing `spawn.rs`'s own
+/// `build_terminal_argv` already uses for `$AOIDE_TERMINAL`), else the
+/// agent's registered [`aoide_protocol::agents::AgentProfile::launch`]
+/// default. An agent with neither is a `failed[]` entry naming the gap,
+/// never a guessed invocation. Reuses [`session_spawn`]'s own windowed
+/// path — never a forked launch mechanism.
+fn clean_spawn_from_spec(
+    door: aoide_protocol::Door,
+    spec: &aoide_storage::manifest::SessionSpec,
+    dir: &str,
+    resurrected: &mut Vec<serde_json::Value>,
+    failed: &mut Vec<serde_json::Value>,
+    changed: &mut Vec<String>,
+) {
+    let argv: Vec<String> = match &spec.command {
+        Some(command) => command.split_whitespace().map(str::to_string).collect(),
+        None => match agent_profile(&spec.agent) {
+            Some(p) if !p.launch.is_empty() => p.launch.iter().map(|s| s.to_string()).collect(),
+            _ => {
+                failed.push(json!({
+                    "host": spec.host, "dir": spec.dir, "agent": spec.agent,
+                    "disposition": "failed",
+                    "reason": format!(
+                        "no `command` given and no registered default launch for agent `{}` — add a `command` to the spec",
+                        spec.agent
+                    ),
+                }));
+                return;
+            }
+        },
+    };
+    if argv.is_empty() {
+        failed.push(json!({
+            "host": spec.host, "dir": spec.dir, "agent": spec.agent,
+            "disposition": "failed", "reason": "spec's `command` is empty after whitespace-splitting",
+        }));
+        return;
+    }
+
+    let mut flags = BTreeMap::new();
+    flags.insert("agent".to_string(), spec.agent.clone());
+    flags.insert("windowed".to_string(), "true".to_string());
+    flags.insert("cwd".to_string(), dir.to_string());
+    let out = session_spawn(&Invocation { path: vec!["spawn".to_string()], args: argv, flags, door });
+    if out.status != Status::Ok {
+        failed.push(json!({
+            "host": spec.host, "dir": spec.dir, "agent": spec.agent,
+            "disposition": "failed", "reason": out.message,
+        }));
+        return;
+    }
+    let session_id = out
+        .data
+        .as_ref()
+        .and_then(|d| d.get("sessionId"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let registered = out
+        .data
+        .as_ref()
+        .and_then(|d| d.get("registered"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    changed.push(format!(
+        "session {session_id}: clean-spawned from manifest spec ({}){}",
+        spec.agent,
+        if registered { "" } else { " (not yet registered)" }
+    ));
+    resurrected.push(json!({
+        "sessionId": session_id,
+        "agent": spec.agent,
+        "registered": registered,
+        "disposition": "clean-spawned",
+    }));
 }
 
 #[cfg(test)]
@@ -947,8 +1227,27 @@ mod tests {
 
     #[test]
     fn missing_project_flag_is_a_usage_error() {
+        // Bare mode (no flags at all) now tries a manifest walk-up FIRST
+        // (U2) — chdir into a fresh, manifest-free scratch dir so this
+        // stays deterministic regardless of where `cargo test` happens to
+        // run from, rather than depending on the real ambient cwd's own
+        // ancestry having no `.aoide/project.json` (every real ancestor of
+        // a fresh temp dir is guaranteed manifest-free, the same
+        // assumption `aoide_storage::manifest`'s own walk-up-none test
+        // already leans on).
+        let _guard = crate::env_lock().lock().unwrap();
+        let scratch = unique_stage("resurrect-no-manifest-no-flags");
+        let _cwd = CwdGuard::enter(&scratch);
+
         let out = session_resurrect(&flag_invocation(&["resurrect"], &[]));
         assert_eq!(out.status, aoide_protocol::output::Status::Usage);
+        assert!(
+            out.message.contains("--project") && out.message.contains("project.json"),
+            "the taught error must name both misses: {}",
+            out.message
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     /// `--all` and `--id` are unchanged escapes (P-C4's own scope line): both
@@ -1078,6 +1377,15 @@ mod tests {
             out.message
         );
 
+        // The gate-6 fix (U2): an empty-selection early return must still
+        // write the ONE audit line every resurrect invocation gets, never
+        // silently skip it because nothing was selected.
+        let log = std::fs::read_to_string(root.join("log")).unwrap_or_default();
+        assert!(
+            log.contains("resurrect") && log.contains("undying set is empty"),
+            "an empty-selection resurrect must still audit: {log}"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1104,6 +1412,317 @@ mod tests {
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         let skipped = out.data.as_ref().unwrap()["skipped"].as_array().unwrap().clone();
         assert_eq!(skipped.len(), 1, "the repeated id must be deduped to one candidate: {skipped:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── U2: bare-manifest mode ───────────────────────────────────────────
+
+    /// Restores the real process cwd on drop, even if the test body panics
+    /// mid-assertion — without this, a panicking test would leave every
+    /// LATER test in this same process running from the wrong directory
+    /// (tests share one OS process; `--test-threads=1` plus `env_lock`
+    /// serializes access, but only a `Drop` guard protects against a panic
+    /// skipping the restore).
+    struct CwdGuard {
+        prev: std::path::PathBuf,
+    }
+    impl CwdGuard {
+        fn enter(dir: &std::path::Path) -> Self {
+            let prev = std::env::current_dir().expect("current_dir must resolve in a test");
+            std::env::set_current_dir(dir).expect("chdir into the scratch dir must succeed");
+            CwdGuard { prev }
+        }
+    }
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.prev);
+        }
+    }
+
+    /// Build a manifest at `root` (also this test's `AOIDE_STATE_DIR`/
+    /// `AOIDE_STAGE_DIR` root — no collision, `.aoide/` sits beside, never
+    /// inside, `state/`/`stage/`) with the given specs, chdir into
+    /// `root/work` (proving the walk actually climbs, not just checks
+    /// cwd itself), and return `(root, CwdGuard)` — the guard must outlive
+    /// the call that exercises `session_resurrect`.
+    fn setup_manifest(tag: &str, specs: Vec<aoide_storage::manifest::SessionSpec>) -> (std::path::PathBuf, CwdGuard) {
+        let root = unique_stage(tag);
+        let stage = root.join("stage");
+        let state = root.join("state");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+
+        aoide_storage::manifest::save_manifest(
+            &root,
+            &aoide_storage::manifest::Manifest { version: aoide_storage::manifest::MANIFEST_VERSION, sessions: specs },
+        )
+        .unwrap();
+
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let guard = CwdGuard::enter(&work);
+        (root, guard)
+    }
+
+    fn manifest_spec(host: &str, dir: &str, agent: &str, command: Option<&str>) -> aoide_storage::manifest::SessionSpec {
+        aoide_storage::manifest::SessionSpec {
+            host: host.to_string(),
+            dir: dir.to_string(),
+            agent: agent.to_string(),
+            command: command.map(str::to_string),
+        }
+    }
+
+    /// The headline case: bare `resurrect`, no flags, cwd nested under a
+    /// project with a manifest but no matching ledger history — the spec
+    /// clean-spawns (windowed, `AOIDE_TERMINAL=true` for a real-but-inert
+    /// child, same fixture `a_successful_resurrect_transfers_the_undying_
+    /// mark_from_old_to_new` already uses) rather than needing any
+    /// `projects.json` registration at all.
+    #[test]
+    fn bare_mode_finds_the_manifest_and_clean_spawns_an_unmatched_spec() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG",
+            "AOIDE_TERMINAL", "WAYLAND_DISPLAY", "DISPLAY",
+        ]);
+        let this_host = aoide_storage::display::local_host_name();
+        let (root, cwd) = setup_manifest(
+            "resurrect-manifest-clean-spawn",
+            vec![manifest_spec(&this_host, ".", "claude", None)],
+        );
+        std::env::set_var("AOIDE_TERMINAL", "true");
+        std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[]));
+        drop(cwd);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.as_ref().unwrap();
+        assert_eq!(data["manifestRoot"], root.to_string_lossy().to_string());
+        let resurrected = data["resurrected"].as_array().unwrap();
+        assert_eq!(resurrected.len(), 1, "data: {data}");
+        assert_eq!(resurrected[0]["disposition"], "clean-spawned");
+        assert_eq!(resurrected[0]["agent"], "claude");
+
+        // Bare-manifest mode audits too, exactly once, same as flag mode.
+        let log = std::fs::read_to_string(root.join("log")).unwrap_or_default();
+        assert!(log.contains("resurrect"), "bare-manifest mode must audit: {log}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A spec whose `command` is given wins over the agent's registered
+    /// default — proven indirectly: an agent with NO registered profile
+    /// (`no-such-harness`) would otherwise fail with no default launch, but
+    /// a `command` on the spec still clean-spawns it.
+    #[test]
+    fn bare_mode_clean_spawn_prefers_the_specs_own_command_over_a_default_launch() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG",
+            "AOIDE_TERMINAL", "WAYLAND_DISPLAY", "DISPLAY",
+        ]);
+        let this_host = aoide_storage::display::local_host_name();
+        let (root, cwd) = setup_manifest(
+            "resurrect-manifest-own-command",
+            vec![manifest_spec(&this_host, ".", "no-such-harness", Some("watch -n1 true"))],
+        );
+        std::env::set_var("AOIDE_TERMINAL", "true");
+        std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[]));
+        drop(cwd);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.as_ref().unwrap();
+        assert_eq!(data["failed"].as_array().unwrap().len(), 0, "data: {data}");
+        let resurrected = data["resurrected"].as_array().unwrap();
+        assert_eq!(resurrected.len(), 1, "data: {data}");
+        assert_eq!(resurrected[0]["disposition"], "clean-spawned");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An agent with neither a `command` nor a registered profile is a
+    /// taught `failed[]` entry, never a guessed argv.
+    #[test]
+    fn bare_mode_clean_spawn_fails_taught_when_neither_command_nor_default_launch_exists() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
+        let this_host = aoide_storage::display::local_host_name();
+        let (root, cwd) = setup_manifest(
+            "resurrect-manifest-no-default",
+            vec![manifest_spec(&this_host, ".", "no-such-harness", None)],
+        );
+
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[]));
+        drop(cwd);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.as_ref().unwrap();
+        let failed = data["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 1, "data: {data}");
+        assert_eq!(failed[0]["disposition"], "failed");
+        assert!(
+            failed[0]["reason"].as_str().unwrap().contains("no-such-harness"),
+            "reason must name the agent: {}",
+            failed[0]["reason"]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A spec whose `host` is not this host's own name is skipped locally,
+    /// never guessed at — remote summoning is U4's job.
+    #[test]
+    fn bare_mode_skips_a_remote_spec_with_a_taught_note() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
+        let (root, cwd) = setup_manifest(
+            "resurrect-manifest-remote",
+            vec![manifest_spec("some-other-host", ".", "claude", None)],
+        );
+
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[]));
+        drop(cwd);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.as_ref().unwrap();
+        let skipped = data["skipped"].as_array().unwrap();
+        assert_eq!(skipped.len(), 1, "data: {data}");
+        assert_eq!(skipped[0]["disposition"], "skipped-remote");
+        assert_eq!(skipped[0]["host"], "some-other-host");
+        assert!(skipped[0]["reason"].as_str().unwrap().contains("U4"), "reason: {}", skipped[0]["reason"]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `dir` that normalizes outside the project root is rejected into
+    /// `failed[]`, never resolved to some path outside the project the
+    /// manifest lives in.
+    #[test]
+    fn bare_mode_rejects_a_dir_that_escapes_the_project_root() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
+        let this_host = aoide_storage::display::local_host_name();
+        let (root, cwd) = setup_manifest(
+            "resurrect-manifest-escape",
+            vec![manifest_spec(&this_host, "../../etc", "claude", None)],
+        );
+
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[]));
+        drop(cwd);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.as_ref().unwrap();
+        let failed = data["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 1, "data: {data}");
+        assert_eq!(failed[0]["disposition"], "failed");
+        assert!(failed[0]["reason"].as_str().unwrap().contains("escapes"), "reason: {}", failed[0]["reason"]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One spec's containment rejection never aborts a sibling spec's own
+    /// resolution — the same per-candidate isolation the flag-mode loop
+    /// already holds, now proven at the per-SPEC level.
+    #[test]
+    fn bare_mode_one_failing_spec_never_aborts_the_rest() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG",
+            "AOIDE_TERMINAL", "WAYLAND_DISPLAY", "DISPLAY",
+        ]);
+        let this_host = aoide_storage::display::local_host_name();
+        let (root, cwd) = setup_manifest(
+            "resurrect-manifest-isolation",
+            vec![
+                manifest_spec(&this_host, "../escape", "claude", None),
+                manifest_spec(&this_host, ".", "claude", None),
+            ],
+        );
+        std::env::set_var("AOIDE_TERMINAL", "true");
+        std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[]));
+        drop(cwd);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.as_ref().unwrap();
+        assert_eq!(data["failed"].as_array().unwrap().len(), 1, "data: {data}");
+        assert_eq!(data["resurrected"].as_array().unwrap().len(), 1, "data: {data}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The enrichment rule: a matching ledger entry revives through the
+    /// SAME `resolve_candidate`/`resurrect_one` path `--id` drives, and
+    /// when more than one entry matches, the NEWEST `endedAt` wins — proven
+    /// via the harness-skip taught message (cheap: no windowed spawn), same
+    /// as the flag-mode `--id`/`--all` tests above prove selection width
+    /// without needing a real spawn either.
+    #[test]
+    fn bare_mode_enrichment_picks_the_newest_matching_ledger_entry() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
+        let this_host = aoide_storage::display::local_host_name();
+        let (root, cwd) = setup_manifest(
+            "resurrect-manifest-enrich-newest",
+            vec![manifest_spec(&this_host, ".", "no-such-harness", None)],
+        );
+        let root_str = root.to_str().unwrap().to_string();
+        set_ledger(&[
+            ledger_entry("ledger-older", "no-such-harness", &root_str, "2026-08-20T01:00:00Z"),
+            ledger_entry("ledger-newer", "no-such-harness", &root_str, "2026-08-20T09:00:00Z"),
+        ]);
+
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[]));
+        drop(cwd);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.as_ref().unwrap();
+        let skipped = data["skipped"].as_array().unwrap();
+        assert_eq!(skipped.len(), 1, "exactly one ledger entry must be selected for enrichment: {data}");
+        assert_eq!(skipped[0]["sessionId"], "ledger-newer", "the NEWEST matching entry must win: {data}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The enrichment path is not just "some ledger match" — it reuses
+    /// `resolve_candidate`/`resurrect_one` verbatim, so a MATCHED entry with
+    /// a `restore` snapshot resolves through the terminal arm exactly like
+    /// `--id` would, and the resulting `resurrected` entry carries
+    /// `disposition: "revived-from-ledger"` (never `"clean-spawned"`,
+    /// proving enrichment — not a fresh launch — is what actually fired).
+    #[test]
+    fn bare_mode_enrichment_revives_a_matched_restore_bearing_entry_via_the_terminal_arm() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG",
+            "AOIDE_TERMINAL", "WAYLAND_DISPLAY", "DISPLAY",
+        ]);
+        let this_host = aoide_storage::display::local_host_name();
+        let (root, cwd) = setup_manifest(
+            "resurrect-manifest-enrich-terminal",
+            vec![manifest_spec(&this_host, ".", "shell", None)],
+        );
+        let root_str = root.to_str().unwrap().to_string();
+        set_ledger(&[ledger_entry_with_restore(
+            "ledger-shell",
+            "shell",
+            &root_str,
+            "2026-08-20T01:00:00Z",
+            Some(RestoreSnapshot { cwd: Some(root_str.clone()), idle: true, argv: None, typed: None }),
+        )]);
+        std::env::set_var("AOIDE_TERMINAL", "true");
+        std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[]));
+        drop(cwd);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.as_ref().unwrap();
+        let resurrected = data["resurrected"].as_array().unwrap();
+        assert_eq!(resurrected.len(), 1, "data: {data}");
+        assert_eq!(resurrected[0]["disposition"], "revived-from-ledger");
+        assert_eq!(resurrected[0]["resumedFrom"], "ledger-shell");
 
         let _ = std::fs::remove_dir_all(&root);
     }

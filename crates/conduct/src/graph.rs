@@ -59,7 +59,7 @@ pub use self::session_store::{session_end, session_phase, session_start};
 // waiting on the agent's own lifetime — see `graph/spawn.rs`'s module doc.
 pub use self::spawn::session_spawn;
 // `graph resurrect` (P-D8, `docs/architecture/AOIDED.md`'s "L5"): revives a
-// project's carried set (or `--all`/`--id`) off the durable ledger, via the
+// project's undying set (or `--all`/`--id`) off the durable ledger, via the
 // windowed spawn path, resolving each candidate through a harness or a
 // terminal arm and delivering its restore snapshot — see
 // `graph/resurrect.rs`'s module doc. Also the daemon's own boot-time
