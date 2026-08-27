@@ -78,6 +78,22 @@
   `{"event": ..., "secret", "consumer", ...}` or `aoided`'s own
   `{"v":0,"class":...}`) is the CALLER's contract, decided beside that
   caller's own producer/consumer code, never encoded here.
+- **`dialog` is a pure extraction (P-P5) — every item moved here stays
+  mechanically identical to its old `aoide-secrets` self, and
+  `aoide-secrets` shims every old spelling back rather than duplicating
+  it.** `DialogResult` is the one rename (`ZenityResult` before the move —
+  this substrate now backs more than one dialog binary and more than one
+  ceremony); every other name is unchanged. A shim's visibility must match
+  what the item had at its OLD path exactly — `pub use` for what was
+  already `pub` (`locked_state`, and `DialogResult` under its old
+  `ZenityResult` name), a bare `use` for what was crate-private — never
+  widen an item's visibility just because moving it needs an import
+  statement to exist. Don't add a SECOND string constant for a dismiss
+  label a new dialog ceremony wants ("Reject request", P-P5's own pairing
+  confirm dialog) — `DISMISS_LABEL` is `aoide-secrets`' own zenity/lyra
+  dialogs' label specifically; a new ceremony with its own wording defines
+  its own constant beside its own caller, the same way `feed`'s record
+  shape stays the caller's contract, never this module's.
 
 ## Extension points
 

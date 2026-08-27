@@ -46,6 +46,20 @@ other crate in this workspace sits above.
   `aoided`'s own event bus and any future producer/consumer pair can share
   it — `aoide-secrets` consumes it via `pub use` at its old
   `watch::Follower` path.
+- `dialog` — the code-entry dialog substrate: `DialogResult` (a dialog
+  child's outcome — approved/dismissed/cancelled/cancelled-externally/
+  spawn-error/infra-failure) and `run_entry_dialog` (the generic
+  spawn-poll-parse loop behind it), the screen-lock probes a popup gate
+  consults first (`locked_state`, `is_locked`, `probe_loginctl_locked`,
+  `probe_locker_running`, `locker_process_name`), the spawn-retry backoff
+  (`next_spawn_backoff` + its floor/ceiling), and the one pure
+  `strip_one_trailing_newline` trim every dialog child's stdout is read
+  through. Extracted from `aoide-secrets`' `watch`/`client` modules (P-P5,
+  same `feed`-precedent shape above) so a SECOND dialog consumer
+  (`aoide-client`'s own pairing-confirm popup) shares it rather than
+  forking a copy — `aoide-secrets` consumes every item back at its old
+  `watch::`/`client::` paths via a `use`/`pub use` shim, matching whichever
+  visibility each item already had there.
 - `state` — `canonical_state`, the session-state vocabulary every producer
   folds onto and every reader trusts verbatim.
 - `wire` — typed A2A-JSON-RPC and MCP payload shapes.

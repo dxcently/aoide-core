@@ -148,13 +148,28 @@
 use crate::client::{self, PendingAsk};
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+// P-P5, F5: the dialog substrate (screen-lock probes, the spawn-retry
+// backoff, the generic dialog-child run loop, and its outcome type) moved
+// to `aoide_protocol::dialog` — a SECOND consumer (`aoide-client`'s own
+// P-P5 popup arm) is what forces the extraction (that module's own doc).
+// Every external spelling at THIS path stays byte-identical: `pub use` for
+// what was already `pub` here (`ZenityResult`/`locked_state`), a bare
+// `use` for what was crate-private (preserving the exact same restricted
+// visibility, never widening it just because the shim needs an import).
+pub use aoide_protocol::dialog::DialogResult as ZenityResult;
+pub use aoide_protocol::dialog::locked_state;
+use aoide_protocol::dialog::{
+    is_locked, locker_process_name, next_spawn_backoff, run_entry_dialog, zenity_available, DISMISS_LABEL, SPAWN_BACKOFF_INITIAL,
+    SPAWN_BACKOFF_MAX,
+};
 
 // ── P1: the pure fold ───────────────────────────────────────────────────
 
@@ -488,19 +503,6 @@ pub fn select_mode(json_mode: bool, popup_mode: bool, stdin_tty: bool) -> Mode {
     }
 }
 
-/// The locked-state OR: `loginctl`'s own `LockedHint` (`None` when it can't
-/// answer — no session id, `loginctl` absent, a non-zero exit — treated as
-/// "doesn't say locked", never as "locked") OR'd with a named locker
-/// process's own liveness (design doc: hyprlock 0.9.6 carries no
-/// `SetLockedHint` symbol, so THIS half is load-bearing on this rig, not a
-/// redundant fallback). Pure — the two real probes ([`probe_loginctl_locked`]/
-/// [`probe_locker_running`]) are thin I/O wrappers this function never
-/// calls itself, the same clock-as-parameter split this module's own doc
-/// holds for `unix_now()`.
-pub fn locked_state(loginctl_locked: Option<bool>, locker_running: bool) -> bool {
-    loginctl_locked.unwrap_or(false) || locker_running
-}
-
 /// What `--popup`'s loop should do about the ask it just picked, given `now`
 /// and the CURRENT locked state — pure, so the ordering itself (near-expiry
 /// beats lock-wait, never the other way around) is unit-tested without a
@@ -669,60 +671,11 @@ pub fn event_to_json(event: &Event) -> Value {
 pub use aoide_protocol::feed::Follower;
 
 // ── `--popup`: lock probes + the zenity dialog ──────────────────────────
-
-/// The locker process name `--popup`'s unlock gate scans `/proc` for —
-/// `AOIDE_SECRETS_LOCKER`, default `hyprlock` (module doc).
-fn locker_process_name() -> String {
-    std::env::var("AOIDE_SECRETS_LOCKER").unwrap_or_else(|_| "hyprlock".to_string())
-}
-
-/// `loginctl show-session <id> -p LockedHint --value`, gated on
-/// `$XDG_SESSION_ID` being set at all — `None` on any failure (no session
-/// id, `loginctl` missing, a non-zero exit, unparseable output), never an
-/// error: this is one OR term of [`locked_state`], and an unanswerable
-/// probe must read as "doesn't say locked," not "locked."
-fn probe_loginctl_locked() -> Option<bool> {
-    let session = std::env::var("XDG_SESSION_ID").ok()?;
-    let output = Command::new("loginctl")
-        .args(["show-session", &session, "-p", "LockedHint", "--value"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim() == "yes")
-}
-
-/// Is a process named `process_name` (its `/proc/<pid>/comm`, exact match
-/// after trimming) currently running? Best-effort: an unreadable `/proc`
-/// entry (a process that exited mid-scan, a permission gap) is skipped, not
-/// fatal — same "a probe that can't answer reads as false, never crashes
-/// the watcher" posture [`probe_loginctl_locked`] holds.
-fn probe_locker_running(process_name: &str) -> bool {
-    let Ok(entries) = std::fs::read_dir("/proc") else { return false };
-    for entry in entries.flatten() {
-        if !entry.file_name().to_string_lossy().chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        let comm_path = entry.path().join("comm");
-        if let Ok(comm) = std::fs::read_to_string(&comm_path) {
-            if comm.trim() == process_name {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// The real locked-state read — wires the two probes above into
-/// [`locked_state`]. The only place either probe is called from `--popup`'s
-/// own loop.
-fn is_locked(locker_process: &str) -> bool {
-    locked_state(probe_loginctl_locked(), probe_locker_running(locker_process))
-}
+//
+// The lock probes (`locker_process_name`/`probe_loginctl_locked`/
+// `probe_locker_running`/`is_locked`/`locked_state`) live in
+// `aoide_protocol::dialog` now (P-P5, F5) — shimmed back at these names via
+// the `use`/`pub use` block near the top of this module.
 
 /// The default `zenity` binary name `run` spawns in production — tests pass
 /// a fake shim's own full path instead (this module's own test section),
@@ -731,86 +684,11 @@ fn is_locked(locker_process: &str) -> bool {
 /// function exists so `--popup`'s own tests need neither).
 const ZENITY_CMD: &str = "zenity";
 
-/// The `--extra-button` label `run_zenity_entry` recognizes as an explicit
-/// dismiss (design doc: "a second button ... never the window's close
-/// box"). Zenity's own contract: pressing an extra button exits non-zero
-/// (the SAME status a bare Cancel produces) but prints the button's own
-/// label to stdout instead of the entry's typed value — this is the one
-/// thing that tells the two apart.
-const DISMISS_LABEL: &str = "Dismiss ask";
-
-/// `popup_loop`'s spawn-retry backoff (task #76 item 3): a failing zenity
-/// spawn (the binary went missing, the display died mid-session — anything
-/// short of the startup `zenity_available` check, which already refuses to
-/// even ENTER `--popup` mode) must not busy-loop a fresh `Command::spawn`
-/// every ~200ms poll tick forever. `next_spawn_backoff` doubles from this
-/// floor up to [`SPAWN_BACKOFF_MAX`] on each consecutive failure; a
-/// SUCCESSFUL spawn (any [`ZenityResult`] other than `SpawnError`) resets it
-/// straight back here (`popup_loop`'s own `spawn_failing`/`spawn_backoff`
-/// state). Deliberately NOT wired through [`crate::park::park_timeout`]'s
-/// tolerant-env-override shape — this is an internal retry cadence, not a
-/// user-facing knob, so no `AOIDE_SECRETS_*` env var governs it.
-const SPAWN_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
-
-/// Ceiling `next_spawn_backoff` never exceeds — see [`SPAWN_BACKOFF_INITIAL`]'s
-/// own doc for the full policy.
-const SPAWN_BACKOFF_MAX: Duration = Duration::from_secs(60);
-
-/// The doubling step itself, pure and unit-tested without actually
-/// sleeping (this crate's own clock/timing-as-parameter discipline,
-/// `AGENTS.md`) — `1s, 2s, 4s, 8s, 16s, 32s, 60s, 60s, ...`, capped at
-/// [`SPAWN_BACKOFF_MAX`] rather than overflowing or wrapping past it.
-fn next_spawn_backoff(current: Duration) -> Duration {
-    current.saturating_mul(2).min(SPAWN_BACKOFF_MAX)
-}
-
-/// The `lyra secrets ask` exit code that means "the dialog infrastructure
-/// itself failed" — NEVER a user action, never collapsed into
-/// [`ZenityResult::Cancelled`] (module doc's live-incident section has the
-/// full story). Mirrors `aoide_lyra::commands::secrets::EXIT_INFRA_FAILURE`
-/// byte for byte; there is no shared Rust type to enforce that agreement
-/// (this crate must never depend on `aoide-lyra` — root `AGENTS.md`'s core/
-/// paint boundary), so both constants carry this SAME comment pointing at
-/// the other file. `zenity` itself never produces this code in practice
-/// (its own real exit codes are `0`/`1`/a `--timeout`-only `5`-ish range,
-/// none of which this crate ever passes `--timeout` to trigger anyway), so
-/// checking for it unconditionally in [`run_entry_dialog`] — regardless of
-/// which binary answered — is safe.
-const LYRA_INFRA_FAILURE_EXIT: i32 = 3;
-
-/// Outcome of one code-entry dialog round trip — never a bare `Result`,
-/// since "the user closed it," "a wrong code," "spawning it failed," and
-/// "the dialog infrastructure itself broke" are four different things the
-/// caller must react to differently.
-#[derive(Debug)]
-pub enum ZenityResult {
-    /// Exit 0 — the code the user typed, trimmed of exactly the one
-    /// trailing newline zenity's own stdout carries
-    /// ([`client::strip_one_trailing_newline`], reused verbatim — never a
-    /// blanket `.trim()`, this crate's own "exactly one, not a blanket
-    /// trim" discipline).
-    Approved(String),
-    /// Non-zero exit, stdout was the [`DISMISS_LABEL`] extra button.
-    Dismissed,
-    /// Non-zero exit, anything else — Cancel, Escape, or the window closed.
-    Cancelled,
-    /// The ask stopped being relevant (completed/dismissed/expired
-    /// elsewhere) WHILE the dialog sat open; the child was killed by its
-    /// exact pid before this returned.
-    CancelledExternally,
-    /// The dialog process could not be spawned or waited on at all (an
-    /// `io::Error` from `Command::spawn`/`Child::try_wait`).
-    SpawnError(String),
-    /// The dialog process spawned and ran, but exited signaling
-    /// [`LYRA_INFRA_FAILURE_EXIT`] (`lyra secrets ask` only — module doc's
-    /// live-incident section) — a genuine infrastructure failure, never a
-    /// user action. The `String` names the exit status only (this
-    /// function's own stdout/stderr split: `lyra`'s stderr is INHERITED
-    /// straight to this process's own, `spawn_lyra_entry`'s own doc, so its
-    /// actual failure detail already reached the journal directly and does
-    /// not need to be re-captured and re-printed here).
-    DialogFailure(String),
-}
+// `DISMISS_LABEL`/`SPAWN_BACKOFF_INITIAL`/`SPAWN_BACKOFF_MAX`/
+// `next_spawn_backoff`/`LYRA_INFRA_FAILURE_EXIT`/`ZenityResult` (now
+// `dialog::DialogResult`, shimmed back under the old name) all live in
+// `aoide_protocol::dialog` now (P-P5, F5) — see this module's own shim
+// import block near the top.
 
 /// `--no-markup` (this commit, review fix): `--text` is built by
 /// interpolating `secret`/`consumer`/`reason`/the origin line — all
@@ -877,59 +755,9 @@ fn spawn_lyra_entry(
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()
 }
 
-/// Run one code-entry dialog CHILD to completion, polling every 200ms
-/// between the dialog's own exit and `should_cancel()` — the mechanism
-/// behind [`ZenityResult::CancelledExternally`] (module doc): `should_cancel`
-/// is the caller's own "is this ask still in the queue?" check, so an ask
-/// that resolves on another terminal while this dialog sits open gets its
-/// EXACT child killed via the `Child` handle this function already holds
-/// (never a re-derived pid, never a name match) rather than left orphaned
-/// on screen for an ask that no longer exists. Generic over HOW the child
-/// was spawned (`spawn` is called exactly once, inside here, so a failed
-/// spawn is still reported as [`ZenityResult::SpawnError`]) — this is the
-/// ONE place either dialog binary's exit status/stdout is parsed, so
-/// `zenity`'s and `lyra`'s output CONTRACT (module doc) staying identical is
-/// what makes sharing this loop correct, not incidental.
-fn run_entry_dialog(spawn: impl FnOnce() -> std::io::Result<Child>, mut should_cancel: impl FnMut() -> bool) -> ZenityResult {
-    let mut child = match spawn() {
-        Ok(c) => c,
-        Err(e) => return ZenityResult::SpawnError(e.to_string()),
-    };
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut raw = String::new();
-                if let Some(mut out) = child.stdout.take() {
-                    let _ = out.read_to_string(&mut raw);
-                }
-                let out = client::strip_one_trailing_newline(raw);
-                return if status.success() {
-                    ZenityResult::Approved(out)
-                } else if out == DISMISS_LABEL {
-                    ZenityResult::Dismissed
-                } else if status.code() == Some(LYRA_INFRA_FAILURE_EXIT) {
-                    // Checked BEFORE falling through to `Cancelled` — the
-                    // ONE branch point this whole distinction exists for
-                    // (module doc's live-incident section, `ZenityResult::
-                    // DialogFailure`'s own doc).
-                    ZenityResult::DialogFailure(format!("dialog child exited with status {status}"))
-                } else {
-                    ZenityResult::Cancelled
-                };
-            }
-            Ok(None) => {
-                if should_cancel() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return ZenityResult::CancelledExternally;
-                }
-                thread::sleep(Duration::from_millis(200));
-            }
-            Err(e) => return ZenityResult::SpawnError(e.to_string()),
-        }
-    }
-}
+// `run_entry_dialog` itself lives in `aoide_protocol::dialog` now (P-P5,
+// F5), shimmed back at this name — the wrappers below are what still stay
+// here, since they know which secrets-specific binary/argv to spawn.
 
 fn run_zenity_entry(zenity_cmd: &str, title: &str, text: &str, should_cancel: impl FnMut() -> bool) -> ZenityResult {
     run_entry_dialog(|| spawn_zenity_entry(zenity_cmd, title, text), should_cancel)
@@ -1024,12 +852,8 @@ fn zenity_error_dialog(zenity_cmd: &str, text: &str) {
         .status();
 }
 
-/// Feature-detect `zenity` at `--popup` startup (`run`'s first check) — the
-/// SAME shape [`enroll::render_qr`]'s own `qrencode` feature-detect uses,
-/// spawn failure IS the detection, never a separate "is it on PATH" probe.
-fn zenity_available(zenity_cmd: &str) -> bool {
-    Command::new(zenity_cmd).arg("--version").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok()
-}
+// `zenity_available` lives in `aoide_protocol::dialog` now (P-P5, F5),
+// shimmed back at this name.
 
 /// P3's dialog choice: is a REAL `lyra` executable resolvable right now?
 /// Mirrors `cli::commands::onboard::lyra_bin_if_resolved`'s exact env-tier/
@@ -2152,28 +1976,8 @@ mod tests {
         assert_eq!(select_mode(false, false, false), Mode::NarrationOnly);
     }
 
-    // ── locked_state (the OR logic, injected probes) ─────────────────
-
-    #[test]
-    fn locked_state_true_when_loginctl_says_locked() {
-        assert!(locked_state(Some(true), false));
-    }
-
-    #[test]
-    fn locked_state_true_when_the_locker_process_is_running_even_if_loginctl_disagrees() {
-        assert!(locked_state(Some(false), true));
-    }
-
-    #[test]
-    fn locked_state_true_when_loginctl_cant_answer_but_the_locker_process_is_running() {
-        assert!(locked_state(None, true));
-    }
-
-    #[test]
-    fn locked_state_false_when_neither_signal_says_locked() {
-        assert!(!locked_state(Some(false), false));
-        assert!(!locked_state(None, false));
-    }
+    // `locked_state`'s own tests moved to `aoide_protocol::dialog`'s test
+    // module (P-P5, F5) with the function itself.
 
     // ── popup_action (dialog-allowed gating, pure) ────────────────────
 
@@ -2231,21 +2035,8 @@ mod tests {
         assert!(POPUP_KILL_LOCKOUT_SECS > LOCKOUT_SECS);
     }
 
-    // ── next_spawn_backoff (spawn-retry doubling, pure) ────────────────
-
-    #[test]
-    fn next_spawn_backoff_doubles_from_the_floor() {
-        assert_eq!(next_spawn_backoff(SPAWN_BACKOFF_INITIAL), Duration::from_secs(2));
-        assert_eq!(next_spawn_backoff(Duration::from_secs(2)), Duration::from_secs(4));
-        assert_eq!(next_spawn_backoff(Duration::from_secs(4)), Duration::from_secs(8));
-    }
-
-    #[test]
-    fn next_spawn_backoff_caps_at_the_ceiling_and_never_exceeds_it() {
-        assert_eq!(next_spawn_backoff(Duration::from_secs(32)), SPAWN_BACKOFF_MAX);
-        assert_eq!(next_spawn_backoff(SPAWN_BACKOFF_MAX), SPAWN_BACKOFF_MAX);
-        assert_eq!(next_spawn_backoff(Duration::from_secs(1000)), SPAWN_BACKOFF_MAX);
-    }
+    // `next_spawn_backoff`'s own tests moved to `aoide_protocol::dialog`'s
+    // test module (P-P5, F5) with the function itself.
 
     // ── zenity_available / run_zenity_entry (fake-zenity shims) ──────
     //
@@ -2310,18 +2101,8 @@ mod tests {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    #[test]
-    fn zenity_available_is_false_for_a_binary_name_that_does_not_exist() {
-        assert!(!zenity_available("aoide-secrets-watch-test-definitely-not-a-real-binary"));
-    }
-
-    #[test]
-    fn zenity_available_is_true_when_the_shim_spawns_and_exits_zero() {
-        let _guard = shim_lock();
-        let shim = write_shim("version", "#!/bin/sh\necho zenity 3.99.0\nexit 0\n");
-        assert!(zenity_available(shim.to_str().unwrap()));
-        remove_shim(&shim);
-    }
+    // `zenity_available`'s own tests moved to `aoide_protocol::dialog`'s
+    // test module (P-P5, F5) with the function itself.
 
     #[test]
     fn run_zenity_entry_returns_the_typed_code_on_exit_zero() {

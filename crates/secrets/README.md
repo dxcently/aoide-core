@@ -827,6 +827,22 @@ internal `Mutex`, or `broker::replay_ledger_lock`) — see `emit_notify`'s own
 doc comment for the exact "no lock held" accounting at each site;
 `append_events_feed` inherits the same guarantee rather than re-earning it.
 
+**The `--popup` dialog substrate now lives in `aoide-protocol` too (P-P5,
+F5, the same pure-extraction shape as `Follower` above) — this crate's own
+spellings are unchanged.** `watch::ZenityResult`, `watch::locked_state`,
+`watch::is_locked`, `watch::run_entry_dialog`, `watch::zenity_available`,
+`watch::next_spawn_backoff` (+ its `SPAWN_BACKOFF_INITIAL`/`_MAX` floor/
+ceiling), `watch::DISMISS_LABEL`, and `client::strip_one_trailing_newline`
+are all `use`/`pub use` shims onto `aoide_protocol::dialog` now — `pub use`
+for what was already `pub` here, a bare `use` for what stayed
+crate-private, matching each item's OLD visibility exactly rather than
+widening anything. `aoide-client`'s own P-P5 pairing-confirm popup is the
+SECOND consumer that forced the move; `spawn_zenity_entry`/
+`spawn_lyra_entry`/`run_zenity_entry`/`run_lyra_entry`/`run_ask_dialog`/
+`zenity_error_dialog`/`popup_loop` stay here exactly as before — they know
+which secrets-specific binary and argv to spawn, which the generic
+run-loop never needed to.
+
 ## Watching events (`secrets watch`, tracker #71 Part 1)
 
 `aoide secrets watch` is a foreground, line-mode terminal surface — the

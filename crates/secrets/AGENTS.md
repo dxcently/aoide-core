@@ -268,6 +268,19 @@
   — the events feed can still miss a line (a truncation between polls, a
   process restart) in a way the broker's own in-memory `ParkRegistry`
   cannot.
+- **The dialog substrate (`ZenityResult`/`locked_state`/`is_locked`/
+  `run_entry_dialog`/`zenity_available`/`next_spawn_backoff`/
+  `DISMISS_LABEL`/`strip_one_trailing_newline`) is a SHIM onto
+  `aoide_protocol::dialog` now (P-P5, F5) — never re-add a real body at
+  these names in this crate.** A behavior change to any of them belongs in
+  `aoide-protocol::dialog` (its own `AGENTS.md`), never patched locally
+  "just this once" — `aoide-client`'s own P-P5 popup arm shares the exact
+  same code, and a local fork here would silently drift the two. What
+  stays genuinely local: `spawn_zenity_entry`/`spawn_lyra_entry`/
+  `run_zenity_entry`/`run_lyra_entry`/`run_ask_dialog`/
+  `zenity_error_dialog`/`resolve_lyra_bin`/`popup_loop` — everything that
+  knows THIS crate's own two dialog binaries and their argv, which the
+  generic run-loop never needed to know.
 - **Every admin command that reads/writes `policy.json`/`totp.secret` refuses
   the wrong effective uid BEFORE touching the file, never after** (P-V4f,
   the yomi-strix incident, 2026-08-22: plain `sudo aoide secrets add …`

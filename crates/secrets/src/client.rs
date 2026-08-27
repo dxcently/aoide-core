@@ -917,27 +917,22 @@ pub(crate) fn stdin_is_tty() -> bool {
     unsafe { libc::isatty(0) != 0 }
 }
 
-/// Strip exactly ONE trailing `\n`, never a blanket `.trim_end()` (same
-/// "exactly one, not a blanket trim" discipline `backend::fetch_value`'s
-/// module doc already holds for a backend's stdout) — a subprocess's own
-/// stdout line carries the newline its own `echo`/`printf` produced; this
-/// removes that one character and nothing else a pasted value might
-/// legitimately end with. Pure and total, so it stays independently unit
-/// tested with no tty involved.
-///
-/// `pub(crate)`: `watch.rs`'s `--popup` zenity-entry reader trims its own
-/// dialog output through this SAME function — [`read_hidden_line`] no
-/// longer needs it itself (P-I1: `aoide_protocol::pick::hidden_input`
-/// hands back a value with no trailing newline to strip), but this stays
-/// the one seam any OTHER stdout-line trim in this crate reaches for
-/// (the "reach into the existing seam, never fork a second trim"
-/// discipline `stdin_is_tty` established alongside it).
-pub(crate) fn strip_one_trailing_newline(mut s: String) -> String {
-    if s.ends_with('\n') {
-        s.pop();
-    }
-    s
-}
+/// Strip exactly ONE trailing `\n`, never a blanket `.trim_end()` — moved
+/// to `aoide_protocol::dialog::strip_one_trailing_newline` at P-P5 (F5,
+/// pure extraction: a SECOND consumer, `aoide-client`'s own popup arm,
+/// needed the identical trim without duplicating it). `pub(crate)` shim:
+/// `watch.rs`'s `--popup` dialog-output reader — now living inside
+/// `aoide_protocol::dialog::run_entry_dialog` itself — trims through the
+/// SAME function; this re-export keeps every existing call at this path
+/// ([`read_hidden_line`] no longer needs it itself, P-I1, but this stays
+/// the one seam any OTHER stdout-line trim in this crate reaches for)
+/// byte-identical. `run_entry_dialog` itself moved too (F5), so its own
+/// call now reaches the function directly, unqualified, inside
+/// `aoide_protocol::dialog` — leaving no live call site AT this path
+/// today; kept anyway as the shim the "no cross-crate copying" discipline
+/// asks for, for the next stdout-line trim this crate reaches for.
+#[allow(unused_imports)]
+pub(crate) use aoide_protocol::dialog::strip_one_trailing_newline;
 
 /// Read one line of hidden input on the real terminal — the tty half of
 /// [`run_put`]'s prompt (module doc). Retrofit (ONBOARD.md's prompt
@@ -1453,22 +1448,12 @@ mod tests {
     //
     // `read_hidden_line`'s own tty path (`aoide_protocol::pick::
     // hidden_input`) is not exercised here — `cargo test`'s own stdin is
-    // never a tty — so these cover exactly the "small seam" the module doc
-    // calls out: `strip_one_trailing_newline`'s pure trim logic, and that
-    // `stdin_is_tty` reads false (so `run_put` takes the untouched pipe
-    // path) under this process's own non-tty stdin, same as every existing
-    // `run_put`-adjacent test already implicitly relies on.
-
-    #[test]
-    fn strip_one_trailing_newline_removes_exactly_one() {
-        assert_eq!(strip_one_trailing_newline("hunter2\n".to_string()), "hunter2");
-        assert_eq!(strip_one_trailing_newline("hunter2\n\n".to_string()), "hunter2\n");
-        assert_eq!(strip_one_trailing_newline("hunter2".to_string()), "hunter2");
-        assert_eq!(strip_one_trailing_newline(String::new()), "");
-        // Trailing spaces in a pasted value are NOT eaten — only the one
-        // newline the Enter key produced, never a blanket `.trim_end()`.
-        assert_eq!(strip_one_trailing_newline("hunter2  \n".to_string()), "hunter2  ");
-    }
+    // never a tty. `strip_one_trailing_newline`'s own pure-trim test moved
+    // to `aoide_protocol::dialog`'s test module with the function itself
+    // (P-P5, F5); what stays here is `stdin_is_tty` reading false (so
+    // `run_put` takes the untouched pipe path) under this process's own
+    // non-tty stdin, same as every existing `run_put`-adjacent test already
+    // implicitly relies on.
 
     // ── P-67: warn-before-overwrite ─────────────────────────────────────
 
