@@ -179,7 +179,7 @@ pub fn register(r: &mut Registry) {
     r.insert(cmd!(
         path: ["secrets", "exec"],
         summary: "Resolve a secret and exec a command with it injected as an env var (Stdio::inherit throughout — never argv, never logged, never an Outcome/JSON field). CLI-only: the value would otherwise have to cross a door that isn't this process's own stdio.",
-        args: [],
+        args: [arg!("command", "string", true, "The command to exec with the secret injected — put it after `--` so its own flags pass through verbatim (the same declaration `conduct` carries for its wrapped command; an undeclared tail would trip the parser's zero-arg overflow guard).")],
         flags: [
             flag!("as", "string", "The consumer name to present to the broker (self-asserted — the policy's consumers[] list is the real gate, not caller identity)."),
             flag!("secret", "string", "The secret's policy name, optionally `name:VAR` to name the injected env var explicitly (default: the name, uppercased, `-` -> `_`)."),
