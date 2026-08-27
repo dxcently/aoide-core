@@ -226,9 +226,39 @@ never the inbound/serve half (that's `aoide-server`).
   the approver's own callback already transitioned it to
   `awaiting-confirm`) it makes no wire call at all and commits THIS
   instance's own record directly on confirmation (decision 4's
-  mutual confirmation, on both ends). `handle_peer_pair_reject` tries
+  mutual confirmation, on both ends). `approve_inbound`/`approve_outbound`
+  take a `skip_confirm: bool` (P-P5) rather than an `&Invocation` — a
+  rename, not a behavior change: `handle_peer_pair_approve` still passes
+  `inv.flag_present("yes")` through unchanged, and `pair_watch`'s own
+  popup arm (below) passes `true` since the dialog itself already IS the
+  confirmation. `handle_peer_pair_reject` tries
   the inbound queue then the outbound queue, aborting an outbound entry at
-  any stage — the ceremony's abort command.
+  any stage — the ceremony's abort command; `reject_by_id(cmd, id)` (P-P5)
+  is its shared body, extracted so `pair_watch`'s popup arm can reject by
+  id alone, with no `Invocation` to construct for a dialog button.
+  `handle_peer_pair_watch` (`peer pair watch [--popup] [--json]`, P-P5,
+  CONTRACTS.md §6) is the launch-record handler for `pair_watch::run`
+  (below) — the SAME "gate the door and the flag combo here, run the
+  blocking loop from `cli`'s own `special` hook" split `handle_events_tail`/
+  `handle_secrets_watch` already hold, appended newest in
+  `register_peer_pair`.
+  **`pair_watch` (P-P5, a NEW module, CONTRACTS.md §6's "Pairing events
+  feed" subsection)** is the pairing ceremony's own watcher: `parse_pair_line`
+  reads the three `class: "gate"`/`source: "a2a-door"` milestones
+  `aoide_server::a2a::emit_pairing_event` writes (`pair-parked`/
+  `pair-revealed`/`pair-awaiting-confirm`) off aoided's OWN events feed —
+  the SAME file `events tail` already follows, since `a2a serve` appends
+  onto it directly; `reconcile` re-derives every pending request straight
+  from `aoide_storage::pairing::list_inbound`/`list_outbound` (the
+  AUTHORITY — the feed line is only ever a trigger to re-check them,
+  mirroring `aoide_secrets::watch`'s identical "tail is a trigger" stance
+  for its own feed), using the EXACT SAS arg order per direction
+  `handle_peer_pair_pending` above already uses; `actionable` decides
+  whether a `Pending` is worth surfacing (an inbound entry once revealed,
+  an outbound entry once `awaiting-confirm`); `run` is the blocking
+  tail/reconcile loop (`aoide_secrets::watch::wait_for_follower`'s exact
+  retry-until-exists shape, a 30s reconcile safety tick). `--popup`
+  refuses up front when `zenity` isn't on `PATH`.
   **`run_pair_request(cmd, url, name, self_url, dial_via, record_via)`
   (P-P6, `dial_via`/`record_via` added P-S4) is `handle_peer_pair_request`'s
   own body, extracted so `peer invite` reaches it too — reused, never

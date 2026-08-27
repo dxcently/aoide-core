@@ -14,9 +14,11 @@ correspondence").
 - `cli`/`dispatch` — argv parsing and the dispatcher, over
   `aoide_protocol::door::run`'s shared skeleton with core's own `special`
   hook (`mcp serve --stdio`, `a2a serve`, `secrets serve`, `secrets exec`,
-  `secrets enroll`, `secrets watch`, `events tail`, `conductor`,
-  `guide`/`schema` raw output).
-- `registry` — the golden command-path snapshot test (80 paths).
+  `secrets enroll`, `secrets watch`, `events tail`, `peer pair watch`
+  (P-P5), `conductor`, `guide`/`schema` raw output).
+- `registry` — the golden command-path snapshot test (75 paths — this
+  number tracks `crates/cli/src/registry.rs`'s own golden list; that file
+  is the source of truth, this prose a restatement of it).
 - `guide` — `aoide guide`, the onboarding tier map.
 - `commands` — the root-coupled groups that must read the ASSEMBLED
   registry: `meta` (guide/schema), `stubs` (not-yet-implemented
@@ -39,16 +41,17 @@ depends on it.
 
 ## How it composes
 
-73 command paths (core's headless-capable, agent-orchestration surface: the
+75 command paths (core's headless-capable, agent-orchestration surface: the
 project/session graph (including `resurrect`, its ledger-backed
 session revival), A2A, peers (including the `peer hub` designation,
-P-D5, the `peer pair request|pending|approve|reject` pairing ceremony,
-P-P2, the `peer allow <name> <cap> on|off` closed-capability grant/
-revoke command backing the A2A spawn arm's hard gate, P-P3, `peer spawn
-<name> -- <text…>`, P-P5b, the signed spawn-shaped `message/send` that
-actually reaches that gate, and `peer discover [--secs N]`/`peer invite
-<name> [--secs N] [--yes]`, P-P6, the LAN discovery beacon's read-only
-sweep and its sugar-over-the-ceremony invite), presence, the
+P-D5, the `peer pair request|pending|approve|reject|watch` pairing
+ceremony, P-P2/P-P5, the `peer allow <name> <cap> on|off`
+closed-capability grant/revoke command backing the A2A spawn arm's hard
+gate, P-P3, `peer spawn <name> -- <text…>`, P-P5b, the signed
+spawn-shaped `message/send` that actually reaches that gate, and `peer
+discover [--secs N]`/`peer invite <name> [--secs N] [--yes]`, P-P6, the
+LAN discovery beacon's read-only sweep and its sugar-over-the-ceremony
+invite), presence, the
 daemon, its own event bus (`events tail`), usage, hooks, the message
 inbox, the secrets broker, this instance's own `identity` (P-P1 of the
 pairing workstream, `docs/architecture/PAIRING.md`)).

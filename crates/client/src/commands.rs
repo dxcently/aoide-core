@@ -1586,7 +1586,7 @@ fn run_pair_request(
 /// independently derived from this instance's own identity plus the
 /// entry's stored transcript fields — never trusted from the wire — exactly
 /// what `peer pair approve` re-derives again before committing anything.
-fn handle_peer_pair_pending(_inv: &Invocation) -> Outcome {
+pub(crate) fn handle_peer_pair_pending(_inv: &Invocation) -> Outcome {
     let cmd = "peer.pair.pending";
     let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
     let inbound = aoide_storage::pairing::list_inbound(now_epoch);
@@ -1661,10 +1661,10 @@ fn handle_peer_pair_approve(inv: &Invocation) -> Outcome {
     let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap_or(0);
 
     if let Some(entry) = aoide_storage::pairing::list_inbound(now_epoch).into_iter().find(|e| e.id == id) {
-        return approve_inbound(inv, cmd, &id, entry, &now, now_epoch);
+        return approve_inbound(inv.flag_present("yes"), cmd, &id, entry, &now, now_epoch);
     }
     if let Some(entry) = aoide_storage::pairing::list_outbound(now_epoch).into_iter().find(|e| e.id == id) {
-        return approve_outbound(inv, cmd, &id, entry, &now, now_epoch);
+        return approve_outbound(inv.flag_present("yes"), cmd, &id, entry, &now, now_epoch);
     }
     Outcome::error(cmd, format!("no pending pairing request with id `{id}` (unknown, already resolved, or expired)"))
         .with_data(json!({ "reason": "unknown-id", "id": id }))
@@ -1682,8 +1682,15 @@ fn handle_peer_pair_approve(inv: &Invocation) -> Outcome {
 /// NOTHING until approved"; an unreachable requester must leave BOTH ends
 /// unpaired, not just one) — then commits THIS instance's own peer record
 /// (`upsert_paired_peer`) and removes the parked entry.
+///
+/// `skip_confirm` (P-P5): `true` bypasses the SAS prompt outright — the
+/// popup arm's own dialog IS the confirmation (an operator who clicked
+/// Approve on the rendered code already confirmed it; a second CLI-shaped
+/// `y`/`yes` prompt on top would be a confirmation of a confirmation).
+/// The ordinary CLI path passes `inv.flag_present("yes")` through
+/// unchanged — this is a parameter rename, not a behavior change.
 fn approve_inbound(
-    inv: &Invocation,
+    skip_confirm: bool,
     cmd: &str,
     id: &str,
     entry: aoide_storage::pairing::InboundPairingRequest,
@@ -1712,7 +1719,7 @@ fn approve_inbound(
     let own_pubkey = kp.info().pubkey_hex;
     let sas = aoide_storage::pairing::derive_sas(&entry.pubkey_hex, &own_pubkey, &requester_nonce, &entry.approver_nonce_hex);
 
-    if !inv.flag_present("yes") {
+    if !skip_confirm {
         match confirm_sas(&sas, &entry.name) {
             Ok(true) => {}
             Ok(false) => {
@@ -1803,8 +1810,11 @@ fn approve_inbound(
 /// confirmation the approver's own side holds — only THEN commits this
 /// instance's own peer record. No wire call here: the approver already
 /// committed its own record before ever sending the callback.
+///
+/// `skip_confirm` (P-P5): same meaning as [`approve_inbound`]'s own
+/// parameter — the popup arm's dialog IS the confirmation.
 fn approve_outbound(
-    inv: &Invocation,
+    skip_confirm: bool,
     cmd: &str,
     id: &str,
     entry: aoide_storage::pairing::OutboundPairingRequest,
@@ -1834,7 +1844,7 @@ fn approve_outbound(
     let own_pubkey = kp.info().pubkey_hex;
     let sas = aoide_storage::pairing::derive_sas(&own_pubkey, &entry.pubkey_hex, &entry.requester_nonce_hex, &entry.approver_nonce_hex);
 
-    if !inv.flag_present("yes") {
+    if !skip_confirm {
         match confirm_sas(&sas, &entry.name) {
             Ok(true) => {}
             Ok(false) => {
@@ -1901,9 +1911,20 @@ fn handle_peer_pair_reject(inv: &Invocation) -> Outcome {
         Some(i) => i.to_string(),
         None => return Outcome::usage(cmd, "usage: aoide peer pair reject <id> [--json]"),
     };
+    reject_by_id(cmd, &id)
+}
+
+/// The shared body of `peer pair reject <id>` — extracted (P-P5) so
+/// `pair_watch`'s own popup arm (a `--yes`-shaped CLI invocation is the
+/// wrong shape for a dialog's "Reject request" button, which knows only
+/// the id) can call it directly with no [`Invocation`] to construct.
+/// Whichever direction the id is parked in, removes it — no peer record
+/// on either end, no wire notification to the other side (module doc on
+/// [`handle_peer_pair_reject`]).
+fn reject_by_id(cmd: &str, id: &str) -> Outcome {
     let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
 
-    match aoide_storage::pairing::take_inbound(&id, now_epoch) {
+    match aoide_storage::pairing::take_inbound(id, now_epoch) {
         Ok(Some(entry)) => {
             return Outcome::ok(cmd, format!("rejected pairing request `{id}` from `{}` — no peer record written", entry.name))
                 .with_data(json!({ "rejected": true, "id": id, "name": entry.name, "direction": "inbound" }))
@@ -1912,13 +1933,42 @@ fn handle_peer_pair_reject(inv: &Invocation) -> Outcome {
         Err(e) => return Outcome::error(cmd, format!("removing the pairing request: {e}")),
     }
 
-    match aoide_storage::pairing::take_outbound(&id, now_epoch) {
+    match aoide_storage::pairing::take_outbound(id, now_epoch) {
         Ok(Some(entry)) => Outcome::ok(cmd, format!("aborted outbound pairing request `{id}` to `{}` — no peer record written", entry.name))
             .with_data(json!({ "rejected": true, "id": id, "name": entry.name, "direction": "outbound" })),
         Ok(None) => Outcome::error(cmd, format!("no pending pairing request with id `{id}` (unknown, already resolved, or expired)"))
             .with_data(json!({ "reason": "unknown-id", "id": id })),
         Err(e) => Outcome::error(cmd, format!("removing the pairing request: {e}")),
     }
+}
+
+/// `peer pair watch [--popup] [--json]`'s launch-record handler (P-P5) —
+/// the SAME shape `aoide_server::commands::handle_events_tail`/
+/// `aoide_secrets::commands::handle_secrets_watch` already hold for a
+/// foreground/blocking command: this only gates the door and refuses a
+/// `--popup`+`--json` combo; the blocking loop itself
+/// (`crate::pair_watch::run`) runs from `cli`'s `special` hook, dispatched
+/// to AFTER this handler records the launch attempt through the single
+/// audit log. CLI-only — a follow-style command that blocks a connection
+/// until Ctrl-C makes no sense over MCP/A2A, the same reasoning
+/// `secrets watch`/`events tail` already established for the same shape
+/// of command.
+fn handle_peer_pair_watch(inv: &Invocation) -> Outcome {
+    let cmd = "peer.pair.watch";
+    if inv.door != aoide_protocol::Door::Cli {
+        return Outcome::usage(
+            cmd,
+            "peer pair watch is a foreground follow that blocks until Ctrl-C; run it from a terminal (not over this door)",
+        );
+    }
+    if inv.flag_present("popup") && inv.flag_present("json") {
+        return Outcome::usage(
+            cmd,
+            "peer pair watch: --popup and --json are mutually exclusive — --popup replaces the terminal narration with a \
+             confirm dialog, --json emits narration-only machine-readable lines; pick one",
+        );
+    }
+    Outcome::ok(cmd, "watching pairing events")
 }
 
 /// `peer discover [--secs N] [--json]` (P-P6, `docs/architecture/
@@ -2188,6 +2238,20 @@ pub fn register_peer_pair(r: &mut Registry) {
         gated: false,
         implemented: true,
         handler: handle_peer_pair_reject,
+    ));
+    r.insert(cmd!(
+        path: ["peer", "pair", "watch"],
+        summary: "Foreground, line-mode follow of the pairing-ceremony events feed (parked/revealed/awaiting-confirm) plus a 30s reconcile safety tick. --json emits one event object per line instead of narration. --popup swaps the terminal narration for a confirm dialog on each actionable request (requires zenity on PATH) — mutually exclusive with --json. CLI-only — blocks until Ctrl-C.",
+        args: [],
+        flags: [flag!(
+            "popup",
+            "bool",
+            "Surface each actionable request (an inbound reveal, or an outbound awaiting-confirm) as a confirm dialog instead of terminal narration. Requires zenity on PATH. Mutually exclusive with --json."
+        )],
+        gated: false,
+        implemented: true,
+        handler: handle_peer_pair_watch,
+        examples: ["peer pair watch", "peer pair watch --json", "peer pair watch --popup"],
     ));
 }
 

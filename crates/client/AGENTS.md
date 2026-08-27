@@ -122,6 +122,46 @@
   `OutboundState` aborts cleanly on reject; this is the ceremony's only
   abort command, so collapsing this back to inbound-only would leave a
   requester with no way to cancel a pairing it no longer wants.
+- **`approve_inbound`/`approve_outbound` take `skip_confirm: bool`, not
+  `&Invocation` (P-P5) — a signature-only refactor.** Don't reach for
+  `inv.flag_present("yes")` inside either function again; the ONLY caller
+  that reads that flag is `handle_peer_pair_approve`, which passes the
+  result in. A future caller with no `Invocation` at all (`pair_watch`'s
+  popup arm is the first) passes `true`/`false` directly — the dialog
+  itself IS the confirmation, so it always passes `true`.
+- **`reject_by_id(cmd, id)` is `handle_peer_pair_reject`'s entire body,
+  extracted (P-P5) so a caller with only an id — no `&Invocation` to
+  construct — can reject a pairing request too.** Keep it a pure
+  `(cmd, id) -> Outcome`; don't grow it a `skip_confirm`-shaped parameter
+  — a reject was never confirmation-gated (module doc above: "a clean
+  refusal"), so there is nothing for a caller to skip.
+- **`pair_watch::reconcile` is a SEPARATE, independent re-implementation
+  of the SAS-deriving loop `handle_peer_pair_pending` already has —
+  not a shared helper, DELIBERATELY (P-P5).** The two arg orders
+  (inbound: `(entry.pubkeyHex, own_pubkey, requester_nonce,
+  entry.approverNonceHex)`; outbound: `(own_pubkey, entry.pubkeyHex,
+  requester_nonce, approver_nonce)`) are asymmetric and easy to swap by
+  accident — `pair_watch`'s own byte-equality test
+  (`reconcile_derives_the_same_sas_handle_peer_pair_pending_prints`) is
+  what catches a swap in EITHER copy, but it can only do that because the
+  two copies are independent; collapsing them into one shared function
+  would make that test tautological (it would just be comparing a value
+  to itself). If a real DRY opportunity ever presents itself here, keep
+  the swap-catching test's independence some other way — never delete it
+  "since there's only one implementation now."
+- **A feed line's own `payload` fields are safe for PASSIVE narration
+  (`narrate`/`event_to_json`) — they are never safe for anything that
+  drives an ACTION.** `name` is `valid_peer_name`-charset-restricted
+  before `a2a.rs::pair_request` ever parks it, the same "validated before
+  it's usable" stance every other displayed field already has — this
+  mirrors `aoide_secrets::watch::narrate_event`'s own identical trust in
+  its feed line's fields for narration-only output. [`reconcile`] is the
+  hard line: it NEVER reads the feed, only
+  `aoide_storage::pairing::list_inbound`/`list_outbound` directly — any
+  future dialog/action arm (this phase's popup, P-P5) must build its
+  displayed text and its SAS from `reconcile`'s own `Pending`, never from
+  a `PairEvent`'s fields, no matter how validated those look. Don't fold
+  the two trust levels back into one "just use the feed line" path.
 - **`run_pair_request` (P-P6) is the ONLY body of `handle_peer_pair_request`
   past its own `<url>`/`--name`/`--self-url` parsing, and `handle_peer_invite`
   calls the SAME function — never a second copy.** `peer invite`'s own doc

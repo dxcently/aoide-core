@@ -36,6 +36,7 @@ pub mod adapter;
 pub mod commands;
 pub mod daemon;
 pub mod discover;
+pub mod pair_watch;
 pub mod peer;
 pub mod tunnel;
 pub mod wire;

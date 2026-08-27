@@ -119,7 +119,8 @@ mod tests {
         // graph.rs`'s module doc for the full table. Bumped by 1 for bare
         // `session` — the undying picker (U3, command-defrag lane U) — a
         // parent command alongside `session.*` the same way bare `graph`
-        // sits alongside `graph.link`: reached 74.
+        // sits alongside `graph.link`: reached 74. Bumped by 1 more for
+        // `peer.pair.watch` (P-P5): reached 75.
         let mut expected: Vec<&str> = vec![
             "a2a.serve",
             "adapter.melete",
@@ -152,6 +153,7 @@ mod tests {
             "peer.pair.pending",
             "peer.pair.reject",
             "peer.pair.request",
+            "peer.pair.watch",
             "peer.pull",
             "peer.remove",
             "peer.spawn",
