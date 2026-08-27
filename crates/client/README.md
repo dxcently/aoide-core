@@ -54,7 +54,7 @@ never the inbound/serve half (that's `aoide-server`).
   this crate's outbound-facing action, the same "outbound only" charter
   every other module here holds.
 - `commands` — this crate's CLI commands:
-  `peer add/list/remove/pull/status/hub/allow/spawn/discover/invite`,
+  `peer add/remove/pull/status/hub/allow/spawn/discover/invite`,
   `peer pair request/pending/approve/reject` (P-P2, CONTRACTS.md §6/§7 —
   `handle_peer_allow` (`peer allow <name> <cap> on|off`, P-P3, `docs/
   architecture/PAIRING.md` decision 5) is a thin wire around

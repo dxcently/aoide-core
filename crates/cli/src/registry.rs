@@ -127,7 +127,6 @@ mod tests {
             "peer.discover",
             "peer.hub",
             "peer.invite",
-            "peer.list",
             "peer.pair.approve",
             "peer.pair.pending",
             "peer.pair.reject",

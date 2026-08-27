@@ -1,4 +1,4 @@
-//! The client domain's CLI commands: `peer add|list|remove|allow|hub|pull|
+//! The client domain's CLI commands: `peer add|remove|allow|hub|pull|
 //! status` and `peer pair request|pending|approve|reject` +
 //! `peer discover|invite` (CONTRACTS.md §7, same-network federation and its
 //! pairing ceremony) and `adapter melete` (the neutral-event consumer).
@@ -422,28 +422,6 @@ fn handle_peer_add(inv: &Invocation) -> Outcome {
     )
     .changed(vec![aoide_storage::peer_store::peers_path().to_string_lossy().into_owned()])
     .with_data(json!({ "peer": peer, "count": peers.len() }))
-}
-
-/// `peer list` — the registered peers (name · url · autogate).
-fn handle_peer_list(_inv: &Invocation) -> Outcome {
-    let cmd = "peer.list";
-    let peers = aoide_storage::peer_store::load_peers();
-    let msg = if peers.is_empty() {
-        "no peers registered".to_string()
-    } else {
-        let lines: Vec<String> = peers
-            .iter()
-            .map(|p| {
-                if p.autogate {
-                    format!("{} · {} · autogate", p.name, p.url)
-                } else {
-                    format!("{} · {}", p.name, p.url)
-                }
-            })
-            .collect();
-        format!("{} registered peer(s):\n{}", peers.len(), lines.join("\n"))
-    };
-    Outcome::ok(cmd, msg).with_data(json!({ "peers": peers, "count": peers.len() }))
 }
 
 /// `peer remove <name>` — deregister; a MISSING name is a clean error, not
@@ -906,11 +884,18 @@ fn handle_peer_pull(inv: &Invocation) -> Outcome {
         .with_data(json!({ "results": results }))
 }
 
-/// `peer status` — each registered peer's last-pull outcome and staleness
-/// (`fresh` within [`aoide_storage::peer_store::PEER_CACHE_TTL_SECS`],
-/// `stale` past it or explicitly marked so, `never-pulled` with no cache
-/// file at all) — the same three-way classification `build_graph`'s fold
-/// uses (`aoide-conduct::graph::doc`), so this and the DAG never disagree.
+/// `peer status` — each registered peer's full registry row (name/url/
+/// autogate/tokenFile/bearerSecret/hub/pubkey/verified/allows/addedAt — the
+/// same shape `peer list` used to be the only place emitting, folded in
+/// here so `peer list` has nothing left to say `peer status --json` doesn't
+/// already say, command-defrag lane task #101) plus its last-pull outcome
+/// and staleness (`fresh` within
+/// [`aoide_storage::peer_store::PEER_CACHE_TTL_SECS`], `stale` past it or
+/// explicitly marked so, `never-pulled` with no cache file at all) — the
+/// same three-way classification `build_graph`'s fold uses
+/// (`aoide-conduct::graph::doc`), so this and the DAG never disagree. The
+/// human-readable message stays the terse per-peer-count summary; the full
+/// row rides `--json`'s `data.peers` only.
 fn handle_peer_status(_inv: &Invocation) -> Outcome {
     let cmd = "peer.status";
     let peers = aoide_storage::peer_store::load_peers();
@@ -927,10 +912,13 @@ fn handle_peer_status(_inv: &Invocation) -> Outcome {
                 Some(entry) => ("stale", entry.fetched_at.clone(), entry.last_error.clone()),
                 None => ("never-pulled", None, None),
             };
-            json!({
-                "name": p.name, "url": p.url, "autogate": p.autogate,
-                "state": state, "fetchedAt": fetched_at, "error": error,
-            })
+            let mut row = serde_json::to_value(p).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("state".to_string(), json!(state));
+                obj.insert("fetchedAt".to_string(), json!(fetched_at));
+                obj.insert("error".to_string(), json!(error));
+            }
+            row
         })
         .collect();
     let msg = if rows.is_empty() {
@@ -959,15 +947,6 @@ pub fn register_peers(r: &mut Registry) {
         gated: false,
         implemented: true,
         handler: handle_peer_add,
-    ));
-    r.insert(cmd!(
-        path: ["peer", "list"],
-        summary: "List registered peers.",
-        args: [],
-        flags: [],
-        gated: false,
-        implemented: true,
-        handler: handle_peer_list,
     ));
     r.insert(cmd!(
         path: ["peer", "remove"],
