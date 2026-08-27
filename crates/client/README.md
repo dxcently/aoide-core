@@ -121,6 +121,50 @@ never the inbound/serve half (that's `aoide-server`).
   `#[ignore]`'d real-ssh proof lives at `cli/tests/tunnel_ssh.rs` instead,
   the same "real bytes, not a mock, but sandboxed-build-unsafe" shape
   `peer_connectivity.rs` already holds.
+- **Dial resolution (P-S4, ssh-transport lane)** — the tunnel seam every
+  outbound POST resolves through BEFORE it ever reaches `commands::
+  post_json` (`aoide-client`'s one HTTP transport, unchanged by this
+  phase). `resolve_dial_url(logical_url, via, tunnel_key)` is the funnel:
+  `via: None` returns `logical_url` byte-for-byte (the "off = unchanged"
+  guarantee, pinned per call site); `via: Some` opens/reuses `tunnel::
+  open_or_reuse` and rewrites the authority to `127.0.0.1:<local port>`
+  via `aoide_storage::tunnel::dial_url`, which preserves the PATH
+  verbatim — the reason `sign_headers_for_peer`'s canonical string (signed
+  over `peer_store::url_path(&peer.url)`, computed independently and
+  never touching the dial url) still verifies on the far end.
+  `post_json_to_peer(peer, …)` resolves `peer.via` (keyed by `peer.name`);
+  `post_json_via(logical_url, via, tunnel_key, …)` is the same funnel for
+  the three ceremony dials that have no `Peer` record yet
+  (`aoide/pairRequest`/`pairReveal` in `run_pair_request`,
+  `aoide/pairApprove` in `approve_inbound`) — keyed by the ceremony's own
+  local nickname. `spawn_on_peer_via(peer, text, via_override)` is
+  `spawn_on_peer`'s own body plus an explicit override that beats
+  `peer.via` (`peer spawn --via`); `spawn_on_peer` itself stays a thin
+  `via_override: None` wrapper so `aoide-conduct`'s existing call site
+  needs no change. `--via` (`ssh://[user@]host[:port]`,
+  `aoide_storage::tunnel::parse_via`) is a FLAG on `peer.add`/
+  `peer.invite`/`peer.pair.request`/`peer.spawn` — never a new command
+  path — parsed by the shared `parse_via_flag` (absent is `None`,
+  malformed is a usage error, the same `parse_secs_flag` stance). The
+  session id a tunnel opens under (`tunnel_session_id`) is
+  `AOIDE_SESSION_ID` when a conducted session set it, else a
+  process-scoped `pid-<pid>` fallback (K3) — **P-S4 stops at resolving and
+  passing that key through; it does not close anything.** Every tunnel
+  this phase opens is left running past its own command's exit — the
+  session-keyed kind because reuse across a session's whole lifetime is
+  the point, the pid-scoped kind because `pull_peer_live`/
+  `send_message_to_peer`/`spawn_on_peer` are called from
+  `aoide-conduct` command handlers this crate cannot wrap, and a partial
+  close covering only the client-owned handlers would make the same
+  function behave inconsistently by caller. The real lifecycle — the
+  session-end fast path and the reaper's orphan-collecting backstop, for
+  BOTH key shapes — is P-S5's job, not started here.
+  **P-S6 (narrowing the A2A door's loopback trust so a tunneled request
+  cannot silently auto-deliver) has not landed.** Every tunneled request
+  reaches the far door as `PeerOrigin::Loopback`
+  (`aoide-server::a2a::classify_origin`), which today gets an
+  unconditional delivery free pass — this phase makes tunneled delivery
+  POSSIBLE, not safe to use against a real peer, until P-S6 lands.
 - `commands` — this crate's CLI commands:
   `peer add/remove/pull/status/hub/allow/spawn/discover/invite`,
   `peer pair request/pending/approve/reject` (P-P2, CONTRACTS.md §6/§7 —
@@ -149,14 +193,25 @@ never the inbound/serve half (that's `aoide-server`).
   mutual confirmation, on both ends). `handle_peer_pair_reject` tries
   the inbound queue then the outbound queue, aborting an outbound entry at
   any stage — the ceremony's abort command.
-  **`run_pair_request(cmd, url, name, self_url)` (P-P6) is
-  `handle_peer_pair_request`'s own body, extracted so `peer invite` reaches
-  it too — reused, never copied.** `handle_peer_pair_request` still owns
-  every bit of `<url>`/`--name`/`--self-url` parsing and the
-  `valid_peer_name` check (a CLI-typed name needs it); `handle_peer_invite`
-  calls straight into `run_pair_request` with a `url`/`name` already lifted
-  off an already-validated, already-confirmed discovery beacon, needing no
-  second name check. `handle_peer_discover`/`handle_peer_invite` (`peer
+  **`run_pair_request(cmd, url, name, self_url, dial_via, record_via)`
+  (P-P6, `dial_via`/`record_via` added P-S4) is `handle_peer_pair_request`'s
+  own body, extracted so `peer invite` reaches it too — reused, never
+  copied.** `handle_peer_pair_request` still owns every bit of
+  `<url>`/`--name`/`--self-url`/`--via` parsing and the `valid_peer_name`
+  check (a CLI-typed name needs it); `handle_peer_invite` calls straight
+  into `run_pair_request` with a `url`/`name` already lifted off an
+  already-validated, already-confirmed discovery beacon, needing no second
+  name check. `dial_via`/`record_via` are deliberately separate: `dial_via`
+  is what the ceremony's OWN two POSTs tunnel through — `None` unless an
+  explicit `--via` was given, so a plain ceremony still dials directly
+  (P-S1's `invite_dial_url` already resolves a working LAN target; forcing
+  every pairing through ssh by default was not asked for). `record_via` is
+  the string parked onto `OutboundPairingRequest.via` for LATER commit
+  (`approve_outbound`) onto the peer record this ceremony creates —
+  `handle_peer_invite` defaults it to K1's src_addr-derived
+  `default_via(&hit.src_addr, "")` even when `dial_via` is `None`, so the
+  resulting peer still gets an automatic transport marker for its own
+  FUTURE calls. `handle_peer_discover`/`handle_peer_invite` (`peer
   discover [--secs N]`/`peer invite <name> [--secs N] [--yes]`) are thin
   wrappers around `discover::run_sweep`/`discover::resolve_invite_target`
   above — `confirm_invite` is this pair's own local helper, still the

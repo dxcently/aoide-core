@@ -2942,6 +2942,7 @@ mod tests {
             pubkey: None,
             verified: false,
             allows: Vec::new(),
+            via: None,
             added_at: "2026-08-25T00:00:00Z".to_string(),
         }
     }
@@ -5311,6 +5312,7 @@ mod tests {
             pubkey: None,
             verified: false,
             allows: Vec::new(),
+            via: None,
             added_at: "2026-08-14T00:00:00Z".into(),
         }])
         .unwrap();
@@ -5410,6 +5412,7 @@ mod tests {
             pubkey: None,
             verified: false,
             allows: Vec::new(),
+            via: None,
             added_at: "2026-08-18T00:00:00Z".into(),
         }])
         .unwrap();
@@ -5930,6 +5933,7 @@ mod tests {
             pubkey: None,
             verified: false,
             allows: Vec::new(),
+            via: None,
             added_at: "2026-08-20T00:00:00Z".into(),
         }])
         .unwrap();
@@ -6416,6 +6420,7 @@ mod tests {
             requested_at: now_iso_utc(),
             expires_at: aoide_storage::pairing::expires_at_from(now_epoch),
             state: aoide_storage::pairing::OutboundState::AwaitingApproval,
+            via: None,
         })
         .unwrap();
 
@@ -6496,6 +6501,7 @@ mod tests {
             requested_at: now_iso_utc(),
             expires_at: aoide_storage::pairing::expires_at_from(now_epoch),
             state: aoide_storage::pairing::OutboundState::AwaitingApproval,
+            via: None,
         })
         .unwrap();
 
@@ -6595,6 +6601,7 @@ mod tests {
             requested_at: now_iso_utc(),
             expires_at: aoide_storage::pairing::expires_at_from(now_epoch),
             state: aoide_storage::pairing::OutboundState::AwaitingApproval,
+            via: None,
         })
         .unwrap();
 

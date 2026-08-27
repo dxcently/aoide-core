@@ -82,7 +82,17 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   duplicate NAME (CONTRACTS.md §7), so two peers can share a URL host or
   hold byte-identical `token_file` contents, and `resolve_peer` then
   answers with whichever matches FIRST in registry (array) order — not
-  the last, not random.
+  the last, not random. `via` (P-S4, ssh-transport lane) is the
+  `Option<String>` transport marker `aoide-client`'s dial resolution reads
+  before every outbound POST to this peer (an `ssh://[user@]host[:port]`
+  string, `crate::tunnel::parse_via`'s own shape) — additive,
+  `#[serde(default)]`+`skip_serializing_if`, the `hub` discipline verbatim:
+  absent for every peer registered before this field existed, and `None`
+  means direct dial (today's behavior, unchanged). `set_peer_via` is the
+  ONLY writer — a SIBLING to `upsert_paired_peer` rather than a new
+  parameter on it, since that function's signature is also called from
+  `aoide-server`'s own pairing integration tests, outside this field's
+  blast radius.
 - `pairing` — the pairing ceremony's own park-and-approve state (P-P2,
   `docs/architecture/PAIRING.md`, CONTRACTS.md §4's `state/peer-pairing-
   inbound.json`/`-outbound.json` subsection): two disk-persisted queues,
@@ -115,6 +125,12 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   approver's `aoide/pairApprove` callback already landed and the approver
   has already committed its own side — both humans confirm
   the same code before either end calls itself paired.
+  `OutboundPairingRequest.via` (P-S4, additive, `#[serde(default)]`) carries
+  the ssh-transport marker THIS instance resolved at request time (an
+  explicit `--via`, or `peer invite`'s src_addr-derived default) forward to
+  the SEPARATE, later `peer pair approve` invocation that actually commits
+  the peer record — the only place that commit happens, so the value has
+  nowhere else to ride between the two.
 - `mode` — the staging/declarative mode marker, read by `shellbridge`
   (which stays in `conduct`, see that crate's charter-smudge note).
 - `ledger` — the durable, append-only session HISTORY (`state/

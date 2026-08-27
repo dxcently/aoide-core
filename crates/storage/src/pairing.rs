@@ -560,6 +560,17 @@ pub struct OutboundPairingRequest {
     /// [`OutboundState::AwaitingApproval`].
     #[serde(default)]
     pub state: OutboundState,
+    /// The ssh-transport marker (P-S4, K1) this ceremony resolved for the
+    /// approver at REQUEST time — a `--via` flag, or (`peer invite`) the
+    /// discovery beacon's observed source address — carried here because
+    /// the actual peer-record commit happens LATER, in a SEPARATE `peer
+    /// pair approve <id>` invocation (`approve_outbound`), which has no
+    /// other way to recover what this instance resolved when the request
+    /// was first sent. `#[serde(default)]` so a file predating this field
+    /// (none in production yet — this phase is new, kept for the same
+    /// additive discipline `state` above already holds) loads `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1062,6 +1073,7 @@ mod tests {
             requested_at: crate::time::iso_utc_from_epoch(now),
             expires_at: expires_at_from(now),
             state,
+            via: None,
         }
     }
 
@@ -1086,6 +1098,42 @@ mod tests {
         assert_eq!(taken.unwrap().pubkey_hex, "approverpubkeyhex");
         assert!(list_outbound(now).is_empty());
         assert!(take_outbound("deadbeef", now).unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    /// The ssh-transport lane's `via` field (P-S4): additive, absent by
+    /// default, round-trips when present — the same back-compat discipline
+    /// `state`'s own `#[serde(default)]` already holds one field over.
+    #[test]
+    fn outbound_via_is_additive_absent_by_default_and_round_trips_when_present() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-pairing-outbound-via-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        env(&dir);
+
+        let now = 1_700_000_000_i64;
+        let mut entry = sample_outbound("with-via", OutboundState::AwaitingApproval);
+        entry.via = Some("ssh://khoa@192.168.1.202".to_string());
+        park_outbound(entry).unwrap();
+
+        let listed = list_outbound(now);
+        assert_eq!(listed[0].via.as_deref(), Some("ssh://khoa@192.168.1.202"));
+
+        // A raw record predating this field (no `via` key at all) loads as
+        // `None`, never a deserialize failure.
+        let raw_old = serde_json::json!({
+            "id": "no-via", "url": "http://box-c/", "name": "box-c",
+            "pubkeyHex": "k", "requesterNonceHex": "r", "approverNonceHex": "a",
+            "requestedAt": crate::time::iso_utc_from_epoch(now), "expiresAt": expires_at_from(now),
+        });
+        let back: OutboundPairingRequest = serde_json::from_value(raw_old).unwrap();
+        assert_eq!(back.via, None);
 
         let _ = std::fs::remove_dir_all(&dir);
         match saved {

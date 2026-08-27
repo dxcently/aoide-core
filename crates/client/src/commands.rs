@@ -238,6 +238,191 @@ fn post_json(url: &str, body: &str, bearer: Option<&str>, extra_headers: &[(Stri
     }
 }
 
+// ── Dial resolution (ssh-transport lane, P-S4): the tunnel seam every
+// ── outbound POST resolves through BEFORE it ever reaches `post_json` ───────
+//
+// `aoide_client::tunnel::open_or_reuse` (P-S3) opens/reuses the ssh child;
+// `aoide_storage::tunnel::dial_url` (P-S2) rewrites the dial url's authority
+// while preserving its PATH verbatim — §0.4's identity guarantee
+// [`sign_headers_for_peer`]'s canonical string depends on. Everything below
+// is additive in front of `post_json`, which itself is UNCHANGED by this
+// phase.
+
+/// The session id a tunnel opened by this process's own dial resolution is
+/// keyed under (the ssh-transport plan's open knob K3): the ambient
+/// `AOIDE_SESSION_ID` a conducted session's parent already exports
+/// (`aoide_conduct::graph::conduct::conduct_socket_path`'s own env — read
+/// here as a plain env var, never a dependency on `aoide-conduct`: `client`
+/// sits BELOW it in the crate DAG), or a process-scoped `pid-<pid>`
+/// fallback for a bare shell that never went through `conduct`/`wrap`.
+///
+/// **P-S4 stops at resolving and passing this key through.** A tunnel
+/// opened under the `AOIDE_SESSION_ID` case is deliberately left OPEN when
+/// this process exits — reused by every later action under the same
+/// conducted session (the plan's own "persistent within a session" shape),
+/// closed only by P-S5's session-end fast path or its reaper backstop,
+/// neither of which exists yet. A tunnel opened under the `pid-<pid>`
+/// fallback is ALSO left open here, even though nothing will ever reuse
+/// that exact key again (a pid is never repeated by a later invocation) —
+/// closing it at this command's own exit was considered (K3's own "closed
+/// on the command's own exit" shape) and deliberately NOT done: `pull_peer_live`/
+/// `send_message_to_peer`/`spawn_on_peer` are called from `aoide-conduct`
+/// command handlers (`who.rs`/`send.rs`/`resurrect.rs`), not from a
+/// client-owned CLI handler this phase can wrap — closing only at the
+/// four client-owned handlers (`peer add|invite|pair request|spawn`) while
+/// leaving those three call sites unclosed would make the SAME function
+/// behave inconsistently depending on which crate called it. A single,
+/// uniform "every tunnel this phase opens stays open" story is more honest
+/// than a partial close that only covers some call sites — P-S5 is where
+/// the real lifecycle (both kinds, both close paths) belongs, all at once.
+fn tunnel_session_id() -> String {
+    std::env::var("AOIDE_SESSION_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("pid-{}", std::process::id()))
+}
+
+/// The port an ssh `-L` forward's REMOTE half should read from — every A2A
+/// door binds `127.0.0.1` only (root `AGENTS.md`'s loopback-only-bind
+/// invariant), so the forward always terminates on the far box's own
+/// loopback; `via`'s `host` is what the tunnel dials INTO, never what the
+/// forward reads FROM once inside (`aoide_client::tunnel::open_or_reuse`'s
+/// own `remote_host`/`remote_port` parameters name this same split).
+/// Extracted from `logical_url`'s own authority via
+/// [`aoide_storage::peer_store::url_host`]; falls back to the scheme's
+/// conventional default (`80`/`443`) only when the url carries no explicit
+/// port — every real peer url in this system names its door port
+/// explicitly, so this is a generous fallback, never the common case.
+fn remote_port_from_url(logical_url: &str) -> Result<u16, String> {
+    let host = aoide_storage::peer_store::url_host(logical_url)
+        .ok_or_else(|| format!("`{logical_url}` is not a url — cannot resolve a tunnel target port"))?;
+    if let Some((_, port)) = host.rsplit_once(':') {
+        return port
+            .parse::<u16>()
+            .map_err(|_| format!("`{logical_url}` has an unparseable port `{port}`"));
+    }
+    if logical_url.trim_start().starts_with("https://") {
+        Ok(443)
+    } else {
+        Ok(80)
+    }
+}
+
+/// Resolve the url a POST should actually dial. `via: None` is the
+/// IDENTITY case — returns `logical_url` byte-for-byte, the "off = today's
+/// behavior, unchanged" guarantee every call site below depends on and a
+/// test pins directly. With a `via`, opens/reuses the tunnel keyed
+/// `(session, tunnel_key)` (`aoide_client::tunnel::open_or_reuse`) and
+/// rewrites `logical_url`'s authority to `127.0.0.1:<local port>` via
+/// [`aoide_storage::tunnel::dial_url`], which preserves the PATH verbatim —
+/// never re-derived here, so a dial url's path and
+/// [`sign_headers_for_peer`]'s canonical-string path can never drift apart
+/// from two independent cuts of the same url.
+fn resolve_dial_url(
+    logical_url: &str,
+    via: Option<&aoide_storage::tunnel::Via>,
+    tunnel_key: &str,
+) -> Result<String, String> {
+    let Some(via) = via else {
+        return Ok(logical_url.to_string());
+    };
+    let remote_port = remote_port_from_url(logical_url)?;
+    let session_id = tunnel_session_id();
+    let local_port = crate::tunnel::open_or_reuse(&session_id, tunnel_key, via, "127.0.0.1", remote_port)?;
+    aoide_storage::tunnel::dial_url(logical_url, local_port)
+}
+
+/// [`post_json`] wrapped with dial resolution for a PAIRED
+/// [`aoide_storage::peer_store::Peer`] — resolves `peer.via` (parsed via
+/// [`aoide_storage::tunnel::parse_via`]) into a dial url keyed by
+/// `peer.name` itself (already `valid_peer_name`-shaped — every registered
+/// peer's own nickname, the identical shape [`aoide_storage::tunnel::
+/// record_path`] requires of a tunnel `key`) BEFORE calling [`post_json`],
+/// changing nothing about what `post_json` itself does. With no `peer.via`
+/// (today's every real peer), [`resolve_dial_url`] is the identity
+/// function — the url handed to `post_json` is `peer.url`, BYTE-IDENTICAL
+/// to every call site's own behavior before this function existed (pinned
+/// per call site by this module's tests). An unparseable `peer.via` (a
+/// hand-edited `peers.json`) is a hard `Err`, never a silent direct-dial
+/// fallback — the same "malformed input refuses, never guesses" stance
+/// [`aoide_storage::tunnel::parse_via`] itself holds.
+fn post_json_to_peer(
+    peer: &aoide_storage::peer_store::Peer,
+    body: &str,
+    bearer: Option<&str>,
+    extra_headers: &[(String, String)],
+    timeout_secs: u64,
+) -> Result<(u16, String), String> {
+    let via = peer
+        .via
+        .as_deref()
+        .map(aoide_storage::tunnel::parse_via)
+        .transpose()
+        .map_err(|e| format!("peer `{}`'s recorded via: {e}", peer.name))?;
+    let dial_url = resolve_dial_url(&peer.url, via.as_ref(), &peer.name)?;
+    post_json(&dial_url, body, bearer, extra_headers, timeout_secs)
+}
+
+/// [`post_json_to_peer`]'s own body, plus an explicit `via_override` that
+/// BEATS `peer.via` when present — [`spawn_on_peer_via`]'s only caller
+/// (`peer spawn --via …`), the one call site an operator can override the
+/// recorded transport marker from at call time. `via_override: None` makes
+/// this byte-identical to [`post_json_to_peer`] (resolves `peer.via`
+/// exactly the same way), which is why [`post_json_to_peer`] itself is
+/// NOT reimplemented in terms of this — the common, override-free path
+/// stays the simpler function.
+fn post_json_to_peer_with_via_override(
+    peer: &aoide_storage::peer_store::Peer,
+    body: &str,
+    bearer: Option<&str>,
+    extra_headers: &[(String, String)],
+    timeout_secs: u64,
+    via_override: Option<&aoide_storage::tunnel::Via>,
+) -> Result<(u16, String), String> {
+    if let Some(via) = via_override {
+        let dial_url = resolve_dial_url(&peer.url, Some(via), &peer.name)?;
+        return post_json(&dial_url, body, bearer, extra_headers, timeout_secs);
+    }
+    post_json_to_peer(peer, body, bearer, extra_headers, timeout_secs)
+}
+
+/// [`post_json`] wrapped with dial resolution for a CEREMONY call — no
+/// `Peer` record exists yet to read a marker off of ([`run_pair_request`]'s
+/// `aoide/pairRequest`/`aoide/pairReveal`, [`approve_inbound`]'s
+/// `aoide/pairApprove` callback), so `via`/`tunnel_key` are the CALLER's
+/// own resolution (an explicit `--via` flag; never auto-derived here).
+/// `bearer`/`extra_headers` are `None`/`&[]` at every real call site (the
+/// ceremony's own protocol, `client/AGENTS.md`) — kept as parameters
+/// anyway so this stays [`post_json`]'s same general shape, not a
+/// ceremony-only special case.
+fn post_json_via(
+    logical_url: &str,
+    via: Option<&aoide_storage::tunnel::Via>,
+    tunnel_key: &str,
+    body: &str,
+    bearer: Option<&str>,
+    extra_headers: &[(String, String)],
+    timeout_secs: u64,
+) -> Result<(u16, String), String> {
+    let dial_url = resolve_dial_url(logical_url, via, tunnel_key)?;
+    post_json(&dial_url, body, bearer, extra_headers, timeout_secs)
+}
+
+/// Parse the `--via` flag shared by every CLI command that accepts the
+/// ssh-transport marker (`peer.add`, `peer.invite`, `peer.pair.request`,
+/// `peer.spawn`, P-S4): absent is `Ok(None)` (today's direct-dial default,
+/// unchanged); present-but-unparsable is `Err` with
+/// [`aoide_storage::tunnel::parse_via`]'s own taught message. A malformed
+/// `--via` is a USAGE error, never a silent fallback to a direct dial —
+/// the same "a typo'd flag never quietly behaves as if it were never
+/// passed" stance [`parse_secs_flag`] already holds one flag over.
+fn parse_via_flag(inv: &Invocation) -> Result<Option<aoide_storage::tunnel::Via>, String> {
+    match inv.flags.get("via").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(spec) => aoide_storage::tunnel::parse_via(spec).map(Some),
+    }
+}
+
 /// Build the four P-P4 signature headers for one outbound POST to `peer`,
 /// or `vec![]` when `peer.verified` is `false` — an unpaired/unverified
 /// peer keeps today's door-wide-bearer-only path exactly as before this
@@ -344,13 +529,20 @@ fn gen_message_id() -> String {
 /// second `add`).
 fn handle_peer_add(inv: &Invocation) -> Outcome {
     let cmd = "peer.add";
+    const USAGE: &str = "usage: aoide peer add <name> <url> [--autogate] [--via ssh://[user@]host[:port]] [--json]";
     let name = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         Some(n) => n.to_string(),
-        None => return Outcome::usage(cmd, "usage: aoide peer add <name> <url> [--autogate] [--json]"),
+        None => return Outcome::usage(cmd, USAGE),
     };
     let url = match inv.args.get(1).map(|s| s.trim()).filter(|s| !s.is_empty()) {
         Some(u) => u.to_string(),
-        None => return Outcome::usage(cmd, "usage: aoide peer add <name> <url> [--autogate] [--json]"),
+        None => return Outcome::usage(cmd, USAGE),
+    };
+    // An invalid --via is a usage error, never a silent fallback to a
+    // direct dial (parse_via_flag's own stance).
+    let via = match parse_via_flag(inv) {
+        Ok(v) => v,
+        Err(e) => return Outcome::usage(cmd, format!("{USAGE} — {e}")),
     };
     // `name` is joined straight into `state/peer-cache/<name>.json`
     // (`peer_store::peer_cache_path`) — reject a traversal shape here,
@@ -405,6 +597,7 @@ fn handle_peer_add(inv: &Invocation) -> Outcome {
         pubkey: None,
         verified: false,
         allows: Vec::new(),
+        via: via.as_ref().map(|v| v.to_string()),
         added_at: aoide_storage::time::now_iso_utc(),
     };
     aoide_storage::peer_store::insert_peer(&mut peers, peer.clone());
@@ -596,7 +789,7 @@ fn pull_one_peer(peer: &aoide_storage::peer_store::Peer) -> Value {
     let attempt: Result<aoide_storage::peer_store::PeerCacheEntry, String> = (|| {
         let bearer = resolve_peer_bearer(peer)?;
         let extra_headers = sign_headers_for_peer(peer, &body_str)?;
-        let (code, resp_body) = post_json(&peer.url, &body_str, bearer.as_deref(), &extra_headers, 15)?;
+        let (code, resp_body) = post_json_to_peer(peer, &body_str, bearer.as_deref(), &extra_headers, 15)?;
         if code != 200 {
             return Err(format!("HTTP {code}"));
         }
@@ -649,7 +842,7 @@ pub fn pull_peer_live(peer: &aoide_storage::peer_store::Peer, timeout_secs: u64)
     let body_str = serde_json::to_string(&body).unwrap_or_default();
     let bearer = resolve_peer_bearer(peer)?;
     let extra_headers = sign_headers_for_peer(peer, &body_str)?;
-    let (code, resp_body) = post_json(&peer.url, &body_str, bearer.as_deref(), &extra_headers, timeout_secs)?;
+    let (code, resp_body) = post_json_to_peer(peer, &body_str, bearer.as_deref(), &extra_headers, timeout_secs)?;
     if code != 200 {
         return Err(format!("HTTP {code}"));
     }
@@ -686,7 +879,7 @@ pub fn send_message_to_peer(
     let body_str = serde_json::to_string(&body).unwrap_or_default();
     let bearer = resolve_peer_bearer(peer)?;
     let extra_headers = sign_headers_for_peer(peer, &body_str)?;
-    let (code, resp) = post_json(&peer.url, &body_str, bearer.as_deref(), &extra_headers, 15)?;
+    let (code, resp) = post_json_to_peer(peer, &body_str, bearer.as_deref(), &extra_headers, 15)?;
     if code != 200 {
         return Err(format!("HTTP {code}"));
     }
@@ -782,6 +975,23 @@ pub fn spawn_on_peer(
     peer: &aoide_storage::peer_store::Peer,
     text: &str,
 ) -> Result<Value, SpawnPeerError> {
+    spawn_on_peer_via(peer, text, None)
+}
+
+/// [`spawn_on_peer`]'s own body, PLUS an optional `--via` OVERRIDE
+/// (P-S4) — `handle_peer_spawn` is the one production caller that ever
+/// passes `Some` (an explicit `peer spawn --via …`, which beats a
+/// recorded `peer.via`); every other caller (`aoide-conduct`'s manifest
+/// remote-summon path, this function's own `spawn_on_peer` above) passes
+/// `None`, making `spawn_on_peer` itself byte-identical-in-behavior to
+/// before this override existed. Extracted rather than adding the
+/// parameter to `spawn_on_peer` directly so `aoide-conduct`'s existing
+/// call site (`graph::resurrect.rs`) needs no change.
+pub fn spawn_on_peer_via(
+    peer: &aoide_storage::peer_store::Peer,
+    text: &str,
+    via_override: Option<&aoide_storage::tunnel::Via>,
+) -> Result<Value, SpawnPeerError> {
     let message_id = gen_message_id();
     let body = crate::wire::build_message_send_body(text, &message_id, None);
     let body_str = serde_json::to_string(&body).unwrap_or_default();
@@ -789,7 +999,7 @@ pub fn spawn_on_peer(
         resolve_peer_bearer(peer).map_err(|e| SpawnPeerError::new("bearer-resolve-failed", e))?;
     let extra_headers =
         sign_headers_for_peer(peer, &body_str).map_err(|e| SpawnPeerError::new("signing-failed", e))?;
-    let (code, resp) = post_json(&peer.url, &body_str, bearer.as_deref(), &extra_headers, 15)
+    let (code, resp) = post_json_to_peer_with_via_override(peer, &body_str, bearer.as_deref(), &extra_headers, 15, via_override)
         .map_err(|e| SpawnPeerError::new("send-failed", e))?;
     if code != 200 {
         return Err(SpawnPeerError {
@@ -845,7 +1055,7 @@ impl std::fmt::Display for SpawnPeerError {
 
 fn handle_peer_spawn(inv: &Invocation) -> Outcome {
     let cmd = "peer.spawn";
-    const USAGE: &str = "usage: aoide peer spawn <name> [--yes] -- <text…>";
+    const USAGE: &str = "usage: aoide peer spawn <name> [--yes] [--via ssh://[user@]host[:port]] -- <text…>";
     let name = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         Some(n) => n.to_string(),
         None => return Outcome::usage(cmd, USAGE),
@@ -854,6 +1064,13 @@ fn handle_peer_spawn(inv: &Invocation) -> Outcome {
     if text.trim().is_empty() {
         return Outcome::usage(cmd, USAGE);
     }
+    // --via beats a recorded Peer.via (spawn_on_peer_via's own doc) — an
+    // invalid --via is a usage error, never a silent fallback to the
+    // recorded marker (parse_via_flag's own stance).
+    let via_override = match parse_via_flag(inv) {
+        Ok(v) => v,
+        Err(e) => return Outcome::usage(cmd, format!("{USAGE} — {e}")),
+    };
 
     let peers = aoide_storage::peer_store::load_peers();
     let peer = match peers.iter().find(|p| p.name == name) {
@@ -892,7 +1109,7 @@ fn handle_peer_spawn(inv: &Invocation) -> Outcome {
         }
     }
 
-    match spawn_on_peer(&peer, &text) {
+    match spawn_on_peer_via(&peer, &text, via_override.as_ref()) {
         Ok(parsed) => {
             let session_id = parsed
                 .get("result")
@@ -1002,6 +1219,7 @@ pub fn register_peers(r: &mut Registry) {
             flag!("autogate", "bool", "Trust this peer: its inbound message/send auto-delivers without the pending queue."),
             flag!("token-file", "string", "Path to a file holding the shared secret this peer must present (Authorization: Bearer <token>) to be identified as this peer — required for --autogate to survive a proxy/tunnel, where every caller's address looks the same."),
             flag!("bearer-secret", "string", "Name of a secret, resolved fresh on every outbound call through the local secrets broker, THIS instance presents as Authorization: Bearer <value> when calling this peer's own A2A door. Absent = no bearer sent (today's behavior)."),
+            flag!("via", "string", "An ssh://[user@]host[:port] transport marker — cross-box calls to this peer dial through an internal ssh tunnel to this target instead of the peer's own url directly. Absent = direct dial (today's behavior)."),
         ],
         gated: false,
         implemented: true,
@@ -1068,6 +1286,7 @@ pub fn register_peers(r: &mut Registry) {
         ],
         flags: [
             flag!("yes", "bool", "Skip the local y/N confirmation (scripted use) — a LOCAL UX gate only; the remote door's own gate is unaffected."),
+            flag!("via", "string", "An ssh://[user@]host[:port] transport marker for THIS call, overriding any via recorded on the peer. Absent = the peer's own recorded via, if any (today's behavior when neither is set)."),
         ],
         gated: false,
         implemented: true,
@@ -1154,9 +1373,10 @@ fn default_self_url() -> String {
 /// after this CLI process exits.
 fn handle_peer_pair_request(inv: &Invocation) -> Outcome {
     let cmd = "peer.pair.request";
+    const USAGE: &str = "usage: aoide peer pair request <url> [--name <n>] [--self-url <url>] [--via ssh://[user@]host[:port]] [--json]";
     let url = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         Some(u) => u.to_string(),
-        None => return Outcome::usage(cmd, "usage: aoide peer pair request <url> [--name <n>] [--self-url <url>] [--json]"),
+        None => return Outcome::usage(cmd, USAGE),
     };
     let name = match inv.flags.get("name").cloned().filter(|s| !s.is_empty()) {
         Some(n) => n,
@@ -1184,8 +1404,17 @@ fn handle_peer_pair_request(inv: &Invocation) -> Outcome {
         .cloned()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(default_self_url);
+    // An invalid --via is a usage error, never a silent fallback to a
+    // direct dial (parse_via_flag's own stance). Unlike `peer invite`
+    // (K1's src_addr-derived default), a plain `peer pair request` has no
+    // observed address to fall back to — no `--via` means no via at all,
+    // exactly today's behavior.
+    let via = match parse_via_flag(inv) {
+        Ok(v) => v,
+        Err(e) => return Outcome::usage(cmd, format!("{USAGE} — {e}")),
+    };
 
-    run_pair_request(cmd, &url, &name, &self_url)
+    run_pair_request(cmd, &url, &name, &self_url, via.as_ref(), via.as_ref().map(|v| v.to_string()))
 }
 
 /// The requester's half of the ceremony, shared verbatim by
@@ -1202,7 +1431,29 @@ fn handle_peer_pair_request(inv: &Invocation) -> Outcome {
 /// with the nonce the commitment already fixed; only once both calls
 /// succeed does this instance derive its own SAS and remember the outbound
 /// request.
-fn run_pair_request(cmd: &str, url: &str, name: &str, self_url: &str) -> Outcome {
+///
+/// **P-S4's two additions, deliberately kept separate.** `dial_via` is what
+/// the ceremony's OWN two POSTs below actually tunnel through — `None`
+/// unless an explicit `--via` flag was given, so a plain `peer pair
+/// request`/`peer invite` dials exactly as before (P-S1's `invite_dial_url`
+/// already resolves a working direct LAN target for `peer invite`; forcing
+/// every ceremony through ssh by default would make PAIRING ITSELF newly
+/// depend on ssh reachability, which nothing asked for). `record_via` is
+/// the string parked into [`aoide_storage::pairing::OutboundPairingRequest::
+/// via`] for LATER commit onto the resulting peer record, in the SEPARATE
+/// `peer pair approve <id>` invocation that actually writes it
+/// (`approve_outbound`) — for `handle_peer_invite` this is K1's
+/// src_addr-derived default even when `dial_via` itself is `None`, so the
+/// PEER this ceremony creates still gets an automatic `via` for its own
+/// FUTURE calls, without the ceremony's own connectivity depending on it.
+fn run_pair_request(
+    cmd: &str,
+    url: &str,
+    name: &str,
+    self_url: &str,
+    dial_via: Option<&aoide_storage::tunnel::Via>,
+    record_via: Option<String>,
+) -> Outcome {
     let (kp, _) = match aoide_storage::identity::load_or_mint() {
         Ok(v) => v,
         Err(e) => {
@@ -1224,7 +1475,7 @@ fn run_pair_request(cmd: &str, url: &str, name: &str, self_url: &str) -> Outcome
     let self_name = aoide_storage::display::local_host_name();
     let body = crate::peer::build_pair_request_body(&own_pubkey, &self_name, &commit, &self_url);
     let body_str = serde_json::to_string(&body).unwrap_or_default();
-    let (code, resp_body) = match post_json(&url, &body_str, None, &[], 15) {
+    let (code, resp_body) = match post_json_via(url, dial_via, name, &body_str, None, &[], 15) {
         Ok(v) => v,
         Err(e) => {
             return Outcome::error(cmd, format!("sending the pairing request to {url}: {e}"))
@@ -1255,7 +1506,7 @@ fn run_pair_request(cmd: &str, url: &str, name: &str, self_url: &str) -> Outcome
     // the ceremony never completes; nothing is parked on this side either.
     let reveal_body = crate::peer::build_pair_reveal_body(&ack.id, &own_nonce);
     let reveal_body_str = serde_json::to_string(&reveal_body).unwrap_or_default();
-    let (reveal_code, reveal_resp_body) = match post_json(&url, &reveal_body_str, None, &[], 15) {
+    let (reveal_code, reveal_resp_body) = match post_json_via(url, dial_via, name, &reveal_body_str, None, &[], 15) {
         Ok(v) => v,
         Err(e) => {
             return Outcome::error(cmd, format!("revealing the nonce to {url}: {e}"))
@@ -1283,6 +1534,7 @@ fn run_pair_request(cmd: &str, url: &str, name: &str, self_url: &str) -> Outcome
         requested_at,
         expires_at: ack.expires_at.clone(),
         state: aoide_storage::pairing::OutboundState::AwaitingApproval,
+        via: record_via,
     };
     if let Err(e) = aoide_storage::pairing::park_outbound(outbound) {
         return Outcome::error(cmd, format!("remembering the outbound pairing request: {e}"));
@@ -1459,7 +1711,19 @@ fn approve_inbound(
 
     let body = crate::peer::build_pair_approve_body(&entry.id, &own_pubkey);
     let body_str = serde_json::to_string(&body).unwrap_or_default();
-    let (code, resp_body) = match post_json(&entry.url, &body_str, None, &[], 15) {
+    // P-S4: wired through the SAME dial-resolution funnel every other
+    // outbound POST uses, keyed by `entry.name` (already `valid_peer_name`-
+    // shaped — the server validates it before ever parking this entry,
+    // `a2a.rs::pair_request`). `via` is always `None` here today —
+    // `InboundPairingRequest` (`storage/src/pairing.rs`) carries no
+    // transport marker of its own, and `peer pair approve` has no `--via`
+    // flag (only `peer.invite`/`peer.pair.request`/`peer.spawn`/`peer.add`
+    // do, per this phase's scope) — so this callback dials `entry.url`
+    // directly, byte-identical to before this funnel existed. Reaching the
+    // REQUESTER through a tunnel when its own door is loopback-bound is a
+    // real, unresolved gap (the plan's R5/K1 "reverse direction") — left
+    // for a follow-on, not silently worked around here.
+    let (code, resp_body) = match post_json_via(&entry.url, None, &entry.name, &body_str, None, &[], 15) {
         Ok(v) => v,
         Err(e) => {
             return Outcome::error(
@@ -1482,6 +1746,16 @@ fn approve_inbound(
         return Outcome::error(cmd, e).with_data(json!({ "reason": "callback-refused", "id": id }));
     }
 
+    // P-S4: the APPROVER's own commit — unlike `approve_outbound`'s
+    // sibling call below, this deliberately does NOT call `set_peer_via`.
+    // `InboundPairingRequest` (`storage/src/pairing.rs`) carries no
+    // transport marker of its own to record (through a tunnel,
+    // `origin_addr` reads "loopback", per §0.7 — not a usable source), and
+    // no `--via` flag exists on `peer pair approve` (out of this phase's
+    // scope). The new peer's `via` is left `None` — the same "absent by
+    // default" a fresh `Peer` already carries; reaching a loopback-bound
+    // requester through a tunnel is the plan's own R5/K1 "reverse
+    // direction," unresolved here.
     let mut peers = aoide_storage::peer_store::load_peers();
     let change = aoide_storage::peer_store::upsert_paired_peer(&mut peers, &entry.name, &entry.url, &entry.pubkey_hex, now);
     if let Err(e) = aoide_storage::peer_store::save_peers(&peers) {
@@ -1559,6 +1833,17 @@ fn approve_outbound(
 
     let mut peers = aoide_storage::peer_store::load_peers();
     let change = aoide_storage::peer_store::upsert_paired_peer(&mut peers, &entry.name, &entry.url, &entry.pubkey_hex, now);
+    // P-S4: the via this ceremony resolved back at `peer invite`/`peer
+    // pair request` time (K1's src_addr-derived default, or an explicit
+    // `--via`) rode the parked entry here — commit it onto the peer record
+    // in the SAME write as the pairing commit above, via the sibling
+    // writer (`set_peer_via`'s own doc on why it's separate from
+    // `upsert_paired_peer`'s signature). `entry.via` is `None` for a plain
+    // `peer pair request` with no `--via` — clears/leaves-absent, exactly
+    // today's behavior.
+    if let Err(e) = aoide_storage::peer_store::set_peer_via(&mut peers, &entry.name, entry.via.as_deref()) {
+        return Outcome::error(cmd, format!("recording the peer's transport marker: {e}"));
+    }
     if let Err(e) = aoide_storage::peer_store::save_peers(&peers) {
         return Outcome::error(cmd, format!("writing the peer registry: {e}"));
     }
@@ -1732,18 +2017,22 @@ fn confirm_invite(name: &str, fpr: &str, url: &str, src_addr: &str) -> Result<bo
 /// confirmation (both operators, both ends) is untouched and still runs.
 fn handle_peer_invite(inv: &Invocation) -> Outcome {
     let cmd = "peer.invite";
+    const USAGE: &str = "usage: aoide peer invite <name> [--secs N] [--yes] [--via ssh://[user@]host[:port]] [--json]";
     let name = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         Some(n) => n.to_string(),
-        None => return Outcome::usage(cmd, "usage: aoide peer invite <name> [--secs N] [--yes] [--json]"),
+        None => return Outcome::usage(cmd, USAGE),
     };
     let secs = match parse_secs_flag(inv) {
         Ok(n) => n,
         Err(()) => {
-            return Outcome::usage(
-                cmd,
-                "usage: aoide peer invite <name> [--secs N] [--yes] [--json] — --secs must be a positive integer",
-            )
+            return Outcome::usage(cmd, format!("{USAGE} — --secs must be a positive integer"))
         }
+    };
+    // An invalid --via is a usage error, never a silent fallback (same
+    // stance every other --via-accepting command holds).
+    let via_flag = match parse_via_flag(inv) {
+        Ok(v) => v,
+        Err(e) => return Outcome::usage(cmd, format!("{USAGE} — {e}")),
     };
 
     let swept = match crate::discover::run_sweep(secs) {
@@ -1813,7 +2102,17 @@ fn handle_peer_invite(inv: &Invocation) -> Outcome {
         }
     }
 
-    run_pair_request(cmd, &dial_url, &hit.beacon.name, &self_url)
+    // K1's settled default: the peer this ceremony creates gets an
+    // automatic `via` derived from the discovery beacon's OBSERVED source
+    // address, so its own FUTURE calls (pull/spawn/send) can reach it
+    // through an ssh tunnel — recorded at `peer pair approve` commit time,
+    // not used for the ceremony's own dial below (`run_pair_request`'s own
+    // doc on why those stay separate). An explicit `--via` beats this
+    // default outright, for both halves.
+    let default_record_via =
+        Some(aoide_storage::tunnel::default_via(&hit.src_addr, "").to_string());
+    let record_via = via_flag.as_ref().map(|v| v.to_string()).or(default_record_via);
+    run_pair_request(cmd, &dial_url, &hit.beacon.name, &self_url, via_flag.as_ref(), record_via)
 }
 
 /// The four `peer pair` commands (P-P2), registered directly after the six
@@ -1827,6 +2126,7 @@ pub fn register_peer_pair(r: &mut Registry) {
         flags: [
             flag!("name", "string", "A local nickname for the other instance; defaults to a sanitized form of the URL's host."),
             flag!("self-url", "string", "This instance's own advertised A2A door URL, for the later approval callback; defaults to http://<host>:<AOIDE_A2A_PORT or 8710>/."),
+            flag!("via", "string", "An ssh://[user@]host[:port] transport marker — both the ceremony's own dial AND the resulting peer's recorded via. Absent = direct dial (today's behavior)."),
         ],
         gated: false,
         implemented: true,
@@ -1886,6 +2186,7 @@ pub fn register_peer_discovery(r: &mut Registry) {
         flags: [
             flag!("secs", "int", "How many seconds to listen (default ~4)."),
             flag!("yes", "bool", "Skip the interactive y/N proceed confirmation (scripted use) — the ceremony's own SAS confirmation is untouched."),
+            flag!("via", "string", "An ssh://[user@]host[:port] transport marker, overriding the default derived from the beacon's observed source address — both the ceremony's own dial AND the resulting peer's recorded via."),
         ],
         gated: false,
         implemented: true,
@@ -1932,6 +2233,7 @@ mod tests {
             pubkey: None,
             verified: false,
             allows: Vec::new(),
+            via: None,
             added_at: "2026-08-24T00:00:00Z".to_string(),
         }
     }
@@ -2333,13 +2635,13 @@ mod tests {
             let self_url = default_self_url();
 
             // `handle_peer_pair_request`'s own documented tail.
-            let direct = run_pair_request("peer.pair.request", url, name, &self_url);
+            let direct = run_pair_request("peer.pair.request", url, name, &self_url, None, None);
             // The same ceremony tail `handle_peer_invite` reaches on its
             // single-match branch — since P-S1 it composes an OBSERVED dial
             // url first (`invite_dial_url`) and passes that instead of the
             // beacon's claim, but the tail function is still this one;
             // reproduced here under `peer.invite`'s own command name.
-            let via_invite = run_pair_request("peer.invite", url, name, &self_url);
+            let via_invite = run_pair_request("peer.invite", url, name, &self_url, None, None);
 
             assert_eq!(direct.status, aoide_protocol::output::Status::Error, "{direct:?}");
             assert_eq!(direct.command, "peer.pair.request");
@@ -2354,6 +2656,253 @@ mod tests {
                 via_invite.message, direct.message,
                 "peer invite and peer pair request must produce an identical failure message here"
             );
+        });
+    }
+
+    // ── Dial resolution (P-S4): the identity guarantee, per call site,
+    // ── pinned directly rather than trusted from a comment — §0.4's
+    // ── "off = unchanged" promise, and the path-preservation invariant
+    // ── sign_headers_for_peer's canonical string depends on. No real ssh
+    // ── anywhere below: a `via` case seeds a REUSABLE tunnel record
+    // ── (a real local listener, this test process's own — genuinely
+    // ── alive — pid) so `aoide_client::tunnel::open_or_reuse` takes its
+    // ── reuse branch and never spawns anything, the same seam
+    // ── `client/src/tunnel.rs`'s own tests exercise, reached here through
+    // ── the public record API instead of the private `SpawnFn` closure. ──
+
+    fn with_temp_runtime_dir<T>(tag: &str, f: impl FnOnce() -> T) -> T {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_runtime = std::env::var("XDG_RUNTIME_DIR").ok();
+        let saved_session = std::env::var("AOIDE_SESSION_ID").ok();
+        let dir = std::env::temp_dir().join(format!(
+            "aoide-client-dial-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &dir);
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        let out = f();
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved_runtime {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+        match saved_session {
+            Some(v) => std::env::set_var("AOIDE_SESSION_ID", v),
+            None => std::env::remove_var("AOIDE_SESSION_ID"),
+        }
+        out
+    }
+
+    /// Seed a REUSABLE tunnel record for `(session_id, key)`: a real local
+    /// listener (so `open_or_reuse`'s reuse probe actually answers) at a
+    /// freshly reserved port, recorded under THIS test process's own pid
+    /// (genuinely alive, so the reuse probe's `proc_exists` check passes
+    /// too) — `open_or_reuse` then takes its reuse branch and never spawns
+    /// anything, real `ssh` least of all. Returns the listener (keep it
+    /// alive for the assertion) and the port it bound.
+    fn seed_reusable_tunnel(session_id: &str, key: &str) -> (std::net::TcpListener, u16) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        aoide_storage::tunnel::save(&aoide_storage::tunnel::TunnelRecord {
+            schema_version: aoide_storage::tunnel::TUNNEL_VERSION.to_string(),
+            session_id: session_id.to_string(),
+            key: key.to_string(),
+            ssh_target: "ssh://sakaki".to_string(),
+            local_port: port,
+            remote_host: "127.0.0.1".to_string(),
+            remote_port: 8710,
+            pid: std::process::id(),
+            opened_at: "2026-08-27T00:00:00Z".to_string(),
+        })
+        .unwrap();
+        (listener, port)
+    }
+
+    #[test]
+    fn resolve_dial_url_is_byte_identical_to_the_logical_url_when_via_is_absent() {
+        // No env, no filesystem, no socket touched at all — via: None never
+        // reaches `open_or_reuse`.
+        for logical in ["http://sakaki:8710/", "http://sakaki:8710/aoide/rpc", "https://box:9/a/b?x=1"] {
+            assert_eq!(
+                resolve_dial_url(logical, None, "sakaki").unwrap(),
+                logical,
+                "identity: the dial url must be byte-for-byte the logical url when off"
+            );
+        }
+    }
+
+    #[test]
+    fn post_json_to_peer_dials_peer_url_verbatim_when_peer_via_is_absent() {
+        // post_json_to_peer's OWN via resolution (peer.via, not the
+        // resolve_dial_url helper directly) — proven by forcing a
+        // connection failure and asserting the error names peer.url's own
+        // host:port, never a rewritten 127.0.0.1:<port> authority.
+        let mut peer = fixture_peer(None);
+        peer.url = "http://127.0.0.1:1/aoide/rpc".to_string(); // reserved, never listened on
+        let err = post_json_to_peer(&peer, "{}", None, &[], 1).unwrap_err();
+        assert!(
+            err.contains("127.0.0.1:1") || err.contains("connect"),
+            "an absent via must dial peer.url's own authority verbatim: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_dial_url_with_a_via_rewrites_the_authority_and_preserves_the_path_verbatim() {
+        with_temp_runtime_dir("resolve-with-via", || {
+            let session_id = tunnel_session_id();
+            let (listener, port) = seed_reusable_tunnel(&session_id, "sakaki");
+
+            let via = aoide_storage::tunnel::parse_via("ssh://sakaki").unwrap();
+            for logical in ["http://sakaki:8710/", "http://sakaki:8710/aoide/rpc", "http://sakaki:8710"] {
+                let dial = resolve_dial_url(logical, Some(&via), "sakaki").unwrap();
+                assert_eq!(
+                    dial,
+                    format!("http://127.0.0.1:{port}{}", aoide_storage::peer_store::url_path(logical)),
+                    "authority becomes 127.0.0.1:<local port>, path preserved via url_path directly"
+                );
+            }
+            drop(listener);
+        });
+    }
+
+    /// §0.4's identity guarantee, pinned directly against
+    /// `sign_headers_for_peer`'s own path source: `sign_headers_for_peer`
+    /// never reads the DIAL url at all (it signs over
+    /// `peer_store::url_path(&peer.url)`, computed independently, before
+    /// dial resolution ever runs) — so the canonical string it signs is
+    /// unaffected by a via rewrite PROVIDED the dial's own path equals
+    /// that same `url_path(&peer.url)`. This asserts exactly that equality
+    /// for a peer carrying a `via`, which is what makes "the far end's
+    /// `HttpRequest.path` (what the tunnel actually delivers) matches what
+    /// was signed" true — a live curl round trip through the tunnel is out
+    /// of reach here (no real ssh), but every byte this signature depends
+    /// on is proven identical either way.
+    #[test]
+    fn a_via_rewrite_never_changes_the_path_sign_headers_for_peer_signs_over() {
+        with_temp_runtime_dir("sign-headers-path-pin", || {
+            let session_id = tunnel_session_id();
+            let (listener, port) = seed_reusable_tunnel(&session_id, "sakaki");
+
+            let mut peer = fixture_peer(None);
+            peer.name = "sakaki".to_string();
+            peer.url = "http://sakaki:8710/aoide/rpc".to_string();
+            peer.via = Some("ssh://sakaki".to_string());
+
+            let signed_path = aoide_storage::peer_store::url_path(&peer.url);
+
+            let via = aoide_storage::tunnel::parse_via(peer.via.as_deref().unwrap()).unwrap();
+            let dial = resolve_dial_url(&peer.url, Some(&via), &peer.name).unwrap();
+            let dial_path = aoide_storage::peer_store::url_path(&dial);
+
+            assert_eq!(
+                dial_path, signed_path,
+                "the tunnel rewrite must never change the byte-for-byte path sign_headers_for_peer signs over"
+            );
+            assert!(dial.starts_with(&format!("http://127.0.0.1:{port}")), "authority is rewritten to the local forward: {dial}");
+
+            // And directly: sign_headers_for_peer itself only ever reads
+            // peer.url (never peer.via, never a dial url) — an unverified
+            // peer's empty-headers shortcut is untouched by via either way.
+            assert_eq!(sign_headers_for_peer(&peer, "{}").unwrap(), Vec::<(String, String)>::new(), "unverified peers are unaffected, via or not");
+            peer.verified = true;
+            let headers_with_via = sign_headers_for_peer(&peer, "{}").unwrap();
+            let mut peer_no_via = peer.clone();
+            peer_no_via.via = None;
+            let headers_without_via = sign_headers_for_peer(&peer_no_via, "{}").unwrap();
+            // Nonce/timestamp differ call to call (fresh each time) — but
+            // the PEER identity header (never derived from via) must agree.
+            let peer_header_idx = aoide_storage::wire_auth::HEADER_PEER;
+            let get = |hs: &[(String, String)]| hs.iter().find(|(k, _)| k == peer_header_idx).map(|(_, v)| v.clone());
+            assert_eq!(get(&headers_with_via), get(&headers_without_via), "peer.via must never influence the signed X-Aoide-Peer identity");
+
+            drop(listener);
+        });
+    }
+
+    #[test]
+    fn parse_via_flag_absent_is_none_present_invalid_is_err_never_a_silent_fallback() {
+        let inv = |flags: &[(&str, &str)]| Invocation {
+            path: vec!["peer".to_string(), "add".to_string()],
+            args: vec![],
+            flags: flags.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            door: aoide_protocol::Door::Cli,
+        };
+        assert_eq!(parse_via_flag(&inv(&[])).unwrap(), None, "absent --via is None, never a guessed default");
+        assert_eq!(
+            parse_via_flag(&inv(&[("via", "ssh://khoa@sakaki")])).unwrap(),
+            Some(aoide_storage::tunnel::parse_via("ssh://khoa@sakaki").unwrap())
+        );
+        let err = parse_via_flag(&inv(&[("via", "http://not-ssh")])).unwrap_err();
+        assert!(!err.is_empty(), "an invalid --via is Err, never silently treated as absent");
+    }
+
+    #[test]
+    fn handle_peer_add_with_an_invalid_via_is_a_usage_error_and_registers_nothing() {
+        with_peer_state("add-invalid-via", || {
+            let inv = Invocation {
+                path: vec!["peer".to_string(), "add".to_string()],
+                args: vec!["sakaki".to_string(), "http://sakaki:8710/".to_string()],
+                flags: [("via".to_string(), "http://not-ssh".to_string())].into_iter().collect(),
+                door: aoide_protocol::Door::Cli,
+            };
+            let out = handle_peer_add(&inv);
+            assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{out:?}");
+            assert!(aoide_storage::peer_store::load_peers().is_empty(), "an invalid --via registers nothing");
+        });
+    }
+
+    /// `--via` beats `Peer.via` — proven WITHOUT ever needing a real
+    /// tunnel or ssh, by making the RECORDED `peer.via` a deliberately
+    /// UNPARSEABLE string (`parse_via`'s own refusal, pure and instant):
+    /// with no override, `post_json_to_peer` must consult it and fail
+    /// immediately on the parse error (proving the recorded via IS read
+    /// when nothing beats it); with an explicit, VALID override, the same
+    /// invalid `peer.via` string must never surface at all — the override
+    /// short-circuits before `peer.via` is ever parsed. The override case
+    /// seeds a REUSABLE tunnel record (this test module's own no-real-ssh
+    /// seam) so the override path completes rather than needing a live
+    /// ssh child.
+    #[test]
+    fn via_override_beats_the_recorded_peer_via() {
+        with_temp_runtime_dir("override-beats-recorded", || {
+            let mut peer = fixture_peer(None);
+            peer.name = "sakaki".to_string();
+            peer.url = "http://sakaki:8710/".to_string();
+            peer.via = Some("not-a-valid-via-at-all".to_string());
+
+            // No override: post_json_to_peer_with_via_override falls back
+            // to post_json_to_peer, which parses peer.via and refuses
+            // immediately — no network touched, the taught parse error
+            // surfaces directly, proving peer.via WAS consulted.
+            let no_override_err =
+                post_json_to_peer_with_via_override(&peer, "{}", None, &[], 1, None).unwrap_err();
+            assert!(
+                no_override_err.contains("not-a-valid-via-at-all"),
+                "with no override, the recorded (invalid) peer.via must be the thing that fails: {no_override_err}"
+            );
+
+            // With an explicit, VALID override, peer.via's garbage string
+            // must never even be looked at — seed a reusable record for
+            // the SAME key (peer.name) the override path also dials
+            // through, so this completes with no real ssh spawned.
+            let session_id = tunnel_session_id();
+            let (listener, _port) = seed_reusable_tunnel(&session_id, "sakaki");
+            let override_via = aoide_storage::tunnel::parse_via("ssh://khoa@sakaki").unwrap();
+            let with_override =
+                post_json_to_peer_with_via_override(&peer, "{}", None, &[], 1, Some(&override_via));
+            match with_override {
+                Err(e) => assert!(
+                    !e.contains("not-a-valid-via-at-all"),
+                    "an explicit --via override must never surface the recorded (invalid) peer.via: {e}"
+                ),
+                Ok(_) => {} // a bounded curl call against the seeded listener may also just succeed/timeout cleanly
+            }
+            drop(listener);
         });
     }
 }

@@ -113,6 +113,24 @@ pub struct Peer {
     /// this module.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allows: Vec<String>,
+    /// The ssh-transport lane's marker (P-S4, `docs/architecture/
+    /// PAIRING.md`'s Transport section): an `ssh://[user@]host[:port]`
+    /// target ([`crate::tunnel::parse_via`]'s own shape) a cross-box call to
+    /// this peer should dial THROUGH — an internal loopback forward instead
+    /// of `url`'s host directly. Absent by default (today's every peer, and
+    /// every peer registered before this field existed) — the exact same
+    /// `#[serde(default)]`+`skip_serializing_if` discipline `pubkey`/
+    /// `bearer_secret` already hold: an old `peers.json` deserializes `via:
+    /// None` on every entry, and a peer with no via omits the key entirely
+    /// rather than writing `"via":null`. `None` means every call to this
+    /// peer dials `url` directly — BYTE-IDENTICAL to before this field
+    /// existed (§0.4's "off = unchanged" guarantee). Set by [`set_peer_via`]
+    /// (the pairing ceremony's requester-side commit, `--via`/K1's
+    /// src_addr-derived default) or `peer add --via`; never a raw `Peer
+    /// { .. }` literal outside this module, the same discipline `allows`
+    /// already holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
     #[serde(rename = "addedAt", default)]
     pub added_at: String,
 }
@@ -254,9 +272,33 @@ pub fn upsert_paired_peer(peers: &mut Vec<Peer>, name: &str, url: &str, pubkey_h
         pubkey: Some(pubkey_hex.to_string()),
         verified: true,
         allows: default_paired_allows(),
+        via: None,
         added_at: added_at.to_string(),
     });
     PairChange::Inserted
+}
+
+/// Set (or clear) a paired peer's `via` transport marker (P-S4) — a
+/// SIBLING writer beside [`upsert_paired_peer`] rather than a new
+/// parameter threaded through it. `upsert_paired_peer` is also called from
+/// `aoide-server`'s own pairing integration tests (`a2a.rs`), a crate
+/// outside this phase's blast radius and test plan — a purely additive
+/// setter keeps that signature untouched and ripples nowhere, mirroring
+/// how [`set_hub`]/[`set_peer_allow`] already sit beside [`insert_peer`]
+/// as their own separate mutation functions rather than parameters folded
+/// into it. `Err` when `name` names no registered peer — the same "a
+/// missing name is a real error, not a silent no-op" stance [`set_hub`]/
+/// [`clear_hub`] hold. `via: None` clears the marker (the common case: a
+/// peer this ceremony never resolved a `--via`/observed-address for, or a
+/// re-pairing whose caller chose not to carry one forward) — every other
+/// field `upsert_paired_peer` leaves untouched on re-pairing stays that
+/// way; only THIS call ever changes `via`.
+pub fn set_peer_via(peers: &mut [Peer], name: &str, via: Option<&str>) -> Result<(), String> {
+    let Some(p) = peers.iter_mut().find(|p| p.name == name) else {
+        return Err(format!("no peer named `{name}`"));
+    };
+    p.via = via.map(|s| s.to_string());
+    Ok(())
 }
 
 /// What [`set_peer_allow`] actually did — mirrors [`HubChange`]'s "report
@@ -712,6 +754,7 @@ mod tests {
             pubkey: None,
             verified: false,
             allows: Vec::new(),
+            via: None,
             added_at: "2026-08-14T00:00:00Z".to_string(),
         }
     }
@@ -1297,5 +1340,57 @@ mod tests {
         assert_eq!(default_peer_name_from_url("http://10.0.0.5:8710/"), Some("10-0-0-5".to_string()));
         assert_eq!(default_peer_name_from_url("http://SAKAKI.local/"), Some("sakaki-local".to_string()));
         assert_eq!(default_peer_name_from_url("not-a-url"), None);
+    }
+
+    // ── `via` — the ssh-transport lane's marker (P-S4, additive) ─────────────
+
+    #[test]
+    fn via_absent_deserializes_none_and_omits_when_absent_but_round_trips_when_present() {
+        // A raw fixture with no `via` key at all — a `peers.json` predating
+        // this field (today's every real file) — must deserialize `None`,
+        // the same additive discipline `pubkey`/`bearerSecret` established.
+        let old_shape = serde_json::json!({
+            "name": "gamma", "url": "http://c/", "autogate": false, "addedAt": "2026-08-14T00:00:00Z"
+        });
+        let back: Peer = serde_json::from_value(old_shape).unwrap();
+        assert_eq!(back.via, None, "absent via deserializes None");
+
+        let without = fixture_peer("alpha", "http://a/", false);
+        let v = serde_json::to_value(&without).unwrap();
+        assert!(v.get("via").is_none(), "absent via is omitted, not written as `\"via\":null`");
+
+        let mut with_via = fixture_peer("beta", "http://b/", false);
+        with_via.via = Some("ssh://khoa@sakaki".to_string());
+        let v2 = serde_json::to_value(&with_via).unwrap();
+        assert_eq!(v2["via"], "ssh://khoa@sakaki");
+        let back2: Peer = serde_json::from_value(v2).unwrap();
+        assert_eq!(back2.via.as_deref(), Some("ssh://khoa@sakaki"));
+    }
+
+    #[test]
+    fn upsert_paired_peer_leaves_via_none_on_a_fresh_insert() {
+        let mut peers: Vec<Peer> = Vec::new();
+        upsert_paired_peer(&mut peers, "box-b", "http://b/", "deadbeef", "2026-08-25T00:00:00Z");
+        assert_eq!(peers[0].via, None, "a fresh pairing stamps no via — set_peer_via is the only writer");
+    }
+
+    #[test]
+    fn set_peer_via_sets_and_clears_without_touching_any_other_field() {
+        let mut peers = vec![fixture_peer("alpha", "http://a/", false)];
+        peers[0].autogate = true;
+
+        assert!(set_peer_via(&mut peers, "alpha", Some("ssh://khoa@sakaki")).is_ok());
+        assert_eq!(peers[0].via.as_deref(), Some("ssh://khoa@sakaki"));
+        assert!(peers[0].autogate, "unrelated fields are untouched");
+
+        assert!(set_peer_via(&mut peers, "alpha", None).is_ok());
+        assert_eq!(peers[0].via, None, "None clears a previously-set via");
+    }
+
+    #[test]
+    fn set_peer_via_rejects_an_unknown_peer_name() {
+        let mut peers = vec![fixture_peer("alpha", "http://a/", false)];
+        let err = set_peer_via(&mut peers, "ghost", Some("ssh://sakaki")).unwrap_err();
+        assert!(err.contains("ghost"));
     }
 }

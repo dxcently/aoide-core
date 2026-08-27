@@ -105,6 +105,15 @@
   leaves `autogate`/`tokenFile`/`bearerSecret`/`hub` untouched — don't widen
   it to a general-purpose peer editor, and don't set those two fields via a
   raw `Peer { .. }` literal anywhere outside `peer_store.rs` itself.
+- **`peer_store::set_peer_via` is the ONE write site for `Peer.via` (P-S4),
+  a SIBLING to `upsert_paired_peer`, never a parameter folded into it.**
+  `upsert_paired_peer`'s signature is also called from `aoide-server`'s own
+  pairing integration tests — a crate outside this field's blast radius —
+  so a purely additive setter beside it (mirroring `set_hub`/
+  `set_peer_allow`'s own precedent) keeps that signature untouched. Don't
+  set `Peer.via` via a raw `Peer { .. }` literal anywhere outside
+  `peer_store.rs` itself, and don't fold it into `upsert_paired_peer`
+  without first checking every one of that function's existing callers.
 - **`pairing`'s request ids are deliberately NOT `state/stage/pending.json`'s
   array-position ids.** A pairing correlation must survive the requester's
   CLI process exiting and an async `aoide/pairApprove` callback arriving

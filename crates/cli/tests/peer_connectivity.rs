@@ -286,6 +286,7 @@ fn peer_add_against_an_unreachable_url_never_registers_and_pull_of_a_down_peer_m
         pubkey: None,
         verified: false,
         allows: Vec::new(),
+        via: None,
         added_at: aoide_storage::time::now_iso_utc(),
     });
     aoide_storage::peer_store::save_peers(&peers).unwrap();
@@ -550,6 +551,7 @@ fn peer_pair_reject_on_an_outbound_entry_aborts_before_the_approvers_callback() 
         requested_at: now.clone(),
         expires_at: expires,
         state: aoide_storage::pairing::OutboundState::AwaitingApproval,
+        via: None,
     };
     aoide_storage::pairing::park_outbound(entry).unwrap();
 
@@ -586,6 +588,7 @@ fn peer_pair_reject_on_an_outbound_entry_aborts_after_the_approvers_callback() {
         requested_at: now.clone(),
         expires_at: expires,
         state: aoide_storage::pairing::OutboundState::AwaitingApproval,
+        via: None,
     };
     aoide_storage::pairing::park_outbound(entry).unwrap();
     let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
@@ -624,6 +627,7 @@ fn peer_pair_approve_on_an_outbound_entry_still_awaiting_the_peers_own_approval_
         requested_at: now.clone(),
         expires_at: expires,
         state: aoide_storage::pairing::OutboundState::AwaitingApproval,
+        via: None,
     };
     aoide_storage::pairing::park_outbound(entry).unwrap();
 
@@ -667,6 +671,11 @@ fn peer_pair_approve_on_an_outbound_entry_awaiting_confirm_commits_with_yes() {
         requested_at: now.clone(),
         expires_at: expires,
         state: aoide_storage::pairing::OutboundState::AwaitingApproval,
+        // P-S4: the via this ceremony resolved at request time (a --via
+        // flag, or peer invite's observed src_addr) rides the parked
+        // entry to this later, separate `peer pair approve` invocation —
+        // asserted below, committed onto the peer record only here.
+        via: Some("ssh://khoa@box-b".to_string()),
     };
     aoide_storage::pairing::park_outbound(entry).unwrap();
     let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
@@ -686,6 +695,7 @@ fn peer_pair_approve_on_an_outbound_entry_awaiting_confirm_commits_with_yes() {
     assert_eq!(peers[0].url, "http://b/");
     assert_eq!(peers[0].pubkey.as_deref(), Some("b".repeat(64).as_str()));
     assert_eq!(peers[0].verified, true);
+    assert_eq!(peers[0].via.as_deref(), Some("ssh://khoa@box-b"), "the parked entry's via is committed onto the peer record at approve time (P-S4)");
     assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "committed and removed from the outbound queue");
 
     let _ = std::fs::remove_dir_all(&root);

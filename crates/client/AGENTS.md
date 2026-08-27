@@ -203,6 +203,44 @@
   `waitpid` there would leave a real zombie. `ECHILD` (the ordinary
   cross-invocation case — an earlier `aoide` run parented the child, not
   this process) falls back to the `/proc` poll, same as always.
+- **Every cross-box POST resolves its dial url through `resolve_dial_url`
+  (P-S4) — never `post_json(&peer.url, …)` or `post_json(&some_raw_url, …)`
+  directly.** `post_json_to_peer(peer, …)` (a registered `Peer`) and
+  `post_json_via(logical_url, via, tunnel_key, …)` (a ceremony call with no
+  `Peer` record yet) are the only two entry points; `commands::post_json`
+  itself is UNCHANGED by this phase and must stay that way — dial
+  resolution is a wrapper in FRONT of it, not a rewrite of it. **The
+  identity guarantee is load-bearing:** `via: None` must return the
+  logical url byte-for-byte, and `resolve_dial_url`'s tunnel-key/path
+  handling must never diverge from `aoide_storage::tunnel::dial_url`'s own
+  path extraction (`peer_store::url_path`) — a second, independently
+  written path cut here would silently break `sign_headers_for_peer`'s
+  canonical string the moment it drifted from the far door's own observed
+  `HttpRequest.path`. **`--via` beats `Peer.via`, never the reverse** —
+  `spawn_on_peer_via`'s `via_override` parameter is checked FIRST,
+  `peer.via` only when the override is absent; a new `--via`-accepting
+  command follows this same precedence, not a per-command variant of it.
+  **The session key (`tunnel_session_id`, K3) is resolved and passed
+  through here, but NOTHING in this phase closes a tunnel.** A conducted
+  session's tunnels stay open past this process's exit by design (reused
+  for the session's whole lifetime); a bare-shell `pid-<pid>` tunnel is
+  ALSO left open — closing it only at the client-owned CLI handlers while
+  `pull_peer_live`/`send_message_to_peer`/`spawn_on_peer` (called from
+  `aoide-conduct`, which cannot be wrapped from here) stayed unclosed would
+  make identical code behave inconsistently by caller. **Do not add a
+  partial close here** — the real lifecycle (session-end fast path, reaper
+  backstop, for both key shapes) is P-S5's, landed all at once or not at
+  all.
+- **P-S6 has not landed — a tunneled request is POSSIBLE, not SAFE,
+  against a real peer.** Every request delivered through an ssh forward
+  reaches the far A2A door as `PeerOrigin::Loopback`
+  (`aoide-server::a2a::classify_origin`), which today carries an
+  unconditional Inject delivery free pass. This module's job stops at
+  making the tunnel work; narrowing that free pass so a verified signature
+  is required for loopback-sourced auto-delivery is `aoide-server`'s job,
+  tracked as the ssh-transport plan's P-S6, and is a REQUIRED phase, not
+  optional hardening — do not treat `--via`/`Peer.via` as safe to recommend
+  for a real cross-box pair until it lands.
 - **The self-invite guard (`discover::is_self_target`) runs BEFORE the
   proceed-confirm and BEFORE the ceremony, in `handle_peer_invite`, never
   inside `run_pair_request` (P-S1).** `run_pair_request` is shared with

@@ -3410,6 +3410,7 @@ mod tests {
             pubkey: None,
             verified: false,
             allows: Vec::new(),
+            via: None,
             added_at: "2026-08-21T00:00:00Z".to_string(),
         }
     }
