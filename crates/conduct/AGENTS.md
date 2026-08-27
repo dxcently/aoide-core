@@ -76,6 +76,51 @@
   Don't make the manifest check consult `projects.json` — the whole point
   is that a manifest is self-sufficient on a host that has never registered
   the project at all.
+- **The both-misses usage error is conditioned on having actually tried the
+  walk (review fix, U2 round 1).** `flag_mode` (`--project`/`--id`/`--all`,
+  any one present) is computed ONCE at the top of `session_resurrect` and
+  consulted a SECOND time at the `require_flag(inv, "project")` failure
+  branch: `flag_mode == true` there returns `require_flag`'s own original
+  `Err` untouched (a flag WAS given, `--project` just wasn't — the walk was
+  never attempted, so the manifest-miss wording would lie); only
+  `flag_mode == false` builds the "no .aoide/project.json above `<cwd>` and
+  no --project/--all/--id given" message. A regression here (returning the
+  both-misses message unconditionally on any `require_flag` failure) is
+  exactly the bug the round-1 review caught — `id_without_project_is_the_
+  ordinary_missing_flag_error_not_the_manifest_message`/`all_without_
+  project_is_the_ordinary_missing_flag_error_not_the_manifest_message`
+  pin it down.
+- **Every row of `resurrect_from_manifest`'s outcome carries a
+  `disposition` (review fix, U2 round 1).** `resurrect_one` is reused
+  VERBATIM for the enrichment path and knows nothing about being called
+  from manifest mode — none of its own pushes into `resurrected`/
+  `skipped`/`failed` carry a `disposition` key. `resurrect_from_manifest`
+  snapshots each bucket's length before calling it and stamps
+  `"revived-from-ledger"`/`"skipped"`/`"failed"` onto whichever ONE grew
+  afterward (`resurrect_one` always pushes into exactly one, never zero,
+  never two, per call) — this loop's OWN pushes (`skipped-remote`,
+  `clean_spawn_from_spec`'s `clean-spawned`/`failed`) already carry theirs
+  inline. Don't add a new `resurrect_one`/`clean_spawn_from_spec` push path
+  without also covering it here — an un-stamped row is exactly the defect
+  a consumer filtering the outcome by `disposition` would silently drop.
+- **Manifest-revived sessions are marked undying unconditionally, gated on
+  `Status::Ok` alone — never on live registration (orchestrator design
+  ruling, U2 round 1).** `mark_manifest_revival_undying` is called from
+  `resurrect_from_manifest` itself, right after EITHER path (enrichment via
+  `resurrect_one`, clean-spawn via `clean_spawn_from_spec`) lands a row in
+  `resurrected` — which by construction only happens past `Status::Ok`.
+  This is its OWN `load_undying`/`set_undying`/`save_undying` call, NOT a
+  `--undying` flag threaded into the shared `spawn` invocation: gating on
+  `registered` (what `aoide spawn --undying` itself gates on) would make
+  this unconditionally untestable in this crate — a live terminal
+  registering is exactly the line `spawn.rs`'s own module doc draws as
+  "never this crate's tests." Don't fold this into flag-mode's own undying
+  TRANSFER block (`resurrect_one`'s pre-existing, untouched
+  `is_undying(&c.entry.session_id)`-gated logic) — that block only ever
+  moves a PRE-existing mark and must stay that way for an ordinary
+  `--all`/`--id` revive; manifest-mode marks unconditionally because every
+  manifest-mode spawn already came from an explicit, operator-authored
+  declaration, not an ordinary revive.
 - **The enrichment rule is a hard ordering: the manifest decides WHAT
   exists, the ledger decides HOW (the User's own design decision, U2).**
   `resurrect_from_manifest` never invents a candidate the manifest didn't
@@ -94,7 +139,12 @@
   never clamps, a `..` that would resolve outside the project root after
   LEXICAL normalization — don't resolve a spec's `dir` by hand (a bare
   `project_root.join(dir)`) anywhere else; that would silently reopen the
-  containment hole this function exists to close.
+  containment hole this function exists to close. It is a STRING check,
+  not a filesystem one: a `dir` with no `..` at all can still pass through
+  a symlink pointing outside the project root at USE time, undetected —
+  accepted under the manifest's host-local, operator-authored trust model
+  (the operator who writes a spec already controls their own disk), not a
+  gap to close with a `canonicalize` call here.
 - **`reap` (toast-free) and `reap_and_announce` (the registered CLI/daemon
   handler) are deliberately two functions, not one.** `reap_and_announce`
   spawns a REAL `notify-send` on the live desktop whenever the sweep

@@ -225,28 +225,54 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   (`aoide_storage::manifest::walk_up`) for the nearest `.aoide/
   project.json` and, if found, revives THAT manifest's specs directly
   (`resurrect_from_manifest`) — self-sufficient, no `projects.json`
-  registration read or required. Not found, the command falls through to
-  the flag-mode path above, whose usage error then names both misses. Any
-  of the three flags routes straight past the manifest check, unchanged —
-  mutually exclusive with bare-manifest mode by construction. Each spec
+  registration read or required. Not found — genuinely bare, no flag
+  either — falls through to the flag-mode path above, whose usage error
+  then names both misses. Any of the three flags present routes straight
+  past the manifest check AND skips the walk entirely — mutually exclusive
+  with bare-manifest mode by construction, so an invocation missing
+  `--project` but carrying `--id`/`--all` gets `require_flag`'s own
+  ORIGINAL, accurate usage error, never the both-misses wording (review
+  fix, U2 round 1 — that branch used to return the manifest-miss message
+  unconditionally on ANY `require_flag` failure, which lied for a flag-mode
+  caller: a flag WAS given, no walk was ever attempted). Each spec
   (`{host, dir, agent, command?}`) resolves independently, one spec's
   failure never aborting the rest: a spec whose `host` isn't this host's
   own name (`aoide_storage::display::local_host_name`) is skipped (remote
   summoning is U4); a local spec's `dir` resolves through
   `aoide_storage::manifest::resolve_spec_dir` (the containment guard — a
-  `..`-laden `dir` is refused, never resolved outside the project root).
-  **The enrichment rule (the User's design decision):** the manifest
-  decides WHAT exists, the ledger decides HOW — the newest entry in THIS
-  HOST's own session ledger whose `cwd`/`agent` match the spec revives
-  through the exact SAME `resolve_candidate`/`resurrect_one` path `--id`
-  drives; no match clean-spawns instead (`clean_spawn_from_spec`), windowed,
-  the spec's own `command` when given else the agent's registered
-  `AgentProfile::launch` default — the same `session_spawn` windowed path
-  every other candidate spawns through, never a forked launch mechanism. An
-  agent with neither is a taught `failed[]` entry. Every outcome (both
-  modes) is audited exactly once (`audit_resurrect`), including an empty
-  selection — the boot-sweep postmortem's own finding that an early return
-  must never silently skip the audit line a full run gets.
+  `..`-laden `dir` is refused, never resolved outside the project root;
+  lexical only, so a symlink INSIDE the project pointing outside it still
+  escapes at use time — accepted under the manifest's host-local,
+  operator-authored trust model, not a gap this guard closes). **The
+  enrichment rule (the User's design decision):** the manifest decides WHAT
+  exists, the ledger decides HOW — the newest entry in THIS HOST's own
+  session ledger whose `cwd`/`agent` match the spec revives through the
+  exact SAME `resolve_candidate`/`resurrect_one` path `--id` drives; no
+  match clean-spawns instead (`clean_spawn_from_spec`), windowed, the
+  spec's own `command` when given (whitespace-split only, no shell-quote
+  awareness — an embedded-space argument cannot be expressed) else the
+  agent's registered `AgentProfile::launch` default — the same
+  `session_spawn` windowed path every other candidate spawns through, never
+  a forked launch mechanism. An agent with neither is a taught `failed[]`
+  entry. Every row of the outcome carries a `disposition`
+  (`revived-from-ledger`/`clean-spawned`/`skipped-remote`/`skipped`/
+  `failed`) — including a row `resurrect_one` itself pushed, stamped after
+  the fact since that function has no idea it's being called from manifest
+  mode (review fix, U2 round 1: those rows used to carry no `disposition`
+  at all). **Manifest-revived sessions are marked undying** (orchestrator
+  design ruling, U2 round 1), both paths, once their spawn reaches
+  `Status::Ok` (`mark_manifest_revival_undying`, its own
+  `load_undying`/`set_undying`/`save_undying` call — not a flag threaded
+  into `spawn`, and never gated on live registration, which this crate's
+  own tests never exercise end-to-end): the manifest spec IS the durable
+  declaration, so a LATER bare `resurrect --project <name>` or the daemon's
+  boot sweep finds the revived session in the undying set without
+  re-walking the manifest — unconditional, unlike flag-mode's own TRANSFER
+  a few paragraphs up, which only ever moves a PRE-existing mark. Every
+  outcome (both modes) is audited exactly once (`audit_resurrect`),
+  including an empty selection — the boot-sweep postmortem's own finding
+  that an early return must never silently skip the audit line a full run
+  gets.
 - **Terminal restore capture (P-C5, durable-sessions plan):**
   `graph/conduct.rs`'s PTY tick (`conduct_refresh_shell`, ~1 Hz, the same
   tick that drives `cwd`/`activity`/`state`) also builds a

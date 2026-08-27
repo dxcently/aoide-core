@@ -204,6 +204,16 @@ pub fn walk_up(start: &Path) -> Option<(PathBuf, Manifest)> {
 /// the read-time twin of that same invariant, needed because a manifest can
 /// be hand-edited or written by a future version this build has never
 /// validated.
+///
+/// **Lexical, not a filesystem guarantee (U2 review round 1).** This is a
+/// STRING check on `dir` — it never touches disk, so it has no opinion
+/// about what a clean-looking (no `..`) `dir` might resolve THROUGH at USE
+/// time: a symlink somewhere inside the project pointing outside it still
+/// escapes, undetected here, the moment a caller actually opens/execs the
+/// returned path. Accepted, not a gap this function is meant to close —
+/// the manifest's whole trust model is host-local and operator-authored,
+/// so the operator who wrote the spec already controls what's on their own
+/// disk, symlinks included.
 pub fn resolve_spec_dir(project_root: &Path, dir: &str) -> Result<PathBuf, String> {
     use std::path::Component;
 

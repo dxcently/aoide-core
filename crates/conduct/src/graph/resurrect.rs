@@ -84,12 +84,19 @@
 //! project.json` and, if found, revives THAT manifest's specs directly —
 //! [`resurrect_from_manifest`] — instead of the flag-mode selection above.
 //! The manifest is SELF-SUFFICIENT: no `projects.json` registration is
-//! read or required. Not found, the command falls through to the ordinary
-//! flag-mode path, whose usage error then names both misses (no manifest
-//! above cwd, no flag given) rather than just the flag. `--project`/
-//! `--all`/`--id` are UNCHANGED escapes that ignore the manifest entirely —
-//! mutually exclusive with bare-manifest mode by construction, since any
-//! one of them present routes straight to the pre-existing flag-mode path.
+//! read or required. Not found — genuinely bare, no flag given either —
+//! the command falls through to the ordinary `--project`-required check,
+//! whose usage error then names both misses (no manifest above cwd, no
+//! flag given). `--project`/`--all`/`--id` are UNCHANGED escapes that
+//! ignore the manifest entirely — mutually exclusive with bare-manifest
+//! mode by construction, since any one of them present routes straight to
+//! the pre-existing flag-mode path AND skips the manifest walk altogether,
+//! so a flag-mode invocation missing `--project` (`--id X` alone, say)
+//! gets `require_flag`'s own ORIGINAL, accurate usage error — never the
+//! both-misses wording, which would lie twice over (a flag WAS given; no
+//! walk was ever attempted). A review fix (U2 round 1) closed exactly this
+//! bug: the both-misses message used to fire unconditionally on any
+//! `require_flag` failure.
 //!
 //! Each manifest spec (`{host, dir, agent, command?}`,
 //! `aoide_storage::manifest::SessionSpec`) resolves independently, same
@@ -117,7 +124,34 @@
 //! — the SAME windowed [`session_spawn`] path every other resurrect
 //! candidate spawns through, never a forked launch mechanism. An agent
 //! with neither a `command` nor a registered profile is a taught
-//! `failed[]` entry, never a guessed argv.
+//! `failed[]` entry, never a guessed argv. Every row of the outcome — both
+//! buckets [`resurrect_one`] can push into as well as this loop's own
+//! `skipped-remote`/`failed`/`clean-spawned` rows — carries a
+//! `disposition` key, stamped after the fact where `resurrect_one` itself
+//! doesn't know it is being called from manifest mode.
+//!
+//! **Manifest-revived sessions are marked undying (orchestrator design
+//! ruling, U2 review round 1).** Once a spawn from EITHER path actually
+//! lands a row in `resurrected` (which only happens past `Status::Ok`, the
+//! same gate `resurrect_one`'s own pre-existing undying TRANSFER block
+//! reads off, never `registered` — a live terminal registering is a fact
+//! this crate's own tests never exercise end-to-end, `spawn.rs`'s own
+//! module doc draws that exact line), [`mark_manifest_revival_undying`]
+//! marks that new id undying directly: one `load_undying`/`set_undying`/
+//! `save_undying`, right here in [`resurrect_from_manifest`] — conceptually
+//! the same idea `aoide spawn --undying` marks a fresh spawn with, but its
+//! own separate call, not a flag threaded into the shared `spawn`
+//! invocation. The manifest spec IS the durable declaration of what should
+//! exist, so marking its revived session undying means a LATER bare
+//! `resurrect --project <name>` (or the daemon's boot sweep) finds it in
+//! the undying set without re-walking or re-consulting the manifest —
+//! flag-mode and manifest-mode revival converge on ONE durable set instead
+//! of tracking two independent notions of "what this project wants
+//! running." This is deliberately unconditional, unlike flag-mode's own
+//! undying TRANSFER a few paragraphs up (which only ever marks a new id
+//! when the OLD ledger id it replaces was already undying): there is no
+//! ordinary-revive case to protect here, every manifest-mode spawn already
+//! came from an explicit, operator-authored declaration.
 
 use super::common::{require_flag, stage_error};
 use super::model::{load_stage, projects_path, sessions_path, ProjectsFile, SessionsFile};
@@ -484,7 +518,18 @@ pub fn session_resurrect(inv: &Invocation) -> Outcome {
 
     let name = match require_flag(inv, "project") {
         Ok(v) => v,
-        Err(_) => {
+        Err(o) => {
+            // The manifest-miss wording is honest ONLY when a manifest walk
+            // was actually attempted — that happened above iff `!flag_mode`.
+            // `flag_mode == true` here means one of `--all`/`--id` was given
+            // without `--project` (no walk was ever tried, and one of the
+            // three flags WAS given) — `require_flag`'s own original error
+            // is the true one in that case (review fix, U2 round 1: this
+            // branch used to return the manifest-miss message unconditionally,
+            // which lied on both counts for e.g. a bare `--id` invocation).
+            if flag_mode {
+                return o;
+            }
             let cwd = std::env::current_dir()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "?".to_string());
@@ -584,6 +629,33 @@ pub fn session_resurrect(inv: &Invocation) -> Outcome {
     out
 }
 
+/// Mark a manifest-revived session's OWN new id undying (orchestrator
+/// design ruling, U2 review round 1) — `entry` is a `resurrected[]` row
+/// (either shape: `resurrect_one`'s own, or `clean_spawn_from_spec`'s),
+/// read back for its `sessionId` rather than threading one down through
+/// another parameter. One `load_undying`/`set_undying`/`save_undying`,
+/// gated on nothing but the row already being IN `resurrected` — which by
+/// construction only happens once the underlying spawn reached
+/// `Status::Ok` (never on `registered`: this crate's own tests never open
+/// a real terminal end-to-end, the same line `spawn.rs`'s module doc
+/// draws, so gating on live registration would make this unconditionally
+/// untestable here). The rationale for marking unconditionally rather than
+/// only transferring a PRE-existing mark (`resurrect_one`'s own transfer
+/// block, a few paragraphs up, untouched by this function): the manifest
+/// spec IS the durable declaration of what should exist, so its revived
+/// session belongs in the undying set regardless of whether the ledger
+/// entry that enriched it (if any) happened to be marked — a later bare
+/// `resurrect --project <name>` or the daemon's boot sweep then finds it
+/// without ever re-walking or re-consulting the manifest.
+fn mark_manifest_revival_undying(entry: &serde_json::Value) {
+    let Some(id) = entry.get("sessionId").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    let mut undying = aoide_storage::undying::load_undying();
+    aoide_storage::undying::set_undying(&mut undying, id, true);
+    let _ = aoide_storage::undying::save_undying(&undying);
+}
+
 /// U2's bare-manifest mode: `resurrect` with no `--project`/`--all`/`--id`
 /// found `.aoide/project.json` walking up from cwd — revive its specs
 /// directly. See this module's own doc for the enrichment rule and the
@@ -642,22 +714,40 @@ fn resurrect_from_manifest(
 
         match matched {
             Some(entry) => {
-                let before = resurrected.len();
-                resurrect_one(
-                    inv.door,
-                    resolve_candidate(entry.clone()),
-                    &mut resurrected,
-                    &mut skipped,
-                    &mut failed,
-                    &mut changed,
-                );
-                if resurrected.len() > before {
+                // `resurrect_one` is the flag-mode function, reused
+                // VERBATIM — it pushes into exactly ONE of the three
+                // buckets per call, none of its own pushes carrying a
+                // `disposition` key (that's a manifest-mode-only concept).
+                // Track each bucket's length so whichever one grew gets
+                // stamped after the fact — every row this loop's own
+                // outcome carries MUST have a `disposition`, so a consumer
+                // filtering by it never silently drops a row that fell
+                // through `resurrect_one`'s own skip/fail shapes (review
+                // fix, U2 round 1).
+                let (before_r, before_s, before_f) = (resurrected.len(), skipped.len(), failed.len());
+                resurrect_one(inv.door, resolve_candidate(entry.clone()), &mut resurrected, &mut skipped, &mut failed, &mut changed);
+                if resurrected.len() > before_r {
                     if let Some(last) = resurrected.last_mut() {
                         last["disposition"] = json!("revived-from-ledger");
                     }
+                    mark_manifest_revival_undying(&resurrected[resurrected.len() - 1]);
+                } else if skipped.len() > before_s {
+                    if let Some(last) = skipped.last_mut() {
+                        last["disposition"] = json!("skipped");
+                    }
+                } else if failed.len() > before_f {
+                    if let Some(last) = failed.last_mut() {
+                        last["disposition"] = json!("failed");
+                    }
                 }
             }
-            None => clean_spawn_from_spec(inv.door, spec, &dir_str, &mut resurrected, &mut failed, &mut changed),
+            None => {
+                let before_r = resurrected.len();
+                clean_spawn_from_spec(inv.door, spec, &dir_str, &mut resurrected, &mut failed, &mut changed);
+                if resurrected.len() > before_r {
+                    mark_manifest_revival_undying(&resurrected[resurrected.len() - 1]);
+                }
+            }
         }
     }
 
@@ -772,6 +862,21 @@ mod tests {
         for e in entries {
             aoide_storage::ledger::append_ledger_entry(e).unwrap();
         }
+    }
+
+    /// Count audit-log lines whose `command` tag is `"resurrect"` — the
+    /// EXACT check the headline invariant needs ("exactly one line per
+    /// invocation", review round 1), not a `contains()` scan that would
+    /// also pass on a log carrying two lines, or a stray substring inside
+    /// some OTHER command's own message.
+    fn count_resurrect_audit_lines(log_path: &std::path::Path) -> usize {
+        std::fs::read_to_string(log_path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v.get("command").and_then(serde_json::Value::as_str) == Some("resurrect"))
+            .count()
     }
 
     fn ledger_entry(
@@ -1250,6 +1355,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
+    /// The review-round-1 fix: `--id` given WITHOUT `--project` is
+    /// flag-mode (one of the three flags is present), so it must NEVER
+    /// attempt a manifest walk and must NEVER get the bare-mode's
+    /// both-misses wording — only `require_flag`'s own, accurate
+    /// `--project`-missing usage error, exactly as it was before U2 ever
+    /// touched this function. No cwd/env setup needed at all: proving this
+    /// doesn't even reach the manifest-walk branch is the whole point.
+    #[test]
+    fn id_without_project_is_the_ordinary_missing_flag_error_not_the_manifest_message() {
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[("id", "some-ledger-id")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage);
+        assert!(out.message.contains("--project"), "message: {}", out.message);
+        assert!(
+            !out.message.contains("project.json"),
+            "an --id-given invocation must get the ORDINARY missing-flag error, never the \
+             manifest-miss wording (which would lie: a flag WAS given, no walk was attempted): {}",
+            out.message
+        );
+    }
+
+    /// Same fix, the `--all` half.
+    #[test]
+    fn all_without_project_is_the_ordinary_missing_flag_error_not_the_manifest_message() {
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[("all", "true")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage);
+        assert!(out.message.contains("--project"), "message: {}", out.message);
+        assert!(!out.message.contains("project.json"), "message: {}", out.message);
+    }
+
     /// `--all` and `--id` are unchanged escapes (P-C4's own scope line): both
     /// widen or narrow past the undying set regardless of the mark — neither
     /// entry below is ever undying, and both still resolve.
@@ -1379,12 +1513,13 @@ mod tests {
 
         // The gate-6 fix (U2): an empty-selection early return must still
         // write the ONE audit line every resurrect invocation gets, never
-        // silently skip it because nothing was selected.
-        let log = std::fs::read_to_string(root.join("log")).unwrap_or_default();
-        assert!(
-            log.contains("resurrect") && log.contains("undying set is empty"),
-            "an empty-selection resurrect must still audit: {log}"
-        );
+        // silently skip it because nothing was selected — exactly one line,
+        // never zero, never two (review round 1: `contains()` alone would
+        // also pass on a duplicated line).
+        let log = root.join("log");
+        assert_eq!(count_resurrect_audit_lines(&log), 1, "log: {}", std::fs::read_to_string(&log).unwrap_or_default());
+        let raw = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(raw.contains("undying set is empty"), "the one line must carry the real message: {raw}");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1508,9 +1643,12 @@ mod tests {
         assert_eq!(resurrected[0]["disposition"], "clean-spawned");
         assert_eq!(resurrected[0]["agent"], "claude");
 
-        // Bare-manifest mode audits too, exactly once, same as flag mode.
-        let log = std::fs::read_to_string(root.join("log")).unwrap_or_default();
-        assert!(log.contains("resurrect"), "bare-manifest mode must audit: {log}");
+        // Bare-manifest mode audits too, EXACTLY once, same as flag mode.
+        let log = root.join("log");
+        assert_eq!(
+            count_resurrect_audit_lines(&log), 1,
+            "log: {}", std::fs::read_to_string(&log).unwrap_or_default()
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1682,6 +1820,59 @@ mod tests {
         let skipped = data["skipped"].as_array().unwrap();
         assert_eq!(skipped.len(), 1, "exactly one ledger entry must be selected for enrichment: {data}");
         assert_eq!(skipped[0]["sessionId"], "ledger-newer", "the NEWEST matching entry must win: {data}");
+        // Review round 1: a row `resurrect_one` itself pushed into `skipped`
+        // (no `disposition` of its own — that's a manifest-mode concept)
+        // must still carry one once it lands in THIS loop's own outcome,
+        // so a consumer filtering by `disposition` never drops it.
+        assert_eq!(skipped[0]["disposition"], "skipped", "data: {data}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The same uniform-disposition fix, the `failed` bucket half: a
+    /// MATCHED entry (terminal arm resolves — a `restore` snapshot is
+    /// present) whose spawn then fails outright (no `$AOIDE_TERMINAL`, the
+    /// same headless taught error `a_windowed_spawn_failure_degrades_
+    /// gracefully_instead_of_erroring_the_command` proves in flag mode)
+    /// must land in `failed` with `disposition: "failed"`, not a bare
+    /// `resurrect_one`-shaped row missing the key entirely.
+    #[test]
+    fn bare_mode_enrichment_spawn_failure_gets_a_failed_disposition_too() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG",
+            "AOIDE_TERMINAL", "WAYLAND_DISPLAY", "DISPLAY",
+        ]);
+        let this_host = aoide_storage::display::local_host_name();
+        let (root, cwd) = setup_manifest(
+            "resurrect-manifest-enrich-failed",
+            vec![manifest_spec(&this_host, ".", "shell", None)],
+        );
+        let root_str = root.to_str().unwrap().to_string();
+        set_ledger(&[ledger_entry_with_restore(
+            "ledger-shell-fail",
+            "shell",
+            &root_str,
+            "2026-08-20T01:00:00Z",
+            Some(RestoreSnapshot { cwd: Some(root_str.clone()), idle: true, argv: None, typed: None }),
+        )]);
+        std::env::remove_var("AOIDE_TERMINAL");
+        std::env::remove_var("WAYLAND_DISPLAY");
+        std::env::remove_var("DISPLAY");
+
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[]));
+        drop(cwd);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.as_ref().unwrap();
+        let failed = data["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 1, "data: {data}");
+        assert_eq!(failed[0]["disposition"], "failed", "data: {data}");
+        assert_eq!(data["resurrected"].as_array().unwrap().len(), 0);
+
+        // A failed spawn never reaches the undying mark either — nothing
+        // to mark, the session never came into being.
+        let undying = aoide_storage::undying::load_undying();
+        assert!(!aoide_storage::undying::is_undying(&undying, "ledger-shell-fail"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1723,6 +1914,54 @@ mod tests {
         assert_eq!(resurrected.len(), 1, "data: {data}");
         assert_eq!(resurrected[0]["disposition"], "revived-from-ledger");
         assert_eq!(resurrected[0]["resumedFrom"], "ledger-shell");
+
+        // Design ruling (U2 review round 1): a manifest-enriched revival
+        // marks its NEW session id undying, gated on Status::Ok alone
+        // (this spawn reached it — "true" launches successfully even
+        // though it never registers).
+        let new_id = resurrected[0]["sessionId"].as_str().unwrap().to_string();
+        let undying = aoide_storage::undying::load_undying();
+        assert!(
+            aoide_storage::undying::is_undying(&undying, &new_id),
+            "a manifest-enriched revival must mark its new session undying"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The design ruling's clean-spawn half: an UNMATCHED spec (no ledger
+    /// enrichment at all — the ordinary fresh-checkout case) still marks
+    /// its freshly clean-spawned session undying, same as the enriched
+    /// path above.
+    #[test]
+    fn bare_mode_clean_spawn_marks_the_new_session_undying() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG",
+            "AOIDE_TERMINAL", "WAYLAND_DISPLAY", "DISPLAY",
+        ]);
+        let this_host = aoide_storage::display::local_host_name();
+        let (root, cwd) = setup_manifest(
+            "resurrect-manifest-clean-spawn-undying",
+            vec![manifest_spec(&this_host, ".", "claude", None)],
+        );
+        std::env::set_var("AOIDE_TERMINAL", "true");
+        std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[]));
+        drop(cwd);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.as_ref().unwrap();
+        let resurrected = data["resurrected"].as_array().unwrap();
+        assert_eq!(resurrected.len(), 1, "data: {data}");
+        assert_eq!(resurrected[0]["disposition"], "clean-spawned");
+        let new_id = resurrected[0]["sessionId"].as_str().unwrap().to_string();
+
+        let undying = aoide_storage::undying::load_undying();
+        assert!(
+            aoide_storage::undying::is_undying(&undying, &new_id),
+            "a manifest clean-spawn must mark its new session undying"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
