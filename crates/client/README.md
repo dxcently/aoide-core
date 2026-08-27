@@ -74,15 +74,19 @@ never the inbound/serve half (that's `aoide-server`).
   already on file for `(session_id, key)` (`aoide_storage::tunnel::load`);
   a record whose pid is alive AND whose local port answers a bounded probe
   is reused as-is (no second `ssh`). Anything else is stale — a dead pid,
-  or a live process whose forward nothing answers on — and the record is
-  about to be REPLACED by a freshly opened one at the same `(session_id,
-  key)`, on a freshly reserved local port (the
-  `TcpListener::bind("127.0.0.1:0")` read-back-drop idiom
-  `cli/tests/peer_connectivity.rs::free_port` already established); a
-  live-but-dead-port OLD pid is killed first (`kill_if_still_our_ssh`, the
-  same guard `close` uses below) — review finding, P-S3 — since once its
-  record is overwritten nothing could ever find that pid again (`close`/
-  the reaper only ever act on a pid loaded FROM a record). The spawned
+  or a live process whose forward nothing answers on — and its OLD pid is
+  killed first (`kill_if_still_our_ssh`, the same guard `close` uses below,
+  P-S3): once confirmed gone, the record is REPLACED by a freshly opened
+  one at the same `(session_id, key)`, on a freshly reserved local port
+  (the `TcpListener::bind("127.0.0.1:0")` read-back-drop idiom
+  `cli/tests/peer_connectivity.rs::free_port` already established). A live,
+  still-ours OLD pid that SURVIVES that bounded kill instead REFUSES the
+  reopen with a taught error rather than being overwritten — opening a
+  second forward to the same target while the first is untracked would
+  strand it, since once its record is overwritten nothing could ever find
+  that pid again (`close`/the reaper only ever act on a pid loaded FROM a
+  record); the caller's own later retry, or the reaper's backstop, clears
+  it once the old child finally exits. The spawned
   `ssh -N -T -o BatchMode=yes …` (stdin/stdout/stderr all `null`) is polled
   (`TcpStream::connect`) until its forward answers or a bounded deadline
   elapses (default 8s, `AOIDE_TUNNEL_OPEN_TIMEOUT` overrides, the same
@@ -106,12 +110,14 @@ never the inbound/serve half (that's `aoide-server`).
   it, and a pid alone is never enough to justify a signal.
   `kill_if_still_our_ssh` returns whether the pid is now safe to forget
   (never alive, never ours, or ours and confirmed dead) versus still alive
-  and still ours — a stubborn/hung child that survives `terminate_pid`'s
-  bounded `SIGTERM`+wait keeps its record on disk instead of losing it,
-  so `aoide-conduct::reap::sweep_orphan_tunnels`'s own backstop can still
-  find and retry it once the session leaves the roster (review finding,
-  task #104: dropping the record on a mere kill ATTEMPT made a survivor
-  permanently untrackable). Once a kill IS justified, `terminate_pid` reaps
+  and still ours — `#[must_use]`, since every caller (`close`, the
+  stale-reopen path above, and `aoide-conduct::reap::sweep_orphan_tunnels`)
+  must gate a record's removal or replacement on it, never discard it. A
+  stubborn/hung child that survives `terminate_pid`'s bounded
+  `SIGTERM`+wait keeps its record on disk instead of losing it, so the
+  reaper's backstop re-gathers the SAME record as a candidate on every
+  later sweep pass and retries the kill, until it is finally confirmed
+  dead — never a one-attempt affair. Once a kill IS justified, `terminate_pid` reaps
   with a real `waitpid(pid, WNOHANG)` poll before ever falling back to a
   `/proc` poll — required whenever `open` and `close` (or a stale reopen)
   share a process, since that pid genuinely IS this process's own child and

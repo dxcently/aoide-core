@@ -31,8 +31,29 @@
   ssh-transport lane's tunnel sweep are the SAME sweep pass conceptually:
   only a roster-less, settled candidate is ever touched, and a candidate
   whose session IS still live is spared outright regardless of what a
-  pid/port probe would say. **The two are NOT symmetric about the stage
-  lock, on purpose.** `sweep_orphan_sockets` runs entirely inside
+  pid/port probe would say. **"Roster-less" is NOT the same test for the
+  two sweeps, on purpose.** The socket sweep treats any session record
+  still present in `sessions.json` as live, whatever its `state`. The
+  tunnel sweep is narrower: a session already `done` — a clean exit that
+  ran `close_all_for_session` but has not yet been pruned off the roster
+  (`prune_done` only fires on a pass that reaped something) — counts as
+  gone for tunnel candidacy specifically, so a record `close` had to KEEP
+  (its child survived the fast path's own bounded kill) does not wait,
+  unbounded, on `prune_done`'s own schedule. This asymmetry is deliberate
+  and narrow: it changes ONLY `orphan_tunnel_candidates`' own roster
+  computation in `reap_inner`, never `sweep_orphan_sockets`'s, and never
+  `prune_done` itself — a `done` session's control socket is already gone
+  by the time `do_session_end` returns, so the socket sweep has no
+  equivalent problem to solve. **`kill_if_still_our_ssh`'s bool return is
+  `#[must_use]` and gates removal at every call site, never discarded —
+  `close`, `open_or_reuse_with`'s stale-record path, and
+  `sweep_orphan_tunnels` all unlink/replace a record ONLY on `true`
+  (confirmed dead or never actually ours); on `false` (confirmed ours and
+  still alive) the record is left exactly where it was, so the reaper's
+  next sweep pass re-gathers the SAME record and retries the kill — no
+  separate retry bookkeeping, and no candidate is ever unlinked out from
+  under a live, untracked child.** **The two sweeps are NOT symmetric about
+  the stage lock, on purpose.** `sweep_orphan_sockets` runs entirely inside
   `with_stage_lock` (`reap_inner`) because unlinking a leftover socket file
   is cheap. A tunnel candidate's `ssh -N` child may still be alive, and
   signaling it (`aoide_client::tunnel::kill_if_still_our_ssh` →
@@ -57,7 +78,8 @@
   clean exit (`aoide_client::tunnel::close_all_for_session`, the fast path,
   likewise run AFTER the stage lock releases since it may block on a real
   `waitpid`); the reaper's tunnel sweep is only the backstop for the session
-  that never got to run that exit path. A new leaving-kind under this same
+  that never got to run that exit path, or the retry for one whose
+  fast-path kill didn't finish in time. A new leaving-kind under this same
   runtime directory joins the sweep the same way — never a separate cleanup
   mechanism.
 - **Every session-write handler routes through `aoide_client::daemon::

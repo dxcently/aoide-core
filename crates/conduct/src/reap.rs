@@ -740,16 +740,25 @@ fn orphan_tunnel_candidates(
 /// afterward, once the lock is already released.
 ///
 /// A dead pid costs nothing extra: `kill_if_still_our_ssh`'s own liveness
-/// check already turns the kill into a no-op, so both the dead-pid and the
-/// alive-pid candidates converge on the same unconditional unlink below. A
-/// candidate whose record fails to remove (already gone, a permission
-/// edge) is simply not reported swept — never a hard error, and never
-/// counted as removed when it wasn't.
+/// check already makes the call a no-op for one, so the dead-pid and the
+/// confirmed-dead-after-signaling alive-pid candidates converge on the same
+/// unlink below. A candidate that is STILL alive and still ours once
+/// `kill_if_still_our_ssh`'s bounded wait elapses (a stubborn or hung
+/// child) is left on disk instead — the same "never drop what a kill only
+/// ATTEMPTED to clear" rule `aoide_client::tunnel::close` holds: unlinking
+/// it here regardless would re-orphan a live child this very sweep just
+/// tried to collect, with no further backstop behind it. A record kept
+/// this way simply reappears as a candidate on
+/// the next sweep pass and gets another try — `orphan_tunnel_candidates`
+/// re-gathers from disk every time, so no separate retry bookkeeping is
+/// needed. A candidate whose record fails to remove (already gone, a
+/// permission edge) is simply not reported swept — never a hard error, and
+/// never counted as removed when it wasn't.
 fn sweep_orphan_tunnels(candidates: Vec<aoide_storage::tunnel::TunnelRecord>) -> Vec<String> {
     let mut swept = Vec::new();
     for rec in candidates {
-        if proc_exists(rec.pid) {
-            aoide_client::tunnel::kill_if_still_our_ssh(rec.pid, rec.local_port, rec.remote_port);
+        if !aoide_client::tunnel::kill_if_still_our_ssh(rec.pid, rec.local_port, rec.remote_port) {
+            continue;
         }
         if aoide_storage::tunnel::remove(&rec.session_id, &rec.key).is_ok() {
             swept.push(format!("{}/{}", rec.session_id, rec.key));
@@ -1209,9 +1218,22 @@ fn reap_inner(
     };
 
     // The ssh tunnels dead sessions left in `$XDG_RUNTIME_DIR/aoide/tunnel`
-    // — GATHERED only (`orphan_tunnel_candidates`), against the SAME
-    // surviving roster the socket sweep just used, for the same "collected
-    // on the pass that reaped it, not the next one" reason. The kill phase
+    // — GATHERED only (`orphan_tunnel_candidates`), against a roster built
+    // the same way the socket sweep's is (minus what THIS pass is about to
+    // reap), for the same "collected on the pass that reaped it, not the
+    // next one" reason — PLUS one narrowing the socket sweep does not
+    // share: a session already `done` (a clean `session end` that ran its
+    // own fast-path close, `aoide_client::tunnel::close_all_for_session`)
+    // is excluded from "surviving" for TUNNEL candidacy specifically. A
+    // `done` session's tunnels have no owner left to close them, but the
+    // session RECORD itself stays present until `prune_done` — which only
+    // runs on a pass that reaped something — so without this narrowing a
+    // record `close` had to keep (its child survived the fast path's own
+    // bounded kill) could wait unbounded on an otherwise quiet desktop.
+    // Socket sweeping and `prune_done` are untouched by
+    // this — a `done` session's control socket is already gone by the time
+    // `do_session_end` returns, and pruning `done` records at all remains
+    // this pass's own reaped-something gate. The kill phase
     // (`sweep_orphan_tunnels`) runs AFTER this whole function returns and
     // the stage lock is released — see that function's doc for why.
     let tunnel_candidates = {
@@ -1219,6 +1241,7 @@ fn reap_inner(
         let surviving: HashSet<&str> = s_file
             .sessions
             .iter()
+            .filter(|s| canonical_state(&s.state) != "done")
             .map(|s| s.session_id.as_str())
             .filter(|id| !dead.contains(id))
             .collect();
@@ -2631,6 +2654,216 @@ mod tests {
         // the safety pin above.
         assert!(std::path::Path::new("/proc").join(my_pid.to_string()).exists());
 
+        let _ = std::fs::remove_dir_all(&runtime);
+    }
+
+    /// Independent-review follow-up: `sweep_orphan_tunnels` used to unlink
+    /// every candidate regardless of whether `kill_if_still_our_ssh`
+    /// actually confirmed the pid dead — a still-alive, still-ours child
+    /// (a stubborn or hung `ssh`) was re-orphaned with no further
+    /// backstop, since a fresh `session reap` pass is the only thing that
+    /// would ever revisit it. Pins the fix at this layer too (not just
+    /// `aoide_client::tunnel::close`'s own unit tests): a genuine, killable
+    /// process whose cmdline actually matches `looks_like_our_ssh` but
+    /// traps `SIGTERM` away survives the sweep with its record intact,
+    /// while an ordinary dead-pid candidate is swept exactly as before.
+    #[test]
+    fn sweep_orphan_tunnels_keeps_a_record_whose_child_survives_the_kill() {
+        use std::os::unix::process::CommandExt;
+
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = crate::graph::testutil::EnvVars::save(&["XDG_RUNTIME_DIR"]);
+        let runtime = crate::graph::testutil::unique_stage("reap-tunnel-survivor");
+        std::fs::create_dir_all(runtime.join("aoide")).unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &runtime);
+
+        // A genuine child whose `/proc/<pid>/cmdline` reads exactly like an
+        // `ssh … -L <port>:<host>:<port> …` (the same `arg0`-override
+        // fixture shape `aoide_client::tunnel`'s own tests use) but traps
+        // `SIGTERM` away — real `ssh` never does this, but `terminate_pid`
+        // only ever sends one bounded `SIGTERM`, so this is the worst case
+        // the guard must still survive correctly. `trap`/`:`/`while` are
+        // shell builtins, so this stays exec-free the same way the source
+        // fixture's own doc explains.
+        let local_port = 40002u16;
+        let remote_port = 8710u16;
+        let spec = format!("{local_port}:127.0.0.1:{remote_port}");
+        let child = std::process::Command::new("bash")
+            .arg0("ssh")
+            .arg("-c")
+            .arg("trap '' TERM; while :; do :; done")
+            .arg("aoide-test-marker")
+            .arg(&spec)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        drop(child);
+        // Give the `trap` a moment to actually install before this test's
+        // own `sweep_orphan_tunnels` call signals it — a fixed, generous
+        // sleep is acceptable here (unlike the `tunnel.rs` unit test this
+        // mirrors) since there is no assertion tight enough for the race to
+        // realistically flip; the trap is a no-I/O shell builtin that runs
+        // in microseconds.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let rec = aoide_storage::tunnel::TunnelRecord {
+            schema_version: aoide_storage::tunnel::TUNNEL_VERSION.to_string(),
+            session_id: "gone-survivor".to_string(),
+            key: "peer-z".to_string(),
+            ssh_target: "ssh://user@host".to_string(),
+            local_port,
+            remote_host: "127.0.0.1".to_string(),
+            remote_port,
+            pid,
+            opened_at: aoide_storage::time::now_iso_utc(),
+        };
+        aoide_storage::tunnel::save(&rec).unwrap();
+
+        let swept = sweep_orphan_tunnels(vec![rec]);
+        assert!(swept.is_empty(), "a still-alive, still-ours candidate must not be reported swept: {swept:?}");
+        assert!(
+            aoide_storage::tunnel::load("gone-survivor", "peer-z").is_some(),
+            "the survivor's record must stay on disk for the next sweep pass to retry"
+        );
+        assert!(proc_exists(pid), "the fixture traps SIGTERM on purpose — it must still be alive");
+
+        // Cleanup: SIGKILL cannot be trapped; reap with a real, blocking
+        // `waitpid` so no zombie is left behind.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        let mut status: libc::c_int = 0;
+        unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+
+        // A second sweep pass, now that the child is actually gone, finally
+        // collects it — the kept record really is retryable, not stuck.
+        let rec2 = aoide_storage::tunnel::load("gone-survivor", "peer-z").unwrap();
+        let swept2 = sweep_orphan_tunnels(vec![rec2]);
+        assert_eq!(swept2, vec!["gone-survivor/peer-z".to_string()]);
+        assert!(aoide_storage::tunnel::load("gone-survivor", "peer-z").is_none());
+
+        let _ = std::fs::remove_dir_all(&runtime);
+    }
+
+    /// DECIDED (independent review, task #104 follow-up): `orphan_tunnel_
+    /// candidates` treats any session still PRESENT in `sessions.json` as
+    /// live — but a clean `session end` (`do_session_end_inner`) marks a
+    /// session `done` IN PLACE; the record itself is only removed once
+    /// `prune_done` runs, which only happens on a pass that reaped
+    /// something. Left unnarrowed, a tunnel record `close` had to KEEP (its
+    /// child survived the fast path's own bounded kill) could wait
+    /// UNBOUNDED on an otherwise quiet desktop, since nothing else ever
+    /// prunes a lone `done` session. Pins the narrowed rule: a `done`
+    /// session's settled tunnel record is a CANDIDATE even while its
+    /// session record still sits in the roster, while a genuinely live
+    /// (not-`done`) session's tunnel is still spared exactly as before —
+    /// and the `done` session record itself is untouched by this (pruning
+    /// it stays `prune_done`'s own job, on its own schedule).
+    #[test]
+    fn reap_treats_a_done_but_unpruned_sessions_settled_tunnel_as_a_candidate() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = crate::graph::testutil::EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "HYPRLAND_INSTANCE_SIGNATURE",
+        ]);
+        std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"); // pid-only/no-window liveness
+        let stage = crate::graph::testutil::unique_stage("reap-done-tunnel-stage");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let runtime = crate::graph::testutil::unique_stage("reap-done-tunnel-runtime");
+        std::fs::create_dir_all(runtime.join("aoide")).unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &runtime);
+
+        let now = now_iso_utc();
+        let mut done_sess = agent("done-sess", "", &now);
+        done_sess.state = "done".into();
+        done_sess.pid = None;
+        done_sess.cwd = "/nonexistent/nowhere".into();
+        let mut live_sess = agent("live-sess", "", &now);
+        live_sess.state = "working".into();
+        live_sess.pid = None;
+        live_sess.cwd = "/nonexistent/nowhere".into();
+
+        write_stage(
+            &sessions_path(),
+            &SessionsFile {
+                schema_version: "0".into(),
+                sessions: vec![done_sess, live_sess],
+            },
+        )
+        .unwrap();
+        // A fresh hook record keeps `live-sess` provably alive under the
+        // third liveness signal — this test's business is the tunnel
+        // carve-out, not the reap-death machinery.
+        let mut hooks = Vec::new();
+        upsert_hook(&mut hooks, "live-sess", "working", &now);
+        write_stage(&hooks_path(), &HooksFile { schema_version: "0".into(), hooks }).unwrap();
+
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let backdate = |p: &std::path::Path| {
+            use std::os::unix::ffi::OsStrExt;
+            let t = (now_epoch - 600) as libc::time_t;
+            let tv = [libc::timeval {
+                tv_sec: t,
+                tv_usec: 0,
+            }; 2];
+            let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::utimes(c.as_ptr(), tv.as_ptr()) }, 0);
+        };
+        let write_record = |session_id: &str, key: &str| {
+            let rec = aoide_storage::tunnel::TunnelRecord {
+                schema_version: aoide_storage::tunnel::TUNNEL_VERSION.to_string(),
+                session_id: session_id.to_string(),
+                key: key.to_string(),
+                ssh_target: "ssh://user@host".to_string(),
+                local_port: 40003,
+                remote_host: "127.0.0.1".to_string(),
+                remote_port: 8710,
+                pid: 999_999_999u32, // dead on any sane machine
+                opened_at: aoide_storage::time::now_iso_utc(),
+            };
+            aoide_storage::tunnel::save(&rec).unwrap();
+            aoide_storage::tunnel::record_path(session_id, key).unwrap()
+        };
+
+        let done_tunnel = write_record("done-sess", "peer-x");
+        backdate(&done_tunnel);
+        let live_tunnel = write_record("live-sess", "peer-y");
+        backdate(&live_tunnel);
+
+        let out = reap(&crate::graph::testutil::invocation(&["session", "reap"], &[]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.unwrap();
+        let orphan_tunnels: Vec<String> = data["orphanTunnels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            orphan_tunnels,
+            vec!["done-sess/peer-x".to_string()],
+            "a done-but-unpruned session's settled tunnel is swept; a live one's is not"
+        );
+        assert!(
+            aoide_storage::tunnel::load("done-sess", "peer-x").is_none(),
+            "the done session's tunnel record is gone"
+        );
+        assert!(
+            aoide_storage::tunnel::load("live-sess", "peer-y").is_some(),
+            "the live session's tunnel record is untouched"
+        );
+        let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert!(
+            s2.sessions.iter().any(|s| s.session_id == "done-sess"),
+            "the done session record itself is not pruned by this — pruning stays prune_done's own job"
+        );
+
+        let _ = std::fs::remove_dir_all(&stage);
         let _ = std::fs::remove_dir_all(&runtime);
     }
 }

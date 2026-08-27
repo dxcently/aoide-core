@@ -155,13 +155,28 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   control socket (`sweep_orphan_sockets`) and, for the ssh-transport lane,
   every tunnel it opened and never closed (`sweep_orphan_tunnels` — a
   roster-less, settled record's still-answering `ssh -N` child is signaled
-  via `aoide_client::tunnel::kill_if_still_our_ssh` before the record is
-  unlinked). A tunnel's fast path is `session_store::do_session_end`, which
-  closes every tunnel a session opened
-  (`aoide_client::tunnel::close_all_for_session`) on its own clean exit; this
-  sweep is only the SUPER+Q/SIGKILL backstop for the session that never got
-  to run that exit path — so an ssh child can never outlive its session and
-  become a resident daemon.
+  via `aoide_client::tunnel::kill_if_still_our_ssh`, and the record is
+  unlinked ONLY once that call confirms the pid actually gone; a stubborn
+  child that survives the bounded kill keeps its record on disk instead, so
+  the very same record simply comes back as a candidate on the next sweep
+  pass and gets retried — no separate retry bookkeeping needed).
+  `orphan_tunnel_candidates`' own idea of "roster-less" is narrower than the
+  socket sweep's: a session already `done` — a clean exit that closed its
+  own tunnels but has not yet been pruned off the roster (`prune_done` only
+  runs on a pass that reaped something) — counts as gone for TUNNEL
+  candidacy specifically, so a record `close` had to keep does not wait on
+  `prune_done`'s own schedule. Socket sweeping is untouched by this: a
+  `done` session's control socket is already gone by the time
+  `do_session_end` returns. A tunnel's fast path is
+  `session_store::do_session_end`, which closes every tunnel a session
+  opened (`aoide_client::tunnel::close_all_for_session`) on its own clean
+  exit — likewise removing a record only once its pid is confirmed gone,
+  and refusing (rather than silently overwriting) a stale reopen whose old
+  child survives its own bounded kill; this sweep is only the
+  SUPER+Q/SIGKILL backstop for the session that never got to run that exit
+  path, or the retry for one whose fast-path kill didn't finish in time —
+  so an ssh child can never outlive its session and become a resident
+  daemon.
 - `graph/window.rs` — window discovery/backfill/listener PLUS the
   automatic-parenting seam (task #89, corrected in review round 2):
   `is_windowless_wrap` (a conducted record is windowless when `headless` is

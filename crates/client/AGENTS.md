@@ -189,13 +189,22 @@
   `ssh` carrying this record's exact `-L` spec is ever signaled. **This
   guard is not `close`'s alone** — `open_or_reuse_with`'s own stale-record
   path runs it on a live-but-dead-port record's OLD pid before that record
-  is overwritten by a freshly opened one at the same `(session_id, key)`;
+  is REPLACED by a freshly opened one at the same `(session_id, key)`;
   skipping this on the reopen path would make the old child permanently
   untrackable the instant its record is replaced, since `close`/
   `close_all_for_session`/the reaper (P-S5) can only ever act on a pid they
-  load FROM a record. **No new code path may replace or drop a tunnel
-  record without first routing the pid it named through
-  `kill_if_still_our_ssh`.** `terminate_pid` reaps with a real
+  load FROM a record. **`kill_if_still_our_ssh` is `#[must_use]` and returns
+  whether the pid is now safe to forget — `true` (never alive, never ours,
+  or ours and confirmed dead) versus `false` (confirmed ours and STILL
+  alive once the bounded kill elapses).** No new code path may replace or
+  drop a tunnel record without first routing the pid it named through
+  `kill_if_still_our_ssh` AND gating on that return value: `close` leaves a
+  survivor's record in place rather than dropping it, and
+  `open_or_reuse_with`'s stale-record path REFUSES the reopen outright
+  (a taught error, never a silent overwrite) rather than replacing a
+  record while the old child it named is still alive and about to become
+  untracked — a second forward to the same target is never opened
+  alongside a live, untracked one. `terminate_pid` reaps with a real
   `waitpid(pid, WNOHANG)` poll before ever falling back to its `/proc`
   poll — required, not cosmetic, for the case where `open` and `close` (or
   a stale reopen) run in the SAME process: that pid genuinely IS this

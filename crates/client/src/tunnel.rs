@@ -8,13 +8,18 @@
 //! **Lifecycle in one line.** `open_or_reuse` loads a record for
 //! `(session_id, key)`; a record whose pid is alive AND whose local port
 //! answers is reused as-is (no second `ssh`); anything else is stale (dead
-//! pid, or a live process nothing is listening through) and is discarded in
-//! favor of a freshly spawned forward. `close`/`close_all_for_session` tear
-//! a forward down and remove its record once the pid is CONFIRMED gone — a
+//! pid, or a live process nothing is listening through) and its OLD pid is
+//! cleared before a fresh forward takes its place — but only once that pid
+//! is CONFIRMED gone. A stale record whose old `ssh` survives the bounded
+//! kill instead REFUSES the reopen outright, never spawning a second
+//! forward to the same target while the first is still alive and about to
+//! lose its only record. `close`/`close_all_for_session` tear a forward
+//! down and remove its record on that same confirmed-gone condition — a
 //! child that survives the bounded kill keeps its record on disk instead,
 //! so the name stays findable rather than becoming an untracked survivor;
 //! P-S5 wires the session-end fast path and the reaper's orphan-collecting
-//! backstop (which retries exactly such a survivor) on top of these two.
+//! backstop (which retries exactly such a survivor, on every pass, until it
+//! is finally confirmed dead) on top of these two.
 //!
 //! **The recycled-pid decision (`close`).** A record's `pid` was proven
 //! alive by an earlier `aoide` invocation, possibly a long time ago — the
@@ -99,19 +104,26 @@ fn open_or_reuse_with(
         }
         // Stale: either the pid is gone, or something is still alive at
         // that pid but nothing answers the forward. Either way the record
-        // is worthless as a dial target and is about to be REPLACED by a
-        // fresh one at this exact (session, key) — not merely deleted. A
-        // live-but-dead-port old process must be killed here, not left for
-        // `close`/the reaper (P-S5) to collect later: both of those can
+        // is worthless as a dial target — but it is not simply discarded.
+        // A live-but-dead-port old process must be killed here, not left
+        // for `close`/the reaper (P-S5) to collect later: both of those can
         // only ever act on a pid they load FROM a record, and this record
-        // is the only place the old pid was ever written down. Once the
-        // fresh record below overwrites it, the old child becomes
-        // PERMANENTLY untrackable — the same guarded kill `close` performs
-        // (alive, AND still looks like this record's own `ssh`) runs on it
-        // first. A genuinely dead pid costs nothing extra here:
-        // `kill_if_still_our_ssh`'s own `proc_exists` check already turns
-        // this into a no-op for the dead-pid case.
-        kill_if_still_our_ssh(rec.pid, rec.local_port, rec.remote_port);
+        // is the only place the old pid was ever written down.
+        // `kill_if_still_our_ssh` reports whether that old pid is now safe
+        // to forget (genuinely dead, or never actually this record's own
+        // `ssh`) versus still alive and still ours. Only the safe-to-forget
+        // case clears the record and lets a fresh forward take its place;
+        // a live, still-ours old child that SURVIVES the bounded kill
+        // instead REFUSES the reopen — spawning a second forward to the
+        // same target while the first is still alive and about to lose its
+        // only record would strand it exactly as untrackable as an
+        // unconditional overwrite always did. The record is left in place
+        // (never overwritten, never removed) so the reaper's own backstop —
+        // or a later retry of this same call, once the old child finally
+        // exits — can still find and finish it.
+        if !kill_if_still_our_ssh(rec.pid, rec.local_port, rec.remote_port) {
+            return Err(stale_reopen_blocked_error(session_id, key, via, remote_host, remote_port));
+        }
         let _ = aoide_storage::tunnel::remove(session_id, key);
     }
 
@@ -266,11 +278,12 @@ fn looks_like_our_ssh(pid: u32, local_port: u16, remote_port: u16) -> bool {
 /// [`looks_like_our_ssh`] still confirms it as `(local_port, remote_port)`'s
 /// own `ssh` child (the module doc's "recycled-pid decision"). Shared by
 /// [`close`] (tearing a forward down on purpose), `open_or_reuse_with`'s
-/// stale-record path (a live-but-dead-port record is about to be
-/// OVERWRITTEN by a fresh one at the same key — without this, the old
-/// child would become permanently untrackable, since `close`/
-/// `close_all_for_session`/the reaper can only ever act on a pid they load
-/// FROM a record), and `aoide-conduct::reap::sweep_orphan_tunnels` (P-S5),
+/// stale-record path (a live-but-dead-port record is about to be REPLACED
+/// by a fresh one at the same key, once its old pid is confirmed gone —
+/// without this, the old child would become permanently untrackable, since
+/// `close`/`close_all_for_session`/the reaper can only ever act on a pid
+/// they load FROM a record), and
+/// `aoide-conduct::reap::sweep_orphan_tunnels` (P-S5),
 /// which loads a record whose SESSION is gone but whose pid still answers
 /// `/proc` and needs the exact same guarded kill before the record is
 /// unlinked out from under it. `pub` (not `pub(crate)`): `aoide-conduct`
@@ -283,8 +296,12 @@ fn looks_like_our_ssh(pid: u32, local_port: u16, remote_port: u16) -> bool {
 /// nothing here was ours to track in the first place), or WAS ours and is
 /// now confirmed dead by [`terminate_pid`]'s bounded wait; `false` only when
 /// it was confirmed ours and is STILL alive once that bound elapses (a
-/// stubborn or hung child). [`close`] uses this to decide whether a record
-/// may be dropped or must be kept for a later retry.
+/// stubborn or hung child). [`close`], `open_or_reuse_with`'s stale-record
+/// path, and `aoide-conduct::reap::sweep_orphan_tunnels` all gate a
+/// record's removal (or replacement) on this — `#[must_use]` because
+/// discarding it is exactly the bug all three once shared: it turns a mere
+/// kill ATTEMPT back into an unconditional drop.
+#[must_use]
 pub fn kill_if_still_our_ssh(pid: u32, local_port: u16, remote_port: u16) -> bool {
     if proc_exists(pid) && looks_like_our_ssh(pid, local_port, remote_port) {
         terminate_pid(pid);
@@ -441,6 +458,29 @@ fn spawn_ssh(local_port: u16, via: &Via, remote_host: &str, remote_port: u16) ->
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     cmd.spawn().map_err(|e| format!("spawn `ssh` for {via}: {e}"))
+}
+
+/// The taught error `open_or_reuse_with` returns when a stale record's OLD
+/// `ssh` child is still alive and still confirmed as ITS OWN once the
+/// bounded kill elapses — a live, untracked-if-overwritten child, so a
+/// second forward to the same target is refused rather than opened
+/// alongside it. Names the session/key so the caller can tell which
+/// tunnel is still tearing down, and says what to do about it: nothing —
+/// this settles on its own the moment the old child finally exits, either
+/// on a later retry of this same call or via the reaper's own backstop.
+fn stale_reopen_blocked_error(
+    session_id: &str,
+    key: &str,
+    via: &Via,
+    remote_host: &str,
+    remote_port: u16,
+) -> String {
+    format!(
+        "an earlier ssh tunnel to {via} for {remote_host}:{remote_port} (session `{session_id}`, key \
+         `{key}`) did not exit after being asked to close, so opening a fresh forward to the same \
+         target was refused rather than leaving the old one untracked — retry in a moment; it settles \
+         on its own once the old process finally exits"
+    )
 }
 
 /// The taught error `open_or_reuse_with` returns when a fresh forward never
@@ -635,6 +675,34 @@ mod tests {
             .map_err(|e| format!("test fake ssh-argv (SIGTERM-immune) spawn: {e}"))
     }
 
+    /// Cleanup companion for [`spawn_fake_ssh_argv_ignoring_sigterm`]:
+    /// `Drop` sends `SIGKILL` (the one signal `trap '' TERM` cannot
+    /// intercept) and reaps with a blocking `waitpid`. A test that spawns a
+    /// SIGTERM-immune child and then panics on some assertion BEFORE its
+    /// own explicit cleanup line would otherwise leak a permanent,
+    /// CPU-spinning process no ordinary signal could stop — this makes that
+    /// cleanup unwind-safe by tying it to scope exit instead of to reaching
+    /// the bottom of the test function. Double-cleanup (this guard firing
+    /// after a test's own explicit `SIGKILL`+`waitpid` already ran) is
+    /// harmless: `kill`/`waitpid` on an already-reaped pid just fail
+    /// (`ESRCH`/`ECHILD`), which this ignores by design — a best-effort
+    /// backstop, not a second assertion.
+    struct KillOnDrop(u32);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` names a pid this test spawned; `SIGKILL`
+            // cannot be trapped or ignored, so this is the one signal
+            // guaranteed to end even the SIGTERM-immune fixture.
+            unsafe { libc::kill(self.0 as libc::pid_t, libc::SIGKILL) };
+            let mut status: libc::c_int = 0;
+            // SAFETY: `&mut status` is a valid local; blocking is fine here
+            // — the pid is either already gone (returns immediately with
+            // ECHILD) or about to be, since SIGKILL was just sent.
+            unsafe { libc::waitpid(self.0 as libc::pid_t, &mut status, 0) };
+        }
+    }
+
     // ── open_or_reuse: reuse ────────────────────────────────────────────
 
     #[test]
@@ -739,6 +807,73 @@ mod tests {
 
             assert_ne!(port, dead_port);
             assert!(!proc_exists(old_pid), "the old, replaced ssh child must be killed, never merely orphaned");
+        });
+    }
+
+    /// Independent-review follow-up: the fix above only covers the old
+    /// child DYING within the bounded kill. A stale record whose old `ssh`
+    /// SURVIVES it must never be silently overwritten either — spawning a
+    /// second forward to the same target while the first is still alive
+    /// and about to lose its only record is exactly the untracked-survivor
+    /// shape `close`'s own fix exists to prevent. Pins the refusal:
+    /// `open_or_reuse_with` errors out, the OLD record stays on disk
+    /// exactly as it was, and the injected spawn never runs at all.
+    #[test]
+    fn stale_reopen_refuses_rather_than_overwrite_a_child_that_survives_the_bounded_kill() {
+        with_temp_runtime_dir("stale-reopen-refuses-survivor", || {
+            let dead_port = {
+                let l = TcpListener::bind("127.0.0.1:0").unwrap();
+                l.local_addr().unwrap().port()
+                // dropped: nothing listens here
+            };
+            let ready_marker = std::env::temp_dir().join(format!(
+                "aoide-client-tunnel-stale-reopen-survivor-ready-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&ready_marker);
+
+            let old_child =
+                spawn_fake_ssh_argv_ignoring_sigterm(dead_port, "127.0.0.1", 8710, &ready_marker).unwrap();
+            let old_pid = old_child.id();
+            // No `.wait()` — same cross-invocation shape every fixture here
+            // uses. `_guard` outlives every assertion below, so a panic
+            // partway through this test still ends the child.
+            drop(old_child);
+            let _guard = KillOnDrop(old_pid);
+
+            let ready_deadline = Instant::now() + Duration::from_secs(2);
+            while !ready_marker.exists() && Instant::now() < ready_deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(ready_marker.exists(), "the fixture child never reported its trap as installed");
+            let _ = std::fs::remove_file(&ready_marker);
+
+            aoide_storage::tunnel::save(&fixture("sess-l", "sakaki", old_pid, dead_port)).unwrap();
+            assert!(proc_exists(old_pid), "the old fake ssh child must be alive before reopen runs");
+
+            let calls = Arc::new(AtomicUsize::new(0));
+            let calls2 = calls.clone();
+            let spawn: SpawnFn = Arc::new(move |_lp, _via, _rh, _rp| {
+                calls2.fetch_add(1, Ordering::SeqCst);
+                panic!("a second forward must never be spawned while the old one is untracked");
+            });
+
+            let via = bare_via("sakaki");
+            let err = open_or_reuse_with("sess-l", "sakaki", &via, "127.0.0.1", 8710, &spawn).unwrap_err();
+            assert!(err.contains("sess-l"), "error must name the session: {err}");
+            assert!(err.contains("sakaki"), "error must name the key: {err}");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "the injected spawn must never run while the old child is untracked"
+            );
+
+            assert!(
+                proc_exists(old_pid),
+                "the fixture traps SIGTERM on purpose — it must still be alive after the refused reopen"
+            );
+            let saved = aoide_storage::tunnel::load("sess-l", "sakaki").unwrap();
+            assert_eq!(saved.pid, old_pid, "the old record must stay exactly as it was, never overwritten");
         });
     }
 
@@ -878,8 +1013,11 @@ mod tests {
             let pid = child.id();
             // No `.wait()` — the record, not this handle, is what `close`
             // acts on (the same cross-invocation shape every other fixture
-            // here uses).
+            // here uses). `_guard` outlives every assertion below, so a
+            // panic anywhere in this closure still ends the child instead
+            // of leaking a permanent spin loop — see `KillOnDrop`'s own doc.
             drop(child);
+            let _guard = KillOnDrop(pid);
 
             // Wait for the marker the script writes only AFTER its `trap`
             // has run — see the fixture's own doc for why this, not a fixed
