@@ -3787,6 +3787,35 @@ mod tests {
     }
 
     #[test]
+    fn classify_origin_maps_cgnat_tailnet_and_lan_addresses_to_remote() {
+        // Table test (M3, task #16): a Melete-triggered job dials in from a
+        // real box's LAN or tailnet address, never loopback — this is the
+        // shape `classify_origin` must fold to `Remote` so `should_deliver_now`
+        // gates it, not the shape that (incorrectly) free-passes it. No
+        // CIDR/tailnet special-casing exists or is added here: every one of
+        // these is just "some non-loopback `Some(ip)`", the same arm
+        // `10.0.0.5` already exercises above — this table only widens the
+        // address SHAPES covered (CGNAT/tailnet 100.64.0.0/10, ordinary LAN),
+        // it does not add a new code path.
+        let cases: &[(&str, PeerOrigin)] = &[
+            // sakaki's tailscale0 (100.82.117.51, brief's verified recon) —
+            // CGNAT-range tailnet address.
+            ("100.82.117.51", PeerOrigin::Remote("100.82.117.51".parse().unwrap())),
+            // sakaki's LAN address (192.168.1.202, brief's verified recon).
+            ("192.168.1.202", PeerOrigin::Remote("192.168.1.202".parse().unwrap())),
+            // Loopback stays loopback regardless of address family —
+            // unchanged by this table, restated here so the two families
+            // sit side by side in one place.
+            ("127.0.0.1", PeerOrigin::Loopback),
+            ("::1", PeerOrigin::Loopback),
+        ];
+        for (addr, expected) in cases {
+            let ip: IpAddr = addr.parse().unwrap();
+            assert_eq!(classify_origin(Some(ip)), *expected, "address {addr}");
+        }
+    }
+
+    #[test]
     fn should_deliver_now_covers_every_origin_autogate_combination() {
         // Loopback is unconditionally trusted — unchanged from before this
         // amendment, regardless of any autogate match.

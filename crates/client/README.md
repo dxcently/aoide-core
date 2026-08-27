@@ -175,7 +175,14 @@ never the inbound/serve half (that's `aoide-server`).
   the recorded `Peer.url` stays the LOGICAL url either way. No signing is
   involved (a card fetch is a plain GET), so there is no canonical-string
   path to keep in sync here, unlike the signed peer calls this funnel also
-  serves.
+  serves. **`peer add --no-verify` skips this fetch entirely** — for a peer
+  that serves no AgentCard at all (a plain A2A client endpoint, e.g. an
+  inbound-only harness that never stood up the discovery surface this GET
+  expects). The peer is recorded exactly as the verified path records it:
+  `verified` was already hardcoded `false` on this path regardless of the
+  fetch (a card fetch is reachability, never identity — that only ever
+  comes from `peer pair`), so skipping it changes nothing about what gets
+  written, only whether the GET runs first.
   The session id a tunnel opens under (`tunnel_session_id`) is
   `AOIDE_SESSION_ID` when a conducted session set it, else a
   process-scoped `pid-<pid>` fallback (K3). This crate only resolves and

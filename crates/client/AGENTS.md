@@ -276,7 +276,11 @@
   rewrite of it. **`handle_peer_add`'s AgentCard fetch is a GET and was
   missed on first landing (review finding) — it now calls
   `resolve_dial_url` directly before its own `run_curl`, same as any other
-  call.** Any FUTURE cross-box network call — POST or otherwise — needs the
+  call.** `--no-verify` (M3, task #16) skips the fetch — and therefore this
+  funnel — entirely, for a peer known to serve no AgentCard; that is the
+  ONLY way `handle_peer_add` ever runs with no network call at all, and it
+  is a deliberate opt-out of verification, never a second dial path around
+  `resolve_dial_url`. Any FUTURE cross-box network call — POST or otherwise — needs the
   same funnel in front of it; a call site added without checking this
   invariant against the full list below (`grep -n 'run_curl\|post_json'`
   in this file) is exactly how the AgentCard fetch was missed the first

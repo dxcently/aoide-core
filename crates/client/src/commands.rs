@@ -529,7 +529,7 @@ fn gen_message_id() -> String {
 /// second `add`).
 fn handle_peer_add(inv: &Invocation) -> Outcome {
     let cmd = "peer.add";
-    const USAGE: &str = "usage: aoide peer add <name> <url> [--autogate] [--via ssh://[user@]host[:port]] [--json]";
+    const USAGE: &str = "usage: aoide peer add <name> <url> [--autogate] [--no-verify] [--via ssh://[user@]host[:port]] [--json]";
     let name = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         Some(n) => n.to_string(),
         None => return Outcome::usage(cmd, USAGE),
@@ -559,6 +559,7 @@ fn handle_peer_add(inv: &Invocation) -> Outcome {
         .with_data(json!({ "reason": "invalid-name", "name": name }));
     }
     let autogate = inv.flag_present("autogate");
+    let no_verify = inv.flag_present("no-verify");
     let token_file = inv.flags.get("token-file").cloned().filter(|s| !s.is_empty());
     let bearer_secret = inv.flags.get("bearer-secret").cloned().filter(|s| !s.is_empty());
 
@@ -583,28 +584,40 @@ fn handle_peer_add(inv: &Invocation) -> Outcome {
     // involved either way (a card fetch is a plain GET, never a signed
     // request), so there is no canonical-string path to keep in sync
     // here, unlike the signed peer calls this funnel also serves.
-    let card_url = crate::wire::resolve_card_url(&url);
-    let fetch_url = match resolve_dial_url(&card_url, via.as_ref(), &name) {
-        Ok(u) => u,
-        Err(e) => {
-            return Outcome::error(cmd, format!("opening a tunnel to verify peer AgentCard at {card_url}: {e}"))
-                .with_data(json!({ "reason": "tunnel-failed", "url": card_url }))
+    //
+    // `--no-verify` skips this entire block — for a peer that serves no
+    // AgentCard at all (a plain A2A client endpoint, e.g. an inbound-only
+    // harness like Melete that never stood up the discovery surface this
+    // fetch expects). The peer is still recorded exactly as the verified
+    // path records it below: `verified` was already hardcoded `false` on
+    // this path regardless (a card fetch is reachability, never identity
+    // — that only ever comes from `peer pair`), so skipping the fetch
+    // changes nothing about what gets written, only whether this one GET
+    // runs first.
+    if !no_verify {
+        let card_url = crate::wire::resolve_card_url(&url);
+        let fetch_url = match resolve_dial_url(&card_url, via.as_ref(), &name) {
+            Ok(u) => u,
+            Err(e) => {
+                return Outcome::error(cmd, format!("opening a tunnel to verify peer AgentCard at {card_url}: {e}"))
+                    .with_data(json!({ "reason": "tunnel-failed", "url": card_url }))
+            }
+        };
+        let (code, body) = match run_curl(&["--", &fetch_url], None) {
+            Ok(v) => v,
+            Err(e) => {
+                return Outcome::error(cmd, format!("verifying peer AgentCard at {card_url}: {e}"))
+                    .with_data(json!({ "reason": "fetch-failed", "url": card_url }))
+            }
+        };
+        if code != 200 {
+            return Outcome::error(cmd, format!("verifying peer AgentCard at {card_url}: HTTP {code}"))
+                .with_data(json!({ "reason": "fetch-http-error", "url": card_url, "httpCode": code }));
         }
-    };
-    let (code, body) = match run_curl(&["--", &fetch_url], None) {
-        Ok(v) => v,
-        Err(e) => {
-            return Outcome::error(cmd, format!("verifying peer AgentCard at {card_url}: {e}"))
-                .with_data(json!({ "reason": "fetch-failed", "url": card_url }))
+        if serde_json::from_str::<Value>(&body).is_err() {
+            return Outcome::error(cmd, format!("verifying peer AgentCard at {card_url}: unparseable response"))
+                .with_data(json!({ "reason": "card-unparseable", "url": card_url }));
         }
-    };
-    if code != 200 {
-        return Outcome::error(cmd, format!("verifying peer AgentCard at {card_url}: HTTP {code}"))
-            .with_data(json!({ "reason": "fetch-http-error", "url": card_url, "httpCode": code }));
-    }
-    if serde_json::from_str::<Value>(&body).is_err() {
-        return Outcome::error(cmd, format!("verifying peer AgentCard at {card_url}: unparseable response"))
-            .with_data(json!({ "reason": "card-unparseable", "url": card_url }));
     }
 
     let peer = aoide_storage::peer_store::Peer {
@@ -1237,6 +1250,7 @@ pub fn register_peers(r: &mut Registry) {
         ],
         flags: [
             flag!("autogate", "bool", "Trust this peer: its inbound message/send auto-delivers without the pending queue."),
+            flag!("no-verify", "bool", "Skip the AgentCard fetch entirely and register the peer unverified — for a peer that serves no AgentCard (a plain A2A client endpoint). `verified` stays false either way; a card fetch was never identity, only reachability."),
             flag!("token-file", "string", "Path to a file holding the shared secret this peer must present (Authorization: Bearer <token>) to be identified as this peer — required for --autogate to survive a proxy/tunnel, where every caller's address looks the same."),
             flag!("bearer-secret", "string", "Name of a secret, resolved fresh on every outbound call through the local secrets broker, THIS instance presents as Authorization: Bearer <value> when calling this peer's own A2A door. Absent = no bearer sent (today's behavior)."),
             flag!("via", "string", "An ssh://[user@]host[:port] transport marker — cross-box calls to this peer dial through an internal ssh tunnel to this target instead of the peer's own url directly. Absent = direct dial (today's behavior)."),
@@ -3089,6 +3103,65 @@ mod tests {
             assert_eq!(peers[0].via.as_deref(), Some("ssh://sakaki"));
 
             drop(listener);
+        });
+    }
+
+    /// `peer add --no-verify` (M3, task #16: Melete inbound via the
+    /// existing A2A door) skips the AgentCard fetch — `run_curl`'s ONE
+    /// call site for the whole command — entirely. Proven the same way
+    /// `aoide_secrets::enroll`'s `qrencode` shim and `aoide_secrets::
+    /// broker`'s `age-keygen` shim prove an external binary was (or
+    /// wasn't) invoked: a fake `curl` dropped earlier on `PATH` that, if
+    /// ever run, touches a marker file. No real network, no real curl
+    /// process — sandbox-safe. If this ever regresses to calling
+    /// `run_curl` anyway, the fake responds with neither a `200` nor
+    /// parseable JSON, so the command would ALSO fail — a false pass here
+    /// is not possible by construction.
+    #[test]
+    fn handle_peer_add_no_verify_never_invokes_curl() {
+        with_peer_state("add-no-verify", || {
+            let shim_dir = std::env::temp_dir().join(format!(
+                "aoide-client-peer-add-noverify-curlshim-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            ));
+            std::fs::create_dir_all(&shim_dir).unwrap();
+            let marker = shim_dir.join("curl-was-invoked");
+            let shim = shim_dir.join("curl");
+            std::fs::write(&shim, format!("#!/bin/sh\ntouch {}\nexit 1\n", marker.display())).unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let saved_path = std::env::var("PATH").ok();
+            std::env::set_var("PATH", format!("{}:{}", shim_dir.display(), saved_path.clone().unwrap_or_default()));
+
+            let inv = Invocation {
+                path: vec!["peer".to_string(), "add".to_string()],
+                args: vec!["melete".to_string(), "http://melete.example:8710/".to_string()],
+                flags: [("no-verify".to_string(), "true".to_string())].into_iter().collect(),
+                door: aoide_protocol::Door::Cli,
+            };
+            let out = handle_peer_add(&inv);
+
+            match saved_path {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+            let curl_ran = marker.exists();
+            let _ = std::fs::remove_dir_all(&shim_dir);
+
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
+            assert!(!curl_ran, "--no-verify must never invoke curl (the shim would have touched its marker)");
+
+            let peers = aoide_storage::peer_store::load_peers();
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].name, "melete");
+            assert_eq!(peers[0].url, "http://melete.example:8710/");
+            assert!(
+                !peers[0].verified,
+                "peer add --no-verify still records verified:false — a card fetch was never identity, only reachability"
+            );
         });
     }
 
