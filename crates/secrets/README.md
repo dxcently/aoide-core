@@ -1012,6 +1012,25 @@ watching secret events — ^C to leave (parked asks stay parked)
   name, consumer, remaining seconds) — never a code, never a value. Grep the
   spawn calls yourself (`watch::spawn_zenity_entry`/`watch::spawn_lyra_entry`)
   if in doubt.
+- **`--text` is UNTRUSTED display data (`reason`/`origin.comm` in
+  particular) and zenity renders `--text` as Pango markup by default, even
+  on `--entry`** (verified live on this host's zenity 4.2.2 — undocumented
+  under `--help-entry`'s own section, but accepted and honored there).
+  `spawn_zenity_entry`/`zenity_error_dialog` both pass `--no-markup`, so a
+  `reason` or an origin `comm` (self-asserted/process-controlled text, this
+  file's own honesty notes above) containing real markup, or a bare `&`,
+  renders as literal text instead of formatting or a parse warning.
+- **The dialog window can never be left orphaned when `lyra secrets ask`
+  itself is killed** — `watch.rs`'s own near-expiry/resolved-elsewhere kill
+  (`run_zenity_entry`/`run_lyra_entry`'s `child.kill()`) only ever reaches
+  the `lyra` PROCESS this crate spawned; the quickshell GRANDCHILD `lyra`
+  spawns is invisible to this crate (no pid, no handle), and `SIGKILL` is
+  untrappable, so `lyra`'s own best-effort cleanup of that grandchild never
+  runs in that case. `lyra`'s `spawn_quickshell` closes the gap on its own
+  side by arming `PR_SET_PDEATHSIG` on the quickshell child before it execs
+  — the kernel kills it the instant `lyra` dies, no cooperation needed from
+  either process at that moment. See `crates/lyra/AGENTS.md`'s own note for
+  the full mechanism; this crate's `AGENTS.md` has the matching half.
 - **Wrong code**: on the zenity path, a brief `zenity --error` shows, then
   the SAME ask's entry dialog re-opens; on the lyra path there is no separate
   error surface (P3's scope is the entry dialog only) — the ask simply stays

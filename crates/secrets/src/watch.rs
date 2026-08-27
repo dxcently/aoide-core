@@ -741,9 +741,25 @@ pub enum ZenityResult {
     SpawnError(String),
 }
 
+/// `--no-markup` (this commit, review fix): `--text` is built by
+/// interpolating `secret`/`consumer`/`reason`/the origin line — all
+/// UNTRUSTED display text (`ask.reason`/`ask.origin.comm` in particular,
+/// this crate's own honesty note: `comm` is PROCESS-CONTROLLED, any process
+/// can `prctl(PR_SET_NAME, ...)` itself to anything) — and zenity renders
+/// `--text` as Pango markup BY DEFAULT, on `--entry` too (verified live on
+/// this host, zenity 4.2.2: `--no-markup` is undocumented under `--help-
+/// entry`'s own "Text entry options" section but IS accepted there and DOES
+/// suppress markup — confirmed by screenshot, `<b>`/`&`/`<i>` rendered as
+/// literal text rather than bold/ampersand-entity/italic once passed). A
+/// `reason`/`comm` containing real Pango markup would otherwise render
+/// as formatting, or worse: `&` alone is an entity-reference PREFIX, so an
+/// unescaped `&` in an origin line can corrupt the rendered text or throw a
+/// GMarkup parse warning. Don't drop this flag "since the text is just a
+/// secret/consumer name" — `reason`/`origin` (P3) made this sink reachable
+/// with genuinely free-text, caller-influenced content for the first time.
 fn spawn_zenity_entry(zenity_cmd: &str, title: &str, text: &str) -> std::io::Result<Child> {
     Command::new(zenity_cmd)
-        .args(["--entry", "--title", title, "--text", text, "--extra-button", DISMISS_LABEL])
+        .args(["--entry", "--no-markup", "--title", title, "--text", text, "--extra-button", DISMISS_LABEL])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -878,8 +894,13 @@ fn run_ask_dialog(
 /// it's read; the ask stays parked underneath regardless of how long this
 /// sits open, same as the tty path's own wrong-code retry.
 fn zenity_error_dialog(zenity_cmd: &str, text: &str) {
+    // `--no-markup` for the identical reason `spawn_zenity_entry` carries
+    // it now (that function's own doc) — this dialog's own `text` only
+    // ever interpolates `ask.secret` today (charset-restricted by
+    // `policy::valid_secret_name`, never free text), but there is no
+    // reason to leave this sink one property away from the others.
     let _ = Command::new(zenity_cmd)
-        .args(["--error", "--text", text])
+        .args(["--error", "--no-markup", "--text", text])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -2216,6 +2237,32 @@ mod tests {
         let argv = std::fs::read_to_string(shim.parent().unwrap().join("argv.log")).unwrap();
         assert!(!argv.contains("--hide-text"), "argv must not carry --hide-text, got: {argv}");
         assert!(argv.contains("--entry"), "argv should still carry --entry, got: {argv}");
+        remove_shim(&shim);
+    }
+
+    /// Review fix: `--text` interpolates untrusted `reason`/`origin.comm`
+    /// (P3) and zenity renders `--text` as Pango markup by default, even on
+    /// `--entry` (`spawn_zenity_entry`'s own doc, confirmed live against
+    /// zenity on this host). `--no-markup` must ride every zenity dialog
+    /// this crate ever opens.
+    #[test]
+    fn spawn_zenity_entry_argv_carries_no_markup() {
+        let _guard = shim_lock();
+        let shim = write_shim("argv-no-markup", "#!/bin/sh\necho \"$@\" > \"$(dirname \"$0\")/argv.log\"\necho 111111\nexit 0\n");
+        let result = run_zenity_entry(shim.to_str().unwrap(), "t", "x", || false);
+        assert!(matches!(result, ZenityResult::Approved(_)), "expected Approved, got {result:?}");
+        let argv = std::fs::read_to_string(shim.parent().unwrap().join("argv.log")).unwrap();
+        assert!(argv.contains("--no-markup"), "argv must carry --no-markup, got: {argv}");
+        remove_shim(&shim);
+    }
+
+    #[test]
+    fn zenity_error_dialog_argv_carries_no_markup() {
+        let _guard = shim_lock();
+        let shim = write_shim("error-no-markup", "#!/bin/sh\necho \"$@\" > \"$(dirname \"$0\")/argv.log\"\nexit 0\n");
+        zenity_error_dialog(shim.to_str().unwrap(), "invalid code for `db-prod`");
+        let argv = std::fs::read_to_string(shim.parent().unwrap().join("argv.log")).unwrap();
+        assert!(argv.contains("--no-markup"), "argv must carry --no-markup, got: {argv}");
         remove_shim(&shim);
     }
 

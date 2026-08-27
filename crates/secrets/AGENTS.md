@@ -1179,6 +1179,26 @@
   resolved alone is sufficient, `zenity` missing in that case is simply
   never consulted (mirrors the "the env tier is trusted unconditionally"
   reasoning `resolve_lyra_bin`'s own doc comment gives).
+- **On the `lyra` path, `run_entry_dialog`'s `child.kill()` (near-expiry,
+  resolved-elsewhere) only ever reaches the `lyra` PROCESS — the quickshell
+  GRANDCHILD it spawned is a separate process this crate never sees a
+  handle to, and `SIGKILL` (what `.kill()` sends) is UNTRAPPABLE, so `lyra`'s
+  own cleanup code (`aoide_lyra::commands::secrets::spawn_and_wait_for_
+  marker`'s own `child.kill()` on quickshell) never runs when THIS is what
+  killed it (review fix, ownership-chain note; `crates/lyra/AGENTS.md`
+  carries this crate's own half in full).** This crate's own kill-by-EXACT-
+  pid discipline (this file's `run_zenity_entry`/`run_lyra_entry` invariant,
+  above) is still correct and still necessary — it is what stops a `lyra`
+  process (and everything under it) from lingering — but it is NOT what
+  closes the quickshell WINDOW in that case; `lyra`'s own `spawn_quickshell`
+  arms `PR_SET_PDEATHSIG` on the quickshell child specifically so the KERNEL
+  closes that gap the instant `lyra` itself dies, no cooperation from either
+  process's own code required at the moment of death. Don't read a future
+  `lyra secrets ask` rewrite that drops `PR_SET_PDEATHSIG` as "this crate's
+  problem to solve from the `watch.rs` side" — `aoide-secrets` has no
+  visibility into `lyra`'s own process tree (no pid, no process-group
+  handle) to kill a grandchild it never held even a handle to; the fix has
+  to live where the grandchild is actually spawned.
 - **A parked ask carries an OPTIONAL "context block" — `reason` (free-text,
   self-asserted) and `origin` (best-effort, kernel-traced) — for a popup/
   prompt surface to show WHY and FROM WHERE an ask exists, not just which
