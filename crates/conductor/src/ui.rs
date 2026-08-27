@@ -112,10 +112,10 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
 fn keymap_hint(panel: Panel) -> &'static str {
     match panel {
         Panel::Graph => {
-            "j/k walk · g/G ends · Enter jump · p prune · e emit · Tab panel · ? help · q quit"
+            "j/k walk · g/G ends · Enter jump · p prune · Tab panel · ? help · q quit"
         }
         Panel::Sessions => {
-            "j/k select · Enter jump/fold · h/l fold · L link · a add · d rm · p prune · e emit · ? help · q quit"
+            "j/k select · Enter jump/fold · h/l fold · L link · a add · d rm · p prune · ? help · q quit"
         }
         Panel::Projects => "j/k select · a add · d remove · Tab panel · ? help · q quit",
         Panel::Log => "Tab panel · ? help · q quit",
@@ -849,7 +849,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         "    g / G            jump to first / last node",
         "    Enter            cue window · tail the log if headless",
         "    Esc / q          close the log tail (Enter also closes it)",
-        "    p / e            prune done · emit graph.json",
+        "    p                prune done sessions (also restages graph.json)",
         "    ◆ project  ● session   ⟨tag⟩ read-only tag",
         "",
         "  SESSIONS",
@@ -858,7 +858,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         "    h / l            fold / unfold the group",
         "    L                link the session under a parent",
         "    a / d            add / remove a project anchor",
-        "    p / e            prune done · emit the DAG",
+        "    p                prune done sessions (restages the DAG)",
         "    ♪ 𝄐 𝄁 𝄽 𝄂        working · awaiting · stopped · idle · done   ‣ fresh",
         "",
         "  PROJECTS: a add · d remove",
@@ -1207,7 +1207,7 @@ mod tests {
                 ts: 1,
                 door: "cli".into(),
                 class: "audit".into(),
-                command: "graph.emit".into(),
+                command: "graph.prune".into(),
                 status: "ok".into(),
                 message: "staged".into(),
             },
@@ -1221,7 +1221,7 @@ mod tests {
             },
         ];
         let out = render_panel(&app, Panel::Log, 100, 20);
-        assert!(out.contains("graph.emit") && out.contains("graph.focus"));
+        assert!(out.contains("graph.prune") && out.contains("graph.focus"));
         assert!(out.contains("cli"), "door column visible");
     }
 

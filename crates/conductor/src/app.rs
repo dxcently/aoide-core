@@ -1280,7 +1280,6 @@ impl App {
                 }
             }
             KeyCode::Char('p') => self.dispatch(&["graph", "prune"], &[]),
-            KeyCode::Char('e') => self.dispatch(&["graph", "emit"], &[]),
             _ => {}
         }
     }
@@ -1348,7 +1347,6 @@ impl App {
                 }
             }
             KeyCode::Char('p') => self.dispatch(&["graph", "prune"], &[]),
-            KeyCode::Char('e') => self.dispatch(&["graph", "emit"], &[]),
             _ => {}
         }
     }
