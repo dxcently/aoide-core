@@ -503,10 +503,9 @@ pub fn valid_peer_name(name: &str) -> bool {
 }
 
 /// The `scheme://host[:port]` authority of a URL (drops any path/query),
-/// bare (no trailing slash) — pure. Mirrors `aoide-client`'s private
-/// `wire::origin_of`, but lives here (not `aoide-client`) since the SERVER
-/// side's inbound autogate match needs it too, and `server` must never
-/// depend on `client`.
+/// bare (no trailing slash) — pure. Lives here (not `aoide-client`) since
+/// the SERVER side's inbound autogate match needs it too, and `server`
+/// must never depend on `client`.
 pub fn url_host(url: &str) -> Option<String> {
     let (_, rest) = url.trim().split_once("://")?;
     let host = rest.split('/').next().unwrap_or(rest);
