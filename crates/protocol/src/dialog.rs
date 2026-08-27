@@ -350,8 +350,9 @@ mod tests {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A `bash` script named explicitly (never a bare `sh`, never a `PATH`
-    /// mutation) — sandbox-safe under a nix build's restricted `PATH`.
+    /// A `#!/bin/sh` script (the one interpreter the nix build sandbox
+    /// provides — `/usr/bin/env` does not exist there), never a `PATH`
+    /// mutation — sandbox-safe under a nix build's restricted `PATH`.
     fn write_shim(tag: &str, script: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "aoide-protocol-dialog-shim-{tag}-{}-{}",
@@ -381,7 +382,7 @@ mod tests {
     #[test]
     fn zenity_available_is_true_when_the_shim_spawns_and_exits_zero() {
         let _guard = shim_lock();
-        let shim = write_shim("version", "#!/usr/bin/env bash\necho zenity 3.99.0\nexit 0\n");
+        let shim = write_shim("version", "#!/bin/sh\necho zenity 3.99.0\nexit 0\n");
         assert!(zenity_available(shim.to_str().unwrap()));
         remove_shim(&shim);
     }

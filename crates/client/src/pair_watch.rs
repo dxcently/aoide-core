@@ -942,8 +942,10 @@ mod tests {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// `bash` named explicitly (never a bare `sh`), shell builtins only
-    /// (`echo`/`exit` — never an external `sleep`).
+    /// `#!/bin/sh` shebang (the one interpreter the nix build sandbox
+    /// provides — `/usr/bin/env` does not exist there; secrets' shims set
+    /// the precedent), shell builtins only (`echo`/`exit` — never an
+    /// external `sleep`).
     fn write_shim(tag: &str, script: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "aoide-client-pair-confirm-shim-{tag}-{}-{}",
@@ -968,7 +970,7 @@ mod tests {
     #[test]
     fn confirm_dialog_exit_zero_is_approved() {
         let _guard = shim_lock();
-        let shim = write_shim("approve", "#!/usr/bin/env bash\nexit 0\n");
+        let shim = write_shim("approve", "#!/bin/sh\nexit 0\n");
         let result = confirm_dialog(shim.to_str().unwrap(), "t", "x", || false);
         assert!(matches!(result, DialogResult::Approved(_)), "expected Approved, got {result:?}");
         remove_shim(&shim);
@@ -977,7 +979,7 @@ mod tests {
     #[test]
     fn confirm_dialog_reject_label_on_stdout_is_dismissed() {
         let _guard = shim_lock();
-        let shim = write_shim("reject", "#!/usr/bin/env bash\necho 'Reject request'\nexit 1\n");
+        let shim = write_shim("reject", "#!/bin/sh\necho 'Reject request'\nexit 1\n");
         let result = confirm_dialog(shim.to_str().unwrap(), "t", "x", || false);
         assert!(matches!(result, DialogResult::Dismissed), "expected Dismissed, got {result:?}");
         remove_shim(&shim);
@@ -986,7 +988,7 @@ mod tests {
     #[test]
     fn confirm_dialog_bare_cancel_is_cancelled_not_dismissed() {
         let _guard = shim_lock();
-        let shim = write_shim("cancel", "#!/usr/bin/env bash\nexit 1\n");
+        let shim = write_shim("cancel", "#!/bin/sh\nexit 1\n");
         let result = confirm_dialog(shim.to_str().unwrap(), "t", "x", || false);
         assert!(matches!(result, DialogResult::Cancelled), "expected Cancelled, got {result:?}");
         remove_shim(&shim);
