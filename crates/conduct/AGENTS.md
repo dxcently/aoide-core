@@ -294,6 +294,36 @@
   explicit `--parent` > ancestry walk > env, in that order, for all three of
   `wrap`/`conduct`/`spawn` (spawn re-execs `conduct --headless`, so fixing
   `conduct`'s own call covers it).
+- **Bare `session` is the undying PICKER, and there is exactly one scripted
+  spelling for the mark — `session undying on|off --id <id>` (U1).** Don't
+  add a `--undying` flag or any other scripted shortcut to bare `session`'s
+  own registration — a non-interactive reach (non-CLI door, no tty,
+  `--json`) is ALWAYS steered to that one existing spelling
+  (`session_pick.rs::require_cli_tty`), never given a second one of its
+  own. Don't gate the picker on `Door::Cli` alone either — `pick::
+  interactive` also requires a real stdin/stdout tty, and `--json` must
+  refuse even ON a real tty (a picker's prompts have no business
+  interleaving with a machine-readable stream a caller explicitly asked
+  for).
+- **`session_pick.rs` never live-probes a peer.** Its peer rows come from
+  `peer_store::load_peer_cache` fed through `who.rs`'s `sessions_from_graph`
+  (widened `pub(super)`, `SessionView` alongside it, U3) — the SAME
+  cache `send --to peer/<query>` resolves against. Don't route it through
+  `who::probe_peers`/`who_with`'s live-pull path "for freshness" — the
+  brief this landed under is explicit that the picker's own tty round-trip
+  must never block on network I/O, and `who`/`who --all` already own the
+  live-presence job.
+- **A peer row's mark writes a `.aoide/project.json` spec, never
+  `state/undying.json` (U3) — the id lives on the peer, this conductor
+  cannot write ITS store.** `session_pick.rs::apply_diff` resolves "current
+  project" via `aoide_storage::manifest::walk_up` from cwd, the identical
+  discovery `resurrect`'s own bare-manifest mode uses (U2); no manifest
+  found there is NEVER a reason to create one — every peer
+  mark/unmark in that confirm reports `skipped[]` with a taught reason
+  instead, while any LOCAL rows in the SAME confirm still apply normally.
+  Don't fold the "no manifest" case into a hard command failure — a picker
+  confirm can genuinely be half-local, half-peer, and the local half's
+  success must never be held hostage to the peer half's missing manifest.
 - **`who` is a projection, never a store.** It must never write
   `state/peer-cache/<name>.json` — `build_graph`'s own fold (`doc.rs`) is
   the ONLY writer of that cache. `who`'s live probe reads straight off the

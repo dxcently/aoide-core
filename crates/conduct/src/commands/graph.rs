@@ -301,6 +301,23 @@ pub fn register(r: &mut Registry) {
     // landed after every entry above it. The golden test sorts before
     // comparing, so this costs nothing there; `schema --json` order is what
     // the append-only rule protects.
+    // ── bare `session`: the undying PICKER (U3, command-defrag lane U) ──
+    // Same parent-command pattern R1 established for bare `graph` (path
+    // ["graph"] alongside ["graph", "link"]): registered here, at the END,
+    // beside `session undying` (which it steers non-interactive/non-tty
+    // callers toward) rather than up with `session start`/`session end` —
+    // registration order matters (`crates/AGENTS.md`), and this landed
+    // after every entry above it.
+    r.insert(cmd!(
+        path: ["session"],
+        summary: "Open the undying PICKER on a real CLI terminal: a multi-select over this box's own sessions plus every registered peer's CACHED sessions (no live pulls), each row pre-checked by its current undying state. Confirm toggles the diff — local rows through state/undying.json, peer rows as a spec in the CURRENT project's .aoide/project.json (no manifest above cwd: peer marks are skipped with a taught reason, local marks in the same confirm still apply). Non-tty, a non-CLI door, or --json: a taught usage error steering to the scripted spelling below — there is no second one.",
+        args: [],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: crate::graph::session_pick,
+        examples: ["session"],
+    ));
     r.insert(cmd!(
         path: ["session", "undying"],
         summary: "Mark or unmark a session as durable in state/undying.json, so a project's whole undying set can later be resurrected together. Bare and --self both resolve the target from $AOIDE_SESSION_ID; --id targets any session id directly, including one already gone from the roster — no roster lookup gates the write, which is what makes the mark flippable post-mortem.",

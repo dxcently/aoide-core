@@ -26,6 +26,7 @@ mod spawn;
 #[cfg(test)]
 pub(crate) mod testutil;
 mod manage;
+mod session_pick;
 mod undying;
 mod who;
 mod window;
@@ -70,6 +71,10 @@ pub use self::resurrect::session_resurrect;
 // command-defrag lane U1): the mark that lets a project's whole undying set
 // be resurrected together — see `graph/undying.rs`'s module doc.
 pub use self::undying::session_undying;
+// Bare `session` (U3, command-defrag lane U): the undying PICKER — a tty
+// multi-select over local + peer-cached sessions, each row pre-checked by
+// its current undying state — see `graph/session_pick.rs`'s module doc.
+pub use self::session_pick::session_pick;
 pub use self::manage::{link, project_add, project_list, project_remove, prune, view};
 // `aoide who` (messaging/presence plan, P-C2): live presence over this
 // box's own sessions plus every registered peer — see `graph/who.rs`'s

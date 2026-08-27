@@ -66,16 +66,22 @@ use std::sync::Arc;
 /// closure) share the exact same call shape.
 pub(super) type PullFn = Arc<dyn Fn(&Peer) -> Result<Value, String> + Send + Sync>;
 
-/// One session as `who` renders it — local or remote, uniformly.
+/// One session as `who` renders it — local or remote, uniformly. Widened to
+/// `pub(super)` (fields too) for a second consumer: `session_pick.rs`'s
+/// bare-`session` picker (U3, command-defrag lane U) builds its peer rows
+/// off the same [`sessions_from_graph`] extraction rather than re-parsing a
+/// peer's cached graph document a second time (this crate's own "no
+/// cross-crate copying" discipline, applied in-file — see [`glyph`]'s own
+/// widening note above for the precedent).
 #[derive(Debug, Clone, PartialEq)]
-struct SessionView {
-    session_id: String,
-    label: String,
-    petname: Option<String>,
-    agent: String,
-    state: String,
-    presence: &'static str,
-    cwd: String,
+pub(super) struct SessionView {
+    pub(super) session_id: String,
+    pub(super) label: String,
+    pub(super) petname: Option<String>,
+    pub(super) agent: String,
+    pub(super) state: String,
+    pub(super) presence: &'static str,
+    pub(super) cwd: String,
 }
 
 /// One node (this box, or one registered peer) as `who` renders it.
@@ -133,7 +139,7 @@ fn build_local_node(sessions: &[SessionRecord], hooks: &[HookRecord], host: &str
 /// (`doc.rs:122-134`). `host` is the label prefix — the peer's registered
 /// name for a remote graph, mirroring the `peer/<rest>` grammar
 /// `storage::addr` resolves queries against.
-fn sessions_from_graph(graph: &Value, host: &str) -> Vec<SessionView> {
+pub(super) fn sessions_from_graph(graph: &Value, host: &str) -> Vec<SessionView> {
     let empty: Vec<Value> = Vec::new();
     let nodes = graph.get("nodes").and_then(Value::as_array).unwrap_or(&empty);
     let edges = graph.get("edges").and_then(Value::as_array).unwrap_or(&empty);

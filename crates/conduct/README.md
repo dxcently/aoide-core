@@ -94,6 +94,35 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   between that edit and the write leaves the OLD id undying (retryable)
   rather than neither (silent loss) — the same bias a failed spawn gets
   deliberately, by never touching the store at all.
+- **The undying picker (U3, command-defrag lane U):** `graph/session_pick.rs`'s
+  `session_pick` is bare `session`'s handler — a parent command registered
+  alongside `session.*` the same way bare `graph` sits alongside `graph
+  link` (R1's pattern, reused rather than re-derived). CLI-only, tty-only
+  (`aoide_protocol::pick::interactive`, gated on `Door::Cli` first the same
+  shape `secrets`' admin quartet holds); a non-interactive reach — a
+  non-CLI door, no tty, or `--json` — always steers to `session undying
+  on|off --id <id>`, U1's scripted spelling, which stays the ONLY scripted
+  form: no `--undying` flag was added to bare `session` (one spelling per
+  capability). The picker itself reaches `aoide_protocol::pick::choose_many`
+  DIRECTLY — no new seam: that function already supports pre-checked
+  defaults and a clean `None` on Esc/EOF, and this crate already depends on
+  `aoide-protocol` the same way `song`'s own `prune_picker` does; there was
+  no missing primitive to add to `pick.rs`. Rows come from this box's own
+  roster (`merged_sessions`, never re-derived) plus every registered peer's
+  CACHED graph via `who.rs`'s `sessions_from_graph` (widened to `pub(super)`
+  this phase for exactly this second consumer, `SessionView` alongside it —
+  see `glyph`'s own widening note in `who.rs` for the precedent) — no live
+  peer probe anywhere in this module. A LOCAL row's mark toggles
+  `state/undying.json` through one load, N mutations, one save (widening
+  `session_undying`'s own single-id discipline to a whole confirm's diff at
+  once); a PEER row's mark writes a `.aoide/project.json` spec instead — the
+  id lives on the peer, so this conductor cannot write ITS store — resolved
+  against the CURRENT project via the exact same `walk_up` `resurrect`'s
+  bare mode already uses, U2, and NEVER auto-created: no manifest above cwd
+  reports every peer mark/unmark in that confirm as `skipped[]`, while any
+  local rows in the SAME confirm still land. See `CONTRACTS.md`'s
+  `.aoide/project.json` section for the exact spec-derivation and dedupe
+  rules.
 - `reap` — liveness reaping (`aoide session reap`), sweeping sessions a
   `SIGKILL`'d terminal could never mark `done`. `reap_and_announce` (the
   registered CLI handler) routes through `daemon_dispatch` first like every

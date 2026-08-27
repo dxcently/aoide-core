@@ -116,7 +116,10 @@ mod tests {
         // -> bare `send`/`spawn`/`resurrect`, `graph.session.*`/`graph.permit`/
         // `graph.pending.*`/`graph.reap`/`graph.prune` -> `session.*`,
         // `graph.project.*` -> `project.*`. See `conduct/src/commands/
-        // graph.rs`'s module doc for the full table.
+        // graph.rs`'s module doc for the full table. Bumped by 1 for bare
+        // `session` — the undying picker (U3, command-defrag lane U) — a
+        // parent command alongside `session.*` the same way bare `graph`
+        // sits alongside `graph.link`: reached 74.
         let mut expected: Vec<&str> = vec![
             "a2a.serve",
             "adapter.melete",
@@ -175,6 +178,7 @@ mod tests {
             "secrets.set-totp",
             "secrets.watch",
             "send",
+            "session",
             "session.end",
             "session.hook",
             "session.pending.approve",
