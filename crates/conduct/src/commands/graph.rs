@@ -81,7 +81,7 @@ pub fn register(r: &mut Registry) {
             flag!("id", "string", "Session id (required); its node id becomes session:<id>."),
             flag!("agent", "string", "Agent name driving the session (default claude)."),
             flag!("cwd", "string", "Working directory; the session anchors under the longest-prefix project."),
-            flag!("window", "string", "Hyprland window address for `graph focus` to jump to."),
+            flag!("window", "string", "Hyprland window address for the focus jump (`focus_session`) to use."),
             flag!("parent", "string", "Spawning session id — records the spawned-by edge (cycle-checked)."),
         ],
         gated: false,
@@ -216,15 +216,6 @@ pub fn register(r: &mut Registry) {
         gated: false,
         implemented: true,
         handler: crate::graph::session_permit,
-    ));
-    r.insert(cmd!(
-        path: ["graph", "focus"],
-        summary: "Jump to a session's window via hyprctl focuswindow (Terminal-Commander session jump).",
-        args: [arg!("node", "string", true, "Session id (or session:<id> node id) to focus.")],
-        flags: [],
-        gated: false,
-        implemented: true,
-        handler: crate::graph::focus,
     ));
     r.insert(cmd!(
         path: ["graph", "prune"],

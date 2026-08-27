@@ -94,7 +94,6 @@ mod tests {
             "content.register",
             "daemon",
             "events.tail",
-            "graph.focus",
             "graph.link",
             "graph.pending.approve",
             "graph.pending.deny",

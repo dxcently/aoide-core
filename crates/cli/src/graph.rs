@@ -21,9 +21,7 @@ pub use aoide_conduct::graph::{link, project_add, project_list, project_remove, 
 // `graph resurrect` (P-D8, `docs/architecture/AOIDED.md`'s "L5") — see this
 // crate's own `AGENTS.md`/README for the golden-count bump this landed with.
 pub use aoide_conduct::graph::session_resurrect;
-pub use aoide_conduct::graph::{
-    focus, focus_session, focus_window, run_hypr_window_listener, FocusError,
-};
+pub use aoide_conduct::graph::{focus_session, focus_window, run_hypr_window_listener, FocusError};
 
 // The `now_iso_utc` passthrough this shim used to carry for
 // `commands/usage.rs` is gone (Phase 9 restructure): `usage` moved to

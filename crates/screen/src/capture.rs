@@ -235,8 +235,8 @@ pub struct CaptureTarget {
 /// site, never a panic or a full-screen fallback. Address comparison reuses
 /// `graph::window`'s own `0x`/case-tolerant [`aoide_conduct::graph::normalize_addr`]
 /// — the stored/typed address and what a human pastes off `hyprctl clients`
-/// can disagree on both, exactly the same tolerance `graph::focus` already
-/// needs for the same reason.
+/// can disagree on both, exactly the same tolerance `graph::focus_session`/
+/// `graph::focus_window` already need for the same reason.
 pub fn find_window<'a>(clients: &'a [hypr::Client], address: &str) -> Option<&'a hypr::Client> {
     let want = aoide_conduct::graph::normalize_addr(address);
     clients.iter().find(|c| aoide_conduct::graph::normalize_addr(&c.address) == want)

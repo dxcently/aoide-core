@@ -501,7 +501,7 @@ fn deliver_local(inv: &Invocation, id: &str) -> Outcome {
     let cmd = "graph.send";
     // Accept the exact `session:<id>` form `graph view --json` emits for a
     // node id, so a copy-pasted id round-trips through `--id` — mirrors
-    // `graph focus`'s identical `session:` stripping (window.rs). Only this
+    // `focus_session`'s identical `session:` stripping (window.rs). Only this
     // known prefix is special-cased; anything else passes through untouched
     // and still falls into the `unknown session` error below, same as
     // before this fix. `--to`'s LOCAL branch already hands in a bare,
@@ -1572,7 +1572,7 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
                 .unwrap_or(false);
             // Best-effort: the hook is a subprocess of the agent's terminal, so
             // discover that window (+ its owning pid) now and register it — this
-            // is what makes a hook-only Claude session `graph focus`-jumpable.
+            // is what makes a hook-only Claude session focus-jumpable.
             // Workspace is stamped later by the shellbridge window-event listener
             // (resolve_pending_session_windows), which is authoritative and keeps
             // it fresh across moves — do_session_start carries only window + pid.

@@ -78,7 +78,7 @@ pub use self::manage::{link, project_add, project_list, project_remove, prune, v
 // conductor ROSTER panel is its second consumer (`who.rs`'s doc comment
 // on `glyph`), reused rather than redrawn.
 pub use self::who::{glyph, who};
-pub use self::window::{focus, focus_session, focus_window, run_hypr_window_listener, FocusError};
+pub use self::window::{focus_session, focus_window, run_hypr_window_listener, FocusError};
 
 // Storage/time passthroughs root's `a2a.rs` / `commands/{a2a,usage}.rs` still
 // reach at `crate::graph::{load_stage, now_iso_utc, sessions_path,

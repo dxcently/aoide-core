@@ -45,7 +45,7 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   it), `SessionRecord`/`SessionsFile`/`load_stage`/`write_stage`. `--id`
   accepts a bare session id OR the exact `session:<id>` form `graph view
   --json` emits for a node id (a known prefix stripped before matching,
-  same discipline `graph focus`/`focus_session` already used) — `graph
+  same discipline `focus_session` already used) — `graph
   view`'s own emitted contract is unchanged, only what `--id`/`--to` accept
   as input widened; an id with any OTHER prefix still errors as unknown,
   unchanged. `graph send` gained `--to <target>` (messaging plan P-C3, mutually exclusive

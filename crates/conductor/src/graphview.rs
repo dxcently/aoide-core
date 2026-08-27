@@ -52,7 +52,7 @@ pub struct Node {
     pub id: String,
     pub kind: NodeKind,
     pub label: String,
-    /// The bare session id (for `graph focus` on Enter); `None` for anchors.
+    /// The bare session id (for the focus jump on Enter); `None` for anchors.
     pub session_id: Option<String>,
     pub state: Option<String>,
     pub tags: Vec<String>,
@@ -158,7 +158,7 @@ pub fn build_model(app: &App) -> Model {
                 // <petname> (…<tail4>)`, degrading to `<host>/<role>/
                 // <sessionId>` for a legacy/petname-less node. `session_id`
                 // (below) stays the bare canonical id — this is the LABEL
-                // only, never what Enter/`graph focus` reads.
+                // only, never what Enter's focus jump reads.
                 let role = if spawned_targets.contains(id.as_str()) { "child" } else { "root" };
                 let petname = n.get("petname").and_then(|v| v.as_str()).map(str::to_string);
                 let rec = aoide_storage::records::SessionRecord {
@@ -705,7 +705,7 @@ mod tests {
         // project (depth 0) → root session (depth 1) → spawned kid (depth 2).
         // Session labels now render the display grammar (petnames plan P3),
         // not the bare id — so lookups here go through `session_id`, the
-        // field that stays the bare canonical id (Enter/`graph focus`
+        // field that stays the bare canonical id (Enter's focus jump
         // unaffected by the label change).
         let proj = m.nodes.iter().find(|n| n.label == "aoide").unwrap();
         let root = m.nodes.iter().find(|n| n.session_id.as_deref() == Some("root")).unwrap();

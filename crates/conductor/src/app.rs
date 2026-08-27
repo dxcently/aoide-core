@@ -268,7 +268,7 @@ pub struct App {
     /// The open headless-log-tail overlay, or `None` (closed) — the same
     /// modal role [`help_open`](Self::help_open) plays, richer payload. Enter
     /// on a session whose record carries `log_path` opens this instead of
-    /// dispatching `graph focus` ([`App::cue_session`]); lib.rs's
+    /// focusing the session's window ([`App::cue_session`]); lib.rs's
     /// `handle_key` swallows keys while it is `Some` the same way it does for
     /// the help overlay.
     pub tail: Option<LogTail>,
@@ -1031,7 +1031,8 @@ impl App {
     /// outcome for the status line, and refresh live state (an action likely
     /// wrote a stage file + an audit line). This is the ONLY way the conductor
     /// mutates anything — and it fires on the keypress itself, not on the next
-    /// tick, so a cue (Enter → `graph focus` → hyprctl) lands instantly.
+    /// tick, so an action (`p` → `graph prune` → a re-drawn roster) lands
+    /// instantly.
     pub fn dispatch(&mut self, path: &[&str], args: &[String]) {
         self.dispatch_with_flags(path, args, BTreeMap::new());
     }
@@ -1076,14 +1077,40 @@ impl App {
     /// headless child (false positive), and a pre-backfill interactive
     /// session can lack one (false negative) — `log_path` is the one field
     /// that means what we need. The windowed and neither-field cases are
-    /// UNCHANGED: `graph focus` dispatches exactly as before, including the
-    /// no-window-address status error when neither is set.
+    /// UNCHANGED in effect: the same no-window-address status error surfaces
+    /// when neither is set. Routing changed with `graph focus`'s deletion
+    /// (command-defrag lane, task #101) — the capability was never anything
+    /// but a thin CLI wrapper over [`graph::focus_session`], so Enter now
+    /// calls it directly instead of round-tripping through the registry
+    /// dispatcher, the same way the shellbridge socket loop already calls it
+    /// for a widget click (`shellbridge.rs`'s `focussession` verb). The
+    /// audit line this used to get for free from `dispatch` is written here
+    /// by hand so the one-audit-log invariant still holds.
     fn cue_session(&mut self, rec: &SessionRecord) {
         if rec.log_path.is_some() {
             self.open_tail(rec);
         } else {
             let id = rec.session_id.clone();
-            self.dispatch(&["graph", "focus"], &[id]);
+            let outcome = match graph::focus_session(&id) {
+                Ok(()) => Outcome::ok("graph.focus", format!("focused session `{id}`")),
+                Err(e) => Outcome::error("graph.focus", format!("{id}: {}", e.message)),
+            };
+            let status = match outcome.status {
+                Status::Ok => "ok",
+                Status::Error => "error",
+                Status::Usage => "usage",
+                Status::NotImplemented => "not-implemented",
+            };
+            let _ = aoide_protocol::audit(
+                &aoide_protocol::default_audit_log(),
+                Door::Cli,
+                aoide_protocol::EventClass::Audit,
+                "graph.focus",
+                status,
+                &outcome.message,
+            );
+            self.last_outcome = Some(outcome);
+            self.reload_all();
         }
     }
 
@@ -1222,7 +1249,7 @@ impl App {
     /// Keys for the DAG (Graph) panel. Navigation walks the same preorder node
     /// list the layout draws, so `j`/`k` can never point at a node that isn't on
     /// screen. Enter cues the selected session's window (the same
-    /// dispatch-backed `graph focus` the roster uses); `e` emits, `p` prunes —
+    /// [`App::cue_session`] focus jump the roster uses); `e` emits, `p` prunes —
     /// the two graph-wide commands — so the visual view is not read-only.
     fn handle_graph_key(&mut self, key: KeyEvent) {
         let nodes = crate::graphview::node_order(self);
@@ -1694,7 +1721,7 @@ mod tests {
         assert_eq!(rgb_to_ansi256(0, 0, 0), 16); // bottom of the cube (black)
     }
 
-    // ── Enter's branch: log tail vs. `graph focus` ──────────────────────────
+    // ── Enter's branch: log tail vs. the focus jump ─────────────────────────
 
     use serde_json::Map;
     use std::sync::Mutex;
@@ -1803,14 +1830,14 @@ mod tests {
         assert_eq!(tail.lines, vec!["hello".to_string(), String::new()]);
         assert!(
             app.last_outcome.is_none(),
-            "headless Enter must not dispatch graph focus"
+            "headless Enter must not focus a session"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn enter_on_a_windowed_roster_row_still_dispatches_graph_focus() {
+    fn enter_on_a_windowed_roster_row_still_focuses_the_session() {
         with_isolated_stage(|| {
             // No `log_path` — only `window_address` (set by the `session`
             // fixture) — so this is the unchanged branch.
@@ -1824,7 +1851,7 @@ mod tests {
             assert!(app.tail.is_none(), "a windowed session never opens a tail");
             assert!(
                 app.last_outcome.is_some(),
-                "windowed Enter still dispatches graph focus"
+                "windowed Enter still focuses the session"
             );
         });
     }

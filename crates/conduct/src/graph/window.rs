@@ -1,18 +1,16 @@
-//! Focus + Hyprland window discovery/reconcile/listener: `graph focus`, the
-//! shared verify-then-dispatch hyprctl seam, phase-② pid-ancestry window
-//! discovery, the authoritative `socket2` event listener, and the
-//! untracked-terminal (`win:*`) synthetic-record reconciler.
+//! Focus + Hyprland window discovery/reconcile/listener: the session-jump
+//! (`focus_session`/`focus_window`) capability, the shared verify-then-dispatch
+//! hyprctl seam, phase-② pid-ancestry window discovery, the authoritative
+//! `socket2` event listener, and the untracked-terminal (`win:*`)
+//! synthetic-record reconciler.
 
-use super::common::{require_args, stage_error};
 use super::conduct::proc_cwd;
 use super::doc::restage_graph;
 use super::model::{
     load_stage, sessions_path, write_stage, SessionRecord, SessionsFile, STAGE_GRAPH_VERSION,
 };
-use aoide_protocol::Invocation;
-use aoide_protocol::output::Outcome;
 use aoide_storage::fs::with_stage_lock;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -94,65 +92,20 @@ pub(crate) fn hyprctl_clients() -> Option<Vec<Value>> {
     }
 }
 
-/// `graph focus <node>` — jump to the session's window via hyprctl
-/// (the Terminal-Commander session-jump flow).
-///
-/// `hyprctl dispatch focuswindow` exits 0 even when the target window is gone,
-/// so we first list live clients (`hyprctl clients -j`) and verify the stored
-/// `windowAddress` is actually present before dispatching. A vanished terminal
-/// → structured `window-not-found` (exit 1), no dispatch.
-pub fn focus(inv: &Invocation) -> Outcome {
-    let args = match require_args(inv, &["node"]) {
-        Ok(a) => a,
-        Err(e) => return e,
-    };
-    // Accept both `session:<id>` node ids and bare session ids.
-    let id = args[0]
-        .strip_prefix("session:")
-        .unwrap_or(&args[0])
-        .to_string();
-    let file: SessionsFile = match load_stage(&sessions_path()) {
-        Ok(f) => f,
-        Err(e) => return stage_error("graph.focus", e),
-    };
-    let Some(rec) = file.sessions.iter().find(|s| s.session_id == id) else {
-        return Outcome::error("graph.focus", format!("unknown session `{id}`"))
-            .with_data(json!({ "reason": "session-not-found", "node": id }));
-    };
-    if rec.window_address.is_empty() {
-        return Outcome::error(
-            "graph.focus",
-            format!("session `{id}` has no windowAddress to focus"),
-        )
-        .with_data(json!({ "reason": "no-window-address", "node": id }));
-    }
-    let addr = rec.window_address.clone();
-
-    // Verify + dispatch through the shared focus fn (the same path the
-    // shellbridge socket loop drives on a widget click).
-    match focus_window(&addr) {
-        Ok(()) => Outcome::ok("graph.focus", format!("focused session `{id}`"))
-            .changed([format!("focused window {addr}")])
-            .with_data(json!({ "node": id, "windowAddress": addr, "dispatcher": "hyprctl" })),
-        Err(e) => Outcome::error("graph.focus", format!("{}: {}", id, e.message)).with_data(json!({
-            "reason": e.reason,
-            "node": id,
-            "windowAddress": addr,
-        })),
-    }
-}
-
 /// A structured failure from [`focus_window`]. `reason` is a stable machine
 /// code (`hyprctl-unavailable` / `hyprctl-failed` / `window-not-found` /
-/// `no-window-address`) reused verbatim by `graph focus`'s error envelope.
+/// `no-window-address`) reused verbatim by every focus-jump caller's own
+/// error envelope (the conductor TUI and the shellbridge socket loop).
 #[derive(Debug, Clone)]
 pub struct FocusError {
     pub reason: &'static str,
     pub message: String,
 }
 
-/// The shared verify-then-dispatch used by BOTH `graph focus` (CLI) and the
-/// shellbridge socket loop (a widget click). `hyprctl dispatch focuswindow`
+/// The shared verify-then-dispatch used by BOTH the conductor TUI's Enter-key
+/// jump ([`focus_session`], called directly — no CLI command exists for this
+/// anymore) and the shellbridge socket loop (a widget click). `hyprctl
+/// dispatch focuswindow`
 /// exits 0 even when the target window is already gone, so we first list live
 /// clients (`hyprctl clients -j`) and confirm the address is actually present
 /// before dispatching — a vanished terminal is a `window-not-found` error, not
@@ -505,7 +458,7 @@ pub(in crate::graph) fn discover_window_address() -> Option<String> {
 /// Best-effort discovery of THIS process's terminal window address AND that
 /// window's owning pid (see [`discover_window_address`]). Shared by `conduct`
 /// (which wants only the address) and the hook door (which records both so a
-/// hook-registered Claude session becomes `graph focus`-jumpable). Guarded
+/// hook-registered Claude session becomes focus-jumpable). Guarded
 /// end-to-end: no Hyprland instance signature, a missing/failed `hyprctl`,
 /// unparseable JSON, or no ancestor match each yield `None` — never an error,
 /// never a slow path beyond one quick `hyprctl` call.
@@ -524,7 +477,7 @@ pub(in crate::graph) fn discover_window() -> Option<(String, u32, Option<i64>)> 
 /// pid) when it is still empty. The hook runs as a subprocess of the agent in
 /// its terminal, so [`discover_window`]'s pid-ancestry ↔ `hyprctl clients` walk
 /// finds that terminal window — giving a Claude Code session (which registers
-/// via `SessionStart` with no window) something for `graph focus` to jump to.
+/// via `SessionStart` with no window) something for the focus jump to reach.
 /// Cheaply gated on `HYPRLAND_INSTANCE_SIGNATURE` and on the address being
 /// empty (so once discovered, later hooks skip all work); a miss leaves the
 /// address empty exactly as before. Only ever fills `windowAddress`/`pid` — it
@@ -602,7 +555,7 @@ pub(in crate::graph) fn ensure_session_window(id: &str) {
 //
 // The hook-time backfill above is LAZY — a session's `windowAddress` only lands
 // on the *next* hook fire, so at click time it is frequently empty and the
-// widget's `graph focus` jump fails. The fix is EVENT-DRIVEN, creation-time
+// widget's focus jump fails. The fix is EVENT-DRIVEN, creation-time
 // capture: the shellbridge service runs a background thread reading Hyprland's
 // `socket2` event stream and, the moment a window opens (or moves / retitles /
 // closes), it (re)resolves every tracked session's window authoritatively. This
@@ -1174,6 +1127,7 @@ pub fn run_hypr_window_listener() {
 mod tests {
     use super::*;
     use crate::graph::testutil::*;
+    use serde_json::json;
 
     #[test]
     fn read_timeout_predicate_distinguishes_tick_from_drop() {

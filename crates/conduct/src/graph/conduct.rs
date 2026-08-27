@@ -951,7 +951,8 @@ fn conduct_multiplex(
 /// mirrored, real code in `data.exitCode`; `AOIDE_SESSION_ID` exported) PLUS: its
 /// own PTY + controlling tty, a per-session injection socket, the
 /// `conductable`/`socket` fields on the record so `graph send` can steer it, and
-/// a best-effort `windowAddress` (phase ② discovery) so `graph focus` can jump.
+/// a best-effort `windowAddress` (phase ② discovery) so the focus jump
+/// (`focus_session`) can reach it.
 pub fn session_conduct(inv: &Invocation) -> Outcome {
     let cmd = "conduct";
     if inv.args.is_empty() {
