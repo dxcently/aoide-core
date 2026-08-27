@@ -20,6 +20,10 @@ aoide-storage = { workspace = true }
 # rather than sending no bearer at all. `aoide-secrets` depends on nothing in
 # this crate's own tree (protocol/libc/serde/serde_json only), so no cycle.
 aoide-secrets = { workspace = true }
+# `tunnel` (P-S3) SIGTERMs a recorded ssh child's pid directly (`libc::kill`)
+# — the same crate/version every other pid-signaling site in this workspace
+# already depends on (`secrets::backend::kill_process_group`).
+libc = { workspace = true }
 
 [dev-dependencies]
 # `daemon`'s tests mutate `AOIDE_DAEMON_SOCKET` — the shared env-serialization

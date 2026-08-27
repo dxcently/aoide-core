@@ -164,6 +164,29 @@
   advertised url instead" fallback or flag — an advertiser that wants its
   advertised url dialed can bind its door somewhere routable; guessing
   which of the two the operator meant is not this code's job.
+- **`tunnel` is the ONE place `Command::new("ssh")` is ever written in this
+  workspace (P-S3) — a new cross-box call site resolves a dial url through
+  `open_or_reuse`, never spawns its own `ssh`.** `aoide_storage::tunnel`
+  (P-S2) owns the record's shape and its pure helpers (parsing, path
+  rewriting, the runtime-dir layout); this module owns the child process:
+  spawning it, probing whether its forward answers, reusing a still-live
+  one, and tearing it down. `BatchMode=yes` on `spawn_ssh`'s argv is an
+  INVARIANT, not a preference — it is the mechanical form of the house rule
+  that aoide never automates ssh key setup: no password or host-key prompt
+  can ever appear, so a missing `authorized_keys` entry on the far end
+  fails fast (an `ssh` exit, caught by `open_or_reuse_with`'s own
+  `try_wait` check inside its poll loop, never merely waited out) instead
+  of hanging on a prompt nothing here could ever answer. **Aoide never
+  writes to anyone's `~/.ssh/authorized_keys`** — the taught errors
+  `spawn_ssh`/`open_or_reuse` return on a failed or timed-out open name the
+  one-time manual step (add this box's key to the far box's
+  `authorized_keys`) but never attempt it themselves. `close`'s
+  recycled-pid guard (`looks_like_our_ssh`, reading `/proc/<pid>/cmdline`)
+  is a DELIBERATE, documented tiny race, not an oversight: a pid recorded
+  by an earlier `aoide` invocation may have been recycled by the OS to an
+  unrelated process by the time `close` runs, so the pid alone is never
+  trusted — only a pid whose own cmdline is still `ssh` carrying this
+  record's exact `-L` spec is ever signaled.
 - **The self-invite guard (`discover::is_self_target`) runs BEFORE the
   proceed-confirm and BEFORE the ceremony, in `handle_peer_invite`, never
   inside `run_pair_request` (P-S1).** `run_pair_request` is shared with

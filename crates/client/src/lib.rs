@@ -24,12 +24,20 @@
 //! instead — this crate is outbound-only, and joining a multicast group to
 //! LISTEN is the client-side action here, mirroring every other `peer *`
 //! command's shape.
+//!
+//! `tunnel` (P-S3, ssh-transport lane) is the ONE place `ssh` is ever
+//! spawned: `open_or_reuse`/`close`/`close_all_for_session` open, probe,
+//! reuse, and tear down the loopback forward a cross-box peer action dials
+//! through when a `--via`/`Peer.via` transport marker is present.
+//! `aoide_storage::tunnel` (P-S2) owns the record's shape and every pure
+//! helper around it; this module owns the child process.
 
 pub mod adapter;
 pub mod commands;
 pub mod daemon;
 pub mod discover;
 pub mod peer;
+pub mod tunnel;
 pub mod wire;
 
 /// A crate-wide lock serialising every test that mutates process-global env
