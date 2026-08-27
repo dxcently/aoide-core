@@ -159,12 +159,14 @@
 //!
 //! - **An out-of-band write** (the direct-path fallback firing because this
 //!   daemon was briefly down, or a genuine hand edit) changes
-//!   `sessions.json`/`hooks.json` with nobody having called `graph emit`
-//!   afterward — [`HandEditWatcher::sweep`] already detects the mtime
-//!   change; [`reconcile_graph_projection`] is the ACTION this phase wires
-//!   into that seam (the module doc above names it as reserved for exactly
-//!   this): re-derive `graph.json` via `aoide_conduct::graph::emit`, the
-//!   SAME handler `graph emit` runs. There is no separate daemon-held
+//!   `sessions.json`/`hooks.json` with nobody having run a manual resync
+//!   (`graph prune`) afterward — [`HandEditWatcher::sweep`] already detects
+//!   the mtime change; [`reconcile_graph_projection`] is the ACTION this
+//!   phase wires into that seam (the module doc above names it as reserved
+//!   for exactly this): re-derive `graph.json` via `aoide_conduct::graph::
+//!   emit` — an internal-only function now (the CLI command was retired;
+//!   `graph prune` is the blessed manual resync, and `restage_graph` already
+//!   covers every mutation site). There is no separate daemon-held
 //!   roster to conflict with — the files ARE the truth at every instant, so
 //!   re-deriving from CURRENT content on the very next tick (≤ ~1s) is
 //!   "newest write wins" by construction.
@@ -354,7 +356,8 @@ fn internal_invocation(path: &[&str]) -> Invocation {
 
 /// P-D6 fold: given the base filenames [`HandEditWatcher::sweep`] just
 /// reported changed, re-derive `graph.json` (via `aoide_conduct::graph::
-/// emit`, the exact `graph emit` handler) when `sessions.json` or
+/// emit`, an internal-only function now — the CLI command was retired in
+/// favor of `graph prune`) when `sessions.json` or
 /// `hooks.json` was among them — module doc's "Graph residency" explains
 /// why re-deriving from CURRENT content is the whole fold (no separate
 /// daemon-held roster exists to conflict with). A no-op (returns `None`,
@@ -1364,8 +1367,8 @@ mod tests {
 
     /// `sessions.json` (or `hooks.json`) among the changed files DOES
     /// trigger a reconcile — `aoide_conduct::graph::emit` re-derives
-    /// `graph.json` from CURRENT stage content, the exact `graph emit`
-    /// handler, no forked logic.
+    /// `graph.json` from CURRENT stage content, the same internal function
+    /// every reconcile call reaches, no forked logic.
     #[test]
     fn reconcile_graph_projection_re_derives_graph_json_when_sessions_changed() {
         let (_guard, stage, saved) = isolated_stage();

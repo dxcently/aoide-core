@@ -1344,7 +1344,7 @@ fn spawn_refusal(resolved: Option<(&aoide_storage::peer_store::Peer, aoide_stora
 
 /// `aoide/graphSummary` (CONTRACTS.md §7): wrap the EXISTING resolved
 /// `graph.json` v0 document ([`resolve_graph_document`], the exact same
-/// function `graph view`/`graph emit` build their document with) in the
+/// function `graph view` builds its document with) in the
 /// federation envelope. No new graph vocabulary — `graph` below is that
 /// document verbatim.
 fn graph_summary(peer_name: &str, self_url: &str) -> Result<Value, (i64, String)> {
@@ -6085,7 +6085,7 @@ mod tests {
         assert_eq!(resp["instance"]["url"], "http://127.0.0.1:8710/");
         assert!(resp["instance"]["emittedAt"].as_str().unwrap().ends_with('Z'));
         // `graph` is EXACTLY what `resolve_graph_document` (the same function
-        // `graph view`/`graph emit` use) produces — no second vocabulary.
+        // `graph view` uses) produces — no second vocabulary.
         assert_eq!(resp["graph"], resolve_graph_document().unwrap());
         assert_eq!(resp["graph"]["schemaVersion"], "0");
         assert!(resp["graph"]["nodes"].is_array());

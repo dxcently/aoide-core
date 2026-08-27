@@ -54,7 +54,7 @@ pub fn register(r: &mut Registry) {
 /// * **an arg that names an existing file** — taken as a literal path.
 /// * **otherwise the arg is a committed-song NAME** →
 ///   `<song>/songbook/<name>/livery.json` (resolved through the same stage-dir
-///   seam as `graph emit`, so an `AOIDE_STAGE_DIR` override relocates it too).
+///   seam as `graph view`, so an `AOIDE_STAGE_DIR` override relocates it too).
 ///
 /// The `livery` command group (`commands/livery.rs`) re-implements this SAME rule
 /// as its own `resolve_notes` with a `skip` offset (its `emit` takes the target

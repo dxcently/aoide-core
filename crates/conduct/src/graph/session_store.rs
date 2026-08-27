@@ -542,7 +542,7 @@ pub(in crate::graph) fn stamp_harness_session_id(id: &str, harness_session_id: &
 /// this DOES call [`restage_graph`]: `build_graph` projects the field as a
 /// `resumed` edge beside `spawned`/`anchors` (CONTRACTS.md §4), so it must be
 /// RENDERED, not only held for internal use — the conductor needs to see the
-/// edge without a second `graph emit`. Change-only; a silent no-op for an
+/// edge without a second manual resync. Change-only; a silent no-op for an
 /// unknown id (the windowed spawn's own terminal may not have registered by
 /// the time `graph resurrect` gets here — an honest no-op, never a crash).
 pub(in crate::graph) fn stamp_resumed_from(id: &str, resumed_from: &str) {

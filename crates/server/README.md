@@ -70,8 +70,9 @@ the inbound half of the two-door contract (the outbound half is
 - **Graph residency (P-D6, `docs/architecture/AOIDED.md`'s "L4")** —
   `run_loop`'s tick, after narrating the hand-edit sweep above, does two
   more things every iteration: `reconcile_graph_projection(changed_files)`
-  re-derives `song/stage/graph.json` (via the exact `graph emit` handler —
-  no forked logic) whenever `sessions.json`/`hooks.json` is among the
+  re-derives `song/stage/graph.json` (via `aoide_conduct::graph::emit`, an
+  internal-only function now — the CLI command was retired in favor of
+  `graph prune` — no forked logic) whenever `sessions.json`/`hooks.json` is among the
   files the sweep just reported changed, so an out-of-band write (the
   direct-fallback CLI path, or a hand edit) is folded into the projection
   on the very next tick rather than waiting for the next dispatch to touch

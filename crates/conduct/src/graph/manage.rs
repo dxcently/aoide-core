@@ -317,8 +317,13 @@ pub fn prune(_inv: &Invocation) -> Outcome {
     .with_data(json!({ "removed": removed, "clearedParents": cleared }))
 }
 
-/// `graph emit` — stage the resolved DAG for Quickshell hot-reload
-/// (mirrors the `livery emit stage` pattern; atomic write).
+/// Stage the resolved DAG for Quickshell hot-reload (atomic write) —
+/// internal-only now. The CLI command was deleted (`restage_graph` already
+/// runs at every project/session mutation site, and `graph prune` is the
+/// blessed manual resync); this function survives as `aoide-server`'s own
+/// out-of-band reconciliation call (`daemon.rs::reconcile_graph_projection`),
+/// which needs a re-derive reachable from outside this crate — `restage_graph`
+/// itself is `pub(crate)`.
 pub fn emit(_inv: &Invocation) -> Outcome {
     let (p, s, h) = match load_inputs("graph.emit") {
         Ok(v) => v,

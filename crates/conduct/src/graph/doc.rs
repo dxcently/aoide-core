@@ -564,8 +564,8 @@ pub(crate) fn ledger_session_exit(rec: &SessionRecord, ended_at: &str) {
 }
 
 /// Re-stage `graph.json` from the CURRENT registries so the document Quickshell
-/// hot-reloads never drifts from what `graph view` (and a fresh `graph emit`)
-/// would compute. Every mutation of projects/sessions calls this, so the staged
+/// hot-reloads never drifts from what `graph view` (and `graph prune`'s
+/// manual resync) would compute. Every mutation of projects/sessions calls this, so the staged
 /// graph is always a pure function of the registries — the staged doc can no
 /// longer go stale behind a `project add`/`remove`/`link`/`prune`.
 pub(crate) fn restage_graph() -> Result<PathBuf, String> {
@@ -582,7 +582,7 @@ pub(crate) fn restage_graph() -> Result<PathBuf, String> {
 /// the exact same three-file-load-then-`build_graph` shape [`restage_graph`]
 /// runs (minus the write). `pub`, not `pub(crate)`: `aoide-server`'s
 /// `aoide/graphSummary` (CONTRACTS.md §7) reuses this so the wire response
-/// and a fresh `graph view --json` / `graph emit` can never diverge into two
+/// and a fresh `graph view --json` can never diverge into two
 /// graph vocabularies — the whole point of wrapping `build_graph`'s output
 /// verbatim rather than inventing a second shape for the federation door.
 pub fn resolve_graph_document() -> Result<Value, String> {

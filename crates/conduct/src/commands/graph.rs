@@ -138,7 +138,7 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["graph", "resurrect"],
-        summary: "Revive resumable sessions off the durable ledger (state/session-ledger.jsonl): resolves --project by exact name, anchors ledger entries to it (longest-prefix, same rule `graph emit` uses), then selects. Bare (no --all/--id) resumes the project's WHOLE carried set (state/carry.json, `graph session carry on|off`) minus any id already alive; --all widens to every anchored entry; --id narrows to one. Each candidate resolves through two arms: a harness with a verified resume argv spawns windowed running `<harness> --resume <id>`; a conducted TERMINAL (no harness profile, but a captured `restore` snapshot) spawns windowed running its login shell, then — once registered — either re-execs its last foreground command (`--yes --submit`, only when it was demonstrably running one, and never for a recorded `sudo …`) or preloads its last typed-but-unsubmitted line into the new prompt (`--yes`, deliberately never `--submit` — nothing runs without a human keystroke) or delivers nothing if it was idle with no typed line. Neither arm resolving is skipped with a taught message. The revived session always mints a NEW sessionId (ids are never recycled) and is stamped resumedFrom, rendered as a `resumed` graph edge; a carried old id transfers its mark onto the new one. A windowed-spawn failure (no $AOIDE_TERMINAL / no display) is folded into `failed` rather than erroring the command, so a headless host degrades gracefully.",
+        summary: "Revive resumable sessions off the durable ledger (state/session-ledger.jsonl): resolves --project by exact name, anchors ledger entries to it (longest-prefix, same rule `graph view` uses), then selects. Bare (no --all/--id) resumes the project's WHOLE carried set (state/carry.json, `graph session carry on|off`) minus any id already alive; --all widens to every anchored entry; --id narrows to one. Each candidate resolves through two arms: a harness with a verified resume argv spawns windowed running `<harness> --resume <id>`; a conducted TERMINAL (no harness profile, but a captured `restore` snapshot) spawns windowed running its login shell, then — once registered — either re-execs its last foreground command (`--yes --submit`, only when it was demonstrably running one, and never for a recorded `sudo …`) or preloads its last typed-but-unsubmitted line into the new prompt (`--yes`, deliberately never `--submit` — nothing runs without a human keystroke) or delivers nothing if it was idle with no typed line. Neither arm resolving is skipped with a taught message. The revived session always mints a NEW sessionId (ids are never recycled) and is stamped resumedFrom, rendered as a `resumed` graph edge; a carried old id transfers its mark onto the new one. A windowed-spawn failure (no $AOIDE_TERMINAL / no display) is folded into `failed` rather than erroring the command, so a headless host degrades gracefully.",
         args: [],
         flags: [
             flag!("project", "string", "Project name to resurrect a session for (required); resolved against projects.json by exact name."),
@@ -247,15 +247,6 @@ pub fn register(r: &mut Registry) {
             "graph reap",
             "graph reap --announce",
         ],
-    ));
-    r.insert(cmd!(
-        path: ["graph", "emit"],
-        summary: "Stage the resolved DAG to song/stage/graph.json for Quickshell hot-reload (atomic).",
-        args: [],
-        flags: [],
-        gated: false,
-        implemented: true,
-        handler: crate::graph::emit,
     ));
     // ── conduct: the PTY-backed conductable wrap (concepts/Conductor-Channel) ─
     r.insert(cmd!(

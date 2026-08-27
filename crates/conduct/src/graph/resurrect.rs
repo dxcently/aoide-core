@@ -7,7 +7,7 @@
 //!
 //! Selection: resolve `--project <x>` against `projects.json` by exact name,
 //! read every ledger line whose `cwd` anchors to it (the SAME longest-
-//! path-prefix rule `graph emit`'s `anchor_for` uses — reused, never
+//! path-prefix rule `graph view`'s `anchor_for` uses — reused, never
 //! re-derived), then pick candidates. `--all` widens to every anchored
 //! entry; `--id` narrows to one specific ledger `sessionId`; bare (neither
 //! flag) resumes the project's WHOLE carried set (`state/carry.json`,

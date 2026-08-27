@@ -138,7 +138,7 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   `graph/resurrect.rs::session_resurrect` (`graph resurrect --project
   <name> [--all | --id <ledgerSessionId>]`) reads that ledger and anchors
   entries to a project by the SAME `anchor_for` longest-prefix rule `graph
-  emit` uses. Selection then branches on the flags: `--all` widens to every
+  view` uses. Selection then branches on the flags: `--all` widens to every
   anchored entry, `--id` narrows to one specific `sessionId`, and bare
   (neither flag) resumes the project's WHOLE carried set
   (`aoide_storage::carry`, `state/carry.json`, durable-sessions plan P-C4) —
