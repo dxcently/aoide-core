@@ -71,6 +71,25 @@ fn handle_rice_declare(inv: &Invocation) -> Outcome {
         }
     };
 
+    // Review fix (different-Sonnet pass on 07a42a0): `name` is joined
+    // unsanitized into both `songbook_dir` (the runtime root) and the
+    // checkout's `song/songbook/` below — without this check a `..`-shaped
+    // name escapes both roots (arbitrary read from `src`, arbitrary write
+    // to `dst`). Same validator `rice compose`/`rice mode` already gate on
+    // (`aoide_song::compose::valid_song_name`,
+    // `^[a-z0-9][a-z0-9-]*$` — rejects `..`/`/` by construction), checked
+    // BEFORE either path is built, not after.
+    if !aoide_song::compose::valid_song_name(&name) {
+        return Outcome::error(
+            "rice.declare",
+            format!(
+                "`{name}` is not a valid song name: must match `^[a-z0-9][a-z0-9-]*$` \
+                 (lowercase letters, digits, hyphens; no leading hyphen, no `/`, no `..`)"
+            ),
+        )
+        .with_data(json!({ "reason": "invalid-name", "name": name }));
+    }
+
     let src = aoide_storage::fs::songbook_dir(&name);
     if !src.is_dir() {
         return Outcome::error(
@@ -165,6 +184,19 @@ mod tests {
     fn missing_name_is_usage() {
         let out = handle_rice_declare(&inv(&[]));
         assert_eq!(out.status, crate::output::Status::Usage);
+    }
+
+    /// Review fix (different-Sonnet pass on 07a42a0): a traversal-shaped
+    /// name must be refused BEFORE it ever reaches `songbook_dir`/the
+    /// checkout join — same pattern `song/src/commands/mode.rs`'s
+    /// `current_staged_song_rejects_a_hand_edited_path_traversal_song_field`
+    /// pins for the sibling stage-file case. No env override needed: the
+    /// name check runs before any path is even built.
+    #[test]
+    fn path_traversal_shaped_name_is_refused_before_any_path_is_built() {
+        let out = handle_rice_declare(&inv(&["../../evil"]));
+        assert_eq!(out.status, crate::output::Status::Error);
+        assert_eq!(out.data.unwrap()["reason"], "invalid-name");
     }
 
     #[test]

@@ -63,7 +63,12 @@ fn default_root() -> std::path::PathBuf {
 }
 
 /// One-shot, idempotent move of the pre-L-C2 `~/Aoide/{song/stage,state,log}`
-/// trees into the new `$AOIDE_ROOT` default (`<home>/.aoide`). `pub`: the
+/// trees into the CURRENT `$AOIDE_ROOT` resolution (`[root]`, not
+/// necessarily its default — a host that set `AOIDE_ROOT` to a custom
+/// absolute path still wants its pre-L-C2 data to land where every getter
+/// will actually look for it; targeting [`default_root`] unconditionally
+/// would silently strand the data at `<home>/.aoide` on such a host, since
+/// nothing reads that path once `AOIDE_ROOT` is set elsewhere). `pub`: the
 /// three real binaries call this ONCE, early in their own `main()` —
 /// `crates/cli/src/bin/aoide.rs`, `crates/cli/src/bin/aoided.rs`,
 /// `crates/lyra/src/bin/lyra.rs` — never from a library getter (see
@@ -75,6 +80,11 @@ fn default_root() -> std::path::PathBuf {
 /// `MIGRATE_CONDUCTING_STAGE_ONCE`, because nothing here is reachable
 /// except by an explicit call.
 ///
+/// `old_root == new_root` is a no-op for the same reason it always was, and
+/// now ALSO covers the (unusual but valid) case of an operator explicitly
+/// setting `AOIDE_ROOT` back to `~/Aoide` itself — nothing to migrate, the
+/// root never moved.
+///
 /// Each of the three pieces is gated on ITS OWN env override being unset —
 /// `$AOIDE_STAGE_DIR` for `song/stage`, `$AOIDE_STATE_DIR` for `state`,
 /// `$AOIDE_AUDIT_LOG` for `log` — independently of one another, so a host
@@ -82,7 +92,7 @@ fn default_root() -> std::path::PathBuf {
 /// from under it.
 pub fn migrate_root_once() {
     let old_root = aoide_protocol::aoide_home().join("Aoide");
-    let new_root = default_root();
+    let new_root = root();
     if old_root == new_root {
         return;
     }
@@ -93,7 +103,7 @@ pub fn migrate_root_once() {
     if std::env::var("AOIDE_STATE_DIR").is_err() {
         migrate_dir(&old_root.join("state"), &new_root.join("state"));
     }
-    if std::env::var("AOIDE_AUDIT_LOG").is_err() {
+    if std::env::var("AOIDE_AUDIT_LOG").map(|v| v.is_empty()).unwrap_or(true) {
         migrate_file(&old_root.join("log"), &new_root.join("log"));
     }
 }
@@ -1761,5 +1771,49 @@ mod tests {
 
         std::env::remove_var("AOIDE_STAGE_DIR");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Review fix (different-Sonnet pass on 07a42a0): `migrate_root_once`
+    /// must target `root()` — the CURRENT resolution, honoring an explicit
+    /// `$AOIDE_ROOT` — not unconditionally `default_root()`. A host that set
+    /// `AOIDE_ROOT` to a custom absolute path still wants its pre-L-C2 data
+    /// moved to where every getter will actually look for it; the earlier
+    /// `default_root()`-only version would have stranded it at
+    /// `<home>/.aoide`, silently unreachable. Every OTHER migration test in
+    /// this module only exercises the unset-`AOIDE_ROOT` (falls back to
+    /// `default_root()`) case — this is the one that pins a GENUINELY
+    /// different custom root.
+    #[test]
+    fn migrate_root_once_targets_a_custom_aoide_root_not_the_default() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = MigrationEnvGuard::capture_and_clear();
+        let home = std::env::temp_dir().join(format!("aoide-migrate-root-custom-{}", std::process::id()));
+        let custom_root =
+            std::env::temp_dir().join(format!("aoide-migrate-root-custom-target-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&custom_root);
+        std::env::set_var("HOME", &home);
+        std::env::set_var("AOIDE_ROOT", &custom_root);
+
+        let old_stage = home.join("Aoide").join("song").join("stage");
+        std::fs::create_dir_all(&old_stage).unwrap();
+        std::fs::write(old_stage.join("livery.json"), "custom-root-bound").unwrap();
+
+        migrate_root_once();
+
+        assert_eq!(
+            std::fs::read_to_string(custom_root.join("song").join("stage").join("livery.json")).unwrap(),
+            "custom-root-bound",
+            "the pre-L-C2 tree must land at the CUSTOM AOIDE_ROOT, not <home>/.aoide"
+        );
+        assert!(
+            !home.join(".aoide").exists(),
+            "nothing should ever have been written under the unused default root"
+        );
+        assert!(!old_stage.exists(), "the old tree must have moved");
+
+        std::env::remove_var("AOIDE_ROOT");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&custom_root);
     }
 }
