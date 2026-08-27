@@ -180,13 +180,29 @@
   writes to anyone's `~/.ssh/authorized_keys`** — the taught errors
   `spawn_ssh`/`open_or_reuse` return on a failed or timed-out open name the
   one-time manual step (add this box's key to the far box's
-  `authorized_keys`) but never attempt it themselves. `close`'s
-  recycled-pid guard (`looks_like_our_ssh`, reading `/proc/<pid>/cmdline`)
-  is a DELIBERATE, documented tiny race, not an oversight: a pid recorded
-  by an earlier `aoide` invocation may have been recycled by the OS to an
-  unrelated process by the time `close` runs, so the pid alone is never
-  trusted — only a pid whose own cmdline is still `ssh` carrying this
-  record's exact `-L` spec is ever signaled.
+  `authorized_keys`) but never attempt it themselves. The recycled-pid
+  guard (`looks_like_our_ssh`, reading `/proc/<pid>/cmdline`; wrapped as
+  `kill_if_still_our_ssh`) is a DELIBERATE, documented tiny race, not an
+  oversight: a pid recorded by an earlier `aoide` invocation may have been
+  recycled by the OS to an unrelated process by the time anything acts on
+  it, so a pid is never trusted alone — only one whose own cmdline is still
+  `ssh` carrying this record's exact `-L` spec is ever signaled. **This
+  guard is not `close`'s alone** — `open_or_reuse_with`'s own stale-record
+  path runs it on a live-but-dead-port record's OLD pid before that record
+  is overwritten by a freshly opened one at the same `(session_id, key)`;
+  skipping this on the reopen path would make the old child permanently
+  untrackable the instant its record is replaced, since `close`/
+  `close_all_for_session`/the reaper (P-S5) can only ever act on a pid they
+  load FROM a record. **No new code path may replace or drop a tunnel
+  record without first routing the pid it named through
+  `kill_if_still_our_ssh`.** `terminate_pid` reaps with a real
+  `waitpid(pid, WNOHANG)` poll before ever falling back to its `/proc`
+  poll — required, not cosmetic, for the case where `open` and `close` (or
+  a stale reopen) run in the SAME process: that pid genuinely IS this
+  process's own child, and nothing else will ever collect it, so skipping
+  `waitpid` there would leave a real zombie. `ECHILD` (the ordinary
+  cross-invocation case — an earlier `aoide` run parented the child, not
+  this process) falls back to the `/proc` poll, same as always.
 - **The self-invite guard (`discover::is_self_target`) runs BEFORE the
   proceed-confirm and BEFORE the ceremony, in `handle_peer_invite`, never
   inside `run_pair_request` (P-S1).** `run_pair_request` is shared with

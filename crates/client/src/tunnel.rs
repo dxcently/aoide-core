@@ -96,11 +96,19 @@ fn open_or_reuse_with(
         }
         // Stale: either the pid is gone, or something is still alive at
         // that pid but nothing answers the forward. Either way the record
-        // is worthless as a dial target — remove it and open fresh. A
-        // live-but-dead-port process is deliberately NOT killed here: this
-        // function's job is "hand back a working port," not process
-        // hygiene. An orphan left this way is exactly what `close` and the
-        // reaper (P-S5) exist to collect.
+        // is worthless as a dial target and is about to be REPLACED by a
+        // fresh one at this exact (session, key) — not merely deleted. A
+        // live-but-dead-port old process must be killed here, not left for
+        // `close`/the reaper (P-S5) to collect later: both of those can
+        // only ever act on a pid they load FROM a record, and this record
+        // is the only place the old pid was ever written down. Once the
+        // fresh record below overwrites it, the old child becomes
+        // PERMANENTLY untrackable — the same guarded kill `close` performs
+        // (alive, AND still looks like this record's own `ssh`) runs on it
+        // first. A genuinely dead pid costs nothing extra here:
+        // `kill_if_still_our_ssh`'s own `proc_exists` check already turns
+        // this into a no-op for the dead-pid case.
+        kill_if_still_our_ssh(rec.pid, rec.local_port, rec.remote_port);
         let _ = aoide_storage::tunnel::remove(session_id, key);
     }
 
@@ -149,7 +157,17 @@ fn open_or_reuse_with(
         pid,
         opened_at: aoide_storage::time::now_iso_utc(),
     };
-    aoide_storage::tunnel::save(&record)?;
+    aoide_storage::tunnel::save(&record).map_err(|e| {
+        // A spawn that succeeded and even answered its own probe, but
+        // whose record then failed to write, is otherwise an immediate,
+        // untracked orphan: nothing will ever find this pid again once
+        // this error propagates and no record exists to name it. Kill and
+        // reap it before returning the error — the same courtesy the
+        // timeout branch above already extends.
+        let _ = child.kill();
+        let _ = child.wait();
+        e
+    })?;
     Ok(local_port)
 }
 
@@ -159,9 +177,7 @@ fn open_or_reuse_with(
 /// [`looks_like_our_ssh`] confirms it is still this record's own child.
 pub fn close(session_id: &str, key: &str) -> Result<(), String> {
     if let Some(rec) = aoide_storage::tunnel::load(session_id, key) {
-        if proc_exists(rec.pid) && looks_like_our_ssh(rec.pid, rec.local_port, rec.remote_port) {
-            terminate_pid(rec.pid);
-        }
+        kill_if_still_our_ssh(rec.pid, rec.local_port, rec.remote_port);
     }
     aoide_storage::tunnel::remove(session_id, key)
 }
@@ -224,21 +240,71 @@ fn looks_like_our_ssh(pid: u32, local_port: u16, remote_port: u16) -> bool {
     is_ssh && has_l_spec
 }
 
+/// Kill `pid` if — and only if — it is still alive AND
+/// [`looks_like_our_ssh`] still confirms it as `(local_port, remote_port)`'s
+/// own `ssh` child (the module doc's "recycled-pid decision"). Shared by
+/// [`close`] (tearing a forward down on purpose) and `open_or_reuse_with`'s
+/// stale-record path (a live-but-dead-port record is about to be
+/// OVERWRITTEN by a fresh one at the same key — without this, the old
+/// child would become permanently untrackable, since `close`/
+/// `close_all_for_session`/the reaper (P-S5) can only ever act on a pid
+/// they load FROM a record).
+fn kill_if_still_our_ssh(pid: u32, local_port: u16, remote_port: u16) {
+    if proc_exists(pid) && looks_like_our_ssh(pid, local_port, remote_port) {
+        terminate_pid(pid);
+    }
+}
+
 /// `SIGTERM` a pid already confirmed (by the caller) to be this record's
-/// own `ssh` child, then wait — best-effort, not a real `wait(2)`: this
-/// pid is not necessarily a child OF THIS PROCESS (a tunnel opened by an
-/// earlier `aoide` invocation has no `Child` handle here to reap), so
-/// "wait" means polling `/proc/<pid>` for its exit within a short bound, a
-/// courtesy for the caller's own next action, never a guarantee.
+/// own `ssh` child, then reap it. Two REAP strategies, tried in order,
+/// because this pid is not always a child OF THIS PROCESS: when it is (a
+/// same-process open-then-close, or `open_or_reuse_with`'s own stale-reopen
+/// path, both of which parented the child moments ago), a bounded
+/// `waitpid(pid, WNOHANG)` poll performs a REAL `wait(2)` so no zombie is
+/// left behind — the courtesy `Child::wait()` gives when a `Child` handle
+/// is on hand, reproduced here without one. `ECHILD` (this pid is not, or
+/// is no longer, a child of this process — the ordinary cross-invocation
+/// case: an earlier `aoide` run opened it) means a real wait can never
+/// succeed here at all; that, and any other `waitpid` failure, falls back
+/// to the original best-effort courtesy of polling `/proc/<pid>` for its
+/// exit within a short bound — never a guarantee, just a nicety for the
+/// caller's own next action.
 fn terminate_pid(pid: u32) {
     // SAFETY: `pid` was just proven by `looks_like_our_ssh` to be this
     // record's own `ssh` child, never an arbitrary/unrelated process.
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGTERM);
     }
-    let deadline = Instant::now() + Duration::from_millis(500);
-    while proc_exists(pid) && Instant::now() < deadline {
+
+    let waitpid_deadline = Instant::now() + Duration::from_millis(500);
+    let mut reaped = false;
+    loop {
+        let mut status: libc::c_int = 0;
+        // SAFETY: `pid` names a real process this call just signaled;
+        // `&mut status` is a valid local; `WNOHANG` never blocks.
+        let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        if r == pid as libc::pid_t {
+            reaped = true;
+            break;
+        }
+        if r < 0 {
+            // Most commonly ECHILD (not our child) — any negative return
+            // means a real wait(2) on this pid cannot succeed from this
+            // process; stop polling waitpid and fall through to the
+            // /proc poll below.
+            break;
+        }
+        if Instant::now() >= waitpid_deadline {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(20));
+    }
+
+    if !reaped {
+        let proc_deadline = Instant::now() + Duration::from_millis(500);
+        while proc_exists(pid) && Instant::now() < proc_deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
@@ -373,6 +439,7 @@ fn exited_before_forward_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::CommandExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -435,6 +502,29 @@ mod tests {
         Arc::new(|_local_port: u16, _via: &Via, _remote_host: &str, _remote_port: u16| {
             Command::new("sleep").arg("10").spawn().map_err(|e| format!("test fake spawn: {e}"))
         })
+    }
+
+    /// A genuine child (`sh -c sleep <n>`, no `ssh` binary involved) whose
+    /// `/proc/<pid>/cmdline` nonetheless reads EXACTLY like this record's
+    /// own `ssh … -L <local_port>:<remote_host>:<remote_port> …` —
+    /// `argv[0]` overridden to `"ssh"` via the `CommandExt::arg0` unix
+    /// extension (Linux echoes whatever `argv[0]` an `execve` was given
+    /// back through `/proc/<pid>/cmdline`, regardless of which binary
+    /// actually ran), plus the exact `-L` spec string as a harmless extra
+    /// positional parameter `sh` never reads. This is what lets
+    /// `looks_like_our_ssh` — and therefore `kill_if_still_our_ssh`/
+    /// `terminate_pid` — be exercised against a REAL, killable, genuinely
+    /// alive process, with no real `ssh` anywhere in this test binary.
+    fn spawn_fake_ssh_argv(local_port: u16, remote_host: &str, remote_port: u16, sleep_secs: u32) -> Result<Child, String> {
+        let spec = format!("{local_port}:{remote_host}:{remote_port}");
+        Command::new("sh")
+            .arg0("ssh")
+            .arg("-c")
+            .arg(format!("sleep {sleep_secs}"))
+            .arg("aoide-test-marker")
+            .arg(spec)
+            .spawn()
+            .map_err(|e| format!("test fake ssh-argv spawn: {e}"))
     }
 
     // ── open_or_reuse: reuse ────────────────────────────────────────────
@@ -502,6 +592,45 @@ mod tests {
             assert!(probe_port(port, Duration::from_millis(200)), "the fresh forward must actually answer");
             let saved = aoide_storage::tunnel::load("sess-b", "sakaki").unwrap();
             assert_eq!(saved.local_port, port);
+        });
+    }
+
+    /// Review finding (HIGH, R2): a stale "live pid, dead port" record used
+    /// to be silently overwritten — the OLD ssh child was never killed, and
+    /// once its record was gone it became permanently untrackable (`close`/
+    /// `close_all_for_session`/the reaper can only ever act on a pid they
+    /// load FROM a record). This pins the fix: the old child — a genuine
+    /// process whose cmdline actually matches `looks_like_our_ssh` — must
+    /// be dead before the reopen's fresh record lands.
+    #[test]
+    fn stale_reopen_kills_the_old_ssh_child_before_overwriting_its_record() {
+        with_temp_runtime_dir("stale-reopen-kills-old", || {
+            let dead_port = {
+                let l = TcpListener::bind("127.0.0.1:0").unwrap();
+                l.local_addr().unwrap().port()
+                // dropped: nothing listens here
+            };
+            let old_child = spawn_fake_ssh_argv(dead_port, "127.0.0.1", 8710, 30).unwrap();
+            let old_pid = old_child.id();
+            // No `.wait()` on `old_child` — the record (not this handle)
+            // is what `open_or_reuse_with` acts on, the same shape a
+            // tunnel opened by an EARLIER `aoide` invocation holds (no
+            // `Child` in this process at all, only the pid on disk).
+            drop(old_child);
+
+            aoide_storage::tunnel::save(&fixture("sess-i", "sakaki", old_pid, dead_port)).unwrap();
+            assert!(proc_exists(old_pid), "the old fake ssh child must be alive before reopen runs");
+            assert!(
+                looks_like_our_ssh(old_pid, dead_port, 8710),
+                "the fixture must actually pass the same guard `close` uses, or this test proves nothing"
+            );
+
+            let via = bare_via("sakaki");
+            let spawn = spawn_that_binds_the_port();
+            let port = open_or_reuse_with("sess-i", "sakaki", &via, "127.0.0.1", 8710, &spawn).unwrap();
+
+            assert_ne!(port, dead_port);
+            assert!(!proc_exists(old_pid), "the old, replaced ssh child must be killed, never merely orphaned");
         });
     }
 
@@ -576,6 +705,43 @@ mod tests {
 
             // Idempotent on the now-missing record.
             assert!(close("sess-e", "sakaki").is_ok());
+        });
+    }
+
+    /// Review finding (MEDIUM): `terminate_pid` used to only poll `/proc`
+    /// after `SIGTERM`, never `waitpid` — harmless when the pid belongs to
+    /// an earlier `aoide` invocation (this process was never its parent,
+    /// so no zombie is ours to leave), but a real zombie when `open` and
+    /// `close` run in the SAME process, since nothing else ever reaps a
+    /// child THIS process itself spawned. Proves the fix does a REAL
+    /// `wait(2)`, not just "vanished from /proc" (a zombie still has a
+    /// `/proc/<pid>` entry): a second `waitpid` on the same pid, run by
+    /// this test AFTER `close`, must itself fail — nothing left to wait
+    /// for, because `close` already collected it.
+    #[test]
+    fn close_on_a_same_process_child_actually_reaps_it_leaving_no_zombie() {
+        with_temp_runtime_dir("close-reaps", || {
+            let local_port = free_local_port().unwrap();
+            let child = spawn_fake_ssh_argv(local_port, "127.0.0.1", 8710, 30).unwrap();
+            let pid = child.id();
+            // Dropped with no `.wait()` — exactly the shape
+            // `open_or_reuse_with`'s own success path leaves behind (the
+            // `Child` goes out of scope once the record is saved), so
+            // `close` genuinely has only a bare pid to work with, even
+            // though — unlike the ordinary cross-invocation case — this
+            // pid IS a child of this very process.
+            drop(child);
+
+            aoide_storage::tunnel::save(&fixture("sess-j", "sakaki", pid, local_port)).unwrap();
+            assert!(proc_exists(pid));
+
+            assert!(close("sess-j", "sakaki").is_ok());
+
+            let mut status: libc::c_int = 0;
+            // SAFETY: `pid` and `&mut status` are valid; `WNOHANG` never blocks.
+            let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+            assert!(r < 0, "a second waitpid on an already-reaped child must fail — nothing left to reap: r={r}");
+            assert!(!proc_exists(pid), "the child must be fully gone, not lingering as a zombie");
         });
     }
 

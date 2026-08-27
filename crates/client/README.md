@@ -74,37 +74,53 @@ never the inbound/serve half (that's `aoide-server`).
   already on file for `(session_id, key)` (`aoide_storage::tunnel::load`);
   a record whose pid is alive AND whose local port answers a bounded probe
   is reused as-is (no second `ssh`). Anything else is stale — a dead pid,
-  or a live process whose forward nothing answers on — and is discarded:
-  the record is removed and a fresh forward is opened on a freshly reserved
-  local port (the `TcpListener::bind("127.0.0.1:0")` read-back-drop idiom
-  `cli/tests/peer_connectivity.rs::free_port` already established). The
-  spawned `ssh -N -T -o BatchMode=yes …` (stdin/stdout/stderr all `null`)
-  is polled (`TcpStream::connect`) until its forward answers or a bounded
-  deadline elapses (default 8s, `AOIDE_TUNNEL_OPEN_TIMEOUT` overrides, the
-  same unparsable-or-zero-falls-back-to-default shape
+  or a live process whose forward nothing answers on — and the record is
+  about to be REPLACED by a freshly opened one at the same `(session_id,
+  key)`, on a freshly reserved local port (the
+  `TcpListener::bind("127.0.0.1:0")` read-back-drop idiom
+  `cli/tests/peer_connectivity.rs::free_port` already established); a
+  live-but-dead-port OLD pid is killed first (`kill_if_still_our_ssh`, the
+  same guard `close` uses below) — review finding, P-S3 — since once its
+  record is overwritten nothing could ever find that pid again (`close`/
+  the reaper only ever act on a pid loaded FROM a record). The spawned
+  `ssh -N -T -o BatchMode=yes …` (stdin/stdout/stderr all `null`) is polled
+  (`TcpStream::connect`) until its forward answers or a bounded deadline
+  elapses (default 8s, `AOIDE_TUNNEL_OPEN_TIMEOUT` overrides, the same
+  unparsable-or-zero-falls-back-to-default shape
   `aoide_storage::pairing::pairing_timeout_secs` holds) — and the poll loop
   also watches the child's own exit (`Child::try_wait`) so a doomed forward
   (missing `authorized_keys`, a refused/unreachable host) fails in well
   under a second instead of sitting out the whole deadline, which is the
-  entire reason `ExitOnForwardFailure=yes` is on the argv. Either failure
-  kills and reaps the child, removes any record, and returns a taught error
-  naming the ssh target and the one-time manual `authorized_keys` step —
-  aoide never writes that file for anyone. `close(session_id, key)`
-  SIGTERMs the recorded pid and removes the record, idempotent on a record
-  already gone; before signaling anything it checks
-  `/proc/<pid>/cmdline` actually names `ssh` carrying this exact `-L` spec
-  (`looks_like_our_ssh`) — a pid an earlier `aoide` invocation recorded may
-  have been recycled by the OS to an unrelated process by the time `close`
-  runs, and a pid alone is never enough to justify a signal.
-  `close_all_for_session(session_id)` closes every tunnel recorded for that
-  session, best-effort across all of them. The actual spawn is an injected
-  closure internally (the same `Arc<dyn Fn(...)>` shape
-  `aoide_conduct::graph::who::PullFn` holds for its own live-probe seam,
-  re-derived rather than imported) so every reuse/stale/timeout/early-exit
-  branch is unit-tested with a fake spawn (an innocuous real `sleep` child,
-  never `ssh`) — the one `#[ignore]`'d real-ssh proof lives at
-  `cli/tests/tunnel_ssh.rs` instead, the same "real bytes, not a mock, but
-  sandboxed-build-unsafe" shape `peer_connectivity.rs` already holds.
+  entire reason `ExitOnForwardFailure=yes` is on the argv. Any failure past
+  that point — the deadline, an early exit, or the record failing to save
+  even after a healthy answering spawn — kills and reaps the child, removes
+  any record, and surfaces a taught error naming the ssh target and the
+  one-time manual `authorized_keys` step; aoide never writes that file for
+  anyone. `close(session_id, key)` SIGTERMs the recorded pid and removes
+  the record, idempotent on a record already gone; before signaling
+  anything it checks `/proc/<pid>/cmdline` actually names `ssh` carrying
+  this exact `-L` spec (`looks_like_our_ssh`, wrapped as
+  `kill_if_still_our_ssh`, shared with the stale-reopen path above) — a pid
+  an earlier `aoide` invocation recorded may have been recycled by the OS
+  to an unrelated process by the time anything acts on it, and a pid alone
+  is never enough to justify a signal. Once a kill IS justified,
+  `terminate_pid` reaps with a real `waitpid(pid, WNOHANG)` poll before
+  ever falling back to a `/proc` poll — required whenever `open` and
+  `close` (or a stale reopen) share a process, since that pid genuinely IS
+  this process's own child and nothing else will ever collect it; `ECHILD`
+  (the ordinary cross-invocation case) falls back to the `/proc` poll, same
+  as always. `close_all_for_session(session_id)` closes every tunnel
+  recorded for that session, best-effort across all of them. The actual
+  spawn is an injected closure internally (the same `Arc<dyn Fn(...)>`
+  shape `aoide_conduct::graph::who::PullFn` holds for its own live-probe
+  seam, re-derived rather than imported) so every reuse/stale/timeout/
+  early-exit/reap branch is unit-tested with a fake spawn (an innocuous
+  real `sleep`/`sh` child, never `ssh` — one fake overrides its own
+  `argv[0]` to `"ssh"`, `CommandExt::arg0`, purely so `looks_like_our_ssh`
+  can be exercised against a genuine, killable process) — the one
+  `#[ignore]`'d real-ssh proof lives at `cli/tests/tunnel_ssh.rs` instead,
+  the same "real bytes, not a mock, but sandboxed-build-unsafe" shape
+  `peer_connectivity.rs` already holds.
 - `commands` — this crate's CLI commands:
   `peer add/remove/pull/status/hub/allow/spawn/discover/invite`,
   `peer pair request/pending/approve/reject` (P-P2, CONTRACTS.md §6/§7 —
