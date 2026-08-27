@@ -778,18 +778,29 @@ fn confirm_spawn(name: &str, text: &str) -> Result<bool, String> {
 /// plain message the caller surfaces and audits directly — the same
 /// `Result`-not-`Outcome` shape [`send_message_to_peer`]/[`pull_peer_live`]
 /// hold, for the same reason (the caller builds its own `Outcome`).
-pub fn spawn_on_peer(peer: &aoide_storage::peer_store::Peer, text: &str) -> Result<Value, String> {
+pub fn spawn_on_peer(
+    peer: &aoide_storage::peer_store::Peer,
+    text: &str,
+) -> Result<Value, SpawnPeerError> {
     let message_id = gen_message_id();
     let body = crate::wire::build_message_send_body(text, &message_id, None);
     let body_str = serde_json::to_string(&body).unwrap_or_default();
-    let bearer = resolve_peer_bearer(peer)?;
-    let extra_headers = sign_headers_for_peer(peer, &body_str)?;
-    let (code, resp) = post_json(&peer.url, &body_str, bearer.as_deref(), &extra_headers, 15)?;
+    let bearer =
+        resolve_peer_bearer(peer).map_err(|e| SpawnPeerError::new("bearer-resolve-failed", e))?;
+    let extra_headers =
+        sign_headers_for_peer(peer, &body_str).map_err(|e| SpawnPeerError::new("signing-failed", e))?;
+    let (code, resp) = post_json(&peer.url, &body_str, bearer.as_deref(), &extra_headers, 15)
+        .map_err(|e| SpawnPeerError::new("send-failed", e))?;
     if code != 200 {
-        return Err(format!("HTTP {code}"));
+        return Err(SpawnPeerError {
+            reason: "send-http-error",
+            message: format!("HTTP {code}"),
+            http_code: Some(code),
+            body: Some(resp),
+        });
     }
-    let parsed: Value =
-        serde_json::from_str(&resp).map_err(|e| format!("unparseable response: {e}"))?;
+    let parsed: Value = serde_json::from_str(&resp)
+        .map_err(|e| SpawnPeerError::new("unparseable-response", format!("unparseable response: {e}")))?;
     // A JSON-RPC error still returns HTTP 200 (same discipline as
     // `send_message_to_peer`) — the remote door's refusal (paired-but-
     // unsigned, allows lacking spawn, skew, …) surfaces VERBATIM, never
@@ -799,9 +810,37 @@ pub fn spawn_on_peer(peer: &aoide_storage::peer_store::Peer, text: &str) -> Resu
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("(no message)");
-        return Err(format!("peer returned an error: {detail}"));
+        return Err(SpawnPeerError::new(
+            "peer-refused",
+            format!("peer returned an error: {detail}"),
+        ));
     }
     Ok(parsed)
+}
+
+/// [`spawn_on_peer`]'s error: the wire stage that failed (`reason`, the same
+/// vocabulary `handle_peer_spawn`'s structured `data` always carried —
+/// bearer-resolve-failed · signing-failed · send-failed · send-http-error ·
+/// unparseable-response · peer-refused) plus the human message; HTTP
+/// failures keep their code and raw body for programmatic consumers.
+#[derive(Debug)]
+pub struct SpawnPeerError {
+    pub reason: &'static str,
+    pub message: String,
+    pub http_code: Option<u16>,
+    pub body: Option<String>,
+}
+
+impl SpawnPeerError {
+    fn new(reason: &'static str, message: String) -> Self {
+        Self { reason, message, http_code: None, body: None }
+    }
+}
+
+impl std::fmt::Display for SpawnPeerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
 }
 
 fn handle_peer_spawn(inv: &Invocation) -> Outcome {
@@ -863,8 +902,17 @@ fn handle_peer_spawn(inv: &Invocation) -> Outcome {
             Outcome::ok(cmd, format!("spawned on `{}` — remote session `{session_id}`", peer.name))
                 .with_data(json!({ "name": peer.name, "url": peer.url, "sessionId": session_id, "response": parsed }))
         }
-        Err(e) => Outcome::error(cmd, format!("spawning on `{}` at {}: {e}", peer.name, peer.url))
-            .with_data(json!({ "reason": "spawn-failed", "name": peer.name, "url": peer.url })),
+        Err(e) => {
+            let mut data = json!({ "reason": e.reason, "name": peer.name, "url": peer.url });
+            if let Some(code) = e.http_code {
+                data["httpCode"] = json!(code);
+            }
+            if let Some(body) = &e.body {
+                data["body"] = json!(body);
+            }
+            Outcome::error(cmd, format!("spawning on `{}` at {}: {e}", peer.name, peer.url))
+                .with_data(data)
+        }
     }
 }
 

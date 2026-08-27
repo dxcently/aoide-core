@@ -916,8 +916,11 @@ fn summon_remote(
 /// `None` when neither exists — the caller turns that into a taught
 /// `failed[]` entry, never a guessed prompt.
 fn summon_text(spec: &aoide_storage::manifest::SessionSpec) -> Option<String> {
-    if let Some(command) = &spec.command {
-        return Some(command.clone());
+    // A whitespace-only command is no command — treated as absent so the
+    // agent default (or the taught None) applies instead of summoning a
+    // blank prompt: the string-form twin of clean_spawn's empty-argv guard.
+    if let Some(command) = spec.command.as_deref().filter(|c| !c.trim().is_empty()) {
+        return Some(command.to_string());
     }
     let profile = agent_profile(&spec.agent)?;
     if profile.launch.is_empty() {
