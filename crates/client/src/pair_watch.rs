@@ -20,8 +20,7 @@
 //! safety tick re-derives the actionable set from scratch on the same
 //! cadence `aoide_secrets::watch::Queue::reconcile` already holds.
 //!
-//! `--popup` (this phase's own arm; not yet built here — see the doc on
-//! [`run`]) is REFUSED up front when `zenity` isn't installed, the same
+//! `--popup` is REFUSED up front when `zenity` isn't installed, the same
 //! "refuse before ever entering popup mode" gate `aoide_secrets::watch::run`
 //! already holds for its own two dialog binaries. `--popup`+`--json`
 //! together is refused one layer up, by `handle_peer_pair_watch`
@@ -30,12 +29,32 @@
 //! already hold between "gate the door and the flag combo" (the
 //! dispatched handler) and "run the blocking loop" (this module,
 //! special-cased in `cli`'s own `run_cli`).
+//!
+//! **The popup arm (F6): zenity `--question` ONLY** — `spawn_pair_confirm`'s
+//! argv, never a `lyra` fallback the way `aoide_secrets::watch`'s own entry
+//! dialog holds one; a QML confirm dialog is a named deferral, not built
+//! here. Four structural rules hold throughout this arm, all provable at
+//! the text-builder/argv level rather than by trusting a comment:
+//! (1) a feed line is a TRIGGER, never a display source — [`confirm_text`]
+//! is built ONLY from a [`Pending`] `reconcile` itself produced, never from
+//! a [`PairEvent`]'s fields; (2) the SAS never crosses a socket, feed, or
+//! argv — [`reconcile`] derives it in-process and [`confirm_text`] embeds
+//! the resulting `String` directly into `--text`, the same way it already
+//! reaches a terminal via `peer pair pending`; (3) argv carries identifiers
+//! and display text only — [`spawn_pair_confirm`] never receives a code to
+//! type back; (4) nothing is ever executed on this instance's behalf by a
+//! dialog's own output — no `sh -c`, no shell interpolation; a hostile
+//! `name`/`url` reaches `--text` as inert display text, protected from
+//! Pango corruption by `--no-markup` alone (`aoide_secrets::watch::
+//! spawn_zenity_entry`'s own doc has the live-verified reasoning).
 
-use aoide_protocol::dialog::zenity_available;
+use aoide_protocol::dialog::{is_locked, locker_process_name, next_spawn_backoff, run_entry_dialog, zenity_available, DialogResult, SPAWN_BACKOFF_INITIAL, SPAWN_BACKOFF_MAX};
 use aoide_protocol::feed::Follower;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -72,13 +91,23 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The default `zenity` binary name `run` checks for before ever entering
-/// `--popup` mode — `aoide_secrets::watch::ZENITY_CMD`'s exact shape,
-/// re-declared here rather than imported (a `&str` constant carries no
-/// "no cross-crate copying" weight the way a moved TYPE or FUNCTION does,
-/// and `aoide-client` has no reason to depend on `aoide-secrets` for one
-/// literal). The confirm-dialog spawn itself (this phase's popup arm)
-/// reuses this same constant rather than declaring a second one.
+/// `--popup` mode, and [`spawn_pair_confirm`]'s own default target —
+/// `aoide_secrets::watch::ZENITY_CMD`'s exact shape, re-declared here
+/// rather than imported (a `&str` constant carries no "no cross-crate
+/// copying" weight the way a moved TYPE or FUNCTION does, and
+/// `aoide-client` has no reason to depend on `aoide-secrets` for one
+/// literal). Passed as a PARAMETER everywhere it matters (never a bare
+/// `Command::new("zenity")` inline) so a test can point at a shim path
+/// with no `PATH` mutation, the same discipline `aoide_secrets::watch`
+/// already holds for its own `zenity_cmd` parameters.
 pub(crate) const ZENITY_CMD: &str = "zenity";
+
+/// The `--extra-button` label [`spawn_pair_confirm`]'s dialog carries and
+/// [`run_entry_dialog`] compares stdout against (F6) — deliberately its
+/// OWN string, never `aoide_protocol::dialog::DISMISS_LABEL`: two
+/// different ceremonies, two different labels, sharing only the reader
+/// (`run_entry_dialog`'s own doc on `dismiss_label`).
+pub(crate) const REJECT_LABEL: &str = "Reject request";
 
 // ── the three pairing-ceremony milestones ────────────────────────────────
 
@@ -245,17 +274,235 @@ pub fn reconcile(now_epoch: i64) -> Vec<Pending> {
     out
 }
 
-/// Is `p` actionable RIGHT NOW — worth a `peer pair approve`/(this
-/// phase's popup)? An inbound entry only once it carries a SAS (unrevealed
-/// means nothing to confirm yet, `approve_inbound`'s own `awaiting-reveal`
-/// refusal); an outbound entry only once it reached `awaiting-confirm`
-/// (`awaiting-approval` means the PEER hasn't approved yet — nothing on
-/// THIS end to confirm, `approve_outbound`'s own refusal).
+/// Is `p` actionable RIGHT NOW — worth a `peer pair approve`, or (with
+/// `--popup`) a confirm dialog? An inbound entry only once it carries a
+/// SAS (unrevealed means nothing to confirm yet, `approve_inbound`'s own
+/// `awaiting-reveal` refusal); an outbound entry only once it reached
+/// `awaiting-confirm` (`awaiting-approval` means the PEER hasn't approved
+/// yet — nothing on THIS end to confirm, `approve_outbound`'s own
+/// refusal).
 pub fn actionable(p: &Pending) -> bool {
     match p.direction.as_str() {
         "inbound" => p.sas.is_some(),
         "outbound" => p.state.as_deref() == Some("awaiting-confirm"),
         _ => false,
+    }
+}
+
+// ── the popup arm (F6) ────────────────────────────────────────────────────
+
+/// The confirm dialog's own argv (F6): `--question` (not `--entry` — this
+/// ceremony confirms a code already DERIVED and shown, it never collects
+/// one typed back), `--no-markup` LOAD-BEARING for the identical reason
+/// `aoide_secrets::watch::spawn_zenity_entry`'s own doc gives (a bare `&`
+/// in a peer's `url` is a Pango entity-reference prefix and can corrupt
+/// the render, or worse, without it), `--ok-label`/`--cancel-label` name
+/// the two ordinary buttons, `--extra-button` [`REJECT_LABEL`] is the
+/// third choice `run_entry_dialog` reads back off stdout. `zenity_cmd` is
+/// a parameter (never `Command::new("zenity")` inline) so a test can
+/// stand in a shim with no `PATH` mutation.
+fn spawn_pair_confirm(zenity_cmd: &str, title: &str, text: &str) -> std::io::Result<Child> {
+    Command::new(zenity_cmd)
+        .args([
+            "--question",
+            "--no-markup",
+            "--title",
+            title,
+            "--text",
+            text,
+            "--ok-label",
+            "Approve",
+            "--cancel-label",
+            "Ignore",
+            "--extra-button",
+            REJECT_LABEL,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+}
+
+/// Run one confirm dialog to completion via the shared
+/// [`run_entry_dialog`] loop, comparing stdout against [`REJECT_LABEL`]
+/// (never `aoide_protocol::dialog::DISMISS_LABEL` — `REJECT_LABEL`'s own
+/// doc).
+fn confirm_dialog(zenity_cmd: &str, title: &str, text: &str, should_cancel: impl FnMut() -> bool) -> DialogResult {
+    run_entry_dialog(|| spawn_pair_confirm(zenity_cmd, title, text), REJECT_LABEL, should_cancel)
+}
+
+/// The dialog's title — pure, no more than `peer pair pending` already
+/// shows (module doc's structural rule 1): built ONLY from a [`Pending`]
+/// `reconcile` produced, never from a [`PairEvent`]'s own fields.
+fn confirm_title(p: &Pending) -> String {
+    format!("aoide \u{b7} pairing with {}", p.name)
+}
+
+/// The dialog's body — pure, same sourcing rule as [`confirm_title`]. The
+/// SAS embeds directly (structural rule 2: it never crossed a socket,
+/// feed, or argv to get here — [`reconcile`] derived it in-process, this
+/// function only formats the `String` it already produced) — no more
+/// context than `peer pair pending`'s own row already shows for the same
+/// direction, and no fingerprint (`identity::fingerprint` is private; a
+/// CLI-first change would need to land before any dialog can show one).
+fn confirm_text(p: &Pending) -> String {
+    let sas = p.sas.as_deref().unwrap_or("");
+    match p.direction.as_str() {
+        "inbound" => format!(
+            "approve pairing with `{}`?\norigin: {}\nurl: {}\ncode: {sas}",
+            p.name,
+            p.origin_addr.as_deref().unwrap_or(""),
+            p.url,
+        ),
+        _ => format!("confirm pairing with `{}`?\nurl: {}\ncode: {sas}", p.name, p.url),
+    }
+}
+
+/// What a finished [`DialogResult`] means for the request it was shown
+/// for — pure, the ONE place this arm's mapping (F6) is decided, so it is
+/// testable with a synthetic [`DialogResult`] and no real dialog spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PopupDecision {
+    /// Exit 0 — commit the pairing (`approve_inbound`/`approve_outbound`,
+    /// `skip_confirm: true` — the dialog itself already IS the
+    /// confirmation).
+    Approve,
+    /// Exit 1, stdout was [`REJECT_LABEL`] — `reject_by_id`.
+    Reject,
+    /// Exit 1, empty stdout — a bare Cancel/Escape/window-close. Session-
+    /// only: added to the caller's own `ignored` set, never touches
+    /// storage.
+    Ignore,
+    /// The dialog could not run at all, or the (unreachable in practice
+    /// for a zenity-only dialog — `LYRA_INFRA_FAILURE_EXIT`'s own doc)
+    /// infra-failure exit landed. Back off the retry cadence; NEVER
+    /// `Ignore` — a broken dialog binary must not silently stop offering
+    /// a request just because it failed to show once.
+    Backoff,
+    /// The request resolved elsewhere while the dialog sat open
+    /// (`should_cancel` fired) — already handled, nothing left to do.
+    Noop,
+}
+
+fn decide(result: &DialogResult) -> PopupDecision {
+    match result {
+        DialogResult::Approved(_) => PopupDecision::Approve,
+        DialogResult::Dismissed => PopupDecision::Reject,
+        DialogResult::Cancelled => PopupDecision::Ignore,
+        DialogResult::CancelledExternally => PopupDecision::Noop,
+        DialogResult::SpawnError(_) | DialogResult::DialogFailure(_) => PopupDecision::Backoff,
+    }
+}
+
+/// Pure: F8's gate — no dialog opens while the screen is locked, ever
+/// (`aoide_protocol::dialog::locked_state`'s own OR of the two real
+/// probes is what `popup_tick` feeds in; this is the one place that
+/// probe's answer turns into a "show or don't" decision, kept separate
+/// from the real I/O so it stays independently testable).
+fn popup_allowed(locked: bool) -> bool {
+    !locked
+}
+
+/// Commit `p`'s pairing with `skip_confirm: true` — looks up ITS FRESH
+/// entry by id and direction (never trusts anything cached from an
+/// earlier `reconcile` call, the same "re-check before acting" discipline
+/// [`actionable`]'s own callers hold) and calls the SAME
+/// `approve_inbound`/`approve_outbound` the CLI's `peer pair approve
+/// --yes` path calls — an approved dialog commits the byte-identical
+/// `peers.json` write a scripted CLI approval would, because it is
+/// LITERALLY the same function, not a reimplementation.
+fn commit_approval(p: &Pending, now_epoch: i64) -> aoide_protocol::output::Outcome {
+    let now = aoide_storage::time::now_iso_utc();
+    match p.direction.as_str() {
+        "inbound" => match aoide_storage::pairing::list_inbound(now_epoch).into_iter().find(|e| e.id == p.id) {
+            Some(entry) => crate::commands::approve_inbound(true, "peer.pair.approve", &p.id, entry, &now, now_epoch),
+            None => aoide_protocol::output::Outcome::error(
+                "peer.pair.approve",
+                format!("pairing request `{}` is no longer pending — nothing to confirm", p.id),
+            ),
+        },
+        _ => match aoide_storage::pairing::list_outbound(now_epoch).into_iter().find(|e| e.id == p.id) {
+            Some(entry) => crate::commands::approve_outbound(true, "peer.pair.approve", &p.id, entry, &now, now_epoch),
+            None => aoide_protocol::output::Outcome::error(
+                "peer.pair.approve",
+                format!("pairing request `{}` is no longer pending — nothing to confirm", p.id),
+            ),
+        },
+    }
+}
+
+/// One popup iteration: pick the next un-ignored actionable [`Pending`],
+/// skip while the screen is locked (F8 — re-offered next tick, never
+/// shown behind a lock screen), show its confirm dialog, and act on
+/// [`decide`]'s mapping. `should_cancel` re-derives [`reconcile`] fresh on
+/// every ~200ms poll (`run_entry_dialog`'s own interval) rather than
+/// reading a cached queue — this arm's request volume is low enough that
+/// the extra `list_inbound`/`list_outbound`/identity-load cost per poll
+/// is cheaper than the machinery a shared, mutex-guarded queue would add.
+fn popup_tick(ignored: &mut HashSet<String>, spawn_backoff: &mut Duration, spawn_failing: &mut bool, json_mode: bool) {
+    let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
+    let pending = reconcile(now_epoch);
+    ignored.retain(|id| pending.iter().any(|p| &p.id == id));
+    let Some(p) = pending.into_iter().find(|p| actionable(p) && !ignored.contains(&p.id)) else {
+        return;
+    };
+
+    if !popup_allowed(is_locked(&locker_process_name())) {
+        return;
+    }
+
+    let title = confirm_title(&p);
+    let text = confirm_text(&p);
+    let id = p.id.clone();
+    let result = confirm_dialog(ZENITY_CMD, &title, &text, || {
+        let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
+        !reconcile(now_epoch).iter().any(|q| q.id == id && actionable(q))
+    });
+
+    if !matches!(result, DialogResult::SpawnError(_) | DialogResult::DialogFailure(_)) && *spawn_failing {
+        *spawn_failing = false;
+        *spawn_backoff = SPAWN_BACKOFF_INITIAL;
+        if !json_mode {
+            println!("  aoide peer pair watch --popup: the dialog is spawning again \u{2014} backoff cleared");
+        }
+    }
+
+    match decide(&result) {
+        PopupDecision::Approve => {
+            let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
+            let outcome = commit_approval(&p, now_epoch);
+            if !json_mode {
+                println!("  {}", outcome.message);
+            }
+        }
+        PopupDecision::Reject => {
+            let outcome = crate::commands::reject_by_id("peer.pair.reject", &p.id);
+            if !json_mode {
+                println!("  {}", outcome.message);
+            }
+        }
+        PopupDecision::Ignore => {
+            ignored.insert(p.id.clone());
+        }
+        PopupDecision::Noop => {
+            if !json_mode {
+                println!("  pairing request {} resolved elsewhere while its popup was open \u{2014} closing the dialog", p.id);
+            }
+        }
+        PopupDecision::Backoff => {
+            if !*spawn_failing {
+                *spawn_failing = true;
+                if !json_mode {
+                    eprintln!(
+                        "  aoide peer pair watch --popup: request {} has no working dialog right now \u{2014} backing off, retrying up to every {}s",
+                        p.id,
+                        SPAWN_BACKOFF_MAX.as_secs()
+                    );
+                }
+            }
+            std::thread::sleep(*spawn_backoff);
+            *spawn_backoff = next_spawn_backoff(*spawn_backoff);
+        }
     }
 }
 
@@ -304,13 +551,11 @@ fn wait_for_follower(events_path: &Path, poll_interval: Duration) -> Result<Foll
 /// mode holds.
 ///
 /// **`popup_mode` (`--popup`) is refused up front when `zenity` isn't
-/// installed** — this phase lands the watcher core only; the actual
-/// confirm-dialog spawn (P-P5's popup arm, this SAME function, a
-/// following change) is what will branch on `popup_mode` past this
-/// guard. Until then, `--popup` and a bare invocation behave identically
-/// past the guard: both narrate an actionable request rather than
-/// popping a dialog — `--popup`'s own dialog is additive, never a
-/// prerequisite for a correct, complete watcher.
+/// installed** (module doc's popup-arm section). Past that guard, EVERY
+/// poll tick runs [`popup_tick`] instead of the plain narrate-only
+/// reconcile below — the confirm dialog it shows subsumes the "actionable
+/// request" narration, so the two are mutually exclusive within one
+/// invocation, never layered.
 pub fn run(events_path: &Path, json_mode: bool, popup_mode: bool) -> i32 {
     if popup_mode && !zenity_available(ZENITY_CMD) {
         eprintln!(
@@ -333,6 +578,9 @@ pub fn run(events_path: &Path, json_mode: bool, popup_mode: bool) -> i32 {
     }
 
     let mut last_reconcile = Instant::now();
+    let mut ignored: HashSet<String> = HashSet::new();
+    let mut spawn_backoff = SPAWN_BACKOFF_INITIAL;
+    let mut spawn_failing = false;
     loop {
         if INTERRUPTED.load(Ordering::SeqCst) {
             return 0;
@@ -361,7 +609,9 @@ pub fn run(events_path: &Path, json_mode: bool, popup_mode: bool) -> i32 {
             }
         }
 
-        if last_reconcile.elapsed() >= RECONCILE_INTERVAL {
+        if popup_mode {
+            popup_tick(&mut ignored, &mut spawn_backoff, &mut spawn_failing, json_mode);
+        } else if last_reconcile.elapsed() >= RECONCILE_INTERVAL {
             last_reconcile = Instant::now();
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
             if !json_mode {
@@ -589,5 +839,264 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    // ── the popup arm (F6) ────────────────────────────────────────────────
+
+    fn fixture_pending(direction: &str, sas: Option<&str>) -> Pending {
+        Pending {
+            id: "abc12345".to_string(),
+            direction: direction.to_string(),
+            name: "box-a".to_string(),
+            origin_addr: Some("10.0.0.5".to_string()),
+            url: "http://box-a:8710/".to_string(),
+            sas: sas.map(str::to_string),
+            state: if direction == "outbound" { Some("awaiting-confirm".to_string()) } else { None },
+        }
+    }
+
+    #[test]
+    fn decide_maps_every_dialog_result_and_a_spawn_failure_is_never_ignore() {
+        assert_eq!(decide(&DialogResult::Approved("".to_string())), PopupDecision::Approve);
+        assert_eq!(decide(&DialogResult::Dismissed), PopupDecision::Reject);
+        assert_eq!(decide(&DialogResult::Cancelled), PopupDecision::Ignore);
+        assert_eq!(decide(&DialogResult::CancelledExternally), PopupDecision::Noop);
+        // The swap-catcher: a spawn failure must back off, and must NEVER
+        // read as `Ignore` — `Ignore` would permanently stop offering a
+        // request just because the dialog binary glitched once.
+        assert_eq!(decide(&DialogResult::SpawnError("no such file".to_string())), PopupDecision::Backoff);
+        assert_ne!(decide(&DialogResult::SpawnError("no such file".to_string())), PopupDecision::Ignore);
+        assert_eq!(decide(&DialogResult::DialogFailure("exit 3".to_string())), PopupDecision::Backoff);
+    }
+
+    #[test]
+    fn popup_allowed_is_the_negation_of_locked_state() {
+        assert!(popup_allowed(false));
+        assert!(!popup_allowed(true));
+        // Driven through the real `locked_state` OR, the same combinator
+        // `aoide_protocol::dialog`'s own tests already exercise directly —
+        // this proves THIS module's gate reads its answer correctly, not
+        // that `locked_state` itself is correct (already covered there).
+        assert!(!popup_allowed(aoide_protocol::dialog::locked_state(Some(true), false)));
+        assert!(!popup_allowed(aoide_protocol::dialog::locked_state(None, true)));
+        assert!(popup_allowed(aoide_protocol::dialog::locked_state(Some(false), false)));
+    }
+
+    #[test]
+    fn confirm_text_never_contains_another_requests_sas() {
+        let a = fixture_pending("inbound", Some("111-222"));
+        let mut b = fixture_pending("inbound", Some("333-444"));
+        b.id = "deadbeef".to_string();
+        b.name = "box-b".to_string();
+
+        let text_a = confirm_text(&a);
+        let text_b = confirm_text(&b);
+        assert!(text_a.contains("111-222"));
+        assert!(!text_a.contains("333-444"), "box-a's dialog text must never carry box-b's code: {text_a}");
+        assert!(text_b.contains("333-444"));
+        assert!(!text_b.contains("111-222"), "box-b's dialog text must never carry box-a's code: {text_b}");
+    }
+
+    #[test]
+    fn confirm_text_and_title_survive_hostile_name_and_url_intact() {
+        // `--no-markup` (spawn_pair_confirm's own doc) is what protects the
+        // RENDER — the builder itself must never truncate, escape, or drop
+        // hostile bytes; it just formats what it was given.
+        let mut p = fixture_pending("inbound", Some("555-666"));
+        p.name = "box-<b>evil</b>-&-more".to_string();
+        p.url = "http://evil/?a=1&b=<script>".to_string();
+        p.origin_addr = Some("10.0.0.5&x=1".to_string());
+
+        let title = confirm_title(&p);
+        let text = confirm_text(&p);
+        assert!(title.contains(&p.name), "{title}");
+        assert!(text.contains(&p.name), "{text}");
+        assert!(text.contains(&p.url), "{text}");
+        assert!(text.contains(p.origin_addr.as_deref().unwrap()), "{text}");
+        assert!(text.contains("555-666"));
+    }
+
+    #[test]
+    fn confirm_text_outbound_carries_no_origin_addr_field() {
+        let p = fixture_pending("outbound", Some("777-888"));
+        let text = confirm_text(&p);
+        // An outbound entry has no connecting-peer address of its own
+        // (`Pending::origin_addr`'s own doc) — the inbound-only "origin:"
+        // line must never appear for one.
+        assert!(!text.contains("origin:"), "{text}");
+        assert!(text.contains("777-888"));
+    }
+
+    /// Serializes this module's own write-a-shim-then-exec-it tests
+    /// against each other — the same genuine `execve()`/`close()` TOCTOU
+    /// `aoide_secrets::watch`'s own `shim_lock` documents at length
+    /// (`crates/secrets/src/watch.rs`, the "Text file busy" flake found
+    /// under heavy parallel contention): every shim here gets its own
+    /// unique tempdir, yet the race still reproduced under heavy
+    /// `--test-threads` contention on a just-written, just-chmod'd file —
+    /// a kernel-timing race, not a path collision, so the fix is simply
+    /// not contending: this lock serializes this module's own write+exec
+    /// pairs against each other.
+    fn shim_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `bash` named explicitly (never a bare `sh`), shell builtins only
+    /// (`echo`/`exit` — never an external `sleep`).
+    fn write_shim(tag: &str, script: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aoide-client-pair-confirm-shim-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("confirm-shim");
+        std::fs::write(&shim, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        shim
+    }
+
+    fn remove_shim(shim: &std::path::Path) {
+        if let Some(dir) = shim.parent() {
+            std::fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    #[test]
+    fn confirm_dialog_exit_zero_is_approved() {
+        let _guard = shim_lock();
+        let shim = write_shim("approve", "#!/usr/bin/env bash\nexit 0\n");
+        let result = confirm_dialog(shim.to_str().unwrap(), "t", "x", || false);
+        assert!(matches!(result, DialogResult::Approved(_)), "expected Approved, got {result:?}");
+        remove_shim(&shim);
+    }
+
+    #[test]
+    fn confirm_dialog_reject_label_on_stdout_is_dismissed() {
+        let _guard = shim_lock();
+        let shim = write_shim("reject", "#!/usr/bin/env bash\necho 'Reject request'\nexit 1\n");
+        let result = confirm_dialog(shim.to_str().unwrap(), "t", "x", || false);
+        assert!(matches!(result, DialogResult::Dismissed), "expected Dismissed, got {result:?}");
+        remove_shim(&shim);
+    }
+
+    #[test]
+    fn confirm_dialog_bare_cancel_is_cancelled_not_dismissed() {
+        let _guard = shim_lock();
+        let shim = write_shim("cancel", "#!/usr/bin/env bash\nexit 1\n");
+        let result = confirm_dialog(shim.to_str().unwrap(), "t", "x", || false);
+        assert!(matches!(result, DialogResult::Cancelled), "expected Cancelled, got {result:?}");
+        remove_shim(&shim);
+    }
+
+    #[test]
+    fn confirm_dialog_reports_a_spawn_error_for_a_nonexistent_shim() {
+        let result = confirm_dialog("/no/such/aoide-pair-confirm-shim-never-exists", "t", "x", || false);
+        assert!(matches!(result, DialogResult::SpawnError(_)), "expected SpawnError, got {result:?}");
+    }
+
+    // ── commit_approval: same peers.json the CLI's `--yes` path writes ────
+
+    /// `approve_inbound`'s own commit is gated on delivering the
+    /// `aoide/pairApprove` callback FIRST (module doc on
+    /// `commands::approve_inbound` — "nothing local writes until that
+    /// callback is acknowledged") — a real, minimal HTTP responder,
+    /// mirroring `commands::tests::spawn_fake_card_server`'s exact shape
+    /// one module over, so this test proves the REAL callback path, not a
+    /// mocked-away one.
+    fn spawn_fake_pair_approve_server() -> (std::net::TcpListener, u16) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepter = listener.try_clone().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            loop {
+                let Ok((mut stream, _)) = accepter.accept() else { break };
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true,"name":"box-a"}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (listener, port)
+    }
+
+    #[test]
+    fn commit_approval_on_an_inbound_entry_writes_the_same_peers_json_the_cli_would() {
+        with_peer_state("commit-approval-inbound", || {
+            let (_listener, port) = spawn_fake_pair_approve_server();
+            let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
+            aoide_storage::pairing::park_inbound(
+                &"a".repeat(64),
+                "box-a",
+                "10.0.0.5",
+                &format!("http://127.0.0.1:{port}/"),
+                &aoide_storage::pairing::derive_commit(&"a".repeat(64), &"c".repeat(32)),
+                &aoide_storage::time::now_iso_utc(),
+                &aoide_storage::pairing::expires_at_from(now_epoch),
+            )
+            .unwrap();
+            let id = aoide_storage::pairing::list_inbound(now_epoch)[0].id.clone();
+            aoide_storage::pairing::reveal_inbound(&id, &"c".repeat(32), now_epoch).unwrap();
+
+            let pending = reconcile(now_epoch);
+            assert_eq!(pending.len(), 1);
+            assert!(actionable(&pending[0]));
+
+            let outcome = commit_approval(&pending[0], now_epoch);
+            assert_eq!(outcome.status, aoide_protocol::output::Status::Ok, "{outcome:?}");
+
+            let peers = aoide_storage::peer_store::load_peers();
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].name, "box-a");
+            assert_eq!(peers[0].pubkey.as_deref(), Some("a".repeat(64).as_str()));
+            assert!(peers[0].verified);
+            assert!(aoide_storage::pairing::list_inbound(now_epoch).is_empty(), "the parked entry is taken on commit");
+        });
+    }
+
+    #[test]
+    fn commit_approval_on_an_outbound_entry_writes_the_same_peers_json_the_cli_would() {
+        with_peer_state("commit-approval-outbound", || {
+            let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
+            aoide_storage::pairing::park_outbound(aoide_storage::pairing::OutboundPairingRequest {
+                id: "deadbeef".to_string(),
+                url: "http://box-b/".to_string(),
+                name: "box-b".to_string(),
+                pubkey_hex: "b".repeat(64),
+                requester_nonce_hex: "c".repeat(32),
+                approver_nonce_hex: "d".repeat(32),
+                requested_at: aoide_storage::time::now_iso_utc(),
+                expires_at: aoide_storage::pairing::expires_at_from(now_epoch),
+                state: aoide_storage::pairing::OutboundState::AwaitingConfirm,
+                via: None,
+            })
+            .unwrap();
+
+            let pending = reconcile(now_epoch);
+            assert_eq!(pending.len(), 1);
+            assert!(actionable(&pending[0]));
+
+            let outcome = commit_approval(&pending[0], now_epoch);
+            assert_eq!(outcome.status, aoide_protocol::output::Status::Ok, "{outcome:?}");
+
+            let peers = aoide_storage::peer_store::load_peers();
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].name, "box-b");
+            assert_eq!(peers[0].pubkey.as_deref(), Some("b".repeat(64).as_str()));
+            assert!(peers[0].verified);
+            assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "the parked entry is taken on commit");
+        });
     }
 }

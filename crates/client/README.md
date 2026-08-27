@@ -257,8 +257,28 @@ never the inbound/serve half (that's `aoide-server`).
   whether a `Pending` is worth surfacing (an inbound entry once revealed,
   an outbound entry once `awaiting-confirm`); `run` is the blocking
   tail/reconcile loop (`aoide_secrets::watch::wait_for_follower`'s exact
-  retry-until-exists shape, a 30s reconcile safety tick). `--popup`
-  refuses up front when `zenity` isn't on `PATH`.
+  retry-until-exists shape, a 30s reconcile safety tick). **`--popup`
+  (F6, zenity `--question` ONLY — no `lyra` fallback, a QML confirm
+  dialog is a named deferral)** refuses up front when `zenity` isn't on
+  `PATH`; past that, `popup_tick` replaces the plain narrate-only
+  reconcile with: pick the next un-ignored actionable `Pending`, skip
+  while the screen is locked (F8, `aoide_protocol::dialog::is_locked`),
+  show `spawn_pair_confirm`'s dialog (`--no-markup` load-bearing, the
+  same Pango-corruption reasoning `aoide_secrets::watch::
+  spawn_zenity_entry` already carries) via `confirm_dialog` (a thin
+  `run_entry_dialog` wrapper comparing stdout against this module's OWN
+  `REJECT_LABEL`, `"Reject request"` — never `aoide_protocol::dialog::
+  DISMISS_LABEL`, a different ceremony's label), and act on `decide`'s
+  mapping (exit 0 → `commit_approval`, which calls the SAME
+  `approve_inbound`/`approve_outbound` with `skip_confirm: true`; the
+  `REJECT_LABEL` extra button → `reject_by_id`; a bare Cancel → session-
+  only `ignored`; a spawn/infra failure → backoff, NEVER `ignored`, the
+  same "a broken binary doesn't silently stop offering the request"
+  stance `aoide_secrets::watch::popup_loop` already holds).
+  `confirm_title`/`confirm_text` are pure and read ONLY from a `Pending`
+  `reconcile` already produced — never a `PairEvent`'s own feed-sourced
+  fields — and show no more than `peer pair pending` already prints (no
+  fingerprint).
   **`run_pair_request(cmd, url, name, self_url, dial_via, record_via)`
   (P-P6, `dial_via`/`record_via` added P-S4) is `handle_peer_pair_request`'s
   own body, extracted so `peer invite` reaches it too — reused, never

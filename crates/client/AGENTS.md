@@ -157,11 +157,24 @@
   mirrors `aoide_secrets::watch::narrate_event`'s own identical trust in
   its feed line's fields for narration-only output. [`reconcile`] is the
   hard line: it NEVER reads the feed, only
-  `aoide_storage::pairing::list_inbound`/`list_outbound` directly — any
-  future dialog/action arm (this phase's popup, P-P5) must build its
-  displayed text and its SAS from `reconcile`'s own `Pending`, never from
-  a `PairEvent`'s fields, no matter how validated those look. Don't fold
-  the two trust levels back into one "just use the feed line" path.
+  `aoide_storage::pairing::list_inbound`/`list_outbound` directly — the
+  popup arm's `confirm_title`/`confirm_text` (P-P5) build their displayed
+  text and SAS from `reconcile`'s own `Pending` exclusively, never from a
+  `PairEvent`'s fields, no matter how validated those look — a future
+  change that threads a `PairEvent` into either function is the one thing
+  to refuse on sight. Don't fold the two trust levels back into one "just
+  use the feed line" path.
+- **`decide` (P-P5) maps a `SpawnError`/`DialogFailure` to `Backoff`,
+  NEVER `Ignore` — the same rule `aoide_secrets::watch::popup_loop`
+  already holds for its own `ZenityResult` match.** `Ignore` is a
+  SESSION-ONLY, USER-CHOSEN dismissal (a bare Cancel/Escape); a dialog
+  that failed to even open never received a user's choice, so treating it
+  as `Ignore` would permanently stop offering a request over what could
+  be a transient glitch (a display hiccup, a momentarily-missing
+  binary). `REJECT_LABEL` (`"Reject request"`) is this arm's OWN string,
+  never `aoide_protocol::dialog::DISMISS_LABEL` — `run_entry_dialog`
+  takes its dismiss label as a parameter specifically so two ceremonies
+  sharing the loop can each pass their own.
 - **`run_pair_request` (P-P6) is the ONLY body of `handle_peer_pair_request`
   past its own `<url>`/`--name`/`--self-url` parsing, and `handle_peer_invite`
   calls the SAME function — never a second copy.** `peer invite`'s own doc

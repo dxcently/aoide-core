@@ -1689,7 +1689,7 @@ fn handle_peer_pair_approve(inv: &Invocation) -> Outcome {
 /// `y`/`yes` prompt on top would be a confirmation of a confirmation).
 /// The ordinary CLI path passes `inv.flag_present("yes")` through
 /// unchanged — this is a parameter rename, not a behavior change.
-fn approve_inbound(
+pub(crate) fn approve_inbound(
     skip_confirm: bool,
     cmd: &str,
     id: &str,
@@ -1813,7 +1813,7 @@ fn approve_inbound(
 ///
 /// `skip_confirm` (P-P5): same meaning as [`approve_inbound`]'s own
 /// parameter — the popup arm's dialog IS the confirmation.
-fn approve_outbound(
+pub(crate) fn approve_outbound(
     skip_confirm: bool,
     cmd: &str,
     id: &str,
@@ -1921,7 +1921,7 @@ fn handle_peer_pair_reject(inv: &Invocation) -> Outcome {
 /// Whichever direction the id is parked in, removes it — no peer record
 /// on either end, no wire notification to the other side (module doc on
 /// [`handle_peer_pair_reject`]).
-fn reject_by_id(cmd: &str, id: &str) -> Outcome {
+pub(crate) fn reject_by_id(cmd: &str, id: &str) -> Outcome {
     let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
 
     match aoide_storage::pairing::take_inbound(id, now_epoch) {
