@@ -24,7 +24,7 @@ fn handle_conductor(inv: &Invocation) -> Outcome {
         Door::Cli => Outcome::ok("conductor", "raising the conductor over the agent sessions")
             .with_data(json!({
                 "interactive": true,
-                "stageDir": aoide_storage::fs::stage_dir().to_string_lossy(),
+                "stageDir": aoide_storage::fs::conducting_stage_dir().to_string_lossy(),
             })),
         _ => Outcome::ok(
             "conductor",

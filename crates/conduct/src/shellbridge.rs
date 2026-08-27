@@ -2,8 +2,8 @@
 //! (concepts/shellbridge).
 //!
 //! Registers agent sessions + window addresses and records Claude Code hook
-//! phases, publishing them to `song/stage/` for Quickshell to read. Writes are
-//! atomic (write-temp-then-rename) so a hot-reload never sees a torn file
+//! phases, publishing them to `state/stage/` for Quickshell to read. Writes
+//! are atomic (write-temp-then-rename) so a hot-reload never sees a torn file
 //! (CONTRACTS.md §4 discipline).
 //!
 //! The process seeds the stage files (atomic writer), then binds its unix
@@ -21,7 +21,7 @@
 //! halves at their old `crate::shellbridge::*` path so no caller changes.
 
 use aoide_protocol as daemon;
-use aoide_storage::fs::{seed_if_absent, stage_dir};
+use aoide_storage::fs::{conducting_stage_dir, seed_if_absent};
 use aoide_storage::mode::{load_mode_marker, RiceMode};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
@@ -571,7 +571,7 @@ fn dispatch_recheck_sessions() {
 /// up on the blocking accept loop.
 pub fn run() -> serde_json::Value {
     let sock = socket_path();
-    let stage = stage_dir();
+    let stage = conducting_stage_dir();
 
     // Seed the two stage files with their documented shapes (empty registries).
     let sessions = json!({

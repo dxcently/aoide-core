@@ -79,7 +79,7 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   session id marked DURABLE, so a project's whole carried set can later be
   resurrected together. Unlike every other `graph session *` handler in this
   crate, it takes no stage lock and does not route through `daemon_dispatch`:
-  `carry.json` is not a `song/stage/` file, so it sits entirely outside the
+  `carry.json` is not a `state/stage/` file, so it sits entirely outside the
   L4 dual-writer surface. `--id` targets any session id, live or not — no
   roster lookup gates the write, which is what makes the mark flippable
   post-mortem off a bare ledger id; bare and `--self` both resolve the

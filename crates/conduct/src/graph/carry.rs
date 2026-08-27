@@ -8,7 +8,7 @@
 //! here. This handler writes ONLY `state/carry.json`: unlike every other
 //! `graph session *` handler in this module, it takes no stage lock and does
 //! not route through `aoide_client::daemon::daemon_dispatch` — `carry.json`
-//! is not a `song/stage/` file, so it sits entirely outside the L4
+//! is not a `state/stage/` file, so it sits entirely outside the L4
 //! dual-writer surface (a second writer there would defeat the store's own
 //! single-writer atomic-write discipline; see `carry.rs`'s own module doc in
 //! `aoide-storage`).

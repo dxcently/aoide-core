@@ -70,7 +70,7 @@ the inbound half of the two-door contract (the outbound half is
 - **Graph residency (P-D6, `docs/architecture/AOIDED.md`'s "L4")** —
   `run_loop`'s tick, after narrating the hand-edit sweep above, does two
   more things every iteration: `reconcile_graph_projection(changed_files)`
-  re-derives `song/stage/graph.json` (via `aoide_conduct::graph::restage_graph`,
+  re-derives `state/stage/graph.json` (via `aoide_conduct::graph::restage_graph`,
   the same function every project/session mutation site already calls — the
   `graph emit` CLI command was retired in favor of `graph prune` — no forked
   logic) whenever `sessions.json`/`hooks.json` is among the

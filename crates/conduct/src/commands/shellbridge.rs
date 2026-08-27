@@ -25,7 +25,7 @@ fn handle_shellbridge(_inv: &Invocation) -> Outcome {
 pub fn register(r: &mut Registry) {
     r.insert(cmd!(
         path: ["shellbridge"],
-        summary: "Run the shellbridge process: publish session/hook state to song/stage/ atomically.",
+        summary: "Run the shellbridge process: publish session/hook state to state/stage/ atomically.",
         args: [],
         flags: [flag!("run", "bool", "Run the long-lived shellbridge process.")],
         gated: false,

@@ -486,7 +486,7 @@ pub fn agent_card_from_commands<'a>(
     let card = AgentCard {
         name: Some("aoide".to_string()),
         description: "aoide — a headless conductor for agent sessions, rice \
-            generation, and the song/stage state tree, exposed as a \
+            generation, and the state/stage tree, exposed as a \
             discoverable A2A remote agent (CONTRACTS.md §6)."
             .to_string(),
         version: Some(aoide_protocol::registry::AOIDE_VERSION.to_string()),

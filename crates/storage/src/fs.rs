@@ -55,6 +55,122 @@ pub fn state_dir() -> std::path::PathBuf {
     aoide_protocol::aoide_home().join("Aoide").join("state")
 }
 
+/// The CONDUCTING stage directory: `~/Aoide/state/stage/` — sessions.json,
+/// hooks.json, projects.json, graph.json, pending.json, herald.json (the
+/// broker-owned roster [`crate::inbox`]'s doc calls the "L4 dual-writer
+/// surface", mirrored by `server/src/daemon.rs::stage_roster`). Split from
+/// [`stage_dir`] (2026-08-27, command-defrag lane S1): those six files are
+/// core orchestration state the `aoide`/`aoided` binaries alone read and
+/// write, never rice/paint — `song/` is lyra's tree
+/// (`docs/architecture/PACKAGE-LAYOUT.md`'s "Two binaries"), so conducting
+/// state has no business living under it. `stage_dir` itself is UNCHANGED
+/// and keeps meaning exactly what it always has — the rice/paint stage tree
+/// (`livery.json`, `mode.json`, and the draft-routing symlink target) — this
+/// is a NEW, separate root, not a rename.
+///
+/// **Precedence mirrors [`stage_dir`] exactly, on purpose:** `$AOIDE_STAGE_DIR`
+/// wins when set to an absolute path (every existing test and the systemd
+/// unit's env already set this to select the conducting stage tree; keeping
+/// it authoritative here means every one of them needs zero changes), else
+/// this falls back to [`state_dir`]`/stage` rather than [`stage_dir`]'s own
+/// `song/stage` fallback. On a box that has never set `$AOIDE_STAGE_DIR` this
+/// is the only path that changes; a test/unit override continues to name one
+/// directory for both trees, exactly as before the split.
+pub fn conducting_stage_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("AOIDE_STAGE_DIR") {
+        let p = std::path::PathBuf::from(&dir);
+        if p.is_absolute() {
+            return p;
+        }
+    }
+    let dir = state_dir().join("stage");
+    MIGRATE_CONDUCTING_STAGE_ONCE.call_once(|| migrate_conducting_stage(&dir));
+    dir
+}
+
+/// The six core stage-file names [`conducting_stage_dir`] owns — the same
+/// roster `server/src/daemon.rs::stage_roster` watches, named here once so
+/// [`migrate_conducting_stage`] doesn't hand-copy the list a second place.
+const CONDUCTING_STAGE_FILES: &[&str] = &[
+    "sessions.json",
+    "hooks.json",
+    "projects.json",
+    "graph.json",
+    "pending.json",
+    "herald.json",
+];
+
+static MIGRATE_CONDUCTING_STAGE_ONCE: std::sync::Once = std::sync::Once::new();
+
+/// One-shot, boot-safe move of the six core stage files from their PRE-split
+/// home (`song/stage/`, i.e. [`stage_dir`]'s own resolution) into `new_dir`
+/// (`state/stage/`) — the command-defrag lane S1 migration. Runs at most once
+/// per process ([`MIGRATE_CONDUCTING_STAGE_ONCE`], driven from
+/// [`conducting_stage_dir`]'s fallback branch only — an `$AOIDE_STAGE_DIR`
+/// override names the SAME directory for both the old and new resolution, so
+/// there is nothing to move and that branch never calls this).
+///
+/// Idempotent and safe to re-run every boot: a file only moves when it exists
+/// at the OLD path and does NOT already exist at the new one — a newer
+/// new-path file (a fresh boot that already migrated, or one seeded after the
+/// move) is never overwritten. `rename` first (same filesystem, the common
+/// case); a cross-filesystem rename falls back to copy-then-remove-source so
+/// the move still completes rather than silently no-op-ing.
+///
+/// **Locking:** not [`with_stage_lock`] — that lock is fixed to `stage_dir()`
+/// (see its own doc), and the files this function moves no longer live
+/// there. A dedicated `.migrate.lock` in `new_dir`, `flock`ed for the
+/// migration's duration, is enough to keep two processes racing this exact
+/// function (e.g. `aoided` and a concurrently-invoked `aoide` CLI at the same
+/// boot) from double-moving a file; best-effort like [`with_stage_lock`] —
+/// an unlockable lock file runs the migration unlocked rather than blocking
+/// boot on a lock hiccup. Ordinary CORE writers racing the migration itself
+/// (a `graph session start` landing mid-move) are not specially guarded
+/// beyond this: at most one host runs this migration, once, at the first
+/// stage-path resolution of its lifetime — the same "known limitation,
+/// acceptable at boot, not a steady-state hazard" class `peer_store`'s own
+/// process-local locks already document.
+fn migrate_conducting_stage(new_dir: &std::path::Path) {
+    let old_dir = stage_dir();
+    if old_dir == new_dir || !old_dir.exists() {
+        return;
+    }
+    if std::fs::create_dir_all(new_dir).is_err() {
+        return;
+    }
+
+    use std::os::unix::io::AsRawFd;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(new_dir.join(".migrate.lock"))
+        .ok();
+    let held = lock
+        .as_ref()
+        .map(|f| unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0)
+        .unwrap_or(false);
+
+    for name in CONDUCTING_STAGE_FILES {
+        let src = old_dir.join(name);
+        let dst = new_dir.join(name);
+        if !src.exists() || dst.exists() {
+            continue;
+        }
+        if std::fs::rename(&src, &dst).is_err() && std::fs::copy(&src, &dst).is_ok() {
+            let _ = std::fs::remove_file(&src);
+        }
+    }
+
+    if held {
+        if let Some(f) = &lock {
+            unsafe {
+                libc::flock(f.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
+
 /// Screen-capture artifacts: `~/Aoide/state/captures/` (`aoide screen shot`,
 /// PACKAGE-LAYOUT.md Phase-1 `screen` command family).
 ///
@@ -377,6 +493,17 @@ pub fn secure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
 /// caller must never nest it — wrap a whole mutator once at its top, never an
 /// inner helper it calls. Best-effort: if the lock file can't be created or
 /// locked we run `f` unlocked rather than block the desktop on a lock hiccup.
+///
+/// **Still locks `stage_dir()`'s own lock file, even for [`conducting_stage_dir`]
+/// callers (command-defrag S1).** `sessions.json`/`hooks.json`/`projects.json`/
+/// `graph.json`/`pending.json`/`herald.json` moved to `state/stage/`, but every
+/// mutator of them still calls this exact function unchanged — the SAME
+/// precedent [`crate::inbox::receive`] already set for `state/inbox.json`
+/// ("one process-wide lock file is enough … a second lock file would be a new
+/// abstraction for zero added correctness"). A second `.stage.lock` under
+/// `state/stage/` would serialise the six core files against each other
+/// without serialising them against `stage_dir()`'s own rice writers sharing
+/// this same lock today — no new hazard exists to close, so none was added.
 pub fn with_stage_lock<T>(f: impl FnOnce() -> T) -> T {
     use std::os::unix::io::AsRawFd;
     let dir = stage_dir();
@@ -1033,5 +1160,200 @@ mod tests {
             Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
             None => std::env::remove_var("AOIDE_STATE_DIR"),
         }
+    }
+
+    // ── `conducting_stage_dir` / the command-defrag S1 migration ───────────
+
+    const CORE_STAGE_FILE_NAMES: &[&str] =
+        &["sessions.json", "hooks.json", "projects.json", "graph.json", "pending.json", "herald.json"];
+
+    /// Save/restore the four env vars every migration test pins, so a test
+    /// that panics mid-body still leaves the crate's env in whatever shape
+    /// the NEXT test expects (the same discipline every other `AOIDE_*`
+    /// override test in this module already holds, widened to the one extra
+    /// var — `HOME` — the migration path additionally depends on through
+    /// [`stage_dir`]/[`state_dir`]'s own `aoide_protocol::aoide_home`).
+    struct MigrationEnvGuard {
+        home: Option<String>,
+        user: Option<String>,
+        stage: Option<String>,
+        state: Option<String>,
+    }
+    impl MigrationEnvGuard {
+        fn capture_and_clear() -> Self {
+            let g = MigrationEnvGuard {
+                home: std::env::var("HOME").ok(),
+                user: std::env::var("AOIDE_USER").ok(),
+                stage: std::env::var("AOIDE_STAGE_DIR").ok(),
+                state: std::env::var("AOIDE_STATE_DIR").ok(),
+            };
+            std::env::remove_var("AOIDE_USER");
+            std::env::remove_var("AOIDE_STAGE_DIR");
+            std::env::remove_var("AOIDE_STATE_DIR");
+            g
+        }
+    }
+    impl Drop for MigrationEnvGuard {
+        fn drop(&mut self) {
+            match &self.home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.user {
+                Some(v) => std::env::set_var("AOIDE_USER", v),
+                None => std::env::remove_var("AOIDE_USER"),
+            }
+            match &self.stage {
+                Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+                None => std::env::remove_var("AOIDE_STAGE_DIR"),
+            }
+            match &self.state {
+                Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+                None => std::env::remove_var("AOIDE_STATE_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn migrate_conducting_stage_moves_every_core_file_from_old_to_new() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = MigrationEnvGuard::capture_and_clear();
+        let home = std::env::temp_dir().join(format!("aoide-migrate-basic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("HOME", &home);
+
+        let old_dir = stage_dir(); // `<home>/Aoide/song/stage`, unset-override fallback
+        let new_dir = state_dir().join("stage");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        for name in CORE_STAGE_FILE_NAMES {
+            std::fs::write(old_dir.join(name), format!("{{\"marker\":\"{name}\"}}")).unwrap();
+        }
+
+        migrate_conducting_stage(&new_dir);
+
+        for name in CORE_STAGE_FILE_NAMES {
+            assert!(!old_dir.join(name).exists(), "{name} must have moved off the old path");
+            let body = std::fs::read_to_string(new_dir.join(name)).unwrap();
+            assert!(body.contains(name), "{name}'s content must have moved verbatim, got {body}");
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn migrate_conducting_stage_second_run_is_a_no_op() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = MigrationEnvGuard::capture_and_clear();
+        let home = std::env::temp_dir().join(format!("aoide-migrate-idempotent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("HOME", &home);
+
+        let old_dir = stage_dir();
+        let new_dir = state_dir().join("stage");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join("sessions.json"), "first-boot").unwrap();
+
+        migrate_conducting_stage(&new_dir);
+        assert_eq!(std::fs::read_to_string(new_dir.join("sessions.json")).unwrap(), "first-boot");
+        assert!(!old_dir.join("sessions.json").exists());
+
+        // Second call: nothing left at the old path, and the new path is
+        // already populated — must run cleanly and change nothing.
+        migrate_conducting_stage(&new_dir);
+        assert_eq!(
+            std::fs::read_to_string(new_dir.join("sessions.json")).unwrap(),
+            "first-boot",
+            "a second migration pass must be a pure no-op"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn migrate_conducting_stage_never_clobbers_a_newer_new_path_file() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = MigrationEnvGuard::capture_and_clear();
+        let home = std::env::temp_dir().join(format!("aoide-migrate-no-clobber-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("HOME", &home);
+
+        let old_dir = stage_dir();
+        let new_dir = state_dir().join("stage");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+        // A STALE old-path file (predates the boot that already migrated)
+        // alongside a NEWER new-path file (written since) — the newer file
+        // must win, and the stale old file is left in place for inspection
+        // rather than silently destroyed.
+        std::fs::write(old_dir.join("sessions.json"), "stale").unwrap();
+        std::fs::write(new_dir.join("sessions.json"), "fresh").unwrap();
+
+        migrate_conducting_stage(&new_dir);
+
+        assert_eq!(std::fs::read_to_string(new_dir.join("sessions.json")).unwrap(), "fresh");
+        assert_eq!(std::fs::read_to_string(old_dir.join("sessions.json")).unwrap(), "stale");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn migrate_conducting_stage_leaves_rice_files_where_they_are() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = MigrationEnvGuard::capture_and_clear();
+        let home = std::env::temp_dir().join(format!("aoide-migrate-rice-untouched-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("HOME", &home);
+
+        let old_dir = stage_dir();
+        let new_dir = state_dir().join("stage");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join("sessions.json"), "core").unwrap();
+        std::fs::write(old_dir.join("livery.json"), "rice-palette").unwrap();
+        std::fs::write(old_dir.join("mode.json"), "rice-mode").unwrap();
+
+        migrate_conducting_stage(&new_dir);
+
+        assert!(!old_dir.join("sessions.json").exists(), "the core file must have moved");
+        assert_eq!(
+            std::fs::read_to_string(old_dir.join("livery.json")).unwrap(),
+            "rice-palette",
+            "rice files are never part of this migration"
+        );
+        assert_eq!(std::fs::read_to_string(old_dir.join("mode.json")).unwrap(), "rice-mode");
+        assert!(!new_dir.join("livery.json").exists());
+        assert!(!new_dir.join("mode.json").exists());
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The one test in this binary that resolves [`conducting_stage_dir`]
+    /// itself with no `$AOIDE_STAGE_DIR` override — proving the Once-guarded
+    /// wiring end to end, not just [`migrate_conducting_stage`] in isolation.
+    /// [`MIGRATE_CONDUCTING_STAGE_ONCE`] fires at most once for the whole
+    /// test binary, so this must be the ONLY call site in this module that
+    /// reaches [`conducting_stage_dir`]'s fallback branch — every other
+    /// migration test above calls [`migrate_conducting_stage`] directly to
+    /// stay independent of that one-shot guard.
+    #[test]
+    fn conducting_stage_dir_resolves_under_state_and_migrates_on_first_call() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = MigrationEnvGuard::capture_and_clear();
+        let home = std::env::temp_dir().join(format!("aoide-migrate-wiring-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("HOME", &home);
+
+        let old_dir = home.join("Aoide").join("song").join("stage");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join("graph.json"), "pre-existing-graph").unwrap();
+
+        let dir = conducting_stage_dir();
+        assert!(dir.ends_with("Aoide/state/stage"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("graph.json")).unwrap(),
+            "pre-existing-graph",
+            "conducting_stage_dir()'s own resolution must have driven the migration"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

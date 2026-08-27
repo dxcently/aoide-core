@@ -106,7 +106,7 @@
   the rest of the test BINARY's life — without this floor it would
   eventually read `$AOIDE_STAGE_DIR` as unset (once whichever test set it
   restores its own prior value) and start reading/writing the REAL
-  `~/Aoide/song/stage/*` on this box. Every test that wants its own
+  `~/Aoide/state/stage/*` on this box. Every test that wants its own
   isolated tempdir still calls `env_lock()` first (existing convention)
   and restores what it captured on exit, same as `aoide-conduct`'s sibling
   `$AOIDE_DAEMON_SOCKET` floor (see that crate's own `AGENTS.md`) — don't

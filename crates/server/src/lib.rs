@@ -51,7 +51,7 @@ pub mod producers;
 /// keeps ticking for the rest of THIS PROCESS's life; without this floor it
 /// would eventually read `AOIDE_STAGE_DIR` as unset (once whichever test set
 /// it restores its own prior value) and start reading/writing the REAL
-/// `~/Aoide/song/stage/*` on this box. Every test that wants its OWN
+/// `~/Aoide/state/stage/*` on this box. Every test that wants its OWN
 /// isolated tempdir still calls `env_lock()` first (existing convention)
 /// and restores to what it captured on exit — which, because of this floor,
 /// is never "fully unset" for the rest of the binary's life once the first

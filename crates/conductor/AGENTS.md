@@ -19,6 +19,16 @@
   or the panic hook — never leave the tty in raw/alternate-screen mode.
 - **Core, never lyra.** No dependency here may pull in wayland/image/song —
   that would contradict "conducting is core identity, painting is lyra's."
+- **Two stage roots, never merged (command-defrag S1, 2026-08-27).**
+  `App::stage` (`aoide_storage::fs::conducting_stage_dir`, `state/stage/`)
+  is for projects/sessions/hooks/graph; `App::rice_stage`
+  (`aoide_storage::fs::stage_dir`, `song/stage/`) is for `livery.json` only
+  (the STATUS panel's palette). A new panel that reads a CONDUCTING file
+  uses `App::stage`; one that reads rice/paint state uses `App::rice_stage`.
+  They resolve to the SAME directory only under an `$AOIDE_STAGE_DIR`
+  override (every test here sets one) — don't collapse them back to one
+  `dir` variable "for simplicity," that reintroduces the coupling the
+  storage-crate split exists to remove.
 - **A keybind is scoped to its own panel's `handle_*_key` handler — a
   letter used on one panel is free to mean something else on another
   (P-D8: `r` = resurrect on PROJECTS, `r` = force-refresh on ROSTER, two

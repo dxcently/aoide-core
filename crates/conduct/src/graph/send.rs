@@ -31,7 +31,7 @@ use aoide_protocol::agents::{agent_profile, known_agents, AgentProfile, HookClas
 use aoide_protocol::Invocation;
 use aoide_protocol::output::Outcome;
 use aoide_storage::addr::{self, LocalCandidate, Resolution};
-use aoide_storage::fs::{stage_dir, with_stage_lock};
+use aoide_storage::fs::{conducting_stage_dir, with_stage_lock};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -43,7 +43,7 @@ use std::path::PathBuf;
 // ── `graph send`: the gated injection door ──────────────────────────────────
 
 /// A pending (unapproved) injection, staged for the conductor to surface for a
-/// one-key approve/deny. Written atomically to `song/stage/pending.json`.
+/// one-key approve/deny. Written atomically to `state/stage/pending.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PendingSend {
     #[serde(rename = "sessionId", default)]
@@ -78,11 +78,14 @@ pub struct PendingFile {
 /// so does `aoide-server`'s #69 hand-edit watcher, which folds
 /// `pending.json` into the same watched-file roster as `sessions.json`/
 /// `hooks.json`/`projects.json`/`graph.json`/`herald.json` — reached via
-/// `aoide_conduct::graph::pending_path()` rather than a second `stage_dir()
-/// .join("pending.json")` literal elsewhere (this crate's own "no
-/// cross-crate copying" convention, widen-don't-fork).
+/// `aoide_conduct::graph::pending_path()` rather than a second
+/// `conducting_stage_dir().join("pending.json")` literal elsewhere (this
+/// crate's own "no cross-crate copying" convention, widen-don't-fork).
+///
+/// `state/stage/pending.json` (command-defrag S1, 2026-08-27) — core
+/// conducting state, moved off `song/stage/` (lyra's tree).
 pub fn pending_path() -> PathBuf {
-    stage_dir().join("pending.json")
+    conducting_stage_dir().join("pending.json")
 }
 
 /// The gate decision for a send.

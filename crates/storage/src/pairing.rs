@@ -59,7 +59,7 @@
 //! — the ceremony's own missing abort command, closed without a new command
 //! (golden count unchanged).
 //!
-//! **Ids are NOT the array-position ids `song/stage/pending.json` uses**
+//! **Ids are NOT the array-position ids `state/stage/pending.json` uses**
 //! (CONTRACTS.md's own doc for that file) — a pairing request's id is
 //! generated once, at park time, and stays stable for the request's whole
 //! life on BOTH ends (the requester's outbound entry and the approver's

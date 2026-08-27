@@ -28,7 +28,7 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["graph", "project", "add"],
-        summary: "Register or update a project anchor root in song/stage/projects.json (atomic, idempotent).",
+        summary: "Register or update a project anchor root in state/stage/projects.json (atomic, idempotent).",
         args: [
             arg!("name", "string", true, "Project name (its node id becomes project:<name>)."),
             arg!("path", "string", false, "Project root path (defaults to the current working directory); sessions anchor by cwd prefix (longest wins)."),
@@ -75,7 +75,7 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["graph", "session", "start"],
-        summary: "Register or update a running session in song/stage/sessions.json (UPSERT; atomic; startedAt preserved on re-start).",
+        summary: "Register or update a running session in state/stage/sessions.json (UPSERT; atomic; startedAt preserved on re-start).",
         args: [],
         flags: [
             flag!("id", "string", "Session id (required); its node id becomes session:<id>."),
@@ -90,7 +90,7 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["graph", "session", "phase"],
-        summary: "Upsert the live hook phase for a session in song/stage/hooks.json (latest updatedAt wins).",
+        summary: "Upsert the live hook phase for a session in state/stage/hooks.json (latest updatedAt wins).",
         args: [],
         flags: [
             flag!("id", "string", "Session id (required)."),
@@ -176,7 +176,7 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["graph", "pending", "list"],
-        summary: "Enumerate held `graph send` / A2A entries in song/stage/pending.json (id is the entry's position — re-list after any approve/deny, positions shift). A malformed entry (a stale hand-edited line) is listed with state `malformed` rather than failing the whole read.",
+        summary: "Enumerate held `graph send` / A2A entries in state/stage/pending.json (id is the entry's position — re-list after any approve/deny, positions shift). A malformed entry (a stale hand-edited line) is listed with state `malformed` rather than failing the whole read.",
         args: [],
         flags: [],
         gated: false,

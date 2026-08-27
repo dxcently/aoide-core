@@ -36,8 +36,9 @@ pub struct CarryRegistry {
 
 /// The carry file path: `state/carry.json` — the same gitignored
 /// root-runtime `state/` dir `peers.json`/`usage.json` live in
-/// (CONTRACTS.md), NOT `song/stage/`: a carry mark is durable operator
-/// state, never staged rehearsal state.
+/// (CONTRACTS.md), NOT inside either stage tree (`state/stage/` or
+/// `song/stage/`): a carry mark is durable operator state, never staged
+/// rehearsal/registry state.
 pub fn carry_path() -> std::path::PathBuf {
     state_dir().join("carry.json")
 }

@@ -518,12 +518,21 @@ fn trunc(s: &str, max: usize) -> String {
 // ── [4] STATUS — stage-tree health ──────────────────────────────────────────
 
 fn draw_status_panel(f: &mut Frame, area: Rect, app: &App) {
-    let stage = aoide_storage::fs::stage_dir();
+    // Two roots since command-defrag S1 (2026-08-27): conducting state
+    // (`sessions.json`/`hooks.json`/`projects.json`/`graph.json`) lives under
+    // `state/stage/`; rice/paint state (`livery.json`) stays `song/stage/`.
+    // They coincide under an `$AOIDE_STAGE_DIR` override (every test fixture
+    // here), and diverge only on the default production layout.
+    let stage = aoide_storage::fs::conducting_stage_dir();
+    let rice_stage = aoide_storage::fs::stage_dir();
     let sock = aoide_conduct::shellbridge::socket_path();
     let audit = aoide_protocol::default_audit_log();
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(format!(" stage dir   {}", stage.display())));
+    if rice_stage != stage {
+        lines.push(Line::from(format!(" rice dir    {}", rice_stage.display())));
+    }
     lines.push(Line::from(""));
     lines.push(file_status(
         &stage.join("projects.json"),
@@ -546,7 +555,7 @@ fn draw_status_panel(f: &mut Frame, area: Rect, app: &App) {
         graph_node_count(&stage.join("graph.json")),
     ));
     lines.push(file_status(
-        &stage.join("livery.json"),
+        &rice_stage.join("livery.json"),
         "livery",
         palette_count(app),
     ));
@@ -743,7 +752,7 @@ fn draw_pending(f: &mut Frame, area: Rect, app: &App) {
     if rows.is_empty() {
         let lines = vec![
             Line::from(""),
-            Line::from("   nothing held — song/stage/pending.json is empty.").style(theme::dim()),
+            Line::from("   nothing held — state/stage/pending.json is empty.").style(theme::dim()),
         ];
         f.render_widget(Paragraph::new(lines), parts[1]);
         return;

@@ -24,7 +24,7 @@ use aoide_conduct::graph::{self, HooksFile, ProjectsFile, SessionRecord, Session
 use aoide_protocol::output::{Outcome, Status};
 use aoide_protocol::Door;
 use aoide_protocol::Invocation;
-use aoide_storage::fs::stage_dir;
+use aoide_storage::fs::{conducting_stage_dir, stage_dir};
 use crossterm::event::{KeyCode, KeyEvent};
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
@@ -435,7 +435,16 @@ impl App {
         std::fs::metadata(path).and_then(|m| m.modified()).ok()
     }
 
+    /// The CONDUCTING stage dir (`sessions.json`/`hooks.json`/`projects.json`/
+    /// `graph.json`) — `state/stage/` (command-defrag S1). Distinct from
+    /// [`App::rice_stage`], which stays `song/stage/` for `livery.json`; the
+    /// two coincide whenever `$AOIDE_STAGE_DIR` is set (every test fixture
+    /// here does), and diverge only on the default production layout.
     fn stage() -> PathBuf {
+        conducting_stage_dir()
+    }
+    /// The rice/paint stage dir (`livery.json`) — unchanged, `song/stage/`.
+    fn rice_stage() -> PathBuf {
         stage_dir()
     }
     fn audit_path() -> PathBuf {
@@ -451,7 +460,7 @@ impl App {
         self.projects = p.projects;
         self.sessions = s.sessions;
         self.hooks = h.hooks;
-        self.palette = load_palette(&stage_notes_path(&dir));
+        self.palette = load_palette(&stage_notes_path(&Self::rice_stage()));
         self.reload_log();
         // A local read through the dispatcher (P-C5) — `reload_all` runs
         // synchronously right after every mutating `App::dispatch`, so this
@@ -464,7 +473,7 @@ impl App {
             sessions: Self::mtime(&dir.join("sessions.json")),
             hooks: Self::mtime(&dir.join("hooks.json")),
             projects: Self::mtime(&dir.join("projects.json")),
-            notes: Self::mtime(&stage_notes_path(&dir)),
+            notes: Self::mtime(&stage_notes_path(&Self::rice_stage())),
             audit: Self::mtime(&Self::audit_path()),
         };
         self.note_new_sessions();
@@ -525,13 +534,14 @@ impl App {
     /// when anything changed (so the loop repaints).
     pub fn poll_refresh(&mut self) -> bool {
         let dir = Self::stage();
+        let rice_dir = Self::rice_stage();
         let mut changed = false;
 
         let cur = StageMtimes {
             sessions: Self::mtime(&dir.join("sessions.json")),
             hooks: Self::mtime(&dir.join("hooks.json")),
             projects: Self::mtime(&dir.join("projects.json")),
-            notes: Self::mtime(&stage_notes_path(&dir)),
+            notes: Self::mtime(&stage_notes_path(&rice_dir)),
             audit: Self::mtime(&Self::audit_path()),
         };
 
@@ -551,7 +561,7 @@ impl App {
             changed = true;
         }
         if cur.notes != self.mtimes.notes {
-            self.palette = load_palette(&stage_notes_path(&dir));
+            self.palette = load_palette(&stage_notes_path(&rice_dir));
             changed = true;
         }
         if cur.audit != self.mtimes.audit {
@@ -795,7 +805,7 @@ impl App {
     // ── PENDING: `graph pending list` through the dispatcher (P-C5) ─────────
     //
     // Unlike ROSTER's `who`, `graph pending list` is a local file read (no
-    // network) — refreshing it costs one JSON parse of `song/stage/pending.json`,
+    // network) — refreshing it costs one JSON parse of `state/stage/pending.json`,
     // not a ~2s-per-peer probe. So there is no throttle window and no
     // background thread here: [`App::refresh_pending`] runs synchronously,
     // called from `reload_all` (which fires after every dispatch — this is
@@ -1785,8 +1795,10 @@ mod tests {
     /// Point `AOIDE_STAGE_DIR`/`AOIDE_AUDIT_LOG` at a fresh empty tempdir for
     /// the duration of `f`, restoring whatever was set before. Any test that
     /// calls `App::dispatch` or `App::poll_refresh` needs this — both read
-    /// the real stage dir otherwise, and on this machine that's the live
-    /// `~/Aoide/song/stage`, not a fixture.
+    /// the real stage dirs otherwise, and on this machine that's the live
+    /// `~/Aoide/state/stage` (conducting) and `~/Aoide/song/stage` (rice),
+    /// not a fixture. `AOIDE_STAGE_DIR` overrides both at once, same as
+    /// today — see `App::stage`/`App::rice_stage`.
     fn with_isolated_stage<R>(f: impl FnOnce() -> R) -> R {
         let _guard = ENV_LOCK.lock().unwrap();
         let dir = tmp_dir("stage-isolated");

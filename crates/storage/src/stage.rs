@@ -1,5 +1,5 @@
 //! Stage-file I/O (missing file → empty registry; writes atomic) and the
-//! four stage-file paths.
+//! four CONDUCTING stage-file paths.
 //!
 //! Moved from `graph/model.rs` (Phase 3a restructure,
 //! docs/architecture/PACKAGE-LAYOUT.md); re-exported at the old path so every
@@ -10,21 +10,29 @@
 //! crossing a crate boundary they must be `pub` here; the root shim narrows
 //! their re-export back to `pub(in crate::graph)` so the original visibility
 //! contract at the root crate boundary is unchanged.
+//!
+//! **`state/stage/`, not `song/stage/` (command-defrag lane S1,
+//! 2026-08-27).** These four files are core orchestration state — CONTRACTS.md
+//! §4 — so they resolve through [`crate::fs::conducting_stage_dir`], not
+//! [`crate::fs::stage_dir`] (which still means the rice/paint stage tree).
+//! `pending.json`/`herald.json`, the other two files in the same broker-owned
+//! roster, live in `aoide-conduct` instead (`graph::pending_path`,
+//! `herald::herald_path`) and made the identical switch.
 
-use crate::fs::{atomic_write, stage_dir};
+use crate::fs::{atomic_write, conducting_stage_dir};
 use serde::Serialize;
 
 pub fn projects_path() -> std::path::PathBuf {
-    stage_dir().join("projects.json")
+    conducting_stage_dir().join("projects.json")
 }
 pub fn sessions_path() -> std::path::PathBuf {
-    stage_dir().join("sessions.json")
+    conducting_stage_dir().join("sessions.json")
 }
 pub fn hooks_path() -> std::path::PathBuf {
-    stage_dir().join("hooks.json")
+    conducting_stage_dir().join("hooks.json")
 }
 pub fn graph_path() -> std::path::PathBuf {
-    stage_dir().join("graph.json")
+    conducting_stage_dir().join("graph.json")
 }
 
 /// Load one stage file; a missing file is an empty registry (tolerated), a

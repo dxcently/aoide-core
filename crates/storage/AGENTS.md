@@ -5,6 +5,26 @@
 - **Stage files are read/written through `fs`/`stage`, never ad hoc.** A new
   consumer that wants a JSON file under the stage tree adds a typed
   accessor here rather than `serde_json::from_str`-ing a raw path elsewhere.
+- **Two stage roots, not one — pick the right one, don't blur them
+  (command-defrag S1, 2026-08-27).** `fs::stage_dir` is rice/paint
+  (`song/stage/`); `fs::conducting_stage_dir` is core orchestration state
+  (`state/stage/`). A new stage-file accessor for something the
+  `aoide`/`aoided` binaries alone read or write goes through
+  `conducting_stage_dir`; a new one for something only `lyra`/QML writes
+  goes through `stage_dir`. Don't "simplify" by routing a core file through
+  `stage_dir` for convenience — that is exactly the coupling the split
+  exists to remove (root `AGENTS.md`'s core-vs-lyra boundary, applied to the
+  stage tree itself).
+- **`fs::migrate_conducting_stage` is a ONE-SHOT, Once-guarded move, not a
+  sync.** It runs at most once per process, only from
+  `conducting_stage_dir`'s no-override fallback branch (an `$AOIDE_STAGE_DIR`
+  override names the same directory for old and new, so there is nothing to
+  move and that branch never calls it). It moves a file only when it exists
+  at the OLD `song/stage/` path and is ABSENT at the new one — never
+  clobbers a fresher `state/stage/` file, never touches a rice file. Don't
+  turn this into a periodic or unconditional re-sync; a second boot with
+  both a old-path leftover and a populated new path should leave the new
+  path exactly as it is.
 - **`takes`/`mode` are a deliberate charter smudge, not an oversight.** Don't
   "clean them up" into a paint-adjacent crate without re-reading
   `docs/architecture/PACKAGE-LAYOUT.md`'s "Charter exceptions" note — `mode`
@@ -85,7 +105,7 @@
   leaves `autogate`/`tokenFile`/`bearerSecret`/`hub` untouched — don't widen
   it to a general-purpose peer editor, and don't set those two fields via a
   raw `Peer { .. }` literal anywhere outside `peer_store.rs` itself.
-- **`pairing`'s request ids are deliberately NOT `song/stage/pending.json`'s
+- **`pairing`'s request ids are deliberately NOT `state/stage/pending.json`'s
   array-position ids.** A pairing correlation must survive the requester's
   CLI process exiting and an async `aoide/pairApprove` callback arriving
   arbitrarily later, so ids are stable 8-hex-char values

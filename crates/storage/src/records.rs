@@ -20,7 +20,7 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// One registered project anchor root (`song/stage/projects.json`).
+/// One registered project anchor root (`state/stage/projects.json`).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Project {
     #[serde(default)]
@@ -88,7 +88,7 @@ pub struct RestoreSnapshot {
     pub typed: Option<String>,
 }
 
-/// One session record (`song/stage/sessions.json`, written by shellbridge).
+/// One session record (`state/stage/sessions.json`, written by shellbridge).
 /// `parentSessionId` is the optional additive spawned-by edge; `extra`
 /// round-trips any fields this version does not know about.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -330,7 +330,7 @@ pub struct SessionRecord {
     pub extra: Map<String, Value>,
 }
 
-/// One hook record (`song/stage/hooks.json`, written by shellbridge).
+/// One hook record (`state/stage/hooks.json`, written by shellbridge).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HookRecord {
     #[serde(rename = "sessionId", default)]

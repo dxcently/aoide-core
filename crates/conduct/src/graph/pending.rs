@@ -1,6 +1,6 @@
 //! `graph pending list|approve|deny` — the pending queue's OTHER half.
 //!
-//! `song/stage/pending.json` is where [`super::send::session_send`] parks a
+//! `state/stage/pending.json` is where [`super::send::session_send`] parks a
 //! held injection when the gate doesn't authorise immediate delivery (no
 //! `--yes`, no autogate match) — and where the A2A door parks the same kind
 //! of held inject when its own admission check doesn't clear it
@@ -154,7 +154,7 @@ fn entry_view(
             "from": Value::Null,
             "state": "malformed",
         });
-        let line = format!("[{index}] <malformed entry — cannot resolve; edit song/stage/pending.json by hand>");
+        let line = format!("[{index}] <malformed entry — cannot resolve; edit state/stage/pending.json by hand>");
         return (json, line);
     }
     let o = v.as_object().expect("checked non-malformed above");
@@ -217,7 +217,7 @@ pub fn pending_list(_inv: &Invocation) -> Outcome {
     }
     let n = arr.len();
     let body = if n == 0 {
-        "song/stage/pending.json is empty".to_string()
+        "state/stage/pending.json is empty".to_string()
     } else {
         lines.join("\n")
     };
@@ -239,7 +239,7 @@ fn take_pending_entry(index: usize) -> Result<Value, String> {
             .ok_or_else(|| format!("no pending entry at index {index}"))?;
         if is_malformed(&arr[index]) {
             return Err(format!(
-                "pending entry {index} is malformed — cannot resolve automatically; edit song/stage/pending.json by hand"
+                "pending entry {index} is malformed — cannot resolve automatically; edit state/stage/pending.json by hand"
             ));
         }
         let removed = arr.remove(index);

@@ -5,11 +5,11 @@
 //! handed to `aoide herald push` through dunst's `script` hook, which reads the
 //! `DUNST_*` environment and sends the record over the shellbridge socket. The
 //! bridge daemon — the single writer, as it already is for `sessions.json` —
-//! folds it into `song/stage/herald.json`, and the QML herald reads that file
+//! folds it into `state/stage/herald.json`, and the QML herald reads that file
 //! and draws the real widget.
 //!
 //!   notification → dunst (daemon only) → `aoide herald push` → bridge socket
-//!                → song/stage/herald.json → Quickshell
+//!                → state/stage/herald.json → Quickshell
 //!
 //! ── Why the socket hop, and not a direct write ────────────────────────────
 //! dunst runs its script asynchronously, so two notifications arriving together
@@ -102,9 +102,10 @@ pub struct HeraldFile {
     pub notifications: Vec<Notification>,
 }
 
-/// `song/stage/herald.json`.
+/// `state/stage/herald.json` (command-defrag S1, 2026-08-27) -- core
+/// conducting state, moved off `song/stage/` (lyra's tree).
 pub fn herald_path() -> std::path::PathBuf {
-    aoide_storage::fs::stage_dir().join("herald.json")
+    aoide_storage::fs::conducting_stage_dir().join("herald.json")
 }
 
 /// Fold one notification into the ledger. Pure, so the replace/append/cap rules

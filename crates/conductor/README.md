@@ -8,10 +8,15 @@ weight, and conducting orchestration is Aoide's core identity (root
 
 ## Named seams (what it exposes)
 
-- `app::App` — live state (projects/sessions/hooks from the stage tree),
-  audit tail, panel/node selection, the last dispatched `Outcome`, the
-  ROSTER panel's throttled `who` cache, the PENDING panel's `graph pending
-  list` cache. Draws nothing.
+- `app::App` — live state (projects/sessions/hooks from the CONDUCTING stage
+  tree, `state/stage/`), audit tail, panel/node selection, the last
+  dispatched `Outcome`, the ROSTER panel's throttled `who` cache, the
+  PENDING panel's `graph pending list` cache. Draws nothing. `App::stage`
+  (`state/stage/`, core) and `App::rice_stage` (`song/stage/`, `livery.json`
+  only, for the STATUS panel's palette) are two DIFFERENT roots
+  (command-defrag lane S1, 2026-08-27) — they coincide only under an
+  `$AOIDE_STAGE_DIR` override (every test here sets one), diverging on the
+  default production layout.
 - `ui` — pure `draw(frame, area, &App)` view functions per panel, testable
   with a `TestBackend`.
 - `graphview` — DAG layout + drawing.
@@ -95,7 +100,9 @@ no-ops with the cursor on an empty list.
 
 `aoide-protocol`, `aoide-conduct` (`build_graph`/`merged_sessions`/
 `anchor_for` — reused, never re-derived), `aoide-storage`. Reads stage files
-directly for live state; does not depend on `aoide-server`.
+directly for live state (`aoide_storage::fs::conducting_stage_dir` for
+projects/sessions/hooks/graph, `stage_dir` for `livery.json` — see
+`app::App`'s own seam note above); does not depend on `aoide-server`.
 
 ## How it composes
 

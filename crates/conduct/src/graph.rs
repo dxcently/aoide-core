@@ -5,7 +5,7 @@
 //! (anchored by cwd, longest path prefix wins) and under each other via
 //! spawned-by edges (`parentSessionId` on the session record). One
 //! computation feeds three outputs: the Unicode tree render, the `--json`
-//! graph document, and the `song/stage/graph.json` stage file Quickshell
+//! graph document, and the `state/stage/graph.json` stage file Quickshell
 //! hot-reloads (CONTRACTS.md §4). Every stage write goes through
 //! shellbridge's atomic writer — never a bare `fs::write`.
 //!

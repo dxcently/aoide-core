@@ -34,7 +34,7 @@ pub mod shellbridge;
 /// the real default socket, and a test that forgot its own override used to
 /// silently dispatch against PRODUCTION state instead of its own tempdir
 /// fixture (caught live: `cargo test -p aoide-conduct` mutated the real
-/// `~/Aoide/song/stage/sessions.json` through the real daemon before this
+/// `~/Aoide/state/stage/sessions.json` through the real daemon before this
 /// stamp existed). This establishes the SAFE DEFAULT only — a test that
 /// wants to prove routing against a FAKE daemon still installs its own
 /// `AOIDE_DAEMON_SOCKET` override afterward, same as any other env var here.

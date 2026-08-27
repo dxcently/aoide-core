@@ -35,7 +35,7 @@
   way — see `client`'s own `AGENTS.md` extension-point note. **`graph/
   carry.rs`'s `session_carry`, `graph/spawn.rs`'s `--carry` mark, and
   `graph/resurrect.rs`'s carry transfer are a deliberate exception, not an
-  oversight:** `state/carry.json` is not a `song/stage/` file, so none of the
+  oversight:** `state/carry.json` is not a `state/stage/` file, so none of the
   three has L4 residency to route through — don't add a `daemon_dispatch`
   prefix to any of them "for consistency" with the family above; that would
   put an extra writer on a file the carry store's own atomic-write CRUD
@@ -92,7 +92,7 @@
   test already set one (P-D6 safety net — an incident, this phase: a real
   resident `aoided` on this exact dev box shares the default socket path
   every routed test handler resolves to when unset, and a test that forgot
-  its own override silently mutated PRODUCTION `~/Aoide/song/stage/
+  its own override silently mutated PRODUCTION `~/Aoide/state/stage/
   sessions.json` through it before this floor existed).** Don't remove or
   weaken this floor to "simplify" `env_lock()` — a test that WANTS to prove
   real daemon routing still installs its own `$AOIDE_DAEMON_SOCKET`

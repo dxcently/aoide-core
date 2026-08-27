@@ -1296,7 +1296,7 @@ mod tests {
         // P-D6: `run_loop`'s tick now writes through `aoide_conduct` (`lib.rs`'s
         // own doc) — this spawns a background thread it never joins, so it
         // needs `env_lock`'s one-time `AOIDE_STAGE_DIR` floor in place before
-        // that thread's first tick, never the real `~/Aoide/song/stage/*`.
+        // that thread's first tick, never the real `~/Aoide/state/stage/*`.
         let _guard = crate::env_lock().lock().unwrap();
         let socket_path = short_tmp("loop").with_extension("sock");
         let events_path = short_tmp("loop-events").with_extension("jsonl");

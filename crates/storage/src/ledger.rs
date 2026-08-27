@@ -75,9 +75,10 @@ pub struct LedgerEntry {
 
 /// The ledger's path: `state/session-ledger.jsonl`, under
 /// [`crate::fs::state_dir`] (real disk, not tmpfs) — sibling to
-/// `state/usage.json`/`state/sessions/<id>.log`, never `song/stage/`: this is
-/// durable history, not live rehearsal state a `rice mode`/stage-reseed ever
-/// resets.
+/// `state/usage.json`/`state/sessions/<id>.log`, never inside either stage
+/// tree (`state/stage/` or `song/stage/`): this is durable history, not live
+/// rehearsal/registry state a `rice mode`/stage-reseed ever resets, or a
+/// broker roster a mutation ever rewrites wholesale.
 pub fn session_ledger_path() -> PathBuf {
     crate::fs::state_dir().join("session-ledger.jsonl")
 }

@@ -9,7 +9,7 @@
 //! re-derives the graph. The node/edge structure comes verbatim from
 //! [`aoide_conduct::graph::build_graph`] — the same pure function every
 //! mutation's `restage_graph()` (and `graph prune`'s manual resync) writes to
-//! `song/stage/graph.json` — so the picture on screen is the document on disk.
+//! `state/stage/graph.json` — so the picture on screen is the document on disk.
 //! We parse that document into a forest (each session has at most one incoming
 //! edge — spawned-by wins over anchors — so the layout is a tree walk), assign
 //! `column = depth` and `row = preorder index`, and paint chips + connectors.
