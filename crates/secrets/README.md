@@ -251,7 +251,7 @@ wire with a new interim shape or a new `op`, never by widening `wait` (see
 below) into something richer.
 
 ```
--> {"op":"resolve","secret":"<name>","consumer":"<consumer>","totp":"<code>"?,"argv0":"<cmd>"?,"wait":<bool>?}
+-> {"op":"resolve","secret":"<name>","consumer":"<consumer>","totp":"<code>"?,"argv0":"<cmd>"?,"wait":<bool>?,"reason":"<text>"?}
 <- {"interim":true,"parked":true,"id":"<id>","timeoutSecs":<N>}   (INTERIM,
                                                       only when this resolve
                                                       parks — P-N2c FIX 1;
@@ -273,7 +273,7 @@ below) into something richer.
 <- {"ok":false,"error":"<value-free message>"}      (denied/error)
 
 -> {"op":"pending"}
-<- {"ok":true,"pending":[{"id":"<id>","secret":"<name>","consumer":"<consumer>","requestedAt":<unix-seconds>,"peerUid":<uid-or-null>},...]}
+<- {"ok":true,"pending":[{"id":"<id>","secret":"<name>","consumer":"<consumer>","requestedAt":<unix-seconds>,"peerUid":<uid-or-null>,"reason":"<text>"|null,"origin":{"username":<string-or-null>,"pid":<int-or-null>,"comm":<string-or-null>,"hostname":<string-or-null>}},...]}
 
 -> {"op":"approve","id":"<id>","totp":"<code>"}
 <- {"ok":true}                                      (code valid — the VALUE
@@ -316,8 +316,8 @@ caller learns its own ask id immediately rather than watching a silent hang
 that is indistinguishable from a wedged broker for up to
 `AOIDE_SECRETS_PARK_TIMEOUT` seconds.
 
-`totp`/`argv0`/`wait` are optional on `resolve` (`wait` defaults to `true`
-— see "Parking a TOTP resolve" below); `put` has neither, but gained
+`totp`/`argv0`/`wait`/`reason` are optional on `resolve` (`wait` defaults to
+`true` — see "Parking a TOTP resolve" below); `put` has neither, but gained
 `overwrite` at P-67 (also optional — absent means `false`, same shape as
 `resolve`'s own optional fields). `consumer` is SELF-ASSERTED (the V1
 ruling `replay.rs` carries): the policy's `consumers[]` list is the real
@@ -328,6 +328,27 @@ self-asserted) and recorded alongside the self-asserted `consumer` name,
 never in place of it — see "Peer identity (`SO_PEERCRED`, task #73)" below.
 `argv0` (the wrapped command's own argv[0], sent by `secrets exec`) exists
 purely so the broker's audit lines can name it — the broker never runs it.
+**`reason` (P3) is free-text, self-asserted, DISPLAY-ONLY context for why
+this ask exists** — `secrets exec` sends the wrapped command's own argv,
+space-joined and truncated to ~60 chars, unless the caller overrides it with
+`--reason <text>` (both `client::derive_reason`/`client::parse_exec_args`,
+this file's own "The release-to-client flow" section shows the full CLI
+shape). It never gates anything, and it only ever matters on a resolve that
+PARKS: `broker::handle_resolve` carries it onto the `ParkedAsk` registry row
+(alongside `peerUid`), the `pending` reply, and the `parked` events-feed
+line — a resolve granted or denied without ever parking has nothing to show
+it to. **`origin` (P3, additive on `pending`/the `parked` event only — never
+sent BY a client, only ever produced BY the broker) is best-effort "who/where
+this ask came from"**, captured ONCE at park time from the SAME `SO_PEERCRED`
+stamp `peerUid` already reads (`peercred::username_for_uid`/`peercred::
+read_comm` off that stamp's `uid`/`pid`) plus the broker's own hostname
+(`enroll::local_hostname` — future-proofing the day a non-local entry point
+exists, `Policy::remote`'s own note; every asker is local today, so this is
+always the broker's own host). Every `origin` field is best-effort and
+UNTRUSTED DISPLAY DATA — `comm` in particular is PROCESS-CONTROLLED text
+(`prctl(PR_SET_NAME, ...)` lets any process name itself anything) — a
+surface renders it, never interprets it, the same posture `consumer`/
+`reason` already hold; `null` per field when unknown, never an error.
 `totp` is consulted ONLY when the resolved policy has `requireTotp: true`
 (`broker::verify_totp_gate`) — on a policy without it, or on a `put` (never
 checked at all), `totp` rides the wire unread if present, same as before
@@ -662,11 +683,19 @@ task's own exact shapes:
 
 ```
 released:  {"event":"released", "secret", "consumer"}            — a TOTP-free grant
-parked:    {"event":"parked", "id", "secret", "consumer", "timeoutSecs"}
+parked:    {"event":"parked", "id", "secret", "consumer", "timeoutSecs", "reason", "origin"}
 completed: {"event":"completed", "id", "secret", "consumer"}      — a successful approve
 dismissed: {"event":"dismissed", "id", "secret", "consumer"}
 expired:   {"event":"expired", "id", "secret", "consumer"}        — a park that timed out
 ```
+
+**`parked`'s `reason`/`origin` are additive (P3)** — `null`/absent on a
+`parked` line an older broker emitted, exactly the same tolerance
+`watch::parse_notify_line` already holds for every other optional field on
+this wire. See the "Secrets wire" section's own `reason`/`origin` paragraph
+above for what each carries and where it comes from; this event is simply
+the FIRST of the three places they ride (registry row -> `pending` reply ->
+this event).
 
 **P-G1 (task #70) adds a SIXTH event, `age-identity-minted`, through the
 SAME `emit_notify` mechanism** — `{"event":"age-identity-minted"}`, fired

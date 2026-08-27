@@ -355,6 +355,12 @@ pub struct ExecArgs {
     pub var: String,
     pub totp: Option<String>,
     pub cmd: Vec<String>,
+    /// Optional, self-asserted, DISPLAY-ONLY context for a popup/prompt
+    /// surface to show ("release `db-prod` for: sudo nixos-rebuild switch")
+    /// — `--reason` when the caller gave one, else [`derive_reason`]'s own
+    /// auto-derivation from `cmd` (same discipline `argv0` already holds:
+    /// never a value, never an env var, never gates anything).
+    pub reason: Option<String>,
 }
 
 /// The env-var name a bare `--secret <name>` (no explicit `:VAR`) injects
@@ -404,7 +410,30 @@ pub fn parse_exec_args(inv: &Invocation) -> Result<ExecArgs, String> {
     if cmd.is_empty() {
         return Err(format!("secrets exec: missing a command after `--` — {EXEC_USAGE}"));
     }
-    Ok(ExecArgs { consumer, secret, var, totp, cmd })
+    let reason = inv.flags.get("reason").cloned().or_else(|| derive_reason(&cmd));
+    Ok(ExecArgs { consumer, secret, var, totp, cmd, reason })
+}
+
+/// Auto-derived when `--reason` is omitted: the wrapped command's own argv,
+/// space-joined, truncated to ~60 chars — the SAME display-only discipline
+/// `argv0` already holds on the wire (never a value, never an env var,
+/// never gates anything; a popup/prompt surface simply shows it — see
+/// `ExecArgs::reason`'s own doc). `None` only when `cmd` itself is empty
+/// (never reached in practice — `parse_exec_args` already refuses an empty
+/// `cmd` before this is called — but this function stays honest on its own
+/// rather than assuming that invariant from outside).
+fn derive_reason(cmd: &[String]) -> Option<String> {
+    if cmd.is_empty() {
+        return None;
+    }
+    let joined = cmd.join(" ");
+    const MAX_CHARS: usize = 60;
+    if joined.chars().count() <= MAX_CHARS {
+        Some(joined)
+    } else {
+        let truncated: String = joined.chars().take(MAX_CHARS.saturating_sub(1)).collect();
+        Some(format!("{truncated}\u{2026}"))
+    }
 }
 
 /// Connect to `socket_path`, send ONE `resolve` request, read the wire's
@@ -417,6 +446,7 @@ pub fn resolve(
     consumer: &str,
     totp: Option<&str>,
     argv0: Option<&str>,
+    reason: Option<&str>,
 ) -> Result<String, String> {
     let mut stream = connect_bounded(socket_path, CONNECT_TIMEOUT).map_err(|e| {
         describe_connect_error(
@@ -432,6 +462,12 @@ pub fn resolve(
     }
     if let Some(a) = argv0 {
         req["argv0"] = Value::String(a.to_string());
+    }
+    // Optional, self-asserted, DISPLAY-ONLY context for why this ask exists
+    // (`ExecArgs::reason`'s own doc) — a popup/prompt surface shows it
+    // alongside the parked ask; the broker never gates on it.
+    if let Some(r) = reason {
+        req["reason"] = Value::String(r.to_string());
     }
     let mut line = req.to_string();
     line.push('\n');
@@ -717,6 +753,25 @@ pub struct PendingAsk {
     pub consumer: String,
     pub requested_at: u64,
     pub peer_uid: Option<u32>,
+    /// Additive over the pre-P3 shape (`peer_uid`'s own precedent, task
+    /// #73) — the wire's optional, self-asserted, display-only
+    /// `resolve.reason`, `None` when the caller sent none.
+    pub reason: Option<String>,
+    /// Additive again — best-effort "who/where this ask came from"
+    /// (`park::AskOrigin`'s own doc), captured broker-side at park time.
+    pub origin: PendingOrigin,
+}
+
+/// The wire-parsed mirror of `park::AskOrigin` — every field best-effort and
+/// DISPLAY-ONLY (that struct's own doc); kept as this crate's own client-side
+/// type rather than reusing `park::AskOrigin` directly since a wire reply is
+/// parsed data, not the broker's own in-memory registry row.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PendingOrigin {
+    pub username: Option<String>,
+    pub pid: Option<i64>,
+    pub comm: Option<String>,
+    pub hostname: Option<String>,
 }
 
 /// Connect to `socket_path`, send ONE `pending` request, read ONE reply
@@ -771,6 +826,17 @@ pub fn pending(socket_path: &Path) -> Result<Vec<PendingAsk>, String> {
                 // #73: additive — absent (an older broker) and an explicit
                 // `null` (unidentified at park time) both read as `None`.
                 peer_uid: a.get("peerUid").and_then(Value::as_u64).map(|u| u as u32),
+                // P3: additive again — same absent-or-null tolerance.
+                reason: a.get("reason").and_then(Value::as_str).map(str::to_string),
+                origin: a
+                    .get("origin")
+                    .map(|o| PendingOrigin {
+                        username: o.get("username").and_then(Value::as_str).map(str::to_string),
+                        pid: o.get("pid").and_then(Value::as_i64),
+                        comm: o.get("comm").and_then(Value::as_str).map(str::to_string),
+                        hostname: o.get("hostname").and_then(Value::as_str).map(str::to_string),
+                    })
+                    .unwrap_or_default(),
             })
         })
         .collect::<Result<Vec<_>, &str>>()
@@ -1001,6 +1067,7 @@ pub fn run_exec(inv: &Invocation, socket_path: &Path) -> i32 {
         &args.consumer,
         args.totp.as_deref(),
         args.cmd.first().map(String::as_str),
+        args.reason.as_deref(),
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -1034,6 +1101,42 @@ mod tests {
             flags: flag_map,
             door: Door::Cli,
         }
+    }
+
+    // ── derive_reason / parse_exec_args's --reason (P3) ──────────────────
+
+    #[test]
+    fn derive_reason_joins_a_short_command_verbatim() {
+        let cmd = vec!["psql".to_string(), "-U".to_string(), "app".to_string()];
+        assert_eq!(derive_reason(&cmd), Some("psql -U app".to_string()));
+    }
+
+    #[test]
+    fn derive_reason_truncates_a_long_command_to_sixty_chars_with_an_ellipsis() {
+        let cmd = vec!["sh".to_string(), "-c".to_string(), "a".repeat(100)];
+        let reason = derive_reason(&cmd).unwrap();
+        assert_eq!(reason.chars().count(), 60);
+        assert!(reason.ends_with('\u{2026}'), "{reason:?}");
+        assert!(reason.starts_with("sh -c "), "{reason:?}");
+    }
+
+    #[test]
+    fn derive_reason_is_none_for_an_empty_command() {
+        assert_eq!(derive_reason(&[]), None);
+    }
+
+    #[test]
+    fn parse_exec_args_derives_reason_from_the_command_when_omitted() {
+        let i = inv(&[("as", "m"), ("secret", "db-prod")], &["psql", "-U", "app"]);
+        let args = parse_exec_args(&i).unwrap();
+        assert_eq!(args.reason.as_deref(), Some("psql -U app"));
+    }
+
+    #[test]
+    fn parse_exec_args_an_explicit_reason_wins_over_the_derived_one() {
+        let i = inv(&[("as", "m"), ("secret", "db-prod"), ("reason", "nightly backup")], &["psql", "-U", "app"]);
+        let args = parse_exec_args(&i).unwrap();
+        assert_eq!(args.reason.as_deref(), Some("nightly backup"));
     }
 
     // ── bounded connect (rider task, alongside #75/#81/#82) ─────────────
@@ -1334,7 +1437,7 @@ mod tests {
     #[test]
     fn resolve_against_a_dead_socket_is_a_connect_error() {
         let dead = Path::new("/tmp/aoide-secrets-nonexistent-test.sock");
-        let err = resolve(dead, "t", "m", None, None).unwrap_err();
+        let err = resolve(dead, "t", "m", None, None, None).unwrap_err();
         assert!(err.contains("connecting"), "{err}");
     }
 
@@ -1506,7 +1609,7 @@ mod tests {
         assert_eq!(pending(&socket_path).unwrap(), Vec::new());
 
         let sock_for_resolve = socket_path.clone();
-        let resolve_thread = std::thread::spawn(move || resolve(&sock_for_resolve, "t", "m", None, None));
+        let resolve_thread = std::thread::spawn(move || resolve(&sock_for_resolve, "t", "m", None, None, None));
 
         let mut ask = None;
         for _ in 0..200 {
@@ -1589,7 +1692,7 @@ mod tests {
         // here as a reminder that FIX 1's new loop sits strictly AFTER the
         // connect step, never wrapping it.
         let dead = Path::new("/tmp/aoide-secrets-nonexistent-interim-test.sock");
-        let err = resolve(dead, "t", "m", None, None).unwrap_err();
+        let err = resolve(dead, "t", "m", None, None, None).unwrap_err();
         assert!(err.contains("connecting"), "{err}");
     }
 

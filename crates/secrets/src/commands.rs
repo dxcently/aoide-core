@@ -183,7 +183,8 @@ pub fn register(r: &mut Registry) {
         flags: [
             flag!("as", "string", "The consumer name to present to the broker (self-asserted — the policy's consumers[] list is the real gate, not caller identity)."),
             flag!("secret", "string", "The secret's policy name, optionally `name:VAR` to name the injected env var explicitly (default: the name, uppercased, `-` -> `_`)."),
-            flag!("totp", "string", "A TOTP code for a requireTotp-gated secret — verified live against this host's enrolled secret (±1-timestep window, single-use: a wrong or already-used code is a plain denial). Omitted (or wrong) on a requireTotp secret PARKS the resolve instead of refusing outright — complete it with `secrets pending`/`secrets approve <id> --totp <code>` from another terminal, or wait out the timeout. Unresolvable only when no TOTP enrollment exists yet on this host (`secrets enroll`).")
+            flag!("totp", "string", "A TOTP code for a requireTotp-gated secret — verified live against this host's enrolled secret (±1-timestep window, single-use: a wrong or already-used code is a plain denial). Omitted (or wrong) on a requireTotp secret PARKS the resolve instead of refusing outright — complete it with `secrets pending`/`secrets approve <id> --totp <code>` from another terminal, or wait out the timeout. Unresolvable only when no TOTP enrollment exists yet on this host (`secrets enroll`)."),
+            flag!("reason", "string", "Free-text context for a popup/prompt surface to show alongside a parked ask -- what this ask is FOR, never a value. Defaults to the wrapped command's own argv, space-joined and truncated to ~60 chars, when omitted.")
         ],
         gated: false,
         implemented: true,
@@ -1458,7 +1459,7 @@ mod tests {
             }
             assert!(connected, "broker did not bind {} in time", socket_path.display());
 
-            let err = crate::client::resolve(&socket_path, "locked", "m", None, None).unwrap_err();
+            let err = crate::client::resolve(&socket_path, "locked", "m", None, None, None).unwrap_err();
             assert!(err.contains("no TOTP enrollment"), "{err}");
 
             drop(broker_thread);

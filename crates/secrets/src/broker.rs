@@ -285,7 +285,7 @@
 //! the process's own primary/effective group. This module only ever touches
 //! the mode bits.
 
-use crate::park::{ParkOutcome, ParkRegistry, WaitResult};
+use crate::park::{AskOrigin, ParkOutcome, ParkRegistry, WaitResult};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -500,6 +500,36 @@ fn peer_uid_display(peer_uid: Option<u32>) -> String {
     peer_uid.map(|u| u.to_string()).unwrap_or_else(|| "unidentified".to_string())
 }
 
+/// Capture a parking ask's [`AskOrigin`] — ONCE, right here, at the SAME
+/// park-time instant `peer_uid` itself is stamped (`AskOrigin`'s own doc on
+/// why this can never be deferred to render time: the pid can exit and be
+/// reused). An unidentified connection (`peer: None`, `peercred::peer_cred`
+/// itself already failed) still gets a hostname — this broker's own host is
+/// knowable regardless of who's asking — but no username/pid/comm, since
+/// there is no kernel-truth pid to read either from.
+fn capture_origin(peer: Option<crate::peercred::PeerCred>) -> AskOrigin {
+    AskOrigin {
+        username: peer.and_then(|p| crate::peercred::username_for_uid(p.uid)),
+        pid: peer.map(|p| p.pid),
+        comm: peer.and_then(|p| crate::peercred::read_comm(p.pid)),
+        hostname: Some(crate::enroll::local_hostname()),
+    }
+}
+
+/// The ONE place an [`AskOrigin`] is rendered onto the wire (the `parked`
+/// events-feed line, `pending`'s reply, `audit_park`'s own record) —
+/// `null` per field when unknown, the SAME "always present, null when
+/// absent" shape `peerUid`/`reason` already hold, so a caller need not
+/// special-case "field absent" vs "field null."
+fn origin_to_json(origin: &AskOrigin) -> Value {
+    json!({
+        "username": origin.username,
+        "pid": origin.pid,
+        "comm": origin.comm,
+        "hostname": origin.hostname,
+    })
+}
+
 /// `resolve` — the fast path is UNCHANGED (module doc): a code present, or
 /// no TOTP gate at all, resolves/denies immediately exactly as before P-N2.
 /// The new branch is [`GateOutcome::NeedsTotp`]: `wait` (default `true`,
@@ -526,6 +556,13 @@ fn handle_resolve(
     let totp = req.get("totp").and_then(Value::as_str).map(str::to_string);
     let wait = req.get("wait").and_then(Value::as_bool).unwrap_or(true);
     let peer_uid = peer.map(|p| p.uid);
+    // Optional, self-asserted, DISPLAY-ONLY context for why this ask exists
+    // — named `ask_reason` (not `reason`) purely to avoid shadowing this
+    // function's own many `reason` locals (the DENIAL text each `Denied`/
+    // `WaitResult` arm below builds) — never gates anything, only ever rides
+    // into the park registry / `pending` reply / `parked` event for a
+    // surface to show a human (`park::ParkedAsk::reason`'s own doc).
+    let ask_reason = req.get("reason").and_then(Value::as_str).map(str::to_string);
 
     if secret.is_empty() || consumer.is_empty() {
         return json!({"ok": false, "error": "malformed request: `secret` and `consumer` are required"});
@@ -566,7 +603,13 @@ fn handle_resolve(
             // stamped onto the ask right here, at park time — the ONE fact
             // `handle_dismiss` later checks a dismisser's own peer uid
             // against (`park::ParkedAsk::peer_uid`'s own doc).
-            let Some((id, rx)) = parked.park_if_room(&secret, &consumer, now_unix, cap, peer_uid) else {
+            // Captured NOW, once, never re-read later (`AskOrigin`'s own
+            // doc: the pid can exit and be reused long before this ask
+            // resolves or a dialog renders it).
+            let origin = capture_origin(peer);
+            let Some((id, rx)) =
+                parked.park_if_room(&secret, &consumer, now_unix, cap, peer_uid, ask_reason.as_deref(), origin.clone())
+            else {
                 // FIX 3b: at the registry-wide cap — the SAME immediate
                 // refusal `wait:false` gives, plus a hint naming the
                 // cap/knob, rather than growing an unbounded thread queue
@@ -581,11 +624,14 @@ fn handle_resolve(
                 audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), false, Some(&reason), peer_uid);
                 return json!({"ok": false, "error": reason});
             };
-            audit_park(secrets_home, &id, &secret, &consumer, peer_uid);
+            audit_park(secrets_home, &id, &secret, &consumer, peer_uid, ask_reason.as_deref(), &origin);
             let timeout = crate::park::park_timeout();
             // P-N3: the popup's future trigger — fired once per park, right
             // alongside `audit_park`, no lock held (`park_if_room` already
-            // returned).
+            // returned). `reason` (additive) rides straight from the wire's
+            // own optional field into this event, unmodified — the ONE
+            // place a caller-supplied ask reason enters the events feed a
+            // popup/tty surface later reads (`ParkedAsk::reason`'s own doc).
             emit_notify(
                 secrets_home,
                 events_path,
@@ -596,6 +642,8 @@ fn handle_resolve(
                     "secret": secret,
                     "consumer": consumer,
                     "timeoutSecs": timeout.as_secs(),
+                    "reason": ask_reason,
+                    "origin": origin_to_json(&origin),
                 }),
             );
             // P-N2c FIX 1: announce the park BEFORE blocking — a write
@@ -666,8 +714,18 @@ fn handle_pending(parked: &ParkRegistry) -> Value {
     let pending: Vec<Value> = parked
         .list()
         .into_iter()
-        .map(|(id, secret, consumer, requested_at, peer_uid)| {
-            json!({"id": id, "secret": secret, "consumer": consumer, "requestedAt": requested_at, "peerUid": peer_uid})
+        .map(|(id, secret, consumer, requested_at, peer_uid, reason, origin)| {
+            json!({
+                "id": id,
+                "secret": secret,
+                "consumer": consumer,
+                "requestedAt": requested_at,
+                "peerUid": peer_uid,
+                // Additive over the pre-this-phase shape (`peerUid`'s own
+                // precedent, task #73) — `null` per field when unknown.
+                "reason": reason,
+                "origin": origin_to_json(&origin),
+            })
         })
         .collect();
     json!({"ok": true, "pending": pending})
@@ -1555,7 +1613,15 @@ fn audit_put(
 /// other audit call in this module — carries the ask's `id` so the two
 /// lines (park, then eventual resolution) can be correlated by a human
 /// reading `audit.log`, never a code or value.
-fn audit_park(secrets_home: &Path, id: &str, secret: &str, consumer: &str, peer_uid: Option<u32>) {
+fn audit_park(
+    secrets_home: &Path,
+    id: &str,
+    secret: &str,
+    consumer: &str,
+    peer_uid: Option<u32>,
+    reason: Option<&str>,
+    origin: &AskOrigin,
+) {
     let record = json!({
         "ts": aoide_protocol::audit::now_secs(),
         "op": "park",
@@ -1563,6 +1629,11 @@ fn audit_park(secrets_home: &Path, id: &str, secret: &str, consumer: &str, peer_
         "secret": secret,
         "consumer": consumer,
         "peerUid": peer_uid,
+        // Additive, same "display-only, self-asserted/best-effort" posture
+        // `argv0` already holds on `audit_resolve`'s own record — never a
+        // value.
+        "reason": reason,
+        "origin": origin_to_json(origin),
     });
     if let Err(e) = append_own_log(secrets_home, &record) {
         eprintln!("[aoide/secrets] could not write the secrets audit log: {e}");
@@ -2809,7 +2880,7 @@ mod tests {
                 let mut id = None;
                 for _ in 0..200 {
                     let list = parked.list();
-                    if let Some((pid, secret, consumer, _, _)) = list.into_iter().next() {
+                    if let Some((pid, secret, consumer, _, _, _, _)) = list.into_iter().next() {
                         assert_eq!(secret, "t");
                         assert_eq!(consumer, "m");
                         id = Some(pid);
@@ -3196,7 +3267,7 @@ mod tests {
         // broker-euid bypass in `dismiss_authorized`).
         let owner_uid = real_euid.wrapping_add(10_000);
         let wrong_uid = real_euid.wrapping_add(20_000);
-        let (id, _rx) = parked.park_if_room("t", "m", NOW, usize::MAX, Some(owner_uid)).unwrap();
+        let (id, _rx) = parked.park_if_room("t", "m", NOW, usize::MAX, Some(owner_uid), None, AskOrigin::default()).unwrap();
 
         with_redirected_audit_log(&home, || {
             let wrong_peer = Some(crate::peercred::PeerCred { uid: wrong_uid, gid: 0, pid: 0 });
@@ -3227,7 +3298,7 @@ mod tests {
         let parked = ParkRegistry::new();
         let real_euid = unsafe { libc::geteuid() };
         let owner_uid = real_euid.wrapping_add(30_000);
-        let (id, _rx) = parked.park_if_room("t", "m", NOW, usize::MAX, Some(owner_uid)).unwrap();
+        let (id, _rx) = parked.park_if_room("t", "m", NOW, usize::MAX, Some(owner_uid), None, AskOrigin::default()).unwrap();
 
         with_redirected_audit_log(&home, || {
             let matching_peer = Some(crate::peercred::PeerCred { uid: owner_uid, gid: 0, pid: 0 });
@@ -3305,7 +3376,7 @@ mod tests {
         let entry = arr.iter().find(|e| e["id"] == unstamped_id).unwrap();
         assert!(entry["peerUid"].is_null(), "{entry}");
 
-        let (stamped_id, _rx2) = parked.park_if_room("with-peer", "m", 2, usize::MAX, Some(4242)).unwrap();
+        let (stamped_id, _rx2) = parked.park_if_room("with-peer", "m", 2, usize::MAX, Some(4242), None, AskOrigin::default()).unwrap();
         let listed = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"pending"}"#, &parked, &mut Vec::new(), None);
         let arr = listed["pending"].as_array().unwrap();
         let entry = arr.iter().find(|e| e["id"] == stamped_id).unwrap();

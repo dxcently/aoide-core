@@ -122,7 +122,19 @@ use std::time::Duration;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Released { secret: String, consumer: String, ts: u64 },
-    Parked { id: String, secret: String, consumer: String, timeout_secs: u64, ts: u64 },
+    /// `reason`/`origin` are additive (P3): the wire's optional,
+    /// self-asserted/best-effort context block a popup/prompt surface shows
+    /// alongside the ask (`park::ParkedAsk::reason`/`park::AskOrigin`'s own
+    /// docs) — `None`/default when the broker sent none.
+    Parked {
+        id: String,
+        secret: String,
+        consumer: String,
+        timeout_secs: u64,
+        ts: u64,
+        reason: Option<String>,
+        origin: client::PendingOrigin,
+    },
     Completed { id: String, secret: String, consumer: String, ts: u64 },
     Dismissed { id: String, secret: String, consumer: String, ts: u64 },
     Expired { id: String, secret: String, consumer: String, ts: u64 },
@@ -170,7 +182,9 @@ pub fn parse_notify_line(line: &str, ts: u64) -> Option<Event> {
         "parked" => {
             let id = payload.get("id").and_then(Value::as_str)?.to_string();
             let timeout_secs = payload.get("timeoutSecs").and_then(Value::as_u64)?;
-            Some(Event::Parked { id, secret, consumer, timeout_secs, ts })
+            let reason = payload.get("reason").and_then(Value::as_str).map(str::to_string);
+            let origin = parse_origin(payload.get("origin"));
+            Some(Event::Parked { id, secret, consumer, timeout_secs, ts, reason, origin })
         }
         "completed" => {
             let id = payload.get("id").and_then(Value::as_str)?.to_string();
@@ -188,6 +202,35 @@ pub fn parse_notify_line(line: &str, ts: u64) -> Option<Event> {
     }
 }
 
+/// Parse a `parked` event's/`pending` reply entry's `"origin"` object
+/// (`broker::origin_to_json`'s exact shape) into a [`client::PendingOrigin`]
+/// — `None`/missing at any level (an absent `origin` key, an old broker, a
+/// field individually `null`) reads as that field's own default, never a
+/// parse error (this module's own "malformed line -> skip, never error"
+/// posture, extended to a field rather than the whole line).
+fn parse_origin(origin: Option<&Value>) -> client::PendingOrigin {
+    let Some(o) = origin else { return client::PendingOrigin::default() };
+    client::PendingOrigin {
+        username: o.get("username").and_then(Value::as_str).map(str::to_string),
+        pid: o.get("pid").and_then(Value::as_i64),
+        comm: o.get("comm").and_then(Value::as_str).map(str::to_string),
+        hostname: o.get("hostname").and_then(Value::as_str).map(str::to_string),
+    }
+}
+
+/// The `--json` mirror of `broker::origin_to_json` — same shape, this
+/// module's own copy since it renders `client::PendingOrigin`, not
+/// `park::AskOrigin` (two different crate-internal types over the identical
+/// wire shape, `client::PendingOrigin`'s own doc on why).
+fn origin_to_json(origin: &client::PendingOrigin) -> Value {
+    json!({
+        "username": origin.username,
+        "pid": origin.pid,
+        "comm": origin.comm,
+        "hostname": origin.hostname,
+    })
+}
+
 /// One parked ask as this surface tracks it — id/secret/consumer/timing
 /// ONLY, never a value (same "never store a value" rule `park::ParkedAsk`
 /// itself holds). `estimated` is true only when [`Queue::reconcile`]
@@ -201,6 +244,9 @@ pub struct Ask {
     pub requested_at: u64,
     pub timeout_secs: u64,
     pub estimated: bool,
+    /// Additive (P3) — see [`Event::Parked`]'s own doc.
+    pub reason: Option<String>,
+    pub origin: client::PendingOrigin,
 }
 
 impl Ask {
@@ -257,7 +303,7 @@ impl Queue {
     /// touches the queue at all (it carries no id — `Event::ask_id`).
     pub fn apply(&mut self, event: &Event) {
         match event {
-            Event::Parked { id, secret, consumer, timeout_secs, ts } => {
+            Event::Parked { id, secret, consumer, timeout_secs, ts, reason, origin } => {
                 if !self.asks.iter().any(|a| &a.id == id) {
                     self.asks.push(Ask {
                         id: id.clone(),
@@ -266,6 +312,8 @@ impl Queue {
                         requested_at: *ts,
                         timeout_secs: *timeout_secs,
                         estimated: false,
+                        reason: reason.clone(),
+                        origin: origin.clone(),
                     });
                 }
             }
@@ -296,6 +344,8 @@ impl Queue {
                     requested_at: p.requested_at,
                     timeout_secs: default_timeout_secs,
                     estimated: true,
+                    reason: p.reason.clone(),
+                    origin: p.origin.clone(),
                 });
             }
         }
@@ -452,6 +502,47 @@ fn mmss(remaining_secs: i64) -> String {
     format!("{}m{:02}s", r / 60, r % 60)
 }
 
+/// The "for: ..." context line (P3) — `None` when the ask carries no
+/// reason, so a caller with nothing to show adds nothing (every surface
+/// renders EXACTLY as before this phase when `reason` is absent, module
+/// doc). The wrapping quotes/label live here, the ONE place, so the tty
+/// prompt and zenity's `--text` show byte-identical wording — `lyra secrets
+/// ask` gets the RAW `reason` text instead ([`spawn_lyra_entry`]'s own doc)
+/// since its own QML owns that surface's layout.
+fn format_reason_line(reason: &Option<String>) -> Option<String> {
+    reason.as_deref().map(|r| format!("for: \"{r}\""))
+}
+
+/// The "from: ..." context line (P3) — degrades gracefully, field by field:
+/// an entirely unidentified origin (every field `None`, `park::AskOrigin`'s
+/// own doc on when that happens) renders NOTHING at all, never a bare
+/// "from:" with nothing after it. `username` falls back to the literal
+/// `unidentified` when a `comm`/`pid`/`hostname` piece IS known but the peer
+/// itself wasn't (should not happen in practice — `peercred::peer_cred`
+/// either resolves the whole `PeerCred` or none of it — kept anyway so this
+/// function never assumes that invariant from outside). This is the ONE
+/// place this wording is built — `lyra secrets ask` receives the finished
+/// string via `--from` rather than re-deriving it from separate flags
+/// ([`spawn_lyra_entry`]'s own doc), so all three surfaces (tty, zenity,
+/// lyra) show byte-identical text.
+fn format_origin_line(origin: &client::PendingOrigin) -> Option<String> {
+    if origin.username.is_none() && origin.pid.is_none() && origin.comm.is_none() && origin.hostname.is_none() {
+        return None;
+    }
+    let mut who = origin.username.clone().unwrap_or_else(|| "unidentified".to_string());
+    if let Some(comm) = &origin.comm {
+        who.push_str(&format!(" \u{b7} {comm}"));
+    }
+    let mut line = format!("from: {who}");
+    if let Some(pid) = origin.pid {
+        line.push_str(&format!(" (pid {pid})"));
+    }
+    if let Some(host) = &origin.hostname {
+        line.push_str(&format!(" @ {host}"));
+    }
+    Some(line)
+}
+
 /// Render one [`Event`] as a single narration line (interactive/piped
 /// text mode) — never a value, ever (module doc).
 pub fn narrate_event(event: &Event) -> String {
@@ -459,7 +550,10 @@ pub fn narrate_event(event: &Event) -> String {
         Event::Released { secret, consumer, ts } => {
             format!("  {}  released    {secret} \u{2192} {consumer}   (no code required)", hms(*ts))
         }
-        Event::Parked { id, secret, consumer, timeout_secs, ts } => {
+        Event::Parked { id, secret, consumer, timeout_secs, ts, .. } => {
+            // `reason`/`origin` are shown on the PROMPT block, not this
+            // terse one-line narration (`format_prompt_header`'s own doc) —
+            // keeping the scrolling narration line unchanged in shape.
             format!(
                 "  {}  parked      {secret} \u{2192} {consumer}   ask {id}   times out in {}",
                 hms(*ts),
@@ -487,7 +581,7 @@ pub fn event_to_json(event: &Event) -> Value {
         Event::Released { secret, consumer, ts } => {
             json!({ "event": "released", "secret": secret, "consumer": consumer, "ts": ts })
         }
-        Event::Parked { id, secret, consumer, timeout_secs, ts } => json!({
+        Event::Parked { id, secret, consumer, timeout_secs, ts, reason, origin } => json!({
             "event": "parked",
             "id": id,
             "secret": secret,
@@ -496,6 +590,8 @@ pub fn event_to_json(event: &Event) -> Value {
             "requestedAt": ts,
             "expiresAt": ts + timeout_secs,
             "ts": ts,
+            "reason": reason,
+            "origin": origin_to_json(origin),
         }),
         Event::Completed { id, secret, consumer, ts } => {
             json!({ "event": "completed", "id": id, "secret": secret, "consumer": consumer, "ts": ts })
@@ -655,18 +751,34 @@ fn spawn_zenity_entry(zenity_cmd: &str, title: &str, text: &str) -> std::io::Res
 }
 
 /// `lyra secrets ask`'s own argv (P3) — `--secret`/`--consumer`/`--seconds`
-/// only, the same "identifiers and TEXT only, never a code" argv discipline
-/// `spawn_zenity_entry` already holds. `lyra_cmd` is a path/name parameter,
-/// never a hardcoded `Command::new("lyra")`, matching `spawn_zenity_entry`'s
-/// own shape so this module's tests can stand in a fake shim for either
-/// binary without a `PATH` mutation.
-fn spawn_lyra_entry(lyra_cmd: &str, secret: &str, consumer: &str, seconds: u64) -> std::io::Result<Child> {
-    Command::new(lyra_cmd)
-        .args(["secrets", "ask", "--secret", secret, "--consumer", consumer, "--seconds", &seconds.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
+/// always, plus two OPTIONAL context flags, the same "identifiers and TEXT
+/// only, never a code" argv discipline `spawn_zenity_entry` already holds.
+/// `reason` rides RAW (`ask.reason`'s own text, untouched — `lyra secrets
+/// ask` owns how it labels/quotes it in its own context block); `from_line`
+/// rides PRE-FORMATTED by [`format_origin_line`] — the ONE place that
+/// multi-part conditional formatting lives, so zenity's `--text`, the tty
+/// prompt, and lyra's dialog render the IDENTICAL "from: ..." wording rather
+/// than three independent reimplementations that could drift. `lyra_cmd` is
+/// a path/name parameter, never a hardcoded `Command::new("lyra")`, matching
+/// `spawn_zenity_entry`'s own shape so this module's tests can stand in a
+/// fake shim for either binary without a `PATH` mutation.
+fn spawn_lyra_entry(
+    lyra_cmd: &str,
+    secret: &str,
+    consumer: &str,
+    seconds: u64,
+    reason: Option<&str>,
+    from_line: Option<&str>,
+) -> std::io::Result<Child> {
+    let mut cmd = Command::new(lyra_cmd);
+    cmd.args(["secrets", "ask", "--secret", secret, "--consumer", consumer, "--seconds", &seconds.to_string()]);
+    if let Some(r) = reason {
+        cmd.args(["--reason", r]);
+    }
+    if let Some(f) = from_line {
+        cmd.args(["--from", f]);
+    }
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
 }
 
 /// Run one code-entry dialog CHILD to completion, polling every 200ms
@@ -721,8 +833,17 @@ fn run_zenity_entry(zenity_cmd: &str, title: &str, text: &str, should_cancel: im
     run_entry_dialog(|| spawn_zenity_entry(zenity_cmd, title, text), should_cancel)
 }
 
-fn run_lyra_entry(lyra_cmd: &str, secret: &str, consumer: &str, seconds: u64, should_cancel: impl FnMut() -> bool) -> ZenityResult {
-    run_entry_dialog(|| spawn_lyra_entry(lyra_cmd, secret, consumer, seconds), should_cancel)
+#[allow(clippy::too_many_arguments)]
+fn run_lyra_entry(
+    lyra_cmd: &str,
+    secret: &str,
+    consumer: &str,
+    seconds: u64,
+    reason: Option<&str>,
+    from_line: Option<&str>,
+    should_cancel: impl FnMut() -> bool,
+) -> ZenityResult {
+    run_entry_dialog(|| spawn_lyra_entry(lyra_cmd, secret, consumer, seconds, reason, from_line), should_cancel)
 }
 
 /// The dialog CHOICE itself (module doc's P3 section): `lyra_cmd` present
@@ -741,10 +862,12 @@ fn run_ask_dialog(
     seconds: u64,
     title: &str,
     text: &str,
+    reason: Option<&str>,
+    from_line: Option<&str>,
     should_cancel: impl FnMut() -> bool,
 ) -> ZenityResult {
     match lyra_cmd {
-        Some(lyra) => run_lyra_entry(lyra, secret, consumer, seconds, should_cancel),
+        Some(lyra) => run_lyra_entry(lyra, secret, consumer, seconds, reason, from_line, should_cancel),
         None => run_zenity_entry(zenity_cmd, title, text, should_cancel),
     }
 }
@@ -835,7 +958,16 @@ fn popup_loop(
 
         let seconds = ask.remaining(now).max(0) as u64;
         let title = format!("aoide \u{b7} {}", ask.secret);
-        let text = format!("code for `{}` \u{2190} {} \u{00b7} {}s left", ask.secret, ask.consumer, seconds);
+        let mut text = format!("code for `{}` \u{2190} {} \u{00b7} {}s left", ask.secret, ask.consumer, seconds);
+        // P3: the SAME context lines `format_prompt_header` shows the tty
+        // prompt, appended to zenity's own `--text` — absent when the ask
+        // carries neither, byte-identical to before this phase in that case.
+        for line in [format_reason_line(&ask.reason), format_origin_line(&ask.origin)].into_iter().flatten() {
+            text.push('\n');
+            text.push_str(&line);
+        }
+        let reason = ask.reason.clone();
+        let from_line = format_origin_line(&ask.origin);
 
         let cancel_queue = Arc::clone(queue);
         let cancel_id = ask.id.clone();
@@ -846,10 +978,21 @@ fn popup_loop(
         // `POPUP_KILL_LOCKOUT_SECS` of expiry — `popup_loop`'s own arm below
         // tells the two apart afterward by re-checking whether the ask is
         // still in the queue.
-        let result = run_ask_dialog(lyra_cmd, zenity_cmd, &ask.secret, &ask.consumer, seconds, &title, &text, || {
-            cancel_queue.lock().unwrap_or_else(|e| e.into_inner()).get(&cancel_id).is_none()
-                || popup_kill_already_open(&cancel_ask, unix_now())
-        });
+        let result = run_ask_dialog(
+            lyra_cmd,
+            zenity_cmd,
+            &ask.secret,
+            &ask.consumer,
+            seconds,
+            &title,
+            &text,
+            reason.as_deref(),
+            from_line.as_deref(),
+            || {
+                cancel_queue.lock().unwrap_or_else(|e| e.into_inner()).get(&cancel_id).is_none()
+                    || popup_kill_already_open(&cancel_ask, unix_now())
+            },
+        );
 
         if !matches!(result, ZenityResult::SpawnError(_)) && spawn_failing {
             spawn_failing = false;
@@ -1053,7 +1196,16 @@ fn format_prompt_header(ask: &Ask, remaining: i64, closed: bool, queued: usize) 
     let est = if ask.estimated { "~" } else { "" };
     let left = if closed { format!("{est}{}s left \u{2014} CLOSED", remaining.max(0)) } else { format!("{est}{} left", mmss(remaining)) };
     let tail = if queued > 0 { format!(" \u{2014} {queued} queued \u{2014}") } else { String::new() };
-    format!("\u{250c} ask {} \u{2500} {} \u{2190} {} \u{2500} asked {asked} \u{2500} {left}{tail}", ask.id, ask.secret, ask.consumer)
+    let mut header =
+        format!("\u{250c} ask {} \u{2500} {} \u{2190} {} \u{2500} asked {asked} \u{2500} {left}{tail}", ask.id, ask.secret, ask.consumer);
+    // P3: the context block — reason then origin, each its own line, both
+    // absent when the ask carries neither (byte-identical to before this
+    // phase in that case).
+    for line in [format_reason_line(&ask.reason), format_origin_line(&ask.origin)].into_iter().flatten() {
+        header.push('\n');
+        header.push_str(&format!("\u{2502} {line}"));
+    }
+    header
 }
 
 /// The FULL prompt block `emit_event` reprints verbatim after an async
@@ -1334,7 +1486,7 @@ mod tests {
         let parked = json!({ "event": "parked", "id": "ab12-1", "secret": "db-prod", "consumer": "claude", "timeoutSecs": 300 });
         assert_eq!(
             parse_notify_line(&notify_line(&parked), 2),
-            Some(Event::Parked { id: "ab12-1".into(), secret: "db-prod".into(), consumer: "claude".into(), timeout_secs: 300, ts: 2 })
+            Some(Event::Parked { id: "ab12-1".into(), secret: "db-prod".into(), consumer: "claude".into(), timeout_secs: 300, ts: 2, reason: None, origin: Default::default() })
         );
 
         let completed = json!({ "event": "completed", "id": "ab12-1", "secret": "db-prod", "consumer": "claude" });
@@ -1354,6 +1506,79 @@ mod tests {
             parse_notify_line(&notify_line(&expired), 5),
             Some(Event::Expired { id: "ab12-1".into(), secret: "db-prod".into(), consumer: "claude".into(), ts: 5 })
         );
+    }
+
+    /// P3: a `parked` line carrying `reason`/`origin` parses both into the
+    /// `Event`; a line WITHOUT either (the pre-P3 shape, an older broker)
+    /// still parses cleanly with both defaulted — `parses_every_one_of_the_
+    /// five_event_kinds`'s own `parked` case above already covers that half.
+    #[test]
+    fn parked_carries_reason_and_origin_when_the_broker_sent_them() {
+        let parked = json!({
+            "event": "parked",
+            "id": "ab12-1",
+            "secret": "db-prod",
+            "consumer": "claude",
+            "timeoutSecs": 300,
+            "reason": "sudo nixos-rebuild switch",
+            "origin": { "username": "khoa", "pid": 4242, "comm": "bash", "hostname": "yomi-strix" },
+        });
+        let event = parse_notify_line(&notify_line(&parked), 2).unwrap();
+        assert_eq!(
+            event,
+            Event::Parked {
+                id: "ab12-1".into(),
+                secret: "db-prod".into(),
+                consumer: "claude".into(),
+                timeout_secs: 300,
+                ts: 2,
+                reason: Some("sudo nixos-rebuild switch".into()),
+                origin: client::PendingOrigin {
+                    username: Some("khoa".into()),
+                    pid: Some(4242),
+                    comm: Some("bash".into()),
+                    hostname: Some("yomi-strix".into()),
+                },
+            }
+        );
+    }
+
+    // ── format_reason_line / format_origin_line (P3 context lines) ──────
+
+    #[test]
+    fn format_reason_line_is_none_when_absent() {
+        assert_eq!(format_reason_line(&None), None);
+    }
+
+    #[test]
+    fn format_reason_line_quotes_and_labels_the_text() {
+        assert_eq!(format_reason_line(&Some("sudo nixos-rebuild switch".into())), Some("for: \"sudo nixos-rebuild switch\"".into()));
+    }
+
+    #[test]
+    fn format_origin_line_is_none_when_every_field_is_unknown() {
+        assert_eq!(format_origin_line(&client::PendingOrigin::default()), None);
+    }
+
+    #[test]
+    fn format_origin_line_renders_every_known_field() {
+        let origin = client::PendingOrigin {
+            username: Some("khoa".into()),
+            pid: Some(4242),
+            comm: Some("bash".into()),
+            hostname: Some("yomi-strix".into()),
+        };
+        assert_eq!(format_origin_line(&origin), Some("from: khoa \u{b7} bash (pid 4242) @ yomi-strix".into()));
+    }
+
+    #[test]
+    fn format_origin_line_degrades_to_unidentified_when_only_the_hostname_is_known() {
+        // A totally unidentified peer (`peercred::peer_cred` itself failed)
+        // still yields a hostname (`capture_origin`'s own doc, broker.rs) —
+        // this proves the degraded rendering never produces a bare "from:"
+        // with nothing after the label.
+        let origin = client::PendingOrigin { hostname: Some("yomi-strix".into()), ..Default::default() };
+        assert_eq!(format_origin_line(&origin), Some("from: unidentified @ yomi-strix".into()));
     }
 
     /// `age-identity-minted` (P-G1) is the one `emit_notify` kind this
@@ -1388,7 +1613,7 @@ mod tests {
     #[test]
     fn apply_parked_inserts_and_a_repeat_parked_line_never_duplicates() {
         let mut q = Queue::new();
-        let event = Event::Parked { id: "1".into(), secret: "t".into(), consumer: "m".into(), timeout_secs: 300, ts: 100 };
+        let event = Event::Parked { id: "1".into(), secret: "t".into(), consumer: "m".into(), timeout_secs: 300, ts: 100, reason: None, origin: Default::default() };
         q.apply(&event);
         q.apply(&event);
         assert_eq!(q.len(), 1);
@@ -1404,7 +1629,7 @@ mod tests {
             |id: &str| Event::Expired { id: id.into(), secret: "t".into(), consumer: "m".into(), ts: 1 },
         ] {
             let mut q = Queue::new();
-            q.apply(&Event::Parked { id: "1".into(), secret: "t".into(), consumer: "m".into(), timeout_secs: 300, ts: 0 });
+            q.apply(&Event::Parked { id: "1".into(), secret: "t".into(), consumer: "m".into(), timeout_secs: 300, ts: 0, reason: None, origin: Default::default() });
             assert_eq!(q.len(), 1);
             q.apply(&make("1"));
             assert!(q.is_empty());
@@ -1421,7 +1646,7 @@ mod tests {
     #[test]
     fn released_never_touches_the_queue() {
         let mut q = Queue::new();
-        q.apply(&Event::Parked { id: "1".into(), secret: "t".into(), consumer: "m".into(), timeout_secs: 300, ts: 0 });
+        q.apply(&Event::Parked { id: "1".into(), secret: "t".into(), consumer: "m".into(), timeout_secs: 300, ts: 0, reason: None, origin: Default::default() });
         q.apply(&Event::Released { secret: "other".into(), consumer: "m".into(), ts: 5 });
         assert_eq!(q.len(), 1);
     }
@@ -1435,6 +1660,8 @@ mod tests {
             consumer: "m".into(),
             requested_at: 42,
             peer_uid: None,
+            reason: None,
+            origin: client::PendingOrigin::default(),
         }];
         q.reconcile(&pending, 300);
         let ask = q.get("unseen").unwrap();
@@ -1446,7 +1673,7 @@ mod tests {
     #[test]
     fn reconcile_drops_an_ask_completed_elsewhere() {
         let mut q = Queue::new();
-        q.apply(&Event::Parked { id: "1".into(), secret: "t".into(), consumer: "m".into(), timeout_secs: 300, ts: 0 });
+        q.apply(&Event::Parked { id: "1".into(), secret: "t".into(), consumer: "m".into(), timeout_secs: 300, ts: 0, reason: None, origin: Default::default() });
         assert_eq!(q.len(), 1);
         q.reconcile(&[], 300); // broker no longer lists it as pending
         assert!(q.is_empty());
@@ -1455,9 +1682,17 @@ mod tests {
     #[test]
     fn reconcile_never_downgrades_a_known_timeout_into_an_estimate() {
         let mut q = Queue::new();
-        q.apply(&Event::Parked { id: "1".into(), secret: "t".into(), consumer: "m".into(), timeout_secs: 60, ts: 0 });
+        q.apply(&Event::Parked { id: "1".into(), secret: "t".into(), consumer: "m".into(), timeout_secs: 60, ts: 0, reason: None, origin: Default::default() });
         let pending =
-            vec![PendingAsk { id: "1".into(), secret: "t".into(), consumer: "m".into(), requested_at: 0, peer_uid: None }];
+            vec![PendingAsk {
+                id: "1".into(),
+                secret: "t".into(),
+                consumer: "m".into(),
+                requested_at: 0,
+                peer_uid: None,
+                reason: None,
+                origin: client::PendingOrigin::default(),
+            }];
         q.reconcile(&pending, 300);
         let ask = q.get("1").unwrap();
         assert_eq!(ask.timeout_secs, 60);
@@ -1469,8 +1704,8 @@ mod tests {
     #[test]
     fn pick_next_returns_the_oldest_requested_at_first() {
         let asks = vec![
-            Ask { id: "b".into(), secret: "t".into(), consumer: "m".into(), requested_at: 200, timeout_secs: 300, estimated: false },
-            Ask { id: "a".into(), secret: "t".into(), consumer: "m".into(), requested_at: 100, timeout_secs: 300, estimated: false },
+            Ask { id: "b".into(), secret: "t".into(), consumer: "m".into(), requested_at: 200, timeout_secs: 300, estimated: false, reason: None, origin: Default::default() },
+            Ask { id: "a".into(), secret: "t".into(), consumer: "m".into(), requested_at: 100, timeout_secs: 300, estimated: false, reason: None, origin: Default::default() },
         ];
         let picked = pick_next(&asks, &HashSet::new()).unwrap();
         assert_eq!(picked.id, "a");
@@ -1479,8 +1714,8 @@ mod tests {
     #[test]
     fn pick_next_skips_ignored_ids() {
         let asks = vec![
-            Ask { id: "a".into(), secret: "t".into(), consumer: "m".into(), requested_at: 100, timeout_secs: 300, estimated: false },
-            Ask { id: "b".into(), secret: "t".into(), consumer: "m".into(), requested_at: 200, timeout_secs: 300, estimated: false },
+            Ask { id: "a".into(), secret: "t".into(), consumer: "m".into(), requested_at: 100, timeout_secs: 300, estimated: false, reason: None, origin: Default::default() },
+            Ask { id: "b".into(), secret: "t".into(), consumer: "m".into(), requested_at: 200, timeout_secs: 300, estimated: false, reason: None, origin: Default::default() },
         ];
         let mut ignored = HashSet::new();
         ignored.insert("a".to_string());
@@ -1504,6 +1739,8 @@ mod tests {
             requested_at,
             timeout_secs,
             estimated: false,
+            reason: None,
+            origin: Default::default(),
         };
         // Exactly 10s remaining: allowed (>=).
         assert!(code_prompt_allowed(&ask(0, 10), 0));
@@ -1532,6 +1769,8 @@ mod tests {
             consumer: "claude".into(),
             timeout_secs: 300,
             ts: 0,
+            reason: None,
+            origin: Default::default(),
         });
         assert!(line.contains("ab12-1"));
         assert!(line.contains("5m00s"));
@@ -1545,6 +1784,8 @@ mod tests {
             consumer: "claude".into(),
             timeout_secs: 300,
             ts: 1_000,
+            reason: None,
+            origin: Default::default(),
         });
         assert_eq!(v["event"], "parked");
         assert_eq!(v["id"], "ab12-1");
@@ -1565,7 +1806,7 @@ mod tests {
     fn event_to_json_never_carries_a_value_field_on_any_shape() {
         for event in [
             Event::Released { secret: "t".into(), consumer: "m".into(), ts: 1 },
-            Event::Parked { id: "1".into(), secret: "t".into(), consumer: "m".into(), timeout_secs: 1, ts: 1 },
+            Event::Parked { id: "1".into(), secret: "t".into(), consumer: "m".into(), timeout_secs: 1, ts: 1, reason: None, origin: Default::default() },
             Event::Completed { id: "1".into(), secret: "t".into(), consumer: "m".into(), ts: 1 },
             Event::Dismissed { id: "1".into(), secret: "t".into(), consumer: "m".into(), ts: 1 },
             Event::Expired { id: "1".into(), secret: "t".into(), consumer: "m".into(), ts: 1 },
@@ -1776,7 +2017,7 @@ mod tests {
     // ── popup_action (dialog-allowed gating, pure) ────────────────────
 
     fn popup_ask(timeout_secs: u64) -> Ask {
-        Ask { id: "1".into(), secret: "t".into(), consumer: "m".into(), requested_at: 0, timeout_secs, estimated: false }
+        Ask { id: "1".into(), secret: "t".into(), consumer: "m".into(), requested_at: 0, timeout_secs, estimated: false, reason: None, origin: Default::default() }
     }
 
     #[test]
@@ -1985,10 +2226,36 @@ mod tests {
     fn spawn_lyra_entry_argv_matches_the_documented_contract() {
         let _guard = shim_lock();
         let shim = write_shim("lyra-argv", "#!/bin/sh\necho \"$@\" > \"$(dirname \"$0\")/argv.log\"\necho 111222\nexit 0\n");
-        let result = run_lyra_entry(shim.to_str().unwrap(), "db-prod", "claude", 42, || false);
+        let result = run_lyra_entry(shim.to_str().unwrap(), "db-prod", "claude", 42, None, None, || false);
         assert!(matches!(result, ZenityResult::Approved(ref c) if c == "111222"), "expected Approved(\"111222\"), got {result:?}");
         let argv = std::fs::read_to_string(shim.parent().unwrap().join("argv.log")).unwrap();
         assert_eq!(argv.trim(), "secrets ask --secret db-prod --consumer claude --seconds 42");
+        remove_shim(&shim);
+    }
+
+    /// P3: `--reason`/`--from` ride the SAME argv, present ONLY when the ask
+    /// actually carries them — the RAW reason text and the PRE-FORMATTED
+    /// origin line respectively (`spawn_lyra_entry`'s own doc on why neither
+    /// is reformatted twice).
+    #[test]
+    fn spawn_lyra_entry_argv_carries_reason_and_from_only_when_present() {
+        let _guard = shim_lock();
+        let shim = write_shim("lyra-argv-context", "#!/bin/sh\necho \"$@\" > \"$(dirname \"$0\")/argv.log\"\necho 333444\nexit 0\n");
+        let result = run_lyra_entry(
+            shim.to_str().unwrap(),
+            "db-prod",
+            "claude",
+            42,
+            Some("sudo nixos-rebuild switch"),
+            Some("from: khoa \u{b7} bash (pid 123) @ yomi-strix"),
+            || false,
+        );
+        assert!(matches!(result, ZenityResult::Approved(ref c) if c == "333444"), "expected Approved(\"333444\"), got {result:?}");
+        let argv = std::fs::read_to_string(shim.parent().unwrap().join("argv.log")).unwrap();
+        assert_eq!(
+            argv.trim(),
+            "secrets ask --secret db-prod --consumer claude --seconds 42 --reason sudo nixos-rebuild switch --from from: khoa \u{b7} bash (pid 123) @ yomi-strix"
+        );
         remove_shim(&shim);
     }
 
@@ -2008,6 +2275,8 @@ mod tests {
             42,
             "t",
             "x",
+            None,
+            None,
             || false,
         );
         assert!(matches!(result, ZenityResult::Approved(ref c) if c == "lyra-picked"), "expected the lyra shim's own output, got {result:?}");
@@ -2020,7 +2289,7 @@ mod tests {
     fn run_ask_dialog_falls_back_to_zenity_when_lyra_is_absent() {
         let _guard = shim_lock();
         let zenity_shim = write_shim("dialog-zenity", "#!/bin/sh\necho zenity-picked\nexit 0\n");
-        let result = run_ask_dialog(None, zenity_shim.to_str().unwrap(), "db-prod", "claude", 42, "t", "x", || false);
+        let result = run_ask_dialog(None, zenity_shim.to_str().unwrap(), "db-prod", "claude", 42, "t", "x", None, None, || false);
         assert!(matches!(result, ZenityResult::Approved(ref c) if c == "zenity-picked"), "expected the zenity shim's own output, got {result:?}");
         remove_shim(&zenity_shim);
     }
@@ -2126,6 +2395,8 @@ mod tests {
             consumer: "m".into(),
             timeout_secs: 12,
             ts: now,
+            reason: None,
+            origin: Default::default(),
         });
         let ask = queue.lock().unwrap().get("1").unwrap().clone();
         assert!(code_prompt_allowed(&ask, now), "precondition: still above the before-open lockout");
@@ -2171,6 +2442,8 @@ mod tests {
             consumer: "m".into(),
             timeout_secs: 300,
             ts: unix_now(),
+            reason: None,
+            origin: Default::default(),
         });
         assert_eq!(queue.lock().unwrap().len(), 1);
 

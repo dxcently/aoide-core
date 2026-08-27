@@ -121,22 +121,22 @@ fn end_to_end_resolve_denies_and_grants_env_round_trip() {
     assert!(connected, "broker did not bind {} in time", socket_path.display());
 
     // ── denied: unknown secret ──────────────────────────────────────────
-    let err = client::resolve(&socket_path, "nope", "m", None, None).unwrap_err();
+    let err = client::resolve(&socket_path, "nope", "m", None, None, None).unwrap_err();
     assert_eq!(err, "secret not found");
     assert!(!marker_path.exists(), "backend was invoked for a denied (unknown secret) resolve");
 
     // ── denied: consumer not in the policy's list ───────────────────────
-    let err = client::resolve(&socket_path, "t", "someone-else", None, None).unwrap_err();
+    let err = client::resolve(&socket_path, "t", "someone-else", None, None, None).unwrap_err();
     assert!(err.contains("not authorized"), "{err}");
     assert!(!marker_path.exists(), "backend was invoked for a denied (wrong consumer) resolve");
 
     // ── denied: requireTotp with no enrollment on this host ────────────
-    let err = client::resolve(&socket_path, "locked", "m", Some("123456"), None).unwrap_err();
+    let err = client::resolve(&socket_path, "locked", "m", Some("123456"), None, None).unwrap_err();
     assert!(err.contains("no TOTP enrollment"), "{err}");
     assert!(!marker_path.exists(), "backend was invoked for a denied (requireTotp) resolve");
 
     // ── granted: resolve() round-trips the value directly ──────────────
-    let value = client::resolve(&socket_path, "t", "m", None, Some("printenv")).unwrap();
+    let value = client::resolve(&socket_path, "t", "m", None, Some("printenv"), None).unwrap();
     assert_eq!(value, "stored-value");
     assert!(marker_path.exists(), "positive control: the backend must run on a granted resolve");
 
@@ -244,7 +244,7 @@ fn put_then_get_round_trips_through_the_real_socket_with_the_seeded_file_backend
     assert_eq!(read_to_string(&stored_file), "sentinel-put-value");
 
     // ── get: the SAME value comes back through resolve() ───────────────
-    let value = client::resolve(&socket_path, "filed", "m", None, None).unwrap();
+    let value = client::resolve(&socket_path, "filed", "m", None, None, None).unwrap();
     assert_eq!(value, "sentinel-put-value");
 
     // ── a bare second put (no `overwrite`) is the P-67 exists refusal ──
@@ -254,7 +254,7 @@ fn put_then_get_round_trips_through_the_real_socket_with_the_seeded_file_backend
 
     // ── overwrite: true replaces the value wholesale ────────────────────
     assert_eq!(client::put(&socket_path, "filed", "second-value", true).unwrap(), true);
-    assert_eq!(client::resolve(&socket_path, "filed", "m", None, None).unwrap(), "second-value");
+    assert_eq!(client::resolve(&socket_path, "filed", "m", None, None, None).unwrap(), "second-value");
 
     // ── neither audit log ever carries the value ────────────────────────
     let own_log = std::fs::read_to_string(secrets_home.join("audit.log")).unwrap();
@@ -337,13 +337,13 @@ fn end_to_end_requiretotp_resolve_grants_then_denies_replay_through_the_socket()
     let code = aoide_secrets::totp::format6(aoide_secrets::totp::hotp(&totp_secret, step, aoide_secrets::totp::DIGITS));
 
     // ── granted ──────────────────────────────────────────────────────
-    let value = client::resolve(&socket_path, "locked", "m", Some(&code), None).unwrap();
+    let value = client::resolve(&socket_path, "locked", "m", Some(&code), None, None).unwrap();
     assert_eq!(value, "stored-value");
     assert!(marker_path.exists(), "positive control: the backend must run on a granted requireTotp resolve");
     std::fs::remove_file(&marker_path).unwrap();
 
     // ── the SAME code again: denied (replay), backend not re-invoked ──
-    let err = client::resolve(&socket_path, "locked", "m", Some(&code), None).unwrap_err();
+    let err = client::resolve(&socket_path, "locked", "m", Some(&code), None, None).unwrap_err();
     assert!(err.contains("already used"), "{err}");
     assert!(!marker_path.exists(), "backend was invoked again on a replayed code");
 
@@ -402,7 +402,7 @@ fn park_then_approve_over_the_real_socket_releases_the_value_to_the_original_cal
     // `resolve` with no code — a new connection, blocked on its own read
     // until `approve` completes it. Runs on its own thread since it BLOCKS.
     let sock_for_resolve = socket_path.clone();
-    let resolve_thread = std::thread::spawn(move || client::resolve(&sock_for_resolve, "locked", "m", None, None));
+    let resolve_thread = std::thread::spawn(move || client::resolve(&sock_for_resolve, "locked", "m", None, None, None));
 
     // `secrets pending` — a SEPARATE connection — must see the ask within a
     // bounded number of short polls.
@@ -488,7 +488,7 @@ fn a_second_connection_is_accepted_and_served_while_the_first_sits_parked() {
     // Park a resolve on its own connection/thread — it will sit blocked
     // until this test dismisses it below.
     let sock_for_resolve = socket_path.clone();
-    let resolve_thread = std::thread::spawn(move || client::resolve(&sock_for_resolve, "locked", "m", None, None));
+    let resolve_thread = std::thread::spawn(move || client::resolve(&sock_for_resolve, "locked", "m", None, None, None));
 
     let mut ask = None;
     for _ in 0..200 {
@@ -505,7 +505,7 @@ fn a_second_connection_is_accepted_and_served_while_the_first_sits_parked() {
     // unrelated NEW connection must complete promptly — a serial accept
     // loop would hang here until the parked one closes.
     let start = std::time::Instant::now();
-    let value = client::resolve(&socket_path, "open", "m", None, None).unwrap();
+    let value = client::resolve(&socket_path, "open", "m", None, None, None).unwrap();
     let elapsed = start.elapsed();
     assert_eq!(value, "open-value");
     assert!(
@@ -599,7 +599,7 @@ fn watch_follower_sees_a_parked_event_within_about_a_second_through_the_real_eve
     // NotFound-poll semantics (goal 3) are proven directly in `watch.rs`'s
     // own unit tests; this test only needs a file to already be there.
     assert_eq!(client::put(&socket_path, "open", "open-value", false).unwrap(), false);
-    assert_eq!(client::resolve(&socket_path, "open", "m", None, None).unwrap(), "open-value");
+    assert_eq!(client::resolve(&socket_path, "open", "m", None, None, None).unwrap(), "open-value");
 
     let mut follower =
         watch::Follower::open_at_end(&events_path).expect("the events feed must already exist after the resolve above");
@@ -608,7 +608,7 @@ fn watch_follower_sees_a_parked_event_within_about_a_second_through_the_real_eve
     assert_eq!(client::put(&socket_path, "locked", "the-real-value", false).unwrap(), false);
     let start = std::time::Instant::now();
     let sock_for_resolve = socket_path.clone();
-    let resolve_thread = std::thread::spawn(move || client::resolve(&sock_for_resolve, "locked", "m", None, None));
+    let resolve_thread = std::thread::spawn(move || client::resolve(&sock_for_resolve, "locked", "m", None, None, None));
 
     let mut seen_parked_id: Option<String> = None;
     let mut elapsed = Duration::from_secs(0);

@@ -1179,6 +1179,52 @@
   resolved alone is sufficient, `zenity` missing in that case is simply
   never consulted (mirrors the "the env tier is trusted unconditionally"
   reasoning `resolve_lyra_bin`'s own doc comment gives).
+- **A parked ask carries an OPTIONAL "context block" — `reason` (free-text,
+  self-asserted) and `origin` (best-effort, kernel-traced) — for a popup/
+  prompt surface to show WHY and FROM WHERE an ask exists, not just which
+  secret/consumer (this commit, P3).** `park::ParkedAsk` gained `reason:
+  Option<String>` (the wire's `resolve.reason`, `secrets exec`'s `--reason`
+  or `client::derive_reason`'s auto-derivation from the wrapped command,
+  space-joined and truncated to ~60 chars — the SAME "display-only, never a
+  value" discipline `argv0` already holds) and `origin: park::AskOrigin`
+  (`{username, pid, comm, hostname}`, ALL best-effort). Don't add a THIRD
+  field to this pair "for completeness" without checking whether it's
+  actually WHY/WHERE context or something else entirely — `reason`/`origin`
+  are deliberately narrow, not a general-purpose metadata bag.
+  **`AskOrigin` is captured EXACTLY ONCE, at park time, from the SAME
+  `SO_PEERCRED` stamp `peer_uid` itself is stamped from
+  (`broker::capture_origin`, called right where `park_if_room` is called) —
+  never re-read later.** A pid can exit and be reused long before an ask
+  resolves or a dialog renders it, so `peercred::read_comm`/`peercred::
+  username_for_uid` (both best-effort, `None` on any failure, never a panic
+  — the SAME fail-to-`None` posture `peer_cred` itself holds) run ONCE here;
+  don't move either call to a later render-time read "since it's simpler" —
+  that would silently start attributing origins to the WRONG process the
+  moment pids wrap. `hostname` (`enroll::local_hostname`) is the ONE field
+  that's genuinely constant across every ask on one broker process, carried
+  per-ask anyway rather than assumed by a remote surface, future-proofing
+  the day a non-local entry point exists (`Policy::remote`'s own note above
+  — today every asker is local, so this is always the broker's own host).
+  **`comm` is PROCESS-CONTROLLED, UNTRUSTED text** (`prctl(PR_SET_NAME,
+  ...)` lets any process rename itself to anything) — rendered verbatim by
+  every surface, never interpreted, the identical posture `consumer`/
+  `reason` already hold; don't special-case it as "more trustworthy than
+  `reason`" just because it traces back to a kernel-verified pid — the PID
+  is kernel-truth, the STRING that process chose to report is not.
+  **The ride is `resolve` request -> `park::ParkedAsk` registry row ->
+  `pending` reply -> `parked` events-feed line -> three rendered surfaces**
+  (`watch::format_reason_line`/`watch::format_origin_line`, the ONE place
+  each line's wording is built): the tty prompt (`format_prompt_header`),
+  zenity's `--text` (`popup_loop`), and `lyra secrets ask`'s own `--reason`/
+  `--from` argv (`spawn_lyra_entry` — `reason` rides RAW since `lyra`'s own
+  QML owns that surface's layout, `from` rides PRE-FORMATTED by
+  `format_origin_line` so the wording never drifts between the three
+  surfaces). Don't reformat `origin` a fourth time inside `lyra`'s own QML;
+  `--from` already carries the finished line. Both are absent-safe
+  end-to-end — an ask with neither renders EXACTLY as it did before this
+  phase on every surface (`format_reason_line`/`format_origin_line` both
+  return `None` when there's nothing to show, and every call site treats
+  `None` as "add nothing," never a placeholder line).
 - **P-N4 (task #76) closes three popup gaps the field/an Opus-judge review
   found, all landed together, none touching the `--json` machine feed
   (byte-stable throughout).** (1) **The near-expiry policy is now TWO

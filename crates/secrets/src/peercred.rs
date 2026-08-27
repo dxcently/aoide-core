@@ -73,6 +73,56 @@ pub fn peer_cred(stream: &UnixStream) -> Option<PeerCred> {
     Some(PeerCred { uid: cred.uid, gid: cred.gid, pid: cred.pid })
 }
 
+/// Best-effort `uid` -> username lookup (`getpwuid_r`, the thread-safe form
+/// — this broker is thread-per-connection, `broker.rs`'s own module doc) —
+/// `None` on any failure (no such uid, a truncated/malformed `passwd` entry,
+/// the lookup mechanism itself unavailable), never a panic, same
+/// fail-to-`None` posture [`peer_cred`] itself holds. This is DISPLAY DATA
+/// for a park's "origin" line (a P3 addition, `park::AskOrigin`'s own doc) —
+/// it never gates anything the way the raw `uid` itself does
+/// (`broker::handle_dismiss`'s peer-uid check, module doc above).
+pub fn username_for_uid(uid: u32) -> Option<String> {
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf: Vec<libc::c_char> = vec![0; 4096];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: `pwd`/`buf`/`result` are correctly sized out-parameters
+    // matching `getpwuid_r`'s documented contract; `buf`'s pointer/len are
+    // passed together and `getpwuid_r` never writes past `buf.len()`.
+    let ret = unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+    if ret != 0 || result.is_null() || pwd.pw_name.is_null() {
+        return None;
+    }
+    // SAFETY: `pwd.pw_name` is a valid NUL-terminated C string owned by
+    // `buf` (still in scope) once `getpwuid_r` returns success with a
+    // non-null `result`.
+    let name = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) }.to_string_lossy().into_owned();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Best-effort `/proc/<pid>/comm` read — the short process name the kernel
+/// itself recorded for `pid` (task #73's own `SO_PEERCRED` pid, extended:
+/// `park::AskOrigin`'s own doc). **Must be read AT PARK TIME, never later**
+/// — the caller's own doc on why (a pid can exit and be reused well before
+/// an ask resolves or a popup renders it). `None` on any failure (the pid
+/// already gone, `/proc` unmounted, an empty read) — this is UNTRUSTED,
+/// process-controlled DISPLAY TEXT (a process may name `comm` anything via
+/// `prctl(PR_SET_NAME, ...)`), rendered verbatim by a surface, never
+/// interpreted as anything else, same posture the wire's self-asserted
+/// `consumer`/`reason` fields already hold.
+pub fn read_comm(pid: i32) -> Option<String> {
+    let raw = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    let trimmed = raw.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +160,28 @@ mod tests {
         let (a, b) = UnixStream::pair().expect("socketpair");
         drop(b);
         assert!(peer_cred(&a).is_some(), "SO_PEERCRED reflects the stamped-at-connect identity, not peer liveness");
+    }
+
+    // ── username_for_uid / read_comm (P3: the ask origin line) ──────────
+
+    #[test]
+    fn username_for_uid_resolves_this_processs_own_euid() {
+        let euid = unsafe { libc::geteuid() };
+        assert!(username_for_uid(euid).is_some(), "this process's own euid must resolve to SOME username on any real host");
+    }
+
+    #[test]
+    fn username_for_uid_is_none_for_an_implausible_uid() {
+        assert_eq!(username_for_uid(u32::MAX), None);
+    }
+
+    #[test]
+    fn read_comm_resolves_this_processs_own_comm() {
+        assert!(read_comm(std::process::id() as i32).is_some(), "/proc/<this pid>/comm must be readable for this live process");
+    }
+
+    #[test]
+    fn read_comm_is_none_for_a_pid_that_does_not_exist() {
+        assert_eq!(read_comm(i32::MAX), None);
     }
 }

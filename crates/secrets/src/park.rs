@@ -178,7 +178,43 @@ pub struct ParkedAsk {
     pub consumer: String,
     pub requested_at: u64,
     pub peer_uid: Option<u32>,
+    /// Untrusted, optional, DISPLAY-ONLY context for why this ask exists —
+    /// the wire's `resolve.reason` field, self-asserted exactly like
+    /// `consumer` (no different honesty story than that field already
+    /// carries). Never gates anything, never interpreted as anything but
+    /// text a human reads on a dialog/prompt (`broker.rs`'s module doc).
+    pub reason: Option<String>,
+    /// WHO/WHERE this ask's requesting connection came from, captured ONCE
+    /// at park time — see [`AskOrigin`]'s own doc.
+    pub origin: AskOrigin,
     tx: mpsc::Sender<ParkOutcome>,
+}
+
+/// The "origin line" a popup/prompt surface shows alongside `reason` (P3:
+/// "from: `<username>` \u{b7} `<comm>` (pid `<pid>`) @ `<hostname>`") —
+/// every field best-effort and DISPLAY-ONLY, never a gate (the raw kernel
+/// `uid` on [`ParkedAsk::peer_uid`] is the ONE field here with any
+/// authorization weight, and it already lives on `ParkedAsk` directly,
+/// unchanged by this struct existing). `username` and `comm` both trace
+/// back to `SO_PEERCRED`'s own `uid`/`pid` (`peercred::username_for_uid`/
+/// `peercred::read_comm`), captured by the broker at the SAME park-time
+/// instant `peer_uid` itself is stamped — a pid can exit and be reused long
+/// before an ask resolves or a dialog renders it, so this must never be
+/// re-read later. `comm` in particular is PROCESS-CONTROLLED, untrusted
+/// text (`prctl(PR_SET_NAME, ...)` lets any process name itself anything) —
+/// render it, never interpret it, the same posture `reason`/`consumer`
+/// already hold. `hostname` is the broker's OWN host (`enroll::
+/// local_hostname`) — constant across every ask on one broker process, but
+/// carried per-ask anyway (never assumed by a remote surface) so a future
+/// non-local entry point (`AGENTS.md`'s `Policy::remote` note) can name
+/// which host actually parked an ask once one exists; today every asker is
+/// local, so this is always the same string as the broker's own hostname.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AskOrigin {
+    pub username: Option<String>,
+    pub pid: Option<i32>,
+    pub comm: Option<String>,
+    pub hostname: Option<String>,
 }
 
 impl ParkedAsk {
@@ -245,7 +281,7 @@ impl ParkRegistry {
     /// caller (tests, and any future one with no cap concern) keeps this
     /// simpler unconditional signature.
     pub fn park(&self, secret: &str, consumer: &str, requested_at: u64) -> (String, mpsc::Receiver<ParkOutcome>) {
-        self.park_if_room(secret, consumer, requested_at, usize::MAX, None)
+        self.park_if_room(secret, consumer, requested_at, usize::MAX, None, None, AskOrigin::default())
             .expect("an unbounded park (cap = usize::MAX) must never refuse")
     }
 
@@ -261,6 +297,7 @@ impl ParkRegistry {
     /// when the registry is already at `cap` — the caller falls back to the
     /// immediate pre-park refusal (the `wait:false` text) rather than
     /// growing the queue further.
+    #[allow(clippy::too_many_arguments)]
     pub fn park_if_room(
         &self,
         secret: &str,
@@ -268,6 +305,8 @@ impl ParkRegistry {
         requested_at: u64,
         cap: usize,
         peer_uid: Option<u32>,
+        reason: Option<&str>,
+        origin: AskOrigin,
     ) -> Option<(String, mpsc::Receiver<ParkOutcome>)> {
         let (tx, rx) = mpsc::channel();
         let mut guard = self.lock();
@@ -277,7 +316,15 @@ impl ParkRegistry {
         let n = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
         guard.insert(
             n,
-            ParkedAsk { secret: secret.to_string(), consumer: consumer.to_string(), requested_at, peer_uid, tx },
+            ParkedAsk {
+                secret: secret.to_string(),
+                consumer: consumer.to_string(),
+                requested_at,
+                peer_uid,
+                reason: reason.map(str::to_string),
+                origin,
+                tx,
+            },
         );
         drop(guard);
         Some((self.format_id(n), rx))
@@ -320,19 +367,30 @@ impl ParkRegistry {
         }
     }
 
-    /// Every parked ask's `(id, secret, consumer, requested_at, peer_uid)`
-    /// — never a value, never a channel handle (`secrets pending`'s whole
-    /// reply). `peer_uid` (task #73) is additive over the pre-#73 shape —
-    /// the kernel-truth uid stamped at park time, `None` when it couldn't
-    /// be read. Ordered by the internal counter (insertion order, since
-    /// it's monotonic) via `BTreeMap`'s own iteration order — the nonce
-    /// prefix is constant across every entry in one registry, so
-    /// formatting it on afterward never disturbs that order.
-    pub fn list(&self) -> Vec<(String, String, String, u64, Option<u32>)> {
+    /// Every parked ask's `(id, secret, consumer, requested_at, peer_uid,
+    /// reason, origin)` — never a value, never a channel handle (`secrets
+    /// pending`'s whole reply). `peer_uid` (task #73) is additive over the
+    /// pre-#73 shape — the kernel-truth uid stamped at park time, `None`
+    /// when it couldn't be read. `reason`/`origin` are additive again — the
+    /// wire's optional, self-asserted/best-effort, display-only context
+    /// (`ParkedAsk`'s own doc, `AskOrigin`'s own doc). Ordered by the
+    /// internal counter (insertion order, since it's monotonic) via
+    /// `BTreeMap`'s own iteration order — the nonce prefix is constant
+    /// across every entry in one registry, so formatting it on afterward
+    /// never disturbs that order.
+    pub fn list(&self) -> Vec<(String, String, String, u64, Option<u32>, Option<String>, AskOrigin)> {
         self.lock()
             .iter()
             .map(|(id, ask)| {
-                (self.format_id(*id), ask.secret.clone(), ask.consumer.clone(), ask.requested_at, ask.peer_uid)
+                (
+                    self.format_id(*id),
+                    ask.secret.clone(),
+                    ask.consumer.clone(),
+                    ask.requested_at,
+                    ask.peer_uid,
+                    ask.reason.clone(),
+                    ask.origin.clone(),
+                )
             })
             .collect()
     }
@@ -426,7 +484,7 @@ mod tests {
         // `park` (unbounded, no peer info) always stamps `None` — only
         // `park_if_room`'s real production caller (`broker::handle_resolve`)
         // ever supplies a peer uid.
-        assert_eq!(list[0], (id, "db-prod".to_string(), "m".to_string(), 1_700_000_000, None));
+        assert_eq!(list[0], (id, "db-prod".to_string(), "m".to_string(), 1_700_000_000, None, None, AskOrigin::default()));
     }
 
     #[test]
@@ -470,16 +528,16 @@ mod tests {
     #[test]
     fn park_if_room_refuses_beyond_the_cap_and_admits_again_after_a_take() {
         let reg = ParkRegistry::new();
-        assert!(reg.park_if_room("a", "m", 1, 2, None).is_some());
-        assert!(reg.park_if_room("b", "m", 2, 2, None).is_some());
-        assert!(reg.park_if_room("c", "m", 3, 2, None).is_none(), "a third park must refuse at cap 2");
+        assert!(reg.park_if_room("a", "m", 1, 2, None, None, AskOrigin::default()).is_some());
+        assert!(reg.park_if_room("b", "m", 2, 2, None, None, AskOrigin::default()).is_some());
+        assert!(reg.park_if_room("c", "m", 3, 2, None, None, AskOrigin::default()).is_none(), "a third park must refuse at cap 2");
         assert_eq!(reg.list().len(), 2);
 
         // Freeing one slot (a take, as approve/dismiss/timeout would do)
         // lets the next park through again.
         let first_id = reg.list().into_iter().next().unwrap().0;
         reg.take(&first_id);
-        assert!(reg.park_if_room("d", "m", 4, 2, None).is_some());
+        assert!(reg.park_if_room("d", "m", 4, 2, None, None, AskOrigin::default()).is_some());
     }
 
     #[test]
@@ -497,7 +555,7 @@ mod tests {
     #[test]
     fn park_if_room_stamps_the_given_peer_uid_and_peek_returns_it() {
         let reg = ParkRegistry::new();
-        let (id, _rx) = reg.park_if_room("t", "m", 1, usize::MAX, Some(4242)).unwrap();
+        let (id, _rx) = reg.park_if_room("t", "m", 1, usize::MAX, Some(4242), None, AskOrigin::default()).unwrap();
         assert_eq!(reg.peek(&id), Some(("t".to_string(), "m".to_string(), Some(4242))));
         let list = reg.list();
         assert_eq!(list.len(), 1);
@@ -505,9 +563,22 @@ mod tests {
     }
 
     #[test]
+    fn park_if_room_stamps_the_given_reason_and_origin_and_list_returns_them() {
+        let reg = ParkRegistry::new();
+        let origin =
+            AskOrigin { username: Some("khoa".into()), pid: Some(4242), comm: Some("bash".into()), hostname: Some("yomi-strix".into()) };
+        let (id, _rx) = reg.park_if_room("t", "m", 1, usize::MAX, Some(4242), Some("sudo nixos-rebuild switch"), origin.clone()).unwrap();
+        let list = reg.list();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].0, id);
+        assert_eq!(list[0].5, Some("sudo nixos-rebuild switch".to_string()));
+        assert_eq!(list[0].6, origin);
+    }
+
+    #[test]
     fn park_if_room_with_no_peer_uid_stamps_none() {
         let reg = ParkRegistry::new();
-        let (id, _rx) = reg.park_if_room("t", "m", 1, usize::MAX, None).unwrap();
+        let (id, _rx) = reg.park_if_room("t", "m", 1, usize::MAX, None, None, AskOrigin::default()).unwrap();
         assert_eq!(reg.peek(&id), Some(("t".to_string(), "m".to_string(), None)));
     }
 
