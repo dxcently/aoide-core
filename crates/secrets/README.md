@@ -1460,6 +1460,26 @@ either the broker or `secrets watch`'s side. This is what fixed the
 operator's home, which that setting blocks; a path inside `RuntimeDirectory`
 is not.
 
+**The popup watcher autostarts as a graphical-session USER unit,
+`aoide-secrets-watch.service`, running `aoide secrets watch --popup`.**
+Before this, nothing ever started `secrets watch` at all — a parked ask
+surfaced only if an operator happened to have one running by hand in some
+terminal. Gated on `aoide.facets.quickshell.enable`, the SAME condition the
+module's own `pkgs.zenity` package pull already uses (a headless box has no
+display for a dialog); `Type = "simple"` + `Restart = "on-failure"` for the
+same "blocks forever" reason the broker service above holds. Its `path`
+carries `zenity` (a systemd user unit's default `PATH` does not reliably
+carry `environment.systemPackages` entries, the same lesson `shellbridge.nix`
+already learned for `hyprctl`/`curl`), and, only when `aoide.lyra.enable` is
+on, `AOIDE_RICE_BIN` points at `pkgs.aoide.rice`'s own `lyra` — `lyra` ships
+from a SEPARATE output than the `aoide` binary this unit execs (P-A8 of the
+binary-split workstream), so `watch::resolve_lyra_bin`'s sibling-of-
+`current_exe()` tier would otherwise never find it. No explicit ordering
+against the SYSTEM `aoide-secrets-serve.service` exists or is needed: `watch::
+wait_for_follower` already waits out a not-yet-created events feed rather
+than exiting, so this unit coming up before the broker has bound its socket
+is a normal race, not a failure.
+
 **Open deployment gap, flagged not fixed here (P-G1, task #70 — this
 crate's own hard constraint forbids touching `.nix` files; the unit-path
 packaging is the orchestrator's, root `AGENTS.md`):** the service's `path`
