@@ -230,16 +230,20 @@
   `peer.via` only when the override is absent; a new `--via`-accepting
   command follows this same precedence, not a per-command variant of it.
   **The session key (`tunnel_session_id`, K3) is resolved and passed
-  through here, but NOTHING in this phase closes a tunnel.** A conducted
-  session's tunnels stay open past this process's exit by design (reused
-  for the session's whole lifetime); a bare-shell `pid-<pid>` tunnel is
-  ALSO left open — closing it only at the client-owned CLI handlers while
-  `pull_peer_live`/`send_message_to_peer`/`spawn_on_peer` (called from
-  `aoide-conduct`, which cannot be wrapped from here) stayed unclosed would
+  through here, but this crate never closes a tunnel itself, by design.**
+  `pull_peer_live`/`send_message_to_peer`/`spawn_on_peer` are called from
+  `aoide-conduct`, which this crate cannot wrap — closing only at the
+  client-owned CLI handlers while those call sites stayed unclosed would
   make identical code behave inconsistently by caller. **Do not add a
-  partial close here** — the real lifecycle (session-end fast path, reaper
-  backstop, for both key shapes) is P-S5's, landed all at once or not at
-  all.
+  partial close here.** The real lifecycle lives one crate up, in
+  `aoide-conduct`: a session-keyed tunnel is closed on its session's own
+  clean exit (`graph::session_store::do_session_end`'s fast path, via
+  `close_all_for_session`) and, for a session that never runs that exit,
+  by `reap::sweep_orphan_tunnels`'s backstop (`kill_if_still_our_ssh` —
+  `pub` in this module for exactly that reaper to reuse, never
+  re-implemented there); a bare-shell `pid-<pid>` tunnel has no session
+  lifecycle to hook, so it is left for that same sweep's ordinary dead-pid
+  arm to collect once its one-shot CLI process has exited.
 - **A tunneled request is safe against a real peer, not merely possible.**
   Every request delivered through an ssh forward reaches the far A2A door
   as `PeerOrigin::Loopback` (`aoide-server::a2a::classify_origin`), which

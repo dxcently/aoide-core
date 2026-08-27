@@ -136,7 +136,18 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   every in-crate caller and unit test calls directly, and what the
   daemon's own tick runs internally on its ~12s cadence — the systemd timer
   becomes a redundant backstop once a daemon is resident, never a second
-  liveness mechanism.
+  liveness mechanism. Beyond session records, the same pass collects two
+  kinds of leavings a killed session left in `$XDG_RUNTIME_DIR/aoide`: its
+  control socket (`sweep_orphan_sockets`) and, for the ssh-transport lane,
+  every tunnel it opened and never closed (`sweep_orphan_tunnels` — a
+  roster-less, settled record's still-answering `ssh -N` child is signaled
+  via `aoide_client::tunnel::kill_if_still_our_ssh` before the record is
+  unlinked). A tunnel's fast path is `session_store::do_session_end`, which
+  closes every tunnel a session opened
+  (`aoide_client::tunnel::close_all_for_session`) on its own clean exit; this
+  sweep is only the SUPER+Q/SIGKILL backstop for the session that never got
+  to run that exit path — so an ssh child can never outlive its session and
+  become a resident daemon.
 - `graph/window.rs` — window discovery/backfill/listener PLUS the
   automatic-parenting seam (task #89, corrected in review round 2):
   `is_windowless_wrap` (a conducted record is windowless when `headless` is

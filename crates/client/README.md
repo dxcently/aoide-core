@@ -159,17 +159,22 @@ never the inbound/serve half (that's `aoide-server`).
   serves.
   The session id a tunnel opens under (`tunnel_session_id`) is
   `AOIDE_SESSION_ID` when a conducted session set it, else a
-  process-scoped `pid-<pid>` fallback (K3) — **P-S4 stops at resolving and
-  passing that key through; it does not close anything.** Every tunnel
-  this phase opens is left running past its own command's exit — the
-  session-keyed kind because reuse across a session's whole lifetime is
-  the point, the pid-scoped kind because `pull_peer_live`/
-  `send_message_to_peer`/`spawn_on_peer` are called from
+  process-scoped `pid-<pid>` fallback (K3). This crate only resolves and
+  passes that key through — it never closes a tunnel itself, on purpose:
+  `pull_peer_live`/`send_message_to_peer`/`spawn_on_peer` are called from
   `aoide-conduct` command handlers this crate cannot wrap, and a partial
   close covering only the client-owned handlers would make the same
-  function behave inconsistently by caller. The real lifecycle — the
-  session-end fast path and the reaper's orphan-collecting backstop, for
-  BOTH key shapes — is P-S5's job, not started here.
+  function behave inconsistently by caller. The real lifecycle lives one
+  crate up, in `aoide-conduct`, and differs by key shape: a session-keyed
+  tunnel is closed on its session's own clean exit
+  (`aoide_client::tunnel::close_all_for_session`, called from
+  `graph::session_store::do_session_end`'s fast path) and, for a session
+  that never gets to run that exit, by `reap::sweep_orphan_tunnels`'s
+  backstop; a pid-scoped tunnel has no session lifecycle to hook a fast
+  path into at all — its one-shot CLI process has already exited by the
+  time any reap pass runs, so the SAME sweep collects it through its
+  ordinary dead-pid arm. Both key shapes converge on one sweep; neither is
+  a special case of it.
   Every tunneled request reaches the far door as `PeerOrigin::Loopback`
   (`aoide-server::a2a::classify_origin`), which carries an unconditional
   delivery free pass for an UNSIGNED request. `aoide-server::a2a` narrows

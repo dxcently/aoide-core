@@ -1038,8 +1038,25 @@ fn do_session_phase_if_inner(id: &str, phase: &str, expected: &str) -> Outcome {
 
 /// Core of `session end`: mark the session `done` (and its hook phase
 /// `done`), re-stage. An unknown id is an ok no-op (matching `project remove`).
+///
+/// Also closes every ssh tunnel this session opened
+/// (`aoide_client::tunnel::close_all_for_session`, ssh-transport lane P-S5) —
+/// the FAST path for the lifecycle rule "persistent within a session,
+/// ephemeral across sessions": a clean `session end` tears its own tunnels
+/// down immediately rather than waiting on the reaper's
+/// `sweep_orphan_tunnels` backstop, which exists precisely for the session
+/// that never gets to run this exit path (SUPER+Q, SIGKILL). Runs AFTER the
+/// stage lock is released, deliberately: closing a tunnel means signaling
+/// and `waitpid`-reaping a real `ssh` child, which can take up to ~1s
+/// (`terminate_pid`'s bounded waits) and has nothing to do with the
+/// sessions/hooks stage files the lock actually guards. Best-effort — a
+/// tunnel that fails to close here is still caught by the reaper, so its
+/// error is never allowed to turn a successful `session end` into a
+/// reported failure.
 pub(in crate::graph) fn do_session_end(id: &str) -> Outcome {
-    with_stage_lock(|| do_session_end_inner(id))
+    let outcome = with_stage_lock(|| do_session_end_inner(id));
+    let _ = aoide_client::tunnel::close_all_for_session(id);
+    outcome
 }
 fn do_session_end_inner(id: &str) -> Outcome {
     let cmd = "session.end";
@@ -1716,6 +1733,61 @@ mod tests {
         let lines2 = aoide_storage::ledger::read_ledger().unwrap();
         let mine2: usize = lines2.iter().filter(|l| l.session_id == "end-ledger-1").count();
         assert_eq!(mine2, 1, "a repeat `session end` must not double-append");
+
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+    #[test]
+    fn session_end_closes_its_own_tunnels_and_spares_another_sessions() {
+        // The ssh-transport lane's P-S5 fast path: a clean `session end`
+        // closes every tunnel THIS session opened
+        // (`aoide_client::tunnel::close_all_for_session`) without touching a
+        // different session's — the reaper's `sweep_orphan_tunnels` is only
+        // the backstop for the session that never gets to run this path.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR"]);
+        let stage = unique_stage("sess-end-tunnels");
+        let state = stage.join("state");
+        let runtime = stage.join("runtime");
+        std::fs::create_dir_all(runtime.join("aoide")).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        std::env::set_var("XDG_RUNTIME_DIR", &runtime);
+
+        session_start(&flag_invocation(
+            &["session", "start"],
+            &[("id", "end-tunnel-1"), ("agent", "claude"), ("cwd", "/w")],
+        ));
+
+        let tunnel_record = |session_id: &str, key: &str| aoide_storage::tunnel::TunnelRecord {
+            schema_version: aoide_storage::tunnel::TUNNEL_VERSION.to_string(),
+            session_id: session_id.to_string(),
+            key: key.to_string(),
+            ssh_target: "ssh://user@host".to_string(),
+            local_port: 40010,
+            remote_host: "127.0.0.1".to_string(),
+            remote_port: 8710,
+            // A pid nothing on the box holds — `close`'s guarded kill is
+            // then a fast no-op, exactly like a genuinely dead forward.
+            pid: 999_999_999,
+            opened_at: aoide_storage::time::now_iso_utc(),
+        };
+        aoide_storage::tunnel::save(&tunnel_record("end-tunnel-1", "peer-a")).unwrap();
+        aoide_storage::tunnel::save(&tunnel_record("other-session", "peer-b")).unwrap();
+
+        let out = session_end(&flag_invocation(
+            &["session", "end"],
+            &[("id", "end-tunnel-1")],
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+
+        assert!(
+            aoide_storage::tunnel::load("end-tunnel-1", "peer-a").is_none(),
+            "the ended session's own tunnel record is closed",
+        );
+        assert!(
+            aoide_storage::tunnel::load("other-session", "peer-b").is_some(),
+            "another session's tunnel record is untouched",
+        );
 
         let _ = std::fs::remove_dir_all(&stage);
     }

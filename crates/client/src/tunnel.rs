@@ -243,13 +243,19 @@ fn looks_like_our_ssh(pid: u32, local_port: u16, remote_port: u16) -> bool {
 /// Kill `pid` if — and only if — it is still alive AND
 /// [`looks_like_our_ssh`] still confirms it as `(local_port, remote_port)`'s
 /// own `ssh` child (the module doc's "recycled-pid decision"). Shared by
-/// [`close`] (tearing a forward down on purpose) and `open_or_reuse_with`'s
+/// [`close`] (tearing a forward down on purpose), `open_or_reuse_with`'s
 /// stale-record path (a live-but-dead-port record is about to be
 /// OVERWRITTEN by a fresh one at the same key — without this, the old
 /// child would become permanently untrackable, since `close`/
-/// `close_all_for_session`/the reaper (P-S5) can only ever act on a pid
-/// they load FROM a record).
-fn kill_if_still_our_ssh(pid: u32, local_port: u16, remote_port: u16) {
+/// `close_all_for_session`/the reaper can only ever act on a pid they load
+/// FROM a record), and `aoide-conduct::reap::sweep_orphan_tunnels` (P-S5),
+/// which loads a record whose SESSION is gone but whose pid still answers
+/// `/proc` and needs the exact same guarded kill before the record is
+/// unlinked out from under it. `pub` (not `pub(crate)`): `aoide-conduct`
+/// sits above `aoide-client` in the crate DAG (`client/AGENTS.md`, "the
+/// `conduct -> client` edge is load-bearing"), so the reaper reuses this
+/// verbatim rather than re-implementing process-killing a second time.
+pub fn kill_if_still_our_ssh(pid: u32, local_port: u16, remote_port: u16) {
     if proc_exists(pid) && looks_like_our_ssh(pid, local_port, remote_port) {
         terminate_pid(pid);
     }

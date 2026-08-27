@@ -37,6 +37,18 @@
 //! [`sweep_orphan_sockets`] — not a session record at all, but this sweep's
 //! leavings and nobody else's job).
 //!
+//! A fourth kind of leaving sits alongside the socket: the ssh tunnel a
+//! cross-box call opened for a session that never got to close it itself
+//! (see [`sweep_orphan_tunnels`], ssh-transport lane P-S5). Same shape as
+//! the socket sweep — a roster-less, settled record is collected — plus one
+//! extra step the socket never needed: the tunnel is a live `ssh -N` child,
+//! not just a leftover file, so a still-answering pid is signaled
+//! (`aoide_client::tunnel::kill_if_still_our_ssh`) before its record is
+//! unlinked. `do_session_end`'s own clean-exit path already closes a
+//! session's tunnels on the fast path (`graph/session_store.rs`); this sweep
+//! is the SUPER+Q/SIGKILL backstop, so an ssh child can never outlive its
+//! session and become a resident daemon.
+//!
 //! A false reap of a merely-quiet live session self-heals: the hook door
 //! re-registers the record on the session's next event.
 //!
@@ -476,6 +488,14 @@ const BOOT_SKEW_GRACE_SECS: i64 = 300; // 5 minutes
 /// duplicate dedup uses.
 const SOCKET_SETTLE_SECS: i64 = 60;
 
+/// How long a tunnel record must have sat untouched before
+/// [`sweep_orphan_tunnels`] will consider it. Same value, same reasoning as
+/// [`SOCKET_SETTLE_SECS`]: `aoide-client::tunnel::open_or_reuse` writes the
+/// record a moment AFTER the forward already answers, so an infant record is
+/// briefly roster-less through no fault of its own the instant a session
+/// starts opening its first tunnel.
+const TUNNEL_SETTLE_SECS: i64 = 60;
+
 /// The instant this machine booted, epoch seconds — `btime` out of
 /// `/proc/stat`. `None` whenever it cannot be read or parsed (no `/proc`, a
 /// stripped container): the pre-boot signal then never fires at all, which is
@@ -647,6 +667,68 @@ fn sweep_orphan_sockets(live_ids: &HashSet<&str>, now_epoch: i64) -> Vec<String>
         }
         if std::fs::remove_file(e.path()).is_ok() {
             swept.push(id.to_string());
+        }
+    }
+    swept.sort();
+    swept
+}
+
+/// Unlink (and, when still alive, kill) the ssh tunnels left behind by
+/// sessions that are no longer on the roster, and return the
+/// `<sessionId>/<key>` pairs swept — [`sweep_orphan_sockets`]'s exact shape,
+/// one crate DAG hop further down: a tunnel record is `aoide-storage`'s
+/// (`aoide_storage::tunnel`), and the pid it names is `aoide-client`'s to
+/// signal (`aoide_client::tunnel::kill_if_still_our_ssh`) — this sweep never
+/// re-implements either, it only decides WHICH records qualify.
+///
+/// `aoide-client::tunnel::open_or_reuse` makes a session's tunnel
+/// PERSISTENT for as long as that session lives (reused, never re-spawned,
+/// across every later cross-box call in the same session) and
+/// `do_session_end`'s fast path (`graph/session_store.rs`) already closes
+/// every tunnel a session opened on its own clean exit — this sweep is the
+/// SUPER+Q/SIGKILL backstop for the session that never got to run that exit
+/// path, the same relationship [`sweep_orphan_sockets`] holds with a killed
+/// `conduct`'s control socket. Left uncollected, the orphaned `ssh -N` child
+/// is exactly the resident-daemon shape the lane's design forbids.
+///
+/// Three guards, mirroring [`sweep_orphan_sockets`] line for line:
+///   * a record whose `sessionId` IS on the roster is skipped outright,
+///     whatever its pid probe would say — a live session's tunnel is never
+///     this sweep's business;
+///   * [`TUNNEL_SETTLE_SECS`] off the record FILE's own mtime spares an
+///     infant record from the moment between the forward answering and
+///     `open_or_reuse` finishing its write;
+///   * a record whose file cannot be resolved or stat'd (a mid-write,
+///     torn-directory, or permission edge) is skipped, never treated as a
+///     hard error — `aoide_storage::tunnel::list_records` already holds this
+///     same tolerate-and-continue discipline for a record that fails to
+///     parse at all, and this sweep must never abort the rest of the
+///     directory over one unreadable entry.
+/// A dead pid costs nothing extra: `kill_if_still_our_ssh`'s own liveness
+/// check already turns the kill into a no-op, so both the dead-pid and the
+/// alive-pid branches converge on the same unconditional unlink below.
+fn sweep_orphan_tunnels(live_ids: &HashSet<&str>, now_epoch: i64) -> Vec<String> {
+    let mut swept = Vec::new();
+    for rec in aoide_storage::tunnel::list_records() {
+        if live_ids.contains(rec.session_id.as_str()) {
+            continue;
+        }
+        let Ok(path) = aoide_storage::tunnel::record_path(&rec.session_id, &rec.key) else {
+            continue;
+        };
+        let settled = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_some_and(|d| now_epoch.saturating_sub(d.as_secs() as i64) >= TUNNEL_SETTLE_SECS);
+        if !settled {
+            continue;
+        }
+        if proc_exists(rec.pid) {
+            aoide_client::tunnel::kill_if_still_our_ssh(rec.pid, rec.local_port, rec.remote_port);
+        }
+        if aoide_storage::tunnel::remove(&rec.session_id, &rec.key).is_ok() {
+            swept.push(format!("{}/{}", rec.session_id, rec.key));
         }
     }
     swept.sort();
@@ -1074,6 +1156,21 @@ fn reap_inner(
         sweep_orphan_sockets(&surviving, now_epoch)
     };
 
+    // The ssh tunnels dead sessions left in `$XDG_RUNTIME_DIR/aoide/tunnel`
+    // (see `sweep_orphan_tunnels`) — computed against the SAME surviving
+    // roster the socket sweep just used, for the same "collected on the pass
+    // that reaped it, not the next one" reason.
+    let orphan_tunnels = {
+        let dead: HashSet<&str> = reaped.iter().map(String::as_str).collect();
+        let surviving: HashSet<&str> = s_file
+            .sessions
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .filter(|id| !dead.contains(id))
+            .collect();
+        sweep_orphan_tunnels(&surviving, now_epoch)
+    };
+
     // Age out the warm `stopped` badge: a turn that ended more than an hour ago is
     // just `idle` now. This is the one transition no hook can ever deliver (a
     // session left alone emits nothing), so the periodic pass owns it — and it runs
@@ -1086,6 +1183,7 @@ fn reap_inner(
         && orphan_hooks.is_empty()
         && superseded_done.is_empty()
         && orphan_sockets.is_empty()
+        && orphan_tunnels.is_empty()
     {
         return Outcome::ok(cmd, "nothing to reap (all sessions live)").with_data(json!({
             "reaped": [],
@@ -1093,6 +1191,7 @@ fn reap_inner(
             "orphanHooks": [],
             "supersededDone": [],
             "orphanSockets": [],
+            "orphanTunnels": [],
             "hyprctlAvailable": hyprctl_available,
         }));
     }
@@ -1200,6 +1299,11 @@ fn reap_inner(
             .iter()
             .map(|id| format!("unlinked orphaned control socket of {id} (nothing listening)")),
     );
+    changed.extend(
+        orphan_tunnels
+            .iter()
+            .map(|id| format!("unlinked orphaned ssh tunnel {id} (session gone)")),
+    );
     match restage_graph() {
         Ok(g) => changed.push(g.to_string_lossy().into_owned()),
         Err(e) => return stage_error(cmd, e),
@@ -1207,14 +1311,15 @@ fn reap_inner(
     Outcome::ok(
         cmd,
         format!(
-            "reaped {} dead session(s); dropped {} total; decayed {} stopped → idle; cleared {} orphaned parent link(s); dropped {} orphaned hook record(s); dropped {} superseded session(s); unlinked {} orphaned socket(s)",
+            "reaped {} dead session(s); dropped {} total; decayed {} stopped → idle; cleared {} orphaned parent link(s); dropped {} orphaned hook record(s); dropped {} superseded session(s); unlinked {} orphaned socket(s); unlinked {} orphaned tunnel(s)",
             reaped.len(),
             removed.len(),
             decayed.len(),
             cleared.len(),
             orphan_hooks.len(),
             superseded_done.len(),
-            orphan_sockets.len()
+            orphan_sockets.len(),
+            orphan_tunnels.len()
         ),
     )
     .changed(changed)
@@ -1226,6 +1331,7 @@ fn reap_inner(
         "orphanHooks": orphan_hooks,
         "supersededDone": superseded_done,
         "orphanSockets": orphan_sockets,
+        "orphanTunnels": orphan_tunnels,
         "hyprctlAvailable": hyprctl_available,
     }))
 }
@@ -2344,6 +2450,108 @@ mod tests {
         for spared in [&on_roster, &listening, &infant, &bridge] {
             assert!(spared.exists(), "spared: {}", spared.display());
         }
+        let _ = std::fs::remove_dir_all(&runtime);
+    }
+
+    /// Mirrors `orphan_control_sockets_are_unlinked_only_with_nothing_listening`
+    /// one crate DAG hop down: fake `TunnelRecord`s (no real `ssh` anywhere —
+    /// the P-S3 test seam this sweep leans on is `aoide_client::tunnel`'s own
+    /// pid/cmdline checks, exercised here only through pids that either don't
+    /// exist or are this very test process, never a spawned child).
+    #[test]
+    fn orphan_ssh_tunnels_are_swept_only_when_roster_less_and_settled() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = crate::graph::testutil::EnvVars::save(&["XDG_RUNTIME_DIR"]);
+        let runtime = crate::graph::testutil::unique_stage("reap-tunnels");
+        std::fs::create_dir_all(runtime.join("aoide")).unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &runtime);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        // Backdate past the settle window — same recipe the socket test uses.
+        let backdate = |p: &std::path::Path| {
+            let t = (now - 600) as libc::time_t;
+            let tv = [libc::timeval {
+                tv_sec: t,
+                tv_usec: 0,
+            }; 2];
+            let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::utimes(c.as_ptr(), tv.as_ptr()) }, 0);
+        };
+        let write_record = |session_id: &str, key: &str, pid: u32| {
+            let rec = aoide_storage::tunnel::TunnelRecord {
+                schema_version: aoide_storage::tunnel::TUNNEL_VERSION.to_string(),
+                session_id: session_id.to_string(),
+                key: key.to_string(),
+                ssh_target: "ssh://user@host".to_string(),
+                local_port: 40000,
+                remote_host: "127.0.0.1".to_string(),
+                remote_port: 8710,
+                pid,
+                opened_at: aoide_storage::time::now_iso_utc(),
+            };
+            aoide_storage::tunnel::save(&rec).unwrap();
+            aoide_storage::tunnel::record_path(session_id, key).unwrap()
+        };
+
+        // Nothing at this pid on any sane machine — a dead-pid orphan.
+        let dead_pid = 999_999_999u32;
+
+        // Orphan: session gone, pid dead, settled. Swept.
+        let orphan_path = write_record("gone-session", "peer-a", dead_pid);
+        backdate(&orphan_path);
+        // Live: session still on the roster, pid ALSO reads dead — spared
+        // regardless, because the roster check runs before any pid probe.
+        let live_path = write_record("alive-session", "peer-b", dead_pid);
+        backdate(&live_path);
+        // Infant: session gone, pid dead, but bound a moment ago — inside the
+        // settle window between the forward answering and `open_or_reuse`
+        // finishing its write. Spared.
+        let _infant_path = write_record("gone-infant", "peer-c", dead_pid);
+        // Orphan with a LIVE pid that is not actually an `ssh` child (this
+        // test process itself): `kill_if_still_our_ssh` must no-op on it
+        // (never signal a process that isn't its own ssh), and the record is
+        // still unlinked — the safety pin proving the guarded kill and the
+        // unconditional unlink are two separate steps.
+        let my_pid = std::process::id();
+        let alive_nonssh_path = write_record("gone-alive-pid", "peer-d", my_pid);
+        backdate(&alive_nonssh_path);
+
+        let live: HashSet<&str> = ["alive-session"].into_iter().collect();
+        let mut swept = sweep_orphan_tunnels(&live, now);
+        swept.sort();
+        assert_eq!(
+            swept,
+            vec![
+                "gone-alive-pid/peer-d".to_string(),
+                "gone-session/peer-a".to_string(),
+            ],
+            "only the dead-pid orphan and the alive-but-not-ours orphan are swept",
+        );
+        assert!(
+            aoide_storage::tunnel::load("gone-session", "peer-a").is_none(),
+            "the roster-less, settled, dead-pid record is unlinked",
+        );
+        assert!(
+            aoide_storage::tunnel::load("gone-alive-pid", "peer-d").is_none(),
+            "the roster-less, settled, alive-but-foreign-pid record is unlinked too",
+        );
+        assert!(
+            aoide_storage::tunnel::load("alive-session", "peer-b").is_some(),
+            "a live session's tunnel is spared even when its pid probe reads dead",
+        );
+        assert!(
+            aoide_storage::tunnel::load("gone-infant", "peer-c").is_some(),
+            "an infant record inside the settle window is spared",
+        );
+        // This test process is very much still alive — the whole point of
+        // the safety pin above.
+        assert!(std::path::Path::new("/proc").join(my_pid.to_string()).exists());
+
         let _ = std::fs::remove_dir_all(&runtime);
     }
 }
