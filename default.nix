@@ -21,6 +21,7 @@
   lib,
   rustPlatform,
   git,
+  curl,
   ...
 }:
 rustPlatform.buildRustPackage {
@@ -108,8 +109,17 @@ rustPlatform.buildRustPackage {
 
   # `aoide-storage::git` shells out to `git` (the project-revert plan's git
   # seam, R2) — its own tests drive a real temp repo, so `git` must be on
-  # PATH in the sandboxed check phase.
-  nativeCheckInputs = [ git ];
+  # PATH in the sandboxed check phase. `aoide-client::commands::run_curl`
+  # (the crate's one HTTP transport, `post_json`/`peer add`'s AgentCard
+  # fetch) shells out to `curl` the same way — the ssh-transport lane's
+  # dial-resolution tests (P-S4) drive real `curl` calls (a fast connection
+  # refusal against a reserved port, or a real loopback HTTP round trip
+  # through a reused tunnel record) rather than mocking the transport, so
+  # `curl` needs the same PATH availability `git` already has here.
+  nativeCheckInputs = [
+    git
+    curl
+  ];
 
   meta = {
     description = "Aoide CLI + daemon — an API that happens to be typeable (agent-first NixOS desktop control).";

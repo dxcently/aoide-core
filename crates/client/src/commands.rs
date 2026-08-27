@@ -2812,7 +2812,21 @@ mod tests {
     /// on is proven identical either way.
     #[test]
     fn a_via_rewrite_never_changes_the_path_sign_headers_for_peer_signs_over() {
-        with_temp_runtime_dir("sign-headers-path-pin", || {
+        // Sandbox fix (review): this test calls `sign_headers_for_peer`,
+        // which mints/loads THIS instance's identity
+        // (`aoide_storage::identity::load_or_mint`) — that needs a
+        // writable `AOIDE_STATE_DIR`, which `with_temp_runtime_dir` alone
+        // never sets (it only isolates `XDG_RUNTIME_DIR` for the tunnel
+        // record). In a build sandbox with no real `$HOME`,
+        // `load_or_mint`'s own default state-dir fallback is unwritable —
+        // "Permission denied" — exactly the failure `with_peer_state`
+        // (used by every OTHER identity-touching test in this module,
+        // e.g. `sign_headers_for_peer_round_trips_a_genuine_signature_for_
+        // a_verified_peer`) already avoids. `with_peer_state_and_temp_
+        // runtime_dir` isolates BOTH under one `env_lock` acquisition
+        // (nesting the two single-purpose helpers would deadlock — see
+        // its own doc).
+        with_peer_state_and_temp_runtime_dir("sign-headers-path-pin", || {
             let session_id = tunnel_session_id();
             let (listener, port) = seed_reusable_tunnel(&session_id, "sakaki");
 
