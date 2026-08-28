@@ -12,7 +12,7 @@ use super::model::{
 };
 use super::identity::peer_cred;
 use super::session_store::{do_session_end, do_session_start, set_session_log_path, stamp_headless, stamp_origin};
-use super::window::{discover_window_address, pid_ancestry, resolve_registration_parent};
+use super::window::{discover_window_address, resolve_registration_parent};
 use aoide_protocol::Invocation;
 use aoide_protocol::output::Outcome;
 use aoide_storage::fs::{session_logs_dir, with_stage_lock};
@@ -901,31 +901,42 @@ fn conduct_multiplex(
                     match l.accept() {
                         Ok((stream, _)) => {
                             // LANE IDENTITY P-ID2 (`CONTRACTS.md`'s identity
-                            // section): read `SO_PEERCRED` on the CONNECTING
-                            // stream and refuse it outright — never
-                            // forwarded to `conns`, never touches the pty —
-                            // when its pid's real `/proc` ancestry roots
-                            // back to THIS session's own pid
-                            // (`std::process::id()`, exactly what this
-                            // process registered itself under — `pid`'s own
-                            // doc on `SessionRecord`). This is the
-                            // un-bypassable replacement for the OLD
-                            // client-side `is_self_send` guard `send.rs`
-                            // used to carry: that guard only ever protected
-                            // a well-behaved caller of `aoide send`; a
-                            // process that opened a raw connection to its
-                            // OWN socket directly bypassed it entirely.
-                            // Kernel ancestry cannot be forged the same way
-                            // — a pid genuinely cannot make itself its own
-                            // ancestor. A `peer_cred` failure (never
-                            // actually expected on an accepted `AF_UNIX`
-                            // stream, but never a panic either) fails OPEN
-                            // to the pre-P-ID2 behavior — this is a narrow,
-                            // additive safety net, not the gate itself (the
-                            // gate stays sender-computed, `send.rs`'s own
-                            // module doc on why).
+                            // section; review round 1 MUST-FIX — the FIRST
+                            // shape of this check refused any connection
+                            // whose ancestry merely CONTAINED this
+                            // session's own pid anywhere upstream, which
+                            // silently broke the single most common flow:
+                            // `session_conduct` registers WITHOUT
+                            // detaching, so a legitimate CHILD session's
+                            // pid is a genuine OS descendant of its
+                            // parent's registered pid, and a child sending
+                            // to its own live parent via `aoide send --id
+                            // <parent> --yes` was dropped downstream of the
+                            // gate with a bare broken pipe `--yes` cannot
+                            // route around). Read `SO_PEERCRED` on the
+                            // CONNECTING stream and refuse it outright —
+                            // never forwarded to `conns`, never touches the
+                            // pty — ONLY when the CONNECTOR's OWN nearest
+                            // live registered session (`identity::
+                            // is_self_originated`'s own doc: the same
+                            // nearest-first walk `attested_sender` uses,
+                            // without seal verification — a narrow
+                            // UX/loop defense, not the security boundary
+                            // the raw same-uid socket door already is,
+                            // OQ1-A/P-ID3) resolves to THIS session's own
+                            // id — true self-injection, never a nested
+                            // child whose OWN nearest session is itself.
+                            // Both a `peer_cred` failure and an
+                            // unresolvable connector fail OPEN (allowed) —
+                            // this guard only ever refuses the one narrow,
+                            // known shape it exists to catch.
                             let self_injection = peer_cred(&stream)
-                                .map(|cred| pid_ancestry(cred.pid).contains(&(std::process::id() as i32)))
+                                .map(|cred| {
+                                    let sessions = load_stage::<SessionsFile>(&sessions_path())
+                                        .map(|f| f.sessions)
+                                        .unwrap_or_default();
+                                    super::identity::is_self_originated(cred.pid, &sessions, id)
+                                })
                                 .unwrap_or(false);
                             if self_injection {
                                 continue; // dropped outright — never accepted into `conns`.
@@ -1881,6 +1892,112 @@ mod tests {
 
         let got = std::fs::read_to_string(&proof).unwrap_or_default();
         assert!(got.is_empty(), "a connection from within the session's own subtree must never reach the pty: got {got:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    /// The MUST-FIX itself (LANE IDENTITY P-ID2, review round 1): a
+    /// DISTINCT, legitimately-registered CHILD session — a REAL OS
+    /// descendant of the target, exactly the shape `session_conduct`'s own
+    /// non-detaching registration produces for a nested `conduct` — must
+    /// be DELIVERED, not refused. The earlier (buggy) shape of this guard
+    /// refused ANY connection whose ancestry merely contained the target's
+    /// pid, which silently broke this exact, single most common flow: a
+    /// child sending to its own live parent via `aoide send --id <parent>
+    /// --yes`. Here a single `fork()`'d DIRECT CHILD stands in for that
+    /// child session — registered with its OWN session id and its OWN
+    /// (real, live) pid BEFORE it connects, so `identity::
+    /// is_self_originated`'s nearest-first resolution finds ITS OWN
+    /// session first, never the target's, even though the target genuinely
+    /// sits one level up in its real `/proc` ancestry.
+    #[test]
+    fn accept_delivers_from_a_distinct_child_session_that_is_a_real_os_descendant() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "XDG_RUNTIME_DIR"]);
+
+        let root = unique_stage("conduct-child-delivers");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+
+        let target_id = "conduct-child-delivers-target";
+        let socket = conduct_socket_path(target_id);
+        let proof = root.join("proof.txt");
+        // Same shape as `conduct_injects_socket_bytes_into_the_child`: read
+        // ONE line off stdin and prove it arrived.
+        let script = format!("IFS= read -r line; printf '%s' \"$line\" > {}", proof.display());
+
+        let path_bytes: Vec<u8> = {
+            use std::os::unix::ffi::OsStrExt;
+            socket.as_os_str().as_bytes().to_vec()
+        };
+        assert!(path_bytes.len() < 100, "test socket path too long for sockaddr_un: {socket:?}");
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            // SAFETY: only raw, async-signal-safe syscalls post-fork — same
+            // discipline `spawn_unrelated_writer` documents. `path_bytes`
+            // was built and owned BEFORE the fork call.
+            unsafe {
+                let mut addr: libc::sockaddr_un = std::mem::zeroed();
+                addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+                for (slot, byte) in addr.sun_path.iter_mut().zip(path_bytes.iter()) {
+                    *slot = *byte as libc::c_char;
+                }
+                let addr_len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+                let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                if fd >= 0 {
+                    for _ in 0..300 {
+                        let rc = libc::connect(
+                            fd,
+                            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+                            addr_len,
+                        );
+                        if rc == 0 {
+                            let payload = b"FROM-CHILD-SESSION\n";
+                            libc::write(fd, payload.as_ptr() as *const libc::c_void, payload.len());
+                            break;
+                        }
+                        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 10_000_000 };
+                        libc::nanosleep(&mut ts, std::ptr::null_mut());
+                    }
+                    libc::close(fd);
+                }
+                libc::_exit(0);
+            }
+        }
+
+        // Still the (original) parent test process: register the FORKED
+        // CHILD's real pid as its OWN, distinct session — BEFORE the
+        // target's accept loop ever processes a connection, so there is no
+        // race against the retry-connecting grandchild above.
+        if pid > 0 {
+            crate::graph::session_store::do_session_start(
+                "conduct-child-delivers-child",
+                Some("claude"),
+                Some("/w"),
+                None,
+                Some(target_id),
+                None,
+                None,
+                None,
+                Some(pid as u32),
+            );
+        }
+
+        let out = session_conduct(&conduct_invocation(&["sh", "-c", &script], &[("id", target_id)]));
+        if pid > 0 {
+            unsafe {
+                let mut status: libc::c_int = 0;
+                libc::waitpid(pid, &mut status, 0); // reap — no zombie left behind.
+            }
+        }
+
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let got = std::fs::read_to_string(&proof).unwrap_or_default();
+        assert_eq!(
+            got, "FROM-CHILD-SESSION",
+            "a distinct, legitimately-registered child session must be delivered, not refused"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

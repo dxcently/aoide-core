@@ -430,13 +430,22 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   (`window.rs::pid_ancestry`, already generalized to an arbitrary pid) to
   find a session whose seal `verify_seal_over` confirms against the
   daemon's LIVE public key (`aoide_client::daemon::daemon_seal_pubkey_hex`
-  — a fresh `ping` round trip, never cached, never a file); `peer_cred`
+  — a fresh `ping` round trip, never cached, never a file; that channel is
+  only as trustworthy as the daemon socket's same-uid exclusivity, which
+  `bind_socket`'s unlink-then-bind with no flock/pidfile does NOT actually
+  provide against a same-uid attacker — P-ID3's job to floor, stated
+  honestly in `CONTRACTS.md` rather than oversold here); `peer_cred`
   reads `SO_PEERCRED` off an accepted `UnixStream` (a local
   reimplementation of `aoide_secrets::peercred`'s own shape — no new
   cross-crate edge for one struct+fn). `graph/conduct.rs`'s per-session
   accept loop calls `peer_cred` on every accepted connection and refuses
-  one whose ancestry roots back to the socket's OWN session, unconditionally
-  — the un-bypassable replacement for the OLD client-side `is_self_send`
+  one whose OWN nearest live registered session (`identity::
+  is_self_originated` — nearest-first, session-boundary aware, review
+  round 1 MUST-FIX: an earlier revision refused on raw ancestry
+  CONTAINMENT, which broke a child sending to its own live parent, since
+  `session_conduct` registers without detaching) resolves to the socket's
+  OWN session — the un-bypassable replacement for the OLD client-side
+  `is_self_send`
   guard `graph/send.rs` used to carry. `graph/send.rs`'s `deliver_local`
   calls `attested_sender` over ITS OWN process's real ancestry (as
   unforgeable a kernel fact, for that SAME real process, as a peercred

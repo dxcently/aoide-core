@@ -184,10 +184,17 @@ fn parse_dispatch_reply(inv: &Invocation, reply: &str) -> Option<Outcome> {
 /// direct stage write) is; there is no safe fallback for an unverifiable
 /// signature. Deliberately NOT cached process-wide: `aoide send` is a
 /// short-lived CLI invocation, so a fresh ~100ms-bounded ping per call is
-/// the honest cost of asking the only trustworthy source (this module's
-/// own doc on why the daemon's OWN wire reply is the sole channel — a
-/// same-uid-writable file would let whoever can forge a seal also forge
-/// the "trusted" key that vouches for it).
+/// the honest cost of asking the daemon directly: a same-uid-writable
+/// FILE would let whoever can forge a seal also forge the "trusted" key
+/// that vouches for it, so a live round trip is the only channel worth
+/// asking. **This is NOT a channel a same-uid attacker is locked out of**:
+/// the daemon socket is bound unlink-then-bind with no flock/pidfile
+/// (aoide_server::daemon::bind_socket), so a same-uid attacker can already
+/// race or evict the real listener and answer with a forged key of its
+/// own — closing that is P-ID3's same-uid dispatch-socket floor, not this
+/// function's job; it buys no more than the raw per-session socket a
+/// same-uid process can already connect to directly (CONTRACTS.md's own
+/// honesty note on this exact boundary).
 pub fn daemon_seal_pubkey_hex() -> Option<String> {
     let socket_path = socket_path();
     let mut stream = connect_bounded(&socket_path, CONNECT_TIMEOUT)?;

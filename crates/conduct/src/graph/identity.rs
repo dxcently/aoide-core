@@ -139,6 +139,53 @@ pub(in crate::graph) fn attested_sender(
     None
 }
 
+/// The per-session control socket's self-injection refusal (LANE IDENTITY
+/// P-ID2, review round 1 MUST-FIX): resolves the CONNECTING pid's OWN
+/// nearest live registered session — the SAME nearest-first walk
+/// [`attested_sender`] uses, but WITHOUT seal verification, since this is
+/// a narrow UX/loop defense, not the security boundary itself (the raw
+/// same-uid socket door is OQ1-A-inherent and stays open until P-ID3
+/// floors it; `verify` here would only add cost, not close anything this
+/// guard doesn't already fail open on). Refuses — returns `true` — ONLY
+/// when the connector's OWN nearest session resolves to `target_session_id`
+/// itself: true self-injection, a session's own descendant (an unregistered
+/// tool subprocess, or an explicit `--id <own-id>` send) reaching back into
+/// its OWN socket.
+///
+/// **Why "nearest", not "contains"**: `session_conduct` registers WITHOUT
+/// detaching (`spawn.rs`'s `--headless` re-exec is the only path that
+/// `setsid`-reparents; a plain `conduct` child stays a true OS descendant
+/// of whatever registered it) — a LEGITIMATE child session's pid is
+/// therefore a genuine descendant of its OWN parent's registered pid. An
+/// earlier revision of this guard refused any connection whose ancestry
+/// merely CONTAINED the target's pid anywhere upstream, which silently
+/// broke the single most common flow: a child sending to its own live
+/// parent via `aoide send --id <parent> --yes` — the child's connecting
+/// pid genuinely has the parent's registered pid in its ancestry, so the
+/// old check refused it, downstream of the gate, with a bare broken pipe
+/// `--yes` cannot route around (this check runs at the TARGET's accept,
+/// after the sender already decided to deliver). Resolving the CONNECTOR's
+/// own NEAREST session instead fixes this: walking nearest-first, a
+/// nested child's own registered pid is found FIRST (it is closer than its
+/// parent's), so it resolves to the CHILD's own session id, never the
+/// parent/target's — only a connection whose nearest resolvable session
+/// genuinely IS the target gets refused.
+///
+/// An unresolvable connector (no seal — irrelevant here, since `verify` is
+/// trivial — but genuinely no registered session anywhere in its ancestry,
+/// e.g. a fully orphaned/reparented process) resolves `None`, which
+/// `is_some_and` folds to `false` — FAILS OPEN (allowed), never refused.
+/// This guard exists to catch one narrow, known shape; an ambiguous
+/// connector is not license to assume the worst the way a REAL gate would.
+pub(in crate::graph) fn is_self_originated(
+    connecting_pid: i32,
+    sessions: &[SessionRecord],
+    target_session_id: &str,
+) -> bool {
+    attested_sender(connecting_pid, sessions, |_rec| true)
+        .is_some_and(|connector_session| connector_session == target_session_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,6 +354,104 @@ mod tests {
             ..Default::default()
         }];
         assert_eq!(attested_sender(me, &sessions, |_| true), None);
+    }
+
+    // ── is_self_originated (review round 1 MUST-FIX) ────────────────────────
+
+    /// True self-injection: the connector's OWN nearest session (found via
+    /// its real `pid` at ancestry position 0, self) IS the target — refused.
+    #[test]
+    fn is_self_originated_refuses_when_the_connector_is_literally_the_target() {
+        let me = std::process::id() as i32;
+        let sessions = vec![SessionRecord {
+            session_id: "target".to_string(),
+            state: "idle".to_string(),
+            pid: Some(me as u32),
+            ..Default::default()
+        }];
+        assert!(is_self_originated(me, &sessions, "target"));
+    }
+
+    /// The MUST-FIX itself: a DISTINCT, legitimately-registered CHILD
+    /// session whose pid is a real OS descendant of the target's own pid
+    /// (exactly the shape `session_conduct`'s own non-detaching
+    /// registration produces) must NOT be refused — its OWN nearest
+    /// session is ITSELF (found first, nearest-first), never the parent
+    /// it happens to descend from. Simulated here without a real fork:
+    /// `me` stands in as the "child's" pid (self is always the nearest
+    /// entry in its own ancestry, position 0), sealed... registered as a
+    /// DIFFERENT session id than the target, with the target ALSO present
+    /// deeper in the (real) ancestry chain — proving the nearest match
+    /// wins over the raw-containment shape the old, buggy guard used.
+    #[test]
+    fn is_self_originated_allows_a_distinct_child_session_even_though_the_target_is_an_ancestor() {
+        let me = std::process::id() as i32;
+        let ancestry = pid_ancestry(me);
+        assert!(ancestry.len() >= 2, "this test needs a real parent pid to stand in as the target");
+        let parent_pid = ancestry[1];
+        let sessions = vec![
+            SessionRecord {
+                session_id: "child-session".to_string(),
+                state: "idle".to_string(),
+                pid: Some(me as u32), // nearest — this is the CONNECTOR's own session.
+                ..Default::default()
+            },
+            SessionRecord {
+                session_id: "target".to_string(),
+                state: "idle".to_string(),
+                pid: Some(parent_pid as u32), // an ancestor, but NOT nearest.
+                ..Default::default()
+            },
+        ];
+        assert!(
+            !is_self_originated(me, &sessions, "target"),
+            "a distinct child session must never be refused just because the target is upstream in its ancestry"
+        );
+    }
+
+    /// An unregistered subprocess of the target (no session of its own
+    /// anywhere in its OWN ancestry below the target) resolves to the
+    /// target itself via the nearest REGISTERED ancestor — still refused,
+    /// the exact "tool call within the wrapped agent" shape the guard
+    /// exists to catch.
+    #[test]
+    fn is_self_originated_refuses_an_unregistered_descendant_whose_nearest_registered_ancestor_is_the_target() {
+        let me = std::process::id() as i32;
+        let sessions = vec![SessionRecord {
+            session_id: "target".to_string(),
+            state: "idle".to_string(),
+            pid: Some(me as u32),
+            ..Default::default()
+        }];
+        // `me` itself has no session record — only ITS ancestor (also
+        // `me`, since a pid is always its own ancestry position 0) does in
+        // this minimal fixture; a genuinely deeper unregistered descendant
+        // behaves identically since `attested_sender` walks past any
+        // pid with no matching record until it finds one.
+        assert!(is_self_originated(me, &sessions, "target"));
+    }
+
+    /// An unresolvable connector (no session anywhere in its ancestry)
+    /// FAILS OPEN — never refused. This guard is a narrow UX/loop defense,
+    /// not the security boundary; an ambiguous connector must not be
+    /// treated as guilty.
+    #[test]
+    fn is_self_originated_fails_open_for_an_unresolvable_connector() {
+        assert!(!is_self_originated(999_999, &[], "target"));
+    }
+
+    /// A resolved sender that is neither the target nor unresolvable —
+    /// some OTHER, unrelated live session — is never refused either.
+    #[test]
+    fn is_self_originated_allows_a_resolved_but_unrelated_sender() {
+        let me = std::process::id() as i32;
+        let sessions = vec![SessionRecord {
+            session_id: "someone-else".to_string(),
+            state: "idle".to_string(),
+            pid: Some(me as u32),
+            ..Default::default()
+        }];
+        assert!(!is_self_originated(me, &sessions, "target"));
     }
 
     // ── peer_cred ────────────────────────────────────────────────────────

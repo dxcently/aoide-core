@@ -900,20 +900,26 @@ fn handle_conn(
         match req.get("op").and_then(Value::as_str) {
             Some("ping") => {
                 // LANE IDENTITY P-ID2 (`CONTRACTS.md`'s identity section):
-                // `sealPubkeyHex` rides the existing `ping` reply — the ONE
-                // channel any same-uid caller can trust for THIS daemon
-                // process's current seal-signing public key. It is never
-                // secret (verifying a signature only needs the public
-                // half), but it must come from a LIVE round trip to the
-                // actual running daemon, never a same-uid-writable FILE —
+                // `sealPubkeyHex` rides the existing `ping` reply — the
+                // channel THIS daemon process's current seal-signing public
+                // key is fetched over. It is never secret (verifying a
+                // signature only needs the public half), but it must come
+                // from a LIVE round trip, never a same-uid-writable FILE —
                 // a file sitting next to the seals it verifies would let
                 // whoever can already forge a seal also forge the "trusted"
                 // key that vouches for it (`identity::mint_ephemeral`'s own
                 // module doc: the seal's whole secrecy claim rests on
-                // process liveness, not file permissions). No new socket,
-                // no peercred floor added here — this is an additive field
-                // on an already-open, already-wired reply; the dispatch
-                // socket's OWN peercred floor (G8) stays P-ID3's job.
+                // process liveness, not file permissions). **This is NOT a
+                // channel a same-uid attacker is locked out of**: `bind_
+                // socket` unlink-then-binds with no `flock`/pidfile, so a
+                // same-uid attacker can already race or evict the real
+                // listener and serve a forged `sealPubkeyHex` of its own —
+                // that same-uid dispatch-socket floor is P-ID3's job, not
+                // this one's; this field buys no more than the raw
+                // per-session socket already leaves open (CONTRACTS.md's
+                // own honesty note on this exact boundary). No new socket,
+                // no peercred floor added here — purely an additive field
+                // on an already-open, already-wired reply.
                 let reply = json!({
                     "ok": true,
                     "daemon": "aoided",
