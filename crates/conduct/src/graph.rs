@@ -16,7 +16,13 @@
 mod common;
 mod conduct;
 mod doc;
-mod identity;
+// LANE IDENTITY P-ID3: `pub(crate)`, not private — `shellbridge.rs` (a
+// SIBLING of this module, not a descendant) reuses `peer_cred`/`PeerCred`
+// for its own cross-uid accept floor rather than hand-rolling a second
+// `SO_PEERCRED` read in this same crate. Still not `pub` at the top block
+// below: this stays an internal kernel-truth primitive, never crossing the
+// `aoide-conduct` -> `aoide` crate boundary root's shim re-exports onward.
+pub(crate) mod identity;
 mod model;
 mod pending;
 mod permit;

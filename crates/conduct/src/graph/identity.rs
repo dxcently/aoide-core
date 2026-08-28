@@ -39,7 +39,7 @@ use std::os::unix::net::UnixStream;
 /// `conduct.rs`; adding a cross-crate edge onto `aoide-secrets` for one
 /// struct+fn would invert nothing architecturally but buys nothing either).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::graph) struct PeerCred {
+pub(crate) struct PeerCred {
     pub uid: u32,
     pub pid: i32,
 }
@@ -48,7 +48,13 @@ pub(in crate::graph) struct PeerCred {
 /// stream, an unexpected `getsockopt` error). Same fail-to-`None`, never-a-
 /// panic, never-a-fabricated-identity contract `aoide_secrets::peercred::
 /// peer_cred` documents for its own callers.
-pub(in crate::graph) fn peer_cred(stream: &UnixStream) -> Option<PeerCred> {
+///
+/// `pub(crate)`, not `pub(in crate::graph)` (LANE IDENTITY P-ID3): this
+/// crate's `shellbridge.rs` — a sibling of `graph`, not a descendant — reuses
+/// this exact primitive for its own accept-time cross-uid floor rather than
+/// re-implementing a second `SO_PEERCRED` read (`graph.rs`'s own `mod
+/// identity` doc comment).
+pub(crate) fn peer_cred(stream: &UnixStream) -> Option<PeerCred> {
     let fd = stream.as_raw_fd();
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
