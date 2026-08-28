@@ -455,6 +455,29 @@
   env/flag "for redundancy": a duplicate advertiser thread would just
   double the send rate and complicate the "both off means silence"
   proof.
+- **`do_spawn` never acks `submitted` on `cmd.spawn()`'s success alone
+  (task #103).** `cmd.spawn()` only proves the WRAPPER `aoide conduct`
+  process launched — it says nothing about whether that process's OWN
+  attempt to exec the configured agent succeeded, since a missing
+  `spawnAgent` binary fails inside a separate, detached process this door
+  has no synchronous view into (`aoide-conduct::graph::conduct::
+  session_conduct`'s "spawn FIRST" ordering already registers no session
+  for that failure — the gap was entirely on THIS side, acking success
+  before that outcome was knowable). `poll_bounded_exit` gives the wrapper
+  `SPAWN_LIVENESS_ATTEMPTS × SPAWN_LIVENESS_INTERVAL` (40×10ms = 400ms) to
+  prove it's still alive via `Child::try_wait()` before the ack goes out; a
+  wrapper that exits inside that window gets `spawn_died_immediately_
+  message`'s taught refusal (naming the configured program, never the full
+  command line or any env) as a proper JSON-RPC error instead of a
+  `submitted` Task naming a session that will never appear in
+  `sessions.json`. This is a bounded WAIT, not a watcher — no new tick
+  producer, no new roster state, and every legitimate spawn (an agent
+  meant to run for minutes) simply pays 400ms of fixed RPC latency it never
+  notices. `poll_bounded_exit`/`spawn_died_immediately_message` are pure
+  over an injected poll closure specifically so they're unit-testable
+  without a real spawn — `do_spawn` itself is still never driven by a test
+  in this file (the existing precedent, `spawn_inject_prompts_success_
+  branch_...`'s own doc comment).
 
 ## Extension points
 

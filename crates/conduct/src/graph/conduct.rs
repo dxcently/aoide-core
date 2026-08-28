@@ -2026,6 +2026,54 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+    /// Task #103's underlying defect, at the layer that already gets it
+    /// right: `spawn_on_pty`'s `cmd.spawn()` fails SYNCHRONOUSLY the instant
+    /// the configured program isn't found (ENOENT) — no fork, no exec, no
+    /// child ever runs — and `session_conduct`'s "spawn FIRST" ordering
+    /// (its own doc comment, above) means that failure is caught before
+    /// `do_session_start` ever writes a record. This is the sync half of
+    /// #103's fix: this crate already registers no ghost for a missing
+    /// binary; the a2a door's OWN bounded liveness check (`aoide-server`'s
+    /// `do_spawn`/`poll_bounded_exit`) is what closes the remaining gap,
+    /// where the door acked `submitted` before this synchronous failure —
+    /// running one process removed, as a detached child — was ever visible
+    /// to it.
+    #[test]
+    fn conduct_of_a_nonexistent_binary_registers_no_session_at_all() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "XDG_RUNTIME_DIR"]);
+
+        let root = unique_stage("conduct-missing-bin");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+
+        let missing = "/definitely/does/not/exist/aoide-test-nonexistent-agent-xyz";
+        let out = session_conduct(&conduct_invocation(
+            &[missing],
+            &[("id", "conduct-missing-bin")],
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error, "msg: {}", out.message);
+        assert!(
+            out.message.contains("failed to conduct"),
+            "taught refusal naming the failed exec: {}",
+            out.message
+        );
+
+        // A missing stage file is `SessionsFile::default()` (empty) per
+        // `load_stage`'s own contract — either shape (file absent, or
+        // present but empty) proves the same thing: no phantom entry, not
+        // even a transient one that later needs the reaper.
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert!(
+            s.sessions.iter().all(|r| r.session_id != "conduct-missing-bin"),
+            "a failed exec must register no ghost session — found one: {:?}",
+            s.sessions.iter().find(|r| r.session_id == "conduct-missing-bin")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
     /// The task #100 defect, end to end: `spawn --agent soak-a -- bash` (the
     /// P-C7 soak's live shape) conducts a REAL shell under a caller-chosen
     /// agent label that is not the literal string `"shell"`. Under the old

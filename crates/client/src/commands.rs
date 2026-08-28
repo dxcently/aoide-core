@@ -3634,6 +3634,44 @@ mod tests {
         assert_eq!(body, "{\"ok\":true}");
     }
 
+    /// Task #103, requester side: once the remote A2A door's bounded
+    /// liveness check (`aoide-server::a2a::do_spawn`) turns a failed spawn
+    /// into a proper JSON-RPC error instead of an optimistic `submitted`
+    /// ack, `spawn_on_peer_via` must surface that taught message CLEANLY —
+    /// never swallowed, never re-summarized — through its existing
+    /// `"peer-refused"` arm. No new client-side code was needed for this;
+    /// this test PINS that the existing plumbing already does the job,
+    /// driven through a fake `curl` shim standing in for the remote door's
+    /// HTTP 200 / JSON-RPC-error response (JSON-RPC errors are always HTTP
+    /// 200 — the error lives in the envelope, not the status line).
+    #[test]
+    fn spawn_on_peer_via_surfaces_a_json_rpc_error_ack_as_a_taught_peer_refused_error() {
+        let taught = "the configured agent (`claude`) exited immediately after launch \
+                       (exit status: 1) \u{2014} it is likely missing from this unit's PATH, \
+                       or the configured spawnAgent command line is wrong";
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": "whatever",
+            "error": { "code": -32603, "message": taught }
+        })
+        .to_string();
+        // A heredoc with a QUOTED delimiter ('JSONBODY') — no `$`/backtick
+        // expansion inside, so the taught message's own backticks pass
+        // through byte-for-byte. `cat`'s own trailing newline is exactly
+        // the separator `run_curl`'s `rsplit_once('\n')` expects before the
+        // `-w "\n%{http_code}"` status line.
+        let script = format!("#!/bin/sh\ncat <<'JSONBODY'\n{body}\nJSONBODY\nprintf '200'\n");
+        let peer = fixture_peer(None);
+        let result = with_fake_curl("spawn-refused", &script, || spawn_on_peer_via(&peer, "hello", None));
+        let err = result.expect_err("a JSON-RPC error ack must surface as an Err, never as Ok");
+        assert_eq!(err.reason, "peer-refused");
+        assert!(
+            err.message.contains(taught),
+            "the taught message must reach the caller verbatim, not summarized: {}",
+            err.message
+        );
+    }
+
     /// Review finding, P-S4 follow-up: `peer add`'s AgentCard verification
     /// is its ONE network call, and used to dial `peer.url` directly even
     /// when `--via` was given — exactly the scenario `--via` exists for (a

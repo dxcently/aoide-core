@@ -179,6 +179,13 @@ the inbound half of the two-door contract (the outbound half is
   that moment, so it cannot reach `session_send` at all (see
   `spawn_inject_prompt`'s doc comment for the race that rules it out).
   These are the only two inbox-filing call sites in the whole tree.
+  **`do_spawn`'s bounded liveness check (task #103)** gives the just-
+  launched wrapper process (`aoide conduct`) a short window (400ms) to
+  prove it's still alive via `Child::try_wait()` before acking `submitted`
+  — a wrapper whose own exec of the configured agent fails (a missing
+  `spawnAgent` binary on this unit's PATH) exits inside that window and
+  gets a taught JSON-RPC error instead, closing the gap where a caller was
+  handed a session id for a spawn that had already failed.
   **Inbound bearer verification (task #84)** resolves the door's expected
   `Authorization: Bearer` token through `aoide-secrets`'s broker rather
   than only reading a static token file: `--bearer-secret <name>` (or

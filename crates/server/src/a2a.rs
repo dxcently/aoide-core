@@ -958,6 +958,55 @@ fn stamp_spawn_origin(id: &str, origin: &str) {
     );
 }
 
+/// How long [`do_spawn`]'s bounded liveness check (task #103) gives the
+/// just-launched wrapper process to prove it's still alive before acking
+/// `submitted` — 40 × 10ms = 400ms, inside the ~300-500ms window the fix
+/// targets. Every legitimate spawn now pays this as fixed RPC latency (an
+/// agent meant to run for minutes never notices 400ms); a wrapper that never
+/// got past its own exec no longer earns a "submitted" ack for a session id
+/// that will never appear in `sessions.json`.
+const SPAWN_LIVENESS_ATTEMPTS: u32 = 40;
+const SPAWN_LIVENESS_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Poll `try_wait` up to `attempts` times, `interval` apart, returning the
+/// exit status the instant one is reported, or `None` once the budget runs
+/// out with the child still alive. Pure over an injected poll closure —
+/// never a real [`std::process::Child`] — so the bounded-wait SHAPE is
+/// unit-testable without spawning a process, the same IO/decision split
+/// `daemon::epoch_already_fired` already uses elsewhere in this crate.
+fn poll_bounded_exit(
+    mut try_wait: impl FnMut() -> std::io::Result<Option<std::process::ExitStatus>>,
+    attempts: u32,
+    interval: Duration,
+) -> Option<std::process::ExitStatus> {
+    for i in 0..attempts {
+        if let Ok(Some(status)) = try_wait() {
+            return Some(status);
+        }
+        if i + 1 < attempts {
+            std::thread::sleep(interval);
+        }
+    }
+    None
+}
+
+/// A taught, no-secrets message for [`poll_bounded_exit`]'s failure arm: the
+/// WRAPPER process (`aoide conduct`, launched by [`do_spawn`]'s own
+/// `cmd.spawn()`) exited before the liveness window closed — virtually
+/// always because ITS OWN attempt to exec the configured agent
+/// (`aoide-conduct::graph::conduct::spawn_on_pty`) failed, since that
+/// function's own "spawn FIRST" discipline means a failed exec there returns
+/// almost instantly with no session ever registered. Names the configured
+/// program (never the full command line — no flag values, no env, no
+/// secrets) and the observed exit status only.
+fn spawn_died_immediately_message(agent_cmd: &str, status: std::process::ExitStatus) -> String {
+    let program = agent_cmd.split_whitespace().next().unwrap_or(agent_cmd);
+    format!(
+        "the configured agent (`{program}`) exited immediately after launch ({status}) — \
+         it is likely missing from this unit's PATH, or the configured spawnAgent command line is wrong"
+    )
+}
+
 /// Spawn a NEW conducted session running the CONFIGURED agent (never a
 /// client-supplied command — see the security-model note above `SessionRef`).
 /// Detached: launched via the aoide binary's own `conduct` subcommand
@@ -978,6 +1027,17 @@ fn stamp_spawn_origin(id: &str, origin: &str) {
 /// that function's doc) and folded into this call's own audit line, so the
 /// spawned session's provenance is visible both in the audit log and on the
 /// record itself, end to end.
+///
+/// **Bounded liveness check (task #103).** `cmd.spawn()` below only proves
+/// the wrapper process itself launched — a caller was previously handed a
+/// `submitted` Task the instant that call returned, with no confirmation the
+/// wrapper's OWN exec of the configured agent ever succeeded (a missing
+/// `spawnAgent` binary on this unit's PATH is the exact defect this closes).
+/// [`poll_bounded_exit`] gives the wrapper `SPAWN_LIVENESS_ATTEMPTS ×
+/// SPAWN_LIVENESS_INTERVAL` to prove it's still running before the ack goes
+/// out; a wrapper that exits inside that window gets
+/// [`spawn_died_immediately_message`]'s taught refusal instead of a phantom
+/// session id.
 fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path, peer_name: &str) -> Result<Value, (i64, String)> {
     let id = format!("a2a-{}-{}", std::process::id(), unix_ts_now());
     let aoide_bin = std::env::current_exe()
@@ -1023,6 +1083,35 @@ fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path, peer_name: &str) ->
 
     match cmd.spawn() {
         Ok(mut child) => {
+            // Bounded liveness confirmation (task #103): `cmd.spawn()` above
+            // only proves the WRAPPER `aoide conduct` process itself
+            // launched — it says nothing about whether ITS OWN attempt to
+            // exec the configured agent succeeded. That failure is
+            // synchronous INSIDE the wrapper (`session_conduct`'s "spawn
+            // FIRST" discipline registers no session and the wrapper exits
+            // almost instantly), but this door is a separate, detached
+            // process with no synchronous view into it — acking
+            // unconditionally here is exactly how a caller was handed a
+            // `submitted` Task naming a session that had already failed to
+            // spawn (the defect this fix closes). Give the wrapper a short
+            // window to prove it's still running before acking success.
+            if let Some(status) = poll_bounded_exit(
+                || child.try_wait(),
+                SPAWN_LIVENESS_ATTEMPTS,
+                SPAWN_LIVENESS_INTERVAL,
+            ) {
+                let msg = spawn_died_immediately_message(agent_cmd, status);
+                let _ = audit(
+                    audit_log,
+                    Door::A2a,
+                    EventClass::Audit,
+                    "a2a.message/send",
+                    "error",
+                    &msg,
+                );
+                return Err((-32603, msg));
+            }
+
             // `setsid()` above detaches the child into its own session so it
             // survives this handler thread, but a new session does NOT
             // reparent the child — this process is still its parent and
@@ -4349,6 +4438,61 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err2.0, -32006);
+    }
+
+    // ── Spawn liveness check (task #103) ──────────────────────────────────
+    //
+    // `poll_bounded_exit` and `spawn_died_immediately_message` are the pure
+    // halves of `do_spawn`'s bounded liveness check, factored out exactly so
+    // they're testable without a real spawn — same "never through `do_spawn`
+    // itself" precedent the table below states for the gate predicates.
+
+    #[test]
+    fn poll_bounded_exit_returns_the_status_the_moment_try_wait_reports_one() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut calls = 0u32;
+        let status = poll_bounded_exit(
+            || {
+                calls += 1;
+                if calls == 3 {
+                    Ok(Some(std::process::ExitStatus::from_raw(1 << 8))) // exit code 1
+                } else {
+                    Ok(None)
+                }
+            },
+            10,
+            Duration::ZERO,
+        );
+        assert_eq!(status.and_then(|s| s.code()), Some(1));
+        assert_eq!(calls, 3, "must stop polling the instant an exit is reported");
+    }
+
+    #[test]
+    fn poll_bounded_exit_gives_up_after_the_full_budget_with_the_child_still_alive() {
+        let mut calls = 0u32;
+        let status = poll_bounded_exit(
+            || {
+                calls += 1;
+                Ok(None)
+            },
+            5,
+            Duration::ZERO,
+        );
+        assert_eq!(status, None, "still alive past the budget — never a false failure");
+        assert_eq!(calls, 5, "the full attempt budget must be spent, no early giving-up");
+    }
+
+    #[test]
+    fn spawn_died_immediately_message_names_the_program_never_the_full_command_line() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = std::process::ExitStatus::from_raw(1 << 8); // exit code 1
+        let msg = spawn_died_immediately_message("claude --dangerously-skip-permissions", status);
+        assert!(msg.contains("`claude`"), "names the configured binary: {msg}");
+        assert!(
+            !msg.contains("--dangerously-skip-permissions"),
+            "never echoes flag values back — taught, not a raw command dump: {msg}"
+        );
+        assert!(!msg.contains("PATH="), "no env leakage");
     }
 
     // ── Spawn gate table (P-P3, PAIRING.md decision 6) ───────────────────────
