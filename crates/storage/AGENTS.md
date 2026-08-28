@@ -92,13 +92,40 @@
   function "for consistency" with `mint` — that would defeat the entire
   point of OQ1-A.
 - **`sealed_id::canonical_seal_string`'s five-field order, NUL-separator,
-  and trimmed/lowercased style are the wire contract, not an
+  AND its per-field normalization rule are the wire contract, not an
   implementation detail (LANE IDENTITY P-ID1) — pinned by
-  `tests::canonical_seal_string_stability_vectors_never_drift`, the same
-  pinning discipline `wire_auth::canonical_string`/`pairing::derive_sas`
-  already hold.** A change to the field order, separator, or case-folding
-  breaks every already-minted seal's ability to re-verify — it needs new
-  pinned vectors AND a `CONTRACTS.md` §4 update in the same commit.
+  `tests::canonical_seal_string_stability_vectors_never_drift` and
+  `tests::canonical_seal_string_is_case_sensitive_for_identity_fields`,
+  the same pinning discipline `wire_auth::canonical_string`/
+  `pairing::derive_sas` already hold.** `sessionId`/`originClass` ride
+  VERBATIM — no trim, no case-fold — DELIBERATELY, unlike `pid`/
+  `pidStarttime`/`issuedAt`'s plain decimal rendering, and unlike
+  `wire_auth::canonical_string`'s own trim+lowercase of its own fields:
+  `sessionId` is the session store's case-sensitive primary key
+  (`session_store.rs` compares it with plain `==`), and `originClass` is
+  about to become P-ID4's origin-gate lookup key, so folding either would
+  let a seal minted for one exact identity verify against a
+  differently-cased one — exactly the cross-identity forgery a credential
+  exists to prevent. **Don't "harmonize" this with `wire_auth::
+  canonical_string`'s trim+lowercase "for consistency"** — the two
+  functions solve different problems (HTTP header normalization vs. exact
+  identity binding) and MUST stay independently normalized. A change to
+  the field order, separator, or (re-)introduced folding breaks every
+  already-minted seal's ability to re-verify — it needs new pinned vectors
+  AND a `CONTRACTS.md` §4 update in the same commit.
+- **A stored `pid_starttime` of `0` is UNVERIFIABLE, never "verified"
+  (LANE IDENTITY P-ID1, `mint_seal`'s documented degrade path for a pid
+  that vanished before mint) — pinned by `aoide-server::daemon::tests::
+  mint_seal_over_a_vanished_pid_degrades_to_a_self_consistent_but_
+  unrevalidatable_zero_starttime`.** No genuine `/proc/<pid>/stat` read
+  ever reports starttime `0` (`window.rs::
+  pid_starttime_reads_a_nonzero_value_for_our_own_real_pid` proves a real
+  read is always `> 0`), so a verifier that reconstructs `SealedIdentity`
+  from a fresh live read can never produce a matching `0`. P-ID2's
+  verify-on-accept MUST branch on this explicitly — treat `pid_starttime
+  == 0` as "cannot revalidate, refuse" up front, never fall through to an
+  ordinary verify that would simply (and silently) fail for the wrong
+  reason.
 - **No gate reads `SessionRecord.seal` yet — don't wire one in without
   reading the LANE IDENTITY plan section first.** P-ID1 (this phase) only
   proves mint → store → verify; P-ID2 is the phase that adds the first

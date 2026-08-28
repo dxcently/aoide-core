@@ -518,9 +518,17 @@ pub fn stamp_origin(id: &str, origin: &str) {
 }
 
 /// Stamp `seal` on a just-registered session record (LANE IDENTITY P-ID1,
-/// `docs/architecture/CONTRACTS.md`'s identity section). A PERMANENT birth
-/// fact once set — change-only, the same shape [`stamp_origin`] just above
-/// holds, and a silent no-op for an unknown id or an empty `seal`. No
+/// `docs/architecture/CONTRACTS.md`'s identity section). Change-only (a
+/// no-op once already set to this exact value) and a silent no-op for an
+/// unknown id or an empty `seal` — the same shape [`stamp_origin`] just
+/// above holds, inherited rather than re-derived. Like `stamp_origin`,
+/// this is NOT an immutability guard: a later call with a genuinely
+/// DIFFERENT `seal` string for the same id still overwrites it, since the
+/// guard only compares against the value already on the record, not
+/// against "has this ever been set before." In practice its one caller
+/// (below) only ever calls this once per successful registration, so it
+/// behaves as a birth fact — but that is a property of the call site, not
+/// an invariant this function enforces. No
 /// `restage_graph()`: like `origin`/`hookAncestry`, this field is consumed
 /// internally (P-ID2's verify-on-accept, not built yet) rather than
 /// rendered into `graph.json`, so stamping it must not churn the

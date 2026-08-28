@@ -344,27 +344,35 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
 - `sealed_id` — the daemon-sealed session credential (LANE IDENTITY P-ID1,
   `docs/architecture/CONTRACTS.md` §4's `seal` field, plan file "LANE
   IDENTITY (#63)"): `SealedIdentity{sessionId, pid, pidStarttime,
-  originClass, issuedAt}`, `canonical_seal_string` (the SAME five-field,
-  NUL-separated, trimmed/lowercased shape `wire_auth::canonical_string`
-  established, restated since the field set differs), and `mint_seal`/
-  `verify_seal` — thin wrappers over `wire_auth::sign_hex`/
-  `verify_signature_hex`, so this module never touches `ed25519_dalek`
-  directly either. **The signing key is NOT `identity::load_or_mint`'s
-  on-disk peer-wire key** — under OQ1-A (the plan file's User-answered
-  threat-model question) a same-uid attacker can read any file the operator
-  owns, so an on-disk key is not secret against it; `identity::
-  mint_ephemeral` (this crate's other new P-ID1 entry point) mints a
-  SEPARATE keypair that lives only in the calling process's memory, never
-  touching disk, so its secrecy rests on process liveness plus Yama
-  `ptrace_scope` instead (see `identity.rs`'s own doc on `mint_ephemeral`,
-  and CONTRACTS.md §4's `seal` paragraph, for the full reasoning and the
-  Yama-off degrade note). `records::SessionRecord.seal` (additive,
-  `skip_serializing_if`) is the one place a minted seal is stored — stamped
-  by `aoide-conduct::graph::session_store::stamp_seal`, this crate's own
-  sibling to `stamp_origin`. **No gate in this codebase reads `seal` yet**
-  — P-ID1 proves the mint → store → verify mechanism only (this module's
-  own test suite: verify TRUE on a genuine seal, FALSE on any single
-  tampered field, FALSE under a different keypair); P-ID2 adds the first
+  originClass, issuedAt}`, `canonical_seal_string` (the same NUL-separated
+  five-field shape `wire_auth::canonical_string` established, but
+  **`sessionId`/`originClass` ride VERBATIM — no trim, no case-folding**;
+  review fix, since `sessionId` is the session store's own case-sensitive
+  primary key and `originClass` is about to be P-ID4's origin-gate lookup
+  key, folding either would let a seal minted for one exact identity
+  verify against a differently-cased one), and `mint_seal`/`verify_seal` —
+  thin wrappers over `wire_auth::sign_hex`/`verify_signature_hex`, so this
+  module never touches `ed25519_dalek` directly either. **The signing key
+  is NOT `identity::load_or_mint`'s on-disk peer-wire key** — under OQ1-A
+  (the plan file's User-answered threat-model question) a same-uid
+  attacker can read any file the operator owns, so an on-disk key is not
+  secret against it; `identity::mint_ephemeral` (this crate's other new
+  P-ID1 entry point) mints a SEPARATE keypair that lives only in the
+  calling process's memory, never touching disk, so its secrecy rests on
+  process liveness plus Yama `ptrace_scope` instead (see `identity.rs`'s
+  own doc on `mint_ephemeral`, and CONTRACTS.md §4's `seal` paragraph, for
+  the full reasoning and the Yama-off degrade note). A `pidStarttime` of
+  `0` (the documented degrade for a pid that vanished before mint) is
+  self-consistent but UNVERIFIABLE against any later live `/proc` read —
+  no genuine read is ever `0` — a caller must treat it as "cannot
+  revalidate," never as "verified." `records::SessionRecord.seal`
+  (additive, `skip_serializing_if`) is the one place a minted seal is
+  stored — stamped by `aoide-conduct::graph::session_store::stamp_seal`,
+  this crate's own sibling to `stamp_origin`. **No gate in this codebase
+  reads `seal` yet** — P-ID1 proves the mint → store → verify mechanism
+  only (this module's own test suite: verify TRUE on a genuine seal, FALSE
+  on any single tampered field including a case-only-different
+  `sessionId`, FALSE under a different keypair); P-ID2 adds the first
   verify-on-accept caller.
 - `wire_auth` — per-request signed wire authentication for paired peers
   (P-P4, `docs/architecture/PAIRING.md`'s "Wire authentication (paired

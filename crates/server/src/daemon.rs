@@ -1596,6 +1596,61 @@ mod tests {
         panic!("could not recover issued_at within a 10s window around now — mint_seal's issued_at clock moved further than expected");
     }
 
+    /// `mint_seal`'s own documented degrade path — `pid_starttime`
+    /// unreadable (a vanished pid) falls back to `0` rather than refusing
+    /// to mint — has a consequence worth pinning directly, not just
+    /// documented in prose: a seal minted this way is SELF-consistent (it
+    /// round-trips against the exact fields it was minted with, zero
+    /// included) but can never be REVALIDATED against a later real
+    /// `/proc` read, because no live process ever reports starttime `0`
+    /// (`window.rs::pid_starttime_reads_a_nonzero_value_for_our_own_real_pid`
+    /// proves a genuine read is always `> 0`). This is the "silent
+    /// weakening" the design flagged: P-ID2's verify-on-accept MUST treat
+    /// a stored `pid_starttime` of `0` as UNVERIFIABLE — there is no live
+    /// starttime it could ever legitimately match — never as "verified
+    /// against a zero-starttime process." This test pins the shape so
+    /// that boundary is provable, not just asserted in a doc comment.
+    #[test]
+    fn mint_seal_over_a_vanished_pid_degrades_to_a_self_consistent_but_unrevalidatable_zero_starttime() {
+        let vanished_pid = 2_000_000_000; // window.rs's own "no such pid" fixture value.
+        assert_eq!(
+            aoide_conduct::graph::pid_starttime(vanished_pid),
+            None,
+            "the fixture pid must not exist on this box for the degrade path to even fire"
+        );
+
+        let seal_hex = mint_seal("s-vanished", vanished_pid, "local");
+        let recovered_issued_at =
+            sealed_id_issued_at_from(&seal_hex, "s-vanished", vanished_pid, 0, "local");
+        let self_consistent = SealedIdentity {
+            session_id: "s-vanished".to_string(),
+            pid: vanished_pid,
+            pid_starttime: 0,
+            origin_class: "local".to_string(),
+            issued_at: recovered_issued_at,
+        };
+        assert!(
+            sealed_id::verify_seal(&seal_keypair().info().pubkey_hex, &self_consistent, &seal_hex),
+            "a degraded seal must still verify against the EXACT fields it was minted with, \
+             zero pid_starttime included — self-consistency is not the property in question"
+        );
+
+        // No real `/proc` read ever produces 0 for a live process — a
+        // verifier reconstructing `SealedIdentity` from a FRESH
+        // `pid_starttime` read (P-ID2's own shape) would build a
+        // `pid_starttime` that is never `0`, so it can never match this
+        // seal's stored `0` even for the SAME still-alive pid. There is no
+        // "verify true" path back to a live process for a seal minted
+        // this way — that is the unrevalidatable property this test pins.
+        let mut against_any_live_read = self_consistent.clone();
+        against_any_live_read.pid_starttime = 1; // stand-in for "any real read, which is never 0".
+        assert!(
+            !sealed_id::verify_seal(&seal_keypair().info().pubkey_hex, &against_any_live_read, &seal_hex),
+            "a zero-starttime seal must not verify against ANY nonzero starttime — including \
+             one read from the very same pid were it somehow still alive"
+        );
+    }
+
     /// A dispatched command that is NOT `session start` never gets sealed —
     /// the module doc's "silent no-op for every OTHER dispatched command".
     #[test]
