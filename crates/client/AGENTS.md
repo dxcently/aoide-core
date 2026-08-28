@@ -253,7 +253,9 @@
   practice.
 - **`discover`'s `run_sweep`/`resolve_invite_target` never touch
   `peer_store` for writing, and `handle_peer_discover`/`handle_peer_invite`
-  must not either (P-P6).** Discovery grants nothing
+  must not either (P-P6) — nor may `run_sweep`'s cross-crate consumer,
+  `aoide-conduct::graph`'s `peer list` (task #120 P2).** Discovery grants
+  nothing
   (`docs/architecture/PAIRING.md`'s "Discovery (advertise-but-locked)"
   section) — the only peer-record write path in this crate is, and stays,
   `run_pair_request`'s `park_outbound` plus `handle_peer_pair_approve`'s

@@ -205,7 +205,7 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   post-cutover) — the `graph` family narrowed at task #101 R1 to the bare
   render plus `graph link`, while `send`/`spawn`/`resurrect` went bare and
   `session *`/`project *` promoted to their own top-level groups — plus
-  `conduct`, `hooks install`, `who`.
+  `conduct`, `hooks install`, `who`, `peer list`.
 - **The durable session ledger + resurrect (P-D8, `docs/architecture/
   AOIDED.md`'s "L5"):** `graph/doc.rs::ledger_session_exit` is the ONE
   shared call both `session_store.rs::do_session_end_inner` (a clean
@@ -499,12 +499,28 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   online/unreachable/never-pulled node-presence map) is `pub`, re-exported
   at `graph::glyph` — the conductor's ROSTER panel (P-C4) is its second
   consumer, reusing it rather than redrawing its own copy.
+- `peer list` — `aoide peer list [--json]` (`graph/peer_list.rs`, task
+  #120 P2): the one-glance mesh roster — this host, every registered peer,
+  every advertising instance heard in one bounded ~2s discovery sweep
+  (`aoide_client::discover::run_sweep`, run concurrently with the probes),
+  each node's running sessions indented beneath. A PURE fold over `who`'s
+  own core (`probe_peers`/`build_peer_node`/`build_local_node`/
+  `sessions_from_graph`, widened to `pub(super)`) plus the sweep's
+  heard-set — never a second prober, never a second presence model, and
+  it writes nothing (`state/peers.json`/`state/peer-cache/` stay other
+  modules' files). Lives in THIS crate, not `aoide-client` beside the
+  rest of the `peer` family, because `aoide-client` cannot depend on
+  `aoide-conduct`; `peer status` (client) keeps the deep per-peer
+  registry view. CONTRACTS.md §7's CLI surface pins the row/mark grammar
+  and the `--json` shape.
 
 ## What it consumes
 
-`aoide-protocol`, `aoide-storage`, `aoide-client` (`who`'s live per-peer
-probe calls `aoide_client::commands::pull_peer_live` — the peer-pull
-transport `peer pull` itself uses, workstream C2; `send --to`'s
+`aoide-protocol`, `aoide-storage`, `aoide-client` (`who`'s and `peer
+list`'s live per-peer probes call `aoide_client::commands::pull_peer_live`
+— the peer-pull transport `peer pull` itself uses, workstream C2; `peer
+list`'s discovery sweep calls `aoide_client::discover::run_sweep` —
+P-P6's one sweep implementation, task #120 P2; `send --to`'s
 remote branch calls `aoide_client::commands::send_message_to_peer`,
 workstream C3; every session-write handler calls `aoide_client::daemon::
 daemon_dispatch`, P-D6; see `client`'s own README for why that edge stays).

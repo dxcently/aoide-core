@@ -84,15 +84,20 @@ pub(super) struct SessionView {
     pub(super) cwd: String,
 }
 
-/// One node (this box, or one registered peer) as `who` renders it.
+/// One node (this box, or one registered peer) as `who` renders it. Widened
+/// to `pub(super)` (fields too) for a second consumer: `peer_list.rs`'s
+/// mesh roster (task #120 P2) classifies its paired rows off the SAME
+/// probe-outcome/cache fold ([`build_peer_node`]) rather than re-deriving a
+/// second presence model — same discipline as [`SessionView`]'s widening
+/// note above.
 #[derive(Debug, Clone, PartialEq)]
-struct NodeView {
-    name: String,
-    is_local: bool,
-    presence: &'static str,
-    fetched_at: Option<String>,
-    error: Option<String>,
-    sessions: Vec<SessionView>,
+pub(super) struct NodeView {
+    pub(super) name: String,
+    pub(super) is_local: bool,
+    pub(super) presence: &'static str,
+    pub(super) fetched_at: Option<String>,
+    pub(super) error: Option<String>,
+    pub(super) sessions: Vec<SessionView>,
 }
 
 /// Session-level presence class (module doc's "Session-level presence").
@@ -109,8 +114,9 @@ fn session_presence(state: &str) -> &'static str {
 
 /// This box's own [`NodeView`] — always `online` (we're running on it right
 /// now). `sessions`/`hooks` are the caller's already-loaded stage files
-/// (`common::load_inputs`); pure otherwise.
-fn build_local_node(sessions: &[SessionRecord], hooks: &[HookRecord], host: &str) -> NodeView {
+/// (`common::load_inputs`); pure otherwise. `pub(super)` for `peer_list.rs`
+/// (see [`NodeView`]'s widening note).
+pub(super) fn build_local_node(sessions: &[SessionRecord], hooks: &[HookRecord], host: &str) -> NodeView {
     let merged = super::model::merged_sessions(sessions, hooks);
     let ids: HashSet<&str> = merged.iter().map(|s| s.session_id.as_str()).collect();
     let sessions = merged
@@ -177,9 +183,10 @@ pub(super) fn sessions_from_graph(graph: &Value, host: &str) -> Vec<SessionView>
 /// Pure: classify one peer's [`NodeView`] from its live-probe OUTCOME and
 /// its already-loaded last cache entry (if any) — no I/O in here at all, so
 /// it is trivially unit-testable with synthetic data. The caller
-/// (`who_with`) does the real `peer_store::load_peer_cache` read and hands
-/// the result in.
-fn build_peer_node(peer: &Peer, probe: Result<Value, String>, cache: Option<PeerCacheEntry>) -> NodeView {
+/// (`who_with`, and `peer_list.rs`'s `peer_list_with` — see [`NodeView`]'s
+/// widening note) does the real `peer_store::load_peer_cache` read and
+/// hands the result in.
+pub(super) fn build_peer_node(peer: &Peer, probe: Result<Value, String>, cache: Option<PeerCacheEntry>) -> NodeView {
     match probe {
         Ok(graph) => NodeView {
             name: peer.name.clone(),
@@ -415,8 +422,9 @@ pub(super) fn who_with(inv: &Invocation, pull: PullFn) -> Outcome {
 
 /// Per-peer live-probe timeout (module doc's presence model — "short
 /// per-peer timeout ~2s"). One named constant rather than a magic number at
-/// the one call site that needs it.
-const PEER_PROBE_TIMEOUT_SECS: u64 = 2;
+/// the two call sites that need it (`who` below, and `peer_list.rs`'s own
+/// production entry — the SAME probe, so the SAME bound).
+pub(super) const PEER_PROBE_TIMEOUT_SECS: u64 = 2;
 
 /// `aoide who [filter] [--json] [--all]` — the real entry point: wires the
 /// live probe to `aoide_client::commands::pull_peer_live` (the SAME

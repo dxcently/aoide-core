@@ -524,6 +524,20 @@
   network via `aoide_client::commands::pull_peer_live` and falls back to
   the cache (read-only) for an unreachable peer; don't "helpfully" have a
   successful live probe refresh the cache as a side effect.
+- **`peer list` (`graph/peer_list.rs`, task #120 P2) is `who`'s core under
+  a wider fold — never a fork of it.** Its presence/session data comes
+  ONLY from `who.rs`'s widened `pub(super)` seam (`probe_peers`/
+  `build_local_node`/`build_peer_node`/`SessionView`/
+  `PEER_PROBE_TIMEOUT_SECS`) and its advertising data ONLY from
+  `aoide_client::discover::run_sweep` — a second prober, a second presence
+  classifier, or a private sweep re-implementation here is the exact
+  cross-copy this crate's discipline forbids. It inherits `who`'s
+  projection rule wholesale (writes nothing: not `state/peers.json`, not
+  `state/peer-cache/`), a failed/empty sweep only ANNOTATES the roster
+  (never fails the command — the paired half is still true), and both
+  network seams (`PullFn`, `SweepFn`) stay injected so its tests never
+  open a socket. Row/mark grammar and `--json` shape are CONTRACTS.md
+  §7-pinned — a rendering change is a contract edit first.
 - **`send::deliver_local`'s success path is ONE of exactly TWO inbox-filing
   calls in the whole tree — never a third.** Every consumer that delivers
   into an ALREADY-REGISTERED session's socket (`send --id`, `--to`

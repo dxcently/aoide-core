@@ -24,6 +24,7 @@ mod doc;
 // `aoide-conduct` -> `aoide` crate boundary root's shim re-exports onward.
 pub(crate) mod identity;
 mod model;
+mod peer_list;
 mod pending;
 mod permit;
 mod resurrect;
@@ -102,6 +103,12 @@ pub use self::manage::{link, project_add, project_list, project_remove, prune, v
 // conductor ROSTER panel is its second consumer (`who.rs`'s doc comment
 // on `glyph`), reused rather than redrawn.
 pub use self::who::{glyph, who};
+// `aoide peer list` (task #120 P2): the one-glance mesh roster — this host,
+// every registered peer, every advertising instance heard in one bounded
+// sweep, each with its running sessions. Lives beside `who` because it IS
+// `who`'s probe/classification core under a wider fold (`peer_list.rs`'s
+// module doc) — `peer status` (aoide-client) keeps the deep per-peer view.
+pub use self::peer_list::peer_list;
 pub use self::window::{focus_session, focus_window, run_hypr_window_listener, FocusError};
 
 // Storage/time passthroughs root's `a2a.rs` / `commands/{a2a,usage}.rs` still

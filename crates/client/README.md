@@ -98,7 +98,12 @@ never the inbound/serve half (that's `aoide-server`).
   compromise; the SAS ceremony backstops it. `resolve_invite_target(heard, name)` is the same
   shape one layer up: `peer invite`'s zero/one/many-match resolution
   against an already-swept result, also pure, and returns the whole
-  `Heard` so `src_addr` reaches `peer invite` for free. This crate's
+  `Heard` so `src_addr` reaches `peer invite` for free. Three consumers
+  drive `run_sweep`: `handle_peer_discover`, `handle_peer_invite`, and
+  `aoide-conduct::graph`'s `peer list` (task #120 P2 — one ~2s sweep
+  merged into the mesh roster's advertising marks and `◆` candidate
+  rows; `is_self_target` is its self-row guard too), all read-only,
+  never a second sweep implementation. This crate's
   send-side counterpart (`a2a serve`'s own advertise thread) lives in
   `aoide-server::discovery` instead — sending is the door-owning process's
   own job; listening is this crate's outbound-facing action, the same
