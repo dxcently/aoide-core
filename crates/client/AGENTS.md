@@ -181,13 +181,30 @@
   `OutboundState` aborts cleanly on reject; this is the ceremony's only
   abort command, so collapsing this back to inbound-only would leave a
   requester with no way to cancel a pairing it no longer wants.
-- **`approve_inbound`/`approve_outbound` take `skip_confirm: bool`, not
-  `&Invocation` (P-P5) — a signature-only refactor.** Don't reach for
-  `inv.flag_present("yes")` inside either function again; the ONLY caller
-  that reads that flag is `handle_peer_pair_approve`, which passes the
-  result in. A future caller with no `Invocation` at all (`pair_watch`'s
-  popup arm is the first) passes `true`/`false` directly — the dialog
-  itself IS the confirmation, so it always passes `true`.
+- **Neither approve half reads `&Invocation` — `approve_outbound` takes
+  `skip_confirm: bool` (P-P5), `approve_inbound` takes the `InboundGate`
+  enum (task #120 P3).** Don't reach for `inv.flag_present(..)` inside
+  either function; the ONLY caller that reads flags is
+  `handle_peer_pair_approve`, which resolves them into the parameter. A
+  caller with no `Invocation` at all (`pair_watch`'s popup arm is the
+  first) passes `true`/`InboundGate::DialogConfirmed` directly — the
+  dialog itself IS that arm's confirmation.
+- **The approver's gate is the TYPED pairing code, and the approve prompt
+  never echoes the SAS (task #120 P3).** `approve_inbound`'s prompt and
+  mismatch messages name the code's SHAPE (`NNN-NNN`), never its value —
+  printing the expected code beside the input would collapse the
+  out-of-band comparison into a copy exercise (`peer pair pending` still
+  shows it; the threat model is the comparison, not secrecy). A wrong
+  code — interactive or `--code` — persists ONE cumulative try
+  (`aoide_storage::pairing::record_inbound_code_try`); the third
+  cumulative mismatch auto-denies (`auto_deny_inbound`: `take_inbound`,
+  nothing committed, `reason: "auto-deny-on-code-mismatch"` for the audit
+  log). An abort (`Esc`/EOF) counts no try. `--yes` maps to
+  `InboundGate::Unavailable`'s taught refusal on an inbound id — never a
+  bypass — while keeping its original skip-the-y/N meaning on the
+  outbound (requester) half, whose confirm is unchanged: the requester's
+  own screen already printed the code, so a typed-code gate there would
+  be this side typing its own output back at itself.
 - **`reject_by_id(cmd, id)` is `handle_peer_pair_reject`'s entire body,
   extracted (P-P5) so a caller with only an id — no `&Invocation` to
   construct — can reject a pairing request too.** Keep it a pure

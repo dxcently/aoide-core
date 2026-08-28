@@ -10,7 +10,8 @@
   9, P-I1 — the second User-authorized break of the zero-new-deps
   discipline, after ed25519-dalek). No other crate in the workspace may add
   `inquire` as a direct dependency — every caller reaches `pick::choose`/
-  `choose_many`/`confirm`/`hidden_input` instead, never `inquire::*` types
+  `choose_many`/`confirm`/`hidden_input`/`text_input` instead, never
+  `inquire::*` types
   directly (`cargo tree -i inquire` should always show exactly one direct
   dependent: `aoide-protocol`). Keep the feature set minimal: `crossterm`
   only (`default-features = false`) — the terminal backend `inquire`

@@ -268,19 +268,29 @@ never the inbound/serve half (that's `aoide-server`).
   before ever computing a SAS. `handle_peer_pair_approve`
   dispatches by direction (Design A, task #119 — REPLACES the old
   `aoide/pairApprove` reverse callback): on an INBOUND entry
-  (`approve_inbound`) it refuses an unrevealed one outright, then commits a
+  (`approve_inbound`) it refuses an unrevealed one outright, then gates on
+  the TYPED pairing code (task #120 P3, `InboundGate` — the operator types
+  the code as read off the REQUESTER's screen, compared against the
+  locally derived SAS via the pure `code_matches`; the prompt never echoes
+  the SAS; a mismatch persists one cumulative try through
+  `aoide_storage::pairing::record_inbound_code_try`, and the third
+  mismatch auto-denies via `auto_deny_inbound` — the same clean removal
+  reject performs, audited as `auto-deny-on-code-mismatch`; `--code
+  NNN-NNN` is the scripted spelling, and `--yes` maps to the taught
+  refusal, never a bypass), then commits a
   local peer record and marks the entry approved PURELY LOCALLY — no wire
   call at all, so an unreachable/loopback-only requester never blocks the
   approver's own half; on an OUTBOUND entry (`approve_outbound`) it POLLS
   `aoide/pairPoll` first (over the SAME forward dial `request` already
   used — `entry.via` if one was recorded) and, once the poll comes back
-  approved, re-derives the SAME SAS and commits THIS instance's own record
-  on confirmation (decision 4's mutual confirmation, on both ends,
-  unchanged). `approve_inbound`/`approve_outbound`
-  take a `skip_confirm: bool` (P-P5) rather than an `&Invocation` — a
-  rename, not a behavior change: `handle_peer_pair_approve` still passes
-  `inv.flag_present("yes")` through unchanged, and `pair_watch`'s own
-  popup arm (below) passes `true` since the dialog itself already IS the
+  approved, re-derives the SAME SAS and confirms `y/N` (`--yes` scripted;
+  the requester's own screen already printed the code, so a typed-code
+  gate there would be this side typing its own output back at itself) —
+  then commits THIS instance's own record (decision 4's mutual
+  confirmation, on both ends, unchanged). `approve_outbound` takes a
+  `skip_confirm: bool` (P-P5); `approve_inbound` takes the `InboundGate`
+  enum instead, `pair_watch`'s popup arm (below) passing
+  `DialogConfirmed` since the dialog itself already IS that arm's
   confirmation. `handle_peer_pair_reject` tries
   the inbound queue then the outbound queue, aborting an outbound entry at
   any stage — the ceremony's abort command; `reject_by_id(cmd, id)` (P-P5)
@@ -322,7 +332,12 @@ never the inbound/serve half (that's `aoide-server`).
   `REJECT_LABEL`, `"Reject request"` — never `aoide_protocol::dialog::
   DISMISS_LABEL`, a different ceremony's label), and act on `decide`'s
   mapping (exit 0 → `commit_approval`, which calls the SAME
-  `approve_inbound`/`approve_outbound` with `skip_confirm: true`; the
+  `approve_inbound`/`approve_outbound` with the dialog standing as the
+  confirmation — `InboundGate::DialogConfirmed` on the inbound arm,
+  `skip_confirm: true` on the outbound one; the popup's dialog collects a
+  plain Approve/Reject, so the CLI tty path's typed-code gate (task #120
+  P3) deliberately does not apply here — a typed-code entry field in the
+  dialog is a named follow-on; the
   `REJECT_LABEL` extra button → `reject_by_id`; a bare Cancel → session-
   only `ignored`; a spawn/infra failure → backoff, NEVER `ignored`, the
   same "a broken binary doesn't silently stop offering the request"

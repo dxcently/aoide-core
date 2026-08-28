@@ -1376,9 +1376,10 @@ pub fn register_peers(r: &mut Registry) {
 // approve <id>` does double duty by DIRECTION, never a fifth command (golden
 // count unchanged by Design A, task #119 — no new command path, only the
 // completion trigger moved): on an INBOUND id (this instance is the
-// APPROVER) it is the ORIGINAL approve flow — re-derive the SAS, confirm,
-// commit LOCALLY, mark the entry approved for the requester's own poll to
-// find (no wire call at all — [`approve_inbound`]'s own doc). On an OUTBOUND
+// APPROVER) it re-derives the SAS, gates on the TYPED pairing code (task
+// #120 P3, [`InboundGate`] — max 3 cumulative mismatches, then auto-deny),
+// commits LOCALLY, and marks the entry approved for the requester's own poll
+// to find (no wire call at all — [`approve_inbound`]'s own doc). On an OUTBOUND
 // id (this instance is the REQUESTER) it POLLS the approver's door first
 // (over the SAME forward dial `peer pair request` already used), and only
 // once that poll comes back `approved` does it re-derive the SAME SAS and
@@ -1393,8 +1394,106 @@ pub fn register_peers(r: &mut Registry) {
 /// confirm` (ONBOARD.md's prompt substrate section, P-I1) — `inquire::
 /// Confirm` on a tty, the identical stdin `y/N` read otherwise; the
 /// question text is unchanged, `confirm` owns the `[y/N]` decoration.
+/// REQUESTER-side only since task #120 P3: [`approve_outbound`]'s confirm
+/// step is the one caller — the approver's own gate is the typed pairing
+/// code ([`approve_inbound`], [`InboundGate`]), never a y/N over a code
+/// this side already printed.
 fn confirm_sas(sas: &str, name: &str) -> Result<bool, String> {
     aoide_protocol::pick::confirm(&format!("pairing request from `{name}` — confirmation code {sas} — do the codes match?"))
+}
+
+/// How many wrong pairing codes an inbound entry tolerates before the CLI
+/// auto-denies it (task #120 P3) — cumulative across invocations
+/// (`aoide_storage::pairing::InboundPairingRequest::tries` persists them)
+/// and across the interactive prompt and the scripted `--code` path alike.
+const MAX_CODE_TRIES: u32 = 3;
+
+/// How `peer pair approve <id>` on an INBOUND entry collects its typed-code
+/// confirmation (task #120 P3) — the approver-side gate: the operator
+/// proves they hold the SAME code the requester's screen shows by TYPING
+/// it, out-of-band (a phone call, a glance), never by y/N-ing a code this
+/// side already printed. Resolved by `handle_peer_pair_approve` from the
+/// invocation; [`approve_inbound`] consumes it AFTER the idempotent
+/// already-approved and awaiting-reveal checks, so those short-circuits
+/// behave identically whichever variant rides in.
+pub(crate) enum InboundGate {
+    /// `pair_watch --popup`'s dialog IS the confirmation (P-P5) — commit
+    /// with no prompt; the popup's own typed-code upgrade is a named
+    /// follow-on (`pair_watch`'s module doc), not this phase.
+    DialogConfirmed,
+    /// Scripted `--code NNN-NNN`: validated once against the derived SAS;
+    /// a mismatch counts one persisted try
+    /// (`aoide_storage::pairing::record_inbound_code_try`).
+    Code(String),
+    /// Interactive CLI tty: prompt to type the code
+    /// (`aoide_protocol::pick::text_input`), re-prompting on mismatch up
+    /// to [`MAX_CODE_TRIES`] cumulative failures.
+    Prompt,
+    /// No way to collect a code — a non-CLI door, a non-tty CLI without
+    /// `--code`, or `--yes` (which no longer bypasses the approver's code):
+    /// a taught refusal, once the short-circuits above don't apply.
+    Unavailable,
+}
+
+/// Does a typed/scripted pairing code match the derived SAS? Both sides are
+/// trimmed and stripped of `-` and internal whitespace before comparing, so
+/// `740729` and `740 729` match a SAS of `740-729` — the operator is copying
+/// digits off another screen, and the separator carries no entropy. Pure,
+/// so the comparison the whole gate rests on is testable with no tty.
+fn code_matches(input: &str, sas: &str) -> bool {
+    let norm = |s: &str| s.chars().filter(|c| !c.is_whitespace() && *c != '-').collect::<String>();
+    let typed = norm(input);
+    !typed.is_empty() && typed == norm(sas)
+}
+
+/// The taught refusal for [`InboundGate::Unavailable`] — one message for
+/// every no-code shape (non-tty, non-CLI door, `--yes`), naming both the
+/// terminal prompt and the scripted spelling.
+fn inbound_code_refusal(cmd: &str, id: &str) -> Outcome {
+    Outcome::usage(
+        cmd,
+        format!(
+            "approving an inbound pairing request takes the TYPED pairing code as read from the \
+             requester's screen — run `aoide peer pair approve {id}` on a real terminal to type it, \
+             or pass `--code NNN-NNN` (scripted); `--yes` does not bypass the approver's code"
+        ),
+    )
+}
+
+/// Persist one wrong-code try ([`aoide_storage::pairing::record_inbound_code_try`])
+/// and hand back the new cumulative count, or the ready-made refusal
+/// `Outcome` when the entry vanished mid-prompt (expired) or the file write
+/// failed — both `Code` and `Prompt` arms of [`approve_inbound`] land here,
+/// never two hand-rolled copies of the same error mapping.
+fn record_code_try(cmd: &str, id: &str, now_epoch: i64) -> Result<u32, Outcome> {
+    match aoide_storage::pairing::record_inbound_code_try(id, now_epoch) {
+        Ok(t) => Ok(t),
+        Err(aoide_storage::pairing::MarkApprovedError::Unknown) => Err(Outcome::error(
+            cmd,
+            format!("no pending pairing request with id `{id}` (unknown, already resolved, or expired)"),
+        )
+        .with_data(json!({ "reason": "unknown-id", "id": id }))),
+        Err(aoide_storage::pairing::MarkApprovedError::Io(e)) => Err(Outcome::error(cmd, format!("recording the code mismatch: {e}"))),
+    }
+}
+
+/// Three cumulative code mismatches — the auto-deny (task #120 P3): the
+/// SAME clean removal `peer pair reject` performs (parked entry taken,
+/// nothing committed, no wire call), surfaced as its own distinct outcome
+/// so the single audit log records the deny as `auto-deny-on-code-mismatch`
+/// rather than an operator-initiated reject.
+fn auto_deny_inbound(cmd: &str, id: &str, name: &str, now_epoch: i64) -> Outcome {
+    if let Err(e) = aoide_storage::pairing::take_inbound(id, now_epoch) {
+        return Outcome::error(cmd, format!("removing the pairing request after {MAX_CODE_TRIES} code mismatches: {e}"));
+    }
+    Outcome::error(
+        cmd,
+        format!(
+            "{MAX_CODE_TRIES} code mismatches — auto-denied pairing request `{id}` from `{name}`: \
+             parked entry removed, nothing committed; a fresh `peer pair request` on their side starts a new ceremony"
+        ),
+    )
+    .with_data(json!({ "reason": "auto-deny-on-code-mismatch", "id": id, "name": name, "tries": MAX_CODE_TRIES, "rejected": true, "direction": "inbound" }))
 }
 
 /// This instance's own default advertised A2A door URL — `--peer-name`'s
@@ -1702,23 +1801,35 @@ pub(crate) fn handle_peer_pair_pending(_inv: &Invocation) -> Outcome {
         .with_data(json!({ "requests": rows }))
 }
 
-/// `peer pair approve <id> [--yes]` — dispatches by DIRECTION (module doc
-/// on this section): an INBOUND id runs [`approve_inbound`] (this instance
-/// is the APPROVER); an OUTBOUND id runs [`approve_outbound`] (this
-/// instance is the REQUESTER, polling the approver's door then confirming);
-/// an id in neither queue is `unknown-id`.
+/// `peer pair approve <id> [--yes] [--code NNN-NNN]` — dispatches by
+/// DIRECTION (module doc on this section): an INBOUND id runs
+/// [`approve_inbound`] (this instance is the APPROVER, gated by the TYPED
+/// pairing code — task #120 P3 — collected per [`InboundGate`]: `--code`
+/// scripted, a `text_input` prompt on a real CLI tty, a taught refusal
+/// anywhere no code can be collected; `--yes` deliberately maps to that
+/// refusal too, never a bypass); an OUTBOUND id runs [`approve_outbound`]
+/// (this instance is the REQUESTER, polling the approver's door then
+/// confirming — `--yes` keeps its original skip-the-y/N meaning THERE,
+/// since the requester's own screen already printed the code it would be
+/// typing back to itself); an id in neither queue is `unknown-id`.
 fn handle_peer_pair_approve(inv: &Invocation) -> Outcome {
     let cmd = "peer.pair.approve";
     let id = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         Some(i) => i.to_string(),
-        None => return Outcome::usage(cmd, "usage: aoide peer pair approve <id> [--yes] [--json]"),
+        None => return Outcome::usage(cmd, "usage: aoide peer pair approve <id> [--yes] [--code NNN-NNN] [--json]"),
     };
 
     let now = aoide_storage::time::now_iso_utc();
     let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap_or(0);
 
     if let Some(entry) = aoide_storage::pairing::list_inbound(now_epoch).into_iter().find(|e| e.id == id) {
-        return approve_inbound(inv.flag_present("yes"), cmd, &id, entry, &now, now_epoch);
+        let gate = match inv.flags.get("code").cloned().filter(|c| !c.trim().is_empty()) {
+            Some(code) => InboundGate::Code(code),
+            None if inv.flag_present("yes") => InboundGate::Unavailable,
+            None if aoide_protocol::pick::interactive(inv.door) => InboundGate::Prompt,
+            None => InboundGate::Unavailable,
+        };
+        return approve_inbound(gate, cmd, &id, entry, &now, now_epoch);
     }
     if let Some(entry) = aoide_storage::pairing::list_outbound(now_epoch).into_iter().find(|e| e.id == id) {
         return approve_outbound(inv.flag_present("yes"), cmd, &id, entry, &now, now_epoch);
@@ -1750,18 +1861,27 @@ fn handle_peer_pair_approve(inv: &Invocation) -> Outcome {
 /// commit AND a correctly-signed poll from the ORIGINAL requester happen.
 ///
 /// Idempotent: re-running this against an already-approved entry is a no-op
-/// success (no second SAS prompt, no second `upsert_paired_peer`) — the
+/// success (no second code prompt, no second `upsert_paired_peer`) — the
 /// operator may have run it twice, or the popup arm may re-offer a stale
 /// row before its own state catches up.
 ///
-/// `skip_confirm` (P-P5): `true` bypasses the SAS prompt outright — the
-/// popup arm's own dialog IS the confirmation (an operator who clicked
-/// Approve on the rendered code already confirmed it; a second CLI-shaped
-/// `y`/`yes` prompt on top would be a confirmation of a confirmation).
-/// The ordinary CLI path passes `inv.flag_present("yes")` through
-/// unchanged — this is a parameter rename, not a behavior change.
+/// **The gate is the TYPED pairing code (task #120 P3, [`InboundGate`]).**
+/// The approver's operator types the code as read off the REQUESTER's
+/// screen (out-of-band — a phone call, a glance) and this compares it
+/// against the locally derived SAS; the prompt itself never echoes that SAS
+/// — printing the expected value beside the input would collapse the
+/// comparison into a copy exercise and defeat the whole gate. A mismatch
+/// counts one persisted try ([`aoide_storage::pairing::record_inbound_code_try`],
+/// cumulative across invocations and across the interactive/scripted
+/// paths); the [`MAX_CODE_TRIES`]rd mismatch auto-denies
+/// ([`auto_deny_inbound`] — the same clean removal `peer pair reject`
+/// performs, audited under its own reason). An abort (`Esc`, `Ctrl-C`)
+/// leaves the entry pending with no try counted — an abort is not a wrong
+/// code. [`InboundGate::DialogConfirmed`] (the `pair_watch --popup` arm,
+/// P-P5) still commits with no prompt at all: the dialog IS that arm's
+/// confirmation, and its typed-code upgrade is a named follow-on.
 pub(crate) fn approve_inbound(
-    skip_confirm: bool,
+    gate: InboundGate,
     cmd: &str,
     id: &str,
     entry: aoide_storage::pairing::InboundPairingRequest,
@@ -1798,21 +1918,57 @@ pub(crate) fn approve_inbound(
     let own_pubkey = kp.info().pubkey_hex;
     let sas = aoide_storage::pairing::derive_sas(&entry.pubkey_hex, &own_pubkey, &requester_nonce, &entry.approver_nonce_hex);
 
-    if !skip_confirm {
-        match confirm_sas(&sas, &entry.name) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Outcome::ok(
+    match gate {
+        InboundGate::DialogConfirmed => {}
+        InboundGate::Unavailable => return inbound_code_refusal(cmd, id),
+        InboundGate::Code(code) => {
+            if !code_matches(&code, &sas) {
+                let tries = match record_code_try(cmd, id, now_epoch) {
+                    Ok(t) => t,
+                    Err(out) => return out,
+                };
+                if tries >= MAX_CODE_TRIES {
+                    return auto_deny_inbound(cmd, id, &entry.name, now_epoch);
+                }
+                return Outcome::error(
                     cmd,
                     format!(
-                        "not confirmed — the request remains pending (confirmation code was {sas}); \
-                         run `aoide peer pair reject {id}` to refuse it outright"
+                        "code mismatch — try {tries} of {MAX_CODE_TRIES}; {} more before this request is auto-denied",
+                        MAX_CODE_TRIES - tries
                     ),
                 )
-                .with_data(json!({ "confirmed": false, "sas": sas, "id": id }))
+                .with_data(json!({ "reason": "code-mismatch", "id": id, "tries": tries }));
             }
-            Err(e) => return Outcome::error(cmd, e),
         }
+        InboundGate::Prompt => loop {
+            // The prompt names the code's SHAPE, never its value (module
+            // doc's echo invariant).
+            let typed = match aoide_protocol::pick::text_input(&format!(
+                "pairing request from `{}` — type the confirmation code shown on the requester's screen (NNN-NNN):",
+                entry.name
+            )) {
+                Ok(t) => t,
+                Err(e) => return Outcome::error(cmd, e),
+            };
+            let Some(typed) = typed else {
+                return Outcome::ok(
+                    cmd,
+                    format!("not confirmed — the request remains pending; run `aoide peer pair reject {id}` to refuse it outright"),
+                )
+                .with_data(json!({ "confirmed": false, "id": id }));
+            };
+            if code_matches(&typed, &sas) {
+                break;
+            }
+            let tries = match record_code_try(cmd, id, now_epoch) {
+                Ok(t) => t,
+                Err(out) => return out,
+            };
+            if tries >= MAX_CODE_TRIES {
+                return auto_deny_inbound(cmd, id, &entry.name, now_epoch);
+            }
+            eprintln!("code mismatch — {} more tr{} before this request is auto-denied", MAX_CODE_TRIES - tries, if MAX_CODE_TRIES - tries == 1 { "y" } else { "ies" });
+        },
     }
 
     // P-S4: the APPROVER's own commit — unlike `approve_outbound`'s
@@ -2335,10 +2491,11 @@ pub fn register_peer_pair(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["peer", "pair", "approve"],
-        summary: "Approve a pending pairing request after confirming its code matches (CLI y/N unless --yes) — the approver commits locally, the requester polls for the release then commits; run on both ends.",
+        summary: "Approve a pending pairing request — the approver TYPES the pairing code as read from the requester's screen (3 cumulative mismatches auto-deny; --code NNN-NNN scripted) and commits locally; the requester polls for the release, confirms y/N (--yes scripted), then commits; run on both ends.",
         args: [arg!("id", "string", true, "The pending pairing request's id (see `peer pair pending`).")],
         flags: [
-            flag!("yes", "bool", "Skip the interactive y/N confirmation (scripted use)."),
+            flag!("yes", "bool", "Skip the interactive y/N confirmation on an OUTBOUND (requester-side) id (scripted use); an inbound id takes --code instead — --yes never bypasses the approver's typed code."),
+            flag!("code", "string", "The pairing code, read from the requester's screen, for approving an INBOUND id without a terminal prompt (scripted use); a wrong code counts one persisted try, and 3 cumulative mismatches auto-deny the request."),
         ],
         gated: false,
         implemented: true,
@@ -3443,7 +3600,7 @@ mod tests {
             let saved_path = std::env::var("PATH").ok();
             std::env::set_var("PATH", format!("{}:{}", shim_dir.display(), saved_path.clone().unwrap_or_default()));
 
-            let outcome = approve_inbound(true, "peer.pair.approve", &id, entry, &now, now_epoch);
+            let outcome = approve_inbound(InboundGate::DialogConfirmed, "peer.pair.approve", &id, entry, &now, now_epoch);
 
             match saved_path {
                 Some(p) => std::env::set_var("PATH", p),
@@ -3599,6 +3756,157 @@ mod tests {
             assert_eq!(listed.len(), 1, "the entry is left untouched, never removed, on a mismatch");
             assert_eq!(listed[0].state, aoide_storage::pairing::OutboundState::AwaitingApproval, "never advances past awaiting-approval on a mismatch");
             assert_eq!(listed[0].pubkey_hex, real_pubkey_b, "the ORIGINAL learned pubkey stays on record, never overwritten by the substituted one");
+        });
+    }
+
+    // ── typed-code approval (task #120 P3) — the approver-side gate's
+    // ── tty-free halves: the pure comparison, the scripted `--code` path,
+    // ── the persisted tries, the auto-deny at 3, and the no-code refusal.
+    // ── The interactive `InboundGate::Prompt` loop renders through a real
+    // ── terminal (`pick::text_input`) and is exercised by hand, the same
+    // ── way `pick`'s own tty backends always have been. ──────────────────
+
+    #[test]
+    fn code_matches_ignores_separator_and_whitespace_but_never_content() {
+        assert!(code_matches("740-729", "740-729"));
+        assert!(code_matches("740729", "740-729"), "the dash carries no entropy");
+        assert!(code_matches(" 740 729 ", "740-729"), "typed spacing is the operator's habit, not a mismatch");
+        assert!(!code_matches("740-728", "740-729"), "a single wrong digit is a mismatch");
+        assert!(!code_matches("", "740-729"), "empty input never matches");
+        assert!(!code_matches("-", "740-729"), "separator-only input normalizes to empty and never matches");
+    }
+
+    /// Park + reveal one inbound entry in the temp state dir and hand back
+    /// (entry, correct SAS) — the SAS derived exactly the way
+    /// `approve_inbound` itself derives it, from the freshly-minted identity.
+    fn parked_revealed_inbound(now_epoch: i64) -> (aoide_storage::pairing::InboundPairingRequest, String) {
+        let requester_pk = "e".repeat(64);
+        let nonce = "aabbccdd11223344";
+        let commit = aoide_storage::pairing::derive_commit(&requester_pk, nonce);
+        let entry = aoide_storage::pairing::park_inbound(
+            &requester_pk,
+            "box-a",
+            "10.0.0.5",
+            "http://box-a:8710/",
+            &commit,
+            &aoide_storage::time::iso_utc_from_epoch(now_epoch),
+            &aoide_storage::pairing::expires_at_from(now_epoch),
+        )
+        .unwrap();
+        let entry = aoide_storage::pairing::reveal_inbound(&entry.id, nonce, now_epoch).unwrap();
+        let (kp, _) = aoide_storage::identity::load_or_mint().unwrap();
+        let sas = aoide_storage::pairing::derive_sas(&requester_pk, &kp.info().pubkey_hex, nonce, &entry.approver_nonce_hex);
+        (entry, sas)
+    }
+
+    #[test]
+    fn approve_inbound_scripted_wrong_codes_count_persisted_tries_then_auto_deny_at_three() {
+        with_peer_state("approve-inbound-code-mismatch", || {
+            let now_epoch = 1_700_000_000_i64;
+            let now = aoide_storage::time::iso_utc_from_epoch(now_epoch);
+            let (entry, _sas) = parked_revealed_inbound(now_epoch);
+            let id = entry.id.clone();
+
+            // "xxx-xxx" can never equal a digits-only SAS — a guaranteed mismatch.
+            for expected_tries in 1..=2u32 {
+                let fresh = aoide_storage::pairing::list_inbound(now_epoch).into_iter().find(|e| e.id == id).unwrap();
+                let out = approve_inbound(InboundGate::Code("xxx-xxx".into()), "peer.pair.approve", &id, fresh, &now, now_epoch);
+                assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
+                assert_eq!(out.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("code-mismatch"));
+                assert_eq!(out.data.as_ref().and_then(|d| d.get("tries")).and_then(Value::as_u64), Some(expected_tries as u64));
+                // Cumulative across invocations: persisted on the parked entry.
+                assert_eq!(aoide_storage::pairing::list_inbound(now_epoch)[0].tries, expected_tries);
+            }
+
+            // The third mismatch auto-denies: the same clean removal reject
+            // performs, nothing committed, its own audited reason.
+            let fresh = aoide_storage::pairing::list_inbound(now_epoch).into_iter().find(|e| e.id == id).unwrap();
+            let out = approve_inbound(InboundGate::Code("xxx-xxx".into()), "peer.pair.approve", &id, fresh, &now, now_epoch);
+            assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
+            assert_eq!(out.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("auto-deny-on-code-mismatch"));
+            assert!(aoide_storage::pairing::list_inbound(now_epoch).is_empty(), "the parked entry is removed, exactly like a reject");
+            assert!(aoide_storage::peer_store::load_peers().is_empty(), "nothing was ever committed");
+        });
+    }
+
+    #[test]
+    fn approve_inbound_scripted_correct_code_commits_and_marks_approved() {
+        with_peer_state("approve-inbound-code-match", || {
+            let now_epoch = 1_700_000_000_i64;
+            let now = aoide_storage::time::iso_utc_from_epoch(now_epoch);
+            let (entry, sas) = parked_revealed_inbound(now_epoch);
+            let id = entry.id.clone();
+
+            // The undashed spelling exercises code_matches' normalization on
+            // the real path, not just the pure test above.
+            let out = approve_inbound(InboundGate::Code(sas.replace('-', "")), "peer.pair.approve", &id, entry, &now, now_epoch);
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
+
+            let peers = aoide_storage::peer_store::load_peers();
+            assert_eq!(peers.len(), 1);
+            assert!(peers[0].verified, "the ceremony's commit is unchanged by the gate swap");
+            let listed = aoide_storage::pairing::list_inbound(now_epoch);
+            assert_eq!(listed.len(), 1, "an approved entry stays parked for the requester's poll (Design A)");
+            assert!(listed[0].approved);
+        });
+    }
+
+    #[test]
+    fn approve_inbound_refuses_where_no_code_can_be_collected_and_counts_no_try() {
+        with_peer_state("approve-inbound-no-code", || {
+            let now_epoch = 1_700_000_000_i64;
+            let now = aoide_storage::time::iso_utc_from_epoch(now_epoch);
+            let (entry, _sas) = parked_revealed_inbound(now_epoch);
+            let id = entry.id.clone();
+
+            let out = approve_inbound(InboundGate::Unavailable, "peer.pair.approve", &id, entry, &now, now_epoch);
+            assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{out:?}");
+            assert!(out.message.contains("--code"), "the refusal teaches the scripted spelling: {}", out.message);
+            assert_eq!(aoide_storage::pairing::list_inbound(now_epoch)[0].tries, 0, "a refusal is not a wrong code");
+        });
+    }
+
+    fn approve_inv(id: &str, flags: &[(&str, &str)]) -> Invocation {
+        Invocation {
+            path: vec!["peer".into(), "pair".into(), "approve".into()],
+            args: vec![id.to_string()],
+            flags: flags.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            door: aoide_protocol::Door::Cli,
+        }
+    }
+
+    /// The handler's own gate resolution, driven through the real
+    /// `handle_peer_pair_approve`: `--yes` on an inbound id maps to the
+    /// taught refusal (never a bypass), and so does a bare non-tty CLI
+    /// invocation (cargo test's stdio is never a terminal — the exact
+    /// non-tty shape a scripted caller hits).
+    #[test]
+    fn handle_approve_inbound_refuses_yes_and_non_tty_without_code() {
+        with_peer_state("approve-inbound-handler-gate", || {
+            let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
+            let (entry, _sas) = parked_revealed_inbound(now_epoch);
+
+            for flags in [vec![("yes", "true")], vec![]] {
+                let out = handle_peer_pair_approve(&approve_inv(&entry.id, &flags));
+                assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{out:?}");
+                assert!(out.message.contains("--code"), "{}", out.message);
+            }
+        });
+    }
+
+    /// Idempotency survives the gate swap: an ALREADY-approved inbound
+    /// entry short-circuits to the no-op success before any gate is
+    /// consulted, so a re-run (scripted or not) never trips the refusal.
+    #[test]
+    fn handle_approve_inbound_already_approved_is_still_a_no_op_success() {
+        with_peer_state("approve-inbound-idempotent", || {
+            let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
+            let (entry, _sas) = parked_revealed_inbound(now_epoch);
+            aoide_storage::pairing::mark_inbound_approved(&entry.id, now_epoch).unwrap();
+
+            let out = handle_peer_pair_approve(&approve_inv(&entry.id, &[("yes", "true")]));
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
+            assert_eq!(out.data.as_ref().and_then(|d| d.get("alreadyApproved")).and_then(Value::as_bool), Some(true));
         });
     }
 }

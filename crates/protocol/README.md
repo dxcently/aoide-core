@@ -79,22 +79,24 @@ other crate in this workspace sits above.
   spawning rather than caught as an `ENOENT` after.
 - `pick` — the interactive prompt substrate (ONBOARD.md's "Prompt substrate"
   section, P-I1): `interactive`, the [`Door::Cli`] + tty gate a caller checks
-  BEFORE opening any prompt at all, and four entry points a caller reaches
+  BEFORE opening any prompt at all, and five entry points a caller reaches
   for once it has — `choose`/`choose_many` (single/multi-select),
-  `confirm` (y/N), `hidden_input` (password entry). Each forks on whether
-  stdin/stdout are a capable terminal: a capable tty backs `choose`/
-  `choose_many`/`confirm` with `inquire::Select`/`MultiSelect`/`Confirm`,
-  and is the ONLY backend `hidden_input` (`inquire::Password`, no
-  confirmation, hidden display mode) has — everything else (piped,
-  redirected, or `TERM=dumb`, which reports as a real tty but by
-  convention cannot render ANSI) keeps the ORIGINAL hand-rolled
-  `BufRead`-driven core (`choose_reading`/`choose_many_reading`/
-  `confirm_reading`) byte-identical. `inquire` (crates.io, minimal
-  `crossterm`-only feature set) is this crate's own dependency, and stays
-  that way — every other crate reaches these four functions through this
-  seam, never `inquire` directly ("wrap, don't scatter"; the DAG-leaf
-  invariant below still holds, since `inquire` is a third-party crate, not
-  an `aoide-*` one).
+  `confirm` (y/N), `hidden_input` (password entry), `text_input` (one
+  echoed line — `hidden_input`'s visible sibling, for input the typist
+  must see, like `peer pair approve`'s typed pairing code). Each forks on
+  whether stdin/stdout are a capable terminal: a capable tty backs
+  `choose`/`choose_many`/`confirm` with `inquire::Select`/`MultiSelect`/
+  `Confirm`, and is the ONLY backend `hidden_input` (`inquire::Password`,
+  no confirmation, hidden display mode) and `text_input` (`inquire::Text`)
+  have — everything else (piped, redirected, or `TERM=dumb`, which
+  reports as a real tty but by convention cannot render ANSI) keeps the
+  ORIGINAL hand-rolled `BufRead`-driven core (`choose_reading`/
+  `choose_many_reading`/`confirm_reading`) byte-identical. `inquire`
+  (crates.io, minimal `crossterm`-only feature set) is this crate's own
+  dependency, and stays that way — every other crate reaches these
+  entry points through this seam, never `inquire` directly ("wrap, don't
+  scatter"; the DAG-leaf invariant below still holds, since `inquire` is
+  a third-party crate, not an `aoide-*` one).
 - `model`, `policy` — model context ceilings, and the daemon's
   `Gate`/`Subscription` policy types.
 

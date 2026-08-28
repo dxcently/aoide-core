@@ -335,6 +335,17 @@ pub struct InboundPairingRequest {
     /// discipline every other field in this struct already holds.
     #[serde(default)]
     pub approved: bool,
+    /// Typed-code approval (task #120 P3): how many WRONG pairing codes have
+    /// been entered against this entry so far — interactive prompt
+    /// mismatches and scripted `--code` mismatches both count, cumulatively,
+    /// persisted here so tries survive across `peer pair approve`
+    /// invocations. Bumped by [`record_inbound_code_try`]; the CLI
+    /// auto-denies (a clean [`take_inbound`] removal) the moment the count
+    /// reaches 3, so a persisted value is always `< 3`. `#[serde(default)]`
+    /// loads `0` on a record predating the field — the same additive
+    /// discipline [`Self::approved`] holds.
+    #[serde(default)]
+    pub tries: u32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -424,6 +435,7 @@ pub fn park_inbound(
         requested_at: requested_at.to_string(),
         expires_at: expires_at.to_string(),
         approved: false,
+        tries: 0,
     };
     requests.push(entry.clone());
     save_inbound(&requests)?;
@@ -535,6 +547,36 @@ pub fn mark_inbound_approved(id: &str, now_epoch: i64) -> Result<InboundPairingR
     };
     kept[idx].approved = true;
     let out = kept[idx].clone();
+    if let Err(e) = save_inbound(&kept) {
+        return Err(MarkApprovedError::Io(e));
+    }
+    Ok(out)
+}
+
+/// Typed-code approval (task #120 P3): record ONE wrong pairing code
+/// entered against a parked inbound entry — increments
+/// [`InboundPairingRequest::tries`], persists it, and returns the new
+/// cumulative count so the caller (`aoide-client::commands::approve_inbound`,
+/// the only production caller) can auto-deny at 3 without a second read.
+/// Interactive prompt mismatches and scripted `--code` mismatches both land
+/// here; the auto-deny itself is the caller's [`take_inbound`] removal,
+/// never a state this function writes. Shares [`MarkApprovedError`]'s
+/// refusal shape — the failure modes (unknown/expired id, file I/O) are
+/// identical to [`mark_inbound_approved`]'s.
+pub fn record_inbound_code_try(id: &str, now_epoch: i64) -> Result<u32, MarkApprovedError> {
+    let all = load_inbound_raw();
+    let (mut kept, _expired) = sweep(all, now_epoch);
+    let idx = match kept.iter().position(|r| r.id == id) {
+        Some(i) => i,
+        None => {
+            if let Err(e) = save_inbound(&kept) {
+                return Err(MarkApprovedError::Io(e));
+            }
+            return Err(MarkApprovedError::Unknown);
+        }
+    };
+    kept[idx].tries = kept[idx].tries.saturating_add(1);
+    let out = kept[idx].tries;
     if let Err(e) = save_inbound(&kept) {
         return Err(MarkApprovedError::Io(e));
     }
@@ -1204,6 +1246,60 @@ mod tests {
             Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
             None => std::env::remove_var("AOIDE_STATE_DIR"),
         }
+    }
+
+    // ── record_inbound_code_try (typed-code approval, task #120 P3) ──────
+
+    #[test]
+    fn record_inbound_code_try_increments_cumulatively_and_persists() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-pairing-code-try-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        env(&dir);
+
+        let now = 1_700_000_000_i64;
+        let commit = derive_commit("pk", "nonce");
+        let entry = park_inbound(
+            "pk", "name", "addr", "url", &commit,
+            &crate::time::iso_utc_from_epoch(now),
+            &expires_at_from(now),
+        )
+        .unwrap();
+        assert_eq!(entry.tries, 0, "a fresh park starts at zero tries");
+
+        assert_eq!(record_inbound_code_try(&entry.id, now).unwrap(), 1);
+        assert_eq!(record_inbound_code_try(&entry.id, now).unwrap(), 2);
+        // The count is READ back from disk, not carried in memory — a later
+        // invocation (the whole reason it persists) sees the same total.
+        assert_eq!(list_inbound(now)[0].tries, 2, "tries survive across loads");
+        assert_eq!(record_inbound_code_try(&entry.id, now).unwrap(), 3);
+
+        assert_eq!(record_inbound_code_try("nosuchid", now).unwrap_err(), MarkApprovedError::Unknown);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    /// `tries` is additive (`#[serde(default)]`): a parked record predating
+    /// the field loads `0`, never a deserialize failure — the same
+    /// discipline `approved`'s own back-compat test below the outbound
+    /// section pins for `via`.
+    #[test]
+    fn inbound_tries_is_additive_and_defaults_to_zero_on_a_legacy_record() {
+        let now = 1_700_000_000_i64;
+        let raw_old = serde_json::json!({
+            "id": "legacy01", "pubkeyHex": "k", "name": "box-a",
+            "originAddr": "10.0.0.5", "url": "http://box-a:8710/",
+            "commitHex": "c", "approverNonceHex": "a",
+            "requestedAt": crate::time::iso_utc_from_epoch(now), "expiresAt": expires_at_from(now),
+        });
+        let back: InboundPairingRequest = serde_json::from_value(raw_old).unwrap();
+        assert_eq!(back.tries, 0);
+        assert!(!back.approved);
     }
 
     // ── outbound park/take round trip ────────────────────────────────────

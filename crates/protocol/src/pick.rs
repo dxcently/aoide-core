@@ -26,9 +26,13 @@
 //! password-entry sibling (`inquire::Password`, tty-only — like `choose`/
 //! `choose_many`, it's the entry point a caller reaches for once it already
 //! knows stdin is a terminal, the same precondition the picker's own
-//! [`interactive`] gate establishes upstream of `choose`). `inquire` lives
-//! in THIS crate's `Cargo.toml` only — every other crate reaches these four
-//! functions, never `inquire` directly (ONBOARD.md's "wrap, don't scatter").
+//! [`interactive`] gate establishes upstream of `choose`), and
+//! [`text_input`] is `hidden_input`'s VISIBLE sibling (`inquire::Text`,
+//! tty-only the same way) for a line the typist must see as they enter it
+//! — `peer pair approve`'s typed pairing code (task #120 P3) is its first
+//! caller. `inquire` lives in THIS crate's `Cargo.toml` only — every other
+//! crate reaches these entry points, never `inquire` directly (ONBOARD.md's
+//! "wrap, don't scatter").
 //!
 //! **The testable seam.** [`choose`]/[`choose_many`]/[`confirm`]'s non-tty
 //! halves open the real [`std::io::stdin`] directly and are therefore not
@@ -41,7 +45,7 @@
 //! has been (its own test's comment already says so).
 
 use crate::audit::Door;
-use inquire::{Confirm, InquireError, MultiSelect, Password, PasswordDisplayMode, Select};
+use inquire::{Confirm, InquireError, MultiSelect, Password, PasswordDisplayMode, Select, Text};
 use std::io::{self, BufRead, IsTerminal, Write};
 
 /// Both stdin AND stdout are a real terminal — the tty half of
@@ -387,6 +391,24 @@ pub fn hidden_input(prompt: &str) -> Result<String, String> {
         .with_display_mode(PasswordDisplayMode::Hidden)
         .prompt()
         .map_err(|e| format!("reading hidden input: {e}"))
+}
+
+/// [`hidden_input`]'s visible sibling — one line of ordinary, echoed text
+/// (`inquire::Text`), for input the typist must be able to SEE as they
+/// enter it: `peer pair approve`'s typed pairing code (task #120 P3, the
+/// first caller) is read off another box's screen and typed here, where a
+/// hidden field would only manufacture typos on a value that is not a
+/// secret from its own typist. Tty-only, exactly like [`hidden_input`]:
+/// the entry point a caller reaches for once it ALREADY knows stdin is a
+/// terminal ([`interactive`]'s gate upstream). `Ok(None)` on `Esc`/`Ctrl-C`
+/// — the same "an abort is a decline, never a distinct error shape" mapping
+/// [`confirm`] holds — and `Err` only for a genuine read failure.
+pub fn text_input(prompt: &str) -> Result<Option<String>, String> {
+    match Text::new(prompt).prompt() {
+        Ok(line) => Ok(Some(line)),
+        Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => Ok(None),
+        Err(e) => Err(format!("reading input: {e}")),
+    }
 }
 
 #[cfg(test)]

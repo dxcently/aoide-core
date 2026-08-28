@@ -409,19 +409,23 @@ fn popup_allowed(locked: bool) -> bool {
     !locked
 }
 
-/// Commit `p`'s pairing with `skip_confirm: true` — looks up ITS FRESH
-/// entry by id and direction (never trusts anything cached from an
-/// earlier `reconcile` call, the same "re-check before acting" discipline
-/// [`actionable`]'s own callers hold) and calls the SAME
-/// `approve_inbound`/`approve_outbound` the CLI's `peer pair approve
-/// --yes` path calls — an approved dialog commits the byte-identical
-/// `peers.json` write a scripted CLI approval would, because it is
-/// LITERALLY the same function, not a reimplementation.
+/// Commit `p`'s pairing with the dialog standing as the confirmation —
+/// looks up ITS FRESH entry by id and direction (never trusts anything
+/// cached from an earlier `reconcile` call, the same "re-check before
+/// acting" discipline [`actionable`]'s own callers hold) and calls the SAME
+/// `approve_inbound`/`approve_outbound` the CLI's `peer pair approve`
+/// path calls — an approved dialog commits the byte-identical
+/// `peers.json` write a CLI approval would, because it is LITERALLY the
+/// same function, not a reimplementation. The inbound arm passes
+/// `InboundGate::DialogConfirmed` (task #120 P3): the dialog collects a
+/// plain Approve/Reject today, so the typed-code gate the CLI tty path now
+/// holds is deliberately NOT applied here — the popup's own typed-code
+/// entry field is a named follow-on, not this phase.
 fn commit_approval(p: &Pending, now_epoch: i64) -> aoide_protocol::output::Outcome {
     let now = aoide_storage::time::now_iso_utc();
     match p.direction.as_str() {
         "inbound" => match aoide_storage::pairing::list_inbound(now_epoch).into_iter().find(|e| e.id == p.id) {
-            Some(entry) => crate::commands::approve_inbound(true, "peer.pair.approve", &p.id, entry, &now, now_epoch),
+            Some(entry) => crate::commands::approve_inbound(crate::commands::InboundGate::DialogConfirmed, "peer.pair.approve", &p.id, entry, &now, now_epoch),
             None => aoide_protocol::output::Outcome::error(
                 "peer.pair.approve",
                 format!("pairing request `{}` is no longer pending — nothing to confirm", p.id),

@@ -166,6 +166,12 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   never from a wire handler) once that instance's own operator confirms —
   the entry stays PARKED (never taken) so `aoide/pairPoll` can still find
   and release it, cleaned up only by the ordinary expiry sweep.
+  `InboundPairingRequest.tries` (task #120 P3, additive,
+  `#[serde(default)]`) counts wrong pairing codes typed against the entry,
+  cumulatively across invocations — bumped by `record_inbound_code_try`
+  (same `MarkApprovedError` refusal shape), while the auto-deny at 3 is
+  the CLI caller's own `take_inbound`, never a state written here; a
+  persisted value is therefore always `< 3`.
   `OutboundPairingRequest.via` (P-S4, additive, `#[serde(default)]`) carries
   the ssh-transport marker THIS instance resolved at request time (an
   explicit `--via`, or `peer invite`'s src_addr-derived default) forward to

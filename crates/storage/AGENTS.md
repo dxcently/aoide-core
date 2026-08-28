@@ -292,6 +292,17 @@
   `mark_inbound_approved`, called ONLY from `aoide-client::commands::approve_inbound`
   (never a wire handler — approving is purely local now), and never
   removes the entry — `aoide/pairPoll` (`aoide-server`) only ever READS it.
+- **`InboundPairingRequest.tries` counts wrong pairing codes; the
+  auto-deny at 3 belongs to the CLI caller, never this crate (task #120
+  P3).** `record_inbound_code_try` only increments-and-persists (returning
+  the new cumulative count, `MarkApprovedError`'s refusal shape);
+  `aoide-client::commands::approve_inbound` is its ONLY production caller
+  and performs the deny itself via `take_inbound`. Don't fold a
+  threshold or a removal into this function — the limit is CLI policy
+  (`MAX_CODE_TRIES` lives in `aoide-client`), and a wire handler must
+  never be able to burn or deny an entry by reaching a storage function
+  that does both. Additive `#[serde(default)]` — a legacy record loads
+  `0`, same discipline as `approved`.
 - **`undying::set_undying`'s return value is the on/off TRANSITION, not
   "did anything on disk change" (P-C1, durable-sessions plan).** Re-marking
   an already-undying id refreshes `marked_at` in place and returns `false`;
