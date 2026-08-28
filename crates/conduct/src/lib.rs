@@ -25,6 +25,17 @@ pub mod shellbridge;
 /// process-global env vars and must serialise against each other under the
 /// multithreaded test harness.
 ///
+/// The mutex itself is `aoide_test_support::env_lock()`'s — delegated, not a
+/// second static, per `crates/AGENTS.md`'s cross-crate note. This binary once
+/// held TWO env mutexes (`commands::hooks` tests took test-support's directly
+/// while everything else took this one), which don't exclude each other: a
+/// hooks test rewriting `HOME`/`AOIDE_ROOT` raced every concurrent
+/// `state_dir()` resolver, and the resulting panic poisoned whichever lock
+/// its section held, cascading (the #117 nix-build flake). Every test in this
+/// crate takes `crate::env_lock()` — never test-support's directly, so the
+/// floors below always stamp — and the delegation keeps both spellings one
+/// mutex regardless.
+///
 /// **P-D6 safety net (incident, this phase — see `AGENTS.md`'s own note):**
 /// the first call in the WHOLE test binary also stamps `AOIDE_DAEMON_SOCKET`
 /// to a path that can never have a real listener, unless a test already set
@@ -56,7 +67,6 @@ pub mod shellbridge;
 /// OTHER test's incidental ledger append off production disk.
 #[cfg(test)]
 pub(crate) fn env_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     static ISOLATE_DAEMON_SOCKET: std::sync::Once = std::sync::Once::new();
     ISOLATE_DAEMON_SOCKET.call_once(|| {
         if std::env::var("AOIDE_DAEMON_SOCKET").is_err() {
@@ -72,5 +82,5 @@ pub(crate) fn env_lock() -> &'static std::sync::Mutex<()> {
             );
         }
     });
-    &LOCK
+    aoide_test_support::env_lock()
 }
