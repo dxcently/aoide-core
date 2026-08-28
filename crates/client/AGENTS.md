@@ -25,10 +25,16 @@
   but not all four headers, so a future edit that adds a header
   conditionally (e.g. "only send `X-Aoide-Nonce` if X") would silently
   turn every affected outbound request into a hard refusal on the far
-  end. The pairing ceremony's own three wire calls
-  (`aoide/pairRequest`/`aoide/pairReveal`/`aoide/pairApprove`) always pass
-  an empty header slice — they are unauthenticated by protocol design (see
-  the P-P2 ceremony invariants below), not merely "not yet wired."
+  end. `aoide/pairRequest`/`aoide/pairReveal` always pass an empty header
+  slice — they are unauthenticated by protocol design (see the P-P2
+  ceremony invariants below), not merely "not yet wired." `aoide/pairPoll`
+  (Design A, task #119, REPLACES the old `aoide/pairApprove` reverse
+  callback) carries a signature too, but never through this function — no
+  `Peer` record exists yet at poll time for its `peer.verified` check to
+  key off, so `build_signed_pair_poll_body` (`commands.rs`) signs directly
+  against the requester's own identity instead, a SEPARATE self-contained
+  scheme (see that function's own doc for why P-P4's header scheme can't
+  bootstrap this).
 - **`HTTP_METHOD` (P-P5b, closing a P-P4 review finding) is the ONE named
   constant `post_json`'s `-X` argument AND `sign_headers_for_peer`'s
   `canonical_string` call both read — never re-introduce a second
@@ -134,22 +140,24 @@
   running."
 
 - **`handle_peer_pair_approve` dispatches by DIRECTION — inbound first,
-  outbound second (P-P2) — and the
-  two halves have opposite wire-then-commit orderings, not a shared one.**
-  `approve_inbound` (this instance is the APPROVER) keeps the original
-  ordering: the approval callback (`aoide/pairApprove`) MUST be delivered
-  to the requester's own door and acknowledged BEFORE this instance writes
-  its own `pubkey`/`verified` peer record — never the reverse, never in
-  parallel. An unreachable or refusing requester must leave BOTH ends
-  unpaired, not just the approver's; committing local state first would
-  let a network hiccup produce an asymmetric pair (one side verified, the
-  other not) with no way for either operator to notice. `approve_outbound`
-  (this instance is the REQUESTER, confirming AFTER the approver's own
-  callback already landed — `OutboundState::AwaitingConfirm`) makes NO
-  wire call at all: the approver already committed its own record before
-  ever sending that callback, so there is nothing left to acknowledge —
-  confirming the SAS commits THIS instance's own record directly via
-  `upsert_paired_peer`. `approve_inbound` also refuses outright
+  outbound second (P-P2) — and Design A (task #119) put the ONE wire call
+  on the OUTBOUND half, never the inbound one; before this phase it was the
+  reverse.** `approve_inbound` (this instance is the APPROVER) is now
+  PURELY LOCAL: it commits its own `pubkey`/`verified` peer record, then
+  marks the parked entry `approved` (`aoide_storage::pairing::mark_inbound_approved`)
+  and leaves it PARKED for the requester's own poll to find — no wire call
+  at all, so an unreachable or loopback-only requester never blocks this
+  half. `approve_outbound` (this instance is the REQUESTER) is the one that
+  now makes a wire call, when its entry is still `AwaitingApproval`: it
+  POSTs a SIGNED `aoide/pairPoll` to the approver's door (over the SAME
+  forward dial `handle_peer_pair_request` already used — `entry.via` if one
+  was recorded), and ONLY on an `approved` response does it call
+  `mark_outbound_awaiting_confirm` (rejecting a released pubkey that
+  doesn't match what this instance learned at request time — the
+  SAS/transcript binding, unchanged from before) and fall through to
+  confirm-then-commit via `upsert_paired_peer`. Never re-introduce a
+  reverse callback here — the WHOLE POINT of Design A is that nothing ever
+  needs to dial IN to the requester. `approve_inbound` also refuses outright
   (`"awaiting-reveal"`) on an entry whose `requester_nonce_hex` is still
   `None` — the commitment hasn't been revealed yet, so there
   is no SAS to confirm. The SAS itself is ALWAYS re-derived from this

@@ -43,21 +43,26 @@
 //!
 //! **Neither side commits a peer record on the FIRST human confirmation
 //! alone (review-bounce fix, decision 4's mutual confirmation, for real).**
-//! B's `peer pair approve` still commits B's own record right away (B
-//! already confirmed the SAS before delivering the callback — nothing left
-//! for B to do). But A's outbound entry does NOT auto-commit the moment
-//! B's `aoide/pairApprove` callback arrives with a matching pubkey — that
-//! would let a network round trip stand in for A's OWN operator ever
-//! looking at the code. Instead [`mark_outbound_awaiting_confirm`]
-//! transitions the entry to [`OutboundState::AwaitingConfirm`]; `peer pair
-//! pending` lists it (SAS shown — A already has both nonces since an
-//! outbound entry only exists post-reveal); `peer pair approve <id>` on an
-//! entry in this state shows the SAME confirm-then-commit y/N prompt B's
-//! own approve already holds, and only THEN calls `upsert_paired_peer`.
-//! `peer pair reject <id>` aborts an outbound entry at EITHER state
-//! ([`OutboundState::AwaitingApproval`] or [`OutboundState::AwaitingConfirm`])
-//! — the ceremony's own missing abort command, closed without a new command
-//! (golden count unchanged).
+//! B's `peer pair approve` still commits B's own record right away — but,
+//! since Design A (task #119, poll-based completion — B's own door may be
+//! loopback-only, so nothing dials OUT to A anymore), that commit is now
+//! PURELY LOCAL: B marks its own parked entry [`InboundPairingRequest::approved`]
+//! ([`mark_inbound_approved`]) and leaves it parked for A to find later. A's
+//! outbound entry does NOT auto-commit the moment A happens to poll and see
+//! `approved: true` either — that would let a network round trip stand in
+//! for A's OWN operator ever looking at the code, same as before. Instead A's
+//! `peer pair approve <id>` POLLS B's door (`aoide/pairPoll`, over the SAME
+//! forward dial the original request/reveal already used — no callback, no
+//! reverse leg); on a verified `approved` response it calls
+//! [`mark_outbound_awaiting_confirm`] to transition the entry to
+//! [`OutboundState::AwaitingConfirm`] and falls straight through to the SAME
+//! confirm-then-commit y/N prompt B's own approve already holds, only THEN
+//! calling `upsert_paired_peer` — the poll REPLACES the callback as the
+//! trigger for this transition; the state machine and the human-confirm gate
+//! it protects are otherwise unchanged. `peer pair reject <id>` aborts an
+//! outbound entry at EITHER state ([`OutboundState::AwaitingApproval`] or
+//! [`OutboundState::AwaitingConfirm`]) — the ceremony's own missing abort
+//! command, closed without a new command (golden count unchanged).
 //!
 //! **Ids are NOT the array-position ids `state/stage/pending.json` uses**
 //! (CONTRACTS.md's own doc for that file) — a pairing request's id is
@@ -318,6 +323,18 @@ pub struct InboundPairingRequest {
     pub requested_at: String,
     #[serde(rename = "expiresAt")]
     pub expires_at: String,
+    /// Design A (poll-based completion, task #119): `true` once this
+    /// instance's own operator has run `peer pair approve` on this entry —
+    /// set by [`mark_inbound_approved`], never unset. An approved entry
+    /// stays PARKED (never taken/removed the way the old callback-delivered
+    /// design removed it on success) so the requester's own `aoide/pairPoll`
+    /// can find it; it is cleaned up only by the ordinary expiry sweep
+    /// ([`sweep`]/[`pairing_timeout_secs`]), same as every other inbound
+    /// entry. `#[serde(default)]` so a file predating this field (none in
+    /// production yet — this phase is new) loads `false`, the same additive
+    /// discipline every other field in this struct already holds.
+    #[serde(default)]
+    pub approved: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -406,6 +423,7 @@ pub fn park_inbound(
         approver_nonce_hex: random_hex(16),
         requested_at: requested_at.to_string(),
         expires_at: expires_at.to_string(),
+        approved: false,
     };
     requests.push(entry.clone());
     save_inbound(&requests)?;
@@ -477,6 +495,48 @@ pub fn reveal_inbound(id: &str, nonce_hex: &str, now_epoch: i64) -> Result<Inbou
     let out = kept[idx].clone();
     if let Err(e) = save_inbound(&kept) {
         return Err(RevealError::Io(e));
+    }
+    Ok(out)
+}
+
+/// Why [`mark_inbound_approved`] refused — same machine-readable shape as
+/// [`RevealError`]/[`ConfirmMarkError`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkApprovedError {
+    /// No parked inbound request has this id (unknown, already resolved, or
+    /// expired).
+    Unknown,
+    /// Reading or writing `state/peer-pairing-inbound.json` itself failed.
+    Io(String),
+}
+
+/// Design A (poll-based completion, task #119): the APPROVER's own `peer
+/// pair approve <id>` calls this in place of the old callback delivery,
+/// AFTER it has already confirmed the SAS and committed its own peer
+/// record — the entry stays PARKED (never taken) with [`InboundPairingRequest::approved`]
+/// flipped `true`, so the requester's own `aoide/pairPoll` can find and
+/// release it later, however long after this CLI process exits. Idempotent:
+/// re-marking an already-approved entry is a no-op success, never an error —
+/// `approve_inbound`'s own idempotent-reapprove guard checks `approved`
+/// itself before ever calling this, but this function stays safe to call
+/// twice on its own merits too, the same tolerant-of-repetition posture
+/// [`park_outbound`]'s replace-by-id already holds.
+pub fn mark_inbound_approved(id: &str, now_epoch: i64) -> Result<InboundPairingRequest, MarkApprovedError> {
+    let all = load_inbound_raw();
+    let (mut kept, _expired) = sweep(all, now_epoch);
+    let idx = match kept.iter().position(|r| r.id == id) {
+        Some(i) => i,
+        None => {
+            if let Err(e) = save_inbound(&kept) {
+                return Err(MarkApprovedError::Io(e));
+            }
+            return Err(MarkApprovedError::Unknown);
+        }
+    };
+    kept[idx].approved = true;
+    let out = kept[idx].clone();
+    if let Err(e) = save_inbound(&kept) {
+        return Err(MarkApprovedError::Io(e));
     }
     Ok(out)
 }
@@ -1051,6 +1111,89 @@ mod tests {
         env(&dir);
 
         assert_eq!(reveal_inbound("nosuchid", "n", 0).unwrap_err(), RevealError::Unknown);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    // ── mark_inbound_approved (Design A, task #119) ──────────────────────
+
+    #[test]
+    fn mark_inbound_approved_sets_the_flag_and_leaves_the_entry_parked() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-pairing-mark-approved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        env(&dir);
+
+        let now = 1_700_000_000_i64;
+        let requested_at = crate::time::iso_utc_from_epoch(now);
+        let expires_at = expires_at_from(now);
+        let commit = derive_commit("pk", "nonce");
+        let entry = park_inbound("pk", "name", "addr", "url", &commit, &requested_at, &expires_at).unwrap();
+        reveal_inbound(&entry.id, "nonce", now).unwrap();
+        assert!(!entry.approved, "unapproved at park time");
+
+        let marked = mark_inbound_approved(&entry.id, now).unwrap();
+        assert!(marked.approved);
+
+        // Approving never removes the entry — the poll still needs to find
+        // it (module doc: "the entry stays PARKED, never taken").
+        let listed = list_inbound(now);
+        assert_eq!(listed.len(), 1, "an approved entry stays parked for the poll to find");
+        assert!(listed[0].approved);
+
+        // Re-marking an already-approved entry is a no-op success, not an
+        // error (module doc's own idempotence note).
+        let remarked = mark_inbound_approved(&entry.id, now).unwrap();
+        assert!(remarked.approved);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
+    fn mark_inbound_approved_on_an_unknown_id_is_refused() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-pairing-mark-approved-unknown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        env(&dir);
+
+        assert_eq!(mark_inbound_approved("nosuchid", 0).unwrap_err(), MarkApprovedError::Unknown);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
+    fn mark_inbound_approved_on_an_expired_entry_is_refused_the_same_as_unknown() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-pairing-mark-approved-expired-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        env(&dir);
+
+        let requested_at = 1_700_000_000_i64;
+        let commit = derive_commit("pk", "nonce");
+        let entry = park_inbound(
+            "pk", "name", "addr", "url", &commit,
+            &crate::time::iso_utc_from_epoch(requested_at),
+            &crate::time::iso_utc_from_epoch(requested_at + 10),
+        )
+        .unwrap();
+
+        let later = requested_at + 3600;
+        assert_eq!(mark_inbound_approved(&entry.id, later).unwrap_err(), MarkApprovedError::Unknown, "an expired entry is gone, same as never existed — the poll's own timeout expiry");
 
         let _ = std::fs::remove_dir_all(&dir);
         match saved {

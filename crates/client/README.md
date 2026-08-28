@@ -62,12 +62,15 @@ never the inbound/serve half (that's `aoide-server`).
   `aoide/pairRequest` call, carrying a `commitHex`, never a
   `nonceHex`), `build_pair_reveal_body`/
   `check_pair_reveal_response` (the requester's immediately-following
-  `aoide/pairReveal` call), and `build_pair_approve_body`/
-  `check_pair_approve_response` (the approver's `aoide/pairApprove`
-  callback) — pure JSON-RPC envelope builders/parsers only, same split as
-  the graphSummary pair above them; the server-side handlers
-  (`pair_request`/`pair_reveal`/`pair_approve_callback`) live in
-  `aoide-server::a2a`, never duplicated here.
+  `aoide/pairReveal` call), and `build_pair_poll_body`/
+  `parse_pair_poll_response` (the requester's `aoide/pairPoll` call —
+  Design A, task #119, REPLACES the old `aoide/pairApprove` reverse
+  callback: the requester polls the approver's door over the SAME forward
+  dial the request/reveal already used, rather than the approver ever
+  dialing back) — pure JSON-RPC envelope builders/parsers only, same split
+  as the graphSummary pair above them; the server-side handlers
+  (`pair_request`/`pair_reveal`/`pair_poll`) live in `aoide-server::a2a`,
+  never duplicated here.
 - `discover` — the discovery beacon's LISTEN half (P-P6,
   `docs/architecture/PAIRING.md`'s "Discovery (advertise-but-locked)"
   section): `run_sweep(secs)` joins `aoide_storage::beacon::GROUP`/`PORT`,
@@ -183,10 +186,11 @@ never the inbound/serve half (that's `aoide-server`).
   never touching the dial url) still verifies on the far end.
   `post_json_to_peer(peer, …)` resolves `peer.via` (keyed by `peer.name`);
   `post_json_via(logical_url, via, tunnel_key, …)` is the same funnel for
-  the three ceremony dials that have no `Peer` record yet
+  the ceremony dials that have no `Peer` record yet
   (`aoide/pairRequest`/`pairReveal` in `run_pair_request`,
-  `aoide/pairApprove` in `approve_inbound`) — keyed by the ceremony's own
-  local nickname. `spawn_on_peer_via(peer, text, via_override)` is
+  `aoide/pairPoll` in `approve_outbound` — Design A, task #119, keyed off
+  `entry.via` when the outbound entry recorded one) — keyed by the
+  ceremony's own local nickname. `spawn_on_peer_via(peer, text, via_override)` is
   `spawn_on_peer`'s own body plus an explicit override that beats
   `peer.via` (`peer spawn --via`); `spawn_on_peer` itself stays a thin
   `via_override: None` wrapper so `aoide-conduct`'s existing call site
@@ -255,15 +259,17 @@ never the inbound/serve half (that's `aoide-server`).
   `confirm` owns the `[y/N]` decoration now). `handle_peer_pair_request` sends
   the commitment and its reveal as two sequential POSTs in one invocation
   before ever computing a SAS. `handle_peer_pair_approve`
-  dispatches by direction: on an INBOUND entry (`approve_inbound`) it
-  refuses an unrevealed one outright, then delivers the `aoide/pairApprove`
-  callback to the requester BEFORE writing any local peer record — an
-  unreachable requester must leave BOTH ends unpaired, never just the
-  approver's; on an OUTBOUND entry (`approve_outbound`, reached only once
-  the approver's own callback already transitioned it to
-  `awaiting-confirm`) it makes no wire call at all and commits THIS
-  instance's own record directly on confirmation (decision 4's
-  mutual confirmation, on both ends). `approve_inbound`/`approve_outbound`
+  dispatches by direction (Design A, task #119 — REPLACES the old
+  `aoide/pairApprove` reverse callback): on an INBOUND entry
+  (`approve_inbound`) it refuses an unrevealed one outright, then commits a
+  local peer record and marks the entry approved PURELY LOCALLY — no wire
+  call at all, so an unreachable/loopback-only requester never blocks the
+  approver's own half; on an OUTBOUND entry (`approve_outbound`) it POLLS
+  `aoide/pairPoll` first (over the SAME forward dial `request` already
+  used — `entry.via` if one was recorded) and, once the poll comes back
+  approved, re-derives the SAME SAS and commits THIS instance's own record
+  on confirmation (decision 4's mutual confirmation, on both ends,
+  unchanged). `approve_inbound`/`approve_outbound`
   take a `skip_confirm: bool` (P-P5) rather than an `&Invocation` — a
   rename, not a behavior change: `handle_peer_pair_approve` still passes
   `inv.flag_present("yes")` through unchanged, and `pair_watch`'s own

@@ -391,8 +391,8 @@ fn post_json_to_peer_with_via_override(
 
 /// [`post_json`] wrapped with dial resolution for a CEREMONY call — no
 /// `Peer` record exists yet to read a marker off of ([`run_pair_request`]'s
-/// `aoide/pairRequest`/`aoide/pairReveal`, [`approve_inbound`]'s
-/// `aoide/pairApprove` callback), so `via`/`tunnel_key` are the CALLER's
+/// `aoide/pairRequest`/`aoide/pairReveal`, [`approve_outbound`]'s
+/// `aoide/pairPoll`), so `via`/`tunnel_key` are the CALLER's
 /// own resolution (an explicit `--via` flag; never auto-derived here).
 /// `bearer`/`extra_headers` are `None`/`&[]` at every real call site (the
 /// ceremony's own protocol, `client/AGENTS.md`) — kept as parameters
@@ -501,6 +501,30 @@ fn sign_headers_for_peer(peer: &aoide_storage::peer_store::Peer, body: &str) -> 
         (aoide_storage::wire_auth::HEADER_NONCE.to_string(), nonce),
         (aoide_storage::wire_auth::HEADER_SIGNATURE.to_string(), signature),
     ])
+}
+
+/// Build a SIGNED `aoide/pairPoll` body for pairing request `id` (Design A,
+/// task #119 — `approve_outbound`'s own poll step; REPLACES the old
+/// `aoide/pairApprove` reverse callback). Unlike [`sign_headers_for_peer`],
+/// this can be called with NO [`aoide_storage::peer_store::Peer`] record at
+/// all — none exists yet at poll time, that's the whole bootstrapping
+/// problem P-P4's header scheme can't solve here
+/// (`aoide-server::a2a::pair_poll`'s own doc). Signs
+/// `aoide_storage::wire_auth::canonical_string("PAIRPOLL", id, timestamp,
+/// nonce, &[])` with THIS instance's own identity — the SAME key that
+/// produced `pubkeyHex` in the original `aoide/pairRequest`, which is what
+/// the approver's door verifies against
+/// ([`aoide_storage::pairing::InboundPairingRequest::pubkey_hex`], captured
+/// at request time). Returns the serialized JSON-RPC body ready to POST.
+fn build_signed_pair_poll_body(id: &str) -> Result<String, String> {
+    let (keypair, _) =
+        aoide_storage::identity::load_or_mint().map_err(|e| format!("loading this instance's identity to poll pairing request `{id}`: {e}"))?;
+    let timestamp = aoide_storage::time::now_iso_utc();
+    let nonce = aoide_storage::pairing::random_hex(16);
+    let canonical = aoide_storage::wire_auth::canonical_string("PAIRPOLL", id, &timestamp, &nonce, &[]);
+    let signature = aoide_storage::wire_auth::sign_hex(&keypair, canonical.as_bytes());
+    let body = crate::peer::build_pair_poll_body(id, &timestamp, &nonce, &signature);
+    Ok(serde_json::to_string(&body).unwrap_or_default())
 }
 
 /// A unique `messageId` for one outbound `message/send` (pid + wall-clock
@@ -1340,9 +1364,8 @@ pub fn register_peers(r: &mut Registry) {
 // the legacy escape for an UNPAIRED peer (a hand-set URL, never verified by
 // key), `peer pair` is the ONE ceremony that mints a `pubkey`/`verified`
 // peer record on BOTH ends — request/reveal/park/approve/reject over the
-// A2A door (`aoide-server::a2a::pair_request`/`pair_reveal`/
-// `pair_approve_callback`), SAS derivation + display
-// (`aoide_storage::pairing::derive_sas`), commit via
+// A2A door (`aoide-server::a2a::pair_request`/`pair_reveal`/`pair_poll`),
+// SAS derivation + display (`aoide_storage::pairing::derive_sas`), commit via
 // `aoide_storage::peer_store::upsert_paired_peer` — which ALSO stamps the
 // ceremony's own default `allows` (`["read","spawn"]`) the first time a
 // peer becomes verified (P-P3, PAIRING.md decision 5); editing that default
@@ -1351,17 +1374,18 @@ pub fn register_peers(r: &mut Registry) {
 //
 // **Both humans confirm, for real (review-bounce Finding 2).** `peer pair
 // approve <id>` does double duty by DIRECTION, never a fifth command (golden
-// stays 76): on an INBOUND id (this instance is the APPROVER) it is the
-// ORIGINAL approve flow — re-derive the SAS, confirm, deliver the callback,
-// commit. On an OUTBOUND id whose entry has reached
-// `aoide_storage::pairing::OutboundState::AwaitingConfirm` (this instance is
-// the REQUESTER, and the approver's own callback already arrived) it is the
-// SAME confirm-then-commit shape, just committing THIS instance's own
-// record instead — no wire call needed at this step, since the approver
-// already committed its own record before ever sending the callback.
-// `peer pair reject <id>` doubles the same way, and on an outbound id is
-// also the ceremony's missing ABORT command: it removes the entry at EITHER
-// outbound state, before or after the callback arrives.
+// count unchanged by Design A, task #119 — no new command path, only the
+// completion trigger moved): on an INBOUND id (this instance is the
+// APPROVER) it is the ORIGINAL approve flow — re-derive the SAS, confirm,
+// commit LOCALLY, mark the entry approved for the requester's own poll to
+// find (no wire call at all — [`approve_inbound`]'s own doc). On an OUTBOUND
+// id (this instance is the REQUESTER) it POLLS the approver's door first
+// (over the SAME forward dial `peer pair request` already used), and only
+// once that poll comes back `approved` does it re-derive the SAME SAS and
+// confirm-then-commit ([`approve_outbound`]'s own doc has the full poll
+// mechanics). `peer pair reject <id>` doubles the same way, and on an
+// outbound id is also the ceremony's missing ABORT command: it removes the
+// entry at either outbound state, whether or not a poll has succeeded yet.
 
 /// Confirm the pairing SAS code matches — `true` only for `y`/`yes`
 /// (case-insensitive), EOF or anything else `false` (the ceremony's own
@@ -1405,9 +1429,10 @@ fn default_self_url() -> String {
 /// its own copy of the SAS (it already has everything: its own pubkey and
 /// nonce, the approver's pubkey and nonce from the first response) and
 /// remember the outbound request (`aoide_storage::pairing::park_outbound`,
-/// `OutboundState::AwaitingApproval`) so this instance's own `a2a serve`
-/// can finish the ceremony when the approval callback arrives, however long
-/// after this CLI process exits.
+/// `OutboundState::AwaitingApproval`) so a LATER `peer pair approve <id>`
+/// invocation — run whenever, long after this CLI process exits — can poll
+/// the approver's door for the release ([`approve_outbound`]'s own doc, task
+/// #119) and finish the ceremony.
 fn handle_peer_pair_request(inv: &Invocation) -> Outcome {
     let cmd = "peer.pair.request";
     const USAGE: &str = "usage: aoide peer pair request <url> [--name <n>] [--self-url <url>] [--via ssh://[user@]host[:port]] [--json]";
@@ -1596,10 +1621,14 @@ fn run_pair_request(
 /// inbound one awaiting approval — before this fix, nothing ever surfaced
 /// it). Inbound rows show a SAS only once revealed (`requester_nonce_hex`
 /// is `Some`, review-bounce Finding 1) — an unrevealed entry shows
-/// `"awaiting reveal"` instead, and `peer pair approve` refuses it. Outbound
-/// rows always carry a SAS (an outbound entry is only ever parked AFTER its
-/// own reveal already succeeded) plus its own `state`
-/// (`awaiting-approval`/`awaiting-confirm`). Every SAS shown here is
+/// `"awaiting reveal"` instead, and `peer pair approve` refuses it. An
+/// APPROVED inbound entry (Design A, task #119 — [`InboundPairingRequest::approved`])
+/// stays listed here too, showing `"approved · awaiting their poll"` — it
+/// remains parked (never taken) until the requester's own `aoide/pairPoll`
+/// releases it or it expires, so the approver's own operator can still see
+/// it's done its part. Outbound rows always carry a SAS (an outbound entry
+/// is only ever parked AFTER its own reveal already succeeded) plus its own
+/// `state` (`awaiting-approval`/`awaiting-confirm`). Every SAS shown here is
 /// independently derived from this instance's own identity plus the
 /// entry's stored transcript fields — never trusted from the wire — exactly
 /// what `peer pair approve` re-derives again before committing anything.
@@ -1628,7 +1657,7 @@ pub(crate) fn handle_peer_pair_pending(_inv: &Invocation) -> Outcome {
             .map(|n| aoide_storage::pairing::derive_sas(&e.pubkey_hex, &own_pubkey, n, &e.approver_nonce_hex));
         rows.push(json!({
             "id": e.id, "direction": "inbound", "name": e.name, "originAddr": e.origin_addr, "url": e.url,
-            "sas": sas, "revealed": e.requester_nonce_hex.is_some(),
+            "sas": sas, "revealed": e.requester_nonce_hex.is_some(), "approved": e.approved,
             "requestedAt": e.requested_at, "expiresAt": e.expires_at,
         }));
     }
@@ -1647,6 +1676,7 @@ pub(crate) fn handle_peer_pair_pending(_inv: &Invocation) -> Outcome {
             let dir = r["direction"].as_str().unwrap_or("");
             let status = match dir {
                 "inbound" if r["revealed"].as_bool() == Some(false) => "awaiting reveal".to_string(),
+                "inbound" if r["approved"].as_bool() == Some(true) => "approved · awaiting their poll".to_string(),
                 "inbound" => format!("code {}", r["sas"].as_str().unwrap_or("")),
                 _ => format!("code {} · {}", r["sas"].as_str().unwrap_or(""), r["state"].as_str().unwrap_or("")),
             };
@@ -1665,8 +1695,8 @@ pub(crate) fn handle_peer_pair_pending(_inv: &Invocation) -> Outcome {
 /// `peer pair approve <id> [--yes]` — dispatches by DIRECTION (module doc
 /// on this section): an INBOUND id runs [`approve_inbound`] (this instance
 /// is the APPROVER); an OUTBOUND id runs [`approve_outbound`] (this
-/// instance is the REQUESTER, confirming after the approver's own
-/// callback); an id in neither queue is `unknown-id`.
+/// instance is the REQUESTER, polling the approver's door then confirming);
+/// an id in neither queue is `unknown-id`.
 fn handle_peer_pair_approve(inv: &Invocation) -> Outcome {
     let cmd = "peer.pair.approve";
     let id = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -1693,12 +1723,26 @@ fn handle_peer_pair_approve(inv: &Invocation) -> Outcome {
 /// against). Otherwise re-derives the SAS from this instance's own identity
 /// plus the parked entry (never trusting a wire-supplied code) and requires
 /// an explicit `y`/`yes` confirmation (CLI prompt, or `--yes` for scripted
-/// tests) BEFORE anything commits. Delivers the `aoide/pairApprove`
-/// callback to the requester's own door FIRST — nothing local writes until
-/// that callback is acknowledged (PAIRING.md: "a parked request grants
-/// NOTHING until approved"; an unreachable requester must leave BOTH ends
-/// unpaired, not just one) — then commits THIS instance's own peer record
-/// (`upsert_paired_peer`) and removes the parked entry.
+/// tests) BEFORE anything commits.
+///
+/// **Design A (task #119): PURELY LOCAL — no network call at all.** The old
+/// shape delivered an `aoide/pairApprove` callback to the requester's own
+/// door FIRST, which meant a requester whose door was loopback-only
+/// ([[doors-loopback-only]]) could never be reached, and the ceremony could
+/// never complete. Now: commit THIS instance's own peer record
+/// (`upsert_paired_peer`), then mark the parked entry
+/// [`aoide_storage::pairing::InboundPairingRequest::approved`]
+/// (`mark_inbound_approved`) and leave it PARKED — never taken — so the
+/// requester's own `aoide/pairPoll` (over the SAME forward dial the request/
+/// reveal already used) can find and release it later, however long after
+/// this command exits. "A parked request grants NOTHING until approved"
+/// (PAIRING.md) still holds: nothing is released to anyone until BOTH this
+/// commit AND a correctly-signed poll from the ORIGINAL requester happen.
+///
+/// Idempotent: re-running this against an already-approved entry is a no-op
+/// success (no second SAS prompt, no second `upsert_paired_peer`) — the
+/// operator may have run it twice, or the popup arm may re-offer a stale
+/// row before its own state catches up.
 ///
 /// `skip_confirm` (P-P5): `true` bypasses the SAS prompt outright — the
 /// popup arm's own dialog IS the confirmation (an operator who clicked
@@ -1714,6 +1758,14 @@ pub(crate) fn approve_inbound(
     now: &str,
     now_epoch: i64,
 ) -> Outcome {
+    if entry.approved {
+        return Outcome::ok(
+            cmd,
+            format!("already approved `{}` — waiting for their own `peer pair approve {id}` to complete their side", entry.name),
+        )
+        .with_data(json!({ "confirmed": true, "id": id, "peer": entry.name, "alreadyApproved": true }));
+    }
+
     let Some(requester_nonce) = entry.requester_nonce_hex.clone() else {
         return Outcome::error(
             cmd,
@@ -1753,43 +1805,6 @@ pub(crate) fn approve_inbound(
         }
     }
 
-    let body = crate::peer::build_pair_approve_body(&entry.id, &own_pubkey);
-    let body_str = serde_json::to_string(&body).unwrap_or_default();
-    // P-S4: wired through the SAME dial-resolution funnel every other
-    // outbound POST uses, keyed by `entry.name` (already `valid_peer_name`-
-    // shaped — the server validates it before ever parking this entry,
-    // `a2a.rs::pair_request`). `via` is always `None` here today —
-    // `InboundPairingRequest` (`storage/src/pairing.rs`) carries no
-    // transport marker of its own, and `peer pair approve` has no `--via`
-    // flag (only `peer.invite`/`peer.pair.request`/`peer.spawn`/`peer.add`
-    // do, per this phase's scope) — so this callback dials `entry.url`
-    // directly, byte-identical to before this funnel existed. Reaching the
-    // REQUESTER through a tunnel when its own door is loopback-bound is a
-    // real, unresolved gap (the plan's R5/K1 "reverse direction") — left
-    // for a follow-on, not silently worked around here.
-    let (code, resp_body) = match post_json_via(&entry.url, None, &entry.name, &body_str, None, &[], 15) {
-        Ok(v) => v,
-        Err(e) => {
-            return Outcome::error(
-                cmd,
-                format!(
-                    "delivering the approval to `{}` at {}: {e} — the request remains pending; \
-                     retry `aoide peer pair approve {id}` once it's reachable",
-                    entry.name, entry.url
-                ),
-            )
-            .with_data(json!({ "reason": "callback-unreachable", "id": id, "sas": sas }))
-        }
-    };
-    if code != 200 {
-        return Outcome::error(cmd, format!("delivering the approval to `{}`: HTTP {code}", entry.name))
-            .with_data(json!({ "reason": "callback-http-error", "id": id, "httpCode": code }));
-    }
-    let parsed_resp: Value = serde_json::from_str(&resp_body).unwrap_or(Value::Null);
-    if let Err(e) = crate::peer::check_pair_approve_response(&parsed_resp) {
-        return Outcome::error(cmd, e).with_data(json!({ "reason": "callback-refused", "id": id }));
-    }
-
     // P-S4: the APPROVER's own commit — unlike `approve_outbound`'s
     // sibling call below, this deliberately does NOT call `set_peer_via`.
     // `InboundPairingRequest` (`storage/src/pairing.rs`) carries no
@@ -1797,36 +1812,60 @@ pub(crate) fn approve_inbound(
     // `origin_addr` reads "loopback", per §0.7 — not a usable source), and
     // no `--via` flag exists on `peer pair approve` (out of this phase's
     // scope). The new peer's `via` is left `None` — the same "absent by
-    // default" a fresh `Peer` already carries; reaching a loopback-bound
-    // requester through a tunnel is the plan's own R5/K1 "reverse
-    // direction," unresolved here.
+    // default" a fresh `Peer` already carries.
     let mut peers = aoide_storage::peer_store::load_peers();
     let change = aoide_storage::peer_store::upsert_paired_peer(&mut peers, &entry.name, &entry.url, &entry.pubkey_hex, now);
     if let Err(e) = aoide_storage::peer_store::save_peers(&peers) {
         return Outcome::error(cmd, format!("writing the peer registry: {e}"));
     }
-    let _ = aoide_storage::pairing::take_inbound(id, now_epoch);
+    // Design A: mark approved, never take — the entry stays parked for the
+    // requester's own poll to find (module doc above).
+    let _ = aoide_storage::pairing::mark_inbound_approved(id, now_epoch);
 
     use aoide_storage::peer_store::PairChange;
     let word = match change {
         PairChange::Inserted => "paired with",
         PairChange::Updated => "re-paired with",
     };
-    Outcome::ok(cmd, format!("{word} `{}` (code {sas}) — verified", entry.name))
-        .changed(vec![aoide_storage::peer_store::peers_path().to_string_lossy().into_owned()])
-        .with_data(json!({ "confirmed": true, "sas": sas, "peer": entry.name, "pubkeyHex": entry.pubkey_hex, "direction": "inbound" }))
+    Outcome::ok(
+        cmd,
+        format!(
+            "{word} `{}` (code {sas}) — verified; awaiting their own `peer pair approve {id}` to poll and complete their side",
+            entry.name
+        ),
+    )
+    .changed(vec![aoide_storage::peer_store::peers_path().to_string_lossy().into_owned()])
+    .with_data(json!({ "confirmed": true, "sas": sas, "peer": entry.name, "pubkeyHex": entry.pubkey_hex, "direction": "inbound" }))
 }
 
-/// The REQUESTER's confirm-then-commit half of `peer pair approve` (this
-/// instance holds the OUTBOUND entry, review-bounce Finding 2). Refuses
-/// while the entry is still `awaiting-approval` — the approver's own
-/// `aoide/pairApprove` callback hasn't arrived yet, so there is nothing to
-/// confirm. Once it has (`OutboundState::AwaitingConfirm`), re-derives the
-/// SAS from this instance's own identity plus the entry's stored transcript
-/// (never trusting the wire) and requires the SAME explicit `y`/`yes`
-/// confirmation the approver's own side holds — only THEN commits this
-/// instance's own peer record. No wire call here: the approver already
-/// committed its own record before ever sending the callback.
+/// The REQUESTER's poll-then-confirm-then-commit half of `peer pair
+/// approve` (this instance holds the OUTBOUND entry, review-bounce
+/// Finding 2's mutual confirmation, preserved).
+///
+/// **Design A (task #119): POLLS instead of waiting on a callback.** The old
+/// shape refused outright while `state == AwaitingApproval`, waiting for an
+/// `aoide/pairApprove` callback the approver's door would dial in to
+/// deliver — unreachable when THIS instance's own door is loopback-only
+/// ([[doors-loopback-only]]). Now, while still `AwaitingApproval`, this POSTs
+/// a SIGNED `aoide/pairPoll` to the approver's door (`build_signed_pair_poll_body`,
+/// over the SAME forward dial `peer pair request`'s own two POSTs already
+/// used — `entry.via` if one was recorded, never a reverse leg). A `pending`
+/// answer refuses with the SAME "still awaiting the peer's own approval"
+/// message the old callback-wait refusal gave (an ordinary, expected outcome
+/// while the operators are still comparing codes out loud). An `approved`
+/// answer calls [`aoide_storage::pairing::mark_outbound_awaiting_confirm`] —
+/// the EXACT function the old callback handler used to call server-side,
+/// only the TRIGGER moved to this poll — which rejects a pubkey that doesn't
+/// match what THIS instance learned at request time (the SAS/transcript
+/// binding: a substituted reveal is refused here, entry untouched, exactly
+/// as the old callback's own mismatch handling refused it). From there on
+/// (now `AwaitingConfirm`, whether transitioned just now or already so from
+/// an earlier poll where the operator declined the confirm prompt) this
+/// re-derives the SAS from this instance's own identity plus the entry's
+/// stored transcript (never trusting the wire) and requires the SAME
+/// explicit `y`/`yes` confirmation the approver's own side holds — only THEN
+/// commits this instance's own peer record. The approver already committed
+/// its own record locally, before this instance ever polled.
 ///
 /// `skip_confirm` (P-P5): same meaning as [`approve_inbound`]'s own
 /// parameter — the popup arm's dialog IS the confirmation.
@@ -1838,18 +1877,71 @@ pub(crate) fn approve_outbound(
     now: &str,
     now_epoch: i64,
 ) -> Outcome {
-    if entry.state != aoide_storage::pairing::OutboundState::AwaitingConfirm {
-        return Outcome::error(
-            cmd,
-            format!(
-                "pairing request `{id}` to `{}` is still awaiting the peer's own approval — nothing to confirm yet; \
-                 try again once they've run `aoide peer pair approve {id}` on their side, or \
-                 `aoide peer pair reject {id}` to abort",
-                entry.name
-            ),
-        )
-        .with_data(json!({ "reason": "awaiting-peer-approval", "id": id }));
-    }
+    let entry = if entry.state == aoide_storage::pairing::OutboundState::AwaitingApproval {
+        let poll_body = match build_signed_pair_poll_body(id) {
+            Ok(b) => b,
+            Err(e) => return Outcome::error(cmd, e).with_data(json!({ "reason": "identity-io-failed", "id": id })),
+        };
+        let via = match entry.via.as_deref().map(aoide_storage::tunnel::parse_via).transpose() {
+            Ok(v) => v,
+            Err(e) => return Outcome::error(cmd, format!("the pairing request's own recorded `via` no longer parses: {e}")),
+        };
+        let (code, resp_body) = match post_json_via(&entry.url, via.as_ref(), &entry.name, &poll_body, None, &[], 15) {
+            Ok(v) => v,
+            Err(e) => {
+                return Outcome::error(
+                    cmd,
+                    format!("polling `{}` at {}: {e} — retry `aoide peer pair approve {id}` once it's reachable", entry.name, entry.url),
+                )
+                .with_data(json!({ "reason": "poll-unreachable", "id": id }))
+            }
+        };
+        if code != 200 {
+            return Outcome::error(cmd, format!("polling `{}`: HTTP {code}", entry.name))
+                .with_data(json!({ "reason": "poll-http-error", "id": id, "httpCode": code }));
+        }
+        let parsed: Value = serde_json::from_str(&resp_body).unwrap_or(Value::Null);
+        let status = match crate::peer::parse_pair_poll_response(&parsed) {
+            Ok(s) => s,
+            Err(e) => return Outcome::error(cmd, e).with_data(json!({ "reason": "poll-refused", "id": id })),
+        };
+        let polled_pubkey = match status {
+            crate::peer::PairPollStatus::Pending => {
+                return Outcome::error(
+                    cmd,
+                    format!(
+                        "pairing request `{id}` to `{}` is still awaiting the peer's own approval — nothing to confirm yet; \
+                         try again once they've run `aoide peer pair approve {id}` on their side, or \
+                         `aoide peer pair reject {id}` to abort",
+                        entry.name
+                    ),
+                )
+                .with_data(json!({ "reason": "awaiting-peer-approval", "id": id }))
+            }
+            crate::peer::PairPollStatus::Approved { pubkey_hex } => pubkey_hex,
+        };
+        // The SAS/transcript binding (review-bounce Finding 2, preserved):
+        // a released pubkey that does not match what THIS instance learned
+        // at request time is refused here, entry untouched — the SAME
+        // rejection the old callback's own mismatch handling gave.
+        match aoide_storage::pairing::mark_outbound_awaiting_confirm(id, &polled_pubkey, now_epoch) {
+            Ok(marked) => marked,
+            Err(aoide_storage::pairing::ConfirmMarkError::Mismatch) => {
+                return Outcome::error(
+                    cmd,
+                    format!("the peer's released identity does not match what this instance learned at request time for `{}` — refusing to bind a substituted reveal", entry.name),
+                )
+                .with_data(json!({ "reason": "reveal-mismatch", "id": id }))
+            }
+            Err(aoide_storage::pairing::ConfirmMarkError::Unknown) => {
+                return Outcome::error(cmd, format!("no pending outbound pairing request with id `{id}` (unknown, already resolved, or expired)"))
+                    .with_data(json!({ "reason": "unknown-id", "id": id }))
+            }
+            Err(aoide_storage::pairing::ConfirmMarkError::Io(e)) => return Outcome::error(cmd, format!("resolving the outbound pairing request: {e}")),
+        }
+    } else {
+        entry
+    };
 
     let (kp, _) = match aoide_storage::identity::load_or_mint() {
         Ok(v) => v,
@@ -2220,7 +2312,7 @@ pub fn register_peer_pair(r: &mut Registry) {
         args: [arg!("url", "string", true, "The other instance's A2A door URL (e.g. http://host:8710/).")],
         flags: [
             flag!("name", "string", "A local nickname for the other instance; defaults to a sanitized form of the URL's host."),
-            flag!("self-url", "string", "This instance's own advertised A2A door URL, for the later approval callback; defaults to http://<host>:<AOIDE_A2A_PORT or 8710>/."),
+            flag!("self-url", "string", "This instance's own advertised A2A door URL, recorded on the resulting peer record for the approver's future non-ceremony calls (the ceremony itself now polls, so this is no longer dialed to complete pairing); defaults to http://<host>:<AOIDE_A2A_PORT or 8710>/."),
             flag!("via", "string", "An ssh://[user@]host[:port] transport marker — both the ceremony's own dial AND the resulting peer's recorded via. Absent = direct dial (today's behavior)."),
         ],
         gated: false,
@@ -2238,7 +2330,7 @@ pub fn register_peer_pair(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["peer", "pair", "approve"],
-        summary: "Approve a pending pairing request after confirming its code matches (CLI y/N unless --yes) — writes verified peer records on both ends.",
+        summary: "Approve a pending pairing request after confirming its code matches (CLI y/N unless --yes) — the approver commits locally, the requester polls for the release then commits; run on both ends.",
         args: [arg!("id", "string", true, "The pending pairing request's id (see `peer pair pending`).")],
         flags: [
             flag!("yes", "bool", "Skip the interactive y/N confirmation (scripted use)."),
@@ -3215,6 +3307,213 @@ mod tests {
                 Ok(_) => {} // a bounded curl call against the seeded listener may also just succeed/timeout cleanly
             }
             drop(listener);
+        });
+    }
+
+    // ── Design A (task #119): poll-based pairing completion ─────────────
+    // ── no approver->requester network callback exists any more ─────────
+
+    /// `approve_inbound`'s own commit is now PURELY LOCAL (module doc) — the
+    /// old shape's ONE network call (the `aoide/pairApprove` callback) is
+    /// gone outright. Proven the same way `handle_peer_add_no_verify_
+    /// never_invokes_curl` proves an external binary was never invoked: a
+    /// fake `curl` dropped on `PATH` that touches a marker file if ever run.
+    /// This is THE test that pins "no approver->requester network callback
+    /// happens" at the client layer (the a2a.rs full-ceremony test pins the
+    /// same invariant one layer down, by never dialing an undialable url).
+    #[test]
+    fn approve_inbound_never_invokes_curl_purely_local_commit() {
+        with_peer_state("approve-inbound-no-curl", || {
+            let now = aoide_storage::time::now_iso_utc();
+            let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
+            let pubkey_a = "a".repeat(64);
+            aoide_storage::pairing::park_inbound(
+                &pubkey_a,
+                "box-a",
+                "10.0.0.5",
+                "http://box-a-is-loopback-only.invalid/",
+                &aoide_storage::pairing::derive_commit(&pubkey_a, &"c".repeat(32)),
+                &now,
+                &aoide_storage::pairing::expires_at_from(now_epoch),
+            )
+            .unwrap();
+            let entry = aoide_storage::pairing::list_inbound(now_epoch).into_iter().next().unwrap();
+            let id = entry.id.clone();
+            aoide_storage::pairing::reveal_inbound(&id, &"c".repeat(32), now_epoch).unwrap();
+            let entry = aoide_storage::pairing::list_inbound(now_epoch).into_iter().next().unwrap();
+
+            let shim_dir = std::env::temp_dir().join(format!(
+                "aoide-client-approve-inbound-curlshim-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            ));
+            std::fs::create_dir_all(&shim_dir).unwrap();
+            let marker = shim_dir.join("curl-was-invoked");
+            let shim = shim_dir.join("curl");
+            std::fs::write(&shim, format!("#!/bin/sh\ntouch {}\nexit 1\n", marker.display())).unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let saved_path = std::env::var("PATH").ok();
+            std::env::set_var("PATH", format!("{}:{}", shim_dir.display(), saved_path.clone().unwrap_or_default()));
+
+            let outcome = approve_inbound(true, "peer.pair.approve", &id, entry, &now, now_epoch);
+
+            match saved_path {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+            let curl_ran = marker.exists();
+            let _ = std::fs::remove_dir_all(&shim_dir);
+
+            assert_eq!(outcome.status, aoide_protocol::output::Status::Ok, "{outcome:?}");
+            assert!(!curl_ran, "approving an inbound request must never invoke curl — it is purely local");
+
+            let peers = aoide_storage::peer_store::load_peers();
+            assert_eq!(peers.len(), 1);
+            assert!(peers[0].verified);
+            let listed = aoide_storage::pairing::list_inbound(now_epoch);
+            assert_eq!(listed.len(), 1, "the entry stays parked for the requester's own poll");
+            assert!(listed[0].approved);
+        });
+    }
+
+    /// A fake `aoide/pairPoll` responder — ANY POST gets the same canned
+    /// JSON reply, mirroring `spawn_fake_card_server`'s exact shape one
+    /// section up (this crate's own established real-curl-real-listener
+    /// pattern for proving a wire path end to end, not mocked away).
+    fn spawn_fake_pair_poll_server(body: &'static str) -> (std::net::TcpListener, u16) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepter = listener.try_clone().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            loop {
+                let Ok((mut stream, _)) = accepter.accept() else { break };
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (listener, port)
+    }
+
+    fn sample_outbound_awaiting_approval(id: &str, url: &str, pubkey_hex: &str) -> aoide_storage::pairing::OutboundPairingRequest {
+        // Relative to REAL current time (not a fixed historical epoch like
+        // this module's other `sample_outbound` fixtures use) — the tests
+        // below drive `mark_outbound_awaiting_confirm`/`list_outbound` with
+        // the ACTUAL current `now_epoch`, so `expires_at` must actually be
+        // in the future relative to that, or the entry sweeps away as
+        // expired before the poll ever runs.
+        let now = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
+        aoide_storage::pairing::OutboundPairingRequest {
+            id: id.to_string(),
+            url: url.to_string(),
+            name: "box-b".to_string(),
+            pubkey_hex: pubkey_hex.to_string(),
+            requester_nonce_hex: "c".repeat(32),
+            approver_nonce_hex: "d".repeat(32),
+            requested_at: aoide_storage::time::iso_utc_from_epoch(now),
+            expires_at: aoide_storage::pairing::expires_at_from(now),
+            state: aoide_storage::pairing::OutboundState::AwaitingApproval,
+            via: None,
+        }
+    }
+
+    /// `approve_outbound`'s own poll step, proven end to end through a REAL
+    /// local HTTP responder (no mock) answering `{"status":"approved",
+    /// "pubkeyHex":<the SAME pubkey the entry already learned at request
+    /// time>}` — the poll REPLACES the old reverse callback, over the SAME
+    /// forward dial (module doc on `approve_outbound`, task #119).
+    #[test]
+    fn approve_outbound_polls_a_real_server_and_completes_on_an_approved_matching_release() {
+        with_peer_state("approve-outbound-poll-approved", || {
+            let pubkey_b = "b".repeat(64);
+            let body: String = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"status":"approved","pubkeyHex":"{pubkey_b}"}}}}"#);
+            let body: &'static str = Box::leak(body.into_boxed_str());
+            let (_listener, port) = spawn_fake_pair_poll_server(body);
+            let url = format!("http://127.0.0.1:{port}/");
+            let entry = sample_outbound_awaiting_approval("deadbeef", &url, &pubkey_b);
+            aoide_storage::pairing::park_outbound(entry.clone()).unwrap();
+
+            let now = aoide_storage::time::now_iso_utc();
+            let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
+            let outcome = approve_outbound(true, "peer.pair.approve", "deadbeef", entry, &now, now_epoch);
+            assert_eq!(outcome.status, aoide_protocol::output::Status::Ok, "{outcome:?}");
+
+            let peers = aoide_storage::peer_store::load_peers();
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].name, "box-b");
+            assert_eq!(peers[0].pubkey.as_deref(), Some(pubkey_b.as_str()));
+            assert!(peers[0].verified);
+            assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "the outbound entry is consumed on commit");
+        });
+    }
+
+    /// A poll answering `{"status":"pending"}` refuses with the SAME
+    /// "still awaiting the peer's own approval" message the old
+    /// callback-wait refusal gave — an ordinary, expected outcome; the
+    /// outbound entry is untouched, so a later retry can still resolve it.
+    #[test]
+    fn approve_outbound_polls_a_real_server_and_refuses_cleanly_while_pending() {
+        with_peer_state("approve-outbound-poll-pending", || {
+            let pubkey_b = "b".repeat(64);
+            let (_listener, port) = spawn_fake_pair_poll_server(r#"{"jsonrpc":"2.0","id":1,"result":{"status":"pending"}}"#);
+            let url = format!("http://127.0.0.1:{port}/");
+            let entry = sample_outbound_awaiting_approval("deadbeef", &url, &pubkey_b);
+            aoide_storage::pairing::park_outbound(entry.clone()).unwrap();
+
+            let now = aoide_storage::time::now_iso_utc();
+            let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
+            let outcome = approve_outbound(true, "peer.pair.approve", "deadbeef", entry, &now, now_epoch);
+            assert_eq!(outcome.status, aoide_protocol::output::Status::Error, "{outcome:?}");
+            assert_eq!(outcome.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("awaiting-peer-approval"));
+
+            assert!(aoide_storage::peer_store::load_peers().is_empty(), "nothing commits while still pending");
+            let listed = aoide_storage::pairing::list_outbound(now_epoch);
+            assert_eq!(listed.len(), 1, "a pending poll leaves the entry untouched for a later retry");
+            assert_eq!(listed[0].state, aoide_storage::pairing::OutboundState::AwaitingApproval);
+        });
+    }
+
+    /// The SAS/transcript binding rejects a SUBSTITUTED reveal: a poll
+    /// answering `approved` with a pubkey that does NOT match what this
+    /// instance learned at the original `aoide/pairRequest` time is refused
+    /// — nothing commits, the entry is left untouched (the SAME rejection
+    /// the old callback's own pubkey-mismatch handling gave, review-bounce
+    /// Finding 2, preserved under Design A).
+    #[test]
+    fn approve_outbound_rejects_a_substituted_pubkey_release_and_commits_nothing() {
+        with_peer_state("approve-outbound-poll-mismatch", || {
+            let real_pubkey_b = "b".repeat(64);
+            let substituted_pubkey = "f".repeat(64);
+            let body: String = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"status":"approved","pubkeyHex":"{substituted_pubkey}"}}}}"#);
+            let body: &'static str = Box::leak(body.into_boxed_str());
+            let (_listener, port) = spawn_fake_pair_poll_server(body);
+            let url = format!("http://127.0.0.1:{port}/");
+            let entry = sample_outbound_awaiting_approval("deadbeef", &url, &real_pubkey_b);
+            aoide_storage::pairing::park_outbound(entry.clone()).unwrap();
+
+            let now = aoide_storage::time::now_iso_utc();
+            let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
+            let outcome = approve_outbound(true, "peer.pair.approve", "deadbeef", entry, &now, now_epoch);
+            assert_eq!(outcome.status, aoide_protocol::output::Status::Error, "{outcome:?}");
+            assert_eq!(outcome.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("reveal-mismatch"));
+
+            assert!(aoide_storage::peer_store::load_peers().is_empty(), "a substituted release must never commit a peer record");
+            let listed = aoide_storage::pairing::list_outbound(now_epoch);
+            assert_eq!(listed.len(), 1, "the entry is left untouched, never removed, on a mismatch");
+            assert_eq!(listed[0].state, aoide_storage::pairing::OutboundState::AwaitingApproval, "never advances past awaiting-approval on a mismatch");
+            assert_eq!(listed[0].pubkey_hex, real_pubkey_b, "the ORIGINAL learned pubkey stays on record, never overwritten by the substituted one");
         });
     }
 }

@@ -7,19 +7,21 @@
 //! the curl transport + CLI commands (`peer add|remove|pull|status`) live
 //! in `commands.rs`, same split `wire.rs`/`commands.rs` hold throughout.
 //!
-//! The pairing ceremony's three wire shapes (P-P2, CONTRACTS.md §6) join the
-//! same split: [`build_pair_request_body`]/[`parse_pair_request_response`]
-//! for the requester's `aoide/pairRequest` call (carrying a COMMITMENT to
-//! its own nonce, never the nonce itself — the commit-then-reveal fix,
+//! The pairing ceremony's wire shapes (P-P2, CONTRACTS.md §6) join the same
+//! split: [`build_pair_request_body`]/[`parse_pair_request_response`] for
+//! the requester's `aoide/pairRequest` call (carrying a COMMITMENT to its
+//! own nonce, never the nonce itself — the commit-then-reveal fix,
 //! `aoide_storage::pairing`'s module doc), [`build_pair_reveal_body`]/
 //! [`check_pair_reveal_response`] for the requester's immediate follow-up
 //! `aoide/pairReveal` call (same `peer pair request` invocation, two
-//! sequential POSTs), and [`build_pair_approve_body`]/
-//! [`check_pair_approve_response`] for the approver's `aoide/pairApprove`
-//! callback — the server-side handlers live in `aoide-server::a2a`
-//! (`pair_request`/`pair_reveal`/`pair_approve_callback`), never duplicated
-//! here; this module only builds/parses the JSON-RPC envelope either side
-//! of that wire.
+//! sequential POSTs), and [`build_pair_poll_body`]/[`parse_pair_poll_response`]
+//! for the requester's `aoide/pairPoll` call (Design A, task #119 — REPLACES
+//! the old `aoide/pairApprove` reverse callback: the requester POLLS the
+//! approver's door over the SAME forward dial the request/reveal already
+//! used, rather than the approver ever dialing back) — the server-side
+//! handlers live in `aoide-server::a2a` (`pair_request`/`pair_reveal`/
+//! `pair_poll`), never duplicated here; this module only builds/parses the
+//! JSON-RPC envelope either side of that wire.
 
 use aoide_protocol::wire::JsonRpcRequest;
 use aoide_storage::peer_store::PeerCacheEntry;
@@ -145,42 +147,70 @@ pub fn build_pair_reveal_body(id: &str, nonce_hex: &str) -> Value {
     serde_json::to_value(&req).expect("JsonRpcRequest always serializes")
 }
 
-/// Build the JSON-RPC `aoide/pairApprove` body the APPROVER's `peer pair
-/// approve` POSTs back to the requester's own door once its operator has
-/// confirmed the SAS — `id` is the SAME id `aoide/pairRequest` returned;
-/// `pubkey_hex` is the approver's own public key. Pure.
-pub fn build_pair_approve_body(id: &str, pubkey_hex: &str) -> Value {
+/// Build the JSON-RPC `aoide/pairPoll` body the REQUESTER's `peer pair
+/// approve <id>` POSTs to the APPROVER's door (Design A, task #119 — REPLACES
+/// the old `aoide/pairApprove` reverse callback), asking "has this been
+/// approved yet?" `id` is the SAME id `aoide/pairRequest` returned;
+/// `timestamp_iso`/`nonce_hex`/`signature_hex` are the requester's own
+/// self-contained signature over
+/// `aoide_storage::wire_auth::canonical_string("PAIRPOLL", id, timestamp_iso,
+/// nonce_hex, &[])`, signed with the requester's OWN identity — never P-P4's
+/// header-based scheme, which needs a verified peer record that doesn't
+/// exist yet at poll time (`aoide-server::a2a::pair_poll`'s own doc has the
+/// full bootstrapping reasoning). Pure.
+pub fn build_pair_poll_body(id: &str, timestamp_iso: &str, nonce_hex: &str, signature_hex: &str) -> Value {
     let req = JsonRpcRequest {
         jsonrpc: "2.0".to_string(),
         id: json!(1),
-        method: "aoide/pairApprove".to_string(),
-        params: json!({ "id": id, "pubkeyHex": pubkey_hex }),
+        method: "aoide/pairPoll".to_string(),
+        params: json!({ "id": id, "timestampIso": timestamp_iso, "nonceHex": nonce_hex, "signatureHex": signature_hex }),
     };
     serde_json::to_value(&req).expect("JsonRpcRequest always serializes")
 }
 
-/// The shared shape [`check_pair_reveal_response`]/[`check_pair_approve_response`]
-/// both check: a JSON-RPC `error` becomes a refusal message prefixed by
-/// `refusal_prefix`; anything else is `Ok(())` — neither reply carries any
-/// data this crate needs to parse structurally beyond that. Pure.
-fn check_ok_response(resp: &Value, refusal_prefix: &str) -> Result<(), String> {
+/// `aoide/pairPoll`'s two possible outcomes (never a third — the door's own
+/// existence-oracle discipline collapses "unknown id"/"wrong signer"/"not
+/// yet approved" into the SAME [`PairPollStatus::Pending`]). `Approved`
+/// carries the approver's own public key, freshly re-derived on that side —
+/// the requester's caller ([`crate::commands::approve_outbound`]) is what
+/// binds this to the transcript it already holds
+/// (`aoide_storage::pairing::mark_outbound_awaiting_confirm`'s own mismatch
+/// check), never trusted blindly here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PairPollStatus {
+    Pending,
+    Approved { pubkey_hex: String },
+}
+
+/// Parse the `aoide/pairPoll` response. Pure.
+pub fn parse_pair_poll_response(resp: &Value) -> Result<PairPollStatus, String> {
     if let Some(err) = resp.get("error") {
         let detail = err.get("message").and_then(Value::as_str).unwrap_or("(no message)");
-        return Err(format!("{refusal_prefix}: {detail}"));
+        return Err(format!("the peer refused the poll: {detail}"));
+    }
+    let result = resp.get("result").ok_or_else(|| "response has no `result`".to_string())?;
+    match result.get("status").and_then(Value::as_str) {
+        Some("approved") => {
+            let pubkey_hex = result
+                .get("pubkeyHex")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "an `approved` poll response has no `pubkeyHex`".to_string())?
+                .to_string();
+            Ok(PairPollStatus::Approved { pubkey_hex })
+        }
+        Some("pending") => Ok(PairPollStatus::Pending),
+        other => Err(format!("unrecognized poll status: {other:?}")),
+    }
+}
+
+/// `aoide/pairReveal`'s reply carries only `{ok}` — a JSON-RPC `error`
+/// becomes a refusal message; anything else is `Ok(())`. Pure.
+pub fn check_pair_reveal_response(resp: &Value) -> Result<(), String> {
+    if let Some(err) = resp.get("error") {
+        let detail = err.get("message").and_then(Value::as_str).unwrap_or("(no message)");
+        return Err(format!("the peer refused the reveal: {detail}"));
     }
     Ok(())
-}
-
-/// `aoide/pairReveal`'s reply carries only `{ok}` — see [`check_ok_response`].
-/// Pure.
-pub fn check_pair_reveal_response(resp: &Value) -> Result<(), String> {
-    check_ok_response(resp, "the peer refused the reveal")
-}
-
-/// `aoide/pairApprove`'s reply carries only `{ok, name}` — see
-/// [`check_ok_response`]. Pure.
-pub fn check_pair_approve_response(resp: &Value) -> Result<(), String> {
-    check_ok_response(resp, "the requester refused the approval")
 }
 
 #[cfg(test)]
@@ -284,16 +314,35 @@ mod tests {
     }
 
     #[test]
-    fn build_pair_approve_body_matches_the_jsonrpc_shape() {
-        let body = build_pair_approve_body("abc12345", "pk");
-        assert_eq!(body["method"], "aoide/pairApprove");
+    fn build_pair_poll_body_matches_the_jsonrpc_shape() {
+        let body = build_pair_poll_body("abc12345", "2026-08-28T00:00:00Z", "n1", "sig");
+        assert_eq!(body["method"], "aoide/pairPoll");
         assert_eq!(body["params"]["id"], "abc12345");
-        assert_eq!(body["params"]["pubkeyHex"], "pk");
+        assert_eq!(body["params"]["timestampIso"], "2026-08-28T00:00:00Z");
+        assert_eq!(body["params"]["nonceHex"], "n1");
+        assert_eq!(body["params"]["signatureHex"], "sig");
     }
 
     #[test]
-    fn check_pair_approve_response_passes_ok_and_surfaces_an_error() {
-        assert!(check_pair_approve_response(&json!({ "result": { "ok": true, "name": "box-a" } })).is_ok());
-        assert!(check_pair_approve_response(&json!({ "error": { "code": -32001, "message": "unknown id" } })).is_err());
+    fn parse_pair_poll_response_extracts_pending_and_approved() {
+        assert_eq!(parse_pair_poll_response(&json!({ "result": { "status": "pending" } })).unwrap(), PairPollStatus::Pending);
+        assert_eq!(
+            parse_pair_poll_response(&json!({ "result": { "status": "approved", "pubkeyHex": "b".repeat(64) } })).unwrap(),
+            PairPollStatus::Approved { pubkey_hex: "b".repeat(64) }
+        );
+    }
+
+    #[test]
+    fn parse_pair_poll_response_rejects_an_error_missing_pubkey_or_unrecognized_status() {
+        let err_resp = json!({ "error": { "code": -32602, "message": "invalid params" } });
+        assert!(parse_pair_poll_response(&err_resp).is_err());
+
+        let missing_pubkey = json!({ "result": { "status": "approved" } });
+        assert!(parse_pair_poll_response(&missing_pubkey).is_err());
+
+        let bad_status = json!({ "result": { "status": "???" } });
+        assert!(parse_pair_poll_response(&bad_status).is_err());
+
+        assert!(parse_pair_poll_response(&json!({})).is_err());
     }
 }

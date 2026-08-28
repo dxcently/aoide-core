@@ -219,12 +219,13 @@
   itself holds for `autogate`/`tokenFile`/`bearerSecret`/`hub`/`allows`.
 - **`pairing`'s request ids are deliberately NOT `state/stage/pending.json`'s
   array-position ids.** A pairing correlation must survive the requester's
-  CLI process exiting and an async `aoide/pairApprove` callback arriving
-  arbitrarily later, so ids are stable 8-hex-char values
-  (`gen_request_id`), generated once at park time and never renumbered by
-  a later list mutation. Don't "simplify" this back to array-position ids
-  — that would break exactly the cross-process correlation the module
-  exists to hold.
+  CLI process exiting and an async `aoide/pairPoll` (Design A, task #119 —
+  the requester's own poll, replacing what used to be an approver-initiated
+  `aoide/pairApprove` callback) arriving arbitrarily later, so ids are
+  stable 8-hex-char values (`gen_request_id`), generated once at park time
+  and never renumbered by a later list mutation. Don't "simplify" this
+  back to array-position ids — that would break exactly the cross-process
+  correlation the module exists to hold.
 - **`pairing::derive_sas`'s four-field order is the wire contract, not an
   implementation detail.** `(requester_pubkey, approver_pubkey,
   requester_nonce, approver_nonce)`, each lowercased/trimmed with a
@@ -272,19 +273,25 @@
   Outbound entries (`park_outbound`) are operator-created, one per `peer
   pair request` invocation, and carry no cap.
 - **`OutboundPairingRequest.state` defers the requester's own peer-record
-  commit past the approver's callback — never
-  collapse the two-state machine back to an implicit "callback arrived
-  means paired."** An entry parks `AwaitingApproval`;
-  `mark_outbound_awaiting_confirm` (called from the `aoide/pairApprove`
-  callback handler in `aoide-server`, on a pubkey match) transitions it to
-  `AwaitingConfirm` and nothing else — no peer-store write happens inside
-  this crate's own pairing module at all; that write is `aoide-client`'s
-  own job, gated behind its own operator confirmation. A pubkey mismatch
-  on the callback leaves the entry completely untouched (still
-  `AwaitingApproval`) rather than re-parking or dropping it — a
+  commit past the approver's approval — never collapse the two-state
+  machine back to an implicit "the poll answered means paired."** An entry
+  parks `AwaitingApproval`; `mark_outbound_awaiting_confirm` — Design A,
+  task #119, now called from `aoide-client::commands::approve_outbound`'s
+  own poll-then-mark step (a CLIENT call, never a server-side wire
+  handler; the old `aoide/pairApprove` callback used to trigger this from
+  `aoide-server`, but the FUNCTION ITSELF is unchanged) — transitions it to
+  `AwaitingConfirm` and nothing else on a pubkey match; no peer-store write
+  happens inside this crate's own pairing module at all; that write is
+  `aoide-client`'s own job, gated behind its own operator confirmation. A
+  pubkey mismatch on the release leaves the entry completely untouched
+  (still `AwaitingApproval`) rather than re-parking or dropping it — a
   transient mismatch is recoverable without restarting the whole
   ceremony, and "untouched" is simpler to reason about than "re-parked
-  with the same content."
+  with the same content." `InboundPairingRequest.approved` is the mirror
+  on the approver's side (Design A, additive, `#[serde(default)]`): set by
+  `mark_inbound_approved`, called ONLY from `aoide-client::commands::approve_inbound`
+  (never a wire handler — approving is purely local now), and never
+  removes the entry — `aoide/pairPoll` (`aoide-server`) only ever READS it.
 - **`undying::set_undying`'s return value is the on/off TRANSITION, not
   "did anything on disk change" (P-C1, durable-sessions plan).** Re-marking
   an already-undying id refreshes `marked_at` in place and returns `false`;

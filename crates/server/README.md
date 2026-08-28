@@ -193,18 +193,20 @@ the inbound half of the two-door contract (the outbound half is
   value is never cached, logged, or placed in any audit line — see
   `CONTRACTS.md`'s "Secrets wire"/§6 sections for the wire contract and
   the resolve-consumer honesty note.
-  **The pairing ceremony's three methods (P-P2,
+  **The pairing ceremony's three methods (P-P2, Design A/task #119,
   CONTRACTS.md §6's "Pairing wire" subsection)** — `pair_request`
-  (`aoide/pairRequest`), `pair_reveal` (`aoide/pairReveal`), and
-  `pair_approve_callback` (`aoide/pairApprove`) — join this same JSON-RPC
-  dispatch table, deliberately UNGATED by `read_ok`/bearer verification:
+  (`aoide/pairRequest`), `pair_reveal` (`aoide/pairReveal`), and `pair_poll`
+  (`aoide/pairPoll` — REPLACES the old `aoide/pairApprove` reverse
+  callback) — join this same JSON-RPC dispatch table. `pair_request`/
+  `pair_reveal` stay deliberately UNGATED by `read_ok`/bearer verification:
   the ceremony's whole point is establishing a credential where none
-  exists yet, so gating any of the three on one would be circular. None
-  grants anything beyond a `pubkey`/`verified` peer record, and that
+  exists yet, so gating either on one would be circular. `pair_poll` is
+  self-authenticating instead (below) — neither door-gated nor fully open.
+  None grants anything beyond a `pubkey`/`verified` peer record, and that
   record commits only on BOTH ends' own separate human confirmation — the
   default `allows` (`["read","spawn"]`) is stamped by
   `aoide_storage::peer_store::upsert_paired_peer` itself, the moment a peer
-  first becomes verified (P-P3, PAIRING.md decision 5), never by these three
+  first becomes verified (P-P3, PAIRING.md decision 5), never by these
   methods directly. `pair_request`
   validates every field (64-hex pubkey, 64-hex commitment, a
   `valid_peer_name` name, a non-empty `://`-bearing url) before calling
@@ -214,29 +216,40 @@ the inbound half of the two-door contract (the outbound half is
   third message: it checks a POSTed nonce against the parked entry's
   earlier commitment (`aoide_storage::pairing::reveal_inbound`) — a match
   stores the nonce so a SAS becomes derivable; a mismatch DROPS the parked
-  entry outright and answers the distinct `-32002` (unlike the
-  approve callback's mismatch handling below, a bad reveal is exactly the
-  shape a MITM's forced retry would take, so it is not treated as a
+  entry outright and answers the distinct `-32002` (a bad reveal is exactly
+  the shape a MITM's forced retry would take, so it is not treated as a
   recoverable hiccup — the reveal is unauthenticated, so a third party
   who obtains a live pending id can destroy that one ceremony attempt
   with a bogus reveal: an accepted denial-of-one-attempt, never an
   impersonation, and the operators simply re-run the ceremony).
-  `pair_approve_callback` looks up the matching
-  outbound entry by id and, on a pubkey match, only TRANSITIONS its state
-  (`aoide_storage::pairing::mark_outbound_awaiting_confirm`,
-  `AwaitingApproval` → `AwaitingConfirm`) — it commits no peer record on
-  either a match or a mismatch; a mismatch leaves the entry
-  untouched (never re-parked, never dropped) so a legitimate retry after a
-  transient hiccup isn't permanently broken. The requester's own peer
-  record commits later, entirely inside `aoide-client`, once that
-  instance's own operator confirms the SAS a second time. All three audit
+  `pair_poll` is the REQUESTER's own follow-up, POSTed to the APPROVER's
+  door over the SAME forward dial `pair_request`/`pair_reveal` already
+  used — it carries a SELF-CONTAINED signature (`{id, timestampIso,
+  nonceHex, signatureHex}`, verified inline against the parked entry's own
+  `pubkey_hex` via `aoide_storage::wire_auth::verify_signature_hex`, never
+  through P-P4's `verify_signed_request` — no `Peer` record exists yet for
+  that to key off) and NEVER writes a peer record. It only READS
+  `InboundPairingRequest::approved` (set PURELY LOCALLY, from
+  `aoide-client::commands::approve_inbound`, never from a wire handler) and
+  returns `{"status":"pending"}` uniformly for an unknown id, a
+  wrongly-signed poll, or a genuinely-not-yet-approved one — never a
+  distinct code that would let an outsider learn which case they hit
+  (the existing-oracle discipline, mirroring `message/send`'s own
+  `contextId` amendment above). Only a verified, approved poll gets
+  `{"status":"approved","pubkeyHex":"<B's own pubkey>"}`. The requester's
+  own peer record commits later, entirely inside `aoide-client`, once that
+  instance's own operator polls and confirms the SAS. All three audit
   via the existing `Door::A2a` audit sink (`a2a.pairRequest`/
-  `a2a.pairReveal`/`a2a.pairApprove`), same as every other A2A method.
+  `a2a.pairReveal`/`a2a.pairPoll`), same as every other A2A method —
+  `pair_poll` audits only its successful release, never a routine
+  "still pending" poll.
   **The pairing events feed (P-P5, CONTRACTS.md §6's "Pairing events feed"
   subsection)** — `emit_pairing_event`, called from the Ok arms of
-  `pair_request` (`pair-parked`), `pair_reveal` (`pair-revealed`), and
-  `pair_approve_callback` (`pair-awaiting-confirm`), never from a mismatch
-  or unknown-id arm. `a2a serve` is a separate process from `aoided`, so
+  `pair_request` (`pair-parked`) and `pair_reveal` (`pair-revealed`) only;
+  `pair_poll` never calls it (Design A retired the third kind,
+  `pair-awaiting-confirm` — that section's own doc has the reasoning),
+  never from a mismatch or unknown-id arm either. `a2a serve` is a separate
+  process from `aoided`, so
   it opens its OWN `aoide_protocol::feed::FeedWriter` onto the SAME
   `crate::daemon::events_path`/`EVENTS_CAP_BYTES`-capped feed file `aoided`
   already writes through — two independent writers sharing one

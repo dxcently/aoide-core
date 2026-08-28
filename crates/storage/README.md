@@ -154,10 +154,18 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   is uncapped (operator-created, one per `peer pair request` call).
   `OutboundPairingRequest.state` (`AwaitingApproval` → `AwaitingConfirm`,
   `mark_outbound_awaiting_confirm`) defers the REQUESTER's own peer-record
-  commit until its own operator confirms a second time, after the
-  approver's `aoide/pairApprove` callback already landed and the approver
-  has already committed its own side — both humans confirm
-  the same code before either end calls itself paired.
+  commit until its own operator confirms a second time, after this
+  instance's own `aoide/pairPoll` (Design A, task #119 — REPLACES the old
+  `aoide/pairApprove` reverse callback: the requester polls the approver's
+  door instead of the approver ever dialing back) comes back `approved` —
+  the approver has already committed its own side, purely locally, by
+  then — both humans confirm the same code before either end calls itself
+  paired. `InboundPairingRequest.approved` (Design A, additive,
+  `#[serde(default)]`) is the mirror image on the approver's side: set by
+  `mark_inbound_approved` (called ONLY from `aoide-client::commands::approve_inbound`,
+  never from a wire handler) once that instance's own operator confirms —
+  the entry stays PARKED (never taken) so `aoide/pairPoll` can still find
+  and release it, cleaned up only by the ordinary expiry sweep.
   `OutboundPairingRequest.via` (P-S4, additive, `#[serde(default)]`) carries
   the ssh-transport marker THIS instance resolved at request time (an
   explicit `--via`, or `peer invite`'s src_addr-derived default) forward to

@@ -608,18 +608,57 @@ fn peer_pair_reject_on_an_outbound_entry_aborts_after_the_approvers_callback() {
     std::env::remove_var("AOIDE_AUDIT_LOG");
 }
 
+/// A minimal, real local `aoide/pairPoll` responder — ANY POST gets the
+/// same canned JSON reply. Mirrors `wait_for_tcp_up`'s own "real listener,
+/// no mock" posture one function up; `#[ignore]`'d callers are the ones
+/// that use this (module doc: real curl, no `curl` on `PATH` in the nix
+/// sandboxed `checkPhase`).
+fn spawn_fake_pair_poll_server(body: &'static str) -> (TcpListener, u16) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepter = listener.try_clone().unwrap();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        loop {
+            let Ok((mut stream, _)) = accepter.accept() else { break };
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            if n == 0 {
+                continue;
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (listener, port)
+}
+
+/// Design A (task #119): `peer pair approve` on an `awaiting-approval`
+/// outbound entry now POLLS the approver's door (real curl, real socket —
+/// the whole point is proving no callback is needed, only a forward dial)
+/// instead of making a network-free local state check. `#[ignore]`'d for
+/// the same reason this file's own real-HTTP round trip above is: no `curl`
+/// on `PATH` in the nix sandboxed `checkPhase` (module doc) — run with
+/// `--ignored` in `nix develop`.
 #[test]
+#[ignore = "real loopback TCP + real curl (Design A's poll) — no network/curl in the nix sandbox; run with --ignored"]
 fn peer_pair_approve_on_an_outbound_entry_still_awaiting_the_peers_own_approval_is_refused() {
     let _guard = aoide_test_support::env_lock().lock().unwrap();
     let root = unique_root("pair-approve-outbound-too-early");
     let _stage = setup_env(&root);
+
+    let (_listener, port) = spawn_fake_pair_poll_server(r#"{"jsonrpc":"2.0","id":1,"result":{"status":"pending"}}"#);
 
     let now = aoide_storage::time::now_iso_utc();
     let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
     let expires = aoide_storage::pairing::expires_at_from(now_epoch);
     let entry = aoide_storage::pairing::OutboundPairingRequest {
         id: "efgh1234".to_string(),
-        url: "http://b/".to_string(),
+        url: format!("http://127.0.0.1:{port}/"),
         name: "box-b".to_string(),
         pubkey_hex: "b".repeat(64),
         requester_nonce_hex: "c".repeat(32),
@@ -632,14 +671,14 @@ fn peer_pair_approve_on_an_outbound_entry_still_awaiting_the_peers_own_approval_
     aoide_storage::pairing::park_outbound(entry).unwrap();
 
     let out = dispatch(&cli_invocation(&["peer", "pair", "approve"], &["efgh1234"], &[("yes", "true")]));
-    assert_eq!(out.status, Status::Error);
+    assert_eq!(out.status, Status::Error, "{}", out.message);
     assert_eq!(out.data.unwrap()["reason"], "awaiting-peer-approval");
     assert!(aoide_storage::peer_store::load_peers().is_empty());
     let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
     assert_eq!(
         aoide_storage::pairing::list_outbound(now_epoch)[0].state,
         aoide_storage::pairing::OutboundState::AwaitingApproval,
-        "a refused early confirm leaves the entry exactly where it was"
+        "a pending poll leaves the entry exactly where it was"
     );
 
     let _ = std::fs::remove_dir_all(&root);

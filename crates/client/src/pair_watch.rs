@@ -1002,48 +1002,19 @@ mod tests {
 
     // ── commit_approval: same peers.json the CLI's `--yes` path writes ────
 
-    /// `approve_inbound`'s own commit is gated on delivering the
-    /// `aoide/pairApprove` callback FIRST (module doc on
-    /// `commands::approve_inbound` — "nothing local writes until that
-    /// callback is acknowledged") — a real, minimal HTTP responder,
-    /// mirroring `commands::tests::spawn_fake_card_server`'s exact shape
-    /// one module over, so this test proves the REAL callback path, not a
-    /// mocked-away one.
-    fn spawn_fake_pair_approve_server() -> (std::net::TcpListener, u16) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let accepter = listener.try_clone().unwrap();
-        std::thread::spawn(move || {
-            use std::io::{Read, Write};
-            loop {
-                let Ok((mut stream, _)) = accepter.accept() else { break };
-                let mut buf = [0u8; 4096];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                if n == 0 {
-                    continue;
-                }
-                let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true,"name":"box-a"}}"#;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(response.as_bytes());
-            }
-        });
-        (listener, port)
-    }
-
+    /// `approve_inbound`'s own commit is now PURELY LOCAL (Design A, task
+    /// #119 — module doc on `commands::approve_inbound`): no network call at
+    /// all, so this test needs no fake server the way the old callback-era
+    /// version of it did — proving that IS part of the point.
     #[test]
     fn commit_approval_on_an_inbound_entry_writes_the_same_peers_json_the_cli_would() {
         with_peer_state("commit-approval-inbound", || {
-            let (_listener, port) = spawn_fake_pair_approve_server();
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             aoide_storage::pairing::park_inbound(
                 &"a".repeat(64),
                 "box-a",
                 "10.0.0.5",
-                &format!("http://127.0.0.1:{port}/"),
+                "http://box-a-is-loopback-only.invalid/",
                 &aoide_storage::pairing::derive_commit(&"a".repeat(64), &"c".repeat(32)),
                 &aoide_storage::time::now_iso_utc(),
                 &aoide_storage::pairing::expires_at_from(now_epoch),
@@ -1064,7 +1035,12 @@ mod tests {
             assert_eq!(peers[0].name, "box-a");
             assert_eq!(peers[0].pubkey.as_deref(), Some("a".repeat(64).as_str()));
             assert!(peers[0].verified);
-            assert!(aoide_storage::pairing::list_inbound(now_epoch).is_empty(), "the parked entry is taken on commit");
+
+            // Design A: the parked entry stays PARKED, marked approved, for
+            // the requester's own poll to find later — never taken here.
+            let listed = aoide_storage::pairing::list_inbound(now_epoch);
+            assert_eq!(listed.len(), 1, "the entry stays parked so the requester's poll can find it");
+            assert!(listed[0].approved);
         });
     }
 

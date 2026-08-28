@@ -197,47 +197,66 @@
   entire undying set is already alive, `session_resurrect` itself resolves
   to the empty-set `Outcome::ok` no-op.
 
-- **`pair_request`/`pair_reveal`/`pair_approve_callback` (P-P2) are
-  deliberately UNGATED by `read_ok`/
-  bearer verification, and this is not an oversight to "fix."** The
-  pairing ceremony's entire purpose is establishing a credential where
-  none exists yet — gating any of the three on an existing credential
-  would be circular. What keeps this safe: a parked/revealed/approved
-  request grants NOTHING by itself (no `allows`, no spawn/bearer gate,
-  P-P3's lane untouched), every field is validated BEFORE anything is
-  parked or resolved (`valid_pubkey_hex`/`valid_nonce_hex`/
-  `valid_commit_hex`/`valid_peer_name`/`valid_callback_url`), the
-  commitment check (`aoide_storage::pairing::reveal_inbound`) binds a
-  reveal to its own earlier request with no signature needed yet
-  (an active MITM cannot force a shared SAS by choosing its own values
-  after seeing the real ones), and the SAS
-  confirmation (`aoide_storage::pairing::derive_sas`) is the actual
-  human-verified gate — it lives in the CLIENT's `peer pair approve`
-  prompt (BOTH times it fires — once on each end), not in this door. Don't add a bearer check to any of the three
-  handlers "for consistency with `message/send`" — that would break the
-  bootstrap the whole ceremony exists to solve.
-- **`pair_approve_callback` never writes a peer record on either a
-  match or a mismatch — it only ever moves an
-  OUTBOUND entry's `state`.** On a pubkey match it calls
-  `aoide_storage::pairing::mark_outbound_awaiting_confirm`, which
-  transitions `AwaitingApproval` → `AwaitingConfirm` and nothing else; the
-  requester's own peer record commits later, entirely inside
-  `aoide-client`, gated behind that instance's own operator running `peer
-  pair approve <id>` a second time. On a pubkey mismatch the outbound
-  entry is left completely UNTOUCHED (still `AwaitingApproval`, never
-  re-parked, never dropped) — a mismatch could be a transient
-  data-integrity hiccup, not necessarily an attack, and leaving the entry
-  exactly where it was lets a legitimate retry just try the callback
-  again with no state to reconcile. Don't reintroduce a peer-store write
-  in this function, and don't drop/re-park the entry on a mismatch — both
-  would commit or destroy state no human on this end confirmed.
+- **`pair_request`/`pair_reveal` (P-P2) are deliberately UNGATED by
+  `read_ok`/bearer verification, and this is not an oversight to "fix."**
+  The pairing ceremony's entire purpose is establishing a credential where
+  none exists yet — gating either on an existing credential would be
+  circular. What keeps this safe: a parked/revealed/approved request
+  grants NOTHING by itself (no `allows`, no spawn/bearer gate, P-P3's lane
+  untouched), every field is validated BEFORE anything is parked or
+  resolved (`valid_pubkey_hex`/`valid_nonce_hex`/`valid_commit_hex`/
+  `valid_peer_name`/`valid_peer_url`), the commitment check
+  (`aoide_storage::pairing::reveal_inbound`) binds a reveal to its own
+  earlier request with no signature needed yet (an active MITM cannot
+  force a shared SAS by choosing its own values after seeing the real
+  ones), and the SAS confirmation (`aoide_storage::pairing::derive_sas`) is
+  the actual human-verified gate — it lives in the CLIENT's `peer pair
+  approve` prompt (BOTH times it fires — once on each end), not in this
+  door. Don't add a bearer check to either handler "for consistency with
+  `message/send`" — that would break the bootstrap the whole ceremony
+  exists to solve. `pair_poll` (Design A, task #119, REPLACES the old
+  `aoide/pairApprove` reverse callback) is DIFFERENT: it is
+  self-authenticating (its own doc has the mechanism) rather than
+  door-level-gated, and this is the correct posture for it too — see the
+  next bullet.
+- **`pair_poll` verifies its OWN signature inline against the parked
+  entry's stored `pubkey_hex` — never through `verify_signed_request`
+  (P-P4), and never writes a peer record.** No verified `Peer` record
+  exists on the approver's side until the very id being polled is
+  approved, so P-P4's header scheme (which requires one) cannot gate this
+  method — `pair_poll` decodes `{id, timestampIso, nonceHex,
+  signatureHex}` from its OWN params and calls
+  `aoide_storage::wire_auth::verify_signature_hex` directly against
+  `InboundPairingRequest.pubkey_hex`. It reads
+  [`InboundPairingRequest::approved`] and returns it, never mutates it —
+  `mark_inbound_approved` (called from `aoide-client::commands::approve_inbound`,
+  not from any wire handler) is the ONLY thing that ever sets that flag,
+  purely locally, no wire call. Every non-approved/unverified/unknown
+  outcome returns the IDENTICAL `{"status":"pending"}` (the
+  existing-oracle discipline, `pair_poll`'s own doc) — don't add a
+  distinct error code for "unknown id" or "bad signature" here; that
+  would let an outsider learn something a legitimate not-yet-approved
+  poller couldn't.
+  `aoide-client::commands::approve_outbound` is what checks a released
+  pubkey against what THIS instance learned at request time
+  (`mark_outbound_awaiting_confirm`'s own `Mismatch` handling, entirely
+  client-side now) — don't reintroduce that check here; this handler has
+  no basis to know what the REQUESTER already learned.
 - **`emit_pairing_event` (P-P5) fires ONLY from an Ok arm, never from a
   mismatch or unknown-id arm, and its `payload` carries fields BY NAME
-  ONLY.** Add a fourth call site the same way — never widen the payload
-  builder to pass a parsed struct wholesale, and never add `sas`/
-  `pubkey*`/`nonce*`/`commit*` to the by-name list; a watcher re-derives
-  the SAS locally from `aoide_storage::pairing::list_inbound`/
-  `list_outbound`; this feed line is a trigger only. `a2a serve` opens
+  ONLY.** Two call sites today (`pair_request`'s `pair-parked`,
+  `pair_reveal`'s `pair-revealed`) — `pair_poll` (Design A, task #119)
+  deliberately does NOT call this: a poll arriving and being answered
+  isn't a state change on the approver's side worth surfacing (it already
+  knows it approved; it did so itself, locally), and the requester's own
+  side never transitions asynchronously anymore either, only synchronously
+  inside `approve_outbound`'s own poll-then-mark call — there is no longer
+  a `pair-awaiting-confirm` kind. Add a call site the same way if a future
+  milestone genuinely needs one — never widen the payload builder to pass
+  a parsed struct wholesale, and never add `sas`/`pubkey*`/`nonce*`/
+  `commit*` to the by-name list; a watcher re-derives the SAS locally from
+  `aoide_storage::pairing::list_inbound`/`list_outbound`; this feed line is
+  a trigger only. `a2a serve` opens
   its own `FeedWriter` onto `aoided`'s events file rather than routing
   through the daemon process (they're separate processes) — don't thread
   a socket call through here to "unify" the two writers; the cap-truncate
