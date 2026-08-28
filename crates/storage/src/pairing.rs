@@ -341,7 +341,10 @@ pub struct InboundPairingRequest {
     /// persisted here so tries survive across `peer pair approve`
     /// invocations. Bumped by [`record_inbound_code_try`]; the CLI
     /// auto-denies (a clean [`take_inbound`] removal) the moment the count
-    /// reaches 3, so a persisted value is always `< 3`. `#[serde(default)]`
+    /// reaches 3. A crash between the third increment's save and the deny
+    /// can persist a value at the limit — the approve path denies such an
+    /// entry up front on next sight, so it is never approvable, but a
+    /// stored `>= 3` is possible. `#[serde(default)]`
     /// loads `0` on a record predating the field — the same additive
     /// discipline [`Self::approved`] holds.
     #[serde(default)]

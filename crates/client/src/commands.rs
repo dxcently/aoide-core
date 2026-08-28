@@ -1908,6 +1908,14 @@ pub(crate) fn approve_inbound(
         .with_data(json!({ "reason": "awaiting-reveal", "id": id }));
     };
 
+    // An entry already at the try limit is denied up front, before any gate
+    // arm runs — a crash between the third try's persisted increment and its
+    // auto-deny (the one window where tries == MAX survives on disk) must
+    // not leave an approvable entry behind.
+    if entry.tries >= MAX_CODE_TRIES {
+        return auto_deny_inbound(cmd, id, &entry.name, now_epoch);
+    }
+
     let (kp, _) = match aoide_storage::identity::load_or_mint() {
         Ok(v) => v,
         Err(e) => {

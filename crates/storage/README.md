@@ -170,8 +170,10 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   `#[serde(default)]`) counts wrong pairing codes typed against the entry,
   cumulatively across invocations — bumped by `record_inbound_code_try`
   (same `MarkApprovedError` refusal shape), while the auto-deny at 3 is
-  the CLI caller's own `take_inbound`, never a state written here; a
-  persisted value is therefore always `< 3`.
+  the CLI caller's own `take_inbound`, never a state written here. A crash
+  between the third increment's save and the deny can persist a value at
+  the limit; the approve path denies such an entry up front on next sight,
+  so it is never approvable.
   `OutboundPairingRequest.via` (P-S4, additive, `#[serde(default)]`) carries
   the ssh-transport marker THIS instance resolved at request time (an
   explicit `--via`, or `peer invite`'s src_addr-derived default) forward to
