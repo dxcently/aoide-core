@@ -403,7 +403,8 @@ fn resurrect_one(
     // writes `origin` on every exit, but nothing read it back until now, so
     // a revived LOCAL session silently became origin-less. A `peer:*` value
     // is refused here on purpose, not carried: `state/session-ledger.jsonl`
-    // is an UNSEALED append-only file (P-ID1/P-ID2 seal it, not this phase)
+    // is an UNSEALED append-only file (the P-ID1 seal covers live session
+    // records, never this ledger)
     // — a same-uid process can append a line claiming `origin:"peer:X"` and
     // then run this ungated LOCAL `aoide resurrect`, which has no door and
     // no seal behind it. `peer:*` is door-authenticated identity (only

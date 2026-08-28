@@ -13,8 +13,10 @@
 //! `consumers[]` list, and now `automation.consumers`, are still checked
 //! against the SELF-ASSERTED wire field — see `AGENTS.md`'s replay-ledger
 //! ruling and `CONTRACTS.md`'s "Honesty note: `consumer` is SELF-ASSERTED"
-//! for why that stays true until authenticated session identity lands
-//! (#63-adjacent, not this phase). What #73 adds is a SEPARATE, orthogonal
+//! for why that stays true even with the sealed session credential (#63)
+//! landed: the seal authenticates the calling SESSION and its origin
+//! CLASS (the origin gate's axis), never the consumer NAME — that
+//! authentication is a separate, unbuilt axis. What #73 adds is a SEPARATE, orthogonal
 //! fact this crate did not have before: the connecting process's real
 //! `uid`, verified by the kernel, independent of anything the wire request
 //! itself claims. `broker::handle_dismiss` is the first (and, as of this

@@ -665,9 +665,11 @@ reason):** the wire's `consumer` field is SELF-ASSERTED — nothing
 authenticates it (this crate's `AGENTS.md`, `CONTRACTS.md`'s "Secrets
 wire" honesty note). `automation.consumers` is checked against that SAME
 self-asserted field, so an automation-open secret is effectively
-CODE-FREE for any local socket caller claiming a listed consumer name,
-until authenticated session identity exists (#63-adjacent, not planned
-here). Automation is a courtesy label on top of the real boundary (socket
+CODE-FREE for any local socket caller claiming a listed consumer name —
+the sealed session credential (#63, consumed by this crate's own origin
+gate) authenticates the calling SESSION and its origin CLASS, never this
+string; consumer-NAME authentication remains a separate, unbuilt axis
+(not planned here). Automation is a courtesy label on top of the real boundary (socket
 group membership), not a cryptographic one, exactly like `consumers[]`
 itself — don't reach for `automation` as a way to "still be safe without
 TOTP" against a hostile co-tenant of the same socket group; it isn't.

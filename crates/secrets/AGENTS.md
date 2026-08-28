@@ -333,8 +333,11 @@
   honesty note mirroring the `ReplayLedger` ruling above, for the
   identical reason). Nothing authenticates the wire's `consumer` field, so
   an automation-open secret is effectively code-free for any local socket
-  caller claiming a listed name, until authenticated session identity
-  exists (#63-adjacent, not planned). Don't treat `automation` as adding
+  caller claiming a listed name — the sealed session credential (#63,
+  consumed by this crate's own origin gate) authenticates the calling
+  SESSION and its origin CLASS, never this string; consumer-NAME
+  authentication remains a separate, unbuilt axis (#51-adjacent, not
+  planned). Don't treat `automation` as adding
   any cryptographic boundary beyond what `consumers[]` already has — it's
   a courtesy label on the same self-asserted field, not a stronger one.
 - **`Policy::remote` (P-N1) gates NOTHING today — that is deliberate, not

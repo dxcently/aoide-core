@@ -599,15 +599,16 @@
   minted and stored, verified on the per-session control socket's own
   accept and consumed by the send gate as of P-ID2, and both remaining
   sockets get a peercred floor of their own as of P-ID3 (below).
-  **`origin` is still attribution, not an
+  **The raw `origin` field is attribution, not an
   authenticated credential** — a same-uid process can still forge a
   LOCAL-class origin (`stamp_origin` trusts whatever non-`peer:*` value it
-  is given), and neither the session's own identity nor the consumer
-  presenting it are authenticated yet; don't let a future consumer gate a
-  security decision on it without the sealed credential task #63's lane
-  builds next (P-ID1+; P-ID4 is the first to gate a REAL decision on
-  `originClass`, once it is read off a VERIFIED seal, never the raw
-  `origin` field). What P-ID0 closes is narrower and real: every
+  is given). Don't let a consumer gate a security decision on the raw
+  field: the authenticated form is the sealed credential (below), and the
+  secrets broker's origin gate (P-ID4) is the model consumer — it gates on
+  `originClass` read off a VERIFIED seal, never the raw `origin` field.
+  The consumer NAME presenting a request stays unauthenticated either way
+  (a separate, unbuilt axis — CONTRACTS.md's identity-lane accounting).
+  What P-ID0 closes is narrower and real: every
   record-STAMP path this codebase drives now refuses a `peer:*` shape it
   didn't mint itself at the door — env AND the unsealed ledger both.
 - **`SessionRecord.seal`/`sealedIssuedAt` are STAMPED from `aoide-server`

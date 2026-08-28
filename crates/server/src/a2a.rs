@@ -2783,8 +2783,9 @@ fn route(
 
 /// The self-asserted consumer name this door presents to the secrets broker
 /// when resolving its own inbound bearer — see `crates/secrets/AGENTS.md`'s
-/// honesty note (consumer identity is self-asserted until #63): nothing on
-/// the wire authenticates this string, it is simply the name an operator's
+/// honesty note (consumer identity is self-asserted; #63's seal
+/// authenticates the session and its origin class, never this string):
+/// nothing on the wire authenticates this string, it is simply the name an operator's
 /// `policy.json` `consumers[]`/`automation.consumers` lists to grant
 /// `a2a serve` access to the named secret.
 const BEARER_CONSUMER_DOOR: &str = "a2a-door";

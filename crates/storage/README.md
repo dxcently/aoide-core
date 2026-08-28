@@ -232,13 +232,14 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   (shellbridge, `aoided`'s own dispatch socket) get a peercred floor of
   their own as of P-ID3 (cross-uid only; see `aoide-conduct`'s own
   README/AGENTS and CONTRACTS.md's identity section for the honest
-  accounting of what that does and does not close). A same-uid
-  process can still forge a
-  LOCAL-class origin, and neither the session's own identity nor the
-  consumer presenting it are authenticated yet (this crate's own
-  `records`/`ledger` section, and CONTRACTS.md's pending-queue note);
-  nothing may gate a security decision on it without the sealed credential
-  task #63's lane builds next (P-ID1+). What P-ID0 closes: every
+  accounting of what that does and does not close). A same-uid process
+  can still forge a LOCAL-class origin as a raw string, so nothing gates a
+  security decision on the field as read off disk — the authenticated form
+  is `sealed_id`'s credential (below), whose VERIFIED `originClass` is
+  what the send gate and the secrets broker's origin gate (P-ID4,
+  `attest`) consume; the consumer NAME presenting a request stays
+  unauthenticated either way (a separate, unbuilt axis — CONTRACTS.md's
+  identity-lane accounting). What P-ID0 closes: every
   record-STAMP path this codebase drives now refuses a `peer:*` shape it
   didn't mint itself at the door — env AND the unsealed ledger both.
   `records::RestoreSnapshot`/`SessionRecord.restore`/`LedgerEntry.restore`

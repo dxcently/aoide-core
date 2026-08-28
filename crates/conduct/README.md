@@ -401,13 +401,15 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   minted and stored, verified on the per-session control socket's own
   accept and consumed by the send gate as of P-ID2, and both remaining
   sockets get a peercred floor of their own as of P-ID3 (below).
-  **Still not a security claim**: a same-uid
-  process can still forge a LOCAL-class origin, and neither the session's
-  own identity nor the consumer presenting it are authenticated yet —
-  nothing may gate a security decision on `origin` without the sealed
-  credential task #63's lane builds next (P-ID1+). What P-ID0 closes: every
-  record-STAMP path this codebase drives now refuses a `peer:*` shape it
-  didn't mint itself at the door — env AND ledger both.
+  **The raw field is attribution, never a gate**: a same-uid process can
+  still forge a LOCAL-class `origin` string, so nothing gates a security
+  decision on the field as read off disk — the authenticated form is the
+  `originClass` carried inside a VERIFIED seal (below), which is what the
+  secrets broker's origin gate (P-ID4) consumes; the consumer NAME
+  presenting a request stays unauthenticated either way (a separate,
+  unbuilt axis — CONTRACTS.md's identity-lane accounting). What P-ID0
+  closes: every record-STAMP path this codebase drives refuses a `peer:*`
+  shape it didn't mint itself at the door — env AND ledger both.
 - **Sealed session credential (LANE IDENTITY P-ID1/P-ID2) — minted by
   `aoide-server`'s daemon, verified and consumed inside this crate.**
   `session_store.rs::stamp_seal` is `SessionRecord.seal`/`sealedIssuedAt`'s

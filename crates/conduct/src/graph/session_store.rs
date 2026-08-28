@@ -479,8 +479,8 @@ pub(in crate::graph) fn stamp_headless(id: &str) {
 ///
 /// `pub` (crosses the crate boundary) and has exactly TWO legitimate
 /// callers, each the record-layer authority for one origin shape (LANE
-/// IDENTITY P-ID0, G16/G5 — this is the write-once-BY-AUTHORITY tightening,
-/// not yet an authenticated credential):
+/// IDENTITY P-ID0, G16/G5 — the write-once-BY-AUTHORITY tightening at the
+/// record layer, distinct from the sealed credential below):
 ///   - `graph/conduct.rs::session_conduct`, for a LOCAL-CLASS origin off its
 ///     own inherited `AOIDE_SESSION_ORIGIN` env — and that call site now
 ///     REFUSES a `peer:*` shape from that env read, because inherited env
@@ -491,9 +491,11 @@ pub(in crate::graph) fn stamp_headless(id: &str) {
 ///     record from the DOOR that authenticated the peer name, never
 ///     threaded through the child's env at all. This is the only place a
 ///     `peer:*` value may originate.
-/// Still attribution, not authentication: a same-uid process can still
-/// forge a LOCAL-class origin, and consumer-name/session identity remain
-/// unauthenticated — that's P-ID1/P-ID2's sealed credential, not this phase.
+/// The raw field is attribution, not authentication: a same-uid process
+/// can still forge a LOCAL-class origin. The authenticated form is the
+/// sealed credential (`stamp_seal` below, P-ID1/P-ID2) — a consumer gates
+/// only on an `originClass` read off a VERIFIED seal, never this raw
+/// string; consumer-NAME authentication remains a separate, unbuilt axis.
 pub fn stamp_origin(id: &str, origin: &str) {
     if origin.is_empty() {
         return;
