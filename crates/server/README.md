@@ -274,11 +274,16 @@ the inbound half of the two-door contract (the outbound half is
   `do_spawn`'s real OS-level process spawn, same house rule every other
   Spawn-arm test already follows). That resolution comes from
   `verify_signed_request` (P-P4) — called once per connection in
-  `handle_connection`, before any dispatch — which authenticates a
-  request's `X-Aoide-Peer`/`X-Aoide-Timestamp`/`X-Aoide-Nonce`/
-  `X-Aoide-Signature` headers against the named peer's stored public key
-  (CONTRACTS.md §6's P-P4 amendment has the full canonical-string/header
-  shape and pinned vectors) and threads the proven name down as
+  `handle_connection`, before any dispatch — which resolves the caller BY
+  KEY (#63 P-ID5): the request's `X-Aoide-Timestamp`/`X-Aoide-Nonce`/
+  `X-Aoide-Signature` headers are verified by trying the signature against
+  every verified peer's stored public key, and the record whose key
+  verifies IS the caller; `X-Aoide-Peer` is attribution only — a
+  claimed-vs-resolved mismatch audits as attribution drift, and its one
+  identity-adjacent role is the exact-name tiebreak among verified records
+  sharing the verifying pubkey (CONTRACTS.md §6's P-P4 amendment has the
+  full canonical-string/header shape, check order, collision semantics,
+  and pinned vectors). The KEY-RESOLVED name threads down as
   `signed_peer_name`; when present, `message_send` resolves EXCLUSIVELY
   against it, never falling back to `aoide_storage::peer_store::
   resolve_peer`'s own two-rung ladder (a peer's own `token_file` —

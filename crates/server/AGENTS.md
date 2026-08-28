@@ -269,7 +269,18 @@
   calls `verify_signed_request` exactly once per connection, strictly
   before either dispatch path, and threads its result down as
   `signed_peer_name: Option<&str>` through `route`/`stream_task`/
-  `RequestCtx` into `message_send`. When `Some(name)`, `message_send`
+  `RequestCtx` into `message_send`. The name it threads is the
+  KEY-RESOLVED one (#63 P-ID5): `verify_signed_request` finds the record
+  BY the stored pubkey that verifies the signature — never by the
+  `X-Aoide-Peer` header, which is attribution only (a claimed-vs-resolved
+  mismatch audits as `attribution-drift` via `attribution_drift_detail`,
+  and the resolved name wins everywhere downstream). Don't reintroduce a
+  name-based lookup into the verifier, and keep the no-match refusal a
+  single code path with a single message — unknown key, unverified peer,
+  keyless record, and bad signature must stay indistinguishable (no
+  existence oracle over the registry); collision semantics (shared-pubkey
+  records: exact-claimed-name tiebreak, else ambiguous refusal) are pinned
+  in CONTRACTS.md §6. When `Some(name)`, `message_send`
   resolves EXCLUSIVELY against that name (`PeerRung::Signature`) — no
   fallback to `aoide_storage::peer_store::resolve_peer`'s addr/token
   ladder even on a registry-lookup miss, since a request
@@ -411,7 +422,11 @@
   of `aoide-storage`. `verify_signed_request` records a nonce ONLY after
   every cheaper check (including the signature itself) already passed —
   don't move the `nonce_is_replay` call earlier "to fail faster"; a forged
-  or garbage nonce must never consume a cache slot. `handle_connection`
+  or garbage nonce must never consume a cache slot. The cache keys on the
+  VERIFYING PUBKEY, never a peer name (#63 P-ID5): `X-Aoide-Peer` is
+  outside the canonical string, so a name-keyed cache would let a captured
+  request replay under a shared-key twin's name — don't "simplify" the key
+  back to a name. `handle_connection`
   calls `verify_signed_request` exactly ONCE per connection, strictly
   before both the streaming and the plain-JSON-RPC dispatch branches —
   don't duplicate that call inside `route`/`stream_task`/`handle_jsonrpc`;

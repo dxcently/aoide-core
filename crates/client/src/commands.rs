@@ -458,23 +458,18 @@ fn parse_via_flag(inv: &Invocation) -> Result<Option<aoide_storage::tunnel::Via>
 /// name on every wire call that claims an identity: the pairing ceremony's
 /// `pairRequest.name` (`run_pair_request`, same `local_host_name()` chain
 /// the discovery advertisement and `graphSummary` also use) and this header both
-/// say "this is who I am," so both must carry the same value. The far end
-/// registers and resolves the caller BY THAT SELF NAME
-/// (`aoide-server::a2a::verify_signed_request` looks up
-/// `peers.iter().find(|p| p.name == peer_name)` against the name it recorded
-/// at pairing time) — `--name`/`peer.name` stay purely a local label this
-/// instance uses to refer to the counterpart, never an identity claim that
-/// crosses the wire. (Sending `peer.name` here was the live yomi↔sakaki
-/// ceremony's second defect, 2026-08-26: e78999f fixed the pairing wire name
-/// but left this header sending the old local-nickname value, so the far
-/// end's lookup failed with "unknown peer" for every signed request after a
-/// successful pair.)
-///
-/// Known limitation (task #63): because the far end resolves the caller BY
-/// NAME, renaming a peer locally on the far end breaks inbound signed
-/// requests from it — the name has to still match what was recorded at pair
-/// time. Resolving identity by public key instead (the signature already
-/// proves the key) is the durable fix and belongs to task #63, not here.
+/// say "this is who I am," so both carry the same value. The name is
+/// ATTRIBUTION, not identity (#63 P-ID5): the far end resolves the caller
+/// BY THE KEY THAT SIGNED (`aoide-server::a2a::verify_signed_request` tries
+/// the signature against every verified peer's stored pubkey and takes the
+/// record whose key verifies — CONTRACTS.md §6 "Inbound verification"), so
+/// a stale or mismatched name here never breaks authentication; the far end
+/// audits the mismatch as attribution drift and proceeds under its own
+/// record's name. The name's one identity-adjacent role on the far end is
+/// the exact-name tiebreak when two of its records share this instance's
+/// pubkey — one more reason this header stays the stable self name.
+/// `--name`/`peer.name` stay purely a local label this instance uses to
+/// refer to the counterpart, never an identity claim that crosses the wire.
 ///
 /// Returns `Err` only on a genuine identity-load failure (a corrupt or
 /// unwritable `state/identity/` — the same failure shape

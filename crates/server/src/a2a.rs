@@ -1135,8 +1135,10 @@ fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path, peer_name: &str) ->
 /// UNFORGEABLE binding that shape always named as its own future lane: an
 /// ed25519 signature over a canonical string binding method, path,
 /// timestamp, nonce, and the body's `sha2` digest
-/// (`aoide_storage::wire_auth::canonical_string`), verified against a
-/// paired peer's own stored pubkey (`verify_signed_request`, this file), a
+/// (`aoide_storage::wire_auth::canonical_string`), resolved to the paired
+/// peer whose stored pubkey verifies it (`verify_signed_request`, this
+/// file — #63 P-ID5: identity is the key, the `X-Aoide-Peer` name is a
+/// display label), a
 /// ±120s replay window, and a bounded in-memory nonce cache — see that
 /// function's own doc comment for the full verification flow. A request
 /// that verifies resolves to [`aoide_storage::peer_store::PeerRung::
@@ -1221,7 +1223,11 @@ fn message_send(
     // `signed_peer_name` arrives ALREADY VERIFIED — the caller
     // (`handle_connection`, via `verify_signed_request`) checked the
     // ed25519 signature, the replay window, and the nonce cache BEFORE this
-    // function ever ran, and only threads a name through on success. When
+    // function ever ran, and only threads a name through on success. The
+    // name it threads is the RESOLVED one (#63 P-ID5): the peer record
+    // whose stored pubkey verified the signature, never the wire-claimed
+    // `X-Aoide-Peer` label — so the find-by-name below is a lookup of an
+    // already-key-authenticated record, not a trust decision. When
     // present, it is the SOLE resolution: no fallthrough to the
     // addr/token ladder for a request that presented signature headers
     // (fail-closed discipline, #84's own "sentinel on resolve failure, no
@@ -2443,27 +2449,32 @@ fn method_not_allowed(method: &str, path: &str) -> (u16, Vec<u8>, String) {
 /// normal operation.
 const NONCE_CACHE_CAP: usize = 4096;
 
-/// `(peer name, nonce)` pairs seen within roughly the current replay
-/// window, oldest-first — see [`NONCE_CACHE_CAP`]'s doc for the
-/// process-locality and sizing reasoning.
+/// `(verifying pubkey hex, nonce)` pairs seen within roughly the current
+/// replay window, oldest-first — see [`NONCE_CACHE_CAP`]'s doc for the
+/// process-locality and sizing reasoning. Keyed on the PUBKEY that verified
+/// the request, not any peer name (#63 P-ID5: identity IS the key): the
+/// `X-Aoide-Peer` header is not part of the canonical string, so a captured
+/// request replayed under a different claimed name still lands on the same
+/// cache key — two verified records sharing one pubkey share one replay
+/// namespace, exactly because they are one signer.
 static NONCE_CACHE: Mutex<VecDeque<(String, String)>> = Mutex::new(VecDeque::new());
 
-/// Check-and-record: `true` (nothing recorded) when `(peer, nonce)` was
+/// Check-and-record: `true` (nothing recorded) when `(key, nonce)` was
 /// ALREADY seen — a replay the caller must refuse. `false` (now recorded)
 /// the first time. Evicts the OLDEST entry once at [`NONCE_CACHE_CAP`],
 /// never growing past it. Poison-recovering like every other process-local
 /// lock in this workspace (`pairing.rs`'s `PARK_LOCK` precedent): a panic
 /// inside one caller must never wedge every OTHER signed request behind a
 /// poisoned lock forever.
-fn nonce_is_replay(peer: &str, nonce: &str) -> bool {
+fn nonce_is_replay(key: &str, nonce: &str) -> bool {
     let mut cache = NONCE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if cache.iter().any(|(p, n)| p == peer && n == nonce) {
+    if cache.iter().any(|(p, n)| p == key && n == nonce) {
         return true;
     }
     if cache.len() >= NONCE_CACHE_CAP {
         cache.pop_front();
     }
-    cache.push_back((peer.to_string(), nonce.to_string()));
+    cache.push_back((key.to_string(), nonce.to_string()));
     false
 }
 
@@ -2477,9 +2488,15 @@ enum SignedRequestOutcome {
     /// None of the four `HEADER_*` values were present — the existing
     /// addr/token resolution ladder applies exactly as before this phase.
     Unsigned,
-    /// All four headers were present and verification succeeded — carries
-    /// the claimed (now proven) peer's name.
-    Verified(String),
+    /// All four headers were present and verification succeeded. `resolved`
+    /// is the name of the peer RECORD whose stored pubkey verified the
+    /// signature (#63 P-ID5: identity is the key) — the name every
+    /// downstream consumer (allows lookup, `peer:<name>` origin stamp,
+    /// autogate) uses. `claimed` is what the `X-Aoide-Peer` header said —
+    /// display/attribution only, carried so the caller can audit a
+    /// claimed-vs-resolved mismatch as attribution drift; it is never
+    /// trusted and never wins over `resolved` anywhere.
+    Verified { resolved: String, claimed: String },
     /// Signature headers were present but verification failed somewhere —
     /// the JSON-RPC `(code, message)` the WHOLE request refuses with, no
     /// matter which method it named.
@@ -2494,11 +2511,33 @@ enum SignedRequestOutcome {
 /// `aoide_storage::pairing::park_inbound`'s own `now_epoch` parameter
 /// holds.
 ///
+/// **Resolution is BY KEY, not by name (#63 P-ID5).** The signature proves
+/// possession of a private key; the caller's identity is the peer record
+/// whose stored `pubkey` verifies that signature — found by trying the
+/// signature against every VERIFIED peer's stored pubkey (operator-curated
+/// small N; one ed25519 verify is microseconds, and the skew check below
+/// runs first so a stale request never costs any). The `X-Aoide-Peer`
+/// header does no identity work: it is display/attribution, checked only
+/// for wire-format validity, and consulted for exactly one thing — the
+/// exact-name tiebreak when MULTIPLE verified records share the verifying
+/// pubkey (the same remote instance paired under two names; both records
+/// hold the same proven key, so the tiebreak picks among equal-security
+/// records, it never elevates a name to identity). Shared-key records with
+/// no exact-name match refuse as ambiguous rather than picking one — their
+/// `allows`/`autogate` may differ, and guessing would grant one record's
+/// grants on the other's behalf.
+///
+/// A signature no verified peer's key verifies refuses with the SAME code
+/// and message as a bad signature — they are literally the same code path,
+/// so the refusal is never an existence oracle over the registry (unknown
+/// key, unverified peer, keyless record, and tampered request are
+/// indistinguishable from outside).
+///
 /// Checks run in an order that never spends work verifying a signature for
-/// a request that's already disqualified for a cheaper reason (unknown/
-/// unpaired peer, no stored pubkey, unparsable timestamp, clock skew), and
-/// records the nonce ONLY after a genuine signature match — a forged or
-/// garbage nonce never consumes a cache slot.
+/// a request that's already disqualified for a cheaper reason (malformed
+/// headers, unparsable timestamp, clock skew), and records the nonce ONLY
+/// after a genuine signature match — a forged or garbage nonce never
+/// consumes a cache slot.
 fn verify_signed_request(req: &HttpRequest, now_epoch: i64) -> SignedRequestOutcome {
     use aoide_storage::wire_auth::{HEADER_NONCE, HEADER_PEER, HEADER_SIGNATURE, HEADER_TIMESTAMP, SIGNATURE_SKEW_ENV};
 
@@ -2522,23 +2561,10 @@ fn verify_signed_request(req: &HttpRequest, now_epoch: i64) -> SignedRequestOutc
         );
     };
 
+    // Wire-format validity only — the VALUE never selects a record below.
     if !aoide_storage::peer_store::valid_peer_name(peer_name) {
         return SignedRequestOutcome::Refused(-32007, format!("`{HEADER_PEER}` is not a well-formed peer name: `{peer_name}`"));
     }
-
-    let peers = aoide_storage::peer_store::load_peers();
-    let Some(peer) = peers.iter().find(|p| p.name == peer_name) else {
-        return SignedRequestOutcome::Refused(-32007, format!("unknown peer `{peer_name}` presented signed-request headers"));
-    };
-    if !peer.verified {
-        return SignedRequestOutcome::Refused(
-            -32007,
-            format!("peer `{peer_name}` has not completed the pairing ceremony — signed requests require a verified peer"),
-        );
-    }
-    let Some(pubkey_hex) = peer.pubkey.as_deref().filter(|s| !s.is_empty()) else {
-        return SignedRequestOutcome::Refused(-32007, format!("peer `{peer_name}` has no stored public key on this instance"));
-    };
 
     let Some(ts_epoch) = aoide_storage::time::parse_iso_utc(timestamp) else {
         return SignedRequestOutcome::Refused(-32007, format!("`{HEADER_TIMESTAMP}` is not a valid ISO-8601 timestamp: `{timestamp}`"));
@@ -2567,18 +2593,76 @@ fn verify_signed_request(req: &HttpRequest, now_epoch: i64) -> SignedRequestOutc
     // (CONTRACTS.md §6) — it only makes the module doc's "binds method"
     // claim structurally true instead of coincidentally true.
     let canonical = aoide_storage::wire_auth::canonical_string(&req.method, &req.path, timestamp, nonce, &req.body);
-    if !aoide_storage::wire_auth::verify_signature_hex(pubkey_hex, canonical.as_bytes(), signature) {
-        return SignedRequestOutcome::Refused(-32007, format!("signature verification failed for peer `{peer_name}`"));
-    }
+    let peers = aoide_storage::peer_store::load_peers();
+    // By-key resolution (fn doc): every verified record whose stored pubkey
+    // verifies this signature. An unverified or keyless record never enters
+    // the trial set — an unverified peer's key can never resolve.
+    let candidates: Vec<&aoide_storage::peer_store::Peer> = peers
+        .iter()
+        .filter(|p| p.verified)
+        .filter(|p| {
+            p.pubkey
+                .as_deref()
+                .filter(|k| !k.is_empty())
+                .is_some_and(|k| aoide_storage::wire_auth::verify_signature_hex(k, canonical.as_bytes(), signature))
+        })
+        .collect();
+    // ONE refusal for unknown key / unverified peer / keyless record / bad
+    // signature alike — never an existence oracle over the registry.
+    let resolved = match candidates.as_slice() {
+        [] => return SignedRequestOutcome::Refused(-32007, "signature verification failed".to_string()),
+        [one] => *one,
+        several => {
+            let Some(exact) = several.iter().find(|p| p.name == peer_name) else {
+                return SignedRequestOutcome::Refused(
+                    -32007,
+                    format!(
+                        "ambiguous signer: {} verified peer records share the public key that verifies this \
+                         signature and none is named `{peer_name}` — send `{HEADER_PEER}` naming one of them, \
+                         or remove the duplicate record (`peer remove`)",
+                        several.len()
+                    ),
+                );
+            };
+            *exact
+        }
+    };
+    let pubkey_hex = resolved.pubkey.as_deref().unwrap_or_default();
 
-    if nonce_is_replay(peer_name, nonce) {
+    if nonce_is_replay(pubkey_hex, nonce) {
         return SignedRequestOutcome::Refused(
             -32009,
-            format!("nonce replay: peer `{peer_name}` reused a `{HEADER_NONCE}` value already seen within the current replay window"),
+            format!(
+                "nonce replay: peer `{}` reused a `{HEADER_NONCE}` value already seen within the current replay window",
+                resolved.name
+            ),
         );
     }
 
-    SignedRequestOutcome::Verified(peer_name.to_string())
+    SignedRequestOutcome::Verified {
+        resolved: resolved.name.clone(),
+        claimed: peer_name.to_string(),
+    }
+}
+
+/// The audit detail `handle_connection` logs when a verified request's
+/// claimed `X-Aoide-Peer` name and its key-resolved record disagree
+/// (#63 P-ID5) — `None` when they agree (the overwhelmingly common case,
+/// nothing logged). Drift is ATTRIBUTION news, never a gate: the request
+/// already proved possession of the resolved record's key, so it proceeds
+/// as the resolved peer everywhere; this line only keeps the operator's
+/// audit trail honest about what the wire claimed. Pure, extracted from
+/// `handle_connection` the same way [`spawn_admitted`] is — testable
+/// without a socket.
+fn attribution_drift_detail(claimed: &str, resolved: &str) -> Option<String> {
+    (claimed != resolved).then(|| {
+        format!(
+            "attribution drift: `{}` claimed `{claimed}` but the signature verifies against the stored \
+             public key of peer `{resolved}` — proceeding as `{resolved}`; the claimed name is a label, \
+             never an identity",
+            aoide_storage::wire_auth::HEADER_PEER
+        )
+    })
 }
 
 /// Route one parsed request to (HTTP status, response body, audit-log
@@ -2594,7 +2678,8 @@ fn verify_signed_request(req: &HttpRequest, now_epoch: i64) -> SignedRequestOutc
 /// so it still unit-tests without a real socket, spawn, or audit-log write.
 /// `signed_peer_name` is P-P4's own addition: `Some(name)` when
 /// [`verify_signed_request`] already verified this request's signature
-/// headers against a paired peer (never re-verified here — `handle_connection`
+/// headers against a paired peer — the KEY-resolved record's name
+/// (#63 P-ID5), never the wire-claimed label (never re-verified here — `handle_connection`
 /// runs that check exactly once, before EITHER dispatch path), threaded
 /// straight into [`RequestCtx`] for `message/send` to consume.
 fn route(
@@ -3029,7 +3114,16 @@ fn handle_connection(
         .unwrap_or(0);
     let signed_peer_name = match verify_signed_request(&req, now_epoch) {
         SignedRequestOutcome::Unsigned => None,
-        SignedRequestOutcome::Verified(name) => Some(name),
+        // The RESOLVED name (the record whose key verified — #63 P-ID5) is
+        // what flows downstream: allows lookup, `peer:<name>` origin stamp,
+        // autogate. The claimed header name is attribution only; when it
+        // disagrees, the drift is audited and the resolved name still wins.
+        SignedRequestOutcome::Verified { resolved, claimed } => {
+            if let Some(detail) = attribution_drift_detail(&claimed, &resolved) {
+                let _ = audit(audit_log, Door::A2a, EventClass::Audit, "a2a.signed-request", "attribution-drift", &detail);
+            }
+            Some(resolved)
+        }
         SignedRequestOutcome::Refused(code, message) => {
             let body_val = jsonrpc_error_value(code, message.clone());
             let body = serde_json::to_vec(&body_val).unwrap_or_default();
@@ -4470,7 +4564,13 @@ mod tests {
         let kp = setup_signed_peer("box-b");
         let now = 1_800_000_000_i64;
         let req = signed_request(&kp, "box-b", "/", b"{\"a\":1}", now, &unique_nonce("ok"));
-        assert_eq!(verify_signed_request(&req, now), SignedRequestOutcome::Verified("box-b".to_string()));
+        assert_eq!(
+            verify_signed_request(&req, now),
+            SignedRequestOutcome::Verified {
+                resolved: "box-b".to_string(),
+                claimed: "box-b".to_string()
+            }
+        );
 
         let _ = std::fs::remove_dir_all(&root);
         match saved {
@@ -4480,7 +4580,12 @@ mod tests {
     }
 
     #[test]
-    fn verify_signed_request_refuses_an_unknown_or_unverified_peer() {
+    fn an_unknown_or_unverified_signer_is_refused_identically_to_a_bad_signature() {
+        // #63 P-ID5's no-existence-oracle pin: a signature matching NO
+        // verified peer's stored key (empty registry, or a peer registered
+        // but never verified) refuses with the EXACT code+message a merely
+        // tampered/bad signature earns — an outsider can never distinguish
+        // "your key isn't registered here" from "your signature is wrong".
         let _guard = crate::env_lock().lock().unwrap();
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -4493,28 +4598,44 @@ mod tests {
         let (kp, _) = aoide_storage::identity::load_or_mint().unwrap();
         let now = 1_800_000_000_i64;
 
-        // No peer registered at all under this claimed name.
+        // Unknown key: nothing registered at all — the claimed name resolves
+        // nothing because names resolve nothing; no stored key verifies.
         let req = signed_request(&kp, "nobody", "/", b"{}", now, &unique_nonce("unknown"));
-        match verify_signed_request(&req, now) {
+        let unknown_key_refusal = match verify_signed_request(&req, now) {
             SignedRequestOutcome::Refused(code, msg) => {
                 assert_eq!(code, -32007);
-                assert!(msg.contains("unknown peer"));
+                (code, msg)
             }
             other => panic!("expected Refused, got {other:?}"),
-        }
+        };
 
-        // Registered, correct pubkey, but never actually paired (`verified: false`).
+        // Registered, correct pubkey, but never actually paired
+        // (`verified: false`) — its key never enters the trial set.
         let mut unverified_peer = fixture_peer("box-c", "http://peer/", false);
         unverified_peer.pubkey = Some(kp.info().pubkey_hex);
         aoide_storage::peer_store::save_peers(&[unverified_peer]).unwrap();
         let req2 = signed_request(&kp, "box-c", "/", b"{}", now, &unique_nonce("unverified"));
-        match verify_signed_request(&req2, now) {
-            SignedRequestOutcome::Refused(code, msg) => {
-                assert_eq!(code, -32007);
-                assert!(msg.contains("pairing ceremony"));
-            }
+        let unverified_refusal = match verify_signed_request(&req2, now) {
+            SignedRequestOutcome::Refused(code, msg) => (code, msg),
             other => panic!("expected Refused, got {other:?}"),
-        }
+        };
+
+        // A genuinely VERIFIED peer, but a tampered body — the plain
+        // bad-signature refusal every case above must be indistinguishable
+        // from.
+        let mut verified_peer = fixture_peer("box-c", "http://peer/", false);
+        verified_peer.verified = true;
+        verified_peer.pubkey = Some(kp.info().pubkey_hex);
+        aoide_storage::peer_store::save_peers(&[verified_peer]).unwrap();
+        let mut req3 = signed_request(&kp, "box-c", "/", b"{\"real\":true}", now, &unique_nonce("bad-sig"));
+        req3.body = b"{\"real\":false}".to_vec();
+        let bad_sig_refusal = match verify_signed_request(&req3, now) {
+            SignedRequestOutcome::Refused(code, msg) => (code, msg),
+            other => panic!("expected Refused, got {other:?}"),
+        };
+
+        assert_eq!(unknown_key_refusal, bad_sig_refusal, "unknown key vs bad signature must be indistinguishable");
+        assert_eq!(unverified_refusal, bad_sig_refusal, "unverified peer's key vs bad signature must be indistinguishable");
 
         let _ = std::fs::remove_dir_all(&root);
         match saved {
@@ -4618,7 +4739,14 @@ mod tests {
         let nonce = unique_nonce("replay");
         let req = signed_request(&kp, "box-b", "/", b"{}", now, &nonce);
 
-        assert_eq!(verify_signed_request(&req, now), SignedRequestOutcome::Verified("box-b".to_string()), "the FIRST use of this nonce must verify");
+        assert_eq!(
+            verify_signed_request(&req, now),
+            SignedRequestOutcome::Verified {
+                resolved: "box-b".to_string(),
+                claimed: "box-b".to_string()
+            },
+            "the FIRST use of this nonce must verify"
+        );
 
         // The EXACT same request, replayed — same nonce, still inside the
         // window — must now refuse, even though the signature itself is
@@ -4636,6 +4764,199 @@ mod tests {
             Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
             None => std::env::remove_var("AOIDE_STATE_DIR"),
         }
+    }
+
+    #[test]
+    fn a_signature_resolves_the_peer_whose_key_signed_even_when_the_name_header_claims_another() {
+        // #63 P-ID5's core inversion: `box-a` holds the signing key, the
+        // wire claims `box-b` (a different, genuinely registered peer) —
+        // resolution follows the KEY, the claimed name survives only as
+        // attribution, and the mismatch produces a drift audit line.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-verify-by-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::env::set_var("AOIDE_STATE_DIR", &root);
+
+        let (kp, _) = aoide_storage::identity::load_or_mint().unwrap();
+        let mut box_a = fixture_peer("box-a", "http://peer-a/", false);
+        box_a.verified = true;
+        box_a.pubkey = Some(kp.info().pubkey_hex);
+        let mut box_b = fixture_peer("box-b", "http://peer-b/", false);
+        box_b.verified = true;
+        // Well-formed but unrelated key material — never verifies anything.
+        box_b.pubkey = Some("aa".repeat(32));
+        aoide_storage::peer_store::save_peers(&[box_a, box_b]).unwrap();
+
+        let now = 1_800_000_000_i64;
+        let req = signed_request(&kp, "box-b", "/", b"{}", now, &unique_nonce("by-key"));
+        match verify_signed_request(&req, now) {
+            SignedRequestOutcome::Verified { resolved, claimed } => {
+                assert_eq!(resolved, "box-a", "the record whose stored key verifies IS the caller");
+                assert_eq!(claimed, "box-b", "the wire's claim rides along for attribution");
+                let detail = attribution_drift_detail(&claimed, &resolved).expect("a claimed-vs-resolved mismatch must produce a drift audit line");
+                assert!(detail.contains("box-a") && detail.contains("box-b"), "the drift line names both: {detail:?}");
+            }
+            other => panic!("expected Verified resolving box-a, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
+    fn a_locally_renamed_peer_still_authenticates_by_its_key() {
+        // The defect that motivated this phase (PAIRING.md's former
+        // known-limitation note): the operator renamed the record, the far
+        // end still claims its old self name — the key hasn't changed, so
+        // authentication must not break.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-verify-renamed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::env::set_var("AOIDE_STATE_DIR", &root);
+
+        let kp = setup_signed_peer("renamed-peer");
+        let now = 1_800_000_000_i64;
+        // The wire still claims the name from before the local rename —
+        // registered nowhere.
+        let req = signed_request(&kp, "old-name", "/", b"{}", now, &unique_nonce("renamed"));
+        match verify_signed_request(&req, now) {
+            SignedRequestOutcome::Verified { resolved, claimed } => {
+                assert_eq!(resolved, "renamed-peer");
+                assert_eq!(claimed, "old-name");
+            }
+            other => panic!("a renamed peer's signature must still resolve it, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
+    fn shared_key_records_take_the_exact_name_tiebreak_or_refuse_ambiguous() {
+        // Collision semantics (#63 P-ID5, pinned in CONTRACTS §6): two
+        // verified records CAN share a pubkey (`upsert_paired_peer` matches
+        // by name only — the same remote instance paired under two names).
+        // Both hold the same PROVEN key, so the claimed name may pick among
+        // them (equal security, possibly different allows/autogate); with no
+        // exact-name match, refusing beats guessing which grants apply.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-verify-shared-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::env::set_var("AOIDE_STATE_DIR", &root);
+
+        let (kp, _) = aoide_storage::identity::load_or_mint().unwrap();
+        let pubkey = kp.info().pubkey_hex;
+        let mut twin_a = fixture_peer("twin-a", "http://peer-a/", false);
+        twin_a.verified = true;
+        twin_a.pubkey = Some(pubkey.clone());
+        let mut twin_b = fixture_peer("twin-b", "http://peer-b/", false);
+        twin_b.verified = true;
+        twin_b.pubkey = Some(pubkey);
+        aoide_storage::peer_store::save_peers(&[twin_a, twin_b]).unwrap();
+
+        let now = 1_800_000_000_i64;
+        // Claimed name matches one twin exactly — that one wins.
+        let req = signed_request(&kp, "twin-b", "/", b"{}", now, &unique_nonce("twin-exact"));
+        match verify_signed_request(&req, now) {
+            SignedRequestOutcome::Verified { resolved, claimed } => {
+                assert_eq!(resolved, "twin-b");
+                assert_eq!(claimed, "twin-b");
+            }
+            other => panic!("an exact-name match among shared-key records must resolve it, got {other:?}"),
+        }
+
+        // Claimed name matches neither — refused as ambiguous, taught.
+        let req2 = signed_request(&kp, "twin-c", "/", b"{}", now, &unique_nonce("twin-none"));
+        match verify_signed_request(&req2, now) {
+            SignedRequestOutcome::Refused(code, msg) => {
+                assert_eq!(code, -32007);
+                assert!(msg.contains("ambiguous"), "must refuse as ambiguous, never pick a record arbitrarily: {msg:?}");
+            }
+            other => panic!("shared-key records with no exact-name match must refuse, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
+    fn a_nonce_replay_is_caught_across_shared_key_records() {
+        // The nonce cache keys on the verifying PUBKEY, not any name
+        // (`NONCE_CACHE`'s doc): `X-Aoide-Peer` is outside the canonical
+        // string, so a captured request replayed under a shared-key twin's
+        // name still lands on the same cache key and refuses.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-verify-twin-replay-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::env::set_var("AOIDE_STATE_DIR", &root);
+
+        let (kp, _) = aoide_storage::identity::load_or_mint().unwrap();
+        let pubkey = kp.info().pubkey_hex;
+        let mut twin_a = fixture_peer("twin-a", "http://peer-a/", false);
+        twin_a.verified = true;
+        twin_a.pubkey = Some(pubkey.clone());
+        let mut twin_b = fixture_peer("twin-b", "http://peer-b/", false);
+        twin_b.verified = true;
+        twin_b.pubkey = Some(pubkey);
+        aoide_storage::peer_store::save_peers(&[twin_a, twin_b]).unwrap();
+
+        let now = 1_800_000_000_i64;
+        let nonce = unique_nonce("twin-replay");
+        let req = signed_request(&kp, "twin-a", "/", b"{}", now, &nonce);
+        assert!(
+            matches!(verify_signed_request(&req, now), SignedRequestOutcome::Verified { .. }),
+            "first use must verify"
+        );
+
+        // The same request re-sent claiming the twin: the name header is
+        // OUTSIDE the canonical string, so the identical method/path/
+        // timestamp/nonce/body yields the byte-identical (deterministic
+        // ed25519) signature — exactly what a captured-and-relabeled replay
+        // carries. Same key, same nonce: still a replay.
+        let replayed = signed_request(&kp, "twin-b", "/", b"{}", now, &nonce);
+        match verify_signed_request(&replayed, now) {
+            SignedRequestOutcome::Refused(code, _) => assert_eq!(code, -32009),
+            other => panic!("a replay under the twin's name must still be caught, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
+    fn attribution_drift_detail_fires_only_on_a_mismatch_and_names_both() {
+        assert_eq!(attribution_drift_detail("box-a", "box-a"), None, "agreement logs nothing");
+        let detail = attribution_drift_detail("claimed-name", "resolved-name").expect("a mismatch must produce the audit detail");
+        assert!(detail.contains("claimed-name") && detail.contains("resolved-name"), "both names in the line: {detail:?}");
+        assert!(detail.contains("X-Aoide-Peer"), "names the header the claim rode in on: {detail:?}");
     }
 
     #[test]
@@ -4697,7 +5018,7 @@ mod tests {
         let req = signed_request(&kp, "yomi-strix", "/", &body_bytes, now, &unique_nonce("admit"));
 
         let signed_peer_name = match verify_signed_request(&req, now) {
-            SignedRequestOutcome::Verified(name) => name,
+            SignedRequestOutcome::Verified { resolved, .. } => resolved,
             other => panic!("expected a REAL genuine signature to verify, got {other:?}"),
         };
         assert_eq!(signed_peer_name, "yomi-strix");
@@ -4749,7 +5070,7 @@ mod tests {
         let now = 1_800_000_000_i64;
         let req = signed_request(&kp, "yomi-strix", "/", &body_bytes, now, &unique_nonce("revoked"));
         let signed_peer_name = match verify_signed_request(&req, now) {
-            SignedRequestOutcome::Verified(name) => name,
+            SignedRequestOutcome::Verified { resolved, .. } => resolved,
             other => panic!("expected a REAL genuine signature to verify, got {other:?}"),
         };
 

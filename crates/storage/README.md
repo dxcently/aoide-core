@@ -102,10 +102,11 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   `PeerRung` carries a THIRD variant, `Signature` (P-P4) — the strongest
   rung, never produced by `resolve_peer` itself (it has no access to the
   raw HTTP request a signature needs); it is yielded only by
-  `aoide-server::a2a::verify_signed_request`, which authenticates a
-  request's `X-Aoide-*` headers against the peer's stored `pubkey` (see
-  `wire_auth` below, CONTRACTS.md §6's P-P4 amendment for the full wire
-  shape). None of the three rungs are interchangeable strength:
+  `aoide-server::a2a::verify_signed_request`, which resolves the caller BY
+  the stored `pubkey` that verifies the request's `X-Aoide-*` signature
+  headers (#63 P-ID5: identity is the key; the claimed name is attribution
+  only — see `wire_auth` below, CONTRACTS.md §6's P-P4 amendment for the
+  full wire shape). None of the three rungs are interchangeable strength:
   `aoide-server`'s spawn arm (`spawn_admitted`) accepts ONLY
   `PeerRung::Signature` — a bare address match carries no possession
   proof, and a bare token match is replayable and identical across every

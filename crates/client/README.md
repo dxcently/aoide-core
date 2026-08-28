@@ -438,10 +438,14 @@ never the inbound/serve half (that's `aoide-server`).
   `aoide_storage::wire_auth::canonical_string(HTTP_METHOD,
   aoide_storage::peer_store::url_path(&peer.url), timestamp, nonce, body)`
   with `aoide_storage::wire_auth::sign_hex`, and sends `X-Aoide-Peer` as
-  `peer.name` (this instance's own local registry name for the
-  counterpart — the pairing ceremony's single shared `name` value makes it
-  identical to what the counterpart's own registry resolves back to this
-  instance). `HTTP_METHOD` (P-P5b, closing a P-P4 review finding) is the
+  this instance's own SELF name (`aoide_storage::display::
+  local_host_name()`, the same value the pairing wire's `pairRequest.name`
+  sends — never `peer.name`, this side's local nickname for the
+  counterpart). The header is attribution only (#63 P-ID5): the far end
+  resolves the caller BY the stored pubkey that verifies the signature,
+  audits any claimed-vs-resolved name mismatch as attribution drift, and
+  uses the claimed name solely as the exact-name tiebreak among its own
+  records sharing this instance's key. `HTTP_METHOD` (P-P5b, closing a P-P4 review finding) is the
   ONE named constant `post_json`'s own `-X` argument reads too — before
   this fix the two carried independent `"POST"` literals that merely
   happened to agree; now there is exactly one value to drift from. An

@@ -58,8 +58,13 @@ use crate::identity::Keypair;
 use ed25519_dalek::Signature;
 use sha2::{Digest, Sha256};
 
-/// The peer's claimed name — the same [`crate::peer_store::valid_peer_name`]
-/// vocabulary as every other peer-name field on this wire.
+/// The signer's claimed self name — the same
+/// [`crate::peer_store::valid_peer_name`] vocabulary as every other
+/// peer-name field on this wire. Attribution only (#63 P-ID5): the verifier
+/// resolves the caller by the stored pubkey that verifies the signature,
+/// never by this value, which is checked for wire-format validity, audited
+/// (drift included), and consulted solely as the exact-name tiebreak among
+/// verified records sharing the verifying pubkey.
 pub const HEADER_PEER: &str = "X-Aoide-Peer";
 /// ISO-8601 UTC, [`crate::time::parse_iso_utc`]-shaped — the moment the
 /// SIGNER minted this request, checked against the verifier's own "now"

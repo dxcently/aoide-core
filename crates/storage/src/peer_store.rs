@@ -367,7 +367,9 @@ pub fn set_peer_allow(peers: &mut [Peer], name: &str, cap: &str, on: bool) -> Re
 /// or an impersonator ever sends. `Signature` (P-P4,
 /// `docs/architecture/PAIRING.md`'s "Wire authentication" section) is an
 /// ed25519 signature over that ONE request's own method/path/timestamp/
-/// nonce/body-digest, verified against the peer's stored pubkey — the only
+/// nonce/body-digest — the peer is resolved BY the stored pubkey that
+/// verifies it (#63 P-ID5: identity is the key; the wire's claimed name is
+/// attribution only) — the only
 /// rung cryptographically bound to the specific request that carried it.
 /// `Signature` is deliberately NOT produced by this function
 /// ([`resolve_peer`]) — verifying one needs the raw HTTP request
