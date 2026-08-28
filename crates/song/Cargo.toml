@@ -10,6 +10,7 @@ name = "aoide_song"
 path = "src/lib.rs"
 
 [dependencies]
+serde = { workspace = true }
 serde_json = { workspace = true }
 aoide-protocol = { workspace = true }
 aoide-storage = { workspace = true }

@@ -13,6 +13,7 @@
 pub mod commands;
 pub mod compose;
 pub mod cover;
+pub mod elements;
 pub mod ipc;
 pub mod live;
 pub mod livery;

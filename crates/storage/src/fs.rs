@@ -451,6 +451,22 @@ pub fn run_qml_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| song.join("run").join("qml"))
 }
 
+/// The live-deployed element config tree non-QML rice targets (waybar,
+/// dunst, ...) read from: `$AOIDE_ROOT/run/elements/` (default
+/// `~/.aoide/run/elements/`) — a sibling of [`run_qml_dir`], resolving off
+/// the exact same runtime root (docs/architecture/ELEMENTS.md, "Runtime
+/// layout").
+///
+/// Mirrors [`run_qml_dir`]'s own derivation exactly, joining `run/elements`
+/// instead of `run/qml`, so an `$AOIDE_STAGE_DIR` override relocates both
+/// together — one runtime root, two run-tree siblings.
+pub fn run_elements_dir() -> std::path::PathBuf {
+    let song = song_dir();
+    song.parent()
+        .map(|root| root.join("run").join("elements"))
+        .unwrap_or_else(|| song.join("run").join("elements"))
+}
+
 /// The Aoide FLAKE root: the git checkout `nix eval` shells out against
 /// (`crate::widgets`'s songbook manifest/registry regeneration, C4/W3) —
 /// and, since L-C2, the ONLY seam any repo-coupled feature (`rice declare`'s
@@ -1097,6 +1113,37 @@ mod tests {
         let _root = RootEnvGuard::set(std::path::Path::new("/tmp/aoide-run-qml-test-root"));
         std::env::remove_var("AOIDE_STAGE_DIR");
         assert_eq!(run_qml_dir(), std::path::PathBuf::from("/tmp/aoide-run-qml-test-root/run/qml"));
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+    }
+
+    #[test]
+    fn run_elements_dir_resolves_as_a_sibling_of_run_qml_under_the_stage_override() {
+        // Mirrors `run_qml_dir_resolves_as_a_sibling_of_song_under_the_stage_override`
+        // exactly — same runtime root, `run/elements` instead of `run/qml`.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+
+        std::env::set_var("AOIDE_STAGE_DIR", "/tmp/aoide-run-elements-test/stage");
+        assert_eq!(
+            run_elements_dir(),
+            std::path::PathBuf::from("/tmp/run/elements"),
+            "run/elements is a sibling of song_dir(), not under stage/"
+        );
+
+        // With `AOIDE_STAGE_DIR` absent: `$AOIDE_ROOT/song/stage` →
+        // song_dir() = `$AOIDE_ROOT/song` → run_elements_dir() =
+        // `$AOIDE_ROOT/run/elements` (`RootEnvGuard` keeps this off `root()`'s
+        // real fallback).
+        let _root = RootEnvGuard::set(std::path::Path::new("/tmp/aoide-run-elements-test-root"));
+        std::env::remove_var("AOIDE_STAGE_DIR");
+        assert_eq!(
+            run_elements_dir(),
+            std::path::PathBuf::from("/tmp/aoide-run-elements-test-root/run/elements")
+        );
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),

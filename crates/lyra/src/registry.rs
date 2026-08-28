@@ -4,9 +4,9 @@
 //!
 //! Golden snapshot: the sorted list of every command path lyra registers.
 //! Mirrors `aoide-cli`'s `registry.rs` test module — same invariant checks,
-//! lyra's own 44-path bundle (P-A4 minted 42; P-I3's `onboard` took it to
-//! 43; P3's `secrets ask` took it to 44 — see `commands/mod.rs::all()` for
-//! the assembly order).
+//! lyra's own 45-path bundle (P-A4 minted 42; P-I3's `onboard` took it to
+//! 43; P3's `secrets ask` took it to 44; L-E1's `element seed` took it to
+//! 45 — see `commands/mod.rs::all()` for the assembly order).
 
 pub use aoide_protocol::registry::*;
 
@@ -71,6 +71,7 @@ mod tests {
 
         let mut expected: Vec<&str> = vec![
             "cover.set",
+            "element.seed",
             "guide",
             "herald.push",
             "livery.emit",
@@ -118,6 +119,6 @@ mod tests {
         expected.sort();
 
         assert_eq!(got, expected, "command path set drifted from lyra's golden snapshot");
-        assert_eq!(got.len(), 44, "lyra's golden path count");
+        assert_eq!(got.len(), 45, "lyra's golden path count");
     }
 }

@@ -12,7 +12,7 @@ are core `aoide` identity, root `AGENTS.md`).
 
 - `bin/lyra` — the binary entry point.
 - `dispatch`/`registry` — lyra's own argv parsing, dispatch, and golden
-  command-path snapshot (44 paths), independent of core's.
+  command-path snapshot (45 paths), independent of core's.
 - `guide` — `lyra guide`.
 - `commands` — lyra's `commands::all()`, pulling in `song`, `screen`, and
   `conduct`'s `shellbridge`/`herald` registration lines (the files stay in
@@ -91,9 +91,13 @@ serve --stdio`'s door loop).
 
 ## How it composes
 
-44 command paths: onboard/rice/draft/mode/cover/livery/quickshell/screen/
-shellbridge/herald/take/secrets ask — everything that paints, or that only a
-desktop needs. Never depends on `aoide-client`/`aoide-conductor` — no A2A client, no
-TUI; those stay core-only. May depend on Nix (`song::widgets`'s `nix eval`,
-and now `commands::onboard`'s own `nix eval`/`nix-instantiate` shell-outs)
-— the one binary allowed to (root `AGENTS.md`, "core is nix-independent").
+45 command paths: onboard/rice/draft/mode/cover/livery/quickshell/screen/
+shellbridge/herald/take/element/secrets ask — everything that paints, or
+that only a desktop needs. `element seed` (L-E1,
+docs/architecture/ELEMENTS.md) renders a song's committed
+`elements/*/element.json` (non-QML rice targets — waybar, dunst, anything
+with a config file) into `run/elements/`. Never depends on
+`aoide-client`/`aoide-conductor` — no A2A client, no TUI; those stay
+core-only. May depend on Nix (`song::widgets`'s `nix eval`, and now
+`commands::onboard`'s own `nix eval`/`nix-instantiate` shell-outs) — the
+one binary allowed to (root `AGENTS.md`, "core is nix-independent").

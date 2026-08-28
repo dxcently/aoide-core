@@ -9,6 +9,7 @@
 
 pub mod cover;
 pub mod draft;
+pub mod elements;
 pub mod livery;
 pub mod mode;
 pub mod quickshell;

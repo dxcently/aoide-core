@@ -17,18 +17,20 @@
 //! in `crates/cli/src/commands/mod.rs::all()`), rice, draft,
 //! mode, cover, livery, rice-late stubs (declare/transpose only — NOT
 //! content/make/update, which stay core), shellbridge, quickshell, screen,
-//! herald, take, secrets (P3: `secrets ask`, the rice-shaped TOTP code-entry
-//! popup — root-coupled like `meta`/`onboard` in shape, but appended LAST
-//! per golden discipline's "append, never reorder," `pkgs/aoide/crates/
-//! AGENTS.md`). Core-only groups (graph, adapter melete, conductor, a2a
-//! serve, agents, peers, usage, hooks, daemon, soundcheck) are absent —
-//! lyra never registers them.
+//! herald, take, element (L-E1, docs/architecture/ELEMENTS.md: `element
+//! seed`, the render pipeline's shell-reachable bridge), secrets (P3:
+//! `secrets ask`, the rice-shaped TOTP code-entry popup — root-coupled like
+//! `meta`/`onboard` in shape, but appended LAST per golden discipline's
+//! "append, never reorder," `pkgs/aoide/crates/AGENTS.md`). Core-only groups
+//! (graph, adapter melete, conductor, a2a serve, agents, peers, usage,
+//! hooks, daemon, soundcheck) are absent — lyra never registers them.
 //!
 //! Path count: 2 (meta) + 1 (onboard) + 1 (mcp.serve) + 3 (rice) + 3 (draft)
 //! + 4 (mode) + 1 (cover) + 3 (livery) + 2 (rice-late) + 1 (shellbridge) + 1
-//! (quickshell) + 14 (screen) + 1 (herald) + 6 (take) + 1 (secrets ask) = 44
-//! (P-I3: 42 -> 43; P3: 43 -> 44). The plan's phase description estimated 41
-//! (the named groups alone, without `mcp.serve`); verified by generating
+//! (quickshell) + 14 (screen) + 1 (herald) + 6 (take) + 1 (element.seed) + 1
+//! (secrets ask) = 45 (P-I3: 42 -> 43; P3: 43 -> 44; L-E1: 44 -> 45). The
+//! plan's phase description estimated 41 (the named groups alone, without
+//! `mcp.serve`); verified by generating
 //! (`lyra schema --json | jq '.commands|length'`) — `mcp.serve` must be a
 //! registered path for `aoide_protocol::door::parse` to ever reach
 //! `lib.rs`'s `special` closure on `mcp serve --stdio`, exactly like core's
@@ -59,6 +61,7 @@ pub fn all() -> Registry {
     aoide_screen::commands::register(&mut r); // screen info, shot, point *, ocr, diff, send (own crate since P-A1)
     aoide_conduct::commands::herald::register(&mut r); // herald push — dunst's script hook into the notification ledger
     aoide_song::commands::take::register(&mut r); // rice take/take.*, rice back — explicit take-store snapshot
+    aoide_song::commands::elements::register(&mut r); // element seed — full render into run/elements/ (L-E1)
     secrets::register(&mut r); // secrets ask — the rice-shaped TOTP code-entry popup (P3)
 
     r

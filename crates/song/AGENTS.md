@@ -46,19 +46,49 @@
 - **Staging/draft/declarative-mode gating lives in `commands`, not here.**
   `rice stage`/`cover set` refuse outside an unlocked mode — that gate is a
   `commands` concern layered over these pure/near-pure engine modules.
+- **`elements::seed_tree` takes explicit paths and touches no global
+  state — `elements::seed_song` is the only env-resolving wrapper around
+  it.** Every other elements test exercises `seed_tree`/`render_files`/
+  `write_files` directly against a tmp dir, no `AOIDE_STAGE_DIR`/
+  `env_lock` needed; only `commands::elements`'s own handler test and
+  `seed_song` itself need the env rig. Don't fold `seed_song`'s
+  `songbook_dir`/`run_elements_dir` resolution back into `seed_tree` — that
+  would make the whole-songbook walker untestable without a stage override,
+  the same split `widgets.rs`'s `copy_tree_atomic`/`sync_song_widgets`
+  already holds.
+- **An element render error must never partially write that element.**
+  `render_files` renders every declared file into memory FIRST and returns
+  the first error without writing anything; `write_files` runs only once
+  `render_files` returned `Ok` for the WHOLE element. Don't merge these two
+  passes into one read-render-write-per-file loop — that would leave a
+  half-updated `run/elements/<name>/` on a mid-list render failure, exactly
+  what ELEMENTS.md's "leaves its old config in place" rules out.
+- **Element/song name validation reuses `compose::valid_song_name` —
+  don't fork the regex.** `element.json`'s `element` field holds to the
+  identical `^[a-z0-9][a-z0-9-]*$` shape `rice compose` already enforces on
+  song names; a second copy of that check would drift the moment one of
+  them changes.
 
 ## Extension points
 
-- **A new `rice`/`livery`/`cover` command** adds a `cmd!`/`register` entry in
-  `commands/`, wired into `lyra`'s `commands::all()` only.
+- **A new `rice`/`livery`/`cover`/`element` command** adds a `cmd!`/
+  `register` entry in `commands/`, wired into `lyra`'s `commands::all()`
+  only.
 - **A new emitter target** (stage/hyprctl/osc/file exist today) extends
   `livery::emit`, keeping the schema-validate → resolve → emit pipeline
   shape.
+- **A new element-descriptor field** extends `elements::Descriptor`/
+  `FileEntry`/`RunSpec` (serde, additive) and `parse_descriptor`'s
+  validation — `docs/architecture/ELEMENTS.md`'s "The descriptor" section is
+  the field-rule authority; `CONTRACTS.md §5`'s "Elements" subsection is
+  pinned in the same commit as any change to those rules.
 
 ## Docs update required in the same commit
 
 - This `README.md` when a new module or CLI command group is added.
 - `docs/architecture/PACKAGE-LAYOUT.md`'s "song rices portably" note if the
   nix-independence boundary shifts.
+- `CONTRACTS.md §5`'s "Elements" subsection when a descriptor field rule
+  changes.
 - `pkgs/aoide/crates/AGENTS.md` for cross-crate invariants — not restated
   here.
