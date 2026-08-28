@@ -16,9 +16,10 @@
 //! The merge is text/structure-level and NEVER a clobber (the kimi
 //! config holds providers/credentials; the claude settings are hand-written).
 //! It is content-aware: an existing entry is identified as OURS by a stable
-//! marker (the `session hook` substring, crossed with the capture-log marker
-//! for mode), then its actual command text is compared against what would be
-//! written now. A match is left untouched (zero rewrite, zero churn); a
+//! marker (`aoide` AND `session hook` both present — see `matches_mode` for
+//! why both are required — crossed with the capture-log marker for mode),
+//! then its actual command text is compared against what would be written
+//! now. A match is left untouched (zero rewrite, zero churn); a
 //! mismatch — a pre-rename spelling, a retired path baked into a `--capture`
 //! wrap, any stale text — is REWRITTEN in place to the current text. So the
 //! second run of an unchanged config reports zero added AND zero updated,
@@ -128,18 +129,31 @@ fn door_command(profile: &AgentProfile, capture: bool) -> String {
 }
 
 /// Identify an existing entry as OURS for this install mode — the
-/// content-comparison step below only ever rewrites an entry this returns
-/// `true` for, never a user's own unrelated hook. Plain and `--capture`
-/// entries are distinguished by the capture log marker, so the two coexist
-/// and neither install clobbers the other. Deliberately loose on the REST of
-/// the command text (a renamed door invocation, an old capture path, any
-/// prior spelling all still carry `session hook`): identification is
-/// separate from freshness — once an entry is identified as ours, its text
-/// is compared against the current `door_command` and rewritten if it
-/// differs, so a stale spelling is exactly the case this is meant to catch,
-/// not exclude.
+/// content-comparison step below only ever REWRITES an entry this returns
+/// `true` for, so a false positive here is no longer harmless (pre-#109 a
+/// false positive just meant "reported present"; post-#109 it means
+/// "command overwritten"). Two independent substrings, both required:
+/// `aoide` (the door binary name every real spelling invokes) and
+/// `session hook` (the verb every real spelling names). Neither alone is
+/// safe — `session hook` alone matches a user's own prose (`echo "logging
+/// session hook state" >> audit.log`), and `aoide` alone would match any
+/// unrelated hook that happens to shell out to the binary. Checked as two
+/// separate `contains` calls, not one joined phrase, because they are NOT
+/// contiguous in the pre-rename spelling (`aoide graph session hook
+/// --agent kimi` — `graph` sits between them); `--agent` was considered and
+/// rejected as a candidate third token because the claude/JSON door command
+/// (`"$a" session hook`) never carries it, old or new (verified against the
+/// actual pre-rename text, commit 5dac2d2). Plain and `--capture` entries
+/// are further distinguished by the capture log marker, so the two coexist
+/// and neither install clobbers the other. Identification is separate from
+/// freshness — once an entry is identified as ours, its text is compared
+/// against the current `door_command` and rewritten if it differs, so a
+/// stale spelling (a renamed door invocation, an old capture path) is
+/// exactly the case this is meant to catch, not exclude.
 fn matches_mode(command: &str, capture: bool) -> bool {
-    command.contains("session hook") && command.contains("-hooks.jsonl") == capture
+    command.contains("aoide")
+        && command.contains("session hook")
+        && command.contains("-hooks.jsonl") == capture
 }
 
 /// Resolve the settings file to merge into: kimi honours `KIMI_CODE_HOME` (its
@@ -855,6 +869,49 @@ mod tests {
     }
 
     #[test]
+    fn kimi_a_prose_hook_that_merely_mentions_session_hook_is_never_identified_as_ours() {
+        // The near-miss the loose pre-tightening marker missed: a user's own
+        // hook whose command TEXT happens to contain the literal phrase
+        // "session hook" (in prose, not an invocation) must never be
+        // identified as ours — post-#109 that identification means an
+        // in-place OVERWRITE, not just a `present` report.
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _env = EnvSaver::capture(&["KIMI_CODE_HOME", "HOME"]);
+        let root = unique_tmp("hooks-kimi-nearmiss");
+        std::env::set_var("KIMI_CODE_HOME", root.join("kimi"));
+        let path = root.join("kimi/config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let prose_line = "command = \"echo \\\"logging session hook state\\\" >> audit.log\"";
+        std::fs::write(
+            &path,
+            format!(
+                "[[hooks]]\nevent = \"SessionStart\"\n{prose_line}\ntimeout = 5\n"
+            ),
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let out = hooks_install(&install_inv("kimi", false));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.unwrap();
+        // Not identified as ours, so never rewritten...
+        assert!(
+            !data["updated"].as_array().unwrap().contains(&json!("SessionStart")),
+            "the prose hook was clobbered: {data}"
+        );
+        // ...and our own SessionStart entry is added alongside it (kimi's
+        // format allows multiple `[[hooks]]` blocks per event, same as the
+        // plain/`--capture` coexistence above).
+        assert!(data["added"].as_array().unwrap().contains(&json!("SessionStart")));
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.starts_with(&before), "the user's own block was not left untouched at its original spot: {after}");
+        assert_eq!(after.matches(prose_line).count(), 1, "the prose command line survives verbatim, exactly once: {after}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn capture_wrap_expands_aoide_root_at_hook_fire_time_not_install_time() {
         // The wrap is a SHELL snippet baked into the installed hook config,
         // not a path resolved in Rust at install time — so `door_command`
@@ -1016,6 +1073,50 @@ mod tests {
         assert_eq!(data2["updated"], json!([]));
         assert!(!data2["added"].as_array().unwrap().contains(&json!("PreToolUse")));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_a_prose_hook_that_merely_mentions_session_hook_is_never_identified_as_ours() {
+        // The JSON counterpart of the TOML near-miss above: a user's own
+        // PreToolUse hook whose command is prose containing the literal
+        // phrase "session hook" (no `aoide` invocation at all) must never
+        // be identified as ours and so never rewritten.
+        if skill_source().is_none() {
+            eprintln!("skipping claude_a_prose_hook_that_merely_mentions_session_hook_is_never_identified_as_ours: not inside an Aoide checkout (no .claude/skills/aoide above the cwd)");
+            return;
+        }
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _env = EnvSaver::capture(&["HOME"]);
+        let root = unique_tmp("hooks-claude-nearmiss");
+        std::env::set_var("HOME", &root);
+        let path = root.join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let prose_command = "echo \"logging session hook state\" >> audit.log";
+        let doc = json!({ "hooks": { "PreToolUse": [
+            { "hooks": [ { "type": "command", "command": prose_command } ] },
+        ] } });
+        std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap() + "\n").unwrap();
+
+        let out = hooks_install(&install_inv("claude", false));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.unwrap();
+        // Not identified as ours, so never rewritten...
+        assert!(
+            !data["updated"].as_array().unwrap().contains(&json!("PreToolUse")),
+            "the prose hook was clobbered: {data}"
+        );
+        // ...and our own PreToolUse group is added alongside it.
+        assert!(data["added"].as_array().unwrap().contains(&json!("PreToolUse")));
+
+        let merged: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let groups = merged["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(groups.len(), 2, "the user's group survives, ours is added alongside it");
+        assert_eq!(
+            groups[0]["hooks"][0]["command"], prose_command,
+            "the prose command must survive byte-identical"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
