@@ -14,8 +14,18 @@
 //!    never an overwrite.
 //!
 //! The merge is text/structure-level and NEVER a clobber (the kimi
-//! config holds providers/credentials; the claude settings are hand-written),
-//! idempotent (the second run reports zero added), and reports exactly what
+//! config holds providers/credentials; the claude settings are hand-written).
+//! It is content-aware: an existing entry is identified as OURS by a stable
+//! marker (the `session hook` substring, crossed with the capture-log marker
+//! for mode), then its actual command text is compared against what would be
+//! written now. A match is left untouched (zero rewrite, zero churn); a
+//! mismatch — a pre-rename spelling, a retired path baked into a `--capture`
+//! wrap, any stale text — is REWRITTEN in place to the current text. So the
+//! second run of an unchanged config reports zero added AND zero updated,
+//! while a run after a command/wrap change converges the on-disk entry
+//! instead of silently leaving it stale (a prior presence-only check missed
+//! exactly this: a renamed-away command or an old capture path kept matching
+//! the marker forever and was never rewritten). Reports exactly what
 //! changed. `--capture` is temporary debugging: the same graph entries with
 //! the command wrapped to tee raw payloads to `$AOIDE_ROOT/state/<agent>-hooks.jsonl`
 //! (NOT `~/Aoide/log` — that path is the audit log FILE) — a DISTINCT
@@ -117,9 +127,17 @@ fn door_command(profile: &AgentProfile, capture: bool) -> String {
     }
 }
 
-/// Does an existing entry's command belong to this install mode? Plain and
-/// `--capture` entries are distinguished by the capture log marker, so the two
-/// coexist and neither install clobbers the other.
+/// Identify an existing entry as OURS for this install mode — the
+/// content-comparison step below only ever rewrites an entry this returns
+/// `true` for, never a user's own unrelated hook. Plain and `--capture`
+/// entries are distinguished by the capture log marker, so the two coexist
+/// and neither install clobbers the other. Deliberately loose on the REST of
+/// the command text (a renamed door invocation, an old capture path, any
+/// prior spelling all still carry `session hook`): identification is
+/// separate from freshness — once an entry is identified as ours, its text
+/// is compared against the current `door_command` and rewritten if it
+/// differs, so a stale spelling is exactly the case this is meant to catch,
+/// not exclude.
 fn matches_mode(command: &str, capture: bool) -> bool {
     command.contains("session hook") && command.contains("-hooks.jsonl") == capture
 }
@@ -137,10 +155,13 @@ fn settings_path(profile: &AgentProfile) -> Result<PathBuf, String> {
 }
 
 /// What one install pass did: which events got a new entry, which already had
-/// one for this mode.
+/// one for this mode with matching text, and which had one identified as ours
+/// but with STALE text — rewritten in place to converge on the current
+/// `door_command`.
 struct InstallReport {
     added: Vec<&'static str>,
     present: Vec<&'static str>,
+    updated: Vec<&'static str>,
 }
 
 /// What the skill-link pass did (or why it didn't).
@@ -249,29 +270,58 @@ fn toml_basic(s: &str) -> String {
 }
 
 /// TOML (kimi): text-level merge — never parse-rewrite (the file holds
-/// providers/credentials). An event counts as installed when a `[[hooks]]`
-/// block names it AND its command matches this mode; missing events append
+/// providers/credentials). An event is identified as ours when a `[[hooks]]`
+/// block names it AND its command matches this mode (`matches_mode`); its
+/// `command` line is then compared to the current `door_command` — a match
+/// is left untouched, a mismatch is rewritten in place (event/timeout lines
+/// untouched, so nothing else in that block moves). Missing events append
 /// `[[hooks]]` blocks at EOF (valid TOML after any preceding table). The entry
 /// carries ONLY `event`/`command`/`timeout` — extra fields make kimi's config
 /// fail to load. A missing file is created (parents included).
 fn install_toml(path: &Path, profile: &AgentProfile, capture: bool) -> Result<InstallReport, String> {
     let existing = std::fs::read_to_string(path).unwrap_or_default();
-    let mut report = InstallReport { added: Vec::new(), present: Vec::new() };
-    let mut out = existing;
+    let mut report = InstallReport { added: Vec::new(), present: Vec::new(), updated: Vec::new() };
+    let wanted = door_command(profile, capture);
+    let wanted_line = format!("command = \"{}\"", toml_basic(&wanted));
+
+    // Split into the preamble (index 0) and each `[[hooks]]` block's body —
+    // `split` drops the marker itself, re-added on rejoin — so a stale
+    // block's `command` line can be rewritten in place without disturbing
+    // its `event`/`timeout` lines or any other block.
+    let mut blocks: Vec<String> = existing.split("[[hooks]]").map(str::to_string).collect();
+    let mut missing: Vec<&'static str> = Vec::new();
     for evt in events_for(profile) {
-        let has = out.split("[[hooks]]").skip(1).any(|block| {
-            block.contains(&format!("event = \"{evt}\""))
+        let hit = blocks.iter().enumerate().skip(1).find_map(|(i, block)| {
+            let is_ours = block.contains(&format!("event = \"{evt}\""))
                 && block
                     .lines()
                     .find(|l| l.trim_start().starts_with("command"))
                     .map(|l| matches_mode(l, capture))
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+            is_ours.then_some(i)
         });
-        if has {
-            report.present.push(evt);
-            continue;
+        match hit {
+            None => {
+                report.added.push(evt);
+                missing.push(evt);
+            }
+            Some(i) => {
+                let current_line = blocks[i]
+                    .lines()
+                    .find(|l| l.trim_start().starts_with("command"))
+                    .expect("matched by the same predicate above")
+                    .to_string();
+                if current_line.trim() == wanted_line {
+                    report.present.push(evt);
+                } else {
+                    report.updated.push(evt);
+                    blocks[i] = blocks[i].replacen(current_line.as_str(), &wanted_line, 1);
+                }
+            }
         }
-        report.added.push(evt);
+    }
+    let mut out = blocks.join("[[hooks]]");
+    for evt in &missing {
         if !out.is_empty() && !out.ends_with('\n') {
             out.push('\n');
         }
@@ -280,7 +330,7 @@ fn install_toml(path: &Path, profile: &AgentProfile, capture: bool) -> Result<In
         }
         out.push_str(&format!(
             "[[hooks]]\nevent = \"{evt}\"\ncommand = \"{}\"\ntimeout = 5\n",
-            toml_basic(&door_command(profile, capture))
+            toml_basic(&wanted)
         ));
     }
     // The onboarding pointer: one SessionStart entry, keyed on its marker —
@@ -303,7 +353,7 @@ fn install_toml(path: &Path, profile: &AgentProfile, capture: bool) -> Result<In
             toml_basic(POINTER_CMD)
         ));
     }
-    if !report.added.is_empty() {
+    if !report.added.is_empty() || !report.updated.is_empty() {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
@@ -313,11 +363,15 @@ fn install_toml(path: &Path, profile: &AgentProfile, capture: bool) -> Result<In
     Ok(report)
 }
 
-/// JSON (claude): parse → add missing entries to the hooks map → serialize,
-/// preserving the rest of the document. An invalid file is an error, never a
-/// clobber. New entries match the existing shape exactly: a matcher-less group
-/// wrapping one `{"type":"command","command":…}` hook. Nothing is written when
-/// nothing was added (a fully-wired file stays byte-identical).
+/// JSON (claude): parse → converge the hooks map → serialize, preserving the
+/// rest of the document. An invalid file is an error, never a clobber. An
+/// event's entry is identified as ours by `matches_mode` on its `command`
+/// string; when found, its text is compared to the current `door_command` —
+/// a match is left untouched, a mismatch is rewritten in place (same group,
+/// same `type`, only `command` changes). A missing event gets a new entry in
+/// the existing shape: a matcher-less group wrapping one
+/// `{"type":"command","command":…}` hook. Nothing is written when nothing
+/// was added or updated (a fully-wired, up-to-date file stays byte-identical).
 fn install_json(path: &Path, profile: &AgentProfile, capture: bool) -> Result<InstallReport, String> {
     let mut doc: Value = match std::fs::read_to_string(path) {
         Ok(text) => serde_json::from_str(&text).map_err(|e| {
@@ -333,42 +387,49 @@ fn install_json(path: &Path, profile: &AgentProfile, capture: bool) -> Result<In
     }
     let hooks = root.entry("hooks").or_insert_with(|| json!({}));
     let hooks = hooks.as_object_mut().expect("hooks is an object");
-    let mut report = InstallReport { added: Vec::new(), present: Vec::new() };
+    let mut report = InstallReport { added: Vec::new(), present: Vec::new(), updated: Vec::new() };
     for evt in events_for(profile) {
-        let has = hooks
-            .get(evt)
-            .and_then(Value::as_array)
-            .map(|groups| {
-                groups.iter().any(|g| {
-                    g.get("hooks")
-                        .and_then(Value::as_array)
-                        .map(|hs| {
-                            hs.iter().any(|h| {
-                                h.get("command")
-                                    .and_then(Value::as_str)
-                                    .map(|c| matches_mode(c, capture))
-                                    .unwrap_or(false)
-                            })
-                        })
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false);
-        if has {
-            report.present.push(evt);
-            continue;
+        let wanted = door_command(profile, capture);
+        let mut found = false;
+        if let Some(groups) = hooks.get_mut(evt).and_then(Value::as_array_mut) {
+            'groups: for g in groups.iter_mut() {
+                let Some(hs) = g.get_mut("hooks").and_then(Value::as_array_mut) else {
+                    continue;
+                };
+                for h in hs.iter_mut() {
+                    let is_ours = h
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .map(|c| matches_mode(c, capture))
+                        .unwrap_or(false);
+                    if !is_ours {
+                        continue;
+                    }
+                    found = true;
+                    let current = h.get("command").and_then(Value::as_str).unwrap_or("");
+                    if current == wanted {
+                        report.present.push(evt);
+                    } else {
+                        report.updated.push(evt);
+                        h["command"] = json!(wanted);
+                    }
+                    break 'groups;
+                }
+            }
         }
-        report.added.push(evt);
-        let group = json!({ "hooks": [ {
-            "type": "command",
-            "command": door_command(profile, capture),
-        } ] });
-        hooks
-            .entry(evt)
-            .or_insert_with(|| json!([]))
-            .as_array_mut()
-            .expect("event entry is an array")
-            .push(group);
+        if !found {
+            report.added.push(evt);
+            let group = json!({ "hooks": [ {
+                "type": "command",
+                "command": wanted,
+            } ] });
+            hooks
+                .entry(evt)
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .expect("event entry is an array")
+                .push(group);
+        }
     }
     // The onboarding pointer: one SessionStart entry, keyed on its marker —
     // mode-independent, so plain and `--capture` runs share the one entry.
@@ -406,7 +467,7 @@ fn install_json(path: &Path, profile: &AgentProfile, capture: bool) -> Result<In
             .expect("event entry is an array")
             .push(group);
     }
-    if !report.added.is_empty() {
+    if !report.added.is_empty() || !report.updated.is_empty() {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
@@ -488,6 +549,7 @@ fn hooks_install(inv: &Invocation) -> Outcome {
                 "agent": profile.name,
                 "added": report.added,
                 "present": report.present,
+                "updated": report.updated,
             }))
         }
     };
@@ -498,6 +560,7 @@ fn hooks_install(inv: &Invocation) -> Outcome {
             "skill_link": link.to_string_lossy(),
             "added": report.added,
             "present": report.present,
+            "updated": report.updated,
         }));
     }
     let (skill_status, skill_note): (&str, String) = match &skill {
@@ -525,8 +588,8 @@ fn hooks_install(inv: &Invocation) -> Outcome {
         SkillLink::Conflict(..) => unreachable!("returned above"),
     };
     let skill_linked = matches!(skill, SkillLink::Linked(..));
-    let changed = !report.added.is_empty() || skill_linked;
-    let message = if report.added.is_empty() {
+    let changed = !report.added.is_empty() || !report.updated.is_empty() || skill_linked;
+    let message = if report.added.is_empty() && report.updated.is_empty() {
         format!(
             "all {} hooks already installed for {} ({}); {skill_note}",
             report.present.len(),
@@ -534,9 +597,16 @@ fn hooks_install(inv: &Invocation) -> Outcome {
             path.display()
         )
     } else {
+        let mut counts = Vec::new();
+        if !report.added.is_empty() {
+            counts.push(format!("installed {}", report.added.len()));
+        }
+        if !report.updated.is_empty() {
+            counts.push(format!("updated {} (stale text converged)", report.updated.len()));
+        }
         format!(
-            "installed {} hook(s) for {} → {}; {skill_note}",
-            report.added.len(),
+            "{} hook(s) for {} → {}; {skill_note}",
+            counts.join(", "),
             profile.name,
             path.display()
         )
@@ -548,6 +618,12 @@ fn hooks_install(inv: &Invocation) -> Outcome {
             .iter()
             .map(|e| format!("hook installed: {e} ({})", profile.name))
             .collect();
+        changes.extend(
+            report
+                .updated
+                .iter()
+                .map(|e| format!("hook updated: {e} ({})", profile.name)),
+        );
         if skill_linked {
             changes.push(format!("skill linked ({})", profile.name));
         }
@@ -560,6 +636,7 @@ fn hooks_install(inv: &Invocation) -> Outcome {
         "settings": path.to_string_lossy(),
         "added": report.added,
         "present": report.present,
+        "updated": report.updated,
         "skill": skill_status,
         "capture": capture,
         "changed": changed,
@@ -665,6 +742,114 @@ mod tests {
         let capture_again = hooks_install(&install_inv("kimi", true));
         assert_eq!(capture_again.data.unwrap()["changed"], false);
         assert_eq!(std::fs::read_to_string(root.join("kimi/config.toml")).unwrap(), text);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn kimi_reinstall_converges_a_stale_command_spelling_and_preserves_user_hook() {
+        // The real yomi incident this fix targets: a pre-rename spelling
+        // (`graph session hook`) still carries the `session hook` marker, so
+        // the presence-only check called it "already installed" forever and
+        // never rewrote it — the kimi harness kept running a dead command.
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _env = EnvSaver::capture(&["KIMI_CODE_HOME", "HOME"]);
+        let root = unique_tmp("hooks-kimi-stale-cmd");
+        std::env::set_var("KIMI_CODE_HOME", root.join("kimi"));
+        let path = root.join("kimi/config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // The stale SessionStart entry, plus the user's OWN unrelated
+        // automation hook — it must survive the reinstall untouched.
+        std::fs::write(
+            &path,
+            "default_model = \"kimi-code/k3-256k\"\n\n\
+             [[hooks]]\n\
+             event = \"SessionStart\"\n\
+             command = \"aoide graph session hook --agent kimi\"\n\
+             timeout = 5\n\n\
+             [[hooks]]\n\
+             event = \"MyOwnAutomation\"\n\
+             command = \"my-own-script.sh\"\n\
+             timeout = 5\n",
+        )
+        .unwrap();
+
+        let out = hooks_install(&install_inv("kimi", false));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.unwrap();
+        assert_eq!(data["changed"], true);
+        // Identified as ours (still carries the marker) and REWRITTEN, not
+        // silently left alone.
+        assert_eq!(data["updated"], json!(["SessionStart"]));
+        // Every other graph event plus the pointer was missing and got added.
+        assert_eq!(data["added"].as_array().unwrap().len(), 10);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("command = \"aoide session hook --agent kimi\""),
+            "stale spelling was not converged: {text}"
+        );
+        assert!(
+            !text.contains("graph session hook"),
+            "stale spelling still present after reinstall: {text}"
+        );
+        // The user's own unrelated hook, untouched, exactly once.
+        assert!(text.contains("event = \"MyOwnAutomation\""));
+        assert!(text.contains("command = \"my-own-script.sh\""));
+        assert_eq!(text.matches("MyOwnAutomation").count(), 1);
+
+        // Reinstalling again over the now-correct text is a true no-op.
+        let out2 = hooks_install(&install_inv("kimi", false));
+        let data2 = out2.data.unwrap();
+        assert_eq!(data2["changed"], false);
+        assert_eq!(data2["added"], json!([]));
+        assert_eq!(data2["updated"], json!([]));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn kimi_capture_reinstall_converges_a_stale_state_path_wrap() {
+        // The other real incident this fix targets: #113 moved the capture
+        // wrap from the retired `~/Aoide/state` to `${AOIDE_ROOT:-...}`, but
+        // both spellings carry the same `-hooks.jsonl` marker — so a
+        // presence-only check kept the retired path installed forever.
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _env = EnvSaver::capture(&["KIMI_CODE_HOME", "HOME"]);
+        let root = unique_tmp("hooks-kimi-stale-wrap");
+        std::env::set_var("KIMI_CODE_HOME", root.join("kimi"));
+        std::env::set_var("HOME", &root);
+        let path = root.join("kimi/config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "[[hooks]]\n\
+             event = \"UserPromptSubmit\"\n\
+             command = \"sh -c 'tee -a \\\"$HOME/Aoide/state/kimi-hooks.jsonl\\\" | aoide session hook --agent kimi'\"\n\
+             timeout = 5\n",
+        )
+        .unwrap();
+
+        let out = hooks_install(&install_inv("kimi", true));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.unwrap();
+        assert_eq!(data["changed"], true);
+        assert_eq!(data["updated"], json!(["UserPromptSubmit"]));
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("${AOIDE_ROOT:-$HOME/.aoide}/state/kimi-hooks.jsonl"),
+            "stale capture wrap was not converged: {text}"
+        );
+        assert!(!text.contains("Aoide/state"), "retired path still present: {text}");
+
+        // Idempotent on the converged text.
+        let out2 = hooks_install(&install_inv("kimi", true));
+        let data2 = out2.data.unwrap();
+        assert_eq!(data2["changed"], false);
+        assert_eq!(data2["updated"], json!([]));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -781,6 +966,56 @@ mod tests {
         // And the full set is present again on a third run.
         let out3 = hooks_install(&install_inv("claude", false));
         assert_eq!(out3.data.unwrap()["changed"], false);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_reinstall_converges_a_stale_command_and_preserves_user_hook() {
+        if skill_source().is_none() {
+            eprintln!("skipping claude_reinstall_converges_a_stale_command_and_preserves_user_hook: not inside an Aoide checkout (no .claude/skills/aoide above the cwd)");
+            return;
+        }
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _env = EnvSaver::capture(&["HOME"]);
+        let root = unique_tmp("hooks-claude-stale");
+        std::env::set_var("HOME", &root);
+        let path = root.join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A stale pre-rename PreToolUse entry (still carries the `session
+        // hook` marker, so a presence-only check would call it installed
+        // forever) sharing its group array with the user's OWN unrelated
+        // PreToolUse hook, which must survive the reinstall untouched.
+        let doc = json!({ "hooks": { "PreToolUse": [
+            { "hooks": [ { "type": "command",
+                "command": "a=$(command -v aoide) || exit 0; \"$a\" graph session hook >/dev/null 2>&1; exit 0" } ] },
+            { "hooks": [ { "type": "command", "command": "my-own-lint-check.sh" } ] },
+        ] } });
+        std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap() + "\n").unwrap();
+
+        let out = hooks_install(&install_inv("claude", false));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.unwrap();
+        assert_eq!(data["changed"], true, "msg: {}", out.message);
+        assert_eq!(data["updated"], json!(["PreToolUse"]));
+
+        let merged: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let groups = merged["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(groups.len(), 2, "no duplicate entry -- the stale one was rewritten in place");
+        assert_eq!(
+            groups[0]["hooks"][0]["command"],
+            "a=$(command -v aoide) || exit 0; \"$a\" session hook >/dev/null 2>&1; exit 0"
+        );
+        // The user's own unrelated hook, untouched.
+        assert_eq!(groups[1]["hooks"][0]["command"], "my-own-lint-check.sh");
+
+        // Idempotent on the converged text.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let out2 = hooks_install(&install_inv("claude", false));
+        let data2 = out2.data.unwrap();
+        assert_eq!(data2["updated"], json!([]));
+        assert!(!data2["added"].as_array().unwrap().contains(&json!("PreToolUse")));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
 
         let _ = std::fs::remove_dir_all(&root);
     }
