@@ -287,9 +287,11 @@ never the inbound/serve half (that's `aoide-server`).
   `register_peer_pair`.
   **`pair_watch` (P-P5, a NEW module, CONTRACTS.md §6's "Pairing events
   feed" subsection)** is the pairing ceremony's own watcher: `parse_pair_line`
-  reads the three `class: "gate"`/`source: "a2a-door"` milestones
+  reads the `class: "gate"`/`source: "a2a-door"` milestones
   `aoide_server::a2a::emit_pairing_event` writes (`pair-parked`/
-  `pair-revealed`/`pair-awaiting-confirm`) off aoided's OWN events feed —
+  `pair-revealed` live; `pair-awaiting-confirm` dormant since task #119
+  retired the callback that emitted it, parsed only for old lines) off
+  aoided's OWN events feed —
   the SAME file `events tail` already follows, since `a2a serve` appends
   onto it directly; `reconcile` re-derives every pending request straight
   from `aoide_storage::pairing::list_inbound`/`list_outbound` (the

@@ -550,11 +550,13 @@ pub fn mark_inbound_approved(id: &str, now_epoch: i64) -> Result<InboundPairingR
 /// `peer pair request`, parks only on a successful reveal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OutboundState {
-    /// Waiting on the approver's own human to confirm the SAS and deliver
-    /// `aoide/pairApprove` — the state every outbound entry starts in.
+    /// Waiting on the approver's own human to confirm the SAS and approve
+    /// locally — the state every outbound entry starts in. This instance
+    /// learns of the approval only by polling `aoide/pairPoll` (task #119:
+    /// there is no approver→requester callback).
     #[serde(rename = "awaiting-approval")]
     AwaitingApproval,
-    /// The approver's callback arrived with a matching pubkey
+    /// A poll answered `approved` with a matching pubkey
     /// ([`mark_outbound_awaiting_confirm`]) — THIS instance's own operator
     /// still has to confirm the SAS before anything commits (`peer pair
     /// approve <id>` on this entry, the requester-side confirm path).
@@ -582,9 +584,10 @@ impl OutboundState {
 }
 
 /// One pairing request THIS instance (the requester) sent out and is
-/// waiting on — either the approver's own callback ([`OutboundState::
-/// AwaitingApproval`]) or this instance's OWN operator's confirm-then-
-/// commit ([`OutboundState::AwaitingConfirm`], module doc).
+/// waiting on — either the approver's local approval, learned by polling
+/// `aoide/pairPoll` ([`OutboundState::AwaitingApproval`]), or this
+/// instance's OWN operator's confirm-then-commit
+/// ([`OutboundState::AwaitingConfirm`], module doc).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboundPairingRequest {
     /// Same id the approver parked it under (module doc — one shared id,
@@ -705,7 +708,7 @@ pub enum ConfirmMarkError {
     /// No parked outbound request has this id (unknown, already completed,
     /// or expired).
     Unknown,
-    /// The callback's `pubkeyHex` does not match what this instance
+    /// The poll release's `pubkeyHex` does not match what this instance
     /// learned at request time — the entry is left EXACTLY as it was
     /// (never removed, never re-parked with different data — there was
     /// nothing to restore since nothing was ever taken off the queue for
@@ -715,8 +718,9 @@ pub enum ConfirmMarkError {
     Io(String),
 }
 
-/// The `aoide/pairApprove` callback's handler-side effect (review-bounce
-/// Finding 2): on a pubkey match, transition the outbound entry to
+/// The requester-side effect of a successful `aoide/pairPoll` release
+/// (task #119; formerly the `aoide/pairApprove` callback's handler-side
+/// effect): on a pubkey match, transition the outbound entry to
 /// [`OutboundState::AwaitingConfirm`] — deliberately NOT a commit. This
 /// instance's OWN operator still has to run `peer pair approve <id>` and
 /// confirm the SAS before `upsert_paired_peer` ever runs on this side

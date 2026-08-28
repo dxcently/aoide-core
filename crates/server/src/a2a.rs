@@ -1527,10 +1527,14 @@ fn self_url(bind: &str, port: u16) -> String {
     format!("http://{bind}:{port}/")
 }
 
-/// Best-effort emit onto aoided's own events feed for one of the three
-/// pairing-ceremony milestones (P-P5, CONTRACTS.md §6's "Pairing events
-/// feed" subsection): `pair-parked`, `pair-revealed`,
-/// `pair-awaiting-confirm`. Never `?`, never panics — the posture
+/// Best-effort emit onto aoided's own events feed for a pairing-ceremony
+/// milestone (P-P5, CONTRACTS.md §6's "Pairing events feed" subsection):
+/// `pair-parked` and `pair-revealed` are the two live kinds. The third,
+/// `pair-awaiting-confirm`, is RETIRED with the callback that emitted it
+/// (task #119 — approval is learned by the requester's own poll, which
+/// runs client-side where this door-side feed writer never sees it);
+/// `parse_pair_line` still reads it for old feed lines. Never `?`,
+/// never panics — the posture
 /// `aoide_secrets::broker::emit_notify` already holds, because a
 /// notification write must never fail or block the ceremony itself
 /// ([`FeedWriter::append`] is already best-effort internally; this
@@ -1752,6 +1756,16 @@ fn pair_reveal(params: &Value, audit_log: &Path) -> Result<Value, (i64, String)>
 /// nonceHex, &[])` (the SAME canonical-string primitive P-P4 signs, reused
 /// rather than reinvented, with an empty body — a poll carries no body of
 /// its own to bind).
+///
+/// The nonce is signed but NOT replay-checked (no `nonce_is_replay` here,
+/// unlike P-P4's request path): a captured poll replays cleanly inside the
+/// skew window, and that is accepted deliberately — the response is
+/// idempotent and releases only B's own pubkey, which `aoide/pairRequest`
+/// already hands to any caller; there is nothing a replay gains. Timing is
+/// likewise not uniform across the pending cases (an unknown id refuses
+/// before the signature verify, a known one pays it) — the oracle
+/// discipline below is byte-level, not timing-level, stated so nobody
+/// reads a stronger claim into it.
 ///
 /// **Existence-oracle discipline (mirrors the door's own Phase G/2026-08-20
 /// amendment for `message/send`'s `contextId` lookup, CONTRACTS.md §6): an

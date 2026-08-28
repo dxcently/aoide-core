@@ -1,9 +1,16 @@
 //! `aoide peer pair watch` (P-P5): a foreground, line-mode follow of
-//! `aoided`'s own events feed for the THREE pairing-ceremony milestones
+//! `aoided`'s own events feed for the pairing-ceremony milestones
 //! `aoide_server::a2a::emit_pairing_event` writes (`pair-parked`/
-//! `pair-revealed`/`pair-awaiting-confirm`, `class: "gate"`,
-//! `source: "a2a-door"`, CONTRACTS.md §6's "Pairing events feed"
-//! subsection) — the SAME tail/reconcile/narrate shape
+//! `pair-revealed`, `class: "gate"`, `source: "a2a-door"`, CONTRACTS.md
+//! §6's "Pairing events feed" subsection) — the SAME tail/reconcile/
+//! narrate shape. The third kind, `pair-awaiting-confirm`, is DORMANT
+//! since task #119 retired the approver→requester callback that was its
+//! only emitter: approval is learned by `peer pair approve`'s own
+//! synchronous poll, so the watcher can no longer self-trigger on an
+//! outbound approval (CONTRACTS.md's feed subsection carries the same
+//! note; active polling in this watch loop is the named follow-on, not
+//! built). [`PairEvent::AwaitingConfirm`] still parses for old lines.
+//! The shape is the one
 //! `aoide_secrets::watch` already proved for the secrets broker's own
 //! feed, and the same simpler (no socket, no interactive prompt) core
 //! `aoide_server::events::tail` already proved for a passive follow.
@@ -122,10 +129,9 @@ pub enum PairEvent {
     /// SAS is now derivable (`aoide_storage::pairing::reveal_inbound`'s
     /// own Ok arm).
     Revealed { id: String, name: String, ts: u64 },
-    /// `pair-awaiting-confirm`: an outbound request's peer just approved
-    /// it — this instance's own operator can now confirm
-    /// (`aoide_storage::pairing::mark_outbound_awaiting_confirm`'s own Ok
-    /// arm).
+    /// `pair-awaiting-confirm`: DORMANT (module doc — task #119 deleted
+    /// its only emitter with the callback; kept so old feed lines still
+    /// parse, never fired by current code).
     AwaitingConfirm { id: String, name: String, ts: u64 },
 }
 
