@@ -18,7 +18,7 @@ use aoide::dispatch::{dispatch, registry};
 use aoide_server::daemon::serve_daemon;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -69,6 +69,15 @@ fn floor_stage_env() {
         }
         if std::env::var_os("AOIDE_STATE_DIR").is_none() {
             std::env::set_var("AOIDE_STATE_DIR", base.join("state"));
+        }
+        // LANE IDENTITY P-ID3 (G8 test below): a controllable, private
+        // `$XDG_RUNTIME_DIR` so `conduct_socket_path`'s default resolution
+        // (`/run/user/1000/aoide/...` otherwise) lands somewhere this test
+        // binary actually owns — the same "floor before a real daemon
+        // touches a shared default path" reasoning this function's own doc
+        // already states for the stage/state dirs.
+        if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+            std::env::set_var("XDG_RUNTIME_DIR", base.join("run"));
         }
     });
 }
@@ -216,6 +225,86 @@ fn a_gated_command_returns_gated_true() {
     assert_eq!(outcome["status"], "not-implemented", "{outcome}");
 
     cleanup(&socket_path, &events_path);
+}
+
+/// LANE IDENTITY P-ID3 (G8): a `send` dispatched over this SAME daemon door
+/// — the REAL registry, the real `send` command, not a fixture — must never
+/// resolve its sender ATTRIBUTION against THIS process's own ambient
+/// `AOIDE_SESSION_ID`. `serve_daemon` runs `dispatch` on a thread inside
+/// THIS test binary, so setting the env var here is not a stand-in for "the
+/// daemon's own env" — for the real production shape (a resident `aoided`
+/// process serving this exact socket op inside its own process), it is
+/// literally the identical fact: whatever `AOIDE_SESSION_ID` `aoided` itself
+/// happened to inherit at launch is exactly what a same-process
+/// `std::env::var` read inside its `dispatch` call would see.
+///
+/// Deliberately no `--yes`, no autogate, and no `--from` on the wire — the
+/// shape a genuinely unrelated same-uid process would produce by dispatching
+/// a raw `send` request directly at this socket, bypassing `aoide send`'s
+/// own CLI entirely. The GATE resolves the DAEMON's own `/proc` ancestry
+/// (this test binary's, here — `init -> ... -> cargo-test`, matching no live
+/// sealed session), so this was ALREADY held pending before the G8 fix; what
+/// the fix changes is the pending entry's ATTRIBUTION, which is what this
+/// test actually pins.
+#[test]
+fn a_daemon_dispatched_send_never_resolves_this_processs_own_ambient_session_id() {
+    let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _saver = aoide_test_support::EnvSaver::capture(&["AOIDE_SESSION_ID", "AOIDE_CONDUCT_AUTOGATE"]);
+    std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+    // Stands in for whatever `aoided`'s OWN launch environment might carry —
+    // a stray value a dispatched `send` must never pick up as if it were the
+    // connecting caller's own attribution.
+    std::env::set_var("AOIDE_SESSION_ID", "daemons-own-stray-session");
+    floor_stage_env();
+
+    let id = "g8-dispatch-target";
+    let socket = aoide_conduct::graph::conduct_socket_path(id);
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    // Nothing must ever connect here — a wrongly-delivered send would.
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    let sf = aoide_conduct::graph::SessionsFile {
+        schema_version: "0".to_string(),
+        sessions: vec![aoide_conduct::graph::SessionRecord {
+            session_id: id.to_string(),
+            state: "idle".to_string(),
+            conductable: Some(true),
+            socket: Some(socket.to_string_lossy().into_owned()),
+            ..Default::default()
+        }],
+    };
+    aoide_conduct::graph::write_stage(&aoide_conduct::graph::sessions_path(), &sf).unwrap();
+
+    let (stream, socket_path, events_path) = start_daemon("g8-send");
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+
+    let outcome = send_dispatch(&mut writer, &mut reader, &["send"], &["hello"], &[("id", id)]);
+
+    assert_eq!(outcome["status"], "ok", "{outcome}");
+    assert_eq!(
+        outcome["data"]["delivered"], false,
+        "no --yes/autogate, and the daemon's own ancestry resolves no live session: this must be held pending, not delivered — {outcome}"
+    );
+    assert!(listener.accept().is_err(), "a gated send must never touch the target's socket");
+
+    let pending: Value = serde_json::from_str(
+        &std::fs::read_to_string(aoide_conduct::graph::pending_path()).expect("pending.json must exist"),
+    )
+    .unwrap();
+    let entries = pending["pending"].as_array().unwrap();
+    let mine = entries
+        .iter()
+        .find(|e| e["sessionId"] == id)
+        .unwrap_or_else(|| panic!("no pending entry for `{id}`: {pending}"));
+    assert!(
+        mine.get("from").is_none() || mine["from"].is_null(),
+        "the pending entry must carry NO attribution — the daemon's own ambient AOIDE_SESSION_ID must never leak in as if it were the caller's: {mine}"
+    );
+
+    cleanup(&socket_path, &events_path);
+    let _ = std::fs::remove_file(&socket);
 }
 
 /// `mcp.serve`/`a2a.serve` never start a server inside the daemon process —

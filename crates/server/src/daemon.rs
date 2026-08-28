@@ -751,6 +751,41 @@ fn read_capped_line(reader: &mut BufReader<UnixStream>, cap: usize) -> Result<Op
 /// [`Door::Daemon`], never read off the wire — a caller cannot claim to be
 /// a different door for the per-command policy checks `dispatch` runs (module
 /// doc's "Door policy is not reimplemented here").
+///
+/// **LANE IDENTITY P-ID3 (G8, attribution half).** `send`'s own
+/// `resolve_sender` (`aoide_conduct::graph::send`'s own doc — ATTRIBUTION,
+/// never the gate) falls back to `AOIDE_SESSION_ID` off the CALLING
+/// process's env whenever a request carries no explicit `--from`. A
+/// `dispatch`ed invocation runs its handler INSIDE THIS daemon process, so
+/// that fallback would read `aoided`'s OWN ambient env — not the
+/// connecting client's, which never crosses this socket at all — and could
+/// misattribute a proxied `send` to whatever session id `aoided` happened
+/// to inherit at launch (parked in a shell, a stray env in the unit file).
+/// The exact leak shape [`crate::a2a::do_inject`] closes for `a2a serve`'s
+/// own env, restated at this second proxy point: a request with no `from`
+/// on the wire is stamped `--from ""`, `resolve_sender`'s own documented
+/// "explicit no attribution" form (the identical mechanism `session
+/// pending approve`'s re-drive already relies on) — never left to fall
+/// through to this process's ambient env. Harmless for every OTHER
+/// command in this registry: none of them reads a `from` flag at all
+/// (`send` is the sole consumer, confirmed by grep — a future command that
+/// grows the same env-fallback shape inherits this scrub for free rather
+/// than needing its own).
+///
+/// **What this does NOT close**: the GATE itself
+/// (`aoide_conduct::graph::send::real_attested_sender`) walks
+/// `std::process::id()`'s own `/proc` ancestry, which — run from inside
+/// THIS process — is `aoided`'s own ancestry, never the connecting
+/// client's. In production that ancestry is `init -> systemd -> aoided`,
+/// which never resolves a live sealed session, so a dispatched `send`
+/// with no `--yes`/autogate ALREADY fails closed to `pending` today — not
+/// because anything here re-derives the connecting client's real identity
+/// (it doesn't), but because the daemon's own ancestry is architecturally
+/// incapable of impersonating one. Threading the connecting peer's real
+/// pid into the gate so a dispatched `send` resolves the ACTUAL caller
+/// (rather than merely failing closed) would touch `send.rs`'s gate
+/// itself — out of this phase's scope fence; see `CONTRACTS.md`'s identity
+/// section for the honest accounting.
 fn invocation_from_dispatch_request(req: &Value) -> Result<Invocation, String> {
     let path: Vec<String> = req
         .get("path")
@@ -780,6 +815,7 @@ fn invocation_from_dispatch_request(req: &Value) -> Result<Invocation, String> {
         }
         Some(_) => return Err("dispatch request's `flags` must be an object".to_string()),
     }
+    flags.entry("from".to_string()).or_insert_with(String::new);
 
     Ok(Invocation { path, args, flags, door: Door::Daemon })
 }
@@ -811,6 +847,36 @@ pub fn serve_daemon(
     Ok(())
 }
 
+/// LANE IDENTITY P-ID3 (G8) — the daemon dispatch socket's CROSS-UID floor,
+/// pure and unit-tested without a real different-uid connection (mirrors
+/// `aoide_secrets::broker::admin_gate` and `aoide_conduct::shellbridge::
+/// cross_uid_gate` exactly — the SAME decision restated at this third
+/// socket, not a fourth wording for it). `None` (admitted) only when the
+/// peer's kernel-attested uid equals `my_euid` — this daemon's OWN euid,
+/// since every legitimate connector (the CLI's `daemon_dispatch` proxy, a
+/// hook's `session hook`, the conductor) already runs as the SAME uid this
+/// process does. An unidentified peer (`SO_PEERCRED` read failed) is
+/// refused the same fail-closed way a mismatched uid is.
+///
+/// **This closes a CROSS-uid gap only.** It does not, and was never meant
+/// to, stop a same-uid process from dispatching a request over this socket
+/// — see [`invocation_from_dispatch_request`]'s own doc for the SEPARATE
+/// attribution fix (G8's other half) and `CONTRACTS.md`'s identity section
+/// for the honest accounting of what remains open.
+fn cross_uid_gate(peer: Option<aoide_secrets::peercred::PeerCred>, my_euid: u32) -> Option<String> {
+    match peer {
+        Some(p) if p.uid == my_euid => None,
+        Some(p) => Some(format!(
+            "aoided dispatch connection refused: peer uid {} does not match this daemon's own uid {my_euid}",
+            p.uid
+        )),
+        None => Some(
+            "aoided dispatch connection refused: peer uid could not be determined (SO_PEERCRED read failed)"
+                .to_string(),
+        ),
+    }
+}
+
 fn accept_loop(
     listener: UnixListener,
     events_path: PathBuf,
@@ -818,9 +884,23 @@ fn accept_loop(
     dispatch: DispatchFn,
     watcher: SharedHandEditWatcher,
 ) {
+    // SAFETY: `geteuid()` takes no arguments and cannot fail.
+    let my_euid = unsafe { libc::geteuid() };
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
+                let peer = aoide_secrets::peercred::peer_cred(&stream);
+                if let Some(reason) = cross_uid_gate(peer, my_euid) {
+                    let _ = audit(
+                        &aoide_protocol::default_audit_log(),
+                        Door::Daemon,
+                        EventClass::Audit,
+                        "aoided",
+                        "peercred-refused",
+                        &reason,
+                    );
+                    continue; // Dropped, unconditionally — never reaches `handle_conn`.
+                }
                 let events_path = events_path.clone();
                 let watcher = Arc::clone(&watcher);
                 if let Err(e) = std::thread::Builder::new()
@@ -1219,6 +1299,95 @@ mod tests {
         assert_eq!(mode, 0o600, "expected the daemon socket to be user-private, got {mode:o}");
         drop(listener);
         std::fs::remove_file(&socket_path).ok();
+    }
+
+    // ── cross_uid_gate (LANE IDENTITY P-ID3, G8) ────────────────────────
+
+    #[test]
+    fn cross_uid_gate_admits_a_matching_euid() {
+        assert_eq!(
+            cross_uid_gate(Some(aoide_secrets::peercred::PeerCred { uid: 1000, gid: 1000, pid: 42 }), 1000),
+            None
+        );
+    }
+
+    #[test]
+    fn cross_uid_gate_refuses_a_mismatched_uid() {
+        assert!(
+            cross_uid_gate(Some(aoide_secrets::peercred::PeerCred { uid: 1001, gid: 1001, pid: 42 }), 1000).is_some()
+        );
+    }
+
+    #[test]
+    fn cross_uid_gate_refuses_an_unidentified_peer() {
+        // Fail-closed, never a benign default — the same posture
+        // `aoide_secrets::broker::admin_gate` holds for a `SO_PEERCRED` read
+        // that failed.
+        assert!(cross_uid_gate(None, 1000).is_some());
+    }
+
+    /// End-to-end against a REAL socketpair: a connection entirely local to
+    /// this process reports THIS process's own euid, which `cross_uid_gate`
+    /// then admits — proving the floor does not refuse the legitimate
+    /// same-uid caller (the CLI's own `daemon_dispatch` proxy, a hook, the
+    /// conductor — every real connector Phase 0 identified) it must never
+    /// touch.
+    #[test]
+    fn a_real_same_process_socketpair_is_admitted() {
+        let (a, _b) = UnixStream::pair().expect("socketpair");
+        let peer = aoide_secrets::peercred::peer_cred(&a);
+        let my_euid = unsafe { libc::geteuid() };
+        assert_eq!(cross_uid_gate(peer, my_euid), None);
+    }
+
+    // ── invocation_from_dispatch_request (LANE IDENTITY P-ID3, G8) ──────
+
+    #[test]
+    fn invocation_from_dispatch_request_stamps_an_absent_from_as_explicit_empty() {
+        let req = json!({
+            "op": "dispatch",
+            "path": ["send"],
+            "args": ["hello"],
+            "flags": {"id": "target"},
+        });
+        let inv = invocation_from_dispatch_request(&req).unwrap();
+        assert_eq!(
+            inv.flags.get("from").map(String::as_str),
+            Some(""),
+            "an absent `from` must be stamped explicit-empty, never left absent to fall through to this process's own env"
+        );
+        assert_eq!(inv.flags.get("id").map(String::as_str), Some("target"), "an unrelated flag rides through unchanged");
+    }
+
+    #[test]
+    fn invocation_from_dispatch_request_preserves_an_explicit_from() {
+        let req = json!({
+            "op": "dispatch",
+            "path": ["send"],
+            "args": ["hello"],
+            "flags": {"id": "target", "from": "peer:someone"},
+        });
+        let inv = invocation_from_dispatch_request(&req).unwrap();
+        assert_eq!(
+            inv.flags.get("from").map(String::as_str),
+            Some("peer:someone"),
+            "a `from` the WIRE actually supplied must never be overwritten"
+        );
+    }
+
+    /// `--from ""` (explicit anonymous) already round-trips untouched, not
+    /// merely an ABSENT key stamped the same way — proves this is a real
+    /// `.entry().or_insert_with()`, not a blind overwrite that would also
+    /// clobber a caller's own deliberate empty string differently.
+    #[test]
+    fn invocation_from_dispatch_request_preserves_an_explicit_empty_from() {
+        let req = json!({
+            "op": "dispatch",
+            "path": ["send"],
+            "flags": {"from": ""},
+        });
+        let inv = invocation_from_dispatch_request(&req).unwrap();
+        assert_eq!(inv.flags.get("from").map(String::as_str), Some(""));
     }
 
     /// `serve_daemon` over a tempdir socket: `ping` round-trips with the
