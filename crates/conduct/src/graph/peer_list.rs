@@ -169,8 +169,13 @@ fn assemble_roster(
     }
     // The candidates: heard, not self, not registered. `heard` is already
     // distinct by (name, source) and MAX_HEARD-bounded (`run_sweep`'s own
-    // fold) — two sources claiming one name stay two rows here, exactly as
-    // `peer discover` keeps an impostor visible beside the real thing.
+    // fold) — two sources claiming one name stay two rows here for
+    // UNPAIRED names, exactly as `peer discover` keeps an impostor
+    // visible beside the real thing. A heard name matching a PAIRED peer
+    // instead folds into that peer's row as its advertising mark (above)
+    // and its observed source is not rendered — a spoofer can light a
+    // paired row's advertising mark, never touch its addr/verified/paired
+    // fields (those come only from the registry and the probe).
     for h in heard {
         if is_self_target(h, host) || peer_names.iter().any(|n| *n == h.advertisement.name) {
             continue;
@@ -625,6 +630,32 @@ mod tests {
         assert_eq!(cand["advertising"], true);
         assert_eq!(cand["addr"], "192.168.1.99");
         assert_eq!(data["sweep"], json!({ "heard": 1, "dropped": 3 }));
+    }
+
+    #[test]
+    fn the_roster_never_writes_peers_json_or_any_state_file() {
+        let _env = Env::set_up("pl-writeban");
+        aoide_storage::peer_store::save_peers(&[peer("sakaki")]).unwrap();
+        let before = std::fs::read(aoide_storage::peer_store::peers_path()).unwrap();
+        let state_files = |dir: &std::path::Path| -> Vec<String> {
+            std::fs::read_dir(dir)
+                .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned())).collect())
+                .unwrap_or_default()
+        };
+        let listing_before = state_files(&_env.state);
+        // A busy run: a live pull, a sweep hearing both an impostor of the
+        // paired name and a stranger — none of it may persist anything.
+        let pull: PullFn = Arc::new(|_| Ok(json!({ "nodes": [], "edges": [] })));
+        let impostor = heard("sakaki", "192.168.1.66");
+        let stranger = heard("stranger", "192.168.1.99");
+        let sweep: SweepFn = Box::new(move || {
+            Ok(SweepResult { heard: vec![impostor.clone(), stranger.clone()], dropped: 0 })
+        });
+        let out = peer_list_with(&invocation(&["peer", "list"], &[]), pull, sweep);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+        let after = std::fs::read(aoide_storage::peer_store::peers_path()).unwrap();
+        assert_eq!(before, after, "peers.json must be byte-identical after a roster run");
+        assert_eq!(listing_before, state_files(&_env.state), "no state file created or removed");
     }
 
     #[test]
