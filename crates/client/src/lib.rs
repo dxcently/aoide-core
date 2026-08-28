@@ -50,9 +50,18 @@ pub mod tunnel;
 pub mod wire;
 
 /// A crate-wide lock serialising every test that mutates process-global env
-/// (`AOIDE_DAEMON_SOCKET` today). Delegates to `aoide-test-support`'s single
-/// mutex, the same pattern `aoide-storage`/`aoide-conduct` already hold
-/// (`pkgs/aoide/crates/AGENTS.md`'s "per-crate tests only").
+/// (`AOIDE_DAEMON_SOCKET` today) OR binds `aoide_storage::advertise::PORT`,
+/// the ONE fixed UDP port `discover::run_sweep` and every test that drives
+/// it through (`discover`'s own real-loopback test, `commands`' `peer
+/// discover` tests) all bind directly (#126). `cargo test` runs `#[test]`
+/// fns across multiple threads by default, and two concurrent binds of the
+/// same fixed port collide (`EADDRINUSE`) — the `commands.rs` sweep tests
+/// were already serialized against EACH OTHER (`with_peer_state` takes this
+/// lock for its whole closure), but `discover`'s own real-socket test held
+/// no lock at all, so it could still race either of them. Delegates to
+/// `aoide-test-support`'s single mutex, the same pattern
+/// `aoide-storage`/`aoide-conduct` already hold (`pkgs/aoide/crates/
+/// AGENTS.md`'s "per-crate tests only").
 #[cfg(test)]
 pub(crate) fn env_lock() -> &'static std::sync::Mutex<()> {
     aoide_test_support::env_lock()

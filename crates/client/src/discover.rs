@@ -385,8 +385,21 @@ mod tests {
     /// This is the shape of test that would have caught task #98: a sender
     /// racing this crate's own `run_sweep` on the same real network stack,
     /// not a mocked socket.
+    ///
+    /// **#126: takes `env_lock` for its whole body**, the SAME lock
+    /// `commands.rs`'s own `peer discover` sweep tests already hold via
+    /// `with_peer_state` — all three tests bind the ONE fixed
+    /// `advertise::PORT` (there is no ephemeral-port form of this test: it
+    /// exists specifically to prove a REAL line sent to the REAL advertised
+    /// port is heard, `run_sweep`'s own doc). Without this, `cargo test`'s
+    /// default parallel scheduling could run this test concurrently with
+    /// either of `commands.rs`'s, both binding the same port, and the loser
+    /// panics on a live `EADDRINUSE` — a real production case
+    /// (`describe_sweep_error`'s own taught message below), just not one
+    /// this crate's own tests should ever manufacture against themselves.
     #[test]
     fn run_sweep_hears_an_advertisement_sent_over_the_real_loopback_stack() {
+        let _guard = crate::env_lock().lock().unwrap();
         let sent = advertise::build("test-sender", "test-sender", "khoa");
         let line = advertise::encode(&sent).expect("a well-formed test advertisement always encodes");
 
