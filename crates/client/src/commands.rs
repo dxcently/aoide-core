@@ -20,7 +20,7 @@ use aoide_protocol::output::Outcome;
 use aoide_protocol::registry::{arg, cmd, flag, Registry};
 use aoide_protocol::Invocation;
 use serde_json::{json, Value};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -38,12 +38,46 @@ fn run_curl(extra: &[&str], stdin_body: Option<&str>) -> Result<(u16, String), S
     run_curl_with_timeout(15, extra, stdin_body)
 }
 
+/// Hard byte cap every curl fetch in this crate is bounded by (#114) —
+/// without it, a misbehaving or hostile far side (a compromised peer, a
+/// captive-portal proxy, `--no-verify` pointed at an arbitrary URL) could
+/// hand back an unbounded body and grow this process's memory without
+/// limit, since [`run_curl_with_timeout`] used to buffer the ENTIRE
+/// response before ever looking at it.
+///
+/// **Investigated legitimate ceiling**: the biggest real payload any call
+/// site here fetches is `peer pull`'s `aoide/graphSummary` response, which
+/// wraps `build_graph`'s node/edge list (`aoide_conduct::graph::doc::
+/// build_graph`) verbatim. Each session node carries a few dozen
+/// small/bounded fields (id, cwd, state, title, `say`) — `title`/`say` are
+/// already truncated to well under 100 chars before they ever reach a
+/// graph document (`aoide_conduct::graph::{permit,send}`'s 27/47/89-char
+/// truncations) — so even a very large multi-host instance (thousands of
+/// sessions + projects) tops out in the low single-digit megabytes once
+/// JSON-encoded. `MAX_RESPONSE_BYTES` is 10x that generous estimate:
+/// comfortably above any real graph pull, tight enough to still refuse a
+/// runaway one.
+const MAX_RESPONSE_BYTES: usize = 20 * 1024 * 1024; // 20 MiB
+
 /// `run_curl`'s parameterised core: same transport, an explicit `--max-time`
 /// instead of the hardcoded `15`. Split out for `pull_peer_live` (`who`'s
 /// presence probe, workstream C2) which needs a much shorter per-peer bound
 /// (~2s) than every other curl call site here — those all keep calling
 /// [`run_curl`] unchanged, so this refactor is a pure internal split, not a
 /// behavior change for `peer pull`/`peer add`/etc.
+///
+/// **#114: bounded by [`MAX_RESPONSE_BYTES`] two ways.** `--max-filesize`
+/// (curl's own flag) refuses BEFORE download when the far side declares an
+/// over-cap `Content-Length` up front — but curl's own docs are explicit
+/// that this does NOT bind a chunked-Transfer-Encoding response, which
+/// carries no such upfront length to check against. So the cap is ALSO
+/// enforced on the bytes actually read into this process: stdout is read
+/// in a bounded loop rather than handed to `wait_with_output` (which
+/// buffers the whole response before this function ever sees a single
+/// byte of it), and the child is killed the moment the running total
+/// crosses the cap — every real fetch in this crate (`post_json`'s peer
+/// POSTs, the AgentCard GET, `mcp_client`'s Melete calls) routes through
+/// this one function, so there is exactly one place this needed wiring.
 fn run_curl_with_timeout(
     timeout_secs: u64,
     extra: &[&str],
@@ -51,7 +85,8 @@ fn run_curl_with_timeout(
 ) -> Result<(u16, String), String> {
     let mut cmd = std::process::Command::new("curl");
     let timeout = timeout_secs.to_string();
-    cmd.args(["-sS", "--max-time", &timeout, "-w", "\n%{http_code}"]);
+    let max_filesize = MAX_RESPONSE_BYTES.to_string();
+    cmd.args(["-sS", "--max-time", &timeout, "--max-filesize", &max_filesize, "-w", "\n%{http_code}"]);
     cmd.args(extra);
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     cmd.stdin(if stdin_body.is_some() { Stdio::piped() } else { Stdio::null() });
@@ -63,10 +98,31 @@ fn run_curl_with_timeout(
         si.write_all(body.as_bytes())
             .map_err(|_| "curl failed".to_string())?;
     }
-    let out = child
-        .wait_with_output()
-        .map_err(|_| "curl failed".to_string())?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut stdout_pipe = child.stdout.take().ok_or_else(|| "curl failed".to_string())?;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = match stdout_pipe.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("curl failed (reading its output)".to_string());
+            }
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > MAX_RESPONSE_BYTES {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "response exceeded the {MAX_RESPONSE_BYTES}-byte cap \u{2014} refusing (the far side sent too much data)"
+            ));
+        }
+    }
+    drop(stdout_pipe);
+    let _ = child.wait(); // exit status was never checked before this fix either — %{http_code} below is the real signal
+    let stdout = String::from_utf8_lossy(&buf);
     let (body, code_str) = match stdout.rsplit_once('\n') {
         Some((b, c)) => (b, c.trim()),
         None => ("", stdout.trim()),
@@ -3503,6 +3559,76 @@ mod tests {
             }
         });
         (listener, port)
+    }
+
+    /// Drop a fake `curl` shim at the front of `PATH` running `script`
+    /// (its full `#!/bin/sh` body), restoring the previous `PATH` and
+    /// removing the shim directory when `f` returns. Reused by both
+    /// `MAX_RESPONSE_BYTES` tests below (#114) — no real network, no real
+    /// `curl` process, same no-mock-needed shim technique the no-verify
+    /// test above already established for proving what does/doesn't reach
+    /// `run_curl`.
+    fn with_fake_curl<T>(tag: &str, script: &str, f: impl FnOnce() -> T) -> T {
+        let _guard = crate::env_lock().lock().unwrap();
+        let shim_dir = std::env::temp_dir().join(format!(
+            "aoide-client-curlshim-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        let shim = shim_dir.join("curl");
+        std::fs::write(&shim, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let saved_path = std::env::var("PATH").ok();
+        std::env::set_var("PATH", format!("{}:{}", shim_dir.display(), saved_path.clone().unwrap_or_default()));
+
+        let out = f();
+
+        match saved_path {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        let _ = std::fs::remove_dir_all(&shim_dir);
+        out
+    }
+
+    /// #114: an over-cap response refuses with the taught error, naming
+    /// the cap, rather than growing this process's memory without limit.
+    /// The shim writes `MAX_RESPONSE_BYTES + 1MiB` of zero bytes (via
+    /// `dd`, fast) with NO `%{http_code}` trailer at all — proving the
+    /// crate's own read-loop cap is what catches this, independent of
+    /// curl's own `--max-filesize` flag (which a real curl binary applies
+    /// only when a response declares its length up front; this shim never
+    /// does, the same shape a chunked-Transfer-Encoding response takes).
+    /// The child is killed the moment the running total crosses the cap,
+    /// so this test returns promptly rather than waiting for the shim's
+    /// full `dd` to finish writing.
+    #[test]
+    fn run_curl_refuses_a_response_over_the_max_response_bytes_cap() {
+        let over_cap_mib = (MAX_RESPONSE_BYTES / (1024 * 1024)) + 1;
+        let script = format!("#!/bin/sh\ndd if=/dev/zero bs=1M count={over_cap_mib} 2>/dev/null\n");
+        let result = with_fake_curl("over-cap", &script, || run_curl(&["--", "http://example.invalid/"], None));
+        let err = result.expect_err("a response past MAX_RESPONSE_BYTES must refuse, never buffer to completion");
+        assert!(
+            err.contains(&MAX_RESPONSE_BYTES.to_string()),
+            "the taught error must name the cap itself: {err}"
+        );
+        assert!(err.contains("exceeded") && err.contains("cap"), "the taught error must say why it refused: {err}");
+    }
+
+    /// #114's other half: an ordinary, well-under-cap payload passes
+    /// through the same read-loop untouched — the byte cap must not
+    /// mangle or truncate a normal response.
+    #[test]
+    fn run_curl_passes_an_ordinary_payload_under_the_cap() {
+        let script = "#!/bin/sh\nprintf '{\"ok\":true}\\n200'\n";
+        let result = with_fake_curl("under-cap", script, || run_curl(&["--", "http://example.invalid/"], None));
+        let (code, body) = result.expect("a small, ordinary payload must pass through the cap untouched");
+        assert_eq!(code, 200);
+        assert_eq!(body, "{\"ok\":true}");
     }
 
     /// Review finding, P-S4 follow-up: `peer add`'s AgentCard verification

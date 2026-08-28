@@ -184,6 +184,23 @@ never the inbound/serve half (that's `aoide-server`).
   `#[ignore]`'d real-ssh proof lives at `cli/tests/tunnel_ssh.rs` instead,
   the same "real bytes, not a mock, but sandboxed-build-unsafe" shape
   `peer_connectivity.rs` already holds.
+- **Response byte cap (#114)** — `run_curl_with_timeout` is the ONE curl
+  spawn point every fetch in this crate funnels through (`post_json`'s peer
+  POSTs, `peer add`'s AgentCard GET, `mcp_client`'s Melete calls); before
+  this fix it buffered a response of ANY size via `wait_with_output`
+  before ever looking at it. `MAX_RESPONSE_BYTES` (20 MiB — 10x the
+  investigated legitimate ceiling: `peer pull`'s `aoide/graphSummary`
+  response, which tops out in the low single-digit megabytes even for a
+  very large multi-host graph, since `title`/`say` fields are already
+  truncated before they reach a graph document) is enforced TWICE: curl's
+  own `--max-filesize` refuses before download when a response declares an
+  over-cap `Content-Length` up front, and — since that flag does not bind
+  a chunked-Transfer-Encoding response, which carries no such upfront
+  length — the bytes actually read off curl's stdout pipe are ALSO capped
+  in the read loop itself, killing the child the moment the running total
+  crosses the limit rather than waiting for it to finish. An over-cap
+  response refuses with a taught error naming the cap; every existing
+  caller's own peer/url context still wraps it, unchanged.
 - **Dial resolution (P-S4, ssh-transport lane)** — the tunnel seam every
   outbound POST resolves through BEFORE it ever reaches `commands::
   post_json` (`aoide-client`'s one HTTP transport, unchanged by this
