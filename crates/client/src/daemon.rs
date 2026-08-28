@@ -173,6 +173,39 @@ fn parse_dispatch_reply(inv: &Invocation, reply: &str) -> Option<Outcome> {
     }
 }
 
+/// LANE IDENTITY P-ID2 (`CONTRACTS.md`'s identity section): the daemon's
+/// CURRENT seal-signing public key, fetched fresh over a `ping` round
+/// trip. `None` covers every failure the SAME way `daemon_dispatch`
+/// already does (no daemon listening, a connect/read timeout, a malformed
+/// reply, a `sealPubkeyHex` that isn't a string) — never a panic, never a
+/// fabricated key. A caller verifying a seal MUST treat `None` here as
+/// "cannot verify, so treat the sender as UNIDENTIFIED" — this is not an
+/// optional nicety the way `daemon_dispatch`'s `None` (fall back to a
+/// direct stage write) is; there is no safe fallback for an unverifiable
+/// signature. Deliberately NOT cached process-wide: `aoide send` is a
+/// short-lived CLI invocation, so a fresh ~100ms-bounded ping per call is
+/// the honest cost of asking the only trustworthy source (this module's
+/// own doc on why the daemon's OWN wire reply is the sole channel — a
+/// same-uid-writable file would let whoever can forge a seal also forge
+/// the "trusted" key that vouches for it).
+pub fn daemon_seal_pubkey_hex() -> Option<String> {
+    let socket_path = socket_path();
+    let mut stream = connect_bounded(&socket_path, CONNECT_TIMEOUT)?;
+    if stream.set_read_timeout(Some(ROUND_TRIP_TIMEOUT)).is_err() {
+        return None;
+    }
+    if stream.write_all(b"{\"op\":\"ping\"}\n").is_err() {
+        return None;
+    }
+    let mut reader = BufReader::new(stream);
+    let mut reply = String::new();
+    if reader.read_line(&mut reply).ok()? == 0 {
+        return None;
+    }
+    let v: Value = serde_json::from_str(reply.trim()).ok()?;
+    v.get("sealPubkeyHex").and_then(Value::as_str).map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,6 +348,84 @@ mod tests {
         let out = out.expect("a connected-but-broken daemon must surface an error, not fall back");
         assert_eq!(out.status, Status::Error);
 
+        std::fs::remove_file(&socket_path).ok();
+    }
+
+    // ── daemon_seal_pubkey_hex ───────────────────────────────────────────
+
+    #[test]
+    fn daemon_seal_pubkey_hex_round_trips_against_a_fake_daemon() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let socket_path = short_tmp("pubkey-roundtrip").with_extension("sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = conn.read(&mut buf).unwrap();
+            let req: Value = serde_json::from_slice(&buf[..n]).unwrap();
+            assert_eq!(req["op"], "ping");
+            let reply = json!({
+                "ok": true, "daemon": "aoided", "pid": 1234, "version": "test",
+                "sealPubkeyHex": "a".repeat(64),
+            });
+            let mut line = reply.to_string();
+            line.push('\n');
+            conn.write_all(line.as_bytes()).unwrap();
+        });
+
+        let saved = std::env::var("AOIDE_DAEMON_SOCKET").ok();
+        std::env::set_var("AOIDE_DAEMON_SOCKET", &socket_path);
+        let pubkey = daemon_seal_pubkey_hex();
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_DAEMON_SOCKET", v),
+            None => std::env::remove_var("AOIDE_DAEMON_SOCKET"),
+        }
+        handle.join().unwrap();
+
+        assert_eq!(pubkey, Some("a".repeat(64)));
+        std::fs::remove_file(&socket_path).ok();
+    }
+
+    /// The fail-closed contract (module doc): no daemon listening → `None`,
+    /// never a fabricated key — a caller MUST treat this as "cannot verify".
+    #[test]
+    fn daemon_seal_pubkey_hex_against_a_dead_socket_is_none() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let socket_path = short_tmp("pubkey-dead").with_extension("sock");
+        let saved = std::env::var("AOIDE_DAEMON_SOCKET").ok();
+        std::env::set_var("AOIDE_DAEMON_SOCKET", &socket_path);
+        assert_eq!(daemon_seal_pubkey_hex(), None);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_DAEMON_SOCKET", v),
+            None => std::env::remove_var("AOIDE_DAEMON_SOCKET"),
+        }
+    }
+
+    /// A daemon that answers but omits/malforms `sealPubkeyHex` (an old
+    /// binary pre-P-ID2, or a broken reply) is `None`, never a panic and
+    /// never a partial/garbage key.
+    #[test]
+    fn daemon_seal_pubkey_hex_missing_field_is_none() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let socket_path = short_tmp("pubkey-missing").with_extension("sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = conn.read(&mut buf);
+            conn.write_all(b"{\"ok\":true,\"daemon\":\"aoided\"}\n").unwrap();
+        });
+
+        let saved = std::env::var("AOIDE_DAEMON_SOCKET").ok();
+        std::env::set_var("AOIDE_DAEMON_SOCKET", &socket_path);
+        let pubkey = daemon_seal_pubkey_hex();
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_DAEMON_SOCKET", v),
+            None => std::env::remove_var("AOIDE_DAEMON_SOCKET"),
+        }
+        handle.join().unwrap();
+
+        assert_eq!(pubkey, None);
         std::fs::remove_file(&socket_path).ok();
     }
 

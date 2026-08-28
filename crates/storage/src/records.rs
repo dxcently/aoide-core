@@ -330,6 +330,28 @@ pub struct SessionRecord {
     /// change-only like `origin`/`hookAncestry` — never re-derived once set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seal: Option<String>,
+    /// The `issuedAt` field baked into `seal`'s signed payload (LANE
+    /// IDENTITY P-ID2, `CONTRACTS.md`'s identity section). Additive
+    /// alongside `seal`, stamped in the SAME call — `verify_seal` needs the
+    /// EXACT `SealedIdentity` that was signed to check a signature against,
+    /// and unlike `pid`/`sessionId`/`originClass` (already on this record)
+    /// or `pidStarttime` (safely RE-DERIVED fresh from `/proc/<pid>/stat`
+    /// at verify time — a stale mint-time value simply fails to match,
+    /// which is the pid-reuse defense working as intended), `issuedAt` is a
+    /// mint-time timestamp with no live fact to re-derive it from. Without
+    /// storing it, a verifier has no way to reconstruct the signed message
+    /// short of brute-forcing every plausible timestamp (exactly what
+    /// `daemon.rs`'s own P-ID1 test helper `sealed_id_issued_at_from` does,
+    /// as a TEST-ONLY expedient — not something a real verify-on-accept
+    /// path can do). Never secret (it's a timestamp, not key material);
+    /// absent means "no seal minted" (same lifecycle as `seal` — always
+    /// `Some` together, always `None` together).
+    #[serde(
+        rename = "sealedIssuedAt",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sealed_issued_at: Option<i64>,
     /// Additive/v0-safe (P-C5, durable-sessions plan): a conducted SHELL's
     /// continuously-captured restore snapshot (`RestoreSnapshot`, above) —
     /// cwd/idle/argv/typed off the PTY tick. Absent for every non-shell

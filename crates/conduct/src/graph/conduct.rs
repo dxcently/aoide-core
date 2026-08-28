@@ -10,16 +10,15 @@ use super::model::{
     canonical_state, load_stage, sessions_path, write_stage, RestoreSnapshot, SessionsFile,
     STAGE_GRAPH_VERSION,
 };
+use super::identity::peer_cred;
 use super::session_store::{do_session_end, do_session_start, set_session_log_path, stamp_headless, stamp_origin};
-use super::window::{discover_window_address, resolve_registration_parent};
+use super::window::{discover_window_address, pid_ancestry, resolve_registration_parent};
 use aoide_protocol::Invocation;
 use aoide_protocol::output::Outcome;
 use aoide_storage::fs::{session_logs_dir, with_stage_lock};
 use serde_json::json;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
-#[cfg(test)]
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 /// The command's basename (the agent-name default), e.g. `/usr/bin/claude` →
@@ -901,6 +900,36 @@ fn conduct_multiplex(
                 loop {
                     match l.accept() {
                         Ok((stream, _)) => {
+                            // LANE IDENTITY P-ID2 (`CONTRACTS.md`'s identity
+                            // section): read `SO_PEERCRED` on the CONNECTING
+                            // stream and refuse it outright — never
+                            // forwarded to `conns`, never touches the pty —
+                            // when its pid's real `/proc` ancestry roots
+                            // back to THIS session's own pid
+                            // (`std::process::id()`, exactly what this
+                            // process registered itself under — `pid`'s own
+                            // doc on `SessionRecord`). This is the
+                            // un-bypassable replacement for the OLD
+                            // client-side `is_self_send` guard `send.rs`
+                            // used to carry: that guard only ever protected
+                            // a well-behaved caller of `aoide send`; a
+                            // process that opened a raw connection to its
+                            // OWN socket directly bypassed it entirely.
+                            // Kernel ancestry cannot be forged the same way
+                            // — a pid genuinely cannot make itself its own
+                            // ancestor. A `peer_cred` failure (never
+                            // actually expected on an accepted `AF_UNIX`
+                            // stream, but never a panic either) fails OPEN
+                            // to the pre-P-ID2 behavior — this is a narrow,
+                            // additive safety net, not the gate itself (the
+                            // gate stays sender-computed, `send.rs`'s own
+                            // module doc on why).
+                            let self_injection = peer_cred(&stream)
+                                .map(|cred| pid_ancestry(cred.pid).contains(&(std::process::id() as i32)))
+                                .unwrap_or(false);
+                            if self_injection {
+                                continue; // dropped outright — never accepted into `conns`.
+                            }
                             let _ = stream.set_nonblocking(true);
                             let fd = stream.as_raw_fd();
                             std::mem::forget(stream); // fd owned raw; closed on drain-EOF below.
@@ -1197,6 +1226,78 @@ mod tests {
     use super::*;
     use crate::graph::session_store::upsert_session;
     use crate::graph::testutil::*;
+
+    /// LANE IDENTITY P-ID2 test infra: write `payload` to `socket` from a
+    /// process that is genuinely NOT a descendant of the calling (test)
+    /// process — a plain `fork()`'d child is still this process's own
+    /// child, so a double-fork daemonizes it: the middle child exits
+    /// immediately, orphaning the grandchild to whatever reaps orphans
+    /// (traditionally pid 1, or a sandbox's own subreaper) — either way,
+    /// NOT this test process, so `pid_ancestry` walking up from the
+    /// grandchild's pid never reaches back here. Everything the grandchild
+    /// touches post-fork (`addr`/`payload`) is built BEFORE the fork call;
+    /// the grandchild itself only ever calls async-signal-safe raw `libc`
+    /// syscalls (`socket`/`connect`/`write`/`close`/`_exit`) — the same
+    /// discipline `spawn_on_pty`'s own `pre_exec` closure documents, never
+    /// touching Rust's allocator or any lock a sibling test thread might
+    /// hold. The grandchild retries its OWN connect in a raw poll loop (no
+    /// `std::thread`, no channel) since the socket may not exist yet the
+    /// instant this returns.
+    fn spawn_unrelated_writer(socket_path: &std::path::Path, payload: &[u8]) {
+        use std::os::unix::ffi::OsStrExt;
+        let path_bytes = socket_path.as_os_str().as_bytes();
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        assert!(path_bytes.len() < addr.sun_path.len(), "test socket path too long: {socket_path:?}");
+        for (slot, byte) in addr.sun_path.iter_mut().zip(path_bytes.iter()) {
+            *slot = *byte as libc::c_char;
+        }
+        let addr_len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        let payload_owned = payload.to_vec();
+
+        // SAFETY: the middle child only calls `setsid`/`fork`/`_exit`
+        // (async-signal-safe); the grandchild only touches the
+        // already-built `addr`/`payload_owned` and raw socket syscalls,
+        // then `_exit`s — never returns into Rust's normal unwind/cleanup
+        // path, never allocates, never touches a lock.
+        let pid1 = unsafe { libc::fork() };
+        if pid1 == 0 {
+            unsafe {
+                libc::setsid();
+                let pid2 = libc::fork();
+                if pid2 == 0 {
+                    let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                    if fd >= 0 {
+                        for _ in 0..300 {
+                            let rc = libc::connect(
+                                fd,
+                                &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+                                addr_len,
+                            );
+                            if rc == 0 {
+                                libc::write(
+                                    fd,
+                                    payload_owned.as_ptr() as *const libc::c_void,
+                                    payload_owned.len(),
+                                );
+                                break;
+                            }
+                            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 10_000_000 };
+                            libc::nanosleep(&mut ts, std::ptr::null_mut());
+                        }
+                        libc::close(fd);
+                    }
+                    libc::_exit(0);
+                }
+                libc::_exit(0); // the middle child exits immediately — orphans the grandchild.
+            }
+        } else if pid1 > 0 {
+            unsafe {
+                let mut status: libc::c_int = 0;
+                libc::waitpid(pid1, &mut status, 0); // reap the middle child — no zombie left behind.
+            }
+        }
+    }
 
     #[test]
     fn output_sink_log_appends_bytes_and_they_read_back() {
@@ -1664,25 +1765,16 @@ mod tests {
         // then exits — proof the injected bytes reached the child's stdin.
         let script = format!("IFS= read -r line; printf '%s' \"$line\" > {}", proof.display());
 
-        // Inject from a helper thread once the socket appears; `conduct` blocks
-        // in THIS thread until the child exits.
-        let socket_c = socket.clone();
-        let injector = std::thread::spawn(move || {
-            for _ in 0..300 {
-                if socket_c.exists() {
-                    if let Ok(mut s) = UnixStream::connect(&socket_c) {
-                        use std::io::Write as _;
-                        let _ = s.write_all(b"MARKER-42\n");
-                        let _ = s.flush();
-                        return;
-                    }
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        });
+        // LANE IDENTITY P-ID2: inject from a DETACHED process (never a
+        // same-process thread — since `session_conduct` runs IN this test
+        // process, a same-pid connection would now be correctly refused as
+        // a self-injection, `spawn_unrelated_writer`'s own doc) — this is
+        // exactly the "some other, unrelated sender" shape the accept
+        // loop's peercred check must still let through. `conduct` blocks in
+        // THIS thread until the wrapped child exits.
+        spawn_unrelated_writer(&socket, b"MARKER-42\n");
 
         let out = session_conduct(&conduct_invocation(&["sh", "-c", &script], &[("id", id)]));
-        injector.join().unwrap();
 
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["exitCode"], 0);
@@ -1704,6 +1796,91 @@ mod tests {
             .ends_with("session-conduct-test.sock"));
         // Socket unlinked on exit.
         assert!(!socket.exists(), "the control socket is unlinked on exit");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    /// LANE IDENTITY P-ID2's own integration test: the accept loop reads a
+    /// REAL `SO_PEERCRED` off a REAL connecting process and refuses it when
+    /// that process's `/proc` ancestry roots back to THIS session's own
+    /// pid — a plain `fork()`'d DIRECT CHILD of the test process is exactly
+    /// that shape here, since `session_conduct` also runs IN this test
+    /// process (module doc's own note on why `spawn_unrelated_writer`
+    /// double-forks instead, for the OPPOSITE case). The wrapped child
+    /// races a backgrounded `cat` against a bounded `sleep` (no `timeout`
+    /// binary dependency — plain POSIX job control) so the test terminates
+    /// whether or not anything ever arrives on stdin; the proof file staying
+    /// EMPTY is the refusal, not a hang.
+    #[test]
+    fn accept_refuses_a_connection_from_within_its_own_session_subtree() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "XDG_RUNTIME_DIR"]);
+
+        let root = unique_stage("conduct-self-refuse");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+
+        let id = "conduct-self-refuse-test";
+        let socket = conduct_socket_path(id);
+        let proof = root.join("proof.txt");
+        let script = format!(
+            "cat > {p} & CP=$!; sleep 1; kill $CP 2>/dev/null; wait $CP 2>/dev/null; true",
+            p = proof.display()
+        );
+
+        // A DIRECT CHILD of this test process — genuinely "within its own
+        // session subtree" from the accept loop's own perspective, since
+        // `std::process::id()` there IS this test process's real pid.
+        let path_bytes: Vec<u8> = {
+            use std::os::unix::ffi::OsStrExt;
+            socket.as_os_str().as_bytes().to_vec()
+        };
+        assert!(path_bytes.len() < 100, "test socket path too long for sockaddr_un: {socket:?}");
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            // SAFETY: only raw, async-signal-safe syscalls post-fork — same
+            // discipline `spawn_unrelated_writer` documents. `path_bytes`
+            // was built and owned BEFORE the fork call.
+            unsafe {
+                let mut addr: libc::sockaddr_un = std::mem::zeroed();
+                addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+                for (slot, byte) in addr.sun_path.iter_mut().zip(path_bytes.iter()) {
+                    *slot = *byte as libc::c_char;
+                }
+                let addr_len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+                let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                if fd >= 0 {
+                    for _ in 0..300 {
+                        let rc = libc::connect(
+                            fd,
+                            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+                            addr_len,
+                        );
+                        if rc == 0 {
+                            let payload = b"SELF-INJECTED\n";
+                            libc::write(fd, payload.as_ptr() as *const libc::c_void, payload.len());
+                            break;
+                        }
+                        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 10_000_000 };
+                        libc::nanosleep(&mut ts, std::ptr::null_mut());
+                    }
+                    libc::close(fd);
+                }
+                libc::_exit(0);
+            }
+        }
+
+        let _out = session_conduct(&conduct_invocation(&["sh", "-c", &script], &[("id", id)]));
+        if pid > 0 {
+            unsafe {
+                let mut status: libc::c_int = 0;
+                libc::waitpid(pid, &mut status, 0); // reap — no zombie left behind.
+            }
+        }
+
+        let got = std::fs::read_to_string(&proof).unwrap_or_default();
+        assert!(got.is_empty(), "a connection from within the session's own subtree must never reach the pty: got {got:?}");
 
         let _ = std::fs::remove_dir_all(&root);
     }

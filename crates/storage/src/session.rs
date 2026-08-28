@@ -123,6 +123,7 @@ pub fn upsert_session(
             // a daemon has minted a sealed credential over this record's
             // pid; a fresh registration otherwise starts without one.
             seal: None,
+            sealed_issued_at: None,
             // Stamped later by the PTY tick's `conduct_refresh_shell`
             // (P-C5), only for a conducted SHELL; a fresh registration has
             // not ticked yet.

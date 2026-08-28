@@ -398,8 +398,10 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   hand-crafted `sessions.json`/ledger line claiming `peer:X` is still a
   readable, unflagged string on disk — nothing here makes the files
   tamper-evident; that is P-ID1 (the daemon-signed credential, below) —
-  minted and stored, but nothing verifies it against an incoming
-  connection yet, which is P-ID2 (the peercred floor), still open.
+  minted and stored, verified on the per-session control socket's own
+  accept and consumed by the send gate as of P-ID2 (below). Two doors
+  remain unfloored by peercred (shellbridge, `aoided`'s own dispatch
+  socket) — P-ID3, still open.
   **Still not a security claim**: a same-uid
   process can still forge a LOCAL-class origin, and neither the session's
   own identity nor the consumer presenting it are authenticated yet —
@@ -407,23 +409,48 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   credential task #63's lane builds next (P-ID1+). What P-ID0 closes: every
   record-STAMP path this codebase drives now refuses a `peer:*` shape it
   didn't mint itself at the door — env AND ledger both.
-- **Sealed session credential (LANE IDENTITY P-ID1) — this crate's two
-  scaffolding pieces, both consumed by `aoide-server`'s daemon, neither a
-  security boundary yet.** `session_store.rs::stamp_seal` is `SessionRecord.
-  seal`'s ONE stamp function (crosses the crate boundary, `pub`, mirroring
-  `stamp_origin` exactly: change-once, no `graph.json` projection), with
-  exactly one legitimate caller — `aoide-server`'s daemon `dispatch`
-  handler, which mints the seal (`aoide_storage::sealed_id::mint_seal`,
-  under the daemon's own in-memory-only keypair, OQ1-A) over the pid a
-  just-registered `session start` record already carries and stamps it
-  here. `window.rs::pid_starttime` (re-exported at `graph::pid_starttime`)
+- **Sealed session credential (LANE IDENTITY P-ID1/P-ID2) — minted by
+  `aoide-server`'s daemon, verified and consumed inside this crate.**
+  `session_store.rs::stamp_seal` is `SessionRecord.seal`/`sealedIssuedAt`'s
+  ONE stamp function (crosses the crate boundary, `pub`, mirroring
+  `stamp_origin`: change-once, no `graph.json` projection), with TWO
+  legitimate callers — `aoide-server`'s daemon `dispatch` handler (mints
+  right after a `session start` dispatch whose record already carries a
+  pid) and the daemon's own tick-driven `seal_unsealed_live_sessions`
+  sweep (closes the gap the dispatch-only path left: a DIRECTLY-registered
+  `aoide conduct` session, the common case, never touches `dispatch` at
+  all). `window.rs::pid_starttime` (re-exported at `graph::pid_starttime`)
   reads `/proc/<pid>/stat` field 22 — the SAME careful "split after the
   final `)`" parse `parent_pid` already established, extended one field
-  further — so `aoide-server` never re-implements that parse for its own
-  `pidStarttime` need. See `CONTRACTS.md` §4's `seal` paragraph and
-  `aoide-storage`'s own README for the full mechanism and the OQ1-A
-  reasoning; **no gate in this codebase reads `seal` yet** — P-ID2 adds
-  the first verify-on-accept caller.
+  further — both at MINT time (the daemon, over the pid a record already
+  carries) and at VERIFY time (this crate's own `graph/identity.rs`,
+  re-reading it FRESH for the connecting/attested pid — never trusting a
+  stored value, the pid-reuse defense). `graph/identity.rs` is where the
+  gate lands: `attested_sender` walks a pid's real `/proc` ancestry
+  (`window.rs::pid_ancestry`, already generalized to an arbitrary pid) to
+  find a session whose seal `verify_seal_over` confirms against the
+  daemon's LIVE public key (`aoide_client::daemon::daemon_seal_pubkey_hex`
+  — a fresh `ping` round trip, never cached, never a file); `peer_cred`
+  reads `SO_PEERCRED` off an accepted `UnixStream` (a local
+  reimplementation of `aoide_secrets::peercred`'s own shape — no new
+  cross-crate edge for one struct+fn). `graph/conduct.rs`'s per-session
+  accept loop calls `peer_cred` on every accepted connection and refuses
+  one whose ancestry roots back to the socket's OWN session, unconditionally
+  — the un-bypassable replacement for the OLD client-side `is_self_send`
+  guard `graph/send.rs` used to carry. `graph/send.rs`'s `deliver_local`
+  calls `attested_sender` over ITS OWN process's real ancestry (as
+  unforgeable a kernel fact, for that SAME real process, as a peercred
+  read of it would be) to feed `sender_is_parent`/
+  `siblings_share_live_parent` — `AOIDE_SESSION_ID` is gone from every gate
+  predicate, kept only as attribution. See `CONTRACTS.md` §4's `seal`
+  paragraph and `aoide-storage`'s own README for the full mechanism and the
+  OQ1-A reasoning. **What P-ID2 does NOT close**: the per-session socket
+  still forwards bytes from any OTHER connection it doesn't specifically
+  refuse (a raw, unrelated same-uid connection bypassing `aoide send`
+  still injects ungated — the socket carries no envelope, so `--yes`
+  cannot be told apart from an ordinary send at the receiving end);
+  shellbridge and `aoided`'s own dispatch socket remain wholly unfloored —
+  P-ID3.
 - `who` — `aoide who [filter] [--json] [--all]` (`graph/who.rs`): live
   presence over this box's own sessions plus every registered peer,
   probed in parallel on each invocation (messaging workstream C2). A

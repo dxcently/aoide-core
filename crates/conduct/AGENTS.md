@@ -409,9 +409,11 @@
   `send`, so the live soak's resurrected re-exec arrived as `from
   quiet-birch (…1892): /run/…/sleep 900` — a bash syntax error — and the
   preload as a line no human typed. The fix keys off the ATTRIBUTED sender
-  (`resolve_sender`, i.e. `--from`), never the gate's env-resolved
-  `is_self_send`: restore is delivered from ANOTHER session's env, which is
-  exactly how it got mis-prefixed. Removing the `from` flag from either
+  (`resolve_sender`, i.e. `--from`), never the gate's own sender identity
+  (LANE IDENTITY P-ID2: a kernel-attested session, `graph/identity.rs::
+  attested_sender` — the two are separate axes on purpose, module doc):
+  restore is delivered from ANOTHER session's env, which is exactly how it
+  got mis-prefixed. Removing the `from` flag from either
   `restore_delivery` branch, or the `attributed_to_target` suppression in
   `deliver_local`, silently reintroduces the corruption. Not a gate
   widening: `--from ""` (explicit anonymous) already skipped the prefix,
@@ -580,35 +582,43 @@
   files**: a hand-crafted `sessions.json`/ledger line claiming `peer:X` is
   still a readable, unflagged string on disk — nothing here makes the files
   tamper-evident; that is P-ID1 (the daemon-signed credential, below) —
-  minted and stored, but nothing verifies it against an incoming
-  connection yet, which is P-ID2 (the peercred floor), still open.
+  minted and stored, verified on the per-session control socket's own
+  accept and consumed by the send gate as of P-ID2 (below). Two doors
+  remain unfloored by peercred (shellbridge, `aoided`'s own dispatch
+  socket) — P-ID3, still open.
   **`origin` is still attribution, not an
   authenticated credential** — a same-uid process can still forge a
   LOCAL-class origin (`stamp_origin` trusts whatever non-`peer:*` value it
   is given), and neither the session's own identity nor the consumer
   presenting it are authenticated yet; don't let a future consumer gate a
   security decision on it without the sealed credential task #63's lane
-  builds next (P-ID1+). What P-ID0 closes is narrower and real: every
+  builds next (P-ID1+; P-ID4 is the first to gate a REAL decision on
+  `originClass`, once it is read off a VERIFIED seal, never the raw
+  `origin` field). What P-ID0 closes is narrower and real: every
   record-STAMP path this codebase drives now refuses a `peer:*` shape it
   didn't mint itself at the door — env AND the unsealed ledger both.
-- **`SessionRecord.seal` has exactly ONE legitimate STAMP caller, and it
-  is NOT in this crate (LANE IDENTITY P-ID1).** `session_store.rs::
-  stamp_seal` is `pub` (crosses the crate boundary) the same way
-  `stamp_origin` does, but unlike `origin` it has no local-class call site
-  in `conduct.rs` at all — the ONLY caller is `aoide-server`'s daemon
-  `dispatch` handler, because the seal's signing key
-  (`aoide_storage::identity::mint_ephemeral`) lives only in THAT process's
-  memory (OQ1-A) and this crate has no access to it. Don't add a second
-  `stamp_seal` call site in this crate "for symmetry with `stamp_origin`"
-  — a call site here would have no key to sign with, and the invariant is
-  "one door, one key, one caller", stricter than `origin`'s "shape-gated,
-  multiple callers". `window.rs::pid_starttime` (re-exported at
-  `graph::pid_starttime`) is a pure `/proc` reader with NO knowledge of
-  sealing at all — don't fold sealing logic into it; `aoide-server` composes
-  it with `aoide_storage::sealed_id::mint_seal` itself. **No gate in this
-  crate (or anywhere) reads `seal` yet** — same P-ID1/P-ID2 boundary as
-  `origin` above, don't wire one in without reading the LANE IDENTITY plan
-  section first.
+- **`SessionRecord.seal`/`sealedIssuedAt` are STAMPED from `aoide-server`
+  only, but VERIFIED from inside this crate (LANE IDENTITY P-ID1/P-ID2).**
+  `session_store.rs::stamp_seal` is `pub` (crosses the crate boundary) the
+  same way `stamp_origin` does, but unlike `origin` it has no local-class
+  call site in `conduct.rs` at all — the seal's signing key
+  (`aoide_storage::identity::mint_ephemeral`) lives only in the DAEMON
+  process's memory (OQ1-A) and this crate has no access to it, so both
+  legitimate callers (the `dispatch` handler's `session start` path, and
+  the daemon's own tick-driven sweep for directly-registered sessions) live
+  in `aoide-server`. Don't add a `stamp_seal` call site in this crate "for
+  symmetry with `stamp_origin`" — there is no key to sign with here.
+  VERIFYING, by contrast, needs only the PUBLIC key (never secret,
+  `aoide_client::daemon::daemon_seal_pubkey_hex` fetches it fresh over
+  `ping`) — that half DOES live here: `graph/identity.rs::verify_seal_over`
+  reconstructs the exact signed `SealedIdentity` (re-deriving `pidStarttime`
+  FRESH via `window.rs::pid_starttime` — never trusting a stored value,
+  the pid-reuse defense) and `attested_sender` walks a pid's real
+  `/proc` ancestry (`window.rs::pid_ancestry`) looking for one that
+  verifies. `graph/send.rs`'s gate and `graph/conduct.rs`'s accept loop are
+  the two consumers — see each file's own module doc. Don't fold sealing
+  or verification logic into `window.rs::pid_starttime` itself — it stays a
+  pure `/proc` reader with no knowledge of either.
 
 ## Extension points
 

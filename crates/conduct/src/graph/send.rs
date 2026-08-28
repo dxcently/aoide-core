@@ -4,6 +4,30 @@
 //! hook JSON both land, so every outcome is audited and a hook payload never
 //! propagates as anything but data.
 //!
+//! **The gate's sender identity (LANE IDENTITY P-ID2, `docs/architecture/
+//! CONTRACTS.md`'s identity section).** `sender_is_parent`/
+//! `siblings_share_live_parent` key on a KERNEL-ATTESTED sender session —
+//! never `AOIDE_SESSION_ID` (removed from every gate predicate; it remains
+//! only as ATTRIBUTION, `resolve_sender`'s own doc). `deliver_local`
+//! resolves that identity by walking THIS `aoide send` process's OWN real
+//! `/proc` ancestry (`std::process::id()` — as unforgeable a kernel fact as
+//! a peercred read of the same real process would be, since neither can
+//! lie about the SAME real pid) to find a session whose sealed
+//! `(pid, pidStarttime)` matches an ancestor AND whose seal verifies
+//! against the daemon's LIVE public key (`real_attested_sender`'s own
+//! doc — never cached, never read from a file). **Why the gate did NOT
+//! move onto the per-session socket's accept side wholesale**, even though
+//! that IS where `SO_PEERCRED` gets read (`graph/conduct.rs`): the socket
+//! carries raw injected BYTES with no envelope, so `--yes`/the global
+//! autogate switch (argv/env-only signals) cannot be told apart from an
+//! ordinary send at the receiving end without inventing a wire protocol,
+//! which this phase does not do. Peercred earns its keep at the accept
+//! side for a narrower, complementary property instead: refusing a
+//! connection that originates from within the TARGET's own session
+//! subtree, unconditionally — the un-bypassable replacement for the OLD
+//! client-side self-send guard this file used to carry (removed; see
+//! `deliver_local`'s own comment on exactly why removing it is sound).
+//!
 //! `send` has two ways to name a target (messaging plan P-C3):
 //! `--id <id>` (the original, unchanged) or `--to <target>` (resolved via
 //! `aoide_storage::addr::resolve`, mutually exclusive with `--id` — see
@@ -151,11 +175,14 @@ fn sender_is_parent(sender_session: Option<&str>, target_parent: Option<&str>) -
 /// loaded sessions file (no I/O here).
 ///
 /// Deliberately blind to whether sender == target: a self-send trivially
-/// satisfies `a == b` here too (same record, same parent field read twice),
-/// so the caller MUST refuse that case before this predicate ever runs — see
-/// the `is_self_send` guard in [`session_send`]. Folding that guard in here
-/// would hide it behind a parameter that looks like just another parent
-/// string.
+/// satisfies `a == b` here too (same record, same parent field read twice)
+/// — the client-side guard that used to refuse this case before the
+/// predicate ran is GONE (LANE IDENTITY P-ID2; `deliver_local`'s own
+/// comment on exactly why removing it is sound). This predicate can
+/// therefore legitimately compute `true` for a genuinely self-attested
+/// sender; the protection against a session injecting into its OWN pty
+/// moved to the RECEIVING socket instead (`graph/conduct.rs`'s accept
+/// loop, kernel-attested and un-bypassable, unlike the old guard here).
 fn siblings_share_live_parent(
     sender_parent: Option<&str>,
     target_parent: Option<&str>,
@@ -240,11 +267,18 @@ fn sanitize_sender(raw: &str) -> String {
 /// can export before calling `send` — both are trivially spoofable by
 /// anyone who can already run `aoide` as this user. This exists so a
 /// receiving agent and the audit log can see who CLAIMS to have sent a
-/// message, not to gate delivery on that claim (the gate in [`send_gate`] is
-/// unaffected by this). The wider door is the control socket itself: whoever
-/// can write to it can already impersonate the target's own keystrokes with
-/// no attribution at all — this label is strictly additive information, never
-/// a trust boundary.
+/// message, never to gate delivery on that claim — [`deliver_local`]'s gate
+/// resolves a SEPARATE, kernel-attested sender identity for that (LANE
+/// IDENTITY P-ID2, module doc); this function's output never reaches
+/// `send_gate`'s inputs. **The still-wider door, unclosed by this phase:**
+/// the per-session control socket (`graph/conduct.rs`) forwards bytes from
+/// ANY connection its accept loop does not specifically refuse (P-ID2 adds
+/// exactly one such refusal — a connection from within the TARGET's own
+/// session subtree, `conduct.rs`'s own doc) — a genuinely unrelated
+/// same-uid process connecting directly (bypassing `aoide send`
+/// altogether) still injects with no gate and no attribution at all. This
+/// label remains strictly additive display information, never a trust
+/// boundary, for exactly that reason.
 fn resolve_sender(inv: &Invocation) -> Option<String> {
     match inv.flags.get("from") {
         Some(f) if f.is_empty() => None, // explicit anonymous — env fallback skipped.
@@ -494,6 +528,24 @@ pub fn session_send(inv: &Invocation) -> Outcome {
     deliver_local(inv, &id)
 }
 
+/// The REAL kernel-attested sender resolution [`deliver_local`] uses in
+/// production (LANE IDENTITY P-ID2, module doc): fetches the daemon's
+/// CURRENT public key over a fresh, ~100ms-bounded `ping` round trip
+/// (`aoide_client::daemon::daemon_seal_pubkey_hex` — never cached, never
+/// read from a file; that function's own doc explains why) and, if that
+/// succeeds, walks THIS process's own real `/proc` ancestry via
+/// [`crate::graph::identity::attested_sender`] to find a verified sealed session
+/// among it. An unreachable daemon makes EVERY sender unidentified, not a
+/// benign fallback: the credential's whole security property rests on a
+/// LIVE daemon (OQ1-A, process liveness) — nothing to authenticate against
+/// otherwise.
+fn real_attested_sender(sessions: &[SessionRecord]) -> Option<String> {
+    let pubkey = aoide_client::daemon::daemon_seal_pubkey_hex()?;
+    crate::graph::identity::attested_sender(std::process::id() as i32, sessions, |rec| {
+        crate::graph::identity::verify_seal_over(rec, &pubkey)
+    })
+}
+
 /// The exact body `--id` has always run, factored out so [`session_send_to`]'s
 /// LOCAL resolution branch re-drives it unmodified rather than reimplementing
 /// any piece of the gate/pending/provenance/audit path — the phase's SACRED
@@ -501,6 +553,21 @@ pub fn session_send(inv: &Invocation) -> Outcome {
 /// below is byte-identical to the pre-P-C3 function body (no `&id`/`id`
 /// reference-vs-owned churn to review).
 fn deliver_local(inv: &Invocation, id: &str) -> Outcome {
+    deliver_local_with(inv, id, real_attested_sender)
+}
+
+/// [`deliver_local`]'s actual body, parameterized over the sender-identity
+/// resolver (LANE IDENTITY P-ID2) so the gate/pending/provenance/audit path
+/// stays exhaustively table-testable WITHOUT a live daemon: production
+/// wires [`real_attested_sender`]; tests inject a fixed resolver (or the
+/// real `attested_sender`/`verify_seal_over` pair against a test keypair,
+/// proving the actual cryptographic machinery, not a stub) — see `mod
+/// tests` below.
+fn deliver_local_with(
+    inv: &Invocation,
+    id: &str,
+    resolve_sender_id: impl Fn(&[SessionRecord]) -> Option<String>,
+) -> Outcome {
     let cmd = "send";
     // Accept the exact `session:<id>` form `graph --json` emits for a
     // node id, so a copy-pasted id round-trips through `--id` — mirrors
@@ -539,34 +606,45 @@ fn deliver_local(inv: &Invocation, id: &str) -> Outcome {
     }
     let socket = socket.unwrap();
 
-    // The gate. The sender's own session id (from the env `aoide conduct` exports)
-    // vs the target's parent decides the parent-autogate rule. The sibling rule
-    // resolves the SENDER's own record from this SAME already-loaded file (no
-    // second read) to find ITS parent, and checks that parent is still live.
-    let sender = std::env::var("AOIDE_SESSION_ID").ok();
-    let is_parent = sender_is_parent(sender.as_deref(), target_parent.as_deref());
-    let sender_parent: Option<String> = sender
-        .as_deref()
-        .and_then(|sid| file.sessions.iter().find(|s| s.session_id == sid))
-        .and_then(|r| r.parent_session_id.clone());
-    let parent_live = target_parent
-        .as_deref()
-        .filter(|p| !p.is_empty())
-        .and_then(|p| file.sessions.iter().find(|s| s.session_id == p))
-        .map(|r| aoide_protocol::canonical_state(&r.state) != "done")
-        .unwrap_or(false);
-    // A self-send (sender id == target id) vacuously satisfies the predicate —
-    // a session is trivially its OWN sibling (same record, same parent field on
-    // both sides of the comparison) — but it is not a sibling relationship at
-    // all, it is a session talking to itself. `AOIDE_SESSION_ID` is exported
-    // into every conducted child's own env, so an unguarded predicate here
-    // would let a prompt-injected `send --id "$AOIDE_SESSION_ID" --submit
-    // -- <text>` self-deliver text straight back into its own input stream,
-    // bypassing approval entirely — a gate WIDENING, not a convenience. Excluded
-    // before the predicate ever runs.
-    let is_self_send = sender.as_deref() == Some(id.as_str());
-    let is_sibling = !is_self_send
-        && siblings_share_live_parent(sender_parent.as_deref(), target_parent.as_deref(), parent_live);
+    // The gate (LANE IDENTITY P-ID2, G1/G2 close). `--yes` and the global
+    // autogate switch outrank identity entirely in `send_gate`'s own
+    // precedence, so the kernel-attested sender resolution — a live daemon
+    // round trip, `real_attested_sender`'s own doc — only runs when it can
+    // actually change the outcome; skipping it otherwise is both a real
+    // cost saving and correct (identity is irrelevant to those two arms).
+    // Once resolved, the sender's own session id feeds the SAME
+    // parent/sibling predicates as before — only WHERE that id comes from
+    // changed: `resolve_sender_id` (module doc), never `AOIDE_SESSION_ID`.
+    // The old client-side self-send guard is GONE (send.rs's own former
+    // ~566): it existed because the env var could be forged to equal the
+    // sender's own id, trivially satisfying "shares a live parent with
+    // itself." A kernel-attested id cannot be forged the same way, but a
+    // session genuinely running `aoide send --id <its-own-real-id>` from
+    // within itself still resolves truthfully to itself — the protection
+    // against THAT moved to the RECEIVING end instead
+    // (`graph/conduct.rs`'s accept loop refuses any connection whose
+    // peercred-derived ancestry roots back to the target's OWN session,
+    // unconditionally, un-bypassably — stronger than the old guard, which
+    // only ever covered well-behaved callers of `aoide send`).
+    let (is_parent, is_sibling) = if yes || autogate_env() {
+        (false, false) // never examined — send_gate's own precedence short-circuits first.
+    } else {
+        let sender = resolve_sender_id(&file.sessions);
+        let is_parent = sender_is_parent(sender.as_deref(), target_parent.as_deref());
+        let sender_parent: Option<String> = sender
+            .as_deref()
+            .and_then(|sid| file.sessions.iter().find(|s| s.session_id == sid))
+            .and_then(|r| r.parent_session_id.clone());
+        let parent_live = target_parent
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .and_then(|p| file.sessions.iter().find(|s| s.session_id == p))
+            .map(|r| aoide_protocol::canonical_state(&r.state) != "done")
+            .unwrap_or(false);
+        let is_sibling =
+            siblings_share_live_parent(sender_parent.as_deref(), target_parent.as_deref(), parent_live);
+        (is_parent, is_sibling)
+    };
     let gate = send_gate(yes, is_parent, is_sibling);
     // The provenance attribution — `--from` or `AOIDE_SESSION_ID` (see
     // [`resolve_sender`]) — is resolved once here, from the ORIGINAL
@@ -622,9 +700,10 @@ fn deliver_local(inv: &Invocation, id: &str) -> Outcome {
     // `resurrect`'s restore delivery, putting a session's own prior
     // bytes back at its own prompt — needs those bytes verbatim (a prefixed
     // re-exec is a shell syntax error; a prefixed preload is a line no human
-    // typed). Note this keys off the ATTRIBUTED sender, not the gate's
-    // env-resolved `is_self_send` — restore is delivered from another
-    // session's env, which is exactly why it was mis-prefixed. Not a gate
+    // typed). Note this keys off the ATTRIBUTED sender, never the gate's
+    // own kernel-attested sender identity (LANE IDENTITY P-ID2) — restore
+    // is delivered from another session's env, which is exactly why it was
+    // mis-prefixed. Not a gate
     // widening: attribution was already caller-asserted (`--from ""` is the
     // documented explicit-anonymous form that also skips the prefix), and
     // the audit line still records the attributed sender either way.
@@ -3064,16 +3143,59 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+    // ── LANE IDENTITY P-ID2: the kernel-attested gate ───────────────────────
+
+    /// Seal an ALREADY-REGISTERED session record (`do_session_start`'s own
+    /// `pid` param) with a REAL signature under `kp`, over its own live
+    /// `pid` — mirrors exactly what `stamp_seal` writes in production
+    /// (`server::daemon::mint_seal`/`seal_freshly_registered_session`).
+    /// `pid` must be a real, live pid so `pid_starttime` resolves — every
+    /// caller below passes `std::process::id()`, since `attested_sender`
+    /// walks the CALLING TEST PROCESS's own real ancestry. `origin` is
+    /// STAMPED onto the record first (`stamp_origin`, never just baked
+    /// into the signed identity) — `verify_seal_over` reads `originClass`
+    /// straight off the record's OWN `origin` field, so sealing over a
+    /// value the record doesn't actually carry would mismatch the
+    /// canonical string and silently fail verification (the exact bug
+    /// this comment exists to keep from regressing: an earlier revision
+    /// sealed over a caller-supplied string no `stamp_origin` call ever
+    /// wrote, which verified against nothing and hung every caller's
+    /// `accept()` join waiting for a delivery that could never happen).
+    fn seal_test_session(id: &str, pid: i32, origin: &str, kp: &aoide_storage::identity::Keypair) {
+        if !origin.is_empty() {
+            crate::graph::session_store::stamp_origin(id, origin);
+        }
+        let starttime =
+            crate::graph::window::pid_starttime(pid).expect("test pid must be a real, live pid");
+        let issued_at = 1_700_000_000;
+        let identity = aoide_storage::sealed_id::SealedIdentity {
+            session_id: id.to_string(),
+            pid,
+            pid_starttime: starttime,
+            origin_class: origin.to_string(),
+            issued_at,
+        };
+        let seal_hex = aoide_storage::sealed_id::mint_seal(kp, &identity);
+        crate::graph::session_store::stamp_seal(id, &seal_hex, issued_at);
+    }
+
+    /// The REAL `attested_sender`/`verify_seal_over` pipeline (module doc
+    /// on why this is not a stub) pinned to a fixed test keypair — every
+    /// "genuine" gate test below wires this in place of
+    /// `real_attested_sender`'s live daemon ping, exercising the actual
+    /// cryptographic verification without needing a running `aoided`.
+    fn test_resolver(pubkey_hex: String) -> impl Fn(&[SessionRecord]) -> Option<String> {
+        move |sessions| {
+            crate::graph::identity::attested_sender(std::process::id() as i32, sessions, |rec| {
+                crate::graph::identity::verify_seal_over(rec, &pubkey_hex)
+            })
+        }
+    }
+
     #[test]
     fn send_delivers_when_sender_is_the_targets_parent() {
         let _guard = crate::env_lock().lock().unwrap();
-        let _env = EnvVars::save(&[
-            "AOIDE_STAGE_DIR",
-            "XDG_RUNTIME_DIR",
-            "AOIDE_AUDIT_LOG",
-            "AOIDE_CONDUCT_AUTOGATE",
-            "AOIDE_SESSION_ID",
-        ]);
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG", "AOIDE_CONDUCT_AUTOGATE"]);
 
         let root = unique_stage("send-parent");
         let stage = root.join("stage");
@@ -3082,8 +3204,14 @@ mod tests {
         std::env::set_var("XDG_RUNTIME_DIR", &root);
         std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
         std::env::remove_var("AOIDE_CONDUCT_AUTOGATE"); // no global autogate.
-        // The SENDER is the orchestrator session `orch`.
-        std::env::set_var("AOIDE_SESSION_ID", "orch");
+
+        let me = std::process::id() as i32;
+        let kp = aoide_storage::identity::mint_ephemeral().unwrap();
+        // The SENDER is the orchestrator session `orch` — sealed over THIS
+        // TEST PROCESS's own real pid, since `attested_sender` walks the
+        // calling process's own ancestry (self included).
+        do_session_start("orch", Some("claude"), Some("/w"), None, None, None, None, None, Some(me as u32));
+        seal_test_session("orch", me, "local", &kp);
 
         let id = "child-of-orch";
         let socket = conduct_socket_path(id);
@@ -3111,20 +3239,38 @@ mod tests {
             buf
         });
 
-        // No --yes: delivery is authorised purely by the parent relationship.
-        let out = session_send(&send_invocation(&["go"], &[("id", id), ("submit", "true")]));
+        // No --yes: delivery is authorised purely by the parent relationship,
+        // resolved via the REAL sealed-ancestry pipeline.
+        let out = deliver_local_with(
+            &send_invocation(&["go"], &[("id", id), ("submit", "true")]),
+            id,
+            test_resolver(kp.info().pubkey_hex.clone()),
+        );
         let got = acc.join().unwrap();
 
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["delivered"], true);
         assert_eq!(out.data.as_ref().unwrap()["gate"], "autogate-parent");
-        // The gate's sender (`AOIDE_SESSION_ID=orch`) doubles as the
-        // provenance attribution — the delivered bytes carry the prefix.
-        assert_eq!(String::from_utf8(got).unwrap(), "from orch: go\n");
+        // The attested sender (`orch`) doubles as the provenance attribution
+        // ONLY when `--from`/`AOIDE_SESSION_ID` also names it — attribution
+        // stays a SEPARATE axis from the gate (module doc); with neither set
+        // here, no prefix is added.
+        assert_eq!(String::from_utf8(got).unwrap(), "go\n");
 
-        // An UNRELATED sender (different session) to the same child stays pending.
-        std::env::set_var("AOIDE_SESSION_ID", "stranger");
-        let out = session_send(&send_invocation(&["hi"], &[("id", id)]));
+        // An UNIDENTIFIED caller (the resolver finds no seal in its
+        // ancestry at all — P-ID2's "no seal in ancestry" case, e.g. a
+        // bare shell running `aoide send` with no conducted session above
+        // it) stays pending, even for the SAME target `orch` genuinely
+        // parents. An injected `None` resolver stands in — the crypto
+        // `test_resolver` would keep finding `orch` regardless of what
+        // OTHER unsealed sessions exist, since it walks THIS test
+        // process's own real, unchanging ancestry; identity resolution
+        // itself is exhaustively covered by `graph::identity`'s own tests.
+        let out = deliver_local_with(
+            &send_invocation(&["hi"], &[("id", id)]),
+            id,
+            |_sessions| None,
+        );
         assert_eq!(out.data.as_ref().unwrap()["state"], "pending");
         assert_eq!(out.data.as_ref().unwrap()["delivered"], false);
 
@@ -3139,7 +3285,6 @@ mod tests {
             "AOIDE_AUDIT_LOG",
             "AOIDE_CONDUCT_AUTOGATE",
             "AOIDE_CONDUCT_SIBLING_AUTOGATE",
-            "AOIDE_SESSION_ID",
         ]);
 
         let root = unique_stage("send-sibling");
@@ -3151,14 +3296,19 @@ mod tests {
         std::env::remove_var("AOIDE_CONDUCT_AUTOGATE"); // no global autogate.
         std::env::remove_var("AOIDE_CONDUCT_SIBLING_AUTOGATE"); // default: enabled.
 
+        let me = std::process::id() as i32;
+        let kp = aoide_storage::identity::mint_ephemeral().unwrap();
+
         // A live parent `orch`, and two of its children: `sib-a` (the sender,
-        // NOT conductable — it never receives) and `sib-b` (the conductable
-        // TARGET). Neither is the other's parent — only their shared, live
-        // parent makes this a sibling send.
+        // sealed over THIS test process's own pid, NOT conductable — it
+        // never receives) and `sib-b` (the conductable TARGET). Neither is
+        // the other's parent — only their shared, live parent makes this a
+        // sibling send.
         do_session_start("orch", Some("claude"), Some("/w"), None, None, None, None, None, None);
         do_session_start(
-            "sib-a", Some("claude"), Some("/w"), None, Some("orch"), None, None, None, None,
+            "sib-a", Some("claude"), Some("/w"), None, Some("orch"), None, None, None, Some(me as u32),
         );
+        seal_test_session("sib-a", me, "local", &kp);
         let target = "sib-b";
         let socket = conduct_socket_path(target);
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
@@ -3177,7 +3327,6 @@ mod tests {
 
         // (a) sender and target share a live parent, no --yes, no env autogate,
         // sender is NOT the target's parent → DELIVERED, sibling label.
-        std::env::set_var("AOIDE_SESSION_ID", "sib-a");
         let acc = std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
             use std::io::Read as _;
@@ -3185,68 +3334,77 @@ mod tests {
             let _ = conn.read_to_end(&mut buf);
             buf
         });
-        let out = session_send(&send_invocation(&["hey", "sib"], &[("id", target)]));
+        let out = deliver_local_with(
+            &send_invocation(&["hey", "sib"], &[("id", target)]),
+            target,
+            test_resolver(kp.info().pubkey_hex.clone()),
+        );
         let got = acc.join().unwrap();
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["delivered"], true);
         assert_eq!(out.data.as_ref().unwrap()["gate"], "autogate-sibling");
-        // `AOIDE_SESSION_ID=sib-a` doubles as the gate's sender AND the
-        // provenance attribution (see [`resolve_sender`]) — the delivered
-        // bytes carry the sibling's prefix, DISPLAY-mapped to its
-        // auto-minted petname+tail (petnames plan P3; every session mints
-        // one on registration since P2, so `sib-a` — a real registered
-        // sender — always hits that path). Pulled off the roster rather
-        // than hand-guessed since the mint is non-deterministic.
-        let sessions: SessionsFile = load_stage(&sessions_path()).unwrap();
-        let sender_petname = sessions
-            .sessions
-            .iter()
-            .find(|s| s.session_id == "sib-a")
-            .and_then(|s| s.petname.clone())
-            .expect("every minted session carries a petname (P2)");
-        assert_eq!(
-            String::from_utf8(got).unwrap(),
-            format!(
-                "from {sender_petname} (…{}): hey sib",
-                aoide_storage::display::short_tail("sib-a")
-            )
-        );
+        // No attribution set (`--from`/`AOIDE_SESSION_ID`) → no prefix, even
+        // though the gate's sealed sender resolved successfully — attribution
+        // and the gate are separate axes (module doc).
+        assert_eq!(String::from_utf8(got).unwrap(), "hey sib");
 
         // (b) same pair, but the opt-out env is set → held pending, not delivered.
         std::env::set_var("AOIDE_CONDUCT_SIBLING_AUTOGATE", "0");
-        let out = session_send(&send_invocation(&["hey", "again"], &[("id", target)]));
+        let out = deliver_local_with(
+            &send_invocation(&["hey", "again"], &[("id", target)]),
+            target,
+            test_resolver(kp.info().pubkey_hex.clone()),
+        );
         assert_eq!(out.data.as_ref().unwrap()["state"], "pending");
         assert_eq!(out.data.as_ref().unwrap()["delivered"], false);
         std::env::remove_var("AOIDE_CONDUCT_SIBLING_AUTOGATE"); // back to enabled.
 
-        // (c) a cross-tree sender (a different parent than the target's) → pending.
+        // (c) a cross-tree sender — the resolver truthfully attests to a
+        // REAL, sealed session whose parent differs from the target's own
+        // → pending: `siblings_share_live_parent` refuses it on the
+        // parent-mismatch, not on identity. An INJECTED resolver stands in
+        // here (not the crypto `test_resolver`, which would keep finding
+        // `sib-a` — this test process's own real ancestry doesn't change
+        // just because an unrelated record exists) — the identity
+        // resolution itself is already exhaustively covered by
+        // `graph::identity`'s own table tests; this proves the GATE
+        // correctly refuses a genuinely different sender once resolved.
         do_session_start(
             "cross-sender", Some("claude"), Some("/w"), None, Some("other-parent"), None, None,
             None, None,
         );
-        std::env::set_var("AOIDE_SESSION_ID", "cross-sender");
-        let out = session_send(&send_invocation(&["nope"], &[("id", target)]));
+        let out = deliver_local_with(
+            &send_invocation(&["nope"], &[("id", target)]),
+            target,
+            |_sessions| Some("cross-sender".to_string()),
+        );
         assert_eq!(out.data.as_ref().unwrap()["state"], "pending");
         assert_eq!(out.data.as_ref().unwrap()["delivered"], false);
 
-        // (d) an orphan sender (no AOIDE_SESSION_ID at all) → pending.
-        std::env::remove_var("AOIDE_SESSION_ID");
-        let out = session_send(&send_invocation(&["nope"], &[("id", target)]));
+        // (d) an unidentified caller (the resolver finds nothing at all —
+        // the P-ID2 "no seal in ancestry" case) → pending.
+        let out = deliver_local_with(
+            &send_invocation(&["nope"], &[("id", target)]),
+            target,
+            |_sessions| None,
+        );
         assert_eq!(out.data.as_ref().unwrap()["state"], "pending");
         assert_eq!(out.data.as_ref().unwrap()["delivered"], false);
 
         let _ = std::fs::remove_dir_all(&root);
     }
+    /// LANE IDENTITY P-ID2: the OLD client-side `is_self_send` guard is
+    /// gone (`send.rs`'s own module doc on where the protection moved).
+    /// This pins the NEW split honestly: the GATE alone, fed a resolver
+    /// that (truthfully) attests the sender AS the target itself, computes
+    /// `autogate-sibling` and proceeds to connect+write — exactly what a
+    /// genuinely-self-identified sender's gate arithmetic produces. The
+    /// actual block now lives at the RECEIVING socket, proven by
+    /// `conduct.rs`'s own `accept_refuses_a_connection_from_within_its_own_
+    /// session_subtree` integration test — this test exists so a reader
+    /// sees the responsibility named here, not silently missing.
     #[test]
-    fn send_to_self_never_autodelivers_via_the_sibling_arm() {
-        // Regression for a real gate-widening: `AOIDE_SESSION_ID` is exported
-        // into every conducted child's own env, so a prompt-injected `graph
-        // send --id "$AOIDE_SESSION_ID" --submit -- <text>` finds ITS OWN
-        // record as sender — sender_parent == target_parent trivially (same
-        // record, same field, read twice) and the shared parent is live in the
-        // normal case. Without the `is_self_send` guard this self-delivers
-        // text straight back into the session's own input stream, bypassing
-        // approval. It must queue, exactly like any other ungated send.
+    fn send_to_self_gate_arithmetic_would_deliver_the_block_now_lives_at_the_socket() {
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
@@ -3254,7 +3412,6 @@ mod tests {
             "AOIDE_AUDIT_LOG",
             "AOIDE_CONDUCT_AUTOGATE",
             "AOIDE_CONDUCT_SIBLING_AUTOGATE",
-            "AOIDE_SESSION_ID",
         ]);
 
         let root = unique_stage("send-self");
@@ -3271,30 +3428,44 @@ mod tests {
         let socket = conduct_socket_path(id);
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let listener = UnixListener::bind(&socket).unwrap();
-        listener.set_nonblocking(true).unwrap(); // prove nothing connects.
         do_session_start(
             id,
             Some("claude"),
             Some("/w"),
             None,
-            Some("orch"), // a live parent — the predicate WOULD fire if unguarded.
+            Some("orch"), // a live parent — the sibling predicate DOES fire.
             Some(true),
             Some(socket.to_str().unwrap()),
             None,
             None,
         );
 
-        // The sender IS the target — the exact shape a self-injecting prompt
-        // would produce (`--id "$AOIDE_SESSION_ID"`).
-        std::env::set_var("AOIDE_SESSION_ID", id);
-        let out = session_send(&send_invocation(&["do", "a", "thing"], &[("id", id)]));
-        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
-        assert_eq!(out.data.as_ref().unwrap()["state"], "pending");
-        assert_eq!(out.data.as_ref().unwrap()["delivered"], false);
-        assert!(
-            matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
-            "a self-send delivers nothing"
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+
+        // The resolver truthfully attests the sender AS the target itself —
+        // exactly what a genuinely self-connecting process's kernel identity
+        // would resolve to.
+        let out = deliver_local_with(
+            &send_invocation(&["do", "a", "thing"], &[("id", id)]),
+            id,
+            |_sessions| Some(id.to_string()),
         );
+        acc.join().unwrap(); // the stand-in listener accepts unconditionally — this test is
+                              // about the GATE's own arithmetic, not the real receiver's block.
+
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(
+            out.data.as_ref().unwrap()["gate"],
+            "autogate-sibling",
+            "the gate itself no longer special-cases a self-attested sender — the guard moved"
+        );
+        assert_eq!(out.data.as_ref().unwrap()["delivered"], true);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3324,7 +3495,6 @@ mod tests {
             "AOIDE_AUDIT_LOG",
             "AOIDE_CONDUCT_AUTOGATE",
             "AOIDE_CONDUCT_SIBLING_AUTOGATE",
-            "AOIDE_SESSION_ID",
         ]);
 
         let root = unique_stage("send-sibling-done-parent");
@@ -3336,10 +3506,14 @@ mod tests {
         std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
         std::env::remove_var("AOIDE_CONDUCT_SIBLING_AUTOGATE"); // default: enabled.
 
+        let me = std::process::id() as i32;
+        let kp = aoide_storage::identity::mint_ephemeral().unwrap();
+
         do_session_start("orch", Some("claude"), Some("/w"), None, None, None, None, None, None);
         do_session_start(
-            "sib-a", Some("claude"), Some("/w"), None, Some("orch"), None, None, None, None,
+            "sib-a", Some("claude"), Some("/w"), None, Some("orch"), None, None, None, Some(me as u32),
         );
+        seal_test_session("sib-a", me, "local", &kp);
         let target = "sib-b";
         let socket = conduct_socket_path(target);
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
@@ -3360,14 +3534,82 @@ mod tests {
         // `done` (sib-a/sib-b are not `kind: subagent`, so they survive intact).
         do_session_end("orch");
 
-        std::env::set_var("AOIDE_SESSION_ID", "sib-a");
-        let out = session_send(&send_invocation(&["nope"], &[("id", target)]));
+        let out = deliver_local_with(
+            &send_invocation(&["nope"], &[("id", target)]),
+            target,
+            test_resolver(kp.info().pubkey_hex),
+        );
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["state"], "pending");
         assert_eq!(out.data.as_ref().unwrap()["delivered"], false);
         assert!(
             matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
             "a dead-parent sibling send delivers nothing"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    /// The G1 close, end to end, through the REAL production entry point
+    /// (`session_send` → `deliver_local` → `real_attested_sender`, NOT the
+    /// test-injected resolver every other test above uses): a forged
+    /// `AOIDE_SESSION_ID` naming a genuine, live parent no longer flips
+    /// pending → deliver, because the gate never reads it at all. No daemon
+    /// is listening in this test environment, so `real_attested_sender`'s
+    /// own live `ping` round trip returns `None` — the honest, fail-closed
+    /// consequence of "the credential's security rests on a live daemon"
+    /// (module doc), not a special case carved out for the test.
+    #[test]
+    fn send_ignores_a_forged_aoide_session_id_env_the_real_production_path() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_DAEMON_SOCKET",
+            "AOIDE_SESSION_ID",
+        ]);
+
+        let root = unique_stage("send-forged-env");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        // No daemon listening on this socket — `daemon_seal_pubkey_hex`
+        // must fail closed (`None`), never fall back to trusting the env.
+        std::env::set_var("AOIDE_DAEMON_SOCKET", root.join("no-such-daemon.sock"));
+
+        do_session_start("orch", Some("claude"), Some("/w"), None, None, None, None, None, None);
+        let id = "child-of-orch";
+        let socket = conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap(); // prove nothing connects.
+        do_session_start(
+            id,
+            Some("claude"),
+            Some("/w"),
+            None,
+            Some("orch"), // a genuine, live parent — the exact shape the forgery targets.
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+            None,
+        );
+
+        // Forge the env to claim the real parent's identity — no seal
+        // backs this claim.
+        std::env::set_var("AOIDE_SESSION_ID", "orch");
+        let out = session_send(&send_invocation(&["go"], &[("id", id), ("submit", "true")]));
+
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(out.data.as_ref().unwrap()["state"], "pending", "a forged env must never flip pending → deliver");
+        assert_eq!(out.data.as_ref().unwrap()["delivered"], false);
+        assert!(
+            matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "a forged-env send delivers nothing"
         );
 
         let _ = std::fs::remove_dir_all(&root);

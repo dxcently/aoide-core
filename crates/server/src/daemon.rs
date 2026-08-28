@@ -344,7 +344,7 @@ fn rebaseline_stage_roster(watcher: &SharedHandEditWatcher) {
     }
 }
 
-// ── LANE IDENTITY P-ID1: the sealed session credential (scaffolding) ───────
+// ── LANE IDENTITY P-ID1/P-ID2: the sealed session credential ───────────────
 //
 // `docs/architecture/CONTRACTS.md`'s identity section, plan file "LANE
 // IDENTITY (#63)"'s OQ1-A answer: a same-uid attacker can read any file
@@ -358,15 +358,32 @@ fn rebaseline_stage_roster(watcher: &SharedHandEditWatcher) {
 // off, this degrades to liveness-only (still a live daemon process, not a
 // same-uid-secret key) — CONTRACTS carries that honesty note.
 //
-// **P-ID1 proves the mint/store/verify MECHANISM only.** No gate reads
-// `SessionRecord::seal` yet, and the pid minted over below is whatever the
-// record ALREADY carries (`session.rs`'s `pid` field) — real registrations
+// **P-ID1 proved the mint/store/verify MECHANISM only; P-ID2 wires the
+// first real consumer.** `seal_freshly_registered_session` below mints
+// over whatever pid the record ALREADY carries — real registrations
 // reaching this dispatch path via the bare `session start` wire command
-// carry no pid at all today (`session_conduct`'s own direct, non-dispatched
-// registration is the one path that does), so a seal is minted only when
-// one is present; that is the honest scaffolding boundary, not a bug.
-// P-ID2 replaces this pid with the control socket's own peercred-
-// authenticated connecting pid and adds the first verify-on-accept caller.
+// carry no pid at all today, so this fires only when one is present. That
+// left the common real-world path — `aoide conduct -- <agent>`'s own
+// DIRECT, non-dispatched registration, the one path that DOES carry a pid
+// — never sealed at all, since it never touches `dispatch`.
+// [`seal_unsealed_live_sessions`] closes that gap: a tick-driven sweep that
+// seals ANY live, pid-carrying session missing one, regardless of which
+// path registered it. `aoide_conduct::graph::conduct::conduct.rs`'s own
+// per-session control socket reads `SO_PEERCRED` on every accepted
+// connection and refuses one whose connecting pid is a descendant of the
+// socket's OWN session (the un-bypassable replacement for the old
+// client-side self-send guard); the SEND GATE's parent/sibling identity
+// check, by contrast, stays computed in the SENDING `aoide send` process
+// itself — walking ITS OWN real `/proc` ancestry (`std::process::id()`,
+// exactly as unforgeable a kernel fact as a peercred read, since a process
+// cannot lie to itself about its own pid) against these sealed records,
+// verified against THIS daemon's live public key (fetched fresh over
+// `ping`'s `sealPubkeyHex`, below — never a same-uid-writable file). See
+// `aoide_conduct::graph::send`'s own module doc for why the gate could not
+// move onto the accept side wholesale: the per-session socket carries raw
+// bytes with no envelope, so `--yes`/autogate (argv-only signals) cannot
+// be told apart from an ordinary send at the receiving end without a wire
+// protocol this phase does not add.
 
 /// This daemon PROCESS's own in-memory seal-signing keypair (module doc) —
 /// minted exactly ONCE via [`OnceLock`], the first time [`seal_keypair`] is
@@ -393,18 +410,23 @@ fn seal_keypair() -> &'static Keypair {
 /// builds a [`SealedIdentity`], and signs it under this process's own
 /// [`seal_keypair`]. `pid_starttime` unreadable (a vanished pid, a
 /// stripped-down `/proc`) degrades to `0` rather than refusing to mint —
-/// P-ID1 stores no security claim on this value yet (module doc), so a
-/// mint must never hard-fail the dispatch reply it rides alongside.
-pub(crate) fn mint_seal(session_id: &str, pid: i32, origin_class: &str) -> String {
+/// a verifier's own fresh `/proc` re-read can never produce a matching `0`
+/// (`CONTRACTS.md`'s identity section), so this degrade is self-closing,
+/// not a security hole. Returns `(seal_hex, issued_at)` — LANE IDENTITY
+/// P-ID2: `issued_at` is part of the signed payload with no live fact a
+/// verifier can re-derive it from, so every caller stamps it alongside the
+/// seal (`SessionRecord::sealed_issued_at`'s own doc).
+pub(crate) fn mint_seal(session_id: &str, pid: i32, origin_class: &str) -> (String, i64) {
     let pid_starttime = aoide_conduct::graph::pid_starttime(pid).unwrap_or(0);
+    let issued_at = aoide_protocol::audit::now_secs() as i64;
     let identity = SealedIdentity {
         session_id: session_id.to_string(),
         pid,
         pid_starttime,
         origin_class: origin_class.to_string(),
-        issued_at: aoide_protocol::audit::now_secs() as i64,
+        issued_at,
     };
-    sealed_id::mint_seal(seal_keypair(), &identity)
+    (sealed_id::mint_seal(seal_keypair(), &identity), issued_at)
 }
 
 /// After a dispatched `session start` succeeds, mint+stamp a seal for the
@@ -431,8 +453,53 @@ fn seal_freshly_registered_session(inv: &Invocation, outcome: &aoide_protocol::o
     };
     let Some(pid) = rec.pid else { return };
     let origin_class = rec.origin.clone().unwrap_or_default();
-    let seal = mint_seal(id, pid as i32, &origin_class);
-    aoide_conduct::graph::stamp_seal(id, &seal);
+    let (seal, issued_at) = mint_seal(id, pid as i32, &origin_class);
+    aoide_conduct::graph::stamp_seal(id, &seal, issued_at);
+}
+
+/// LANE IDENTITY P-ID2 (`CONTRACTS.md`'s identity section): mint+stamp a
+/// seal for every LIVE, pid-carrying session that doesn't have one yet —
+/// closes the gap P-ID1 shipped as scaffolding (`seal_freshly_registered_
+/// session`'s own doc): its ONE caller sits on the `dispatch` handler,
+/// reached only by a daemon-ROUTED `session start`, but the common
+/// real-world registration — `aoide conduct -- <agent>` — writes its
+/// record DIRECTLY (`aoide_conduct::graph::conduct::session_conduct`,
+/// never through `dispatch` at all), so under P-ID1 alone it was NEVER
+/// sealed. Run every tick (module doc's "six stats is cheap" precedent —
+/// a session roster is small, and gating this on the hand-edit watcher's
+/// own `sessions.json` detection would miss a session that was already
+/// live across a daemon restart, since the watcher's baseline seeds from
+/// current-on-disk state at construction). `done` sessions are skipped —
+/// no seal is minted for a session that has already exited, matching
+/// `stamp_origin`/`stamp_seal`'s own "birth fact" posture. Best-effort: a
+/// load/write failure here is silently skipped and retried next tick,
+/// same posture as every other tick producer in this loop. Returns `true`
+/// when it wrote `sessions.json` at least once — the caller folds that
+/// into the hand-edit watcher's baseline (`rebaseline_stage_roster`'s own
+/// convention: a daemon-internal write must never be reported back to
+/// itself as a hand edit on the very next sweep).
+fn seal_unsealed_live_sessions() -> bool {
+    let file: aoide_storage::records::SessionsFile =
+        match aoide_storage::stage::load_stage(&aoide_storage::stage::sessions_path()) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+    let due: Vec<(String, i32, String)> = file
+        .sessions
+        .iter()
+        .filter(|s| {
+            s.seal.is_none()
+                && s.pid.is_some()
+                && aoide_protocol::canonical_state(&s.state) != "done"
+        })
+        .map(|s| (s.session_id.clone(), s.pid.unwrap() as i32, s.origin.clone().unwrap_or_default()))
+        .collect();
+    let wrote = !due.is_empty();
+    for (id, pid, origin_class) in due {
+        let (seal, issued_at) = mint_seal(&id, pid, &origin_class);
+        aoide_conduct::graph::stamp_seal(&id, &seal, issued_at);
+    }
+    wrote
 }
 
 /// A synthetic, in-process-only `Invocation` for a command this daemon runs
@@ -832,11 +899,27 @@ fn handle_conn(
 
         match req.get("op").and_then(Value::as_str) {
             Some("ping") => {
+                // LANE IDENTITY P-ID2 (`CONTRACTS.md`'s identity section):
+                // `sealPubkeyHex` rides the existing `ping` reply — the ONE
+                // channel any same-uid caller can trust for THIS daemon
+                // process's current seal-signing public key. It is never
+                // secret (verifying a signature only needs the public
+                // half), but it must come from a LIVE round trip to the
+                // actual running daemon, never a same-uid-writable FILE —
+                // a file sitting next to the seals it verifies would let
+                // whoever can already forge a seal also forge the "trusted"
+                // key that vouches for it (`identity::mint_ephemeral`'s own
+                // module doc: the seal's whole secrecy claim rests on
+                // process liveness, not file permissions). No new socket,
+                // no peercred floor added here — this is an additive field
+                // on an already-open, already-wired reply; the dispatch
+                // socket's OWN peercred floor (G8) stays P-ID3's job.
                 let reply = json!({
                     "ok": true,
                     "daemon": "aoided",
                     "pid": std::process::id(),
                     "version": AOIDE_VERSION,
+                    "sealPubkeyHex": seal_keypair().info().pubkey_hex,
                 });
                 if write_json_line(&mut writer, &reply).is_err() {
                     return;
@@ -1027,6 +1110,18 @@ pub fn run_loop(
     let mut ticks: u64 = 0;
     loop {
         secrets_mirror.tick(&feed);
+        // LANE IDENTITY P-ID2: seal any live, pid-carrying session that
+        // isn't sealed yet — `seal_unsealed_live_sessions`'s own doc on why
+        // this runs unconditionally rather than gated on a hand-edit. Its
+        // own write is folded into the watcher's baseline immediately
+        // (same discipline `rebaseline_stage_roster` uses for a dispatched
+        // write), so the sweep right below never reports it back as a
+        // hand edit.
+        if seal_unsealed_live_sessions() {
+            if let Ok(mut w) = hand_edit_watcher.lock() {
+                w.note_own_write(&aoide_storage::stage::sessions_path());
+            }
+        }
         // A poisoned lock (only possible if a dispatch-side re-baseline ever
         // panicked mid-lock) is not this loop's problem to fix — fall back
         // to an empty sweep rather than `continue`, so the tick still hits
@@ -1142,6 +1237,13 @@ mod tests {
         assert_eq!(reply["daemon"], "aoided", "{reply}");
         assert_eq!(reply["version"], AOIDE_VERSION, "{reply}");
         assert!(reply["pid"].as_u64().is_some(), "{reply}");
+        // LANE IDENTITY P-ID2: `sealPubkeyHex` is the ONE trustworthy
+        // channel for the daemon's current seal-signing public key (module
+        // doc on the `ping` handler) — must be a real 64-char hex string,
+        // and must match THIS process's own `seal_keypair`.
+        let pubkey_hex = reply["sealPubkeyHex"].as_str().expect("sealPubkeyHex must be a string");
+        assert_eq!(pubkey_hex.len(), 64, "{pubkey_hex}");
+        assert!(pubkey_hex.chars().all(|c| c.is_ascii_hexdigit()), "{pubkey_hex}");
 
         std::fs::remove_file(&socket_path).ok();
         std::fs::remove_file(&events_path).ok();
@@ -1510,20 +1612,21 @@ mod tests {
     /// non-empty seal — `pid_starttime` (routed through
     /// `aoide_conduct::graph::pid_starttime`) resolves for a real, live
     /// process, not just a fixture number. The full mint→stamp→verify round
-    /// trip (including recovering the internally-minted `issued_at`) is
-    /// proven by the dispatch-wired test right below.
+    /// trip is proven by the dispatch-wired test right below.
     #[test]
     fn mint_seal_produces_a_seal_for_our_own_real_pid() {
         let me = std::process::id() as i32;
-        let seal_hex = mint_seal("s-self", me, "local");
+        let (seal_hex, _issued_at) = mint_seal("s-self", me, "local");
         assert!(!seal_hex.is_empty(), "a real pid must mint a non-empty seal");
     }
 
     /// The wiring end to end: a successful dispatched `session start` whose
     /// record already carries a `pid` (module doc's scaffolding case) gets
-    /// a `seal` stamped onto it, and that seal verifies against THIS
-    /// daemon process's own public key using the record's own stamped
-    /// fields — the exact round trip P-ID2's verify-on-accept will reuse.
+    /// a `seal` AND `sealedIssuedAt` stamped onto it (LANE IDENTITY P-ID2 —
+    /// `issued_at` now rides the record instead of being unrecoverable),
+    /// and that seal verifies against THIS daemon process's own public key
+    /// using the record's own stamped fields — the exact round trip
+    /// P-ID2's verify-on-accept reuses.
     #[test]
     fn seal_freshly_registered_session_stamps_a_verifiable_seal_when_the_record_has_a_pid() {
         let (_guard, stage, saved) = isolated_stage();
@@ -1551,6 +1654,7 @@ mod tests {
             aoide_storage::stage::load_stage(&aoide_storage::stage::sessions_path()).unwrap();
         let rec = after.sessions.iter().find(|s| s.session_id == "s1").unwrap();
         let seal_hex = rec.seal.clone().expect("a record with a pid must be sealed");
+        let issued_at = rec.sealed_issued_at.expect("a sealed record must carry sealedIssuedAt");
 
         let starttime = aoide_conduct::graph::pid_starttime(me).unwrap();
         let identity = SealedIdentity {
@@ -1558,7 +1662,7 @@ mod tests {
             pid: me,
             pid_starttime: starttime,
             origin_class: "local".to_string(),
-            issued_at: sealed_id_issued_at_from(&seal_hex, "s1", me, starttime, "local"),
+            issued_at,
         };
         assert!(
             sealed_id::verify_seal(&seal_keypair().info().pubkey_hex, &identity, &seal_hex),
@@ -1570,30 +1674,6 @@ mod tests {
         );
 
         restore_stage(&stage, saved);
-    }
-
-    /// `issued_at` is minted internally and not handed back by `mint_seal`
-    /// (module doc), so a verifying test that does not itself hold the
-    /// exact mint instant has to recover it — brute-force over a tiny
-    /// window around "now" is exactly what a REAL verifier (P-ID2) will
-    /// need anyway once `issued_at` rides on the record, so this is not
-    /// test-only scaffolding, it is the honest shape of "recompute the
-    /// canonical string and see which `issued_at` makes it verify".
-    fn sealed_id_issued_at_from(seal_hex: &str, session_id: &str, pid: i32, pid_starttime: u64, origin_class: &str) -> i64 {
-        let now = aoide_protocol::audit::now_secs() as i64;
-        for candidate in (now - 5)..=(now + 5) {
-            let identity = SealedIdentity {
-                session_id: session_id.to_string(),
-                pid,
-                pid_starttime,
-                origin_class: origin_class.to_string(),
-                issued_at: candidate,
-            };
-            if sealed_id::verify_seal(&seal_keypair().info().pubkey_hex, &identity, seal_hex) {
-                return candidate;
-            }
-        }
-        panic!("could not recover issued_at within a 10s window around now — mint_seal's issued_at clock moved further than expected");
     }
 
     /// `mint_seal`'s own documented degrade path — `pid_starttime`
@@ -1619,15 +1699,13 @@ mod tests {
             "the fixture pid must not exist on this box for the degrade path to even fire"
         );
 
-        let seal_hex = mint_seal("s-vanished", vanished_pid, "local");
-        let recovered_issued_at =
-            sealed_id_issued_at_from(&seal_hex, "s-vanished", vanished_pid, 0, "local");
+        let (seal_hex, issued_at) = mint_seal("s-vanished", vanished_pid, "local");
         let self_consistent = SealedIdentity {
             session_id: "s-vanished".to_string(),
             pid: vanished_pid,
             pid_starttime: 0,
             origin_class: "local".to_string(),
-            issued_at: recovered_issued_at,
+            issued_at,
         };
         assert!(
             sealed_id::verify_seal(&seal_keypair().info().pubkey_hex, &self_consistent, &seal_hex),
@@ -1732,6 +1810,88 @@ mod tests {
         let after: aoide_storage::records::SessionsFile =
             aoide_storage::stage::load_stage(&aoide_storage::stage::sessions_path()).unwrap();
         assert_eq!(after.sessions[0].seal, None, "a failed dispatch must never be sealed");
+
+        restore_stage(&stage, saved);
+    }
+
+    /// LANE IDENTITY P-ID2: the gap `seal_freshly_registered_session`'s own
+    /// doc names — a session registered DIRECTLY (never through `dispatch`,
+    /// the real shape `aoide conduct` registers under) is picked up by
+    /// [`seal_unsealed_live_sessions`] instead, sealed the same way, and
+    /// its `sealedIssuedAt` round-trips onto the record too. A `done`
+    /// session and one that already carries a seal are both left alone.
+    #[test]
+    fn seal_unsealed_live_sessions_seals_a_directly_registered_record() {
+        let (_guard, stage, saved) = isolated_stage();
+        let me = std::process::id() as i32;
+
+        let sf = aoide_storage::records::SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![
+                aoide_storage::records::SessionRecord {
+                    session_id: "direct-1".to_string(),
+                    agent: "claude".to_string(),
+                    state: "idle".to_string(),
+                    started_at: "2026-01-01T00:00:00Z".to_string(),
+                    pid: Some(me as u32),
+                    origin: Some("local".to_string()),
+                    ..Default::default()
+                },
+                aoide_storage::records::SessionRecord {
+                    session_id: "already-sealed".to_string(),
+                    state: "idle".to_string(),
+                    pid: Some(me as u32),
+                    seal: Some("existing-seal".to_string()),
+                    sealed_issued_at: Some(42),
+                    ..Default::default()
+                },
+                aoide_storage::records::SessionRecord {
+                    session_id: "exited".to_string(),
+                    state: "done".to_string(),
+                    pid: Some(me as u32),
+                    ..Default::default()
+                },
+                aoide_storage::records::SessionRecord {
+                    session_id: "no-pid".to_string(),
+                    state: "idle".to_string(),
+                    ..Default::default()
+                },
+            ],
+        };
+        aoide_storage::stage::write_stage(&aoide_storage::stage::sessions_path(), &sf).unwrap();
+
+        let wrote = seal_unsealed_live_sessions();
+        assert!(wrote, "a live pid-carrying unsealed record must trigger a write");
+
+        let after: aoide_storage::records::SessionsFile =
+            aoide_storage::stage::load_stage(&aoide_storage::stage::sessions_path()).unwrap();
+        let direct = after.sessions.iter().find(|s| s.session_id == "direct-1").unwrap();
+        let seal_hex = direct.seal.clone().expect("a live, pid-carrying, unsealed record must get sealed");
+        let issued_at = direct.sealed_issued_at.expect("sealedIssuedAt must be stamped alongside seal");
+        let starttime = aoide_conduct::graph::pid_starttime(me).unwrap();
+        let identity = SealedIdentity {
+            session_id: "direct-1".to_string(),
+            pid: me,
+            pid_starttime: starttime,
+            origin_class: "local".to_string(),
+            issued_at,
+        };
+        assert!(
+            sealed_id::verify_seal(&seal_keypair().info().pubkey_hex, &identity, &seal_hex),
+            "the sweep-minted seal must verify against the daemon's own public key"
+        );
+
+        // Already-sealed, done, and pid-less records are all left untouched.
+        let already = after.sessions.iter().find(|s| s.session_id == "already-sealed").unwrap();
+        assert_eq!(already.seal.as_deref(), Some("existing-seal"), "an existing seal must never be overwritten");
+        assert_eq!(already.sealed_issued_at, Some(42));
+        let exited = after.sessions.iter().find(|s| s.session_id == "exited").unwrap();
+        assert_eq!(exited.seal, None, "a done session must never be sealed");
+        let no_pid = after.sessions.iter().find(|s| s.session_id == "no-pid").unwrap();
+        assert_eq!(no_pid.seal, None, "a pid-less record must never be sealed");
+
+        // A second sweep with nothing left to seal is a quiet no-op.
+        assert!(!seal_unsealed_live_sessions(), "nothing left to seal on a second sweep");
 
         restore_stage(&stage, saved);
     }

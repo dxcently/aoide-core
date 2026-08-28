@@ -121,19 +121,25 @@
   ever reports starttime `0` (`window.rs::
   pid_starttime_reads_a_nonzero_value_for_our_own_real_pid` proves a real
   read is always `> 0`), so a verifier that reconstructs `SealedIdentity`
-  from a fresh live read can never produce a matching `0`. P-ID2's
-  verify-on-accept MUST branch on this explicitly — treat `pid_starttime
-  == 0` as "cannot revalidate, refuse" up front, never fall through to an
+  from a fresh live read can never produce a matching `0`. `aoide_conduct::
+  graph::identity::verify_seal_over` (P-ID2's verify-on-accept caller)
+  branches on this explicitly, up front — a `None`/`0` live read is
+  refused before ever reaching `verify_seal`, never falling through to an
   ordinary verify that would simply (and silently) fail for the wrong
-  reason.
-- **No gate reads `SessionRecord.seal` yet — don't wire one in without
-  reading the LANE IDENTITY plan section first.** P-ID1 (this phase) only
-  proves mint → store → verify; P-ID2 is the phase that adds the first
-  verify-on-accept caller (the control socket's peercred floor), and P-ID4
-  is the first to gate a real policy decision on `originClass`. A change
-  that makes any door/socket/broker DECISION depend on `seal`'s presence
-  or content before P-ID2 lands is out of scope for this crate and belongs
-  in that later phase's own review, not slipped in here.
+  reason; pinned by that function's own `verify_seal_over_rejects_when_
+  the_live_starttime_read_is_unreadable` test.
+- **`SessionRecord.seal`/`sealedIssuedAt` are consumed OUTSIDE this
+  crate — don't add a gate here.** This crate mints, stores, and
+  cryptographically verifies a seal (`sealed_id::{mint_seal,verify_seal}`)
+  but makes NO policy decision on one — both real consumers
+  (`aoide-conduct`'s send gate and its per-session control socket's accept
+  loop, LANE IDENTITY P-ID2) live in `aoide-conduct::graph::identity`,
+  which reconstructs the exact `SealedIdentity` a stored `seal` was signed
+  over and calls this crate's `verify_seal` against a pubkey it fetches
+  itself over the daemon's `ping` reply. P-ID4 is the first phase to gate
+  a REAL policy decision (per-secret `allowRemoteOrigin`) on a VERIFIED
+  `originClass` — that policy logic belongs in `aoide-secrets`/
+  `aoide-server`, not here either.
 - **`wire_auth::canonical_string`'s five-field order, NUL-separator, and
   lowercased/trimmed style are the wire contract, not an implementation
   detail (P-P4) — pinned by

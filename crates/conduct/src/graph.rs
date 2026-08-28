@@ -16,6 +16,7 @@
 mod common;
 mod conduct;
 mod doc;
+mod identity;
 mod model;
 mod pending;
 mod permit;

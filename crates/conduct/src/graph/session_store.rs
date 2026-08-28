@@ -534,14 +534,27 @@ pub fn stamp_origin(id: &str, origin: &str) {
 /// rendered into `graph.json`, so stamping it must not churn the
 /// widget-facing document.
 ///
-/// `pub` (crosses the crate boundary) with exactly ONE legitimate caller:
-/// `aoide-server`'s daemon `dispatch` handler, which mints the seal over the
-/// pid the record it just registered already carries (P-ID1's scaffolding —
-/// P-ID2 replaces that pid with a peercred-authenticated one) and stamps it
-/// here, the same "stamp from the authority that just authenticated the
-/// fact" shape [`stamp_origin`]'s own doc names. **No gate reads this field
-/// yet** — this call proves the mint/store/verify mechanism, nothing more.
-pub fn stamp_seal(id: &str, seal: &str) {
+/// `pub` (crosses the crate boundary), called from `aoide-server`'s daemon
+/// (LANE IDENTITY P-ID2, `CONTRACTS.md`'s identity section): once from the
+/// `dispatch` handler's `session start` path (P-ID1's original caller,
+/// pid already on the record), and once from the daemon tick's own
+/// sealing sweep — the fix for the gap P-ID1 shipped as scaffolding
+/// (module doc there): `session_conduct`'s own DIRECT, non-dispatched
+/// registration — the common real-world path, `aoide conduct -- <agent>`
+/// — never touches the daemon's `dispatch` handler at all, so it was
+/// NEVER sealed under P-ID1. The tick sweep (`server::daemon::
+/// seal_unsealed_live_sessions`) closes that: every live, pid-carrying,
+/// unsealed session gets a seal within one tick (~1s) of registering,
+/// regardless of which path registered it.
+///
+/// `issued_at` rides alongside `seal` (both stamped together, both
+/// change-only against the value already on the record) — `verify_seal`
+/// needs the EXACT signed `SealedIdentity` to check a signature against,
+/// and `issued_at` has no live fact a verifier can re-derive it from
+/// (`SessionRecord::sealed_issued_at`'s own doc) — this is the same
+/// "stamp from the authority that just authenticated the fact" shape
+/// [`stamp_origin`]'s own doc names.
+pub fn stamp_seal(id: &str, seal: &str, issued_at: i64) {
     if seal.is_empty() {
         return;
     }
@@ -556,6 +569,7 @@ pub fn stamp_seal(id: &str, seal: &str) {
             .find(|s| s.session_id == id && s.seal.as_deref() != Some(seal))
         {
             s.seal = Some(seal.to_string());
+            s.sealed_issued_at = Some(issued_at);
             if file.schema_version.is_empty() {
                 file.schema_version = STAGE_GRAPH_VERSION.to_string();
             }
@@ -2304,21 +2318,23 @@ mod tests {
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
         do_session_start("sealed-1", Some("claude"), Some("/w"), None, None, None, None, None, None);
-        stamp_seal("sealed-1", "deadbeefcafe");
+        stamp_seal("sealed-1", "deadbeefcafe", 1_700_000_000);
 
         let s: SessionsFile = load_stage(&sessions_path()).unwrap();
         let rec = s.sessions.iter().find(|r| r.session_id == "sealed-1").unwrap();
         assert_eq!(rec.seal.as_deref(), Some("deadbeefcafe"));
+        assert_eq!(rec.sealed_issued_at, Some(1_700_000_000));
 
         // A registration nobody sealed never gets a `seal` at all.
         do_session_start("unsealed-1", Some("claude"), Some("/w"), None, None, None, None, None, None);
         let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
         let unsealed = s2.sessions.iter().find(|r| r.session_id == "unsealed-1").unwrap();
         assert_eq!(unsealed.seal, None);
+        assert_eq!(unsealed.sealed_issued_at, None);
 
         // An empty seal is a no-op, same as an unknown id.
-        stamp_seal("unsealed-1", "");
-        stamp_seal("no-such-session", "deadbeef");
+        stamp_seal("unsealed-1", "", 1_700_000_000);
+        stamp_seal("no-such-session", "deadbeef", 1_700_000_000);
         let s3: SessionsFile = load_stage(&sessions_path()).unwrap();
         assert_eq!(s3.sessions.iter().find(|r| r.session_id == "unsealed-1").unwrap().seal, None);
 

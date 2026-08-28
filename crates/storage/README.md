@@ -209,8 +209,11 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   untrusted source. **This closes the STAMP paths, not the files** — a
   hand-crafted `sessions.json`/ledger line claiming `peer:X` is still a
   readable, unflagged string on disk; nothing here makes the files
-  tamper-evident, that is P-ID1 (the daemon-signed credential)/P-ID2 (the
-  peercred floor), still open. A same-uid process can still forge a
+  tamper-evident, that is P-ID1 (the daemon-signed credential) minted and
+  stored, verified on the per-session control socket's own accept and
+  consumed by the send gate as of P-ID2 — two doors (shellbridge,
+  `aoided`'s own dispatch socket) remain unfloored, P-ID3. A same-uid
+  process can still forge a
   LOCAL-class origin, and neither the session's own identity nor the
   consumer presenting it are authenticated yet (this crate's own
   `records`/`ledger` section, and CONTRACTS.md's pending-queue note);
@@ -365,15 +368,26 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   `0` (the documented degrade for a pid that vanished before mint) is
   self-consistent but UNVERIFIABLE against any later live `/proc` read —
   no genuine read is ever `0` — a caller must treat it as "cannot
-  revalidate," never as "verified." `records::SessionRecord.seal`
-  (additive, `skip_serializing_if`) is the one place a minted seal is
-  stored — stamped by `aoide-conduct::graph::session_store::stamp_seal`,
-  this crate's own sibling to `stamp_origin`. **No gate in this codebase
-  reads `seal` yet** — P-ID1 proves the mint → store → verify mechanism
-  only (this module's own test suite: verify TRUE on a genuine seal, FALSE
-  on any single tampered field including a case-only-different
-  `sessionId`, FALSE under a different keypair); P-ID2 adds the first
-  verify-on-accept caller.
+  revalidate," never as "verified." `records::SessionRecord.seal`/
+  `sealedIssuedAt` (both additive, `skip_serializing_if`, one lifecycle —
+  always `Some` together) are where a minted seal is stored — stamped by
+  `aoide-conduct::graph::session_store::stamp_seal`, this crate's own
+  sibling to `stamp_origin`. `sealedIssuedAt` exists because `issuedAt` has
+  no live fact a verifier can re-derive it from the way `pidStarttime` does
+  (a fresh `/proc` read) — without it, checking a signature means
+  brute-forcing every plausible mint instant, which is exactly what this
+  module's OWN P-ID1 test suite did before this field existed. **P-ID2 is
+  the first phase to read `seal`**: `aoide-conduct::graph::identity::
+  verify_seal_over` reconstructs the exact signed `SealedIdentity` from a
+  record (never trusting a stored `pidStarttime`, always a fresh `/proc`
+  read) and calls this module's `verify_seal` against the daemon's LIVE
+  public key; `attested_sender` walks a pid's ancestry looking for one that
+  verifies, feeding both `aoide-conduct`'s send gate and its per-session
+  control socket's accept loop (see that crate's own README for the
+  wiring). This module's own test suite (verify TRUE on a genuine seal,
+  FALSE on any single tampered field including a case-only-different
+  `sessionId`, FALSE under a different keypair) still proves the mechanism
+  in isolation; P-ID2's tests prove the real consumers.
 - `wire_auth` — per-request signed wire authentication for paired peers
   (P-P4, `docs/architecture/PAIRING.md`'s "Wire authentication (paired
   peers)" section, CONTRACTS.md §6's own amendment for the full wire
