@@ -15,15 +15,16 @@
 //! handler in `aoide-conduct` tries first, over the resident `aoided`'s
 //! own control socket.
 //!
-//! `discover` (P-P6, `docs/architecture/PAIRING.md`'s "Discovery
-//! (advertise-but-locked)" section) is the discovery beacon's LISTEN half —
-//! `peer discover`/`peer invite`'s shared multicast sweep, dedupe-by-
-//! fingerprint fold, and (for `peer invite`) the pure heard-set resolution
-//! its ambiguous/absent-name refusal is built on. The SEND half
-//! (`a2a serve`'s own advertise thread) lives in `aoide-server::discovery`
-//! instead — this crate is outbound-only, and joining a multicast group to
-//! LISTEN is the client-side action here, mirroring every other `peer *`
-//! command's shape.
+//! `discover` (P-P6 + task #120, `docs/architecture/PAIRING.md`'s
+//! "Discovery (advertise-but-locked)" section) is the discovery
+//! advertisement's LISTEN half — `peer discover`/`peer invite`'s shared
+//! UDP sweep (a plain fixed-port bind hears the broadcast; no group join,
+//! no probing), its bounded dedupe fold, and (for `peer invite`) the pure
+//! heard-set resolution its ambiguous/absent-name refusal is built on. The
+//! SEND half (`a2a serve`'s own advertise thread) lives in
+//! `aoide-server::discovery` instead — this crate is outbound-only, and
+//! LISTENING is the client-side action here, mirroring every other
+//! `peer *` command's shape.
 //!
 //! `tunnel` (P-S3, ssh-transport lane) is the ONE place `ssh` is ever
 //! spawned: `open_or_reuse`/`close`/`close_all_for_session` open, probe,

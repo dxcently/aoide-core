@@ -321,22 +321,27 @@ the inbound half of the two-door contract (the outbound half is
   immediately-delivered payload's bytes stay untouched, so an
   already-autogated peer's delivery is byte-identical to before this
   phase).
-- `discovery` — the discovery beacon's ADVERTISE half (P-P6,
-  `docs/architecture/PAIRING.md`'s "Discovery (advertise-but-locked)"
-  section, CONTRACTS.md §6's "Discovery beacon" subsection). `a2a::serve`
-  calls `spawn_advertiser` exactly once, at launch, ONLY when
-  `a2a::resolve_discovery_advertise` (`--discovery-advertise`/
-  `AOIDE_DISCOVERY_ADVERTISE`, mirroring `resolve_bind_port`'s own
-  precedence) says on — off by default, no thread, no socket, no identity
-  file touched at all otherwise. Each tick (~30s, jittered) binds a fresh
-  ephemeral UDP socket, sends one `aoide_storage::beacon` line to the
-  fixed multicast group+port, and drops the socket — fire-and-forget, no
+- `discovery` — the discovery advertisement's SEND half (P-P6 + task
+  #120, `docs/architecture/PAIRING.md`'s "Discovery
+  (advertise-but-locked)" section, CONTRACTS.md §6's "Discovery
+  advertisement" subsection). `a2a::serve` calls `spawn_advertiser`
+  exactly once, at launch — the thread always exists, but a tick only
+  SENDS when `a2a::resolve_discovery_advertise`'s launch-time force
+  (`--discovery-advertise`/`AOIDE_DISCOVERY_ADVERTISE`, mirroring
+  `resolve_bind_port`'s own precedence) OR the runtime switch
+  (`aoide_storage::advertise::enabled`, flipped by `aoide peer advertise
+  on|off`, read fresh every tick) says on — both off by default: silent
+  ticks, no socket, nothing on the wire. A sending tick (~30s, jittered)
+  binds a fresh ephemeral UDP socket with `SO_BROADCAST`, sends one
+  `aoide_storage::advertise` line (name + ssh hop claim ONLY — no door
+  URL, no key, no identity file touched) to the fixed
+  broadcast-address+port, and drops the socket — fire-and-forget, no
   connection state held between ticks. Fallible spawn
   (`thread::Builder::spawn`, `daemon.rs`'s discipline, not `a2a.rs`'s own
   plain `thread::spawn` for connection handlers — that one is reserved for
   a NEW socket-based door, not a background worker thread) — a refused OS
   thread costs discovery only, never the door. The RECEIVE half
-  (`peer discover`/`peer invite`'s multicast sweep) lives in
+  (`peer discover`/`peer invite`'s sweep) lives in
   `aoide-client::discover` instead; this crate stays inbound/serve-only.
 - `commands` — this crate's CLI commands: `daemon`, `shellbridge` (registration
   only — the files stay in `conduct`), `a2a serve`, `events tail` (P-D3,

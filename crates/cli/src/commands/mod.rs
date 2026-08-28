@@ -47,7 +47,9 @@ use crate::registry::Registry;
 /// went 87 -> 48 in the same commit; nothing else in this list moved or
 /// reordered. `melete status/graph/call` (M2, task #14, appended newest —
 /// the Melete MCP client, `aoide_client::mcp_client`'s own module doc) took
-/// the golden count 75 -> 78.
+/// the golden count 75 -> 78; `peer advertise` (task #120, registered
+/// inside `register_peer_discovery` beside the sweep commands it switches)
+/// took it 78 -> 79.
 pub fn all() -> Registry {
     let mut r = Registry::new();
 
@@ -72,7 +74,7 @@ pub fn all() -> Registry {
     aoide_server::commands::register_events(&mut r); // events tail — aoided's own feed follow command (P-D3, appended newest)
     aoide_storage::commands::register_identity(&mut r); // identity — this instance's ed25519 identity show command (pairing workstream P-P1, appended newest)
     aoide_client::commands::register_peer_pair(&mut r); // peer pair request/pending/approve/reject — the pairing ceremony's CLI half (P-P2, appended newest)
-    aoide_client::commands::register_peer_discovery(&mut r); // peer discover/invite — the LAN discovery beacon's CLI half (P-P6, appended newest)
+    aoide_client::commands::register_peer_discovery(&mut r); // peer discover/invite/advertise — LAN discovery's CLI half (P-P6 + task #120, appended newest)
     aoide_client::mcp_client::register_melete(&mut r); // melete status/graph/call — the Melete MCP client (M2, task #14, appended newest)
 
     r

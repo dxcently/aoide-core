@@ -457,7 +457,7 @@ fn parse_via_flag(inv: &Invocation) -> Result<Option<aoide_storage::tunnel::Via>
 /// meaning to the far end. Each instance identifies itself by its own self
 /// name on every wire call that claims an identity: the pairing ceremony's
 /// `pairRequest.name` (`run_pair_request`, same `local_host_name()` chain
-/// the discovery beacon and `graphSummary` also use) and this header both
+/// the discovery advertisement and `graphSummary` also use) and this header both
 /// say "this is who I am," so both must carry the same value. The far end
 /// registers and resolves the caller BY THAT SELF NAME
 /// (`aoide-server::a2a::verify_signed_request` looks up
@@ -1410,11 +1410,21 @@ fn confirm_sas(sas: &str, name: &str) -> Result<bool, String> {
 /// proxy/tunnel hostname).
 fn default_self_url() -> String {
     let host = aoide_storage::display::local_host_name();
-    let port: u16 = std::env::var("AOIDE_A2A_PORT")
+    format!("http://{host}:{}/", default_a2a_port())
+}
+
+/// The house A2A door port this box assumes for itself AND for a
+/// discovered peer: `AOIDE_A2A_PORT` (the same env the `aoide-a2a`
+/// systemd unit sets) or the house default `8710`. `peer invite` composes
+/// its dial target with this (task #120 — the advertisement carries no
+/// door URL, so there is no per-peer port to read off the wire); a peer
+/// on a non-default port takes the explicit `peer pair request <url>`
+/// path instead.
+fn default_a2a_port() -> u16 {
+    std::env::var("AOIDE_A2A_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
-        .unwrap_or(8710);
-    format!("http://{host}:{port}/")
+        .unwrap_or(8710)
 }
 
 /// `peer pair request <url> [--name <n>] [--self-url <url>]` — the
@@ -1482,7 +1492,7 @@ fn handle_peer_pair_request(inv: &Invocation) -> Outcome {
 /// The requester's half of the ceremony, shared verbatim by
 /// `handle_peer_pair_request` (a CLI-typed `<url>`/`--name`, validated
 /// above) AND `handle_peer_invite` (P-P6 — a `url`/`name` already lifted
-/// straight off an already-validated, already-confirmed discovery beacon,
+/// straight off an already-validated, already-confirmed discovery advertisement,
 /// so it needs no SECOND `valid_peer_name` check here). Extracted so
 /// `peer invite` reaches the SAME ceremony code `peer pair request` does —
 /// never a copy (PAIRING.md: "sugar over the ceremony, nothing more").
@@ -2080,21 +2090,21 @@ fn handle_peer_pair_watch(inv: &Invocation) -> Outcome {
     Outcome::ok(cmd, "watching pairing events")
 }
 
-/// `peer discover [--secs N] [--json]` (P-P6, `docs/architecture/
-/// PAIRING.md`'s "Discovery (advertise-but-locked)" section): joins the
-/// fixed multicast group, listens `--secs` seconds (default
-/// `discover::DEFAULT_SWEEP_SECS`, ~4), and prints every DISTINCT
-/// fingerprint heard — name, fingerprint, url, `srcAddr`, first/last heard,
-/// and how many times (`discover::run_sweep`'s own dedupe-by-fingerprint
-/// fold). `url` is the beacon's own CLAIM (a loopback-bound advertiser's
-/// `url` reads `http://127.0.0.1:<port>/` no matter who hears it);
-/// `srcAddr` is the packet's actual source address, an OBSERVATION this
-/// process made directly (P-S1) — the two are shown side by side precisely
-/// so an operator can see them disagree. **Read-only** — this command
-/// never writes `state/peers.json`; the pairing ceremony is the only thing
-/// that ever registers a peer. Malformed beacons are dropped and counted,
-/// never echoed raw (house rule 4) — `dropped` in the JSON data is a bare
-/// total, nothing more specific about what was wrong with any one of them.
+/// `peer discover [--secs N] [--json]` (P-P6 + task #120,
+/// `docs/architecture/PAIRING.md`'s "Discovery (advertise-but-locked)"
+/// section): listens on the fixed UDP port for `--secs` seconds (default
+/// `discover::DEFAULT_SWEEP_SECS`, ~4) and prints every DISTINCT
+/// (name, source) heard — name, the claimed ssh hop (`user`@`host`),
+/// `srcAddr`, first/last heard, and how many times
+/// (`discover::run_sweep`'s own bounded fold). `host`/`user` are the
+/// advertisement's own CLAIM; `srcAddr` is the packet's actual source
+/// address, an OBSERVATION this process made directly (P-S1) — shown side
+/// by side precisely so an operator can see them disagree. **Read-only**
+/// — this command never writes `state/peers.json`; the pairing ceremony
+/// is the only thing that ever registers a peer. Malformed advertisements
+/// are dropped and counted, never echoed raw (house rule 4) — `dropped`
+/// in the JSON data is a bare total, nothing more specific about what was
+/// wrong with any one of them.
 fn handle_peer_discover(inv: &Invocation) -> Outcome {
     let cmd = "peer.discover";
     let secs = match parse_secs_flag(inv) {
@@ -2120,9 +2130,9 @@ fn handle_peer_discover(inv: &Invocation) -> Outcome {
         .iter()
         .map(|h| {
             json!({
-                "name": h.beacon.name,
-                "fpr": h.beacon.fpr,
-                "url": h.beacon.url,
+                "name": h.advertisement.name,
+                "host": h.advertisement.host,
+                "user": h.advertisement.user,
                 "srcAddr": h.src_addr,
                 "firstHeard": h.first_heard,
                 "lastHeard": h.last_heard,
@@ -2132,7 +2142,7 @@ fn handle_peer_discover(inv: &Invocation) -> Outcome {
         .collect();
 
     let message = if swept.heard.is_empty() {
-        format!("heard no discovery beacons in {secs}s ({} malformed dropped)", swept.dropped)
+        format!("heard no discovery advertisements in {secs}s ({} malformed dropped)", swept.dropped)
     } else {
         format!(
             "heard {} distinct instance{} in {secs}s ({} malformed dropped)",
@@ -2165,12 +2175,12 @@ fn parse_secs_flag(inv: &Invocation) -> Result<u64, ()> {
 /// discovered peer — a LOCAL UX confirmation only (mirrors
 /// `confirm_spawn`/`confirm_sas`'s exact idiom), never a security gate:
 /// the ceremony's own SAS confirmation (both operators, both ends) is the
-/// sole authority either way. Shows BOTH `url` (the beacon's own
-/// advertised claim) and `src_addr` (the packet's OBSERVED source address,
-/// P-S1) so the operator sees the substitution `invite_dial_url` is about
-/// to make, not just its result.
-fn confirm_invite(name: &str, fpr: &str, url: &str, src_addr: &str) -> Result<bool, String> {
-    eprint!("invite `{name}` (advertised {url}, observed at {src_addr}, fingerprint {fpr}) to pair — proceed? [y/N] ");
+/// sole authority either way. Shows BOTH the advertisement's claimed ssh
+/// hop (`user`@`host`) and `src_addr` (the packet's OBSERVED source
+/// address, P-S1) so the operator sees the claim and the observation side
+/// by side before anything is dialed.
+fn confirm_invite(name: &str, host: &str, user: &str, src_addr: &str) -> Result<bool, String> {
+    eprint!("invite `{name}` (claims ssh {user}@{host}, observed at {src_addr}) to pair — proceed? [y/N] ");
     let _ = std::io::stderr().flush();
     let mut line = String::new();
     let read = std::io::stdin()
@@ -2180,28 +2190,31 @@ fn confirm_invite(name: &str, fpr: &str, url: &str, src_addr: &str) -> Result<bo
     Ok(read > 0 && matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
-/// `peer invite <name> [--secs N] [--yes] [--json]` (P-P6, PAIRING.md's own
-/// "sugar over the ceremony, nothing more" framing): runs its OWN discover
-/// sweep (never reuses a previous one — a beacon is only ever as fresh as
-/// the sweep that heard it), resolves `<name>` against the heard set
-/// (`discover::resolve_invite_target`), and on EXACTLY one match runs the
-/// SAME [`run_pair_request`] core `peer pair request` itself calls —
-/// reused, never copied (this is what "reaches the same code path"
-/// actually means here: both handlers bottom out in the identical
-/// function, not two functions that merely look alike). Zero or multiple
-/// matches refuse with a taught error listing every name that WAS heard
-/// (never raw beacon content — house rule 4; only already-validated
-/// `name`s ever reach this point). The ceremony url dialed is composed
-/// from the hit's OBSERVED source address, not its advertised `url`
-/// (`discover::invite_dial_url`, P-S1) — a loopback-bound advertiser's
-/// `url` is useless as a dial target for anyone but itself. Before
-/// dialing, the SELF-INVITE GUARD (`discover::is_self_target`) refuses
-/// when the heard fingerprint is this instance's own, or when the composed
-/// dial target resolves to this instance's own door — the "you just
+/// `peer invite <name> [--secs N] [--yes] [--json]` (P-P6 + task #120,
+/// PAIRING.md's own "sugar over the ceremony, nothing more" framing): runs
+/// its OWN discover sweep (never reuses a previous one — an advertisement
+/// is only ever as fresh as the sweep that heard it), resolves `<name>`
+/// against the heard set (`discover::resolve_invite_target`), and on
+/// EXACTLY one match runs the SAME [`run_pair_request`] core `peer pair
+/// request` itself calls — reused, never copied (this is what "reaches the
+/// same code path" actually means here: both handlers bottom out in the
+/// identical function, not two functions that merely look alike). Zero or
+/// multiple matches refuse with a taught error listing every name that WAS
+/// heard (never raw advertisement content — house rule 4; only
+/// already-validated `name`s ever reach this point). The ceremony url
+/// dialed is composed from the hit's OBSERVED source address, never a
+/// claimed one (P-S1), on the house door port ([`default_a2a_port`]) — the
+/// advertisement deliberately carries NO door URL (rendezvous, not
+/// authentication; `aoide_storage::advertise`'s module doc), so a
+/// non-default far-end port needs a plain `peer pair request <url>`
+/// instead. Before dialing, the SELF-INVITE GUARD
+/// (`discover::is_self_target`) refuses when the heard name is this
+/// instance's own or the datagram came from loopback — the "you just
 /// invited yourself" case owed here because this is where the target is
-/// chosen. `--yes` skips only the LOCAL proceed-confirm (`confirm_invite`),
-/// exactly `peer spawn`'s own `--yes` idiom — the ceremony's OWN SAS
-/// confirmation (both operators, both ends) is untouched and still runs.
+/// chosen (a broadcast always loops back to its own sender). `--yes` skips
+/// only the LOCAL proceed-confirm (`confirm_invite`), exactly `peer
+/// spawn`'s own `--yes` idiom — the ceremony's OWN SAS confirmation (both
+/// operators, both ends) is untouched and still runs.
 fn handle_peer_invite(inv: &Invocation) -> Outcome {
     let cmd = "peer.invite";
     const USAGE: &str = "usage: aoide peer invite <name> [--secs N] [--yes] [--via ssh://[user@]host[:port]] [--json]";
@@ -2236,7 +2249,7 @@ fn handle_peer_invite(inv: &Invocation) -> Outcome {
             return Outcome::error(
                 cmd,
                 format!(
-                    "heard no beacon named `{name}` in {secs}s — heard: {}",
+                    "heard no advertisement named `{name}` in {secs}s — heard: {}",
                     if heard.is_empty() { "(none)".to_string() } else { heard.join(", ") }
                 ),
             )
@@ -2245,61 +2258,53 @@ fn handle_peer_invite(inv: &Invocation) -> Outcome {
         Err(crate::discover::InviteResolveError::Ambiguous { heard }) => {
             return Outcome::error(
                 cmd,
-                format!("heard multiple beacons named `{name}` — ambiguous; heard: {}", heard.join(", ")),
+                format!("heard multiple advertisements named `{name}` — ambiguous; heard: {}", heard.join(", ")),
             )
             .with_data(json!({ "reason": "ambiguous", "name": name, "heard": heard }));
         }
     };
 
-    let dial_url = match crate::discover::invite_dial_url(&hit.beacon.url, &hit.src_addr) {
-        Ok(u) => u,
-        Err(e) => {
-            return Outcome::error(cmd, format!("composing a dial target for `{}`: {e}", hit.beacon.name))
-                .with_data(json!({ "reason": "dial-url-invalid", "name": hit.beacon.name, "beaconUrl": hit.beacon.url, "srcAddr": hit.src_addr }))
-        }
-    };
+    // The dial target: the OBSERVED source address on the house door port
+    // (handler doc — the advertisement carries no door URL to read a port
+    // off, by design).
+    let dial_url = format!("http://{}:{}/", hit.src_addr, default_a2a_port());
 
     let self_url = default_self_url();
-    let own_fpr = match aoide_storage::identity::load_or_mint() {
-        Ok((kp, _)) => kp.info().fingerprint,
-        Err(e) => {
-            return Outcome::error(cmd, format!("loading this instance's identity: {e}"))
-                .with_data(json!({ "reason": "identity-io-failed" }))
-        }
-    };
-    if crate::discover::is_self_target(&hit.beacon.fpr, &own_fpr, &dial_url, &[self_url.clone()]) {
+    let own_name = aoide_storage::display::local_host_name();
+    if crate::discover::is_self_target(&hit, &own_name) {
         return Outcome::error(
             cmd,
             format!(
-                "`{}` resolves to this instance's own door (fingerprint {own_fpr}) — refusing to invite yourself",
-                hit.beacon.name
+                "`{}` resolves to this instance's own advertisement — refusing to invite yourself",
+                hit.advertisement.name
             ),
         )
-        .with_data(json!({ "reason": "self-invite", "name": hit.beacon.name, "fpr": own_fpr, "dialUrl": dial_url }));
+        .with_data(json!({ "reason": "self-invite", "name": hit.advertisement.name, "srcAddr": hit.src_addr }));
     }
 
     if !inv.flag_present("yes") {
-        match confirm_invite(&hit.beacon.name, &hit.beacon.fpr, &hit.beacon.url, &hit.src_addr) {
+        match confirm_invite(&hit.advertisement.name, &hit.advertisement.host, &hit.advertisement.user, &hit.src_addr) {
             Ok(true) => {}
             Ok(false) => {
-                return Outcome::ok(cmd, format!("not confirmed — nothing sent to `{}`", hit.beacon.name))
-                    .with_data(json!({ "confirmed": false, "name": hit.beacon.name }))
+                return Outcome::ok(cmd, format!("not confirmed — nothing sent to `{}`", hit.advertisement.name))
+                    .with_data(json!({ "confirmed": false, "name": hit.advertisement.name }))
             }
             Err(e) => return Outcome::error(cmd, e),
         }
     }
 
     // K1's settled default: the peer this ceremony creates gets an
-    // automatic `via` derived from the discovery beacon's OBSERVED source
-    // address, so its own FUTURE calls (pull/spawn/send) can reach it
-    // through an ssh tunnel — recorded at `peer pair approve` commit time,
-    // not used for the ceremony's own dial below (`run_pair_request`'s own
-    // doc on why those stay separate). An explicit `--via` beats this
-    // default outright, for both halves.
+    // automatic `via` derived from the advertisement's OBSERVED source
+    // address plus its claimed ssh login (task #120 — the one thing the
+    // wire exists to carry), so its own FUTURE calls (pull/spawn/send) can
+    // reach it through an ssh tunnel — recorded at `peer pair approve`
+    // commit time, not used for the ceremony's own dial below
+    // (`run_pair_request`'s own doc on why those stay separate). An
+    // explicit `--via` beats this default outright, for both halves.
     let default_record_via =
-        Some(aoide_storage::tunnel::default_via(&hit.src_addr, "").to_string());
+        Some(aoide_storage::tunnel::default_via(&hit.src_addr, &hit.advertisement.user).to_string());
     let record_via = via_flag.as_ref().map(|v| v.to_string()).or(default_record_via);
-    run_pair_request(cmd, &dial_url, &hit.beacon.name, &self_url, via_flag.as_ref(), record_via)
+    run_pair_request(cmd, &dial_url, &hit.advertisement.name, &self_url, via_flag.as_ref(), record_via)
 }
 
 /// The four `peer pair` commands (P-P2), registered directly after the six
@@ -2364,16 +2369,52 @@ pub fn register_peer_pair(r: &mut Registry) {
     ));
 }
 
-/// `peer discover`/`peer invite` (P-P6, `docs/architecture/PAIRING.md`'s
-/// "Discovery (advertise-but-locked)" section), registered directly after
-/// `register_peer_pair` — discovery is sugar OVER the ceremony that group
-/// already owns, never a parallel mechanism, so it joins the group it
-/// extends the same way `register_peer_pair` itself did for the six
-/// legacy `peer` commands.
+/// `peer advertise on|off` (task #120): flip this instance's discovery
+/// advertise switch (`aoide_storage::advertise::set_enabled`,
+/// `state/advertise.json`). Idempotent, and says which of the two it was —
+/// "flipped" names both states, "already" names the one it stays in. The
+/// switch is READ by a running `a2a serve`'s advertise thread on every
+/// tick (~30-40s), so no restart is involved — but no `a2a serve` running
+/// means nothing is emitting either way, which the message teaches rather
+/// than assumes.
+fn handle_peer_advertise(inv: &Invocation) -> Outcome {
+    let cmd = "peer.advertise";
+    const USAGE: &str = "usage: aoide peer advertise on|off";
+    let on = match inv.args.first().map(|s| s.trim()) {
+        Some("on") => true,
+        Some("off") => false,
+        _ => return Outcome::usage(cmd, USAGE),
+    };
+    let previous = match aoide_storage::advertise::set_enabled(on) {
+        Ok(p) => p,
+        Err(e) => {
+            return Outcome::error(cmd, format!("writing the advertise switch: {e}"))
+                .with_data(json!({ "reason": "switch-io-failed" }))
+        }
+    };
+    let state = if on { "on" } else { "off" };
+    let message = if previous == on {
+        format!("discovery advertising already {state}")
+    } else {
+        format!(
+            "discovery advertising: {} -> {state} — a running `a2a serve` picks this up within \
+             ~40s; without one, nothing advertises either way",
+            if previous { "on" } else { "off" }
+        )
+    };
+    Outcome::ok(cmd, message).with_data(json!({ "enabled": on, "changed": previous != on }))
+}
+
+/// `peer discover`/`peer invite`/`peer advertise` (P-P6 + task #120,
+/// `docs/architecture/PAIRING.md`'s "Discovery (advertise-but-locked)"
+/// section), registered directly after `register_peer_pair` — discovery is
+/// sugar OVER the ceremony that group already owns, never a parallel
+/// mechanism, so it joins the group it extends the same way
+/// `register_peer_pair` itself did for the six legacy `peer` commands.
 pub fn register_peer_discovery(r: &mut Registry) {
     r.insert(cmd!(
         path: ["peer", "discover"],
-        summary: "Listen for discovery beacons on the LAN multicast group and print every distinct instance heard (name, fingerprint, url, and the observed source address) — read-only, never writes state/peers.json.",
+        summary: "Listen for discovery advertisements on the LAN (UDP broadcast, fixed port) and print every distinct instance heard (name, claimed ssh hop user@host, and the observed source address) — read-only, never writes state/peers.json.",
         args: [],
         flags: [flag!("secs", "int", "How many seconds to listen (default ~4).")],
         gated: false,
@@ -2382,16 +2423,26 @@ pub fn register_peer_discovery(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["peer", "invite"],
-        summary: "Discover <name> on the LAN and, on exactly one match, run the pairing ceremony (peer pair request) against its advertised url.",
-        args: [arg!("name", "string", true, "The instance name to look for among heard discovery beacons.")],
+        summary: "Discover <name> on the LAN and, on exactly one match, run the pairing ceremony (peer pair request) against its observed source address.",
+        args: [arg!("name", "string", true, "The instance name to look for among heard discovery advertisements.")],
         flags: [
             flag!("secs", "int", "How many seconds to listen (default ~4)."),
             flag!("yes", "bool", "Skip the interactive y/N proceed confirmation (scripted use) — the ceremony's own SAS confirmation is untouched."),
-            flag!("via", "string", "An ssh://[user@]host[:port] transport marker, overriding the default derived from the beacon's observed source address — both the ceremony's own dial AND the resulting peer's recorded via."),
+            flag!("via", "string", "An ssh://[user@]host[:port] transport marker, overriding the default derived from the advertisement's observed source address and claimed ssh login — both the ceremony's own dial AND the resulting peer's recorded via."),
         ],
         gated: false,
         implemented: true,
         handler: handle_peer_invite,
+    ));
+    r.insert(cmd!(
+        path: ["peer", "advertise"],
+        summary: "Switch this instance's discovery advertising on or off (state/advertise.json; default off) — a running a2a serve reads the switch every tick and emits name + ssh hop info only, never a door URL or key.",
+        args: [arg!("state", "string", true, "`on` or `off`.")],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_peer_advertise,
+        examples: ["peer advertise on", "peer advertise off"],
     ));
 }
 
@@ -2755,16 +2806,15 @@ mod tests {
 
     // ── `peer discover` — discovery grants nothing (P-P6). ───────────────────
     //
-    // `run_sweep` needs a real socket (bind + multicast join), so this can't
-    // be a fully pure test — but it does NOT need a real BEACON to prove the
-    // one invariant that matters here: a 1s sweep that hears nothing still
-    // must leave `state/peers.json` byte-identical to what it was before.
-    // The genuine heard-a-real-beacon path is `cli/tests/
-    // discovery_connectivity.rs`'s `#[ignore]`'d real-multicast test; this
-    // one runs wherever the network namespace can JOIN the multicast group
-    // at all (`discover::multicast_capable` — the nix build sandbox's
-    // loopback-only namespace refuses the join itself with ENODEV, not
-    // just delivery) and skips with a note where it can't.
+    // `run_sweep` needs a real socket (a plain fixed-port bind — no group
+    // join since the #106 broadcast fix, so this runs everywhere, the nix
+    // build sandbox included), but it does NOT need a real ADVERTISEMENT
+    // to prove the one invariant that matters here: a 1s sweep that hears
+    // nothing still must leave `state/peers.json` byte-identical to what
+    // it was before. The genuine heard-a-real-advertisement path is
+    // `discover::tests::run_sweep_hears_an_advertisement_sent_over_the_
+    // real_loopback_stack` plus `cli/tests/discovery_connectivity.rs`'s
+    // `#[ignore]`'d real-network tests.
 
     fn discover_inv(secs: &str) -> Invocation {
         Invocation {
@@ -2777,10 +2827,6 @@ mod tests {
 
     #[test]
     fn peer_discover_never_writes_peers_json_even_on_an_empty_sweep() {
-        if !crate::discover::multicast_capable() {
-            eprintln!("skipping peer_discover_never_writes_peers_json_even_on_an_empty_sweep: no multicast-capable interface in this network namespace");
-            return;
-        }
         with_peer_state("discover-no-write", || {
             // A pre-existing peer record must survive `peer discover`
             // completely untouched — the clearest possible proof discover
@@ -2801,10 +2847,6 @@ mod tests {
 
     #[test]
     fn peer_discover_never_writes_peers_json_from_an_entirely_empty_registry() {
-        if !crate::discover::multicast_capable() {
-            eprintln!("skipping peer_discover_never_writes_peers_json_from_an_entirely_empty_registry: no multicast-capable interface in this network namespace");
-            return;
-        }
         with_peer_state("discover-no-write-empty", || {
             let out = handle_peer_discover(&discover_inv("1"));
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
@@ -2815,12 +2857,55 @@ mod tests {
         });
     }
 
+    // ── `peer advertise on|off` (task #120) — the runtime switch, default
+    // ── off, idempotent, reporting exactly what changed. ─────────────────────
+
+    fn advertise_inv(args: &[&str]) -> Invocation {
+        Invocation {
+            path: vec!["peer".to_string(), "advertise".to_string()],
+            args: args.iter().map(|s| s.to_string()).collect(),
+            flags: Default::default(),
+            door: aoide_protocol::Door::Cli,
+        }
+    }
+
+    #[test]
+    fn peer_advertise_flips_the_switch_idempotently_and_reports_exactly_what_changed() {
+        with_peer_state("advertise-toggle", || {
+            assert!(!aoide_storage::advertise::enabled(), "default posture is OFF");
+
+            let on = handle_peer_advertise(&advertise_inv(&["on"]));
+            assert_eq!(on.status, aoide_protocol::output::Status::Ok, "{on:?}");
+            assert_eq!(on.data.as_ref().unwrap()["changed"], true, "{on:?}");
+            assert!(aoide_storage::advertise::enabled());
+
+            let again = handle_peer_advertise(&advertise_inv(&["on"]));
+            assert_eq!(again.status, aoide_protocol::output::Status::Ok, "{again:?}");
+            assert_eq!(again.data.as_ref().unwrap()["changed"], false, "{again:?}");
+            assert!(again.message.contains("already on"), "{}", again.message);
+
+            let off = handle_peer_advertise(&advertise_inv(&["off"]));
+            assert_eq!(off.data.as_ref().unwrap()["changed"], true, "{off:?}");
+            assert!(!aoide_storage::advertise::enabled());
+        });
+    }
+
+    #[test]
+    fn peer_advertise_refuses_anything_but_on_or_off() {
+        // Pure arg validation — refused before any state file is touched,
+        // so no temp dir is needed.
+        for bad in [&[][..], &["maybe"][..], &["ON"][..]] {
+            let out = handle_peer_advertise(&advertise_inv(bad));
+            assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{out:?}");
+        }
+    }
+
     // ── `peer invite` bottoms out in the exact same `run_pair_request`
     // ── `peer pair request` runs (P-P6) — proven directly by calling it
     // ── through both entry points against the SAME unreachable door and
     // ── asserting byte-identical outcomes, rather than trusting that the
     // ── two call sites merely look alike. The genuine end-to-end proof
-    // ── (a real discovered beacon resolving to a real second door that
+    // ── (a real discovered advertisement resolving to a real second door that
     // ── actually parks an outbound pairing request) lives in `cli/tests/
     // ── discovery_connectivity.rs`'s `#[ignore]`'d real-network test —
     // ── this one needs no network at all, since an unreachable loopback
@@ -2838,10 +2923,10 @@ mod tests {
             // `handle_peer_pair_request`'s own documented tail.
             let direct = run_pair_request("peer.pair.request", url, name, &self_url, None, None);
             // The same ceremony tail `handle_peer_invite` reaches on its
-            // single-match branch — since P-S1 it composes an OBSERVED dial
-            // url first (`invite_dial_url`) and passes that instead of the
-            // beacon's claim, but the tail function is still this one;
-            // reproduced here under `peer.invite`'s own command name.
+            // single-match branch — it composes an OBSERVED dial url first
+            // (src_addr + `default_a2a_port`, P-S1/task #120) and passes
+            // that, but the tail function is still this one; reproduced
+            // here under `peer.invite`'s own command name.
             let via_invite = run_pair_request("peer.invite", url, name, &self_url, None, None);
 
             assert_eq!(direct.status, aoide_protocol::output::Status::Error, "{direct:?}");

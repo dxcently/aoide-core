@@ -314,7 +314,7 @@ const ENV_KNOBS: &[(&str, &str)] = &[
     ),
     (
         "AOIDE_DISCOVERY_ADVERTISE",
-        "Truthy enables the A2A LAN discovery beacon; mirrors aoide.a2a.discoveryAdvertise (docs/architecture/PAIRING.md).",
+        "Truthy forces the A2A LAN discovery advertisement on; mirrors aoide.a2a.discoveryAdvertise, beside the runtime `aoide peer advertise on|off` switch (docs/architecture/PAIRING.md).",
     ),
 ];
 

@@ -420,20 +420,24 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   doc comment states the reasoning). `HEADER_PEER`/`HEADER_TIMESTAMP`/
   `HEADER_NONCE`/`HEADER_SIGNATURE` are the four wire header names — always
   present together or not at all, never independently optional.
-- `beacon` — the discovery beacon's wire format (P-P6,
-  `docs/architecture/PAIRING.md`'s "Discovery (advertise-but-locked)"
-  section, CONTRACTS.md §6's "Discovery beacon" subsection): the one-line
-  `{v, name, fpr, url}` JSON shape `a2a serve` may emit on a fixed UDP
-  multicast group+port (`GROUP`/`PORT`, `239.255.87.10:8711`, pinned here
-  so both ends of the wire agree without a handshake), plus every
-  validator a hearer applies BEFORE trusting a field (`valid_fingerprint`
-  for the colon-separated display fingerprint shape,
-  `valid_url` for `http(s)`-only, and `MAX_LINE_BYTES` checked on the raw
-  bytes before any JSON parse — house rule 4's discipline, a beacon is
-  untrusted network data). Pure wire format and validators only: no socket
-  I/O lives here (`aoide-server::discovery` sends, `aoide-client::discover`
-  listens) and no write path into `peer_store` — discovery grants nothing,
-  by construction, since this module cannot write a peer record even if a
+- `advertise` — the discovery advertisement's wire format and the
+  advertise switch (P-P6 + task #120, `docs/architecture/PAIRING.md`'s
+  "Discovery (advertise-but-locked)" section, CONTRACTS.md §6's
+  "Discovery advertisement" subsection): the one-line
+  `{v, name, host, user}` JSON shape `a2a serve` may emit by UDP
+  broadcast (`BROADCAST_ADDR`/`PORT`, `255.255.255.255:8711`, pinned here
+  so both ends of the wire agree without a handshake — name + ssh hop
+  claim ONLY, never a door URL or a key: rendezvous, not
+  authentication), every validator a hearer applies BEFORE trusting a
+  field (`valid_host`/`valid_user` for bounded metacharacter-free
+  shapes, and `MAX_LINE_BYTES` checked on the raw bytes before any JSON
+  parse — house rule 4's discipline, an advertisement is untrusted
+  network data), and `enabled`/`set_enabled`, the `state/advertise.json`
+  switch `aoide peer advertise on|off` flips (default OFF,
+  tolerate-missing, atomic write). No socket I/O lives here
+  (`aoide-server::discovery` sends, `aoide-client::discover` listens)
+  and no write path into `peer_store` — discovery grants nothing, by
+  construction, since this module cannot write a peer record even if a
   caller wanted it to.
 - `commands` — this crate's CLI commands: `usage` (local token/cost rollup),
   `inbox list|read|clear` (the store above's CLI surface), and `identity`

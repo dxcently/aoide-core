@@ -220,19 +220,24 @@ pub fn resolve_bearer_secret(inv: &Invocation) -> String {
         .unwrap_or_default()
 }
 
-/// Resolve whether THIS `a2a serve` process advertises a discovery beacon
-/// (P-P6, `docs/architecture/PAIRING.md`'s "Discovery (advertise-but-locked)"
-/// section): `--discovery-advertise` flag (bare presence, no value — the
-/// same shape `--stdio`/`--all`/`--windowed` already hold elsewhere in this
-/// tree) → `AOIDE_DISCOVERY_ADVERTISE` env, truthy in
-/// `{1,true,yes,all}` (the exact vocabulary `aoide-conduct::graph::send`'s
-/// own `AOIDE_CONDUCT_AUTOGATE` already established — one truthy-env
-/// convention, not a second one invented here) → **OFF by default**
-/// (PAIRING.md: "off by default" — no beacon, ever, until an operator opts
-/// in explicitly). Mirrors [`resolve_spawn_agent`]/[`resolve_token_file`]'s
-/// exact flag-then-env-then-default precedence shape, the idiomatic knob
-/// home this door already established for every other operator-facing
-/// toggle.
+/// Resolve whether THIS `a2a serve` process is FORCED to advertise for
+/// its whole lifetime (P-P6, `docs/architecture/PAIRING.md`'s "Discovery
+/// (advertise-but-locked)" section): `--discovery-advertise` flag (bare
+/// presence, no value — the same shape `--stdio`/`--all`/`--windowed`
+/// already hold elsewhere in this tree) → `AOIDE_DISCOVERY_ADVERTISE` env,
+/// truthy in `{1,true,yes,all}` (the exact vocabulary
+/// `aoide-conduct::graph::send`'s own `AOIDE_CONDUCT_AUTOGATE` already
+/// established — one truthy-env convention, not a second one invented
+/// here) → **OFF by default** (PAIRING.md: "off by default" — no
+/// advertisement, ever, until an operator opts in explicitly). Mirrors
+/// [`resolve_spawn_agent`]/[`resolve_token_file`]'s exact
+/// flag-then-env-then-default precedence shape, the idiomatic knob home
+/// this door already established for every other operator-facing toggle.
+/// This is the nix-declarative half of the switch; the runtime half is
+/// `aoide peer advertise on|off` (`aoide_storage::advertise::enabled`),
+/// OR'd in per tick by the advertise thread
+/// (`discovery::spawn_advertiser`), so `false` here still leaves the
+/// operator one command away from advertising, no restart.
 pub fn resolve_discovery_advertise(inv: &Invocation) -> bool {
     if inv.flag_present("discovery-advertise") {
         return true;
@@ -1519,10 +1524,10 @@ fn valid_peer_url(s: &str) -> bool {
 }
 
 /// The door URL THIS `a2a serve` process is actually answering on, derived
-/// from `bind`/`port` — the ONE formula both [`route`]'s own
-/// `aoide/graphSummary` handling and the discovery beacon (P-P6) build
-/// their `self_url`/`url` from, factored out so a future change to how the
-/// advertised URL is derived can't drift between the two call sites.
+/// from `bind`/`port` — [`route`]'s own `aoide/graphSummary` handling
+/// builds its `self_url` from this one formula. (The discovery
+/// advertisement carries NO door URL at all — task #120's rendezvous-not-
+/// authentication stance, `aoide_storage::advertise`'s module doc.)
 fn self_url(bind: &str, port: u16) -> String {
     format!("http://{bind}:{port}/")
 }
@@ -2831,17 +2836,17 @@ impl Drop for ConnGuard {
 /// (no handler thread spawned, no `BufReader`/parse work done) rather than
 /// growing the thread count without limit.
 ///
-/// `discovery_advertise` (P-P6, [`resolve_discovery_advertise`]) gates the
-/// ONE thing this function does besides the accept loop itself: when
-/// `true`, it lazily mints/loads this instance's own P-P1 identity (the
-/// same `identity::load_or_mint` `aoide identity` calls — discipline named
-/// in PAIRING.md's own "Discovery" section) and starts the beacon
-/// advertise thread (`discovery::spawn_advertiser`) before ever entering
-/// the loop below. A failure loading identity here is logged and
-/// discovery is skipped — it never fails the door itself; `false` (the
-/// default) starts no thread at all and touches no identity file,
-/// matching the brief's own "provable via the thread not spawning" test
-/// shape.
+/// The advertise thread (`discovery::spawn_advertiser`) is the ONE thing
+/// this function starts besides the accept loop itself — always spawned,
+/// so the runtime switch (`aoide peer advertise on|off`, read fresh every
+/// tick) can take effect without a restart. `discovery_advertise` (P-P6,
+/// [`resolve_discovery_advertise`]) is the launch-time FORCE-ON half,
+/// OR'd with that switch per tick; with both off (the default) the thread
+/// ticks silently and sends nothing. No identity file is touched either
+/// way — the advertisement carries name + ssh hop info only, never a
+/// fingerprint (rendezvous, not authentication; `aoide_storage::
+/// advertise`'s module doc). A refused thread spawn is logged and costs
+/// discovery only, never the door itself.
 //
 // TODO(a2a-hardening): chunked Transfer-Encoding and extra systemd
 // sandboxing (aoide-a2a.service) are deliberately out of scope for this
@@ -2866,35 +2871,44 @@ pub fn serve(
         file_token: expected_token.to_string(),
     };
 
-    // Discovery advertising (P-P6) — off unless the operator opted in
-    // (`resolve_discovery_advertise`, checked by the caller). The join
-    // handle is deliberately dropped: dropping a `JoinHandle` detaches
-    // nothing extra (the thread already runs independent of it), and this
-    // function itself never returns until the process exits, so there is
-    // no later point to join it against anyway (module doc's "clean
-    // shutdown needs no signal" note).
-    if discovery_advertise {
-        match aoide_storage::identity::load_or_mint() {
-            Ok((kp, _)) => {
-                let fpr = kp.info().fingerprint;
-                let advertised_url = self_url(bind, port);
-                // Gated on the spawn actually happening — a refused spawn
-                // already printed its own "continuing without" line, and an
-                // "advertising" claim right after it would be a lie.
-                if crate::discovery::spawn_advertiser(peer_name, &fpr, &advertised_url).is_some() {
-                    eprintln!(
-                        "aoide a2a discovery: advertising {advertised_url} on {}:{}",
-                        aoide_storage::beacon::GROUP,
-                        aoide_storage::beacon::PORT
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "aoide a2a discovery: loading this instance's identity: {e} — \
-                     continuing without discovery advertising"
-                );
-            }
+    // Discovery advertising (P-P6 + task #120) — the thread always spawns
+    // so the runtime switch (`aoide peer advertise on|off`) works without
+    // a restart; whether a tick SENDS is `discovery_advertise ||
+    // aoide_storage::advertise::enabled()`, checked inside the thread.
+    // `user` is this process's own login ($USER → $LOGNAME, the same chain
+    // `aoide-client::tunnel::resolve_login` walks) — with neither set
+    // there is no ssh hop to advertise, so advertising is skipped with a
+    // taught line rather than emitting a line every listener would drop as
+    // invalid. The join handle is deliberately dropped: dropping a
+    // `JoinHandle` detaches nothing extra (the thread already runs
+    // independent of it), and this function itself never returns until the
+    // process exits, so there is no later point to join it against anyway
+    // (module doc's "clean shutdown needs no signal" note).
+    {
+        let host = aoide_storage::display::local_host_name();
+        let user = std::env::var("USER")
+            .ok()
+            .filter(|u| !u.trim().is_empty())
+            .or_else(|| std::env::var("LOGNAME").ok().filter(|u| !u.trim().is_empty()))
+            .unwrap_or_default();
+        if !aoide_storage::advertise::valid_user(&user) {
+            eprintln!(
+                "aoide a2a discovery: no usable ssh login for an advertisement (neither $USER \
+                 nor $LOGNAME holds one) — continuing without discovery advertising"
+            );
+        } else if crate::discovery::spawn_advertiser(peer_name, &host, &user, discovery_advertise)
+            .is_some()
+            && discovery_advertise
+        {
+            // The "advertising" claim is only printed when this process is
+            // FORCED on — the runtime switch's state can change under a
+            // long-lived process, so its ticks speak for themselves.
+            eprintln!(
+                "aoide a2a discovery: advertising {peer_name} ({user}@{host}) by broadcast \
+                 {}:{}",
+                aoide_storage::advertise::BROADCAST_ADDR,
+                aoide_storage::advertise::PORT
+            );
         }
     }
 
@@ -6388,12 +6402,12 @@ mod tests {
     }
 
     // ── `resolve_discovery_advertise` (P-P6) — off unless a flag or a
-    // ── truthy env explicitly opts in. This is the ENTIRE gate `serve`
-    // ── checks before ever calling `discovery::spawn_advertiser` — proving
-    // ── this function returns `false` on a bare/absent env, with no flag,
-    // ── IS proving "the thread doesn't spawn" without any real thread,
-    // ── socket, or sleep involved (the brief's own "provable via the
-    // ── thread not spawning, not via sleeping" shape). ──────────────────
+    // ── truthy env explicitly opts in. This is the launch-time FORCE-ON
+    // ── half `serve` hands `discovery::spawn_advertiser`; the runtime
+    // ── half is `aoide_storage::advertise::enabled()` (its own crate's
+    // ── tests), OR'd in per tick. `false` here + switch off (the
+    // ── default) = a tick that sends nothing — proven with no real
+    // ── thread, socket, or sleep involved. ──────────────────────────────
 
     #[test]
     fn resolve_discovery_advertise_is_off_by_default() {

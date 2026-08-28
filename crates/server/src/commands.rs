@@ -127,7 +127,7 @@ pub fn register_a2a_serve(r: &mut Registry) {
             flag!("peer-name", "string", "Override this instance's aoide/graphSummary instance name (default: the OS hostname)."),
             flag!("token-file", "string", "Path to a file holding the shared secret an inbound message/send must present (Authorization: Bearer <token>) (default aoide.a2a.tokenFile; empty = no token required, loopback keeps today's automatic trust)."),
             flag!("bearer-secret", "string", "Name of a secret, resolved fresh on every request through the local secrets broker, this door expects as its inbound Authorization: Bearer token (default AOIDE_A2A_BEARER_SECRET; empty = not configured). Takes precedence over --token-file when set; a broker resolve failure fails closed."),
-            flag!("discovery-advertise", "bool", "Advertise this instance's own discovery beacon (name/fingerprint/url) on the fixed LAN multicast group+port, ~30s jittered cadence, for aoide peer discover/invite to hear (default aoide.a2a.discoveryAdvertise / AOIDE_DISCOVERY_ADVERTISE; off by default — discovery grants nothing, docs/architecture/PAIRING.md)."),
+            flag!("discovery-advertise", "bool", "Force this instance's own discovery advertisement (name + ssh hop user@host, nothing more) on for this process's lifetime — UDP broadcast on the fixed LAN port, ~30s jittered cadence, for aoide peer discover/invite to hear (default aoide.a2a.discoveryAdvertise / AOIDE_DISCOVERY_ADVERTISE; off by default — the runtime switch is aoide peer advertise on|off; discovery grants nothing, docs/architecture/PAIRING.md)."),
         ],
         gated: false,
         implemented: true,

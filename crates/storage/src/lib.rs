@@ -58,12 +58,14 @@
 //! `peer_store::resolve_peer`, which has no access to the raw HTTP request
 //! a signature needs).
 //!
-//! `beacon` (P-P6, `docs/architecture/PAIRING.md`'s "Discovery
-//! (advertise-but-locked)" section) is the newest: the one-JSON-line
-//! `{v, name, fpr, url}` wire format an `a2a serve` process may emit on a
-//! fixed UDP multicast group+port, and the validation `aoide peer
-//! discover`/`peer invite` apply to every line heard before trusting it.
-//! Pure wire format and validators only — no socket I/O lives here (that's
+//! `advertise` (P-P6 + task #120, `docs/architecture/PAIRING.md`'s
+//! "Discovery (advertise-but-locked)" section) is the newest: the
+//! one-JSON-line `{v, name, host, user}` advertisement an `a2a serve`
+//! process may emit by UDP broadcast on a fixed port, the validation
+//! `aoide peer discover`/`peer invite` apply to every line heard before
+//! trusting it, and the `state/advertise.json` switch `aoide peer
+//! advertise on|off` flips (default OFF). Wire format, validators, and
+//! the switch file only — no socket I/O lives here (that's
 //! `aoide-server::discovery`'s send side and `aoide-client::discover`'s
 //! listen side), and no write path into `peer_store` either: discovery
 //! grants nothing, by design.
@@ -94,7 +96,7 @@
 //! transport.
 
 pub mod addr;
-pub mod beacon;
+pub mod advertise;
 pub mod commands;
 pub mod display;
 pub mod edits;

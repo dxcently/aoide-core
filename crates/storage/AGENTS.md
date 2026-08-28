@@ -334,20 +334,25 @@
   there rather than continuing to search upward for a "better" one. Don't
   add a fallback-to-parent path; a broken nearest manifest is a bug to
   surface, not paper over with a stale grandparent's specs.
-- **`beacon` never writes `peer_store`, and never will (P-P6).** It reaches
-  into `peer_store` for exactly one READ (`valid_peer_name`, so the
-  beacon's `name` shares the same nickname shape check every other
-  peer-name field on the wire already holds to) — don't add a write path
-  here "for convenience": discovery grants nothing is the whole point of
-  the feature (`docs/architecture/PAIRING.md`'s "Discovery
+- **`advertise` never writes `peer_store`, and never will (P-P6).** It
+  reaches into `peer_store` for exactly one READ (`valid_peer_name`, so
+  the advertisement's `name` shares the same nickname shape check every
+  other peer-name field on the wire already holds to) — don't add a write
+  path here "for convenience": discovery grants nothing is the whole
+  point of the feature (`docs/architecture/PAIRING.md`'s "Discovery
   (advertise-but-locked)" section), and a write site in the ONE module
   every hearer's validation funnels through would be exactly the kind of
-  quiet erosion that invariant depends on never happening. `GROUP`/`PORT`/
-  `MAX_LINE_BYTES`/the `v` version constant are the wire contract, pinned
-  by CONTRACTS.md §6's "Discovery beacon" subsection — a change to any of
-  them needs a matching CONTRACTS update in the same commit, the same
-  discipline `wire_auth`'s canonical string and `pairing::derive_sas`
-  already hold above.
+  quiet erosion that invariant depends on never happening. The wire
+  carries name + ssh hop claim ONLY (task #120: rendezvous, not
+  authentication) — never grow it a door URL, key, or fingerprint field.
+  `BROADCAST_ADDR`/`PORT`/`MAX_LINE_BYTES`/the `v` version constant are
+  the wire contract, pinned by CONTRACTS.md §6's "Discovery
+  advertisement" subsection — a change to any of them needs a matching
+  CONTRACTS update in the same commit, the same discipline `wire_auth`'s
+  canonical string and `pairing::derive_sas` already hold above. The one
+  state file this module owns, `state/advertise.json`, is a bool switch
+  (default OFF) — keep it that way rather than growing it into a config
+  surface.
 
 - **A tunnel record is RUNTIME state, never versioned, never a credential
   (ssh-transport lane, P-S2).** `tunnel/<sessionId>/<key>.json` lives under

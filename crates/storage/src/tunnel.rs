@@ -165,8 +165,9 @@ pub fn parse_via(spec: &str) -> Result<Via, String> {
 }
 
 /// Build a `Via` directly from an observed IP and login, skipping the
-/// string round trip [`parse_via`] exists for — the beacon-derived default
-/// (`Heard::src_addr`, P-S1) when no explicit `--via` was given. `user`
+/// string round trip [`parse_via`] exists for — the advertisement-derived
+/// default (`Heard::src_addr`, P-S1) when no explicit `--via` was given.
+/// `user`
 /// empty is treated as absent, the same "no user segment" shape a bare
 /// `ssh://host` parses to.
 pub fn default_via(ip: &str, user: &str) -> Via {

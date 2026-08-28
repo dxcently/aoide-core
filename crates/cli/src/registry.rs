@@ -122,7 +122,9 @@ mod tests {
         // sits alongside `graph.link`: reached 74. Bumped by 1 more for
         // `peer.pair.watch` (P-P5): reached 75. Bumped by 3 for `melete
         // status`/`melete graph`/`melete call` (M2, task #14) — the Melete
-        // MCP client, `aoide_client::mcp_client` — reached 78.
+        // MCP client, `aoide_client::mcp_client` — reached 78. Bumped by 1
+        // for `peer.advertise` (task #120) — the discovery advertise
+        // switch — reached 79.
         let mut expected: Vec<&str> = vec![
             "a2a.serve",
             "adapter.melete",
@@ -150,6 +152,7 @@ mod tests {
             "melete.status",
             "onboard",
             "peer.add",
+            "peer.advertise",
             "peer.allow",
             "peer.discover",
             "peer.hub",

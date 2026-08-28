@@ -625,7 +625,7 @@ pub struct OutboundPairingRequest {
     pub state: OutboundState,
     /// The ssh-transport marker (P-S4, K1) this ceremony resolved for the
     /// approver at REQUEST time — a `--via` flag, or (`peer invite`) the
-    /// discovery beacon's observed source address — carried here because
+    /// discovery advertisement's observed source address — carried here because
     /// the actual peer-record commit happens LATER, in a SEPARATE `peer
     /// pair approve <id>` invocation (`approve_outbound`), which has no
     /// other way to recover what this instance resolved when the request

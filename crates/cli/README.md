@@ -49,9 +49,10 @@ ceremony, P-P2/P-P5, the `peer allow <name> <cap> on|off`
 closed-capability grant/revoke command backing the A2A spawn arm's hard
 gate, P-P3, `peer spawn <name> -- <text…>`, P-P5b, the signed
 spawn-shaped `message/send` that actually reaches that gate, and `peer
-discover [--secs N]`/`peer invite <name> [--secs N] [--yes]`, P-P6, the
-LAN discovery beacon's read-only sweep and its sugar-over-the-ceremony
-invite), presence, the
+discover [--secs N]`/`peer invite <name> [--secs N] [--yes]`/`peer
+advertise on|off`, P-P6 + task #120, the LAN discovery advertisement's
+read-only sweep, its sugar-over-the-ceremony invite, and this instance's
+own advertise switch), presence, the
 daemon, its own event bus (`events tail`), usage, hooks, the message
 inbox, the secrets broker, this instance's own `identity` (P-P1 of the
 pairing workstream, `docs/architecture/PAIRING.md`)).

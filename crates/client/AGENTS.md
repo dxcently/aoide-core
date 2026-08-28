@@ -237,16 +237,16 @@
 - **`run_pair_request` (P-P6) is the ONLY body of `handle_peer_pair_request`
   past its own `<url>`/`--name`/`--self-url` parsing, and `handle_peer_invite`
   calls the SAME function — never a second copy.** `peer invite`'s own doc
-  and CONTRACTS.md §6's "Discovery beacon" subsection both promise `peer
+  and CONTRACTS.md §6's "Discovery advertisement" subsection both promise `peer
   invite` "runs the ceremony," and this is what makes that literally true
   rather than aspirational: a future change to the ceremony's wire calls,
   its outbound-parking shape, or its SAS derivation touches ONE function
   and both callers inherit it identically. `run_pair_request` does NOT
   re-validate its `name` argument (`valid_peer_name`) — that check stays in
   `handle_peer_pair_request` alone, since only a CLI-typed `--name` needs
-  it; `handle_peer_invite`'s `name` already came off a beacon
-  `aoide_storage::beacon::parse_and_validate` validated before it was ever
-  displayed. Don't move the `valid_peer_name` check INTO `run_pair_request`
+  it; `handle_peer_invite`'s `name` already came off an advertisement
+  `aoide_storage::advertise::parse_and_validate` validated before it was
+  ever displayed. Don't move the `valid_peer_name` check INTO `run_pair_request`
   "for symmetry" — it would just re-run a check that has already passed on
   the invite path, for no benefit, and would misattribute a `peer.invite`
   usage error to a check that only ever fires for the OTHER caller in
@@ -261,21 +261,21 @@
   that seems to want a registry write (e.g. "remember what was last
   discovered") belongs in a NEW, explicitly-named cache, never folded into
   `state/peers.json` itself.
-- **A beacon's `url` is a CLAIM; a `Heard`'s `src_addr` is an OBSERVATION —
-  never swap which one is trusted (P-S1).** `url` is whatever the
-  advertiser put on the wire (a loopback-bound door always claims
-  `http://127.0.0.1:<port>/`, useless as a dial target for anyone but
-  itself); `src_addr` is the UDP packet's actual source IP, captured by
-  THIS process's own socket, never sent by the advertiser and never
-  believed to be anything but what was measured. `invite_dial_url` reads
-  the host from `src_addr` and everything else (scheme, port, path) from
-  `url` — it is a targeted substitution, not a preference for one field
-  wholesale over the other, and `Beacon` itself never grows a `src_addr`
-  field (the wire shape is CONTRACTS-pinned; the observation belongs on
-  `Heard`, which is local-only and unpinned). Do not add a "trust the
-  advertised url instead" fallback or flag — an advertiser that wants its
-  advertised url dialed can bind its door somewhere routable; guessing
-  which of the two the operator meant is not this code's job.
+- **An advertisement's `host`/`user` are CLAIMS; a `Heard`'s `src_addr`
+  is an OBSERVATION — never swap which one is trusted (P-S1).**
+  `host`/`user` are whatever the advertiser put on the wire; `src_addr`
+  is the UDP packet's actual source IP, captured by THIS process's own
+  socket, never sent by the advertiser and never believed to be anything
+  but what was measured. Everything that dials — `handle_peer_invite`'s
+  composed target, the K1 default `via` — takes its ADDRESS from
+  `src_addr`; the claimed `user` rides along only as the ssh login, and
+  the claimed `host` is display-only. `Advertisement` itself never grows
+  a `src_addr` field (the wire shape is CONTRACTS-pinned; the
+  observation belongs on `Heard`, which is local-only and unpinned), and
+  it never regrows a door-URL or key field either (task #120:
+  rendezvous, not authentication). Do not add a "dial the claimed host
+  instead" fallback or flag — guessing which of the two the operator
+  meant is not this code's job.
 - **`tunnel` is the ONE place `Command::new("ssh")` is ever written in this
   workspace (P-S3) — a new cross-box call site resolves a dial url through
   `open_or_reuse`, never spawns its own `ssh`.** `aoide_storage::tunnel`
