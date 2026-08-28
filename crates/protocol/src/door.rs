@@ -410,6 +410,12 @@ enum DeclaredFlag {
     /// No candidate declares it (an alias-spelled path mid-collection, a typo
     /// rejected by name after the path match, or the dispatcher-level
     /// `--audit-log` override) — the legacy peek-and-consume applies.
+    /// Consequence for aliases: an alias-spelled invocation of a command
+    /// whose declared BOOL flag precedes positionals falls into this arm
+    /// and re-swallows the next token (the exact #111 shape) — harmless for
+    /// today's one flagless alias (`peer rm`), but any future alias for a
+    /// bool-flagged command must resolve aliases BEFORE the flag loop or
+    /// teach this judge the alias table.
     Undeclared,
 }
 

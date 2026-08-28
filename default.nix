@@ -61,16 +61,15 @@ rustPlatform.buildRustPackage {
   # reading: the package build runs the whole suite.
   cargoTestFlags = [ "--workspace" ];
 
-  # task #117: the sandbox check runs SERIALIZED (--test-threads=1 via this
-  # nixpkgs switch). Under libtest parallelism, aoide-conduct's hooks tests
-  # race on state_dir and one panic inside an env_lock()-held section
-  # poisons the lock for every test queued behind it — a nondeterministic
-  # cascade that failed real deploy builds (different tests red each run,
-  # including the User's 2026-08-28 yomi rebuild). Serial threads is the
-  # determinism floor for DEPLOY builds; the state_dir race itself is
-  # #117's still-open root-cause fix, and lifting this switch again is
-  # gated on that fix landing plus 3x green parallel runs (the #81 bar).
-  dontUseCargoParallelTests = true;
+  # task #117 (resolved): the sandbox check runs parallel again. The
+  # nondeterministic deploy-build cascade traced to aoide-conduct's hooks
+  # tests taking a DIFFERENT env-lock mutex (aoide_test_support's) than the
+  # rest of the crate (crate::env_lock) — two locks, no mutual exclusion,
+  # so an env rewrite raced every concurrent state_dir() resolver and one
+  # panic poisoned a held lock for everything behind it. fec4c54 aliases
+  # both spellings to ONE mutex; the lift bar (fix + 3x green parallel
+  # aoide-conduct runs, the #81 precedent) was met and independently
+  # re-proven in review before the serialization switch came back out.
 
   # task #81 (this commit): the secrets crate's EnvGuard test helper
   # (backend.rs) now takes the SAME crate::env_lock() every other
