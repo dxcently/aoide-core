@@ -2627,9 +2627,13 @@ fn verify_signed_request(req: &HttpRequest, now_epoch: i64) -> SignedRequestOutc
             *exact
         }
     };
-    let pubkey_hex = resolved.pubkey.as_deref().unwrap_or_default();
+    // Case-normalized: hex_decode verifies case-insensitively, so twin
+    // records whose stored pubkeys differ only in hex case (hand-edited
+    // registry only — hex_encode always emits lowercase) must still share
+    // one replay-cache key.
+    let pubkey_hex = resolved.pubkey.as_deref().unwrap_or_default().to_ascii_lowercase();
 
-    if nonce_is_replay(pubkey_hex, nonce) {
+    if nonce_is_replay(&pubkey_hex, nonce) {
         return SignedRequestOutcome::Refused(
             -32009,
             format!(
