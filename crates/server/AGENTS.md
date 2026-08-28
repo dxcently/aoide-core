@@ -473,7 +473,10 @@
   `sessions.json`. This is a bounded WAIT, not a watcher — no new tick
   producer, no new roster state, and every legitimate spawn (an agent
   meant to run for minutes) simply pays 400ms of fixed RPC latency it never
-  notices. `poll_bounded_exit`/`spawn_died_immediately_message` are pure
+  notices. That is a stated CONSTRAINT on `spawnAgent`, not an accident:
+  the configured agent is assumed to be long-lived, and one that
+  legitimately runs to completion in under 400ms would be misreported as
+  died-immediately — configure such a command as a job, not a spawnAgent. `poll_bounded_exit`/`spawn_died_immediately_message` are pure
   over an injected poll closure specifically so they're unit-testable
   without a real spawn — `do_spawn` itself is still never driven by a test
   in this file (the existing precedent, `spawn_inject_prompts_success_
