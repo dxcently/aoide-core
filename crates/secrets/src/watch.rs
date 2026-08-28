@@ -167,8 +167,8 @@ use std::time::Duration;
 pub use aoide_protocol::dialog::DialogResult as ZenityResult;
 pub use aoide_protocol::dialog::locked_state;
 use aoide_protocol::dialog::{
-    is_locked, locker_process_name, next_spawn_backoff, run_entry_dialog, zenity_available, DISMISS_LABEL, SPAWN_BACKOFF_INITIAL,
-    SPAWN_BACKOFF_MAX,
+    is_locked, locker_process_name, next_spawn_backoff, run_entry_dialog, sleep_backoff_interruptible, zenity_available, DISMISS_LABEL,
+    SPAWN_BACKOFF_INITIAL, SPAWN_BACKOFF_MAX,
 };
 
 // ── P1: the pure fold ───────────────────────────────────────────────────
@@ -1067,7 +1067,11 @@ fn popup_loop(
                         SPAWN_BACKOFF_MAX.as_secs()
                     );
                 }
-                thread::sleep(spawn_backoff);
+                // #108: interruptible — a plain `thread::sleep` here would
+                // make Ctrl-C wait out the full backoff (up to
+                // `SPAWN_BACKOFF_MAX`, 60s) before this loop's own
+                // `INTERRUPTED` check (top of `popup_loop`) is reached again.
+                sleep_backoff_interruptible(spawn_backoff, &INTERRUPTED);
                 spawn_backoff = next_spawn_backoff(spawn_backoff);
             }
         }

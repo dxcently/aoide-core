@@ -58,7 +58,10 @@ other crate in this workspace sits above.
   spawn-poll-parse loop behind it), the screen-lock probes a popup gate
   consults first (`locked_state`, `is_locked`, `probe_loginctl_locked`,
   `probe_locker_running`, `locker_process_name`), the spawn-retry backoff
-  (`next_spawn_backoff` + its floor/ceiling), and the one pure
+  (`next_spawn_backoff` + its floor/ceiling) and its interruptible sleep
+  (`sleep_backoff_interruptible`, #108 — chops the backoff into ~200ms
+  ticks against a caller-owned `AtomicBool` so Ctrl-C/shutdown never waits
+  out the full up-to-60s backoff), and the one pure
   `strip_one_trailing_newline` trim every dialog child's stdout is read
   through. Extracted from `aoide-secrets`' `watch`/`client` modules (P-P5,
   same `feed`-precedent shape above) so a SECOND dialog consumer

@@ -35,6 +35,7 @@
 
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -130,6 +131,32 @@ pub const SPAWN_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// wrapping past it.
 pub fn next_spawn_backoff(current: Duration) -> Duration {
     current.saturating_mul(2).min(SPAWN_BACKOFF_MAX)
+}
+
+/// The tick a backoff sleep is chopped into so a shutdown signal is never
+/// waited out in full — the same ~200ms cadence a popup loop's own
+/// no-actionable-request idle sleep already polls at, reused here as the
+/// responsiveness floor for a backoff that can otherwise run up to
+/// [`SPAWN_BACKOFF_MAX`] (60s).
+const BACKOFF_SLEEP_TICK: Duration = Duration::from_millis(200);
+
+/// Sleep `duration`, checking `interrupted` every [`BACKOFF_SLEEP_TICK`] and
+/// returning early the moment it flips true. A plain `thread::sleep` on
+/// [`next_spawn_backoff`]'s own duration would make Ctrl-C/shutdown wait out
+/// the full backoff (up to [`SPAWN_BACKOFF_MAX`]) before a popup loop's own
+/// `INTERRUPTED` check is reached again — this is the interruptible
+/// replacement both `aoide-secrets`' and `aoide-client`'s popup loops back
+/// their spawn-retry backoff sleep with.
+pub fn sleep_backoff_interruptible(duration: Duration, interrupted: &AtomicBool) {
+    let mut remaining = duration;
+    while remaining > Duration::ZERO {
+        if interrupted.load(Ordering::SeqCst) {
+            return;
+        }
+        let tick = remaining.min(BACKOFF_SLEEP_TICK);
+        thread::sleep(tick);
+        remaining -= tick;
+    }
 }
 
 // ── the dialog-child run loop ─────────────────────────────────────────────
@@ -320,6 +347,49 @@ mod tests {
         assert_eq!(next_spawn_backoff(Duration::from_secs(32)), SPAWN_BACKOFF_MAX);
         assert_eq!(next_spawn_backoff(SPAWN_BACKOFF_MAX), SPAWN_BACKOFF_MAX);
         assert_eq!(next_spawn_backoff(Duration::from_secs(1000)), SPAWN_BACKOFF_MAX);
+    }
+
+    // ── sleep_backoff_interruptible (#108: the backoff sleep must not wait
+    // out a shutdown signal) ─────────────────────────────────────────────
+
+    #[test]
+    fn sleep_backoff_interruptible_returns_promptly_when_already_interrupted() {
+        // The already-true case (the exact shape a `popup_loop` sees after
+        // `on_sigint` fires mid-backoff): must not sleep the full duration
+        // at all — proves the check happens BEFORE the first tick, not just
+        // between ticks.
+        let interrupted = AtomicBool::new(true);
+        let start = std::time::Instant::now();
+        sleep_backoff_interruptible(SPAWN_BACKOFF_MAX, &interrupted);
+        assert!(start.elapsed() < Duration::from_millis(100), "an already-interrupted call must return near-instantly, took {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn sleep_backoff_interruptible_stops_within_one_tick_of_a_concurrent_interrupt() {
+        // A real popup loop flips `INTERRUPTED` from a signal handler while
+        // the backoff sleep is in progress — simulate that with a second
+        // thread, and prove the sleep exits within roughly one
+        // `BACKOFF_SLEEP_TICK` (200ms) rather than waiting out the full
+        // duration (here, several seconds).
+        let interrupted = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&interrupted);
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            flag.store(true, Ordering::SeqCst);
+        });
+        let start = std::time::Instant::now();
+        sleep_backoff_interruptible(Duration::from_secs(5), &interrupted);
+        let elapsed = start.elapsed();
+        handle.join().unwrap();
+        assert!(elapsed < Duration::from_millis(500), "expected an early return well under the 5s duration, took {elapsed:?}");
+    }
+
+    #[test]
+    fn sleep_backoff_interruptible_sleeps_the_full_duration_when_never_interrupted() {
+        let interrupted = AtomicBool::new(false);
+        let start = std::time::Instant::now();
+        sleep_backoff_interruptible(Duration::from_millis(50), &interrupted);
+        assert!(start.elapsed() >= Duration::from_millis(50));
     }
 
     // ── strip_one_trailing_newline (pure) ──────────────────────────────
