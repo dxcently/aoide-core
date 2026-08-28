@@ -432,6 +432,25 @@
   "for consistency." The audit line records the attributed sender
   regardless of target kind — this invariant only ever governs the bytes
   written to the socket.
+- **The submit keystroke is a SEPARATE, LATER socket write, never
+  concatenated onto the text payload (task #124, live-diagnosed on kimi
+  0.31.1).** `send.rs::write_delivery` writes `payload` first, sleeps
+  `SUBMIT_KEYSTROKE_DELAY`, then writes `submit_key` alone — a `\r`/`\n`
+  arriving in the SAME pty write as preceding text is what kimi's TUI input
+  parser paste-coalesces into a composer newline instead of Enter, leaving
+  the prompt unsubmitted; a keystroke arriving as its own later write
+  submits correctly. `conduct_multiplex`'s injection relay (`graph/
+  conduct.rs`) already does one `read()`-then-pty-`write()` per `poll()`
+  wakeup, so this needed no relay-side change — only the WRITER side had to
+  stop concatenating. `SUBMIT_KEYSTROKE_DELAY` (300ms) is empirically
+  pinned, not guessed: a live windowed kimi session on this box reproduced
+  the exact newline-not-submit failure at 120ms and submitted cleanly,
+  twice, at 300ms — don't shrink it back down without repeating that live
+  proof. Applied to EVERY profile, one code path, no per-agent branch: a
+  separately-written `\n` is semantically identical to the old concatenated
+  one for claude/pi, so this is a delay, not a behavior change, for either.
+  Don't reintroduce `payload.push_str(submit_key)` before the write — that
+  is the exact regression this invariant guards against.
 - **A recorded foreground of `sudo …` is never re-exec'd (P-C6, orchestrator
   ruling on durable-sessions plan open knob 5).** `resurrect.rs::
   is_sudo_argv` is the one, narrow, named check — `argv[0]`'s basename

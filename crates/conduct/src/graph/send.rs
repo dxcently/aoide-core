@@ -64,6 +64,32 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 
+/// The gap between the text payload write and the trailing submit-keystroke
+/// write in [`deliver_local_with`] (task #124, live-diagnosed on kimi
+/// 0.31.1). Kimi's TUI input parser paste-coalesces a `\r` that arrives in
+/// the same event batch as preceding text into a composer NEWLINE rather
+/// than Enter — the prompt sits unsubmitted; a `\r` arriving as its own
+/// LATER read submits correctly. `conduct_multiplex`'s injection relay
+/// (`graph/conduct.rs`) does one `read()`-then-pty-`write()` per `poll()`
+/// wakeup, so two socket writes this far apart DO land as two distinct pty
+/// writes — the relay needs no change. The value itself is empirically
+/// pinned, not guessed: a live windowed kimi session on this box reproduced
+/// the exact newline-not-submit failure at 120ms (proving the gap must
+/// clear more than one syscall-level scheduling tick — kimi's own
+/// paste-coalescing window is apparently tied to its input/render tick, not
+/// to wall-clock micro-timing) and submitted cleanly, twice, at 300ms —
+/// see the task #124 commit body for the screenshot-verified trace. Applied
+/// UNIVERSALLY, every profile, one code path: a separately-written `\n` is
+/// semantically identical to today's concatenated one for claude/pi, so
+/// this is a delay, not a behavior change, for either. Zeroed under
+/// `cfg(test)` so the unit suite doesn't pay it — a real delay is only
+/// meaningful against a real pty reader; [`write_delivery`]'s own tests
+/// pass a real, explicit delay when they need to observe the boundary.
+#[cfg(not(test))]
+const SUBMIT_KEYSTROKE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+#[cfg(test)]
+const SUBMIT_KEYSTROKE_DELAY: std::time::Duration = std::time::Duration::from_millis(0);
+
 // ── `send`: the gated injection door ──────────────────────────────────
 
 /// A pending (unapproved) injection, staged for the conductor to surface for a
@@ -563,6 +589,31 @@ fn deliver_local(inv: &Invocation, id: &str) -> Outcome {
     deliver_local_with(inv, id, real_attested_sender)
 }
 
+/// Write `payload` to `stream`, then — when `submit` is set — a SEPARATE,
+/// LATER write of `submit_key` alone, sleeping `delay` in between (task
+/// #124; see [`SUBMIT_KEYSTROKE_DELAY`]'s doc comment for why this must be
+/// two writes, never one concatenated write). `delay` is a parameter, not a
+/// hardcoded read of the constant, so a test can pass a real, observable gap
+/// directly — [`deliver_local_with`] is the one production caller, and it
+/// always passes [`SUBMIT_KEYSTROKE_DELAY`].
+fn write_delivery(
+    stream: &mut UnixStream,
+    payload: &[u8],
+    submit: bool,
+    submit_key: &str,
+    delay: std::time::Duration,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    stream.write_all(payload)?;
+    stream.flush()?;
+    if submit {
+        std::thread::sleep(delay);
+        stream.write_all(submit_key.as_bytes())?;
+        stream.flush()?;
+    }
+    Ok(())
+}
+
 /// [`deliver_local`]'s actual body, parameterized over the sender-identity
 /// resolver (LANE IDENTITY P-ID2) so the gate/pending/provenance/audit path
 /// stays exhaustively table-testable WITHOUT a live daemon: production
@@ -679,23 +730,21 @@ fn deliver_local_with(
         return out;
     }
 
-    // Deliver: connect + write the payload (+ the target's own submit
-    // keystroke on --submit, decided from the ORIGINAL text before any
-    // prefix). Resolved from `rec.agent` through the SAME profile lookup
-    // `session permit` uses (`profile_for_agent`, promoted `pub(in
-    // crate::graph)` in permit.rs) — an unregistered/empty agent falls back
-    // to claude's `\n`, exactly as that lookup already does; no second
-    // resolver. The provenance prefix (see [`provenance_prefix`]) is then
-    // prepended to the payload as a whole — since the prefix itself is
+    // Deliver: connect + write the payload, THEN — on --submit — a SEPARATE
+    // later write of the target's own submit keystroke (see
+    // SUBMIT_KEYSTROKE_DELAY below for why this is two socket writes, never
+    // one concatenated write). Resolved from `rec.agent` through the SAME
+    // profile lookup `session permit` uses (`profile_for_agent`, promoted
+    // `pub(in crate::graph)` in permit.rs) — an unregistered/empty agent
+    // falls back to claude's `\n`, exactly as that lookup already does; no
+    // second resolver. The provenance prefix (see [`provenance_prefix`]) is
+    // then prepended to the payload as a whole — since the prefix itself is
     // newline-free, that lands it on the payload's first line only, never
-    // disturbing a later line or the trailing submit keystroke. The title
-    // (`one_line_title`), the `names_the_node` check, and the audit
-    // `untrusted_data` below all keep reading the ORIGINAL `text`, never this
-    // prefixed payload.
+    // disturbing a later line. The title (`one_line_title`), the
+    // `names_the_node` check, and the audit `untrusted_data` below all keep
+    // reading the ORIGINAL `text`, never this prefixed payload.
+    let submit_key = super::permit::profile_for_agent(&rec.agent).submit_key;
     let mut payload = text.clone();
-    if submit {
-        payload.push_str(super::permit::profile_for_agent(&rec.agent).submit_key);
-    }
     // Display-only: the prefix names the sender by petname+tail when the
     // ALREADY-LOADED roster (`file.sessions`) resolves one, never the raw id
     // — `attributed_sender` itself (the raw id) is what `record_pending` and
@@ -741,10 +790,8 @@ fn deliver_local_with(
     }
     match UnixStream::connect(&socket) {
         Ok(mut stream) => {
-            use std::io::Write as _;
-            if let Err(e) = stream
-                .write_all(payload.as_bytes())
-                .and_then(|_| stream.flush())
+            if let Err(e) =
+                write_delivery(&mut stream, payload.as_bytes(), submit, submit_key, SUBMIT_KEYSTROKE_DELAY)
             {
                 let out = Outcome::error(cmd, format!("failed to inject into `{id}`: {e}"))
                     .with_data(json!({ "reason": "socket-write-failed", "id": id, "socket": socket }));
@@ -799,7 +846,8 @@ fn deliver_local_with(
     } else {
         String::new()
     };
-    let mut changed = vec![format!("injected {} byte(s) into {id}", payload.len())];
+    let total_bytes = payload.len() + if submit { submit_key.len() } else { 0 };
+    let mut changed = vec![format!("injected {total_bytes} byte(s) into {id}")];
     if let Some(note) = inbox_note {
         changed.push(note);
     }
@@ -2896,6 +2944,95 @@ mod tests {
         assert_eq!(delivered, "hello world\r");
         assert_eq!(delivered.matches('\r').count(), 1);
         assert_eq!(delivered.matches('\n').count(), 0, "no newline for a kimi target");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn write_delivery_performs_two_ordered_writes_when_submit_is_set() {
+        // Task #124: kimi's TUI paste-coalesces a submit keystroke that
+        // arrives in the SAME pty write as preceding text into a composer
+        // newline, never Enter — so the fix is two SEPARATE socket writes
+        // (text, then the submit key alone), not one concatenated write.
+        // Back-to-back writes with NO gap can still coalesce in the kernel's
+        // socket buffer before a blocked reader wakes (a stream socket
+        // carries no message boundaries of its own) — which is exactly why
+        // `delay` is a real, non-zero, injected value here rather than
+        // `SUBMIT_KEYSTROKE_DELAY`'s own zeroed `cfg(test)` value: this test
+        // needs to actually observe two separate `read()`s land, not merely
+        // call `write_delivery` twice. The acceptor's two independent
+        // `read()` calls (never `read_to_end`) are what makes a regression
+        // back to one concatenated write visible: it would hand the whole
+        // payload to the FIRST `read()`, leaving the second empty.
+        let root = unique_stage("write-delivery-two-writes");
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = root.join("s.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut first = [0u8; 256];
+            let n1 = conn.read(&mut first).unwrap();
+            let mut second = [0u8; 256];
+            let n2 = conn.read(&mut second).unwrap();
+            (first[..n1].to_vec(), second[..n2].to_vec())
+        });
+
+        let mut stream = UnixStream::connect(&socket).unwrap();
+        write_delivery(
+            &mut stream,
+            b"hello world",
+            true,
+            "\r",
+            std::time::Duration::from_millis(30),
+        )
+        .unwrap();
+        let (first, second) = acc.join().unwrap();
+
+        assert_eq!(
+            String::from_utf8(first).unwrap(),
+            "hello world",
+            "the first socket write is the text payload alone, no submit key riding along"
+        );
+        assert_eq!(
+            String::from_utf8(second).unwrap(),
+            "\r",
+            "the submit key arrives as its OWN later write — kimi's profile, not a fixed \\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn write_delivery_is_one_write_when_submit_is_not_set() {
+        // The non-submit path is untouched: no `submit_key` write happens at
+        // all, so an acceptor's `read_to_end` (blocking until the sender's
+        // `UnixStream` drops and closes its half of the connection) sees
+        // exactly the text and nothing trails it.
+        let root = unique_stage("write-delivery-one-write");
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = root.join("s.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+
+        {
+            let mut stream = UnixStream::connect(&socket).unwrap();
+            write_delivery(&mut stream, b"hello world", false, "\r", std::time::Duration::ZERO)
+                .unwrap();
+        } // drop closes the stream, unblocking the acceptor's read_to_end.
+        let got = acc.join().unwrap();
+
+        assert_eq!(
+            String::from_utf8(got).unwrap(),
+            "hello world",
+            "no --submit means no submit-key write at all, text arrives unaccompanied"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

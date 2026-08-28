@@ -73,6 +73,14 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   session's first turn is typed before that session has a `SessionRecord`
   at all, so it can't reach `deliver_local` and files itself instead — see
   `aoide_storage::inbox`'s module doc for the full two-writer reasoning.
+- **`send.rs::write_delivery`** is the one place a delivered payload actually
+  reaches a target's control socket (task #124): the text write, then — on
+  `--submit` — a SEPARATE, later write of the target's own submit keystroke,
+  never one concatenated write. A concatenated write is exactly what kimi's
+  TUI paste-coalesces into a composer newline instead of Enter, leaving the
+  prompt unsubmitted; see `SUBMIT_KEYSTROKE_DELAY`'s doc comment (AGENTS.md
+  has the full invariant) for the empirically-pinned delay between the two
+  writes. `deliver_local_with` is the one production caller.
 - **The undying mark (P-C2/P-C3, durable-sessions plan; renamed from "carry"
   at command-defrag lane U1, 2026-08-27; relocated under `session grant` at
   the session-surface redesign, command-defrag lane X, 2026-08-28):**
