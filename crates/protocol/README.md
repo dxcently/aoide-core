@@ -36,7 +36,13 @@ other crate in this workspace sits above.
   ergonomic shorthands (`ALIASES`, e.g. `peer rm` for `peer remove`) to
   their canonical path before the greedy match runs, so a shorthand is
   never a second registered command — the registry, `schema --json`, and
-  every golden snapshot see only the canonical spelling.
+  every golden snapshot see only the canonical spelling. Flag arity is the
+  registry's call, not the spelling's: a flag declared `"bool"` never
+  consumes the following token as its value (`peer add --no-verify alice`
+  keeps `alice` positional), a valued flag consumes exactly one, and any
+  token that reads both ways — a value colliding with a command-path
+  segment, or a flag bool-for-one-candidate valued-for-another — is a loud
+  usage error naming both spellings, never a silent guess.
 - `feed` — the append-only JSON-lines feed primitive: `FeedWriter` (append
   one JSON object per line, capped and truncated-in-place rather than
   rotated) and `Follower` (tail one file from EOF, delta-reads only,

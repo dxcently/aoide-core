@@ -86,7 +86,9 @@ pub fn parse(argv: &[String], door: Door, bin_name: &str, registry: &Registry) -
             continue;
         }
         if let Some(name) = a.strip_prefix("--") {
-            // `--flag=value` or `--flag value` or bare boolean `--flag`.
+            // `--flag=value` or `--flag value` or bare boolean `--flag` —
+            // whether the spaced form may consume a value is decided by the
+            // registry's declared flag type (`declared_flag_kind`), below.
             if let Some((k, v)) = name.split_once('=') {
                 if k == "json" {
                     json = true;
@@ -96,26 +98,51 @@ pub fn parse(argv: &[String], door: Door, bin_name: &str, registry: &Registry) -
                 json = true;
                 flags.insert("json".into(), "true".into());
             } else {
-                // Peek: if the next token is a value (not a flag), consume it.
-                if i + 1 < argv.len() && !argv[i + 1].starts_with("--") {
-                    if is_command_token(&argv[i + 1], &positionals, registry) {
-                        // The token reads both ways: this flag's value, or the
-                        // next segment of a command path still being spelled
-                        // (`graph session --id start` vs `graph session start
-                        // --id …`). Neither reading is safe to pick silently —
-                        // refuse loudly, naming both.
-                        return Err(ambiguous_flag_outcome(
-                            name,
-                            &argv[i + 1],
-                            &positionals,
-                            registry,
-                            bin_name,
-                        ));
+                // The registry decides whether this flag takes a value: a
+                // declared-bool flag NEVER consumes the next token (#111 —
+                // `peer add --no-verify alice` used to swallow `alice` as
+                // no-verify's value). Only a valued (or undeclared — rejected
+                // by name later anyway) flag peeks ahead.
+                match declared_flag_kind(name, &positionals, registry) {
+                    DeclaredFlag::Bool => {
+                        flags.insert(name.to_string(), "true".into());
                     }
-                    flags.insert(name.to_string(), argv[i + 1].clone());
-                    i += 1;
-                } else {
-                    flags.insert(name.to_string(), "true".into());
+                    DeclaredFlag::Mixed if i + 1 < argv.len() && !argv[i + 1].starts_with("--") => {
+                        // Declared bool by one candidate command and valued by
+                        // another, with a consumable token following: the token
+                        // genuinely reads both ways. Same convention as the
+                        // path-segment collision below (#48) — refuse loudly,
+                        // never guess.
+                        return Err(mixed_flag_outcome(name, &argv[i + 1], &positionals, bin_name));
+                    }
+                    DeclaredFlag::Mixed => {
+                        // Nothing consumable follows — only the bare-boolean
+                        // reading exists.
+                        flags.insert(name.to_string(), "true".into());
+                    }
+                    DeclaredFlag::Valued | DeclaredFlag::Undeclared => {
+                        // Peek: if the next token is a value (not a flag), consume it.
+                        if i + 1 < argv.len() && !argv[i + 1].starts_with("--") {
+                            if is_command_token(&argv[i + 1], &positionals, registry) {
+                                // The token reads both ways: this flag's value, or the
+                                // next segment of a command path still being spelled
+                                // (`graph session --id start` vs `graph session start
+                                // --id …`). Neither reading is safe to pick silently —
+                                // refuse loudly, naming both.
+                                return Err(ambiguous_flag_outcome(
+                                    name,
+                                    &argv[i + 1],
+                                    &positionals,
+                                    registry,
+                                    bin_name,
+                                ));
+                            }
+                            flags.insert(name.to_string(), argv[i + 1].clone());
+                            i += 1;
+                        } else {
+                            flags.insert(name.to_string(), "true".into());
+                        }
+                    }
                 }
             }
         } else {
@@ -360,6 +387,76 @@ fn signature(c: &Command) -> String {
         }
     }
     sig
+}
+
+/// What the registry declares `--name` to be at this point in the parse —
+/// judged across every CANDIDATE command, i.e. every registered command whose
+/// path agrees with the positionals collected so far on their common prefix
+/// (covers both orderings: the flag before the path is complete, and the flag
+/// after the full path with args already interleaved). Same position-aware
+/// stance as [`is_command_token`], one struct field over: that helper reads
+/// the candidates' PATHS, this one reads their flag specs.
+enum DeclaredFlag {
+    /// Every candidate that declares the flag declares it `"bool"` — it never
+    /// takes a value token.
+    Bool,
+    /// Every candidate that declares it gives it a non-bool type — it may
+    /// consume the next token as its value.
+    Valued,
+    /// Declared `"bool"` by one candidate and valued by another — with a
+    /// consumable token following, the parse refuses loudly rather than
+    /// guessing (the #48 convention).
+    Mixed,
+    /// No candidate declares it (an alias-spelled path mid-collection, a typo
+    /// rejected by name after the path match, or the dispatcher-level
+    /// `--audit-log` override) — the legacy peek-and-consume applies.
+    Undeclared,
+}
+
+/// Resolve `--name` against the candidate commands' flag specs — see
+/// [`DeclaredFlag`] for the verdicts and the candidate definition.
+fn declared_flag_kind(name: &str, prior: &[String], registry: &Registry) -> DeclaredFlag {
+    let mut bool_seen = false;
+    let mut valued_seen = false;
+    for c in registry.commands() {
+        let n = c.path.len().min(prior.len());
+        if !c.path[..n].iter().zip(&prior[..n]).all(|(a, b)| *a == b) {
+            continue;
+        }
+        if let Some(f) = c.flags.iter().find(|f| f.name == name) {
+            if f.ty == "bool" {
+                bool_seen = true;
+            } else {
+                valued_seen = true;
+            }
+        }
+    }
+    match (bool_seen, valued_seen) {
+        (true, true) => DeclaredFlag::Mixed,
+        (true, false) => DeclaredFlag::Bool,
+        (false, true) => DeclaredFlag::Valued,
+        (false, false) => DeclaredFlag::Undeclared,
+    }
+}
+
+/// The usage error for a flag declared `"bool"` by one candidate command and
+/// valued by another, with a consumable token following ([`DeclaredFlag::
+/// Mixed`]) — the token reads both ways and the parser refuses to pick,
+/// naming both spellings, same as [`ambiguous_flag_outcome`].
+fn mixed_flag_outcome(flag: &str, value: &str, prior: &[String], bin_name: &str) -> Outcome {
+    let at = if prior.is_empty() { String::new() } else { format!(" {}", prior.join(" ")) };
+    Outcome::usage(
+        prior.join("."),
+        format!(
+            "ambiguous: `--{flag}` is boolean for one `{bin_name}{at}` command and \
+             takes a value for another — `{value}` could be its value or a positional\
+             \n\ndid you mean:\
+             \n  {bin_name} … --{flag}={value}  (`{value}` as the flag's value)\
+             \n  {bin_name} … --{flag} -- {value}  (`{value}` as a positional, `--{flag}` bare)\
+             \n\nspell the full command path before the flag to disambiguate; \
+             run '{bin_name} --help' for the full command list"
+        ),
+    )
 }
 
 /// Is this token part of a command path (so a preceding `--flag` must not
@@ -695,6 +792,29 @@ mod tests {
             handler: noop,
             available: || true,
         });
+        // The #111 filed shape: a command with positional args plus a
+        // declared-bool flag AND a declared-valued flag, mirroring the real
+        // `peer add <name> <url> [--no-verify] [--via …]`.
+        r.insert(Command {
+            path: &["peer", "add"],
+            summary: "Register a peer.",
+            args: &[
+                Arg { name: "name", ty: "string", required: true, description: "Peer name." },
+                Arg { name: "url", ty: "string", required: true, description: "Peer URL." },
+            ],
+            flags: &[
+                JSON_FLAG,
+                Flag { name: "no-verify", ty: "bool", description: "Skip the card fetch." },
+                Flag { name: "via", ty: "string", description: "Tunnel spec." },
+            ],
+            gated: false,
+            implemented: true,
+            internal: false,
+            exit_codes: (),
+            examples: &[],
+            handler: noop,
+            available: || true,
+        });
         r
     }
 
@@ -831,6 +951,124 @@ mod tests {
         assert_eq!(aliased.path, canonical.path);
         assert_eq!(aliased.args, canonical.args);
         assert_eq!(aliased.args, vec!["alice"]);
+    }
+
+    /// Regression (#111, filed off the M3 review): a declared-BOOL flag given
+    /// before the positional args swallowed the following token as its value —
+    /// `peer add --no-verify alice url` parsed as flags={no-verify:"alice"},
+    /// args=["url"], silently dropping a positional. The registry declares the
+    /// flag's type, so the parser must never let a bool consume a value token.
+    #[test]
+    fn a_bool_flag_before_positionals_never_swallows_the_next_token() {
+        let reg = test_registry();
+        let (inv, _) = parse(
+            &argv(&["peer", "add", "--no-verify", "alice", "http://h:7466"]),
+            Door::Cli,
+            "aoide",
+            &reg,
+        )
+        .unwrap();
+        assert_eq!(inv.path, vec!["peer", "add"]);
+        assert_eq!(inv.args, vec!["alice", "http://h:7466"], "both positionals survive");
+        assert_eq!(inv.flags.get("no-verify").map(String::as_str), Some("true"));
+    }
+
+    /// The neighboring shapes around the #111 fix: a bool flag at the end and
+    /// between positionals binds bare either way, with every positional kept.
+    #[test]
+    fn a_bool_flag_at_the_end_or_between_positionals_binds_bare() {
+        let reg = test_registry();
+
+        let (inv, _) = parse(
+            &argv(&["peer", "add", "alice", "http://h:7466", "--no-verify"]),
+            Door::Cli,
+            "aoide",
+            &reg,
+        )
+        .unwrap();
+        assert_eq!(inv.args, vec!["alice", "http://h:7466"]);
+        assert_eq!(inv.flags.get("no-verify").map(String::as_str), Some("true"));
+
+        let (inv, _) = parse(
+            &argv(&["peer", "add", "alice", "--no-verify", "http://h:7466"]),
+            Door::Cli,
+            "aoide",
+            &reg,
+        )
+        .unwrap();
+        assert_eq!(inv.args, vec!["alice", "http://h:7466"]);
+        assert_eq!(inv.flags.get("no-verify").map(String::as_str), Some("true"));
+    }
+
+    /// A bool flag placed before the command path is even complete resolves
+    /// through the same candidate-aware type lookup — the following token
+    /// stays a path segment, never the flag's value.
+    #[test]
+    fn a_bool_flag_before_the_path_is_complete_leaves_the_segment_alone() {
+        let reg = test_registry();
+        let (inv, _) = parse(
+            &argv(&["peer", "--no-verify", "add", "alice", "http://h:7466"]),
+            Door::Cli,
+            "aoide",
+            &reg,
+        )
+        .unwrap();
+        assert_eq!(inv.path, vec!["peer", "add"]);
+        assert_eq!(inv.args, vec!["alice", "http://h:7466"]);
+        assert_eq!(inv.flags.get("no-verify").map(String::as_str), Some("true"));
+    }
+
+    /// The converse must be untouched by the #111 fix: a genuinely VALUED
+    /// flag before the positionals still consumes exactly its one value.
+    #[test]
+    fn a_valued_flag_before_positionals_still_consumes_its_value() {
+        let reg = test_registry();
+        let (inv, _) = parse(
+            &argv(&["peer", "add", "--via", "ssh://h:22", "alice", "http://h:7466"]),
+            Door::Cli,
+            "aoide",
+            &reg,
+        )
+        .unwrap();
+        assert_eq!(inv.args, vec!["alice", "http://h:7466"]);
+        assert_eq!(inv.flags.get("via").map(String::as_str), Some("ssh://h:22"));
+    }
+
+    /// A flag declared `"bool"` by one candidate command and valued by a
+    /// sibling, with a consumable token following, reads both ways — the
+    /// parser refuses loudly (the #48 convention) instead of guessing, and
+    /// names both unambiguous spellings.
+    #[test]
+    fn a_flag_declared_bool_and_valued_by_sibling_commands_fails_loudly() {
+        let mut r = Registry::new();
+        let mk = |path: &'static [&'static str], ty: &'static str| Command {
+            path,
+            summary: "Test.",
+            args: &[Arg { name: "x", ty: "string", required: false, description: "X." }],
+            flags: if ty == "bool" {
+                &[JSON_FLAG, Flag { name: "force", ty: "bool", description: "F." }]
+            } else {
+                &[JSON_FLAG, Flag { name: "force", ty: "string", description: "F." }]
+            },
+            gated: false,
+            implemented: true,
+            internal: false,
+            exit_codes: (),
+            examples: &[],
+            handler: noop,
+            available: || true,
+        };
+        r.insert(mk(&["thing", "one"], "bool"));
+        r.insert(mk(&["thing", "two"], "string"));
+
+        let err = parse(&argv(&["thing", "--force", "val"]), Door::Cli, "aoide", &r).unwrap_err();
+        assert_eq!(err.status, Status::Usage, "mixed declaration + consumable token → exit 2");
+        assert!(err.message.contains("--force"), "{}", err.message);
+        assert!(err.message.contains("--force=val"), "offers the valued spelling: {}", err.message);
+
+        // With nothing consumable following, only the bare reading exists.
+        let (inv, _) = parse(&argv(&["thing", "one", "--force"]), Door::Cli, "aoide", &r).unwrap();
+        assert_eq!(inv.flags.get("force").map(String::as_str), Some("true"));
     }
 
     #[test]
