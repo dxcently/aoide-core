@@ -253,12 +253,21 @@
   sharing the loop can each pass their own.
 - **`run_pair_request` (P-P6) is the ONLY body of `handle_peer_pair_request`
   past its own `<url>`/`--name`/`--self-url` parsing, and `handle_peer_invite`
-  calls the SAME function — never a second copy.** `peer invite`'s own doc
+  and bare `pair` (`handle_pair`, task #120 P3) reach the SAME function —
+  never a second copy — through `pair_with_heard`, the shared
+  settled-target tail (dial-URL composition off the OBSERVED source, K1's
+  `record_via` default).** `peer invite`'s own doc
   and CONTRACTS.md §6's "Discovery advertisement" subsection both promise `peer
   invite` "runs the ceremony," and this is what makes that literally true
   rather than aspirational: a future change to the ceremony's wire calls,
   its outbound-parking shape, or its SAS derivation touches ONE function
-  and both callers inherit it identically. `run_pair_request` does NOT
+  and every caller inherits it identically. `handle_pair` holds bare
+  `session`'s exact door discipline — CLI + real tty
+  (`pick::interactive`) or a taught refusal naming the scripted
+  spellings, never a read from a stdin nobody is typing into — and
+  filters self-advertisements (`is_self_target`) BEFORE the menu renders,
+  so picking a row can stand as the proceed-confirmation without a
+  second y/N. `run_pair_request` does NOT
   re-validate its `name` argument (`valid_peer_name`) — that check stays in
   `handle_peer_pair_request` alone, since only a CLI-typed `--name` needs
   it; `handle_peer_invite`'s `name` already came off an advertisement

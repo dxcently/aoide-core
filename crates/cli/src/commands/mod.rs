@@ -52,7 +52,10 @@ use crate::registry::Registry;
 /// took it 78 -> 79; `peer list` (task #120 P2, appended newest — the
 /// one-glance mesh roster, registered from `aoide-conduct` because it
 /// folds `who`'s probe core, see `conduct/src/commands/peer_list.rs`) took
-/// it 79 -> 80.
+/// it 79 -> 80; bare `pair` (task #120 P3, appended newest — the friendly
+/// interactive entry into the pairing ceremony: one sweep, a select menu,
+/// then the SAME `run_pair_request` core `peer invite` drives) took it
+/// 80 -> 81.
 pub fn all() -> Registry {
     let mut r = Registry::new();
 
@@ -80,6 +83,7 @@ pub fn all() -> Registry {
     aoide_client::commands::register_peer_discovery(&mut r); // peer discover/invite/advertise — LAN discovery's CLI half (P-P6 + task #120, appended newest)
     aoide_client::mcp_client::register_melete(&mut r); // melete status/graph/call — the Melete MCP client (M2, task #14, appended newest)
     aoide_conduct::commands::peer_list::register(&mut r); // peer list — the one-glance mesh roster over who's probe core + one discovery sweep (task #120 P2, appended newest)
+    aoide_client::commands::register_pair(&mut r); // pair — the interactive pairing picker over one sweep, driving the same ceremony core (task #120 P3, appended newest)
 
     r
 }

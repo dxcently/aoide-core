@@ -128,6 +128,9 @@ mod tests {
         // — the one-glance mesh roster (this host + registered peers +
         // advertising instances, sessions under each), registered from
         // `aoide-conduct` because it folds `who`'s probe core — reached 80.
+        // Bumped by 1 for bare `pair` (task #120 P3) — the interactive
+        // pairing picker, one sweep + a select menu driving the SAME
+        // `run_pair_request` ceremony core `peer invite` uses — reached 81.
         let mut expected: Vec<&str> = vec![
             "a2a.serve",
             "adapter.melete",
@@ -154,6 +157,7 @@ mod tests {
             "melete.graph",
             "melete.status",
             "onboard",
+            "pair",
             "peer.add",
             "peer.advertise",
             "peer.allow",

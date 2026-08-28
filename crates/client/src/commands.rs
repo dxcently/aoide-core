@@ -2352,9 +2352,11 @@ fn confirm_invite(name: &str, host: &str, user: &str, src_addr: &str) -> Result<
 /// is only ever as fresh as the sweep that heard it), resolves `<name>`
 /// against the heard set (`discover::resolve_invite_target`), and on
 /// EXACTLY one match runs the SAME [`run_pair_request`] core `peer pair
-/// request` itself calls — reused, never copied (this is what "reaches the
-/// same code path" actually means here: both handlers bottom out in the
-/// identical function, not two functions that merely look alike). Zero or
+/// request` itself calls, through [`pair_with_heard`] (the settled-target
+/// tail bare `pair`'s picker shares) — reused, never copied (this is what
+/// "reaches the same code path" actually means here: the handlers bottom
+/// out in the identical function, not functions that merely look alike).
+/// Zero or
 /// multiple matches refuse with a taught error listing every name that WAS
 /// heard (never raw advertisement content — house rule 4; only
 /// already-validated `name`s ever reach this point). The ceremony url
@@ -2420,12 +2422,6 @@ fn handle_peer_invite(inv: &Invocation) -> Outcome {
         }
     };
 
-    // The dial target: the OBSERVED source address on the house door port
-    // (handler doc — the advertisement carries no door URL to read a port
-    // off, by design).
-    let dial_url = format!("http://{}:{}/", hit.src_addr, default_a2a_port());
-
-    let self_url = default_self_url();
     let own_name = aoide_storage::display::local_host_name();
     if crate::discover::is_self_target(&hit, &own_name) {
         return Outcome::error(
@@ -2449,18 +2445,31 @@ fn handle_peer_invite(inv: &Invocation) -> Outcome {
         }
     }
 
-    // K1's settled default: the peer this ceremony creates gets an
-    // automatic `via` derived from the advertisement's OBSERVED source
-    // address plus its claimed ssh login (task #120 — the one thing the
-    // wire exists to carry), so its own FUTURE calls (pull/spawn/send) can
-    // reach it through an ssh tunnel — recorded at `peer pair approve`
-    // commit time, not used for the ceremony's own dial below
-    // (`run_pair_request`'s own doc on why those stay separate). An
-    // explicit `--via` beats this default outright, for both halves.
+    pair_with_heard(cmd, &hit, via_flag.as_ref())
+}
+
+/// The tail `peer invite` and bare `pair` share once a [`crate::discover::Heard`]
+/// target is settled (each having already run its own guard/confirmation):
+/// compose the dial URL from the hit's OBSERVED source address on the house
+/// door port ([`default_a2a_port`] — the advertisement carries no door URL
+/// to read a port off, by design), and run the SAME [`run_pair_request`]
+/// core `peer pair request` itself calls — reused, never forked.
+///
+/// K1's settled default: the peer this ceremony creates gets an automatic
+/// `via` derived from the advertisement's OBSERVED source address plus its
+/// claimed ssh login (task #120 — the one thing the wire exists to carry),
+/// so its own FUTURE calls (pull/spawn/send) can reach it through an ssh
+/// tunnel — recorded at `peer pair approve` commit time, not used for the
+/// ceremony's own dial (`run_pair_request`'s own doc on why those stay
+/// separate). An explicit `--via` beats this default outright, for both
+/// halves.
+fn pair_with_heard(cmd: &str, hit: &crate::discover::Heard, via_flag: Option<&aoide_storage::tunnel::Via>) -> Outcome {
+    let dial_url = format!("http://{}:{}/", hit.src_addr, default_a2a_port());
+    let self_url = default_self_url();
     let default_record_via =
         Some(aoide_storage::tunnel::default_via(&hit.src_addr, &hit.advertisement.user).to_string());
-    let record_via = via_flag.as_ref().map(|v| v.to_string()).or(default_record_via);
-    run_pair_request(cmd, &dial_url, &hit.advertisement.name, &self_url, via_flag.as_ref(), record_via)
+    let record_via = via_flag.map(|v| v.to_string()).or(default_record_via);
+    run_pair_request(cmd, &dial_url, &hit.advertisement.name, &self_url, via_flag, record_via)
 }
 
 /// The four `peer pair` commands (P-P2), registered directly after the six
@@ -2600,6 +2609,109 @@ pub fn register_peer_discovery(r: &mut Registry) {
         implemented: true,
         handler: handle_peer_advertise,
         examples: ["peer advertise on", "peer advertise off"],
+    ));
+}
+
+/// Bare `pair`'s sweep window (task #120 P3): one bounded listen, ~2s —
+/// the same short window `peer list`'s roster sweep settled on (a friendly
+/// entry command should answer fast; a quiet LAN that needs longer has
+/// `peer discover --secs N`).
+const PAIR_SWEEP_SECS: u64 = 2;
+
+/// Bare `aoide pair` (task #120 P3) — the friendly entry into the pairing
+/// ceremony: one bounded advertisement sweep ([`crate::discover::run_sweep`],
+/// [`PAIR_SWEEP_SECS`]), then an interactive SELECT menu over the
+/// advertising candidates (`aoide_protocol::pick::choose` — the same
+/// `inquire`-backed picker substrate bare `session` opens), and the picked
+/// row drives the EXISTING invite/request path ([`pair_with_heard`] →
+/// [`run_pair_request`] — reuse, never a fork); `run_pair_request`'s own
+/// success message then prints the SAS and teaches the approve step on
+/// both ends. Picking a row IS the proceed-confirmation — no second
+/// `confirm_invite`-style y/N on top (`peer invite <name>` needs one
+/// because its target arrives as a typed argument, not a choice made
+/// looking at the candidate).
+///
+/// Row text renders only already-validated advertisement fields
+/// (`advertise::parse_and_validate` gates every one — house rule 4) plus
+/// the OBSERVED source address, claim and observation side by side, the
+/// same untrusted-display stance `peer list`'s `◆` candidate rows hold.
+/// Own advertisements are filtered out up front
+/// (`discover::is_self_target` — a broadcast always loops back to its own
+/// sender), so the menu never offers a self-pair.
+///
+/// CLI-door + real-tty only (`pick::interactive`, the same gate bare
+/// `session` holds; `--json` steers to the taught refusal too — a picker's
+/// prompts have no business interleaving with a machine-readable stream):
+/// every other shape gets a taught refusal naming the scripted spellings,
+/// never a hang on a stdin nobody is typing into.
+fn handle_pair(inv: &Invocation) -> Outcome {
+    let cmd = "pair";
+    let taught = "bare `pair` opens an interactive pairing picker on a real CLI terminal; scripted path: \
+                  `aoide peer advertise on` on the other box, then `aoide peer invite <name> --yes` or \
+                  `aoide peer pair request <url> [--via ssh://[user@]host]` here";
+    if inv.door != aoide_protocol::Door::Cli {
+        return Outcome::usage(cmd, format!("{taught} (this door is not the CLI)"));
+    }
+    if inv.flag_present("json") || !aoide_protocol::pick::interactive(inv.door) {
+        return Outcome::usage(cmd, taught);
+    }
+
+    let swept = match crate::discover::run_sweep(PAIR_SWEEP_SECS) {
+        Ok(s) => s,
+        Err(e) => {
+            return Outcome::error(cmd, crate::discover::describe_sweep_error(&e))
+                .with_data(json!({ "reason": "sweep-failed" }))
+        }
+    };
+    let own_name = aoide_storage::display::local_host_name();
+    let candidates: Vec<crate::discover::Heard> = swept
+        .heard
+        .into_iter()
+        .filter(|h| !crate::discover::is_self_target(h, &own_name))
+        .collect();
+    if candidates.is_empty() {
+        return Outcome::ok(
+            cmd,
+            format!(
+                "heard no advertising instances in {PAIR_SWEEP_SECS}s ({} malformed dropped) — on the OTHER box, \
+                 switch advertising on with `aoide peer advertise on` (a running `a2a serve` emits it within ~40s) \
+                 and run `aoide pair` here again; or pair manually with \
+                 `aoide peer pair request <url> [--via ssh://[user@]host]`",
+                swept.dropped
+            ),
+        )
+        .with_data(json!({ "heard": 0, "dropped": swept.dropped }));
+    }
+
+    let rows: Vec<String> = candidates
+        .iter()
+        .map(|h| {
+            format!(
+                "{} — claims ssh {}@{}, observed at {}",
+                h.advertisement.name, h.advertisement.user, h.advertisement.host, h.src_addr
+            )
+        })
+        .collect();
+    match aoide_protocol::pick::choose("pair with which instance?", &rows, None) {
+        None => Outcome::ok(cmd, "nothing chosen — nothing sent"),
+        Some(i) => pair_with_heard(cmd, &candidates[i], None),
+    }
+}
+
+/// Bare `pair` (task #120 P3), registered at the END of assembly like
+/// every appended-newest command — the top-level friendly entry into the
+/// ceremony `register_peer_pair`/`register_peer_discovery` own the
+/// scripted spellings of.
+pub fn register_pair(r: &mut Registry) {
+    r.insert(cmd!(
+        path: ["pair"],
+        summary: "Open the interactive pairing picker on a real CLI terminal: one ~2s advertisement sweep, a select menu over the advertising instances heard (name, claimed ssh hop, observed source), and the picked one runs the same ceremony `peer invite`/`peer pair request` drive — then prints the code to compare and the approve step for both ends. Non-tty or non-CLI invocations get a taught pointer at the scripted spellings instead.",
+        args: [],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_pair,
+        examples: ["pair"],
     ));
 }
 
@@ -3892,6 +4004,32 @@ mod tests {
                 assert!(out.message.contains("--code"), "{}", out.message);
             }
         });
+    }
+
+    /// Bare `pair` never hangs where nobody can answer a menu: a non-CLI
+    /// door, a `--json` ask, and a non-tty CLI invocation (cargo test's
+    /// stdio) all get the taught refusal BEFORE any sweep runs — pinned
+    /// here by the refusal arriving instantly with the scripted spellings
+    /// in it.
+    #[test]
+    fn bare_pair_refuses_non_tty_non_cli_and_json_with_the_taught_message() {
+        let inv = |door, flags: &[(&str, &str)]| Invocation {
+            path: vec!["pair".into()],
+            args: vec![],
+            flags: flags.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            door,
+        };
+        for (invocation, why) in [
+            (inv(aoide_protocol::Door::Mcp, &[]), "non-CLI door"),
+            (inv(aoide_protocol::Door::A2a, &[]), "non-CLI door"),
+            (inv(aoide_protocol::Door::Cli, &[("json", "true")]), "--json"),
+            (inv(aoide_protocol::Door::Cli, &[]), "non-tty CLI (test harness stdio)"),
+        ] {
+            let out = handle_pair(&invocation);
+            assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{why}: {out:?}");
+            assert!(out.message.contains("peer advertise on"), "{why} refusal teaches the advertise switch: {}", out.message);
+            assert!(out.message.contains("peer pair request"), "{why} refusal teaches the manual path: {}", out.message);
+        }
     }
 
     /// Idempotency survives the gate swap: an ALREADY-approved inbound

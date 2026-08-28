@@ -354,10 +354,14 @@ never the inbound/serve half (that's `aoide-server`).
   check (a CLI-typed name needs it); `handle_peer_invite` calls straight
   into `run_pair_request` with a `name` already lifted off an
   already-validated, already-confirmed discovery advertisement, needing
-  no second name check, and a `url` it composed itself from the OBSERVED
+  no second name check, and a `url` composed from the OBSERVED
   source address on the house door port (`default_a2a_port` —
   `AOIDE_A2A_PORT` or 8710; the advertisement carries no door URL, task
-  #120). `dial_via`/`record_via` are deliberately separate: `dial_via`
+  #120) — that composition, plus K1's `record_via` default, lives in
+  `pair_with_heard(cmd, hit, via_flag)`, the settled-target tail
+  `handle_peer_invite` and bare `pair`'s picker (below) both call so
+  neither ever forks the ceremony. `dial_via`/`record_via` are
+  deliberately separate: `dial_via`
   is what the ceremony's OWN two POSTs tunnel through — `None` unless an
   explicit `--via` was given, so a plain ceremony still dials directly
   (forcing every pairing through ssh by default was not asked for).
@@ -385,6 +389,16 @@ never the inbound/serve half (that's `aoide-server`).
   vs already-so; the emitting `a2a serve` reads the switch every tick,
   so the message names the ~40s pickup and that nothing emits without a
   running `a2a serve`.
+  `handle_pair` (bare `aoide pair`, task #120 P3, `register_pair` —
+  appended newest at the END of `cli`'s assembly) is the friendly
+  interactive entry: CLI-door + real-tty only (`pick::interactive`, the
+  same gate bare `session` holds; non-tty/non-CLI/`--json` get a taught
+  pointer at the scripted spellings), one bounded ~2s sweep
+  (`PAIR_SWEEP_SECS`), self-advertisements filtered via `is_self_target`,
+  then `pick::choose` over rows rendering the already-validated claim
+  beside the observed source — the picked row IS the proceed-confirmation
+  and goes straight through `pair_with_heard`; hearing nothing teaches
+  `peer advertise on` and the manual `peer pair request <url>` path.
   `adapter melete` (`peer hub
   <name> [--clear]`, P-D5, designates at most one registered peer as the
   hub `aoide_storage::addr::resolve_with_hub` prefers as a last-resort
