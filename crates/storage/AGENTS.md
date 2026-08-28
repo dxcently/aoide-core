@@ -320,7 +320,7 @@
   "did anything on disk change" (P-C1, durable-sessions plan).** Re-marking
   an already-undying id refreshes `marked_at` in place and returns `false`;
   unmarking an absent id is a no-op and also returns `false`. Don't fold the
-  timestamp refresh into the return value — the `session undying`
+  timestamp refresh into the return value — the `session grant undying`
   command reports this bool verbatim as `changed`, and a `markedAt` bump
   reported as a state change would be misleading (nothing about undying/not
   actually flipped).

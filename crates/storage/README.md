@@ -263,7 +263,7 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
 - `undying` — the undying mark (durable-sessions plan, P-C1; renamed from
   "carry" at command-defrag lane U1, 2026-08-27): `state/undying.json`, the
   set of session ids marked durable so a project's whole undying set can be
-  resurrected together (`session undying on|off`). Mirrors `peer_store`
+  resurrected together (`session grant undying on|off`). Mirrors `peer_store`
   exactly — `load_undying`/`save_undying` tolerate a missing/corrupt file as
   empty and write atomically via `fs::atomic_write` (not
   `atomic_write_private`: a session id is the same class of data

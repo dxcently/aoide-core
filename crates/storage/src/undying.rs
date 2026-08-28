@@ -1,7 +1,7 @@
 //! The undying mark: `state/undying.json` (v0) — the set of session ids
 //! marked durable, so a project's whole undying set can be resurrected
-//! together (`session undying on|off`, CONTRACTS.md's `state/undying.json`
-//! section).
+//! together (`session grant undying on|off`, CONTRACTS.md's
+//! `state/undying.json` section).
 //!
 //! Prototyped under the name "carry" (task #96, `state/carry.json`); this is
 //! the shipped rename (command-defrag lane U1, 2026-08-27) — same shape and
@@ -136,7 +136,7 @@ pub fn save_undying(undying: &[UndyingSession]) -> Result<(), String> {
 /// already-undying id re-marked `on`, or an absent id marked `off`, both
 /// return `false` even though the former still touched `markedAt`. Pure
 /// list mutation, so the CRUD is unit-testable off disk; the caller
-/// (`session undying`) reports this bool as `changed`.
+/// (`session grant undying`) reports this bool as `changed`.
 pub fn set_undying(undying: &mut Vec<UndyingSession>, id: &str, on: bool) -> bool {
     let pos = undying.iter().position(|c| c.session_id == id);
     match (pos, on) {

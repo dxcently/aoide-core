@@ -74,7 +74,7 @@
 //! `undying` (durable-sessions plan, P-C1; renamed from "carry" at
 //! command-defrag lane U1, 2026-08-27) holds `state/undying.json`, the set
 //! of session ids marked durable so a project's whole undying set can be
-//! resurrected together (`session undying on|off`). Mirrors `peer_store`'s
+//! resurrected together (`session grant undying on|off`). Mirrors `peer_store`'s
 //! shape and discipline exactly (tolerate-missing/corrupt-as-empty,
 //! `fs::atomic_write`, pure list mutations), plus a one-shot migration off
 //! the pre-rename `state/carry.json` — see its own module doc.

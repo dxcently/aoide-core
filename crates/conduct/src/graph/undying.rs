@@ -360,7 +360,7 @@ mod tests {
         }
     }
 
-    /// `session undying on --id <id>` surfaces the warning in the command's
+    /// `session grant undying on --id <id>` surfaces the warning in the command's
     /// own Outcome message (not a log line) when the target session has
     /// neither capture nor a resumable harness profile — the P-C7 soak's
     /// exact live shape, reached through `--agent soak-a -- bash` and then

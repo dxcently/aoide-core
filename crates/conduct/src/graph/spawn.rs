@@ -475,7 +475,7 @@ pub fn session_spawn(inv: &Invocation) -> Outcome {
     } else {
         false
     };
-    // Same nothing-to-restore warning `session undying on` carries
+    // Same nothing-to-restore warning `session grant undying on` carries
     // (`undying.rs::nothing_to_restore_warning`, task #100): `program` (this
     // function's own, not a roster read-back) is the WRAPPED command
     // `captures_like_a_shell` decides on directly, no race against the

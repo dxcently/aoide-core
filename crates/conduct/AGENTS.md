@@ -454,11 +454,11 @@
   has_capture)` mirrors `resolve_candidate`'s own two arms — a registered
   harness `AgentProfile.resume_args`, or `has_capture` (this session's own
   P-C5 restore snapshot, gated by `captures_like_a_shell` above) — and both
-  mark sites (`spawn --undying`, `session undying on --id <id>`) append its
+  mark sites (`spawn --undying`, `session grant undying on --id <id>`) append its
   text onto their own Outcome MESSAGE, never a log line, whenever NEITHER
   arm would resolve. `spawn --undying` computes `has_capture` directly off
   the command it just built (no roster read-back, no race against the
-  conducted child's own first refresh tick); `session undying on` reads it
+  conducted child's own first refresh tick); `session grant undying on` reads it
   off the LIVE roster record's `restore` field and stays silent for an id
   absent from the roster (no live signal to warn from — same posture `live`
   already takes) and for `off` (a future restore isn't promised either way,
