@@ -442,7 +442,14 @@
   submits correctly. `conduct_multiplex`'s injection relay (`graph/
   conduct.rs`) already does one `read()`-then-pty-`write()` per `poll()`
   wakeup, so this needed no relay-side change — only the WRITER side had to
-  stop concatenating. `SUBMIT_KEYSTROKE_DELAY` (300ms) is empirically
+  stop concatenating. That relay shape is a timing argument, not a message
+  boundary: SOCK_STREAM carries none, so a relay thread starved past the
+  delay would read both writes back as one concatenated chunk — the delay
+  IS what keeps the two writes distinct at the pty. Two callers pay it
+  beyond the CLI: the a2a door's inject (per-connection thread, fine) and
+  boot auto-resume's restore resubmits, which run serially before the
+  daemon's tick loop starts — N undying resubmits delay reaper start by
+  N×300ms, bounded and boot-once. `SUBMIT_KEYSTROKE_DELAY` (300ms) is empirically
   pinned, not guessed: a live windowed kimi session on this box reproduced
   the exact newline-not-submit failure at 120ms and submitted cleanly,
   twice, at 300ms — don't shrink it back down without repeating that live
