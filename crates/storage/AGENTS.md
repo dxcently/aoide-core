@@ -77,6 +77,36 @@
   field on `IdentityInfo` (or a new serializable type anywhere in
   `identity.rs`) that could plausibly carry key material gets checked
   against this test before it lands, not after.
+- **`identity::mint_ephemeral` never writes to disk, and a caller must mint
+  it exactly ONCE per process (LANE IDENTITY P-ID1).** Unlike
+  `load_or_mint` (idempotent — every call after the first re-reads the
+  SAME on-disk key), `mint_ephemeral` mints a genuinely FRESH keypair on
+  every call — it exists specifically so a same-uid attacker who can read
+  every `0600` file under the operator's own uid still cannot read the
+  key (OQ1-A: secrecy rests on process liveness plus Yama `ptrace_scope`,
+  not file permissions). A caller that calls it more than once per process
+  (or calls it lazily per-request instead of once at startup, held in a
+  `OnceLock`/static) silently invalidates every seal minted under the
+  prior key — `aoide-server`'s daemon is the one production caller today
+  and holds it in exactly that shape. Don't add a disk-write path to this
+  function "for consistency" with `mint` — that would defeat the entire
+  point of OQ1-A.
+- **`sealed_id::canonical_seal_string`'s five-field order, NUL-separator,
+  and trimmed/lowercased style are the wire contract, not an
+  implementation detail (LANE IDENTITY P-ID1) — pinned by
+  `tests::canonical_seal_string_stability_vectors_never_drift`, the same
+  pinning discipline `wire_auth::canonical_string`/`pairing::derive_sas`
+  already hold.** A change to the field order, separator, or case-folding
+  breaks every already-minted seal's ability to re-verify — it needs new
+  pinned vectors AND a `CONTRACTS.md` §4 update in the same commit.
+- **No gate reads `SessionRecord.seal` yet — don't wire one in without
+  reading the LANE IDENTITY plan section first.** P-ID1 (this phase) only
+  proves mint → store → verify; P-ID2 is the phase that adds the first
+  verify-on-accept caller (the control socket's peercred floor), and P-ID4
+  is the first to gate a real policy decision on `originClass`. A change
+  that makes any door/socket/broker DECISION depend on `seal`'s presence
+  or content before P-ID2 lands is out of scope for this crate and belongs
+  in that later phase's own review, not slipped in here.
 - **`wire_auth::canonical_string`'s five-field order, NUL-separator, and
   lowercased/trimmed style are the wire contract, not an implementation
   detail (P-P4) — pinned by

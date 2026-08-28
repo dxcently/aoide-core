@@ -109,6 +109,7 @@ pub mod pairing;
 pub mod peer_store;
 pub mod petname;
 pub mod records;
+pub mod sealed_id;
 pub mod session;
 pub mod stage;
 pub mod takes;

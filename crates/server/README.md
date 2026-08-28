@@ -117,6 +117,29 @@ the inbound half of the two-door contract (the outbound half is
   headless host's taught "no `$AOIDE_TERMINAL`" error is only
   `eprintln!`'d here, never propagated — the tick/loop itself is never at
   risk.
+- **The sealed session credential (LANE IDENTITY P-ID1, `docs/architecture/
+  CONTRACTS.md` §4's `seal` field) — scaffolding, no gate consumes it
+  yet.** `daemon::seal_keypair` mints this daemon PROCESS's own ed25519
+  keypair exactly once (`aoide_storage::identity::mint_ephemeral`, held in
+  a module-level `OnceLock`) and NEVER writes it to disk — under OQ1-A
+  (the plan file's User-answered threat-model question) the seal's
+  secrecy rests on process liveness plus Yama `ptrace_scope`, not file
+  permissions, since a same-uid attacker can read any file the operator
+  owns, including `state/identity/`'s own on-disk peer-wire key.
+  `daemon::mint_seal(session_id, pid, origin_class)` builds a
+  `SealedIdentity` (reading `pid_starttime` via `aoide_conduct::
+  graph::pid_starttime`, no second `/proc` parse) and signs it under that
+  key (`aoide_storage::sealed_id::mint_seal`). `handle_conn`'s `dispatch`
+  op calls `daemon::seal_freshly_registered_session` right after a
+  successful `session start` dispatch: if the just-written record already
+  carries a `pid` (today, only `session_conduct`'s own direct
+  registration does — the bare wire path does not), it mints a seal and
+  stamps it via `aoide_conduct::graph::stamp_seal`. **This is honest
+  scaffolding, not a security boundary**: the pid sealed over is
+  whatever the record already carries, not yet a peercred-verified
+  CONNECTING pid (P-ID2's socket change), and nothing anywhere reads
+  `seal` back to gate a decision. See CONTRACTS.md §4's `seal` paragraph
+  and `aoide-storage`'s own README for the full mechanism.
 - `events` — `tail`, the blocking loop behind `aoide events tail` (P-D3):
   follows the daemon's own events feed with a `Follower` and prints every
   line whose `class` passes an (optional, comma-separated) filter, `--json`

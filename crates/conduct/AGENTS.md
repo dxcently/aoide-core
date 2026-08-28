@@ -579,8 +579,10 @@
   rendered into `graph.json`. **This closes the STAMP paths, not the
   files**: a hand-crafted `sessions.json`/ledger line claiming `peer:X` is
   still a readable, unflagged string on disk — nothing here makes the files
-  tamper-evident; that is P-ID1 (the daemon-signed credential)/P-ID2 (the
-  peercred floor), still open. **`origin` is still attribution, not an
+  tamper-evident; that is P-ID1 (the daemon-signed credential, below) —
+  minted and stored, but nothing verifies it against an incoming
+  connection yet, which is P-ID2 (the peercred floor), still open.
+  **`origin` is still attribution, not an
   authenticated credential** — a same-uid process can still forge a
   LOCAL-class origin (`stamp_origin` trusts whatever non-`peer:*` value it
   is given), and neither the session's own identity nor the consumer
@@ -589,6 +591,24 @@
   builds next (P-ID1+). What P-ID0 closes is narrower and real: every
   record-STAMP path this codebase drives now refuses a `peer:*` shape it
   didn't mint itself at the door — env AND the unsealed ledger both.
+- **`SessionRecord.seal` has exactly ONE legitimate STAMP caller, and it
+  is NOT in this crate (LANE IDENTITY P-ID1).** `session_store.rs::
+  stamp_seal` is `pub` (crosses the crate boundary) the same way
+  `stamp_origin` does, but unlike `origin` it has no local-class call site
+  in `conduct.rs` at all — the ONLY caller is `aoide-server`'s daemon
+  `dispatch` handler, because the seal's signing key
+  (`aoide_storage::identity::mint_ephemeral`) lives only in THAT process's
+  memory (OQ1-A) and this crate has no access to it. Don't add a second
+  `stamp_seal` call site in this crate "for symmetry with `stamp_origin`"
+  — a call site here would have no key to sign with, and the invariant is
+  "one door, one key, one caller", stricter than `origin`'s "shape-gated,
+  multiple callers". `window.rs::pid_starttime` (re-exported at
+  `graph::pid_starttime`) is a pure `/proc` reader with NO knowledge of
+  sealing at all — don't fold sealing logic into it; `aoide-server` composes
+  it with `aoide_storage::sealed_id::mint_seal` itself. **No gate in this
+  crate (or anywhere) reads `seal` yet** — same P-ID1/P-ID2 boundary as
+  `origin` above, don't wire one in without reading the LANE IDENTITY plan
+  section first.
 
 ## Extension points
 

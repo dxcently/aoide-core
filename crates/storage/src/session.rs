@@ -119,6 +119,10 @@ pub fn upsert_session(
             // aoide-server's A2A door spawned on behalf of a paired peer; a
             // fresh registration otherwise starts without one.
             origin: None,
+            // Stamped later by `stamp_seal` (LANE IDENTITY P-ID1), only once
+            // a daemon has minted a sealed credential over this record's
+            // pid; a fresh registration otherwise starts without one.
+            seal: None,
             // Stamped later by the PTY tick's `conduct_refresh_shell`
             // (P-C5), only for a conducted SHELL; a fresh registration has
             // not ticked yet.

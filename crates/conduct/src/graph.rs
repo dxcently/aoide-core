@@ -61,6 +61,12 @@ pub use self::session_store::{session_end, session_phase, session_start};
 // child's own (forgeable) env. `stamp_origin`'s own doc comment names both
 // legitimate callers.
 pub use self::session_store::stamp_origin;
+// LANE IDENTITY P-ID1: `aoide-server`'s daemon `dispatch` handler is the one
+// legitimate caller — it stamps a just-minted sealed credential directly
+// onto the record it just registered a pid for, the same "stamp from the
+// authority that just authenticated the fact" shape `stamp_origin` set the
+// precedent for.
+pub use self::session_store::stamp_seal;
 // `graph spawn` (P2 of the conducted-agents plan): the detached sibling of
 // `conduct` that re-execs `conduct --headless` and returns without
 // waiting on the agent's own lifetime — see `graph/spawn.rs`'s module doc.
@@ -117,3 +123,9 @@ pub(crate) use self::window::hyprctl_clients;
 /// commands (`screen shot --session`, `screen point --from-shot`, …) already
 /// relied on when they lived here.
 pub use self::window::normalize_addr;
+
+/// LANE IDENTITY P-ID1: `aoide-server`'s daemon needs this SAME careful
+/// `/proc/<pid>/stat` parse (window.rs's own doc) to mint a sealed
+/// credential's `pidStarttime` field — re-exported here rather than a
+/// second implementation one crate up.
+pub use self::window::pid_starttime;

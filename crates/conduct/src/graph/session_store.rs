@@ -517,6 +517,45 @@ pub fn stamp_origin(id: &str, origin: &str) {
     });
 }
 
+/// Stamp `seal` on a just-registered session record (LANE IDENTITY P-ID1,
+/// `docs/architecture/CONTRACTS.md`'s identity section). A PERMANENT birth
+/// fact once set — change-only, the same shape [`stamp_origin`] just above
+/// holds, and a silent no-op for an unknown id or an empty `seal`. No
+/// `restage_graph()`: like `origin`/`hookAncestry`, this field is consumed
+/// internally (P-ID2's verify-on-accept, not built yet) rather than
+/// rendered into `graph.json`, so stamping it must not churn the
+/// widget-facing document.
+///
+/// `pub` (crosses the crate boundary) with exactly ONE legitimate caller:
+/// `aoide-server`'s daemon `dispatch` handler, which mints the seal over the
+/// pid the record it just registered already carries (P-ID1's scaffolding —
+/// P-ID2 replaces that pid with a peercred-authenticated one) and stamps it
+/// here, the same "stamp from the authority that just authenticated the
+/// fact" shape [`stamp_origin`]'s own doc names. **No gate reads this field
+/// yet** — this call proves the mint/store/verify mechanism, nothing more.
+pub fn stamp_seal(id: &str, seal: &str) {
+    if seal.is_empty() {
+        return;
+    }
+    with_stage_lock(|| {
+        let mut file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        if let Some(s) = file
+            .sessions
+            .iter_mut()
+            .find(|s| s.session_id == id && s.seal.as_deref() != Some(seal))
+        {
+            s.seal = Some(seal.to_string());
+            if file.schema_version.is_empty() {
+                file.schema_version = STAGE_GRAPH_VERSION.to_string();
+            }
+            let _ = write_stage(&sessions_path(), &file);
+        }
+    });
+}
+
 /// Stamp `harnessSessionId` — the raw hook payload's OWN `session_id` field
 /// (P-D7) — on a session record, on EVERY hook event that carries one, not
 /// just at registration: unlike `hookAncestry`/`headless` (birth facts,
@@ -2239,6 +2278,41 @@ mod tests {
         stamp_origin("no-such-session", "peer:ghost");
         let s3: SessionsFile = load_stage(&sessions_path()).unwrap();
         assert_eq!(s3.sessions.iter().find(|r| r.session_id == "local-1").unwrap().origin, None);
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn stamp_seal_lands_the_field_and_never_restages_graph_json() {
+        // LANE IDENTITY P-ID1: `stamp_seal` is `graph.json`-invisible, the
+        // same shape `stamp_origin`'s own sibling test just above proves.
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("stamp-seal");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        do_session_start("sealed-1", Some("claude"), Some("/w"), None, None, None, None, None, None);
+        stamp_seal("sealed-1", "deadbeefcafe");
+
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let rec = s.sessions.iter().find(|r| r.session_id == "sealed-1").unwrap();
+        assert_eq!(rec.seal.as_deref(), Some("deadbeefcafe"));
+
+        // A registration nobody sealed never gets a `seal` at all.
+        do_session_start("unsealed-1", Some("claude"), Some("/w"), None, None, None, None, None, None);
+        let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let unsealed = s2.sessions.iter().find(|r| r.session_id == "unsealed-1").unwrap();
+        assert_eq!(unsealed.seal, None);
+
+        // An empty seal is a no-op, same as an unknown id.
+        stamp_seal("unsealed-1", "");
+        stamp_seal("no-such-session", "deadbeef");
+        let s3: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(s3.sessions.iter().find(|r| r.session_id == "unsealed-1").unwrap().seal, None);
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),

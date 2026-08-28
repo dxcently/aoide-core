@@ -234,6 +234,38 @@ fn mint() -> io::Result<(Keypair, bool)> {
     ))
 }
 
+/// Mint a fresh keypair that lives ONLY in this process's memory — never
+/// written to disk. This is [`mint`]'s ON-DISK-write-free twin, added for
+/// LANE IDENTITY P-ID1's sealed session credential (`docs/architecture/
+/// CONTRACTS.md`'s identity section): under OQ1-A the daemon's seal-signing
+/// key must NOT be [`load_or_mint`]'s own on-disk key, because that file is
+/// `0600` under the OPERATOR's own uid — readable by the exact same-uid
+/// adversary this lane's thesis names, so a same-uid attacker could forge a
+/// seal by reading it. An ephemeral key's secrecy instead rests on process
+/// liveness (a same-uid attacker can read any file but not another live
+/// process's heap without `ptrace`, which Yama `ptrace_scope>=1` blocks by
+/// default) — see the daemon-side caller's own doc for the full trust-root
+/// note.
+///
+/// Same keygen as [`mint`] (a fresh 32-byte seed off the system RNG via
+/// `getrandom::fill`), minus BOTH disk writes — no `identity/` dir, no
+/// `ed25519.key`, no `created_at` sidecar; `created_at` is simply "now",
+/// since there is no file to have minted it earlier. The caller is expected
+/// to call this ONCE per process and hold the returned [`Keypair`] for the
+/// whole process lifetime (a module-level `OnceLock` at the call site,
+/// LANE IDENTITY P-ID1's daemon wiring) — a second call mints a genuinely
+/// DIFFERENT key, silently invalidating every seal minted under the first.
+pub fn mint_ephemeral() -> io::Result<Keypair> {
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("system RNG unavailable: {e}")))?;
+    let signing_key = SigningKey::from_bytes(&seed);
+    Ok(Keypair {
+        signing_key,
+        created_at: now_iso_utc(),
+    })
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -327,6 +359,22 @@ mod tests {
         assert_eq!(loaded.info(), minted_info);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mint_ephemeral_never_touches_disk_and_two_calls_differ() {
+        // LANE IDENTITY P-ID1: no `AOIDE_STATE_DIR` is set at all here — if
+        // `mint_ephemeral` ever touched `fs::state_dir()`/`identity_dir()`,
+        // this test would either panic (no env) or pollute whatever the
+        // process's real state dir happens to be. Its only job is proving
+        // the in-memory contract.
+        let a = mint_ephemeral().unwrap();
+        let b = mint_ephemeral().unwrap();
+        assert_ne!(
+            a.info().pubkey_hex,
+            b.info().pubkey_hex,
+            "two ephemeral mints must be genuinely different keys, never memoized"
+        );
     }
 
     #[test]

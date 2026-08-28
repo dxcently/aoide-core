@@ -316,6 +316,20 @@ pub struct SessionRecord {
     /// projects it verbatim into the durable session ledger on exit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// The daemon-sealed session credential (LANE IDENTITY P-ID1,
+    /// `docs/architecture/CONTRACTS.md`'s identity section): a hex ed25519
+    /// signature (`aoide_storage::sealed_id::mint_seal`) over a
+    /// `SealedIdentity{sessionId, pid, pidStarttime, originClass, issuedAt}`
+    /// built from THIS record — an opaque, never-secret blob (it's a
+    /// signature; verifying it needs only the daemon's public key, never
+    /// this field back). Additive/v0-safe — absent on a legacy record and
+    /// on every record no daemon has sealed (today: the common case). **No
+    /// gate reads this field yet** — P-ID1 only mints/stores/verifies the
+    /// mechanism; P-ID2 wires a verify-on-accept check into the control
+    /// socket and send gate. Stamped by `aoide_conduct::graph::stamp_seal`,
+    /// change-only like `origin`/`hookAncestry` — never re-derived once set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal: Option<String>,
     /// Additive/v0-safe (P-C5, durable-sessions plan): a conducted SHELL's
     /// continuously-captured restore snapshot (`RestoreSnapshot`, above) —
     /// cwd/idle/argv/typed off the PTY tick. Absent for every non-shell
@@ -643,6 +657,34 @@ mod tests {
         let legacy: SessionRecord =
             serde_json::from_str(r#"{ "sessionId": "s", "windowAddress": "0x1" }"#).unwrap();
         assert_eq!(legacy.log_path, None);
+    }
+    #[test]
+    fn session_record_seal_round_trips_and_stays_absent_when_unset() {
+        // LANE IDENTITY P-ID1: `seal` serialises as a plain string when set,
+        // and is skipped (skip_serializing_if) when None — the same
+        // additive/v0-safe wire contract every other v0-safe field on this
+        // struct holds (`logPath`/`petname`/`origin` above).
+        let mut rec = SessionRecord {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        rec.seal = Some("deadbeef".to_string());
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("\"seal\":\"deadbeef\""), "serialised: {json}");
+        let back: SessionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.seal, rec.seal);
+
+        // A record with no seal omits the key entirely (no null noise) and a
+        // legacy record with no `seal` field parses to None.
+        let bare = SessionRecord {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        let bare_json = serde_json::to_string(&bare).unwrap();
+        assert!(!bare_json.contains("\"seal\""), "serialised: {bare_json}");
+        let legacy: SessionRecord =
+            serde_json::from_str(r#"{ "sessionId": "s", "windowAddress": "0x1" }"#).unwrap();
+        assert_eq!(legacy.seal, None);
     }
     #[test]
     fn session_record_petname_round_trips_and_stays_absent_when_unset() {

@@ -288,6 +288,24 @@ pub(in crate::graph) fn pid_ancestry(pid: i32) -> Vec<i32> {
     chain
 }
 
+/// Read `pid`'s start time (`/proc/<pid>/stat` field 22, 1-indexed —
+/// `man proc(5)`) — LANE IDENTITY P-ID1's other half of the (pid,
+/// starttime) reuse-proof identity a sealed credential is minted over (this
+/// module's own doc header: "a pid alone is reusable, (pid, starttime) is
+/// the reuse-proof identity"). Same careful "split after the FINAL `)`"
+/// parse [`parent_pid`] already uses, extended one field further: after the
+/// closing paren, `state`(3) and `ppid`(4) are the first two whitespace
+/// fields [`parent_pid`] already consumes, so `starttime`(22) sits at index
+/// `22 - 3 = 19` in that same split — a fixed offset from the SAME anchor,
+/// never a second independent parse of the line. `None` on any read/parse
+/// miss (a vanished pid, a malformed `/proc` line, or a stripped-down
+/// `/proc` with fewer fields than expected).
+pub fn pid_starttime(pid: i32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after = &stat[stat.rfind(')')? + 1..];
+    after.split_whitespace().nth(22 - 3)?.parse().ok()
+}
+
 /// Automatic-parenting seam (task #89), tier 2: find the live AGENT-kind
 /// session whose own `hookAncestry` (stamped once at ITS SessionStart, see
 /// `session_store::stamp_hook_ancestry`) intersects THIS process's own
@@ -1522,6 +1540,24 @@ mod tests {
         assert!(chain.len() <= 64, "the walk is bounded");
         // A nonexistent pid yields just the seed (no /proc entry to walk up).
         assert_eq!(pid_ancestry(2_000_000_000), vec![2_000_000_000]);
+    }
+
+    #[test]
+    fn pid_starttime_reads_a_nonzero_value_for_our_own_real_pid() {
+        // LANE IDENTITY P-ID1: this is the exact call the daemon's `mint_seal`
+        // makes over a live pid — proving it against a real, running process
+        // (this test's own pid) is the ground-truth case, not a fixture.
+        let me = std::process::id() as i32;
+        let starttime = pid_starttime(me).expect("our own /proc/<pid>/stat must parse");
+        assert!(starttime > 0, "a real process's starttime is never zero");
+
+        // Reading it twice for the same live pid must be stable (it never
+        // changes for the life of the process).
+        assert_eq!(pid_starttime(me), Some(starttime));
+
+        // A nonexistent pid yields None (no /proc entry to read) — never a
+        // panic, never a fabricated 0.
+        assert_eq!(pid_starttime(2_000_000_000), None);
     }
 
     #[test]

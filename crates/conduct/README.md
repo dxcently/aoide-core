@@ -397,14 +397,33 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   this refusal. **This closes the STAMP paths, not the files**: a
   hand-crafted `sessions.json`/ledger line claiming `peer:X` is still a
   readable, unflagged string on disk — nothing here makes the files
-  tamper-evident; that is P-ID1 (the daemon-signed credential)/P-ID2 (the
-  peercred floor), still open. **Still not a security claim**: a same-uid
+  tamper-evident; that is P-ID1 (the daemon-signed credential, below) —
+  minted and stored, but nothing verifies it against an incoming
+  connection yet, which is P-ID2 (the peercred floor), still open.
+  **Still not a security claim**: a same-uid
   process can still forge a LOCAL-class origin, and neither the session's
   own identity nor the consumer presenting it are authenticated yet —
   nothing may gate a security decision on `origin` without the sealed
   credential task #63's lane builds next (P-ID1+). What P-ID0 closes: every
   record-STAMP path this codebase drives now refuses a `peer:*` shape it
   didn't mint itself at the door — env AND ledger both.
+- **Sealed session credential (LANE IDENTITY P-ID1) — this crate's two
+  scaffolding pieces, both consumed by `aoide-server`'s daemon, neither a
+  security boundary yet.** `session_store.rs::stamp_seal` is `SessionRecord.
+  seal`'s ONE stamp function (crosses the crate boundary, `pub`, mirroring
+  `stamp_origin` exactly: change-once, no `graph.json` projection), with
+  exactly one legitimate caller — `aoide-server`'s daemon `dispatch`
+  handler, which mints the seal (`aoide_storage::sealed_id::mint_seal`,
+  under the daemon's own in-memory-only keypair, OQ1-A) over the pid a
+  just-registered `session start` record already carries and stamps it
+  here. `window.rs::pid_starttime` (re-exported at `graph::pid_starttime`)
+  reads `/proc/<pid>/stat` field 22 — the SAME careful "split after the
+  final `)`" parse `parent_pid` already established, extended one field
+  further — so `aoide-server` never re-implements that parse for its own
+  `pidStarttime` need. See `CONTRACTS.md` §4's `seal` paragraph and
+  `aoide-storage`'s own README for the full mechanism and the OQ1-A
+  reasoning; **no gate in this codebase reads `seal` yet** — P-ID2 adds
+  the first verify-on-accept caller.
 - `who` — `aoide who [filter] [--json] [--all]` (`graph/who.rs`): live
   presence over this box's own sessions plus every registered peer,
   probed in parallel on each invocation (messaging workstream C2). A

@@ -74,6 +74,28 @@
   `accept_loop`/`handle_conn` — a second instance means two baselines that
   can each independently go stale against the other's writes, reopening
   task #92 by a different door.
+- **`daemon::seal_keypair` mints exactly ONE keypair per process, in a
+  `OnceLock`, and it must NEVER be written to disk (LANE IDENTITY P-ID1,
+  OQ1-A).** This is the daemon's own in-memory seal-signing key, deliberately
+  a DIFFERENT keypair from `state/identity/`'s on-disk peer-wire key — a
+  same-uid attacker can read that on-disk file, so a seal signed with it
+  would not be secret against the exact adversary this lane's thesis names.
+  Don't "simplify" by reusing `identity::load_or_mint`'s key here, and
+  don't add any code path that persists `seal_keypair`'s bytes anywhere —
+  its whole secrecy claim is "this process is still alive, and `ptrace`
+  against it is blocked" (Yama `ptrace_scope>=1`), which a disk copy would
+  destroy outright.
+- **`daemon::seal_freshly_registered_session` mints/stamps a seal ONLY for
+  a successful `session start` dispatch whose record already carries a
+  `pid`, and it is NOT a security gate.** No gate anywhere reads
+  `SessionRecord.seal` yet (P-ID2 adds the first verify-on-accept caller) —
+  don't make this function's success/failure affect the dispatch reply, and
+  don't wire a door/socket decision on `seal`'s presence without first
+  reading the LANE IDENTITY plan section (P-ID2/P-ID4's own scope). The pid
+  it mints over is the record's OWN `pid` field, not yet a peercred-verified
+  connecting pid — stated as scaffolding in its own doc comment, not to be
+  quietly upgraded into a security claim by a future edit that forgets the
+  boundary.
 - **Request-line reads on the daemon socket go through
   `daemon::read_capped_line` (a hand-rolled `fill_buf`/`consume` loop),
   never `BufReader::read_line` (P-D4, closing a P-D2-flagged gap).**

@@ -263,6 +263,7 @@ mod tests {
             harness_session_id: None,
             resumed_from: None,
             origin: None,
+            seal: None,
             restore: None,
             extra: serde_json::Map::new(),
         }
