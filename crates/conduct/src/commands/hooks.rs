@@ -17,7 +17,7 @@
 //! config holds providers/credentials; the claude settings are hand-written),
 //! idempotent (the second run reports zero added), and reports exactly what
 //! changed. `--capture` is temporary debugging: the same graph entries with
-//! the command wrapped to tee raw payloads to `~/Aoide/state/<agent>-hooks.jsonl`
+//! the command wrapped to tee raw payloads to `$AOIDE_ROOT/state/<agent>-hooks.jsonl`
 //! (NOT `~/Aoide/log` — that path is the audit log FILE) — a DISTINCT
 //! idempotency key, so capture entries coexist with plain ones
 //! (installing without `--capture` replaces nothing) and are removed manually.
@@ -36,7 +36,7 @@ pub fn register(r: &mut Registry) {
         path: ["hooks", "install"],
         summary: "Wire an agent harness's settings file to pipe its hooks into `session hook`, and symlink the repo's skill directory into the harness's skills dir when it has one (idempotent merge; never clobbers existing config or an unrelated file at the link path).",
         args: [arg!("agent", "string", true, "Agent harness to wire up (claude | kimi | pi).")],
-        flags: [flag!("capture", "bool", "TEMPORARY debugging: wrap the hook command to tee raw payloads to ~/Aoide/state/<agent>-hooks.jsonl. Capture entries coexist with the plain ones (installing without --capture replaces nothing); remove them manually when done.")],
+        flags: [flag!("capture", "bool", "TEMPORARY debugging: wrap the hook command to tee raw payloads to $AOIDE_ROOT/state/<agent>-hooks.jsonl. Capture entries coexist with the plain ones (installing without --capture replaces nothing); remove them manually when done.")],
         gated: false,
         implemented: true,
         handler: hooks_install,
@@ -88,13 +88,19 @@ fn events_for(profile: &AgentProfile) -> Vec<&'static str> {
 /// directly; plain claude entries use the defensive wrapper the hand-written
 /// settings already carry (a missing aoide is a silent no-op, and the door
 /// never exits non-zero inside a hook). `--capture` tees the raw payload to
-/// `~/Aoide/state/<agent>-hooks.jsonl` first (`~/Aoide/log` is the audit log
-/// FILE, not a directory) — its `-hooks.jsonl` marker is what makes capture a
-/// distinct idempotency key.
+/// `$AOIDE_ROOT/state/<agent>-hooks.jsonl` first (`~/Aoide/log` is the audit
+/// log FILE, not a directory) — its `-hooks.jsonl` marker is what makes
+/// capture a distinct idempotency key. The path is baked as a SHELL
+/// expression, not an install-time-resolved absolute path: this command runs
+/// later, in the agent harness's own shell, at hook-fire time — so it
+/// expands `$AOIDE_ROOT` there (falling back to `$HOME/.aoide` unset), the
+/// same precedence `aoide_storage::fs::state_dir()`'s default branch
+/// resolves in Rust, rather than baking in whatever root happened to be
+/// configured on the installing host.
 fn door_command(profile: &AgentProfile, capture: bool) -> String {
     if capture {
         format!(
-            "sh -c 'tee -a \"$HOME/Aoide/state/{}-hooks.jsonl\" | aoide session hook --agent {}'",
+            "sh -c 'tee -a \"${{AOIDE_ROOT:-$HOME/.aoide}}/state/{}-hooks.jsonl\" | aoide session hook --agent {}'",
             profile.name, profile.name
         )
     } else {
@@ -463,11 +469,14 @@ fn hooks_install(inv: &Invocation) -> Outcome {
             )
         }
     };
-    // The capture wrap tees into ~/Aoide/state — make sure it exists.
+    // The capture wrap tees into `$AOIDE_ROOT/state` — make sure it exists.
+    // Resolved here via `state_dir()` (the installing host's OWN
+    // `$AOIDE_ROOT`/`$AOIDE_STATE_DIR`) purely so the directory pre-exists;
+    // the wrap baked into the settings file itself re-derives the same
+    // default at hook-fire time in its own shell (see `door_command`), so a
+    // later host with a different `$AOIDE_ROOT` still resolves correctly.
     if capture {
-        if let Some(home) = std::env::var_os("HOME") {
-            let _ = std::fs::create_dir_all(PathBuf::from(home).join("Aoide/state"));
-        }
+        let _ = std::fs::create_dir_all(aoide_storage::fs::state_dir());
     }
     // The skill link, after the settings merge (a skill refusal must not
     // block the hook wiring, and the report below carries both outcomes).
@@ -641,9 +650,14 @@ mod tests {
         let text = std::fs::read_to_string(root.join("kimi/config.toml")).unwrap();
         assert_eq!(text.matches("[[hooks]]").count(), 21, "plain + pointer + capture coexist");
         assert_eq!(text.matches(POINTER_MARKER).count(), 1);
-        assert!(text.contains("tee -a \\\"$HOME/Aoide/state/kimi-hooks.jsonl\\\" | aoide session hook --agent kimi"));
-        // The capture log dir was created.
-        assert!(root.join("Aoide/state").is_dir());
+        assert!(text.contains(
+            "tee -a \\\"${AOIDE_ROOT:-$HOME/.aoide}/state/kimi-hooks.jsonl\\\" | aoide session hook --agent kimi"
+        ));
+        // The capture log dir was created — under `$HOME/.aoide/state` here
+        // since `AOIDE_ROOT` is unset for this test (the installing host's
+        // `state_dir()` default), NOT under the retired `$HOME/Aoide`.
+        assert!(root.join(".aoide/state").is_dir());
+        assert!(!root.join("Aoide/state").exists());
 
         // Re-running EITHER mode adds nothing.
         let plain_again = hooks_install(&install_inv("kimi", false));
@@ -651,6 +665,46 @@ mod tests {
         let capture_again = hooks_install(&install_inv("kimi", true));
         assert_eq!(capture_again.data.unwrap()["changed"], false);
         assert_eq!(std::fs::read_to_string(root.join("kimi/config.toml")).unwrap(), text);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn capture_wrap_expands_aoide_root_at_hook_fire_time_not_install_time() {
+        // The wrap is a SHELL snippet baked into the installed hook config,
+        // not a path resolved in Rust at install time — so `door_command`
+        // must emit the `${AOIDE_ROOT:-...}` expansion form literally,
+        // whatever this process's own env happens to be, and never a
+        // hardcoded `~/Aoide` or an install-time-resolved absolute path.
+        let profile = agent_profile("kimi").unwrap();
+        let cmd = door_command(&profile, true);
+        assert!(
+            cmd.contains("${AOIDE_ROOT:-$HOME/.aoide}/state/kimi-hooks.jsonl"),
+            "wrap did not carry the AOIDE_ROOT-with-fallback expansion: {cmd}"
+        );
+        assert!(!cmd.contains("Aoide/state"), "wrap still names the retired ~/Aoide root: {cmd}");
+    }
+
+    #[test]
+    fn capture_install_creates_the_log_dir_under_a_configured_aoide_root() {
+        // Install-time, the capture log dir is pre-created via
+        // `aoide_storage::fs::state_dir()` — proving it tracks a CONFIGURED
+        // `AOIDE_ROOT` (a scratch path here), not the retired `~/Aoide`.
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _env = EnvSaver::capture(&["KIMI_CODE_HOME", "HOME", "AOIDE_ROOT", "AOIDE_STATE_DIR"]);
+        std::env::remove_var("AOIDE_STATE_DIR");
+        let root = unique_tmp("hooks-kimi-cap-root");
+        let home = root.join("home");
+        let aoide_root = root.join("configured-root");
+        std::env::set_var("KIMI_CODE_HOME", home.join("kimi"));
+        std::env::set_var("HOME", &home);
+        std::env::set_var("AOIDE_ROOT", &aoide_root);
+
+        hooks_install(&install_inv("kimi", true));
+
+        assert!(aoide_root.join("state").is_dir());
+        assert!(!home.join("Aoide/state").exists());
+        assert!(!home.join(".aoide/state").exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }
