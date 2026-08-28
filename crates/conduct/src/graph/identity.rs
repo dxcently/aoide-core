@@ -26,9 +26,7 @@
 //! un-bypassably — the replacement for the old client-side `is_self_send`
 //! guard, which only ever guarded well-behaved callers of `aoide send`).
 
-use super::model::{canonical_state, SessionRecord};
-use super::window::{pid_ancestry, pid_starttime};
-use aoide_storage::sealed_id::{verify_seal, SealedIdentity};
+use super::model::SessionRecord;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 
@@ -80,35 +78,16 @@ pub(crate) fn peer_cred(stream: &UnixStream) -> Option<PeerCred> {
 
 /// Reconstruct the exact `SealedIdentity` `rec.seal` was signed over and
 /// check it against `pubkey_hex` (LANE IDENTITY P-ID2). Fail-closed on
-/// every incomplete/unrevalidatable shape, never treated as "verified":
-/// no `pid` (never conductable), no `seal`/`sealedIssuedAt` (never
-/// sealed), or a live `/proc/<pid>/stat` read that comes back absent OR
-/// exactly `0` — a `0` starttime is `mint_seal`'s own documented degrade
-/// for a pid that had ALREADY vanished at mint time (`CONTRACTS.md`'s
-/// identity section: "no live process ever reports starttime 0"), so a
-/// FRESH read landing on `0` here can only mean the pid still doesn't
-/// exist, never a legitimate match. `pid`/`sessionId`/`originClass` come
-/// straight off the record; `pidStarttime` is RE-DERIVED fresh (never
-/// trusted from a stored value — this is the pid-reuse defense: a stale
-/// mint-time value simply fails to match a live process's real starttime).
+/// every incomplete/unrevalidatable shape, never treated as "verified" —
+/// `pidStarttime` RE-DERIVED fresh, never trusted from a stored value (the
+/// pid-reuse defense). The BODY lives in `aoide_storage::attest::
+/// verify_seal_over` as of LANE IDENTITY P-ID4 (the secrets broker's origin
+/// gate verifies the identical seal shape and `aoide-secrets` cannot depend
+/// on this crate — that module's doc has the full DAG argument and the
+/// complete fail-closed contract); this delegate keeps `crate::graph`'s
+/// call sites and tests unchanged.
 pub(in crate::graph) fn verify_seal_over(rec: &SessionRecord, pubkey_hex: &str) -> bool {
-    let (Some(pid), Some(seal_hex), Some(issued_at)) =
-        (rec.pid, rec.seal.as_deref(), rec.sealed_issued_at)
-    else {
-        return false;
-    };
-    let starttime = match pid_starttime(pid as i32) {
-        Some(t) if t != 0 => t,
-        _ => return false,
-    };
-    let identity = SealedIdentity {
-        session_id: rec.session_id.clone(),
-        pid: pid as i32,
-        pid_starttime: starttime,
-        origin_class: rec.origin.clone().unwrap_or_default(),
-        issued_at,
-    };
-    verify_seal(pubkey_hex, &identity, seal_hex)
+    aoide_storage::attest::verify_seal_over(rec, pubkey_hex)
 }
 
 /// The kernel-attested sender resolution (LANE IDENTITY P-ID2, module
@@ -130,19 +109,17 @@ pub(in crate::graph) fn verify_seal_over(rec: &SessionRecord, pubkey_hex: &str) 
 /// `None` when no ancestor resolves — an "unidentified" caller, which
 /// every gate caller must treat as fail-closed (pending), never as a
 /// benign default.
+/// The BODY (the nearest-first walk over the real `/proc` ancestry) lives
+/// in `aoide_storage::attest::attested_session` as of LANE IDENTITY P-ID4
+/// — one walk, shared with the secrets broker's origin gate (that module's
+/// doc has the DAG argument); this delegate keeps `crate::graph`'s call
+/// sites, tests, and the name `attested_sender` unchanged.
 pub(in crate::graph) fn attested_sender(
     start_pid: i32,
     sessions: &[SessionRecord],
     verify: impl Fn(&SessionRecord) -> bool,
 ) -> Option<String> {
-    for pid in pid_ancestry(start_pid) {
-        if let Some(rec) = sessions.iter().find(|s| {
-            s.pid == Some(pid as u32) && canonical_state(&s.state) != "done" && verify(s)
-        }) {
-            return Some(rec.session_id.clone());
-        }
-    }
-    None
+    aoide_storage::attest::attested_session(start_pid, sessions, verify)
 }
 
 /// The per-session control socket's self-injection refusal (LANE IDENTITY
@@ -195,7 +172,9 @@ pub(in crate::graph) fn is_self_originated(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::window::{pid_ancestry, pid_starttime};
     use aoide_storage::identity;
+    use aoide_storage::sealed_id::SealedIdentity;
 
     fn sealed_record(session_id: &str, pid: i32, origin: Option<&str>, kp: &identity::Keypair) -> SessionRecord {
         let starttime = pid_starttime(pid).expect("test pids must be real, live pids");

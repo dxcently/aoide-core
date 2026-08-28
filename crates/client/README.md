@@ -9,12 +9,16 @@ never the inbound/serve half (that's `aoide-server`).
 - `daemon` — the fourth door's outbound half (P-D6, `docs/architecture/
   AOIDED.md`'s "L4 — graph residency"): `daemon_dispatch(&Invocation) ->
   Option<Outcome>` tries the resident `aoided`'s `{"op":"dispatch"}` wire
-  (`socket_path()` re-derives `$AOIDE_DAEMON_SOCKET` →
+  (`socket_path()` resolves `$AOIDE_DAEMON_SOCKET` →
   `$XDG_RUNTIME_DIR/aoide/aoided.sock`, the identical convention
-  `aoide_server::daemon::socket_path` resolves — re-derived rather than
-  imported, since this crate sits BELOW `aoide-server` in the DAG) with a
-  bounded connect (`connect_bounded`, a background-thread-plus-channel
-  race, ~100ms). `None` means "nothing usable answered" — the caller's own
+  `aoide_server::daemon::socket_path` resolves — this crate sits BELOW
+  `aoide-server` in the DAG, so it is never imported from there; as of
+  LANE IDENTITY P-ID4 the derivation's body, the bounded connect
+  (`connect_bounded`, a background-thread-plus-channel race, ~100ms), and
+  the `daemon_seal_pubkey_hex` ping fetch all live in
+  `aoide_storage::attest`, with this module's public seams delegating —
+  the secrets broker's origin gate needs the same fetch and cannot depend
+  on this crate). `None` means "nothing usable answered" — the caller's own
   pre-existing direct stage-write path runs unchanged; any OTHER failure
   once a connection exists becomes `Some(Outcome::error(...))` instead of a
   silent fallback, since a daemon that answered but broke is a real bug

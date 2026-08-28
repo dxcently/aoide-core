@@ -418,15 +418,17 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   pid) and the daemon's own tick-driven `seal_unsealed_live_sessions`
   sweep (closes the gap the dispatch-only path left: a DIRECTLY-registered
   `aoide conduct` session, the common case, never touches `dispatch` at
-  all). `window.rs::pid_starttime` (re-exported at `graph::pid_starttime`)
-  reads `/proc/<pid>/stat` field 22 — the SAME careful "split after the
-  final `)`" parse `parent_pid` already established, extended one field
-  further — both at MINT time (the daemon, over the pid a record already
-  carries) and at VERIFY time (this crate's own `graph/identity.rs`,
-  re-reading it FRESH for the connecting/attested pid — never trusting a
-  stored value, the pid-reuse defense). `graph/identity.rs` is where the
-  gate lands: `attested_sender` walks a pid's real `/proc` ancestry
-  (`window.rs::pid_ancestry`, already generalized to an arbitrary pid) to
+  all). `window.rs::pid_starttime` (re-exported at `graph::pid_starttime`;
+  its body — the `/proc/<pid>/stat` field-22 read — lives in
+  `aoide_storage::attest` as of LANE IDENTITY P-ID4, this crate
+  delegating) is read both at MINT time (the daemon, over the pid a record
+  already carries) and at VERIFY time (this crate's own
+  `graph/identity.rs`, re-reading it FRESH for the connecting/attested pid
+  — never trusting a stored value, the pid-reuse defense).
+  `graph/identity.rs` is where the gate lands: `attested_sender` walks a
+  pid's real `/proc` ancestry (`window.rs::pid_ancestry`; both walk bodies
+  likewise delegated to `aoide_storage::attest`, shared with the secrets
+  broker's P-ID4 origin gate) to
   find a session whose seal `verify_seal_over` confirms against the
   daemon's LIVE public key (`aoide_client::daemon::daemon_seal_pubkey_hex`
   — a fresh `ping` round trip, never cached, never a file; that channel is

@@ -52,7 +52,6 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::mpsc;
 use std::time::Duration;
 
 /// The connect half's budget (module doc) — short, since a live daemon on
@@ -68,25 +67,16 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
 /// finish under ordinary load.
 const ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Resolve the daemon's own control socket — mirrors
-/// `aoide_server::daemon::socket_path` exactly (module doc's "Why this
-/// isn't..."): `$AOIDE_DAEMON_SOCKET` when set to a non-blank value, else
-/// `$XDG_RUNTIME_DIR/aoide/aoided.sock`.
+/// Resolve the daemon's own control socket — `$AOIDE_DAEMON_SOCKET` when
+/// set to a non-blank value, else `$XDG_RUNTIME_DIR/aoide/aoided.sock`
+/// (mirroring `aoide_server::daemon::socket_path`, module doc's "Why this
+/// isn't..."). The derivation's BODY lives in `aoide_storage::attest::
+/// daemon_socket_path` as of LANE IDENTITY P-ID4 — the secrets broker's
+/// origin gate fetches the daemon's seal pubkey over the same socket and
+/// `aoide-secrets` cannot depend on this crate (that module's doc has the
+/// full DAG argument); this delegate keeps every caller unchanged.
 pub fn socket_path() -> PathBuf {
-    if let Ok(p) = std::env::var("AOIDE_DAEMON_SOCKET") {
-        if !p.trim().is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    runtime_dir().join("aoided.sock")
-}
-
-fn runtime_dir() -> PathBuf {
-    let runtime = std::env::var("XDG_RUNTIME_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/run/user/1000".into());
-    PathBuf::from(runtime).join("aoide")
+    aoide_storage::attest::daemon_socket_path()
 }
 
 /// Bounded replacement for `UnixStream::connect` (module doc's "Why the
@@ -96,17 +86,10 @@ fn runtime_dir() -> PathBuf {
 /// the thread itself still exits the moment the OS call returns, it is
 /// never left blocked forever.
 fn connect_bounded(socket_path: &std::path::Path, timeout: Duration) -> Option<UnixStream> {
-    let (tx, rx) = mpsc::channel();
-    let sp = socket_path.to_path_buf();
-    if std::thread::Builder::new().spawn(move || {
-        let _ = tx.send(UnixStream::connect(&sp));
-    }).is_err() {
-        return None; // Could not even spawn the racer thread — treat as "no daemon."
-    }
-    match rx.recv_timeout(timeout) {
-        Ok(Ok(stream)) => Some(stream),
-        Ok(Err(_)) | Err(_) => None,
-    }
+    // The thread-plus-channel race the module doc describes — its BODY
+    // moved to `aoide_storage::attest::connect_bounded` at LANE IDENTITY
+    // P-ID4 alongside the seal-pubkey fetch it bounds there.
+    aoide_storage::attest::connect_bounded(socket_path, timeout)
 }
 
 /// Try the resident daemon's `dispatch` op for `inv`; `None` means the
@@ -196,21 +179,12 @@ fn parse_dispatch_reply(inv: &Invocation, reply: &str) -> Option<Outcome> {
 /// same-uid process can already connect to directly (CONTRACTS.md's own
 /// honesty note on this exact boundary).
 pub fn daemon_seal_pubkey_hex() -> Option<String> {
-    let socket_path = socket_path();
-    let mut stream = connect_bounded(&socket_path, CONNECT_TIMEOUT)?;
-    if stream.set_read_timeout(Some(ROUND_TRIP_TIMEOUT)).is_err() {
-        return None;
-    }
-    if stream.write_all(b"{\"op\":\"ping\"}\n").is_err() {
-        return None;
-    }
-    let mut reader = BufReader::new(stream);
-    let mut reply = String::new();
-    if reader.read_line(&mut reply).ok()? == 0 {
-        return None;
-    }
-    let v: Value = serde_json::from_str(reply.trim()).ok()?;
-    v.get("sealPubkeyHex").and_then(Value::as_str).map(str::to_string)
+    // The fetch's BODY lives in `aoide_storage::attest::daemon_seal_pubkey_hex`
+    // as of LANE IDENTITY P-ID4 — the secrets broker's origin gate needs the
+    // SAME live-ping fetch and `aoide-secrets` cannot depend on this crate
+    // (that module's doc has the DAG argument; every property this doc
+    // states — fresh, uncached, never a file — holds there verbatim).
+    aoide_storage::attest::daemon_seal_pubkey_hex()
 }
 
 #[cfg(test)]

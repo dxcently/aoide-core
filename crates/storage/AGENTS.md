@@ -118,28 +118,34 @@
   that vanished before mint) — pinned by `aoide-server::daemon::tests::
   mint_seal_over_a_vanished_pid_degrades_to_a_self_consistent_but_
   unrevalidatable_zero_starttime`.** No genuine `/proc/<pid>/stat` read
-  ever reports starttime `0` (`window.rs::
+  ever reports starttime `0` (`attest.rs::
   pid_starttime_reads_a_nonzero_value_for_our_own_real_pid` proves a real
   read is always `> 0`), so a verifier that reconstructs `SealedIdentity`
-  from a fresh live read can never produce a matching `0`. `aoide_conduct::
-  graph::identity::verify_seal_over` (P-ID2's verify-on-accept caller)
-  branches on this explicitly, up front — a `None`/`0` live read is
-  refused before ever reaching `verify_seal`, never falling through to an
-  ordinary verify that would simply (and silently) fail for the wrong
-  reason; pinned by that function's own `verify_seal_over_rejects_when_
-  the_live_starttime_read_is_unreadable` test.
-- **`SessionRecord.seal`/`sealedIssuedAt` are consumed OUTSIDE this
-  crate — don't add a gate here.** This crate mints, stores, and
-  cryptographically verifies a seal (`sealed_id::{mint_seal,verify_seal}`)
-  but makes NO policy decision on one — both real consumers
-  (`aoide-conduct`'s send gate and its per-session control socket's accept
-  loop, LANE IDENTITY P-ID2) live in `aoide-conduct::graph::identity`,
-  which reconstructs the exact `SealedIdentity` a stored `seal` was signed
-  over and calls this crate's `verify_seal` against a pubkey it fetches
-  itself over the daemon's `ping` reply. P-ID4 is the first phase to gate
-  a REAL policy decision (per-secret `allowRemoteOrigin`) on a VERIFIED
-  `originClass` — that policy logic belongs in `aoide-secrets`/
-  `aoide-server`, not here either.
+  from a fresh live read can never produce a matching `0`.
+  `attest::verify_seal_over` (P-ID2's verify-on-accept, its body lifted
+  here at P-ID4 — `aoide_conduct::graph::identity` delegates) branches on
+  this explicitly, up front — a `None`/`0` live read is refused before
+  ever reaching `verify_seal`, never falling through to an ordinary
+  verify that would simply (and silently) fail for the wrong reason;
+  pinned by `attest.rs`'s own stale-starttime rejection test and the
+  delegate-side `verify_seal_over_rejects_when_the_live_starttime_read_
+  is_unreadable` test.
+- **This crate RESOLVES a sealed caller (`attest`, LANE IDENTITY P-ID4)
+  but never GATES on one — policy decisions stay outside.** `attest.rs`
+  is the ONE implementation of the "pid → real `/proc` ancestry → sealed
+  session → verified origin" lookup (the walk, the fresh-starttime
+  `verify_seal_over`, the live `ping` seal-pubkey fetch) — lifted here
+  because both consumers need it and the DAG forbids every other shared
+  home (`aoide-secrets` may never depend on `aoide-conduct`/`aoide-client`;
+  that module's own doc has the full argument). `aoide-conduct::graph::
+  {window,identity}` and `aoide-client::daemon` keep their public seams as
+  thin delegates onto it — edit the BODY here, never regrow one in a
+  delegate. What each caller DOES with a resolved (or `None` =
+  UNIDENTIFIED, never "verified") answer is that caller's own documented
+  gate decision: the send gate + per-session accept loop (P-ID2, in
+  `aoide-conduct`), and the secrets broker's per-secret `allowRemoteOrigin`
+  origin gate (P-ID4, in `aoide-secrets`) — that policy logic never moves
+  here.
 - **`wire_auth::canonical_string`'s five-field order, NUL-separator, and
   lowercased/trimmed style are the wire contract, not an implementation
   detail (P-P4) — pinned by

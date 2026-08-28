@@ -396,17 +396,30 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   (a fresh `/proc` read) — without it, checking a signature means
   brute-forcing every plausible mint instant, which is exactly what this
   module's OWN P-ID1 test suite did before this field existed. **P-ID2 is
-  the first phase to read `seal`**: `aoide-conduct::graph::identity::
-  verify_seal_over` reconstructs the exact signed `SealedIdentity` from a
-  record (never trusting a stored `pidStarttime`, always a fresh `/proc`
-  read) and calls this module's `verify_seal` against the daemon's LIVE
-  public key; `attested_sender` walks a pid's ancestry looking for one that
-  verifies, feeding both `aoide-conduct`'s send gate and its per-session
-  control socket's accept loop (see that crate's own README for the
-  wiring). This module's own test suite (verify TRUE on a genuine seal,
-  FALSE on any single tampered field including a case-only-different
-  `sessionId`, FALSE under a different keypair) still proves the mechanism
-  in isolation; P-ID2's tests prove the real consumers.
+  the first phase to read `seal`**: `attest::verify_seal_over` (below)
+  reconstructs the exact signed `SealedIdentity` from a record (never
+  trusting a stored `pidStarttime`, always a fresh `/proc` read) and calls
+  this module's `verify_seal` against the daemon's LIVE public key. This
+  module's own test suite (verify TRUE on a genuine seal, FALSE on any
+  single tampered field including a case-only-different `sessionId`, FALSE
+  under a different keypair) still proves the mechanism in isolation; the
+  consumers' tests prove the wiring.
+- `attest` — the kernel-attested caller resolution (LANE IDENTITY P-ID4's
+  seam lift; bodies moved from `aoide-conduct::graph::{window,identity}`
+  and `aoide-client::daemon`, which all delegate here): the bounded
+  `/proc` ancestry walk (`pid_ancestry`, self-first/nearest-first) and
+  starttime read (`pid_starttime`), `verify_seal_over` (fresh-starttime
+  reconstruction — the pid-reuse defense), `attested_session` (the
+  verified nearest-ancestor walk the send gate keys on), the daemon
+  seal-pubkey channel (`daemon_socket_path`/`connect_bounded`/
+  `daemon_seal_pubkey_hex` — a LIVE `ping` round trip, never a file), and
+  `attested_caller` — the secrets broker's one-stop: peercred pid →
+  verified `(sessionId, originClass)`, `None` = UNIDENTIFIED. Lives here
+  because the crate DAG forbids every other shared home (`aoide-secrets`
+  may never depend on `aoide-conduct`/`aoide-client`) and every ingredient
+  — `records::SessionRecord`, `stage::sessions_path`, `sealed_id`,
+  `identity` — already does; resolution only, never a policy decision
+  (this crate's `AGENTS.md`).
 - `wire_auth` — per-request signed wire authentication for paired peers
   (P-P4, `docs/architecture/PAIRING.md`'s "Wire authentication (paired
   peers)" section, CONTRACTS.md §6's own amendment for the full wire

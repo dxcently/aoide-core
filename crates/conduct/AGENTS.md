@@ -623,15 +623,16 @@
   symmetry with `stamp_origin`" — there is no key to sign with here.
   VERIFYING, by contrast, needs only the PUBLIC key (never secret,
   `aoide_client::daemon::daemon_seal_pubkey_hex` fetches it fresh over
-  `ping`) — that half DOES live here: `graph/identity.rs::verify_seal_over`
-  reconstructs the exact signed `SealedIdentity` (re-deriving `pidStarttime`
-  FRESH via `window.rs::pid_starttime` — never trusting a stored value,
-  the pid-reuse defense) and `attested_sender` walks a pid's real
-  `/proc` ancestry (`window.rs::pid_ancestry`) looking for one that
-  verifies. `graph/send.rs`'s gate and `graph/conduct.rs`'s accept loop are
-  the two consumers — see each file's own module doc. Don't fold sealing
-  or verification logic into `window.rs::pid_starttime` itself — it stays a
-  pure `/proc` reader with no knowledge of either.
+  `ping`) — that half's SEAMS live here, but as of LANE IDENTITY P-ID4
+  their BODIES live in `aoide_storage::attest` (the secrets broker's
+  origin gate needs the identical walk/verify and `aoide-secrets` cannot
+  depend on this crate — that module's doc has the full DAG argument):
+  `graph/identity.rs::verify_seal_over`, `attested_sender`, and
+  `window.rs::pid_ancestry`/`pid_starttime` are thin delegates keeping
+  every `crate::graph` call site and test unchanged. Edit the body in
+  `aoide-storage::attest`, never regrow one in a delegate here.
+  `graph/send.rs`'s gate and `graph/conduct.rs`'s accept loop are the two
+  consumers in this crate — see each file's own module doc.
 - **`identity::peer_cred`/`PeerCred` are `pub(crate)`, not `pub(in
   crate::graph)` (LANE IDENTITY P-ID3) — `shellbridge.rs` reuses them
   directly.** Widened once, for exactly the reason `graph.rs`'s own `mod

@@ -97,6 +97,7 @@
 
 pub mod addr;
 pub mod advertise;
+pub mod attest;
 pub mod commands;
 pub mod display;
 pub mod edits;

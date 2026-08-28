@@ -120,12 +120,15 @@
 - **`daemon::daemon_dispatch` is outbound too, not an exception to "outbound
   only."** It is the CLIENT side of the fourth door (P-D6): a routed
   handler in `conduct`/`server` calling OUT to the resident `aoided`'s
-  socket, never anything that listens. `daemon::socket_path` re-derives
-  `aoide_server::daemon::socket_path`'s exact convention rather than
-  importing it — this crate sits BELOW `aoide-server` in the DAG (`server`
+  socket, never anything that listens. `daemon::socket_path` resolves
+  `aoide_server::daemon::socket_path`'s exact convention without importing
+  it from there — this crate sits BELOW `aoide-server` in the DAG (`server`
   depends on `conduct`, which depends on this crate), so an import would
-  invert it; a change to the daemon socket's resolution rule updates BOTH
-  copies in the same commit.
+  invert it. As of LANE IDENTITY P-ID4 the derivation (plus
+  `connect_bounded` and the `daemon_seal_pubkey_hex` ping fetch) lives in
+  `aoide_storage::attest` with this module delegating — edit the body
+  there; a change to the daemon socket's resolution rule updates that body
+  AND `aoide-server`'s bind-side copy in the same commit.
 - **`daemon_dispatch` returning `None` is not the same as an error, and the
   distinction is load-bearing.** `None` means "nothing usable answered" —
   dead socket, refused connect, or `inv.door == Door::Daemon` (the

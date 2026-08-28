@@ -255,18 +255,6 @@ pub fn focus_workspace(ws: i64) -> Result<(), FocusError> {
 // so every impure step is guarded and an empty result just leaves the address
 // unset (exactly as before this phase).
 
-/// Read the parent pid of `pid` from `/proc/<pid>/stat`. The `comm` (2nd) field
-/// is wrapped in parens and may itself contain spaces or `)`, so ppid is parsed
-/// as the 2nd whitespace field AFTER the FINAL `)` (state, then ppid) — the only
-/// robust way to split a stat line. `None` on any read/parse miss.
-fn parent_pid(pid: i32) -> Option<i32> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after = &stat[stat.rfind(')')? + 1..];
-    let mut fields = after.split_whitespace();
-    let _state = fields.next()?; // the process state char
-    fields.next()?.parse().ok() // ppid
-}
-
 /// The pid-ancestry chain of `pid`, self first, walking up the ppid chain via
 /// `/proc`. Bounded (a bad `/proc` or a self-parenting loop can never spin) and
 /// stops at init (ppid ≤ 1) — the terminal is always a mid-chain ancestor.
@@ -274,36 +262,27 @@ fn parent_pid(pid: i32) -> Option<i32> {
 /// Widened from module-private to `pub(in crate::graph)` (task #89): the
 /// automatic-parenting seam (`ancestry_parent`, below) and the hook door
 /// (`send.rs`, stamping a fresh session's own `hookAncestry`) both need this
-/// SAME real-`/proc` walk — never a second implementation of it.
+/// SAME real-`/proc` walk — never a second implementation of it. The BODY
+/// (and its `parent_pid` stat-line parse) lives in
+/// `aoide_storage::attest::pid_ancestry` as of LANE IDENTITY P-ID4 — the
+/// secrets broker's origin gate needs the identical walk and `aoide-secrets`
+/// cannot depend on this crate (that module's own doc has the full DAG
+/// argument); this delegate keeps every `crate::graph` call site unchanged.
 pub(in crate::graph) fn pid_ancestry(pid: i32) -> Vec<i32> {
-    let mut chain = Vec::new();
-    let mut cur = pid;
-    for _ in 0..64 {
-        chain.push(cur);
-        match parent_pid(cur) {
-            Some(p) if p > 1 && p != cur => cur = p,
-            _ => break,
-        }
-    }
-    chain
+    aoide_storage::attest::pid_ancestry(pid)
 }
 
 /// Read `pid`'s start time (`/proc/<pid>/stat` field 22, 1-indexed —
 /// `man proc(5)`) — LANE IDENTITY P-ID1's other half of the (pid,
 /// starttime) reuse-proof identity a sealed credential is minted over (this
 /// module's own doc header: "a pid alone is reusable, (pid, starttime) is
-/// the reuse-proof identity"). Same careful "split after the FINAL `)`"
-/// parse [`parent_pid`] already uses, extended one field further: after the
-/// closing paren, `state`(3) and `ppid`(4) are the first two whitespace
-/// fields [`parent_pid`] already consumes, so `starttime`(22) sits at index
-/// `22 - 3 = 19` in that same split — a fixed offset from the SAME anchor,
-/// never a second independent parse of the line. `None` on any read/parse
-/// miss (a vanished pid, a malformed `/proc` line, or a stripped-down
-/// `/proc` with fewer fields than expected).
+/// the reuse-proof identity"). The BODY (the "split after the FINAL `)`"
+/// stat-line parse) lives in `aoide_storage::attest::pid_starttime` as of
+/// LANE IDENTITY P-ID4, beside the walk and the seal-verify it feeds — this
+/// delegate keeps the `crate::graph::pid_starttime` re-export and its
+/// callers unchanged.
 pub fn pid_starttime(pid: i32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after = &stat[stat.rfind(')')? + 1..];
-    after.split_whitespace().nth(22 - 3)?.parse().ok()
+    aoide_storage::attest::pid_starttime(pid)
 }
 
 /// Automatic-parenting seam (task #89), tier 2: find the live AGENT-kind
