@@ -476,9 +476,16 @@ fn audit_send(inv: &Invocation, status: &str, message: &str, text: &str) {
 /// delivered. A delivered payload that names the node also carries a `from
 /// <sender>: ` provenance prefix on its first line when a sender resolves
 /// (see [`resolve_sender`] / [`provenance_prefix`] — attribution, not
-/// authentication); the title, the keystroke check, and the audit
-/// `untrusted_data` all still see the unprefixed text. Every outcome writes
-/// an audit line, the sender folded into its message.
+/// authentication) — but only when the target is an AGENT session
+/// (`rec.agent` is neither `"shell"` nor empty, #116); a SHELL target's
+/// delivered bytes are always verbatim, since a prefix would corrupt the
+/// command line the shell reads, the same "delivered bytes arrive
+/// verbatim" discipline `resurrect`'s restore delivery already holds. The
+/// title, the keystroke check, and the audit `untrusted_data` all still
+/// see the unprefixed text either way. Every outcome writes an audit
+/// line, the sender folded into its message — the audit trail always
+/// records who claimed to send it, regardless of whether the delivered
+/// bytes carried a prefix.
 ///
 /// **`--to <target>`** resolves `target` via [`aoide_storage::addr::resolve`]
 /// against this box's current local sessions + registered peers (see
@@ -707,10 +714,27 @@ fn deliver_local_with(
     // widening: attribution was already caller-asserted (`--from ""` is the
     // documented explicit-anonymous form that also skips the prefix), and
     // the audit line still records the attributed sender either way.
+    //
+    // A send to a SHELL target (#116) is likewise never prefixed, for the
+    // SAME "the delivered bytes must arrive verbatim" reasoning restore
+    // delivery already established (this discipline's precedent). A shell
+    // has no concept of an attribution comment on its input — `rec.agent`
+    // being `"shell"` (a plain terminal, `window.rs`'s auto-registration)
+    // or empty (an unregistered/legacy record, the same fallback
+    // `profile_for_agent` already treats as shell-shaped) means whatever
+    // reaches the socket is read as a COMMAND LINE, not a message a human
+    // or agent reads — `from <sender>: rm -rf /tmp/x` is not the command
+    // `rm -rf /tmp/x`, corrupting it exactly like an unprefixed restore
+    // would have. An AGENT target (any other `rec.agent`) still gets the
+    // prefix: a prompt is not a command line, and the agent benefits from
+    // seeing who sent it. Either way the audit line ([`audit_send`])
+    // records the attributed sender regardless — this only ever changes
+    // what rides in the bytes written to the socket.
     let attributed_to_target = attributed_sender.as_deref() == Some(id.as_str());
+    let is_shell_target = matches!(rec.agent.as_str(), "" | "shell");
     let prefix_sender = attributed_sender
         .as_deref()
-        .filter(|_| !attributed_to_target)
+        .filter(|_| !attributed_to_target && !is_shell_target)
         .map(|s| display_sender(s, &file.sessions));
     if let Some(prefix) = provenance_prefix(prefix_sender.as_deref(), &text) {
         payload = format!("{prefix}{payload}");
@@ -2538,6 +2562,77 @@ mod tests {
             "the title carries no provenance prefix"
         );
         assert_eq!(out.data.as_ref().unwrap()["title"], "fix the reaper");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #116: a send to a SHELL target from a DIFFERENT session (so the
+    /// `attributed_to_target`/self-attribution exemption above does NOT
+    /// apply — this is the general case, not the restore special case) is
+    /// STILL delivered with no provenance prefix. Before this fix, this
+    /// exact shape delivered `from the-sender: fix the reaper\n` to a shell
+    /// socket — a prefix a shell reads as the start of a command line, not
+    /// attribution text, corrupting whatever command the sender meant to
+    /// run. Same fixture as `delivered_payload_carries_the_provenance_
+    /// prefix_but_the_title_does_not` immediately above, with the ONE
+    /// difference load-bearing here: the target's `agent` is `"shell"`
+    /// instead of `"claude"`.
+    #[test]
+    fn send_to_a_shell_target_from_another_session_is_delivered_verbatim_no_provenance_prefix() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+
+        let root = unique_stage("send-shell-verbatim");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::set_var("AOIDE_SESSION_ID", "the-sender");
+
+        let id = "shell-target";
+        let socket = conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        do_session_start(
+            id,
+            Some("shell"),
+            Some("/w"),
+            None,
+            None,
+            Some(true),
+            Some(socket.to_str().unwrap()),
+            None,
+            None,
+        );
+
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+
+        let out = session_send(&send_invocation(
+            &["fix", "the", "reaper"],
+            &[("id", id), ("submit", "true"), ("yes", "true")],
+        ));
+        let got = acc.join().unwrap();
+
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(
+            String::from_utf8(got).unwrap(),
+            "fix the reaper\n",
+            "a shell target's delivered bytes carry NO provenance prefix, from anyone"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

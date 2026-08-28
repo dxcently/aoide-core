@@ -418,6 +418,20 @@
   `deliver_local`, silently reintroduces the corruption. Not a gate
   widening: `--from ""` (explicit anonymous) already skipped the prefix,
   and the audit line records the attributed sender either way.
+- **A SHELL target's delivered bytes are ALSO always verbatim, for every
+  sender, not only a self-attributed one (#116, the same "delivered bytes
+  arrive verbatim" discipline the bullet above holds).** `deliver_local_with`
+  gates the `provenance_prefix` call on `rec.agent` being neither `"shell"`
+  nor empty (the same shell-shaped check `profile_for_agent`'s own fallback
+  already treats as equivalent) — a shell has no concept of an attribution
+  comment on its input; whatever reaches the socket is read as a COMMAND
+  LINE, so `from <sender>: rm -rf /tmp/x` corrupts the command exactly like
+  an unprefixed restore delivery would have. An AGENT target (any other
+  `rec.agent`) keeps the prefix — a prompt is not a command line, and the
+  agent benefits from seeing who sent it; don't widen this check to agents
+  "for consistency." The audit line records the attributed sender
+  regardless of target kind — this invariant only ever governs the bytes
+  written to the socket.
 - **A recorded foreground of `sudo …` is never re-exec'd (P-C6, orchestrator
   ruling on durable-sessions plan open knob 5).** `resurrect.rs::
   is_sudo_argv` is the one, narrow, named check — `argv[0]`'s basename
