@@ -348,6 +348,26 @@
   no reader yet is exactly what this note exists to close before it
   becomes a live gap the way the automation-consumer self-assertion note
   above already is.
+- **`Policy::allow_remote_origin` (LANE IDENTITY P-ID4) keys ONLY on a
+  POSITIVELY-attested remote origin — never turn it into a gate on
+  unidentified callers.** `broker::resolve_gate`'s origin check refuses a
+  caller whose SEALED session (resolved from the connection's peercred pid
+  via `aoide_storage::attest::attested_caller` — the ONE shared
+  implementation; never copy the walk into this crate, and never trust a
+  wire-asserted origin) carries a `peer:*` originClass, unless the secret
+  opted in. `None` — unidentified — falls through untouched: local
+  unidentified callers were always admitted under OQ1-A, refusing them
+  would break every legitimate non-session caller while stopping no
+  same-uid attacker, and the gate's whole honesty is "narrows attested
+  remote-origin sessions, authenticates nothing local." Keep the check
+  BEFORE the TOTP/park branch (a refused remote-origin caller must never
+  park — parking it would invite an approve that bypasses the refusal)
+  and keep `caller` a resolve_gate PARAMETER (clock discipline), never an
+  ambient read inside the gate. The three axes stay distinct: `remote` =
+  transport, `automation` = code, `allowRemoteOrigin` = caller provenance
+  — a change to any one of them updates `policy.rs`'s field docs, the
+  README's "The origin gate" section, and `CONTRACTS.md`'s origin-gate
+  paragraph in the same commit.
 - **A parked ask never stores or touches a value — the same "never store a
   value" rule above, extended to the registry P-N2 adds.** `park::
   ParkedAsk` carries only `secret`/`consumer`/`requested_at` and a private

@@ -132,6 +132,7 @@ name = "aoide-secrets"
 version = "0.0.1"
 dependencies = [
  "aoide-protocol",
+ "aoide-storage",
  "libc",
  "serde",
  "serde_json",

@@ -5,8 +5,10 @@
 //! shape doesn't shift out from under it later.
 //!
 //! **Name validation is fresh here, not reused from
-//! `aoide_storage::peer_store::valid_peer_name`** (this crate doesn't
-//! depend on `aoide-storage`, and won't until a later phase needs it):
+//! `aoide_storage::peer_store::valid_peer_name`** (the `aoide-storage`
+//! dependency the crate now carries arrived at LANE IDENTITY P-ID4 for
+//! `attest::attested_caller` alone — the name rule below predates it and
+//! stays deliberately independent):
 //! the plan's B2 salvage note calls for a secret name STRICTER than a
 //! peer name even though both restrict to the same character set
 //! (`[a-z0-9-]`) — [`valid_secret_name`] additionally forbids a leading
@@ -117,12 +119,29 @@ pub struct Policy {
     /// ever touching its backend.
     #[serde(default)]
     pub remote: bool,
+    /// Remote-ORIGIN admission (LANE IDENTITY P-ID4) — the third, distinct
+    /// axis next to `automation` and `remote`: may a LOCAL resolve made by
+    /// a session that a REMOTE PEER created (sealed `originClass` `peer:*`,
+    /// positively attested via `aoide_storage::attest::attested_caller`)
+    /// be admitted for THIS secret? `remote` above is the TRANSPORT axis
+    /// (may the secret be served through a non-local entry point);
+    /// `automation` is the TOTP axis (may listed consumers skip the code);
+    /// this is the CALLER-PROVENANCE axis. Defaults to `false` — DENY — on
+    /// both a fresh policy and an existing `policy.json` predating this
+    /// field, and [`crate::broker`]'s `resolve_gate` enforces it live: a
+    /// positively remote-origin caller is refused unless the secret opts
+    /// in (`secrets allow-remote-origin <name> on`). The gate keys ONLY on
+    /// positive attestation — an UNIDENTIFIED caller is untouched by it
+    /// (see `broker.rs`'s module doc for that boundary, stated exactly).
+    #[serde(default)]
+    pub allow_remote_origin: bool,
 }
 
 impl Policy {
     /// Construct a policy with no consumers/sharing restrictions,
-    /// `requireTotp` off, automation closed, and `remote` off — the
-    /// caller narrows from here.
+    /// `requireTotp` off, automation closed, `remote` off, and
+    /// `allowRemoteOrigin` off (deny remote-origin callers) — the caller
+    /// narrows (or, for the two remote axes, widens) from here.
     pub fn new(name: impl Into<String>, backend: impl Into<String>, key: impl Into<String>) -> Self {
         Policy {
             name: name.into(),
@@ -133,6 +152,7 @@ impl Policy {
             shared_with: Vec::new(),
             automation: Automation::default(),
             remote: false,
+            allow_remote_origin: false,
         }
     }
 }
@@ -231,13 +251,15 @@ mod tests {
         assert!(!policy.automation.enabled);
         assert!(policy.automation.consumers.is_empty());
         assert!(!policy.remote);
+        assert!(!policy.allow_remote_origin);
     }
 
-    // ── automation / remote (P-N1) ──────────────────────────────────────
+    // ── automation / remote (P-N1) / allowRemoteOrigin (P-ID4) ──────────
 
     /// The exact live shape: an OLD `policy.json` written before P-N1
-    /// carries neither `automation` nor `remote` at all — must load
-    /// cleanly, treated as automation disabled/empty and remote false.
+    /// carries neither `automation` nor `remote` (nor P-ID4's
+    /// `allowRemoteOrigin`) at all — must load cleanly, treated as
+    /// automation disabled/empty, remote false, remote-origin DENIED.
     #[test]
     fn old_shape_json_with_no_automation_or_remote_key_loads_as_closed() {
         let json = r#"{"name":"t","backend":"pass","key":"k","requireTotp":true,"consumers":["m"],"sharedWith":[]}"#;
@@ -246,20 +268,26 @@ mod tests {
         assert!(!policy.automation.enabled);
         assert!(policy.automation.consumers.is_empty());
         assert!(!policy.remote);
+        assert!(
+            !policy.allow_remote_origin,
+            "a legacy row must load with remote-origin callers DENIED — the P-ID4 default"
+        );
     }
 
     #[test]
-    fn new_shape_json_round_trips_automation_and_remote() {
+    fn new_shape_json_round_trips_automation_remote_and_allow_remote_origin() {
         let mut policy = Policy::new("db-prod", "pass", "prod/db");
         policy.require_totp = true;
         policy.automation.enabled = true;
         policy.automation.consumers.push("m".into());
         policy.remote = true;
+        policy.allow_remote_origin = true;
 
         let json = serde_json::to_value(&policy).unwrap();
         assert_eq!(json["automation"]["enabled"], true);
         assert_eq!(json["automation"]["consumers"][0], "m");
         assert_eq!(json["remote"], true);
+        assert_eq!(json["allowRemoteOrigin"], true, "the wire spelling is camelCase");
 
         let back: Policy = serde_json::from_value(json).unwrap();
         assert_eq!(back, policy);

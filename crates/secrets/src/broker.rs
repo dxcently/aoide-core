@@ -213,8 +213,41 @@
 //! (`automation.enabled`) and `consumer` is one of the names LISTED in
 //! `automation.consumers` skips the code entirely for THAT consumer, every
 //! other caller (automation closed, or open but unlisted) is gated exactly
-//! as before this field existed. Gate order is otherwise unchanged: exists
-//! -> consumers-authorization -> `totp_required` -> fetch.
+//! as before this field existed. Gate order: exists ->
+//! consumers-authorization -> remote-origin (below) -> `totp_required` ->
+//! fetch.
+//!
+//! **The origin gate (LANE IDENTITY P-ID4) — the first real consumer of
+//! the sealed session credential.** After exists/consumers and BEFORE the
+//! TOTP/automation branch, [`resolve_gate`] checks the CALLER's attested
+//! provenance: [`handle_resolve`] resolves the connection's kernel-truth
+//! `SO_PEERCRED` pid through `aoide_storage::attest::attested_caller`
+//! (real `/proc` ancestry -> sealed session -> seal verified against the
+//! daemon's LIVE `ping`-fetched public key, fresh-starttime pid-reuse
+//! defense included — never anything the wire asserts) and hands the
+//! result in as a parameter, clock-discipline style. A caller whose sealed
+//! session is REMOTE-ORIGIN (`originClass` `peer:*` — a session a remote
+//! peer created) is refused unless the secret's `allowRemoteOrigin` policy
+//! bit (default OFF, `secrets allow-remote-origin <name> on` to opt in) is
+//! set; the refusal ([`denied_remote_origin_message`]) names the flag, the
+//! session, and its origin. Sitting BEFORE the TOTP branch means a refused
+//! remote-origin caller never parks and never reaches approve — no
+//! re-check needed on the approve path. **The boundary, exactly:** this
+//! gate NARROWS positively-attested remote-origin sessions; it does not
+//! authenticate local ones. An UNIDENTIFIED caller (no sealed session in
+//! its ancestry, an unreachable daemon, an unreadable roster — and, in the
+//! packaged cross-uid deployment where the broker runs as the
+//! `aoide-secrets` system user, EVERY caller, since the operator's daemon
+//! socket and `sessions.json` are both unreachable cross-uid) is NOT
+//! refused by this gate: same-uid honesty (OQ1-A) means local unidentified
+//! callers were always admitted, and refusing them here would break every
+//! legitimate non-session caller while stopping no same-uid attacker (who
+//! could always detach from its ancestry). `consumer` therefore STAYS
+//! self-asserted — consumer-name authentication is a separate, unbuilt
+//! axis — and the three policy axes stay distinct: `remote` (may this
+//! secret be served through a NON-LOCAL entry point), `automation` (may a
+//! listed consumer skip TOTP), `allowRemoteOrigin` (may a session a REMOTE
+//! PEER created resolve this secret locally).
 //!
 //! **`requireTotp` is wired live (P-V3).** [`resolve_gate`] rejects it
 //! outright ONLY when no `secrets enroll` has ever run on this host
@@ -568,9 +601,20 @@ fn handle_resolve(
         return json!({"ok": false, "error": "malformed request: `secret` and `consumer` are required"});
     }
 
-    // The one real-clock read in this function — see module doc.
+    // The one real-clock read in this function — see module doc. The
+    // caller's attested origin is resolved here too, once per resolve
+    // (LANE IDENTITY P-ID4) — like the clock, an impure read taken at the
+    // edge and handed into the deterministic gate as a parameter.
     let now_unix = aoide_protocol::audit::now_secs();
-    match resolve_gate(secrets_home, &secret, &consumer, totp.as_deref(), now_unix) {
+    let caller = attested_caller_origin(peer);
+    match resolve_gate(
+        secrets_home,
+        &secret,
+        &consumer,
+        totp.as_deref(),
+        now_unix,
+        caller.as_ref().map(|(s, o)| (s.as_str(), o.as_str())),
+    ) {
         GateOutcome::Granted { value, totp_free } => {
             audit_resolve(secrets_home, &secret, &consumer, argv0.as_deref(), true, None, peer_uid);
             // P-N3: notify only the TOTP-free grant (`requireTotp:false`, or
@@ -1048,9 +1092,10 @@ fn admin_gate(peer_uid: Option<u32>, secrets_home: &Path, subcommand: &str) -> O
 
 /// The `{op:"admin", verb:...}` op family (task #79): the live daemon
 /// becomes the single writer for `policy.json`/backend-store mutation, with
-/// the SAME eight commands `commands.rs`'s direct-home CRUD quintet always
+/// the SAME commands `commands.rs`'s direct-home CRUD quintet always
 /// exposed (`add`/`rm`/`grant`/`revoke`/`set-totp`/`automate`/`expose`/
-/// `migrate`) — this function is the ONE place any of them executes over
+/// `allow-remote-origin`/`migrate`) — this function is the ONE place any of
+/// them executes over
 /// the socket, gated by [`admin_gate`] before a single byte of `policy.json`
 /// is touched, and run inside [`put_lock`]'s critical section (the SAME
 /// lock a `put` already serializes under — one process, one writer, one
@@ -1102,6 +1147,9 @@ fn handle_admin(secrets_home: &Path, req: &Value, peer: Option<crate::peercred::
             "revoke" => crate::admin::revoke(secrets_home, &name, &str_field("consumer")),
             "set-totp" => crate::admin::set_totp(secrets_home, &name, str_field("state") == "on"),
             "expose" => crate::admin::expose(secrets_home, &name, str_field("state") == "on"),
+            "allow-remote-origin" => {
+                crate::admin::allow_remote_origin(secrets_home, &name, str_field("state") == "on")
+            }
             "automate" => match str_field("action").as_str() {
                 "on" => crate::admin::automate_toggle(secrets_home, &name, true),
                 "off" => crate::admin::automate_toggle(secrets_home, &name, false),
@@ -1328,8 +1376,20 @@ enum GateOutcome {
 /// function and everything it calls stay deterministic given the same
 /// inputs. `totp` is treated as absent when blank/whitespace-only, same as
 /// an outright missing field (task requirement: "no (or empty) totp
-/// field").
-fn resolve_gate(secrets_home: &Path, secret: &str, consumer: &str, totp: Option<&str>, now_unix: u64) -> GateOutcome {
+/// field"). `caller` (LANE IDENTITY P-ID4) is the connection's
+/// POSITIVELY-attested sealed session, `(sessionId, originClass)`, resolved
+/// by [`handle_resolve`] via [`attested_caller_origin`] and handed in as a
+/// parameter for the same reason the clock is — this function stays
+/// deterministic and exhaustively table-testable; `None` means
+/// UNIDENTIFIED, which the origin check below deliberately does not touch.
+fn resolve_gate(
+    secrets_home: &Path,
+    secret: &str,
+    consumer: &str,
+    totp: Option<&str>,
+    now_unix: u64,
+    caller: Option<(&str, &str)>,
+) -> GateOutcome {
     let policies = match crate::store::load_policies(secrets_home) {
         Ok(p) => p,
         Err(e) => {
@@ -1346,6 +1406,18 @@ fn resolve_gate(secrets_home: &Path, secret: &str, consumer: &str, totp: Option<
     let authorized = policy.consumers.is_empty() || policy.consumers.iter().any(|c| c == consumer);
     if !authorized {
         return GateOutcome::Denied("consumer not authorized for this secret".to_string());
+    }
+    // The origin gate (LANE IDENTITY P-ID4): after exists/consumers, before
+    // TOTP/automation — a caller whose SEALED session is remote-origin
+    // (`peer:*`) is refused unless this secret opted in, so a remote-origin
+    // caller can never even reach the park/approve machinery for a secret
+    // that hasn't admitted it. Keys ONLY on a POSITIVELY-attested remote
+    // origin (module doc's "The origin gate" section states the boundary
+    // exactly): `caller == None` — unidentified — falls through untouched.
+    if let Some((session_id, origin)) = caller {
+        if origin.starts_with("peer:") && !policy.allow_remote_origin {
+            return GateOutcome::Denied(denied_remote_origin_message(secret, session_id, origin));
+        }
     }
     // P-N3: recorded once, up front, so the eventual `Granted` variant can
     // say honestly whether a code was ever checked — `totp_required` itself
@@ -1379,6 +1451,39 @@ fn resolve_gate(secrets_home: &Path, secret: &str, consumer: &str, totp: Option<
         Ok(value) => GateOutcome::Granted { value, totp_free },
         Err(e) => GateOutcome::Denied(e),
     }
+}
+
+/// The origin-gate refusal's exact wording (LANE IDENTITY P-ID4) — a pure
+/// function so the taught message is testable without a live daemon or a
+/// sealed roster. Names the SECRET, the caller's sealed session + origin
+/// (kernel-attested facts, never wire-asserted ones), and the exact flag +
+/// command that opts the secret in. Value-free by construction, same as
+/// every other refusal in this module.
+fn denied_remote_origin_message(secret: &str, session_id: &str, origin: &str) -> String {
+    format!(
+        "this caller's session `{session_id}` is remote-origin (`{origin}`) and secret `{secret}` \
+         does not admit remote-origin callers — its allowRemoteOrigin flag is off (the default); \
+         an operator can opt this secret in with `aoide secrets allow-remote-origin {secret} on`"
+    )
+}
+
+/// Resolve the connecting peer's POSITIVELY-attested sealed session (LANE
+/// IDENTITY P-ID4): kernel-truth `SO_PEERCRED` pid -> real `/proc`
+/// ancestry -> sealed session record -> seal verified against the daemon's
+/// LIVE public key, all via `aoide_storage::attest::attested_caller` (ONE
+/// implementation, shared with `aoide-conduct`'s send gate — that module's
+/// doc has the DAG argument and the fresh-starttime pid-reuse defense).
+/// `None` on ANY missing link — an unidentified connection (`peer: None`),
+/// an unreachable daemon, an unreadable roster, no verifying ancestor —
+/// and `None` always means UNIDENTIFIED: the origin gate ignores it, per
+/// the module doc's stated boundary. In the packaged cross-uid deployment
+/// (the broker as the `aoide-secrets` system user) both the operator's
+/// daemon socket and their `sessions.json` are unreachable, so THIS
+/// resolves `None` for every caller there — the gate bites wherever the
+/// broker runs as the operator's own uid (`attest`'s module doc carries
+/// the same honesty note from the other side).
+fn attested_caller_origin(peer: Option<crate::peercred::PeerCred>) -> Option<(String, String)> {
+    aoide_storage::attest::attested_caller(peer?.pid)
 }
 
 /// Serializes [`verify_totp_gate`]'s ENTIRE replay-ledger load -> record ->
@@ -1835,7 +1940,7 @@ mod tests {
     fn unknown_secret_is_denied_with_a_clear_reason() {
         let home = tmp_home("unknown");
         seed(&home, &[]);
-        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "nope", "m", None, NOW));
+        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "nope", "m", None, NOW, None));
         assert!(!granted);
         assert_eq!(result.unwrap_err(), "secret not found");
         std::fs::remove_dir_all(&home).ok();
@@ -1862,7 +1967,7 @@ mod tests {
         let path = crate::store::policy_path(&home);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        let (resolve_granted, resolve_result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", None, NOW));
+        let (resolve_granted, resolve_result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", None, NOW, None));
         let (put_granted, put_result) = put_outcome_as_result(put_gate(&home, "t", "irrelevant", false));
 
         // Restore before any assertion could early-return and leave the
@@ -1888,7 +1993,7 @@ mod tests {
         let mut p = Policy::new("t", "scratch", "stored-value");
         p.consumers = vec!["m".to_string()];
         seed(&home, &[p]);
-        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "someone-else", None, NOW));
+        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "someone-else", None, NOW, None));
         assert!(!granted);
         assert!(result.unwrap_err().contains("not authorized"));
         std::fs::remove_dir_all(&home).ok();
@@ -1899,9 +2004,206 @@ mod tests {
         let home = tmp_home("anyconsumer");
         let p = Policy::new("t", "scratch", "stored-value");
         seed(&home, &[p]);
-        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "whoever", None, NOW));
+        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "whoever", None, NOW, None));
         assert!(granted);
         assert_eq!(result.unwrap(), "stored-value");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── the origin gate (LANE IDENTITY P-ID4) ────────────────────────────
+
+    /// A POSITIVELY-attested remote-origin caller on a DEFAULT secret
+    /// (allowRemoteOrigin off) is refused — before TOTP ever enters the
+    /// picture — with the taught message naming the flag, the session, and
+    /// its origin. The backend never runs.
+    #[test]
+    fn a_remote_origin_caller_is_refused_on_a_default_secret() {
+        let home = tmp_home("origin-deny");
+        seed(&home, &[Policy::new("t", "scratch", "stored-value")]);
+        let (granted, result) = gate_outcome_as_result(resolve_gate(
+            &home, "t", "m", None, NOW,
+            Some(("remote-orch", "peer:sakaki")),
+        ));
+        assert!(!granted);
+        let err = result.unwrap_err();
+        assert!(err.contains("allowRemoteOrigin"), "the refusal names the flag: {err}");
+        assert!(err.contains("remote-orch"), "the refusal names the session: {err}");
+        assert!(err.contains("peer:sakaki"), "the refusal names the origin: {err}");
+        assert!(err.contains("secrets allow-remote-origin t on"), "the refusal teaches the opt-in: {err}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The opt-in admits the same remote-origin caller — and sits BEFORE
+    /// the TOTP branch, so with no TOTP gate the value releases normally.
+    #[test]
+    fn allow_remote_origin_on_admits_a_remote_origin_caller() {
+        let home = tmp_home("origin-optin");
+        let mut p = Policy::new("t", "scratch", "stored-value");
+        p.allow_remote_origin = true;
+        seed(&home, &[p]);
+        let (granted, result) = gate_outcome_as_result(resolve_gate(
+            &home, "t", "m", None, NOW,
+            Some(("remote-orch", "peer:sakaki")),
+        ));
+        assert!(granted);
+        assert_eq!(result.unwrap(), "stored-value");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The gate keys ONLY on a `peer:*` origin: a LOCAL-origin attested
+    /// caller and an UNIDENTIFIED one (`None` — the module doc's stated
+    /// boundary: this gate narrows remote-origin sessions, it does not
+    /// authenticate local ones) both resolve exactly as before P-ID4.
+    #[test]
+    fn local_origin_and_unidentified_callers_are_untouched_by_the_origin_gate() {
+        let home = tmp_home("origin-local");
+        seed(&home, &[Policy::new("t", "scratch", "stored-value")]);
+
+        let (granted, result) = gate_outcome_as_result(resolve_gate(
+            &home, "t", "m", None, NOW,
+            Some(("local-orch", "local")),
+        ));
+        assert!(granted, "a local-origin attested caller is admitted");
+        assert_eq!(result.unwrap(), "stored-value");
+
+        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", None, NOW, None));
+        assert!(granted, "an unidentified caller is admitted — this gate never authenticates locals");
+        assert_eq!(result.unwrap(), "stored-value");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Gate ORDER: exists/consumers still win over the origin check — an
+    /// unauthorized consumer gets the consumers refusal, not the origin
+    /// one, even when the caller is remote-origin; and a remote-origin
+    /// refusal on a `requireTotp` secret fires BEFORE any park/TOTP path
+    /// (the refusal is immediate, never `NeedsTotp`).
+    #[test]
+    fn origin_gate_sits_after_consumers_and_before_totp() {
+        let home = tmp_home("origin-order");
+        let mut listed = Policy::new("t", "scratch", "k");
+        listed.consumers = vec!["m".to_string()];
+        let mut totp_gated = Policy::new("t2", "scratch", "k2");
+        totp_gated.require_totp = true;
+        seed(&home, &[listed, totp_gated]);
+
+        let (granted, result) = gate_outcome_as_result(resolve_gate(
+            &home, "t", "someone-else", None, NOW,
+            Some(("remote-orch", "peer:sakaki")),
+        ));
+        assert!(!granted);
+        assert_eq!(result.unwrap_err(), "consumer not authorized for this secret");
+
+        match resolve_gate(&home, "t2", "m", None, NOW, Some(("remote-orch", "peer:sakaki"))) {
+            GateOutcome::Denied(reason) => {
+                assert!(reason.contains("allowRemoteOrigin"), "{reason}");
+            }
+            GateOutcome::NeedsTotp => panic!("a refused remote-origin caller must never park"),
+            GateOutcome::Granted { .. } => panic!("must be denied"),
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The FULL plumbing, end to end through `handle_line` (LANE IDENTITY
+    /// P-ID4): a real sealed roster on disk (`AOIDE_STAGE_DIR`), a fake
+    /// daemon serving the REAL minting key's pubkey over `ping`
+    /// (`AOIDE_DAEMON_SOCKET`), and a connection whose kernel-truth
+    /// peercred pid is this very process — attested as remote-origin, the
+    /// resolve is refused; re-seal the roster under a STALE starttime and
+    /// the caller degrades to UNIDENTIFIED (the pid-reuse defense holding
+    /// through the new call path) and is admitted again.
+    #[test]
+    fn handle_resolve_refuses_an_attested_remote_origin_caller_end_to_end() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_audit = std::env::var("AOIDE_AUDIT_LOG").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_sock = std::env::var("AOIDE_DAEMON_SOCKET").ok();
+
+        let home = tmp_home("origin-e2e");
+        std::env::set_var("AOIDE_AUDIT_LOG", home.join("mirrored-aoide-log"));
+        let stage = home.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        seed(&home, &[Policy::new("t", "scratch", "stored-value")]);
+
+        let kp = aoide_storage::identity::mint_ephemeral().unwrap();
+        let me = std::process::id() as i32;
+        let starttime = aoide_storage::attest::pid_starttime(me).unwrap();
+        let seal_over = |st: u64| {
+            let sid = aoide_storage::sealed_id::SealedIdentity {
+                session_id: "remote-orch".to_string(),
+                pid: me,
+                pid_starttime: st,
+                origin_class: "peer:sakaki".to_string(),
+                issued_at: 1_700_000_000,
+            };
+            aoide_storage::records::SessionRecord {
+                session_id: "remote-orch".to_string(),
+                state: "idle".to_string(),
+                pid: Some(me as u32),
+                origin: Some("peer:sakaki".to_string()),
+                seal: Some(aoide_storage::sealed_id::mint_seal(&kp, &sid)),
+                sealed_issued_at: Some(1_700_000_000),
+                ..Default::default()
+            }
+        };
+        let write_roster = |rec| {
+            let roster = aoide_storage::records::SessionsFile {
+                schema_version: "0".to_string(),
+                sessions: vec![rec],
+            };
+            aoide_storage::stage::write_stage(&aoide_storage::stage::sessions_path(), &roster).unwrap();
+        };
+        write_roster(seal_over(starttime));
+
+        // A one-shot fake daemon per connection attempt, serving the REAL
+        // minting key's pubkey.
+        let sock = home.join("aoided.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let pubkey = kp.info().pubkey_hex;
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                let reply = json!({"ok": true, "daemon": "aoided", "sealPubkeyHex": pubkey});
+                let mut w = stream;
+                let _ = w.write_all(format!("{reply}\n").as_bytes());
+            }
+        });
+        std::env::set_var("AOIDE_DAEMON_SOCKET", &sock);
+
+        let peer = Some(crate::peercred::PeerCred {
+            uid: crate::home::effective_uid(),
+            gid: 0,
+            pid: me,
+        });
+        let req = r#"{"op":"resolve","secret":"t","consumer":"m"}"#;
+        let reply = handle_line(&home, &home.join("events.jsonl"), req, &ParkRegistry::new(), &mut Vec::new(), peer);
+        assert_eq!(reply["ok"], false, "{reply}");
+        let err = reply["error"].as_str().unwrap();
+        assert!(err.contains("allowRemoteOrigin"), "{err}");
+        assert!(err.contains("peer:sakaki"), "{err}");
+
+        // Pid-reuse defense through the new call path: a roster whose seal
+        // was minted over a STALE starttime no longer attests — the caller
+        // is UNIDENTIFIED and the same resolve is admitted.
+        write_roster(seal_over(starttime + 1));
+        let reply = handle_line(&home, &home.join("events.jsonl"), req, &ParkRegistry::new(), &mut Vec::new(), peer);
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["value"], "stored-value");
+
+        match saved_audit {
+            Some(v) => std::env::set_var("AOIDE_AUDIT_LOG", v),
+            None => std::env::remove_var("AOIDE_AUDIT_LOG"),
+        }
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        match saved_sock {
+            Some(v) => std::env::set_var("AOIDE_DAEMON_SOCKET", v),
+            None => std::env::remove_var("AOIDE_DAEMON_SOCKET"),
+        }
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1912,7 +2214,7 @@ mod tests {
         p.require_totp = true;
         seed(&home, &[p]);
         // No `totp.secret` written — nothing has enrolled this host yet.
-        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some("123456"), NOW));
+        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some("123456"), NOW, None));
         assert!(!granted);
         assert!(result.unwrap_err().contains("no TOTP enrollment"));
         std::fs::remove_dir_all(&home).ok();
@@ -1924,7 +2226,7 @@ mod tests {
         let mut p = Policy::new("t", "scratch", "stored-value");
         p.consumers = vec!["m".to_string()];
         seed(&home, &[p]);
-        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", None, NOW));
+        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", None, NOW, None));
         assert!(granted);
         assert_eq!(result.unwrap(), "stored-value");
         std::fs::remove_dir_all(&home).ok();
@@ -1961,7 +2263,7 @@ mod tests {
         let secret = seed_enrolled(&home, p);
         let code = code_for_now(&secret, NOW);
 
-        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some(&code), NOW));
+        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some(&code), NOW, None));
         assert!(granted, "{result:?}");
         assert_eq!(result.unwrap(), "stored-value");
         std::fs::remove_dir_all(&home).ok();
@@ -1978,7 +2280,7 @@ mod tests {
         let p = Policy::new("t", "scratch", "stored-value");
         seed_enrolled(&home, p);
 
-        let outcome = resolve_gate(&home, "t", "m", None, NOW);
+        let outcome = resolve_gate(&home, "t", "m", None, NOW, None);
         assert!(matches!(outcome, GateOutcome::NeedsTotp), "expected NeedsTotp");
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1993,7 +2295,7 @@ mod tests {
         let wrong_num: u32 = (correct.parse::<u32>().unwrap() + 1) % 1_000_000;
         let wrong = crate::totp::format6(wrong_num);
 
-        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some(&wrong), NOW));
+        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some(&wrong), NOW, None));
         assert!(!granted);
         assert!(result.unwrap_err().contains("invalid or expired"));
         std::fs::remove_dir_all(&home).ok();
@@ -2005,7 +2307,7 @@ mod tests {
         let p = Policy::new("t", "scratch", "stored-value");
         seed_enrolled(&home, p);
 
-        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some("not-a-number"), NOW));
+        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some("not-a-number"), NOW, None));
         assert!(!granted);
         assert!(result.unwrap_err().contains("malformed"));
         std::fs::remove_dir_all(&home).ok();
@@ -2022,7 +2324,7 @@ mod tests {
         let secret = seed_enrolled(&home, p);
         let code = code_for_now(&secret, NOW);
 
-        let (first_granted, first_result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some(&code), NOW));
+        let (first_granted, first_result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some(&code), NOW, None));
         assert!(first_granted, "{first_result:?}");
 
         // A second, DIFFERENT claimed consumer doesn't matter — the ledger
@@ -2030,7 +2332,7 @@ mod tests {
         // resolve wire's `consumer` field is self-asserted, so a
         // per-consumer ledger would let one typed code redeem once per
         // invented label).
-        let (second_granted, second_result) = gate_outcome_as_result(resolve_gate(&home, "t", "someone-else-entirely", Some(&code), NOW));
+        let (second_granted, second_result) = gate_outcome_as_result(resolve_gate(&home, "t", "someone-else-entirely", Some(&code), NOW, None));
         assert!(!second_granted);
         assert!(second_result.unwrap_err().contains("already used"));
         std::fs::remove_dir_all(&home).ok();
@@ -2049,7 +2351,7 @@ mod tests {
         let secret = seed_enrolled(&home, p);
         let code = code_for_now(&secret, NOW);
 
-        let (granted, _) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some(&code), NOW));
+        let (granted, _) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some(&code), NOW, None));
         assert!(granted);
 
         // Nothing here reuses any in-process state from the call above —
@@ -2058,7 +2360,7 @@ mod tests {
         let step = crate::totp::timestep(NOW);
         assert!(ledger_after_restart.is_used(step), "the ledger file must have the spent timestep");
 
-        let (granted_again, result_again) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some(&code), NOW));
+        let (granted_again, result_again) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some(&code), NOW, None));
         assert!(!granted_again);
         assert!(result_again.unwrap_err().contains("already used"));
         std::fs::remove_dir_all(&home).ok();
@@ -2092,20 +2394,20 @@ mod tests {
         // but still must never touch the backend), wrong code, replay
         // (after one legitimate grant) — every one of these must leave the
         // marker untouched.
-        let outcome = resolve_gate(&home, "t", "m", None, NOW);
+        let outcome = resolve_gate(&home, "t", "m", None, NOW, None);
         assert!(matches!(outcome, GateOutcome::NeedsTotp), "expected NeedsTotp");
         assert!(!marker.exists(), "backend ran on a needs-totp (would-park) case");
 
-        let (granted, _) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some(&wrong), NOW));
+        let (granted, _) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some(&wrong), NOW, None));
         assert!(!granted);
         assert!(!marker.exists(), "backend ran on a wrong-code denial");
 
-        let (granted, _) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some(&code), NOW));
+        let (granted, _) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some(&code), NOW, None));
         assert!(granted, "the legitimate code should be granted (and now the marker DOES exist)");
         assert!(marker.exists(), "positive control: the backend must run on a granted resolve");
         std::fs::remove_file(&marker).unwrap();
 
-        let (granted, _) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some(&code), NOW));
+        let (granted, _) = gate_outcome_as_result(resolve_gate(&home, "t", "m", Some(&code), NOW, None));
         assert!(!granted, "the same code must be denied the second time (replay)");
         assert!(!marker.exists(), "backend ran on a replay denial");
 
@@ -2130,7 +2432,7 @@ mod tests {
         // TOTP enrollment" otherwise).
         seed(&home, &[p]);
 
-        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", None, NOW));
+        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", None, NOW, None));
         assert!(granted, "{result:?}");
         assert_eq!(result.unwrap(), "stored-value");
         std::fs::remove_dir_all(&home).ok();
@@ -2148,7 +2450,7 @@ mod tests {
         p.automation.consumers = vec!["m".to_string()];
         seed(&home, &[p]);
 
-        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "someone-else", None, NOW));
+        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "someone-else", None, NOW, None));
         assert!(!granted);
         assert!(result.unwrap_err().contains("no TOTP enrollment"));
         std::fs::remove_dir_all(&home).ok();
@@ -2165,7 +2467,7 @@ mod tests {
         p.automation.consumers = vec!["m".to_string()]; // listed, but NOT enabled
         seed(&home, &[p]);
 
-        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", None, NOW));
+        let (granted, result) = gate_outcome_as_result(resolve_gate(&home, "t", "m", None, NOW, None));
         assert!(!granted);
         assert!(result.unwrap_err().contains("no TOTP enrollment"));
         std::fs::remove_dir_all(&home).ok();
@@ -3532,7 +3834,7 @@ mod tests {
             let barrier_a = barrier.clone();
             let a = std::thread::spawn(move || {
                 barrier_a.wait();
-                resolve_gate(&home_a, "t", "m", Some(&code_a), NOW)
+                resolve_gate(&home_a, "t", "m", Some(&code_a), NOW, None)
             });
 
             let home_b = home.clone();
@@ -3540,7 +3842,7 @@ mod tests {
             let barrier_b = barrier.clone();
             let b = std::thread::spawn(move || {
                 barrier_b.wait();
-                resolve_gate(&home_b, "t", "m", Some(&code_b), NOW)
+                resolve_gate(&home_b, "t", "m", Some(&code_b), NOW, None)
             });
 
             let ra = a.join().unwrap();

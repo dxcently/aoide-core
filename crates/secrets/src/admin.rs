@@ -1,6 +1,7 @@
 //! Broker-callable admin-command mutations (task #79) — the SAME
 //! read-modify-write logic `commands.rs`'s direct-home CRUD quintet
-//! (`add`/`rm`/`grant`/`revoke`/`set-totp`/`automate`/`expose`/`migrate`)
+//! (`add`/`rm`/`grant`/`revoke`/`set-totp`/`automate`/`expose`/
+//! `allow-remote-origin`/`migrate`)
 //! used to carry inline, extracted so `broker::handle_admin` can call it
 //! too, inside the SAME `broker::put_lock` critical section a `put` already
 //! runs under (module doc — one process, one writer, one lock guarding
@@ -150,6 +151,30 @@ pub fn expose(home: &Path, name: &str, want: bool) -> Result<AdminOutcome, Strin
     policy.remote = want;
     store::save_policies(home, &policies).map_err(|e| policy_io_error(home, e))?;
     Ok(AdminOutcome::changed(format!("secret `{name}` remote set to `{state}`"), format!("policy:{name}")))
+}
+
+/// `secrets allow-remote-origin <name> on|off` (LANE IDENTITY P-ID4) —
+/// flips `Policy::allow_remote_origin`, the remote-ORIGIN admission axis
+/// (`policy.rs`'s own field doc states the three-axis split against
+/// `remote`/`automation`). Same idempotent shape as [`expose`]/[`set_totp`]:
+/// re-setting the current state reports "unchanged" and writes nothing.
+pub fn allow_remote_origin(home: &Path, name: &str, want: bool) -> Result<AdminOutcome, String> {
+    let state = if want { "on" } else { "off" };
+    let mut policies = store::load_policies(home).map_err(|e| policy_io_error(home, e))?;
+    let Some(policy) = policies.iter_mut().find(|p| p.name == name) else {
+        return Err(format!("no policy for secret `{name}`"));
+    };
+    if policy.allow_remote_origin == want {
+        return Ok(AdminOutcome::unchanged(format!(
+            "secret `{name}` allowRemoteOrigin already `{state}` — unchanged"
+        )));
+    }
+    policy.allow_remote_origin = want;
+    store::save_policies(home, &policies).map_err(|e| policy_io_error(home, e))?;
+    Ok(AdminOutcome::changed(
+        format!("secret `{name}` allowRemoteOrigin set to `{state}`"),
+        format!("policy:{name}"),
+    ))
 }
 
 /// `secrets automate <name> on|off` — flips `Policy::automation.enabled`.

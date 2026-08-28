@@ -131,6 +131,10 @@ mod tests {
         // Bumped by 1 for bare `pair` (task #120 P3) — the interactive
         // pairing picker, one sweep + a select menu driving the SAME
         // `run_pair_request` ceremony core `peer invite` uses — reached 81.
+        // Bumped by 1 for `secrets allow-remote-origin` (LANE IDENTITY
+        // P-ID4) — the per-secret remote-origin admission bit the broker's
+        // origin gate enforces (deny by default; the first real consumer
+        // of the sealed session credential) — reached 82.
         let mut expected: Vec<&str> = vec![
             "a2a.serve",
             "adapter.melete",
@@ -180,6 +184,7 @@ mod tests {
             "resurrect",
             "schema",
             "secrets.add",
+            "secrets.allow-remote-origin",
             "secrets.approve",
             "secrets.automate",
             "secrets.dismiss",

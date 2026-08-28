@@ -94,6 +94,15 @@
 //!   secret as remote-reachable ahead of one landing; see
 //!   `crate::policy::Policy::remote`'s own doc and this crate's `AGENTS.md`
 //!   for the invariant a future non-local door must hold.
+//! - `allow-remote-origin` (LANE IDENTITY P-ID4) — `secrets
+//!   allow-remote-origin <name> on|off` flips the policy's
+//!   `allowRemoteOrigin` bit, the remote-ORIGIN admission axis
+//!   `broker::resolve_gate`'s origin gate enforces LIVE (unlike `expose`,
+//!   this one changes behavior the moment it flips): off (the default)
+//!   refuses a resolve whose caller session is positively attested as
+//!   remote-origin (sealed `peer:*`), on admits it. Same admin gate, same
+//!   idempotency discipline as `expose`; the three axes' split is stated
+//!   in `crate::policy::Policy::allow_remote_origin`'s own doc.
 //! - `pending`/`approve`/`dismiss` (P-N2) — the parked-resolve completion
 //!   surface: [`handle_secrets_pending`] lists every in-flight ask ([`crate::
 //!   client::pending`], value-free by construction); [`handle_secrets_approve`]
@@ -109,8 +118,12 @@
 //! `automate`/`expose` are appended in `register()` (golden discipline —
 //! `pkgs/aoide/crates/AGENTS.md`: append, never reorder), golden 61 -> 63;
 //! `pending`/`approve`/`dismiss` (P-N2) are appended last, golden 63 -> 66;
-//! `watch` (this commit, tracker #71 Part 1 — the terminal completion
-//! surface for a parked ask) is appended newest, golden 66 -> 67.
+//! `watch` (tracker #71 Part 1 — the terminal completion
+//! surface for a parked ask) is appended next, golden 66 -> 67;
+//! `allow-remote-origin` (LANE IDENTITY P-ID4) is appended newest,
+//! golden 81 -> 82 (the count moved between those landings for reasons
+//! outside this crate — `crates/cli/src/registry.rs`'s own golden note is
+//! the full chain).
 //! - `watch` — a foreground, line-mode broker-event narrator + prompt
 //!   surface (`crate::watch`'s own module doc has the full mechanism).
 //!   [`handle_secrets_watch`] only gates the door (CLI-only, same
@@ -141,10 +154,11 @@
 //! `set` backend template, over the socket (`crate::broker::handle_put`'s
 //! module doc).
 //!
-//! **`add`/`rm`/`grant`/`revoke`/`set-totp`/`automate`/`expose`/`migrate`
+//! **`add`/`rm`/`grant`/`revoke`/`set-totp`/`automate`/`expose`/
+//! `allow-remote-origin`/`migrate`
 //! also carry the admin-identity guard** ([`require_admin_identity`], `home::admin_identity_check`'s
 //! module doc — the yomi-strix incident, 2026-08-22): called right after
-//! [`require_cli`] in every one of those eight handlers, BEFORE
+//! [`require_cli`] in every one of those handlers, BEFORE
 //! `store::load_policies`/`store::save_policies` ever runs, it refuses the
 //! call outright when this process's effective uid doesn't own the
 //! secrets home — plain `sudo` (root, euid 0) is explicitly one of the
@@ -369,6 +383,19 @@ pub fn register(r: &mut Registry) {
         implemented: true,
         handler: handle_secrets_migrate,
         examples: ["secrets migrate db-prod", "secrets migrate db-prod --backend age"],
+    ));
+    r.insert(cmd!(
+        path: ["secrets", "allow-remote-origin"],
+        summary: "Flip an EXISTING secret's remote-origin admission bit on or off (LANE IDENTITY P-ID4). Off (the default) refuses a resolve whose CALLER SESSION is positively attested as remote-origin (a sealed `peer:*` originClass — a session a remote peer created); on admits it. Distinct from `expose` (remote = may the secret be served through a non-local entry point) and `automate` (may listed consumers skip TOTP) — this gates WHO locally asks, by kernel-attested provenance. Unidentified callers are untouched by this gate. Idempotent: re-setting the same state reports \"unchanged\" and writes nothing.",
+        args: [
+            arg!("name", "string", true, "The secret's nickname — must already have a policy (`secrets add` first)."),
+            arg!("state", "string", true, "`on` or `off`.")
+        ],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_secrets_allow_remote_origin,
+        examples: ["secrets allow-remote-origin db-prod on", "secrets allow-remote-origin db-prod off"],
     ));
 }
 
@@ -754,6 +781,43 @@ fn handle_secrets_expose(inv: &Invocation) -> Outcome {
     admin_dispatch(cmd, "expose", fields, || crate::admin::expose(&home::secrets_home(), &name, want))
 }
 
+/// `secrets allow-remote-origin <name> on|off` (LANE IDENTITY P-ID4) —
+/// flips the policy's `allowRemoteOrigin` bit, the remote-ORIGIN admission
+/// axis `broker::resolve_gate`'s origin gate reads (see that module's
+/// "The origin gate" section for the boundary it enforces, exactly). Same
+/// admin family spelling as `expose`/`set-totp` (`<name> on|off`, the
+/// hyphenated-command precedent `set-totp` established), same
+/// `require_cli` + broker-first `admin_dispatch` routing, same idempotency:
+/// re-setting the current state reports "unchanged" and writes nothing.
+fn handle_secrets_allow_remote_origin(inv: &Invocation) -> Outcome {
+    let cmd = "secrets.allow-remote-origin";
+    const USAGE: &str = "usage: secrets allow-remote-origin <name> on|off";
+    if let Some(hint) = require_cli(inv, cmd) {
+        return hint;
+    }
+    let Some(name) = inv.args.first().cloned() else {
+        return Outcome::usage(cmd, format!("secrets allow-remote-origin: missing <name> — {USAGE}"));
+    };
+    let Some(state) = inv.args.get(1).cloned() else {
+        return Outcome::usage(cmd, format!("secrets allow-remote-origin: missing on|off — {USAGE}"));
+    };
+    let want = match state.as_str() {
+        "on" => true,
+        "off" => false,
+        _ => {
+            return Outcome::usage(
+                cmd,
+                format!("secrets allow-remote-origin expects `on` or `off`, got `{state}` — {USAGE}"),
+            )
+        }
+    };
+    let fields =
+        serde_json::Map::from_iter([("name".to_string(), json!(name.clone())), ("state".to_string(), json!(state))]);
+    admin_dispatch(cmd, "allow-remote-origin", fields, || {
+        crate::admin::allow_remote_origin(&home::secrets_home(), &name, want)
+    })
+}
+
 /// `secrets pending` (P-N2) — CLI-only via the SAME [`require_cli`] gate as
 /// `put`/`exec`, but deliberately **NOT** [`require_admin_identity`]: this
 /// is the operator-side socket surface (task requirement — "like put/exec,
@@ -1050,6 +1114,7 @@ mod tests {
                 "secrets.dismiss",
                 "secrets.watch",
                 "secrets.migrate",
+                "secrets.allow-remote-origin",
             ]
         );
         for c in r.commands() {
@@ -1538,6 +1603,72 @@ mod tests {
             let off = inv(Door::Cli, &["secrets", "automate"], &["t", "off"], &[]);
             assert_eq!(handle_secrets_automate(&off).status, Status::Ok);
             assert!(!store::load_policies(home).unwrap()[0].automation.enabled);
+        });
+    }
+
+    // ── allow-remote-origin (LANE IDENTITY P-ID4) ────────────────────────
+
+    #[test]
+    fn allow_remote_origin_on_off_flips_the_bit_and_persists_reload_proves() {
+        with_secrets_home("aro-on-off", |home| {
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "pass"), ("key", "x")]);
+            assert_eq!(handle_secrets_add(&add).status, Status::Ok);
+            assert!(
+                !store::load_policies(home).unwrap()[0].allow_remote_origin,
+                "a fresh policy denies remote-origin callers — the default"
+            );
+
+            let on = inv(Door::Cli, &["secrets", "allow-remote-origin"], &["t", "on"], &[]);
+            let out = handle_secrets_allow_remote_origin(&on);
+            assert_eq!(out.status, Status::Ok, "{out:?}");
+            assert!(!out.changed.is_empty());
+            assert!(out.message.contains("allowRemoteOrigin"), "{}", out.message);
+            assert!(store::load_policies(home).unwrap()[0].allow_remote_origin);
+
+            let off = inv(Door::Cli, &["secrets", "allow-remote-origin"], &["t", "off"], &[]);
+            assert_eq!(handle_secrets_allow_remote_origin(&off).status, Status::Ok);
+            assert!(!store::load_policies(home).unwrap()[0].allow_remote_origin);
+        });
+    }
+
+    #[test]
+    fn allow_remote_origin_re_set_is_a_reported_no_op() {
+        with_secrets_home("aro-idempotent", |home| {
+            let add = inv(Door::Cli, &["secrets", "add"], &["t"], &[("backend", "pass"), ("key", "x")]);
+            handle_secrets_add(&add);
+            let on = inv(Door::Cli, &["secrets", "allow-remote-origin"], &["t", "on"], &[]);
+            handle_secrets_allow_remote_origin(&on);
+            let bytes_before = std::fs::read(store::policy_path(home)).unwrap();
+
+            let out = handle_secrets_allow_remote_origin(&on);
+            assert_eq!(out.status, Status::Ok, "{out:?}");
+            assert!(out.changed.is_empty(), "a no-op allow-remote-origin must report nothing changed");
+            assert!(out.message.contains("unchanged"), "{}", out.message);
+            assert_eq!(
+                std::fs::read(store::policy_path(home)).unwrap(),
+                bytes_before,
+                "a no-op must not rewrite policy.json"
+            );
+        });
+    }
+
+    #[test]
+    fn allow_remote_origin_usage_errors_teach_the_exact_spelling() {
+        with_secrets_home("aro-usage", |_home| {
+            let missing_state = inv(Door::Cli, &["secrets", "allow-remote-origin"], &["t"], &[]);
+            let out = handle_secrets_allow_remote_origin(&missing_state);
+            assert_eq!(out.status, Status::Usage);
+            assert!(out.message.contains("on|off"), "{}", out.message);
+
+            let bad_state = inv(Door::Cli, &["secrets", "allow-remote-origin"], &["t", "maybe"], &[]);
+            let out = handle_secrets_allow_remote_origin(&bad_state);
+            assert_eq!(out.status, Status::Usage);
+            assert!(out.message.contains("`maybe`"), "{}", out.message);
+
+            let unknown = inv(Door::Cli, &["secrets", "allow-remote-origin"], &["nope", "on"], &[]);
+            let out = handle_secrets_allow_remote_origin(&unknown);
+            assert_eq!(out.status, Status::Error);
+            assert!(out.message.contains("no policy for secret `nope`"), "{}", out.message);
         });
     }
 

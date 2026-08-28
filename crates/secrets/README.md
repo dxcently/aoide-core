@@ -61,7 +61,18 @@ the consumers it lists are checked against the SAME self-asserted
 doesn't); `remote` (default `false`) is a per-secret reachability flag
 with NO behavior change yet — `secrets expose <name> on|off` — that every
 future non-local entry point onto this broker must check before releasing
-a value (see "Remote reachability" below). **P-N2 (this commit) parks a
+a value (see "Remote reachability" below). **LANE IDENTITY P-ID4 adds the
+third policy axis, and it is LIVE**: `allowRemoteOrigin` (default `false`
+— deny) — `secrets allow-remote-origin <name> on|off` — refuses a resolve
+whose CALLER SESSION is positively attested as remote-origin (a sealed
+`peer:*` originClass, resolved from the connection's `SO_PEERCRED` pid
+through `aoide_storage::attest::attested_caller`: kernel ancestry + the
+daemon-sealed session credential, never anything the wire asserts) unless
+the secret opts in. The three axes never conflate: `remote` = transport
+(may the secret be SERVED non-locally), `automation` = code (may a listed
+consumer skip TOTP), `allowRemoteOrigin` = caller provenance (may a
+session a REMOTE PEER created resolve it locally). See "The origin gate"
+below for the gate order and the exact boundary. **P-N2 (this commit) parks a
 `requireTotp` resolve with no code instead of refusing it outright**: the
 requesting connection now WAITS (default 300s, `AOIDE_SECRETS_PARK_TIMEOUT`
 to change it) while the ask is completed from a SEPARATE connection —
@@ -672,6 +683,38 @@ crate invariant (`AGENTS.md`): every non-local entry point added later
 MUST refuse a secret whose `remote` is `false` before ever touching its
 backend. `secrets expose <name> on|off` flips it, same idempotency
 discipline as `set-totp`/`automate`.
+
+## The origin gate (`secrets allow-remote-origin`, LANE IDENTITY P-ID4)
+
+`policy.json`'s third axis: `allowRemoteOrigin` (default `false`; absent
+on an existing file loads as `false` — deny). Unlike `remote`, this one is
+LIVE: `broker::resolve_gate` runs it on every resolve, after
+exists/consumers and BEFORE the TOTP/park branch (a refused remote-origin
+caller never parks), keyed on the CALLER's kernel-attested provenance —
+`handle_resolve` resolves the connection's `SO_PEERCRED` pid through
+`aoide_storage::attest::attested_caller` (real `/proc` ancestry -> sealed
+session record -> seal verified against the daemon's LIVE `ping`-fetched
+public key, fresh-starttime pid-reuse defense included) and hands the
+answer into the gate as a parameter, clock-discipline style. A caller
+whose sealed session is remote-origin (`originClass` `peer:*` — a session
+a remote peer created) is refused with a taught message naming the flag,
+the session, and its origin, unless the secret opted in; the refusal
+audits name-only. `secrets allow-remote-origin <name> on|off` flips the
+bit, same admin gate and idempotency discipline as `expose`.
+
+**The boundary, exactly (this crate's `AGENTS.md` holds it as an
+invariant):** the gate NARROWS positively-attested remote-origin sessions;
+it does not authenticate local ones. An UNIDENTIFIED caller — no sealed
+session in its ancestry, an unreachable daemon, an unreadable roster — is
+NOT refused: local unidentified callers were always admitted under the
+same-uid trust model (OQ1-A), and this gate keys ONLY on positive
+attestation. In the packaged cross-uid deployment (the broker as the
+`aoide-secrets` system user) the operator's daemon socket and
+`sessions.json` are both unreachable, so every caller resolves
+UNIDENTIFIED there today — the gate bites wherever the broker runs as the
+operator's own uid (the cargo-only/dev shape `home.rs` documents).
+Consumer-name authentication stays a separate, unbuilt axis — the seal
+authenticates the SESSION and its CLASS, never the `consumer` string.
 
 ## Broker notifications (P-N3)
 
