@@ -583,9 +583,8 @@
   still a readable, unflagged string on disk — nothing here makes the files
   tamper-evident; that is P-ID1 (the daemon-signed credential, below) —
   minted and stored, verified on the per-session control socket's own
-  accept and consumed by the send gate as of P-ID2 (below). Two doors
-  remain unfloored by peercred (shellbridge, `aoided`'s own dispatch
-  socket) — P-ID3, still open.
+  accept and consumed by the send gate as of P-ID2, and both remaining
+  sockets get a peercred floor of their own as of P-ID3 (below).
   **`origin` is still attribution, not an
   authenticated credential** — a same-uid process can still forge a
   LOCAL-class origin (`stamp_origin` trusts whatever non-`peer:*` value it
@@ -619,6 +618,38 @@
   the two consumers — see each file's own module doc. Don't fold sealing
   or verification logic into `window.rs::pid_starttime` itself — it stays a
   pure `/proc` reader with no knowledge of either.
+- **`identity::peer_cred`/`PeerCred` are `pub(crate)`, not `pub(in
+  crate::graph)` (LANE IDENTITY P-ID3) — `shellbridge.rs` reuses them
+  directly.** Widened once, for exactly the reason `graph.rs`'s own `mod
+  identity` doc comment gives: a sibling module reusing the SAME kernel-
+  truth primitive beats a second `SO_PEERCRED` read in this crate. Do not
+  widen further to plain `pub` "for convenience" — this stays an internal
+  primitive, never crossing the `aoide-conduct` -> `aoide` crate boundary
+  root's shim re-exports onward; `aoide-server` reuses `aoide_secrets::
+  peercred` instead (already `pub`, already a dependency) rather than
+  reaching into this crate for it, the same "small local reimplementation
+  over a one-fn cross-crate edge" discipline `identity.rs`'s own module doc
+  states for its relationship to `aoide-secrets::peercred`. **The cross-uid
+  floor on shellbridge/`aoided` (`cross_uid_gate` in each file, pure,
+  unit-tested without a real different-uid connection) does NOT stop a
+  same-uid attacker** — every legitimate connector on both sockets already
+  shares the operator's own uid under OQ1-A. Do not add a same-uid
+  restriction to shellbridge's verdict door in this crate to "finish the
+  job": the legitimate verdict caller is the desktop QML process, which is
+  NOT part of any agent session's ancestry, so an ancestry-shaped floor
+  would refuse the real caller, not just an attacker — this residual is
+  documented, not silently left, in `CONTRACTS.md`'s identity section.
+  `send.rs`'s own gate (`real_attested_sender`) stays untouched by this
+  phase — a request dispatched through `aoided`'s socket (or injected
+  through `a2a serve`) resolves the GATE against whichever process is
+  actually running `deliver_local`, which is the daemon's/`a2a serve`'s own
+  ancestry, not the original caller's; don't "fix" this by threading a
+  peercred pid into `send.rs` without opening that as its own scoped phase
+  — P-ID3 closed only the ATTRIBUTION half of that gap (`aoided`'s
+  `invocation_from_dispatch_request` and `a2a::do_inject` both stamp an
+  absent `from` explicit-empty rather than let it fall through to their own
+  process's ambient `AOIDE_SESSION_ID`), not the gate's own identity
+  resolution.
 
 ## Extension points
 

@@ -211,8 +211,11 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   readable, unflagged string on disk; nothing here makes the files
   tamper-evident, that is P-ID1 (the daemon-signed credential) minted and
   stored, verified on the per-session control socket's own accept and
-  consumed by the send gate as of P-ID2 — two doors (shellbridge,
-  `aoided`'s own dispatch socket) remain unfloored, P-ID3. A same-uid
+  consumed by the send gate as of P-ID2 — the remaining two sockets
+  (shellbridge, `aoided`'s own dispatch socket) get a peercred floor of
+  their own as of P-ID3 (cross-uid only; see `aoide-conduct`'s own
+  README/AGENTS and CONTRACTS.md's identity section for the honest
+  accounting of what that does and does not close). A same-uid
   process can still forge a
   LOCAL-class origin, and neither the session's own identity nor the
   consumer presenting it are authenticated yet (this crate's own

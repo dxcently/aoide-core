@@ -137,9 +137,28 @@ the inbound half of the two-door contract (the outbound half is
   stamps it via `aoide_conduct::graph::stamp_seal`. **This is honest
   scaffolding, not a security boundary**: the pid sealed over is
   whatever the record already carries, not yet a peercred-verified
-  CONNECTING pid (P-ID2's socket change), and nothing anywhere reads
-  `seal` back to gate a decision. See CONTRACTS.md §4's `seal` paragraph
-  and `aoide-storage`'s own README for the full mechanism.
+  CONNECTING pid, and nothing anywhere reads `seal` back to gate a
+  decision. See CONTRACTS.md §4's `seal` paragraph and `aoide-storage`'s
+  own README for the full mechanism.
+- **The dispatch socket's own accept gets a cross-uid floor, and two
+  attribution leaks close (LANE IDENTITY P-ID3).** `daemon::accept_loop`
+  reads `aoide_secrets::peercred::peer_cred` on every accepted connection
+  and refuses one whose peer uid doesn't match this daemon's own euid,
+  fail-closed on an unidentified peer — the same `admin_gate` shape the
+  secrets broker already holds, restated here for this THIRD socket
+  (`daemon::cross_uid_gate`, `shellbridge::cross_uid_gate` in
+  `aoide-conduct`). Cross-uid only: every legitimate connector already
+  shares the daemon's own uid under OQ1-A. Separately,
+  `invocation_from_dispatch_request` stamps an absent `from` flag
+  explicit-empty so a `send` handler running INSIDE this process (a
+  dispatched request runs its handler on the daemon's own thread) never
+  falls back to reading the DAEMON's own ambient `AOIDE_SESSION_ID` as if
+  it were the connecting client's attribution (G8); `a2a::do_inject` does
+  the identical stamp for a remote inject, so it never picks up `aoide a2a
+  serve`'s own ambient env either (G9). Neither closes the GATE itself
+  (`aoide_conduct::graph::send::real_attested_sender`, out of this phase's
+  scope fence) — see `aoide-conduct`'s own README/AGENTS for the honest
+  accounting of what that leaves open.
 - `events` — `tail`, the blocking loop behind `aoide events tail` (P-D3):
   follows the daemon's own events feed with a `Follower` and prints every
   line whose `class` passes an (optional, comma-separated) filter, `--json`

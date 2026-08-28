@@ -61,6 +61,44 @@
   allowlist a review-blocking violation; a new per-command policy need is
   proved by a failing test against the EXISTING handler's `inv.door`
   branch, never by a new table in this crate.
+- **`daemon::accept_loop` refuses a CROSS-uid connection before it ever
+  reaches `handle_conn` (LANE IDENTITY P-ID3, G8).** `cross_uid_gate` is a
+  pure decision fn (`Option<PeerCred>` in, `Option<String>` refusal reason
+  out) mirroring `aoide_secrets::broker::admin_gate`'s exact shape — reuse
+  that mirroring for any FUTURE socket-based door in this crate rather than
+  inventing a fourth wording. Reads `aoide_secrets::peercred::peer_cred`
+  (already `pub`, already a dependency — do not reach into
+  `aoide-conduct::graph::identity` for its OWN `pub(crate)`-only
+  `peer_cred`, which is unreachable across the crate boundary anyway; do
+  not vendor a THIRD `SO_PEERCRED` reader here). **This is a CROSS-uid
+  floor only** — it does not, and is not meant to, stop a same-uid process
+  from dispatching a request over this socket; every legitimate connector
+  (the CLI's `daemon_dispatch` proxy, a hook, the conductor) already shares
+  the daemon's own uid under OQ1-A.
+- **`invocation_from_dispatch_request` stamps an absent `from` flag
+  explicit-empty (LANE IDENTITY P-ID3, G8's attribution half) — never
+  leaves it absent.** `send`'s own `resolve_sender` falls back to
+  `AOIDE_SESSION_ID` off the CALLING process's env whenever `--from` is
+  absent; a `dispatch`ed invocation runs its handler INSIDE this daemon
+  process, so that fallback would read `aoided`'s own ambient env, not the
+  connecting client's (which never crosses this socket at all). Stamping
+  `--from ""` on an absent flag is `resolve_sender`'s own documented
+  "explicit no attribution" form — it SKIPS the env fallback outright,
+  the same mechanism `a2a::do_inject` uses for the identical leak (G9). Do
+  not "fix" this by clearing `AOIDE_SESSION_ID` out of the daemon's own
+  process env instead: this crate is thread-per-connection
+  (`accept_loop`'s own doc above), and mutating global env from a
+  connection-handling thread races every OTHER concurrent connection's own
+  env reads — the flags-map stamp is per-request and touches no shared
+  state. **This does NOT close the GATE** (`aoide_conduct::graph::
+  send::real_attested_sender`, untouched by this phase, out of its scope
+  fence) — it walks `std::process::id()`'s own `/proc` ancestry, which for
+  a dispatched `send` is `aoided`'s own ancestry, not the connecting
+  client's; in production (`init -> systemd -> aoided`) that never resolves
+  a live sealed session, so a dispatched `send` with no `--yes`/autogate
+  already fails closed to `pending` — not because this fix re-derives the
+  real caller's identity, but because the daemon's own ancestry is
+  architecturally incapable of impersonating one.
 - **`producers::HandEditWatcher` is ONE shared `Arc<Mutex<..>>` instance
   (`daemon::SharedHandEditWatcher`), not tick-private (task #92).** A
   dispatched session command writes stage files on `handle_conn`'s own
@@ -318,6 +356,30 @@
   `deliver_now` is `true`, `Some("peer:<name>")` only when it's `false`
   (queuing). Don't lift that `!deliver_now` guard without re-reading why
   it's there.
+- **`do_inject` stamps the `from` flag EXPLICIT-EMPTY when its own `from`
+  parameter is `None` (LANE IDENTITY P-ID3, G9) — never leaves the flag
+  absent.** `session_send`'s `resolve_sender` falls back to
+  `AOIDE_SESSION_ID` off the CALLING process's env whenever `--from` is
+  absent, and `do_inject` calls `session_send` DIRECTLY, in-process — the
+  "calling process" for a remote A2A inject is `aoide a2a serve` itself, a
+  long-lived process whose own ambient env has nothing to do with whichever
+  remote peer just sent the message. `from.unwrap_or_default()` (an empty
+  `String` when `None`) is `resolve_sender`'s own documented "explicit no
+  attribution" form (`--from ""`) — it skips the env fallback outright,
+  rather than merely overwriting whatever the env currently holds, so this
+  holds regardless of what `a2a serve`'s own env carries at any given
+  moment. Don't revert to a bare `if let Some(f) = from { flags.insert(...)
+  }` "for symmetry with reading `from`" — that shape is exactly what let
+  the daemon's own ambient `AOIDE_SESSION_ID` leak into an unattributed
+  inject's pending record before this fix
+  (`an_unattributed_inject_never_falls_back_to_this_processs_own_ambient_session_id`
+  is the regression pin). This closes only the ATTRIBUTION leak, not the
+  GATE — `real_attested_sender` still walks `a2a serve`'s own `/proc`
+  ancestry for `do_inject`'s in-process `session_send` call, same posture
+  `aoided`'s dispatch-socket `send` holds (`accept_loop`'s own invariant
+  above); it already fails closed in practice because `restore_delivery`
+  and `do_inject` both only reach the gate with `--yes` already forced or
+  the ancestry never resolving a live session.
 - **`NONCE_CACHE` (P-P4) is process-local, in-memory, and deliberately NOT
   a `HashSet` — a bounded `VecDeque<(peer, nonce)>` capped at
   `NONCE_CACHE_CAP` with FIFO eviction, so it never needs a second
