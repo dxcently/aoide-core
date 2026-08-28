@@ -98,10 +98,20 @@
 //! `len()` check followed by a second unlocked insert — so two racing
 //! `pair_request` calls on one broker process can never jointly overrun
 //! the cap by one, the identical TOCTOU discipline `secrets::park::
-//! ParkRegistry::park_if_room` already holds. **Known limitation, same
-//! shape as that crate's own admin-CRUD note:** the lock is per-process
-//! memory; it does not serialize two SEPARATE `a2a serve` processes
-//! against the same `state/` dir (there is normally only ever one). Beyond
+//! ParkRegistry::park_if_room` already holds. **Cross-process (#119 review
+//! finding 4), every load-modify-write of EITHER park file additionally
+//! runs under [`crate::fs::with_stage_lock`]** — the same flock
+//! `state/inbox.json`'s writers already reuse for a `state/` file
+//! (`inbox::receive`'s doc: "one process-wide lock file is enough … a
+//! second lock file would be a new abstraction for zero added
+//! correctness"): the resident `a2a serve` process and a concurrent CLI
+//! invocation (`peer pair approve`/`reject`, a poll release) mutate the
+//! same `state/peer-pairing-{inbound,outbound}.json`, and an unserialized
+//! pair of read-modify-writes would silently drop an `approved` flag or a
+//! `tries` increment. `PARK_LOCK` stays alongside it as the in-process cap
+//! guard: `with_stage_lock` is best-effort by contract (a lock hiccup runs
+//! the closure unlocked), so the mutex still guarantees two same-process
+//! parks can never jointly overrun the cap. Beyond
 //! the cap, [`park_inbound`] refuses with a taught error naming the cap
 //! and its env knob — the caller (`aoide-server::a2a::pair_request`) maps
 //! that refusal to a JSON-RPC error, never a silent drop. Outbound entries
@@ -130,7 +140,7 @@
 //! [`tests::derive_sas_stability_vectors_never_drift`] so it renders
 //! identically on both boxes forever (PAIRING.md's own requirement).
 
-use crate::fs::{atomic_write, state_dir};
+use crate::fs::{atomic_write, state_dir, with_stage_lock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Mutex;
@@ -385,17 +395,21 @@ fn save_inbound(requests: &[InboundPairingRequest]) -> Result<(), String> {
 /// pending`'s whole reply (inbound half) — an entry with
 /// `requester_nonce_hex: None` has no SAS to show yet (module doc).
 pub fn list_inbound(now_epoch: i64) -> Vec<InboundPairingRequest> {
-    let all = load_inbound_raw();
-    let (kept, expired) = sweep(all, now_epoch);
-    if expired > 0 {
-        let _ = save_inbound(&kept);
-    }
-    kept
+    with_stage_lock(|| {
+        let all = load_inbound_raw();
+        let (kept, expired) = sweep(all, now_epoch);
+        if expired > 0 {
+            let _ = save_inbound(&kept);
+        }
+        kept
+    })
 }
 
 /// Park a fresh inbound request — the approver's `aoide/pairRequest`
 /// handler's whole job. Cap-checked under [`PARK_LOCK`] (module doc,
-/// review-bounce Finding 3): a full queue refuses BEFORE any id is minted
+/// review-bounce Finding 3) with the whole load-modify-write inside
+/// [`with_stage_lock`] like every other mutator here (module doc, #119
+/// review finding 4): a full queue refuses BEFORE any id is minted
 /// or anything is written. Returns the freshly-minted
 /// [`InboundPairingRequest`] (including its new `id`,
 /// `requester_nonce_hex: None`, and freshly-generated
@@ -412,37 +426,39 @@ pub fn park_inbound(
     expires_at: &str,
 ) -> Result<InboundPairingRequest, String> {
     let _guard = PARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // `requested_at` is the caller's own "now" (module doc) — reused as the
-    // sweep reference so a cap check never counts an already-expired entry
-    // against the live queue.
-    let now_epoch = crate::time::parse_iso_utc(requested_at).unwrap_or(i64::MAX);
-    let (mut requests, _expired) = sweep(load_inbound_raw(), now_epoch);
-    let cap = pairing_park_cap();
-    if requests.len() >= cap {
-        return Err(format!(
-            "the pairing park queue is already at its cap of {cap} concurrently parked inbound \
-             requests ({PAIRING_PARK_CAP_ENV} raises it) — approve, reject, or wait for an \
-             existing request to expire before retrying"
-        ));
-    }
-    let id = gen_request_id(&requests.iter().map(|r| r.id.clone()).collect::<Vec<_>>());
-    let entry = InboundPairingRequest {
-        id,
-        pubkey_hex: pubkey_hex.to_string(),
-        name: name.to_string(),
-        origin_addr: origin_addr.to_string(),
-        url: url.to_string(),
-        commit_hex: commit_hex.to_string(),
-        requester_nonce_hex: None,
-        approver_nonce_hex: random_hex(16),
-        requested_at: requested_at.to_string(),
-        expires_at: expires_at.to_string(),
-        approved: false,
-        tries: 0,
-    };
-    requests.push(entry.clone());
-    save_inbound(&requests)?;
-    Ok(entry)
+    with_stage_lock(|| {
+        // `requested_at` is the caller's own "now" (module doc) — reused as the
+        // sweep reference so a cap check never counts an already-expired entry
+        // against the live queue.
+        let now_epoch = crate::time::parse_iso_utc(requested_at).unwrap_or(i64::MAX);
+        let (mut requests, _expired) = sweep(load_inbound_raw(), now_epoch);
+        let cap = pairing_park_cap();
+        if requests.len() >= cap {
+            return Err(format!(
+                "the pairing park queue is already at its cap of {cap} concurrently parked inbound \
+                 requests ({PAIRING_PARK_CAP_ENV} raises it) — approve, reject, or wait for an \
+                 existing request to expire before retrying"
+            ));
+        }
+        let id = gen_request_id(&requests.iter().map(|r| r.id.clone()).collect::<Vec<_>>());
+        let entry = InboundPairingRequest {
+            id,
+            pubkey_hex: pubkey_hex.to_string(),
+            name: name.to_string(),
+            origin_addr: origin_addr.to_string(),
+            url: url.to_string(),
+            commit_hex: commit_hex.to_string(),
+            requester_nonce_hex: None,
+            approver_nonce_hex: random_hex(16),
+            requested_at: requested_at.to_string(),
+            expires_at: expires_at.to_string(),
+            approved: false,
+            tries: 0,
+        };
+        requests.push(entry.clone());
+        save_inbound(&requests)?;
+        Ok(entry)
+    })
 }
 
 /// Remove and return one inbound request by id, `None` if it never existed
@@ -451,12 +467,14 @@ pub fn park_inbound(
 /// unknown one would). `peer pair reject`'s inbound-side lookup, and
 /// `peer pair approve`'s final removal once a callback has succeeded.
 pub fn take_inbound(id: &str, now_epoch: i64) -> Result<Option<InboundPairingRequest>, String> {
-    let all = load_inbound_raw();
-    let (mut kept, _expired) = sweep(all, now_epoch);
-    let idx = kept.iter().position(|r| r.id == id);
-    let taken = idx.map(|i| kept.remove(i));
-    save_inbound(&kept)?;
-    Ok(taken)
+    with_stage_lock(|| {
+        let all = load_inbound_raw();
+        let (mut kept, _expired) = sweep(all, now_epoch);
+        let idx = kept.iter().position(|r| r.id == id);
+        let taken = idx.map(|i| kept.remove(i));
+        save_inbound(&kept)?;
+        Ok(taken)
+    })
 }
 
 /// Why [`reveal_inbound`] refused — a machine-readable enum, never a string
@@ -487,31 +505,33 @@ pub enum RevealError {
 /// caller (`aoide/pairReveal`), `peer pair request`'s second POST (client
 /// crate) is the one production caller of that method.
 pub fn reveal_inbound(id: &str, nonce_hex: &str, now_epoch: i64) -> Result<InboundPairingRequest, RevealError> {
-    let all = load_inbound_raw();
-    let (mut kept, _expired) = sweep(all, now_epoch);
-    let idx = match kept.iter().position(|r| r.id == id) {
-        Some(i) => i,
-        None => {
+    with_stage_lock(|| {
+        let all = load_inbound_raw();
+        let (mut kept, _expired) = sweep(all, now_epoch);
+        let idx = match kept.iter().position(|r| r.id == id) {
+            Some(i) => i,
+            None => {
+                if let Err(e) = save_inbound(&kept) {
+                    return Err(RevealError::Io(e));
+                }
+                return Err(RevealError::Unknown);
+            }
+        };
+        let expected = derive_commit(&kept[idx].pubkey_hex, nonce_hex);
+        if expected != kept[idx].commit_hex {
+            kept.remove(idx);
             if let Err(e) = save_inbound(&kept) {
                 return Err(RevealError::Io(e));
             }
-            return Err(RevealError::Unknown);
+            return Err(RevealError::Mismatch);
         }
-    };
-    let expected = derive_commit(&kept[idx].pubkey_hex, nonce_hex);
-    if expected != kept[idx].commit_hex {
-        kept.remove(idx);
+        kept[idx].requester_nonce_hex = Some(nonce_hex.to_string());
+        let out = kept[idx].clone();
         if let Err(e) = save_inbound(&kept) {
             return Err(RevealError::Io(e));
         }
-        return Err(RevealError::Mismatch);
-    }
-    kept[idx].requester_nonce_hex = Some(nonce_hex.to_string());
-    let out = kept[idx].clone();
-    if let Err(e) = save_inbound(&kept) {
-        return Err(RevealError::Io(e));
-    }
-    Ok(out)
+        Ok(out)
+    })
 }
 
 /// Why [`mark_inbound_approved`] refused — same machine-readable shape as
@@ -537,23 +557,25 @@ pub enum MarkApprovedError {
 /// twice on its own merits too, the same tolerant-of-repetition posture
 /// [`park_outbound`]'s replace-by-id already holds.
 pub fn mark_inbound_approved(id: &str, now_epoch: i64) -> Result<InboundPairingRequest, MarkApprovedError> {
-    let all = load_inbound_raw();
-    let (mut kept, _expired) = sweep(all, now_epoch);
-    let idx = match kept.iter().position(|r| r.id == id) {
-        Some(i) => i,
-        None => {
-            if let Err(e) = save_inbound(&kept) {
-                return Err(MarkApprovedError::Io(e));
+    with_stage_lock(|| {
+        let all = load_inbound_raw();
+        let (mut kept, _expired) = sweep(all, now_epoch);
+        let idx = match kept.iter().position(|r| r.id == id) {
+            Some(i) => i,
+            None => {
+                if let Err(e) = save_inbound(&kept) {
+                    return Err(MarkApprovedError::Io(e));
+                }
+                return Err(MarkApprovedError::Unknown);
             }
-            return Err(MarkApprovedError::Unknown);
+        };
+        kept[idx].approved = true;
+        let out = kept[idx].clone();
+        if let Err(e) = save_inbound(&kept) {
+            return Err(MarkApprovedError::Io(e));
         }
-    };
-    kept[idx].approved = true;
-    let out = kept[idx].clone();
-    if let Err(e) = save_inbound(&kept) {
-        return Err(MarkApprovedError::Io(e));
-    }
-    Ok(out)
+        Ok(out)
+    })
 }
 
 /// Typed-code approval (task #120 P3): record ONE wrong pairing code
@@ -567,23 +589,25 @@ pub fn mark_inbound_approved(id: &str, now_epoch: i64) -> Result<InboundPairingR
 /// refusal shape — the failure modes (unknown/expired id, file I/O) are
 /// identical to [`mark_inbound_approved`]'s.
 pub fn record_inbound_code_try(id: &str, now_epoch: i64) -> Result<u32, MarkApprovedError> {
-    let all = load_inbound_raw();
-    let (mut kept, _expired) = sweep(all, now_epoch);
-    let idx = match kept.iter().position(|r| r.id == id) {
-        Some(i) => i,
-        None => {
-            if let Err(e) = save_inbound(&kept) {
-                return Err(MarkApprovedError::Io(e));
+    with_stage_lock(|| {
+        let all = load_inbound_raw();
+        let (mut kept, _expired) = sweep(all, now_epoch);
+        let idx = match kept.iter().position(|r| r.id == id) {
+            Some(i) => i,
+            None => {
+                if let Err(e) = save_inbound(&kept) {
+                    return Err(MarkApprovedError::Io(e));
+                }
+                return Err(MarkApprovedError::Unknown);
             }
-            return Err(MarkApprovedError::Unknown);
+        };
+        kept[idx].tries = kept[idx].tries.saturating_add(1);
+        let out = kept[idx].tries;
+        if let Err(e) = save_inbound(&kept) {
+            return Err(MarkApprovedError::Io(e));
         }
-    };
-    kept[idx].tries = kept[idx].tries.saturating_add(1);
-    let out = kept[idx].tries;
-    if let Err(e) = save_inbound(&kept) {
-        return Err(MarkApprovedError::Io(e));
-    }
-    Ok(out)
+        Ok(out)
+    })
 }
 
 // ── Outbound (requester-side): a request THIS instance is awaiting on ──────
@@ -715,22 +739,26 @@ fn save_outbound(requests: &[OutboundPairingRequest]) -> Result<(), String> {
 /// ([`OutboundState::AwaitingApproval`] by default). Replaces by id rather
 /// than duplicating (operator-created, no cap needed — module doc).
 pub fn park_outbound(entry: OutboundPairingRequest) -> Result<(), String> {
-    let mut requests = load_outbound_raw();
-    requests.retain(|r| r.id != entry.id);
-    requests.push(entry);
-    save_outbound(&requests)
+    with_stage_lock(move || {
+        let mut requests = load_outbound_raw();
+        requests.retain(|r| r.id != entry.id);
+        requests.push(entry);
+        save_outbound(&requests)
+    })
 }
 
 /// Remove and return one outbound request by id — `peer pair reject`'s
 /// outbound-side lookup (any state), and the requester-side confirm's
 /// final removal once its own operator has committed.
 pub fn take_outbound(id: &str, now_epoch: i64) -> Result<Option<OutboundPairingRequest>, String> {
-    let all = load_outbound_raw();
-    let (mut kept, _expired) = sweep_outbound(all, now_epoch);
-    let idx = kept.iter().position(|r| r.id == id);
-    let taken = idx.map(|i| kept.remove(i));
-    save_outbound(&kept)?;
-    Ok(taken)
+    with_stage_lock(|| {
+        let all = load_outbound_raw();
+        let (mut kept, _expired) = sweep_outbound(all, now_epoch);
+        let idx = kept.iter().position(|r| r.id == id);
+        let taken = idx.map(|i| kept.remove(i));
+        save_outbound(&kept)?;
+        Ok(taken)
+    })
 }
 
 /// List every currently-unexpired outbound request, sweeping expired ones
@@ -738,12 +766,14 @@ pub fn take_outbound(id: &str, now_epoch: i64) -> Result<Option<OutboundPairingR
 /// (review-bounce Finding 2 — this used to be a diagnostic-only seam with
 /// no CLI reader; it is now load-bearing).
 pub fn list_outbound(now_epoch: i64) -> Vec<OutboundPairingRequest> {
-    let all = load_outbound_raw();
-    let (kept, expired) = sweep_outbound(all, now_epoch);
-    if expired > 0 {
-        let _ = save_outbound(&kept);
-    }
-    kept
+    with_stage_lock(|| {
+        let all = load_outbound_raw();
+        let (kept, expired) = sweep_outbound(all, now_epoch);
+        if expired > 0 {
+            let _ = save_outbound(&kept);
+        }
+        kept
+    })
 }
 
 /// Why [`mark_outbound_awaiting_confirm`] refused — same machine-readable
@@ -771,29 +801,31 @@ pub enum ConfirmMarkError {
 /// confirm the SAS before `upsert_paired_peer` ever runs on this side
 /// (module doc: mutual confirmation, for real).
 pub fn mark_outbound_awaiting_confirm(id: &str, pubkey_hex: &str, now_epoch: i64) -> Result<OutboundPairingRequest, ConfirmMarkError> {
-    let all = load_outbound_raw();
-    let (mut kept, _expired) = sweep_outbound(all, now_epoch);
-    let idx = match kept.iter().position(|r| r.id == id) {
-        Some(i) => i,
-        None => {
+    with_stage_lock(|| {
+        let all = load_outbound_raw();
+        let (mut kept, _expired) = sweep_outbound(all, now_epoch);
+        let idx = match kept.iter().position(|r| r.id == id) {
+            Some(i) => i,
+            None => {
+                if let Err(e) = save_outbound(&kept) {
+                    return Err(ConfirmMarkError::Io(e));
+                }
+                return Err(ConfirmMarkError::Unknown);
+            }
+        };
+        if kept[idx].pubkey_hex != pubkey_hex {
             if let Err(e) = save_outbound(&kept) {
                 return Err(ConfirmMarkError::Io(e));
             }
-            return Err(ConfirmMarkError::Unknown);
+            return Err(ConfirmMarkError::Mismatch);
         }
-    };
-    if kept[idx].pubkey_hex != pubkey_hex {
+        kept[idx].state = OutboundState::AwaitingConfirm;
+        let out = kept[idx].clone();
         if let Err(e) = save_outbound(&kept) {
             return Err(ConfirmMarkError::Io(e));
         }
-        return Err(ConfirmMarkError::Mismatch);
-    }
-    kept[idx].state = OutboundState::AwaitingConfirm;
-    let out = kept[idx].clone();
-    if let Err(e) = save_outbound(&kept) {
-        return Err(ConfirmMarkError::Io(e));
-    }
-    Ok(out)
+        Ok(out)
+    })
 }
 
 fn sweep(entries: Vec<InboundPairingRequest>, now_epoch: i64) -> (Vec<InboundPairingRequest>, usize) {
@@ -1479,6 +1511,135 @@ mod tests {
         match saved {
             Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
             None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    // ── cross-process lock (with_stage_lock) on both park files ──────────
+
+    /// A held `.stage.lock` flock BLOCKS a park-file mutator until released —
+    /// the lock-is-taken assertion for the cross-process discipline (#119
+    /// review finding 4). Two real OS processes are impractical in this test
+    /// rig, but `flock(2)` locks are per-open-file-description, so a second
+    /// fd in the SAME process contends exactly like a second process would —
+    /// this is the closest in-process stand-in for the real `a2a serve` vs
+    /// CLI race the lock exists to serialize.
+    #[test]
+    fn a_held_stage_flock_blocks_an_inbound_mutation_until_released() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-pairing-flock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        env(&dir);
+        std::env::set_var("AOIDE_STAGE_DIR", dir.join("stage"));
+
+        let now = 1_700_000_000_i64;
+        let entry = park_inbound(
+            "pk", "name", "addr", "url", &derive_commit("pk", "n"),
+            &crate::time::iso_utc_from_epoch(now),
+            &expires_at_from(now),
+        )
+        .unwrap();
+
+        // Hold the SAME lock file with_stage_lock flocks, on our own fd.
+        use std::os::unix::io::AsRawFd;
+        std::fs::create_dir_all(dir.join("stage")).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(dir.join("stage/.stage.lock"))
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let id = entry.id.clone();
+        let t = std::thread::spawn(move || {
+            let out = mark_inbound_approved(&id, now);
+            tx.send(()).unwrap();
+            out
+        });
+
+        // While the flock is held the mutator must not complete. (A slow
+        // thread start can only make this assertion vacuously true, never
+        // flaky-fail — the mutator physically cannot pass the flock.)
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            rx.try_recv().is_err(),
+            "mark_inbound_approved completed while the stage flock was held — the mutator is not taking the cross-process lock"
+        );
+
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+        let marked = t.join().unwrap().unwrap();
+        assert!(marked.approved);
+        assert!(list_inbound(now)[0].approved, "the release let the write land");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+    }
+
+    /// Concurrent-ish coverage over both files: racing read-modify-writes
+    /// from separate threads (each `with_stage_lock` call opens its own fd,
+    /// so they contend like separate processes) lose no update — every
+    /// `tries` increment lands on the inbound file, every parked entry lands
+    /// on the outbound file. Unserialized, either loss was the exact #119
+    /// finding-4 symptom.
+    #[test]
+    fn racing_mutators_lose_no_increment_and_no_parked_entry() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-pairing-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        env(&dir);
+        std::env::set_var("AOIDE_STAGE_DIR", dir.join("stage"));
+
+        let now = 1_700_000_000_i64;
+        let entry = park_inbound(
+            "pk", "name", "addr", "url", &derive_commit("pk", "n"),
+            &crate::time::iso_utc_from_epoch(now),
+            &expires_at_from(now),
+        )
+        .unwrap();
+
+        let tries_threads: Vec<_> = (0..8)
+            .map(|_| {
+                let id = entry.id.clone();
+                std::thread::spawn(move || record_inbound_code_try(&id, now).unwrap())
+            })
+            .collect();
+        let park_threads: Vec<_> = (0..6)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    park_outbound(sample_outbound(&format!("id{i:05x}"), OutboundState::AwaitingApproval)).unwrap()
+                })
+            })
+            .collect();
+        for t in tries_threads {
+            t.join().unwrap();
+        }
+        for t in park_threads {
+            t.join().unwrap();
+        }
+
+        assert_eq!(list_inbound(now)[0].tries, 8, "every increment landed — none lost to a racing read-modify-write");
+        assert_eq!(list_outbound(now).len(), 6, "every parked outbound entry landed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
         }
     }
 

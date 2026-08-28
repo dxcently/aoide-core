@@ -152,7 +152,12 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   (`pairing_park_cap`, `AOIDE_PAIRING_PARK_CAP` env, default 32,
   check-then-insert under one `PARK_LOCK` acquisition, same discipline
   `aoide-secrets::park::park_if_room` holds); `park_outbound`
-  is uncapped (operator-created, one per `peer pair request` call).
+  is uncapped (operator-created, one per `peer pair request` call). Every
+  mutator of either park file runs its whole load-modify-write under
+  `fs::with_stage_lock` — the same flock `inbox::receive` reuses for a
+  `state/` file — so the `a2a serve` process and a concurrent CLI never
+  race each other's read-modify-write on
+  `state/peer-pairing-{inbound,outbound}.json`.
   `OutboundPairingRequest.state` (`AwaitingApproval` → `AwaitingConfirm`,
   `mark_outbound_awaiting_confirm`) defers the REQUESTER's own peer-record
   commit until its own operator confirms a second time, after this

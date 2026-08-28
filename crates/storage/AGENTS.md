@@ -270,12 +270,19 @@
   `AOIDE_PAIRING_PARK_CAP` override), and only then mints an id and
   writes — mirroring `aoide-secrets::park::park_if_room`'s own
   check-then-insert discipline exactly, closing the same TOCTOU race a
-  separate check-then-insert pair would reopen. `PARK_LOCK` is
-  process-local (`static Mutex<()>`, poison-recovering); like the ledger
-  and `peer_store`'s own file-based state, it does not serialize across
-  separate OS processes touching the same `state/peer-pairing-inbound.json`
-  concurrently — a known limitation, same shape as `aoide-secrets`'s own
-  admin-CRUD note, not something this function's own lock can close.
+  separate check-then-insert pair would reopen. Cross-process, EVERY
+  load-modify-write of either park file (`park_inbound`/`take_inbound`/
+  `reveal_inbound`/`mark_inbound_approved`/`record_inbound_code_try`/
+  `list_inbound` and the outbound five) runs under
+  `crate::fs::with_stage_lock` — the same flock `inbox::receive` already
+  reuses for a `state/` file — so the resident `a2a serve` process and a
+  concurrent CLI invocation can never silently drop each other's
+  `approved` flag or `tries` increment (#119 review finding 4). A new
+  mutator here wraps its whole load-modify-write in `with_stage_lock` the
+  same way, never a bare `load → save`. `PARK_LOCK`
+  (process-local `static Mutex<()>`, poison-recovering) stays alongside as
+  the cap's in-process guarantee: `with_stage_lock` is best-effort by
+  contract (a lock hiccup runs the closure unlocked), the mutex is not.
   Outbound entries (`park_outbound`) are operator-created, one per `peer
   pair request` invocation, and carry no cap.
 - **`OutboundPairingRequest.state` defers the requester's own peer-record
