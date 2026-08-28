@@ -827,9 +827,22 @@ fn do_inject(
     // `"from": "peer:<name>"` through the exact same field a local
     // `--from`/`AOIDE_SESSION_ID` attribution already populates — no second
     // attribution field invented.
-    if let Some(f) = from {
-        flags.insert("from".to_string(), f.to_string());
-    }
+    // LANE IDENTITY P-ID3 (G9): when the caller resolved to NO attributable
+    // identity (`from` is `None` — an unpaired/unsigned peer, or a resolved
+    // peer this door chose not to attribute), the flag is stamped
+    // EXPLICITLY EMPTY rather than left absent. `session_send`'s own
+    // `resolve_sender` falls back to `AOIDE_SESSION_ID` off the calling
+    // process's env whenever `--from` is absent — and the "calling process"
+    // for an inbound A2A message is `aoide a2a serve` ITSELF, a long-lived
+    // process whose own ambient env has nothing to do with the remote peer
+    // that just sent this message. Left alone, a remote inject could
+    // misattribute to whatever session id `a2a serve` happened to inherit
+    // at launch. `--from ""` is `resolve_sender`'s own documented
+    // "explicit no attribution" form (the same mechanism `session pending
+    // approve`'s re-drive already relies on) — it skips the env fallback
+    // outright rather than merely overwriting it, so this holds regardless
+    // of what `a2a serve`'s own env carries.
+    flags.insert("from".to_string(), from.unwrap_or_default().to_string());
     let inv = Invocation {
         path: vec!["send".to_string()],
         args: vec![prompt.to_string()],
@@ -5087,6 +5100,102 @@ mod tests {
         match saved_state {
             Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
             None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    /// LANE IDENTITY P-ID3 (G9): the exact `from: None` shape the test above
+    /// already produces (an unresolvable `signed_peer_name`), but with
+    /// `AOIDE_SESSION_ID` set in THIS PROCESS's own env first — standing in
+    /// for whatever `aoide a2a serve` might have inherited at launch. Before
+    /// the fix, `do_inject`'s bare `if let Some(f) = from` left `--from`
+    /// entirely absent on an unattributed inject, so `session_send`'s
+    /// `resolve_sender` fell back to reading THIS env var and misattributed
+    /// the pending entry to it. The fix stamps `--from ""` explicitly
+    /// whenever `from` is `None`, which `resolve_sender` documents as
+    /// skipping the env fallback outright — so the pending entry's `from`
+    /// must stay unattributed no matter what `AOIDE_SESSION_ID` says.
+    #[test]
+    fn an_unattributed_inject_never_falls_back_to_this_processs_own_ambient_session_id() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_session_id = std::env::var("AOIDE_SESSION_ID").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-g9-no-env-leak-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_STATE_DIR", root.join("state"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        // The one line that matters: this stands in for a stray
+        // `AOIDE_SESSION_ID` in `aoide a2a serve`'s OWN launch environment —
+        // never the remote caller's, which has no channel to set it at all.
+        std::env::set_var("AOIDE_SESSION_ID", "daemons-own-stray-session");
+
+        let token_file = root.join("real-peer.token");
+        std::fs::write(&token_file, "real-secret").unwrap();
+        let mut real_peer = fixture_peer("real-peer", "http://10.0.0.9:8710/", false);
+        real_peer.token_file = Some(token_file.to_string_lossy().into_owned());
+        aoide_storage::peer_store::save_peers(&[real_peer]).unwrap();
+
+        let id = "g9-no-env-leak-tgt";
+        let socket = aoide_conduct::graph::conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![conductable_session(id, &socket)],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let audit_log = root.join("log");
+        let params = serde_json::json!({
+            "message": { "parts": [{ "kind": "text", "text": "hi" }], "contextId": id }
+        });
+        let remote_origin = PeerOrigin::Remote("10.0.0.9".parse().unwrap());
+        // An unresolvable `signed_peer_name` ("ghost") — `do_inject` sees
+        // `from: None`, exactly the shape that used to fall through to the
+        // env.
+        let result = message_send(
+            &params,
+            &audit_log,
+            "",
+            remote_origin,
+            "",
+            Some("real-secret"),
+            Some("ghost"),
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(listener.accept().is_err(), "unattributed + non-autogate must never touch the socket");
+
+        let pending: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(stage.join("pending.json")).unwrap()).unwrap();
+        let entries = pending["pending"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].get("from").is_none() || entries[0]["from"].is_null(),
+            "an unattributed inject must NEVER pick up this process's own ambient AOIDE_SESSION_ID — got {:?}",
+            entries[0].get("from")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+        match saved_session_id {
+            Some(v) => std::env::set_var("AOIDE_SESSION_ID", v),
+            None => std::env::remove_var("AOIDE_SESSION_ID"),
         }
     }
 
