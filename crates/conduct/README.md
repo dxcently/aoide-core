@@ -366,35 +366,45 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   reads stdin, so it never populates `typed`. See AGENTS.md for why this
   is refusal-based, not best-effort.
 - **Session origin (P-P3, `docs/architecture/PAIRING.md` decision 7;
-  write-authority tightened at LANE IDENTITY P-ID0, G16/G5):**
+  write-authority tightened at LANE IDENTITY P-ID0, G16/G5, review round 1):**
   `session_store.rs::stamp_origin` (now `pub`, crossing the crate boundary)
   stamps `SessionRecord.origin` — `"peer:<name>"` for a session
   `aoide-server`'s A2A door spawned on behalf of an identified, paired peer.
-  It has exactly two legitimate callers: `aoide-server`'s `a2a::do_spawn`
-  calls it DIRECTLY on the just-spawned record (`stamp_spawn_origin`,
-  polling for the record's registration the same way `spawn_inject_prompt`
-  already does), from the door where the peer name is actually
-  authenticated — the only place a `peer:*` value may originate.
+  It has exactly two legitimate STAMP callers: `aoide-server`'s
+  `a2a::do_spawn` calls it DIRECTLY on the just-spawned record
+  (`stamp_spawn_origin`, polling for the record's registration the same way
+  `spawn_inject_prompt` already does), from the door where the peer name is
+  actually authenticated — the only place a `peer:*` value may originate.
   `graph/conduct.rs::session_conduct` calls it for a LOCAL-CLASS value off
   its own inherited `AOIDE_SESSION_ORIGIN` env, right after
   `do_session_start`, same seam `stamp_headless` uses — and REFUSES a
   `peer:*` shape read from that env (a taught refusal, never a panic):
   inherited env is exactly what a same-uid process can set on itself before
   invoking `aoide conduct` directly, so a `peer:*` value threaded that way
-  was never trustworthy. No `graph.json` projection (like
-  `headless`/`hookAncestry`, consumed internally, not rendered) —
-  `doc.rs::ledger_session_exit` projects it verbatim into the durable
-  session ledger's own `origin` field at exit, and `graph/resurrect.rs`
-  reads that field BACK to carry a peer-origin session's provenance forward
-  onto its revived record (G6, same phase — the ledger wrote `origin` on
-  every exit long before anything read it back). **Still not a security
-  claim**: a same-uid process can still forge a LOCAL-class origin, and
-  neither the session's own identity nor the consumer presenting it are
-  authenticated yet — nothing may gate a security decision on `origin`
-  without the sealed credential task #63's lane builds next (P-ID1+). What
-  P-ID0 closes: the specific `peer:*` forgery shape (a local process
-  claiming to BE a peer-spawned session via one env var) is now
-  record-layer impossible, not merely undocumented.
+  was never trustworthy. A THIRD path reads `origin` back rather than
+  stamping it fresh: `doc.rs::ledger_session_exit` projects
+  `SessionRecord.origin` verbatim into the durable session ledger's own
+  `origin` field at exit (no `graph.json` projection — like
+  `headless`/`hookAncestry`, consumed internally, not rendered), and
+  `graph/resurrect.rs::origin_to_carry` reads that field BACK on a revival to
+  carry a LOCAL-class session's own provenance forward onto its revived
+  record (G6, same phase). It REFUSES a `peer:*` shape found there too
+  (eprintln, never carried): `state/session-ledger.jsonl` is a plain,
+  same-uid-writable, append-only file — a same-uid process can append a line
+  claiming `origin:"peer:X"` and then run the ungated local `aoide
+  resurrect`, which has no door and no seal behind it to re-mint that
+  authority. `origin_to_carry` is pure and directly unit-tested for exactly
+  this refusal. **This closes the STAMP paths, not the files**: a
+  hand-crafted `sessions.json`/ledger line claiming `peer:X` is still a
+  readable, unflagged string on disk — nothing here makes the files
+  tamper-evident; that is P-ID1 (the daemon-signed credential)/P-ID2 (the
+  peercred floor), still open. **Still not a security claim**: a same-uid
+  process can still forge a LOCAL-class origin, and neither the session's
+  own identity nor the consumer presenting it are authenticated yet —
+  nothing may gate a security decision on `origin` without the sealed
+  credential task #63's lane builds next (P-ID1+). What P-ID0 closes: every
+  record-STAMP path this codebase drives now refuses a `peer:*` shape it
+  didn't mint itself at the door — env AND ledger both.
 - `who` — `aoide who [filter] [--json] [--all]` (`graph/who.rs`): live
   presence over this box's own sessions plus every registered peer,
   probed in parallel on each invocation (messaging workstream C2). A

@@ -243,16 +243,27 @@ the inbound half of the two-door contract (the outbound half is
   capability gets the exact `peer allow` fix; every other shape gets the
   original "pair first, then allow" message. The resolved peer's name also
   threads two ways past the gate: `do_spawn` calls `stamp_spawn_origin`
-  (LANE IDENTITY P-ID0, G16/G5) to stamp `SessionRecord.origin =
-  "peer:<name>"` DIRECTLY on the just-spawned record once it registers —
-  this door is the authenticated writer, not the child's own env, since any
-  same-uid process can set an env var on itself before invoking `aoide
-  conduct` directly (`aoide-conduct`'s `session_conduct` now refuses
-  exactly that shape from its env read) — and the Inject arm's own
-  `resolved_peer` (a SEPARATE, ungated identity lookup — attribution, never
-  a gate) rides
-  `do_inject`'s existing `--from` flag onto a QUEUED `pending.json` entry
-  only (an immediately-delivered payload's bytes stay untouched, so an
+  (LANE IDENTITY P-ID0, G16/G5, review round 1) to stamp
+  `SessionRecord.origin = "peer:<name>"` DIRECTLY on the just-spawned record
+  once it registers — this door is the ONLY place a `peer:*` value may
+  originate, not the child's own env, since any same-uid process can set an
+  env var on itself before invoking `aoide conduct` directly
+  (`aoide-conduct`'s `session_conduct` refuses exactly that shape from its
+  env read, and a third path, `graph/resurrect.rs::origin_to_carry`,
+  refuses it again when reading a revived session's own ledger entry back —
+  `state/session-ledger.jsonl` is unsealed, so a same-uid process could
+  otherwise forge the shape there too). `stamp_spawn_origin` polls for the
+  record's registration on the same best-effort budget
+  `spawn_inject_prompt` uses (~3s); a disclosed behavior change from the
+  pre-P-ID0 synchronous env write — a child that registers slower than that
+  window now loses its stamp, logged by name (`eprintln`) rather than
+  silently, and the poll never retries unboundedly past it. Neither of
+  these closes the FILE: a hand-crafted `sessions.json`/ledger line is
+  still a readable, unflagged string on disk — sealing that is P-ID1/P-ID2,
+  still open. The Inject arm's own `resolved_peer` (a SEPARATE, ungated
+  identity lookup — attribution, never a gate) rides `do_inject`'s existing
+  `--from` flag onto a QUEUED `pending.json` entry only (an
+  immediately-delivered payload's bytes stay untouched, so an
   already-autogated peer's delivery is byte-identical to before this
   phase).
 - `discovery` — the discovery beacon's ADVERTISE half (P-P6,

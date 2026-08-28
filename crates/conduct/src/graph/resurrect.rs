@@ -314,6 +314,34 @@ fn restore_delivery(door: aoide_protocol::Door, new_id: &str, restore: &RestoreS
     })
 }
 
+/// What `resurrect_one` does with a ledger entry's `origin` field when
+/// reviving it (LANE IDENTITY P-ID0, G6 MUST-FIX). `Carry` for anything
+/// EXCEPT a `peer:*` shape — a `peer:*` value gets `RefusedPeer` instead of
+/// being silently dropped, because `state/session-ledger.jsonl` is an
+/// UNSEALED append-only file (sealing is P-ID1/P-ID2's job, not this
+/// phase): a same-uid process can append a line claiming `origin:"peer:X"`
+/// and then run this ungated LOCAL `aoide resurrect`, which has no door and
+/// no seal behind it. `peer:*` is door-authenticated identity — only
+/// `a2a::do_spawn`'s `stamp_spawn_origin` may mint it (`stamp_origin`'s own
+/// doc names the two legitimate STAMP callers) — so a local resurrect
+/// re-minting that authority off an unsealed file would be exactly the
+/// forgery this lane closes, not a fix for it. Pure and directly
+/// unit-testable, so the refusal is provable without a real spawn.
+#[derive(Debug, PartialEq, Eq)]
+enum OriginCarry<'a> {
+    Carry(&'a str),
+    RefusedPeer(&'a str),
+    Nothing,
+}
+
+fn origin_to_carry(ledger_origin: Option<&str>) -> OriginCarry<'_> {
+    match ledger_origin {
+        Some(origin) if origin.starts_with("peer:") => OriginCarry::RefusedPeer(origin),
+        Some(origin) => OriginCarry::Carry(origin),
+        None => OriginCarry::Nothing,
+    }
+}
+
 /// Spawn one candidate via the windowed path and fold the outcome into
 /// `resurrected`/`skipped`/`failed`. Never returns an error — every failure
 /// mode is data, per the module doc.
@@ -371,15 +399,28 @@ fn resurrect_one(
     stamp_resumed_from(&new_id, &c.entry.session_id);
 
     // Carry the ledger entry's own `origin` forward onto the revived record
-    // (LANE IDENTITY P-ID0, G6): `ledger_session_exit` writes `origin` on
-    // every exit, but nothing read it back until now — a revived
-    // peer-origin session silently became origin-less, losing its
-    // provenance on every resurrection. Change-only/no-op-safe exactly like
-    // `stamp_resumed_from` above (an unknown id or empty origin is a silent
-    // no-op); absent on the ledger entry (a locally-registered session
-    // never had one) means nothing to carry, same as before.
-    if let Some(origin) = c.entry.origin.as_deref() {
-        stamp_origin(&new_id, origin);
+    // (LANE IDENTITY P-ID0, G6) — LOCAL-CLASS ONLY. `ledger_session_exit`
+    // writes `origin` on every exit, but nothing read it back until now, so
+    // a revived LOCAL session silently became origin-less. A `peer:*` value
+    // is refused here on purpose, not carried: `state/session-ledger.jsonl`
+    // is an UNSEALED append-only file (P-ID1/P-ID2 seal it, not this phase)
+    // — a same-uid process can append a line claiming `origin:"peer:X"` and
+    // then run this ungated LOCAL `aoide resurrect`, which has no door and
+    // no seal behind it. `peer:*` is door-authenticated identity (only
+    // `a2a::do_spawn`'s `stamp_spawn_origin` may mint it, per `stamp_origin`'s
+    // own doc); a local resurrect re-minting that authority off an unsealed
+    // file would be exactly the forgery this lane closes, not a fix for it.
+    // Change-only/no-op-safe exactly like `stamp_resumed_from` above for the
+    // carried case (an unknown id or empty origin is a silent no-op);
+    // absent on the ledger entry (a locally-registered session never had
+    // one) means nothing to carry, same as before.
+    match origin_to_carry(c.entry.origin.as_deref()) {
+        OriginCarry::Carry(origin) => stamp_origin(&new_id, origin),
+        OriginCarry::RefusedPeer(origin) => eprintln!(
+            "aoide resurrect: reviving `{}` as LOCAL-class — its ledger origin `{origin}` cannot be trusted from an unsealed ledger and is not carried forward (P-ID1's sealed credential closes this)",
+            c.entry.session_id
+        ),
+        OriginCarry::Nothing => {}
     }
 
     // Undying transfer (P-C3, durable-sessions plan): if the OLD id was
@@ -1405,12 +1446,12 @@ mod tests {
     }
 
     /// G6 (LANE IDENTITY P-ID0), data-integrity half: `resurrect_one` reads
-    /// `c.entry.origin` straight off the resolved candidate to carry it
-    /// forward onto the revived record — this pins that `resolve_candidate`
-    /// (the harness-arm/terminal-arm dispatcher every mode routes through)
-    /// carries the ledger entry's `origin` into the `Candidate` unmodified,
-    /// the exact value the carry-forward line at the bottom of
-    /// `resurrect_one` consumes. Pure, no env, no spawn.
+    /// `c.entry.origin` straight off the resolved candidate — this pins
+    /// that `resolve_candidate` (the harness-arm/terminal-arm dispatcher
+    /// every mode routes through) carries the ledger entry's `origin` into
+    /// the `Candidate` unmodified, the exact value `origin_to_carry` (and
+    /// hence the carry-forward line at the bottom of `resurrect_one`)
+    /// consumes. Pure, no env, no spawn.
     #[test]
     fn resolve_candidate_preserves_the_ledger_entrys_origin() {
         let entry = aoide_storage::ledger::LedgerEntry {
@@ -1421,16 +1462,32 @@ mod tests {
         assert_eq!(candidate.entry.origin.as_deref(), Some("peer:yomi-strix"));
     }
 
-    /// G6 (LANE IDENTITY P-ID0), wiring half: a peer-origin ledger entry must
-    /// not derail an otherwise-ordinary resurrect — `resurrect_one`'s new
-    /// `stamp_origin` call sits right after `stamp_resumed_from`, on the
-    /// SAME `AOIDE_TERMINAL=true` fixture that never actually registers a
-    /// record (see the undying-transfer test above), so this proves the new
-    /// call is a safe no-op in exactly that shape (an unknown id, same as
-    /// `stamp_resumed_from` already tolerates) rather than a panic or an
-    /// error status. Whether the value actually LANDS on a real record is
-    /// `stamp_origin`'s own contract, proven directly in
-    /// `session_store.rs`'s `stamp_origin_lands_the_field_and_never_
+    /// G6 MUST-FIX (LANE IDENTITY P-ID0, review round 1): THE real
+    /// assertion — a `peer:*` ledger origin is REFUSED, never carried,
+    /// because `state/session-ledger.jsonl` is unsealed and a local
+    /// resurrect has no door behind it to authenticate that shape. A
+    /// non-peer (local-class) origin still carries forward normally, and
+    /// no ledger origin at all carries nothing — `origin_to_carry` is pure,
+    /// so this is provable without a spawn, a registered record, or any
+    /// env at all.
+    #[test]
+    fn origin_to_carry_refuses_a_peer_shape_and_carries_everything_else() {
+        assert_eq!(origin_to_carry(Some("peer:yomi-strix")), OriginCarry::RefusedPeer("peer:yomi-strix"));
+        assert_eq!(origin_to_carry(Some("local")), OriginCarry::Carry("local"));
+        assert_eq!(origin_to_carry(None), OriginCarry::Nothing);
+    }
+
+    /// G6 (LANE IDENTITY P-ID0), wiring half: a peer-origin ledger entry
+    /// must not derail an otherwise-ordinary resurrect (the taught refusal
+    /// eprintln fires, but the invocation still succeeds cleanly) —
+    /// `resurrect_one`'s `origin_to_carry` match sits right after
+    /// `stamp_resumed_from`, on the SAME `AOIDE_TERMINAL=true` fixture that
+    /// never actually registers a record (see the undying-transfer test
+    /// above), so this exercises the `RefusedPeer` arm specifically rather
+    /// than only proving it in isolation. The refusal DECISION itself is
+    /// the real assertion above; whether a carried (non-peer) value LANDS
+    /// on a real record is `stamp_origin`'s own contract, proven directly
+    /// in `session_store.rs`'s `stamp_origin_lands_the_field_and_never_
     /// restages_graph_json` — a real registered windowed spawn is the live
     /// gate's job, per this module's own doc (top of file), never this
     /// crate's.

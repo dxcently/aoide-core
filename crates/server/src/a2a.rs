@@ -915,8 +915,15 @@ fn spawn_inject_prompt(id: &str, prompt: &str) {
 ///
 /// Retries on the session record landing in `sessions.json`, the identical
 /// registration race [`spawn_inject_prompt`] above already tolerates
-/// (best-effort, same 300×10ms budget): a spawn whose child never registers
-/// simply never gets stamped, same as it never gets its opening turn typed.
+/// (best-effort, same 300×10ms budget — ~3s): a spawn whose child never
+/// registers within that window simply never gets stamped, same as it never
+/// gets its opening turn typed. Disclosed behavior change from the pre-P-ID0
+/// shape (a synchronous env write that could never "miss"): a genuinely
+/// slow-to-register child can now lose its origin stamp. Never silent about
+/// it, though — poll exhaustion with no registration found is eprintln'd by
+/// name, so a dropped stamp shows up rather than vanishing quietly. No
+/// unbounded retry: a spawn that never registers at all (a failed exec, a
+/// missing agent binary) must not spin this thread forever.
 fn stamp_spawn_origin(id: &str, origin: &str) {
     for _ in 0..300 {
         let registered = load_stage(&sessions_path())
@@ -928,6 +935,9 @@ fn stamp_spawn_origin(id: &str, origin: &str) {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+    eprintln!(
+        "aoide a2a: could not stamp peer origin for `{id}` within 3s — session registered late or spawn failed"
+    );
 }
 
 /// Spawn a NEW conducted session running the CONFIGURED agent (never a

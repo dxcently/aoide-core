@@ -549,36 +549,46 @@
 - **`SessionRecord.origin` is a PERMANENT birth fact stamped ONCE per
   record, the same discipline `headless`/`hookAncestry` already hold
   (P-P3, `docs/architecture/PAIRING.md` decision 7) — never re-derived
-  later. Write AUTHORITY is split by shape, tightened at LANE IDENTITY
-  P-ID0 (G16/G5).** `session_store.rs::stamp_origin` is `pub` (crosses the
-  crate boundary) and is the ONE writer function, but it has exactly two
-  legitimate call sites, each authoritative for one shape only:
-  `graph/conduct.rs::session_conduct` calls it right after
-  `do_session_start`, reading a LOCAL-CLASS value off its own inherited
-  `AOIDE_SESSION_ORIGIN` env — and REFUSES (eprintln, never panics) a
-  `peer:*` shape read from that env, because inherited env is exactly what
-  a same-uid process can set on itself before invoking `aoide conduct`
-  directly. `aoide-server`'s `a2a::do_spawn` (`stamp_spawn_origin`) calls it
-  DIRECTLY on the just-spawned record instead — polling for the record's
-  registration the same way `spawn_inject_prompt` already does — from the
-  door where the peer name IS authenticated; this is the ONLY legitimate
-  source of a `peer:*` value. **Do not add a third caller or a third shape
-  without re-deriving this split**: the whole point is that a `peer:*`
-  origin can only ever come from the one place that actually authenticated
-  it. No `restage_graph()` — like `headless`, `origin` is consumed
-  internally (`doc.rs::ledger_session_exit`'s projection into the durable
-  ledger, and `graph/resurrect.rs` reading that ledger field back to carry
-  a peer-origin session's provenance forward onto its revived record — G6,
-  same phase), not rendered into `graph.json`. **`origin` is still
-  attribution, not an authenticated credential** — a same-uid process can
-  still forge a LOCAL-class origin (`stamp_origin` trusts whatever
-  non-`peer:*` value `AOIDE_SESSION_ORIGIN` says), and neither the
-  session's own identity nor the consumer presenting it are authenticated
-  yet; don't let a future consumer gate a security decision on it without
-  the sealed credential task #63's lane builds next (P-ID1+). What P-ID0
-  closes is narrower and real: the specific `peer:*` forgery (any local
-  process claiming to BE a peer-spawned session via one env var) is now
-  record-layer impossible, not merely undocumented.
+  later. Write AUTHORITY is split by SHAPE, not by caller count, tightened
+  at LANE IDENTITY P-ID0 (G16/G5, review round 1).**
+  `session_store.rs::stamp_origin` is `pub` (crosses the crate boundary)
+  and is the ONE writer function, with THREE call sites today — but the
+  invariant that matters is narrower than "exactly two callers": **a
+  `peer:*` shape may be stamped from exactly ONE place, `aoide-server`'s
+  `a2a::do_spawn` (`stamp_spawn_origin`)**, called DIRECTLY on the
+  just-spawned record — polling for the record's registration the same way
+  `spawn_inject_prompt` already does — from the door where the peer name IS
+  authenticated. Every OTHER call site may stamp a LOCAL-CLASS value but
+  MUST refuse a `peer:*` shape, because neither has a door behind it:
+  `graph/conduct.rs::session_conduct` reads its own inherited
+  `AOIDE_SESSION_ORIGIN` env (a same-uid process can set that on itself
+  before invoking `aoide conduct` directly) and `graph/
+  resurrect.rs::origin_to_carry` reads a revived session's OWN ledger entry
+  back (`state/session-ledger.jsonl` is a plain, same-uid-writable,
+  append-only file — a same-uid process can append a line claiming
+  `origin:"peer:X"` and then run the ungated local `aoide resurrect`,
+  which likewise has no door behind it). Both REFUSE (eprintln, never
+  panic) a `peer:*` value from their own untrusted source instead of
+  stamping it. **A future third-plus call site is fine as long as it holds
+  this same refusal** — the invariant is "peer:* only from an authenticated
+  door", never "count the callers". No `restage_graph()` — like `headless`,
+  `origin` is consumed internally (`doc.rs::ledger_session_exit`'s
+  projection into the durable ledger, and `origin_to_carry` reading that
+  field back to carry a LOCAL-class session's provenance forward onto its
+  revived record — G6, same phase, `peer:*` excluded per above), not
+  rendered into `graph.json`. **This closes the STAMP paths, not the
+  files**: a hand-crafted `sessions.json`/ledger line claiming `peer:X` is
+  still a readable, unflagged string on disk — nothing here makes the files
+  tamper-evident; that is P-ID1 (the daemon-signed credential)/P-ID2 (the
+  peercred floor), still open. **`origin` is still attribution, not an
+  authenticated credential** — a same-uid process can still forge a
+  LOCAL-class origin (`stamp_origin` trusts whatever non-`peer:*` value it
+  is given), and neither the session's own identity nor the consumer
+  presenting it are authenticated yet; don't let a future consumer gate a
+  security decision on it without the sealed credential task #63's lane
+  builds next (P-ID1+). What P-ID0 closes is narrower and real: every
+  record-STAMP path this codebase drives now refuses a `peer:*` shape it
+  didn't mint itself at the door — env AND the unsealed ledger both.
 
 ## Extension points
 
