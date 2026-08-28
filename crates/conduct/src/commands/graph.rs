@@ -293,45 +293,54 @@ pub fn register(r: &mut Registry) {
         implemented: true,
         handler: crate::graph::session_conduct,
     ));
-    // ── session undying: the durable mark (durable-sessions plan, P-C2;
-    // renamed from "carry" at command-defrag lane U1, 2026-08-27) ──
-    // Registered here, at the END of `register` — not beside the other
-    // `session *` entries above — because registration order is load-bearing
-    // (`crates/AGENTS.md`, "Registry order is load-bearing") and this command
-    // landed after every entry above it. The golden test sorts before
-    // comparing, so this costs nothing there; `schema --json` order is what
-    // the append-only rule protects.
-    // ── bare `session`: the undying PICKER (U3, command-defrag lane U) ──
-    // Same parent-command pattern R1 established for bare `graph` (path
-    // ["graph"] alongside ["graph", "link"]): registered here, at the END,
-    // beside `session undying` (which it steers non-interactive/non-tty
-    // callers toward) rather than up with `session start`/`session end` —
-    // registration order matters (`crates/AGENTS.md`), and this landed
-    // after every entry above it.
+    // ── bare `session`: the ROSTER (session-surface redesign, command-defrag
+    // lane X, 2026-08-28 — supersedes both the U3 undying picker that used
+    // to live here AND the standalone `aoide who` command, folded away
+    // entirely). Registered here, at the END — same parent-command pattern
+    // R1 established for bare `graph` (path ["graph"] alongside ["graph",
+    // "link"]) — registration order matters (`crates/AGENTS.md`), and this
+    // landed after every entry above it.
     r.insert(cmd!(
         path: ["session"],
-        summary: "Open the undying PICKER on a real CLI terminal: a multi-select over this box's own sessions plus every registered peer's CACHED sessions (no live pulls), each row pre-checked by its current undying state. Confirm toggles the diff — local rows through state/undying.json, peer rows as a spec in the CURRENT project's .aoide/project.json (no manifest above cwd: peer marks are skipped with a taught reason, local marks in the same confirm still apply). Non-tty, a non-CLI door, or --json: a taught usage error steering to the scripted spelling below — there is no second one.",
-        args: [],
-        flags: [],
+        summary: "Roster listing: this box's own sessions plus every registered peer, probed in parallel on every call (the retired `aoide who` command's exact probe/cache-fallback pipeline). Bare groups sessions by PROJECT (a registered projects.json name, else a .aoide/project.json manifest directory's own basename, else a trailing (no project) bucket); --hosts groups by HOST instead — this host, then each peer, byte-identical to `who`'s old rendering. --json mirrors either grouping structurally.",
+        args: [arg!("filter", "string", false, "Narrow what's displayed (never what's probed): a local session id/tail4/petname, a host/role/petname line, peer/<rest>, or a plain substring against a node/session name.")],
+        flags: [
+            flag!("hosts", "bool", "Group by host instead of by project — the retired `who` command's own grouping."),
+            flag!("all", "bool", "Also list `done` sessions (omitted by default)."),
+        ],
         gated: false,
         implemented: true,
-        handler: crate::graph::session_pick,
-        examples: ["session"],
+        handler: crate::graph::session_roster,
+        examples: [
+            "session",
+            "session --hosts",
+            "session --hosts --all",
+        ],
     ));
+    // ── session grant: the GRANT family (session-surface redesign,
+    // command-defrag lane X) — a POSITIONAL <kind> grammar (`secrets
+    // automate <name> on|off` style) replacing the old standalone `session
+    // undying` command, which this absorbs and retires (hard cutover, no
+    // alias). One kind today: `undying` (U1/U3's mark, relocated verbatim).
+    // Registered last — landed after every entry above it.
     r.insert(cmd!(
-        path: ["session", "undying"],
-        summary: "Mark or unmark a session as durable in state/undying.json, so a project's whole undying set can later be resurrected together. Bare and --self both resolve the target from $AOIDE_SESSION_ID; --id targets any session id directly, including one already gone from the roster — no roster lookup gates the write, which is what makes the mark flippable post-mortem.",
-        args: [arg!("state", "string", true, "The undying state to set: `on` or `off`.")],
+        path: ["session", "grant"],
+        summary: "Grant (or open a picker to grant) a session capability. Bare (no <kind>) teaches the grantable set; an unknown kind is a taught refusal. `undying` (the only kind today): with no state, opens the interactive PICKER on a real CLI terminal — a multi-select over this box's own sessions plus every registered peer's CACHED sessions (no live pulls), each row pre-checked by its current undying state, confirmed in one Enter (non-tty/non-CLI/--json steers to the scripted form below instead); with on|off, marks or unmarks a session as durable in state/undying.json directly, so a project's whole undying set can later be resurrected together. Bare and --self both resolve the target from $AOIDE_SESSION_ID; --id targets any session id directly, including one already gone from the roster.",
+        args: [
+            arg!("kind", "string", true, "The grant kind — `undying` today."),
+            arg!("state", "string", false, "For `undying`: the state to set, `on` or `off`. Omit to open the interactive picker instead."),
+        ],
         flags: [
             flag!("self", "bool", "Target this session, resolved from $AOIDE_SESSION_ID (the default when neither --self nor --id is given)."),
             flag!("id", "string", "Target session id directly (mutually exclusive with --self); no roster lookup gates it, so a dead id is a valid target."),
         ],
         gated: false,
         implemented: true,
-        handler: crate::graph::session_undying,
+        handler: crate::graph::session_grant,
         examples: [
-            "session undying on --self",
-            "session undying off --id <session-id>",
+            "session grant undying",
+            "session grant undying on --self",
+            "session grant undying off --id <session-id>",
         ],
     ));
 }

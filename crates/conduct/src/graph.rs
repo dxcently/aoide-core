@@ -33,8 +33,8 @@ mod session_store;
 mod spawn;
 #[cfg(test)]
 pub(crate) mod testutil;
+mod grant;
 mod manage;
-mod session_pick;
 mod undying;
 mod who;
 mod window;
@@ -87,27 +87,26 @@ pub use self::spawn::session_spawn;
 // auto-resume trigger (`aoide-server`'s `daemon.rs`), called in-process the
 // same way `run_internal_reap` calls `crate::reap::reap_and_announce`.
 pub use self::resurrect::session_resurrect;
-// `session undying` (P-C2, durable-sessions plan; renamed from "carry" at
-// command-defrag lane U1): the mark that lets a project's whole undying set
-// be resurrected together — see `graph/undying.rs`'s module doc.
-pub use self::undying::session_undying;
-// Bare `session` (U3, command-defrag lane U): the undying PICKER — a tty
-// multi-select over local + peer-cached sessions, each row pre-checked by
-// its current undying state — see `graph/session_pick.rs`'s module doc.
-pub use self::session_pick::session_pick;
+// `session grant` (session-surface redesign, command-defrag lane X,
+// 2026-08-28): the GRANT family — `undying` (U1/U3's mark, relocated
+// verbatim) is the only kind today; the standalone `session undying`
+// command this absorbs is retired — see `graph/grant.rs`'s module doc.
+pub use self::grant::session_grant;
 pub use self::manage::{link, project_add, project_list, project_remove, prune, view};
-// `aoide who` (messaging/presence plan, P-C2): live presence over this
-// box's own sessions plus every registered peer — see `graph/who.rs`'s
-// module doc for the probe/filter design. `glyph` (the node-presence
-// online/unreachable/never-pulled map) rides alongside it — P-C4's
-// conductor ROSTER panel is its second consumer (`who.rs`'s doc comment
-// on `glyph`), reused rather than redrawn.
-pub use self::who::{glyph, who};
+// Bare `session` (session-surface redesign, command-defrag lane X): the
+// ROSTER — grouped by PROJECT bare, by HOST under `--hosts` (byte-identical
+// to the retired standalone `aoide who` command's own rendering) — see
+// `graph/who.rs`'s module doc for the probe/filter/attribution design.
+// `glyph` (the node-presence online/unreachable/never-pulled map) rides
+// alongside it — P-C4's conductor ROSTER panel is its second consumer
+// (`who.rs`'s doc comment on `glyph`), reused rather than redrawn.
+pub use self::who::{glyph, session_roster};
 // `aoide peer list` (task #120 P2): the one-glance mesh roster — this host,
 // every registered peer, every advertising instance heard in one bounded
-// sweep, each with its running sessions. Lives beside `who` because it IS
-// `who`'s probe/classification core under a wider fold (`peer_list.rs`'s
-// module doc) — `peer status` (aoide-client) keeps the deep per-peer view.
+// sweep, each with its running sessions. Lives beside the roster core
+// because it IS `who.rs`'s probe/classification core under a wider fold
+// (`peer_list.rs`'s module doc) — `peer status` (aoide-client) keeps the
+// deep per-peer view.
 pub use self::peer_list::peer_list;
 pub use self::window::{focus_session, focus_window, run_hypr_window_listener, FocusError};
 

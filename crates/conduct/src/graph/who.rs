@@ -1,14 +1,30 @@
-//! `aoide who [filter] [--json] [--all]` — live presence over this box's own
-//! sessions plus every registered peer (messaging/presence plan, P-C2). A
+//! The ROSTER core (messaging/presence plan, P-C2; folded under `session` at
+//! the session-surface redesign, command-defrag lane X, 2026-08-28) — live
+//! presence over this box's own sessions plus every registered peer. A
 //! PROJECTION, never a store: `build_graph`'s peer fold (`doc.rs:156-201`)
 //! already folds registered peers with freshness off their pull CACHE; this
 //! module never writes `state/peer-cache/<name>.json` — nothing here is a
 //! second source of truth for it.
 //!
+//! **The standalone `aoide who` command is RETIRED (hard cutover, no
+//! alias — this exact spelling is now unknown, same as a typo).** Its
+//! collection pipeline ([`collect_roster`]) and its host-grouped rendering
+//! ([`render_nodes`]/[`node_json`]) both SURVIVE, unchanged in mechanism,
+//! now reached at `aoide session --hosts` ([`session_roster`]/
+//! [`session_roster_with`]) — the SAME `Roster` [`collect_roster`] builds
+//! also feeds bare `session`'s PROJECT-grouped rendering
+//! ([`group_by_project`]/[`render_groups`]), so `who`'s old byte-for-byte
+//! output survives as one of two renderings behind one command instead of
+//! living behind a command of its own. `conductor`'s ROSTER panel
+//! (`conductor/src/app.rs`'s `spawn_roster_fetch`) dispatches
+//! `session --hosts` now — same `Outcome` shape (`nodes`, byte-identical to
+//! `who`'s), so that panel needed no rendering change, only its own dispatch
+//! `Invocation`.
+//!
 //! ## Presence model (User-decided, verbatim from the plan)
 //!
 //! Every registered peer is ALWAYS-ON: a resident door means host-up ==
-//! door-answering. So `who` probes every registered peer LIVE on EVERY
+//! door-answering. So this module probes every registered peer LIVE on EVERY
 //! invocation — one [`std::thread`] per peer (no new deps), each bounded by
 //! a short per-peer timeout (~2s) enforced by the transport itself (curl's
 //! own `--max-time`, inside [`aoide_client::commands::pull_peer_live`]) —
@@ -37,21 +53,38 @@
 //! real 2s bound lives inside curl, one process this crate's tests never
 //! spawn.
 //!
-//! ## Filter semantics
+//! ## Filter semantics (`--hosts` rendering only)
 //!
 //! An optional positional `filter` narrows what's DISPLAYED; it never
 //! changes what gets probed (every peer is probed regardless — see
-//! [`who_with`]). Resolution order: try `storage::addr::resolve` first —
-//! `Local`/`Ambiguous` narrows to exactly those local session ids;
+//! [`session_roster_with`]). Resolution order: try `storage::addr::resolve`
+//! first — `Local`/`Ambiguous` narrows to exactly those local session ids;
 //! `Remote{peer, query}` narrows to that one peer node, additionally
 //! substring-matching its sessions when `query` is non-empty. A query the
 //! resolver can't place at all (`NotFound` — most commonly a plain
 //! substring nobody typed as a full grammar token) falls back to a
 //! case-sensitive substring match: a node whose own name contains it keeps
 //! every session, otherwise only ITS sessions whose id/petname/label
-//! contain it survive.
+//! contain it survive. Applies to both groupings — it narrows `nodes`
+//! BEFORE the host/project split, so a filter behaves identically either
+//! way.
+//!
+//! ## Project attribution (bare `session`'s own grouping)
+//!
+//! [`project_bucket`] reuses whichever attribution the codebase already
+//! computes — never a third one: a registered `projects.json` name
+//! ([`super::model::anchor_for`], longest-prefix, PURE string matching, so
+//! it resolves identically for a peer session's cwd under the fleet's
+//! shared-path convention the same way `grant.rs`'s peer-spec relativization
+//! already leans on) wins when present; else a `.aoide/project.json`
+//! manifest found by walking up from the cwd ON THIS HOST'S OWN FILESYSTEM
+//! (`aoide_storage::manifest::walk_up`) renders by that directory's own
+//! basename — a peer's foreign cwd simply never resolves a manifest here
+//! (the walk is real `Path::is_file()` checks against THIS filesystem), so
+//! it falls through harmlessly rather than lying about a match. Neither
+//! resolving lands the session in the trailing [`NO_PROJECT`] bucket.
 
-use super::model::{resolved_parent, HookRecord, SessionRecord};
+use super::model::{resolved_parent, HookRecord, Project, SessionRecord};
 use aoide_protocol::output::Outcome;
 use aoide_protocol::Invocation;
 use aoide_storage::addr::{self, LocalCandidate, Resolution};
@@ -60,19 +93,19 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-/// A `who`-probe pull closure: given a peer, return its live resolved graph
+/// A roster-probe pull closure: given a peer, return its live resolved graph
 /// document (`{nodes, edges}`) or a reason it couldn't be fetched. Boxed so
 /// production (`aoide_client::commands::pull_peer_live`) and tests (a canned
 /// closure) share the exact same call shape.
 pub(super) type PullFn = Arc<dyn Fn(&Peer) -> Result<Value, String> + Send + Sync>;
 
-/// One session as `who` renders it — local or remote, uniformly. Widened to
-/// `pub(super)` (fields too) for a second consumer: `session_pick.rs`'s
-/// bare-`session` picker (U3, command-defrag lane U) builds its peer rows
-/// off the same [`sessions_from_graph`] extraction rather than re-parsing a
-/// peer's cached graph document a second time (this crate's own "no
-/// cross-crate copying" discipline, applied in-file — see [`glyph`]'s own
-/// widening note above for the precedent).
+/// One session as the roster renders it — local or remote, uniformly.
+/// `pub(super)` (fields too) for three consumers: `session_pick`-turned-
+/// `grant.rs`'s undying picker (U3) builds its peer rows off the same
+/// [`sessions_from_graph`] extraction rather than re-parsing a peer's cached
+/// graph document a second time, and `peer_list.rs`'s mesh roster (task
+/// #120 P2) does likewise (this crate's own "no cross-crate copying"
+/// discipline, applied in-file).
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct SessionView {
     pub(super) session_id: String,
@@ -84,8 +117,8 @@ pub(super) struct SessionView {
     pub(super) cwd: String,
 }
 
-/// One node (this box, or one registered peer) as `who` renders it. Widened
-/// to `pub(super)` (fields too) for a second consumer: `peer_list.rs`'s
+/// One node (this box, or one registered peer) as the host-grouped rendering
+/// shows it. `pub(super)` (fields too) for a second consumer: `peer_list.rs`'s
 /// mesh roster (task #120 P2) classifies its paired rows off the SAME
 /// probe-outcome/cache fold ([`build_peer_node`]) rather than re-deriving a
 /// second presence model — same discipline as [`SessionView`]'s widening
@@ -100,7 +133,7 @@ pub(super) struct NodeView {
     pub(super) sessions: Vec<SessionView>,
 }
 
-/// Session-level presence class (module doc's "Session-level presence").
+/// Session-level presence class (module doc's "Presence model").
 fn session_presence(state: &str) -> &'static str {
     match state {
         "stopped" => "stale",
@@ -183,9 +216,9 @@ pub(super) fn sessions_from_graph(graph: &Value, host: &str) -> Vec<SessionView>
 /// Pure: classify one peer's [`NodeView`] from its live-probe OUTCOME and
 /// its already-loaded last cache entry (if any) — no I/O in here at all, so
 /// it is trivially unit-testable with synthetic data. The caller
-/// (`who_with`, and `peer_list.rs`'s `peer_list_with` — see [`NodeView`]'s
-/// widening note) does the real `peer_store::load_peer_cache` read and
-/// hands the result in.
+/// ([`collect_roster`], and `peer_list.rs`'s `peer_list_with` — see
+/// [`NodeView`]'s widening note) does the real
+/// `peer_store::load_peer_cache` read and hands the result in.
 pub(super) fn build_peer_node(peer: &Peer, probe: Result<Value, String>, cache: Option<PeerCacheEntry>) -> NodeView {
     match probe {
         Ok(graph) => NodeView {
@@ -308,12 +341,11 @@ fn apply_filter(filter: &str, host: &str, nodes: Vec<NodeView>, locals: &[Sessio
 }
 
 /// Node-level presence glyph — `online`/`unreachable`/`never-pulled` (this
-/// module's doc, "Presence model"). Widened to `pub` (re-exported at
-/// `graph.rs` alongside [`who`]) for a second consumer: the conductor's
-/// ROSTER panel (messaging/presence plan, P-C4) paints the exact same three
-/// glyphs over this same `presence` string and must not redraw its own copy
-/// of this map — reuse it instead of forking it (crate `AGENTS.md`'s "no
-/// cross-crate copying").
+/// module's doc, "Presence model"). `pub` (re-exported at `graph.rs`
+/// alongside [`session_roster`]) for a second consumer: the conductor's
+/// ROSTER panel (P-C4) paints the exact same three glyphs over this same
+/// `presence` string and must not redraw its own copy of this map — reuse
+/// it instead of forking it (crate `AGENTS.md`'s "no cross-crate copying").
 pub fn glyph(presence: &str) -> &'static str {
     match presence {
         "online" => "●",
@@ -323,8 +355,10 @@ pub fn glyph(presence: &str) -> &'static str {
     }
 }
 
-/// The Unicode roster render — mirrors `doc.rs::render`'s glyph/branch style
-/// (`◆`/`●`/`├─`/`└─`) so every human surface reads the same grammar.
+/// The Unicode HOST-grouped render — mirrors `doc.rs::render`'s glyph/branch
+/// style (`◆`/`●`/`├─`/`└─`) so every human surface reads the same grammar.
+/// `session --hosts`'s renderer; byte-identical to the retired `who`
+/// command's own output.
 fn render_nodes(nodes: &[NodeView]) -> String {
     let mut out: Vec<String> = Vec::new();
     for n in nodes {
@@ -368,17 +402,120 @@ fn node_json(n: &NodeView) -> Value {
     })
 }
 
-/// The testable core: everything `who` does EXCEPT choosing the real `pull`
-/// closure. Loads local stage state (real file I/O — sanctioned, same as
-/// every other `graph` command) and `state/peers.json`/`peer-cache/` (also
-/// real file I/O), but the one network-shaped step — probing peers — goes
-/// through the injected `pull`, so a test never opens a socket.
-pub(super) fn who_with(inv: &Invocation, pull: PullFn) -> Outcome {
-    let cmd = "who";
-    let (_, s, h) = match super::common::load_inputs(cmd) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
+/// The trailing catch-all bucket name for a session whose cwd resolves
+/// neither a registered project nor a manifest (module doc's "Project
+/// attribution") — always sorted last in [`group_by_project`]'s output.
+const NO_PROJECT: &str = "(no project)";
+
+/// Attribute one session's cwd to a project bucket for bare `session`'s
+/// PROJECT-grouped listing — see the module doc's "Project attribution".
+/// `None` means neither attribution resolved; the caller buckets that as
+/// [`NO_PROJECT`].
+pub(super) fn project_bucket(cwd: &str, projects: &[Project]) -> Option<String> {
+    if let Some(i) = super::model::anchor_for(cwd, projects) {
+        return Some(projects[i].name.clone());
+    }
+    let path = std::path::Path::new(cwd);
+    if !path.is_absolute() {
+        // A session's own cwd is always recorded absolute; a stray relative
+        // string (malformed input, a test fixture) must never be walked
+        // relative to THIS process's own cwd — that would attribute a
+        // session by an accident of where the roster command happens to
+        // run, not by anything the session itself carries.
+        return None;
+    }
+    let (root, _manifest) = aoide_storage::manifest::walk_up(path)?;
+    Some(root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| root.to_string_lossy().into_owned()))
+}
+
+/// One project's bucket in bare `session`'s roster — a registered name, a
+/// manifest directory's basename, or the trailing [`NO_PROJECT`] catch-all.
+#[derive(Debug, Clone, PartialEq)]
+struct ProjectGroup {
+    name: String,
+    sessions: Vec<SessionView>,
+}
+
+/// Fold every node's sessions into project buckets — a single pass over
+/// `nodes` in the SAME order [`collect_roster`] built them (local first,
+/// then each peer in probe order), so within a bucket session order mirrors
+/// the host-grouped rendering's own order. Buckets are sorted
+/// alphabetically by name, [`NO_PROJECT`] always trailing last (module
+/// doc's "Project attribution" / the task brief's own wording).
+fn group_by_project(nodes: Vec<NodeView>, projects: &[Project]) -> Vec<ProjectGroup> {
+    let mut order: Vec<String> = Vec::new();
+    let mut buckets: std::collections::HashMap<String, Vec<SessionView>> = std::collections::HashMap::new();
+    for node in nodes {
+        for sv in node.sessions {
+            let name = project_bucket(&sv.cwd, projects).unwrap_or_else(|| NO_PROJECT.to_string());
+            if !buckets.contains_key(&name) {
+                order.push(name.clone());
+            }
+            buckets.entry(name).or_default().push(sv);
+        }
+    }
+    let mut names: Vec<String> = order.into_iter().filter(|n| n != NO_PROJECT).collect();
+    names.sort();
+    if buckets.contains_key(NO_PROJECT) {
+        names.push(NO_PROJECT.to_string());
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            let sessions = buckets.remove(&name).unwrap_or_default();
+            ProjectGroup { name, sessions }
+        })
+        .collect()
+}
+
+/// The Unicode PROJECT-grouped render — same branch/line grammar
+/// [`render_nodes`] uses (`◆`/`├─`/`└─`, `label  agent  state  cwd` per
+/// session row), grouped by project bucket instead of by host.
+fn render_groups(groups: &[ProjectGroup]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for g in groups {
+        out.push(format!("◆ {}", g.name));
+        for (i, s) in g.sessions.iter().enumerate() {
+            let branch = if i + 1 == g.sessions.len() { "└─ " } else { "├─ " };
+            out.push(format!("{branch}{}  {}  {}  {}", s.label, s.agent, s.state, s.cwd));
+        }
+    }
+    if out.is_empty() {
+        return "(no local sessions, no peers registered)".to_string();
+    }
+    out.join("\n")
+}
+
+fn group_json(g: &ProjectGroup) -> Value {
+    json!({
+        "name": g.name,
+        "sessions": g.sessions.iter().map(|s| json!({
+            "sessionId": s.session_id,
+            "label": s.label,
+            "petname": s.petname,
+            "agent": s.agent,
+            "state": s.state,
+            "presence": s.presence,
+            "cwd": s.cwd,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Everything bare `session`'s two renderings share before they diverge —
+/// local sessions/hooks/projects loaded once (`common::load_inputs`), every
+/// registered peer probed LIVE exactly as the retired `who` command did
+/// (module doc's "Presence model"). `host`/`--hosts` rendering and the
+/// PROJECT rendering both call this and then diverge purely on how they
+/// group/render `nodes`.
+pub(super) struct Roster {
+    pub(super) host: String,
+    pub(super) projects: Vec<Project>,
+    pub(super) locals: Vec<SessionRecord>,
+    pub(super) nodes: Vec<NodeView>,
+}
+
+pub(super) fn collect_roster(cmd: &str, pull: PullFn) -> Result<Roster, Outcome> {
+    let (p, s, h) = super::common::load_inputs(cmd)?;
     let host = aoide_storage::display::local_host_name();
     let local_node = build_local_node(&s.sessions, &h.hooks, &host);
 
@@ -391,12 +528,31 @@ pub(super) fn who_with(inv: &Invocation, pull: PullFn) -> Outcome {
         nodes.push(build_peer_node(&peer, result, cache));
     }
 
-    // Filter narrows DISPLAY only — every peer above was already probed
-    // regardless (module doc's "Filter semantics": probe all, filter
-    // display).
+    Ok(Roster { host, projects: p.projects, locals: s.sessions, nodes })
+}
+
+/// Per-peer live-probe timeout (module doc's presence model — "short
+/// per-peer timeout ~2s"). One named constant rather than a magic number at
+/// the two call sites that need it ([`session_roster`] below, and
+/// `peer_list.rs`'s own production entry — the SAME probe, so the SAME
+/// bound).
+pub(super) const PEER_PROBE_TIMEOUT_SECS: u64 = 2;
+
+/// The testable core: everything `session`'s bare listing does EXCEPT
+/// choosing the real `pull` closure. `--hosts` renders exactly what the
+/// retired `who` command used to (byte-identical message/JSON shape);
+/// without it, sessions group by PROJECT instead. `filter`/`--all` apply to
+/// either grouping, narrowing `nodes` BEFORE the host/project split.
+pub(super) fn session_roster_with(inv: &Invocation, pull: PullFn) -> Outcome {
+    let cmd = "session";
+    let Roster { host, projects, locals, mut nodes } = match collect_roster(cmd, pull) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+
     let filter = inv.args.first().map(|a| a.trim()).filter(|a| !a.is_empty());
     if let Some(f) = filter {
-        nodes = apply_filter(f, &host, nodes, &s.sessions);
+        nodes = apply_filter(f, &host, nodes, &locals);
     }
 
     if !inv.flag_present("all") {
@@ -405,34 +561,46 @@ pub(super) fn who_with(inv: &Invocation, pull: PullFn) -> Outcome {
         }
     }
 
-    let total_sessions: usize = nodes.iter().map(|n| n.sessions.len()).sum();
-    let message = format!(
-        "{} node(s), {} session(s)\n{}",
-        nodes.len(),
-        total_sessions,
-        render_nodes(&nodes)
-    );
-    let data = json!({
-        "host": host,
-        "generatedAt": aoide_storage::time::now_iso_utc(),
-        "nodes": nodes.iter().map(node_json).collect::<Vec<_>>(),
-    });
-    Outcome::ok(cmd, message).with_data(data)
+    if inv.flag_present("hosts") {
+        let total_sessions: usize = nodes.iter().map(|n| n.sessions.len()).sum();
+        let message = format!(
+            "{} node(s), {} session(s)\n{}",
+            nodes.len(),
+            total_sessions,
+            render_nodes(&nodes)
+        );
+        let data = json!({
+            "host": host,
+            "generatedAt": aoide_storage::time::now_iso_utc(),
+            "nodes": nodes.iter().map(node_json).collect::<Vec<_>>(),
+        });
+        Outcome::ok(cmd, message).with_data(data)
+    } else {
+        let groups = group_by_project(nodes, &projects);
+        let total_sessions: usize = groups.iter().map(|g| g.sessions.len()).sum();
+        let message = format!(
+            "{} project(s), {} session(s)\n{}",
+            groups.len(),
+            total_sessions,
+            render_groups(&groups)
+        );
+        let data = json!({
+            "host": host,
+            "generatedAt": aoide_storage::time::now_iso_utc(),
+            "projects": groups.iter().map(group_json).collect::<Vec<_>>(),
+        });
+        Outcome::ok(cmd, message).with_data(data)
+    }
 }
 
-/// Per-peer live-probe timeout (module doc's presence model — "short
-/// per-peer timeout ~2s"). One named constant rather than a magic number at
-/// the two call sites that need it (`who` below, and `peer_list.rs`'s own
-/// production entry — the SAME probe, so the SAME bound).
-pub(super) const PEER_PROBE_TIMEOUT_SECS: u64 = 2;
-
-/// `aoide who [filter] [--json] [--all]` — the real entry point: wires the
-/// live probe to `aoide_client::commands::pull_peer_live` (the SAME
-/// transport `peer pull` uses, per the crate's `Cargo.toml` note on the
-/// `conduct → client` edge) and hands off to [`who_with`].
-pub fn who(inv: &Invocation) -> Outcome {
+/// `aoide session [filter] [--hosts] [--json] [--all]` — the real entry
+/// point: wires the live probe to `aoide_client::commands::pull_peer_live`
+/// (the SAME transport `peer pull` uses, per the crate's `Cargo.toml` note
+/// on the `conduct → client` edge) and hands off to
+/// [`session_roster_with`].
+pub fn session_roster(inv: &Invocation) -> Outcome {
     let pull: PullFn = Arc::new(|p: &Peer| aoide_client::commands::pull_peer_live(p, PEER_PROBE_TIMEOUT_SECS));
-    who_with(inv, pull)
+    session_roster_with(inv, pull)
 }
 
 #[cfg(test)]
@@ -481,6 +649,10 @@ mod tests {
             })
             .collect();
         json!({ "schemaVersion": "0", "nodes": nodes, "edges": [] })
+    }
+
+    fn project(name: &str, path: &str) -> Project {
+        Project { name: name.to_string(), path: path.to_string(), ..Default::default() }
     }
 
     // ── session_presence: the three-way session classification ──────────
@@ -651,7 +823,89 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    // ── who_with: the full pipeline, injected pull, real local stage I/O ──
+    // ── project_bucket / group_by_project: attribution + trailing bucket ──
+
+    #[test]
+    fn project_bucket_prefers_a_registered_project_over_a_manifest() {
+        let projects = vec![project("aoide", "/home/k/Aoide")];
+        assert_eq!(project_bucket("/home/k/Aoide/pkgs/aoide", &projects), Some("aoide".to_string()));
+    }
+
+    #[test]
+    fn project_bucket_falls_back_to_a_manifest_directorys_own_basename() {
+        let root = std::env::temp_dir().join(format!("aoide-who-manifest-bucket-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        aoide_storage::manifest::save_manifest(&root, &aoide_storage::manifest::Manifest::default()).unwrap();
+
+        let nested = root.join("sub");
+        std::fs::create_dir_all(&nested).unwrap();
+        let bucket = project_bucket(nested.to_str().unwrap(), &[]);
+        assert_eq!(bucket, root.file_name().map(|n| n.to_string_lossy().into_owned()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn project_bucket_is_none_with_neither_a_registered_project_nor_a_manifest() {
+        let root = std::env::temp_dir().join(format!("aoide-who-no-project-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(project_bucket(root.to_str().unwrap(), &[]), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn group_by_project_sorts_named_buckets_alphabetically_with_no_project_trailing() {
+        let nodes = vec![NodeView {
+            name: "sakaki".to_string(),
+            is_local: true,
+            presence: "online",
+            fetched_at: None,
+            error: None,
+            sessions: vec![
+                SessionView { session_id: "s1".into(), label: "l1".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/z/nowhere".into() },
+                SessionView { session_id: "s2".into(), label: "l2".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/proj/zeta/x".into() },
+                SessionView { session_id: "s3".into(), label: "l3".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/proj/alpha/x".into() },
+            ],
+        }];
+        let projects = vec![project("zeta", "/proj/zeta"), project("alpha", "/proj/alpha")];
+        let groups = group_by_project(nodes, &projects);
+        let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "zeta", NO_PROJECT]);
+        assert_eq!(groups[2].sessions[0].session_id, "s1");
+    }
+
+    #[test]
+    fn group_by_project_attributes_a_remote_sessions_cwd_the_same_host_agnostic_way() {
+        // A peer's session cwd matching a LOCALLY-registered project's path
+        // string (the fleet's shared-path convention, `grant.rs`'s own peer
+        // relativization leans on the same thing) attributes purely by
+        // string match — no filesystem access, so it works identically for
+        // a foreign host's cwd.
+        let nodes = vec![NodeView {
+            name: "yomi-strix".to_string(),
+            is_local: false,
+            presence: "online",
+            fetched_at: None,
+            error: None,
+            sessions: vec![SessionView {
+                session_id: "r1".into(),
+                label: "yomi-strix/root/r1".into(),
+                petname: None,
+                agent: "claude".into(),
+                state: "working".into(),
+                presence: "online",
+                cwd: "/home/k/Aoide/pkgs/aoide".into(),
+            }],
+        }];
+        let projects = vec![project("aoide", "/home/k/Aoide")];
+        let groups = group_by_project(nodes, &projects);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "aoide");
+    }
+
+    // ── session_roster_with: the full pipeline, injected pull, real local stage I/O ──
 
     struct Env {
         _guard: std::sync::MutexGuard<'static, ()>,
@@ -695,8 +949,22 @@ mod tests {
         Arc::new(|_: &Peer| panic!("no peers registered — pull must never be called"))
     }
 
+    fn hosts_invocation(args: &[&str], flags: &[(&str, &str)]) -> Invocation {
+        let mut f: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::from([("hosts".to_string(), "true".to_string())]);
+        for (k, v) in flags {
+            f.insert(k.to_string(), v.to_string());
+        }
+        Invocation {
+            path: vec!["session".into()],
+            args: args.iter().map(|s| s.to_string()).collect(),
+            flags: f,
+            door: aoide_protocol::Door::Cli,
+        }
+    }
+
     #[test]
-    fn who_with_reports_local_sessions_with_no_peers_registered() {
+    fn hosts_mode_reports_local_sessions_with_no_peers_registered() {
         let _env = Env::set_up("no-peers");
         let sf = super::super::model::SessionsFile {
             schema_version: "0".to_string(),
@@ -704,7 +972,7 @@ mod tests {
         };
         super::super::model::write_stage(&super::super::model::sessions_path(), &sf).unwrap();
 
-        let out = who_with(&invocation(&["who"], &[]), never_called_pull());
+        let out = session_roster_with(&hosts_invocation(&[], &[]), never_called_pull());
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         let data = out.data.unwrap();
         let nodes = data["nodes"].as_array().unwrap();
@@ -714,7 +982,7 @@ mod tests {
     }
 
     #[test]
-    fn who_with_omits_done_sessions_unless_all_is_passed() {
+    fn hosts_mode_omits_done_sessions_unless_all_is_passed() {
         let _env = Env::set_up("done-omitted");
         let sf = super::super::model::SessionsFile {
             schema_version: "0".to_string(),
@@ -725,17 +993,17 @@ mod tests {
         };
         super::super::model::write_stage(&super::super::model::sessions_path(), &sf).unwrap();
 
-        let out = who_with(&invocation(&["who"], &[]), never_called_pull());
+        let out = session_roster_with(&hosts_invocation(&[], &[]), never_called_pull());
         let data = out.data.unwrap();
         assert_eq!(data["nodes"][0]["sessions"].as_array().unwrap().len(), 1, "done is omitted");
 
-        let out_all = who_with(&flag_invocation(&["who"], &[("all", "true")]), never_called_pull());
+        let out_all = session_roster_with(&hosts_invocation(&[], &[("all", "true")]), never_called_pull());
         let data_all = out_all.data.unwrap();
         assert_eq!(data_all["nodes"][0]["sessions"].as_array().unwrap().len(), 2, "--all keeps done");
     }
 
     #[test]
-    fn who_with_probes_every_registered_peer_and_classifies_by_outcome() {
+    fn hosts_mode_probes_every_registered_peer_and_classifies_by_outcome() {
         let _env = Env::set_up("peers-probed");
         aoide_storage::peer_store::save_peers(&[peer("alpha"), peer("beta")]).unwrap();
         // `beta` has a stale cache to fall back on; `alpha` has none.
@@ -753,7 +1021,7 @@ mod tests {
                 Err("unreachable".to_string())
             }
         });
-        let out = who_with(&invocation(&["who"], &[]), pull);
+        let out = session_roster_with(&hosts_invocation(&[], &[]), pull);
         let data = out.data.unwrap();
         let nodes: Vec<&Value> = data["nodes"].as_array().unwrap().iter().collect();
         assert_eq!(nodes.len(), 3, "local + alpha + beta");
@@ -769,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn who_with_filter_never_changes_which_peers_get_probed() {
+    fn hosts_mode_filter_never_changes_which_peers_get_probed() {
         let _env = Env::set_up("filter-probes-all");
         aoide_storage::peer_store::save_peers(&[peer("alpha"), peer("beta")]).unwrap();
         let probed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -779,12 +1047,107 @@ mod tests {
             Ok(json!({ "nodes": [], "edges": [] }))
         });
         // A filter that only displays "alpha" must still have probed "beta".
-        let out = who_with(&invocation(&["who"], &["alpha"]), pull);
+        let out = session_roster_with(&hosts_invocation(&["alpha"], &[]), pull);
         let mut names = probed.lock().unwrap().clone();
         names.sort();
         assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()], "every peer was probed");
         let data = out.data.unwrap();
         let nodes = data["nodes"].as_array().unwrap();
         assert!(nodes.iter().all(|n| n["name"] != "beta"), "but only alpha is displayed");
+    }
+
+    // ── session_roster_with: PROJECT grouping (bare, no --hosts) ──────────
+
+    fn project_invocation() -> Invocation {
+        flag_invocation(&["session"], &[])
+    }
+
+    #[test]
+    fn bare_mode_groups_local_sessions_by_registered_project() {
+        let _env = Env::set_up("project-grouping");
+        let sf = super::super::model::SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![session("s1", "/proj/aoide/sub", "working", "1", None)],
+        };
+        super::super::model::write_stage(&super::super::model::sessions_path(), &sf).unwrap();
+        let pf = super::super::model::ProjectsFile {
+            schema_version: "0".to_string(),
+            projects: vec![project("aoide", "/proj/aoide")],
+        };
+        super::super::model::write_stage(&super::super::model::projects_path(), &pf).unwrap();
+
+        let out = session_roster_with(&project_invocation(), never_called_pull());
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+        let data = out.data.unwrap();
+        let projects = data["projects"].as_array().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0]["name"], "aoide");
+        assert_eq!(projects[0]["sessions"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn bare_mode_groups_a_manifest_only_dir_by_its_own_basename() {
+        let _env = Env::set_up("project-grouping-manifest");
+        let manifest_root = std::env::temp_dir().join(format!("aoide-who-manifest-only-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&manifest_root);
+        std::fs::create_dir_all(&manifest_root).unwrap();
+        aoide_storage::manifest::save_manifest(&manifest_root, &aoide_storage::manifest::Manifest::default()).unwrap();
+
+        let cwd = manifest_root.to_string_lossy().into_owned();
+        let sf = super::super::model::SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![session("s1", &cwd, "working", "1", None)],
+        };
+        super::super::model::write_stage(&super::super::model::sessions_path(), &sf).unwrap();
+
+        let out = session_roster_with(&project_invocation(), never_called_pull());
+        let data = out.data.unwrap();
+        let projects = data["projects"].as_array().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0]["name"], manifest_root.file_name().unwrap().to_string_lossy().to_string());
+
+        let _ = std::fs::remove_dir_all(&manifest_root);
+    }
+
+    #[test]
+    fn bare_mode_buckets_a_session_matching_neither_attribution_as_no_project() {
+        let _env = Env::set_up("project-grouping-none");
+        let lonely = std::env::temp_dir().join(format!("aoide-who-lonely-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&lonely);
+        std::fs::create_dir_all(&lonely).unwrap();
+
+        let cwd = lonely.to_string_lossy().into_owned();
+        let sf = super::super::model::SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![session("s1", &cwd, "working", "1", None)],
+        };
+        super::super::model::write_stage(&super::super::model::sessions_path(), &sf).unwrap();
+
+        let out = session_roster_with(&project_invocation(), never_called_pull());
+        let data = out.data.unwrap();
+        let projects = data["projects"].as_array().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0]["name"], NO_PROJECT);
+
+        let _ = std::fs::remove_dir_all(&lonely);
+    }
+
+    #[test]
+    fn bare_mode_attributes_a_remote_session_to_a_registered_project_by_cwd() {
+        let _env = Env::set_up("project-grouping-remote");
+        let pf = super::super::model::ProjectsFile {
+            schema_version: "0".to_string(),
+            projects: vec![project("aoide", "/home/k/Aoide")],
+        };
+        super::super::model::write_stage(&super::super::model::projects_path(), &pf).unwrap();
+        aoide_storage::peer_store::save_peers(&[peer("yomi-strix")]).unwrap();
+
+        let pull: PullFn = Arc::new(|_: &Peer| Ok(peer_graph(&[("r1", "working", "/home/k/Aoide/pkgs/aoide", None)])));
+        let out = session_roster_with(&project_invocation(), pull);
+        let data = out.data.unwrap();
+        let projects = data["projects"].as_array().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0]["name"], "aoide");
+        assert_eq!(projects[0]["sessions"][0]["sessionId"], "r1");
     }
 }

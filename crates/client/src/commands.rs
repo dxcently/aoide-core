@@ -60,8 +60,9 @@ fn run_curl(extra: &[&str], stdin_body: Option<&str>) -> Result<(u16, String), S
 const MAX_RESPONSE_BYTES: usize = 20 * 1024 * 1024; // 20 MiB
 
 /// `run_curl`'s parameterised core: same transport, an explicit `--max-time`
-/// instead of the hardcoded `15`. Split out for `pull_peer_live` (`who`'s
-/// presence probe, workstream C2) which needs a much shorter per-peer bound
+/// instead of the hardcoded `15`. Split out for `pull_peer_live` (the
+/// roster core's presence probe, workstream C2 — reached via bare
+/// `session`/`--hosts`) which needs a much shorter per-peer bound
 /// (~2s) than every other curl call site here — those all keep calling
 /// [`run_curl`] unchanged, so this refactor is a pure internal split, not a
 /// behavior change for `peer pull`/`peer add`/etc.
@@ -940,15 +941,17 @@ fn pull_one_peer(peer: &aoide_storage::peer_store::Peer) -> Value {
 /// Pull ONE peer's `aoide/graphSummary` LIVE, with an explicit per-call
 /// `timeout_secs`, WITHOUT writing `state/peer-cache/<name>.json` — the
 /// read-only sibling of [`pull_one_peer`] (which persists on every
-/// outcome). `aoide who`'s presence probe (conduct crate, workstream C2)
-/// is the reason this exists: it reuses this exact curl transport (never
-/// reimplements HTTP — see the crate's `Cargo.toml` for why the
-/// `conduct → client` edge stays) but must never treat a presence query as
-/// a cache-refreshing side effect. `build_graph`'s fold (`aoide-conduct`)
-/// is the ONLY writer of that cache; `who` only ever READS it, as the
-/// fallback for a peer this call fails to reach. Returns just the peer's
-/// resolved `graph` document (`{nodes, edges}`) — `who` has no use for the
-/// envelope's `instance` field `pull_one_peer` also captures.
+/// outcome). The roster core's presence probe (conduct crate, workstream
+/// C2 — reached via bare `session`/`--hosts`; the standalone `who` command
+/// it originally backed is retired, session-surface redesign, command-defrag
+/// lane X, 2026-08-28) is the reason this exists: it reuses this exact curl
+/// transport (never reimplements HTTP — see the crate's `Cargo.toml` for why
+/// the `conduct → client` edge stays) but must never treat a presence query
+/// as a cache-refreshing side effect. `build_graph`'s fold (`aoide-conduct`)
+/// is the ONLY writer of that cache; the roster core only ever READS it, as
+/// the fallback for a peer this call fails to reach. Returns just the peer's
+/// resolved `graph` document (`{nodes, edges}`) — the roster core has no use
+/// for the envelope's `instance` field `pull_one_peer` also captures.
 pub fn pull_peer_live(peer: &aoide_storage::peer_store::Peer, timeout_secs: u64) -> Result<Value, String> {
     let body = crate::peer::build_graph_summary_request();
     let body_str = serde_json::to_string(&body).unwrap_or_default();
@@ -974,8 +977,8 @@ pub fn pull_peer_live(peer: &aoide_storage::peer_store::Peer, timeout_secs: u64)
 /// edge.
 ///
 /// Same `run_curl` transport and 15s timeout every other `message/send`
-/// call site in this file uses — this is a real delivery, not `who`'s
-/// short-timeout presence probe, so it does NOT reuse
+/// call site in this file uses — this is a real delivery, not the roster
+/// core's short-timeout presence probe, so it does NOT reuse
 /// [`pull_peer_live`]'s tighter bound. Returns the parsed JSON-RPC response
 /// on a 200 with no `error` member; any transport/HTTP/JSON-RPC failure is
 /// `Err` with a plain message the caller (`aoide-conduct`) can surface and

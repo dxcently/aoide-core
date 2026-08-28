@@ -10,8 +10,9 @@ weight, and conducting orchestration is Aoide's core identity (root
 
 - `app::App` — live state (projects/sessions/hooks from the CONDUCTING stage
   tree, `state/stage/`), audit tail, panel/node selection, the last
-  dispatched `Outcome`, the ROSTER panel's throttled `who` cache, the
-  PENDING panel's `session pending list` cache. Draws nothing. `App::stage`
+  dispatched `Outcome`, the ROSTER panel's throttled `session --hosts`
+  cache, the PENDING panel's `session pending list` cache. Draws nothing.
+  `App::stage`
   (`state/stage/`, core) and `App::rice_stage` (`song/stage/`, `livery.json`
   only, for the STATUS panel's palette) are two DIFFERENT roots
   (command-defrag lane S1, 2026-08-27) — they coincide only under an
@@ -26,30 +27,34 @@ weight, and conducting orchestration is Aoide's core identity (root
 
 ## ROSTER: presence over this box + every registered peer (P-C4; selection + compose P-C5)
 
-Rows are `who --json`'s `Outcome.data`, dispatched through the same
-injected `DispatchFn` as every other action — never re-derived — parsed
-into `App::roster_nodes()` (local box first, then peers, exactly `who`'s
-own order), then flattened into `App::roster_flat_rows()` for selection
-(one `Vec` is the single source of truth for both render and key handling,
-the same shape `App::dag_rows()` uses over the DAG). Node glyphs
-(`●`/`◐`/`○` — online/unreachable/never-pulled) match `who`'s own
-Unicode-roster vocabulary (`conduct/src/graph/who.rs`'s private `glyph`
-helper — same three glyphs, independently drawn here since that helper
-isn't public); session glyphs reuse the conductor's existing musical-note
-set (`theme::state_glyph`) since `who` classifies sessions off the
-identical state vocabulary the SESSION panel already reads.
+Rows are `session --hosts --json`'s `Outcome.data` (the standalone `who`
+command this used to dispatch is retired — session-surface redesign,
+command-defrag lane X, 2026-08-28 — folded into bare `session`'s `--hosts`
+grouping; same `Outcome` shape, only the dispatched path/flags changed),
+dispatched through the same injected `DispatchFn` as every other action —
+never re-derived — parsed into `App::roster_nodes()` (local box first, then
+peers, exactly the roster's own order), then flattened into
+`App::roster_flat_rows()` for selection (one `Vec` is the single source of
+truth for both render and key handling, the same shape `App::dag_rows()`
+uses over the DAG). Node glyphs (`●`/`◐`/`○` —
+online/unreachable/never-pulled) call `aoide_conduct::graph::glyph`
+directly (`conduct/src/graph/who.rs`'s `pub` roster-presence helper — no
+forked copy here); session glyphs reuse the conductor's existing
+musical-note set (`theme::state_glyph`) since the roster classifies
+sessions off the identical state vocabulary the SESSION panel already
+reads.
 
-`who` performs a LIVE network probe of every registered peer (~2s/peer,
-parallel) on every invocation, so this pane throttles: it re-dispatches at
-most every ~15s while VISIBLE, never on every ~500ms tick. Switching into
-the pane with a stale cache fires one immediate fetch; `r` forces one
-regardless of the throttle window. The dispatch itself runs on its own
-`std::thread` (mirroring `who`'s own internal `probe_peers` pattern) and
-reports back over an `mpsc` channel the tick loop polls without blocking —
-the one dispatch in this crate that does not go through the synchronous
-`App::dispatch` (which every mutating action uses), because `who` never
-mutates anything and its live probes would otherwise freeze the tick loop
-for the probe's duration.
+`session --hosts` performs a LIVE network probe of every registered peer
+(~2s/peer, parallel) on every invocation, so this pane throttles: it
+re-dispatches at most every ~15s while VISIBLE, never on every ~500ms tick.
+Switching into the pane with a stale cache fires one immediate fetch; `r`
+forces one regardless of the throttle window. The dispatch itself runs on
+its own `std::thread` (mirroring the roster core's own internal
+`probe_peers` pattern) and reports back over an `mpsc` channel the tick
+loop polls without blocking — the one dispatch in this crate that does not
+go through the synchronous `App::dispatch` (which every mutating action
+uses), because the roster never mutates anything and its live probes would
+otherwise freeze the tick loop for the probe's duration.
 
 `j`/`k` walk the flattened rows; `s` on a selected SESSION row (P-C5) opens
 the existing inline `Input` line editor, pre-labeled with that row's own
@@ -65,8 +70,8 @@ same as any other dispatch, no special-casing needed here).
 Rows are `session pending list --json`'s `Outcome.data`, dispatched through
 the same injected `DispatchFn`, parsed into `App::pending_rows()` — never
 re-derived: the malformed-entry detection and display-grammar rendering
-stay in `conduct::graph::pending`. Unlike ROSTER's `who`, `session pending
-list` is a local file read (no network), so there is no throttle and no
+stay in `conduct::graph::pending`. Unlike ROSTER's `session --hosts`,
+`session pending list` is a local file read (no network), so there is no throttle and no
 background thread: `App::refresh_pending` runs synchronously, called from
 `reload_all` (which fires after every dispatch) and from the tick loop
 while the pane is visible.

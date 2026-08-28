@@ -11,14 +11,15 @@
 //! Everything here is a PURE fold ([`assemble_roster`]) over three inputs
 //! other modules already own the machinery for:
 //!
-//! - **Presence + sessions** come from `who.rs`'s own core, called
+//! - **Presence + sessions** come from `who.rs`'s own roster core, called
 //!   directly: [`probe_peers`] (one bounded live pull per registered peer,
 //!   in parallel), [`build_peer_node`] (probe-outcome/cache-fallback
 //!   classification), [`build_local_node`] (this box's own stage). The
-//!   probe closure is `who`'s exact production wiring
-//!   (`aoide_client::commands::pull_peer_live`, [`PEER_PROBE_TIMEOUT_SECS`])
-//!   — never a re-implementation, so `who` and `peer list` can never
-//!   disagree about who is up.
+//!   probe closure is `session --hosts`'s exact production wiring (the
+//!   retired standalone `who` command's own wiring, unchanged —
+//!   `aoide_client::commands::pull_peer_live`, [`PEER_PROBE_TIMEOUT_SECS`])
+//!   — never a re-implementation, so `session --hosts` and `peer list` can
+//!   never disagree about which nodes are up.
 //! - **Advertising instances** come from ONE bounded discovery sweep —
 //!   `aoide_client::discover::run_sweep` ([`SWEEP_SECS`], P-P6/task #120's
 //!   validated, deduped, [`aoide_client::discover::MAX_HEARD`]-capped
@@ -259,12 +260,12 @@ fn row_json(r: &Row) -> Value {
     })
 }
 
-/// The testable core, `who_with`'s exact shape one seam wider: real local
-/// stage + peer-store I/O, but BOTH network-shaped steps — the per-peer
-/// probes and the discovery sweep — arrive injected, so a test never opens
-/// a socket. The sweep runs on its own thread beside the probe fan-out
-/// (both are ~2s walls; serial would double the command's latency for
-/// nothing).
+/// The testable core, `who.rs::session_roster_with`'s exact shape one seam
+/// wider: real local stage + peer-store I/O, but BOTH network-shaped steps —
+/// the per-peer probes and the discovery sweep — arrive injected, so a test
+/// never opens a socket. The sweep runs on its own thread beside the probe
+/// fan-out (both are ~2s walls; serial would double the command's latency
+/// for nothing).
 pub(super) fn peer_list_with(_inv: &Invocation, pull: PullFn, sweep: SweepFn) -> Outcome {
     let cmd = "peer.list";
     let (_, s, h) = match super::common::load_inputs(cmd) {
@@ -294,7 +295,7 @@ pub(super) fn peer_list_with(_inv: &Invocation, pull: PullFn, sweep: SweepFn) ->
     };
 
     let mut rows = assemble_roster(local, peer_nodes, &heard, &host);
-    // RUNNING sessions (rider 6) — `done` never makes the roster (`who`'s
+    // RUNNING sessions (rider 6) — `done` never makes the roster (`session`'s
     // default view, minus its `--all` escape: the deep view owns that).
     for r in &mut rows {
         r.sessions.retain(|sv| sv.presence != "done");
@@ -325,8 +326,10 @@ pub(super) fn peer_list_with(_inv: &Invocation, pull: PullFn, sweep: SweepFn) ->
 /// single window is a sample, never a census.
 const SWEEP_SECS: u64 = 2;
 
-/// `aoide peer list [--json]` — the real entry point: `who`'s exact probe
-/// wiring plus one real `run_sweep`, handed to [`peer_list_with`].
+/// `aoide peer list [--json]` — the real entry point: the roster core's
+/// exact probe wiring (`session --hosts`'s own — the retired `who`
+/// command's wiring, unchanged) plus one real `run_sweep`, handed to
+/// [`peer_list_with`].
 pub fn peer_list(inv: &Invocation) -> Outcome {
     let pull: PullFn =
         Arc::new(|p: &Peer| aoide_client::commands::pull_peer_live(p, PEER_PROBE_TIMEOUT_SECS));

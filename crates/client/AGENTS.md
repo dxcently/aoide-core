@@ -7,7 +7,10 @@
   adapter. The serve/listen half lives in `aoide-server` and must never
   migrate here.
 - **The `conduct → client` edge is load-bearing, not a smell.** `conduct`'s
-  presence projection (`who`, workstream C2, landed) calls this crate's
+  presence projection (the roster core, workstream C2, landed — reached via
+  bare `session`/`--hosts`; the standalone `who` command it originally
+  backed is retired, session-surface redesign, command-defrag lane X,
+  2026-08-28) calls this crate's
   `commands::pull_peer_live` for its live per-peer probe. Don't "heal" it
   by inverting the dependency or duplicating the transport in `conduct` —
   see `docs/architecture/PACKAGE-LAYOUT.md`'s "Verified facts" note on this

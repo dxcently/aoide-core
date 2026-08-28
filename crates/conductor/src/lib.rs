@@ -32,8 +32,8 @@
 //! still the audit log (the LOG panel tails it); live state is still
 //! stage-file mtimes, polled each tick (~500 ms via the crossterm poll
 //! timeout). There is no watcher, no async runtime — one thread, one loop
-//! for everything except ROSTER's own dispatch: `who` performs LIVE network
-//! probes, so its throttled (~15s) fetch runs on its own background
+//! for everything except ROSTER's own dispatch: `session --hosts` performs
+//! LIVE network probes, so its throttled (~15s) fetch runs on its own background
 //! `std::thread` and reports back over a channel the tick polls without
 //! blocking (see `app`'s "ROSTER" section) — the one deliberate exception to
 //! "one thread". PENDING's `graph pending list` is a local file read, so it

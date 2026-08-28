@@ -74,8 +74,10 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   at all, so it can't reach `deliver_local` and files itself instead — see
   `aoide_storage::inbox`'s module doc for the full two-writer reasoning.
 - **The undying mark (P-C2/P-C3, durable-sessions plan; renamed from "carry"
-  at command-defrag lane U1, 2026-08-27):** `graph/undying.rs`'s
-  `session_undying` (`session undying on|off [--self | --id <id>]`) is the
+  at command-defrag lane U1, 2026-08-27; relocated under `session grant` at
+  the session-surface redesign, command-defrag lane X, 2026-08-28):**
+  `graph/undying.rs`'s
+  `undying_grant` (`session grant undying on|off [--self | --id <id>]`) is the
   command over `aoide_storage::undying`'s store (`state/undying.json`) — a
   session id marked DURABLE, so a project's whole undying set can later be
   resurrected together. Unlike every other `session *` handler in this
@@ -95,7 +97,7 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   rather than neither (silent loss) — the same bias a failed spawn gets
   deliberately, by never touching the store at all.
   **The nothing-to-restore warning (task #100):** both mark sites — `session
-  undying on` and `spawn --undying` — carry `undying.rs::
+  grant undying on` and `spawn --undying` — carry `undying.rs::
   nothing_to_restore_warning(agent, has_capture)` into their own Outcome
   MESSAGE (never a log line) whenever a session is marked undying with
   neither arm `resurrect.rs::resolve_candidate` tries able to resolve it
@@ -103,32 +105,41 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   registered harness `AgentProfile.resume_args`. `spawn --undying` computes
   `has_capture` directly off the command it just built
   (`captures_like_a_shell`, no race against the conducted child's own first
-  tick); `session undying on --id <id>` reads it off the LIVE roster
+  tick); `session grant undying on --id <id>` reads it off the LIVE roster
   record's own `restore` field, and stays silent for an id absent from the
   roster (no live signal to warn from, the same posture `live` already
   takes) or when marking OFF (a future restore is no longer promised
   either way, so there is nothing to warn about).
-- **The undying picker (U3, command-defrag lane U):** `graph/session_pick.rs`'s
-  `session_pick` is bare `session`'s handler — a parent command registered
-  alongside `session.*` the same way bare `graph` sits alongside `graph
-  link` (R1's pattern, reused rather than re-derived). CLI-only, tty-only
-  (`aoide_protocol::pick::interactive`, gated on `Door::Cli` first the same
-  shape `secrets`' admin quartet holds); a non-interactive reach — a
-  non-CLI door, no tty, or `--json` — always steers to `session undying
-  on|off --id <id>`, U1's scripted spelling, which stays the ONLY scripted
-  form: no `--undying` flag was added to bare `session` (one spelling per
-  capability). The picker itself reaches `aoide_protocol::pick::choose_many`
-  DIRECTLY — no new seam: that function already supports pre-checked
-  defaults and a clean `None` on Esc/EOF, and this crate already depends on
-  `aoide-protocol` the same way `song`'s own `prune_picker` does; there was
-  no missing primitive to add to `pick.rs`. Rows come from this box's own
-  roster (`merged_sessions`, never re-derived) plus every registered peer's
-  CACHED graph via `who.rs`'s `sessions_from_graph` (widened to `pub(super)`
-  this phase for exactly this second consumer, `SessionView` alongside it —
-  see `glyph`'s own widening note in `who.rs` for the precedent) — no live
-  peer probe anywhere in this module. A LOCAL row's mark toggles
+- **The grant family (session-surface redesign, command-defrag lane X,
+  2026-08-28 — supersedes U3/U1):** `graph/grant.rs`'s `session_grant` is
+  `session grant`'s handler — a POSITIONAL `<kind>` grammar (`secrets
+  automate <name> on|off` style, not a second registered path per kind).
+  One kind today, `undying`: bare `session grant undying` (no state)
+  dispatches to the interactive PICKER (`undying_picker`, U3's exact body
+  relocated verbatim from what used to be bare `session`'s own handler —
+  bare `session` now renders the roster instead, see the `who`/roster-core
+  bullet below); `session grant undying on|off [--self | --id <id>]`
+  dispatches to the SCRIPTED mark (`super::undying::undying_grant`, U1's
+  exact body relocated from the standalone `session undying` command,
+  which this absorbs and retires — hard cutover, no alias). `session
+  grant` with no kind teaches the grantable set; an unknown kind is a
+  taught refusal.
+  The picker is CLI-only, tty-only (`aoide_protocol::pick::interactive`,
+  gated on `Door::Cli` first the same shape `secrets`' admin quartet
+  holds); a non-interactive reach — a non-CLI door, no tty, or `--json` —
+  always steers to the scripted spelling above, which stays the ONLY
+  scripted form (one spelling per capability). The picker itself reaches
+  `aoide_protocol::pick::choose_many` DIRECTLY — no new seam: that function
+  already supports pre-checked defaults and a clean `None` on Esc/EOF, and
+  this crate already depends on `aoide-protocol` the same way `song`'s own
+  `prune_picker` does; there was no missing primitive to add to `pick.rs`.
+  Rows come from this box's own roster (`merged_sessions`, never
+  re-derived) plus every registered peer's CACHED graph via `who.rs`'s
+  `sessions_from_graph` (`pub(super)`, `SessionView` alongside it — see
+  `glyph`'s own widening note in `who.rs` for the precedent) — no live peer
+  probe anywhere in this module. A LOCAL row's mark toggles
   `state/undying.json` through one load, N mutations, one save (widening
-  `session_undying`'s own single-id discipline to a whole confirm's diff at
+  `undying_grant`'s own single-id discipline to a whole confirm's diff at
   once); a PEER row's mark writes a `.aoide/project.json` spec instead — the
   id lives on the peer, so this conductor cannot write ITS store — resolved
   against the CURRENT project via the exact same `walk_up` `resurrect`'s
@@ -141,8 +152,11 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   outright, silently sinking every other legitimate peer change in the same
   confirm; `changed[]` only ever names what the save actually persisted.
   Unmarking removes EVERY spec matching `{host, dir, agent}`, not just the
-  first. See `CONTRACTS.md`'s `.aoide/project.json` section for the exact
-  spec-derivation and dedupe rules.
+  first. The kind dispatch in `session_grant` is a plain match arm — a
+  future kind (#127, secret grants) adds one arm, reusing the picker's own
+  CLI+tty gate shape rather than re-deriving it. See `CONTRACTS.md`'s
+  `.aoide/project.json` section for the exact spec-derivation and dedupe
+  rules.
 - `reap` — liveness reaping (`aoide session reap`), sweeping sessions a
   `SIGKILL`'d terminal could never mark `done`. `reap_and_announce` (the
   registered CLI handler) routes through `daemon_dispatch` first like every
@@ -205,7 +219,9 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   post-cutover) — the `graph` family narrowed at task #101 R1 to the bare
   render plus `graph link`, while `send`/`spawn`/`resurrect` went bare and
   `session *`/`project *` promoted to their own top-level groups — plus
-  `conduct`, `hooks install`, `who`, `peer list`.
+  `conduct`, `hooks install`, `peer list` (the standalone `who` command that
+  used to round out this list is retired, session-surface redesign,
+  command-defrag lane X, 2026-08-28 — folded into bare `session`/`--hosts`).
 - **The durable session ledger + resurrect (P-D8, `docs/architecture/
   AOIDED.md`'s "L5"):** `graph/doc.rs::ledger_session_exit` is the ONE
   shared call both `session_store.rs::do_session_end_inner` (a clean
@@ -495,21 +511,33 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   re-derives the real caller's identity — threading the connecting peer's
   pid into the gate itself would touch `send.rs`, out of this phase's scope
   fence.
-- `who` — `aoide who [filter] [--json] [--all]` (`graph/who.rs`): live
-  presence over this box's own sessions plus every registered peer,
-  probed in parallel on each invocation (messaging workstream C2). A
-  PROJECTION, never a store — it never writes `state/peer-cache/`;
-  `build_graph`'s own fold (`doc.rs`) owns that file. `glyph` (the
-  online/unreachable/never-pulled node-presence map) is `pub`, re-exported
-  at `graph::glyph` — the conductor's ROSTER panel (P-C4) is its second
-  consumer, reusing it rather than redrawing its own copy.
+- **`session` (bare) — the ROSTER (session-surface redesign, command-defrag
+  lane X, 2026-08-28; supersedes the U3 picker AND the standalone `aoide
+  who` command, both retired — hard cutover, no alias).** `aoide session
+  [filter] [--hosts] [--json] [--all]` (`graph/who.rs`, now the shared
+  roster core): live presence over this box's own sessions plus every
+  registered peer, probed in parallel on each invocation (messaging
+  workstream C2 — the exact pipeline `who` used to run, unchanged). Bare
+  groups sessions by PROJECT (`project_bucket`: a registered `projects.json`
+  name via `anchor_for`, else a `.aoide/project.json` manifest directory's
+  own basename via `walk_up`, else a trailing `(no project)` bucket);
+  `--hosts` groups by HOST instead — this host, then each peer,
+  byte-identical to `who`'s old rendering (`render_nodes`/`node_json`
+  survive unchanged). `filter`/`--all` narrow `nodes` BEFORE either split,
+  so they apply to both groupings uniformly. A PROJECTION, never a store —
+  it never writes `state/peer-cache/`; `build_graph`'s own fold (`doc.rs`)
+  owns that file. `glyph` (the online/unreachable/never-pulled node-presence
+  map) is `pub`, re-exported at `graph::glyph` — the conductor's ROSTER
+  panel (P-C4) is its second consumer, reusing it rather than redrawing its
+  own copy (its dispatch moved from `who` to `session --hosts`, same
+  `Outcome` shape).
 - `peer list` — `aoide peer list [--json]` (`graph/peer_list.rs`, task
   #120 P2): the one-glance mesh roster — this host, every registered peer,
   every advertising instance heard in one bounded ~2s discovery sweep
   (`aoide_client::discover::run_sweep`, run concurrently with the probes),
-  each node's running sessions indented beneath. A PURE fold over `who`'s
-  own core (`probe_peers`/`build_peer_node`/`build_local_node`/
-  `sessions_from_graph`, widened to `pub(super)`) plus the sweep's
+  each node's running sessions indented beneath. A PURE fold over the
+  roster core's own probe (`probe_peers`/`build_peer_node`/`build_local_node`/
+  `sessions_from_graph`, `pub(super)`) plus the sweep's
   heard-set — never a second prober, never a second presence model, and
   it writes nothing (`state/peers.json`/`state/peer-cache/` stay other
   modules' files). Lives in THIS crate, not `aoide-client` beside the
@@ -520,8 +548,8 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
 
 ## What it consumes
 
-`aoide-protocol`, `aoide-storage`, `aoide-client` (`who`'s and `peer
-list`'s live per-peer probes call `aoide_client::commands::pull_peer_live`
+`aoide-protocol`, `aoide-storage`, `aoide-client` (bare `session`/`--hosts`'s
+and `peer list`'s live per-peer probes call `aoide_client::commands::pull_peer_live`
 — the peer-pull transport `peer pull` itself uses, workstream C2; `peer
 list`'s discovery sweep calls `aoide_client::discover::run_sweep` —
 P-P6's one sweep implementation, task #120 P2; `send --to`'s

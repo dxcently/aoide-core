@@ -88,7 +88,8 @@
 //!
 //! Nothing registers or calls this module yet — it is a library addition
 //! only, per this phase's scope. The messaging/presence plan's later phases
-//! are the intended callers: **C2** (`aoide who`) uses it to resolve a
+//! are the intended callers: **C2** (`aoide session`/`--hosts`, formerly
+//! `aoide who`) uses it to resolve a
 //! filter argument against the live-probed roster; **C3** (`graph send
 //! --to <target>`) uses it to turn `--to` into either a local `sessionId`
 //! (existing send path, unchanged) or a `Remote { peer, query }` it hands
@@ -294,8 +295,8 @@ mod tests {
             },
             Case {
                 // The exact form `graph view --json` emits for a node id
-                // (`session:<id>`) round-trips through `--to`/`who` just
-                // like a bare copy-pasted id.
+                // (`session:<id>`) round-trips through `--to`/`session
+                // --hosts` just like a bare copy-pasted id.
                 name: "a session:-prefixed id resolves the same as the bare id",
                 query: "session:sess-aaaa-1111",
                 host: "sakaki",

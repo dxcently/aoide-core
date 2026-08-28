@@ -89,7 +89,7 @@
   `session hook`, and `reap::reap_and_announce` all follow this exact
   one-line prefix. A new session-write handler joins the family the same
   way — see `client`'s own `AGENTS.md` extension-point note. **`graph/
-  undying.rs`'s `session_undying`, `graph/spawn.rs`'s `--undying` mark, and
+  undying.rs`'s `undying_grant`, `graph/spawn.rs`'s `--undying` mark, and
   `graph/resurrect.rs`'s undying transfer are a deliberate exception, not an
   oversight:** `state/undying.json` is not a `state/stage/` file, so none of
   the three has L4 residency to route through — don't add a `daemon_dispatch`
@@ -478,28 +478,40 @@
   explicit `--parent` > ancestry walk > env, in that order, for all three of
   `wrap`/`conduct`/`spawn` (spawn re-execs `conduct --headless`, so fixing
   `conduct`'s own call covers it).
-- **Bare `session` is the undying PICKER, and there is exactly one scripted
-  spelling for the mark — `session undying on|off --id <id>` (U1).** Don't
-  add a `--undying` flag or any other scripted shortcut to bare `session`'s
-  own registration — a non-interactive reach (non-CLI door, no tty,
+- **`who` and bare `session`'s old undying-picker meaning are BOTH retired
+  (session-surface redesign, command-defrag lane X, 2026-08-28 — hard
+  cutover, no alias).** Bare `session` is now the ROSTER (`who.rs`'s
+  `session_roster`/`session_roster_with` — grouped by PROJECT bare, by HOST
+  under `--hosts`), and the undying picker/mark live at `session grant
+  undying` (`grant.rs`'s `session_grant`, dispatching on a positional
+  `<kind>`). Don't reintroduce a standalone `who` registration or a bare
+  `session` picker "for compatibility" — both spellings are unknown now,
+  same as a typo; the mechanisms they backed (the roster's probe pipeline,
+  the picker's row-building) survive unchanged, only the registered paths
+  moved.
+- **`session grant` has exactly one scripted spelling for the undying
+  mark — `session grant undying on|off --id <id>` (U1, relocated).** Don't
+  add a `--undying` flag or any other scripted shortcut anywhere else — a
+  non-interactive reach to the picker branch (non-CLI door, no tty,
   `--json`) is ALWAYS steered to that one existing spelling
-  (`session_pick.rs::require_cli_tty`), never given a second one of its
-  own. Don't gate the picker on `Door::Cli` alone either — `pick::
-  interactive` also requires a real stdin/stdout tty, and `--json` must
-  refuse even ON a real tty (a picker's prompts have no business
-  interleaving with a machine-readable stream a caller explicitly asked
-  for).
-- **`session_pick.rs` never live-probes a peer.** Its peer rows come from
-  `peer_store::load_peer_cache` fed through `who.rs`'s `sessions_from_graph`
-  (widened `pub(super)`, `SessionView` alongside it, U3) — the SAME
-  cache `send --to peer/<query>` resolves against. Don't route it through
-  `who::probe_peers`/`who_with`'s live-pull path "for freshness" — the
-  brief this landed under is explicit that the picker's own tty round-trip
-  must never block on network I/O, and `who`/`who --all` already own the
-  live-presence job.
+  (`grant.rs::require_cli_tty`), never given a second one of its own. Don't
+  gate the picker on `Door::Cli` alone either — `pick::interactive` also
+  requires a real stdin/stdout tty, and `--json` must refuse even ON a real
+  tty (a picker's prompts have no business interleaving with a
+  machine-readable stream a caller explicitly asked for). The scripted
+  branch (`undying.rs::undying_grant`) carries NO such gate — unchanged
+  from `session undying`'s own reach from any door, since a script/daemon
+  needs it too.
+- **`grant.rs`'s picker branch never live-probes a peer.** Its peer rows
+  come from `peer_store::load_peer_cache` fed through `who.rs`'s
+  `sessions_from_graph` (`pub(super)`, `SessionView` alongside it, U3). Don't
+  route it through `who.rs::probe_peers`/`collect_roster`'s live-pull path
+  "for freshness" — the brief this landed under is explicit that the
+  picker's own tty round-trip must never block on network I/O, and bare
+  `session`/`--hosts` already own the live-presence job.
 - **A peer row's mark writes a `.aoide/project.json` spec, never
   `state/undying.json` (U3) — the id lives on the peer, this conductor
-  cannot write ITS store.** `session_pick.rs::apply_diff` resolves "current
+  cannot write ITS store.** `grant.rs::apply_diff` resolves "current
   project" via `aoide_storage::manifest::walk_up` from cwd, the identical
   discovery `resurrect`'s own bare-manifest mode uses (U2); no manifest
   found there is NEVER a reason to create one — every peer
@@ -532,20 +544,40 @@
   position).** A hand-duplicated entry in `.aoide/project.json` (an
   operator who edited the file directly) is cleaned up in one unmark, not
   one confirm per copy — don't narrow this back to a first-match removal.
-- **`who` is a projection, never a store.** It must never write
+- **The roster (`who.rs`, reached at bare `session`/`--hosts`) is a
+  projection, never a store.** It must never write
   `state/peer-cache/<name>.json` — `build_graph`'s own fold (`doc.rs`) is
-  the ONLY writer of that cache. `who`'s live probe reads straight off the
+  the ONLY writer of that cache. Its live probe reads straight off the
   network via `aoide_client::commands::pull_peer_live` and falls back to
   the cache (read-only) for an unreachable peer; don't "helpfully" have a
   successful live probe refresh the cache as a side effect.
-- **`peer list` (`graph/peer_list.rs`, task #120 P2) is `who`'s core under
-  a wider fold — never a fork of it.** Its presence/session data comes
-  ONLY from `who.rs`'s widened `pub(super)` seam (`probe_peers`/
+- **`session --hosts`'s and bare `session`'s PROJECT grouping share ONE
+  `collect_roster` — never two collection passes.** `who.rs`'s `Roster`
+  struct (`host`, `projects`, `locals`, `nodes`) is built ONCE per
+  invocation; `session_roster_with` branches ONLY on how it renders/groups
+  `nodes` afterward (`render_nodes`/`node_json` for `--hosts`,
+  `group_by_project`/`render_groups`/`group_json` otherwise). Don't
+  duplicate the local-stage-load + peer-probe sequence for a future
+  grouping — extend the branch, not the collection.
+- **`project_bucket` reuses whichever project attribution the codebase
+  already computes — never a third one.** A registered `projects.json`
+  name via `anchor_for` (pure string matching — works identically for a
+  peer session's cwd under the fleet's shared-path convention) wins; else a
+  `.aoide/project.json` manifest found by walking up FROM THE SESSION'S OWN
+  CWD on this host's own filesystem (`aoide_storage::manifest::walk_up`)
+  renders by that directory's basename. Don't walk up from the CURRENT
+  process's cwd instead (that's `grant.rs`'s "current project" concept, a
+  different thing) — `project_bucket` must attribute EVERY session by its
+  OWN cwd, local or peer, or a multi-session listing would silently
+  misattribute every session but the first.
+- **`peer list` (`graph/peer_list.rs`, task #120 P2) is the roster core's
+  probe under a wider fold — never a fork of it.** Its presence/session data
+  comes ONLY from `who.rs`'s `pub(super)` seam (`probe_peers`/
   `build_local_node`/`build_peer_node`/`SessionView`/
   `PEER_PROBE_TIMEOUT_SECS`) and its advertising data ONLY from
   `aoide_client::discover::run_sweep` — a second prober, a second presence
   classifier, or a private sweep re-implementation here is the exact
-  cross-copy this crate's discipline forbids. It inherits `who`'s
+  cross-copy this crate's discipline forbids. It inherits the roster's
   projection rule wholesale (writes nothing: not `state/peers.json`, not
   `state/peer-cache/`), a failed/empty sweep only ANNOTATES the roster
   (never fails the command — the paired half is still true), and both
@@ -697,6 +729,14 @@
 - **A new `graph`/`conduct`/`hooks` command** adds a `cmd!`/`register` entry in
   `commands/`, wired into `cli`'s `commands::all()` (this crate's commands are
   core, never `lyra`'s).
+- **A new `session grant` kind** (#127's secret grants are the next one
+  named, not yet built) adds one `match` arm in `grant.rs::session_grant` —
+  no new registered path, no `commands/` entry: `<kind>` is a positional
+  argument on the ONE `["session", "grant"]` path, `secrets automate <name>
+  on|off` style. If the new kind wants a picker too, reuse
+  `grant.rs::require_cli_tty`'s CLI+tty gate shape rather than re-deriving
+  it — there is still only one multi-select primitive
+  (`aoide_protocol::pick::choose_many`) in this crate.
 - **A new hook event or harness profile** extends `aoide_protocol::agents`,
   not this crate — the harness-profile table lives one layer down.
 

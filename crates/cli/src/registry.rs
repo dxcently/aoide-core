@@ -135,6 +135,23 @@ mod tests {
         // P-ID4) — the per-secret remote-origin admission bit the broker's
         // origin gate enforces (deny by default; the first real consumer
         // of the sealed session credential) — reached 82.
+        //
+        // Session-surface redesign (command-defrag lane X, 2026-08-28) —
+        // three movements in the SAME commit, net 82 -> 81:
+        //   - `session.undying` RETIRED (-1, 82 -> 81): absorbed into
+        //     `session.grant`'s positional `<kind>` grammar below — the
+        //     standalone scripted spelling is now unknown, same as a typo.
+        //   - `session.grant` ADDED (+1, 81 -> 82): the grant family — one
+        //     kind today, `undying` (bare = interactive picker, relocated
+        //     verbatim from the old bare `session`; `on|off` = the scripted
+        //     mark `session.undying` used to be).
+        //   - `who` RETIRED (-1, 82 -> 81): folded entirely into bare
+        //     `session` — `session --hosts` now renders exactly what `who`
+        //     used to (byte-identical), and plain bare `session` groups by
+        //     PROJECT instead of by host. `session` itself keeps its
+        //     existing path (no count change from it — only its meaning
+        //     changed, from the U3 undying picker to the roster).
+        // Net: 82 - 1 + 1 - 1 = 81.
         let mut expected: Vec<&str> = vec![
             "a2a.serve",
             "adapter.melete",
@@ -203,6 +220,7 @@ mod tests {
             "send",
             "session",
             "session.end",
+            "session.grant",
             "session.hook",
             "session.pending.approve",
             "session.pending.deny",
@@ -212,12 +230,10 @@ mod tests {
             "session.prune",
             "session.reap",
             "session.start",
-            "session.undying",
             "soundcheck",
             "spawn",
             "update",
             "usage",
-            "who",
         ];
         expected.sort();
 

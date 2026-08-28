@@ -181,28 +181,32 @@ pub struct LogTail {
     mtime: Option<SystemTime>,
 }
 
-/// Throttle window for the ROSTER panel's `who` dispatch (messaging/presence
-/// plan, P-C4). `who` performs a LIVE network probe of every registered peer
-/// on each invocation (`conduct/src/graph/who.rs`'s module doc), so the pane
-/// re-dispatches at most this often — never on every ~500ms UI tick.
+/// Throttle window for the ROSTER panel's `session --hosts` dispatch
+/// (messaging/presence plan, P-C4; the retired standalone `who` command's
+/// own throttle, unchanged — session-surface redesign, command-defrag lane
+/// X, 2026-08-28). `session --hosts` performs a LIVE network probe of every
+/// registered peer on each invocation (`conduct/src/graph/who.rs`'s module
+/// doc — the roster core), so the pane re-dispatches at most this often —
+/// never on every ~500ms UI tick.
 pub const ROSTER_THROTTLE: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// One session row under a [`RosterNode`] — reshaped straight from `who
-/// --json`'s `nodes[].sessions[]` (`conduct/src/graph/who.rs::node_json`),
-/// never re-derived: `label`/`state` are exactly the strings `who` already
-/// computed (display-grammar label, canonical state vocabulary), so
-/// `theme::state_glyph`/`state_style` — the SAME glyph mapping the SESSION
-/// panel already paints — apply unchanged.
+/// One session row under a [`RosterNode`] — reshaped straight from `session
+/// --hosts --json`'s `nodes[].sessions[]` (`conduct/src/graph/
+/// who.rs::node_json`), never re-derived: `label`/`state` are exactly the
+/// strings the roster core already computed (display-grammar label,
+/// canonical state vocabulary), so `theme::state_glyph`/`state_style` — the
+/// SAME glyph mapping the SESSION panel already paints — apply unchanged.
 #[derive(Debug, Clone, Default)]
 pub struct RosterSession {
     pub label: String,
     pub state: String,
 }
 
-/// One node (this box, or a registered peer) as `who --json` reports it —
-/// parsed from the cached `Outcome`'s `data.nodes[]`. `presence` is one of
-/// `who`'s own three node-level classes: `online` | `unreachable` |
-/// `never-pulled` (`who.rs`'s module doc, "Presence model").
+/// One node (this box, or a registered peer) as `session --hosts --json`
+/// reports it — parsed from the cached `Outcome`'s `data.nodes[]`.
+/// `presence` is one of the roster core's own three node-level classes:
+/// `online` | `unreachable` | `never-pulled` (`who.rs`'s module doc,
+/// "Presence model").
 #[derive(Debug, Clone, Default)]
 pub struct RosterNode {
     pub name: String,
@@ -212,11 +216,12 @@ pub struct RosterNode {
     pub sessions: Vec<RosterSession>,
 }
 
-/// The ROSTER panel's cache: the last `who` [`Outcome`] plus when it landed.
-/// `fetched_at: None` means "never fetched this run" — always stale, so the
-/// first tick/visit fetches immediately. This is the ONLY state the panel
-/// holds; there is no second copy of presence logic here, only a reshape of
-/// what `who --json` already returned (crate `AGENTS.md`'s "frontend only").
+/// The ROSTER panel's cache: the last `session --hosts` [`Outcome`] plus
+/// when it landed. `fetched_at: None` means "never fetched this run" —
+/// always stale, so the first tick/visit fetches immediately. This is the
+/// ONLY state the panel holds; there is no second copy of presence logic
+/// here, only a reshape of what `session --hosts --json` already returned
+/// (crate `AGENTS.md`'s "frontend only").
 #[derive(Debug, Clone, Default)]
 pub struct RosterCache {
     pub outcome: Option<Outcome>,
@@ -227,8 +232,8 @@ pub struct RosterCache {
 /// read-only pane) — a node header, one of its sessions, or the cosmetic
 /// "(no sessions)" filler a node with an empty session list renders. Mirrors
 /// [`DagRow`]'s "one Vec is the single source of truth for both render and
-/// key handling" shape, over `who`'s node/session tree instead of the DAG.
-/// `is_last` on `Session` is the tree-branch glyph's own lookahead
+/// key handling" shape, over the roster's node/session tree instead of the
+/// DAG. `is_last` on `Session` is the tree-branch glyph's own lookahead
 /// (`└─`/`├─`), precomputed here so the render side never re-derives it.
 #[derive(Debug, Clone)]
 pub enum RosterRow {
@@ -305,9 +310,9 @@ pub struct App {
     /// real one in — see [`DispatchFn`]'s doc comment for why this is
     /// injected rather than reached for as a trunk global.
     dispatch_fn: DispatchFn,
-    /// The ROSTER panel's cache — last `who` fetch + when.
+    /// The ROSTER panel's cache — last `session --hosts` fetch + when.
     pub roster: RosterCache,
-    /// `Some` while a background `who` dispatch is in flight — set by
+    /// `Some` while a background `session --hosts` dispatch is in flight — set by
     /// [`App::spawn_roster_fetch`], drained (never blocked on) by
     /// [`App::drain_roster`]. See the module doc's "Roster: throttled,
     /// backgrounded dispatch" for why this exists at all.
@@ -601,8 +606,8 @@ impl App {
             self.clamp_selection();
         }
 
-        // ROSTER: independent of the stage-mtime watch above — `who` is live
-        // network state, not a stage file. Deliberately outside the
+        // ROSTER: independent of the stage-mtime watch above — the roster is
+        // live network state, not a stage file. Deliberately outside the
         // `if changed` block: draining/spawning a roster fetch must run every
         // tick regardless of whether anything else changed.
         if self.poll_roster() {
@@ -618,20 +623,25 @@ impl App {
         changed
     }
 
-    // ── ROSTER: throttled, backgrounded `who` dispatch (P-C4) ───────────────
+    // ── ROSTER: throttled, backgrounded `session --hosts` dispatch (P-C4;
+    // re-spelled from the retired standalone `who` command at the
+    // session-surface redesign, command-defrag lane X, 2026-08-28 — same
+    // mechanism, same `Outcome` shape, only the dispatched path/flags
+    // changed) ──────────────────────────────────────────────────────────
     //
-    // `who` performs a live network probe of every registered peer on EVERY
-    // invocation (`conduct/src/graph/who.rs`'s module doc) — up to ~2s per
-    // peer, run in parallel inside `who` itself but still ~2s wall-clock in
-    // the worst case. Calling it through `App::dispatch` the way every other
-    // action does would block the ~500ms tick loop for that long, so this
-    // dispatch runs on its OWN `std::thread` (the exact pattern `who`'s own
+    // `session --hosts` performs a live network probe of every registered
+    // peer on EVERY invocation (`conduct/src/graph/who.rs`'s module doc —
+    // the roster core) — up to ~2s per peer, run in parallel inside the
+    // roster core itself but still ~2s wall-clock in the worst case.
+    // Calling it through `App::dispatch` the way every other action does
+    // would block the ~500ms tick loop for that long, so this dispatch runs
+    // on its OWN `std::thread` (the exact pattern the roster core's own
     // `probe_peers` already uses one layer down) and reports back over an
     // `mpsc` channel that the tick loop only ever polls non-blockingly. This
     // is the ONE dispatch site in the crate that does not go through
-    // `App::dispatch` — `who` never mutates anything, so there is no stage
-    // write to `reload_all()` after, and the audit record still happens
-    // (the dispatched `Invocation` still carries `Door::Cli`).
+    // `App::dispatch` — the roster never mutates anything, so there is no
+    // stage write to `reload_all()` after, and the audit record still
+    // happens (the dispatched `Invocation` still carries `Door::Cli`).
 
     /// Is the cached roster stale enough to re-fetch? `None` (never fetched)
     /// is always stale.
@@ -642,10 +652,10 @@ impl App {
         }
     }
 
-    /// Non-blocking: pick up a finished background `who` dispatch, if any.
-    /// A fetch still running just leaves `roster_rx` in place for the next
-    /// poll. Returns `true` when the cache changed (so the tick loop knows to
-    /// repaint).
+    /// Non-blocking: pick up a finished background `session --hosts`
+    /// dispatch, if any. A fetch still running just leaves `roster_rx` in
+    /// place for the next poll. Returns `true` when the cache changed (so
+    /// the tick loop knows to repaint).
     fn drain_roster(&mut self) -> bool {
         let Some(rx) = &self.roster_rx else {
             return false;
@@ -668,9 +678,9 @@ impl App {
         }
     }
 
-    /// Spawn the `who` dispatch on a background thread. A no-op while a
-    /// fetch is already in flight — callers (the tick, a panel switch, the
-    /// manual refresh key) never need to check that themselves.
+    /// Spawn the `session --hosts` dispatch on a background thread. A no-op
+    /// while a fetch is already in flight — callers (the tick, a panel
+    /// switch, the manual refresh key) never need to check that themselves.
     fn spawn_roster_fetch(&mut self) {
         if self.roster_rx.is_some() {
             return;
@@ -679,9 +689,12 @@ impl App {
         let dispatch_fn = self.dispatch_fn;
         std::thread::spawn(move || {
             let inv = Invocation {
-                path: vec!["who".to_string()],
+                path: vec!["session".to_string()],
                 args: Vec::new(),
-                flags: BTreeMap::from([("json".to_string(), "true".to_string())]),
+                flags: BTreeMap::from([
+                    ("json".to_string(), "true".to_string()),
+                    ("hosts".to_string(), "true".to_string()),
+                ]),
                 door: Door::Cli,
             };
             let outcome = dispatch_fn(&inv);
@@ -702,8 +715,8 @@ impl App {
             // A landed fetch can SHRINK the roster (a peer went unreachable,
             // a session ended) — `roster_sel` was clamped against the OLD
             // row count. `reload_all`/`poll_refresh`'s stage-mtime path
-            // clamps after every reload, but a background `who` completing
-            // is the one mutation that bypasses both (review nit): without
+            // clamps after every reload, but a background roster fetch
+            // completing is the one mutation that bypasses both (review nit): without
             // this, render's `.min()` would visibly highlight the last row
             // while `open_compose`'s raw `.get(self.roster_sel)` silently
             // no-ops `s` against a row that no longer exists at that index.
@@ -716,8 +729,8 @@ impl App {
         changed
     }
 
-    /// The ROSTER panel's rows, parsed from the cached `who` [`Outcome`]
-    /// (never re-derived — the crate's one rule). Malformed/absent data
+    /// The ROSTER panel's rows, parsed from the cached `session --hosts`
+    /// [`Outcome`] (never re-derived — the crate's one rule). Malformed/absent data
     /// yields an empty roster rather than panicking; [`App::roster_status`]
     /// tells the pane why.
     pub fn roster_nodes(&self) -> Vec<RosterNode> {
@@ -757,7 +770,7 @@ impl App {
     /// [`App::roster_nodes`] flattened into one selectable `Vec` (P-C5 adds
     /// selection to C4's read-only pane) — the same "one row model for
     /// render + keys" shape [`App::dag_rows`] already uses over the DAG,
-    /// here over `who`'s node/session tree. `roster_sel` indexes this, never
+    /// here over the roster's node/session tree. `roster_sel` indexes this, never
     /// `roster_nodes()`'s nested shape directly.
     pub fn roster_flat_rows(&self) -> Vec<RosterRow> {
         let mut rows = Vec::new();
@@ -780,8 +793,8 @@ impl App {
     }
 
     /// A one-line fetch status for the pane header: probing, freshly
-    /// fetched, never fetched yet, or — when `who` itself came back
-    /// non-`Ok` — that error, in the same `[tag] command: message` shape
+    /// fetched, never fetched yet, or — when the roster fetch itself came
+    /// back non-`Ok` — that error, in the same `[tag] command: message` shape
     /// [`App::status_message`] uses for the global status line (house
     /// style; P-C4 review nit). Without this branch a failed fetch would
     /// render as a bare "fetched Ns ago" over an empty roster, silently
@@ -804,7 +817,7 @@ impl App {
 
     // ── PENDING: `session pending list` through the dispatcher (P-C5) ─────────
     //
-    // Unlike ROSTER's `who`, `session pending list` is a local file read (no
+    // Unlike ROSTER's `session --hosts`, `session pending list` is a local file read (no
     // network) — refreshing it costs one JSON parse of `state/stage/pending.json`,
     // not a ~2s-per-peer probe. So there is no throttle window and no
     // background thread here: [`App::refresh_pending`] runs synchronously,
@@ -1193,9 +1206,9 @@ impl App {
 
     /// `s` on a selected ROSTER session row opens the compose prompt
     /// ([`InputKind::Compose`]), pre-labeled with the row's own
-    /// display-grammar label — the exact string `who` already computed and
-    /// the exact string `send --to <target>` resolves back to a
-    /// session (petname, tail4, host/role/petname — whatever `who` rendered).
+    /// display-grammar label — the exact string the roster core already
+    /// computed and the exact string `send --to <target>` resolves back to a
+    /// session (petname, tail4, host/role/petname — whatever the roster rendered).
     /// A no-op on a node-header or empty-node row: there is no session to
     /// address, and the frontend never invents one.
     fn open_compose(&mut self) {
@@ -1985,9 +1998,9 @@ mod tests {
     /// `ENV_LOCK` above guards a different piece of shared state.
     static ROSTER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    fn counting_who_dispatch(_: &Invocation) -> Outcome {
+    fn counting_roster_dispatch(_: &Invocation) -> Outcome {
         ROSTER_CALLS.fetch_add(1, Ordering::SeqCst);
-        Outcome::ok("who", "1 node(s), 0 session(s)")
+        Outcome::ok("session", "1 node(s), 0 session(s)")
             .with_data(json!({ "host": "h", "generatedAt": "t", "nodes": [] }))
     }
 
@@ -1997,7 +2010,7 @@ mod tests {
             let _rguard = ROSTER_TEST_LOCK.lock().unwrap();
             ROSTER_CALLS.store(0, Ordering::SeqCst);
 
-            let mut app = App::for_test_with_dispatch(counting_who_dispatch);
+            let mut app = App::for_test_with_dispatch(counting_roster_dispatch);
             app.panel = Panel::Roster;
             app.roster.fetched_at = Some(Instant::now()); // just fetched — well inside the window
 
@@ -2014,7 +2027,7 @@ mod tests {
             let _rguard = ROSTER_TEST_LOCK.lock().unwrap();
             ROSTER_CALLS.store(0, Ordering::SeqCst);
 
-            let mut app = App::for_test_with_dispatch(counting_who_dispatch);
+            let mut app = App::for_test_with_dispatch(counting_roster_dispatch);
             app.panel = Panel::Roster; // visible, `fetched_at: None` — always stale
 
             app.poll_refresh();
@@ -2023,7 +2036,7 @@ mod tests {
             let outcome = rx
                 .recv_timeout(Duration::from_secs(2))
                 .expect("the background dispatch completes");
-            assert_eq!(outcome.command, "who");
+            assert_eq!(outcome.command, "session");
             assert_eq!(ROSTER_CALLS.load(Ordering::SeqCst), 1);
         });
     }
@@ -2034,7 +2047,7 @@ mod tests {
             let _rguard = ROSTER_TEST_LOCK.lock().unwrap();
             ROSTER_CALLS.store(0, Ordering::SeqCst);
 
-            let mut app = App::for_test_with_dispatch(counting_who_dispatch);
+            let mut app = App::for_test_with_dispatch(counting_roster_dispatch);
             app.panel = Panel::Session; // NOT the roster pane
 
             app.poll_refresh();
@@ -2049,7 +2062,7 @@ mod tests {
         let _rguard = ROSTER_TEST_LOCK.lock().unwrap();
         ROSTER_CALLS.store(0, Ordering::SeqCst);
 
-        let mut app = App::for_test_with_dispatch(counting_who_dispatch);
+        let mut app = App::for_test_with_dispatch(counting_roster_dispatch);
         assert_eq!(app.panel, Panel::Graph, "starts elsewhere");
 
         app.select_panel(Panel::Roster); // no tick involved at all
@@ -2067,7 +2080,7 @@ mod tests {
         let _rguard = ROSTER_TEST_LOCK.lock().unwrap();
         ROSTER_CALLS.store(0, Ordering::SeqCst);
 
-        let mut app = App::for_test_with_dispatch(counting_who_dispatch);
+        let mut app = App::for_test_with_dispatch(counting_roster_dispatch);
         app.roster.fetched_at = Some(Instant::now());
 
         app.select_panel(Panel::Roster);
@@ -2081,7 +2094,7 @@ mod tests {
         let _rguard = ROSTER_TEST_LOCK.lock().unwrap();
         ROSTER_CALLS.store(0, Ordering::SeqCst);
 
-        let mut app = App::for_test_with_dispatch(counting_who_dispatch);
+        let mut app = App::for_test_with_dispatch(counting_roster_dispatch);
         app.panel = Panel::Roster;
         app.roster.fetched_at = Some(Instant::now()); // fresh — a tick would skip it
 
@@ -2100,7 +2113,7 @@ mod tests {
         let _rguard = ROSTER_TEST_LOCK.lock().unwrap();
         ROSTER_CALLS.store(0, Ordering::SeqCst);
 
-        let mut app = App::for_test_with_dispatch(counting_who_dispatch);
+        let mut app = App::for_test_with_dispatch(counting_roster_dispatch);
         app.panel = Panel::Roster;
         app.spawn_roster_fetch();
         assert!(app.roster_rx.is_some());
@@ -2151,11 +2164,11 @@ mod tests {
                 },
             ],
         });
-        app.roster.outcome = Some(Outcome::ok("who", "2 node(s), 1 session(s)").with_data(data));
+        app.roster.outcome = Some(Outcome::ok("session", "2 node(s), 1 session(s)").with_data(data));
         app.roster.fetched_at = Some(Instant::now());
 
         let nodes = app.roster_nodes();
-        assert_eq!(nodes.len(), 2, "local + one peer, in who's own order");
+        assert_eq!(nodes.len(), 2, "local + one peer, in the roster's own order");
         assert!(nodes[0].is_local && nodes[0].name == "sakaki", "local box first");
         assert_eq!(nodes[0].sessions[0].label, "sakaki/root/s1");
         assert_eq!(nodes[0].sessions[0].state, "working");
@@ -2169,12 +2182,12 @@ mod tests {
     #[test]
     fn roster_status_surfaces_a_non_ok_outcome_instead_of_hiding_it() {
         let mut app = App::for_test(Vec::new(), Vec::new(), Vec::new());
-        app.roster.outcome = Some(Outcome::error("who", "stage read failed: permission denied"));
+        app.roster.outcome = Some(Outcome::error("session", "stage read failed: permission denied"));
         app.roster.fetched_at = Some(Instant::now());
 
         let status = app.roster_status();
         assert!(
-            status.starts_with("[err] who: stage read failed"),
+            status.starts_with("[err] session: stage read failed"),
             "the error message surfaces in the pane, not a bare age: {status}"
         );
         assert!(
@@ -2210,7 +2223,7 @@ mod tests {
     #[test]
     fn a_landed_background_fetch_that_shrinks_the_roster_clamps_selection_so_compose_never_silently_no_ops(
     ) {
-        // Review nit: `drain_roster`/`poll_roster` (the background `who`
+        // Review nit: `drain_roster`/`poll_roster` (the background roster
         // fetch completing) is the one mutation that bypassed
         // `clamp_selection` — `reload_all` and `poll_refresh`'s
         // stage-mtime-gated block both call it, this path didn't. Start on
@@ -2228,7 +2241,7 @@ mod tests {
         // Populate the exact channel `spawn_roster_fetch` uses, as if a
         // background fetch just landed — deterministic, no thread race.
         let (tx, rx) = mpsc::channel();
-        let shrunk = Outcome::ok("who", "1 node(s), 1 session(s)").with_data(json!({
+        let shrunk = Outcome::ok("session", "1 node(s), 1 session(s)").with_data(json!({
             "host": "sakaki", "generatedAt": "t",
             "nodes": [
                 {
@@ -2278,7 +2291,7 @@ mod tests {
                 },
             ],
         });
-        Outcome::ok("who", "2 node(s), 2 session(s)").with_data(data)
+        Outcome::ok("session", "2 node(s), 2 session(s)").with_data(data)
     }
 
     // ── Compose: `s` on a ROSTER session row (P-C5) ──────────────────────
@@ -2376,7 +2389,7 @@ mod tests {
         app.handle_key(KeyEvent::from(KeyCode::Char('r')));
 
         // `dispatch_with_flags` also calls `reload_all()` right after, which
-        // fires its own dispatches (who/graph view/…) through the SAME
+        // fires its own dispatches (session/graph view/…) through the SAME
         // injected fn — filter to the resurrect call specifically, same as
         // `compose_builds_the_exact_expected_invocation` does for `send`.
         let calls = RESURRECT_CALLS.lock().unwrap();

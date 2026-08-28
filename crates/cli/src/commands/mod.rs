@@ -28,8 +28,7 @@ use crate::registry::Registry;
 /// soundcheck (the mechanical-integrity command's WORKING-tree half,
 /// `aoide-upkeep`; report-only, forever — see its own module doc for the
 /// finding format and why the COMMITTED-tree half lives in `nix flake
-/// check` instead), who (live presence over sessions + registered peers,
-/// messaging workstream C2), inbox list/read/clear (appended newest — the
+/// check` instead), inbox list/read/clear (appended newest — the
 /// durable per-host message store, messaging workstream C6), secrets
 /// serve/exec/add/rm/grant/revoke (appended newest — Workstream SECRETS's
 /// broker daemon + client + admin CLI surface, P-V2), events tail
@@ -74,7 +73,6 @@ pub fn all() -> Registry {
     aoide_storage::commands::register(&mut r); // usage — local token/cost rollup (CONTRACTS.md §4)
     aoide_conduct::commands::hooks::register(&mut r); // hooks install — the hook-installer command
     aoide_upkeep::commands::register(&mut r); // soundcheck — mechanical-integrity WORKING-tree sweep, report-only
-    aoide_conduct::commands::who::register(&mut r); // who — live presence over sessions + registered peers (messaging workstream C2)
     aoide_storage::commands::register_inbox(&mut r); // inbox list/read/clear — durable per-host message store (messaging workstream C6, appended newest)
     aoide_secrets::commands::register(&mut r); // secrets serve/exec/add/rm/grant/revoke — the secrets broker (Workstream SECRETS P-V2, appended newest)
     aoide_server::commands::register_events(&mut r); // events tail — aoided's own feed follow command (P-D3, appended newest)
@@ -82,7 +80,7 @@ pub fn all() -> Registry {
     aoide_client::commands::register_peer_pair(&mut r); // peer pair request/pending/approve/reject — the pairing ceremony's CLI half (P-P2, appended newest)
     aoide_client::commands::register_peer_discovery(&mut r); // peer discover/invite/advertise — LAN discovery's CLI half (P-P6 + task #120, appended newest)
     aoide_client::mcp_client::register_melete(&mut r); // melete status/graph/call — the Melete MCP client (M2, task #14, appended newest)
-    aoide_conduct::commands::peer_list::register(&mut r); // peer list — the one-glance mesh roster over who's probe core + one discovery sweep (task #120 P2, appended newest)
+    aoide_conduct::commands::peer_list::register(&mut r); // peer list — the one-glance mesh roster over the roster core's probe (formerly who's) + one discovery sweep (task #120 P2, appended newest)
     aoide_client::commands::register_pair(&mut r); // pair — the interactive pairing picker over one sweep, driving the same ceremony core (task #120 P3, appended newest)
 
     r

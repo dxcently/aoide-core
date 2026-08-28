@@ -1,15 +1,20 @@
-//! `session undying on|off [--self | --id <id>]` — mark or unmark a
+//! `session grant undying on|off [--self | --id <id>]` — mark or unmark a
 //! session DURABLE, so a project's whole undying set can later be
 //! resurrected together (`resurrect`, `CONTRACTS.md`'s `state/undying.json`
 //! section).
 //!
 //! Prototyped under the name "carry" (task #96, `graph session carry`);
-//! this is the shipped rename (command-defrag lane U1, 2026-08-27) — the
-//! command only, over the store `aoide_storage::undying` already provides
-//! (P-C1, landed) — no reimplementation of the store's CRUD here. This
-//! handler writes ONLY `state/undying.json`: unlike every other `session *`
-//! handler in this module, it takes no stage lock and does not route
-//! through `aoide_client::daemon::daemon_dispatch` — `undying.json` is not a
+//! shipped under this name at command-defrag lane U1 (2026-08-27); relocated
+//! under the `session grant` positional-kind grammar at the session-surface
+//! redesign (command-defrag lane X, 2026-08-28) — [`undying_grant`] is
+//! [`super::grant::session_grant`]'s scripted-branch callee, not a
+//! registered command in its own right anymore (the standalone `session
+//! undying` path this absorbs is now unknown, same as a typo). The store
+//! logic is untouched throughout: a thin command over `aoide_storage::
+//! undying`'s CRUD (P-C1, landed) — no reimplementation here. This function
+//! writes ONLY `state/undying.json`: unlike every other `session *` handler
+//! in this crate, it takes no stage lock and does not route through
+//! `aoide_client::daemon::daemon_dispatch` — `undying.json` is not a
 //! `state/stage/` file, so it sits entirely outside the L4 dual-writer
 //! surface (a second writer there would defeat the store's own
 //! single-writer atomic-write discipline; see `undying.rs`'s own module doc
@@ -20,7 +25,6 @@
 //! design: a mark must be flippable post-mortem, off a bare ledger id, after
 //! the session that owned it is gone.
 
-use super::common::require_args;
 use super::model::{load_stage, sessions_path, SessionsFile};
 #[cfg(test)]
 use super::model::{write_stage, RestoreSnapshot, SessionRecord};
@@ -29,7 +33,10 @@ use aoide_protocol::Invocation;
 use aoide_storage::undying::{load_undying, save_undying, set_undying};
 use serde_json::json;
 
-/// `aoide session undying (on|off) [--self | --id <id>] [--json]`.
+/// `aoide session grant undying (on|off) [--self | --id <id>] [--json]` —
+/// the SCRIPTED mark, called by [`super::grant::session_grant`] with the
+/// state positional it already parsed off `inv.args[1]` (`inv.args[0]` is
+/// the kind, `"undying"`, consumed by the dispatcher).
 ///
 /// Target resolution: `--id <id>` names any session id directly; otherwise
 /// `--self` (or a bare invocation, the same default) reads
@@ -38,15 +45,10 @@ use serde_json::json;
 /// and `--id` together is a usage error; neither an `--id` nor a resolvable
 /// `$AOIDE_SESSION_ID` is likewise a usage error naming both — never a
 /// silent no-op.
-pub fn session_undying(inv: &Invocation) -> Outcome {
-    let cmd = "session.undying";
-    let usage = "usage: aoide session undying (on|off) [--self | --id <id>] [--json]";
+pub(super) fn undying_grant(inv: &Invocation, cmd: &str, state: &str) -> Outcome {
+    let usage = "usage: aoide session grant undying (on|off) [--self | --id <id>] [--json]";
 
-    let args = match require_args(inv, &["on|off"]) {
-        Ok(a) => a,
-        Err(o) => return o,
-    };
-    let on = match args[0].as_str() {
+    let on = match state {
         "on" => true,
         "off" => false,
         other => {
@@ -167,9 +169,14 @@ mod tests {
         root
     }
 
+    /// `args` is vestigial post-relocation — `undying_grant` no longer reads
+    /// `inv.args` at all (the state positional is a direct function
+    /// parameter now, resolved by `grant.rs`'s dispatcher before this
+    /// function is ever called) — kept only so a caller can still shape a
+    /// realistic `Invocation` if some future test needs it.
     fn undying_invocation(args: &[&str], flags: &[(&str, &str)]) -> Invocation {
         Invocation {
-            path: vec!["session".into(), "undying".into()],
+            path: vec!["session".into(), "grant".into()],
             args: args.iter().map(|s| s.to_string()).collect(),
             flags: flags.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             door: aoide_protocol::Door::Cli,
@@ -182,13 +189,13 @@ mod tests {
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
         let root = setup("undying-roundtrip");
 
-        let on = session_undying(&undying_invocation(&["on"], &[("id", "sess-1")]));
+        let on = undying_grant(&undying_invocation(&[], &[("id", "sess-1")]), "session.grant", "on");
         assert_eq!(on.status, Status::Ok, "msg: {}", on.message);
         assert_eq!(on.data.as_ref().unwrap()["undying"], true);
         assert_eq!(on.changed, vec!["sess-1: undying".to_string()]);
         assert!(aoide_storage::undying::is_undying(&aoide_storage::undying::load_undying(), "sess-1"));
 
-        let off = session_undying(&undying_invocation(&["off"], &[("id", "sess-1")]));
+        let off = undying_grant(&undying_invocation(&[], &[("id", "sess-1")]), "session.grant", "off");
         assert_eq!(off.status, Status::Ok, "msg: {}", off.message);
         assert_eq!(off.data.as_ref().unwrap()["undying"], false);
         assert_eq!(off.changed, vec!["sess-1: not undying".to_string()]);
@@ -204,7 +211,7 @@ mod tests {
         let root = setup("undying-bare-env");
         std::env::set_var("AOIDE_SESSION_ID", "env-sess");
 
-        let out = session_undying(&undying_invocation(&["on"], &[]));
+        let out = undying_grant(&undying_invocation(&[], &[]), "session.grant", "on");
         assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["sessionId"], "env-sess");
         assert!(aoide_storage::undying::is_undying(&aoide_storage::undying::load_undying(), "env-sess"));
@@ -219,7 +226,7 @@ mod tests {
         let root = setup("undying-self-flag");
         std::env::set_var("AOIDE_SESSION_ID", "self-sess");
 
-        let out = session_undying(&undying_invocation(&["on"], &[("self", "true")]));
+        let out = undying_grant(&undying_invocation(&[], &[("self", "true")]), "session.grant", "on");
         assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["sessionId"], "self-sess");
 
@@ -236,7 +243,7 @@ mod tests {
         let root = setup("undying-post-mortem");
         // sessions.json stays empty for this test — the id below is never in it.
 
-        let out = session_undying(&undying_invocation(&["on"], &[("id", "long-dead-id")]));
+        let out = undying_grant(&undying_invocation(&[], &[("id", "long-dead-id")]), "session.grant", "on");
         assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
         let data = out.data.as_ref().unwrap();
         assert_eq!(data["undying"], true);
@@ -257,7 +264,7 @@ mod tests {
         };
         write_stage(&sessions_path(), &file).unwrap();
 
-        let out = session_undying(&undying_invocation(&["on"], &[("id", "live-id")]));
+        let out = undying_grant(&undying_invocation(&[], &[("id", "live-id")]), "session.grant", "on");
         assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["live"], true);
 
@@ -271,7 +278,7 @@ mod tests {
         let root = setup("undying-no-target");
         std::env::remove_var("AOIDE_SESSION_ID");
 
-        let out = session_undying(&undying_invocation(&["on"], &[]));
+        let out = undying_grant(&undying_invocation(&[], &[]), "session.grant", "on");
         assert_eq!(out.status, Status::Usage);
         assert!(out.message.contains("--self"), "msg: {}", out.message);
         assert!(out.message.contains("--id"), "msg: {}", out.message);
@@ -281,24 +288,26 @@ mod tests {
 
     #[test]
     fn self_and_id_together_is_a_usage_error() {
-        let out = session_undying(&undying_invocation(&["on"], &[("self", "true"), ("id", "sess-1")]));
+        let out = undying_grant(&undying_invocation(&[], &[("self", "true"), ("id", "sess-1")]), "session.grant", "on");
         assert_eq!(out.status, Status::Usage);
         assert!(out.message.contains("mutually exclusive"), "msg: {}", out.message);
     }
 
     #[test]
     fn an_unknown_positional_word_is_a_usage_error_naming_both_states() {
-        let out = session_undying(&undying_invocation(&["maybe"], &[("id", "sess-1")]));
+        let out = undying_grant(&undying_invocation(&[], &[("id", "sess-1")]), "session.grant", "maybe");
         assert_eq!(out.status, Status::Usage);
         assert!(out.message.contains("on"), "msg: {}", out.message);
         assert!(out.message.contains("off"), "msg: {}", out.message);
     }
 
-    #[test]
-    fn missing_positional_is_a_usage_error() {
-        let out = session_undying(&undying_invocation(&[], &[("id", "sess-1")]));
-        assert_eq!(out.status, Status::Usage);
-    }
+    // `missing_positional_is_a_usage_error` (the state positional absent
+    // entirely) moved to `grant.rs`'s
+    // `undying_kind_with_no_state_dispatches_to_the_picker_and_hits_its_tty_gate`
+    // — that case now routes to the PICKER, not a usage error here, since
+    // `session_grant`'s own dispatcher branches on `inv.args.get(1)` before
+    // `undying_grant` is ever called; this function can no longer observe a
+    // missing state at all.
 
     /// A re-mark (already-on, marked on again) is not a TRANSITION —
     /// `changed` stays empty, matching `set_undying`'s own idempotency
@@ -309,11 +318,11 @@ mod tests {
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
         let root = setup("undying-remark");
 
-        let first = session_undying(&undying_invocation(&["on"], &[("id", "sess-1")]));
+        let first = undying_grant(&undying_invocation(&[], &[("id", "sess-1")]), "session.grant", "on");
         assert_eq!(first.status, Status::Ok);
         assert!(!first.changed.is_empty());
 
-        let second = session_undying(&undying_invocation(&["on"], &[("id", "sess-1")]));
+        let second = undying_grant(&undying_invocation(&[], &[("id", "sess-1")]), "session.grant", "on");
         assert_eq!(second.status, Status::Ok);
         assert!(second.changed.is_empty(), "a re-mark is not a transition: {:?}", second.changed);
         assert_eq!(second.data.as_ref().unwrap()["undying"], true);
@@ -371,7 +380,7 @@ mod tests {
         };
         write_stage(&sessions_path(), &file).unwrap();
 
-        let out = session_undying(&undying_invocation(&["on"], &[("id", "soak-sess")]));
+        let out = undying_grant(&undying_invocation(&[], &[("id", "soak-sess")]), "session.grant", "on");
         assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
         assert!(
             out.message.contains("warning:"),
@@ -404,7 +413,7 @@ mod tests {
         };
         write_stage(&sessions_path(), &file).unwrap();
 
-        let out = session_undying(&undying_invocation(&["on"], &[("id", "captured-sess")]));
+        let out = undying_grant(&undying_invocation(&[], &[("id", "captured-sess")]), "session.grant", "on");
         assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
         assert!(!out.message.contains("warning:"), "msg: {}", out.message);
 
@@ -424,7 +433,7 @@ mod tests {
         };
         write_stage(&sessions_path(), &file).unwrap();
 
-        let out = session_undying(&undying_invocation(&["on"], &[("id", "claude-sess")]));
+        let out = undying_grant(&undying_invocation(&[], &[("id", "claude-sess")]), "session.grant", "on");
         assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
         assert!(!out.message.contains("warning:"), "msg: {}", out.message);
 
@@ -449,7 +458,7 @@ mod tests {
         };
         write_stage(&sessions_path(), &file).unwrap();
 
-        let out = session_undying(&undying_invocation(&["off"], &[("id", "soak-sess-off")]));
+        let out = undying_grant(&undying_invocation(&[], &[("id", "soak-sess-off")]), "session.grant", "off");
         assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
         assert!(!out.message.contains("warning:"), "msg: {}", out.message);
 
@@ -465,7 +474,7 @@ mod tests {
         let root = setup("undying-warn-unrostered");
         // sessions.json stays empty — the id below is never in it.
 
-        let out = session_undying(&undying_invocation(&["on"], &[("id", "long-dead-id")]));
+        let out = undying_grant(&undying_invocation(&[], &[("id", "long-dead-id")]), "session.grant", "on");
         assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
         assert!(!out.message.contains("warning:"), "msg: {}", out.message);
 

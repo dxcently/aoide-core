@@ -337,8 +337,9 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
 - `addr` — the pure address resolver (messaging/presence plan, P-C1),
   inverting `display::session_label`'s grammar to turn a typed query back
   into a local session id or a deferred `peer/<rest>` remote query. Zero
-  I/O, agnostic of any call site — `aoide who` (`aoide-conduct::graph::who`,
-  C2) and `send --to` (`aoide-conduct::graph::send`, C3) both call
+  I/O, agnostic of any call site — bare `session`/`--hosts`
+  (`aoide-conduct::graph::who`, C2 — the roster core, formerly the standalone
+  `who` command) and `send --to` (`aoide-conduct::graph::send`, C3) both call
   `resolve` directly. `resolve_with_hub` (P-D5) composes it with the hub
   preference (`peer_store::Peer.hub`): a hub-designated peer is offered as
   one last, least-specific `Remote` candidate only on `resolve`'s own

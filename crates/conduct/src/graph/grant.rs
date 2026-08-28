@@ -1,22 +1,40 @@
-//! `aoide session` (bare) — the undying PICKER (U3, command-defrag lane U).
+//! `session grant <kind> [on|off] [--id <id> | --self]` — the GRANT family
+//! (session-surface redesign, command-defrag lane X, 2026-08-28). A
+//! POSITIONAL `<kind>` grammar, matching `secrets automate <name> on|off`
+//! (`crates/secrets/src/commands.rs`) rather than growing a second flag on
+//! bare `session` — which no longer picks anything: it renders the roster
+//! instead (`who.rs`'s module doc, "The roster core"). One kind exists
+//! today, `undying` — [`GRANTABLE_KINDS`] — the U1/U3 mark, relocated here
+//! verbatim, nothing about its own mechanics changed:
 //!
-//! `session undying on|off [--self | --id <id>]` (U1) is the scripted
-//! spelling — one flag flips one id. This command is its tty sibling: a
-//! multi-select over every session this conductor can see (this box's own
-//! roster, plus every registered peer's CACHED graph — no live pulls, see
-//! below), each row pre-checked by its CURRENT undying state, confirmed in
-//! one Enter. There is deliberately no second scripted spelling here (no
-//! `--undying` flag on bare `session`) — one spelling per capability, the
-//! same "deletes more" rule `AGENTS.md`'s "Building" section states.
+//! - `session grant undying` (bare, no state) opens the interactive
+//!   PICKER — [`undying_picker`], U3's exact body, only relocated. A
+//!   multi-select over every session this conductor can see (this box's
+//!   own roster, plus every registered peer's CACHED graph — no live
+//!   pulls, see below), each row pre-checked by its CURRENT undying state,
+//!   confirmed in one Enter.
+//! - `session grant undying on|off [--self | --id <id>]` is the SCRIPTED
+//!   mark — [`super::undying::undying_grant`], U1's exact body, relocated
+//!   from the standalone `session undying` command, which this absorbs and
+//!   retires (hard cutover, no alias: `session undying` is now unknown,
+//!   same as a typo).
+//! - `session grant` (no kind at all) teaches the grantable set; an
+//!   unknown kind is a taught refusal. The dispatch in [`session_grant`] is
+//!   a plain match arm — a future kind (#127, secret grants) adds one arm,
+//!   and if it wants a picker too, reuses [`undying_picker`]'s own
+//!   CLI+tty gate shape ([`require_cli_tty`]) rather than re-deriving it —
+//!   there is still only one multi-select primitive in this crate.
 //!
-//! **CLI-only, tty-only.** [`session_pick`] gates on [`aoide_protocol::Door::Cli`]
-//! FIRST (the same `require_cli` shape `secrets`' admin quartet holds —
-//! `crates/secrets/src/commands.rs`), then on [`aoide_protocol::pick::interactive`]
-//! (door + a real stdin/stdout tty) — `--json` also steers to the taught
+//! **CLI-only, tty-only — the picker branch only.** [`undying_picker`]
+//! gates on [`aoide_protocol::Door::Cli`] FIRST (the same `require_cli`
+//! shape `secrets`' admin quartet holds — `crates/secrets/src/
+//! commands.rs`), then on [`aoide_protocol::pick::interactive`] (door + a
+//! real stdin/stdout tty) — `--json` also steers to the taught
 //! non-interactive path, since a picker's prompts would otherwise corrupt a
 //! machine-readable stream. Every non-interactive reach lands on the exact
-//! same taught usage error naming the scripted form: nothing here re-derives
-//! `session undying`'s own usage text.
+//! same taught usage error naming the scripted form. The SCRIPTED branch
+//! (`undying_grant`) carries no such gate — unchanged from `session
+//! undying`'s own reach from any door, since a script/daemon needs it too.
 //!
 //! **The seam: `aoide_protocol::pick::choose_many`, reached directly — no
 //! new seam.** `pick.rs`'s own module doc already frames the picker as door
@@ -359,13 +377,15 @@ pub(super) fn apply_diff(
     ApplyResult { changed, skipped }
 }
 
-/// `Door::Cli`, real-tty gate — the taught non-interactive path both share
-/// (module doc's "CLI-only, tty-only"). `--json` steers here too, even on a
-/// real tty: a picker's prompts have no business interleaving with a
-/// machine-readable stream a caller explicitly asked for.
+/// `Door::Cli`, real-tty gate — the taught non-interactive path the picker
+/// branch holds (module doc's "CLI-only, tty-only — the picker branch
+/// only"). `--json` steers here too, even on a real tty: a picker's prompts
+/// have no business interleaving with a machine-readable stream a caller
+/// explicitly asked for.
 fn require_cli_tty(inv: &Invocation, cmd: &str) -> Option<Outcome> {
-    let taught = "bare `session` opens an interactive picker on a real CLI terminal; \
-                  script the mark directly instead: `session undying on|off --id <id>`";
+    let taught = "bare `session grant undying` opens an interactive picker on a real CLI \
+                  terminal; script the mark directly instead: \
+                  `session grant undying on|off --id <id>`";
     if inv.door != Door::Cli {
         return Some(Outcome::usage(cmd, format!("{taught} (this door is not the CLI)")));
     }
@@ -375,14 +395,44 @@ fn require_cli_tty(inv: &Invocation, cmd: &str) -> Option<Outcome> {
     None
 }
 
-/// `aoide session` (bare, no subcommand) — the entry point. See the module
-/// doc for the full design; this function is the thin impure shell around
+/// Grantable kinds — one today. A future kind (#127, secret grants) is one
+/// more entry here plus one more `match` arm in [`session_grant`].
+const GRANTABLE_KINDS: &[&str] = &["undying"];
+
+/// `session grant <kind> [on|off] [--id <id> | --self]` — the registered
+/// entry point (module doc has the full grammar). Bare (no `<kind>`) teaches
+/// the grantable set; an unknown kind is a taught refusal; `undying` with no
+/// state dispatches to [`undying_picker`], with a state to
+/// [`super::undying::undying_grant`].
+pub fn session_grant(inv: &Invocation) -> Outcome {
+    let cmd = "session.grant";
+    let usage = format!(
+        "usage: aoide session grant <kind> [on|off] [--id <id> | --self] — grantable kinds: {}",
+        GRANTABLE_KINDS.join(", ")
+    );
+    let Some(kind) = inv.args.first().map(String::as_str) else {
+        return Outcome::usage(cmd, usage);
+    };
+    match kind {
+        "undying" => match inv.args.get(1).map(String::as_str) {
+            None => undying_picker(inv, cmd),
+            Some(state) => super::undying::undying_grant(inv, cmd, state),
+        },
+        other => Outcome::usage(
+            cmd,
+            format!("`{other}` is not a grantable kind — grantable: {}\n{usage}", GRANTABLE_KINDS.join(", ")),
+        ),
+    }
+}
+
+/// `session grant undying` (bare, no state) — the interactive picker, U3's
+/// body relocated verbatim. See the module doc for the full design; this
+/// function is the thin impure shell around
 /// [`build_rows`]/[`diff_selection`]/[`apply_diff`], loading local stage
 /// state, every registered peer's CACHED graph (no live probe), and the
 /// current project's manifest (`walk_up` from cwd, `None` if none exists
 /// above it — never created here).
-pub fn session_pick(inv: &Invocation) -> Outcome {
-    let cmd = "session";
+fn undying_picker(inv: &Invocation, cmd: &str) -> Outcome {
     if let Some(hint) = require_cli_tty(inv, cmd) {
         return hint;
     }
@@ -854,20 +904,20 @@ mod tests {
         if json {
             flags.insert("json".to_string(), "true".to_string());
         }
-        Invocation { path: vec!["session".into()], args: vec![], flags, door }
+        Invocation { path: vec!["session".into(), "grant".into()], args: vec!["undying".into()], flags, door }
     }
 
     #[test]
     fn require_cli_tty_refuses_every_non_cli_door() {
         for door in [Door::Mcp, Door::Daemon, Door::A2a] {
-            let hint = require_cli_tty(&inv(door, false), "session");
+            let hint = require_cli_tty(&inv(door, false), "session.grant");
             assert!(hint.is_some());
         }
     }
 
     #[test]
     fn require_cli_tty_refuses_json_even_on_the_cli_door() {
-        let hint = require_cli_tty(&inv(Door::Cli, true), "session");
+        let hint = require_cli_tty(&inv(Door::Cli, true), "session.grant");
         assert!(hint.is_some(), "cargo test's own stdio is never a tty either, but --json must refuse regardless");
     }
 
@@ -876,7 +926,51 @@ mod tests {
         // cargo test's stdin/stdout are never a real tty, so Door::Cli alone
         // (no --json) still refuses here -- the genuinely-interactive case
         // can only be proven by hand, same caveat pick.rs's own tests carry.
-        let hint = require_cli_tty(&inv(Door::Cli, false), "session");
+        let hint = require_cli_tty(&inv(Door::Cli, false), "session.grant");
         assert!(hint.is_some());
+    }
+
+    // ── session_grant: kind dispatch (bare/unknown/undying-picker-vs-scripted) ──
+
+    fn grant_inv(args: &[&str]) -> Invocation {
+        Invocation {
+            path: vec!["session".into(), "grant".into()],
+            args: args.iter().map(|s| s.to_string()).collect(),
+            flags: std::collections::BTreeMap::new(),
+            door: Door::Cli,
+        }
+    }
+
+    #[test]
+    fn bare_grant_with_no_kind_teaches_the_grantable_set() {
+        let out = session_grant(&grant_inv(&[]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage);
+        assert!(out.message.contains("undying"), "msg: {}", out.message);
+    }
+
+    #[test]
+    fn an_unknown_kind_is_a_taught_refusal() {
+        let out = session_grant(&grant_inv(&["secrets"]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage);
+        assert!(out.message.contains("not a grantable kind"), "msg: {}", out.message);
+        assert!(out.message.contains("undying"), "msg: {}", out.message);
+    }
+
+    #[test]
+    fn undying_kind_with_no_state_dispatches_to_the_picker_and_hits_its_tty_gate() {
+        // Not a real tty under `cargo test`, so this proves routing (the
+        // picker's own gate fires) rather than the picker's interactive body.
+        let out = session_grant(&grant_inv(&["undying"]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage);
+        assert!(out.message.contains("interactive picker"), "msg: {}", out.message);
+    }
+
+    #[test]
+    fn undying_kind_with_a_bogus_state_is_a_usage_error_from_the_scripted_path() {
+        // Proves routing reaches `undying_grant`, not the picker (which
+        // would refuse on the tty gate instead, a different message).
+        let out = session_grant(&grant_inv(&["undying", "sideways"]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage);
+        assert!(out.message.contains("not an undying state"), "msg: {}", out.message);
     }
 }

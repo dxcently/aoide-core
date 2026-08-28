@@ -2,14 +2,16 @@
 //! #120 P2, the one-glance mesh roster). Handler body lives in
 //! `graph/peer_list.rs`; this module only wires schema metadata to the
 //! already-public `crate::graph::peer_list` function — the same discipline
-//! `commands/who.rs` follows for `who`, whose probe core the roster reuses.
+//! `commands/graph.rs` follows for bare `session`, whose probe core (`who.rs`,
+//! now the shared roster core — the standalone `who` command it once backed
+//! is retired) this roster reuses.
 //!
 //! Registered in THIS crate (not `aoide-client` beside the rest of the
-//! `peer` family) because the roster is a presence projection over `who`'s
-//! own core, and `aoide-client` cannot depend on `aoide-conduct` (the edge
-//! runs the other way). Moved-in position: registered LAST in `cli`'s
-//! `commands::all()` (the append-only precedent) — a new command never
-//! reorders an existing `register()` call, only appends after it.
+//! `peer` family) because the roster is a presence projection over
+//! `who.rs`'s own core, and `aoide-client` cannot depend on `aoide-conduct`
+//! (the edge runs the other way). Moved-in position: registered LAST in
+//! `cli`'s `commands::all()` (the append-only precedent) — a new command
+//! never reorders an existing `register()` call, only appends after it.
 
 use aoide_protocol::registry::{cmd, Registry};
 

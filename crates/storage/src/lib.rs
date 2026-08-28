@@ -24,7 +24,8 @@
 //! `display::session_label` — a human types what the label showed,
 //! `addr::resolve` works back to a session id or a deferred remote query.
 //! Zero I/O, agnostic of any call site, same as `petname`/`display` — C2
-//! (`aoide who`) and C3 (`graph send --to`) are its callers.
+//! (bare `session`/`--hosts`, the roster core, formerly the standalone
+//! `aoide who` command) and C3 (`graph send --to`) are its callers.
 //! `addr::resolve_with_hub` (P-D5) composes it with the hub preference
 //! (`peer_store::Peer.hub`): a hub-designated peer as one last,
 //! least-specific candidate only when `resolve` finds nothing at all.

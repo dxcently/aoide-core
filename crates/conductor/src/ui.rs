@@ -17,7 +17,7 @@
 //! originals. `ROSTER` (messaging/presence plan, P-C4; selection + compose
 //! added P-C5) and `PENDING` (P-C5) are later, distinct additions. ROSTER is
 //! presence over this box plus every registered peer, sourced from a
-//! throttled, backgrounded `who` dispatch (`app`'s "ROSTER" section covers
+//! throttled, backgrounded `session --hosts` dispatch (`app`'s "ROSTER" section covers
 //! the threading; this file only paints what `App::roster_flat_rows` hands
 //! it) — plus, since P-C5, selection and an `s`-to-compose affordance.
 //! PENDING is held `send`/A2A entries from `session pending list`, a
@@ -639,16 +639,17 @@ fn palette_summary<'a>(app: &App) -> Line<'a> {
 // ── [5] ROSTER — presence over this box + every registered peer ────────────
 //
 // Read-only (messaging/presence plan, P-C4): rows come straight from the
-// cached `who --json` `Outcome` (`App::roster_nodes` — a reshape, never a
-// re-derivation), local box first then peers in `who`'s own order. Node
-// glyphs (`●`/`◐`/`○`) call `aoide_conduct::graph::glyph` DIRECTLY — `who`
-// widened it to `pub` for exactly this (P-C4 review nits; no forked copy
-// here); session glyphs are the conductor's existing musical-note set
-// (`theme::state_glyph`) applied to `who`'s canonical `state` string — the
-// SAME mapping the SESSION panel paints, since `who` classifies sessions
-// off the identical vocabulary. Staleness wording ("last seen") is also
-// `who`'s own — `render_nodes` in `who.rs` says it first; this pane matches
-// rather than inventing "as of".
+// cached `session --hosts --json` `Outcome` (`App::roster_nodes` — a
+// reshape, never a re-derivation), local box first then peers in the
+// roster's own order. Node glyphs (`●`/`◐`/`○`) call
+// `aoide_conduct::graph::glyph` DIRECTLY — widened to `pub` for exactly this
+// (P-C4 review nits; no forked copy here); session glyphs are the
+// conductor's existing musical-note set (`theme::state_glyph`) applied to
+// the roster's canonical `state` string — the SAME mapping the SESSION
+// panel paints, since the roster classifies sessions off the identical
+// vocabulary. Staleness wording ("last seen") is also the roster's own —
+// `render_nodes` in `who.rs` says it first; this pane matches rather than
+// inventing "as of".
 
 fn draw_roster(f: &mut Frame, area: Rect, app: &App) {
     let rows = app.roster_flat_rows();
@@ -1366,13 +1367,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&deep_base);
     }
 
-    // ── ROSTER panel (P-C4): fixed `who --json` fixture -> render ───────────
+    // ── ROSTER panel (P-C4): fixed `session --hosts --json` fixture -> render ──
 
-    /// A fixed `who --json` fixture, shaped exactly like
-    /// `conduct/src/graph/who.rs::who_with`'s real `Outcome.data` (this box
-    /// online, one unreachable peer with a stale-cache session, one
-    /// never-pulled peer) — the ONLY input `draw_roster` is allowed to read.
-    fn who_fixture() -> aoide_protocol::output::Outcome {
+    /// A fixed `session --hosts --json` fixture, shaped exactly like
+    /// `conduct/src/graph/who.rs::session_roster_with`'s real `Outcome.data`
+    /// (this box online, one unreachable peer with a stale-cache session,
+    /// one never-pulled peer) — the ONLY input `draw_roster` is allowed to
+    /// read.
+    fn roster_fixture() -> aoide_protocol::output::Outcome {
         let data = serde_json::json!({
             "host": "sakaki",
             "generatedAt": "2026-08-21T00:00:00Z",
@@ -1423,14 +1425,14 @@ mod tests {
                 },
             ],
         });
-        aoide_protocol::output::Outcome::ok("who", "3 node(s), 2 session(s)").with_data(data)
+        aoide_protocol::output::Outcome::ok("session", "3 node(s), 2 session(s)").with_data(data)
     }
 
     #[test]
     fn roster_panel_renders_grouped_nodes_with_presence_glyphs_and_staleness() {
         let mut a = App::for_test(vec![], vec![], vec![]);
         a.panel = Panel::Roster;
-        a.roster.outcome = Some(who_fixture());
+        a.roster.outcome = Some(roster_fixture());
 
         let backend = TestBackend::new(100, 30);
         let mut term = Terminal::new(backend).unwrap();
@@ -1459,7 +1461,7 @@ mod tests {
             "an unreachable peer's last-known session still surfaces: {out}"
         );
 
-        // Local box first, then peers — `who`'s own node order, never
+        // Local box first, then peers — the roster's own node order, never
         // re-sorted here.
         let local_pos = out.find("sakaki (this host)").unwrap();
         let peer_pos = out.find("yomi-strix").unwrap();

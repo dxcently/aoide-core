@@ -853,8 +853,9 @@ fn resurrect_from_manifest(
 /// Past those three, this reuses [`aoide_client::commands::spawn_on_peer`]
 /// VERBATIM — the identical signed spawn-shaped `message/send`
 /// (`context_id: None`) `aoide peer spawn` drives (the `conduct` → `client`
-/// edge this crate's `Cargo.toml` already documents for `who`, extended to
-/// this tenant) — never a re-implementation of the wire, never a shell-out
+/// edge this crate's `Cargo.toml` already documents for the roster core's
+/// own live peer probe (`who.rs`, reached via bare `session`/`--hosts`),
+/// extended to this tenant) — never a re-implementation of the wire, never a shell-out
 /// to the `aoide` CLI. No confirm prompt: unlike `peer spawn`'s interactive
 /// `--yes` gate, a manifest spec IS the operator's own standing
 /// declaration — the identical posture U2's local clean-spawn already

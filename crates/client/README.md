@@ -427,7 +427,8 @@ never the inbound/serve half (that's `aoide-server`).
   this handler just reports which of set/moved/cleared/no-op happened);
   also exposes two
   non-command functions that are the `conduct → client` edge's crossing
-  points: `pull_peer_live` (`who`'s live per-peer probe, read-only) and
+  points: `pull_peer_live` (the roster core's live per-peer probe, reached
+  via bare `session`/`--hosts` — read-only) and
   `send_message_to_peer` (`send --to <peer>/<query>`'s delivery,
   workstream C3 — POSTs `message/send` with an explicit `contextId` naming
   the resolved remote session). **Outbound bearer presentation (task
@@ -512,8 +513,10 @@ rather than a second wire client written here).
 
 `conduct`, `screen`, `server` (dev-dependency only, for one round-trip
 test), and `cli` depend on it. **The `conduct → client` edge is intentional,
-not technical debt**: `conduct`'s `who` presence command (workstream C2,
-landed) calls this crate's `commands::pull_peer_live` for its live
+not technical debt**: `conduct`'s roster core (workstream C2, landed;
+reached via bare `session`/`--hosts` — the standalone `who` command it
+originally backed is retired, session-surface redesign, command-defrag lane
+X, 2026-08-28) calls this crate's `commands::pull_peer_live` for its live
 per-peer probe, `send --to`'s remote branch (workstream C3, landed)
 calls `commands::send_message_to_peer` to deliver, and (P-D6) every
 session-write handler (`session start/phase/end/hook`, `session reap`)

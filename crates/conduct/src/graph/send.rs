@@ -972,7 +972,7 @@ fn resolve_remote_query(peer: &str, query: &str, candidates: &[LocalCandidate<'_
 /// `who.rs::sessions_from_graph`'s label construction
 /// (`display::session_label` with the peer's own name standing in as
 /// `host`), so an ambiguous/not-found `--to` error names candidates the same
-/// way `aoide who` would already be showing them.
+/// way `aoide session --hosts` would already be showing them.
 fn peer_session_label(peer: &str, session_id: &str, petname: Option<&str>, role: &str) -> String {
     let rec = aoide_storage::records::SessionRecord {
         session_id: session_id.to_string(),
@@ -1001,7 +1001,8 @@ fn ignored_remote_flags(inv: &Invocation) -> Vec<&'static str> {
 /// Deliver `text` to ONE remote session on `peer`, resolved from `query`
 /// against `peer`'s CACHED graph (`state/peer-cache/<peer>.json`) — a live
 /// pull is deliberately NOT performed here (the plan's own call: the cache
-/// is the addressing source for `send`; `who` is the probe command). No cache
+/// is the addressing source for `send`; `session --hosts` is the probe
+/// command). No cache
 /// at all (peer never pulled) is a clean error pointing at `peer pull`,
 /// never a silent auto-pull — a send should be predictable, not trigger a
 /// network fetch the user didn't ask for.
