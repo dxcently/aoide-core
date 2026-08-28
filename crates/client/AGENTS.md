@@ -386,7 +386,12 @@
   to point at their own door on purpose (loopback testing, a self-pair
   smoke test); only the DISCOVERED path needs the "you just invited
   yourself" refusal, because only there does the target come from an
-  automated resolution the operator didn't type by hand.
+  automated resolution the operator didn't type by hand. Known gap: the
+  guard's `own_name` is env/hostname-tier only, so a serve advertising
+  under a custom `--peer-name` FLAG escapes the name arm while the
+  self-heard broadcast arrives on the physical interface (missing the
+  loopback arm) — such an invite dials this box's own door; the SAS
+  ceremony backstops it (both codes land in front of one operator).
 
 ## Extension points
 

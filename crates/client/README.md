@@ -91,7 +91,11 @@ never the inbound/serve half (that's `aoide-server`).
   `Heard`, local-only and unpinned. `is_self_target(heard, own_name)` is
   the self-invite guard: true when the heard name is this instance's own
   or the datagram came from loopback (a broadcast always loops back to
-  its own sender). `resolve_invite_target(heard, name)` is the same
+  its own sender). Known gap: a serve advertising under a custom
+  `--peer-name` flag escapes the name arm (`own_name` here derives from
+  env/hostname only) and the self-heard broadcast arrives on the
+  physical interface, so such a self-invite proceeds — confusion, not
+  compromise; the SAS ceremony backstops it. `resolve_invite_target(heard, name)` is the same
   shape one layer up: `peer invite`'s zero/one/many-match resolution
   against an already-swept result, also pure, and returns the whole
   `Heard` so `src_addr` reaches `peer invite` for free. This crate's
