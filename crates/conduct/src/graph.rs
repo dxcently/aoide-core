@@ -55,6 +55,12 @@ pub use self::pending::{pending_approve, pending_deny, pending_list};
 pub use self::permit::{answer_summons, session_permit, summons_card_id};
 pub use self::send::{pending_path, session_hook, session_send};
 pub use self::session_store::{session_end, session_phase, session_start};
+// LANE IDENTITY P-ID0 (G16/G5): `aoide-server`'s `a2a::do_spawn` is the
+// authenticated-peer-origin writer — it stamps `peer:<name>` directly on
+// the record it just spawned, rather than threading the value through the
+// child's own (forgeable) env. `stamp_origin`'s own doc comment names both
+// legitimate callers.
+pub use self::session_store::stamp_origin;
 // `graph spawn` (P2 of the conducted-agents plan): the detached sibling of
 // `conduct` that re-execs `conduct --headless` and returns without
 // waiting on the agent's own lifetime — see `graph/spawn.rs`'s module doc.

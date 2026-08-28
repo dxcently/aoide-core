@@ -165,7 +165,7 @@
 use super::common::{require_flag, stage_error};
 use super::model::{load_stage, projects_path, sessions_path, ProjectsFile, SessionsFile};
 use super::send::session_send;
-use super::session_store::stamp_resumed_from;
+use super::session_store::{stamp_origin, stamp_resumed_from};
 use super::spawn::session_spawn;
 use aoide_protocol::agents::agent_profile;
 use aoide_protocol::output::{Outcome, Status};
@@ -369,6 +369,18 @@ fn resurrect_one(
     // false` on a slow terminal open) — never a second wait loop here;
     // `session_spawn` already spent its own registration budget.
     stamp_resumed_from(&new_id, &c.entry.session_id);
+
+    // Carry the ledger entry's own `origin` forward onto the revived record
+    // (LANE IDENTITY P-ID0, G6): `ledger_session_exit` writes `origin` on
+    // every exit, but nothing read it back until now — a revived
+    // peer-origin session silently became origin-less, losing its
+    // provenance on every resurrection. Change-only/no-op-safe exactly like
+    // `stamp_resumed_from` above (an unknown id or empty origin is a silent
+    // no-op); absent on the ledger entry (a locally-registered session
+    // never had one) means nothing to carry, same as before.
+    if let Some(origin) = c.entry.origin.as_deref() {
+        stamp_origin(&new_id, origin);
+    }
 
     // Undying transfer (P-C3, durable-sessions plan): if the OLD id was
     // durable, move the mark onto the fresh one rather than leaving it
@@ -1388,6 +1400,67 @@ mod tests {
             "an unrelated undying id must be left untouched"
         );
         assert_eq!(undying.len(), 2, "exactly one id moves — the set's size is unchanged");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// G6 (LANE IDENTITY P-ID0), data-integrity half: `resurrect_one` reads
+    /// `c.entry.origin` straight off the resolved candidate to carry it
+    /// forward onto the revived record — this pins that `resolve_candidate`
+    /// (the harness-arm/terminal-arm dispatcher every mode routes through)
+    /// carries the ledger entry's `origin` into the `Candidate` unmodified,
+    /// the exact value the carry-forward line at the bottom of
+    /// `resurrect_one` consumes. Pure, no env, no spawn.
+    #[test]
+    fn resolve_candidate_preserves_the_ledger_entrys_origin() {
+        let entry = aoide_storage::ledger::LedgerEntry {
+            origin: Some("peer:yomi-strix".to_string()),
+            ..ledger_entry("ledger-peer-origin", "claude", "/home/khoa/Aoide", "2026-08-20T01:00:00Z")
+        };
+        let candidate = resolve_candidate(entry);
+        assert_eq!(candidate.entry.origin.as_deref(), Some("peer:yomi-strix"));
+    }
+
+    /// G6 (LANE IDENTITY P-ID0), wiring half: a peer-origin ledger entry must
+    /// not derail an otherwise-ordinary resurrect — `resurrect_one`'s new
+    /// `stamp_origin` call sits right after `stamp_resumed_from`, on the
+    /// SAME `AOIDE_TERMINAL=true` fixture that never actually registers a
+    /// record (see the undying-transfer test above), so this proves the new
+    /// call is a safe no-op in exactly that shape (an unknown id, same as
+    /// `stamp_resumed_from` already tolerates) rather than a panic or an
+    /// error status. Whether the value actually LANDS on a real record is
+    /// `stamp_origin`'s own contract, proven directly in
+    /// `session_store.rs`'s `stamp_origin_lands_the_field_and_never_
+    /// restages_graph_json` — a real registered windowed spawn is the live
+    /// gate's job, per this module's own doc (top of file), never this
+    /// crate's.
+    #[test]
+    fn a_peer_origin_ledger_entry_never_derails_an_ordinary_resurrect() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_STATE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_TERMINAL",
+            "WAYLAND_DISPLAY",
+            "DISPLAY",
+        ]);
+        let (root, proj_path) = setup("resurrect-origin-carry");
+        std::env::set_var("AOIDE_TERMINAL", "true");
+        std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+
+        let entry = aoide_storage::ledger::LedgerEntry {
+            origin: Some("peer:yomi-strix".to_string()),
+            ..ledger_entry("ledger-peer-origin", "claude", &proj_path, "2026-08-20T01:00:00Z")
+        };
+        set_ledger(&[entry]);
+
+        let out = session_resurrect(&flag_invocation(&["resurrect"], &[("project", "proj"), ("all", "true")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.as_ref().unwrap();
+        let resurrected = data["resurrected"].as_array().unwrap();
+        assert_eq!(resurrected.len(), 1, "data: {data}");
 
         let _ = std::fs::remove_dir_all(&root);
     }

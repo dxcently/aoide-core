@@ -242,11 +242,15 @@ the inbound half of the two-door contract (the outbound half is
   is failing to sign); a `Signature`-resolved peer missing the `spawn`
   capability gets the exact `peer allow` fix; every other shape gets the
   original "pair first, then allow" message. The resolved peer's name also
-  threads two ways past the gate: `do_spawn` sets
-  `AOIDE_SESSION_ORIGIN=peer:<name>` on the child it launches (read by
-  `aoide-conduct`'s `session_conduct`, which stamps
-  `SessionRecord.origin`), and the Inject arm's own `resolved_peer` (a
-  SEPARATE, ungated identity lookup — attribution, never a gate) rides
+  threads two ways past the gate: `do_spawn` calls `stamp_spawn_origin`
+  (LANE IDENTITY P-ID0, G16/G5) to stamp `SessionRecord.origin =
+  "peer:<name>"` DIRECTLY on the just-spawned record once it registers —
+  this door is the authenticated writer, not the child's own env, since any
+  same-uid process can set an env var on itself before invoking `aoide
+  conduct` directly (`aoide-conduct`'s `session_conduct` now refuses
+  exactly that shape from its env read) — and the Inject arm's own
+  `resolved_peer` (a SEPARATE, ungated identity lookup — attribution, never
+  a gate) rides
   `do_inject`'s existing `--from` flag onto a QUEUED `pending.json` entry
   only (an immediately-delivered payload's bytes stay untouched, so an
   already-autogated peer's delivery is byte-identical to before this

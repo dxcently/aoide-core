@@ -546,25 +546,39 @@
   template parser) is a PURE function on purpose — no env read, no spawn —
   so it stays directly unit-testable; do the env reads (`terminal_template`/
   `require_display`) in the thin callers around it, never inside it.
-- **`SessionRecord.origin` is a PERMANENT birth fact stamped ONCE, the same
-  discipline `headless`/`hookAncestry` already hold (P-P3, `docs/
-  architecture/PAIRING.md` decision 7) — never re-derived or re-stamped
-  later.** `session_store.rs::stamp_origin` is the one writer;
+- **`SessionRecord.origin` is a PERMANENT birth fact stamped ONCE per
+  record, the same discipline `headless`/`hookAncestry` already hold
+  (P-P3, `docs/architecture/PAIRING.md` decision 7) — never re-derived
+  later. Write AUTHORITY is split by shape, tightened at LANE IDENTITY
+  P-ID0 (G16/G5).** `session_store.rs::stamp_origin` is `pub` (crosses the
+  crate boundary) and is the ONE writer function, but it has exactly two
+  legitimate call sites, each authoritative for one shape only:
   `graph/conduct.rs::session_conduct` calls it right after
-  `do_session_start`, reading `AOIDE_SESSION_ORIGIN` off the process env —
-  this crate has no dependency on `aoide-server` and cannot see the A2A
-  door directly, so the env var IS the seam (mirrors how `AOIDE_AUDIT_LOG`
-  already threads a per-child fact from a spawning process into a
-  `conduct` child). No `restage_graph()` — like `headless`, `origin` is
-  consumed internally (`doc.rs::ledger_session_exit`'s projection into the
-  durable ledger), not rendered into `graph.json`. **`origin` is
-  attribution, not authentication** — `stamp_origin` trusts whatever
-  `AOIDE_SESSION_ORIGIN` says, and any same-uid process can set that var
-  before running `aoide conduct` and forge `"peer:X"` with no door
-  involved at all; don't let a future consumer gate a decision on it
-  without first upgrading it to an authenticated channel (task #63's
-  lane) — it is exactly as spoofable as `--from`/`AOIDE_SESSION_ID`
-  already are.
+  `do_session_start`, reading a LOCAL-CLASS value off its own inherited
+  `AOIDE_SESSION_ORIGIN` env — and REFUSES (eprintln, never panics) a
+  `peer:*` shape read from that env, because inherited env is exactly what
+  a same-uid process can set on itself before invoking `aoide conduct`
+  directly. `aoide-server`'s `a2a::do_spawn` (`stamp_spawn_origin`) calls it
+  DIRECTLY on the just-spawned record instead — polling for the record's
+  registration the same way `spawn_inject_prompt` already does — from the
+  door where the peer name IS authenticated; this is the ONLY legitimate
+  source of a `peer:*` value. **Do not add a third caller or a third shape
+  without re-deriving this split**: the whole point is that a `peer:*`
+  origin can only ever come from the one place that actually authenticated
+  it. No `restage_graph()` — like `headless`, `origin` is consumed
+  internally (`doc.rs::ledger_session_exit`'s projection into the durable
+  ledger, and `graph/resurrect.rs` reading that ledger field back to carry
+  a peer-origin session's provenance forward onto its revived record — G6,
+  same phase), not rendered into `graph.json`. **`origin` is still
+  attribution, not an authenticated credential** — a same-uid process can
+  still forge a LOCAL-class origin (`stamp_origin` trusts whatever
+  non-`peer:*` value `AOIDE_SESSION_ORIGIN` says), and neither the
+  session's own identity nor the consumer presenting it are authenticated
+  yet; don't let a future consumer gate a security decision on it without
+  the sealed credential task #63's lane builds next (P-ID1+). What P-ID0
+  closes is narrower and real: the specific `peer:*` forgery (any local
+  process claiming to BE a peer-spawned session via one env var) is now
+  record-layer impossible, not merely undocumented.
 
 ## Extension points
 

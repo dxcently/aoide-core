@@ -468,19 +468,33 @@ pub(in crate::graph) fn stamp_headless(id: &str) {
 }
 
 /// Stamp `origin` on a just-registered session record (P-P3,
-/// `docs/architecture/PAIRING.md` decision 7) — `"peer:<name>"` for a
-/// session `aoide-server`'s A2A door spawned on behalf of an identified,
-/// paired peer, threaded here via the `AOIDE_SESSION_ORIGIN` env var
-/// `a2a::do_spawn` sets on the child it launches (`session_conduct` reads
-/// it right after `do_session_start`, the same seam [`stamp_headless`]
-/// uses). A PERMANENT birth fact, like `headless`/`hookAncestry`: stamped
-/// once, change-only (a no-op once already set to this exact value), never
-/// re-derived later. No `restage_graph()` — like `hookAncestry`/`headless`,
-/// consumed internally (the durable session ledger, via
-/// `doc::ledger_session_exit`) rather than rendered into `graph.json`, so
-/// stamping it must not churn the widget-facing document. A silent no-op
-/// for an unknown id or an empty `origin`.
-pub(in crate::graph) fn stamp_origin(id: &str, origin: &str) {
+/// `docs/architecture/PAIRING.md` decision 7). A PERMANENT birth fact, like
+/// `headless`/`hookAncestry`: stamped once, change-only (a no-op once
+/// already set to this exact value), never re-derived later. No
+/// `restage_graph()` — like `hookAncestry`/`headless`, consumed internally
+/// (the durable session ledger, via `doc::ledger_session_exit`) rather than
+/// rendered into `graph.json`, so stamping it must not churn the
+/// widget-facing document. A silent no-op for an unknown id or an empty
+/// `origin`.
+///
+/// `pub` (crosses the crate boundary) and has exactly TWO legitimate
+/// callers, each the record-layer authority for one origin shape (LANE
+/// IDENTITY P-ID0, G16/G5 — this is the write-once-BY-AUTHORITY tightening,
+/// not yet an authenticated credential):
+///   - `graph/conduct.rs::session_conduct`, for a LOCAL-CLASS origin off its
+///     own inherited `AOIDE_SESSION_ORIGIN` env — and that call site now
+///     REFUSES a `peer:*` shape from that env read, because inherited env
+///     is exactly what a same-uid process can set on itself before invoking
+///     `aoide conduct` directly.
+///   - `aoide-server`'s `a2a::do_spawn` (`stamp_spawn_origin`), for a
+///     `peer:<name>` origin — called directly on the just-spawned session's
+///     record from the DOOR that authenticated the peer name, never
+///     threaded through the child's env at all. This is the only place a
+///     `peer:*` value may originate.
+/// Still attribution, not authentication: a same-uid process can still
+/// forge a LOCAL-class origin, and consumer-name/session identity remain
+/// unauthenticated — that's P-ID1/P-ID2's sealed credential, not this phase.
+pub fn stamp_origin(id: &str, origin: &str) {
     if origin.is_empty() {
         return;
     }

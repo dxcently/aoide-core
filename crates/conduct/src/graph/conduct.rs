@@ -1097,14 +1097,22 @@ pub fn session_conduct(inv: &Invocation) -> Outcome {
     if headless {
         stamp_headless(&id);
     }
-    // Origin (P-P3, `docs/architecture/PAIRING.md` decision 7): threaded in
-    // via `AOIDE_SESSION_ORIGIN`, set by `aoide-server::a2a::do_spawn` on
-    // the child it launches when the A2A spawn arm resolved the caller to
-    // an identified, paired peer — absent for every locally-launched
-    // `conduct` (a plain terminal, `graph spawn`, etc.), which is exactly
-    // when this env var is simply unset.
+    // Origin, LOCAL-CLASS ONLY (P-P3, `docs/architecture/PAIRING.md`
+    // decision 7; tightened at LANE IDENTITY P-ID0, G16/G5): inherited
+    // process env is exactly what a same-uid process can set on ITSELF
+    // before invoking `aoide conduct` directly, so a `peer:*` shape read
+    // here is unauthenticated and must never be trusted — that shape now
+    // comes ONLY from `aoide-server::a2a::do_spawn` stamping the record
+    // directly at the door where the peer name IS authenticated
+    // (`stamp_spawn_origin` in `crates/server/src/a2a.rs`), never threaded
+    // through this env var. A taught refusal, not a panic: a hostile
+    // `AOIDE_SESSION_ORIGIN=peer:X` simply fails to stamp.
     if let Ok(origin) = std::env::var("AOIDE_SESSION_ORIGIN") {
-        if !origin.is_empty() {
+        if origin.starts_with("peer:") {
+            eprintln!(
+                "aoide conduct: refusing to stamp origin `{origin}` from AOIDE_SESSION_ORIGIN — a peer:* origin may only be stamped by the a2a door itself"
+            );
+        } else if !origin.is_empty() {
             stamp_origin(&id, &origin);
         }
     }
@@ -1851,15 +1859,15 @@ mod tests {
     }
 
     #[test]
-    fn conduct_registration_stamps_origin_from_the_env_var_and_leaves_it_absent_when_unset() {
-        // P-P3, `docs/architecture/PAIRING.md` decision 7: `aoide-server`'s
-        // `a2a::do_spawn` sets `AOIDE_SESSION_ORIGIN=peer:<name>` on the
-        // child it launches; `session_conduct` reads it right after
-        // registration and stamps `SessionRecord.origin` — proven here
-        // without spawning through the real A2A door (this crate can't see
-        // `aoide-server` at all), mirroring `headless_conduct_registration_
-        // stamps_the_permanent_headless_marker`'s exact shape one env var
-        // over.
+    fn conduct_registration_refuses_a_peer_origin_from_the_env_var() {
+        // LANE IDENTITY P-ID0 (G16/G5): `AOIDE_SESSION_ORIGIN` is inherited
+        // process env — a same-uid process can set it on ITSELF before
+        // invoking `aoide conduct` directly, so a `peer:*` shape read here
+        // must never be trusted. `session_conduct` now refuses exactly this
+        // shape rather than stamping it; a genuine peer origin is stamped
+        // by `aoide-server::a2a::do_spawn` calling `stamp_origin` directly
+        // on the record (proven in that crate's own test, which this crate
+        // cannot see).
         let _guard = crate::env_lock().lock().unwrap();
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_SESSION_ORIGIN"]);
 
@@ -1879,7 +1887,24 @@ mod tests {
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         let s: SessionsFile = load_stage(&sessions_path()).unwrap();
         let rec = s.sessions.iter().find(|r| r.session_id == "conduct-origin-peer").unwrap();
-        assert_eq!(rec.origin.as_deref(), Some("peer:yomi-strix"));
+        assert_eq!(
+            rec.origin, None,
+            "a peer:* shape read off inherited env must be refused, never stamped"
+        );
+
+        // A non-peer env value is local-class and still stamps — the
+        // refusal is specific to the `peer:` shape, not to the env read
+        // entirely.
+        std::env::set_var("AOIDE_SESSION_ORIGIN", "local");
+        let out_local = session_conduct(&conduct_invocation(
+            &["sh", "-c", "true"],
+            &[("id", "conduct-origin-local-class")],
+        ));
+        assert_eq!(out_local.status, aoide_protocol::output::Status::Ok, "msg: {}", out_local.message);
+        let s_local: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let rec_local =
+            s_local.sessions.iter().find(|r| r.session_id == "conduct-origin-local-class").unwrap();
+        assert_eq!(rec_local.origin.as_deref(), Some("local"));
 
         // No env var set at all — a plain local registration never gets one.
         std::env::remove_var("AOIDE_SESSION_ORIGIN");

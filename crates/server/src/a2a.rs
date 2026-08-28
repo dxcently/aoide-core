@@ -902,6 +902,34 @@ fn spawn_inject_prompt(id: &str, prompt: &str) {
     }
 }
 
+/// Stamp `origin=peer:<name>` directly on the just-spawned session's own
+/// record — LANE IDENTITY P-ID0 (G16/G5): this DOOR is the record-layer
+/// authority for a `peer:*` origin, because it is the one place the peer
+/// name is actually authenticated (`message_send`'s signature/token
+/// resolution, above `do_spawn`'s call site). Threading the value through
+/// the child's own env (the pre-P-ID0 shape) was unauthenticated — any
+/// same-uid process can set `AOIDE_SESSION_ORIGIN=peer:X` on itself before
+/// invoking `aoide conduct` directly — so `graph/conduct.rs::session_conduct`
+/// now REFUSES that shape from its env read entirely, and this function is
+/// the only remaining writer of a `peer:*` value.
+///
+/// Retries on the session record landing in `sessions.json`, the identical
+/// registration race [`spawn_inject_prompt`] above already tolerates
+/// (best-effort, same 300×10ms budget): a spawn whose child never registers
+/// simply never gets stamped, same as it never gets its opening turn typed.
+fn stamp_spawn_origin(id: &str, origin: &str) {
+    for _ in 0..300 {
+        let registered = load_stage(&sessions_path())
+            .map(|f: SessionsFile| f.sessions.iter().any(|s| s.session_id == id))
+            .unwrap_or(false);
+        if registered {
+            aoide_conduct::graph::stamp_origin(id, origin);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Spawn a NEW conducted session running the CONFIGURED agent (never a
 /// client-supplied command — see the security-model note above `SessionRef`).
 /// Detached: launched via the aoide binary's own `conduct` subcommand
@@ -916,11 +944,12 @@ fn spawn_inject_prompt(id: &str, prompt: &str) {
 /// `peer_name` is the resolved, PAIRED, spawn-allowed peer `message_send`'s
 /// gate already proved before calling this (P-P3, PAIRING.md decision 6) —
 /// never optional at this call site, since the gate refuses outright
-/// otherwise. Threaded to the child as `AOIDE_SESSION_ORIGIN=peer:<name>`
-/// (`graph/conduct.rs::session_conduct` reads it right after registration
-/// and stamps `SessionRecord.origin`, decision 7) and folded into this
-/// call's own audit line, so the spawned session's provenance is visible
-/// both in the audit log and on the record itself, end to end.
+/// otherwise. Stamped directly onto the spawned record as `origin =
+/// "peer:<name>"` by [`stamp_spawn_origin`] below (LANE IDENTITY P-ID0,
+/// G16/G5 — this door is the authenticated writer, not the child's env; see
+/// that function's doc) and folded into this call's own audit line, so the
+/// spawned session's provenance is visible both in the audit log and on the
+/// record itself, end to end.
 fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path, peer_name: &str) -> Result<Value, (i64, String)> {
     let id = format!("a2a-{}-{}", std::process::id(), unix_ts_now());
     let aoide_bin = std::env::current_exe()
@@ -940,12 +969,14 @@ fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path, peer_name: &str) ->
     let mut cmd = std::process::Command::new(&aoide_bin);
     cmd.args(&argv)
         .env("AOIDE_AUDIT_LOG", audit_log)
-        // Explicitly cleared first: `Command` otherwise inherits this
-        // process's own full environment, and `a2a serve` itself is never
-        // launched with `AOIDE_SESSION_ORIGIN` set, but this keeps the
-        // child's origin stamp honest even if that ever changed.
+        // No `AOIDE_SESSION_ORIGIN` on the child (LANE IDENTITY P-ID0,
+        // G16/G5 — reversed from the pre-P-ID0 shape): threading a `peer:*`
+        // origin through inherited env was unauthenticated, since any
+        // same-uid process can set that same var on itself before invoking
+        // `aoide conduct` directly. `stamp_spawn_origin` below stamps the
+        // record from THIS door instead, once the child registers. Cleared
+        // explicitly in case `a2a serve`'s own env ever carried one.
         .env_remove("AOIDE_SESSION_ORIGIN")
-        .env("AOIDE_SESSION_ORIGIN", &origin)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -975,6 +1006,14 @@ fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path, peer_name: &str) ->
             std::thread::spawn(move || {
                 let _ = child.wait();
             });
+            // Stamp the record's origin from THIS door, off the handler
+            // thread so a slow-to-register child never adds latency to the
+            // RPC response — see `stamp_spawn_origin`'s doc comment.
+            {
+                let id = id.clone();
+                let origin = origin.clone();
+                std::thread::spawn(move || stamp_spawn_origin(&id, &origin));
+            }
             // Best-effort first-turn injection — see the doc comment above.
             spawn_inject_prompt(&id, prompt);
             let _ = audit(
@@ -3365,6 +3404,45 @@ mod tests {
         let resp2 = handle_jsonrpc(&req2, &test_ctx(Path::new("/dev/null"), "claude"));
         assert_eq!(resp2["error"]["code"], -32004);
         assert_eq!(resp2["error"]["message"], "session not conductable");
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    /// LANE IDENTITY P-ID0 (G16/G5): `stamp_spawn_origin` is the record-layer
+    /// authority `do_spawn` now calls directly, rather than threading a
+    /// `peer:*` value through the child's own env — proven up to, but never
+    /// through, `do_spawn`'s real process spawn, same documented boundary
+    /// `peer_spawn_signed_and_allowed_is_admitted_up_to_the_do_spawn_
+    /// boundary` draws above: the record here is written directly (as
+    /// `session_conduct`'s own registration would, once the child comes up),
+    /// so the retry loop finds it on its very first poll.
+    #[test]
+    fn stamp_spawn_origin_lands_a_peer_origin_on_an_already_registered_record() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = std::env::temp_dir().join(format!(
+            "aoide-server-a2a-stamp-origin-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![fixture_session("a2a-spawned-1", "working", None)],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        stamp_spawn_origin("a2a-spawned-1", "peer:yomi-strix");
+
+        let after: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let rec = after.sessions.iter().find(|s| s.session_id == "a2a-spawned-1").unwrap();
+        assert_eq!(rec.origin.as_deref(), Some("peer:yomi-strix"));
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),

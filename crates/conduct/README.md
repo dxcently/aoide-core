@@ -365,24 +365,36 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   interactive shell (`is_shell && read_stdin`) — a headless conduct never
   reads stdin, so it never populates `typed`. See AGENTS.md for why this
   is refusal-based, not best-effort.
-- **Session origin (P-P3, `docs/architecture/PAIRING.md` decision 7):**
-  `session_store.rs::stamp_origin` stamps `SessionRecord.origin` —
-  `"peer:<name>"` for a session `aoide-server`'s A2A door spawned on
-  behalf of an identified, paired peer — right after `do_session_start`,
-  same seam `stamp_headless` uses. `graph/conduct.rs::session_conduct`
-  reads it off the `AOIDE_SESSION_ORIGIN` env var `aoide-server`'s
-  `a2a::do_spawn` sets on the child it launches; a locally-launched
-  `conduct` (a plain terminal, `spawn`, etc.) never has that env var
-  set, so `origin` stays absent. No `graph.json` projection (like
+- **Session origin (P-P3, `docs/architecture/PAIRING.md` decision 7;
+  write-authority tightened at LANE IDENTITY P-ID0, G16/G5):**
+  `session_store.rs::stamp_origin` (now `pub`, crossing the crate boundary)
+  stamps `SessionRecord.origin` — `"peer:<name>"` for a session
+  `aoide-server`'s A2A door spawned on behalf of an identified, paired peer.
+  It has exactly two legitimate callers: `aoide-server`'s `a2a::do_spawn`
+  calls it DIRECTLY on the just-spawned record (`stamp_spawn_origin`,
+  polling for the record's registration the same way `spawn_inject_prompt`
+  already does), from the door where the peer name is actually
+  authenticated — the only place a `peer:*` value may originate.
+  `graph/conduct.rs::session_conduct` calls it for a LOCAL-CLASS value off
+  its own inherited `AOIDE_SESSION_ORIGIN` env, right after
+  `do_session_start`, same seam `stamp_headless` uses — and REFUSES a
+  `peer:*` shape read from that env (a taught refusal, never a panic):
+  inherited env is exactly what a same-uid process can set on itself before
+  invoking `aoide conduct` directly, so a `peer:*` value threaded that way
+  was never trustworthy. No `graph.json` projection (like
   `headless`/`hookAncestry`, consumed internally, not rendered) —
-  `doc.rs::ledger_session_exit` is the ONE place it surfaces, projected
-  verbatim into the durable session ledger's own `origin` field. `origin`
-  is attribution, not authentication: any same-uid process can set
-  `AOIDE_SESSION_ORIGIN` before running `aoide conduct` and forge
-  `"peer:X"` with no door involved, the same ordinary spoofable
-  same-user process state `--from`/`AOIDE_SESSION_ID` already are — nothing
-  may ever gate on it without upgrading it to an authenticated channel
-  first (task #63's lane).
+  `doc.rs::ledger_session_exit` projects it verbatim into the durable
+  session ledger's own `origin` field at exit, and `graph/resurrect.rs`
+  reads that field BACK to carry a peer-origin session's provenance forward
+  onto its revived record (G6, same phase — the ledger wrote `origin` on
+  every exit long before anything read it back). **Still not a security
+  claim**: a same-uid process can still forge a LOCAL-class origin, and
+  neither the session's own identity nor the consumer presenting it are
+  authenticated yet — nothing may gate a security decision on `origin`
+  without the sealed credential task #63's lane builds next (P-ID1+). What
+  P-ID0 closes: the specific `peer:*` forgery shape (a local process
+  claiming to BE a peer-spawned session via one env var) is now
+  record-layer impossible, not merely undocumented.
 - `who` — `aoide who [filter] [--json] [--all]` (`graph/who.rs`): live
   presence over this box's own sessions plus every registered peer,
   probed in parallel on each invocation (messaging workstream C2). A

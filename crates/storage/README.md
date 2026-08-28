@@ -182,20 +182,34 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   other two wire-shape additions — the daemon's boot-time auto-resume flag
   and the mark a resurrected session's own record carries.
   `records::SessionRecord.origin`/`LedgerEntry.origin` (P-P3,
-  `docs/architecture/PAIRING.md` decision 7) are the provenance pair:
-  `"peer:<name>"` for a session an identified, paired peer's A2A spawn
-  created, additive on the live record (`skip_serializing_if`), always
-  present (possibly `null`) on the closed ledger line — `SessionRecord`'s
-  own value is projected verbatim into the `LedgerEntry` at exit, the same
-  "additive live field, always-serialized ledger field" shape
-  `resumedFrom` already set the precedent for. `origin` is attribution,
-  not authentication — `aoide-conduct`'s `stamp_origin` takes whatever the
-  `AOIDE_SESSION_ORIGIN` env var says, and any same-uid process can set
-  that var before running `aoide conduct`, the same ordinary spoofable
-  same-user process state `--from`/`AOIDE_SESSION_ID` already are (this
+  `docs/architecture/PAIRING.md` decision 7; write-authority tightened at
+  LANE IDENTITY P-ID0, G16/G5) are the provenance pair: `"peer:<name>"`
+  for a session an identified, paired peer's A2A spawn created, additive
+  on the live record (`skip_serializing_if`), always present (possibly
+  `null`) on the closed ledger line — `SessionRecord`'s own value is
+  projected verbatim into the `LedgerEntry` at exit, the same "additive
+  live field, always-serialized ledger field" shape `resumedFrom` already
+  set the precedent for, AND `aoide-conduct`'s `graph/resurrect.rs` now
+  reads the ledger field back on revival to carry a peer-origin session's
+  provenance forward onto its fresh record (G6 — the ledger wrote `origin`
+  on every exit long before anything read it back). `origin` is still
+  attribution, not an authenticated credential — but `aoide-conduct`'s
+  `stamp_origin` (`pub`, crossing the crate boundary) now has exactly two
+  legitimate callers, each authoritative for one shape: `aoide-server`'s
+  `a2a::do_spawn` stamps a `peer:<name>` value DIRECTLY on the record from
+  the door that authenticated the peer name (the only legitimate source of
+  that shape), while `aoide-conduct`'s own `session_conduct` stamps a
+  LOCAL-CLASS value off its inherited `AOIDE_SESSION_ORIGIN` env and
+  REFUSES a `peer:*` shape read from that env — inherited env is exactly
+  what a same-uid process can set on itself before running `aoide conduct`
+  directly, so that shape was never trustworthy there. A same-uid process
+  can still forge a LOCAL-class origin, and neither the session's own
+  identity nor the consumer presenting it are authenticated yet (this
   crate's own `records`/`ledger` section, and CONTRACTS.md's pending-queue
-  note); nothing may ever gate on it without upgrading it to an
-  authenticated channel first (task #63's lane).
+  note); nothing may gate a security decision on it without the sealed
+  credential task #63's lane builds next (P-ID1+). What P-ID0 closes: the
+  specific `peer:*` forgery shape is now record-layer impossible, not
+  merely undocumented.
   `records::RestoreSnapshot`/`SessionRecord.restore`/`LedgerEntry.restore`
   (P-C5, durable-sessions plan) are a conducted TERMINAL's continuously-
   captured `{cwd, idle, argv, typed}` snapshot — the SAME `RestoreSnapshot`
