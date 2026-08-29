@@ -897,7 +897,7 @@ fn summon_remote(
                 "disposition": "failed",
                 "reason": format!(
                     "peer `{}` is registered but not paired — summoning requires a signed \
-                     request from a VERIFIED peer; pair first with `aoide peer pair request \
+                     request from a VERIFIED peer; pair first with `aoide peer pair \
                      <url> --name {}`",
                     spec.host, spec.host
                 ),
@@ -2087,7 +2087,7 @@ mod tests {
         assert_eq!(failed.len(), 1, "data: {data}");
         assert_eq!(failed[0]["disposition"], "failed");
         assert!(
-            failed[0]["reason"].as_str().unwrap().contains("peer pair request"),
+            failed[0]["reason"].as_str().unwrap().contains("peer pair"),
             "reason must teach the pairing ceremony: {}",
             failed[0]["reason"]
         );

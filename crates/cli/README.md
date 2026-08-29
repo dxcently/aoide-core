@@ -44,14 +44,14 @@ depends on it.
 75 command paths (core's headless-capable, agent-orchestration surface: the
 project/session graph (including `resurrect`, its ledger-backed
 session revival), A2A, peers (including the `peer hub` designation,
-P-D5, the `peer pair request|pending|approve|reject|watch` pairing
-ceremony, P-P2/P-P5, the `peer allow <name> <cap> on|off`
+P-D5, the `peer pair <target>`/`peer pending`/`peer pair approve|reject|watch`
+pairing ceremony, P-P2/P-P5/P-PV2, the `peer allow <name> <cap> on|off`
 closed-capability grant/revoke command backing the A2A spawn arm's hard
 gate, P-P3, `peer spawn <name> -- <text…>`, P-P5b, the signed
 spawn-shaped `message/send` that actually reaches that gate, and `peer
-discover [--secs N]`/`peer invite <name> [--secs N] [--yes]`/`peer
-advertise on|off`, P-P6 + task #120, the LAN discovery advertisement's
-read-only sweep, its sugar-over-the-ceremony invite, and this instance's
+discover [--secs N]`/`peer advertise on|off`, P-P6 + task #120, the LAN
+discovery advertisement's read-only sweep (`peer pair`'s own hostname arm
+is the sugar-over-the-ceremony half, P-PV2), and this instance's
 own advertise switch), presence, the
 daemon, its own event bus (`events tail`), usage, hooks, the message
 inbox, the secrets broker, this instance's own `identity` (P-P1 of the

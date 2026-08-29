@@ -20,22 +20,22 @@
 //!
 //! Every OTHER shape this feature's tests need — advertisement
 //! serialize/validate, the malformed-variant drops, the bounded
-//! dedupe-by-(name, source) fold, `peer invite`'s zero/one/many-match
-//! resolution, the advertise switch's off-by-default idempotence, `peer
-//! discover` never writing `state/peers.json`, the loopback-path sweep
-//! round trip, and `peer invite`'s single-match branch calling the
-//! identical `run_pair_request` `peer pair request` runs — is proven
-//! WITHOUT leaving the sandbox, in `aoide-storage::advertise::tests`,
+//! dedupe-by-(name, source) fold, `peer pair`'s hostname arm's
+//! zero/one/many-match resolution, the advertise switch's off-by-default
+//! idempotence, `peer discover` never writing `state/peers.json`, the
+//! loopback-path sweep round trip, and `peer pair`'s hostname arm calling
+//! the identical `run_pair_request` its url arm runs — is proven WITHOUT
+//! leaving the sandbox, in `aoide-storage::advertise::tests`,
 //! `aoide-client::discover::tests` (whose
 //! `run_sweep_hears_an_advertisement_sent_over_the_real_loopback_stack`
 //! exercises the real socket over loopback, un-gated), `aoide-client::
 //! commands::tests::peer_discover_*`/`peer_advertise_*`/
-//! `peer_invite_tail_and_peer_pair_request_are_the_same_function_not_two_copies`,
+//! `peer_pair_hostname_arm_and_url_arm_are_the_same_function_not_two_copies`,
 //! and `aoide-server::a2a::tests::resolve_discovery_advertise_*`. This
 //! file holds only the two tests that genuinely need a live, routable
 //! network: the bare advertise→discover round trip over real broadcast,
-//! and the full `peer invite`-drives-a-real-pairing-ceremony round trip
-//! below it.
+//! and the full `peer pair <hostname>`-drives-a-real-pairing-ceremony
+//! round trip below it.
 
 use aoide::dispatch::{dispatch, registry, Invocation};
 use aoide_protocol::Door;
@@ -138,11 +138,11 @@ fn advertise_then_discover_and_invite_resolve_round_trip_over_real_broadcast() {
     assert_eq!(heard.advertisement.user, user);
     assert!(heard.count >= 1);
 
-    // `peer invite`'s own real-network half: the SAME already-swept
-    // result, resolved by name — proves the discover→resolve pipeline
-    // `handle_peer_invite` drives, without needing a second real A2A door
-    // up to prove the (already-shared, already-tested) `run_pair_request`
-    // tail.
+    // `peer pair`'s hostname arm's own real-network half: the SAME
+    // already-swept result, resolved by name — proves the discover→resolve
+    // pipeline `pair_via_hostname` drives, without needing a second real
+    // A2A door up to prove the (already-shared, already-tested)
+    // `run_pair_request` tail.
     let hit = aoide_client::discover::resolve_invite_target(&last.heard, name)
         .unwrap_or_else(|e| panic!("expected exactly one real match for `{name}`, got {e:?}"));
     assert_eq!(hit.advertisement.user, user);
@@ -153,26 +153,25 @@ fn advertise_then_discover_and_invite_resolve_round_trip_over_real_broadcast() {
     assert!(matches!(miss, Err(aoide_client::discover::InviteResolveError::NoMatch { .. })));
 }
 
-/// `peer invite`'s single-match path must reach the EXACT same
-/// `run_pair_request` body `peer pair request` itself runs (client/
-/// AGENTS.md's own invariant on this). `aoide-client`'s own unit tests
-/// (`commands::tests::
-/// peer_invite_tail_and_peer_pair_request_are_the_same_function_not_two_copies`)
-/// prove this without a network, by calling both entry points against an
+/// `peer pair`'s hostname arm's single-match path must reach the EXACT
+/// same `run_pair_request` body its url arm runs (client/AGENTS.md's own
+/// invariant on this). `aoide-client`'s own unit tests (`commands::tests::
+/// peer_pair_hostname_arm_and_url_arm_are_the_same_function_not_two_copies`)
+/// prove this without a network, by calling both arms against an
 /// unreachable door and diffing the outcome. What THAT test can't reach is
-/// the wiring in between — `handle_peer_invite`'s own discover → resolve
+/// the wiring in between — `pair_via_hostname`'s own discover → resolve
 /// pipeline actually producing a real `Heard` to feed the shared function.
 /// This test closes that gap for real: a REAL second A2A door ("peer B"),
-/// its REAL discovery advertisement, and `aoide peer invite <name> --yes`
+/// its REAL discovery advertisement, and `aoide peer pair <name> --yes`
 /// dispatched exactly as an operator would type it — then the SAME
-/// observable state change `peer pair request` itself produces is asserted
+/// observable state change the url arm itself produces is asserted
 /// directly: an outbound pairing request parked in
 /// `peer-pairing-outbound.json`, pointed at the OBSERVED-address dial url
-/// `handle_peer_invite` composed.
+/// `pair_via_hostname` composed.
 ///
 /// Two accommodations for the advertisement carrying no door URL (task
 /// #120), both confined to this `#[ignore]`'d file: `AOIDE_A2A_PORT` is
-/// pinned to peer B's ephemeral port so `handle_peer_invite`'s
+/// pinned to peer B's ephemeral port so `pair_via_hostname`'s
 /// `default_a2a_port` dial resolves to the door that actually exists, and
 /// peer B binds `0.0.0.0` — a broadcast's observed source is this box's
 /// own interface address, so a loopback-bound door would be unreachable at
@@ -181,7 +180,7 @@ fn advertise_then_discover_and_invite_resolve_round_trip_over_real_broadcast() {
 /// architecture/PAIRING.md`'s Transport section).
 #[test]
 #[ignore = "real UDP broadcast + real TCP on a routable bind — no network in the nix sandbox; run with --ignored"]
-fn peer_invite_single_match_reaches_the_shared_run_pair_request_over_real_broadcast_and_tcp() {
+fn peer_pair_hostname_arm_single_match_reaches_the_shared_run_pair_request_over_real_broadcast_and_tcp() {
     let _guard = aoide_test_support::env_lock().lock().unwrap();
     let root = unique_root("invite-ceremony");
     setup_env(&root);
@@ -207,19 +206,20 @@ fn peer_invite_single_match_reaches_the_shared_run_pair_request_over_real_broadc
     wait_for_tcp_up(&format!("127.0.0.1:{port_b}"));
 
     // Advertise B by name + ssh hop over a real broadcast — the exact wire
-    // `discover::run_sweep` on the invite side parses. The name must
-    // differ from this box's own hostname or `peer invite`'s self-guard
+    // `discover::run_sweep` on the pairing side parses. The name must
+    // differ from this box's own hostname or `peer pair`'s self-guard
     // (rightly) refuses it.
     let name = "advertise-peer-b";
     let _advertiser = aoide_server::discovery::spawn_advertiser(name, "peer-b-host", "khoa", true);
 
-    // `peer invite` end to end — the exact command an operator types.
-    // `--secs 20` covers the advertiser's real send jitter on a loaded box.
-    let invite_out = dispatch(&cli_invocation(&["peer", "invite"], &[name], &[("yes", "true"), ("secs", "20")]));
-    assert_eq!(invite_out.status, aoide_protocol::output::Status::Ok, "{}", invite_out.message);
+    // `peer pair <hostname>` end to end — the exact command an operator
+    // types. `--secs 20` covers the advertiser's real send jitter on a
+    // loaded box.
+    let pair_out = dispatch(&cli_invocation(&["peer", "pair"], &[name], &[("yes", "true"), ("secs", "20")]));
+    assert_eq!(pair_out.status, aoide_protocol::output::Status::Ok, "{}", pair_out.message);
 
-    // The SAME state change `peer pair request` itself would produce: an
-    // outbound entry parked for `name` — proving `handle_peer_invite`
+    // The SAME state change the url arm itself would produce: an
+    // outbound entry parked for `name` — proving `pair_via_hostname`
     // actually ran `run_pair_request`'s body, not merely returned an `Ok`
     // status some other way. Its url is the OBSERVED-source dial target on
     // the pinned port, never anything off the wire line.

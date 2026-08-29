@@ -35,7 +35,7 @@ use crate::registry::Registry;
 /// (appended newest — the aoided event bus's own terminal-reachable follow
 /// command, P-D3, `docs/architecture/AOIDED.md`'s "L1" section), identity
 /// (this instance's ed25519 identity show command, P-P1 of the pairing
-/// workstream), peer pair request/pending/approve/reject (appended newest —
+/// workstream), peer pair/pending/approve/reject/watch (appended newest —
 /// the pairing ceremony's CLI half, P-P2, `docs/architecture/PAIRING.md`).
 ///
 /// P-A5 (binary-split workstream) removed the 11 register lines for the
@@ -53,8 +53,11 @@ use crate::registry::Registry;
 /// folds `who`'s probe core, see `conduct/src/commands/peer_list.rs`) took
 /// it 79 -> 80; bare `pair` (task #120 P3, appended newest — the friendly
 /// interactive entry into the pairing ceremony: one sweep, a select menu,
-/// then the SAME `run_pair_request` core `peer invite` drives) took it
-/// 80 -> 81.
+/// then the SAME `run_pair_request` core the ceremony's own request path
+/// drives) took it 80 -> 81. P-PV2 (the User's locked spec) collapsed
+/// `peer invite`/`peer pair request` into ONE smart-target `peer pair`
+/// (-1: two dead paths, one new) and renamed `peer pair pending` to `peer
+/// pending` (net 0) — took it 81 -> 80.
 pub fn all() -> Registry {
     let mut r = Registry::new();
 
@@ -77,8 +80,8 @@ pub fn all() -> Registry {
     aoide_secrets::commands::register(&mut r); // secrets serve/exec/add/rm/grant/revoke — the secrets broker (Workstream SECRETS P-V2, appended newest)
     aoide_server::commands::register_events(&mut r); // events tail — aoided's own feed follow command (P-D3, appended newest)
     aoide_storage::commands::register_identity(&mut r); // identity — this instance's ed25519 identity show command (pairing workstream P-P1, appended newest)
-    aoide_client::commands::register_peer_pair(&mut r); // peer pair request/pending/approve/reject — the pairing ceremony's CLI half (P-P2, appended newest)
-    aoide_client::commands::register_peer_discovery(&mut r); // peer discover/invite/advertise — LAN discovery's CLI half (P-P6 + task #120, appended newest)
+    aoide_client::commands::register_peer_pair(&mut r); // peer pair/pending + peer pair approve/reject/watch — the pairing ceremony's CLI half (P-P2, P-PV2, appended newest)
+    aoide_client::commands::register_peer_discovery(&mut r); // peer discover/advertise — LAN discovery's CLI half (P-P6 + task #120, appended newest)
     aoide_client::mcp_client::register_melete(&mut r); // melete status/graph/call — the Melete MCP client (M2, task #14, appended newest)
     aoide_conduct::commands::peer_list::register(&mut r); // peer list — the one-glance mesh roster over the roster core's probe (formerly who's) + one discovery sweep (task #120 P2, appended newest)
     aoide_client::commands::register_pair(&mut r); // pair — the interactive pairing picker over one sweep, driving the same ceremony core (task #120 P3, appended newest)

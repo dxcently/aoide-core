@@ -220,7 +220,7 @@
   **A caller passing `None` must mean "nothing to say," never "clear
   it"** — `approve_outbound` (`aoide-client`) only calls `set_peer_via` at
   all when the ceremony resolved an actual via; a re-pair that named none
-  leaves a previously-recorded `via` (e.g. one `peer invite` set) exactly
+  leaves a previously-recorded `via` (e.g. one `peer pair`'s hostname arm set) exactly
   as it was, the same untouched-unless-named stance `upsert_paired_peer`
   itself holds for `autogate`/`tokenFile`/`bearerSecret`/`hub`/`allows`.
 - **`pairing`'s request ids are deliberately NOT `state/stage/pending.json`'s
@@ -258,8 +258,9 @@
   parks with it absent (`park_inbound` never takes
   a nonce — only a commitment) and gains it only once `reveal_inbound`
   verifies the commitment. A caller deriving a SAS from an inbound entry
-  MUST check `is_some()` first (`peer pair pending`'s `sas: Option<..>`,
-  `peer pair approve`'s "awaiting reveal" refusal) — treating `None` as
+  MUST check `is_some()` first (`aoide-client::pair_watch::reconcile`'s
+  own `Pending.sas: Option<..>`, `peer pair approve`'s "awaiting reveal"
+  refusal) — treating `None` as
   "empty string" or defaulting it would let an unrevealed entry's SAS
   silently derive from an attacker-guessable value instead of refusing.
 - **The inbound park queue is capped under the SAME lock the insert itself

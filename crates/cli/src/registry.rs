@@ -152,6 +152,19 @@ mod tests {
         //     existing path (no count change from it — only its meaning
         //     changed, from the U3 undying picker to the roster).
         // Net: 82 - 1 + 1 - 1 = 81.
+        //
+        // P-PV2 (the User's locked spec, three grill rounds) collapses the
+        // pairing command surface, net 81 -> 80: `peer.invite` (-1) and
+        // `peer.pair.request` (-1) DIE outright, hard cutover, no aliases —
+        // folded into ONE `peer.pair` (+1, positional `<target>`, SMART
+        // TARGET dispatch: a URL dials directly, anything else resolves by
+        // discovery sweep — reuses the same `run_pair_request` core both
+        // dead commands called). `peer.pair.pending` RENAMES to
+        // `peer.pending` (net 0, path change only) — its rows drop the SAS/
+        // confirmation code (never shown outside the out-of-band compare
+        // the approve step preserves). `peer.pair.approve`'s `<id>` becomes
+        // optional when exactly one request is pending (no new path).
+        // Net: 81 - 1 - 1 + 1 = 80.
         let mut expected: Vec<&str> = vec![
             "a2a.serve",
             "adapter.melete",
@@ -184,13 +197,12 @@ mod tests {
             "peer.allow",
             "peer.discover",
             "peer.hub",
-            "peer.invite",
             "peer.list",
+            "peer.pair",
             "peer.pair.approve",
-            "peer.pair.pending",
             "peer.pair.reject",
-            "peer.pair.request",
             "peer.pair.watch",
+            "peer.pending",
             "peer.pull",
             "peer.remove",
             "peer.spawn",

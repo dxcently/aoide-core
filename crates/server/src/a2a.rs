@@ -1498,7 +1498,7 @@ fn spawn_refusal(resolved: Option<(&aoide_storage::peer_store::Peer, aoide_stora
             -32006,
             "spawn refused: spawn requires the caller be identified via a verified, per-request \
              SIGNED request from a paired peer (an address match, or an unverified token match, \
-             never admits spawn) — pair first via `peer pair request`, then `peer allow <name> spawn on`"
+             never admits spawn) — pair first via `peer pair`, then `peer allow <name> spawn on`"
                 .to_string(),
         ),
     }
@@ -4595,14 +4595,14 @@ mod tests {
 
         let (code, msg) = spawn_refusal(None);
         assert_eq!(code, -32006);
-        assert!(msg.contains("peer pair request"), "no resolution at all must point at the pairing ceremony: {msg:?}");
+        assert!(msg.contains("peer pair"), "no resolution at all must point at the pairing ceremony: {msg:?}");
 
         let mut unverified = fixture_peer("box-c", "http://10.0.0.6:8710/", false);
         unverified.allows = vec!["spawn".to_string()]; // allows populated but never actually paired.
         let (code, msg) = spawn_refusal(Some((&unverified, PeerRung::Token)));
         assert_eq!(code, -32006);
         assert!(
-            msg.contains("peer pair request"),
+            msg.contains("peer pair"),
             "Token rung but NOT verified is the generic 'never paired' message, not the 'must sign' one: {msg:?}"
         );
     }

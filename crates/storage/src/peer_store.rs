@@ -435,12 +435,12 @@ pub fn resolve_peer<'a>(peers: &'a [Peer], addr: Option<IpAddr>, presented_token
 }
 
 /// A default local nickname for a peer named only by URL (`aoide peer pair
-/// request <url>` with no `--name`) — [`url_host`]'s bare authority,
+/// <url>` with no `--name`) — [`url_host`]'s bare authority,
 /// lowercased and sanitized to [`valid_peer_name`]'s shape (`.`/`:` become
 /// `-`, anything else not in `[a-z0-9-]` is dropped), leading/trailing/
 /// duplicate hyphens collapsed. `None` when the URL has no parseable host
 /// at all, or the sanitized result is empty/still invalid — the caller
-/// (`aoide-client::commands::handle_peer_pair_request`) then requires an
+/// (`aoide-client::commands::pair_via_url`) then requires an
 /// explicit `--name` rather than guessing further. Pure.
 pub fn default_peer_name_from_url(url: &str) -> Option<String> {
     let host = url_host(url)?;

@@ -413,7 +413,7 @@ fn peer_rm_is_a_parser_alias_for_peer_remove_and_never_a_second_schema_entry() {
 // ── The pairing ceremony's CLI half (P-P2) ───────────────────────────────
 
 #[test]
-fn peer_pair_request_rejects_an_invalid_name_without_touching_the_network_or_registry() {
+fn peer_pair_url_target_rejects_an_invalid_name_without_touching_the_network_or_registry() {
     let _guard = aoide_test_support::env_lock().lock().unwrap();
     let root = unique_root("pair-request-invalid-name");
     let _stage = setup_env(&root);
@@ -423,7 +423,7 @@ fn peer_pair_request_rejects_an_invalid_name_without_touching_the_network_or_reg
     // (not a fetch error) proves the name check fired before any network
     // I/O or identity mint.
     let out = dispatch(&cli_invocation(
-        &["peer", "pair", "request"],
+        &["peer", "pair"],
         &["http://127.0.0.1:1/"],
         &[("name", "../../evil")],
     ));
@@ -439,12 +439,12 @@ fn peer_pair_request_rejects_an_invalid_name_without_touching_the_network_or_reg
 }
 
 #[test]
-fn peer_pair_request_with_no_url_is_a_usage_error() {
+fn peer_pair_with_no_target_is_a_usage_error() {
     let _guard = aoide_test_support::env_lock().lock().unwrap();
     let root = unique_root("pair-request-no-url");
     let _stage = setup_env(&root);
 
-    let out = dispatch(&cli_invocation(&["peer", "pair", "request"], &[], &[]));
+    let out = dispatch(&cli_invocation(&["peer", "pair"], &[], &[]));
     assert_eq!(out.status, Status::Usage);
 
     let _ = std::fs::remove_dir_all(&root);
@@ -478,12 +478,12 @@ fn peer_pair_approve_and_reject_on_an_unknown_id_leave_no_record_change() {
 }
 
 #[test]
-fn peer_pair_pending_on_an_empty_registry_is_ok_with_an_empty_list() {
+fn peer_pending_on_an_empty_registry_is_ok_with_an_empty_list() {
     let _guard = aoide_test_support::env_lock().lock().unwrap();
     let root = unique_root("pair-pending-empty");
     let _stage = setup_env(&root);
 
-    let out = dispatch(&cli_invocation(&["peer", "pair", "pending"], &[], &[]));
+    let out = dispatch(&cli_invocation(&["peer", "pending"], &[], &[]));
     assert_eq!(out.status, Status::Ok);
     assert_eq!(out.data.unwrap()["requests"].as_array().unwrap().len(), 0);
 

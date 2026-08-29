@@ -1,7 +1,7 @@
 //! The client domain's CLI commands: `peer add|remove|allow|hub|pull|
-//! status` and `peer pair request|pending|approve|reject` +
-//! `peer discover|invite` (CONTRACTS.md §7, same-network federation and its
-//! pairing ceremony) and `adapter melete` (the neutral-event consumer).
+//! status` and `peer pair|pending` + `peer pair approve|reject|watch` +
+//! `peer discover|advertise` (CONTRACTS.md §7, same-network federation and
+//! its pairing ceremony) and `adapter melete` (the neutral-event consumer).
 //!
 //! Moved from the root package's `src/commands/a2a.rs` + the client half of
 //! `src/commands/infra.rs` (Phase 9 restructure,
@@ -1063,7 +1063,7 @@ fn confirm_spawn(name: &str, text: &str) -> Result<bool, String> {
 /// local peer at all."** The local check below exists SOLELY to catch the
 /// obviously-doomed case (no verified peer → no identity to sign with →
 /// the remote can never resolve a `Signature` rung) with a clear, LOCAL
-/// taught error naming `peer pair request`. Every OTHER refusal shape —
+/// taught error naming `peer pair`. Every OTHER refusal shape —
 /// `allows` lacking `spawn`, clock skew, a revoked pairing — is the remote
 /// door's OWN call; this function never second-guesses it, and surfaces
 /// whatever JSON-RPC error the door returns VERBATIM (taught), per
@@ -1196,7 +1196,7 @@ fn handle_peer_spawn(inv: &Invocation) -> Outcome {
                 format!(
                     "peer `{name}` is registered but not paired — spawn requires a signed request \
                      from a VERIFIED peer (docs/architecture/PAIRING.md decision 6); pair first with \
-                     `aoide peer pair request <url> --name {name}`"
+                     `aoide peer pair <url> --name {name}`"
                 ),
             )
             .with_data(json!({ "reason": "unpaired-peer", "name": name }));
@@ -1206,7 +1206,7 @@ fn handle_peer_spawn(inv: &Invocation) -> Outcome {
                 cmd,
                 format!(
                     "no peer named `{name}` — spawn requires a paired peer; register and pair it \
-                     first with `aoide peer pair request <url> --name {name}`"
+                     first with `aoide peer pair <url> --name {name}`"
                 ),
             )
             .with_data(json!({ "reason": "unknown-peer", "name": name }));
@@ -1411,8 +1411,8 @@ pub fn register_peers(r: &mut Registry) {
     ));
 }
 
-// ── The four `peer pair` commands (P-P2, CONTRACTS.md §6 — the pairing
-// ── ceremony's wire + CLI ceremony) ──────────────────────────────────────
+// ── The `peer pair`/`peer pending` commands (P-P2, P-PV2, CONTRACTS.md §6
+// ── — the pairing ceremony's wire + CLI ceremony) ─────────────────────────
 //
 // `peer add`/`peer pair` are two SEPARATE paths onto the same registry
 // (`docs/architecture/PAIRING.md`'s "Settled decisions" #2): `peer add` is
@@ -1436,7 +1436,8 @@ pub fn register_peers(r: &mut Registry) {
 // commits LOCALLY, and marks the entry approved for the requester's own poll
 // to find (no wire call at all — [`approve_inbound`]'s own doc). On an OUTBOUND
 // id (this instance is the REQUESTER) it POLLS the approver's door first
-// (over the SAME forward dial `peer pair request` already used), and only
+// (over the SAME forward dial `peer pair`'s own request/reveal already
+// used), and only
 // once that poll comes back `approved` does it re-derive the SAME SAS and
 // confirm-then-commit ([`approve_outbound`]'s own doc has the full poll
 // mechanics). `peer pair reject <id>` doubles the same way, and on an
@@ -1545,7 +1546,7 @@ fn auto_deny_inbound(cmd: &str, id: &str, name: &str, now_epoch: i64) -> Outcome
         cmd,
         format!(
             "{MAX_CODE_TRIES} code mismatches — auto-denied pairing request `{id}` from `{name}`: \
-             parked entry removed, nothing committed; a fresh `peer pair request` on their side starts a new ceremony"
+             parked entry removed, nothing committed; a fresh `peer pair` on their side starts a new ceremony"
         ),
     )
     .with_data(json!({ "reason": "auto-deny-on-code-mismatch", "id": id, "name": name, "tries": MAX_CODE_TRIES, "rejected": true, "direction": "inbound" }))
@@ -1559,7 +1560,7 @@ fn auto_deny_inbound(cmd: &str, id: &str, name: &str, now_epoch: i64) -> Outcome
 /// house default `8710`; the host is `aoide_storage::display::
 /// local_host_name` (already the shared fallback chain `a2a::
 /// resolve_peer_name` itself delegates to). `--self-url` overrides this
-/// outright — the one flag `peer pair request` needs when the door binds
+/// outright — the one flag `peer pair`'s url arm needs when the door binds
 /// somewhere this default can't guess (a non-default port, a reverse
 /// proxy/tunnel hostname).
 fn default_self_url() -> String {
@@ -1620,11 +1621,11 @@ fn outbound_ip_toward(toward: &str) -> Option<std::net::IpAddr> {
 
 /// The house A2A door port this box assumes for itself AND for a
 /// discovered peer: `AOIDE_A2A_PORT` (the same env the `aoide-a2a`
-/// systemd unit sets) or the house default `8710`. `peer invite` composes
-/// its dial target with this (task #120 — the advertisement carries no
-/// door URL, so there is no per-peer port to read off the wire); a peer
-/// on a non-default port takes the explicit `peer pair request <url>`
-/// path instead.
+/// systemd unit sets) or the house default `8710`. `peer pair`'s hostname
+/// arm composes its dial target with this (task #120 — the advertisement
+/// carries no door URL, so there is no per-peer port to read off the
+/// wire); a peer on a non-default port takes the explicit `peer pair
+/// <url>` path instead.
 fn default_a2a_port() -> u16 {
     std::env::var("AOIDE_A2A_PORT")
         .ok()
@@ -1644,9 +1645,36 @@ fn port_from_url(url: &str) -> Option<u16> {
     port_str.parse::<u16>().ok()
 }
 
-/// `peer pair request <url> [--name <n>] [--self-url <url>]` — the
-/// REQUESTER's half. Mints this instance's identity if it doesn't exist
-/// yet (`aoide_storage::identity::load_or_mint`), mints a fresh nonce, POSTs
+/// `peer pair <target> [--name <n>] [--self-url <url>] [--self-via …]
+/// [--via …] [--secs N] [--yes] [--json]` — the ONE entry point into the
+/// pairing ceremony's REQUEST half (the User's locked spec, P-PV2,
+/// superseding the old `peer pair request`/`peer invite` split). SMART
+/// TARGET dispatch decides which of the two ceremony arms `<target>`
+/// means, by SHAPE alone, never a flag: a URL (`target.contains("://")`)
+/// is an EXPLICIT DIAL — [`pair_via_url`], byte-identical to the old `peer
+/// pair request <url>` path (P-PV1's via/self-via defaults included).
+/// Anything else is a HOSTNAME — [`pair_via_hostname`], the old `peer
+/// invite <name>` path: one beacon sweep, resolved by advertisement name.
+/// Both arms bottom out in the SAME [`run_pair_request`] core — reused,
+/// never forked.
+fn handle_peer_pair(inv: &Invocation) -> Outcome {
+    let cmd = "peer.pair";
+    const USAGE: &str = "usage: aoide peer pair <url-or-hostname> [--name <n>] [--self-url <url>] [--self-via ssh://[user@]host] [--via ssh://[user@]host[:port]] [--secs N] [--yes] [--json]";
+    let target = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(t) => t.to_string(),
+        None => return Outcome::usage(cmd, USAGE),
+    };
+    if target.contains("://") {
+        pair_via_url(cmd, inv, &target, USAGE)
+    } else {
+        pair_via_hostname(cmd, inv, &target, USAGE)
+    }
+}
+
+/// `peer pair <target>`'s EXPLICIT-DIAL arm (`target` is a URL) — the old
+/// `peer pair request <url>` handler's own body, unchanged: mints this
+/// instance's identity if it doesn't exist yet
+/// (`aoide_storage::identity::load_or_mint`), mints a fresh nonce, POSTs
 /// `aoide/pairRequest` carrying a COMMITMENT to that nonce (never the nonce
 /// itself — review-bounce Finding 1, `aoide_storage::pairing`'s module doc:
 /// the original one-round-trip shape let an active on-path attacker choose
@@ -1659,17 +1687,13 @@ fn port_from_url(url: &str) -> Option<u16> {
 /// `OutboundState::AwaitingApproval`) so a LATER `peer pair approve <id>`
 /// invocation — run whenever, long after this CLI process exits — can poll
 /// the approver's door for the release ([`approve_outbound`]'s own doc, task
-/// #119) and finish the ceremony.
-fn handle_peer_pair_request(inv: &Invocation) -> Outcome {
-    let cmd = "peer.pair.request";
-    const USAGE: &str = "usage: aoide peer pair request <url> [--name <n>] [--self-url <url>] [--self-via ssh://[user@]host] [--via ssh://[user@]host[:port]] [--json]";
-    let url = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        Some(u) => u.to_string(),
-        None => return Outcome::usage(cmd, USAGE),
-    };
+/// #119) and finish the ceremony. `--secs`/`--yes` are the hostname arm's
+/// own flags and are simply inert here — a URL is already an explicit,
+/// typed act with nothing to sweep for or confirm before dialing.
+fn pair_via_url(cmd: &str, inv: &Invocation, url: &str, usage: &str) -> Outcome {
     let name = match inv.flags.get("name").cloned().filter(|s| !s.is_empty()) {
         Some(n) => n,
-        None => match aoide_storage::peer_store::default_peer_name_from_url(&url) {
+        None => match aoide_storage::peer_store::default_peer_name_from_url(url) {
             Some(n) => n,
             None => {
                 return Outcome::error(cmd, "could not derive a nickname from the URL — pass --name explicitly")
@@ -1694,13 +1718,13 @@ fn handle_peer_pair_request(inv: &Invocation) -> Outcome {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(default_self_url);
     // An invalid --via is a usage error, never a silent fallback to a
-    // direct dial (parse_via_flag's own stance). Unlike `peer invite`
-    // (K1's src_addr-derived default), a plain `peer pair request` has no
+    // direct dial (parse_via_flag's own stance). Unlike the hostname arm
+    // (K1's src_addr-derived default), an explicit URL target has no
     // observed address to fall back to — no `--via` means no via at all,
     // exactly today's behavior.
     let via = match parse_via_flag(inv) {
         Ok(v) => v,
-        Err(e) => return Outcome::usage(cmd, format!("{USAGE} — {e}")),
+        Err(e) => return Outcome::usage(cmd, format!("{usage} — {e}")),
     };
     // `default_self_via`'s outbound-route trick needs a real dial target —
     // when this call goes through a tunnel, the address actually routed to
@@ -1708,7 +1732,7 @@ fn handle_peer_pair_request(inv: &Invocation) -> Outcome {
     // which the tunnel may make unreachable directly.
     let toward = match via.as_ref() {
         Some(v) => v.host.clone(),
-        None => aoide_storage::peer_store::url_host(&url).unwrap_or_else(|| url.clone()),
+        None => aoide_storage::peer_store::url_host(url).unwrap_or_else(|| url.to_string()),
     };
     let self_via = inv
         .flags
@@ -1717,17 +1741,18 @@ fn handle_peer_pair_request(inv: &Invocation) -> Outcome {
         .filter(|s| !s.is_empty())
         .or_else(|| default_self_via(&toward));
 
-    run_pair_request(cmd, &url, &name, &self_url, self_via.as_deref(), via.as_ref(), via.as_ref().map(|v| v.to_string()))
+    run_pair_request(cmd, url, &name, &self_url, self_via.as_deref(), via.as_ref(), via.as_ref().map(|v| v.to_string()))
 }
 
 /// The requester's half of the ceremony, shared verbatim by
-/// `handle_peer_pair_request` (a CLI-typed `<url>`/`--name`, validated
-/// above) AND `handle_peer_invite` (P-P6 — a `url`/`name` already lifted
-/// straight off an already-validated, already-confirmed discovery advertisement,
-/// so it needs no SECOND `valid_peer_name` check here). Extracted so
-/// `peer invite` reaches the SAME ceremony code `peer pair request` does —
-/// never a copy (PAIRING.md: "sugar over the ceremony, nothing more").
-/// Everything from here down is unchanged from the pre-P-P6 shape of
+/// [`pair_via_url`] (`peer pair <url>` — a CLI-typed url/`--name`,
+/// validated above) AND [`pair_with_heard`] (`peer pair <hostname>`/bare
+/// `pair` — a `url`/`name` already lifted straight off an
+/// already-validated, already-confirmed discovery advertisement, so it
+/// needs no SECOND `valid_peer_name` check here). Extracted so the
+/// hostname arm reaches the SAME ceremony code the url arm does — never a
+/// copy (PAIRING.md: "sugar over the ceremony, nothing more").
+/// Everything from here down is unchanged from the pre-P-PV2 shape of
 /// `handle_peer_pair_request`: mint-or-load this instance's identity, mint
 /// a fresh nonce, POST `aoide/pairRequest` carrying a COMMITMENT to that
 /// nonce (never the nonce itself), then immediately POST `aoide/pairReveal`
@@ -1737,8 +1762,8 @@ fn handle_peer_pair_request(inv: &Invocation) -> Outcome {
 ///
 /// **P-S4's two additions, deliberately kept separate.** `dial_via` is what
 /// the ceremony's OWN two POSTs below actually tunnel through — `None` for
-/// a plain `peer pair request <url>` (no observed address to derive a
-/// default from) and, for `handle_peer_invite`/bare `pair`, an explicit
+/// a plain `peer pair <url>` (no observed address to derive a
+/// default from) and, for the hostname arm/bare `pair`, an explicit
 /// `--via` or else [`pair_with_heard`]'s own src_addr-derived default
 /// (P-PV1: loopback-only doors, task #131 — a discovered peer's door is
 /// reached only through its ssh tunnel, so the ceremony's OWN dial needs
@@ -1863,57 +1888,50 @@ fn run_pair_request(
     .with_data(json!({ "id": ack.id, "name": name, "url": url, "sas": sas, "expiresAt": ack.expires_at }))
 }
 
-/// `peer pair pending` — every pairing request THIS instance is still
-/// holding open, BOTH directions (review-bounce Finding 2: an outbound
-/// entry awaiting THIS instance's own confirm is exactly as "pending" as an
-/// inbound one awaiting approval — before this fix, nothing ever surfaced
-/// it). Inbound rows show a SAS only once revealed (`requester_nonce_hex`
-/// is `Some`, review-bounce Finding 1) — an unrevealed entry shows
-/// `"awaiting reveal"` instead, and `peer pair approve` refuses it. An
-/// APPROVED inbound entry (Design A, task #119 — [`InboundPairingRequest::approved`])
-/// stays listed here too, showing `"approved · awaiting their poll"` — it
+/// `peer pending` — every pairing request THIS instance is still holding
+/// open, BOTH directions (review-bounce Finding 2: an outbound entry
+/// awaiting THIS instance's own confirm is exactly as "pending" as an
+/// inbound one awaiting approval — before that fix, nothing ever surfaced
+/// it). Inbound rows carry `revealed` (`requester_nonce_hex.is_some()`,
+/// review-bounce Finding 1) — an unrevealed entry shows `"awaiting
+/// reveal"`, and `peer pair approve` refuses it. An APPROVED inbound entry
+/// (Design A, task #119 — [`InboundPairingRequest::approved`]) stays
+/// listed here too, showing `"approved · awaiting their poll"` — it
 /// remains parked (never taken) until the requester's own `aoide/pairPoll`
 /// releases it or it expires, so the approver's own operator can still see
-/// it's done its part. Outbound rows always carry a SAS (an outbound entry
-/// is only ever parked AFTER its own reveal already succeeded) plus its own
-/// `state` (`awaiting-approval`/`awaiting-confirm`). Every SAS shown here is
-/// independently derived from this instance's own identity plus the
-/// entry's stored transcript fields — never trusted from the wire — exactly
-/// what `peer pair approve` re-derives again before committing anything.
-pub(crate) fn handle_peer_pair_pending(_inv: &Invocation) -> Outcome {
-    let cmd = "peer.pair.pending";
+/// it's done its part. Outbound rows carry their own `state`
+/// (`awaiting-approval`/`awaiting-confirm`).
+///
+/// **Never the SAS/pairing code (P-PV2, the User's locked spec).** The
+/// code is read off the REQUESTER's own terminal and typed on the
+/// APPROVER's — printing it here too would defeat the whole point of that
+/// out-of-band comparison (an operator could just read both sides off this
+/// one listing instead of actually comparing two independent screens).
+/// `peer pair approve` still independently re-derives it from this
+/// instance's own identity plus the entry's stored transcript fields —
+/// never trusted from the wire — exactly as before; only THIS row listing
+/// stops showing it.
+pub(crate) fn handle_peer_pending(_inv: &Invocation) -> Outcome {
+    let cmd = "peer.pending";
     let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
     let inbound = aoide_storage::pairing::list_inbound(now_epoch);
     let outbound = aoide_storage::pairing::list_outbound(now_epoch);
     if inbound.is_empty() && outbound.is_empty() {
         return Outcome::ok(cmd, "no pending pairing requests").with_data(json!({ "requests": [] }));
     }
-    let (kp, _) = match aoide_storage::identity::load_or_mint() {
-        Ok(v) => v,
-        Err(e) => {
-            return Outcome::error(cmd, format!("loading this instance's identity: {e}"))
-                .with_data(json!({ "reason": "identity-io-failed" }))
-        }
-    };
-    let own_pubkey = kp.info().pubkey_hex;
 
     let mut rows: Vec<Value> = Vec::new();
     for e in &inbound {
-        let sas = e
-            .requester_nonce_hex
-            .as_deref()
-            .map(|n| aoide_storage::pairing::derive_sas(&e.pubkey_hex, &own_pubkey, n, &e.approver_nonce_hex));
         rows.push(json!({
             "id": e.id, "direction": "inbound", "name": e.name, "originAddr": e.origin_addr, "url": e.url,
-            "sas": sas, "revealed": e.requester_nonce_hex.is_some(), "approved": e.approved,
+            "revealed": e.requester_nonce_hex.is_some(), "approved": e.approved,
             "requestedAt": e.requested_at, "expiresAt": e.expires_at,
         }));
     }
     for e in &outbound {
-        let sas = aoide_storage::pairing::derive_sas(&own_pubkey, &e.pubkey_hex, &e.requester_nonce_hex, &e.approver_nonce_hex);
         rows.push(json!({
             "id": e.id, "direction": "outbound", "name": e.name, "url": e.url,
-            "sas": sas, "state": e.state.as_str(),
+            "state": e.state.as_str(),
             "requestedAt": e.requested_at, "expiresAt": e.expires_at,
         }));
     }
@@ -1925,8 +1943,8 @@ pub(crate) fn handle_peer_pair_pending(_inv: &Invocation) -> Outcome {
             let status = match dir {
                 "inbound" if r["revealed"].as_bool() == Some(false) => "awaiting reveal".to_string(),
                 "inbound" if r["approved"].as_bool() == Some(true) => "approved · awaiting their poll".to_string(),
-                "inbound" => format!("code {}", r["sas"].as_str().unwrap_or("")),
-                _ => format!("code {} · {}", r["sas"].as_str().unwrap_or(""), r["state"].as_str().unwrap_or("")),
+                "inbound" => "revealed · run `peer pair approve` with the code from their screen".to_string(),
+                _ => r["state"].as_str().unwrap_or("").to_string(),
             };
             format!(
                 "{} · {dir} · {} · {status} · requested {}",
@@ -1940,7 +1958,30 @@ pub(crate) fn handle_peer_pair_pending(_inv: &Invocation) -> Outcome {
         .with_data(json!({ "requests": rows }))
 }
 
-/// `peer pair approve <id> [--yes] [--code NNN-NNN]` — dispatches by
+/// Resolve `peer pair approve`'s (P-PV2) OPTIONAL `<id>` when omitted: the
+/// sole pending request across BOTH directions (`aoide_storage::pairing::
+/// list_inbound`/`list_outbound`), or a taught `Outcome::usage` — zero
+/// pending names nothing to approve, multiple pending lists every id
+/// (`aoide peer pending` shows the same set) and requires the caller name
+/// one explicitly. Never a silent guess.
+fn sole_pending_id(cmd: &str, now_epoch: i64) -> Result<String, Outcome> {
+    let mut ids: Vec<String> = aoide_storage::pairing::list_inbound(now_epoch).into_iter().map(|e| e.id).collect();
+    ids.extend(aoide_storage::pairing::list_outbound(now_epoch).into_iter().map(|e| e.id));
+    match ids.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => Err(Outcome::usage(cmd, "no pending pairing requests to approve — see `aoide peer pending`")),
+        _ => Err(Outcome::usage(
+            cmd,
+            format!(
+                "multiple pending pairing requests — an id is required: {} (see `aoide peer pending`)",
+                ids.join(", ")
+            ),
+        )
+        .with_data(json!({ "reason": "ambiguous-id", "ids": ids }))),
+    }
+}
+
+/// `peer pair approve [<id>] [--yes] [--code NNN-NNN]` — dispatches by
 /// DIRECTION (module doc on this section): an INBOUND id runs
 /// [`approve_inbound`] (this instance is the APPROVER, gated by the TYPED
 /// pairing code — task #120 P3 — collected per [`InboundGate`]: `--code`
@@ -1951,15 +1992,25 @@ pub(crate) fn handle_peer_pair_pending(_inv: &Invocation) -> Outcome {
 /// confirming — `--yes` keeps its original skip-the-y/N meaning THERE,
 /// since the requester's own screen already printed the code it would be
 /// typing back to itself); an id in neither queue is `unknown-id`.
+///
+/// **`<id>` is OPTIONAL (P-PV2, the User's locked spec).** Omitted with
+/// EXACTLY ONE pending request (either direction — [`sole_pending_id`]):
+/// that one is approved, no id-copying required for the common case.
+/// Omitted with zero or multiple pending: a taught error (zero: nothing to
+/// approve; multiple: the id is required, every pending id is listed) —
+/// never a silent guess at which request the operator meant.
 fn handle_peer_pair_approve(inv: &Invocation) -> Outcome {
     let cmd = "peer.pair.approve";
-    let id = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        Some(i) => i.to_string(),
-        None => return Outcome::usage(cmd, "usage: aoide peer pair approve <id> [--yes] [--code NNN-NNN] [--json]"),
-    };
-
     let now = aoide_storage::time::now_iso_utc();
     let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap_or(0);
+
+    let id = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(i) => i.to_string(),
+        None => match sole_pending_id(cmd, now_epoch) {
+            Ok(i) => i,
+            Err(out) => return out,
+        },
+    };
 
     if let Some(entry) = aoide_storage::pairing::list_inbound(now_epoch).into_iter().find(|e| e.id == id) {
         let gate = match inv.flags.get("code").cloned().filter(|c| !c.trim().is_empty()) {
@@ -2189,7 +2240,7 @@ pub(crate) fn approve_inbound(
 /// deliver — unreachable when THIS instance's own door is loopback-only
 /// ([[doors-loopback-only]]). Now, while still `AwaitingApproval`, this POSTs
 /// a SIGNED `aoide/pairPoll` to the approver's door (`build_signed_pair_poll_body`,
-/// over the SAME forward dial `peer pair request`'s own two POSTs already
+/// over the SAME forward dial `peer pair`'s own two POSTs already
 /// used — `entry.via` if one was recorded, never a reverse leg). A `pending`
 /// answer refuses with the SAME "still awaiting the peer's own approval"
 /// message the old callback-wait refusal gave (an ordinary, expected outcome
@@ -2313,15 +2364,15 @@ pub(crate) fn approve_outbound(
 
     let mut peers = aoide_storage::peer_store::load_peers();
     let change = aoide_storage::peer_store::upsert_paired_peer(&mut peers, &entry.name, &entry.url, &entry.pubkey_hex, now);
-    // P-S4: the via this ceremony resolved back at `peer invite`/`peer
-    // pair request` time (K1's src_addr-derived default, or an explicit
-    // `--via`) rode the parked entry here — commit it onto the peer record
-    // in the SAME write as the pairing commit above, via the sibling
-    // writer (`set_peer_via`'s own doc on why it's separate from
+    // P-S4: the via this ceremony resolved back at `peer pair` request
+    // time (K1's src_addr-derived default, or an explicit `--via`) rode
+    // the parked entry here — commit it onto the peer record in the SAME
+    // write as the pairing commit above, via the sibling writer
+    // (`set_peer_via`'s own doc on why it's separate from
     // `upsert_paired_peer`'s signature). ONLY when `entry.via` is `Some`
     // (review fix, P-S4 follow-up) — a plain re-pair with no `--via` must
-    // LEAVE a previously-recorded via (e.g. one `peer invite` set) exactly
-    // as it was, the same "untouched unless this call names a change"
+    // LEAVE a previously-recorded via (e.g. one earlier `peer pair` set)
+    // exactly as it was, the same "untouched unless this call names a change"
     // stance `upsert_paired_peer` itself already holds for `autogate`/
     // `tokenFile`/`bearerSecret`/`hub`/`allows` on re-pairing; calling
     // `set_peer_via` unconditionally with `None` would silently WIPE that
@@ -2485,21 +2536,27 @@ fn handle_peer_discover(inv: &Invocation) -> Outcome {
     Outcome::ok(cmd, message).with_data(json!({ "heard": heard, "dropped": swept.dropped, "secs": secs }))
 }
 
-/// `--secs`'s shared parse for `peer discover`/`peer invite`: absent or
-/// unparsable-but-absent-equivalent defaults to
-/// `discover::DEFAULT_SWEEP_SECS`; present-but-not-a-positive-integer is a
-/// usage error (`Err(())`, the caller renders its own exact usage string)
-/// rather than silently falling back — a typo'd `--secs` should never
-/// quietly listen for the default window instead of what the operator
-/// actually asked for.
-fn parse_secs_flag(inv: &Invocation) -> Result<u64, ()> {
+/// `--secs`'s shared parse, parameterized by DEFAULT: absent or
+/// unparsable-but-absent-equivalent defaults to `default`;
+/// present-but-not-a-positive-integer is a usage error (`Err(())`, the
+/// caller renders its own exact usage string) rather than silently falling
+/// back — a typo'd `--secs` should never quietly listen for the default
+/// window instead of what the operator actually asked for.
+fn parse_secs_flag_with_default(inv: &Invocation, default: u64) -> Result<u64, ()> {
     match inv.flags.get("secs") {
-        None => Ok(crate::discover::DEFAULT_SWEEP_SECS),
+        None => Ok(default),
         Some(s) => match s.parse::<u64>() {
             Ok(n) if n > 0 => Ok(n),
             _ => Err(()),
         },
     }
+}
+
+/// `peer discover`'s own default window ([`crate::discover::DEFAULT_SWEEP_SECS`],
+/// ~4s) — unrelated to and unchanged by P-PV2; [`pair_via_hostname`] holds
+/// its own, much longer, default instead ([`PAIR_TARGET_SWEEP_SECS`]).
+fn parse_secs_flag(inv: &Invocation) -> Result<u64, ()> {
+    parse_secs_flag_with_default(inv, crate::discover::DEFAULT_SWEEP_SECS)
 }
 
 /// Prompt `y/N` on stderr before running the pairing ceremony against a
@@ -2521,51 +2578,53 @@ fn confirm_invite(name: &str, host: &str, user: &str, src_addr: &str) -> Result<
     Ok(read > 0 && matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
-/// `peer invite <name> [--secs N] [--yes] [--json]` (P-P6 + task #120,
-/// PAIRING.md's own "sugar over the ceremony, nothing more" framing): runs
-/// its OWN discover sweep (never reuses a previous one — an advertisement
-/// is only ever as fresh as the sweep that heard it), resolves `<name>`
-/// against the heard set (`discover::resolve_invite_target`), and on
-/// EXACTLY one match runs the SAME [`run_pair_request`] core `peer pair
-/// request` itself calls, through [`pair_with_heard`] (the settled-target
-/// tail bare `pair`'s picker shares) — reused, never copied (this is what
-/// "reaches the same code path" actually means here: the handlers bottom
-/// out in the identical function, not functions that merely look alike).
-/// Zero or
-/// multiple matches refuse with a taught error listing every name that WAS
-/// heard (never raw advertisement content — house rule 4; only
-/// already-validated `name`s ever reach this point). The ceremony url
-/// dialed is composed from the hit's OBSERVED source address, never a
-/// claimed one (P-S1), on the house door port ([`default_a2a_port`]) — the
+/// [`handle_peer_pair`]'s own default sweep window when `<target>` reads as
+/// a hostname (P-PV2, the User's locked spec) — deliberately NOT
+/// [`crate::discover::DEFAULT_SWEEP_SECS`] (`peer discover`'s own ~4s,
+/// unrelated and unchanged): a real LAN's advertise cadence is a ~30-40s
+/// tick (`handle_peer_advertise`'s own doc), so 4s reliably missed it in
+/// practice — task #129's known miss. 45s comfortably spans one tick.
+const PAIR_TARGET_SWEEP_SECS: u64 = 45;
+
+/// `peer pair <target>`'s HOSTNAME arm (`target` is not a URL) — the old
+/// `peer invite <name>` handler's own body, unchanged apart from the
+/// sweep default (above): runs its OWN discover sweep (never reuses a
+/// previous one — an advertisement is only ever as fresh as the sweep that
+/// heard it), resolves `target` against the heard set
+/// (`discover::resolve_invite_target`), and on EXACTLY one match runs the
+/// SAME [`run_pair_request`] core the url arm calls, through
+/// [`pair_with_heard`] (the settled-target tail bare `pair`'s picker
+/// shares) — reused, never copied (this is what "reaches the same code
+/// path" actually means here: the handlers bottom out in the identical
+/// function, not functions that merely look alike). Zero or multiple
+/// matches refuse with a taught error listing every name that WAS heard
+/// (never raw advertisement content — house rule 4; only
+/// already-validated names ever reach this point). The ceremony url dialed
+/// is composed from the hit's OBSERVED source address, never a claimed one
+/// (P-S1), on the house door port ([`default_a2a_port`]) — the
 /// advertisement deliberately carries NO door URL (rendezvous, not
 /// authentication; `aoide_storage::advertise`'s module doc), so a
-/// non-default far-end port needs a plain `peer pair request <url>`
-/// instead. Before dialing, the SELF-INVITE GUARD
+/// non-default far-end port needs the explicit url arm (`peer pair
+/// <url>`) instead. Before dialing, the SELF-PAIR GUARD
 /// (`discover::is_self_target`) refuses when the heard name is this
 /// instance's own or the datagram came from loopback — the "you just
-/// invited yourself" case owed here because this is where the target is
-/// chosen (a broadcast always loops back to its own sender). `--yes` skips
-/// only the LOCAL proceed-confirm (`confirm_invite`), exactly `peer
-/// spawn`'s own `--yes` idiom — the ceremony's OWN SAS confirmation (both
-/// operators, both ends) is untouched and still runs.
-fn handle_peer_invite(inv: &Invocation) -> Outcome {
-    let cmd = "peer.invite";
-    const USAGE: &str = "usage: aoide peer invite <name> [--secs N] [--yes] [--via ssh://[user@]host[:port]] [--self-via ssh://[user@]host] [--json]";
-    let name = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        Some(n) => n.to_string(),
-        None => return Outcome::usage(cmd, USAGE),
-    };
-    let secs = match parse_secs_flag(inv) {
+/// tried to pair with yourself" case owed here because this is where the
+/// target is chosen (a broadcast always loops back to its own sender).
+/// `--yes` skips only the LOCAL proceed-confirm (`confirm_invite`), exactly
+/// `peer spawn`'s own `--yes` idiom — the ceremony's OWN SAS confirmation
+/// (both operators, both ends) is untouched and still runs.
+fn pair_via_hostname(cmd: &str, inv: &Invocation, target: &str, usage: &str) -> Outcome {
+    let secs = match parse_secs_flag_with_default(inv, PAIR_TARGET_SWEEP_SECS) {
         Ok(n) => n,
         Err(()) => {
-            return Outcome::usage(cmd, format!("{USAGE} — --secs must be a positive integer"))
+            return Outcome::usage(cmd, format!("{usage} — --secs must be a positive integer"))
         }
     };
     // An invalid --via is a usage error, never a silent fallback (same
     // stance every other --via-accepting command holds).
     let via_flag = match parse_via_flag(inv) {
         Ok(v) => v,
-        Err(e) => return Outcome::usage(cmd, format!("{USAGE} — {e}")),
+        Err(e) => return Outcome::usage(cmd, format!("{usage} — {e}")),
     };
     let self_via_flag = inv.flags.get("self-via").cloned().filter(|s| !s.is_empty());
 
@@ -2577,24 +2636,24 @@ fn handle_peer_invite(inv: &Invocation) -> Outcome {
         }
     };
 
-    let hit = match crate::discover::resolve_invite_target(&swept.heard, &name) {
+    let hit = match crate::discover::resolve_invite_target(&swept.heard, target) {
         Ok(h) => h,
         Err(crate::discover::InviteResolveError::NoMatch { heard }) => {
             return Outcome::error(
                 cmd,
                 format!(
-                    "heard no advertisement named `{name}` in {secs}s — heard: {}",
+                    "heard no advertisement named `{target}` in {secs}s — heard: {}",
                     if heard.is_empty() { "(none)".to_string() } else { heard.join(", ") }
                 ),
             )
-            .with_data(json!({ "reason": "no-match", "name": name, "heard": heard }));
+            .with_data(json!({ "reason": "no-match", "name": target, "heard": heard }));
         }
         Err(crate::discover::InviteResolveError::Ambiguous { heard }) => {
             return Outcome::error(
                 cmd,
-                format!("heard multiple advertisements named `{name}` — ambiguous; heard: {}", heard.join(", ")),
+                format!("heard multiple advertisements named `{target}` — ambiguous; heard: {}", heard.join(", ")),
             )
-            .with_data(json!({ "reason": "ambiguous", "name": name, "heard": heard }));
+            .with_data(json!({ "reason": "ambiguous", "name": target, "heard": heard }));
         }
     };
 
@@ -2603,7 +2662,7 @@ fn handle_peer_invite(inv: &Invocation) -> Outcome {
         return Outcome::error(
             cmd,
             format!(
-                "`{}` resolves to this instance's own advertisement — refusing to invite yourself",
+                "`{}` resolves to this instance's own advertisement — refusing to pair with yourself",
                 hit.advertisement.name
             ),
         )
@@ -2624,12 +2683,13 @@ fn handle_peer_invite(inv: &Invocation) -> Outcome {
     pair_with_heard(cmd, &hit, via_flag.as_ref(), self_via_flag.as_deref())
 }
 
-/// The tail `peer invite` and bare `pair` share once a [`crate::discover::Heard`]
-/// target is settled (each having already run its own guard/confirmation):
-/// compose the dial URL from the hit's OBSERVED source address on the house
-/// door port ([`default_a2a_port`] — the advertisement carries no door URL
-/// to read a port off, by design), and run the SAME [`run_pair_request`]
-/// core `peer pair request` itself calls — reused, never forked.
+/// The tail `peer pair`'s hostname arm ([`pair_via_hostname`]) and bare
+/// `pair` share once a [`crate::discover::Heard`] target is settled (each
+/// having already run its own guard/confirmation): compose the dial URL
+/// from the hit's OBSERVED source address on the house door port
+/// ([`default_a2a_port`] — the advertisement carries no door URL to read a
+/// port off, by design), and run the SAME [`run_pair_request`] core the
+/// url arm ([`pair_via_url`]) calls — reused, never forked.
 ///
 /// P-PV1's settled default (task #131 — loopback-only doors, superseding
 /// K1): the peer this ceremony creates gets an automatic `via` derived from
@@ -2683,37 +2743,41 @@ fn resolve_pair_vias(
     (dial_via, record_via)
 }
 
-/// The four `peer pair` commands (P-P2), registered directly after the six
-/// legacy `peer` commands — same-network federation's pairing ceremony joins
-/// the group it extends, nothing existing reorders.
+/// `peer pair`/`peer pending` (P-PV2, the User's locked spec, superseding
+/// P-P2's `peer pair request`/`peer pair pending` split) plus `peer pair
+/// approve|reject|watch`, registered directly after the six legacy `peer`
+/// commands — same-network federation's pairing ceremony joins the group
+/// it extends, nothing existing reorders.
 pub fn register_peer_pair(r: &mut Registry) {
     r.insert(cmd!(
-        path: ["peer", "pair", "request"],
-        summary: "Send a pairing request to another aoide instance's A2A door and display the confirmation code (SAS) to compare out-of-band.",
-        args: [arg!("url", "string", true, "The other instance's A2A door URL (e.g. http://host:8710/).")],
+        path: ["peer", "pair"],
+        summary: "Send a pairing request and display the confirmation code (SAS) plus its pending id to compare out-of-band. A URL-shaped target (contains \"://\") dials it directly; anything else is a hostname, resolved by a discovery beacon sweep.",
+        args: [arg!("target", "string", true, "A URL (e.g. http://host:8710/) to dial directly, or a hostname to resolve via a discovery sweep.")],
         flags: [
-            flag!("name", "string", "A local nickname for the other instance; defaults to a sanitized form of the URL's host."),
+            flag!("name", "string", "A local nickname for the other instance (URL target only); defaults to a sanitized form of the URL's host."),
             flag!("self-url", "string", "This instance's own advertised A2A door URL, recorded on the resulting peer record for the approver's future non-ceremony calls (the ceremony itself now polls, so this is no longer dialed to complete pairing); defaults to http://<host>:<AOIDE_A2A_PORT or 8710>/."),
             flag!("self-via", "string", "This instance's own ssh://[user@]host reach-back hop claim, sent on the wire beside --self-url so an approver that only ever observes this request over a tunnel (loopback) can still record a working via; defaults to ssh://<local user>@<the local address routed toward the peer>."),
             flag!("via", "string", "An ssh://[user@]host[:port] transport marker — both the ceremony's own dial AND the resulting peer's recorded via. Absent = direct dial (today's behavior)."),
+            flag!("secs", "int", "Hostname target only: how many seconds to sweep for the advertisement (default 45)."),
+            flag!("yes", "bool", "Hostname target only: skip the interactive y/N proceed confirmation (scripted use) — the ceremony's own SAS confirmation is untouched."),
         ],
         gated: false,
         implemented: true,
-        handler: handle_peer_pair_request,
+        handler: handle_peer_pair,
     ));
     r.insert(cmd!(
-        path: ["peer", "pair", "pending"],
-        summary: "List pairing requests parked on this instance, each with its own independently-derived confirmation code.",
+        path: ["peer", "pending"],
+        summary: "List pairing requests parked on this instance. Never shows the confirmation code (SAS) — that is read off the requester's own screen and typed on the approver's, out-of-band; see `peer pair approve`.",
         args: [],
         flags: [],
         gated: false,
         implemented: true,
-        handler: handle_peer_pair_pending,
+        handler: handle_peer_pending,
     ));
     r.insert(cmd!(
         path: ["peer", "pair", "approve"],
-        summary: "Approve a pending pairing request — the approver TYPES the pairing code as read from the requester's screen (3 cumulative mismatches auto-deny; --code NNN-NNN scripted) and commits locally; the requester polls for the release, confirms y/N (--yes scripted), then commits; run on both ends.",
-        args: [arg!("id", "string", true, "The pending pairing request's id (see `peer pair pending`).")],
+        summary: "Approve a pending pairing request — the approver TYPES the pairing code as read from the requester's screen (3 cumulative mismatches auto-deny; --code NNN-NNN scripted) and commits locally; the requester polls for the release, confirms y/N (--yes scripted), then commits; run on both ends. <id> may be omitted when exactly one request is pending.",
+        args: [arg!("id", "string", false, "The pending pairing request's id (see `peer pending`); required when more than one request is pending.")],
         flags: [
             flag!("yes", "bool", "Skip the interactive y/N confirmation on an OUTBOUND (requester-side) id (scripted use); an inbound id takes --code instead — --yes never bypasses the approver's typed code."),
             flag!("code", "string", "The pairing code, read from the requester's screen, for approving an INBOUND id without a terminal prompt (scripted use); a wrong code counts one persisted try, and 3 cumulative mismatches auto-deny the request."),
@@ -2725,7 +2789,7 @@ pub fn register_peer_pair(r: &mut Registry) {
     r.insert(cmd!(
         path: ["peer", "pair", "reject"],
         summary: "Refuse a pending pairing request — a clean removal, no peer record on either end.",
-        args: [arg!("id", "string", true, "The pending pairing request's id (see `peer pair pending`).")],
+        args: [arg!("id", "string", true, "The pending pairing request's id (see `peer pending`).")],
         flags: [],
         gated: false,
         implemented: true,
@@ -2783,12 +2847,15 @@ fn handle_peer_advertise(inv: &Invocation) -> Outcome {
     Outcome::ok(cmd, message).with_data(json!({ "enabled": on, "changed": previous != on }))
 }
 
-/// `peer discover`/`peer invite`/`peer advertise` (P-P6 + task #120,
+/// `peer discover`/`peer advertise` (P-P6 + task #120,
 /// `docs/architecture/PAIRING.md`'s "Discovery (advertise-but-locked)"
 /// section), registered directly after `register_peer_pair` — discovery is
 /// sugar OVER the ceremony that group already owns, never a parallel
 /// mechanism, so it joins the group it extends the same way
 /// `register_peer_pair` itself did for the six legacy `peer` commands.
+/// `peer pair <hostname>`'s own hostname arm ([`pair_via_hostname`], P-PV2)
+/// is the sugar-over-the-ceremony command now — `peer invite` died in the
+/// same phase, hard cutover, no alias.
 pub fn register_peer_discovery(r: &mut Registry) {
     r.insert(cmd!(
         path: ["peer", "discover"],
@@ -2798,20 +2865,6 @@ pub fn register_peer_discovery(r: &mut Registry) {
         gated: false,
         implemented: true,
         handler: handle_peer_discover,
-    ));
-    r.insert(cmd!(
-        path: ["peer", "invite"],
-        summary: "Discover <name> on the LAN and, on exactly one match, run the pairing ceremony (peer pair request) against its observed source address.",
-        args: [arg!("name", "string", true, "The instance name to look for among heard discovery advertisements.")],
-        flags: [
-            flag!("secs", "int", "How many seconds to listen (default ~4)."),
-            flag!("yes", "bool", "Skip the interactive y/N proceed confirmation (scripted use) — the ceremony's own SAS confirmation is untouched."),
-            flag!("via", "string", "An ssh://[user@]host[:port] transport marker, overriding the default derived from the advertisement's observed source address and claimed ssh login — both the ceremony's own dial AND the resulting peer's recorded via."),
-            flag!("self-via", "string", "This instance's own ssh://[user@]host reach-back hop claim, sent on the wire beside self-url so an approver that only ever observes this request over a tunnel (loopback) can still record a working via; defaults to ssh://<local user>@<the local address routed toward the peer>."),
-        ],
-        gated: false,
-        implemented: true,
-        handler: handle_peer_invite,
     ));
     r.insert(cmd!(
         path: ["peer", "advertise"],
@@ -2836,13 +2889,12 @@ const PAIR_SWEEP_SECS: u64 = 2;
 /// [`PAIR_SWEEP_SECS`]), then an interactive SELECT menu over the
 /// advertising candidates (`aoide_protocol::pick::choose` — the same
 /// `inquire`-backed picker substrate bare `session` opens), and the picked
-/// row drives the EXISTING invite/request path ([`pair_with_heard`] →
-/// [`run_pair_request`] — reuse, never a fork); `run_pair_request`'s own
-/// success message then prints the SAS and teaches the approve step on
-/// both ends. Picking a row IS the proceed-confirmation — no second
-/// `confirm_invite`-style y/N on top (`peer invite <name>` needs one
-/// because its target arrives as a typed argument, not a choice made
-/// looking at the candidate).
+/// row drives the EXISTING [`pair_with_heard`] → [`run_pair_request`] path
+/// — reuse, never a fork; `run_pair_request`'s own success message then
+/// prints the SAS and teaches the approve step on both ends. Picking a row
+/// IS the proceed-confirmation — no second `confirm_invite`-style y/N on
+/// top (`peer pair <hostname>` needs one because its target arrives as a
+/// typed argument, not a choice made looking at the candidate).
 ///
 /// Row text renders only already-validated advertisement fields
 /// (`advertise::parse_and_validate` gates every one — house rule 4) plus
@@ -2860,8 +2912,8 @@ const PAIR_SWEEP_SECS: u64 = 2;
 fn handle_pair(inv: &Invocation) -> Outcome {
     let cmd = "pair";
     let taught = "bare `pair` opens an interactive pairing picker on a real CLI terminal; scripted path: \
-                  `aoide peer advertise on` on the other box, then `aoide peer invite <name> --yes` or \
-                  `aoide peer pair request <url> [--via ssh://[user@]host]` here";
+                  `aoide peer advertise on` on the other box, then `aoide peer pair <name> --yes` \
+                  (hostname) or `aoide peer pair <url> [--via ssh://[user@]host]` (explicit dial) here";
     if inv.door != aoide_protocol::Door::Cli {
         return Outcome::usage(cmd, format!("{taught} (this door is not the CLI)"));
     }
@@ -2889,7 +2941,7 @@ fn handle_pair(inv: &Invocation) -> Outcome {
                 "heard no advertising instances in {PAIR_SWEEP_SECS}s ({} malformed dropped) — on the OTHER box, \
                  switch advertising on with `aoide peer advertise on` (a running `a2a serve` emits it within ~40s) \
                  and run `aoide pair` here again; or pair manually with \
-                 `aoide peer pair request <url> [--via ssh://[user@]host]`",
+                 `aoide peer pair <url> [--via ssh://[user@]host]`",
                 swept.dropped
             ),
         )
@@ -2918,7 +2970,7 @@ fn handle_pair(inv: &Invocation) -> Outcome {
 pub fn register_pair(r: &mut Registry) {
     r.insert(cmd!(
         path: ["pair"],
-        summary: "Open the interactive pairing picker on a real CLI terminal: one ~2s advertisement sweep, a select menu over the advertising instances heard (name, claimed ssh hop, observed source), and the picked one runs the same ceremony `peer invite`/`peer pair request` drive — then prints the code to compare and the approve step for both ends. Non-tty or non-CLI invocations get a taught pointer at the scripted spellings instead.",
+        summary: "Open the interactive pairing picker on a real CLI terminal: one ~2s advertisement sweep, a select menu over the advertising instances heard (name, claimed ssh hop, observed source), and the picked one runs the same ceremony `peer pair` drives — then prints the code to compare and the approve step for both ends. Non-tty or non-CLI invocations get a taught pointer at the scripted spellings instead.",
         args: [],
         flags: [],
         gated: false,
@@ -3273,7 +3325,7 @@ mod tests {
             assert_eq!(out.status, aoide_protocol::output::Status::Error);
             assert_eq!(out.data.as_ref().unwrap()["reason"], "unknown-peer");
             assert!(
-                out.message.contains("peer pair request"),
+                out.message.contains("peer pair"),
                 "taught error must name the pairing ceremony: {}",
                 out.message
             );
@@ -3292,7 +3344,7 @@ mod tests {
             assert_eq!(out.status, aoide_protocol::output::Status::Error);
             assert_eq!(out.data.as_ref().unwrap()["reason"], "unpaired-peer");
             assert!(
-                out.message.contains("peer pair request"),
+                out.message.contains("peer pair"),
                 "taught error must name the pairing ceremony: {}",
                 out.message
             );
@@ -3473,11 +3525,11 @@ mod tests {
         }
     }
 
-    // ── `peer invite` bottoms out in the exact same `run_pair_request`
-    // ── `peer pair request` runs (P-P6) — proven directly by calling it
-    // ── through both entry points against the SAME unreachable door and
-    // ── asserting byte-identical outcomes, rather than trusting that the
-    // ── two call sites merely look alike. The genuine end-to-end proof
+    // ── `peer pair`'s hostname arm bottoms out in the exact same
+    // ── `run_pair_request` its url arm runs (P-PV2) — proven directly by
+    // ── calling it through both entry points against the SAME unreachable
+    // ── door and asserting byte-identical outcomes, rather than trusting
+    // ── that the two arms merely look alike. The genuine end-to-end proof
     // ── (a real discovered advertisement resolving to a real second door that
     // ── actually parks an outbound pairing request) lives in `cli/tests/
     // ── discovery_connectivity.rs`'s `#[ignore]`'d real-network test —
@@ -3485,35 +3537,34 @@ mod tests {
     // ── port fails identically (and fast) through either call site. ─────────
 
     #[test]
-    fn peer_invite_tail_and_peer_pair_request_are_the_same_function_not_two_copies() {
-        with_peer_state("invite-shares-run-pair-request", || {
+    fn peer_pair_hostname_arm_and_url_arm_are_the_same_function_not_two_copies() {
+        with_peer_state("hostname-arm-shares-run-pair-request", || {
             // Port 1 is reserved and never listened on in practice — an
             // immediate, deterministic connection refusal either way.
             let url = "http://127.0.0.1:1/";
-            let name = "unreachable-invite-target";
+            let name = "unreachable-pair-target";
             let self_url = default_self_url();
 
-            // `handle_peer_pair_request`'s own documented tail.
-            let direct = run_pair_request("peer.pair.request", url, name, &self_url, None, None, None);
-            // The same ceremony tail `handle_peer_invite` reaches on its
+            // `pair_via_url`'s own documented tail.
+            let direct = run_pair_request("peer.pair", url, name, &self_url, None, None, None);
+            // The same ceremony tail `pair_via_hostname` reaches on its
             // single-match branch — it composes an OBSERVED dial url first
             // (src_addr + `default_a2a_port`, P-S1/task #120) and passes
             // that, but the tail function is still this one; reproduced
-            // here under `peer.invite`'s own command name.
-            let via_invite = run_pair_request("peer.invite", url, name, &self_url, None, None, None);
+            // here under the identical `peer.pair` command name both arms
+            // now share.
+            let via_hostname = run_pair_request("peer.pair", url, name, &self_url, None, None, None);
 
             assert_eq!(direct.status, aoide_protocol::output::Status::Error, "{direct:?}");
-            assert_eq!(direct.command, "peer.pair.request");
-            assert_eq!(via_invite.status, direct.status);
-            assert_eq!(via_invite.command, "peer.invite");
-            // Same failure MESSAGE from both call sites (the `cmd` argument
-            // never rides the message text itself, only `Outcome::command`)
-            // — proves it is one function's error path taken twice under two
-            // different labels, not two independently drifting
-            // implementations that merely happen to agree today.
+            assert_eq!(direct.command, "peer.pair");
+            assert_eq!(via_hostname.status, direct.status);
+            assert_eq!(via_hostname.command, "peer.pair");
+            // Same failure MESSAGE from both call sites — proves it is one
+            // function's error path taken twice, not two independently
+            // drifting implementations that merely happen to agree today.
             assert_eq!(
-                via_invite.message, direct.message,
-                "peer invite and peer pair request must produce an identical failure message here"
+                via_hostname.message, direct.message,
+                "peer pair's url arm and hostname arm must produce an identical failure message here"
             );
         });
     }
@@ -4548,7 +4599,7 @@ mod tests {
             let out = handle_pair(&invocation);
             assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{why}: {out:?}");
             assert!(out.message.contains("peer advertise on"), "{why} refusal teaches the advertise switch: {}", out.message);
-            assert!(out.message.contains("peer pair request"), "{why} refusal teaches the manual path: {}", out.message);
+            assert!(out.message.contains("peer pair"), "{why} refusal teaches the manual path: {}", out.message);
         }
     }
 
@@ -4566,5 +4617,191 @@ mod tests {
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
             assert_eq!(out.data.as_ref().and_then(|d| d.get("alreadyApproved")).and_then(Value::as_bool), Some(true));
         });
+    }
+
+    // ── P-PV2 (the User's locked spec): the collapsed command surface ────
+
+    fn approve_inv_no_id(flags: &[(&str, &str)]) -> Invocation {
+        Invocation {
+            path: vec!["peer".into(), "pair".into(), "approve".into()],
+            args: vec![],
+            flags: flags.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            door: aoide_protocol::Door::Cli,
+        }
+    }
+
+    /// `peer pair approve` with NO id, exactly one pending request: that
+    /// one is resolved and approved — no id-copying required for the
+    /// common case (the User's locked spec, point 4).
+    #[test]
+    fn approve_with_no_id_resolves_the_sole_pending_request() {
+        with_peer_state("approve-no-id-sole-pending", || {
+            let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
+            let (entry, sas) = parked_revealed_inbound(now_epoch);
+
+            let out = handle_peer_pair_approve(&approve_inv_no_id(&[("code", &sas)]));
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
+            assert_eq!(out.data.as_ref().and_then(|d| d.get("peer")).and_then(Value::as_str), Some(entry.name.as_str()));
+        });
+    }
+
+    /// `peer pair approve` with NO id, ZERO pending: a taught refusal
+    /// naming there is nothing to approve — never a silent no-op.
+    #[test]
+    fn approve_with_no_id_and_nothing_pending_is_a_taught_refusal() {
+        with_peer_state("approve-no-id-zero-pending", || {
+            let out = handle_peer_pair_approve(&approve_inv_no_id(&[]));
+            assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{out:?}");
+            assert!(out.message.contains("no pending"), "{}", out.message);
+        });
+    }
+
+    /// `peer pair approve` with NO id, MULTIPLE pending: a taught refusal
+    /// requiring an explicit id, listing every id currently pending —
+    /// never a silent guess at which request the operator meant.
+    #[test]
+    fn approve_with_no_id_and_multiple_pending_requires_the_id_and_lists_them() {
+        with_peer_state("approve-no-id-multiple-pending", || {
+            let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
+            let (first, _) = parked_revealed_inbound(now_epoch);
+            let pubkey_b = "b".repeat(64);
+            let outbound = sample_outbound_awaiting_approval("deadbeef", "http://box-b/", &pubkey_b);
+            aoide_storage::pairing::park_outbound(outbound).unwrap();
+
+            let out = handle_peer_pair_approve(&approve_inv_no_id(&[]));
+            assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{out:?}");
+            assert!(out.message.contains(&first.id), "{}", out.message);
+            assert!(out.message.contains("deadbeef"), "{}", out.message);
+            let ids = out.data.as_ref().and_then(|d| d.get("ids")).and_then(Value::as_array).cloned().unwrap_or_default();
+            assert_eq!(ids.len(), 2, "{out:?}");
+        });
+    }
+
+    /// `peer pending` (P-PV2, the User's locked spec point 3) NEVER shows
+    /// the SAS/pairing code — neither in the human message nor anywhere in
+    /// the JSON data — for an inbound OR an outbound row, whether revealed,
+    /// approved, or freshly parked. The code is read off the requester's
+    /// own screen and typed on the approver's; showing it here would defeat
+    /// that out-of-band comparison.
+    #[test]
+    fn peer_pending_never_carries_the_sas_code_inbound_or_outbound() {
+        with_peer_state("pending-no-sas", || {
+            let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
+            let (_inbound_entry, inbound_sas) = parked_revealed_inbound(now_epoch);
+            let pubkey_b = "b".repeat(64);
+            let outbound = sample_outbound_awaiting_approval("deadbeef", "http://box-b/", &pubkey_b);
+            let outbound_sas = aoide_storage::pairing::derive_sas(
+                &aoide_storage::identity::load_or_mint().unwrap().0.info().pubkey_hex,
+                &outbound.pubkey_hex,
+                &outbound.requester_nonce_hex,
+                &outbound.approver_nonce_hex,
+            );
+            aoide_storage::pairing::park_outbound(outbound).unwrap();
+
+            let out = handle_peer_pending(&Invocation {
+                path: vec!["peer".into(), "pending".into()],
+                args: vec![],
+                flags: Default::default(),
+                door: aoide_protocol::Door::Cli,
+            });
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
+
+            let rows = out.data.as_ref().unwrap()["requests"].as_array().unwrap();
+            assert_eq!(rows.len(), 2, "{rows:?}");
+            for row in rows {
+                assert!(row.get("sas").is_none(), "peer pending must never carry a `sas` field: {row}");
+            }
+
+            let rendered = serde_json::to_string(out.data.as_ref().unwrap()).unwrap();
+            assert!(!rendered.contains(&inbound_sas), "the inbound code must never appear in peer pending's data: {rendered}");
+            assert!(!rendered.contains(&outbound_sas), "the outbound code must never appear in peer pending's data: {rendered}");
+            assert!(!out.message.contains(&inbound_sas), "nor in its human message: {}", out.message);
+            assert!(!out.message.contains(&outbound_sas), "nor in its human message: {}", out.message);
+        });
+    }
+
+    /// `peer pair <target>` SMART TARGET dispatch (the User's locked spec,
+    /// point 1): a URL-shaped target (`"://"`) takes the EXPLICIT DIAL arm
+    /// — proven here by its own distinct failure shape (`fetch-failed`,
+    /// [`pair_via_url`]'s own reason, no sweep ever runs). A bare word
+    /// takes the HOSTNAME arm — proven by ITS distinct failure shape
+    /// (`no-match`, [`pair_via_hostname`]'s own reason, naming the sweep
+    /// window it actually ran) — never the url arm's reason, and vice
+    /// versa.
+    #[test]
+    fn peer_pair_smart_target_dispatches_url_and_hostname_to_different_arms() {
+        with_peer_state("smart-target-url-arm", || {
+            // Port 1 is reserved and never listened on in practice — an
+            // immediate, deterministic connection refusal, never a sweep.
+            let inv = Invocation {
+                path: vec!["peer".into(), "pair".into()],
+                args: vec!["http://127.0.0.1:1/".to_string()],
+                flags: Default::default(),
+                door: aoide_protocol::Door::Cli,
+            };
+            let out = handle_peer_pair(&inv);
+            assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
+            let reason = out.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str).unwrap_or("");
+            assert!(
+                matches!(reason, "fetch-failed" | "fetch-http-error" | "unparseable" | "refused" | "no-default-name" | "invalid-name"),
+                "a URL target must take the explicit-dial arm, never the sweep arm: {out:?}"
+            );
+        });
+
+        with_peer_state("smart-target-hostname-arm", || {
+            // `with_peer_state` already holds `crate::env_lock()` for its
+            // whole body — the SAME lock every real-sweep test in this
+            // module takes (its own doc, `run_sweep_hears_an_advertisement_
+            // sent_over_the_real_loopback_stack`'s doc in `discover.rs`); a
+            // second `.lock()` here on the same (non-reentrant) mutex, on
+            // the SAME thread, would deadlock rather than merely block.
+            let inv = Invocation {
+                path: vec!["peer".into(), "pair".into()],
+                args: vec!["nobody-is-advertising-this-name".to_string()],
+                flags: [("secs".to_string(), "1".to_string())].into_iter().collect(),
+                door: aoide_protocol::Door::Cli,
+            };
+            let out = handle_peer_pair(&inv);
+            assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
+            assert_eq!(
+                out.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str),
+                Some("no-match"),
+                "a bare hostname target must take the sweep arm and refuse with no-match: {out:?}"
+            );
+            assert!(out.message.contains("1s"), "the refusal names the sweep window actually used: {}", out.message);
+        });
+    }
+
+    /// `peer pair approve`/`reject`/`watch` are SUBCOMMANDS of `peer pair`
+    /// and WIN over a hostname positional of the same literal spelling
+    /// (the User's locked spec, point 4) — the registry's own greedy
+    /// longest-prefix match ([`aoide_protocol::door::parse`]) resolves
+    /// `aoide peer pair approve` to the 3-segment subcommand before it ever
+    /// considers the 2-segment `peer pair <target>` with `"approve"` riding
+    /// as the target; an ordinary hostname resolves to the smart-target
+    /// command instead, with the word riding as its positional arg. A box
+    /// literally named "approve" (or "reject"/"watch") therefore cannot be
+    /// paired by bare hostname — it needs the explicit URL form, which is
+    /// documented on `peer pair`'s own registered usage line.
+    #[test]
+    fn peer_pair_approve_reject_watch_subcommand_names_win_over_a_hostname_positional() {
+        let mut r = Registry::new();
+        register_peer_pair(&mut r);
+        register_peer_discovery(&mut r);
+        register_pair(&mut r);
+
+        for sub in ["approve", "reject", "watch"] {
+            let argv = vec!["peer".to_string(), "pair".to_string(), sub.to_string()];
+            let (inv, _json) = aoide_protocol::door::parse(&argv, aoide_protocol::Door::Cli, "aoide", &r)
+                .unwrap_or_else(|e| panic!("`peer pair {sub}` must parse as the subcommand: {e:?}"));
+            assert_eq!(inv.path, vec!["peer".to_string(), "pair".to_string(), sub.to_string()], "{sub} must resolve to the subcommand, not a hostname target");
+        }
+
+        // An ordinary hostname (no collision) resolves to the smart-target
+        // command, with the word riding as its own positional arg.
+        let argv = vec!["peer".to_string(), "pair".to_string(), "yomi-strix".to_string()];
+        let (inv, _json) = aoide_protocol::door::parse(&argv, aoide_protocol::Door::Cli, "aoide", &r).unwrap();
+        assert_eq!(inv.path, vec!["peer".to_string(), "pair".to_string()]);
+        assert_eq!(inv.args, vec!["yomi-strix".to_string()]);
     }
 }

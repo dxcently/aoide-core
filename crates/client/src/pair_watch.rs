@@ -21,8 +21,10 @@
 //! feed): [`parse_pair_line`] never carries a SAS, pubkey, nonce, or
 //! commitment — [`reconcile`] re-derives the SAS locally from THIS
 //! instance's own identity plus the parked/pending entry, exactly the
-//! arg order `handle_peer_pair_pending`
-//! (`aoide_client::commands`) already uses for each direction. A missed
+//! arg order `approve_inbound`/`approve_outbound`
+//! (`aoide_client::commands`) already use for each direction — `peer
+//! pending` itself carries no SAS at all (P-PV2, the User's locked spec).
+//! A missed
 //! or malformed line never strands a request: [`run`]'s 30s reconcile
 //! safety tick re-derives the actionable set from scratch on the same
 //! cadence `aoide_secrets::watch::Queue::reconcile` already holds.
@@ -46,8 +48,9 @@
 //! is built ONLY from a [`Pending`] `reconcile` itself produced, never from
 //! a [`PairEvent`]'s fields; (2) the SAS never crosses a socket, feed, or
 //! argv — [`reconcile`] derives it in-process and [`confirm_text`] embeds
-//! the resulting `String` directly into `--text`, the same way it already
-//! reaches a terminal via `peer pair pending`; (3) argv carries identifiers
+//! the resulting `String` directly into `--text` (this popup dialog IS
+//! this arm's own out-of-band confirmation — `peer pending` itself shows
+//! no code at all, P-PV2); (3) argv carries identifiers
 //! and display text only — [`spawn_pair_confirm`] never receives a code to
 //! type back; (4) nothing is ever executed on this instance's behalf by a
 //! dialog's own output — no `sh -c`, no shell interpolation; a hostile
@@ -181,7 +184,11 @@ pub fn narrate(event: &PairEvent) -> String {
             format!("  {}  parked      pairing request {id} from `{name}` ({origin_addr})", hms(*ts))
         }
         PairEvent::Revealed { id, name, ts } => {
-            format!("  {}  revealed    pairing request {id} from `{name}` \u{2014} run `aoide peer pair pending` for its code", hms(*ts))
+            format!(
+                "  {}  revealed    pairing request {id} from `{name}` \u{2014} run `aoide peer pair approve {id}` \
+                 and type the code read from the requester's own screen",
+                hms(*ts)
+            )
         }
         PairEvent::AwaitingConfirm { id, name, ts } => {
             format!("  {}  approved    `{name}` approved pairing {id} \u{2014} confirm with `aoide peer pair approve {id}`", hms(*ts))
@@ -231,11 +238,11 @@ pub struct Pending {
 /// Re-derive every pending pairing request directly from
 /// `aoide_storage::pairing::list_inbound`/`list_outbound` — the AUTHORITY
 /// (module doc), never the feed. SAS derivation uses the EXACT arg orders
-/// `handle_peer_pair_pending` (`aoide_client::commands`) already uses per
-/// direction (inbound: `(entry.pubkeyHex, own_pubkey, requester_nonce,
+/// `approve_inbound`/`approve_outbound` (`aoide_client::commands`) already
+/// use per direction (inbound: `(entry.pubkeyHex, own_pubkey, requester_nonce,
 /// entry.approverNonceHex)`; outbound: `(own_pubkey, entry.pubkeyHex,
 /// requester_nonce, approver_nonce)`) — a swap here would silently derive
-/// a DIFFERENT code than `peer pair pending`/`approve` show, which is
+/// a DIFFERENT code than `peer pair approve` shows, which is
 /// exactly what this module's own byte-equality test catches. An
 /// identity-load failure degrades to an empty list (best-effort,
 /// consistent with a watcher's own "can't answer this tick, try again
@@ -340,9 +347,9 @@ fn confirm_dialog(zenity_cmd: &str, title: &str, text: &str, should_cancel: impl
     run_entry_dialog(|| spawn_pair_confirm(zenity_cmd, title, text), REJECT_LABEL, should_cancel)
 }
 
-/// The dialog's title — pure, no more than `peer pair pending` already
-/// shows (module doc's structural rule 1): built ONLY from a [`Pending`]
-/// `reconcile` produced, never from a [`PairEvent`]'s own fields.
+/// The dialog's title — pure (module doc's structural rule 1): built ONLY
+/// from a [`Pending`] `reconcile` produced, never from a [`PairEvent`]'s
+/// own fields.
 fn confirm_title(p: &Pending) -> String {
     format!("aoide \u{b7} pairing with {}", p.name)
 }
@@ -350,10 +357,11 @@ fn confirm_title(p: &Pending) -> String {
 /// The dialog's body — pure, same sourcing rule as [`confirm_title`]. The
 /// SAS embeds directly (structural rule 2: it never crossed a socket,
 /// feed, or argv to get here — [`reconcile`] derived it in-process, this
-/// function only formats the `String` it already produced) — no more
-/// context than `peer pair pending`'s own row already shows for the same
-/// direction, and no fingerprint (`identity::fingerprint` is private; a
-/// CLI-first change would need to land before any dialog can show one).
+/// function only formats the `String` it already produced) — this dialog
+/// is the ONE place a pending SAS is ever shown for the popup arm (`peer
+/// pending` itself carries none, P-PV2), and no fingerprint
+/// (`identity::fingerprint` is private; a CLI-first change would need to
+/// land before any dialog can show one).
 fn confirm_text(p: &Pending) -> String {
     let sas = p.sas.as_deref().unwrap_or("");
     match p.direction.as_str() {
@@ -737,8 +745,14 @@ mod tests {
         out
     }
 
+    /// The swap-catcher: `reconcile`'s own SAS-derivation arg order must
+    /// stay byte-identical to `approve_inbound`'s (the AUTHORITATIVE
+    /// derivation an approver's own `peer pair approve` commits against) —
+    /// `peer pending` itself carries no SAS to compare against any more
+    /// (P-PV2, the User's locked spec), so this pins against the approve
+    /// path directly instead.
     #[test]
-    fn reconcile_derives_the_same_sas_handle_peer_pair_pending_prints() {
+    fn reconcile_derives_the_same_sas_approve_inbound_would() {
         with_peer_state("swap-catcher", || {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             aoide_storage::pairing::park_inbound(
@@ -755,18 +769,21 @@ mod tests {
             let id = aoide_storage::pairing::list_inbound(now_epoch)[0].id.clone();
             aoide_storage::pairing::reveal_inbound(&id, &"c".repeat(32), now_epoch).unwrap();
 
-            let inv = aoide_protocol::Invocation {
-                path: vec!["peer".to_string(), "pair".to_string(), "pending".to_string()],
-                args: Vec::new(),
-                flags: Default::default(),
-                door: aoide_protocol::Door::Cli,
-            };
-            let outcome = crate::commands::handle_peer_pair_pending(&inv);
-            let expected_sas = outcome.data.as_ref().unwrap()["requests"][0]["sas"].as_str().unwrap().to_string();
+            let entry = aoide_storage::pairing::list_inbound(now_epoch).into_iter().find(|e| e.id == id).unwrap();
+            let (kp, _) = aoide_storage::identity::load_or_mint().unwrap();
+            let own_pubkey = kp.info().pubkey_hex;
+            // The exact arg order `approve_inbound` (`aoide_client::commands`)
+            // derives its own SAS with.
+            let expected_sas = aoide_storage::pairing::derive_sas(
+                &entry.pubkey_hex,
+                &own_pubkey,
+                entry.requester_nonce_hex.as_deref().unwrap(),
+                &entry.approver_nonce_hex,
+            );
 
             let pending = reconcile(now_epoch);
             assert_eq!(pending.len(), 1);
-            assert_eq!(pending[0].sas.as_deref(), Some(expected_sas.as_str()), "reconcile must derive the BYTE-IDENTICAL code `peer pair pending` shows");
+            assert_eq!(pending[0].sas.as_deref(), Some(expected_sas.as_str()), "reconcile must derive the BYTE-IDENTICAL code approve_inbound would");
         });
     }
 

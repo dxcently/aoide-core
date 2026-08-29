@@ -104,10 +104,10 @@ never the inbound/serve half (that's `aoide-server`).
   env/hostname only) and the self-heard broadcast arrives on the
   physical interface, so such a self-invite proceeds — confusion, not
   compromise; the SAS ceremony backstops it. `resolve_invite_target(heard, name)` is the same
-  shape one layer up: `peer invite`'s zero/one/many-match resolution
-  against an already-swept result, also pure, and returns the whole
-  `Heard` so `src_addr` reaches `peer invite` for free. Three consumers
-  drive `run_sweep`: `handle_peer_discover`, `handle_peer_invite`, and
+  shape one layer up: `peer pair`'s hostname arm's zero/one/many-match
+  resolution against an already-swept result, also pure, and returns the
+  whole `Heard` so `src_addr` reaches that arm for free. Three consumers
+  drive `run_sweep`: `handle_peer_discover`, `pair_via_hostname`, and
   `aoide-conduct::graph`'s `peer list` (task #120 P2 — one ~2s sweep
   merged into the mesh roster's advertising marks and `◆` candidate
   rows; `is_self_target` is its self-row guard too), all read-only,
@@ -228,7 +228,7 @@ never the inbound/serve half (that's `aoide-server`).
   `via_override: None` wrapper so `aoide-conduct`'s existing call site
   needs no change. `--via` (`ssh://[user@]host[:port]`,
   `aoide_storage::tunnel::parse_via`) is a FLAG on `peer.add`/
-  `peer.invite`/`peer.pair.request`/`peer.spawn` — never a new command
+  `peer.pair`/`peer.spawn` — never a new command
   path — parsed by the shared `parse_via_flag` (absent is `None`,
   malformed is a usage error, the same `parse_secs_flag` stance).
   **`peer add`'s AgentCard verification (its ONE network call) dials
@@ -275,8 +275,9 @@ never the inbound/serve half (that's `aoide-server`).
   by construction and never rides Loopback's trust, so tunneled delivery is
   safe against a real, non-autogate peer, not merely possible.
 - `commands` — this crate's CLI commands:
-  `peer add/remove/pull/status/hub/allow/spawn/discover/invite`,
-  `peer pair request/pending/approve/reject` (P-P2, CONTRACTS.md §6/§7 —
+  `peer add/remove/pull/status/hub/allow/spawn/discover`,
+  `peer pair/pending` + `peer pair approve/reject/watch` (P-P2, P-PV2,
+  CONTRACTS.md §6/§7 —
   `handle_peer_allow` (`peer allow <name> <cap> on|off`, P-P3, `docs/
   architecture/PAIRING.md` decision 5) is a thin wire around
   `aoide_storage::peer_store::set_peer_allow` — idempotent, refuses an
@@ -288,7 +289,9 @@ never the inbound/serve half (that's `aoide-server`).
   `aoide_protocol::pick::confirm` (ONBOARD.md's prompt substrate section,
   P-I1) rather than a hand-rolled stdin read — `inquire::Confirm` on a tty,
   the identical `y/N` stdin read otherwise; the question text is unchanged,
-  `confirm` owns the `[y/N]` decoration now). `handle_peer_pair_request` sends
+  `confirm` owns the `[y/N]` decoration now). `pair_via_url`/`pair_via_hostname`
+  (the SMART TARGET dispatch of `peer pair <target>`'s two arms, P-PV2)
+  both bottom out in `run_pair_request`, which sends
   the commitment and its reveal as two sequential POSTs in one invocation
   before ever computing a SAS. `handle_peer_pair_approve`
   dispatches by direction (Design A, task #119 — REPLACES the old
@@ -357,7 +360,8 @@ never the inbound/serve half (that's `aoide-server`).
   AUTHORITY — the feed line is only ever a trigger to re-check them,
   mirroring `aoide_secrets::watch`'s identical "tail is a trigger" stance
   for its own feed), using the EXACT SAS arg order per direction
-  `handle_peer_pair_pending` above already uses; `actionable` decides
+  `approve_inbound`/`approve_outbound` above already use — `peer pending`
+  itself carries no SAS at all, P-PV2; `actionable` decides
   whether a `Pending` is worth surfacing (an inbound entry once revealed,
   an outbound entry once `awaiting-confirm`); `run` is the blocking
   tail/reconcile loop (`aoide_secrets::watch::wait_for_follower`'s exact
@@ -386,15 +390,15 @@ never the inbound/serve half (that's `aoide-server`).
   stance `aoide_secrets::watch::popup_loop` already holds).
   `confirm_title`/`confirm_text` are pure and read ONLY from a `Pending`
   `reconcile` already produced — never a `PairEvent`'s own feed-sourced
-  fields — and show no more than `peer pair pending` already prints (no
-  fingerprint).
+  fields — and are the ONE place a pending SAS is ever shown for the popup
+  arm (`peer pending` itself carries none, P-PV2; no fingerprint).
   **`run_pair_request(cmd, url, name, self_url, self_via, dial_via,
   record_via)` (P-P6, `dial_via`/`record_via` added P-S4, `self_via` added
-  P-PV1/task #131) is `handle_peer_pair_request`'s own body, extracted so
-  `peer invite` reaches it too — reused, never copied.**
-  `handle_peer_pair_request` still owns every bit of
+  P-PV1/task #131) is `pair_via_url`'s own body, extracted so
+  `pair_via_hostname` reaches it too — reused, never copied.**
+  `pair_via_url` still owns every bit of
   `<url>`/`--name`/`--self-url`/`--self-via`/`--via` parsing and the
-  `valid_peer_name` check (a CLI-typed name needs it); `handle_peer_invite`
+  `valid_peer_name` check (a CLI-typed name needs it); `pair_via_hostname`
   calls straight into `run_pair_request` with a `name` already lifted off
   an already-validated, already-confirmed discovery advertisement, needing
   no second name check, and a `url` composed from the OBSERVED
@@ -403,8 +407,13 @@ never the inbound/serve half (that's `aoide-server`).
   #120) — that composition, plus the `dial_via`/`record_via` derivation
   below, lives in `resolve_pair_vias(hit, via_flag)` (pure, unit-tested
   with no dial), called from `pair_with_heard(cmd, hit, via_flag,
-  self_via_flag)`, the settled-target tail `handle_peer_invite` and bare
+  self_via_flag)`, the settled-target tail `pair_via_hostname` and bare
   `pair`'s picker (below) both call so neither ever forks the ceremony.
+  `handle_peer_pair(inv)` is the ONE registered entry point (P-PV2, the
+  User's locked spec) — SMART TARGET dispatch on the first positional arg
+  (`"://"` present → `pair_via_url`, else → `pair_via_hostname`), never a
+  second command path; `peer invite`/`peer pair request` died outright,
+  hard cutover, no aliases.
   `dial_via`/`record_via` are related but distinct: `record_via` is
   UNCONDITIONAL — the advertisement's observed address plus its claimed
   login, string-rendered via `default_via`, even when that login is empty
@@ -439,11 +448,11 @@ never the inbound/serve half (that's `aoide-server`).
   at — falling back to the claimed hostname only when that lookup itself
   fails. `toward` is the address actually being dialed: `pair_with_heard`
   passes `hit.src_addr` (the observed source, already the real target);
-  `handle_peer_pair_request` passes `via`'s own host when dialing through
+  `pair_via_url` passes `via`'s own host when dialing through
   a tunnel (the ssh target, not the logical `url`, which the tunnel may
   make unreachable directly), else the `url`'s own host.
-  `handle_peer_discover`/`handle_peer_invite` (`peer
-  discover [--secs N]`/`peer invite <name> [--secs N] [--yes]`) are thin
+  `handle_peer_discover`/`pair_via_hostname` (`peer
+  discover [--secs N]`/`peer pair <name> [--secs N] [--yes]`) are thin
   wrappers around `discover::run_sweep`/`discover::resolve_invite_target`
   above — `confirm_invite` is this pair's own local helper, still the
   original hand-rolled `y/N` stdin read `confirm_sas`/`confirm_spawn` used
@@ -451,7 +460,7 @@ never the inbound/serve half (that's `aoide-server`).
   above — out of that phase's own scope, not an oversight; it shows both
   the advertisement's claimed ssh hop and its observed `src_addr` side
   by side, so an operator sees claim and observation before anything
-  dials. `handle_peer_invite` refuses before dialing anything when
+  dials. `pair_via_hostname` refuses before dialing anything when
   `discover::is_self_target` says the resolved target is this instance's
   own advertisement — `peer discover`'s own JSON `heard` rows carry
   `srcAddr` alongside the claimed fields for the same reason.
@@ -469,7 +478,7 @@ never the inbound/serve half (that's `aoide-server`).
   then `pick::choose` over rows rendering the already-validated claim
   beside the observed source — the picked row IS the proceed-confirmation
   and goes straight through `pair_with_heard`; hearing nothing teaches
-  `peer advertise on` and the manual `peer pair request <url>` path.
+  `peer advertise on` and the manual `peer pair <url>` path.
   `adapter melete` (`peer hub
   <name> [--clear]`, P-D5, designates at most one registered peer as the
   hub `aoide_storage::addr::resolve_with_hub` prefers as a last-resort

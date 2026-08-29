@@ -175,7 +175,7 @@
   `approve_outbound` (this instance is the REQUESTER) is the one that
   now makes a wire call, when its entry is still `AwaitingApproval`: it
   POSTs a SIGNED `aoide/pairPoll` to the approver's door (over the SAME
-  forward dial `handle_peer_pair_request` already used — `entry.via` if one
+  forward dial `run_pair_request` already used — `entry.via` if one
   was recorded), and ONLY on an `approved` response does it call
   `mark_outbound_awaiting_confirm` (rejecting a released pubkey that
   doesn't match what this instance learned at request time — the
@@ -190,7 +190,7 @@
   (`aoide_storage::pairing::derive_sas`) on EITHER path — never trusted
   from anything the wire carries, since the entire point of the ceremony
   is a code neither side can spoof to the other.
-- **`handle_peer_pair_request` sends the commitment and the reveal as TWO
+- **`run_pair_request` sends the commitment and the reveal as TWO
   sequential POSTs inside ONE invocation (P-P2) — never split
   across two separate CLI calls.** It mints its own nonce locally, POSTs
   `build_pair_request_body` carrying only `derive_commit(pubkey, nonce)`
@@ -198,7 +198,8 @@
   POSTs `build_pair_reveal_body(id, nonce)` to the SAME door before ever
   computing or printing a SAS — a reveal that fails (unreachable,
   HTTP error, or the peer refusing with a commitment mismatch) fails the
-  whole `peer pair request` call; nothing is parked as a usable outbound
+  whole `peer pair` call (either arm — `pair_via_url`/`pair_via_hostname`,
+  P-PV2, both call this one core); nothing is parked as a usable outbound
   entry with an unrevealed commitment on this side, since this side chose
   the nonce and always has it.
 - **`handle_peer_pair_reject` tries the inbound queue, THEN the outbound
@@ -218,8 +219,10 @@
   never echoes the SAS (task #120 P3).** `approve_inbound`'s prompt and
   mismatch messages name the code's SHAPE (`NNN-NNN`), never its value —
   printing the expected code beside the input would collapse the
-  out-of-band comparison into a copy exercise (`peer pair pending` still
-  shows it; the threat model is the comparison, not secrecy). A wrong
+  out-of-band comparison into a copy exercise (`peer pending` shows NO
+  code at all, P-PV2 — the threat model is the comparison, not secrecy,
+  but a listing either operator can glance at defeats it just the same
+  as an echoed prompt would). A wrong
   code — interactive or `--code` — persists ONE cumulative try
   (`aoide_storage::pairing::record_inbound_code_try`); the third
   cumulative mismatch auto-denies (`auto_deny_inbound`: `take_inbound`,
@@ -237,13 +240,18 @@
   — a reject was never confirmation-gated (module doc above: "a clean
   refusal"), so there is nothing for a caller to skip.
 - **`pair_watch::reconcile` is a SEPARATE, independent re-implementation
-  of the SAS-deriving loop `handle_peer_pair_pending` already has —
-  not a shared helper, DELIBERATELY (P-P5).** The two arg orders
+  of the SAS-deriving arg orders `approve_inbound`/`approve_outbound`
+  hold — not a shared helper, DELIBERATELY (P-P5).** `peer pending`
+  itself carries NO SAS at all (P-PV2, the User's locked spec) — the
+  code is read off the requester's own screen and typed on the
+  approver's, never shown in a listing either operator could just glance
+  at — so `reconcile`'s own swap-catcher pins against the APPROVE path's
+  derivation instead. The two arg orders
   (inbound: `(entry.pubkeyHex, own_pubkey, requester_nonce,
   entry.approverNonceHex)`; outbound: `(own_pubkey, entry.pubkeyHex,
   requester_nonce, approver_nonce)`) are asymmetric and easy to swap by
   accident — `pair_watch`'s own byte-equality test
-  (`reconcile_derives_the_same_sas_handle_peer_pair_pending_prints`) is
+  (`reconcile_derives_the_same_sas_approve_inbound_would`) is
   what catches a swap in EITHER copy, but it can only do that because the
   two copies are independent; collapsing them into one shared function
   would make that test tautological (it would just be comparing a value
@@ -276,48 +284,51 @@
   never `aoide_protocol::dialog::DISMISS_LABEL` — `run_entry_dialog`
   takes its dismiss label as a parameter specifically so two ceremonies
   sharing the loop can each pass their own.
-- **`run_pair_request` (P-P6) is the ONLY body of `handle_peer_pair_request`
+- **`run_pair_request` (P-P6) is the ONLY body of `pair_via_url`
   past its own `<url>`/`--name`/`--self-url`/`--self-via` parsing, and
-  `handle_peer_invite` and bare `pair` (`handle_pair`, task #120 P3) reach
+  `pair_via_hostname` and bare `pair` (`handle_pair`, task #120 P3) reach
   the SAME function — never a second copy — through `pair_with_heard`, the
   shared settled-target tail (dial-URL composition off the OBSERVED
   source, `resolve_pair_vias`'s `dial_via`/`record_via` derivation, task
-  #131).** Don't reintroduce K1's old split where only `record_via` got
+  #131). `handle_peer_pair` (P-PV2, the User's locked spec) is the ONE
+  registered entry point over both arms — SMART TARGET dispatch on the
+  first positional arg's shape (`"://"` → `pair_via_url`, else →
+  `pair_via_hostname`), never a second command path.** Don't reintroduce
+  K1's old split where only `record_via` got
   the observed-address default and `dial_via` stayed `None` by default —
   a loopback-only door (the case task #131 exists for) is simply
   undialable that way; `resolve_pair_vias` is the ONE place both are
   derived, unit-tested directly (no dial, no tempdir), so a future change
   to that derivation touches one pure function, never two call sites that
-  could drift. `peer invite`'s own doc
-  and CONTRACTS.md §6's "Discovery advertisement" subsection both promise `peer
-  invite` "runs the ceremony," and this is what makes that literally true
-  rather than aspirational: a future change to the ceremony's wire calls,
-  its outbound-parking shape, or its SAS derivation touches ONE function
-  and every caller inherits it identically. `handle_pair` holds bare
-  `session`'s exact door discipline — CLI + real tty
-  (`pick::interactive`) or a taught refusal naming the scripted
-  spellings, never a read from a stdin nobody is typing into — and
-  filters self-advertisements (`is_self_target`) BEFORE the menu renders,
-  so picking a row can stand as the proceed-confirmation without a
-  second y/N. `run_pair_request` does NOT
+  could drift. CONTRACTS.md §6's "Discovery advertisement" subsection
+  promises `peer pair`'s hostname arm "runs the ceremony," and this is
+  what makes that literally true rather than aspirational: a future
+  change to the ceremony's wire calls, its outbound-parking shape, or its
+  SAS derivation touches ONE function and every caller inherits it
+  identically. `handle_pair` holds bare `session`'s exact door
+  discipline — CLI + real tty (`pick::interactive`) or a taught refusal
+  naming the scripted spellings, never a read from a stdin nobody is
+  typing into — and filters self-advertisements (`is_self_target`)
+  BEFORE the menu renders, so picking a row can stand as the
+  proceed-confirmation without a second y/N. `run_pair_request` does NOT
   re-validate its `name` argument (`valid_peer_name`) — that check stays in
-  `handle_peer_pair_request` alone, since only a CLI-typed `--name` needs
-  it; `handle_peer_invite`'s `name` already came off an advertisement
+  `pair_via_url` alone, since only a CLI-typed `--name` needs
+  it; `pair_via_hostname`'s `name` already came off an advertisement
   `aoide_storage::advertise::parse_and_validate` validated before it was
   ever displayed. Don't move the `valid_peer_name` check INTO `run_pair_request`
   "for symmetry" — it would just re-run a check that has already passed on
-  the invite path, for no benefit, and would misattribute a `peer.invite`
-  usage error to a check that only ever fires for the OTHER caller in
+  the hostname arm, for no benefit, and would misattribute a `peer.pair`
+  usage error to a check that only ever fires for the OTHER arm in
   practice.
 - **`discover`'s `run_sweep`/`resolve_invite_target` never touch
-  `peer_store` for writing, and `handle_peer_discover`/`handle_peer_invite`
+  `peer_store` for writing, and `handle_peer_discover`/`pair_via_hostname`
   must not either (P-P6) — nor may `run_sweep`'s cross-crate consumer,
   `aoide-conduct::graph`'s `peer list` (task #120 P2).** Discovery grants
   nothing
   (`docs/architecture/PAIRING.md`'s "Discovery (advertise-but-locked)"
   section) — the only peer-record write path in this crate is, and stays,
   `run_pair_request`'s `park_outbound` plus `handle_peer_pair_approve`'s
-  `upsert_paired_peer` calls. A future `peer discover`/`peer invite` edit
+  `upsert_paired_peer` calls. A future `peer discover`/`peer pair` edit
   that seems to want a registry write (e.g. "remember what was last
   discovered") belongs in a NEW, explicitly-named cache, never folded into
   `state/peers.json` itself.
@@ -326,7 +337,7 @@
   `host`/`user` are whatever the advertiser put on the wire; `src_addr`
   is the UDP packet's actual source IP, captured by THIS process's own
   socket, never sent by the advertiser and never believed to be anything
-  but what was measured. Everything that dials — `handle_peer_invite`'s
+  but what was measured. Everything that dials — `pair_via_hostname`'s
   composed target, the K1 default `via` — takes its ADDRESS from
   `src_addr`; the claimed `user` rides along only as the ssh login, and
   the claimed `host` is display-only. `Advertisement` itself never grows
@@ -439,19 +450,19 @@
   signature-rung autogate restoring delivery for a peer the operator
   already marked auto-deliver. `--via`/`Peer.via` are safe to recommend for
   a real cross-box pair.
-- **The self-invite guard (`discover::is_self_target`) runs BEFORE the
-  proceed-confirm and BEFORE the ceremony, in `handle_peer_invite`, never
+- **The self-pair guard (`discover::is_self_target`) runs BEFORE the
+  proceed-confirm and BEFORE the ceremony, in `pair_via_hostname`, never
   inside `run_pair_request` (P-S1).** `run_pair_request` is shared with
-  `handle_peer_pair_request`, whose `<url>` a human typed and is entitled
+  `pair_via_url`, whose `<url>` a human typed and is entitled
   to point at their own door on purpose (loopback testing, a self-pair
-  smoke test); only the DISCOVERED path needs the "you just invited
-  yourself" refusal, because only there does the target come from an
-  automated resolution the operator didn't type by hand. Known gap: the
-  guard's `own_name` is env/hostname-tier only, so a serve advertising
-  under a custom `--peer-name` FLAG escapes the name arm while the
-  self-heard broadcast arrives on the physical interface (missing the
-  loopback arm) — such an invite dials this box's own door; the SAS
-  ceremony backstops it (both codes land in front of one operator).
+  smoke test); only the DISCOVERED (hostname) arm needs the "you just
+  tried to pair with yourself" refusal, because only there does the
+  target come from an automated resolution the operator didn't type by
+  hand. Known gap: the guard's `own_name` is env/hostname-tier only, so a
+  serve advertising under a custom `--peer-name` FLAG escapes the name
+  arm while the self-heard broadcast arrives on the physical interface
+  (missing the loopback arm) — such a pair dials this box's own door; the
+  SAS ceremony backstops it (both codes land in front of one operator).
 
 ## Extension points
 

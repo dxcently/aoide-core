@@ -193,8 +193,8 @@ pub fn describe_sweep_error(e: &std::io::Error) -> String {
     }
 }
 
-/// Why `peer invite <name>` can't proceed straight to the ceremony —
-/// mirrors the shape `handle_peer_pair_request`'s own refusals already
+/// Why `peer pair <hostname>` can't proceed straight to the ceremony —
+/// mirrors the shape `pair_via_url`'s own refusals already
 /// take (a reason string plus the taught detail), kept as a typed enum
 /// here so the command handler builds the exact `Outcome` shape without
 /// re-deriving the message text in two places.
