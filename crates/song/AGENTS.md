@@ -46,6 +46,20 @@
 - **Staging/draft/declarative-mode gating lives in `commands`, not here.**
   `rice stage`/`cover set` refuse outside an unlocked mode — that gate is a
   `commands` concern layered over these pure/near-pure engine modules.
+- **`health.rs` is a second liveness mechanism, deliberately — not a
+  violation of `aoide-conduct`'s "don't add a second liveness mechanism"
+  rule.** That rule (`pkgs/aoide/crates/conduct/AGENTS.md`) guards ONE
+  domain: a killed terminal's PROCESS liveness, owned entirely by `reap`.
+  `health.rs` watches a different failure class with nothing in common but
+  the word "liveness" — a quickshell process that is very much alive (no
+  crash, no exit) but has silently lost its Wayland output and rendered
+  onto Qt's internal placeholder screen. Different subject (screen
+  attachment, not a session), different predicate (a journal placeholder-
+  screen line AND a live `hyprctl layers` zero-surface reading, not a pid/
+  window-address probe), different crate (`lyra`-only, vs `conduct`'s
+  core-only `reap`). Don't fold this into `reap` or generalize `reap` to
+  cover it — the two mechanisms check unrelated things on unrelated
+  subjects, and merging them would only muddy both.
 - **`elements::seed_tree` takes explicit paths and touches no global
   state — `elements::seed_song` is the only env-resolving wrapper around
   it.** Every other elements test exercises `seed_tree`/`render_files`/

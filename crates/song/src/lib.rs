@@ -14,6 +14,7 @@ pub mod commands;
 pub mod compose;
 pub mod cover;
 pub mod elements;
+pub mod health;
 pub mod ipc;
 pub mod live;
 pub mod livery;

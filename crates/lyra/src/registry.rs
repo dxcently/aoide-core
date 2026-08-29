@@ -4,10 +4,11 @@
 //!
 //! Golden snapshot: the sorted list of every command path lyra registers.
 //! Mirrors `aoide-cli`'s `registry.rs` test module — same invariant checks,
-//! lyra's own 47-path bundle (P-A4 minted 42; P-I3's `onboard` took it to
+//! lyra's own 48-path bundle (P-A4 minted 42; P-I3's `onboard` took it to
 //! 43; P3's `secrets ask` took it to 44; L-E1's `element seed` took it to
 //! 45; P-PV3's `pair ask` took it to 46, then its own revert's `pair
-//! confirm` took it to 47 — see `commands/mod.rs::all()` for the assembly
+//! confirm` took it to 47; `quickshell healthcheck` — the placeholder-screen
+//! watchdog — took it to 48 — see `commands/mod.rs::all()` for the assembly
 //! order).
 
 pub use aoide_protocol::registry::*;
@@ -83,6 +84,7 @@ mod tests {
             "onboard",
             "pair.ask",
             "pair.confirm",
+            "quickshell.healthcheck",
             "quickshell.reload",
             "rice.back",
             "rice.compose",
@@ -123,6 +125,6 @@ mod tests {
         expected.sort();
 
         assert_eq!(got, expected, "command path set drifted from lyra's golden snapshot");
-        assert_eq!(got.len(), 47, "lyra's golden path count");
+        assert_eq!(got.len(), 48, "lyra's golden path count");
     }
 }

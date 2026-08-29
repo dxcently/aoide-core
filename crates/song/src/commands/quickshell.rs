@@ -28,6 +28,15 @@ pub fn register(r: &mut Registry) {
         implemented: true,
         handler: handle_quickshell_reload,
     ));
+    r.insert(cmd!(
+        path: ["quickshell", "healthcheck"],
+        summary: "Detect and recover the placeholder-screen lockup: aoide-quickshell.service alive but rendered onto Qt's internal placeholder screen after a transient output blip, with zero layer-shell surfaces on the real monitor. Restarts the service to reattach; withholds and notifies after repeated triggers in a short window. Meant to run off a systemd timer, not interactively.",
+        args: [],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_quickshell_healthcheck,
+    ));
 }
 
 /// `quickshell reload` — best-effort, always `Outcome::ok` regardless of
@@ -38,6 +47,16 @@ fn handle_quickshell_reload(_inv: &Invocation) -> Outcome {
     let status = crate::ipc::quickshell_ipc_reload();
     Outcome::ok("quickshell.reload", status.message())
         .with_data(json!({ "status": status.tag() }))
+}
+
+/// `quickshell healthcheck` — best-effort, always `Outcome::ok`: whether
+/// nothing was wrong, a restart was fired, or a restart was withheld under
+/// backoff are all reported facts, not command failures (same posture as
+/// `handle_quickshell_reload` above).
+fn handle_quickshell_healthcheck(_inv: &Invocation) -> Outcome {
+    let outcome = crate::health::run_healthcheck();
+    Outcome::ok("quickshell.healthcheck", outcome.message())
+        .with_data(json!({ "status": outcome.tag() }))
 }
 
 #[cfg(test)]
