@@ -1680,10 +1680,20 @@ fn emit_pairing_event(kind: &str, payload: Value) {
 /// never the nonce itself — module doc on `aoide_storage::pairing`, the
 /// commit-then-reveal fix), and its own advertised A2A door URL (recorded
 /// for the resulting peer record's own future non-ceremony calls — Design A,
-/// task #119: the ceremony's own completion no longer dials this URL).
-/// THIS instance (box B)
-/// parks it ([`aoide_storage::pairing::park_inbound`], cap-checked — a
-/// full queue is `-32000`, review-bounce Finding 3) and answers
+/// task #119: the ceremony's own completion no longer dials this URL) —
+/// PLUS an OPTIONAL `selfVia` (P-PV1, task #131): A's own self-asserted
+/// `ssh://[user@]host` reach-back hop claim, carried alongside `url` for
+/// exactly the case where A's door is loopback-only and reached through a
+/// tunnel — B, dialed over that tunnel, can only ever OBSERVE the
+/// connection arriving from loopback, so nothing about the connection
+/// itself can answer "how do I dial A back"; `selfVia` is A's own claim of
+/// that answer (same trust class as `url` — self-asserted data, a
+/// transport marker only; trust stays in pubkeys + SAS). Absent on an old
+/// requester, or when A has no such claim to make. THIS instance (box B)
+/// parks it whole, `selfVia` included ([`aoide_storage::pairing::
+/// park_inbound`], cap-checked — a full queue is `-32000`, review-bounce
+/// Finding 3), for its own LATER `peer pair approve` commit to read
+/// (`aoide-client::commands::approve_inbound`'s own doc), and answers
 /// SYNCHRONOUSLY with its OWN public key and a freshly-minted nonce —
 /// public material, same "freely shown" stance `docs/architecture/
 /// PAIRING.md`'s "Identity" section already states for `aoide identity`,
@@ -1703,6 +1713,12 @@ fn pair_request(params: &Value, origin: PeerOrigin, audit_log: &Path) -> Result<
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let commit_hex = params.get("commitHex").and_then(Value::as_str).unwrap_or("");
     let url = params.get("url").and_then(Value::as_str).unwrap_or("");
+    // OPTIONAL (P-PV1, task #131) — an old requester's body carries no
+    // `selfVia` key at all, and any shape that isn't a non-empty string
+    // (absent, wrong type, empty) collapses to `None` the same way: this
+    // field is never load-bearing enough to refuse a pairing request over,
+    // only to enrich the approver's eventual commit when present.
+    let self_via = params.get("selfVia").and_then(Value::as_str).filter(|s| !s.is_empty());
 
     if !valid_pubkey_hex(pubkey_hex) {
         return Err((-32602, "invalid params: pubkeyHex must be 64 hex characters".to_string()));
@@ -1736,6 +1752,7 @@ fn pair_request(params: &Value, origin: PeerOrigin, audit_log: &Path) -> Result<
         commit_hex,
         &requested_at,
         &expires_at,
+        self_via,
     )
     .map_err(|e| (-32000_i64, e))?;
 
@@ -7294,6 +7311,7 @@ mod tests {
         let entry = aoide_storage::pairing::park_inbound(
             &requester_pubkey, "box-a", "10.0.0.5", "http://box-a:8710/", &commit, &now,
             &aoide_storage::pairing::expires_at_from(now_epoch),
+            None,
         )
         .unwrap();
         aoide_storage::pairing::reveal_inbound(&entry.id, &"c".repeat(32), now_epoch).unwrap();
@@ -7364,6 +7382,7 @@ mod tests {
         let entry = aoide_storage::pairing::park_inbound(
             &requester_pubkey, "box-a", "10.0.0.5", "http://box-a:8710/", &commit, &now,
             &aoide_storage::pairing::expires_at_from(now_epoch),
+            None,
         )
         .unwrap();
         aoide_storage::pairing::reveal_inbound(&entry.id, &"c".repeat(32), now_epoch).unwrap();

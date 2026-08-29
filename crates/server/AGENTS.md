@@ -203,9 +203,15 @@
   none exists yet — gating either on an existing credential would be
   circular. What keeps this safe: a parked/revealed/approved request
   grants NOTHING by itself (no `allows`, no spawn/bearer gate, P-P3's lane
-  untouched), every field is validated BEFORE anything is parked or
-  resolved (`valid_pubkey_hex`/`valid_nonce_hex`/`valid_commit_hex`/
-  `valid_peer_name`/`valid_peer_url`), the commitment check
+  untouched), every REQUIRED field is validated BEFORE anything is parked
+  or resolved (`valid_pubkey_hex`/`valid_nonce_hex`/`valid_commit_hex`/
+  `valid_peer_name`/`valid_peer_url`) — `selfVia` (task #131) is the one
+  deliberate exception: OPTIONAL, and read with no validator at all
+  (absent/wrong-type/empty all fold to `None`), since it is never
+  load-bearing enough to refuse the whole request over; don't add one "for
+  consistency" — a malformed claim is `approve_inbound`'s problem alone,
+  much later, the same as a malformed `Peer.via` anywhere else. The
+  commitment check
   (`aoide_storage::pairing::reveal_inbound`) binds a reveal to its own
   earlier request with no signature needed yet (an active MITM cannot
   force a shared SAS by choosing its own values after seeing the real

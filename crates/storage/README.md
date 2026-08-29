@@ -182,10 +182,22 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   so it is never approvable.
   `OutboundPairingRequest.via` (P-S4, additive, `#[serde(default)]`) carries
   the ssh-transport marker THIS instance resolved at request time (an
-  explicit `--via`, or `peer invite`'s src_addr-derived default) forward to
+  explicit `--via`, or `peer invite`/bare `pair`'s src_addr-derived
+  default) forward to
   the SEPARATE, later `peer pair approve` invocation that actually commits
   the peer record — the only place that commit happens, so the value has
   nowhere else to ride between the two.
+  `InboundPairingRequest.self_via` (task #131, additive, `#[serde(default,
+  skip_serializing_if = "Option::is_none")]`) is the mirror image on the
+  APPROVER'S side: the requester's own OPTIONAL `selfVia` claim off
+  `aoide/pairRequest`'s wire params, carried through `park_inbound` with no
+  validation here (never eagerly parsed — only ever consumed, later, at
+  `peer pair approve`'s own commit, same as any other recorded `via`
+  string). It exists for the same reason `OutboundPairingRequest.via`
+  does, from the OTHER direction: a request that reaches the approver over
+  the requester's own ssh tunnel arrives, as far as the approver can
+  observe, from loopback, so `origin_addr` (§0.7) is never a usable source
+  for a working `via` — the requester has to claim one itself.
 - `mode` — the staging/declarative mode marker, read by `shellbridge`
   (which stays in `conduct`, see that crate's charter-smudge note).
 - `ledger` — the durable, append-only session HISTORY (`state/

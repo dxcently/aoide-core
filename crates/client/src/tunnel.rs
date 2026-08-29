@@ -403,14 +403,12 @@ fn open_timeout_secs() -> u64 {
 
 // ── the real ssh child ──────────────────────────────────────────────────
 
-/// `via`'s ssh login: its own `user` segment when present, else `$USER`,
-/// else `$LOGNAME`, else a taught refusal — never a guessed literal
-/// (the ssh-transport plan's K4; no new env knob, `--via user@host`
-/// already covers the override).
-fn resolve_login(via: &Via) -> Result<String, String> {
-    if let Some(u) = &via.user {
-        return Ok(u.clone());
-    }
+/// This box's own login: `$USER`, else `$LOGNAME`, else `Err` — the
+/// env-only half of [`resolve_login`]'s chain, pulled out so a caller with
+/// no `Via` at hand (`commands::default_self_via`, the pairing wire's own
+/// reach-back hop claim) can reuse the identical fallback instead of
+/// re-deriving it.
+pub(crate) fn local_login() -> Result<String, String> {
     if let Ok(u) = std::env::var("USER") {
         if !u.trim().is_empty() {
             return Ok(u);
@@ -421,9 +419,20 @@ fn resolve_login(via: &Via) -> Result<String, String> {
             return Ok(u);
         }
     }
-    Err(format!(
-        "no ssh login for `{via}` — neither $USER nor $LOGNAME is set; pass an explicit --via user@host"
-    ))
+    Err("neither $USER nor $LOGNAME is set".to_string())
+}
+
+/// `via`'s ssh login: its own `user` segment when present, else
+/// [`local_login`]'s `$USER`/`$LOGNAME` chain, else a taught refusal —
+/// never a guessed literal (the ssh-transport plan's K4; no new env knob,
+/// `--via user@host` already covers the override).
+fn resolve_login(via: &Via) -> Result<String, String> {
+    if let Some(u) = &via.user {
+        return Ok(u.clone());
+    }
+    local_login().map_err(|_| {
+        format!("no ssh login for `{via}` — neither $USER nor $LOGNAME is set; pass an explicit --via user@host")
+    })
 }
 
 /// The ONE place `Command::new("ssh")` is ever written. `BatchMode=yes` is

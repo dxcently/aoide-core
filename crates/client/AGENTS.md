@@ -153,7 +153,21 @@
   marks the parked entry `approved` (`aoide_storage::pairing::mark_inbound_approved`)
   and leaves it PARKED for the requester's own poll to find — no wire call
   at all, so an unreachable or loopback-only requester never blocks this
-  half. `approve_outbound` (this instance is the REQUESTER) is the one that
+  half.
+- **`approve_inbound`'s commit maps `entry.self_via` to `{url, via}` — get
+  this backwards and every loopback-only requester's peer record comes out
+  undialable (task #131).** Present, the commit is `url:
+  http://127.0.0.1:<AOIDE_A2A_PORT or 8710>/` (never `entry.url` — the
+  requester-observed door, undialable through the very tunnel that
+  delivered this request) and `via: entry.self_via` via `set_peer_via` in
+  the SAME write as `upsert_paired_peer`, mirroring the sibling-writer
+  shape `approve_outbound`'s own `entry.via` commit already holds just
+  below it. Absent, both stay exactly what `upsert_paired_peer` alone
+  already produces: `entry.url` verbatim, `via` untouched (never call
+  `set_peer_via` with `None` here — that would WIPE a via a previous
+  pairing recorded, the same "untouched unless this call names a change"
+  stance `approve_outbound`'s own `Some`-gated call already holds).
+  `approve_outbound` (this instance is the REQUESTER) is the one that
   now makes a wire call, when its entry is still `AwaitingApproval`: it
   POSTs a SIGNED `aoide/pairPoll` to the approver's door (over the SAME
   forward dial `handle_peer_pair_request` already used — `entry.via` if one
@@ -258,11 +272,18 @@
   takes its dismiss label as a parameter specifically so two ceremonies
   sharing the loop can each pass their own.
 - **`run_pair_request` (P-P6) is the ONLY body of `handle_peer_pair_request`
-  past its own `<url>`/`--name`/`--self-url` parsing, and `handle_peer_invite`
-  and bare `pair` (`handle_pair`, task #120 P3) reach the SAME function —
-  never a second copy — through `pair_with_heard`, the shared
-  settled-target tail (dial-URL composition off the OBSERVED source, K1's
-  `record_via` default).** `peer invite`'s own doc
+  past its own `<url>`/`--name`/`--self-url`/`--self-via` parsing, and
+  `handle_peer_invite` and bare `pair` (`handle_pair`, task #120 P3) reach
+  the SAME function — never a second copy — through `pair_with_heard`, the
+  shared settled-target tail (dial-URL composition off the OBSERVED
+  source, `resolve_pair_vias`'s `dial_via`/`record_via` derivation, task
+  #131).** Don't reintroduce K1's old split where only `record_via` got
+  the observed-address default and `dial_via` stayed `None` by default —
+  a loopback-only door (the case task #131 exists for) is simply
+  undialable that way; `resolve_pair_vias` is the ONE place both are
+  derived, unit-tested directly (no dial, no tempdir), so a future change
+  to that derivation touches one pure function, never two call sites that
+  could drift. `peer invite`'s own doc
   and CONTRACTS.md §6's "Discovery advertisement" subsection both promise `peer
   invite` "runs the ceremony," and this is what makes that literally true
   rather than aspirational: a future change to the ceremony's wire calls,

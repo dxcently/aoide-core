@@ -63,8 +63,12 @@ never the inbound/serve half (that's `aoide-server`).
 - `peer` — peer-federation client half (CONTRACTS.md §7), joined at P-P2 by
   the pairing ceremony's own wire builders/parsers:
   `build_pair_request_body`/`parse_pair_request_response` (the requester's
-  `aoide/pairRequest` call, carrying a `commitHex`, never a
-  `nonceHex`), `build_pair_reveal_body`/
+  `aoide/pairRequest` call, carrying a `commitHex`, never a `nonceHex` —
+  and, task #131, an OPTIONAL `selfVia` beside `self_url`: the requester's
+  own self-asserted reach-back hop claim, same trust class as `self_url`,
+  omitted outright rather than sent `null` when the caller has none, so an
+  old approver — which never looks for the field — sees exactly the shape
+  it always has), `build_pair_reveal_body`/
   `check_pair_reveal_response` (the requester's immediately-following
   `aoide/pairReveal` call), and `build_pair_poll_body`/
   `parse_pair_poll_response` (the requester's `aoide/pairPoll` call —
@@ -279,7 +283,7 @@ never the inbound/serve half (that's `aoide-server`).
   unknown peer or an unknown capability with distinct taught errors, no
   network call (this instance's own `state/peers.json` is authoritative
   for its own `allows` grants) —
-  `confirm_sas`/`default_self_url` are this group's own local helpers:
+  `confirm_sas`/`default_self_url`/`default_self_via` are this group's own local helpers:
   `confirm_sas` (like `confirm_spawn` below) is a thin wrapper around
   `aoide_protocol::pick::confirm` (ONBOARD.md's prompt substrate section,
   P-I1) rather than a hand-rolled stdin read — `inquire::Confirm` on a tty,
@@ -301,7 +305,19 @@ never the inbound/serve half (that's `aoide-server`).
   refusal, never a bypass), then commits a
   local peer record and marks the entry approved PURELY LOCALLY — no wire
   call at all, so an unreachable/loopback-only requester never blocks the
-  approver's own half; on an OUTBOUND entry (`approve_outbound`) it POLLS
+  approver's own half. **The commit's `url`/`via` depend on the parked
+  entry's `self_via` (task #131).** Present — the requester claimed a
+  reach-back hop on the wire (`InboundPairingRequest::self_via`, carried
+  through from `aoide/pairRequest`'s own `selfVia`) — the commit records
+  `url: http://127.0.0.1:<AOIDE_A2A_PORT or 8710>/` (loopback-as-seen-
+  from-the-far-side; the requester's own door is reachable only through
+  the very tunnel that delivered this request, so `entry.url`'s
+  requester-observed host is never directly dialable) and `via` set to the
+  claim itself, via `set_peer_via` in the SAME write as `upsert_paired_peer`
+  (the sibling-writer shape `approve_outbound`'s own equivalent call,
+  below, already holds). Absent — an old requester, or one with nothing to
+  claim — the commit is exactly what it always was: `entry.url` verbatim,
+  `via` left unset. On an OUTBOUND entry (`approve_outbound`) it POLLS
   `aoide/pairPoll` first (over the SAME forward dial `request` already
   used — `entry.via` if one was recorded) and, once the poll comes back
   approved, re-derives the SAME SAS and confirms `y/N` (`--yes` scripted;
@@ -367,32 +383,47 @@ never the inbound/serve half (that's `aoide-server`).
   `reconcile` already produced — never a `PairEvent`'s own feed-sourced
   fields — and show no more than `peer pair pending` already prints (no
   fingerprint).
-  **`run_pair_request(cmd, url, name, self_url, dial_via, record_via)`
-  (P-P6, `dial_via`/`record_via` added P-S4) is `handle_peer_pair_request`'s
-  own body, extracted so `peer invite` reaches it too — reused, never
-  copied.** `handle_peer_pair_request` still owns every bit of
-  `<url>`/`--name`/`--self-url`/`--via` parsing and the `valid_peer_name`
-  check (a CLI-typed name needs it); `handle_peer_invite` calls straight
-  into `run_pair_request` with a `name` already lifted off an
-  already-validated, already-confirmed discovery advertisement, needing
+  **`run_pair_request(cmd, url, name, self_url, self_via, dial_via,
+  record_via)` (P-P6, `dial_via`/`record_via` added P-S4, `self_via` added
+  P-PV1/task #131) is `handle_peer_pair_request`'s own body, extracted so
+  `peer invite` reaches it too — reused, never copied.**
+  `handle_peer_pair_request` still owns every bit of
+  `<url>`/`--name`/`--self-url`/`--self-via`/`--via` parsing and the
+  `valid_peer_name` check (a CLI-typed name needs it); `handle_peer_invite`
+  calls straight into `run_pair_request` with a `name` already lifted off
+  an already-validated, already-confirmed discovery advertisement, needing
   no second name check, and a `url` composed from the OBSERVED
   source address on the house door port (`default_a2a_port` —
   `AOIDE_A2A_PORT` or 8710; the advertisement carries no door URL, task
-  #120) — that composition, plus K1's `record_via` default, lives in
-  `pair_with_heard(cmd, hit, via_flag)`, the settled-target tail
-  `handle_peer_invite` and bare `pair`'s picker (below) both call so
-  neither ever forks the ceremony. `dial_via`/`record_via` are
-  deliberately separate: `dial_via`
-  is what the ceremony's OWN two POSTs tunnel through — `None` unless an
-  explicit `--via` was given, so a plain ceremony still dials directly
-  (forcing every pairing through ssh by default was not asked for).
-  `record_via` is the string parked onto `OutboundPairingRequest.via`
-  for LATER commit (`approve_outbound`) onto the peer record this
-  ceremony creates — `handle_peer_invite` defaults it to K1's
-  `default_via(&hit.src_addr, &hit.advertisement.user)` (observed
-  address, claimed login) even when `dial_via` is `None`, so the
-  resulting peer still gets an automatic transport marker for its own
-  FUTURE calls. `handle_peer_discover`/`handle_peer_invite` (`peer
+  #120) — that composition, plus the `dial_via`/`record_via` derivation
+  below, lives in `resolve_pair_vias(hit, via_flag)` (pure, unit-tested
+  with no dial), called from `pair_with_heard(cmd, hit, via_flag,
+  self_via_flag)`, the settled-target tail `handle_peer_invite` and bare
+  `pair`'s picker (below) both call so neither ever forks the ceremony.
+  `dial_via`/`record_via` are related but distinct: `record_via` is
+  UNCONDITIONAL — the advertisement's observed address plus its claimed
+  login, string-rendered via `default_via`, even when that login is empty
+  — parked onto `OutboundPairingRequest.via` for LATER commit
+  (`approve_outbound`) onto the peer record this ceremony creates, so that
+  peer has an automatic transport marker for its own FUTURE calls.
+  `dial_via` (task #131 — previously `None` unless an explicit `--via` was
+  given, forcing every plain ceremony to dial directly) now rides the SAME
+  derived default too, UNLESS the advertisement carried no ssh claim at
+  all (empty login), in which case there is nothing to tunnel through and
+  the dial stays direct: against a door that binds loopback-only, the
+  observed address is never directly dialable, so the ceremony's own two
+  POSTs need the tunnel exactly as much as the record does. An explicit
+  `--via` beats both defaults outright, for both halves, unchanged.
+  `self_via` (task #131) is this instance's OWN reach-back hop claim —
+  `default_self_via()` (`ssh://<local login>@<local hostname>`, reusing
+  `crate::tunnel::local_login`'s `$USER`/`$LOGNAME` chain and
+  `aoide_storage::display::local_host_name`, `None` when neither env var is
+  set) or an explicit `--self-via`, carried on the wire beside `self_url`
+  ([`crate::peer::build_pair_request_body`] below) so the approver — which
+  can only ever OBSERVE this request arriving over the tunnel, i.e.
+  loopback — has something to record a working `via` from at ITS OWN
+  `peer pair approve` commit time (`approve_inbound`, below).
+  `handle_peer_discover`/`handle_peer_invite` (`peer
   discover [--secs N]`/`peer invite <name> [--secs N] [--yes]`) are thin
   wrappers around `discover::run_sweep`/`discover::resolve_invite_target`
   above — `confirm_invite` is this pair's own local helper, still the

@@ -515,7 +515,7 @@ fn peer_pair_approve_on_an_unrevealed_inbound_entry_is_refused_with_awaiting_rev
     let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
     let expires = aoide_storage::pairing::expires_at_from(now_epoch);
     let commit = aoide_storage::pairing::derive_commit(&"a".repeat(64), &"c".repeat(32));
-    let entry = aoide_storage::pairing::park_inbound(&"a".repeat(64), "box-a", "127.0.0.1", "http://a/", &commit, &now, &expires).unwrap();
+    let entry = aoide_storage::pairing::park_inbound(&"a".repeat(64), "box-a", "127.0.0.1", "http://a/", &commit, &now, &expires, None).unwrap();
     assert!(entry.requester_nonce_hex.is_none(), "freshly parked, never revealed");
 
     let out = dispatch(&cli_invocation(&["peer", "pair", "approve"], &[entry.id.as_str()], &[("yes", "true")]));

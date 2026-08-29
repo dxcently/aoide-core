@@ -359,6 +359,24 @@ pub struct InboundPairingRequest {
     /// discipline [`Self::approved`] holds.
     #[serde(default)]
     pub tries: u32,
+    /// The requester's OPTIONAL self-asserted reach-back hop claim (P-PV1,
+    /// task #131) — the wire's `selfVia`, straight off `aoide/pairRequest`'s
+    /// params. Loopback-only doors defeat the OLD assumption that the
+    /// approver can derive a working `via` from the connection it observes:
+    /// a request arriving over the requester's own ssh tunnel is seen from
+    /// loopback, not the requester's real address, so nothing about the
+    /// connection itself can ever answer "how do I dial this peer back."
+    /// `self_via` is the requester's own claim of that hop — same trust
+    /// class as [`Self::url`] (self-asserted DATA, a transport marker only;
+    /// trust stays in pubkeys + SAS) — carried through so `peer pair
+    /// approve`'s own commit ([`crate` client crate's `approve_inbound`])
+    /// can record a peer `via` that actually reaches back out.
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]` so a
+    /// parked entry predating this field loads `None` and a `None` here
+    /// never grows the file — the same additive discipline
+    /// [`Self::requester_nonce_hex`] already holds.
+    #[serde(rename = "selfVia", default, skip_serializing_if = "Option::is_none")]
+    pub self_via: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -414,7 +432,12 @@ pub fn list_inbound(now_epoch: i64) -> Vec<InboundPairingRequest> {
 /// [`InboundPairingRequest`] (including its new `id`,
 /// `requester_nonce_hex: None`, and freshly-generated
 /// `approver_nonce_hex`) so the caller can build the synchronous wire
-/// response from it directly.
+/// response from it directly. `self_via` (P-PV1, task #131) is the
+/// requester's OPTIONAL self-asserted reach-back hop claim off the wire's
+/// `selfVia` — carried straight through onto [`InboundPairingRequest::
+/// self_via`] with no validation here (the same "never eagerly parsed,
+/// only at dial time" stance every other recorded `via` string already
+/// holds); `None` when the wire carried no claim at all.
 #[allow(clippy::too_many_arguments)]
 pub fn park_inbound(
     pubkey_hex: &str,
@@ -424,6 +447,7 @@ pub fn park_inbound(
     commit_hex: &str,
     requested_at: &str,
     expires_at: &str,
+    self_via: Option<&str>,
 ) -> Result<InboundPairingRequest, String> {
     let _guard = PARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     with_stage_lock(|| {
@@ -454,6 +478,7 @@ pub fn park_inbound(
             expires_at: expires_at.to_string(),
             approved: false,
             tries: 0,
+            self_via: self_via.map(|s| s.to_string()),
         };
         requests.push(entry.clone());
         save_inbound(&requests)?;
@@ -1032,6 +1057,7 @@ mod tests {
             &commit,
             &crate::time::iso_utc_from_epoch(now),
             &expires_at_from(now),
+            None,
         )
         .unwrap();
         assert_eq!(entry.id.len(), 8);
@@ -1070,6 +1096,7 @@ mod tests {
             "pk", "name", "addr", "url", &commit,
             &crate::time::iso_utc_from_epoch(requested_at),
             &crate::time::iso_utc_from_epoch(requested_at + 10), // expires in 10s
+            None,
         )
         .unwrap();
 
@@ -1101,7 +1128,7 @@ mod tests {
         let now = 1_700_000_000_i64;
         let requested_at = crate::time::iso_utc_from_epoch(now);
         let expires_at = expires_at_from(now);
-        let park = |pk: &str| park_inbound(pk, "name", "addr", "url", &derive_commit(pk, "n"), &requested_at, &expires_at);
+        let park = |pk: &str| park_inbound(pk, "name", "addr", "url", &derive_commit(pk, "n"), &requested_at, &expires_at, None);
 
         let first = park("pk1").expect("first park is under the cap");
         park("pk2").expect("second park is exactly at the cap");
@@ -1139,7 +1166,7 @@ mod tests {
         let requested_at = crate::time::iso_utc_from_epoch(now);
         let expires_at = expires_at_from(now);
         let commit = derive_commit("pk", "the-real-nonce");
-        let entry = park_inbound("pk", "name", "addr", "url", &commit, &requested_at, &expires_at).unwrap();
+        let entry = park_inbound("pk", "name", "addr", "url", &commit, &requested_at, &expires_at, None).unwrap();
         assert!(entry.requester_nonce_hex.is_none());
 
         let revealed = reveal_inbound(&entry.id, "the-real-nonce", now).unwrap();
@@ -1168,7 +1195,7 @@ mod tests {
         let requested_at = crate::time::iso_utc_from_epoch(now);
         let expires_at = expires_at_from(now);
         let commit = derive_commit("pk", "the-real-nonce");
-        let entry = park_inbound("pk", "name", "addr", "url", &commit, &requested_at, &expires_at).unwrap();
+        let entry = park_inbound("pk", "name", "addr", "url", &commit, &requested_at, &expires_at, None).unwrap();
 
         let err = reveal_inbound(&entry.id, "a-different-nonce", now).unwrap_err();
         assert_eq!(err, RevealError::Mismatch);
@@ -1214,7 +1241,7 @@ mod tests {
         let requested_at = crate::time::iso_utc_from_epoch(now);
         let expires_at = expires_at_from(now);
         let commit = derive_commit("pk", "nonce");
-        let entry = park_inbound("pk", "name", "addr", "url", &commit, &requested_at, &expires_at).unwrap();
+        let entry = park_inbound("pk", "name", "addr", "url", &commit, &requested_at, &expires_at, None).unwrap();
         reveal_inbound(&entry.id, "nonce", now).unwrap();
         assert!(!entry.approved, "unapproved at park time");
 
@@ -1270,6 +1297,7 @@ mod tests {
             "pk", "name", "addr", "url", &commit,
             &crate::time::iso_utc_from_epoch(requested_at),
             &crate::time::iso_utc_from_epoch(requested_at + 10),
+            None,
         )
         .unwrap();
 
@@ -1299,6 +1327,7 @@ mod tests {
             "pk", "name", "addr", "url", &commit,
             &crate::time::iso_utc_from_epoch(now),
             &expires_at_from(now),
+            None,
         )
         .unwrap();
         assert_eq!(entry.tries, 0, "a fresh park starts at zero tries");
@@ -1412,6 +1441,64 @@ mod tests {
         });
         let back: OutboundPairingRequest = serde_json::from_value(raw_old).unwrap();
         assert_eq!(back.via, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    /// P-PV1 (task #131): the wire's OPTIONAL `selfVia` claim, threaded
+    /// through `park_inbound` onto [`InboundPairingRequest::self_via`],
+    /// round-trips through a real park/list exactly like
+    /// [`outbound_via_is_additive_absent_by_default_and_round_trips_when_present`]'s
+    /// outbound sibling — and a raw record predating this field (no
+    /// `selfVia` key at all, the shape every parked entry had before this
+    /// phase) loads `None`, never a deserialize failure.
+    #[test]
+    fn inbound_self_via_is_additive_absent_by_default_and_round_trips_when_present() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-pairing-inbound-self-via-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        env(&dir);
+
+        let now = 1_700_000_000_i64;
+        let commit = derive_commit("pk", "n");
+        let with_claim = park_inbound(
+            "pk", "with-claim", "10.0.0.5", "http://with-claim/", &commit,
+            &crate::time::iso_utc_from_epoch(now), &expires_at_from(now),
+            Some("ssh://khoa@with-claim"),
+        )
+        .unwrap();
+        assert_eq!(with_claim.self_via.as_deref(), Some("ssh://khoa@with-claim"));
+
+        let no_claim = park_inbound(
+            "pk2", "no-claim", "10.0.0.6", "http://no-claim/", &derive_commit("pk2", "n2"),
+            &crate::time::iso_utc_from_epoch(now), &expires_at_from(now),
+            None,
+        )
+        .unwrap();
+        assert!(no_claim.self_via.is_none());
+
+        let listed = list_inbound(now);
+        let listed_with_claim = listed.iter().find(|r| r.id == with_claim.id).unwrap();
+        assert_eq!(listed_with_claim.self_via.as_deref(), Some("ssh://khoa@with-claim"), "the claim survives a park-then-list round trip");
+        let listed_no_claim = listed.iter().find(|r| r.id == no_claim.id).unwrap();
+        assert!(listed_no_claim.self_via.is_none());
+
+        // A raw record predating this field (no `selfVia` key at all) loads
+        // as `None`, never a deserialize failure — the same additive
+        // discipline every other optional field on this struct holds.
+        let raw_old = serde_json::json!({
+            "id": "predates-self-via", "url": "http://box-c/", "name": "box-c",
+            "pubkeyHex": "k", "originAddr": "10.0.0.7", "commitHex": commit,
+            "approverNonceHex": "a",
+            "requestedAt": crate::time::iso_utc_from_epoch(now), "expiresAt": expires_at_from(now),
+        });
+        let back: InboundPairingRequest = serde_json::from_value(raw_old).unwrap();
+        assert_eq!(back.self_via, None);
 
         let _ = std::fs::remove_dir_all(&dir);
         match saved {
@@ -1538,6 +1625,7 @@ mod tests {
             "pk", "name", "addr", "url", &derive_commit("pk", "n"),
             &crate::time::iso_utc_from_epoch(now),
             &expires_at_from(now),
+            None,
         )
         .unwrap();
 
@@ -1606,6 +1694,7 @@ mod tests {
             "pk", "name", "addr", "url", &derive_commit("pk", "n"),
             &crate::time::iso_utc_from_epoch(now),
             &expires_at_from(now),
+            None,
         )
         .unwrap();
 

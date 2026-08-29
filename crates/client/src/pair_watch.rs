@@ -749,6 +749,7 @@ mod tests {
                 &aoide_storage::pairing::derive_commit(&"a".repeat(64), &"c".repeat(32)),
                 &aoide_storage::time::now_iso_utc(),
                 &aoide_storage::pairing::expires_at_from(now_epoch),
+                None,
             )
             .unwrap();
             let id = aoide_storage::pairing::list_inbound(now_epoch)[0].id.clone();
@@ -781,6 +782,7 @@ mod tests {
                 &aoide_storage::pairing::derive_commit(&"a".repeat(64), &"c".repeat(32)),
                 &aoide_storage::time::now_iso_utc(),
                 &aoide_storage::pairing::expires_at_from(now_epoch),
+                None,
             )
             .unwrap();
 
@@ -1035,6 +1037,7 @@ mod tests {
                 &aoide_storage::pairing::derive_commit(&"a".repeat(64), &"c".repeat(32)),
                 &aoide_storage::time::now_iso_utc(),
                 &aoide_storage::pairing::expires_at_from(now_epoch),
+                None,
             )
             .unwrap();
             let id = aoide_storage::pairing::list_inbound(now_epoch)[0].id.clone();

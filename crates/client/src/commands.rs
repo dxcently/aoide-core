@@ -1567,6 +1567,23 @@ fn default_self_url() -> String {
     format!("http://{host}:{}/", default_a2a_port())
 }
 
+/// This instance's own default reach-back hop claim (P-PV1) — the wire's
+/// OPTIONAL `selfVia` field, carried beside `self_url` on `aoide/pairRequest`
+/// so the approver (which only ever OBSERVES the request arriving over the
+/// requester's own ssh tunnel, i.e. loopback) can record a `via` that
+/// actually reaches back out: `ssh://<local login>@<local hostname>`, the
+/// same two halves [`default_self_url`] already derives (`local_host_name`)
+/// plus [`crate::tunnel::local_login`]'s `$USER`/`$LOGNAME` chain — reused,
+/// never re-derived. `None` when neither env var is set (no guessed
+/// literal), the same "refuse rather than guess" stance
+/// [`crate::tunnel::resolve_login`] already holds; `--self-via` overrides
+/// this outright, mirroring `--self-url`.
+fn default_self_via() -> Option<String> {
+    let login = crate::tunnel::local_login().ok()?;
+    let host = aoide_storage::display::local_host_name();
+    Some(format!("ssh://{login}@{host}"))
+}
+
 /// The house A2A door port this box assumes for itself AND for a
 /// discovered peer: `AOIDE_A2A_PORT` (the same env the `aoide-a2a`
 /// systemd unit sets) or the house default `8710`. `peer invite` composes
@@ -1599,7 +1616,7 @@ fn default_a2a_port() -> u16 {
 /// #119) and finish the ceremony.
 fn handle_peer_pair_request(inv: &Invocation) -> Outcome {
     let cmd = "peer.pair.request";
-    const USAGE: &str = "usage: aoide peer pair request <url> [--name <n>] [--self-url <url>] [--via ssh://[user@]host[:port]] [--json]";
+    const USAGE: &str = "usage: aoide peer pair request <url> [--name <n>] [--self-url <url>] [--self-via ssh://[user@]host] [--via ssh://[user@]host[:port]] [--json]";
     let url = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         Some(u) => u.to_string(),
         None => return Outcome::usage(cmd, USAGE),
@@ -1630,6 +1647,12 @@ fn handle_peer_pair_request(inv: &Invocation) -> Outcome {
         .cloned()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(default_self_url);
+    let self_via = inv
+        .flags
+        .get("self-via")
+        .cloned()
+        .filter(|s| !s.is_empty())
+        .or_else(default_self_via);
     // An invalid --via is a usage error, never a silent fallback to a
     // direct dial (parse_via_flag's own stance). Unlike `peer invite`
     // (K1's src_addr-derived default), a plain `peer pair request` has no
@@ -1640,7 +1663,7 @@ fn handle_peer_pair_request(inv: &Invocation) -> Outcome {
         Err(e) => return Outcome::usage(cmd, format!("{USAGE} — {e}")),
     };
 
-    run_pair_request(cmd, &url, &name, &self_url, via.as_ref(), via.as_ref().map(|v| v.to_string()))
+    run_pair_request(cmd, &url, &name, &self_url, self_via.as_deref(), via.as_ref(), via.as_ref().map(|v| v.to_string()))
 }
 
 /// The requester's half of the ceremony, shared verbatim by
@@ -1659,24 +1682,29 @@ fn handle_peer_pair_request(inv: &Invocation) -> Outcome {
 /// request.
 ///
 /// **P-S4's two additions, deliberately kept separate.** `dial_via` is what
-/// the ceremony's OWN two POSTs below actually tunnel through — `None`
-/// unless an explicit `--via` flag was given, so a plain `peer pair
-/// request`/`peer invite` dials exactly as before (P-S1's `invite_dial_url`
-/// already resolves a working direct LAN target for `peer invite`; forcing
-/// every ceremony through ssh by default would make PAIRING ITSELF newly
-/// depend on ssh reachability, which nothing asked for). `record_via` is
-/// the string parked into [`aoide_storage::pairing::OutboundPairingRequest::
-/// via`] for LATER commit onto the resulting peer record, in the SEPARATE
-/// `peer pair approve <id>` invocation that actually writes it
-/// (`approve_outbound`) — for `handle_peer_invite` this is K1's
-/// src_addr-derived default even when `dial_via` itself is `None`, so the
-/// PEER this ceremony creates still gets an automatic `via` for its own
-/// FUTURE calls, without the ceremony's own connectivity depending on it.
+/// the ceremony's OWN two POSTs below actually tunnel through — `None` for
+/// a plain `peer pair request <url>` (no observed address to derive a
+/// default from) and, for `handle_peer_invite`/bare `pair`, an explicit
+/// `--via` or else [`pair_with_heard`]'s own src_addr-derived default
+/// (P-PV1: loopback-only doors, task #131 — a discovered peer's door is
+/// reached only through its ssh tunnel, so the ceremony's OWN dial needs
+/// that same default, not only the record). `record_via` is the string
+/// parked into [`aoide_storage::pairing::OutboundPairingRequest::via`] for
+/// LATER commit onto the resulting peer record, in the SEPARATE `peer pair
+/// approve <id>` invocation that actually writes it (`approve_outbound`).
+/// `self_via` (P-PV1) is this instance's OWN reach-back hop claim —
+/// `ssh://<local user>@<local host>` by default
+/// ([`default_self_via`]), overridable by `--self-via` — carried on the
+/// wire beside `self_url` so the far end, which can only ever OBSERVE this
+/// request arriving over the tunnel (i.e. loopback), has something to
+/// record a working `via` from at ITS OWN approve-commit time
+/// ([`approve_inbound`]'s own doc).
 fn run_pair_request(
     cmd: &str,
     url: &str,
     name: &str,
     self_url: &str,
+    self_via: Option<&str>,
     dial_via: Option<&aoide_storage::tunnel::Via>,
     record_via: Option<String>,
 ) -> Outcome {
@@ -1699,7 +1727,7 @@ fn run_pair_request(
     // file the requester under the requester's-nickname-for-the-approver
     // (the live yomi↔sakaki ceremony's phantom-peer defect, 2026-08-26).
     let self_name = aoide_storage::display::local_host_name();
-    let body = crate::peer::build_pair_request_body(&own_pubkey, &self_name, &commit, &self_url);
+    let body = crate::peer::build_pair_request_body(&own_pubkey, &self_name, &commit, &self_url, self_via);
     let body_str = serde_json::to_string(&body).unwrap_or_default();
     let (code, resp_body) = match post_json_via(url, dial_via, name, &body_str, None, &[], 15) {
         Ok(v) => v,
@@ -2034,16 +2062,33 @@ pub(crate) fn approve_inbound(
         },
     }
 
-    // P-S4: the APPROVER's own commit — unlike `approve_outbound`'s
-    // sibling call below, this deliberately does NOT call `set_peer_via`.
-    // `InboundPairingRequest` (`storage/src/pairing.rs`) carries no
-    // transport marker of its own to record (through a tunnel,
-    // `origin_addr` reads "loopback", per §0.7 — not a usable source), and
-    // no `--via` flag exists on `peer pair approve` (out of this phase's
-    // scope). The new peer's `via` is left `None` — the same "absent by
-    // default" a fresh `Peer` already carries.
+    // P-S4/P-PV1: the APPROVER's own commit. `InboundPairingRequest` carries
+    // no OBSERVED transport marker (through a tunnel, `origin_addr` reads
+    // "loopback", per §0.7 — not a usable source) — but P-PV1 (task #131)
+    // gives it a CLAIMED one: when the wire's `selfVia` rode this entry
+    // (`entry.self_via`), the requester's own door is reachable only
+    // through that hop, the same convention the sakaki/chiyo/osaka peer
+    // rows already hold by hand — `url` becomes the loopback-as-seen-from-
+    // the-far-side door (`http://127.0.0.1:<AOIDE_A2A_PORT or 8710>/`,
+    // never `entry.url`'s requester-observed host, which the approver can
+    // never dial directly through the tunnel) and `via` becomes the claim
+    // itself, committed in the SAME write as the pairing commit below
+    // (`set_peer_via`'s own doc on why it's a sibling writer beside
+    // `upsert_paired_peer`). No claim on the entry (an old requester, or
+    // one with nothing to claim) commits EXACTLY today's shape: `entry.url`
+    // verbatim, `via` left `None` — the same "absent by default" a fresh
+    // `Peer` already carries.
+    let record_url = match entry.self_via.as_deref() {
+        Some(_) => format!("http://127.0.0.1:{}/", default_a2a_port()),
+        None => entry.url.clone(),
+    };
     let mut peers = aoide_storage::peer_store::load_peers();
-    let change = aoide_storage::peer_store::upsert_paired_peer(&mut peers, &entry.name, &entry.url, &entry.pubkey_hex, now);
+    let change = aoide_storage::peer_store::upsert_paired_peer(&mut peers, &entry.name, &record_url, &entry.pubkey_hex, now);
+    if let Some(via) = entry.self_via.as_deref() {
+        if let Err(e) = aoide_storage::peer_store::set_peer_via(&mut peers, &entry.name, Some(via)) {
+            return Outcome::error(cmd, format!("recording the peer's transport marker: {e}"));
+        }
+    }
     if let Err(e) = aoide_storage::peer_store::save_peers(&peers) {
         return Outcome::error(cmd, format!("writing the peer registry: {e}"));
     }
@@ -2438,7 +2483,7 @@ fn confirm_invite(name: &str, host: &str, user: &str, src_addr: &str) -> Result<
 /// operators, both ends) is untouched and still runs.
 fn handle_peer_invite(inv: &Invocation) -> Outcome {
     let cmd = "peer.invite";
-    const USAGE: &str = "usage: aoide peer invite <name> [--secs N] [--yes] [--via ssh://[user@]host[:port]] [--json]";
+    const USAGE: &str = "usage: aoide peer invite <name> [--secs N] [--yes] [--via ssh://[user@]host[:port]] [--self-via ssh://[user@]host] [--json]";
     let name = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         Some(n) => n.to_string(),
         None => return Outcome::usage(cmd, USAGE),
@@ -2455,6 +2500,7 @@ fn handle_peer_invite(inv: &Invocation) -> Outcome {
         Ok(v) => v,
         Err(e) => return Outcome::usage(cmd, format!("{USAGE} — {e}")),
     };
+    let self_via_flag = inv.flags.get("self-via").cloned().filter(|s| !s.is_empty());
 
     let swept = match crate::discover::run_sweep(secs) {
         Ok(s) => s,
@@ -2508,7 +2554,7 @@ fn handle_peer_invite(inv: &Invocation) -> Outcome {
         }
     }
 
-    pair_with_heard(cmd, &hit, via_flag.as_ref())
+    pair_with_heard(cmd, &hit, via_flag.as_ref(), self_via_flag.as_deref())
 }
 
 /// The tail `peer invite` and bare `pair` share once a [`crate::discover::Heard`]
@@ -2518,21 +2564,53 @@ fn handle_peer_invite(inv: &Invocation) -> Outcome {
 /// to read a port off, by design), and run the SAME [`run_pair_request`]
 /// core `peer pair request` itself calls — reused, never forked.
 ///
-/// K1's settled default: the peer this ceremony creates gets an automatic
-/// `via` derived from the advertisement's OBSERVED source address plus its
-/// claimed ssh login (task #120 — the one thing the wire exists to carry),
-/// so its own FUTURE calls (pull/spawn/send) can reach it through an ssh
-/// tunnel — recorded at `peer pair approve` commit time, not used for the
-/// ceremony's own dial (`run_pair_request`'s own doc on why those stay
-/// separate). An explicit `--via` beats this default outright, for both
-/// halves.
-fn pair_with_heard(cmd: &str, hit: &crate::discover::Heard, via_flag: Option<&aoide_storage::tunnel::Via>) -> Outcome {
+/// P-PV1's settled default (task #131 — loopback-only doors, superseding
+/// K1): the peer this ceremony creates gets an automatic `via` derived from
+/// the advertisement's OBSERVED source address plus its claimed ssh login
+/// (task #120 — the one thing the wire exists to carry), so its own FUTURE
+/// calls (pull/spawn/send) can reach it through an ssh tunnel — recorded at
+/// `peer pair approve` commit time, exactly as before. The SAME derived
+/// default now ALSO rides the ceremony's OWN dial (`dial_via` below):
+/// against a door that binds loopback-only, a direct dial to the observed
+/// address never connects at all, so the ceremony itself needs the tunnel
+/// too, not just the record it leaves behind. The one exception is an
+/// advertisement with no ssh claim at all (`advertisement.user` empty) —
+/// nothing to tunnel through, so the dial stays direct, exactly as before
+/// P-PV1. An explicit `--via` beats this default outright, for both halves.
+fn pair_with_heard(
+    cmd: &str,
+    hit: &crate::discover::Heard,
+    via_flag: Option<&aoide_storage::tunnel::Via>,
+    self_via_flag: Option<&str>,
+) -> Outcome {
     let dial_url = format!("http://{}:{}/", hit.src_addr, default_a2a_port());
     let self_url = default_self_url();
-    let default_record_via =
-        Some(aoide_storage::tunnel::default_via(&hit.src_addr, &hit.advertisement.user).to_string());
-    let record_via = via_flag.map(|v| v.to_string()).or(default_record_via);
-    run_pair_request(cmd, &dial_url, &hit.advertisement.name, &self_url, via_flag, record_via)
+    let self_via = self_via_flag.map(|s| s.to_string()).or_else(default_self_via);
+    let (dial_via, record_via) = resolve_pair_vias(hit, via_flag);
+    run_pair_request(cmd, &dial_url, &hit.advertisement.name, &self_url, self_via.as_deref(), dial_via.as_ref(), record_via)
+}
+
+/// The pure decision [`pair_with_heard`] otherwise buries inline (P-PV1,
+/// task #131) — split out so it is unit-testable with no dial, no tempdir,
+/// no ssh: what `via` the ceremony's OWN two POSTs dial through, and what
+/// `via` gets parked for LATER commit onto the resulting peer record.
+/// `record_via` is unconditional — the advertisement's observed address
+/// plus its claimed login, string-rendered, exactly as it always has been,
+/// even when that login is empty (`aoide_storage::tunnel::default_via`'s
+/// own "empty user is absent, not refused" stance). `dial_via` rides the
+/// SAME derived default too UNLESS the advertisement carried no ssh claim
+/// at all (`hit.advertisement.user` empty) — nothing to tunnel through, so
+/// the dial stays direct, exactly as it did before P-PV1. An explicit
+/// `via_flag` beats both defaults outright, for both halves.
+fn resolve_pair_vias(
+    hit: &crate::discover::Heard,
+    via_flag: Option<&aoide_storage::tunnel::Via>,
+) -> (Option<aoide_storage::tunnel::Via>, Option<String>) {
+    let default_via = aoide_storage::tunnel::default_via(&hit.src_addr, &hit.advertisement.user);
+    let record_via = via_flag.map(|v| v.to_string()).or_else(|| Some(default_via.to_string()));
+    let default_dial_via = (!hit.advertisement.user.is_empty()).then_some(default_via);
+    let dial_via = via_flag.cloned().or(default_dial_via);
+    (dial_via, record_via)
 }
 
 /// The four `peer pair` commands (P-P2), registered directly after the six
@@ -2546,6 +2624,7 @@ pub fn register_peer_pair(r: &mut Registry) {
         flags: [
             flag!("name", "string", "A local nickname for the other instance; defaults to a sanitized form of the URL's host."),
             flag!("self-url", "string", "This instance's own advertised A2A door URL, recorded on the resulting peer record for the approver's future non-ceremony calls (the ceremony itself now polls, so this is no longer dialed to complete pairing); defaults to http://<host>:<AOIDE_A2A_PORT or 8710>/."),
+            flag!("self-via", "string", "This instance's own ssh://[user@]host reach-back hop claim, sent on the wire beside --self-url so an approver that only ever observes this request over a tunnel (loopback) can still record a working via; defaults to ssh://<local user>@<local hostname>."),
             flag!("via", "string", "An ssh://[user@]host[:port] transport marker — both the ceremony's own dial AND the resulting peer's recorded via. Absent = direct dial (today's behavior)."),
         ],
         gated: false,
@@ -2658,6 +2737,7 @@ pub fn register_peer_discovery(r: &mut Registry) {
             flag!("secs", "int", "How many seconds to listen (default ~4)."),
             flag!("yes", "bool", "Skip the interactive y/N proceed confirmation (scripted use) — the ceremony's own SAS confirmation is untouched."),
             flag!("via", "string", "An ssh://[user@]host[:port] transport marker, overriding the default derived from the advertisement's observed source address and claimed ssh login — both the ceremony's own dial AND the resulting peer's recorded via."),
+            flag!("self-via", "string", "This instance's own ssh://[user@]host reach-back hop claim, sent on the wire beside self-url so an approver that only ever observes this request over a tunnel (loopback) can still record a working via; defaults to ssh://<local user>@<local hostname>."),
         ],
         gated: false,
         implemented: true,
@@ -2757,7 +2837,7 @@ fn handle_pair(inv: &Invocation) -> Outcome {
         .collect();
     match aoide_protocol::pick::choose("pair with which instance?", &rows, None) {
         None => Outcome::ok(cmd, "nothing chosen — nothing sent"),
-        Some(i) => pair_with_heard(cmd, &candidates[i], None),
+        Some(i) => pair_with_heard(cmd, &candidates[i], None, None),
     }
 }
 
@@ -2820,6 +2900,45 @@ mod tests {
             via: None,
             added_at: "2026-08-24T00:00:00Z".to_string(),
         }
+    }
+
+    // ── `resolve_pair_vias` (P-PV1, task #131) — pure, no dial, no tempdir,
+    // ── so this seam is unit-testable directly, unlike `pair_with_heard`
+    // ── itself (needs a live ssh + a live door to actually dial). ─────────
+
+    fn heard_with_login(src_addr: &str, user: &str) -> crate::discover::Heard {
+        crate::discover::Heard {
+            advertisement: aoide_storage::advertise::build("box-a", "box-a", user),
+            src_addr: src_addr.to_string(),
+            first_heard: "T0".to_string(),
+            last_heard: "T0".to_string(),
+            count: 1,
+        }
+    }
+
+    #[test]
+    fn resolve_pair_vias_dial_rides_the_derived_default_when_the_ad_claims_a_login() {
+        let hit = heard_with_login("10.0.0.5", "khoa");
+        let (dial_via, record_via) = resolve_pair_vias(&hit, None);
+        assert_eq!(dial_via.map(|v| v.to_string()), Some("ssh://khoa@10.0.0.5".to_string()), "the ceremony's OWN dial now rides the same derived default the record always got");
+        assert_eq!(record_via, Some("ssh://khoa@10.0.0.5".to_string()));
+    }
+
+    #[test]
+    fn resolve_pair_vias_keeps_a_direct_dial_when_the_ad_claims_no_login() {
+        let hit = heard_with_login("10.0.0.5", "");
+        let (dial_via, record_via) = resolve_pair_vias(&hit, None);
+        assert!(dial_via.is_none(), "no ssh claim at all — nothing to tunnel through, dial stays direct exactly as before P-PV1");
+        assert_eq!(record_via, Some("ssh://10.0.0.5".to_string()), "record_via is unconditional and unchanged by P-PV1 — still derived even with no claimed login");
+    }
+
+    #[test]
+    fn resolve_pair_vias_an_explicit_via_beats_the_derived_default_for_both_halves() {
+        let hit = heard_with_login("10.0.0.5", "khoa");
+        let explicit = aoide_storage::tunnel::parse_via("ssh://other@elsewhere:2222").unwrap();
+        let (dial_via, record_via) = resolve_pair_vias(&hit, Some(&explicit));
+        assert_eq!(dial_via.map(|v| v.to_string()), Some("ssh://other@elsewhere:2222".to_string()));
+        assert_eq!(record_via, Some("ssh://other@elsewhere:2222".to_string()));
     }
 
     // ── `handle_peer_allow` (P-P3) — pure file I/O, so unlike most `peer`
@@ -3253,13 +3372,13 @@ mod tests {
             let self_url = default_self_url();
 
             // `handle_peer_pair_request`'s own documented tail.
-            let direct = run_pair_request("peer.pair.request", url, name, &self_url, None, None);
+            let direct = run_pair_request("peer.pair.request", url, name, &self_url, None, None, None);
             // The same ceremony tail `handle_peer_invite` reaches on its
             // single-match branch — it composes an OBSERVED dial url first
             // (src_addr + `default_a2a_port`, P-S1/task #120) and passes
             // that, but the tail function is still this one; reproduced
             // here under `peer.invite`'s own command name.
-            let via_invite = run_pair_request("peer.invite", url, name, &self_url, None, None);
+            let via_invite = run_pair_request("peer.invite", url, name, &self_url, None, None, None);
 
             assert_eq!(direct.status, aoide_protocol::output::Status::Error, "{direct:?}");
             assert_eq!(direct.command, "peer.pair.request");
@@ -3860,6 +3979,7 @@ mod tests {
                 &aoide_storage::pairing::derive_commit(&pubkey_a, &"c".repeat(32)),
                 &now,
                 &aoide_storage::pairing::expires_at_from(now_epoch),
+                None,
             )
             .unwrap();
             let entry = aoide_storage::pairing::list_inbound(now_epoch).into_iter().next().unwrap();
@@ -4063,6 +4183,18 @@ mod tests {
     /// (entry, correct SAS) — the SAS derived exactly the way
     /// `approve_inbound` itself derives it, from the freshly-minted identity.
     fn parked_revealed_inbound(now_epoch: i64) -> (aoide_storage::pairing::InboundPairingRequest, String) {
+        parked_revealed_inbound_with_self_via(now_epoch, None)
+    }
+
+    /// [`parked_revealed_inbound`], with the wire's OPTIONAL `selfVia` claim
+    /// threaded through to `park_inbound` (P-PV1) — the seam
+    /// `approve_inbound_records_loopback_url_and_claimed_via_when_self_via_present`
+    /// needs to prove the approver's commit maps a present claim onto
+    /// `{loopback url, via}`.
+    fn parked_revealed_inbound_with_self_via(
+        now_epoch: i64,
+        self_via: Option<&str>,
+    ) -> (aoide_storage::pairing::InboundPairingRequest, String) {
         let requester_pk = "e".repeat(64);
         let nonce = "aabbccdd11223344";
         let commit = aoide_storage::pairing::derive_commit(&requester_pk, nonce);
@@ -4074,6 +4206,7 @@ mod tests {
             &commit,
             &aoide_storage::time::iso_utc_from_epoch(now_epoch),
             &aoide_storage::pairing::expires_at_from(now_epoch),
+            self_via,
         )
         .unwrap();
         let entry = aoide_storage::pairing::reveal_inbound(&entry.id, nonce, now_epoch).unwrap();
@@ -4131,6 +4264,54 @@ mod tests {
             let listed = aoide_storage::pairing::list_inbound(now_epoch);
             assert_eq!(listed.len(), 1, "an approved entry stays parked for the requester's poll (Design A)");
             assert!(listed[0].approved);
+        });
+    }
+
+    /// P-PV1 (task #131), change (c): a parked entry carrying the wire's
+    /// `selfVia` claim commits `{url: loopback-as-seen-from-the-far-side,
+    /// via: the claim itself}` — never `entry.url` (the requester-observed
+    /// host the approver can never dial directly through the tunnel that
+    /// delivered this very request). The sakaki/chiyo/osaka rows in
+    /// production `peers.json` are this exact shape, hand-derived before
+    /// this fix existed.
+    #[test]
+    fn approve_inbound_records_loopback_url_and_claimed_via_when_self_via_present() {
+        with_peer_state("approve-inbound-self-via-present", || {
+            let now_epoch = 1_700_000_000_i64;
+            let now = aoide_storage::time::iso_utc_from_epoch(now_epoch);
+            let (entry, _sas) = parked_revealed_inbound_with_self_via(now_epoch, Some("ssh://khoa@box-a"));
+            let id = entry.id.clone();
+
+            let out = approve_inbound(InboundGate::DialogConfirmed, "peer.pair.approve", &id, entry, &now, now_epoch);
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
+
+            let peers = aoide_storage::peer_store::load_peers();
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].url, format!("http://127.0.0.1:{}/", default_a2a_port()), "the claim's presence rewrites the record to the loopback-as-seen-from-the-far-side convention, never entry.url");
+            assert_eq!(peers[0].via.as_deref(), Some("ssh://khoa@box-a"), "via is the claim itself, committed in the same write");
+        });
+    }
+
+    /// The mirror of the test above: no `selfVia` claim on the parked entry
+    /// (an old requester, or one with nothing to claim) commits EXACTLY
+    /// today's shape — `entry.url` verbatim, `via` left absent. No
+    /// regression on the ordinary direct-LAN case.
+    #[test]
+    fn approve_inbound_leaves_todays_shape_when_self_via_absent() {
+        with_peer_state("approve-inbound-self-via-absent", || {
+            let now_epoch = 1_700_000_000_i64;
+            let now = aoide_storage::time::iso_utc_from_epoch(now_epoch);
+            let (entry, _sas) = parked_revealed_inbound(now_epoch);
+            let entry_url = entry.url.clone();
+            let id = entry.id.clone();
+
+            let out = approve_inbound(InboundGate::DialogConfirmed, "peer.pair.approve", &id, entry, &now, now_epoch);
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
+
+            let peers = aoide_storage::peer_store::load_peers();
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].url, entry_url, "no claim — url is entry.url verbatim, exactly today's behavior");
+            assert!(peers[0].via.is_none(), "no claim — via stays absent, exactly today's behavior");
         });
     }
 

@@ -83,14 +83,28 @@ pub fn parse_graph_summary_response(resp: &Value, name: &str, fetched_at: &str) 
 /// reading), a COMMITMENT to a fresh nonce (`commit_hex` —
 /// `aoide_storage::pairing::derive_commit(pubkey_hex, nonce_hex)`, the
 /// nonce itself stays local until [`build_pair_reveal_body`]'s follow-up
-/// call), and its own advertised A2A door URL (where the later reveal and
-/// approval callbacks are delivered). Pure.
-pub fn build_pair_request_body(pubkey_hex: &str, self_name: &str, commit_hex: &str, self_url: &str) -> Value {
+/// call), its own advertised A2A door URL (where the later reveal and
+/// approval callbacks are delivered), and OPTIONALLY `self_via` — this
+/// instance's own reach-back hop claim (`ssh://[user@]host`, P-PV1, task
+/// #131). The wire only ever sees `self_url` as the requester's door; when
+/// that door is reached over an ssh tunnel, the approver OBSERVES the
+/// connection arriving from loopback and cannot derive a working `via` from
+/// the connection itself — `self_via` is the requester's own SELF-ASSERTED
+/// claim of the hop that reaches it back, the same trust class as
+/// `self_url` (a transport marker only; trust stays in pubkeys + SAS, never
+/// this field). Omitted (`None`) when the caller has no such claim, so an
+/// old approver — which never looks for `selfVia` at all — sees exactly the
+/// shape it always has. Pure.
+pub fn build_pair_request_body(pubkey_hex: &str, self_name: &str, commit_hex: &str, self_url: &str, self_via: Option<&str>) -> Value {
+    let mut params = json!({ "pubkeyHex": pubkey_hex, "name": self_name, "commitHex": commit_hex, "url": self_url });
+    if let Some(via) = self_via {
+        params["selfVia"] = json!(via);
+    }
     let req = JsonRpcRequest {
         jsonrpc: "2.0".to_string(),
         id: json!(1),
         method: "aoide/pairRequest".to_string(),
-        params: json!({ "pubkeyHex": pubkey_hex, "name": self_name, "commitHex": commit_hex, "url": self_url }),
+        params,
     };
     serde_json::to_value(&req).expect("JsonRpcRequest always serializes")
 }
@@ -263,13 +277,36 @@ mod tests {
 
     #[test]
     fn build_pair_request_body_matches_the_jsonrpc_shape() {
-        let body = build_pair_request_body("pk", "box-b", "commit", "http://a/");
+        let body = build_pair_request_body("pk", "box-b", "commit", "http://a/", None);
         assert_eq!(body["method"], "aoide/pairRequest");
         assert_eq!(body["params"]["pubkeyHex"], "pk");
         assert_eq!(body["params"]["name"], "box-b");
         assert_eq!(body["params"]["commitHex"], "commit");
         assert_eq!(body["params"]["url"], "http://a/");
         assert!(body["params"].get("nonceHex").is_none(), "the nonce itself never rides pairRequest");
+        assert!(body["params"].get("selfVia").is_none(), "selfVia is omitted outright when the caller has no claim, never sent null");
+    }
+
+    #[test]
+    fn build_pair_request_body_carries_self_via_when_given() {
+        let body = build_pair_request_body("pk", "box-b", "commit", "http://a/", Some("ssh://khoa@box-b"));
+        assert_eq!(body["params"]["selfVia"], "ssh://khoa@box-b");
+    }
+
+    #[test]
+    fn build_pair_request_body_without_self_via_still_parses_on_an_old_approver_shape() {
+        // An old approver's params struct has no `selfVia` field at all —
+        // simulate its `Deserialize` over a body this (new) requester sent
+        // with no claim, and confirm the shape round-trips with nothing
+        // extra required.
+        let body = build_pair_request_body("pk", "box-b", "commit", "http://a/", None);
+        let params = body["params"].clone();
+        assert!(params.get("selfVia").is_none());
+        // And the reverse: an old requester's body (no selfVia key at all)
+        // must still be exactly what a body with an explicit None produces
+        // — proving the field is well and truly absent, not `null`.
+        let old_shape = json!({ "pubkeyHex": "pk", "name": "box-b", "commitHex": "commit", "url": "http://a/" });
+        assert_eq!(params, old_shape);
     }
 
     #[test]

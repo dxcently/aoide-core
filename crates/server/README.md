@@ -219,7 +219,15 @@ the inbound half of the two-door contract (the outbound half is
   `valid_peer_name` name, a non-empty `://`-bearing url) before calling
   `aoide_storage::pairing::park_inbound` — malformed input never reaches
   the parked-state file, and a park past the configured cap is refused
-  with a distinct `-32000`. `pair_reveal` is the ceremony's
+  with a distinct `-32000`. It also reads the OPTIONAL `selfVia` param
+  (task #131 — the requester's own self-asserted reach-back hop claim,
+  for the case where the requester's own door is loopback-only and this
+  request is arriving over ITS tunnel, so nothing about the connection
+  itself can answer "how do I dial the requester back") with no
+  validation of its own: absent, wrong type, or empty all collapse to
+  `None` alike, since the field is never load-bearing enough to refuse a
+  pairing request over — only to enrich the eventual `peer pair approve`
+  commit when present. `pair_reveal` is the ceremony's
   third message: it checks a POSTed nonce against the parked entry's
   earlier commitment (`aoide_storage::pairing::reveal_inbound`) — a match
   stores the nonce so a SAS becomes derivable; a mismatch DROPS the parked

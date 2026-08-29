@@ -316,6 +316,20 @@
   never be able to burn or deny an entry by reaching a storage function
   that does both. Additive `#[serde(default)]` — a legacy record loads
   `0`, same discipline as `approved`.
+- **`InboundPairingRequest.self_via` is carried, never validated or parsed,
+  by this crate (task #131).** `park_inbound`'s `self_via: Option<&str>`
+  param stores whatever `aoide-server::a2a::pair_request` hands it
+  straight onto the field with no shape-checking here — the same "only
+  ever parsed at dial time, by the caller that actually dials" stance
+  every other recorded `via` string in this crate already holds (`Peer.via`,
+  `OutboundPairingRequest.via`). Don't add a `parse_via` call inside
+  `park_inbound` — a malformed claim must never refuse the WHOLE pairing
+  request; it only ever matters later, at `aoide-client::commands::
+  approve_inbound`'s own commit, and even there a bad string just fails
+  that one call the same way a bad `Peer.via` already does. Additive
+  `#[serde(default, skip_serializing_if = "Option::is_none")]` — a legacy
+  record loads `None` and a `None` here never grows the file, same
+  discipline `requester_nonce_hex` already holds.
 - **`undying::set_undying`'s return value is the on/off TRANSITION, not
   "did anything on disk change" (P-C1, durable-sessions plan).** Re-marking
   an already-undying id refreshes `marked_at` in place and returns `false`;
