@@ -213,8 +213,16 @@
   either function; the ONLY caller that reads flags is
   `handle_peer_pair_approve`, which resolves them into the parameter. A
   caller with no `Invocation` at all (`pair_watch`'s popup arm is the
-  first) passes `true`/`InboundGate::DialogConfirmed` directly — the
-  dialog itself IS that arm's confirmation.
+  first) passes `InboundGate::Code(<typed>)`/`true` directly — the popup's
+  own dialog (P-PV3, task #132) collects a typed code exactly like the CLI
+  tty/`--code` paths do, so it rides the SAME gate rather than a separate
+  no-prompt variant. `InboundGate::DialogConfirmed` (the old "the dialog
+  itself IS the confirmation, no code check" variant) is RETIRED — nothing
+  constructs it any more; don't reintroduce a no-check gate variant for a
+  future dialog surface without re-deriving why the typed-code gate
+  doesn't apply there (`pair_watch`'s own module doc has the outbound
+  arm's own reasoning for why ITS dialog shows the code where inbound's
+  never does).
 - **The approver's gate is the TYPED pairing code, and the approve prompt
   never echoes the SAS (task #120 P3).** `approve_inbound`'s prompt and
   mismatch messages name the code's SHAPE (`NNN-NNN`), never its value —

@@ -1462,7 +1462,7 @@ fn confirm_sas(sas: &str, name: &str) -> Result<bool, String> {
 /// auto-denies it (task #120 P3) — cumulative across invocations
 /// (`aoide_storage::pairing::InboundPairingRequest::tries` persists them)
 /// and across the interactive prompt and the scripted `--code` path alike.
-const MAX_CODE_TRIES: u32 = 3;
+pub(crate) const MAX_CODE_TRIES: u32 = 3;
 
 /// How `peer pair approve <id>` on an INBOUND entry collects its typed-code
 /// confirmation (task #120 P3) — the approver-side gate: the operator
@@ -1473,10 +1473,6 @@ const MAX_CODE_TRIES: u32 = 3;
 /// already-approved and awaiting-reveal checks, so those short-circuits
 /// behave identically whichever variant rides in.
 pub(crate) enum InboundGate {
-    /// `pair_watch --popup`'s dialog IS the confirmation (P-P5) — commit
-    /// with no prompt; the popup's own typed-code upgrade is a named
-    /// follow-on (`pair_watch`'s module doc), not this phase.
-    DialogConfirmed,
     /// Scripted `--code NNN-NNN`: validated once against the derived SAS;
     /// a mismatch counts one persisted try
     /// (`aoide_storage::pairing::record_inbound_code_try`).
@@ -1496,7 +1492,7 @@ pub(crate) enum InboundGate {
 /// `740729` and `740 729` match a SAS of `740-729` — the operator is copying
 /// digits off another screen, and the separator carries no entropy. Pure,
 /// so the comparison the whole gate rests on is testable with no tty.
-fn code_matches(input: &str, sas: &str) -> bool {
+pub(crate) fn code_matches(input: &str, sas: &str) -> bool {
     let norm = |s: &str| s.chars().filter(|c| !c.is_whitespace() && *c != '-').collect::<String>();
     let typed = norm(input);
     !typed.is_empty() && typed == norm(sas)
@@ -2082,9 +2078,10 @@ fn handle_peer_pair_approve(inv: &Invocation) -> Outcome {
 /// ([`auto_deny_inbound`] — the same clean removal `peer pair reject`
 /// performs, audited under its own reason). An abort (`Esc`, `Ctrl-C`)
 /// leaves the entry pending with no try counted — an abort is not a wrong
-/// code. [`InboundGate::DialogConfirmed`] (the `pair_watch --popup` arm,
-/// P-P5) still commits with no prompt at all: the dialog IS that arm's
-/// confirmation, and its typed-code upgrade is a named follow-on.
+/// code. **`pair_watch --popup`'s own dialog is `InboundGate::Code`
+/// too** (P-PV3, task #132): it collects the SAME typed code this gate
+/// already validates everywhere else, so the popup arm runs through this
+/// exact match arm, not a separate no-prompt one.
 pub(crate) fn approve_inbound(
     gate: InboundGate,
     cmd: &str,
@@ -2132,7 +2129,6 @@ pub(crate) fn approve_inbound(
     let sas = aoide_storage::pairing::derive_sas(&entry.pubkey_hex, &own_pubkey, &requester_nonce, &entry.approver_nonce_hex);
 
     match gate {
-        InboundGate::DialogConfirmed => {}
         InboundGate::Unavailable => return inbound_code_refusal(cmd, id),
         InboundGate::Code(code) => {
             if !code_matches(&code, &sas) {
@@ -4174,6 +4170,8 @@ mod tests {
             let id = entry.id.clone();
             aoide_storage::pairing::reveal_inbound(&id, &"c".repeat(32), now_epoch).unwrap();
             let entry = aoide_storage::pairing::list_inbound(now_epoch).into_iter().next().unwrap();
+            let (kp, _) = aoide_storage::identity::load_or_mint().unwrap();
+            let sas = aoide_storage::pairing::derive_sas(&pubkey_a, &kp.info().pubkey_hex, &"c".repeat(32), &entry.approver_nonce_hex);
 
             let shim_dir = std::env::temp_dir().join(format!(
                 "aoide-client-approve-inbound-curlshim-{}-{}",
@@ -4191,7 +4189,7 @@ mod tests {
             let saved_path = std::env::var("PATH").ok();
             std::env::set_var("PATH", format!("{}:{}", shim_dir.display(), saved_path.clone().unwrap_or_default()));
 
-            let outcome = approve_inbound(InboundGate::DialogConfirmed, "peer.pair.approve", &id, entry, &now, now_epoch);
+            let outcome = approve_inbound(InboundGate::Code(sas), "peer.pair.approve", &id, entry, &now, now_epoch);
 
             match saved_path {
                 Some(p) => std::env::set_var("PATH", p),
@@ -4482,10 +4480,10 @@ mod tests {
         with_peer_state("approve-inbound-self-via-present", || {
             let now_epoch = 1_700_000_000_i64;
             let now = aoide_storage::time::iso_utc_from_epoch(now_epoch);
-            let (entry, _sas) = parked_revealed_inbound_with_self_via(now_epoch, Some("ssh://khoa@box-a"));
+            let (entry, sas) = parked_revealed_inbound_with_self_via(now_epoch, Some("ssh://khoa@box-a"));
             let id = entry.id.clone();
 
-            let out = approve_inbound(InboundGate::DialogConfirmed, "peer.pair.approve", &id, entry, &now, now_epoch);
+            let out = approve_inbound(InboundGate::Code(sas), "peer.pair.approve", &id, entry, &now, now_epoch);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
             let peers = aoide_storage::peer_store::load_peers();
@@ -4512,12 +4510,12 @@ mod tests {
         with_peer_state("approve-inbound-self-via-nondefault-port", || {
             let now_epoch = 1_700_000_000_i64;
             let now = aoide_storage::time::iso_utc_from_epoch(now_epoch);
-            let (entry, _sas) =
+            let (entry, sas) =
                 parked_revealed_inbound_with_self_via_and_url(now_epoch, Some("ssh://khoa@box-a"), "http://box-a:9999/");
             let id = entry.id.clone();
             assert_ne!(9999, default_a2a_port(), "the fixture port must differ from the default for this test to prove anything");
 
-            let out = approve_inbound(InboundGate::DialogConfirmed, "peer.pair.approve", &id, entry, &now, now_epoch);
+            let out = approve_inbound(InboundGate::Code(sas), "peer.pair.approve", &id, entry, &now, now_epoch);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
             let peers = aoide_storage::peer_store::load_peers();
@@ -4535,11 +4533,11 @@ mod tests {
         with_peer_state("approve-inbound-self-via-absent", || {
             let now_epoch = 1_700_000_000_i64;
             let now = aoide_storage::time::iso_utc_from_epoch(now_epoch);
-            let (entry, _sas) = parked_revealed_inbound(now_epoch);
+            let (entry, sas) = parked_revealed_inbound(now_epoch);
             let entry_url = entry.url.clone();
             let id = entry.id.clone();
 
-            let out = approve_inbound(InboundGate::DialogConfirmed, "peer.pair.approve", &id, entry, &now, now_epoch);
+            let out = approve_inbound(InboundGate::Code(sas), "peer.pair.approve", &id, entry, &now, now_epoch);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
             let peers = aoide_storage::peer_store::load_peers();

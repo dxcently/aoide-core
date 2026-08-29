@@ -6,8 +6,8 @@
   (root `AGENTS.md`) — adding either here reopens the exact boundary P-A4
   drew. If a paint feature seems to need the graph or A2A, that's a signal
   it belongs in core, not a reason to add the dependency here.
-- **Lyra's golden is independent of core's.** `registry.rs`'s snapshot (45
-  paths) is its own list, not a subset check against `cli`'s 69 — the two
+- **Lyra's golden is independent of core's.** `registry.rs`'s snapshot (46
+  paths) is its own list, not a subset check against `cli`'s 80 — the two
   evolve separately.
 - **`commands::all()`'s order is byte-stable**, same discipline as `cli`'s —
   append, never reorder (see `pkgs/aoide/crates/AGENTS.md`).
@@ -28,13 +28,15 @@
   registration lines for these live in lyra's `commands`; the implementation
   files stay in `aoide-conduct` (see that crate's charter-smudge note) —
   don't duplicate or move them here.
-- **`commands::secrets::spawn_quickshell` arms `PR_SET_PDEATHSIG` on the
+- **`commands::dialog_qml::spawn_quickshell` arms `PR_SET_PDEATHSIG` on the
   quickshell child BEFORE it execs — this is what actually closes an ask
-  dialog when `lyra secrets ask` itself is killed, not this process's own
-  cleanup code (review fix, this commit; the ownership chain, since it
-  crosses this crate and `aoide-secrets`, is documented in BOTH crates'
-  `AGENTS.md`, this bullet is this crate's half).** `aoide_secrets::watch`'s
-  own near-expiry/resolved-elsewhere kill path (`run_entry_dialog`'s
+  dialog when `lyra secrets ask`/`lyra pair ask` itself is killed, not this
+  process's own cleanup code (originally a `commands::secrets` review fix;
+  moved here at the P-PV3 extraction, unchanged — the ownership chain,
+  since it crosses this crate and `aoide-secrets`/`aoide-client`, is
+  documented in every crate's `AGENTS.md`, this bullet is this crate's
+  half).** `aoide_secrets::watch`'s/`aoide_client::pair_watch`'s own
+  near-expiry/resolved-elsewhere kill path (`run_entry_dialog`'s
   `child.kill()`) sends `SIGKILL` to the `lyra` PROCESS it spawned — `SIGKILL`
   is UNTRAPPABLE, so `spawn_and_wait_for_marker`'s own best-effort
   `child.kill()` on the quickshell grandchild NEVER RUNS in that case (the
@@ -57,28 +59,40 @@
   same way). Don't drop this from a future `spawn_quickshell` rewrite "since
   `spawn_and_wait_for_marker` already kills the child" — that cleanup only
   runs when the FUNCTION returns normally, never when the whole process is
-  killed out from under it. Live-verified (this commit): opened a dialog,
-  `kill -9`'d the `lyra` pid, confirmed via `pgrep quickshell` that the
-  dialog's own quickshell process was gone within the same second — no
-  polling, no timeout, the kernel delivered it synchronously with the
-  parent's death.
-- **`commands::secrets::EXIT_INFRA_FAILURE` (exit `3`) is RESERVED for "the
-  dialog infrastructure itself broke" and must NEVER collide with `0`
-  (approved) or `1` (dismissed/cancelled) — live-incident fix, this commit,
+  killed out from under it. Live-verified (original `commands::secrets`
+  commit): opened a dialog, `kill -9`'d the `lyra` pid, confirmed via
+  `pgrep quickshell` that the dialog's own quickshell process was gone
+  within the same second — no polling, no timeout, the kernel delivered it
+  synchronously with the parent's death.
+- **`commands::dialog_qml::EXIT_INFRA_FAILURE` (exit `3`) is RESERVED for
+  "the dialog infrastructure itself broke" and must NEVER collide with `0`
+  (approved) or `1` (dismissed/cancelled) — live-incident fix originally in
+  `commands::secrets`, moved to the shared module at the P-PV3 extraction,
   that constant's own doc has the full incident.** Every internal-failure
-  path in `commands::secrets` (a `quickshell` spawn error, `AskResult::
-  Failed` — `spawn_and_wait_for_marker`'s own case for a marker-less exit)
-  routes through `handle_secrets_ask`'s `"failed"` outcome tag, which
-  `lib.rs`'s `special` hook is the ONE place that maps onto this exit code
-  PLUS an `eprintln!` naming what happened. Don't add a new internal-failure
-  case that falls through to the generic `_` arm (now USAGE-only,
-  `lib.rs`'s own comment) or reuses `output::exit::ERROR` — either would
-  silently reintroduce the exact incident this exists to close: `aoide-
-  secrets`' own `watch::run_entry_dialog` (the OTHER side of this contract,
-  no shared Rust type — this crate must never depend on `aoide-secrets` or
-  vice versa, root `AGENTS.md`'s core/paint boundary, so both sides
-  duplicate the literal `3` in their own doc comments) reads exit `1` as a
-  bare user cancel, never as a failure worth retrying.
+  path in `commands::secrets`/`commands::pair` (a `quickshell` spawn error,
+  `AskResult::Failed` — `spawn_and_wait_for_marker`'s own case for a
+  marker-less exit) routes through each command's own `"failed"` outcome
+  tag, which `lib.rs`'s `special` hook (one arm per command, `["secrets",
+  "ask"]`/`["pair", "ask"]`) is the ONE place that maps onto this exit code
+  PLUS an `eprintln!` naming what happened. Both commands re-export the
+  constant at their own path (`commands::secrets::EXIT_INFRA_FAILURE`/
+  `commands::pair::EXIT_INFRA_FAILURE`) purely so `lib.rs`'s two `special`
+  arms don't have to reach into `dialog_qml` directly — don't add a new
+  internal-failure case that falls through to the generic `_` arm (now
+  USAGE-only, `lib.rs`'s own comment) or reuses `output::exit::ERROR` —
+  either would silently reintroduce the exact incident this exists to
+  close: `aoide-secrets`' own `watch::run_entry_dialog` / `aoide-client`'s
+  own `pair_watch::run_entry_dialog` (the OTHER side of this contract, no
+  shared Rust type — this crate must never depend on `aoide-secrets`/
+  `aoide-client` or vice versa, root `AGENTS.md`'s core/paint boundary, so
+  every side duplicates the literal `3` in its own doc comments) reads
+  exit `1` as a bare user cancel, never as a failure worth retrying.
+- **`commands::dialog_qml` is the ONE place the six-box entry component
+  renders — a caller adds wording/flags, never a second QML template
+  (P-PV3, the extraction `commands::pair` forced).** A future THIRD
+  code-entry dialog reuses this module the same way `commands::pair` does;
+  don't copy `commands::secrets`' pre-extraction shape again "since it's
+  just one file."
 
 ## Extension points
 
@@ -94,3 +108,9 @@
 - The golden snapshot in `registry.rs` when the command-path set changes.
 - `docs/architecture/PACKAGE-LAYOUT.md`/`CONTRACTS.md §3` when the
   core/lyra split itself shifts.
+- `commands::dialog_qml`'s own module doc, plus every caller's doc
+  (`commands::secrets`, `commands::pair`, `aoide-secrets`' `watch.rs`,
+  `aoide-client`'s `pair_watch.rs`) when the shared output contract
+  (marker line shapes, exit codes) changes — it is duplicated prose across
+  a boundary no shared Rust type can enforce (root `AGENTS.md`'s core/paint
+  split), so a drift here is silent until a dialog answers wrong.

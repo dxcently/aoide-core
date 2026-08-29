@@ -115,6 +115,38 @@ pub fn run_lyra(argv: &[String]) -> i32 {
             });
         }
 
+        // `pair ask` (P-PV3, task #132) speaks the SAME zenity-shaped output
+        // contract as `secrets ask` above, one marker/label swapped:
+        // `crates/lyra/src/commands/pair.rs`'s module doc has the full
+        // rundown. `aoide_client::pair_watch::run_entry_dialog` reads this
+        // process's stdout expecting the typed code (exit 0), the literal
+        // string `Reject request` (exit 1), or a bare cancel (exit 1,
+        // nothing on stdout) — never a JSON envelope.
+        if inv.path == ["pair", "ask"] {
+            let outcome = dispatch::dispatch(inv);
+            let result = outcome.data.as_ref().and_then(|d| d.get("result")).and_then(|r| r.as_str());
+            return Some(match result {
+                Some("approved") => {
+                    let code = outcome.data.as_ref().and_then(|d| d.get("code")).and_then(|c| c.as_str()).unwrap_or("");
+                    println!("{code}");
+                    output::exit::OK
+                }
+                Some("dismissed") => {
+                    println!("Reject request");
+                    output::exit::ERROR
+                }
+                Some("cancelled") => output::exit::ERROR,
+                Some("failed") => {
+                    eprintln!("aoide lyra pair ask: {}", outcome.message);
+                    commands::pair::EXIT_INFRA_FAILURE
+                }
+                _ => {
+                    eprintln!("{}", outcome.message);
+                    output::exit::USAGE
+                }
+            });
+        }
+
         // `livery emit` / `livery resolve` / `livery lint` print the
         // engine's raw byte output in text mode, NOT the outcome envelope —
         // same posture as `schema` above. `--json` keeps the structured
