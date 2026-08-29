@@ -454,6 +454,42 @@ fn peer_pair_with_no_target_is_a_usage_error() {
     std::env::remove_var("AOIDE_AUDIT_LOG");
 }
 
+/// Review finding (P-PV2 follow-up): old `peer pair request <url>` muscle
+/// memory has no third `peer.pair.request` path left to greedily match —
+/// `door::parse`'s own longest-prefix match (the REAL argv parser, not a
+/// hand-built `Invocation`) resolves it to the 2-segment `peer.pair` with
+/// `["request", "<url>"]` as ITS OWN two args. Proven end to end: the real
+/// parser produces exactly that path/args split, and dispatching it refuses
+/// fast (well under the 45s hostname-arm sweep window — proof no sweep or
+/// dial ever ran) with a usage error naming the fold, never silently
+/// treating "request" as a hostname to sweep for and discarding the url.
+#[test]
+fn peer_pair_request_old_spelling_is_a_fast_taught_usage_error_never_a_silent_sweep() {
+    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let root = unique_root("pair-request-old-spelling");
+    let _stage = setup_env(&root);
+
+    let argv: Vec<String> = ["peer", "pair", "request", "http://127.0.0.1:1/"].iter().map(|s| s.to_string()).collect();
+    let (inv, _json) = aoide_protocol::door::parse(&argv, Door::Cli, "aoide", registry())
+        .expect("`peer pair request <url>` still parses — just not as its own command anymore");
+    assert_eq!(inv.path, vec!["peer", "pair"], "no `peer.pair.request` path exists to match anymore");
+    assert_eq!(inv.args, vec!["request", "http://127.0.0.1:1/"], "both old tokens land as peer.pair's own args");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let out = dispatch(&inv);
+    assert!(Instant::now() < deadline, "must refuse fast, never burn a sweep window on the discarded url");
+    assert_eq!(out.status, Status::Usage, "{out:?}");
+    assert!(out.data.is_none(), "no `reason` field — this refusal fires before either arm ever runs: {out:?}");
+    assert!(out.message.contains("peer pair request"), "{}", out.message);
+    assert!(out.message.contains("peer invite"), "{}", out.message);
+
+    let _ = std::fs::remove_dir_all(&root);
+    std::env::remove_var("AOIDE_STAGE_DIR");
+    std::env::remove_var("AOIDE_STATE_DIR");
+    std::env::remove_var("XDG_RUNTIME_DIR");
+    std::env::remove_var("AOIDE_AUDIT_LOG");
+}
+
 #[test]
 fn peer_pair_approve_and_reject_on_an_unknown_id_leave_no_record_change() {
     let _guard = aoide_test_support::env_lock().lock().unwrap();

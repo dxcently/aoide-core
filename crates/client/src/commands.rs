@@ -1659,11 +1659,26 @@ fn port_from_url(url: &str) -> Option<u16> {
 /// never forked.
 fn handle_peer_pair(inv: &Invocation) -> Outcome {
     let cmd = "peer.pair";
-    const USAGE: &str = "usage: aoide peer pair <url-or-hostname> [--name <n>] [--self-url <url>] [--self-via ssh://[user@]host] [--via ssh://[user@]host[:port]] [--secs N] [--yes] [--json]";
+    const USAGE: &str = "usage: aoide peer pair <url-or-hostname> [--name <n>] [--self-url <url>] [--self-via ssh://[user@]host] [--via ssh://[user@]host[:port]] [--secs N] [--yes] [--json] — takes exactly ONE positional target; the old `peer pair request <url>`/`peer invite <name>` folded into this single `peer pair <target>` (P-PV2, hard cutover, no alias)";
     let target = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         Some(t) => t.to_string(),
         None => return Outcome::usage(cmd, USAGE),
     };
+    // `peer pair` takes EXACTLY one positional (review finding, P-PV2
+    // follow-up): a second one is never valid syntax. The registry has no
+    // third `peer.pair.request` path to greedily match anymore, so old
+    // `peer pair request <url>` muscle memory lands its `request`/`<url>`
+    // pair here as THIS command's own `args`, past its single declared
+    // `target`. Silently reading only `args[0]` ("request") and discarding
+    // the real url would burn a full hostname-arm sweep window looking for
+    // an advertiser literally named "request" before failing with a
+    // message that never mentions the URL was even seen — worse than an
+    // ordinary unknown-command refusal. Refuse loudly instead, uniformly:
+    // the fold explanation lives in `USAGE` itself (shown on every arity
+    // error alike), never a special case keyed on `target == "request"`.
+    if inv.args.len() > 1 {
+        return Outcome::usage(cmd, USAGE);
+    }
     if target.contains("://") {
         pair_via_url(cmd, inv, &target, USAGE)
     } else {
@@ -4770,6 +4785,37 @@ mod tests {
             );
             assert!(out.message.contains("1s"), "the refusal names the sweep window actually used: {}", out.message);
         });
+    }
+
+    /// Review finding (P-PV2 follow-up): old `peer pair request <url>`
+    /// muscle memory has no third `peer.pair.request` path to greedily
+    /// match anymore, so it lands here as `peer.pair`'s OWN two args
+    /// (`["request", "<url>"]`) — reading only `args[0]` and discarding the
+    /// url would silently burn a full sweep window looking for an
+    /// advertiser named "request" before failing with no mention the url
+    /// was ever seen. `peer pair` now refuses ANY second positional
+    /// outright — proven here by asserting Usage AND that no sweep or dial
+    /// ever ran (no `data.reason` at all: neither arm's error shape, since
+    /// neither arm is ever reached). The taught text lives in `USAGE`
+    /// itself, shown identically for every arity error — never a special
+    /// case keyed on the first arg spelling "request".
+    #[test]
+    fn peer_pair_refuses_a_second_positional_naming_the_dead_dual_command_fold() {
+        let inv = Invocation {
+            path: vec!["peer".into(), "pair".into()],
+            args: vec!["request".to_string(), "http://127.0.0.1:1/".to_string()],
+            flags: Default::default(),
+            door: aoide_protocol::Door::Cli,
+        };
+        let out = handle_peer_pair(&inv);
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{out:?}");
+        assert!(
+            out.data.as_ref().and_then(|d| d.get("reason")).is_none(),
+            "neither arm's error shape must appear — this refusal fires before either arm ever runs: {out:?}"
+        );
+        assert!(out.message.contains("peer pair request"), "{}", out.message);
+        assert!(out.message.contains("peer invite"), "{}", out.message);
+        assert!(out.message.contains("peer pair <target>"), "{}", out.message);
     }
 
     /// `peer pair approve`/`reject`/`watch` are SUBCOMMANDS of `peer pair`
