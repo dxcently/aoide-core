@@ -1571,17 +1571,51 @@ fn default_self_url() -> String {
 /// OPTIONAL `selfVia` field, carried beside `self_url` on `aoide/pairRequest`
 /// so the approver (which only ever OBSERVES the request arriving over the
 /// requester's own ssh tunnel, i.e. loopback) can record a `via` that
-/// actually reaches back out: `ssh://<local login>@<local hostname>`, the
-/// same two halves [`default_self_url`] already derives (`local_host_name`)
-/// plus [`crate::tunnel::local_login`]'s `$USER`/`$LOGNAME` chain — reused,
-/// never re-derived. `None` when neither env var is set (no guessed
-/// literal), the same "refuse rather than guess" stance
-/// [`crate::tunnel::resolve_login`] already holds; `--self-via` overrides
-/// this outright, mirroring `--self-url`.
-fn default_self_via() -> Option<String> {
+/// actually reaches back out: `ssh://<local login>@<host>`.
+///
+/// **The HOST half is the LOCAL OUTBOUND ADDRESS toward `toward` (host, or
+/// `host:port`), never a claimed OS hostname (review finding — a live
+/// LAN check found hostnames here resolving only through the router's
+/// DHCP-DNS, and two boxes coming back as IPv6/link-local mixes:
+/// resolution by luck, exactly the fragility the codebase's own K1 rule
+/// —"never a claimed host" on [`aoide_storage::tunnel::default_via`] —
+/// exists to avoid; every live `via` row is IP-based for the same reason).**
+/// [`outbound_ip_toward`] opens a UDP socket, `connect`s it to `toward`
+/// (no packet ever sent — `connect` on a UDP socket only picks a route),
+/// and reads back the LOCAL address the kernel chose for that route: on an
+/// ordinary LAN, the address the far side can actually reach this box at.
+/// Falls back to [`aoide_storage::display::local_host_name`]'s claimed
+/// hostname ONLY when the UDP trick itself fails (no route yet, or
+/// anything else `connect`/`local_addr` can return an `Err` for) — still
+/// self-asserted, best-effort DATA either way (the wire's own trust stays
+/// in pubkeys + SAS, never this field). The LOGIN half is
+/// [`crate::tunnel::local_login`]'s `$USER`/`$LOGNAME` chain, reused
+/// verbatim from [`crate::tunnel::resolve_login`] — `None` when neither
+/// env var is set (no guessed literal there either). `--self-via`
+/// overrides this whole function outright, mirroring `--self-url`; every
+/// caller only ever reaches this as an `Option::or_else` fallback.
+fn default_self_via(toward: &str) -> Option<String> {
     let login = crate::tunnel::local_login().ok()?;
-    let host = aoide_storage::display::local_host_name();
+    let host = outbound_ip_toward(toward)
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(aoide_storage::display::local_host_name);
     Some(format!("ssh://{login}@{host}"))
+}
+
+/// The local address the kernel would route a packet toward `toward`
+/// (`host` or `host:port`) through — no packet is ever actually sent, a
+/// UDP `connect` only resolves a route and binds the socket's local
+/// endpoint to it. `toward` gets a dummy port appended (`8710`, never used
+/// for anything beyond satisfying `ToSocketAddrs` — any nonzero port picks
+/// the identical route) when it doesn't already carry one. `None` on any
+/// failure (unresolvable host, no route, socket error) — the caller's own
+/// fallback case, never a panic; this is a best-effort LAN heuristic, not
+/// a guarantee.
+fn outbound_ip_toward(toward: &str) -> Option<std::net::IpAddr> {
+    let target = if toward.contains(':') { toward.to_string() } else { format!("{toward}:8710") };
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect(&target).ok()?;
+    socket.local_addr().ok().map(|addr| addr.ip())
 }
 
 /// The house A2A door port this box assumes for itself AND for a
@@ -1596,6 +1630,18 @@ fn default_a2a_port() -> u16 {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8710)
+}
+
+/// The port a `scheme://host[:port][/path]` url's own authority carries —
+/// lightweight, reusing [`aoide_storage::peer_store::url_host`]'s existing
+/// authority extraction rather than pulling in a full URL parser for one
+/// field. `None` on an unparseable url, a bare host with no `:port`
+/// segment at all, or a port that doesn't fit `u16` — every one of those
+/// is a caller's fallback case, never a panic.
+fn port_from_url(url: &str) -> Option<u16> {
+    let authority = aoide_storage::peer_store::url_host(url)?;
+    let (_, port_str) = authority.rsplit_once(':')?;
+    port_str.parse::<u16>().ok()
 }
 
 /// `peer pair request <url> [--name <n>] [--self-url <url>]` — the
@@ -1647,12 +1693,6 @@ fn handle_peer_pair_request(inv: &Invocation) -> Outcome {
         .cloned()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(default_self_url);
-    let self_via = inv
-        .flags
-        .get("self-via")
-        .cloned()
-        .filter(|s| !s.is_empty())
-        .or_else(default_self_via);
     // An invalid --via is a usage error, never a silent fallback to a
     // direct dial (parse_via_flag's own stance). Unlike `peer invite`
     // (K1's src_addr-derived default), a plain `peer pair request` has no
@@ -1662,6 +1702,20 @@ fn handle_peer_pair_request(inv: &Invocation) -> Outcome {
         Ok(v) => v,
         Err(e) => return Outcome::usage(cmd, format!("{USAGE} — {e}")),
     };
+    // `default_self_via`'s outbound-route trick needs a real dial target —
+    // when this call goes through a tunnel, the address actually routed to
+    // is `via`'s own host (the ssh target), never the logical `url`'s host,
+    // which the tunnel may make unreachable directly.
+    let toward = match via.as_ref() {
+        Some(v) => v.host.clone(),
+        None => aoide_storage::peer_store::url_host(&url).unwrap_or_else(|| url.clone()),
+    };
+    let self_via = inv
+        .flags
+        .get("self-via")
+        .cloned()
+        .filter(|s| !s.is_empty())
+        .or_else(|| default_self_via(&toward));
 
     run_pair_request(cmd, &url, &name, &self_url, self_via.as_deref(), via.as_ref(), via.as_ref().map(|v| v.to_string()))
 }
@@ -1693,12 +1747,14 @@ fn handle_peer_pair_request(inv: &Invocation) -> Outcome {
 /// LATER commit onto the resulting peer record, in the SEPARATE `peer pair
 /// approve <id>` invocation that actually writes it (`approve_outbound`).
 /// `self_via` (P-PV1) is this instance's OWN reach-back hop claim —
-/// `ssh://<local user>@<local host>` by default
-/// ([`default_self_via`]), overridable by `--self-via` — carried on the
-/// wire beside `self_url` so the far end, which can only ever OBSERVE this
-/// request arriving over the tunnel (i.e. loopback), has something to
-/// record a working `via` from at ITS OWN approve-commit time
-/// ([`approve_inbound`]'s own doc).
+/// `ssh://<local login>@<local address routed toward the peer>` by default
+/// ([`default_self_via`] — the HOST half is the local outbound address the
+/// kernel picks for a route toward the peer, never a claimed OS hostname;
+/// that function's own doc has the full reasoning), overridable by
+/// `--self-via` — carried on the wire beside `self_url` so the far end,
+/// which can only ever OBSERVE this request arriving over the tunnel (i.e.
+/// loopback), has something to record a working `via` from at ITS OWN
+/// approve-commit time ([`approve_inbound`]'s own doc).
 fn run_pair_request(
     cmd: &str,
     url: &str,
@@ -2078,8 +2134,19 @@ pub(crate) fn approve_inbound(
     // one with nothing to claim) commits EXACTLY today's shape: `entry.url`
     // verbatim, `via` left `None` — the same "absent by default" a fresh
     // `Peer` already carries.
+    //
+    // The PORT in the loopback rewrite is the REQUESTER's own door port,
+    // parsed off `entry.url` (their own `self_url`, already encoding
+    // whatever port their door actually binds — review finding, first
+    // pass wrongly read THIS box's own `AOIDE_A2A_PORT`, which has no
+    // relation to the requester's) — `default_a2a_port()` is only ever a
+    // fallback for the rare case `entry.url` carries no parseable port at
+    // all (a malformed or hand-edited self-claim).
     let record_url = match entry.self_via.as_deref() {
-        Some(_) => format!("http://127.0.0.1:{}/", default_a2a_port()),
+        Some(_) => {
+            let port = port_from_url(&entry.url).unwrap_or_else(default_a2a_port);
+            format!("http://127.0.0.1:{port}/")
+        }
         None => entry.url.clone(),
     };
     let mut peers = aoide_storage::peer_store::load_peers();
@@ -2585,7 +2652,10 @@ fn pair_with_heard(
 ) -> Outcome {
     let dial_url = format!("http://{}:{}/", hit.src_addr, default_a2a_port());
     let self_url = default_self_url();
-    let self_via = self_via_flag.map(|s| s.to_string()).or_else(default_self_via);
+    // `hit.src_addr` is the OBSERVED source address — the real dial target
+    // this whole ceremony is already using, so it is also the right target
+    // for `default_self_via`'s outbound-route trick.
+    let self_via = self_via_flag.map(|s| s.to_string()).or_else(|| default_self_via(&hit.src_addr));
     let (dial_via, record_via) = resolve_pair_vias(hit, via_flag);
     run_pair_request(cmd, &dial_url, &hit.advertisement.name, &self_url, self_via.as_deref(), dial_via.as_ref(), record_via)
 }
@@ -2624,7 +2694,7 @@ pub fn register_peer_pair(r: &mut Registry) {
         flags: [
             flag!("name", "string", "A local nickname for the other instance; defaults to a sanitized form of the URL's host."),
             flag!("self-url", "string", "This instance's own advertised A2A door URL, recorded on the resulting peer record for the approver's future non-ceremony calls (the ceremony itself now polls, so this is no longer dialed to complete pairing); defaults to http://<host>:<AOIDE_A2A_PORT or 8710>/."),
-            flag!("self-via", "string", "This instance's own ssh://[user@]host reach-back hop claim, sent on the wire beside --self-url so an approver that only ever observes this request over a tunnel (loopback) can still record a working via; defaults to ssh://<local user>@<local hostname>."),
+            flag!("self-via", "string", "This instance's own ssh://[user@]host reach-back hop claim, sent on the wire beside --self-url so an approver that only ever observes this request over a tunnel (loopback) can still record a working via; defaults to ssh://<local user>@<the local address routed toward the peer>."),
             flag!("via", "string", "An ssh://[user@]host[:port] transport marker — both the ceremony's own dial AND the resulting peer's recorded via. Absent = direct dial (today's behavior)."),
         ],
         gated: false,
@@ -2737,7 +2807,7 @@ pub fn register_peer_discovery(r: &mut Registry) {
             flag!("secs", "int", "How many seconds to listen (default ~4)."),
             flag!("yes", "bool", "Skip the interactive y/N proceed confirmation (scripted use) — the ceremony's own SAS confirmation is untouched."),
             flag!("via", "string", "An ssh://[user@]host[:port] transport marker, overriding the default derived from the advertisement's observed source address and claimed ssh login — both the ceremony's own dial AND the resulting peer's recorded via."),
-            flag!("self-via", "string", "This instance's own ssh://[user@]host reach-back hop claim, sent on the wire beside self-url so an approver that only ever observes this request over a tunnel (loopback) can still record a working via; defaults to ssh://<local user>@<local hostname>."),
+            flag!("self-via", "string", "This instance's own ssh://[user@]host reach-back hop claim, sent on the wire beside self-url so an approver that only ever observes this request over a tunnel (loopback) can still record a working via; defaults to ssh://<local user>@<the local address routed toward the peer>."),
         ],
         gated: false,
         implemented: true,
@@ -2939,6 +3009,58 @@ mod tests {
         let (dial_via, record_via) = resolve_pair_vias(&hit, Some(&explicit));
         assert_eq!(dial_via.map(|v| v.to_string()), Some("ssh://other@elsewhere:2222".to_string()));
         assert_eq!(record_via, Some("ssh://other@elsewhere:2222".to_string()));
+    }
+
+    #[test]
+    fn port_from_url_extracts_the_authoritys_own_port_or_none() {
+        assert_eq!(port_from_url("http://box-a:9999/"), Some(9999));
+        assert_eq!(port_from_url("http://10.0.0.5:8710/aoide/pairRequest"), Some(8710));
+        assert_eq!(port_from_url("http://box-a/"), None, "no :port segment at all — a caller's fallback case, never a guessed port");
+        assert_eq!(port_from_url("not-a-url"), None);
+        assert_eq!(port_from_url("http://box-a:not-a-number/"), None);
+    }
+
+    /// Review finding (high): `default_self_via`'s HOST half must be the
+    /// local outbound address toward the peer, never a claimed OS
+    /// hostname (a LAN check found hostnames resolving only through the
+    /// router's DHCP-DNS — resolution by luck). Dialing `127.0.0.1`
+    /// deterministically routes back to `127.0.0.1` on any box, with no
+    /// real network involved (a UDP `connect` never sends a packet) — the
+    /// same reasoning `outbound_ip_toward`'s own doc gives.
+    #[test]
+    fn outbound_ip_toward_resolves_to_loopback_when_dialing_127_0_0_1() {
+        assert_eq!(outbound_ip_toward("127.0.0.1"), Some("127.0.0.1".parse().unwrap()));
+        assert_eq!(outbound_ip_toward("127.0.0.1:9999"), Some("127.0.0.1".parse().unwrap()), "an explicit port in `toward` is honored, never overridden");
+    }
+
+    /// `default_self_via`'s own claim-formatting (`ssh://<login>@<host>`),
+    /// pinned deterministically: `$USER` is stamped to a known value and
+    /// `toward` is loopback, so the HOST half resolves the same way
+    /// [`outbound_ip_toward_resolves_to_loopback_when_dialing_127_0_0_1`]
+    /// above already proved it does, with no real network involved either
+    /// way.
+    #[test]
+    fn default_self_via_formats_login_at_the_outbound_address_toward_the_peer() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_user = std::env::var("USER").ok();
+        let saved_logname = std::env::var("LOGNAME").ok();
+        std::env::set_var("USER", "testuser");
+        std::env::remove_var("LOGNAME");
+
+        assert_eq!(default_self_via("127.0.0.1").as_deref(), Some("ssh://testuser@127.0.0.1"));
+
+        std::env::remove_var("USER");
+        std::env::remove_var("LOGNAME");
+        assert_eq!(default_self_via("127.0.0.1"), None, "no $USER/$LOGNAME at all — refuse rather than guess a login, same as resolve_login's own stance");
+
+        match saved_user {
+            Some(v) => std::env::set_var("USER", v),
+            None => std::env::remove_var("USER"),
+        }
+        match saved_logname {
+            Some(v) => std::env::set_var("LOGNAME", v),
+            None => std::env::remove_var("LOGNAME"),
+        }
     }
 
     // ── `handle_peer_allow` (P-P3) — pure file I/O, so unlike most `peer`
@@ -4195,6 +4317,21 @@ mod tests {
         now_epoch: i64,
         self_via: Option<&str>,
     ) -> (aoide_storage::pairing::InboundPairingRequest, String) {
+        parked_revealed_inbound_with_self_via_and_url(now_epoch, self_via, "http://box-a:8710/")
+    }
+
+    /// [`parked_revealed_inbound_with_self_via`], with the parked entry's
+    /// own `url` also overridable — the seam
+    /// `approve_inbound_records_the_requesters_own_port_parsed_from_entry_url`
+    /// needs to prove the loopback rewrite carries the REQUESTER's own
+    /// door port (parsed off `entry.url`), never this box's own
+    /// `AOIDE_A2A_PORT` (review finding — the first pass read the wrong
+    /// box's port entirely).
+    fn parked_revealed_inbound_with_self_via_and_url(
+        now_epoch: i64,
+        self_via: Option<&str>,
+        url: &str,
+    ) -> (aoide_storage::pairing::InboundPairingRequest, String) {
         let requester_pk = "e".repeat(64);
         let nonce = "aabbccdd11223344";
         let commit = aoide_storage::pairing::derive_commit(&requester_pk, nonce);
@@ -4202,7 +4339,7 @@ mod tests {
             &requester_pk,
             "box-a",
             "10.0.0.5",
-            "http://box-a:8710/",
+            url,
             &commit,
             &aoide_storage::time::iso_utc_from_epoch(now_epoch),
             &aoide_storage::pairing::expires_at_from(now_epoch),
@@ -4287,8 +4424,39 @@ mod tests {
 
             let peers = aoide_storage::peer_store::load_peers();
             assert_eq!(peers.len(), 1);
+            // The fixture's own url (`http://box-a:8710/`) happens to carry
+            // the house default port too — `approve_inbound_records_the_
+            // requesters_own_port_parsed_from_entry_url` below is the test
+            // that actually proves this is parsed off entry.url and not
+            // this box's own `AOIDE_A2A_PORT`, by using a DIFFERENT port.
             assert_eq!(peers[0].url, format!("http://127.0.0.1:{}/", default_a2a_port()), "the claim's presence rewrites the record to the loopback-as-seen-from-the-far-side convention, never entry.url");
             assert_eq!(peers[0].via.as_deref(), Some("ssh://khoa@box-a"), "via is the claim itself, committed in the same write");
+        });
+    }
+
+    /// Review finding (high): the first pass of the loopback rewrite read
+    /// THIS box's own `AOIDE_A2A_PORT`/default, which has no relation to
+    /// the REQUESTER's actual door port — `entry.url` (the requester's own
+    /// `self_url`) already encodes it. A distinct, non-default port here
+    /// (`9999`, deliberately unequal to `default_a2a_port()`'s `8710`)
+    /// proves the commit parses `entry.url`'s own port rather than
+    /// defaulting to this box's.
+    #[test]
+    fn approve_inbound_records_the_requesters_own_port_parsed_from_entry_url() {
+        with_peer_state("approve-inbound-self-via-nondefault-port", || {
+            let now_epoch = 1_700_000_000_i64;
+            let now = aoide_storage::time::iso_utc_from_epoch(now_epoch);
+            let (entry, _sas) =
+                parked_revealed_inbound_with_self_via_and_url(now_epoch, Some("ssh://khoa@box-a"), "http://box-a:9999/");
+            let id = entry.id.clone();
+            assert_ne!(9999, default_a2a_port(), "the fixture port must differ from the default for this test to prove anything");
+
+            let out = approve_inbound(InboundGate::DialogConfirmed, "peer.pair.approve", &id, entry, &now, now_epoch);
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
+
+            let peers = aoide_storage::peer_store::load_peers();
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].url, "http://127.0.0.1:9999/", "the loopback rewrite must carry the REQUESTER's own door port, parsed from entry.url, never this box's own AOIDE_A2A_PORT/default");
         });
     }
 

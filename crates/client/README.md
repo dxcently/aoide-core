@@ -309,10 +309,15 @@ never the inbound/serve half (that's `aoide-server`).
   entry's `self_via` (task #131).** Present — the requester claimed a
   reach-back hop on the wire (`InboundPairingRequest::self_via`, carried
   through from `aoide/pairRequest`'s own `selfVia`) — the commit records
-  `url: http://127.0.0.1:<AOIDE_A2A_PORT or 8710>/` (loopback-as-seen-
-  from-the-far-side; the requester's own door is reachable only through
-  the very tunnel that delivered this request, so `entry.url`'s
-  requester-observed host is never directly dialable) and `via` set to the
+  `url: http://127.0.0.1:<port>/` (loopback-as-seen-from-the-far-side; the
+  requester's own door is reachable only through the very tunnel that
+  delivered this request, so `entry.url`'s requester-observed HOST is
+  never directly dialable) where `<port>` is `port_from_url(&entry.url)`
+  — the REQUESTER's own door port, parsed off their own `self_url`
+  (review finding: the first pass of this fix wrongly defaulted to THIS
+  box's own `AOIDE_A2A_PORT`, which names nothing about the requester;
+  `port_from_url` only ever falls back to `default_a2a_port()` when
+  `entry.url` itself carries no parseable port) — and `via` set to the
   claim itself, via `set_peer_via` in the SAME write as `upsert_paired_peer`
   (the sibling-writer shape `approve_outbound`'s own equivalent call,
   below, already holds). Absent — an old requester, or one with nothing to
@@ -415,14 +420,28 @@ never the inbound/serve half (that's `aoide-server`).
   POSTs need the tunnel exactly as much as the record does. An explicit
   `--via` beats both defaults outright, for both halves, unchanged.
   `self_via` (task #131) is this instance's OWN reach-back hop claim —
-  `default_self_via()` (`ssh://<local login>@<local hostname>`, reusing
-  `crate::tunnel::local_login`'s `$USER`/`$LOGNAME` chain and
-  `aoide_storage::display::local_host_name`, `None` when neither env var is
-  set) or an explicit `--self-via`, carried on the wire beside `self_url`
-  ([`crate::peer::build_pair_request_body`] below) so the approver — which
-  can only ever OBSERVE this request arriving over the tunnel, i.e.
-  loopback — has something to record a working `via` from at ITS OWN
-  `peer pair approve` commit time (`approve_inbound`, below).
+  `default_self_via(toward)` (`ssh://<local login>@<local outbound address
+  routed toward `toward`>`, reusing `crate::tunnel::local_login`'s
+  `$USER`/`$LOGNAME` chain for the login half, `None` when neither env var
+  is set) or an explicit `--self-via`, carried on the wire beside
+  `self_url` ([`crate::peer::build_pair_request_body`] below) so the
+  approver — which can only ever OBSERVE this request arriving over the
+  tunnel, i.e. loopback — has something to record a working `via` from at
+  ITS OWN `peer pair approve` commit time (`approve_inbound`, below).
+  **The HOST half is deliberately NOT `aoide_storage::display::
+  local_host_name`'s claimed hostname (review finding, task #131) — a live
+  LAN check found hostnames resolving only through the router's DHCP-DNS,
+  exactly the fragility K1's own "never a claimed host" rule (`Peer.via`)
+  exists to avoid.** `outbound_ip_toward(toward)` opens a UDP socket,
+  `connect`s it to `toward` (no packet sent — `connect` on a UDP socket
+  only resolves a route) and reads back the LOCAL address the kernel chose
+  — on an ordinary LAN, the address the peer can actually reach this box
+  at — falling back to the claimed hostname only when that lookup itself
+  fails. `toward` is the address actually being dialed: `pair_with_heard`
+  passes `hit.src_addr` (the observed source, already the real target);
+  `handle_peer_pair_request` passes `via`'s own host when dialing through
+  a tunnel (the ssh target, not the logical `url`, which the tunnel may
+  make unreachable directly), else the `url`'s own host.
   `handle_peer_discover`/`handle_peer_invite` (`peer
   discover [--secs N]`/`peer invite <name> [--secs N] [--yes]`) are thin
   wrappers around `discover::run_sweep`/`discover::resolve_invite_target`

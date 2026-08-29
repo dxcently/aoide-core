@@ -157,12 +157,17 @@
 - **`approve_inbound`'s commit maps `entry.self_via` to `{url, via}` — get
   this backwards and every loopback-only requester's peer record comes out
   undialable (task #131).** Present, the commit is `url:
-  http://127.0.0.1:<AOIDE_A2A_PORT or 8710>/` (never `entry.url` — the
-  requester-observed door, undialable through the very tunnel that
-  delivered this request) and `via: entry.self_via` via `set_peer_via` in
-  the SAME write as `upsert_paired_peer`, mirroring the sibling-writer
-  shape `approve_outbound`'s own `entry.via` commit already holds just
-  below it. Absent, both stay exactly what `upsert_paired_peer` alone
+  http://127.0.0.1:<port>/` (never `entry.url` — the requester-observed
+  door, undialable through the very tunnel that delivered this request)
+  and `via: entry.self_via` via `set_peer_via` in the SAME write as
+  `upsert_paired_peer`, mirroring the sibling-writer shape
+  `approve_outbound`'s own `entry.via` commit already holds just below it.
+  **`<port>` is `port_from_url(&entry.url)` — the REQUESTER's own door
+  port. Never `default_a2a_port()` outright (review finding: the first
+  pass read THIS box's own `AOIDE_A2A_PORT`, which has no relation to the
+  requester's door at all)** — `port_from_url` is only ever a fallback for
+  the rare case `entry.url` carries no parseable port. Absent (no
+  `self_via` claim), both stay exactly what `upsert_paired_peer` alone
   already produces: `entry.url` verbatim, `via` untouched (never call
   `set_peer_via` with `None` here — that would WIPE a via a previous
   pairing recorded, the same "untouched unless this call names a change"
