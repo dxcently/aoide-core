@@ -147,6 +147,37 @@ pub fn run_lyra(argv: &[String]) -> i32 {
             });
         }
 
+        // `pair confirm` (P-PV3 revert, task #132) — the OUTBOUND sibling
+        // of `pair ask` above, speaking the SAME zenity-`--question`-shaped
+        // contract rather than `--entry`'s: exit 0 on approve with NOTHING
+        // meaningful on stdout (an empty approval — this dialog never
+        // collects a typed value), `Reject request` on stdout + exit 1 on
+        // dismiss, a bare cancel (exit 1, nothing on stdout), and
+        // `EXIT_INFRA_FAILURE` for a spawn/marker-less failure. Don't print
+        // anything on the approved arm — a stray "code" here would be read
+        // as a typed value by `aoide_client::pair_watch::run_entry_dialog`,
+        // which is exactly what this revert removed.
+        if inv.path == ["pair", "confirm"] {
+            let outcome = dispatch::dispatch(inv);
+            let result = outcome.data.as_ref().and_then(|d| d.get("result")).and_then(|r| r.as_str());
+            return Some(match result {
+                Some("approved") => output::exit::OK,
+                Some("dismissed") => {
+                    println!("Reject request");
+                    output::exit::ERROR
+                }
+                Some("cancelled") => output::exit::ERROR,
+                Some("failed") => {
+                    eprintln!("aoide lyra pair confirm: {}", outcome.message);
+                    commands::pair::EXIT_INFRA_FAILURE
+                }
+                _ => {
+                    eprintln!("{}", outcome.message);
+                    output::exit::USAGE
+                }
+            });
+        }
+
         // `livery emit` / `livery resolve` / `livery lint` print the
         // engine's raw byte output in text mode, NOT the outcome envelope —
         // same posture as `schema` above. `--json` keeps the structured

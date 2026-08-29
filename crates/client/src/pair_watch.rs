@@ -39,38 +39,59 @@
 //! dispatched handler) and "run the blocking loop" (this module,
 //! special-cased in `cli`'s own `run_cli`).
 //!
-//! **The popup arm (F6, upgraded P-PV3/task #132): a TYPED-CODE entry
-//! dialog, never a bare yes/no.** [`resolve_lyra_bin`] feature-detects
-//! `lyra` the SAME three-tier way `aoide_secrets::watch::resolve_lyra_bin`
-//! does (env override, `current_exe()` sibling, bare-name-on-`PATH` —
-//! duplicated here rather than imported, since neither crate may depend on
-//! the other or on `aoide-cli`); when it resolves, [`run_ask_dialog`] spawns
-//! `lyra pair ask` (the SAME six-boxes-plus-dash surface `lyra secrets ask`
-//! renders) instead of `zenity --entry`, falling back to zenity on a `lyra`
-//! `SpawnError`/`DialogFailure` for that one attempt (`aoide_secrets::
-//! watch::run_ask_dialog`'s own fallback shape, reused unchanged: the
-//! plugin philosophy's whole point, root `AGENTS.md` house rule 7, is that
-//! the fancy surface degrades to the plain one, never that a fancy-surface
-//! failure strands the request). The operator TYPES the confirmation code
-//! rather than clicking Approve/Reject — matching the CLI tty path's own
-//! `InboundGate::Prompt` gate byte for byte on the INBOUND (approver)
-//! direction: [`commit_approval`] now runs `InboundGate::Code(<typed>)`
+//! **The popup arm (F6, upgraded P-PV3/task #132): TWO dialog shapes, one
+//! per pairing direction — never a single bare yes/no.**
+//! [`resolve_lyra_bin`] feature-detects `lyra` the SAME three-tier way
+//! `aoide_secrets::watch::resolve_lyra_bin` does (env override,
+//! `current_exe()` sibling, bare-name-on-`PATH` — duplicated here rather
+//! than imported, since neither crate may depend on the other or on
+//! `aoide-cli`); when it resolves, the dialog spawns a `lyra pair`
+//! subcommand instead of a `zenity` invocation, falling back to zenity on
+//! a `lyra` `SpawnError`/`DialogFailure` for that one attempt
+//! (`aoide_secrets::watch::run_ask_dialog`'s own fallback shape, reused
+//! unchanged: the plugin philosophy's whole point, root `AGENTS.md` house
+//! rule 7, is that the fancy surface degrades to the plain one, never that
+//! a fancy-surface failure strands the request).
+//!
+//! **INBOUND (approver): a TYPED-CODE entry dialog** — [`run_ask_dialog`]
+//! spawns `lyra pair ask` (the SAME six-boxes-plus-dash surface `lyra
+//! secrets ask` renders) or `zenity --entry`. The operator TYPES the
+//! confirmation code they read off the REQUESTER's own screen,
+//! out-of-band — matching the CLI tty path's own `InboundGate::Prompt`
+//! gate byte for byte: [`commit_approval`] runs `InboundGate::Code(<typed>)`
 //! through `approve_inbound`, so the SAME SAS comparison and
 //! [`crate::commands::MAX_CODE_TRIES`] auto-deny machinery the CLI already
 //! holds applies identically here — `InboundGate::DialogConfirmed` (a bare
 //! "the dialog itself IS the confirmation," no code check at all) is
 //! RETIRED by this upgrade; nothing constructs it any more (`crate::
-//! commands`' own doc has the removal). On the OUTBOUND (requester)
-//! direction — where the CLI's own `confirm_sas`/`--yes` never asked for a
-//! typed code, since this instance generated the SAS itself and just needs
-//! to prove the operator actually read it — the dialog SHOWS that
-//! self-generated code (never a leak: it originates locally, the CLI's own
-//! `confirm_sas` prints it too) and the typed value is compared against it
-//! in-process (`crate::commands::code_matches`, [`commit_approval`]'s
-//! outbound arm) before `approve_outbound(true, ...)` ever runs — a
-//! mismatch simply doesn't commit and the request stays offered next tick,
-//! with no persisted-try counter (`OutboundPairingRequest` carries none;
-//! this is a click-through guard, not the approver's security gate).
+//! commands`' own doc has the removal). The dialog NEVER shows the code
+//! (the approver's whole gate is typing a code read from elsewhere;
+//! showing it would collapse the out-of-band comparison into a copy
+//! exercise, the same reasoning `crate::commands::approve_inbound`'s own
+//! doc gives for why its tty prompt never echoes the SAS either).
+//!
+//! **OUTBOUND (requester): a CONFIRM dialog, never a retype** —
+//! [`run_confirm_dialog`] spawns `lyra pair confirm` or `zenity
+//! --question`. This instance GENERATED the SAS itself
+//! (`reconcile`'s own outbound arm) before the dialog ever opens, so the
+//! dialog SHOWS it large and plain (not a leak — the CLI's own
+//! `confirm_sas` prints the identical value) and the operator's whole job
+//! is a single Approve/Reject action — `commit_approval`'s outbound arm
+//! commits UNCONDITIONALLY on Approve (`approve_outbound(true, ...)`,
+//! `skip_confirm` — the dialog itself IS the confirmation, exactly as it
+//! was before this whole phase). **This is a deliberate REVERT within
+//! P-PV3 itself** (a design-review round on this same task): an earlier
+//! pass on this phase collected a typed retype on the outbound arm too —
+//! reusing the SAME six-box entry surface with the code pre-shown as
+//! context — which a review correctly called out as copy-the-pixels
+//! theater: the code is already on screen in the SAME window the boxes
+//! sit in, so retyping it proves nothing an Approve click doesn't already
+//! prove, while visually borrowing the INBOUND arm's security-critical
+//! typed-entry language for a step that was never a security gate
+//! (`crate::commands::code_matches`'s own outbound-comparison call, and
+//! the whole notion of a typed value crossing this arm, is GONE — don't
+//! reintroduce it here without re-deriving why the copy-the-pixels
+//! critique doesn't apply to whatever prompted the reintroduction).
 //!
 //! Four structural rules hold throughout this arm, all provable at the
 //! text-builder/argv level rather than by trusting a comment: (1) a feed
@@ -78,22 +99,22 @@
 //! [`dialog_code`] are built ONLY from a [`Pending`] `reconcile` itself
 //! produced, never from a [`PairEvent`]'s fields; (2) the INBOUND SAS is
 //! NEVER shown in the dialog — [`dialog_code`] returns `None` for an
-//! inbound `Pending` unconditionally, the same "the prompt never echoes
-//! the SAS" rule `crate::commands::approve_inbound`'s own doc holds for
-//! the tty path (echoing it would collapse the out-of-band comparison into
-//! a copy exercise); the OUTBOUND SAS is shown deliberately (see above);
+//! inbound `Pending` unconditionally; the OUTBOUND SAS is shown
+//! deliberately, on a CONFIRM surface, never an entry one (see above);
 //! (3) argv carries identifiers and display text only, never a value used
-//! to VALIDATE anything on the dialog's own side — [`spawn_zenity_entry`]/
-//! [`spawn_lyra_entry`] never receive an expected code to compare against,
-//! only render whatever the operator types back to the caller for THIS
-//! process to compare; (4) nothing is ever executed on this instance's
-//! behalf by a dialog's own output — no `sh -c`, no shell interpolation; a
-//! hostile `name`/`url` reaches dialog text as inert display text,
-//! protected from Pango corruption by `--no-markup` on the zenity path
-//! (`aoide_secrets::watch::spawn_zenity_entry`'s own doc has the
-//! live-verified reasoning) and from breaking a QML string literal by
-//! `dialog_qml::qml_escape` on the lyra path (`crates/lyra/src/commands/
-//! dialog_qml.rs`'s own doc).
+//! to VALIDATE anything on the dialog's own side — neither
+//! [`spawn_zenity_entry`]/[`spawn_lyra_entry`] (inbound) nor
+//! [`spawn_zenity_confirm`]/[`spawn_lyra_confirm`] (outbound) ever receive
+//! an expected code to compare against; the inbound dialogs render
+//! whatever the operator typed back to the caller for THIS process to
+//! compare, the outbound ones render only a boolean Approve/Reject; (4)
+//! nothing is ever executed on this instance's behalf by a dialog's own
+//! output — no `sh -c`, no shell interpolation; a hostile `name`/`url`
+//! reaches dialog text as inert display text, protected from Pango
+//! corruption by `--no-markup` on the zenity path (`aoide_secrets::
+//! watch::spawn_zenity_entry`'s own doc has the live-verified reasoning)
+//! and from breaking a QML string literal by `dialog_qml::qml_escape` on
+//! the lyra path (`crates/lyra/src/commands/dialog_qml.rs`'s own doc).
 
 use aoide_protocol::dialog::{
     is_locked, locker_process_name, next_spawn_backoff, run_entry_dialog, sleep_backoff_interruptible, zenity_available, DialogResult,
@@ -152,12 +173,13 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 /// already holds for its own `zenity_cmd` parameters.
 pub(crate) const ZENITY_CMD: &str = "zenity";
 
-/// The `--extra-button`/dismiss-control label [`spawn_zenity_entry`]'s and
-/// `lyra pair ask`'s own dialogs carry and [`run_entry_dialog`] compares
-/// stdout against (F6) — deliberately its
-/// OWN string, never `aoide_protocol::dialog::DISMISS_LABEL`: two
-/// different ceremonies, two different labels, sharing only the reader
-/// (`run_entry_dialog`'s own doc on `dismiss_label`).
+/// The `--extra-button`/dismiss-control label EVERY dialog this module
+/// spawns carries — [`spawn_zenity_entry`]/[`spawn_zenity_confirm`] and
+/// `lyra pair ask`/`lyra pair confirm` alike — and [`run_entry_dialog`]
+/// compares stdout against (F6) — deliberately its OWN string, never
+/// `aoide_protocol::dialog::DISMISS_LABEL`: two different ceremonies, two
+/// different labels, sharing only the reader (`run_entry_dialog`'s own
+/// doc on `dismiss_label`).
 pub(crate) const REJECT_LABEL: &str = "Reject request";
 
 // ── the three pairing-ceremony milestones ────────────────────────────────
@@ -361,13 +383,13 @@ fn resolve_lyra_bin() -> Option<String> {
     resolved.then_some(bin)
 }
 
-/// The zenity entry dialog's own argv — `--entry` (this ceremony COLLECTS
-/// a typed code now, never a bare confirm), `--no-markup` load-bearing for
-/// the identical reason `aoide_secrets::watch::spawn_zenity_entry`'s own
-/// doc gives, `--extra-button` [`REJECT_LABEL`] is the third choice
-/// `run_entry_dialog` reads back off stdout. `zenity_cmd` is a parameter
-/// (never `Command::new("zenity")` inline) so a test can stand in a shim
-/// with no `PATH` mutation.
+/// The zenity ENTRY dialog's own argv (INBOUND only) — `--entry` (this
+/// direction COLLECTS a typed code, read off the requester's own screen),
+/// `--no-markup` load-bearing for the identical reason `aoide_secrets::
+/// watch::spawn_zenity_entry`'s own doc gives, `--extra-button`
+/// [`REJECT_LABEL`] is the third choice `run_entry_dialog` reads back off
+/// stdout. `zenity_cmd` is a parameter (never `Command::new("zenity")`
+/// inline) so a test can stand in a shim with no `PATH` mutation.
 fn spawn_zenity_entry(zenity_cmd: &str, title: &str, text: &str) -> std::io::Result<Child> {
     Command::new(zenity_cmd)
         .args(["--entry", "--no-markup", "--title", title, "--text", text, "--extra-button", REJECT_LABEL])
@@ -377,16 +399,14 @@ fn spawn_zenity_entry(zenity_cmd: &str, title: &str, text: &str) -> std::io::Res
         .spawn()
 }
 
-/// `lyra pair ask`'s own argv — `--id`/`--name`/`--context` always,
-/// `--code` only for an outbound [`Pending`] ([`dialog_code`]'s own doc on
-/// why). `lyra_cmd` is a path/name parameter, matching [`spawn_zenity_entry`]'s
+/// `lyra pair ask`'s own argv (INBOUND only) — `--id`/`--name`/`--context`,
+/// never a code (that command carries no `--code` flag at all — the
+/// approver's whole gate is typing a value that arrives from elsewhere).
+/// `lyra_cmd` is a path/name parameter, matching [`spawn_zenity_entry`]'s
 /// own shape.
-fn spawn_lyra_entry(lyra_cmd: &str, id: &str, name: &str, context: &str, code: Option<&str>) -> std::io::Result<Child> {
+fn spawn_lyra_entry(lyra_cmd: &str, id: &str, name: &str, context: &str) -> std::io::Result<Child> {
     let mut cmd = Command::new(lyra_cmd);
     cmd.args(["pair", "ask", "--id", id, "--name", name, "--context", context]);
-    if let Some(c) = code {
-        cmd.args(["--code", c]);
-    }
     // `stderr(Stdio::inherit())` — same live-incident fix
     // `aoide_secrets::watch::spawn_lyra_entry`'s own doc gives: `lyra pair
     // ask`'s own failure `eprintln!`s land directly in this process's
@@ -398,16 +418,78 @@ fn run_zenity_entry(zenity_cmd: &str, title: &str, text: &str, should_cancel: im
     run_entry_dialog(|| spawn_zenity_entry(zenity_cmd, title, text), REJECT_LABEL, should_cancel)
 }
 
-fn run_lyra_entry(lyra_cmd: &str, id: &str, name: &str, context: &str, code: Option<&str>, should_cancel: impl FnMut() -> bool) -> DialogResult {
-    run_entry_dialog(|| spawn_lyra_entry(lyra_cmd, id, name, context, code), REJECT_LABEL, should_cancel)
+fn run_lyra_entry(lyra_cmd: &str, id: &str, name: &str, context: &str, should_cancel: impl FnMut() -> bool) -> DialogResult {
+    run_entry_dialog(|| spawn_lyra_entry(lyra_cmd, id, name, context), REJECT_LABEL, should_cancel)
 }
 
-/// The dialog CHOICE — `lyra` when [`resolve_lyra_bin`] found one, falling
-/// back to `zenity` for the SAME attempt on a `lyra` `SpawnError`/
-/// `DialogFailure` (`aoide_secrets::watch::run_ask_dialog`'s own fallback
-/// shape, reused unchanged — module doc's popup-arm section).
+/// The INBOUND dialog CHOICE — `lyra pair ask` when [`resolve_lyra_bin`]
+/// found one, falling back to `zenity --entry` for the SAME attempt on a
+/// `lyra` `SpawnError`/`DialogFailure` (`aoide_secrets::watch::
+/// run_ask_dialog`'s own fallback shape, reused unchanged — module doc's
+/// popup-arm section). `context` doubles as zenity's own `--text` — the
+/// inbound dialog never has a second, code-carrying line to append
+/// ([`dialog_code`] is unconditionally `None` for this direction).
+fn run_ask_dialog(lyra_cmd: Option<&str>, zenity_cmd: &str, id: &str, name: &str, title: &str, context: &str, mut should_cancel: impl FnMut() -> bool) -> DialogResult {
+    let Some(lyra) = lyra_cmd else {
+        return run_zenity_entry(zenity_cmd, title, context, should_cancel);
+    };
+    let result = run_lyra_entry(lyra, id, name, context, &mut should_cancel);
+    match &result {
+        DialogResult::SpawnError(e) | DialogResult::DialogFailure(e) => {
+            eprintln!("aoide peer pair watch --popup: lyra pair ask failed for request {id}: {e} \u{2014} falling back to zenity for this request");
+            if zenity_available(zenity_cmd) {
+                run_zenity_entry(zenity_cmd, title, context, should_cancel)
+            } else {
+                eprintln!("aoide peer pair watch --popup: zenity is not available either \u{2014} request {id} stays parked, will retry");
+                result
+            }
+        }
+        _ => result,
+    }
+}
+
+/// The zenity CONFIRM dialog's own argv (OUTBOUND only, P-PV3 revert) —
+/// `--question` (never `--entry`: this direction shows a code already
+/// GENERATED and known, it never collects one typed back),
+/// `--ok-label`/`--cancel-label` name the two ordinary buttons,
+/// `--extra-button` [`REJECT_LABEL`] the third — restored to the EXACT
+/// pre-P-PV3 argv shape this ceremony's confirm dialog always held
+/// (`spawn_pair_confirm`, this module's own git history), since nothing
+/// about outbound's own confirmation ever needed to change.
+fn spawn_zenity_confirm(zenity_cmd: &str, title: &str, text: &str) -> std::io::Result<Child> {
+    Command::new(zenity_cmd)
+        .args(["--question", "--no-markup", "--title", title, "--text", text, "--ok-label", "Approve", "--cancel-label", "Ignore", "--extra-button", REJECT_LABEL])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+}
+
+/// `lyra pair confirm`'s own argv (OUTBOUND only) — `--id`/`--name`/
+/// `--context`/`--code`, the last ALWAYS present (a confirm dialog with
+/// nothing to show would be a blank window — `lyra pair confirm`'s own
+/// `handle_pair_confirm` refuses without it).
+fn spawn_lyra_confirm(lyra_cmd: &str, id: &str, name: &str, context: &str, code: &str) -> std::io::Result<Child> {
+    let mut cmd = Command::new(lyra_cmd);
+    cmd.args(["pair", "confirm", "--id", id, "--name", name, "--context", context, "--code", code]);
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()
+}
+
+fn run_zenity_confirm(zenity_cmd: &str, title: &str, text: &str, should_cancel: impl FnMut() -> bool) -> DialogResult {
+    run_entry_dialog(|| spawn_zenity_confirm(zenity_cmd, title, text), REJECT_LABEL, should_cancel)
+}
+
+fn run_lyra_confirm(lyra_cmd: &str, id: &str, name: &str, context: &str, code: &str, should_cancel: impl FnMut() -> bool) -> DialogResult {
+    run_entry_dialog(|| spawn_lyra_confirm(lyra_cmd, id, name, context, code), REJECT_LABEL, should_cancel)
+}
+
+/// The OUTBOUND dialog CHOICE — `lyra pair confirm` when [`resolve_lyra_bin`]
+/// found one, falling back to `zenity --question` for the SAME attempt on
+/// a `lyra` `SpawnError`/`DialogFailure`, mirroring [`run_ask_dialog`]'s
+/// own fallback shape exactly, just against the confirm pair instead of
+/// the entry pair.
 #[allow(clippy::too_many_arguments)]
-fn run_ask_dialog(
+fn run_confirm_dialog(
     lyra_cmd: Option<&str>,
     zenity_cmd: &str,
     id: &str,
@@ -415,18 +497,18 @@ fn run_ask_dialog(
     title: &str,
     text: &str,
     context: &str,
-    code: Option<&str>,
+    code: &str,
     mut should_cancel: impl FnMut() -> bool,
 ) -> DialogResult {
     let Some(lyra) = lyra_cmd else {
-        return run_zenity_entry(zenity_cmd, title, text, should_cancel);
+        return run_zenity_confirm(zenity_cmd, title, text, should_cancel);
     };
-    let result = run_lyra_entry(lyra, id, name, context, code, &mut should_cancel);
+    let result = run_lyra_confirm(lyra, id, name, context, code, &mut should_cancel);
     match &result {
         DialogResult::SpawnError(e) | DialogResult::DialogFailure(e) => {
-            eprintln!("aoide peer pair watch --popup: lyra pair ask failed for request {id}: {e} \u{2014} falling back to zenity for this request");
+            eprintln!("aoide peer pair watch --popup: lyra pair confirm failed for request {id}: {e} \u{2014} falling back to zenity for this request");
             if zenity_available(zenity_cmd) {
-                run_zenity_entry(zenity_cmd, title, text, should_cancel)
+                run_zenity_confirm(zenity_cmd, title, text, should_cancel)
             } else {
                 eprintln!("aoide peer pair watch --popup: zenity is not available either \u{2014} request {id} stays parked, will retry");
                 result
@@ -463,6 +545,8 @@ fn dialog_context(p: &Pending) -> String {
 /// [`Pending`] — this instance generated that SAS itself
 /// (`reconcile`'s own outbound arm), so showing it is not a leak; the CLI's
 /// own `confirm_sas` prints the identical value for the identical reason.
+/// The outbound direction always carries `Some` in practice
+/// (`Pending::sas`'s own doc: "always `Some` for an outbound entry").
 fn dialog_code(p: &Pending) -> Option<&str> {
     match p.direction.as_str() {
         "inbound" => None,
@@ -473,13 +557,15 @@ fn dialog_code(p: &Pending) -> Option<&str> {
 /// What a finished [`DialogResult`] means for the request it was shown
 /// for — pure, the ONE place this arm's mapping (F6) is decided, so it is
 /// testable with a synthetic [`DialogResult`] and no real dialog spawn.
-/// Takes `result` BY VALUE (unlike the pre-upgrade version) so
-/// [`PopupDecision::Approve`]'s typed code moves out with no clone.
+/// Takes `result` BY VALUE so [`PopupDecision::Approve`]'s payload moves
+/// out with no clone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PopupDecision {
-    /// Exit 0 — the TYPED code, to be gated through `commit_approval`
-    /// (`InboundGate::Code` on the inbound arm, a local `code_matches`
-    /// compare on the outbound one — module doc's popup-arm section).
+    /// Exit 0. On the INBOUND arm the `String` is the operator's TYPED
+    /// code, gated through `commit_approval`'s `InboundGate::Code`; on the
+    /// OUTBOUND arm it is an irrelevant empty string (a confirm dialog has
+    /// no value to carry) and `commit_approval` ignores it outright —
+    /// module doc's popup-arm section has the full split.
     Approve(String),
     /// Exit 1, stdout was [`REJECT_LABEL`] — `reject_by_id`.
     Reject,
@@ -517,24 +603,19 @@ fn popup_allowed(locked: bool) -> bool {
     !locked
 }
 
-/// Commit `p`'s pairing with the OPERATOR-TYPED `code` as the gate — looks
-/// up ITS FRESH entry by id and direction (never trusts anything cached
-/// from an earlier `reconcile` call, the same "re-check before acting"
-/// discipline [`actionable`]'s own callers hold). **Inbound: runs
+/// Commit `p`'s pairing on a dialog Approve — looks up ITS FRESH entry by
+/// id and direction (never trusts anything cached from an earlier
+/// `reconcile` call, the same "re-check before acting" discipline
+/// [`actionable`]'s own callers hold). **Inbound: runs
 /// `InboundGate::Code(code)` through `approve_inbound`** — the SAME SAS
 /// comparison and [`crate::commands::MAX_CODE_TRIES`] auto-deny machinery
 /// the CLI tty path already holds, byte-identical (`InboundGate::
-/// DialogConfirmed` is RETIRED by this upgrade — nothing constructs it any
-/// more, `crate::commands`' own doc on the removal). **Outbound: compares
-/// `code` against `p.sas` locally first** (`crate::commands::code_matches`
-/// — the SAME normalization the CLI's own gate uses, dashes/whitespace
-/// stripped before comparing), only calling `approve_outbound(true, ...)`
-/// (`skip_confirm` — the typed-and-matched code IS the confirmation) on a
-/// match; a mismatch commits nothing and leaves the request pending for
-/// the next tick, with no persisted-try counter
-/// (`OutboundPairingRequest` carries none — this is a click-through guard
-/// against a stray Approve, not the approver's own security gate, module
-/// doc's popup-arm section).
+/// DialogConfirmed` is RETIRED — nothing constructs it any more,
+/// `crate::commands`' own doc on the removal). **Outbound: `code` is
+/// IGNORED and the commit is UNCONDITIONAL** (`approve_outbound(true,
+/// ...)`, `skip_confirm` — the dialog itself IS the confirmation, module
+/// doc's popup-arm section: a confirm dialog has no typed value to gate
+/// on in the first place, this is the ceremony's original shape, restored).
 fn commit_approval(p: &Pending, code: &str, now_epoch: i64) -> aoide_protocol::output::Outcome {
     let now = aoide_storage::time::now_iso_utc();
     match p.direction.as_str() {
@@ -545,34 +626,27 @@ fn commit_approval(p: &Pending, code: &str, now_epoch: i64) -> aoide_protocol::o
                 format!("pairing request `{}` is no longer pending — nothing to confirm", p.id),
             ),
         },
-        _ => {
-            if !crate::commands::code_matches(code, p.sas.as_deref().unwrap_or("")) {
-                return aoide_protocol::output::Outcome::error(
-                    "peer.pair.approve",
-                    format!("typed code did not match the pairing request `{}` — nothing committed, still pending", p.id),
-                )
-                .with_data(json!({ "reason": "code-mismatch", "id": p.id }));
-            }
-            match aoide_storage::pairing::list_outbound(now_epoch).into_iter().find(|e| e.id == p.id) {
-                Some(entry) => crate::commands::approve_outbound(true, "peer.pair.approve", &p.id, entry, &now, now_epoch),
-                None => aoide_protocol::output::Outcome::error(
-                    "peer.pair.approve",
-                    format!("pairing request `{}` is no longer pending — nothing to confirm", p.id),
-                ),
-            }
-        }
+        _ => match aoide_storage::pairing::list_outbound(now_epoch).into_iter().find(|e| e.id == p.id) {
+            Some(entry) => crate::commands::approve_outbound(true, "peer.pair.approve", &p.id, entry, &now, now_epoch),
+            None => aoide_protocol::output::Outcome::error(
+                "peer.pair.approve",
+                format!("pairing request `{}` is no longer pending — nothing to confirm", p.id),
+            ),
+        },
     }
 }
 
 /// One popup iteration: pick the next un-ignored actionable [`Pending`],
 /// skip while the screen is locked (F8 — re-offered next tick, never
-/// shown behind a lock screen), show its confirm dialog, and act on
-/// [`decide`]'s mapping. `should_cancel` re-derives [`reconcile`] fresh on
-/// every ~200ms poll (`run_entry_dialog`'s own interval) rather than
-/// reading a cached queue — this arm's request volume is low enough that
-/// the extra `list_inbound`/`list_outbound`/identity-load cost per poll
-/// is cheaper than the machinery a shared, mutex-guarded queue would add.
-#[allow(clippy::too_many_arguments)]
+/// shown behind a lock screen), show its dialog — [`run_ask_dialog`]
+/// (typed-code entry) on the INBOUND arm, [`run_confirm_dialog`] (a single
+/// Approve/Reject over the already-known code) on the OUTBOUND one — and
+/// act on [`decide`]'s mapping. `should_cancel` re-derives [`reconcile`]
+/// fresh on every ~200ms poll (`run_entry_dialog`'s own interval) rather
+/// than reading a cached queue — this arm's request volume is low enough
+/// that the extra `list_inbound`/`list_outbound`/identity-load cost per
+/// poll is cheaper than the machinery a shared, mutex-guarded queue would
+/// add.
 fn popup_tick(ignored: &mut HashSet<String>, spawn_backoff: &mut Duration, spawn_failing: &mut bool, json_mode: bool, lyra_cmd: Option<&str>) {
     let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
     let pending = reconcile(now_epoch);
@@ -587,22 +661,28 @@ fn popup_tick(ignored: &mut HashSet<String>, spawn_backoff: &mut Duration, spawn
 
     let title = confirm_title(&p);
     let context = dialog_context(&p);
-    let code = dialog_code(&p);
-    // The zenity `--text` mirrors the SAME context/code lines
-    // `dialog_qml::render_code_entry_qml` renders for the lyra path, so
-    // both dialogs show byte-identical wording (module doc's "one place
-    // this wording lives" precedent, `aoide_secrets::watch::
-    // format_origin_line`'s own doc has the same discipline).
-    let mut text = context.clone();
-    if let Some(c) = code {
-        text.push('\n');
-        text.push_str(&format!("code: {c}"));
-    }
     let id = p.id.clone();
-    let result = run_ask_dialog(lyra_cmd, ZENITY_CMD, &id, &p.name, &title, &text, &context, code, || {
-        let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
-        !reconcile(now_epoch).iter().any(|q| q.id == id && actionable(q))
-    });
+
+    let result = if p.direction == "inbound" {
+        let cancel_id = id.clone();
+        run_ask_dialog(lyra_cmd, ZENITY_CMD, &id, &p.name, &title, &context, move || {
+            let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
+            !reconcile(now_epoch).iter().any(|q| q.id == cancel_id && actionable(q))
+        })
+    } else {
+        // The zenity `--text` mirrors the SAME context/code lines
+        // `dialog_qml::render_code_confirm_qml` renders for the lyra path,
+        // so both dialogs show byte-identical wording (module doc's "one
+        // place this wording lives" precedent, `aoide_secrets::watch::
+        // format_origin_line`'s own doc has the same discipline).
+        let code = dialog_code(&p).unwrap_or("").to_string();
+        let text = format!("{context}\ncode: {code}");
+        let cancel_id = id.clone();
+        run_confirm_dialog(lyra_cmd, ZENITY_CMD, &id, &p.name, &title, &text, &context, &code, move || {
+            let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
+            !reconcile(now_epoch).iter().any(|q| q.id == cancel_id && actionable(q))
+        })
+    };
 
     if !matches!(result, DialogResult::SpawnError(_) | DialogResult::DialogFailure(_)) && *spawn_failing {
         *spawn_failing = false;
@@ -1193,7 +1273,7 @@ mod tests {
         let _guard = shim_lock();
         let lyra_shim = write_shim("lyra-ok", "#!/bin/sh\necho 111-222\nexit 0\n");
         let zenity_shim = write_shim("zenity-unused", "#!/bin/sh\necho 999-999\nexit 0\n");
-        let result = run_ask_dialog(Some(lyra_shim.to_str().unwrap()), zenity_shim.to_str().unwrap(), "id1", "box-a", "t", "x", "ctx", None, || false);
+        let result = run_ask_dialog(Some(lyra_shim.to_str().unwrap()), zenity_shim.to_str().unwrap(), "id1", "box-a", "t", "ctx", || false);
         assert_eq!(result_code(&result), Some("111-222".to_string()), "lyra's own answer must win when it resolves");
         remove_shim(&lyra_shim);
         remove_shim(&zenity_shim);
@@ -1203,17 +1283,7 @@ mod tests {
     fn run_ask_dialog_falls_back_to_zenity_on_a_lyra_spawn_error() {
         let _guard = shim_lock();
         let zenity_shim = write_shim("zenity-fallback", "#!/bin/sh\necho 333-444\nexit 0\n");
-        let result = run_ask_dialog(
-            Some("/no/such/aoide-pair-lyra-shim-never-exists"),
-            zenity_shim.to_str().unwrap(),
-            "id1",
-            "box-a",
-            "t",
-            "x",
-            "ctx",
-            None,
-            || false,
-        );
+        let result = run_ask_dialog(Some("/no/such/aoide-pair-lyra-shim-never-exists"), zenity_shim.to_str().unwrap(), "id1", "box-a", "t", "ctx", || false);
         assert_eq!(result_code(&result), Some("333-444".to_string()), "a lyra spawn failure must fall back to zenity for the SAME attempt");
         remove_shim(&zenity_shim);
     }
@@ -1222,8 +1292,76 @@ mod tests {
     fn run_ask_dialog_with_no_lyra_bin_goes_straight_to_zenity() {
         let _guard = shim_lock();
         let zenity_shim = write_shim("zenity-only", "#!/bin/sh\necho 555-666\nexit 0\n");
-        let result = run_ask_dialog(None, zenity_shim.to_str().unwrap(), "id1", "box-a", "t", "x", "ctx", None, || false);
+        let result = run_ask_dialog(None, zenity_shim.to_str().unwrap(), "id1", "box-a", "t", "ctx", || false);
         assert_eq!(result_code(&result), Some("555-666".to_string()));
+        remove_shim(&zenity_shim);
+    }
+
+    // ── run_zenity_confirm / run_confirm_dialog (P-PV3 revert, outbound) ──
+
+    #[test]
+    fn run_zenity_confirm_exit_zero_is_approved_with_no_typed_value() {
+        let _guard = shim_lock();
+        let shim = write_shim("confirm-approve", "#!/bin/sh\nexit 0\n");
+        let result = run_zenity_confirm(shim.to_str().unwrap(), "t", "x", || false);
+        assert_eq!(result_code(&result), Some(String::new()), "a plain OK carries no payload -- the confirm never collects a typed value");
+        remove_shim(&shim);
+    }
+
+    #[test]
+    fn run_zenity_confirm_reject_label_on_stdout_is_dismissed() {
+        let _guard = shim_lock();
+        let shim = write_shim("confirm-reject", "#!/bin/sh\necho 'Reject request'\nexit 1\n");
+        let result = run_zenity_confirm(shim.to_str().unwrap(), "t", "x", || false);
+        assert!(matches!(result, DialogResult::Dismissed), "expected Dismissed, got {result:?}");
+        remove_shim(&shim);
+    }
+
+    #[test]
+    fn run_zenity_confirm_bare_cancel_is_cancelled_not_dismissed() {
+        let _guard = shim_lock();
+        let shim = write_shim("confirm-cancel", "#!/bin/sh\nexit 1\n");
+        let result = run_zenity_confirm(shim.to_str().unwrap(), "t", "x", || false);
+        assert!(matches!(result, DialogResult::Cancelled), "expected Cancelled, got {result:?}");
+        remove_shim(&shim);
+    }
+
+    #[test]
+    fn run_confirm_dialog_prefers_lyra_when_a_bin_resolves() {
+        let _guard = shim_lock();
+        let lyra_shim = write_shim("confirm-lyra-ok", "#!/bin/sh\nexit 0\n");
+        let zenity_shim = write_shim("confirm-zenity-unused", "#!/bin/sh\necho should-not-run\nexit 1\n");
+        let result = run_confirm_dialog(Some(lyra_shim.to_str().unwrap()), zenity_shim.to_str().unwrap(), "id1", "box-b", "t", "x", "ctx", "111-222", || false);
+        assert_eq!(result_code(&result), Some(String::new()), "lyra's own answer must win when it resolves");
+        remove_shim(&lyra_shim);
+        remove_shim(&zenity_shim);
+    }
+
+    #[test]
+    fn run_confirm_dialog_falls_back_to_zenity_on_a_lyra_spawn_error() {
+        let _guard = shim_lock();
+        let zenity_shim = write_shim("confirm-zenity-fallback", "#!/bin/sh\nexit 0\n");
+        let result = run_confirm_dialog(
+            Some("/no/such/aoide-pair-confirm-lyra-shim-never-exists"),
+            zenity_shim.to_str().unwrap(),
+            "id1",
+            "box-b",
+            "t",
+            "x",
+            "ctx",
+            "111-222",
+            || false,
+        );
+        assert_eq!(result_code(&result), Some(String::new()), "a lyra spawn failure must fall back to zenity for the SAME attempt");
+        remove_shim(&zenity_shim);
+    }
+
+    #[test]
+    fn run_confirm_dialog_with_no_lyra_bin_goes_straight_to_zenity() {
+        let _guard = shim_lock();
+        let zenity_shim = write_shim("confirm-zenity-only", "#!/bin/sh\nexit 0\n");
+        let result = run_confirm_dialog(None, zenity_shim.to_str().unwrap(), "id1", "box-b", "t", "x", "ctx", "111-222", || false);
+        assert_eq!(result_code(&result), Some(String::new()));
         remove_shim(&zenity_shim);
     }
 
@@ -1340,9 +1478,11 @@ mod tests {
             let pending = reconcile(now_epoch);
             assert_eq!(pending.len(), 1);
             assert!(actionable(&pending[0]));
-            let sas = pending[0].sas.clone().unwrap();
 
-            let outcome = commit_approval(&pending[0], &sas, now_epoch);
+            // The confirm dialog carries no typed value (P-PV3 revert) —
+            // `commit_approval` is called with an EMPTY string here on
+            // purpose, proving the outbound arm never looks at it.
+            let outcome = commit_approval(&pending[0], "", now_epoch);
             assert_eq!(outcome.status, aoide_protocol::output::Status::Ok, "{outcome:?}");
 
             let peers = aoide_storage::peer_store::load_peers();
@@ -1354,14 +1494,18 @@ mod tests {
         });
     }
 
-    /// P-PV3 (task #132): the outbound arm's typed-code retype is a
-    /// click-through guard, not a persisted-try security gate — a mismatch
-    /// commits NOTHING and leaves the request pending for the next tick,
-    /// with no `tries` counter anywhere on `OutboundPairingRequest` (it
-    /// carries none) to increment.
+    /// P-PV3 revert (task #132, review round): the outbound arm's `code`
+    /// parameter is IGNORED entirely — a confirm dialog has no typed value
+    /// to gate on, so approval commits unconditionally regardless of what
+    /// string `commit_approval` happens to be called with. This is the
+    /// ceremony's ORIGINAL shape, restored: an earlier pass on this same
+    /// phase added a `code_matches` comparison here (retyping the
+    /// already-shown code), which review correctly called copy-the-pixels
+    /// theater — this test pins that the comparison is genuinely gone, not
+    /// merely undocumented.
     #[test]
-    fn commit_approval_on_an_outbound_entry_a_mismatched_typed_code_commits_nothing() {
-        with_peer_state("commit-approval-outbound-mismatch", || {
+    fn commit_approval_on_an_outbound_entry_commits_regardless_of_the_code_argument() {
+        with_peer_state("commit-approval-outbound-unconditional", || {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             aoide_storage::pairing::park_outbound(aoide_storage::pairing::OutboundPairingRequest {
                 id: "deadbeef".to_string(),
@@ -1381,12 +1525,53 @@ mod tests {
             assert_eq!(pending.len(), 1);
             assert!(actionable(&pending[0]));
 
+            // "xxx-xxx" would have failed the old code_matches comparison —
+            // it must commit anyway, proving no comparison runs at all.
             let outcome = commit_approval(&pending[0], "xxx-xxx", now_epoch);
-            assert_eq!(outcome.status, aoide_protocol::output::Status::Error, "{outcome:?}");
-            assert_eq!(outcome.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("code-mismatch"));
+            assert_eq!(outcome.status, aoide_protocol::output::Status::Ok, "{outcome:?}");
 
-            assert!(aoide_storage::peer_store::load_peers().is_empty(), "nothing was ever committed on a mismatch");
-            assert_eq!(aoide_storage::pairing::list_outbound(now_epoch).len(), 1, "the entry stays pending, offered again next tick");
+            let peers = aoide_storage::peer_store::load_peers();
+            assert_eq!(peers.len(), 1);
+            assert!(peers[0].verified);
+            assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "the parked entry is taken on commit");
+        });
+    }
+
+    /// P-PV3 (task #132): a dismissed or cancelled outbound dialog must
+    /// never reach `commit_approval` at all — `decide`'s own mapping
+    /// (already pinned above) sends `Dismissed`/`Cancelled` to
+    /// `PopupDecision::Reject`/`Ignore`, and `popup_tick`'s match only
+    /// ever calls `commit_approval` from the `Approve` arm. This test pins
+    /// the OUTBOUND storage side of that: neither a reject nor an ignore
+    /// touches `peers.json` or takes the parked entry.
+    #[test]
+    fn an_outbound_entry_is_untouched_by_reject_and_by_a_bare_ignore() {
+        with_peer_state("outbound-reject-and-ignore-untouched", || {
+            let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
+            aoide_storage::pairing::park_outbound(aoide_storage::pairing::OutboundPairingRequest {
+                id: "deadbeef".to_string(),
+                url: "http://box-b/".to_string(),
+                name: "box-b".to_string(),
+                pubkey_hex: "b".repeat(64),
+                requester_nonce_hex: "c".repeat(32),
+                approver_nonce_hex: "d".repeat(32),
+                requested_at: aoide_storage::time::now_iso_utc(),
+                expires_at: aoide_storage::pairing::expires_at_from(now_epoch),
+                state: aoide_storage::pairing::OutboundState::AwaitingConfirm,
+                via: None,
+            })
+            .unwrap();
+
+            // `Cancelled` (a bare Esc/close) — `decide` sends it to
+            // `Ignore`, which never calls `commit_approval` at all.
+            assert_eq!(decide(DialogResult::Cancelled), PopupDecision::Ignore);
+            // `Dismissed` — `decide` sends it to `Reject`, `popup_tick`'s
+            // own arm calls `reject_by_id`, never `commit_approval`.
+            let out = crate::commands::reject_by_id("peer.pair.reject", "deadbeef");
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
+
+            assert!(aoide_storage::peer_store::load_peers().is_empty(), "nothing was ever committed");
+            assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "reject aborts the outbound entry outright");
         });
     }
 }

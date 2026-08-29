@@ -1492,7 +1492,7 @@ pub(crate) enum InboundGate {
 /// `740729` and `740 729` match a SAS of `740-729` — the operator is copying
 /// digits off another screen, and the separator carries no entropy. Pure,
 /// so the comparison the whole gate rests on is testable with no tty.
-pub(crate) fn code_matches(input: &str, sas: &str) -> bool {
+fn code_matches(input: &str, sas: &str) -> bool {
     let norm = |s: &str| s.chars().filter(|c| !c.is_whitespace() && *c != '-').collect::<String>();
     let typed = norm(input);
     !typed.is_empty() && typed == norm(sas)

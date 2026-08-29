@@ -136,6 +136,33 @@ pub(crate) fn run_code_entry_dialog(
     result
 }
 
+/// The CONFIRM variant (P-PV3 revert, task #132) — same orchestration as
+/// [`run_code_entry_dialog`], [`render_code_confirm_qml`] in place of
+/// [`render_code_entry_qml`]: no boxes, no `TextInput`, `code` rendered
+/// large as plain display text, two actions (a clean Approve, the quiet
+/// flat `dismiss_text` control). This is `lyra pair ask`'s ORIGINAL sibling
+/// on the outbound (requester) side of the pairing ceremony — that
+/// direction generates its own code locally and only needs the operator to
+/// confirm they saw it, never to retype a code that arrived from
+/// elsewhere (`crates/client/src/pair_watch.rs`'s own module doc has the
+/// full reasoning for why the two pairing directions get two different
+/// dialog shapes sharing this one visual family).
+pub(crate) fn run_code_confirm_dialog(
+    quickshell_cmd: &str,
+    file_prefix: &str,
+    window_title: &str,
+    header_lines: &[HeaderLine],
+    code: &str,
+    dismiss_text: &str,
+    result_marker: &str,
+) -> Result<AskResult, String> {
+    let qml = render_code_confirm_qml(window_title, header_lines, code, dismiss_text, result_marker);
+    let qml_path = write_temp_qml(file_prefix, &qml).map_err(|e| format!("writing the dialog's QML: {e}"))?;
+    let result = spawn_and_wait_for_marker(quickshell_cmd, &qml_path, result_marker);
+    let _ = std::fs::remove_file(&qml_path);
+    result
+}
+
 /// The scratch directory a generated QML file lands in — `$XDG_RUNTIME_DIR`
 /// when set (a per-user, tmpfs-backed, already-`0700` directory systemd
 /// provisions on every graphical session), else `std::env::temp_dir()`.
@@ -232,6 +259,12 @@ fn parse_marker_line(line: &str, result_marker: &str) -> Option<AskResult> {
     let rest = line[idx + result_marker.len()..].trim_end();
     if let Some(code) = rest.strip_prefix("CODE:") {
         Some(AskResult::Approved(code.to_string()))
+    } else if rest == "APPROVE" {
+        // The confirm variant's own marker (P-PV3 revert, task #132) — no
+        // value was ever typed, so `Approved` carries an empty string, the
+        // same "irrelevant payload" shape a zenity `--question`'s plain OK
+        // produces on stdout.
+        Some(AskResult::Approved(String::new()))
     } else if rest == "DISMISS" {
         Some(AskResult::Dismissed)
     } else if rest == "CANCEL" {
@@ -452,6 +485,126 @@ __HEADER_BLOCK__
 }
 "##;
 
+/// Render the CONFIRM variant's QML (P-PV3 revert, task #132) — same
+/// visual family as [`render_code_entry_qml`] (title, header lines, fixed-
+/// size float hints, the flat dismiss control) but the six-box `TextInput`
+/// is replaced by `code` rendered as large plain display text, and two
+/// actions: a filled "Approve" rectangle button and the quiet flat
+/// `dismiss_text` control underneath. Esc cancels (the Rectangle holds
+/// keyboard focus, same "Keys on the one focused item" shape
+/// [`render_code_entry_qml`]'s own `codeInput` holds). `code` is UNTRUSTED-
+/// ADJACENT in the sense that it is this instance's OWN locally-derived
+/// value (never peer-supplied) but still routed through [`qml_escape`] on
+/// principle, the same "escape every value this function touches, don't
+/// special-case one as trusted" posture `header_line_qml` already holds.
+pub(crate) fn render_code_confirm_qml(window_title: &str, header_lines: &[HeaderLine], code: &str, dismiss_text: &str, result_marker: &str) -> String {
+    let header_block: String = header_lines.iter().map(header_line_qml).collect();
+
+    CONFIRM_TEMPLATE
+        .replace("__TITLE__", &qml_escape(window_title))
+        .replace("__HEADER_BLOCK__\n", &header_block)
+        .replace("__CODE__", &qml_escape(code))
+        .replace("__DISMISS_TEXT__", &qml_escape(dismiss_text))
+        .replace("__RESULT_MARKER__", result_marker)
+}
+
+const CONFIRM_TEMPLATE: &str = r##"import QtQuick
+import QtQuick.Window
+import QtQuick.Controls
+
+Window {
+    id: win
+    width: 400
+    height: 220
+    minimumWidth: width
+    maximumWidth: width
+    minimumHeight: height
+    maximumHeight: height
+    visible: true
+    title: "__TITLE__"
+    color: "#1e1e2e"
+    flags: Qt.Dialog
+
+    function approveAsk() {
+        console.log("__RESULT_MARKER__APPROVE");
+    }
+    function dismissAsk() {
+        console.log("__RESULT_MARKER__DISMISS");
+    }
+    onClosing: console.log("__RESULT_MARKER__CANCEL")
+    Component.onCompleted: keyCatcher.forceActiveFocus()
+
+    Rectangle {
+        id: keyCatcher
+        anchors.fill: parent
+        color: "#1e1e2e"
+        focus: true
+        Keys.onPressed: (event) => {
+            if (event.key === Qt.Key_Escape) {
+                console.log("__RESULT_MARKER__CANCEL");
+                event.accepted = true;
+            }
+        }
+
+        Column {
+            anchors.centerIn: parent
+            spacing: 14
+
+__HEADER_BLOCK__
+
+            Text {
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: "__CODE__"
+                color: "#89b4fa"
+                font.pixelSize: 30
+                font.bold: true
+                font.family: "monospace"
+            }
+
+            Rectangle {
+                id: approveButton
+                anchors.horizontalCenter: parent.horizontalCenter
+                width: 110
+                height: 38
+                radius: 6
+                color: approveArea.containsMouse ? "#89b4fa" : "#313244"
+                border.width: 1
+                border.color: "#89b4fa"
+                Text {
+                    anchors.centerIn: parent
+                    text: "Approve"
+                    color: approveArea.containsMouse ? "#1e1e2e" : "#cdd6f4"
+                    font.pixelSize: 14
+                    font.bold: true
+                }
+                MouseArea {
+                    id: approveArea
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: approveAsk()
+                }
+            }
+
+            Text {
+                text: "__DISMISS_TEXT__"
+                color: "#7f849c"
+                font.pixelSize: 12
+                font.underline: dismissArea.containsMouse
+                anchors.horizontalCenter: parent.horizontalCenter
+                MouseArea {
+                    id: dismissArea
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: dismissAsk()
+                }
+            }
+        }
+    }
+}
+"##;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,6 +625,14 @@ mod tests {
     fn parse_marker_line_reads_dismiss_and_cancel() {
         assert_eq!(parse_marker_line("MARK:DISMISS", "MARK:"), Some(AskResult::Dismissed));
         assert_eq!(parse_marker_line("MARK:CANCEL", "MARK:"), Some(AskResult::Cancelled));
+    }
+
+    #[test]
+    fn parse_marker_line_reads_approve_as_an_empty_approved() {
+        // The confirm variant's own marker (P-PV3 revert) — no value was
+        // ever typed, so this must be `Approved("")`, never a distinct
+        // variant the caller has to special-case.
+        assert_eq!(parse_marker_line("MARK:APPROVE", "MARK:"), Some(AskResult::Approved(String::new())));
     }
 
     #[test]
@@ -544,6 +705,46 @@ mod tests {
         assert!(qml.contains("AOIDE_PAIR_ASK_RESULT:CANCEL"));
         assert!(qml.contains("\"Reject request\""));
         assert!(!qml.contains("Dismiss ask"));
+    }
+
+    // ── render_code_confirm_qml (pure, P-PV3 revert) ──────────────────────
+
+    #[test]
+    fn render_confirm_embeds_title_header_code_and_dismiss_text() {
+        let qml = render_code_confirm_qml("aoide · box-b", &[HeaderLine::bold("confirm pairing with `box-b`")], "740-729", "Reject request", "MARK:");
+        assert!(qml.contains("title: \"aoide · box-b\""));
+        assert!(qml.contains("confirm pairing with `box-b`"));
+        assert!(qml.contains("text: \"740-729\""), "the code must render as plain display text: {qml}");
+        assert!(qml.contains("\"Reject request\""));
+        assert!(qml.contains("\"Approve\""));
+    }
+
+    #[test]
+    fn render_confirm_carries_no_box_or_text_input_chrome() {
+        // The whole point of the revert: no six-box entry surface, no
+        // underlying TextInput to type into — a plain Approve button and a
+        // dismiss control only.
+        let qml = render_code_confirm_qml("t", &[HeaderLine::bold("x")], "111-222", "Dismiss ask", "MARK:");
+        assert!(!qml.contains("model: 3"), "confirm must carry no digit-box repeaters: {qml}");
+        assert!(!qml.contains("TextInput"), "confirm must carry no typed-entry field: {qml}");
+        assert!(!qml.contains("boxIndex"));
+    }
+
+    #[test]
+    fn render_confirm_uses_the_callers_own_result_marker_and_approve_dismiss_cancel_markers() {
+        let qml = render_code_confirm_qml("t", &[HeaderLine::bold("x")], "111-222", "Reject request", "AOIDE_PAIR_ASK_RESULT:");
+        assert!(qml.contains("AOIDE_PAIR_ASK_RESULT:APPROVE"));
+        assert!(qml.contains("AOIDE_PAIR_ASK_RESULT:DISMISS"));
+        assert!(qml.contains("AOIDE_PAIR_ASK_RESULT:CANCEL"));
+    }
+
+    #[test]
+    fn render_confirm_floats_via_fixed_size_hints_and_escapes_a_hostile_code() {
+        let hostile = "111\"; Qt.quit(); //\u{2028}222";
+        let qml = render_code_confirm_qml("t", &[HeaderLine::bold("x")], hostile, "Dismiss ask", "MARK:");
+        assert!(qml.contains("flags: Qt.Dialog"));
+        assert!(qml.contains("minimumWidth: width"));
+        assert!(qml.contains(&qml_escape(hostile)), "the code must be escaped, never embedded raw: {qml}");
     }
 
     #[test]
@@ -665,6 +866,52 @@ mod tests {
     #[test]
     fn run_code_entry_dialog_reports_a_spawn_error_for_a_nonexistent_binary() {
         let err = run_code_entry_dialog("/no/such/aoide-lyra-quickshell-shim", "aoide-dialog-qml-test", "t", &[], "Dismiss ask", "MARK:").unwrap_err();
+        assert!(err.contains("spawning quickshell"), "{err}");
+    }
+
+    // ── run_code_confirm_dialog / the output contract (P-PV3 revert) ──────
+
+    #[test]
+    fn run_code_confirm_dialog_returns_approved_with_no_typed_value_when_the_shim_approves() {
+        let _guard = shim_lock();
+        let shim = write_shim("confirm-approve", "#!/bin/sh\necho MARK:APPROVE\nexit 0\n");
+        let result = run_code_confirm_dialog(shim.to_str().unwrap(), "aoide-dialog-qml-confirm-test", "t", &[HeaderLine::bold("x")], "111-222", "Dismiss ask", "MARK:").unwrap();
+        assert_eq!(result, AskResult::Approved(String::new()));
+        remove_shim(&shim);
+    }
+
+    #[test]
+    fn run_code_confirm_dialog_returns_dismissed_when_the_shim_prints_dismiss() {
+        let _guard = shim_lock();
+        let shim = write_shim("confirm-dismiss", "#!/bin/sh\necho MARK:DISMISS\nexit 0\n");
+        let result = run_code_confirm_dialog(shim.to_str().unwrap(), "aoide-dialog-qml-confirm-test", "t", &[HeaderLine::bold("x")], "111-222", "Dismiss ask", "MARK:").unwrap();
+        assert_eq!(result, AskResult::Dismissed);
+        remove_shim(&shim);
+    }
+
+    #[test]
+    fn run_code_confirm_dialog_returns_cancelled_when_the_shim_prints_cancel() {
+        let _guard = shim_lock();
+        let shim = write_shim("confirm-cancel", "#!/bin/sh\necho MARK:CANCEL\nexit 0\n");
+        let result = run_code_confirm_dialog(shim.to_str().unwrap(), "aoide-dialog-qml-confirm-test", "t", &[HeaderLine::bold("x")], "111-222", "Dismiss ask", "MARK:").unwrap();
+        assert_eq!(result, AskResult::Cancelled);
+        remove_shim(&shim);
+    }
+
+    #[test]
+    fn run_code_confirm_dialog_returns_failed_when_the_shim_never_prints_a_marker() {
+        let _guard = shim_lock();
+        let shim = write_shim("confirm-silent", "#!/bin/sh\nexit 0\n");
+        let result = run_code_confirm_dialog(shim.to_str().unwrap(), "aoide-dialog-qml-confirm-test", "t", &[HeaderLine::bold("x")], "111-222", "Dismiss ask", "MARK:").unwrap();
+        assert!(matches!(result, AskResult::Failed(_)), "expected Failed, got {result:?}");
+        remove_shim(&shim);
+    }
+
+    #[test]
+    fn run_code_confirm_dialog_reports_a_spawn_error_for_a_nonexistent_binary() {
+        let err =
+            run_code_confirm_dialog("/no/such/aoide-lyra-quickshell-confirm-shim", "aoide-dialog-qml-confirm-test", "t", &[], "111-222", "Dismiss ask", "MARK:")
+                .unwrap_err();
         assert!(err.contains("spawning quickshell"), "{err}");
     }
 

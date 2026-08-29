@@ -30,7 +30,7 @@
   don't duplicate or move them here.
 - **`commands::dialog_qml::spawn_quickshell` arms `PR_SET_PDEATHSIG` on the
   quickshell child BEFORE it execs — this is what actually closes an ask
-  dialog when `lyra secrets ask`/`lyra pair ask` itself is killed, not this
+  dialog when `lyra secrets ask`/`lyra pair ask`/`lyra pair confirm` itself is killed, not this
   process's own cleanup code (originally a `commands::secrets` review fix;
   moved here at the P-PV3 extraction, unchanged — the ownership chain,
   since it crosses this crate and `aoide-secrets`/`aoide-client`, is
@@ -87,12 +87,19 @@
   `aoide-client` or vice versa, root `AGENTS.md`'s core/paint boundary, so
   every side duplicates the literal `3` in its own doc comments) reads
   exit `1` as a bare user cancel, never as a failure worth retrying.
-- **`commands::dialog_qml` is the ONE place the six-box entry component
-  renders — a caller adds wording/flags, never a second QML template
-  (P-PV3, the extraction `commands::pair` forced).** A future THIRD
-  code-entry dialog reuses this module the same way `commands::pair` does;
-  don't copy `commands::secrets`' pre-extraction shape again "since it's
-  just one file."
+- **`commands::dialog_qml` is the ONE place either surface renders — the
+  six-box ENTRY component and the plain-code CONFIRM component alike — a
+  caller adds wording/flags, never a second QML template of either shape
+  (P-PV3: the extraction `commands::pair`'s own `pair ask` forced the
+  entry side; `pair confirm`'s own design revert, same phase, forced the
+  confirm side).** A future caller needing either shape reuses this
+  module the same way `commands::pair` does; don't copy
+  `commands::secrets`' pre-extraction shape again "since it's just one
+  file," and don't reach for the ENTRY surface to build a confirm-shaped
+  dialog "since it's already there" — `commands::pair`'s own module doc
+  has the review finding that makes that substitution actively misleading
+  (a retype over an already-visible code proves nothing an Approve click
+  doesn't).
 
 ## Extension points
 

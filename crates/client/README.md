@@ -368,40 +368,48 @@ never the inbound/serve half (that's `aoide-server`).
   an outbound entry once `awaiting-confirm`); `run` is the blocking
   tail/reconcile loop (`aoide_secrets::watch::wait_for_follower`'s exact
   retry-until-exists shape, a 30s reconcile safety tick). **`--popup`
-  (F6, upgraded P-PV3/task #132: a TYPED-CODE entry dialog, never a bare
-  yes/no)** refuses up front when NEITHER `lyra` nor `zenity` resolves
-  (`resolve_lyra_bin`, the SAME three-tier check `aoide_secrets::watch::
-  resolve_lyra_bin` runs, repeated here since neither crate may depend on
-  the other); past that, `popup_tick` replaces the plain narrate-only
-  reconcile with: pick the next un-ignored actionable `Pending`, skip
-  while the screen is locked (F8, `aoide_protocol::dialog::is_locked`),
-  show `run_ask_dialog`'s dialog — `lyra pair ask` (the SAME six-box
-  surface `lyra secrets ask` renders) when `resolve_lyra_bin` found one,
-  falling back to `zenity --entry` on a `lyra` `SpawnError`/
-  `DialogFailure` for that one attempt (`aoide_secrets::watch::
-  run_ask_dialog`'s own fallback shape, reused unchanged), `--no-markup`
-  load-bearing on the zenity path for the same Pango-corruption reasoning
-  `aoide_secrets::watch::spawn_zenity_entry` already carries — and act on
-  `decide`'s mapping (exit 0 → the TYPED code, gated through
-  `commit_approval`: `InboundGate::Code` on the inbound arm — the SAME SAS
+  (F6, upgraded P-PV3/task #132: TWO dialog shapes, one per pairing
+  direction, never a single bare yes/no)** refuses up front when NEITHER
+  `lyra` nor `zenity` resolves (`resolve_lyra_bin`, the SAME three-tier
+  check `aoide_secrets::watch::resolve_lyra_bin` runs, repeated here since
+  neither crate may depend on the other); past that, `popup_tick` replaces
+  the plain narrate-only reconcile with: pick the next un-ignored
+  actionable `Pending`, skip while the screen is locked (F8,
+  `aoide_protocol::dialog::is_locked`), show its dialog, and act on
+  `decide`'s mapping. **INBOUND (approver): `run_ask_dialog`** — `lyra
+  pair ask` (the SAME six-box entry surface `lyra secrets ask` renders)
+  when `resolve_lyra_bin` found one, falling back to `zenity --entry` on a
+  `lyra` `SpawnError`/`DialogFailure` for that one attempt
+  (`aoide_secrets::watch::run_ask_dialog`'s own fallback shape, reused
+  unchanged), `--no-markup` load-bearing on the zenity path for the same
+  Pango-corruption reasoning `aoide_secrets::watch::spawn_zenity_entry`
+  already carries. Exit 0 hands back the TYPED code, gated through
+  `commit_approval`'s inbound arm: `InboundGate::Code` — the SAME SAS
   comparison and `MAX_CODE_TRIES` auto-deny machinery the CLI tty/`--code`
-  paths already hold, byte-identical; a local `code_matches` compare
-  against `p.sas` on the outbound arm, only calling `approve_outbound(true,
-  ...)` on a match, with no persisted-try counter (`OutboundPairingRequest`
-  carries none — a click-through guard, not the approver's security gate);
-  the `REJECT_LABEL` extra button/dismiss control → `reject_by_id`; a bare
-  Cancel → session-only `ignored`; a spawn/infra failure on BOTH binaries →
-  backoff, NEVER `ignored`, the same "a broken binary doesn't silently stop
-  offering the request" stance `aoide_secrets::watch::popup_loop` already
-  holds). `confirm_title`/`dialog_context`/`dialog_code` are pure and read
-  ONLY from a `Pending` `reconcile` already produced — never a
-  `PairEvent`'s own feed-sourced fields. `dialog_code` returns `None`
-  UNCONDITIONALLY for an inbound `Pending` (the approver's whole gate is
-  typing a code read from elsewhere — showing it would collapse the
-  out-of-band comparison, `approve_inbound`'s own doc gives the identical
-  reasoning for the tty prompt) and `Some(sas)` for an outbound one (this
-  instance generated that SAS itself — not a leak, and the CLI's own
-  `confirm_sas` already prints it for the identical reason).
+  paths already hold, byte-identical. **OUTBOUND (requester):
+  `run_confirm_dialog`** — `lyra pair confirm`/`zenity --question`
+  (restored to the ceremony's ORIGINAL confirm argv shape), the SAME
+  lyra-then-zenity-fallback pattern. Exit 0 is an unconditional Approve —
+  `commit_approval`'s outbound arm IGNORES whatever string rides along and
+  calls `approve_outbound(true, ...)` regardless, the dialog itself being
+  the confirmation exactly as it always was (P-PV3's own review round
+  reverted an interim design that retyped the code here too, correctly
+  called copy-the-pixels theater since the code was already on screen in
+  the same window). Both arms share: the `REJECT_LABEL` extra
+  button/dismiss control → `reject_by_id`; a bare Cancel → session-only
+  `ignored`; a spawn/infra failure on BOTH binaries → backoff, NEVER
+  `ignored`, the same "a broken binary doesn't silently stop offering the
+  request" stance `aoide_secrets::watch::popup_loop` already holds.
+  `confirm_title`/`dialog_context`/`dialog_code` are pure and read ONLY
+  from a `Pending` `reconcile` already produced — never a `PairEvent`'s
+  own feed-sourced fields. `dialog_code` returns `None` UNCONDITIONALLY
+  for an inbound `Pending` (the approver's whole gate is typing a code
+  read from elsewhere — showing it would collapse the out-of-band
+  comparison, `approve_inbound`'s own doc gives the identical reasoning
+  for the tty prompt) and `Some(sas)` for an outbound one, fed straight
+  into the confirm dialog's own display (this instance generated that SAS
+  itself — not a leak, and the CLI's own `confirm_sas` already prints it
+  for the identical reason).
   **`run_pair_request(cmd, url, name, self_url, self_via, dial_via,
   record_via)` (P-P6, `dial_via`/`record_via` added P-S4, `self_via` added
   P-PV1/task #131) is `pair_via_url`'s own body, extracted so
