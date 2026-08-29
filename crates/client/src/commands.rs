@@ -2808,12 +2808,12 @@ pub fn register_peer_pair(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["peer", "pair", "watch"],
-        summary: "Foreground, line-mode follow of the pairing-ceremony events feed (parked/revealed/awaiting-confirm) plus a 30s reconcile safety tick. --json emits one event object per line instead of narration. --popup swaps the terminal narration for a confirm dialog on each actionable request (requires zenity on PATH) — mutually exclusive with --json. CLI-only — blocks until Ctrl-C.",
+        summary: "Foreground, line-mode follow of the pairing-ceremony events feed (parked/revealed/awaiting-confirm) plus a 30s reconcile safety tick. --json emits one event object per line instead of narration. --popup (opt-in, aoide.pairing.popup) swaps the terminal narration for a dialog shaped by direction on each actionable request: typed-code entry on an inbound reveal, a single Approve/Reject on an outbound awaiting-confirm — lyra when it resolves, zenity otherwise — mutually exclusive with --json. CLI-only — blocks until Ctrl-C.",
         args: [],
         flags: [flag!(
             "popup",
             "bool",
-            "Surface each actionable request (an inbound reveal, or an outbound awaiting-confirm) as a confirm dialog instead of terminal narration. Requires zenity on PATH. Mutually exclusive with --json."
+            "Surface each actionable request as a dialog instead of terminal narration: typed-code entry (inbound reveal) or a single Approve/Reject (outbound awaiting-confirm) — lyra when it resolves, zenity otherwise. Requires one of the two on PATH. Mutually exclusive with --json."
         )],
         gated: false,
         implemented: true,

@@ -361,7 +361,7 @@ the inbound half of the two-door contract (the outbound half is
   plain `thread::spawn` for connection handlers — that one is reserved for
   a NEW socket-based door, not a background worker thread) — a refused OS
   thread costs discovery only, never the door. The RECEIVE half
-  (`peer discover`/`peer invite`'s sweep) lives in
+  (`peer discover`/`peer pair`'s hostname-target sweep) lives in
   `aoide-client::discover` instead; this crate stays inbound/serve-only.
 - `commands` — this crate's CLI commands: `daemon`, `shellbridge` (registration
   only — the files stay in `conduct`), `a2a serve`, `events tail` (P-D3,

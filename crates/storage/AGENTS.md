@@ -285,7 +285,7 @@
   the cap's in-process guarantee: `with_stage_lock` is best-effort by
   contract (a lock hiccup runs the closure unlocked), the mutex is not.
   Outbound entries (`park_outbound`) are operator-created, one per `peer
-  pair request` invocation, and carry no cap.
+  pair` invocation, and carry no cap.
 - **`OutboundPairingRequest.state` defers the requester's own peer-record
   commit past the approver's approval — never collapse the two-state
   machine back to an implicit "the poll answered means paired."** An entry

@@ -567,7 +567,7 @@ never the inbound/serve half (that's `aoide-server`).
   exactly one question (is `name` a registered, `verified` peer at all — an
   unsigned request could never satisfy the remote's `PeerRung::Signature`
   -only requirement regardless), refusing with a taught error naming `peer
-  pair request`, then confirms (`--yes` skips only this LOCAL `y`/`N`
+  pair`, then confirms (`--yes` skips only this LOCAL `y`/`N`
   prompt, `confirm_spawn`, mirroring `confirm_sas`'s idiom) before calling
   `spawn_on_peer` and shaping the `Outcome`. **`aoide-conduct`'s manifest
   remote-summon path** (U4, command-defrag lane U — `graph::resurrect::
