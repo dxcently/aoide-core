@@ -17,11 +17,17 @@
 #     (`pkgs.aoide.rice`) — droppable from a headless closure that only ever
 #     references `pkgs.aoide` (the `out` output: `aoide` + `aoided`).
 #   * cargo deps vendored via `cargoLock.lockFile` so the build is pure/offline.
+#   * `paint ? true` — false builds ONLY the core `aoide`/`aoided` pair
+#     (`-p aoide-cli`, no `rice` output, no test phase) for the static-musl
+#     variant (`aoide-static`, pkgs/aoide/flake.nix). Nothing about the
+#     dynamic default changes: every caller that omits the arg gets exactly
+#     today's three-binary, tested build.
 {
   lib,
   rustPlatform,
   git,
   curl,
+  paint ? true,
   ...
 }:
 rustPlatform.buildRustPackage {
@@ -38,11 +44,9 @@ rustPlatform.buildRustPackage {
   # boxes — sakaki and any future doors-only host) can install `pkgs.aoide`
   # (aoide + aoided only) without `pkgs.aoide.rice` ever entering its closure.
   # `out` stays first so plain `pkgs.aoide`/`${pkgs.aoide}` keeps resolving to
-  # the core pair, unchanged for every existing caller.
-  outputs = [
-    "out"
-    "rice"
-  ];
+  # the core pair, unchanged for every existing caller. `paint = false` drops
+  # `rice` — there is no `lyra` to give it an output.
+  outputs = [ "out" ] ++ lib.optionals paint [ "rice" ];
 
   cargoLock.lockFile = ./Cargo.lock;
 
@@ -98,10 +102,17 @@ rustPlatform.buildRustPackage {
   # of the plan's ladder, first form; verified live via `ls result/bin`). All
   # three still install to $out at this point; P-A8's `postFixup` below is
   # what relocates `lyra` alone into `$rice`.
-  cargoBuildFlags = [ "--workspace" ];
+  # `paint = false` scopes the build to the core crate alone — no lyra, no
+  # song/screen weight — for the static variant.
+  cargoBuildFlags = if paint then [ "--workspace" ] else [ "-p" "aoide-cli" ];
 
-  # Walking skeleton: no live-system integration tests in the sandbox.
-  doCheck = true;
+  # `paint = false` also turns the test phase off. The dynamic `pkg-aoide`
+  # check already runs this exact suite over identical sources; this
+  # variant's job is a link-and-run proof, not a second test run, and
+  # skipping it keeps musl-specific flakiness (128 KB default thread stacks,
+  # NSS differences) out of the gate. Inverse if musl divergence ever
+  # matters: turn `doCheck` on with `cargoTestFlags` scoped to core crates.
+  doCheck = paint;
 
   # P-A8: relocate `lyra` into the `rice` output. `cargoInstallHook` (like
   # every nixpkgs install hook) installs to $out regardless of the declared
@@ -112,8 +123,9 @@ rustPlatform.buildRustPackage {
   # finished artifact. `moveToOutput` is provided unconditionally by the
   # `multiple-outputs.sh` setup hook baked into stdenv — no extra input
   # needed. No `dev`/`doc` split declared here, so there is no
-  # dev-output-interference hazard to work around.
-  postFixup = ''
+  # dev-output-interference hazard to work around. `paint = false` never
+  # built a `lyra` binary, so there is nothing to move.
+  postFixup = lib.optionalString paint ''
     moveToOutput bin/lyra "$rice"
   '';
 

@@ -42,10 +42,19 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
           aoide = pkgs.callPackage ./default.nix { };
+          # aoide-static — the core pair (`aoide`/`aoided`, no `lyra`) linked
+          # against musl with `+crt-static`, for a host with no nix store: a
+          # link-and-run proof, not a second copy of the test suite (see
+          # default.nix's `doCheck` comment). `pkgsStatic` retargets the
+          # WHOLE package set (not just rustc) to `pkgsCross.musl64` plus
+          # `+crt-static`, so `rustPlatform.buildRustPackage` from it needs
+          # no extra flags — same call shape as the dynamic build above, one
+          # more argument.
+          aoide-static = pkgs.pkgsStatic.callPackage ./default.nix { paint = false; };
         in
         {
           default = aoide;
-          inherit aoide;
+          inherit aoide aoide-static;
         }
       );
 
