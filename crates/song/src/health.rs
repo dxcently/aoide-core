@@ -50,11 +50,26 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// A 3rd trigger inside this many seconds withholds the restart instead of
-/// looping forever against a genuinely flapping output (suspected hub/GPU
-/// power-state issue, not yet confirmed) — see [`backoff_engaged`].
-const BACKOFF_WINDOW_SECS: i64 = 300;
-const BACKOFF_CAP: usize = 3;
+/// How long a run of restarts stays in view before it's forgotten, and the
+/// same window the once-per-episode notification is gated against (see
+/// [`already_notified_this_episode`]): a continuously-engaged episode never
+/// outlives this window, since it ends once enough restart timestamps age
+/// out of it, so comparing the last notification against the same window is
+/// enough to fire the toast exactly once per episode while still letting a
+/// later, genuinely new episode notify again. An hour of quiet resets the
+/// ladder below to its bottom rung.
+const HISTORY_WINDOW_SECS: i64 = 3600;
+
+/// Exponential retry ladder: the minimum gap, in seconds, required since the
+/// last restart before another is allowed, indexed by how many restarts
+/// already sit in [`HISTORY_WINDOW_SECS`] — 0/1/2/3/4-or-more restarts so far
+/// map to 0s/15s/60s/300s/900s. The last rung is a floor, never a ceiling
+/// that gives up: once the ladder bottoms out it keeps trying forever at the
+/// 900s (15-minute) cadence instead of stopping — see
+/// [`ladder_permits_restart`] and the module header for why "eventually
+/// refuse" is exactly the failure mode a suspected flapping output cannot be
+/// allowed to reproduce.
+const RETRY_LADDER_SECS: [i64; 5] = [0, 15, 60, 300, 900];
 
 /// The result of one `aoide quickshell healthcheck` run.
 pub enum HealthOutcome {
@@ -63,9 +78,13 @@ pub enum HealthOutcome {
     Healthy,
     /// Confirmed stuck; the service was restarted.
     Restarted,
-    /// Confirmed stuck again, but [`backoff_engaged`] withheld the restart —
-    /// a herald notification was fired instead.
-    BackoffWithheld,
+    /// Confirmed stuck again, but [`ladder_permits_restart`] says the retry
+    /// ladder's gap since the last restart hasn't elapsed yet. Withheld for
+    /// THIS TICK only, silently — the next tick (~15s later, off the timer)
+    /// re-evaluates and restarts as soon as the gap has passed. Never a
+    /// terminal state: see the module header and [`RETRY_LADDER_SECS`] for
+    /// why this design never stops trying.
+    Deferred { next_attempt_in_secs: i64, recent_restarts: usize },
 }
 
 impl HealthOutcome {
@@ -73,7 +92,7 @@ impl HealthOutcome {
         match self {
             HealthOutcome::Healthy => "healthy",
             HealthOutcome::Restarted => "restarted",
-            HealthOutcome::BackoffWithheld => "backoff-withheld",
+            HealthOutcome::Deferred { .. } => "deferred",
         }
     }
 
@@ -83,9 +102,12 @@ impl HealthOutcome {
             HealthOutcome::Restarted => {
                 "quickshell was stuck on a placeholder screen; restarted".to_string()
             }
-            HealthOutcome::BackoffWithheld => {
-                "quickshell is stuck again but the restart backoff engaged; notified instead"
-                    .to_string()
+            HealthOutcome::Deferred { next_attempt_in_secs, recent_restarts } => {
+                let plural = if *recent_restarts == 1 { "" } else { "s" };
+                format!(
+                    "quickshell is stuck; next restart attempt in {next_attempt_in_secs}s \
+                     ({recent_restarts} restart{plural} in the last hour)"
+                )
             }
         }
     }
@@ -136,20 +158,66 @@ pub(crate) fn shell_has_zero_layers(layers: &Value) -> bool {
 /// Pure: restart timestamps (unix epoch seconds) from a marker file's
 /// contents that still fall inside `window_secs` of `now` — everything
 /// older is treated as expired and dropped, so the window is a sliding one,
-/// never a cumulative lifetime count.
+/// never a cumulative lifetime count. Bounded on BOTH sides (`t <= now` as
+/// well as `now - t < window_secs`): a line ahead of `now` — an NTP step, a
+/// clock skew correction, a corrupted or hand-edited marker — must never
+/// count as "recent" via a negative age, because [`ladder_permits_restart`]
+/// would then measure `now - last` as deeply negative and never reach
+/// [`required_gap_secs`], turning [`next_attempt_in_secs`] into an
+/// effectively permanent refusal instead of the bounded delay this design
+/// promises (see the module header and [`RETRY_LADDER_SECS`]).
 pub(crate) fn recent_restarts_within(marker_contents: &str, now: i64, window_secs: i64) -> Vec<i64> {
     marker_contents
         .lines()
         .filter_map(|l| l.trim().parse::<i64>().ok())
-        .filter(|&t| now - t < window_secs)
+        .filter(|&t| t <= now && now - t < window_secs)
         .collect()
 }
 
-/// Pure: has this already restarted `cap` times inside the window? `true`
-/// means withhold — a hardware-level flap that keeps re-triggering must not
-/// turn into an infinite restart loop.
-pub(crate) fn backoff_engaged(recent: &[i64], cap: usize) -> bool {
-    recent.len() >= cap
+/// Pure: the minimum number of seconds required since the last restart
+/// before another is allowed, given how many restarts already sit in the
+/// window. The index floors at the ladder's final rung (900s) rather than
+/// panicking or growing past it — this is what makes [`RETRY_LADDER_SECS`] a
+/// floor and never a "stop" state: every count of prior restarts, however
+/// large, still maps to a finite, reachable gap.
+pub(crate) fn required_gap_secs(restarts_in_window: usize) -> i64 {
+    let rung = restarts_in_window.min(RETRY_LADDER_SECS.len() - 1);
+    RETRY_LADDER_SECS[rung]
+}
+
+/// Pure: does the retry ladder permit a restart right now? `recent` is
+/// already pruned to the sliding window by [`recent_restarts_within`]. No
+/// prior restart in the window always permits (the ladder's 0s rung).
+/// Otherwise the gap is measured against the MOST RECENT restart, not the
+/// oldest — each restart resets the clock for the next rung — and must have
+/// reached [`required_gap_secs`] for how many restarts already sit in the
+/// window. This is a delay, never a denial: there is no `recent`/`now` pair
+/// this returns `false` for forever, because the ladder floors at 900s
+/// instead of an unreachable cap.
+pub(crate) fn ladder_permits_restart(recent: &[i64], now: i64) -> bool {
+    match recent.iter().copied().max() {
+        None => true,
+        Some(last) => now - last >= required_gap_secs(recent.len()),
+    }
+}
+
+/// Pure: seconds remaining until [`ladder_permits_restart`] would allow a
+/// restart, for the deferral message — never negative, so the message never
+/// reads as overdue when it's actually already due.
+pub(crate) fn next_attempt_in_secs(recent: &[i64], now: i64) -> i64 {
+    match recent.iter().copied().max() {
+        None => 0,
+        Some(last) => (required_gap_secs(recent.len()) - (now - last)).max(0),
+    }
+}
+
+/// Pure: has the ladder bottomed out at its 900s floor? True from the 4th
+/// restart in the window onward. This is the point the once-per-episode
+/// notification in [`run_healthcheck`] fires — by then the pattern is
+/// clearly not a one-off blip, unlike an early rung that could still be a
+/// single transient blip self-correcting on its own.
+pub(crate) fn ladder_at_cap(restarts_in_window: usize) -> bool {
+    restarts_in_window >= RETRY_LADDER_SECS.len() - 1
 }
 
 /// Pure: the marker's sentinel line for "a backoff notification already
@@ -172,6 +240,29 @@ pub(crate) fn last_notified_at(marker_contents: &str) -> Option<i64> {
 /// again.
 pub(crate) fn already_notified_this_episode(last_notified: Option<i64>, now: i64, window_secs: i64) -> bool {
     last_notified.is_some_and(|t| now - t < window_secs)
+}
+
+/// Pure: compose the marker file's full body from a set of restart
+/// timestamps (already pruned to the sliding window, the same shape
+/// [`recent_restarts_within`] returns) and a `notified:` sentinel to carry
+/// forward, if any. The one place [`run_healthcheck`]'s two marker writes
+/// (defer-with-notify and restart) both build their contents from, so the
+/// sentinel can never again be dropped by one write path while the other
+/// keeps it — that asymmetry was the spam defect: the restart-path write
+/// used to compose its body from timestamps alone, unconditionally losing
+/// whatever `notified:` line [`last_notified_at`] would have found in the
+/// prior contents, so every restart at the ladder's 900s cap cleared the
+/// sentinel and the very next deferred tick read that absence as "never
+/// notified" and fired again — once per restart instead of once per
+/// episode. `notified: None` composes a body with no sentinel line at all
+/// (not a placeholder) — the shape a fresh marker, or a prior with no
+/// sentinel to carry, collapses to.
+pub(crate) fn marker_body(timestamps: &[i64], notified: Option<i64>) -> String {
+    let mut lines: Vec<String> = timestamps.iter().map(i64::to_string).collect();
+    if let Some(t) = notified {
+        lines.push(format!("notified:{t}"));
+    }
+    lines.join("\n")
 }
 
 fn marker_path() -> PathBuf {
@@ -227,10 +318,17 @@ fn restart_service() {
 /// Raise a toast through the stock freedesktop client, detached — same
 /// idiom as `aoide-conduct`'s `announce_reap`/`dispatch_rice_mode_toggle`: a
 /// slow/missing `notify-send` must never delay or fail the healthcheck
-/// itself (it is a `oneshot` on a 15s timer).
-fn notify_backoff_engaged() {
+/// itself (it is a `oneshot` on a 15s timer). Fired once per episode, only
+/// once the ladder has bottomed out at its 900s floor (see
+/// [`ladder_at_cap`]) — by then the pattern is clearly not a one-off blip.
+/// Best-effort, not this healthcheck's fallback: dunst's `skip_display`
+/// (`modules/dendrites/dunst.nix`) means it never draws, only forwards to
+/// the herald ledger inside the very shell this reports on, so the toast
+/// only becomes visible once the shell recovers — the restart the caller
+/// already fired is what actually does the work.
+fn notify_still_flapping() {
     match Command::new("notify-send").args(["--app-name=aoide", "quickshell watchdog"]).arg(
-        "quickshell keeps landing on a placeholder screen — restart withheld after repeated triggers; investigate the output/monitor connection",
+        "quickshell keeps landing on a placeholder screen and is being restarted repeatedly — the output/monitor connection looks suspect",
     ).spawn() {
         Ok(mut child) => {
             std::thread::spawn(move || {
@@ -264,22 +362,41 @@ pub fn run_healthcheck() -> HealthOutcome {
 
     let now = now_epoch();
     let marker = marker_path();
+    if let Some(parent) = marker.parent() {
+        // Best-effort, same guarded posture as every write below: `state/`
+        // is normally seeded by the nix module's systemd-tmpfiles rule
+        // (`modules/nucleus/aoided.nix`), but nothing in this crate creates
+        // it, and an absent directory would otherwise make BOTH writes below
+        // silently fail — `recent` would then never accumulate, the ladder
+        // would permanently take its "no prior restart" branch, and the
+        // shell would get restarted every ~15s forever, the exact inverse of
+        // the future-timestamp defect above and just as bad. A failure here
+        // must not panic or change the outcome, so it's swallowed exactly
+        // like the writes are.
+        let _ = std::fs::create_dir_all(parent);
+    }
     let prior = std::fs::read_to_string(&marker).unwrap_or_default();
-    let recent = recent_restarts_within(&prior, now, BACKOFF_WINDOW_SECS);
-    if backoff_engaged(&recent, BACKOFF_CAP) {
-        if !already_notified_this_episode(last_notified_at(&prior), now, BACKOFF_WINDOW_SECS) {
-            notify_backoff_engaged();
-            let mut lines: Vec<String> = recent.iter().map(i64::to_string).collect();
-            lines.push(format!("notified:{now}"));
-            let _ = std::fs::write(&marker, lines.join("\n"));
+    let recent = recent_restarts_within(&prior, now, HISTORY_WINDOW_SECS);
+    if !ladder_permits_restart(&recent, now) {
+        if ladder_at_cap(recent.len())
+            && !already_notified_this_episode(last_notified_at(&prior), now, HISTORY_WINDOW_SECS)
+        {
+            notify_still_flapping();
+            let _ = std::fs::write(&marker, marker_body(&recent, Some(now)));
         }
-        return HealthOutcome::BackoffWithheld;
+        return HealthOutcome::Deferred {
+            next_attempt_in_secs: next_attempt_in_secs(&recent, now),
+            recent_restarts: recent.len(),
+        };
     }
 
+    // Carry the prior `notified:` sentinel (if any) forward — see
+    // `marker_body`'s doc for why composing this body from `updated` alone
+    // was the spam defect: it silently dropped whatever notification state
+    // `prior` was carrying every time a restart landed.
     let mut updated = recent;
     updated.push(now);
-    let body: String = updated.iter().map(i64::to_string).collect::<Vec<_>>().join("\n");
-    let _ = std::fs::write(&marker, body);
+    let _ = std::fs::write(&marker, marker_body(&updated, last_notified_at(&prior)));
     restart_service();
     HealthOutcome::Restarted
 }
@@ -378,10 +495,143 @@ mod tests {
     }
 
     #[test]
-    fn backoff_engages_at_the_cap_not_one_past_it() {
-        assert!(!backoff_engaged(&[1, 2], 3));
-        assert!(backoff_engaged(&[1, 2, 3], 3));
-        assert!(backoff_engaged(&[1, 2, 3, 4], 3));
+    fn required_gap_secs_follows_the_ladder_and_floors_at_the_cap() {
+        assert_eq!(required_gap_secs(0), 0);
+        assert_eq!(required_gap_secs(1), 15);
+        assert_eq!(required_gap_secs(2), 60);
+        assert_eq!(required_gap_secs(3), 300);
+        assert_eq!(required_gap_secs(4), 900);
+        // 5-or-more never becomes "never" — the floor holds indefinitely.
+        assert_eq!(required_gap_secs(5), 900);
+        assert_eq!(required_gap_secs(100), 900);
+    }
+
+    #[test]
+    fn ladder_withholds_before_the_required_gap_has_elapsed() {
+        // One restart already in the window (rung 1: 15s required); only
+        // 10s have passed since it.
+        assert!(!ladder_permits_restart(&[1000], 1010));
+    }
+
+    #[test]
+    fn ladder_permits_once_the_required_gap_has_elapsed() {
+        assert!(ladder_permits_restart(&[1000], 1015));
+        assert!(ladder_permits_restart(&[1000], 1020));
+    }
+
+    #[test]
+    fn ladder_always_permits_with_no_prior_restart_in_the_window() {
+        assert!(ladder_permits_restart(&[], 1000));
+    }
+
+    #[test]
+    fn ladder_gates_on_the_most_recent_restart_not_the_oldest() {
+        // Three restarts already in the window; the 4th must wait out the
+        // 3-restart rung (300s) measured from the LAST of the three, not
+        // the first.
+        let recent = [1000, 1015, 1075];
+        assert!(!ladder_permits_restart(&recent, 1075 + 299));
+        assert!(ladder_permits_restart(&recent, 1075 + 300));
+    }
+
+    #[test]
+    fn an_hour_of_quiet_prunes_the_window_and_resets_the_ladder_to_the_bottom_rung() {
+        let marker = "1000\n1015\n1075\n1375\n";
+        let long_after = 1375 + HISTORY_WINDOW_SECS;
+        let recent = recent_restarts_within(marker, long_after, HISTORY_WINDOW_SECS);
+        assert!(recent.is_empty());
+        assert_eq!(required_gap_secs(recent.len()), 0);
+        assert!(ladder_permits_restart(&recent, long_after));
+    }
+
+    #[test]
+    fn ladder_reaches_cap_at_four_restarts_in_the_window_not_before() {
+        assert!(!ladder_at_cap(3));
+        assert!(ladder_at_cap(4));
+        assert!(ladder_at_cap(5));
+    }
+
+    #[test]
+    fn next_attempt_in_secs_counts_down_and_never_goes_negative() {
+        assert_eq!(next_attempt_in_secs(&[1000], 1000), 15);
+        assert_eq!(next_attempt_in_secs(&[1000], 1010), 5);
+        assert_eq!(next_attempt_in_secs(&[1000], 1015), 0);
+        assert_eq!(next_attempt_in_secs(&[1000], 1020), 0);
+    }
+
+    #[test]
+    fn next_attempt_in_secs_is_zero_without_a_prior_restart() {
+        assert_eq!(next_attempt_in_secs(&[], 1000), 0);
+    }
+
+    // Regression: this design must never permanently withhold. For any
+    // restart history, waiting the ladder's own longest possible gap (the
+    // 900s cap rung) since the last restart always reaches a moment the
+    // ladder permits — there is no `recent` for which it refuses forever.
+    // Deliberately one-sided: `now` is always `last + 900` here, i.e.
+    // `now >= last` in every case, so this covers only the "wait long
+    // enough" axis. The OPPOSITE, adversarial axis — a marker timestamp
+    // AHEAD of `now` — is covered separately below, since a naive filter
+    // that only checks `now - t < window_secs` (no lower bound on `t`)
+    // would pass a future `t` through as a negative age and this loop would
+    // never catch that: `last` here is always taken from the same clock as
+    // `now`, never manufactured ahead of it.
+    #[test]
+    fn no_restart_history_ever_permanently_refuses_a_future_restart() {
+        for count in 0..=50usize {
+            let recent: Vec<i64> = (0..count).map(|i| i as i64 * 10).collect();
+            let last = recent.iter().copied().max().unwrap_or(0);
+            assert!(ladder_permits_restart(&recent, last + 900));
+        }
+    }
+
+    // Regression for the defect the loop above is structurally blind to: a
+    // marker line AHEAD of `now` (an NTP step, a clock skew correction, a
+    // corrupted or hand-edited marker) must never be counted as "recent" —
+    // `recent_restarts_within` used to filter on `now - t < window_secs`
+    // alone, with no `t <= now` lower bound, so a future `t` produced a
+    // negative age that passed the filter. Downstream, `ladder_permits_restart`
+    // then measured `now - last` as deeply negative (never reaching
+    // `required_gap_secs`), and `next_attempt_in_secs` reported a wait of
+    // `required_gap + |now - last|` — a marker dated 2100 against a real
+    // `now` of 2027 produced a reported wait of roughly 73 years, a de-facto
+    // permanent refusal despite [`RETRY_LADDER_SECS`] never being a "stop"
+    // state on paper.
+    #[test]
+    fn a_future_marker_timestamp_is_dropped_not_counted_as_recent() {
+        let now = 1_800_000_000_i64; // a real "now"
+        let wildly_future = now + 60 * 60 * 24 * 365 * 70; // ~2100 against a ~2027 `now`
+
+        let recent = recent_restarts_within(&format!("{wildly_future}\n"), now, HISTORY_WINDOW_SECS);
+        assert!(recent.is_empty(), "a future timestamp must never count as a recent restart");
+        assert!(ladder_permits_restart(&recent, now), "no valid recent restart means the ladder permits immediately");
+        assert_eq!(next_attempt_in_secs(&recent, now), 0);
+    }
+
+    #[test]
+    fn recent_restarts_within_keeps_now_itself_but_drops_anything_past_it() {
+        // `t <= now` is inclusive at the boundary (t == now is not "future"),
+        // but t == now + 1 already is.
+        assert_eq!(recent_restarts_within("1000\n", 1000, 300), vec![1000]);
+        assert!(recent_restarts_within("1001\n", 1000, 300).is_empty());
+    }
+
+    #[test]
+    fn a_future_marker_line_never_poisons_the_gate_alongside_a_real_recent_restart() {
+        // A marker holding one genuine recent restart AND one wildly future
+        // (corrupted) entry: the future line must be dropped, and the ladder
+        // must gate ONLY on the real restart — a bounded, sane wait, never
+        // the multi-year refusal a negative age would have produced.
+        let now = 1_800_000_000_i64;
+        let wildly_future = now + 60 * 60 * 24 * 365 * 70;
+        let marker = format!("{now}\n{wildly_future}\n");
+
+        let recent = recent_restarts_within(&marker, now, HISTORY_WINDOW_SECS);
+        assert_eq!(recent, vec![now]);
+        assert!(!ladder_permits_restart(&recent, now), "rung 1 (15s) hasn't elapsed yet");
+        let wait = next_attempt_in_secs(&recent, now);
+        assert_eq!(wait, 15);
+        assert!(wait <= *RETRY_LADDER_SECS.last().unwrap(), "must stay within the ladder's own bound, not blow up");
     }
 
     #[test]
@@ -416,17 +666,66 @@ mod tests {
 
     #[test]
     fn a_notification_outside_the_window_allows_a_fresh_one() {
-        // A later, genuinely new backoff episode (old timestamps long aged
+        // A later, genuinely new flapping episode (old timestamps long aged
         // out) must still get its own toast, not stay silent forever.
         assert!(!already_notified_this_episode(Some(1000), 1300, 300));
+    }
+
+    #[test]
+    fn marker_body_with_no_timestamps_and_no_sentinel_is_an_empty_string() {
+        assert_eq!(marker_body(&[], None), "");
+    }
+
+    #[test]
+    fn marker_body_renders_bare_timestamps_one_per_line() {
+        assert_eq!(marker_body(&[1000, 1015, 1075], None), "1000\n1015\n1075");
+    }
+
+    // Regression for the spam defect: composing the RESTART-path body from
+    // `updated` (fresh timestamps) must still carry a sentinel found in
+    // `prior` forward rather than losing it, the way the old inline
+    // `updated.iter()...join("\n")` composition unconditionally did.
+    #[test]
+    fn marker_body_carries_the_notified_sentinel_through_a_restart_path_write() {
+        let prior = "700\nnotified:650\n";
+        let recent = recent_restarts_within(prior, 900, HISTORY_WINDOW_SECS);
+        let mut updated = recent;
+        updated.push(900);
+        let body = marker_body(&updated, last_notified_at(prior));
+        assert_eq!(body, "700\n900\nnotified:650");
+        // And the composed body round-trips: a subsequent read finds the
+        // SAME sentinel, unlike the old code where it vanished after one
+        // restart-path write.
+        assert_eq!(last_notified_at(&body), Some(650));
+    }
+
+    // Complement: an episode boundary — no sentinel to carry (a fresh
+    // marker, or a prior that never reached the ladder's cap) — must clear
+    // to no `notified:` line at all, not some leftover or placeholder value,
+    // so the next tick's `already_notified_this_episode` sees a clean
+    // `None` and is free to notify on a genuinely new episode.
+    #[test]
+    fn marker_body_with_no_sentinel_to_carry_clears_it_at_an_episode_boundary() {
+        let body = marker_body(&[900], None);
+        assert_eq!(body, "900");
+        assert_eq!(last_notified_at(&body), None);
+        assert!(!already_notified_this_episode(last_notified_at(&body), 900, HISTORY_WINDOW_SECS));
     }
 
     #[test]
     fn outcome_tags_and_messages() {
         assert_eq!(HealthOutcome::Healthy.tag(), "healthy");
         assert_eq!(HealthOutcome::Restarted.tag(), "restarted");
-        assert_eq!(HealthOutcome::BackoffWithheld.tag(), "backoff-withheld");
         assert!(HealthOutcome::Restarted.message().contains("restarted"));
+
+        let deferred = HealthOutcome::Deferred { next_attempt_in_secs: 847, recent_restarts: 4 };
+        assert_eq!(deferred.tag(), "deferred");
+        let msg = deferred.message();
+        assert!(msg.contains("847"), "{msg}");
+        assert!(msg.contains("4 restarts"), "{msg}");
+
+        let singular = HealthOutcome::Deferred { next_attempt_in_secs: 10, recent_restarts: 1 };
+        assert!(singular.message().contains("1 restart "), "{}", singular.message());
     }
 
     // `run_healthcheck()` itself isn't unit-tested here: it reads the REAL

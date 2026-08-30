@@ -30,7 +30,7 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["quickshell", "healthcheck"],
-        summary: "Detect and recover the placeholder-screen lockup: aoide-quickshell.service alive but rendered onto Qt's internal placeholder screen after a transient output blip, with zero layer-shell surfaces on the real monitor. Restarts the service to reattach; withholds and notifies after repeated triggers in a short window. Meant to run off a systemd timer, not interactively.",
+        summary: "Detect and recover the placeholder-screen lockup: aoide-quickshell.service alive but rendered onto Qt's internal placeholder screen after a transient output blip, painting no layer-shell surfaces anywhere. Restarts the service to reattach, spacing repeated attempts along a retry ladder (immediate, then 15s/60s/5m, settling at 15m) that slows down but never stops. Meant to run off a systemd timer, not interactively.",
         args: [],
         flags: [],
         gated: false,
