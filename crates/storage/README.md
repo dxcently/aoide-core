@@ -1,10 +1,11 @@
 # aoide-storage
 
 Durable session data + memory persistence: stage-file record shapes, atomic
-stage I/O, session/hook upsert ops, the staging/declarative mode marker, and
-the peer-federation registry + pull cache (CONTRACTS.md §7). File-first by
-decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
-"storage backend" open question).
+stage I/O, session/hook upsert ops, the staging/declarative mode marker, the
+peer-federation registry + pull cache (CONTRACTS.md §7), and the one INTENT
+file among all that state — the portable runtime config (`config`). File-first
+by decision — no embedded database yet
+(`docs/architecture/PACKAGE-LAYOUT.md`, "storage backend" open question).
 
 ## Named seams (what it exposes)
 
@@ -57,6 +58,41 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   resolver uses, applied to a directory instead of an executable. Returns
   `None` (never a default that might not exist) when neither resolves; the
   caller turns that into a taught error naming both locations.
+- `config` — the portable runtime config (task #135 P-C, CONTRACTS.md §4's
+  `config.toml` subsection): `$AOIDE_ROOT/config.toml`, the one file here
+  that records INTENT rather than state. It exists because core is portable
+  — `aoide`/`aoided` are cargo-buildable on any Linux with no NixOS
+  assumption (root `AGENTS.md`), so a CORE command's configuration cannot
+  live in a NixOS module option: on a non-nix host that option does not
+  exist, and "rebuild to change a grant" is not an operation. Nix is ONE
+  authoring front-end (`modules/nucleus/config.nix`) that renders the whole
+  file to a READ-ONLY store path and points `$AOIDE_CONFIG` at it —
+  immutability IS the provenance, so there is no marker field to go stale
+  and the two worlds never write the same path. `source` resolves in two
+  tiers, absolute-path-wins like every other override in `fs`:
+  `$AOIDE_CONFIG` (MANAGED — `set` refuses it and names it), else
+  `$AOIDE_ROOT/config.toml` (UNMANAGED, writable). One function, so the CLI,
+  the daemon, and the stdio MCP façade have no per-door variant to drift. A
+  missing file is every default, never an error (`advertise::enabled`'s own
+  tolerate-missing stance); a file that EXISTS but carries an unknown key,
+  an unknown section, or a value outside its vocabulary is a LOUD error
+  naming the offence — this file carries grants, so silent tolerance of a
+  typo is the exact failure the format choice refuses (TOML, because the
+  reasoning behind a grant has to live beside it, which JSON has nowhere to
+  put; not YAML, whose implicit coercion is the opposite of failing loudly).
+  `SCHEMA` is a walkable const TABLE — sections, their keys, each key's
+  value vocabulary, and a `read` fn projecting that key off a typed
+  `Config` — and `validate`, `set`, and `aoide config`'s own listing all
+  walk it rather than restating it in match arms. v0 carries exactly one
+  section: `[pairing]`'s `defaultGrant`, whose vocabulary IS
+  `peer_store::PEER_CAPABILITIES` (the same closed set `peer allow`
+  enforces, never a second list). `set` is the only writer: it refuses a
+  managed config, an unknown key, a value outside its vocabulary, and a
+  config already on disk that does not load — each with a taught error, and
+  nothing written in any of them — then edits the file's own text through
+  `toml_edit` so an operator's comments survive, re-parses the result
+  through the same gate the next `load` will apply, and commits it with
+  `fs::atomic_write`.
 - `session` — pure session/hook upsert operations.
 - `peer_store` — the peer-federation registry + pull cache (CONTRACTS.md §7).
   `Peer` carries two independent, opposite-direction credential fields:
@@ -481,8 +517,11 @@ decision — no embedded database yet (`docs/architecture/PACKAGE-LAYOUT.md`,
   construction, since this module cannot write a peer record even if a
   caller wanted it to.
 - `commands` — this crate's CLI commands: `usage` (local token/cost rollup),
-  `inbox list|read|clear` (the store above's CLI surface), and `identity`
-  (the module above's CLI surface). `peer pair`/`peer pending`/`peer pair
+  `inbox list|read|clear` (the store above's CLI surface), `identity`
+  (the module above's CLI surface), and `config`/`config set` (the config
+  module's — `config` prints the effective values, the path they resolved
+  from, and whether it is managed or unmanaged; `config set` is the one
+  schema-validated write). `peer pair`/`peer pending`/`peer pair
   approve|reject|watch` lives in `aoide-client` instead (outbound transport crosses the
   `client → storage` DAG edge; this crate exposes `pairing`/`peer_store`
   as the library, `client` drives the wire).
@@ -495,8 +534,13 @@ of P-P1 — `ed25519-dalek`/`getrandom` for `identity`, joined at P-P2 by
 zero-new-deps discipline, scoped to cryptographic primitives specifically
 (User ruling 2026-08-25, `docs/architecture/PAIRING.md`'s kill-list and
 decision 1; see the workspace `Cargo.toml`'s own comment on those entries
-for the version/feature reasoning). It is the second-lowest crate in the
-DAG — everything that persists state sits above it.
+for the version/feature reasoning). `toml`/`toml_edit` join them at P-C for
+`config` — the second sanctioned break, scoped to the one runtime format,
+split by direction (`toml` deserializes into the typed schema, `toml_edit`
+rewrites one key in place so comments survive); both are pure Rust over one
+shared parser/writer stack, which is what keeps `checks.portability`'s
+static-musl artifact buildable. It is the second-lowest crate in the DAG —
+everything that persists state sits above it.
 
 ## How it composes
 

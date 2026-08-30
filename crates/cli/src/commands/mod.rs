@@ -40,7 +40,8 @@ use crate::registry::Registry;
 /// advertise/list (task #120), bare `pair` (task #120 P3 — the friendly
 /// interactive entry into the pairing ceremony: one sweep, a select menu,
 /// then the SAME `run_pair_request` core the ceremony's own request path
-/// drives).
+/// drives), config + config set (task #135 P-C — the portable runtime config
+/// file, `$AOIDE_ROOT/config.toml`).
 ///
 /// P-A5 (binary-split workstream) removed the register lines for the
 /// graphical bundle — rice/draft/mode/cover/livery/rice-late-stubs/
@@ -80,6 +81,7 @@ pub fn all() -> Registry {
     aoide_client::mcp_client::register_melete(&mut r); // melete status/graph/call — the Melete MCP client (M2, task #14, appended newest)
     aoide_conduct::commands::peer_list::register(&mut r); // peer list — the one-glance mesh roster over the roster core's probe (formerly who's) + one discovery sweep (task #120 P2, appended newest)
     aoide_client::commands::register_pair(&mut r); // pair — the interactive pairing picker over one sweep, driving the same ceremony core (task #120 P3, appended newest)
+    aoide_storage::commands::register_config(&mut r); // config, config set — the portable runtime config file (task #135 P-C, appended newest)
 
     r
 }

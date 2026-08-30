@@ -85,6 +85,13 @@
 //! (`manifest::walk_up`), distinct in every way from `undying`'s host-local
 //! live-id marks. See its own module doc for the full contrast.
 //!
+//! `config` (task #135 P-C) is the one INTENT file among all this state:
+//! `$AOIDE_ROOT/config.toml`, a portable runtime config a human edits and a
+//! nix module may instead render read-only to a store path (`$AOIDE_CONFIG`).
+//! Core is cargo-buildable anywhere, so a core command's configuration cannot
+//! live in a NixOS option — see its own module doc for the resolution order,
+//! the managed/unmanaged split, and why the schema is a walkable table.
+//!
 //! `tunnel` (ssh-transport lane, P-S2) is the newest: the ssh tunnel
 //! registry a cross-box client action opens to reach a peer whose door is
 //! not otherwise routable — `tunnel-<sessionId>-<key>.json` records under
@@ -100,6 +107,7 @@ pub mod addr;
 pub mod advertise;
 pub mod attest;
 pub mod commands;
+pub mod config;
 pub mod display;
 pub mod edits;
 pub mod fs;

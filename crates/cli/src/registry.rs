@@ -165,11 +165,19 @@ mod tests {
         // the approve step preserves). `peer.pair.approve`'s `<id>` becomes
         // optional when exactly one request is pending (no new path).
         // Net: 81 - 1 - 1 + 1 = 80.
+        //
+        // Bumped by 2 for `config` and `config.set` (task #135 P-C) — the
+        // portable runtime config file (`$AOIDE_ROOT/config.toml`,
+        // `aoide_storage::config`): core is cargo-buildable on any host, so
+        // a core command's configuration cannot live in a NixOS option —
+        // reached 82.
         let mut expected: Vec<&str> = vec![
             "a2a.serve",
             "adapter.melete",
             "conduct",
             "conductor",
+            "config",
+            "config.set",
             "content.approve",
             "content.ingest",
             "content.propose",

@@ -25,6 +25,13 @@ getrandom = { workspace = true }
 # scope as `ed25519-dalek`/`getrandom` above — see the workspace
 # Cargo.toml's own comment.
 sha2 = { workspace = true }
+# `config` — the portable runtime config file (task #135 P-C,
+# `$AOIDE_ROOT/config.toml`). `toml` reads it into the typed schema,
+# `toml_edit` rewrites one key in place so `aoide config set` keeps an
+# operator's comments; see the workspace Cargo.toml's own comment for the
+# split and the pure-Rust closure note.
+toml = { workspace = true }
+toml_edit = { workspace = true }
 
 [dev-dependencies]
 # The commands tests share the workspace rig (scratch dirs, EnvSaver,

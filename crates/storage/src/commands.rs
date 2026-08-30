@@ -814,6 +814,135 @@ fn handle_identity(_inv: &Invocation) -> Outcome {
     out
 }
 
+// ── `aoide config` (task #135 P-C, the portable runtime config) ────────────
+
+/// `aoide config` / `aoide config set`, appended newest into `cli`'s
+/// `commands::all()`. The file, its resolution order, and the schema table
+/// every refusal below is walked off live in [`crate::config`]; these
+/// handlers only parse invocations and render.
+pub fn register_config(r: &mut Registry) {
+    r.insert(cmd!(
+        path: ["config"],
+        summary: "Show the effective runtime config (config.toml), the path it resolved from, and whether that path is managed (rendered read-only elsewhere) or unmanaged (editable here). A missing file is every default, never an error.",
+        args: [],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_config,
+        examples: ["config", "config --json"],
+    ));
+    r.insert(cmd!(
+        path: ["config", "set"],
+        summary: "Set one config key, schema-validated and written in place so comments survive. Refuses a managed or unwritable config with the path to edit instead, and never writes a config it could not first load.",
+        args: [
+            arg!("key", "string", true, "The key as `<section>.<key>`, e.g. pairing.defaultGrant."),
+            arg!("value", "string", true, "The new value. A list key takes a comma-separated list; empty means the empty list."),
+        ],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_config_set,
+        examples: ["config set pairing.defaultGrant read", "config set pairing.defaultGrant read,spawn"],
+    ));
+}
+
+/// `aoide config [--json]` — the effective config plus its provenance.
+fn handle_config(_inv: &Invocation) -> Outcome {
+    let cmd = "config";
+    let loaded = match crate::config::load() {
+        Ok(l) => l,
+        Err(e) => {
+            return Outcome::error(cmd, e.to_string())
+                .with_data(json!({ "reason": "config-unreadable", "path": e.path().to_string_lossy() }));
+        }
+    };
+
+    // The human listing walks the schema table, so a key that exists is
+    // always shown — including one the file never mentions, at its default.
+    let mut lines = Vec::new();
+    for section in crate::config::SCHEMA {
+        for key in section.keys {
+            lines.push(format!(
+                "{}.{} = {}",
+                section.name,
+                key.name,
+                crate::config::render_value(&(key.read)(&loaded.config))
+            ));
+        }
+    }
+
+    let provenance = format!(
+        "{} ({}{})",
+        loaded.path.display(),
+        if loaded.managed { "managed" } else { "unmanaged" },
+        if loaded.present { "" } else { ", absent — all defaults" }
+    );
+    Outcome::ok(cmd, format!("{provenance}\n{}", lines.join("\n"))).with_data(json!({
+        "schemaVersion": crate::config::SCHEMA_VERSION,
+        "path": loaded.path.to_string_lossy(),
+        "managed": loaded.managed,
+        "present": loaded.present,
+        "config": loaded.config,
+    }))
+}
+
+/// `aoide config set <key> <value> [--json]` — one schema-validated,
+/// comment-preserving, atomic write.
+fn handle_config_set(inv: &Invocation) -> Outcome {
+    let cmd = "config.set";
+    let (key, raw) = match (inv.args.first(), inv.args.get(1)) {
+        (Some(k), Some(v)) => (k.trim(), v.as_str()),
+        _ => {
+            return Outcome::usage(
+                cmd,
+                format!(
+                    "usage: aoide config set <section>.<key> <value> — known keys are {}",
+                    crate::config::keys().join(", ")
+                ),
+            );
+        }
+    };
+
+    match crate::config::set(key, raw) {
+        Ok(out) => {
+            let what = if out.created {
+                "created"
+            } else if out.changed {
+                "updated"
+            } else {
+                "unchanged"
+            };
+            let mut outcome = Outcome::ok(
+                cmd,
+                format!("{} = {} ({what} in {})", out.key, out.value, out.path.display()),
+            );
+            if out.changed || out.created {
+                outcome = outcome
+                    .changed(vec![format!("{}: {} = {}", out.path.display(), out.key, out.value)]);
+            }
+            outcome.with_data(json!({
+                "path": out.path.to_string_lossy(),
+                "key": out.key,
+                "value": out.value,
+                "changed": out.changed,
+                "created": out.created,
+            }))
+        }
+        Err(refusal) => {
+            let reason = match refusal {
+                crate::config::SetRefusal::Managed { .. } => "config-managed",
+                crate::config::SetRefusal::Unwritable { .. } => "config-unwritable",
+                crate::config::SetRefusal::UnknownKey { .. } => "config-unknown-key",
+                crate::config::SetRefusal::BadValue { .. } => "config-bad-value",
+                crate::config::SetRefusal::Unloadable { .. } => "config-unloadable",
+                crate::config::SetRefusal::Io { .. } => "config-io-failed",
+            };
+            Outcome::error(cmd, refusal.to_string())
+                .with_data(json!({ "reason": reason, "key": key }))
+        }
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {

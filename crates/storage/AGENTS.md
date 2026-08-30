@@ -59,6 +59,51 @@
   that resolver has no such fallback either (its own tier 3, the bare name,
   only exists because `Command::spawn` can resolve it off `PATH` at exec
   time — there is no equivalent for a directory).
+- **`config` holds INTENT; every other module here holds STATE — never move
+  a value across that line (task #135 P-C).** `config.toml` records what an
+  operator WANTS ahead of anything happening; `peers.json`'s records/allows/
+  hub, the pairing park queues, `advertise.json`'s switch, `undying.json`
+  record what HAPPENED. A new decision an operator makes UP FRONT gets a
+  `config` key; a fact the system observes or commits gets a state file.
+  Don't migrate an existing state field into `config` "for tidiness" — a
+  `state/*.json` value is written by code and a config value is written by a
+  human, and the two have opposite ownership.
+- **`config::SCHEMA` is the ONE place a config key is described — walk it,
+  never restate it in a match arm.** The table carries each key's name,
+  `ValueKind` vocabulary, summary, and a `read` fn projecting it off a typed
+  `Config`; `validate`, `set`, and `commands.rs`'s `config` listing all walk
+  it. A new key is one table row plus its struct field — and if a new key
+  needs a shape the one `ValueKind` variant can't express, widen the enum
+  and `parse_value`/`render_value` with it, never branch on the key's name.
+  A later interactive picker (section → key → a value menu typed to that
+  key) has to enumerate the same table; scattered match arms would make that
+  a rewrite instead of a reader.
+- **`config`'s vocabularies are borrowed from their own domain, never
+  minted here.** `pairing.defaultGrant`'s `ValueKind::ClosedList` IS
+  `peer_store::PEER_CAPABILITIES` — the same closed set `peer allow`
+  enforces. A second list would drift the moment a capability lands, and
+  `config.rs`'s own test asserts the two are the same value, not merely
+  equal-looking.
+- **`config::set` never partially writes, and never writes at all on a
+  managed config.** The order is load-bearing: managed check → key lookup →
+  read + parse the config already on disk (refusing to build on one that
+  doesn't load) → parse the value → edit the document → RE-PARSE the
+  rendered text through `parse` → atomic write. Nothing before the last step
+  touches the filesystem, so every refusal leaves the file byte-identical.
+  Don't "simplify" by writing first and validating after, and don't drop the
+  re-parse — it is what guarantees a write can never leave behind a file the
+  next `load` would refuse.
+- **`config::set` edits the file's TEXT through `toml_edit`; it never
+  serializes the whole `Config` back out.** The comments an operator wrote
+  beside a grant ARE the reason this file is TOML rather than JSON, and a
+  serialize-the-struct round trip erases them silently. The two crates split
+  by direction on purpose — `toml` reads (typed, `deny_unknown_fields`),
+  `toml_edit` writes (format-preserving) — don't collapse them onto one by
+  routing the write through `toml::to_string`.
+- **`$AOIDE_CONFIG` is absolute-path-wins, like every other override in
+  `fs`.** A relative or empty value is ignored outright and resolution falls
+  to `$AOIDE_ROOT/config.toml` — a runtime path is never resolved against an
+  arbitrary cwd. Don't add a cwd-relative tier "for convenience".
 - **`takes`/`mode` are a deliberate charter smudge, not an oversight.** Don't
   "clean them up" into a paint-adjacent crate without re-reading
   `docs/architecture/PACKAGE-LAYOUT.md`'s "Charter exceptions" note — `mode`
@@ -432,9 +477,17 @@
 
 - **A new durable record shape** adds a type to `records` and a read/write
   pair to `fs`/`stage`; existing consumers never touch raw file paths for it.
-- **A new CLI command** (this crate has three groups today, `usage`, `inbox
-  list|read|clear`, and `identity`) adds a `cmd!`/`register` entry in
-  `commands.rs`, wired into the owning app crate's `commands::all()`. The
+- **A new config key** is one row in `config::SCHEMA` plus its field on the
+  matching `Config` sub-struct (`#[serde(rename)]` when the file spelling is
+  camelCase, `#[serde(default = …)]` so an absent key still reads its
+  default). Nothing else changes — the validator, the `config` listing, and
+  `config set` all pick it up by walking the table. A new SECTION lands with
+  the consumer that reads it, never ahead of one, and updates CONTRACTS.md
+  §4's `config.toml` subsection in the same commit.
+- **A new CLI command** (this crate has four groups today, `usage`, `inbox
+  list|read|clear`, `identity`, and `config`/`config set`) adds a
+  `cmd!`/`register` entry in `commands.rs`, wired into the owning app
+  crate's `commands::all()`. The
   pairing ceremony's own CLI commands (`peer pair *`) live in `aoide-client`
   instead — this crate exposes the `pairing`/`peer_store` library only,
   since the ceremony needs outbound HTTP transport this crate never holds.
@@ -443,7 +496,9 @@
 
 - This `README.md` when a new module or stage-file shape is added.
 - `CONTRACTS.md §4`/`§7` when a stage-file or peer-registry wire shape
-  changes.
+  changes — including `config.toml`'s own subsection when `config::SCHEMA`
+  gains or loses a section/key, plus `modules/nucleus/config.nix` when the
+  nix authoring front-end's option shape moves with it.
 - `CONTRACTS.md §6` when `wire_auth`'s canonical string, header names, or
   pinned vectors change (P-P4).
 - `pkgs/aoide/crates/AGENTS.md` for cross-crate invariants (registry order,

@@ -32,10 +32,12 @@
 }:
 rustPlatform.buildRustPackage {
   pname = "aoide";
-  # Prebeta versioning start (2026-08-22, root README.md's "Versioning"
-  # section) — matches pkgs/aoide/Cargo.toml's [workspace.package].version,
-  # the single Cargo-side source every crate inherits from.
-  version = "0.0.1";
+  # Read from the workspace manifest, the ONE release-version source every
+  # crate already inherits via `version.workspace = true` (CONTRACTS.md's
+  # "Release version" section). Derived rather than copied: the patch digit
+  # bumps at the end of every major phase, and a hand-kept literal here would
+  # drift on the first one that forgot it.
+  version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
   src = lib.cleanSource ./.;
 

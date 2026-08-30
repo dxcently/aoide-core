@@ -31,7 +31,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "aoide-cli"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aoide-client",
  "aoide-conduct",
@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "aoide-client"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aoide-protocol",
  "aoide-secrets",
@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "aoide-conduct"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aoide-client",
  "aoide-protocol",
@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "aoide-conductor"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aoide-conduct",
  "aoide-protocol",
@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "aoide-lyra"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aoide-conduct",
  "aoide-protocol",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "aoide-protocol"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "inquire",
  "serde",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "aoide-screen"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aoide-conduct",
  "aoide-protocol",
@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "aoide-secrets"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aoide-protocol",
  "aoide-storage",
@@ -140,7 +140,7 @@ dependencies = [
 
 [[package]]
 name = "aoide-server"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aoide-client",
  "aoide-conduct",
@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "aoide-song"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aoide-protocol",
  "aoide-storage",
@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "aoide-storage"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aoide-protocol",
  "aoide-test-support",
@@ -175,18 +175,20 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "toml",
+ "toml_edit",
 ]
 
 [[package]]
 name = "aoide-test-support"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aoide-protocol",
 ]
 
 [[package]]
 name = "aoide-upkeep"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aoide-protocol",
  "aoide-storage",
@@ -834,6 +836,16 @@ dependencies = [
  "png",
  "zune-core",
  "zune-jpeg",
+]
+
+[[package]]
+name = "indexmap"
+version = "2.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07aa2048142242915a31d35844fb311e0e53fcca590c3a0a40dcf1b841fa09eb"
+dependencies = [
+ "equivalent",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -1586,6 +1598,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_spanned"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1882,6 +1903,58 @@ name = "time-core"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
+
+[[package]]
+name = "toml"
+version = "1.1.4+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3aace63f4bbcdfc2c965b059de67119c89c4017a70d633be6c104910f67056f5"
+dependencies = [
+ "indexmap",
+ "serde_core",
+ "serde_spanned",
+ "toml_datetime",
+ "toml_parser",
+ "toml_writer",
+ "winnow",
+]
+
+[[package]]
+name = "toml_datetime"
+version = "1.1.1+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3165f65f62e28e0115a00b2ebdd37eb6f3b641855f9d636d3cd4103767159ad7"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
+name = "toml_edit"
+version = "0.25.13+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6975367e4d2ef766d86af01ffad14b622fecc8d4357a998fbc4deb6e9bacaf9b"
+dependencies = [
+ "indexmap",
+ "toml_datetime",
+ "toml_parser",
+ "toml_writer",
+ "winnow",
+]
+
+[[package]]
+name = "toml_parser"
+version = "1.1.3+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d38ac1cf9b95face32296c0a3ede1fdc270627c9d9c02a7274dd6d960dc4d56"
+dependencies = [
+ "winnow",
+]
+
+[[package]]
+name = "toml_writer"
+version = "1.1.2+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "typenum"
@@ -2194,6 +2267,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
+]
+
+[[package]]
+name = "winnow"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

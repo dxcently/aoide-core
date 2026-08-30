@@ -5,17 +5,17 @@
 resolver = "2"
 members = ["crates/protocol", "crates/storage", "crates/conduct", "crates/client", "crates/server", "crates/song", "crates/conductor", "crates/test-support", "crates/cli", "crates/upkeep", "crates/screen", "crates/lyra", "crates/secrets"]
 
-# The one release-version source for the whole workspace (versioning start,
-# 2026-08-22 — User-directed: prebeta is 0.0.X, the patch bumps only at a
-# User-directed release point, see the root README.md's "Versioning"
-# section). Every crate's own `[package]` inherits via `version.workspace =
-# true` rather than repeating the literal — a bump is ONE edit here, not
-# thirteen. `aoide_protocol::registry::AOIDE_VERSION` (the schema/MCP/A2A
-# runtime-readable version) derives from THIS crate's own manifest version
-# via `env!("CARGO_PKG_VERSION")`, so it can never drift from what's
-# declared here.
+# The one release-version source for the whole workspace (User-directed:
+# prebeta is 0.0.X, the patch bumps by one at the end of each completed
+# major phase — CONTRACTS.md's "Release version" section). Every crate's own
+# `[package]` inherits via `version.workspace = true` rather than repeating
+# the literal, `pkgs/aoide/default.nix` reads this file for its own
+# derivation version, and `aoide_protocol::registry::AOIDE_VERSION` (the
+# schema/MCP/A2A runtime-readable version) derives from the app crate's
+# inherited manifest version via `env!("CARGO_PKG_VERSION")` — a bump is ONE
+# edit here and nothing downstream can drift from it.
 [workspace.package]
-version = "0.0.1"
+version = "0.0.2"
 
 # ONE version source for the whole workspace (the monorepo standard): every
 # crate inherits via `{ workspace = true }` — no per-manifest version repeats.
@@ -108,6 +108,22 @@ aoide-lyra = { path = "crates/lyra" }
 ed25519-dalek = "3"
 getrandom = { version = "0.4", default-features = false }
 sha2 = "0.11"
+# `toml`/`toml_edit` — the portable runtime config substrate (task #135 P-C,
+# `$AOIDE_ROOT/config.toml`, consumer `aoide-storage::config`). Core is
+# portable, so config INTENT cannot live in NixOS module options; the one
+# runtime file is TOML because it is the one file a human edits and the
+# reasoning behind a grant has to live beside it. Two crates from the same
+# maintainers over one shared parser/writer stack (`toml_datetime`,
+# `toml_parser`, `toml_writer`, `winnow`, `serde_spanned`), split by
+# direction: `toml` deserializes into the typed schema (`deny_unknown_fields`
+# turns a typo in a GRANTS file into a named, loud failure instead of a
+# silently-ignored key), `toml_edit` rewrites one key in place for `aoide
+# config set` so an operator's comments survive the write that a plain
+# re-serialize would erase. Pure Rust, no C dependency — core's portability
+# guarantee (`checks.nix-independence`, `checks.portability`) rests on the
+# closure staying Rust + libc.
+toml = "1"
+toml_edit = "0.25"
 # `aoide-secrets` — Workstream SECRETS's secrets broker (named "vault"
 # until the P-V4b rename — same crate, no split-brain): TOTP, policy
 # types, replay ledger, otpauth:// URI construction (P-V1); the
