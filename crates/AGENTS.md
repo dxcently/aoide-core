@@ -23,7 +23,9 @@ Both app crates pin their exact command-path set in a golden snapshot test
 `lyra/src/registry.rs`, same name). Adding, removing, or renaming a command
 updates the matching golden list in the SAME commit as the `register()`
 change — a red golden test is never "expected," it's the signal a
-`commands::all()` edit forgot its snapshot.
+`commands::all()` edit forgot its snapshot. These golden lists are the SOLE
+authority for each binary's command set — no count or tally lives anywhere
+else.
 
 ## No cross-crate copying
 
