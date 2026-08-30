@@ -1,8 +1,8 @@
 # pkgs/aoide/flake.nix — the Aoide core (aoide CLI + aoided daemon) as its own
 # flake.
 #
-# Topology (b) of AOIDE-DEV §7 "Separate Aoide from AoideOS": the core is a
-# self-flaked package, nixpkgs-only, consumed by the root AoideOS flake as a
+# Topology (b) of `docs/architecture/PACKAGE-LAYOUT.md` ("Two binaries"): the
+# core is a self-flaked package, nixpkgs-only, consumed by the root flake as a
 # `path:` input (root flake.nix, `inputs.aoide`). This file is the marker that
 # flips `pkgs/aoide` from a callPackage target into an input: lib/pkgs.nix
 # skips any package dir carrying its own flake.nix. Graduation to a separate
