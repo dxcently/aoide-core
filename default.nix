@@ -104,7 +104,14 @@ rustPlatform.buildRustPackage {
   # what relocates `lyra` alone into `$rice`.
   # `paint = false` scopes the build to the core crate alone — no lyra, no
   # song/screen weight — for the static variant.
-  cargoBuildFlags = if paint then [ "--workspace" ] else [ "-p" "aoide-cli" ];
+  cargoBuildFlags =
+    if paint then
+      [ "--workspace" ]
+    else
+      [
+        "-p"
+        "aoide-cli"
+      ];
 
   # `paint = false` also turns the test phase off. The dynamic `pkg-aoide`
   # check already runs this exact suite over identical sources; this
