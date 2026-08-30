@@ -1515,5 +1515,5 @@ template, now given to a hung mint too).
   this crate's own wire docs (`README.md`'s "The wire", `broker.rs`'s
   module doc) for a reader who never opens this crate's Rust — update the
   crate docs FIRST, `CONTRACTS.md` follows in the same commit.
-- `lib/vmTest.nix`'s `cmd_count` tripwire and its nearby count-history
+- `tests/vm-boot.nix`'s `cmd_count` tripwire and its nearby count-history
   comment when the command set changes (same commit as the golden snapshot).
