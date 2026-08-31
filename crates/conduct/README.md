@@ -40,6 +40,21 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   harness_session_id` (P-D7) from the raw hook payload's own `session_id`
   on every event that carries one, mapped-to-an-action or not — see
   `CONTRACTS.md`'s `sessions.json` entry for the full field contract.
+- **The check lane (task #139), wired into `session hook`'s two lifecycle
+  triggers.** `hook_for_profile`'s `HookAction::Start` arm calls
+  `aoide_upkeep::checklane::on_session_start(&id, cwd)`; its
+  `HookAction::Phase` arm calls `checklane::on_stop(&id, cwd)` exactly when
+  `phase == "stopped"` — the one phase string `HookClass::Stop` alone
+  produces (`map_hook`), so every other phase transition
+  (`working`/`awaiting`) is untouched. Either call's `Option<String>` note
+  (`lane_note`) rides on the SAME `Outcome` `session hook` already builds —
+  appended to `inner.message` after an em dash, and surfaced separately as
+  `data.checkLane` — never a second message, never a second door. This is
+  the reason `commands/hooks.rs::door_command`'s claude wrapper stopped
+  swallowing stdout (`2>/dev/null` now, was `>/dev/null 2>&1`): stdout is
+  the one channel an `Ok` outcome's rendered body ever reaches the harness
+  through (`aoide_protocol::door::run`'s `println!`), so a lane note with
+  nowhere to print is a note that never fires.
 - `graph` — the session DAG: build/merge/send/spawn/wrap, `normalize_addr`
   (widened to `pub` at P-A1 so `screen` could reach it without duplicating
   it), `SessionRecord`/`SessionsFile`/`load_stage`/`write_stage`. `--id`
@@ -198,7 +213,20 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   SUPER+Q/SIGKILL backstop for the session that never got to run that exit
   path, or the retry for one whose fast-path kill didn't finish in time —
   so an ssh child can never outlive its session and become a resident
-  daemon.
+  daemon. `abandoned_headless_shells` adds ONE narrow carve-out into the
+  kind gate that otherwise keeps every shell record out of staleness
+  judgment: a HEADLESS (never-windowed) conducted shell, ticked at least
+  once as a shell (`restore.is_some()`), sitting at a bare idle prompt with
+  its per-session pty log (`log_path`) untouched past `REAP_IDLE_STALE_SECS`
+  — the worker terminal an agent's own `spawn` left running and never
+  returned to. The touch signal is the log file's own mtime: any byte ever
+  crossing the pty, from the original spawned command's output through any
+  later injected `aoide send`, resets it, so a human's later use of an
+  agent-spawned terminal is safe from this signal without the injection
+  door ever needing to attribute WHO sent it (`send.rs`'s own
+  `resolve_sender` doc: that attribution is self-reported and never
+  enforced). No new field: `restore`/`log_path` are both P-C5/headless
+  fields the record already carries.
 - `graph/window.rs` — window discovery/backfill/listener PLUS the
   automatic-parenting seam (task #89, corrected in review round 2):
   `is_windowless_wrap` (a conducted record is windowless when `headless` is
@@ -556,7 +584,9 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
 
 ## What it consumes
 
-`aoide-protocol`, `aoide-storage`, `aoide-client` (bare `session`/`--hosts`'s
+`aoide-protocol`, `aoide-storage`, `aoide-upkeep` (`session hook`'s check-lane
+trigger, above — the ONLY reach into that crate from outside `cli`),
+`aoide-client` (bare `session`/`--hosts`'s
 and `peer list`'s live per-peer probes call `aoide_client::commands::pull_peer_live`
 — the peer-pull transport `peer pull` itself uses, workstream C2; `peer
 list`'s discovery sweep calls `aoide_client::discover::run_sweep` —

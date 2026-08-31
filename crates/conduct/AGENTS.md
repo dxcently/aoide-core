@@ -97,6 +97,27 @@
   put an extra writer on a file the undying store's own atomic-write CRUD
   already lets multiple call sites share safely (each call is load-mutate-
   save on the whole set, never a partial write).
+- **The check lane's two hook calls are best-effort and gated on the EXACT
+  event, never on a broader phase family (task #139).**
+  `graph/send.rs::hook_for_profile` calls `aoide_upkeep::checklane::
+  on_session_start` only from `HookAction::Start`, and `checklane::on_stop`
+  only inside `HookAction::Phase` guarded on `phase == "stopped"` — the one
+  phase string `HookClass::Stop` alone produces (`map_hook`); don't widen
+  that guard to fire on `working`/`awaiting` too, or the lane's own delta
+  arithmetic (baseline vs. "what changed") stops meaning what its message
+  claims. Both calls take the raw payload's OWN `cwd` (present on every real
+  hook payload, not a stage-file lookup) and degrade to `None` on a missing
+  `cwd`, a disabled lane, or an unloadable config — same best-effort stance
+  every other hook action in this function already holds; a check-lane
+  failure must never fail the hook. **`commands/hooks.rs::door_command`'s
+  claude wrapper must keep letting stdout through** (`2>/dev/null` today,
+  never `>/dev/null 2>&1` again) — stdout is the ONLY channel a `session
+  hook` `Outcome` ever reaches the harness through (`aoide_protocol::
+  door::run`'s `println!` on `Ok`), so restoring the old blanket redirect
+  silently kills every lane note (and every other hook message) without
+  touching a single assertion in this crate's own test suite, since none of
+  those tests observe the harness's actual stdout — only the returned
+  `Outcome` in-process.
 - **The undying transfer is one `save_undying` call, never two.**
   `resurrect.rs`'s `resurrect_one` adds the new id and drops the old one in
   the SAME in-memory `Vec<UndyingSession>` before writing — the new id goes
@@ -475,6 +496,31 @@
   `restore`-less shell entry (predating P-C5) still hits the pre-existing
   taught skip; don't widen the gate to bare `agent == "shell"`, which would
   resolve a candidate this crate has no captured facts about.
+- **`reap`'s one carve-out into the shell kind gate is `restore.is_some()` +
+  `headless` + `state == "idle"`, never `pid`-liveness alone
+  (`abandoned_headless_shells`, `reap.rs`).** The kind gate every other
+  signal in `is_session_dead` respects exists because "a shell record's pid
+  IS its terminal" — a live pid must never be overruled by staleness. That
+  holds for an INTERACTIVE shell, where a live pid means a human is (or may
+  be) sitting at the window. It does not hold for a HEADLESS worker shell
+  `aoide spawn` leaves running with no window ever attached: there the
+  ONLY way anything ever reaches it again is the injection door
+  (`aoide send`), which cannot tell an agent's own follow-up from a
+  human's (`send.rs`'s own `resolve_sender` doc — attribution is
+  self-reported and unenforced, never a trust boundary). So the touch
+  signal is the per-session pty LOG FILE's mtime (`log_path`), not
+  attribution: ANY byte crossing the pty — the spawned command's own
+  output, or any later send from anyone — resets the clock, which is what
+  keeps a human's later use of an agent-spawned terminal safe from this
+  signal without ever needing to know who touched it. `restore.is_some()`
+  (stamped only by the P-C5 tick, itself gated on
+  `captures_like_a_shell`) keeps this from ever reaching a headless
+  AGENT or a one-shot command — neither ever populates `restore`, so
+  `log_mtime` structurally has nothing to read for them and the signal
+  never fires. **A shell has no self-heal, unlike an agent** (whose hook
+  door re-registers a falsely-reaped record on its next event) — this is
+  why the carve-out stays this narrow, and why widening it needs the same
+  bar this bullet documents, not a looser one.
 - **The nothing-to-restore warning fires at MARK time, not at resurrect
   time (task #100).** `undying.rs::nothing_to_restore_warning(agent,
   has_capture)` mirrors `resolve_candidate`'s own two arms — a registered

@@ -611,6 +611,85 @@ fn orphaned_subagents(
         .collect()
 }
 
+/// A HEADLESS, never-windowed conducted SHELL — the worker terminal `aoide
+/// spawn` leaves running once whatever an agent launched inside it has
+/// finished — whose per-session pty log has gained not one byte since
+/// [`REAP_IDLE_STALE_SECS`] ago. PURE — `log_mtime` is injected (the real
+/// caller reads the log file's own mtime off disk), exactly like every
+/// other staleness probe in this file.
+///
+/// The one new carve-out into the kind gate [`is_session_dead`] otherwise
+/// holds absolute (`is_agent_kind`'s own doc: "a shell record's pid IS its
+/// terminal", so a live pid alone must never be overruled by staleness) —
+/// and it stays narrow on purpose, because a shell has no self-heal: an
+/// agent's hook door re-registers a falsely-reaped AGENT on its very next
+/// event ([`is_session_dead`]'s own "never-false-reap" doc), but nothing
+/// ever re-registers a shell mid-life, so a false positive here is
+/// unrecoverable in a way this file's other signals are not. Three guards
+/// keep it to exactly the shape an agent-spawned, unattended worker
+/// terminal has, and never a human's:
+///   * `headless` — a PERMANENT, self-reported registration fact stamped
+///     once at `aoide conduct --headless` and never cleared (and, per that
+///     field's own doc, proof against a stray window ever landing on this
+///     record later). An INTERACTIVE (windowed) shell is never eligible,
+///     whatever its log evidence says.
+///   * `restore.is_some()` — stamped ONLY by `conduct`'s P-C5 tick
+///     (`graph/conduct.rs::conduct_refresh_shell`), which itself only runs
+///     when the wrapped command's own basename is `bash`/`zsh`/`fish`/`sh`
+///     (`captures_like_a_shell`) — the same `restore.is_some()` proxy
+///     `resurrect.rs`'s own terminal-candidate arm already uses for
+///     "was this actually ticked as a shell". An agent or a one-shot
+///     command spawned headless never sets this field at all, so this
+///     signal structurally can never reach either.
+///   * `state == "idle"` (the bare prompt) — never `working` (a live
+///     foreground command, however quiet) or `awaiting` (a sudo prompt
+///     mid-conversation). Only a terminal doing NOTHING right now is even
+///     considered.
+///
+/// The touch signal is the per-session pty LOG FILE's own mtime
+/// (`state/sessions/<id>.log`, `log_path`): every byte that crosses this
+/// pty appends to it — the spawned command's own original output, AND any
+/// LATER injected `aoide send` (an agent's own follow-up, or a human's —
+/// the injection door cannot tell the two apart, `graph/send.rs`'s own
+/// `resolve_sender` doc: attribution there is self-reported and never
+/// enforced at the receiving socket, so it is never a trust boundary).
+/// "Silent past the band" therefore means exactly "nothing has happened in
+/// this terminal, from anyone, in over [`REAP_IDLE_STALE_SECS`]" — the only
+/// decidable meaning of "unused" this codebase can stand behind. The moment
+/// anything is sent into it — the spawning agent's own follow-up, a
+/// different agent, or a human who found and used it — the log grows and
+/// the clock resets, which is what keeps a human's later use of an
+/// agent-spawned terminal safe from this signal without this file ever
+/// needing to know WHO touched it.
+///
+/// No log evidence at all (`log_mtime` returns `None` — the log was never
+/// opened, or the session degraded to stdout because opening it failed,
+/// `graph/conduct.rs`'s own best-effort fallback) never counts as
+/// staleness: absence of evidence is never evidence of death, the same
+/// guard [`is_session_dead`] holds for `last_seen`.
+///
+/// This never KILLS the underlying process — the same posture every other
+/// signal in this file takes toward a still-alive pid (the one exception,
+/// [`sweep_orphan_tunnels`], only ever signals a live process once its
+/// OWNING session is already gone, never as the primary death signal
+/// itself). A record this catches drops off the roster; a still-running
+/// shell behind it keeps running, untracked, until its own natural exit.
+fn abandoned_headless_shells(
+    sessions: &[SessionRecord],
+    now_epoch: i64,
+    log_mtime: impl Fn(&SessionRecord) -> Option<i64>,
+) -> Vec<String> {
+    sessions
+        .iter()
+        .filter(|s| s.state != "done")
+        .filter(|s| s.headless && s.restore.is_some() && canonical_state(&s.state) == "idle")
+        .filter(|s| {
+            log_mtime(s).is_some_and(|seen| now_epoch.saturating_sub(seen) > REAP_IDLE_STALE_SECS)
+        })
+        .map(|s| s.session_id.clone())
+        .collect()
+}
+
 /// Unlink the control sockets left behind by sessions that are no longer on
 /// the roster, and return the ids swept.
 ///
@@ -1163,6 +1242,26 @@ fn reap_inner(
     // Same settle grace as the dedup above, so an infant awaiting its own
     // parent link is never judged.
     for id in orphaned_subagents(&s_file.sessions, is_recent) {
+        if !reaped.contains(&id) {
+            reaped.push(id);
+        }
+    }
+
+    // And the abandoned worker shells: a headless (never-windowed) conducted
+    // shell an agent spawned and never returned to, sitting idle with its
+    // pty log untouched past the same at-rest band any other headless
+    // record is judged against (see `abandoned_headless_shells`). The
+    // log-mtime probe mirrors `last_seen`'s transcript-mtime read above — a
+    // per-session file, read fresh off disk every pass, never cached.
+    let log_mtime = |s: &SessionRecord| -> Option<i64> {
+        s.log_path
+            .as_deref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+    };
+    for id in abandoned_headless_shells(&s_file.sessions, now_epoch, log_mtime) {
         if !reaped.contains(&id) {
             reaped.push(id);
         }
@@ -2468,6 +2567,204 @@ mod tests {
 
         // The settle grace spares an infant here too.
         assert!(orphaned_subagents(&sessions, |_| true).is_empty());
+    }
+
+    /// A headless, never-windowed conducted SHELL that HAS been ticked by
+    /// `conduct`'s P-C5 refresh (`restore` populated) — the exact shape
+    /// `abandoned_headless_shells` targets. `conductable: Some(true)`
+    /// mirrors a real `aoide spawn -- bash` registration and keeps
+    /// `is_agent_kind` false, so the end-to-end `reap()` tests below prove
+    /// the NEW signal specifically, never a coincidental fold of the
+    /// pre-existing one (which this shape is already excluded from, by
+    /// `is_session_dead`'s own kind gate).
+    fn headless_shell(id: &str, state: &str) -> SessionRecord {
+        SessionRecord {
+            session_id: id.into(),
+            agent: "bash".into(),
+            window_address: String::new(),
+            state: state.into(),
+            started_at: now_iso_utc(),
+            pid: Some(std::process::id()),
+            conductable: Some(true),
+            headless: true,
+            restore: Some(aoide_storage::records::RestoreSnapshot::default()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn abandoned_headless_shells_reaps_one_stale_and_untouched() {
+        let now = 1_800_000_000_i64;
+        let rec = headless_shell("worker", "idle");
+        let stale = |_: &SessionRecord| Some(now - 100 * 3600); // 100h silent
+        assert_eq!(
+            abandoned_headless_shells(&[rec], now, stale),
+            vec!["worker".to_string()],
+        );
+    }
+
+    #[test]
+    fn abandoned_headless_shells_spares_one_recently_touched() {
+        let now = 1_800_000_000_i64;
+        let rec = headless_shell("worker", "idle");
+        let recent = |_: &SessionRecord| Some(now - 3600); // 1h ago, well under the band
+        assert!(abandoned_headless_shells(&[rec], now, recent).is_empty());
+    }
+
+    #[test]
+    fn abandoned_headless_shells_spares_a_windowed_shell_even_when_stale() {
+        // The headless gate holds even given otherwise-identical stale
+        // evidence — an INTERACTIVE (windowed) shell, a human's own
+        // terminal, is never eligible for this signal.
+        let now = 1_800_000_000_i64;
+        let mut rec = headless_shell("interactive", "idle");
+        rec.headless = false;
+        rec.window_address = "0xAAA".into();
+        let stale = |_: &SessionRecord| Some(now - 100 * 3600);
+        assert!(abandoned_headless_shells(&[rec], now, stale).is_empty());
+    }
+
+    #[test]
+    fn abandoned_headless_shells_spares_a_never_shell_ticked_record() {
+        // No `restore` at all — an agent or a one-shot command spawned
+        // headless never sets this field, so this signal must never reach
+        // either, however stale their log evidence reads.
+        let now = 1_800_000_000_i64;
+        let mut rec = headless_shell("agent-headless", "idle");
+        rec.restore = None;
+        let stale = |_: &SessionRecord| Some(now - 100 * 3600);
+        assert!(abandoned_headless_shells(&[rec], now, stale).is_empty());
+    }
+
+    #[test]
+    fn abandoned_headless_shells_spares_working_and_awaiting_states() {
+        // A live foreground command (working), or a sudo prompt mid-
+        // conversation (awaiting), is never considered — only a bare,
+        // doing-nothing prompt is.
+        let now = 1_800_000_000_i64;
+        let stale = |_: &SessionRecord| Some(now - 100 * 3600);
+        assert!(
+            abandoned_headless_shells(&[headless_shell("w", "working")], now, stale).is_empty()
+        );
+        assert!(
+            abandoned_headless_shells(&[headless_shell("a", "awaiting")], now, stale).is_empty()
+        );
+    }
+
+    #[test]
+    fn abandoned_headless_shells_spares_with_no_log_evidence_at_all() {
+        // Absence of evidence is never evidence of death — the log was
+        // never opened (a failed open degrades to stdout,
+        // `graph/conduct.rs`'s own best-effort fallback) or is otherwise
+        // unreadable.
+        let now = 1_800_000_000_i64;
+        let rec = headless_shell("no-log", "idle");
+        assert!(abandoned_headless_shells(&[rec], now, |_| None).is_empty());
+    }
+
+    #[test]
+    fn abandoned_headless_shells_ignores_already_done_records() {
+        let now = 1_800_000_000_i64;
+        let rec = headless_shell("gone", "done");
+        let stale = |_: &SessionRecord| Some(now - 100 * 3600);
+        assert!(abandoned_headless_shells(&[rec], now, stale).is_empty());
+    }
+
+    /// End-to-end through `reap()`: a headless worker shell whose pty log
+    /// has sat untouched past `REAP_IDLE_STALE_SECS` is reaped — proving
+    /// `reap_inner`'s `log_mtime` closure actually reads the real log
+    /// file's mtime off disk, not just the pure predicate above.
+    #[test]
+    fn reap_collects_a_headless_worker_shell_whose_log_has_gone_stale() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = crate::graph::testutil::EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_STATE_DIR",
+            "HYPRLAND_INSTANCE_SIGNATURE",
+        ]);
+        std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"); // pid-only/no-window liveness
+        let stage = crate::graph::testutil::unique_stage("reap-headless-shell-stale");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", stage.join("state"));
+
+        let log = stage.join("worker.log");
+        std::fs::write(&log, b"$ the last thing that ever ran here\n").unwrap();
+        let backdate_secs = REAP_IDLE_STALE_SECS + 3600; // an hour past the band
+        let t = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - backdate_secs) as libc::time_t;
+        let tv = [libc::timeval { tv_sec: t, tv_usec: 0 }; 2];
+        let c = std::ffi::CString::new(log.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::utimes(c.as_ptr(), tv.as_ptr()) }, 0);
+
+        let mut rec = headless_shell("worker", "idle");
+        rec.log_path = Some(log.to_string_lossy().into_owned());
+        write_stage(
+            &sessions_path(),
+            &SessionsFile { schema_version: "0".into(), sessions: vec![rec] },
+        )
+        .unwrap();
+
+        let out = reap(&crate::graph::testutil::invocation(&["session", "reap"], &[]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let reaped: Vec<String> = out.data.as_ref().unwrap()["reaped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(reaped.contains(&"worker".to_string()), "reaped: {reaped:?}");
+
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    /// The opposite proof, and the literal guarantee the User asked for: a
+    /// worker shell whose log was touched RECENTLY — as `aoide send` would
+    /// leave it, from an agent's own follow-up or a human's — survives.
+    /// Anything that touches the terminal after spawn keeps it off the
+    /// reap list. (Deliberately keeps `startedAt` recent, unlike the
+    /// hook-fold regression test above: an ancient `startedAt` with no
+    /// other evidence would instead trip the UNRELATED pre-boot-ghost
+    /// signal — this test isolates `abandoned_headless_shells` alone.)
+    #[test]
+    fn reap_spares_a_headless_worker_shell_whose_log_was_touched_after_spawn() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = crate::graph::testutil::EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_STATE_DIR",
+            "HYPRLAND_INSTANCE_SIGNATURE",
+        ]);
+        std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
+        let stage = crate::graph::testutil::unique_stage("reap-headless-shell-fresh");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", stage.join("state"));
+
+        let log = stage.join("worker.log");
+        // Freshly written — mtime is "now", well under the band, exactly as
+        // if a follow-up command had just been sent into it.
+        std::fs::write(&log, b"$ someone just ran another command here\n").unwrap();
+
+        let mut rec = headless_shell("worker", "idle");
+        rec.log_path = Some(log.to_string_lossy().into_owned());
+        write_stage(
+            &sessions_path(),
+            &SessionsFile { schema_version: "0".into(), sessions: vec![rec] },
+        )
+        .unwrap();
+
+        let out = reap(&crate::graph::testutil::invocation(&["session", "reap"], &[]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(
+            out.data.unwrap()["reaped"],
+            json!([]),
+            "a worker shell touched after spawn must survive despite an ancient startedAt"
+        );
+
+        let _ = std::fs::remove_dir_all(&stage);
     }
 
     #[test]
