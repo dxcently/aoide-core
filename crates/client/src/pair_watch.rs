@@ -276,10 +276,12 @@ pub fn event_to_json(event: &PairEvent) -> Value {
 /// feed (module doc). `direction` is `"inbound"`/`"outbound"`;
 /// `origin_addr` is `Some` only for an inbound entry (an outbound request
 /// has no connecting-peer address of its own to report — module doc on
-/// `aoide_storage::pairing::OutboundPairingRequest`); `state` is `Some`
-/// only for an outbound entry (`OutboundState::as_str()`, `"awaiting-
-/// approval"`/`"awaiting-confirm"`) — [`actionable`] is the one place
-/// that reads it. `sas` is `None` for an inbound entry that hasn't been
+/// `aoide_storage::pairing::OutboundPairingRequest`); `state` carries
+/// `OutboundState::as_str()` (`"awaiting-approval"`/`"awaiting-confirm"`)
+/// for an outbound entry and this end's own verdict
+/// (`"awaiting-approval"`/`"approved"`, off
+/// `InboundPairingRequest::approved`) for an inbound one — [`actionable`]
+/// is the one place that reads it. `sas` is `None` for an inbound entry that hasn't been
 /// revealed yet (no requester nonce to derive against); always `Some` for
 /// an outbound entry (its own nonce was chosen locally before the
 /// commitment was ever sent — `OutboundPairingRequest::requester_nonce_hex`
@@ -332,7 +334,7 @@ pub fn reconcile(now_epoch: i64) -> Vec<Pending> {
             origin_addr: Some(e.origin_addr.clone()),
             url: e.url.clone(),
             sas,
-            state: None,
+            state: Some(if e.approved { "approved" } else { "awaiting-approval" }.to_string()),
         });
     }
     for e in &outbound {
@@ -353,13 +355,17 @@ pub fn reconcile(now_epoch: i64) -> Vec<Pending> {
 /// Is `p` actionable RIGHT NOW — worth a `peer pair approve`, or (with
 /// `--popup`) a confirm dialog? An inbound entry only once it carries a
 /// SAS (unrevealed means nothing to confirm yet, `approve_inbound`'s own
-/// `awaiting-reveal` refusal); an outbound entry only once it reached
+/// `awaiting-reveal` refusal) AND is still `awaiting-approval` — an
+/// approved entry stays PARKED so the requester's own `aoide/pairPoll`
+/// can find it (`aoide_storage::pairing::mark_inbound_approved`), so a
+/// SAS alone would re-raise the code dialog on every tick for a request
+/// this operator already answered. An outbound entry only once it reached
 /// `awaiting-confirm` (`awaiting-approval` means the PEER hasn't approved
 /// yet — nothing on THIS end to confirm, `approve_outbound`'s own
 /// refusal).
 pub fn actionable(p: &Pending) -> bool {
     match p.direction.as_str() {
-        "inbound" => p.sas.is_some(),
+        "inbound" => p.sas.is_some() && p.state.as_deref() == Some("awaiting-approval"),
         "outbound" => p.state.as_deref() == Some("awaiting-confirm"),
         _ => false,
     }
@@ -1041,6 +1047,39 @@ mod tests {
         });
     }
 
+    #[test]
+    fn an_approved_inbound_entry_stops_being_actionable() {
+        with_peer_state("approved-inbound", || {
+            let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
+            let nonce = "c".repeat(32);
+            let id = aoide_storage::pairing::park_inbound(
+                &"a".repeat(64),
+                "box-a",
+                "10.0.0.5",
+                "http://box-a/",
+                &aoide_storage::pairing::derive_commit(&"a".repeat(64), &nonce),
+                &aoide_storage::time::now_iso_utc(),
+                &aoide_storage::pairing::expires_at_from(now_epoch),
+                None,
+            )
+            .unwrap()
+            .id;
+            aoide_storage::pairing::reveal_inbound(&id, &nonce, now_epoch).unwrap();
+
+            let pending = reconcile(now_epoch);
+            assert_eq!(pending.len(), 1);
+            assert!(actionable(&pending[0]), "a revealed, unapproved inbound entry is the one thing the code dialog is for");
+
+            // Approval leaves the entry PARKED so the requester's own
+            // pairPoll can still find it — the very reason a SAS alone
+            // used to re-raise the dialog on every 30s tick.
+            aoide_storage::pairing::mark_inbound_approved(&id, now_epoch).unwrap();
+            let pending = reconcile(now_epoch);
+            assert_eq!(pending.len(), 1, "still parked for the requester's poll");
+            assert!(pending[0].sas.is_some(), "still revealed — the SAS never goes away");
+            assert!(!actionable(&pending[0]), "this operator already typed the code; never ask again");
+        });
+    }
     // ── the tail: deadline-loop, never a fixed sleep ─────────────────────
 
     #[test]

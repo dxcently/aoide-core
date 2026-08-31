@@ -364,8 +364,11 @@ never the inbound/serve half (that's `aoide-server`).
   for its own feed), using the EXACT SAS arg order per direction
   `approve_inbound`/`approve_outbound` above already use — `peer pending`
   itself carries no SAS at all, P-PV2; `actionable` decides
-  whether a `Pending` is worth surfacing (an inbound entry once revealed,
-  an outbound entry once `awaiting-confirm`); `run` is the blocking
+  whether a `Pending` is worth surfacing (an inbound entry once revealed
+  and only while still `awaiting-approval` — approval leaves the entry
+  PARKED for the requester's own `pairPoll`, so a revealed SAS alone
+  would re-raise the code dialog every tick for a request this operator
+  already answered; an outbound entry once `awaiting-confirm`); `run` is the blocking
   tail/reconcile loop (`aoide_secrets::watch::wait_for_follower`'s exact
   retry-until-exists shape, a 30s reconcile safety tick). **`--popup`
   (F6, upgraded P-PV3/task #132: TWO dialog shapes, one per pairing
