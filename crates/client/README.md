@@ -293,7 +293,14 @@ never the inbound/serve half (that's `aoide-server`).
   what every test drives so none of them sit on a poll. `--wait 0` is the
   documented escape for a scripted caller that cannot sit on a human, and a
   timeout returns Ok with the request still parked — `peer pair approve`
-  finishes it later, which is also what makes Ctrl-C safe. `poll_outbound_once` is the ONE implementation of the
+  finishes it later, which is also what makes Ctrl-C safe. The deadline is
+  MONOTONIC (`Instant`, never `now_iso_utc`): a wall-clock deadline is
+  defeated outright by an NTP step or a suspend/resume during the wait, which
+  would leave the loop polling past the bound the command promised. The wall
+  clock is still read inside the loop, where entry expiry needs it.
+  `--allow` beside `--wait 0` is refused rather than accepted-and-dropped —
+  that path returns before anything commits, and a grant is never persisted
+  on a parked entry. `poll_outbound_once` is the ONE implementation of the
   `aoide/pairPoll` round trip and of the SAS/transcript binding that refuses
   a substituted reveal; its `PollOutcome::Pending` is the only arm a caller
   may retry, every other being terminal, so a `--wait` loop cannot hammer an

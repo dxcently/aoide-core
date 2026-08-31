@@ -2007,6 +2007,15 @@ const PAIR_POLL_CADENCE: std::time::Duration = std::time::Duration::from_secs(5)
 /// the span of a phone call in which two people read a code to each other.
 const DEFAULT_PAIR_WAIT_SECS: u64 = 600;
 
+/// Has the wait run out? Both sides are `u64` seconds and neither is cast:
+/// the first shape compared a monotonic elapsed against `wait_secs as i64`,
+/// so a `--wait` above `i64::MAX` reinterpreted as negative and "timed out"
+/// on the first tick — the exact inverse of what the operator asked for
+/// (review finding). Pure, so that inversion stays proven rather than argued.
+fn wait_is_over(elapsed_secs: u64, wait_secs: u64) -> bool {
+    elapsed_secs >= wait_secs
+}
+
 /// Build the post-request behaviour off `peer pair`'s own flags. `--wait 0`
 /// is the documented escape back to the pre-P2 detached shape, for anything
 /// scripted that cannot sit on a human.
@@ -2015,7 +2024,21 @@ fn pair_finish_from(inv: &Invocation) -> Result<PairFinish, String> {
         Some(raw) => raw.trim().parse::<u64>().map_err(|_| format!("--wait takes whole seconds (0 to park and return), not `{raw}`"))?,
         None => DEFAULT_PAIR_WAIT_SECS,
     };
-    Ok(PairFinish { wait_secs, skip_confirm: inv.flag_present("yes"), grant: parse_allow_flag(inv)? })
+    let grant = parse_allow_flag(inv)?;
+    // `--wait 0` returns before anything commits, so a grant named here has
+    // nowhere to land — and the ceremony deliberately does NOT persist one on
+    // a detached entry (the User's decision: the grant stays attached to a
+    // live human at commit time). Accepting the pair silently would drop the
+    // flag, the same silent no-op `grant_note` exists to prevent one step
+    // later. Refuse by name instead.
+    if wait_secs == 0 && grant.is_some() {
+        return Err(
+            "--allow needs a wait to land in: `--wait 0` parks the request and returns before anything commits, and a grant is never persisted on a parked entry — \
+             retype `--allow` on the `peer pair approve <id>` that finishes the pair"
+                .to_string(),
+        );
+    }
+    Ok(PairFinish { wait_secs, skip_confirm: inv.flag_present("yes"), grant })
 }
 
 /// Block until the approver releases `id`, then confirm and commit — the
@@ -2036,8 +2059,15 @@ fn wait_and_commit(cmd: &str, id: &str, name: &str, sas: &str, finish: &PairFini
         Ok(a) => a,
         Err(e) => return Outcome::error(cmd, e).with_data(json!({ "reason": "grant-unresolved", "id": id })),
     };
-    let started = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
-    let mut announced_minutes = 0_i64;
+    // MONOTONIC, never the wall clock (review finding): an NTP step or a
+    // suspend/resume during the wait moves `now_iso_utc` backward, and a
+    // deadline measured against it then never arrives — the loop would poll
+    // forever past the bound this command promised. `Instant` cannot go
+    // backward, so the timeout holds whatever the clock does. The wall clock
+    // is still read INSIDE the loop, where it belongs: entry expiry is a
+    // stored ISO timestamp, so `list_outbound` must be asked in its terms.
+    let began = std::time::Instant::now();
+    let mut announced_minutes = 0_u64;
 
     loop {
         let now = aoide_storage::time::now_iso_utc();
@@ -2055,8 +2085,8 @@ fn wait_and_commit(cmd: &str, id: &str, name: &str, sas: &str, finish: &PairFini
             PollOutcome::Pending => {}
         }
 
-        let elapsed = now_epoch - started;
-        if elapsed >= finish.wait_secs as i64 {
+        let elapsed = began.elapsed().as_secs();
+        if wait_is_over(elapsed, finish.wait_secs) {
             return Outcome::ok(
                 cmd,
                 format!(
@@ -4636,6 +4666,40 @@ mod tests {
         let f = pair_finish_from(&inv).unwrap();
         assert!(f.skip_confirm);
         assert_eq!(f.grant, Some(vec!["read".to_string(), "spawn".to_string()]));
+    }
+
+    /// `--wait 0` returns before anything commits, so an `--allow` beside it
+    /// has nowhere to land — and the ceremony never persists a grant on a
+    /// parked entry. Silently accepting the pair would drop the flag, the
+    /// same silent no-op `grant_note` refuses one step later.
+    #[test]
+    fn allow_beside_wait_zero_is_refused_rather_than_dropped() {
+        let mut inv = pair_approve_inv(&[]);
+        inv.flags.insert("wait".to_string(), "0".to_string());
+        inv.flags.insert("allow".to_string(), "read,spawn".to_string());
+        let err = pair_finish_from(&inv).unwrap_err();
+        assert!(err.contains("--allow"), "{err}");
+        assert!(err.contains("peer pair approve"), "and it names where to retype it: {err}");
+
+        // Either alone is fine — only the combination is the contradiction.
+        inv.flags.remove("allow");
+        assert_eq!(pair_finish_from(&inv).unwrap().wait_secs, 0);
+        inv.flags.insert("allow".to_string(), "read".to_string());
+        inv.flags.insert("wait".to_string(), "600".to_string());
+        assert!(pair_finish_from(&inv).is_ok());
+    }
+
+    /// The deadline compares two `u64`s and casts neither. The first shape
+    /// compared against `wait_secs as i64`, so a `--wait` above `i64::MAX`
+    /// read as NEGATIVE and "timed out" on the first tick — an operator
+    /// asking for the longest possible wait got an instant return instead.
+    #[test]
+    fn a_wait_past_i64_max_is_a_long_wait_not_an_instant_timeout() {
+        assert!(!wait_is_over(0, u64::MAX), "the largest wait has not elapsed at t=0");
+        assert!(!wait_is_over(0, i64::MAX as u64 + 1), "the exact value the old cast flipped negative");
+        assert!(!wait_is_over(599, 600));
+        assert!(wait_is_over(600, 600), "the bound is inclusive — 600s of a 600s wait is over");
+        assert!(wait_is_over(0, 0), "a zero wait is over the moment it starts");
     }
 
     /// The property that keeps a ten-minute wait from becoming a ten-minute
