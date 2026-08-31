@@ -7787,7 +7787,7 @@ mod tests {
         // still find it; nothing here dials A's `url` at all.
         aoide_storage::pairing::mark_inbound_approved(&id, now_epoch).unwrap();
         let mut peers_b = aoide_storage::peer_store::load_peers();
-        aoide_storage::peer_store::upsert_paired_peer(&mut peers_b, &entry.name, &entry.url, &entry.pubkey_hex, &now_iso_utc());
+        aoide_storage::peer_store::upsert_paired_peer(&mut peers_b, &entry.name, &entry.url, &entry.pubkey_hex, &now_iso_utc(), &["read".to_string()]);
         aoide_storage::peer_store::save_peers(&peers_b).unwrap();
 
         // B's own record for A: pubkey = A's real key, verified, name =
@@ -7833,7 +7833,7 @@ mod tests {
         let sas_a_confirm = aoide_storage::pairing::derive_sas(&pubkey_a, &marked.pubkey_hex, &marked.requester_nonce_hex, &marked.approver_nonce_hex);
         assert_eq!(sas_a_confirm, sas_a, "A re-derives the identical code at its own confirm step");
         let mut peers_a = aoide_storage::peer_store::load_peers();
-        aoide_storage::peer_store::upsert_paired_peer(&mut peers_a, &marked.name, &marked.url, &marked.pubkey_hex, &now_iso_utc());
+        aoide_storage::peer_store::upsert_paired_peer(&mut peers_a, &marked.name, &marked.url, &marked.pubkey_hex, &now_iso_utc(), &["read".to_string()]);
         aoide_storage::peer_store::save_peers(&peers_a).unwrap();
         aoide_storage::pairing::take_outbound(&id, now_epoch).unwrap();
 

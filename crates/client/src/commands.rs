@@ -1422,10 +1422,14 @@ pub fn register_peers(r: &mut Registry) {
 // A2A door (`aoide-server::a2a::pair_request`/`pair_reveal`/`pair_poll`),
 // SAS derivation + display (`aoide_storage::pairing::derive_sas`), commit via
 // `aoide_storage::peer_store::upsert_paired_peer` — which ALSO stamps the
-// ceremony's own default `allows` (`["read","spawn"]`) the first time a
-// peer becomes verified (P-P3, PAIRING.md decision 5); editing that default
-// afterward is `peer allow <name> <cap> on|off`'s own separate command
-// (registered in `register_peers` above), never a second write site here.
+// peer's `allows` the first time it becomes verified (P-P3, PAIRING.md
+// decision 5). That grant is `config.toml`'s `[pairing] defaultGrant`
+// (`["read"]` unless an operator widened it), or the `--allow` typed on this
+// one commit; `resolve_grant` is the single place either is read. Editing a
+// LIVE grant afterward is `peer allow <name> <cap> on|off`'s own separate
+// command (registered in `register_peers` above), never a second write site
+// here — and a re-pairing never re-grants, so a revoked capability survives
+// a key rotation.
 //
 // **Both humans confirm, for real (review-bounce Finding 2).** `peer pair
 // approve <id>` does double duty by DIRECTION, never a fifth command (golden
@@ -1456,6 +1460,62 @@ pub fn register_peers(r: &mut Registry) {
 /// this side already printed.
 fn confirm_sas(sas: &str, name: &str) -> Result<bool, String> {
     aoide_protocol::pick::confirm(&format!("pairing request from `{name}` — confirmation code {sas} — do the codes match?"))
+}
+
+/// The capability set a pairing commit stamps on a FIRST verification (task
+/// #135 P1) — `Some` is the `--allow` an operator typed at this commit,
+/// `None` reads `config.toml`'s `[pairing] defaultGrant`
+/// (`aoide_storage::config`, whose own default is `["read"]`).
+///
+/// **Resolution lives here, not in the store.** `upsert_paired_peer` takes
+/// the finished list; a store function reading the config would be a second
+/// resolution path, and it would have to swallow a malformed grants file at
+/// the one moment that must fail loudly (`config`'s own module doc: "this one
+/// must fail loudly, never guess"). So an unreadable or invalid `config.toml`
+/// REFUSES the commit here rather than quietly falling back to the built-in
+/// default — the ceremony is exactly where a wrong grant is expensive.
+///
+/// Both directions of `peer pair approve` and both popup arms call this, so
+/// there is one answer to "what is this pairing worth" per commit.
+fn resolve_grant(grant: Option<&[String]>) -> Result<Vec<String>, String> {
+    match grant {
+        Some(g) => Ok(g.to_vec()),
+        None => aoide_storage::config::load().map(|l| l.config.pairing.default_grant).map_err(|e| {
+            format!("reading the default grant from the config: {e} — fix it, or name the grant outright with `--allow read` on this approve")
+        }),
+    }
+}
+
+/// Read `--allow` off the invocation, per the SAME closed vocabulary and the
+/// SAME parser `config set pairing.defaultGrant` already uses
+/// (`aoide_storage::config::parse_value` over
+/// [`aoide_storage::peer_store::PEER_CAPABILITIES`]) — never a second list to
+/// drift. Comma-separated rather than a repeated flag because
+/// `Invocation::flags` is a map, one value per name: a second `--allow` would
+/// silently overwrite the first, which is the wrong failure for a grants
+/// input. `--allow ""` is the empty grant — "verified, and allowed nothing
+/// yet" is a real intent, the same one `config set pairing.defaultGrant ""`
+/// already expresses.
+fn parse_allow_flag(inv: &Invocation) -> Result<Option<Vec<String>>, String> {
+    let Some(raw) = inv.flags.get("allow") else {
+        return Ok(None);
+    };
+    let kind = aoide_storage::config::ValueKind::ClosedList(aoide_storage::peer_store::PEER_CAPABILITIES);
+    aoide_storage::config::parse_value(&kind, raw).map(Some).map_err(|e| format!("--allow: {e}"))
+}
+
+/// What a commit says about `allows`. A grant lands ONLY on a first
+/// verification — `upsert_paired_peer` leaves an already-verified peer's set
+/// exactly as it was, so a revoked capability stays revoked across a key
+/// rotation. An `--allow` that silently did nothing is precisely the surprise
+/// this clause exists to prevent, so the re-pair case says so and names the
+/// command that does change a live grant.
+fn grant_note(first_pairing: bool, allows: &[String]) -> String {
+    match (first_pairing, allows.is_empty()) {
+        (false, _) => ", grant unchanged (`peer allow` edits a live one)".to_string(),
+        (true, true) => ", granted nothing".to_string(),
+        (true, false) => format!(", granted {}", allows.join(", ")),
+    }
 }
 
 /// How many wrong pairing codes an inbound entry tolerates before the CLI
@@ -2023,6 +2083,11 @@ fn handle_peer_pair_approve(inv: &Invocation) -> Outcome {
         },
     };
 
+    let allow = match parse_allow_flag(inv) {
+        Ok(a) => a,
+        Err(e) => return Outcome::usage(cmd, e),
+    };
+
     if let Some(entry) = aoide_storage::pairing::list_inbound(now_epoch).into_iter().find(|e| e.id == id) {
         let gate = match inv.flags.get("code").cloned().filter(|c| !c.trim().is_empty()) {
             Some(code) => InboundGate::Code(code),
@@ -2030,10 +2095,10 @@ fn handle_peer_pair_approve(inv: &Invocation) -> Outcome {
             None if aoide_protocol::pick::interactive(inv.door) => InboundGate::Prompt,
             None => InboundGate::Unavailable,
         };
-        return approve_inbound(gate, cmd, &id, entry, &now, now_epoch);
+        return approve_inbound(gate, cmd, &id, entry, &now, now_epoch, allow.as_deref());
     }
     if let Some(entry) = aoide_storage::pairing::list_outbound(now_epoch).into_iter().find(|e| e.id == id) {
-        return approve_outbound(inv.flag_present("yes"), cmd, &id, entry, &now, now_epoch);
+        return approve_outbound(inv.flag_present("yes"), cmd, &id, entry, &now, now_epoch, allow.as_deref());
     }
     Outcome::error(cmd, format!("no pending pairing request with id `{id}` (unknown, already resolved, or expired)"))
         .with_data(json!({ "reason": "unknown-id", "id": id }))
@@ -2089,6 +2154,7 @@ pub(crate) fn approve_inbound(
     entry: aoide_storage::pairing::InboundPairingRequest,
     now: &str,
     now_epoch: i64,
+    grant: Option<&[String]>,
 ) -> Outcome {
     if entry.approved {
         return Outcome::ok(
@@ -2097,6 +2163,14 @@ pub(crate) fn approve_inbound(
         )
         .with_data(json!({ "confirmed": true, "id": id, "peer": entry.name, "alreadyApproved": true }));
     }
+
+    // Resolved BEFORE the code gate, not beside the commit that uses it: a
+    // malformed `config.toml` would otherwise refuse only after the operator
+    // had already read a code off the far screen and typed it here.
+    let allows = match resolve_grant(grant) {
+        Ok(a) => a,
+        Err(e) => return Outcome::error(cmd, e).with_data(json!({ "reason": "grant-unresolved", "id": id })),
+    };
 
     let Some(requester_nonce) = entry.requester_nonce_hex.clone() else {
         return Outcome::error(
@@ -2212,7 +2286,8 @@ pub(crate) fn approve_inbound(
         None => entry.url.clone(),
     };
     let mut peers = aoide_storage::peer_store::load_peers();
-    let change = aoide_storage::peer_store::upsert_paired_peer(&mut peers, &entry.name, &record_url, &entry.pubkey_hex, now);
+    let first_pairing = !peers.iter().any(|p| p.name == entry.name && p.verified);
+    let change = aoide_storage::peer_store::upsert_paired_peer(&mut peers, &entry.name, &record_url, &entry.pubkey_hex, now, &allows);
     if let Some(via) = entry.self_via.as_deref() {
         if let Err(e) = aoide_storage::peer_store::set_peer_via(&mut peers, &entry.name, Some(via)) {
             return Outcome::error(cmd, format!("recording the peer's transport marker: {e}"));
@@ -2233,12 +2308,13 @@ pub(crate) fn approve_inbound(
     Outcome::ok(
         cmd,
         format!(
-            "{word} `{}` (code {sas}) — verified; awaiting their own `peer pair approve {id}` to poll and complete their side",
-            entry.name
+            "{word} `{}` (code {sas}) — verified{}; awaiting their own `peer pair approve {id}` to poll and complete their side",
+            entry.name,
+            grant_note(first_pairing, &allows)
         ),
     )
     .changed(vec![aoide_storage::peer_store::peers_path().to_string_lossy().into_owned()])
-    .with_data(json!({ "confirmed": true, "sas": sas, "peer": entry.name, "pubkeyHex": entry.pubkey_hex, "direction": "inbound" }))
+    .with_data(json!({ "confirmed": true, "sas": sas, "peer": entry.name, "pubkeyHex": entry.pubkey_hex, "direction": "inbound", "grant": allows, "grantStamped": first_pairing }))
 }
 
 /// The REQUESTER's poll-then-confirm-then-commit half of `peer pair
@@ -2279,7 +2355,16 @@ pub(crate) fn approve_outbound(
     entry: aoide_storage::pairing::OutboundPairingRequest,
     now: &str,
     now_epoch: i64,
+    grant: Option<&[String]>,
 ) -> Outcome {
+    // Resolved before the poll: a malformed `config.toml` refuses without a
+    // network round trip and without asking the operator to confirm a code
+    // this side would then decline to commit.
+    let allows = match resolve_grant(grant) {
+        Ok(a) => a,
+        Err(e) => return Outcome::error(cmd, e).with_data(json!({ "reason": "grant-unresolved", "id": id })),
+    };
+
     let entry = if entry.state == aoide_storage::pairing::OutboundState::AwaitingApproval {
         let poll_body = match build_signed_pair_poll_body(id) {
             Ok(b) => b,
@@ -2374,7 +2459,8 @@ pub(crate) fn approve_outbound(
     }
 
     let mut peers = aoide_storage::peer_store::load_peers();
-    let change = aoide_storage::peer_store::upsert_paired_peer(&mut peers, &entry.name, &entry.url, &entry.pubkey_hex, now);
+    let first_pairing = !peers.iter().any(|p| p.name == entry.name && p.verified);
+    let change = aoide_storage::peer_store::upsert_paired_peer(&mut peers, &entry.name, &entry.url, &entry.pubkey_hex, now, &allows);
     // P-S4: the via this ceremony resolved back at `peer pair` request
     // time (K1's src_addr-derived default, or an explicit `--via`) rode
     // the parked entry here — commit it onto the peer record in the SAME
@@ -2404,9 +2490,9 @@ pub(crate) fn approve_outbound(
         PairChange::Inserted => "paired with",
         PairChange::Updated => "re-paired with",
     };
-    Outcome::ok(cmd, format!("{word} `{}` (code {sas}) — verified", entry.name))
+    Outcome::ok(cmd, format!("{word} `{}` (code {sas}) — verified{}", entry.name, grant_note(first_pairing, &allows)))
         .changed(vec![aoide_storage::peer_store::peers_path().to_string_lossy().into_owned()])
-        .with_data(json!({ "confirmed": true, "sas": sas, "peer": entry.name, "pubkeyHex": entry.pubkey_hex, "direction": "outbound" }))
+        .with_data(json!({ "confirmed": true, "sas": sas, "peer": entry.name, "pubkeyHex": entry.pubkey_hex, "direction": "outbound", "grant": allows, "grantStamped": first_pairing }))
 }
 
 /// `peer pair reject <id>` — a clean refusal: removes the parked entry
@@ -2792,6 +2878,7 @@ pub fn register_peer_pair(r: &mut Registry) {
         flags: [
             flag!("yes", "bool", "Skip the interactive y/N confirmation on an OUTBOUND (requester-side) id (scripted use); an inbound id takes --code instead — --yes never bypasses the approver's typed code."),
             flag!("code", "string", "The pairing code, read from the requester's screen, for approving an INBOUND id without a terminal prompt (scripted use); a wrong code counts one persisted try, and 3 cumulative mismatches auto-deny the request."),
+            flag!("allow", "string", "The capabilities this commit grants the peer, comma-separated (read, spawn) — overriding config.toml's `[pairing] defaultGrant` for this pairing only, and empty (--allow \"\") to grant nothing. Applies ONLY on a peer's FIRST verification: re-pairing an already-verified peer never re-grants, so use `peer allow` to change a live grant."),
         ],
         gated: false,
         implemented: true,
@@ -3132,20 +3219,40 @@ mod tests {
     // ── same reasoning `handle_peer_hub`'s own storage-layer tests already
     // ── rest on. ─────────────────────────────────────────────────────────────
 
+    /// `AOIDE_ROOT` and `AOIDE_CONFIG` are sandboxed alongside the state dir
+    /// because a pairing commit now resolves its grant from `config.toml`
+    /// (`resolve_grant`): left alone, these tests would read the developer's
+    /// own `~/.aoide/config.toml` and go red on a machine whose operator had
+    /// widened `defaultGrant` — or on a malformed file that has nothing to do
+    /// with the code under test. Inside the sandbox the file is absent, so
+    /// every `grant: None` path resolves the built-in `["read"]`.
     fn with_peer_state<T>(tag: &str, f: impl FnOnce() -> T) -> T {
         let _guard = crate::env_lock().lock().unwrap();
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_root = std::env::var("AOIDE_ROOT").ok();
+        let saved_config = std::env::var("AOIDE_CONFIG").ok();
         let dir = std::env::temp_dir().join(format!(
             "aoide-client-peer-allow-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
+        std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("AOIDE_STATE_DIR", &dir);
+        std::env::set_var("AOIDE_ROOT", &dir);
+        std::env::remove_var("AOIDE_CONFIG");
         let out = f();
         let _ = std::fs::remove_dir_all(&dir);
         match saved {
             Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
             None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+        match saved_root {
+            Some(v) => std::env::set_var("AOIDE_ROOT", v),
+            None => std::env::remove_var("AOIDE_ROOT"),
+        }
+        match saved_config {
+            Some(v) => std::env::set_var("AOIDE_CONFIG", v),
+            None => std::env::remove_var("AOIDE_CONFIG"),
         }
         out
     }
@@ -4189,7 +4296,7 @@ mod tests {
             let saved_path = std::env::var("PATH").ok();
             std::env::set_var("PATH", format!("{}:{}", shim_dir.display(), saved_path.clone().unwrap_or_default()));
 
-            let outcome = approve_inbound(InboundGate::Code(sas), "peer.pair.approve", &id, entry, &now, now_epoch);
+            let outcome = approve_inbound(InboundGate::Code(sas), "peer.pair.approve", &id, entry, &now, now_epoch, None);
 
             match saved_path {
                 Some(p) => std::env::set_var("PATH", p),
@@ -4278,7 +4385,7 @@ mod tests {
 
             let now = aoide_storage::time::now_iso_utc();
             let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
-            let outcome = approve_outbound(true, "peer.pair.approve", "deadbeef", entry, &now, now_epoch);
+            let outcome = approve_outbound(true, "peer.pair.approve", "deadbeef", entry, &now, now_epoch, None);
             assert_eq!(outcome.status, aoide_protocol::output::Status::Ok, "{outcome:?}");
 
             let peers = aoide_storage::peer_store::load_peers();
@@ -4305,7 +4412,7 @@ mod tests {
 
             let now = aoide_storage::time::now_iso_utc();
             let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
-            let outcome = approve_outbound(true, "peer.pair.approve", "deadbeef", entry, &now, now_epoch);
+            let outcome = approve_outbound(true, "peer.pair.approve", "deadbeef", entry, &now, now_epoch, None);
             assert_eq!(outcome.status, aoide_protocol::output::Status::Error, "{outcome:?}");
             assert_eq!(outcome.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("awaiting-peer-approval"));
 
@@ -4336,7 +4443,7 @@ mod tests {
 
             let now = aoide_storage::time::now_iso_utc();
             let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
-            let outcome = approve_outbound(true, "peer.pair.approve", "deadbeef", entry, &now, now_epoch);
+            let outcome = approve_outbound(true, "peer.pair.approve", "deadbeef", entry, &now, now_epoch, None);
             assert_eq!(outcome.status, aoide_protocol::output::Status::Error, "{outcome:?}");
             assert_eq!(outcome.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("reveal-mismatch"));
 
@@ -4427,7 +4534,7 @@ mod tests {
             // "xxx-xxx" can never equal a digits-only SAS — a guaranteed mismatch.
             for expected_tries in 1..=2u32 {
                 let fresh = aoide_storage::pairing::list_inbound(now_epoch).into_iter().find(|e| e.id == id).unwrap();
-                let out = approve_inbound(InboundGate::Code("xxx-xxx".into()), "peer.pair.approve", &id, fresh, &now, now_epoch);
+                let out = approve_inbound(InboundGate::Code("xxx-xxx".into()), "peer.pair.approve", &id, fresh, &now, now_epoch, None);
                 assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
                 assert_eq!(out.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("code-mismatch"));
                 assert_eq!(out.data.as_ref().and_then(|d| d.get("tries")).and_then(Value::as_u64), Some(expected_tries as u64));
@@ -4438,7 +4545,7 @@ mod tests {
             // The third mismatch auto-denies: the same clean removal reject
             // performs, nothing committed, its own audited reason.
             let fresh = aoide_storage::pairing::list_inbound(now_epoch).into_iter().find(|e| e.id == id).unwrap();
-            let out = approve_inbound(InboundGate::Code("xxx-xxx".into()), "peer.pair.approve", &id, fresh, &now, now_epoch);
+            let out = approve_inbound(InboundGate::Code("xxx-xxx".into()), "peer.pair.approve", &id, fresh, &now, now_epoch, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
             assert_eq!(out.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("auto-deny-on-code-mismatch"));
             assert!(aoide_storage::pairing::list_inbound(now_epoch).is_empty(), "the parked entry is removed, exactly like a reject");
@@ -4456,7 +4563,7 @@ mod tests {
 
             // The undashed spelling exercises code_matches' normalization on
             // the real path, not just the pure test above.
-            let out = approve_inbound(InboundGate::Code(sas.replace('-', "")), "peer.pair.approve", &id, entry, &now, now_epoch);
+            let out = approve_inbound(InboundGate::Code(sas.replace('-', "")), "peer.pair.approve", &id, entry, &now, now_epoch, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
             let peers = aoide_storage::peer_store::load_peers();
@@ -4466,6 +4573,127 @@ mod tests {
             assert_eq!(listed.len(), 1, "an approved entry stays parked for the requester's poll (Design A)");
             assert!(listed[0].approved);
         });
+    }
+
+    // ── The grant a commit stamps (task #135 P1) — `config.toml`'s
+    // ── `[pairing] defaultGrant`, or this commit's own `--allow`. ────────────
+
+    /// Write a `config.toml` into the sandboxed `AOIDE_ROOT` `with_peer_state`
+    /// already sets up, so a test can drive the real resolution path rather
+    /// than a hand-built `Config`.
+    fn write_config(body: &str) {
+        std::fs::write(aoide_storage::fs::root().join(aoide_storage::config::CONFIG_FILE), body).unwrap();
+    }
+
+    fn approve_the_one_inbound(now_epoch: i64, grant: Option<&[String]>) -> Outcome {
+        let now = aoide_storage::time::iso_utc_from_epoch(now_epoch);
+        let (entry, sas) = parked_revealed_inbound(now_epoch);
+        let id = entry.id.clone();
+        approve_inbound(InboundGate::Code(sas), "peer.pair.approve", &id, entry, &now, now_epoch, grant)
+    }
+
+    #[test]
+    fn a_first_pairing_stamps_the_configs_default_grant_not_a_literal() {
+        with_peer_state("grant-config-default", || {
+            // No config.toml at all — the built-in default, which task #135
+            // P1 narrowed from ["read","spawn"] to ["read"].
+            let out = approve_the_one_inbound(1_700_000_000, None);
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
+            assert_eq!(aoide_storage::peer_store::load_peers()[0].allows, vec!["read".to_string()]);
+            assert!(out.message.contains("granted read"), "the commit says what it granted: {}", out.message);
+        });
+        with_peer_state("grant-config-widened", || {
+            write_config("[pairing]\ndefaultGrant = [\"read\", \"spawn\"]\n");
+            let out = approve_the_one_inbound(1_700_000_000, None);
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
+            assert_eq!(
+                aoide_storage::peer_store::load_peers()[0].allows,
+                vec!["read".to_string(), "spawn".to_string()],
+                "an operator who widened defaultGrant gets the wider set, with no code change and no rebuild"
+            );
+        });
+    }
+
+    #[test]
+    fn allow_overrides_the_config_default_for_this_one_pairing() {
+        with_peer_state("grant-allow-override", || {
+            write_config("[pairing]\ndefaultGrant = [\"read\"]\n");
+            let out = approve_the_one_inbound(1_700_000_000, Some(&["read".to_string(), "spawn".to_string()]));
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
+            assert_eq!(aoide_storage::peer_store::load_peers()[0].allows, vec!["read".to_string(), "spawn".to_string()]);
+            assert!(out.message.contains("granted read, spawn"), "{}", out.message);
+
+            // Nothing persisted it: the config is untouched, so the NEXT
+            // pairing is back to the declared default (the User's decision —
+            // the grant stays attached to a live human at commit time).
+            assert_eq!(aoide_storage::config::load().unwrap().config.pairing.default_grant, vec!["read".to_string()]);
+        });
+    }
+
+    /// The half an operator is most likely to get wrong: `--allow` on a
+    /// RE-pairing looks like it widens a live peer and does not.
+    #[test]
+    fn re_pairing_never_regrants_and_the_message_says_so() {
+        with_peer_state("grant-repair-unchanged", || {
+            let now_epoch = 1_700_000_000_i64;
+            approve_the_one_inbound(now_epoch, None);
+            assert_eq!(aoide_storage::peer_store::load_peers()[0].allows, vec!["read".to_string()]);
+
+            // Same box pairs again (a key rotation) and this operator types
+            // the wider grant.
+            let out = approve_the_one_inbound(now_epoch, Some(&["read".to_string(), "spawn".to_string()]));
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
+            assert_eq!(
+                aoide_storage::peer_store::load_peers()[0].allows,
+                vec!["read".to_string()],
+                "an already-verified peer's grant survives a re-pair untouched — a revoked spawn stays revoked"
+            );
+            assert!(out.message.contains("grant unchanged"), "a --allow that did nothing must never be silent: {}", out.message);
+            assert!(out.message.contains("peer allow"), "and it names the command that does change a live grant: {}", out.message);
+        });
+    }
+
+    #[test]
+    fn a_malformed_config_refuses_the_commit_rather_than_guessing_a_grant() {
+        with_peer_state("grant-config-malformed", || {
+            write_config("[pairing]\ndefaultGrant = [\"read\", \"root\"]\n");
+            let out = approve_the_one_inbound(1_700_000_000, None);
+            assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
+            assert!(out.message.contains("root"), "the refusal names the offending value: {}", out.message);
+            assert!(out.message.contains("--allow"), "and the way past it: {}", out.message);
+            assert!(
+                aoide_storage::peer_store::load_peers().is_empty(),
+                "nothing is committed on an unresolvable grant — a grants file that cannot be read must not fall back to a default"
+            );
+        });
+    }
+
+    #[test]
+    fn allow_parses_the_same_closed_vocabulary_config_set_does() {
+        let mut inv = pair_approve_inv(&[]);
+        assert_eq!(parse_allow_flag(&inv).unwrap(), None, "absent means `use the config`, never the empty grant");
+
+        inv.flags.insert("allow".to_string(), "read,spawn".to_string());
+        assert_eq!(parse_allow_flag(&inv).unwrap(), Some(vec!["read".to_string(), "spawn".to_string()]));
+
+        inv.flags.insert("allow".to_string(), " read , spawn ".to_string());
+        assert_eq!(parse_allow_flag(&inv).unwrap(), Some(vec!["read".to_string(), "spawn".to_string()]), "spacing is an operator's, not a value");
+
+        inv.flags.insert("allow".to_string(), String::new());
+        assert_eq!(parse_allow_flag(&inv).unwrap(), Some(Vec::new()), "`--allow \"\"` is `grant nothing`, a real intent");
+
+        inv.flags.insert("allow".to_string(), "read,root".to_string());
+        let err = parse_allow_flag(&inv).unwrap_err();
+        assert!(err.contains("root"), "an unknown capability is refused BY NAME: {err}");
+    }
+
+    fn pair_approve_inv(args: &[&str]) -> Invocation {
+        Invocation {
+            path: vec!["peer".to_string(), "pair".to_string(), "approve".to_string()],
+            args: args.iter().map(|s| s.to_string()).collect(),
+            flags: Default::default(),
+            door: aoide_protocol::Door::Cli,
+        }
     }
 
     /// P-PV1 (task #131), change (c): a parked entry carrying the wire's
@@ -4483,7 +4711,7 @@ mod tests {
             let (entry, sas) = parked_revealed_inbound_with_self_via(now_epoch, Some("ssh://khoa@box-a"));
             let id = entry.id.clone();
 
-            let out = approve_inbound(InboundGate::Code(sas), "peer.pair.approve", &id, entry, &now, now_epoch);
+            let out = approve_inbound(InboundGate::Code(sas), "peer.pair.approve", &id, entry, &now, now_epoch, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
             let peers = aoide_storage::peer_store::load_peers();
@@ -4515,7 +4743,7 @@ mod tests {
             let id = entry.id.clone();
             assert_ne!(9999, default_a2a_port(), "the fixture port must differ from the default for this test to prove anything");
 
-            let out = approve_inbound(InboundGate::Code(sas), "peer.pair.approve", &id, entry, &now, now_epoch);
+            let out = approve_inbound(InboundGate::Code(sas), "peer.pair.approve", &id, entry, &now, now_epoch, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
             let peers = aoide_storage::peer_store::load_peers();
@@ -4537,7 +4765,7 @@ mod tests {
             let entry_url = entry.url.clone();
             let id = entry.id.clone();
 
-            let out = approve_inbound(InboundGate::Code(sas), "peer.pair.approve", &id, entry, &now, now_epoch);
+            let out = approve_inbound(InboundGate::Code(sas), "peer.pair.approve", &id, entry, &now, now_epoch, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
             let peers = aoide_storage::peer_store::load_peers();
@@ -4555,7 +4783,7 @@ mod tests {
             let (entry, _sas) = parked_revealed_inbound(now_epoch);
             let id = entry.id.clone();
 
-            let out = approve_inbound(InboundGate::Unavailable, "peer.pair.approve", &id, entry, &now, now_epoch);
+            let out = approve_inbound(InboundGate::Unavailable, "peer.pair.approve", &id, entry, &now, now_epoch, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{out:?}");
             assert!(out.message.contains("--code"), "the refusal teaches the scripted spelling: {}", out.message);
             assert_eq!(aoide_storage::pairing::list_inbound(now_epoch)[0].tries, 0, "a refusal is not a wrong code");

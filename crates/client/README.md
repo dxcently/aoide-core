@@ -284,6 +284,19 @@ never the inbound/serve half (that's `aoide-server`).
   unknown peer or an unknown capability with distinct taught errors, no
   network call (this instance's own `state/peers.json` is authoritative
   for its own `allows` grants) —
+  `resolve_grant`/`parse_allow_flag`/`grant_note` are the grant seam both
+  commit directions share (task #135 P1): what a FIRST verification stamps
+  is `config.toml`'s `[pairing] defaultGrant` (`["read"]` by default), or
+  the `--allow read,spawn` typed on that one `peer pair approve` — parsed by
+  `aoide_storage::config::parse_value` over `PEER_CAPABILITIES`, the same
+  validator and the same closed vocabulary `config set` uses, never a second
+  list. Comma-separated, not a repeated flag, because `Invocation::flags` is
+  a map and a second `--allow` would silently overwrite the first. A config
+  that does not load REFUSES the commit instead of falling back, and the
+  refusal happens BEFORE the code gate so nobody types a code this side will
+  decline to commit. `grant_note` exists because a `--allow` on a RE-pairing
+  legitimately does nothing (`upsert_paired_peer` never re-grants), and that
+  must not be silent —
   `confirm_sas`/`default_self_url`/`default_self_via` are this group's own local helpers:
   `confirm_sas` (like `confirm_spawn` below) is a thin wrapper around
   `aoide_protocol::pick::confirm` (ONBOARD.md's prompt substrate section,

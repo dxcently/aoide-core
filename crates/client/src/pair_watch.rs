@@ -626,14 +626,14 @@ fn commit_approval(p: &Pending, code: &str, now_epoch: i64) -> aoide_protocol::o
     let now = aoide_storage::time::now_iso_utc();
     match p.direction.as_str() {
         "inbound" => match aoide_storage::pairing::list_inbound(now_epoch).into_iter().find(|e| e.id == p.id) {
-            Some(entry) => crate::commands::approve_inbound(crate::commands::InboundGate::Code(code.to_string()), "peer.pair.approve", &p.id, entry, &now, now_epoch),
+            Some(entry) => crate::commands::approve_inbound(crate::commands::InboundGate::Code(code.to_string()), "peer.pair.approve", &p.id, entry, &now, now_epoch, None),
             None => aoide_protocol::output::Outcome::error(
                 "peer.pair.approve",
                 format!("pairing request `{}` is no longer pending — nothing to confirm", p.id),
             ),
         },
         _ => match aoide_storage::pairing::list_outbound(now_epoch).into_iter().find(|e| e.id == p.id) {
-            Some(entry) => crate::commands::approve_outbound(true, "peer.pair.approve", &p.id, entry, &now, now_epoch),
+            Some(entry) => crate::commands::approve_outbound(true, "peer.pair.approve", &p.id, entry, &now, now_epoch, None),
             None => aoide_protocol::output::Outcome::error(
                 "peer.pair.approve",
                 format!("pairing request `{}` is no longer pending — nothing to confirm", p.id),

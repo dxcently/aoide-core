@@ -122,8 +122,9 @@ by decision — no embedded database yet
   decision 5) is a CLOSED capability set (`PEER_CAPABILITIES`: `"read"`,
   `"spawn"`) — never a per-capability serde bool scatter — additive,
   empty for every unpaired/legacy peer; `upsert_paired_peer` stamps the
-  ceremony's own default (`["read","spawn"]`) the moment a peer FIRST
-  becomes verified, and leaves it untouched on a later key rotation (a
+  grant its CALLER resolved (`config.toml`'s `[pairing] defaultGrant`, or a
+  `--allow` typed on that one commit — never a literal here) the moment a
+  peer FIRST becomes verified, and leaves it untouched on a later key rotation (a
   revoked capability survives re-pairing). `set_peer_allow` (`peer allow
   <name> <cap> on|off`'s library half) is the only OTHER writer —
   idempotent, refuses an unknown peer or an unknown capability (the

@@ -146,14 +146,6 @@ pub fn valid_capability(cap: &str) -> bool {
     PEER_CAPABILITIES.contains(&cap)
 }
 
-/// The default `allows` a peer gets the moment it FIRST becomes `verified`
-/// (PAIRING.md decision 5: "a peer that completes the pairing ceremony gets
-/// `["read","spawn"]` stamped at commit time") — [`upsert_paired_peer`]'s
-/// only caller of this.
-fn default_paired_allows() -> Vec<String> {
-    vec!["read".to_string(), "spawn".to_string()]
-}
-
 /// `skip_serializing_if` helper for a plain (non-`Option`) `bool` field whose
 /// common case is `false` — mirrors `records.rs`'s own private `is_false`
 /// (not reused directly: that one is private to its module, and a peer's
@@ -237,13 +229,23 @@ pub enum PairChange {
 /// Commit the pairing ceremony's own outcome (P-P2, both call sites: the
 /// approver writing the requester's record, and the requester's own door
 /// writing the approver's record on the callback) — the ONE place either
-/// side of the ceremony writes a peer's `pubkey`/`verified`/default
-/// `allows`. A fresh insert takes every unpaired field's ordinary default
-/// (`autogate: false`, no token/bearer, not the hub) PLUS the ceremony's
-/// own default `allows` ([`default_paired_allows`], P-P3 decision 5:
-/// `["read","spawn"]`) — completing the ceremony for the first time IS
-/// "becoming verified," so the default stamp belongs here, not a second
-/// call site. Re-pairing an EXISTING peer (decision: "replaces key material
+/// side of the ceremony writes a peer's `pubkey`/`verified`/`allows`.
+/// A fresh insert takes every unpaired field's ordinary default
+/// (`autogate: false`, no token/bearer, not the hub) PLUS `grant` —
+/// completing the ceremony for the first time IS "becoming verified," so
+/// the stamp belongs here, not a second call site.
+///
+/// **`grant` is the CALLER's, never a literal here** (P-P3 decision 5, as
+/// amended by task #135 P1). What a first pairing is worth is an operator's
+/// INTENT, so it lives in `config.toml`'s `[pairing] defaultGrant`
+/// ([`crate::config`]) or in the `--allow` an operator typed at the commit —
+/// both resolved by the client before this call. A store function that read
+/// the config itself would be a second resolution path and would swallow a
+/// malformed grants file at the one moment it must fail loudly. Elements are
+/// expected to be [`PEER_CAPABILITIES`]; the resolver validates, so nothing
+/// re-checks here.
+///
+/// Re-pairing an EXISTING peer (decision: "replaces key material
 /// only after the same SAS confirmation, never silently" — the caller's own
 /// confirmation gate, not this function's) touches `pubkey`/`verified`/`url`
 /// always, but `allows` ONLY when the peer was NOT already verified before
@@ -251,14 +253,14 @@ pub enum PairChange {
 /// re-grant a capability an operator revoked via `peer allow ... off`
 /// (P-P3), so `allows` (like `autogate`/`token_file`/`bearer_secret`/`hub`)
 /// is left exactly as it was once a peer has been verified at least once.
-pub fn upsert_paired_peer(peers: &mut Vec<Peer>, name: &str, url: &str, pubkey_hex: &str, added_at: &str) -> PairChange {
+pub fn upsert_paired_peer(peers: &mut Vec<Peer>, name: &str, url: &str, pubkey_hex: &str, added_at: &str, grant: &[String]) -> PairChange {
     if let Some(p) = peers.iter_mut().find(|p| p.name == name) {
         let first_pairing = !p.verified;
         p.pubkey = Some(pubkey_hex.to_string());
         p.verified = true;
         p.url = url.to_string();
         if first_pairing {
-            p.allows = default_paired_allows();
+            p.allows = grant.to_vec();
         }
         return PairChange::Updated;
     }
@@ -271,7 +273,7 @@ pub fn upsert_paired_peer(peers: &mut Vec<Peer>, name: &str, url: &str, pubkey_h
         hub: false,
         pubkey: Some(pubkey_hex.to_string()),
         verified: true,
-        allows: default_paired_allows(),
+        allows: grant.to_vec(),
         via: None,
         added_at: added_at.to_string(),
     });
@@ -1134,14 +1136,14 @@ mod tests {
     #[test]
     fn upsert_paired_peer_inserts_a_fresh_verified_entry_with_unpaired_fields_at_default() {
         let mut peers: Vec<Peer> = Vec::new();
-        let change = upsert_paired_peer(&mut peers, "box-b", "http://b/", "deadbeef", "2026-08-25T00:00:00Z");
+        let change = upsert_paired_peer(&mut peers, "box-b", "http://b/", "deadbeef", "2026-08-25T00:00:00Z", &["read".to_string()]);
         assert_eq!(change, PairChange::Inserted);
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].name, "box-b");
         assert_eq!(peers[0].url, "http://b/");
         assert_eq!(peers[0].pubkey.as_deref(), Some("deadbeef"));
         assert!(peers[0].verified);
-        assert_eq!(peers[0].allows, vec!["read".to_string(), "spawn".to_string()], "a fresh pairing stamps the ceremony's default allows (decision 5)");
+        assert_eq!(peers[0].allows, vec!["read".to_string()], "a fresh pairing stamps EXACTLY the grant the caller resolved, never a literal of its own");
         assert!(!peers[0].autogate, "a fresh paired peer is never autogated by construction");
         assert!(peers[0].token_file.is_none());
         assert!(peers[0].bearer_secret.is_none());
@@ -1157,13 +1159,13 @@ mod tests {
         // empty — an unpaired `peer add` entry pairing for the FIRST time.
         let mut peers = vec![existing];
 
-        let change = upsert_paired_peer(&mut peers, "box-b", "http://new-b/", "cafef00d", "2026-08-25T00:00:00Z");
+        let change = upsert_paired_peer(&mut peers, "box-b", "http://new-b/", "cafef00d", "2026-08-25T00:00:00Z", &["read".to_string(), "spawn".to_string()]);
         assert_eq!(change, PairChange::Updated);
         assert_eq!(peers.len(), 1, "re-pairing never duplicates the entry");
         assert_eq!(peers[0].url, "http://new-b/", "url is replaced");
         assert_eq!(peers[0].pubkey.as_deref(), Some("cafef00d"));
         assert!(peers[0].verified);
-        assert_eq!(peers[0].allows, vec!["read".to_string(), "spawn".to_string()], "first-time verification stamps the default allows same as a fresh insert");
+        assert_eq!(peers[0].allows, vec!["read".to_string(), "spawn".to_string()], "first-time verification stamps the caller's grant same as a fresh insert — here a widened one");
         assert!(peers[0].autogate, "autogate is untouched by re-pairing");
         assert_eq!(peers[0].token_file.as_deref(), Some("/tmp/tok"), "token_file untouched");
         assert_eq!(peers[0].bearer_secret.as_deref(), Some("secret-name"), "bearer_secret untouched");
@@ -1173,18 +1175,20 @@ mod tests {
     fn upsert_paired_peer_on_an_already_verified_name_never_resets_allows() {
         // A key rotation (re-pairing) on a peer that was ALREADY verified —
         // its operator may have since revoked `spawn` via `peer allow ...
-        // off`; re-pairing must never silently re-grant it.
+        // off`; re-pairing must never silently re-grant it — not even when
+        // THIS commit's own grant is the wider one (an `--allow read,spawn`
+        // typed at the re-pair, or a `defaultGrant` widened since).
         let mut existing = fixture_peer("box-b", "http://old-b/", false);
         existing.verified = true;
         existing.pubkey = Some("oldkey".to_string());
         existing.allows = vec!["read".to_string()]; // spawn already revoked.
         let mut peers = vec![existing];
 
-        let change = upsert_paired_peer(&mut peers, "box-b", "http://new-b/", "newkey", "2026-08-25T00:00:00Z");
+        let change = upsert_paired_peer(&mut peers, "box-b", "http://new-b/", "newkey", "2026-08-25T00:00:00Z", &["read".to_string(), "spawn".to_string()]);
         assert_eq!(change, PairChange::Updated);
         assert_eq!(peers[0].pubkey.as_deref(), Some("newkey"), "key material still rotates");
         assert!(peers[0].verified);
-        assert_eq!(peers[0].allows, vec!["read".to_string()], "already-verified peer's allows survive a key rotation untouched — a revoked spawn stays revoked");
+        assert_eq!(peers[0].allows, vec!["read".to_string()], "already-verified peer's allows survive a key rotation untouched — a revoked spawn stays revoked, even against a wider grant on this very call");
     }
 
     // ── `allows` — P-P3 additive field ────────────────────────────────────────
@@ -1372,7 +1376,7 @@ mod tests {
     #[test]
     fn upsert_paired_peer_leaves_via_none_on_a_fresh_insert() {
         let mut peers: Vec<Peer> = Vec::new();
-        upsert_paired_peer(&mut peers, "box-b", "http://b/", "deadbeef", "2026-08-25T00:00:00Z");
+        upsert_paired_peer(&mut peers, "box-b", "http://b/", "deadbeef", "2026-08-25T00:00:00Z", &["read".to_string()]);
         assert_eq!(peers[0].via, None, "a fresh pairing stamps no via — set_peer_via is the only writer");
     }
 

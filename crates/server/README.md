@@ -211,10 +211,10 @@ the inbound half of the two-door contract (the outbound half is
   self-authenticating instead (below) — neither door-gated nor fully open.
   None grants anything beyond a `pubkey`/`verified` peer record, and that
   record commits only on BOTH ends' own separate human confirmation — the
-  default `allows` (`["read","spawn"]`) is stamped by
-  `aoide_storage::peer_store::upsert_paired_peer` itself, the moment a peer
-  first becomes verified (P-P3, PAIRING.md decision 5), never by these
-  methods directly. `pair_request`
+  `allows` set is stamped by `aoide_storage::peer_store::upsert_paired_peer`
+  itself, the moment a peer first becomes verified (P-P3, PAIRING.md
+  decision 5), from the grant the CLI half resolved (`[pairing] defaultGrant`
+  or `--allow`) — never by these methods directly, and never off the wire. `pair_request`
   validates every field (64-hex pubkey, 64-hex commitment, a
   `valid_peer_name` name, a non-empty `://`-bearing url) before calling
   `aoide_storage::pairing::park_inbound` — malformed input never reaches

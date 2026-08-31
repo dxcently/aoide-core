@@ -253,6 +253,13 @@
   leaves `autogate`/`tokenFile`/`bearerSecret`/`hub` untouched — don't widen
   it to a general-purpose peer editor, and don't set those two fields via a
   raw `Peer { .. }` literal anywhere outside `peer_store.rs` itself.
+  **Its `grant` parameter is the caller's, and this module never resolves
+  one (task #135 P1).** The capability set a first pairing stamps is an
+  operator's INTENT — `config.toml`'s `[pairing] defaultGrant`, or the
+  `--allow` typed on that commit — so the client resolves it and passes the
+  finished list. Reading `config` from inside `peer_store` would be a second
+  resolution path AND would have to swallow a malformed grants file at the
+  one moment that must fail loudly; keep the store a store.
 - **`peer_store::set_peer_via` is the ONE write site for `Peer.via` (P-S4),
   a SIBLING to `upsert_paired_peer`, never a parameter folded into it.**
   `upsert_paired_peer`'s signature is also called from `aoide-server`'s own
