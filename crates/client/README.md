@@ -284,6 +284,15 @@ never the inbound/serve half (that's `aoide-server`).
   unknown peer or an unknown capability with distinct taught errors, no
   network call (this instance's own `state/peers.json` is authoritative
   for its own `allows` grants) —
+  `poll_outbound_once`/`commit_outbound` are the requester's half as TWO
+  named seams (task #135 P2), with `approve_outbound` reduced to calling
+  each once. `poll_outbound_once` is the ONE implementation of the
+  `aoide/pairPoll` round trip and of the SAS/transcript binding that refuses
+  a substituted reveal; its `PollOutcome::Pending` is the only arm a caller
+  may retry, every other being terminal, so a `--wait` loop cannot hammer an
+  unreachable box or a refused reveal. A second copy of that loop anywhere is
+  the design error the split exists to prevent — a blocking `peer pair` and
+  `mesh pair` both consume these rather than reimplementing them.
   `resolve_grant`/`parse_allow_flag`/`grant_note` are the grant seam both
   commit directions share (task #135 P1): what a FIRST verification stamps
   is `config.toml`'s `[pairing] defaultGrant` (`["read"]` by default), or
