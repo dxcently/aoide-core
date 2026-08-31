@@ -62,7 +62,7 @@ use std::collections::HashSet;
 use std::os::unix::net::UnixStream;
 #[cfg(test)]
 use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The gap between the text payload write and the trailing submit-keystroke
 /// write in [`deliver_local_with`] (task #124, live-diagnosed on kimi
@@ -1706,6 +1706,13 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
         }
         return noop("unmapped-or-missing-event");
     };
+    // The check lane (task #139): a message ONLY at the two triggers the
+    // design names — SessionStart (below, the `HookAction::Start` arm) and
+    // the real Stop event (the `HookAction::Phase` arm, gated on
+    // `phase == "stopped"`, the one phase string `HookClass::Stop` alone
+    // produces — see `map_hook`). Folded onto the final Outcome's message
+    // after the match so every OTHER event stays exactly as chatty as it was.
+    let mut lane_note: Option<String> = None;
     let inner = match action {
         HookAction::Start { id, cwd } => {
             // A claude launched INSIDE a conducted session inherits its parent's
@@ -1756,6 +1763,13 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
                 pid,
             );
             stamp_hook_ancestry(&id, &my_hook_ancestry());
+            // The check lane's own SessionStart trigger: run it, record the
+            // baseline, flag an already-red or already-.nix-carrying tree.
+            // Best-effort (`None` on a missing `cwd`, a disabled lane, or an
+            // unloadable config) — never fails this hook.
+            if let Some(cwd_str) = cwd.as_deref() {
+                lane_note = aoide_upkeep::checklane::on_session_start(&id, Path::new(cwd_str));
+            }
             // A FRESH id is inserted `idle` by `upsert_session`. A RESUME (same id,
             // SessionStart source=resume/compact/clear) deliberately preserves the
             // stored state — a working/awaiting session must not be reset — but a
@@ -1801,6 +1815,19 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
                     &id,
                     payload.get("message").and_then(Value::as_str),
                 );
+            }
+            // The check lane's own Stop trigger — `phase == "stopped"` is the
+            // one string `HookClass::Stop` alone produces (`map_hook`), so
+            // this never fires on a mere `working`/`awaiting` transition.
+            // Re-runs the lane and reports only the DELTA against the
+            // baseline `on_session_start` recorded, off the raw payload's
+            // OWN `cwd` (not a stage lookup — every hook payload carries it).
+            // Best-effort, same as the SessionStart arm: `None` on a missing
+            // `cwd`, a disabled lane, or an unloadable config.
+            if phase == "stopped" {
+                if let Some(cwd_str) = payload.get("cwd").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    lane_note = aoide_upkeep::checklane::on_stop(&id, Path::new(cwd_str));
+                }
             }
             out
         }
@@ -1945,12 +1972,23 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
         }
     }
     // Fold the inner outcome into an ok envelope — exit 0, no matter what.
-    Outcome::ok(cmd, inner.message)
+    // The check lane's note (if either trigger produced one) rides on the
+    // SAME message, separated by an em dash: this is the one text channel
+    // that actually reaches the harness (`hooks::door_command`'s claude
+    // wrapper stopped swallowing stdout for exactly this reason), so the
+    // note has nowhere else to go.
+    let note_for_data = lane_note.clone();
+    let message = match lane_note {
+        Some(note) => format!("{} — {note}", inner.message),
+        None => inner.message,
+    };
+    Outcome::ok(cmd, message)
         .changed(inner.changed)
         .with_data(json!({
             "action": "applied",
             "innerStatus": format!("{:?}", inner.status),
             "innerData": inner.data,
+            "checkLane": note_for_data,
         }))
 }
 
@@ -4642,6 +4680,71 @@ mod tests {
             None => std::env::remove_var("AOIDE_STAGE_DIR"),
         }
         let _ = std::fs::remove_dir_all(&stage);
+    }
+    #[test]
+    fn check_lane_note_flows_from_a_configured_verify_command_through_the_hook_outcome() {
+        // Task #139: proves the WIRING — that `aoide_upkeep::checklane`'s note
+        // actually reaches the `Outcome` `session hook` returns — not the
+        // lane's own logic (covered exhaustively in `aoide-upkeep`'s own
+        // tests). Isolates BOTH the conduct stage (`AOIDE_STAGE_DIR`, the
+        // usual convention here) AND the config root (`AOIDE_ROOT`) — the
+        // check lane reads `aoide_storage::config`, which every OTHER test in
+        // this module never touches and must not start touching by accident.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_ROOT", "AOIDE_CONFIG", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        std::env::remove_var("AOIDE_CONFIG");
+        let stage = unique_stage("check-lane-wiring-stage");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let config_root = unique_stage("check-lane-wiring-config");
+        std::env::set_var("AOIDE_ROOT", &config_root);
+        aoide_storage::config::set("upkeep.verifyCommand", "false").unwrap();
+
+        // A real git repo the lane can actually scan (unlike this file's other
+        // hook tests, which use a fictional, nonexistent `cwd` since they
+        // never exercise anything that reads the tree).
+        let tree = unique_stage("check-lane-wiring-tree");
+        let run_git = |args: &[&str]| {
+            let status =
+                std::process::Command::new("git").arg("-C").arg(&tree).args(args).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.email", "test@example.invalid"]);
+        run_git(&["config", "user.name", "test"]);
+        std::fs::write(tree.join("README.md"), "x\n").unwrap();
+        run_git(&["add", "README.md"]);
+        run_git(&["commit", "-q", "-m", "init"]);
+
+        // SessionStart: the configured command is `false`, so the baseline is
+        // red — the Outcome's own message carries the note, joined onto
+        // whatever `do_session_start` already said.
+        let out = hook_from_str(&format!(
+            r#"{{ "session_id": "wire1", "hook_event_name": "SessionStart", "cwd": "{}" }}"#,
+            tree.display()
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+        assert!(out.message.contains("already red"), "{}", out.message);
+        assert!(out.message.contains("inherited"), "{}", out.message);
+        let data = out.data.unwrap();
+        assert!(
+            data["checkLane"].as_str().unwrap().contains("already red"),
+            "{data}"
+        );
+
+        // Stop, nothing changed since the baseline: no note appended at all —
+        // the message and `checkLane` read exactly as they would with the
+        // lane off.
+        let out2 = hook_from_str(&format!(
+            r#"{{ "session_id": "wire1", "hook_event_name": "Stop", "cwd": "{}" }}"#,
+            tree.display()
+        ));
+        assert!(!out2.message.contains("check lane"), "{}", out2.message);
+        assert!(out2.data.unwrap()["checkLane"].is_null());
+
+        let _ = std::fs::remove_dir_all(&stage);
+        let _ = std::fs::remove_dir_all(&config_root);
+        let _ = std::fs::remove_dir_all(&tree);
     }
     #[test]
     fn hook_notification_blocks_and_the_clearing_set_lifts_it() {

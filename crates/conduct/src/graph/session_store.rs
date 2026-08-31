@@ -1133,6 +1133,11 @@ fn do_session_phase_if_inner(id: &str, phase: &str, expected: &str) -> Outcome {
 pub(in crate::graph) fn do_session_end(id: &str) -> Outcome {
     let outcome = with_stage_lock(|| do_session_end_inner(id));
     let _ = aoide_client::tunnel::close_all_for_session(id);
+    // The check lane's own baseline for this session (task #139 review
+    // finding: nothing ever deleted `state/checklane/<id>.json` — an effect
+    // with no inverse). Same best-effort posture as the tunnel close above;
+    // a session with no baseline (the lane was never configured) is a no-op.
+    aoide_upkeep::checklane::forget_baseline(id);
     outcome
 }
 fn do_session_end_inner(id: &str) -> Outcome {

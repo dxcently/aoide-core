@@ -1409,6 +1409,20 @@ fn reap_inner(
         (removed, cleared)
     };
 
+    // The check lane's own baseline for every id actually leaving the roster
+    // here (task #139 review finding: nothing ever deleted
+    // `state/checklane/<id>.json` on THIS exit path — `removed` is
+    // `prune_done`'s full drop set, a superset of `reaped` since it also
+    // sweeps any pre-existing `done` record). Mirrors the same call
+    // `graph/session_store.rs::do_session_end` makes on the clean-exit path;
+    // this is the SIGKILL/liveness-reap backstop for the sessions that never
+    // got to run that path. Best-effort, same posture as that call: a
+    // session with no baseline (the lane was never configured, or it
+    // already ran `on_stop`'s own compaction) is a no-op.
+    for id in &removed {
+        aoide_upkeep::checklane::forget_baseline(id);
+    }
+
     // Drop the superseded tombstones, narrowly — only the ids identified above,
     // never the whole `done` set. Runs on a quiet (non-reaping) pass too, which
     // is the steady state they otherwise accumulate in; when a reaping pass

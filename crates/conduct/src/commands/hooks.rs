@@ -108,7 +108,43 @@ fn events_for(profile: &AgentProfile) -> Vec<&'static str> {
 /// same precedence `aoide_storage::fs::state_dir()`'s default branch
 /// resolves in Rust, rather than baking in whatever root happened to be
 /// configured on the installing host.
-fn door_command(profile: &AgentProfile, capture: bool) -> String {
+///
+/// The claude wrapper unmuffles stdout for `SessionStart` and
+/// `UserPromptSubmit` ONLY (task #139). Stdout is the one PIPE a `session
+/// hook` `Outcome` message ever reaches the harness through at all
+/// (confirmed against `protocol::door::run`, which `println!`s an `Ok`
+/// outcome's rendered body) — but reaching the harness is not reaching the
+/// model. Which events Claude Code actually folds a successful hook's
+/// stdout into the model's own context is
+/// `docs/Aoide-Wiki/protocol/dev/HARNESS-CLAUDE-CODE.md`'s call (its
+/// "Traps" section is the one authority for this fact, not restated here in
+/// full): exactly `SessionStart`/`UserPromptSubmit`; every other event's
+/// stdout (`PreToolUse`, `PostToolUse`, `Stop`, `SubagentStart`/`Stop`,
+/// `SessionEnd`, `Notification`) lands in Claude Code's own debug log,
+/// never the transcript, never the model, so unmuffling them would only
+/// leak routine chatter nobody reads.
+///
+/// **`Stop` itself stays swallowed, deliberately — never a blocking exit
+/// code.** `checklane::on_stop`'s own delta note is computed and folded
+/// into `session hook`'s `Outcome` at Stop (`data.checkLane`,
+/// `graph/send.rs`), but reaching the model FROM Stop itself would require
+/// the blocking `exit 2`/`decision:"block"` contract Claude Code offers for
+/// that one event — rejected on design grounds: it FORCES continuation,
+/// turning a report into a command, exactly what "do not fix unless asked"
+/// exists to prevent (same page, same section). This wrapper's own
+/// `2>/dev/null; exit 0` (stderr suppressed, exit forced 0, unconditionally)
+/// is part of what forecloses that channel on purpose, not by omission. A
+/// deferred-delivery mechanism — carrying the Stop-computed note forward
+/// onto a later context-reaching event instead — is a separate, not-yet-
+/// landed change to `aoide-upkeep`/`send.rs`; this wrapper's own live-event
+/// set already matches what that mechanism will need and does not change
+/// again when it lands.
+///
+/// Stderr stays suppressed on every event (a panic's backtrace has no
+/// business in an agent's transcript); the trailing `; exit 0` is
+/// unconditional regardless, so a future nonzero exit still never breaks the
+/// hook.
+fn door_command(profile: &AgentProfile, capture: bool, event: &str) -> String {
     if capture {
         format!(
             "sh -c 'tee -a \"${{AOIDE_ROOT:-$HOME/.aoide}}/state/{}-hooks.jsonl\" | aoide session hook --agent {}'",
@@ -116,10 +152,18 @@ fn door_command(profile: &AgentProfile, capture: bool) -> String {
         )
     } else {
         match profile.hook_settings.format {
+            SettingsFormat::Json if event == "SessionStart" || event == "UserPromptSubmit" => {
+                r#"a=$(command -v aoide) || exit 0; "$a" session hook 2>/dev/null; exit 0"#
+                    .to_string()
+            }
             SettingsFormat::Json => {
                 r#"a=$(command -v aoide) || exit 0; "$a" session hook >/dev/null 2>&1; exit 0"#
                     .to_string()
             }
+            // kimi's own door_command output never varies by event (no
+            // context-injection distinction to make on this door at all),
+            // so callers for this format pass event-invariant text and
+            // `event` goes unread here.
             SettingsFormat::Toml => format!("aoide session hook --agent {}", profile.name),
             // Unreachable for the declarative profiles — `hooks_install`
             // short-circuits before any door command is built.
@@ -295,7 +339,9 @@ fn toml_basic(s: &str) -> String {
 fn install_toml(path: &Path, profile: &AgentProfile, capture: bool) -> Result<InstallReport, String> {
     let existing = std::fs::read_to_string(path).unwrap_or_default();
     let mut report = InstallReport { added: Vec::new(), present: Vec::new(), updated: Vec::new() };
-    let wanted = door_command(profile, capture);
+    // TOML's own `door_command` output never varies by event — passed empty
+    // since only the JSON (claude) branch reads it (see that function's doc).
+    let wanted = door_command(profile, capture, "");
     let wanted_line = format!("command = \"{}\"", toml_basic(&wanted));
 
     // Split into the preamble (index 0) and each `[[hooks]]` block's body —
@@ -403,7 +449,7 @@ fn install_json(path: &Path, profile: &AgentProfile, capture: bool) -> Result<In
     let hooks = hooks.as_object_mut().expect("hooks is an object");
     let mut report = InstallReport { added: Vec::new(), present: Vec::new(), updated: Vec::new() };
     for evt in events_for(profile) {
-        let wanted = door_command(profile, capture);
+        let wanted = door_command(profile, capture, evt);
         let mut found = false;
         if let Some(groups) = hooks.get_mut(evt).and_then(Value::as_array_mut) {
             'groups: for g in groups.iter_mut() {
@@ -928,12 +974,44 @@ mod tests {
         // whatever this process's own env happens to be, and never a
         // hardcoded `~/Aoide` or an install-time-resolved absolute path.
         let profile = agent_profile("kimi").unwrap();
-        let cmd = door_command(&profile, true);
+        let cmd = door_command(&profile, true, "SessionStart");
         assert!(
             cmd.contains("${AOIDE_ROOT:-$HOME/.aoide}/state/kimi-hooks.jsonl"),
             "wrap did not carry the AOIDE_ROOT-with-fallback expansion: {cmd}"
         );
         assert!(!cmd.contains("Aoide/state"), "wrap still names the retired ~/Aoide root: {cmd}");
+    }
+
+    #[test]
+    fn claude_json_wrapper_unmuffles_stdout_for_session_start_and_prompt_submit_only() {
+        // Task #139 (docs/Aoide-Wiki/protocol/dev/HARNESS-CLAUDE-CODE.md's
+        // "Traps" section is the authority for this rule): SessionStart and
+        // UserPromptSubmit are the two events Claude Code itself folds a
+        // hook's stdout into the model's context for —
+        // UserPromptSubmit is the eventual delivery channel for a Stop-
+        // computed delta note (a later, not-yet-landed change). Every OTHER
+        // event — including Stop — keeps the original full swallow, or
+        // routine hook chatter leaks into events that can never usefully
+        // speak.
+        let profile = agent_profile("claude").unwrap();
+        for evt in ["SessionStart", "UserPromptSubmit"] {
+            let cmd = door_command(&profile, false, evt);
+            assert!(cmd.contains("2>/dev/null"), "{evt}: {cmd}");
+            assert!(!cmd.contains(">/dev/null 2>&1"), "{evt}: {cmd}");
+        }
+
+        for evt in [
+            "PreToolUse",
+            "PostToolUse",
+            "Stop",
+            "SubagentStart",
+            "SubagentStop",
+            "SessionEnd",
+            "Notification",
+        ] {
+            let cmd = door_command(&profile, false, evt);
+            assert!(cmd.contains(">/dev/null 2>&1"), "{evt}: {cmd}");
+        }
     }
 
     #[test]
@@ -981,15 +1059,20 @@ mod tests {
         std::env::set_var("HOME", &root);
         let path = root.join(".claude/settings.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        // Mirror the real hand-written file: the defensive wrapper per event,
-        // plus unrelated keys that must survive untouched.
+        // Mirror the real hand-written file: the defensive wrapper per event —
+        // `door_command` itself builds each entry's expected text, since
+        // SessionStart/UserPromptSubmit's `2>/dev/null` and every other
+        // event's `>/dev/null 2>&1` swallow now differ (task #139) and a
+        // hardcoded literal here drifts the moment that scoping changes
+        // again — plus unrelated keys that must survive untouched.
         let events = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
                       "Notification", "SubagentStart", "SubagentStop", "Stop", "SessionEnd"];
+        let claude_profile = agent_profile("claude").unwrap();
         let mut hooks = serde_json::Map::new();
         for evt in events {
             hooks.insert(evt.to_string(), json!([{ "hooks": [ {
                 "type": "command",
-                "command": "a=$(command -v aoide) || exit 0; \"$a\" session hook >/dev/null 2>&1; exit 0"
+                "command": door_command(&claude_profile, false, evt)
             } ] } ]));
         }
         // The pointer entry too (the real hand-written file carries it), so a
@@ -1068,6 +1151,10 @@ mod tests {
         let merged: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let groups = merged["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(groups.len(), 2, "no duplicate entry -- the stale one was rewritten in place");
+        // PreToolUse converges to the swallow form, not the unmuffled one —
+        // that variant is scoped to SessionStart/UserPromptSubmit only
+        // (task #139); a stale PreToolUse entry rewrites to the same
+        // `>/dev/null 2>&1` every other non-unmuffled event gets.
         assert_eq!(
             groups[0]["hooks"][0]["command"],
             "a=$(command -v aoide) || exit 0; \"$a\" session hook >/dev/null 2>&1; exit 0"

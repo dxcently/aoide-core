@@ -50,11 +50,19 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   (`lane_note`) rides on the SAME `Outcome` `session hook` already builds —
   appended to `inner.message` after an em dash, and surfaced separately as
   `data.checkLane` — never a second message, never a second door. This is
-  the reason `commands/hooks.rs::door_command`'s claude wrapper stopped
-  swallowing stdout (`2>/dev/null` now, was `>/dev/null 2>&1`): stdout is
-  the one channel an `Ok` outcome's rendered body ever reaches the harness
-  through (`aoide_protocol::door::run`'s `println!`), so a lane note with
-  nowhere to print is a note that never fires.
+  part of why `commands/hooks.rs::door_command`'s claude wrapper stopped
+  blanket-swallowing stdout (`aoide_protocol::door::run`'s `println!` on an
+  `Ok` outcome is the ONLY channel a rendered body ever reaches the harness
+  through) — but the wrapper only unmuffles `SessionStart`/
+  `UserPromptSubmit`, the two events Claude Code itself folds a hook's
+  stdout into the model's context for; `Stop` stays swallowed on purpose
+  (blocking the turn to force the note through was rejected on design
+  grounds — see `door_command`'s own doc). So on_stop's note is real, is
+  folded into the `Outcome`, and is inspectable via `--json`'s
+  `data.checkLane` — but on claude it does not yet reach the model live; see
+  `docs/Aoide-Wiki/protocol/dev/HARNESS-CLAUDE-CODE.md`'s "Traps" section
+  for the per-event rule this rests on, and `door_command`'s own doc for
+  the planned deferred-delivery fix.
 - `graph` — the session DAG: build/merge/send/spawn/wrap, `normalize_addr`
   (widened to `pub` at P-A1 so `screen` could reach it without duplicating
   it), `SessionRecord`/`SessionsFile`/`load_stage`/`write_stage`. `--id`

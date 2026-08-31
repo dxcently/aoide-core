@@ -30,6 +30,12 @@ aoide-storage = { workspace = true }
 # edge doesn't cycle (client has no dependency back on conduct).
 aoide-client = { workspace = true }
 libc = { workspace = true }
+# The check lane (task #139): `graph::send::hook_for_profile`'s SessionStart/
+# Stop arms call `aoide_upkeep::checklane::{on_session_start,on_stop}` so the
+# working-tree mechanical-integrity sweep `aoide soundcheck` already owns
+# fires on the agent LOOP itself, not only when someone remembers to run it
+# by hand. No cycle: `aoide-upkeep` depends on nothing in this crate.
+aoide-upkeep = { workspace = true }
 
 [dev-dependencies]
 # The commands/hooks tests share the workspace rig (scratch dirs, EnvSaver,

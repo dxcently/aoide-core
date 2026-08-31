@@ -4,20 +4,25 @@
 //! polices the COMMITTED tree — the git-filtered store copy `nix` evaluates.
 //! It structurally cannot see anything gitignored or merely uncommitted:
 //! `result`, `state/`, an agent's stray file dropped at repo root a moment
-//! ago. That gap is this crate's whole charter, and its only command is
-//! `aoide soundcheck` (`commands::register`).
+//! ago. That gap is this crate's whole charter. Its own command is `aoide
+//! soundcheck` (`commands::register`), a human/agent-invoked report; its own
+//! AUTOMATIC wiring is [`checklane`], invoked from `aoide-conduct`'s `session
+//! hook` at SessionStart/Stop so the same gap gets flagged without anyone
+//! having to remember to ask.
 //!
 //! **Report-only, forever — this is a binding correction, not a v0
-//! shortcut.** `soundcheck` never moves, deletes, formats, or repairs
-//! anything; it only names a problem precisely enough that a human or an
-//! agent can go fix it. See `commands`' module doc for the finding format
-//! and `scan`'s for exactly which checks live here.
+//! shortcut.** Neither `soundcheck` nor [`checklane`] ever moves, deletes,
+//! formats, or repairs anything; each only names a problem precisely enough
+//! that a human or an agent can go fix it. See `commands`' module doc for the
+//! finding format, `scan`'s for exactly which checks live here, and
+//! [`checklane`]'s for the SessionStart/Stop split.
 //!
 //! One-package-one-charter (`docs/architecture/PACKAGE-LAYOUT.md`): repo
 //! hygiene is not `aoide-storage`'s "durable session data" charter, so this
 //! is its own small crate rather than a stretch of that one (soundcheck
 //! design doc, FORK 3, advisor-confirmed).
 
+pub mod checklane;
 pub mod commands;
 pub mod scan;
 

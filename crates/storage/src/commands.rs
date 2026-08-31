@@ -836,7 +836,7 @@ pub fn register_config(r: &mut Registry) {
         summary: "Set one config key, schema-validated and written in place so comments survive. Refuses a managed or unwritable config with the path to edit instead, and never writes a config it could not first load.",
         args: [
             arg!("key", "string", true, "The key as `<section>.<key>`, e.g. pairing.defaultGrant."),
-            arg!("value", "string", true, "The new value. A list key takes a comma-separated list; empty means the empty list."),
+            arg!("value", "string", true, "The new value. A list key takes a comma-separated list (empty means the empty list); a scalar key takes the raw string as-is, commas included."),
         ],
         flags: [],
         gated: false,
@@ -866,7 +866,7 @@ fn handle_config(_inv: &Invocation) -> Outcome {
                 "{}.{} = {}",
                 section.name,
                 key.name,
-                crate::config::render_value(&(key.read)(&loaded.config))
+                crate::config::render_value(&key.kind, &(key.read)(&loaded.config))
             ));
         }
     }

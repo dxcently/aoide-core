@@ -68,8 +68,10 @@ fn slug(path: &str) -> String {
 /// degrades to "this check found nothing" rather than propagating the
 /// failure, so a git-less environment never panics `aoide soundcheck` — it
 /// just can't see C1/C2, which are git-sourced by construction. `commands`'s
-/// tests cover this path explicitly.
-fn run_git(root: &Path, args: &[&str]) -> Option<String> {
+/// tests cover this path explicitly. `pub(crate)`: `checklane`'s own
+/// untracked-`.nix` scan is the same one-command-git's-own-answer shape and
+/// reuses this rather than a second `Command::new("git")` in the crate.
+pub(crate) fn run_git(root: &Path, args: &[&str]) -> Option<String> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(root)

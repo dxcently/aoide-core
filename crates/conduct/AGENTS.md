@@ -110,14 +110,24 @@
   `cwd`, a disabled lane, or an unloadable config — same best-effort stance
   every other hook action in this function already holds; a check-lane
   failure must never fail the hook. **`commands/hooks.rs::door_command`'s
-  claude wrapper must keep letting stdout through** (`2>/dev/null` today,
-  never `>/dev/null 2>&1` again) — stdout is the ONLY channel a `session
-  hook` `Outcome` ever reaches the harness through (`aoide_protocol::
-  door::run`'s `println!` on `Ok`), so restoring the old blanket redirect
-  silently kills every lane note (and every other hook message) without
-  touching a single assertion in this crate's own test suite, since none of
-  those tests observe the harness's actual stdout — only the returned
-  `Outcome` in-process.
+  claude wrapper must keep letting `SessionStart`/`UserPromptSubmit`'s
+  stdout through** (`2>/dev/null` for exactly those two events; every other
+  event, `Stop` included, keeps the original `>/dev/null 2>&1` swallow ON
+  PURPOSE — don't widen either direction). Stdout is the only PIPE a
+  `session hook` `Outcome` ever reaches the harness through
+  (`aoide_protocol::door::run`'s `println!` on `Ok`) — reaching the harness
+  is not reaching the model; which events Claude Code actually folds into
+  context is `docs/Aoide-Wiki/protocol/dev/HARNESS-CLAUDE-CODE.md`'s call
+  (its "Traps" section), not restated here, and it names exactly
+  `SessionStart`/`UserPromptSubmit`. Restoring the old blanket swallow on
+  those two silently kills every lane note without touching a single
+  assertion in this crate's own test suite, since none of those tests
+  observe the harness's actual stdout — only the returned `Outcome`
+  in-process. Conversely, unmuffling `Stop` (or any other event) would only
+  leak routine hook chatter into a channel nobody reads on that event —
+  don't "fix" `on_stop`'s own not-yet-live delivery by widening the
+  wrapper; that fix is a deferred-delivery change in `aoide-upkeep`/this
+  file's Start/Phase arms, not a wrapper change.
 - **The undying transfer is one `save_undying` call, never two.**
   `resurrect.rs`'s `resurrect_one` adds the new id and drops the old one in
   the SAME in-memory `Vec<UndyingSession>` before writing — the new id goes

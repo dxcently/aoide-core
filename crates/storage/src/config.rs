@@ -28,7 +28,14 @@
 //! arms.** Sections, their keys, each key's value vocabulary, and how to read
 //! that key off a typed [`Config`] all live in one const table; [`validate`],
 //! [`set`], and `aoide config`'s own listing every walk it rather than
-//! restating it. A new key is one table row plus its struct field.
+//! restating it. A new key is one table row plus its struct field. Two
+//! sections today, neither aware the other exists: `[pairing]`'s
+//! `defaultGrant` is a [`ValueKind::ClosedList`] (closed vocabulary,
+//! `peer_store::PEER_CAPABILITIES`); `[upkeep]`'s `verifyCommand` is a
+//! [`ValueKind::Scalar`] — the check lane's own verification command
+//! (`aoide session hook`'s SessionStart/Stop wiring), free-form because core
+//! cannot know what "clean" means on every host. A scalar key is the one
+//! place [`SCHEMA`] gives up checking a vocabulary: there isn't one to check.
 //!
 //! **Resolution ([`source`]), identical at every entry point** — the `aoide`
 //! CLI, the `aoided` daemon, and the stdio MCP façade all reach this one
@@ -72,6 +79,8 @@ pub const SCHEMA_VERSION: &str = "0";
 pub struct Config {
     #[serde(default)]
     pub pairing: Pairing,
+    #[serde(default)]
+    pub upkeep: Upkeep,
 }
 
 /// `[pairing]` — the pairing ceremony's own intent.
@@ -98,15 +107,42 @@ impl Default for Pairing {
     }
 }
 
-/// What shape a key's value takes, and what it may contain. One variant today
-/// — every v0 key is a list drawn from a closed vocabulary. A scalar key
-/// widens this enum and [`parse_value`]/[`render_value`] alongside it; nothing
-/// else in this module branches on a key's type.
+/// `[upkeep]` — the check lane's own intent (`aoide session hook`'s
+/// SessionStart/Stop wiring, `aoide-upkeep::checklane`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Upkeep {
+    /// The shell command the check lane runs to answer "is the working tree
+    /// clean" — on a nix host, a `nix flake check` invocation naming the fast
+    /// checks only (fmt/nix-lint/discovery/song-shape/no-song-read/
+    /// surface-ownership: the vm-boot/pkg-*/portability checks are too slow
+    /// for a hook and stay manual); on a non-nix host, `cargo test`/`make
+    /// check`/whatever the project uses. Empty (the default) disables the
+    /// lane outright — core ships with zero opinion on what "clean" means.
+    #[serde(rename = "verifyCommand", default)]
+    pub verify_command: String,
+}
+
+impl Default for Upkeep {
+    fn default() -> Self {
+        Upkeep { verify_command: String::new() }
+    }
+}
+
+/// What shape a key's value takes, and what it may contain. A scalar key has
+/// no vocabulary to check — any string is valid, because [`Upkeep`]'s verify
+/// command is the one config value core cannot itself pass judgment on.
+/// Nothing outside [`parse_value`]/[`render_value`]/[`validate`] branches on
+/// a key's type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueKind {
     /// A list whose every element must appear in this vocabulary. Typed at a
     /// command line as a comma-separated list; empty means the empty list.
     ClosedList(&'static [&'static str]),
+    /// A free-form string — read back as [`KeySpec::read`]'s one-element
+    /// `Vec`, so the walkable-table shape never forks for scalars, but never
+    /// comma-split and never vocabulary-checked.
+    Scalar,
 }
 
 /// One key in one section.
@@ -133,16 +169,28 @@ pub struct SectionSpec {
 
 /// The whole config surface, walkable. Everything that needs to know what a
 /// config key IS reads this — never a match on string literals.
-pub const SCHEMA: &[SectionSpec] = &[SectionSpec {
-    name: "pairing",
-    summary: "The pairing ceremony's own intent.",
-    keys: &[KeySpec {
-        name: "defaultGrant",
-        kind: ValueKind::ClosedList(crate::peer_store::PEER_CAPABILITIES),
-        summary: "Capabilities a peer is granted when it first becomes verified.",
-        read: |c| c.pairing.default_grant.clone(),
-    }],
-}];
+pub const SCHEMA: &[SectionSpec] = &[
+    SectionSpec {
+        name: "pairing",
+        summary: "The pairing ceremony's own intent.",
+        keys: &[KeySpec {
+            name: "defaultGrant",
+            kind: ValueKind::ClosedList(crate::peer_store::PEER_CAPABILITIES),
+            summary: "Capabilities a peer is granted when it first becomes verified.",
+            read: |c| c.pairing.default_grant.clone(),
+        }],
+    },
+    SectionSpec {
+        name: "upkeep",
+        summary: "The check lane's own intent.",
+        keys: &[KeySpec {
+            name: "verifyCommand",
+            kind: ValueKind::Scalar,
+            summary: "Shell command the check lane runs at SessionStart/Stop to verify the working tree. Empty disables the lane.",
+            read: |c| vec![c.upkeep.verify_command.clone()],
+        }],
+    },
+];
 
 /// Every settable key as an operator types it (`<section>.<key>`), in table
 /// order — derived from [`SCHEMA`], so a listing can never disagree with what
@@ -255,7 +303,12 @@ pub fn parse(text: &str, path: &Path) -> Result<Config, LoadError> {
 pub fn validate(config: &Config, path: &Path) -> Result<(), LoadError> {
     for section in SCHEMA {
         for key in section.keys {
-            let ValueKind::ClosedList(vocabulary) = key.kind;
+            let ValueKind::ClosedList(vocabulary) = key.kind else {
+                // Scalar: any string is valid — there is no vocabulary to
+                // check against (the module doc's whole reason this variant
+                // exists).
+                continue;
+            };
             for element in (key.read)(config) {
                 if !vocabulary.contains(&element.as_str()) {
                     return Err(LoadError::InvalidValue {
@@ -287,9 +340,14 @@ pub fn load() -> Result<Loaded, LoadError> {
 
 // ── Values ──────────────────────────────────────────────────────────────────
 
-/// Read a typed value off a command line, per the key's [`ValueKind`].
+/// Read a typed value off a command line, per the key's [`ValueKind`]. A
+/// [`ValueKind::Scalar`] is never comma-split — the raw string IS the value,
+/// whatever it contains (a verify command is one shell line, commas and all).
 pub fn parse_value(kind: &ValueKind, raw: &str) -> Result<Vec<String>, String> {
-    let ValueKind::ClosedList(vocabulary) = kind;
+    let vocabulary = match kind {
+        ValueKind::ClosedList(v) => v,
+        ValueKind::Scalar => return Ok(vec![raw.to_string()]),
+    };
     if raw.trim().is_empty() {
         // "Grant nothing" is a real intent, not a typo.
         return Ok(Vec::new());
@@ -313,9 +371,36 @@ pub fn parse_value(kind: &ValueKind, raw: &str) -> Result<Vec<String>, String> {
     Ok(values)
 }
 
-/// A value as it reads in the file — the same rendering `aoide config` prints.
-pub fn render_value(value: &[String]) -> String {
-    format!("[{}]", value.iter().map(|v| format!("\"{v}\"")).collect::<Vec<_>>().join(", "))
+/// Escape a value for DISPLAY as a TOML basic string (backslash, then quote —
+/// the two characters a basic string cannot carry literally). Display only:
+/// the file itself is always written through `toml_edit` (`set`, below),
+/// which does its own correct escaping independently of this — this
+/// function exists solely so [`render_value`]'s output (`aoide config`'s
+/// listing, `set`'s own confirmation line) never LIES about what a value
+/// holds. A verify command containing a literal `"` (`sh -c "make check"`
+/// is an ordinary shape) is exactly the case a naive `format!("\"{v}\"")`
+/// renders as broken-looking, ambiguous text.
+fn escape_toml_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// A value as it reads in the file — the same rendering `aoide config`
+/// prints. A [`ValueKind::Scalar`] renders as a bare TOML string, never an
+/// array of one.
+pub fn render_value(kind: &ValueKind, value: &[String]) -> String {
+    match kind {
+        ValueKind::ClosedList(_) => format!(
+            "[{}]",
+            value
+                .iter()
+                .map(|v| format!("\"{}\"", escape_toml_string(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        ValueKind::Scalar => {
+            format!("\"{}\"", escape_toml_string(value.first().map(String::as_str).unwrap_or("")))
+        }
+    }
 }
 
 fn unknown_element(element: &str, vocabulary: &[&str]) -> String {
@@ -418,10 +503,6 @@ pub fn set(key: &str, raw: &str) -> Result<SetOutcome, SetRefusal> {
 
     let value = parse_value(&spec.kind, raw)
         .map_err(|detail| SetRefusal::BadValue { key: key.to_string(), detail })?;
-    let mut array = toml_edit::Array::new();
-    for element in &value {
-        array.push(element.as_str());
-    }
     // A section the file does not carry yet is created as a REAL `[section]`
     // header, never the inline `section = { key = ... }` an implicitly-created
     // table renders as. Same shape the nix front-end renders and the same shape
@@ -432,7 +513,19 @@ pub fn set(key: &str, raw: &str) -> Result<SetOutcome, SetRefusal> {
         table.set_implicit(false);
         doc.insert(section.name, toml_edit::Item::Table(table));
     }
-    doc[section.name][spec.name] = toml_edit::value(array);
+    match spec.kind {
+        ValueKind::ClosedList(_) => {
+            let mut array = toml_edit::Array::new();
+            for element in &value {
+                array.push(element.as_str());
+            }
+            doc[section.name][spec.name] = toml_edit::value(array);
+        }
+        ValueKind::Scalar => {
+            let scalar = value.first().map(String::as_str).unwrap_or("");
+            doc[section.name][spec.name] = toml_edit::value(scalar);
+        }
+    }
 
     let text = doc.to_string();
     let after = parse(&text, &path)
@@ -455,7 +548,7 @@ pub fn set(key: &str, raw: &str) -> Result<SetOutcome, SetRefusal> {
     Ok(SetOutcome {
         path,
         key: key.to_string(),
-        value: render_value(&value),
+        value: render_value(&spec.kind, &value),
         changed: before != after,
         created,
     })
@@ -505,12 +598,15 @@ mod tests {
     // ── The table ───────────────────────────────────────────────────────────
 
     #[test]
-    fn every_table_row_reads_a_real_field_and_the_defaults_are_inside_their_own_vocabulary() {
+    fn every_table_row_reads_a_real_field_and_closed_list_defaults_are_inside_their_own_vocabulary() {
         let defaults = Config::default();
         assert!(!SCHEMA.is_empty());
         for section in SCHEMA {
             for key in section.keys {
-                let ValueKind::ClosedList(vocabulary) = key.kind;
+                let ValueKind::ClosedList(vocabulary) = key.kind else {
+                    // Scalar: nothing to check against — every string is valid.
+                    continue;
+                };
                 assert!(!vocabulary.is_empty(), "{}.{} has an empty vocabulary", section.name, key.name);
                 for element in (key.read)(&defaults) {
                     assert!(
@@ -526,7 +622,10 @@ mod tests {
 
     #[test]
     fn the_key_listing_and_the_lookup_agree_with_the_table() {
-        assert_eq!(keys(), vec!["pairing.defaultGrant".to_string()]);
+        assert_eq!(
+            keys(),
+            vec!["pairing.defaultGrant".to_string(), "upkeep.verifyCommand".to_string()]
+        );
         for dotted in keys() {
             assert!(lookup(&dotted).is_some(), "{dotted} lists but does not resolve");
         }
@@ -538,8 +637,16 @@ mod tests {
     #[test]
     fn the_pairing_vocabulary_is_the_one_peer_allow_already_enforces() {
         let (_, spec) = lookup("pairing.defaultGrant").unwrap();
-        let ValueKind::ClosedList(vocabulary) = spec.kind;
+        let ValueKind::ClosedList(vocabulary) = spec.kind else {
+            panic!("pairing.defaultGrant must stay a ClosedList");
+        };
         assert_eq!(vocabulary, crate::peer_store::PEER_CAPABILITIES);
+    }
+
+    #[test]
+    fn the_verify_command_is_a_scalar_with_no_vocabulary_to_check() {
+        let (_, spec) = lookup("upkeep.verifyCommand").unwrap();
+        assert_eq!(spec.kind, ValueKind::Scalar);
     }
 
     // ── Schema ──────────────────────────────────────────────────────────────
@@ -548,6 +655,22 @@ mod tests {
     fn an_empty_document_is_every_default() {
         assert_eq!(parse("", &probe()).unwrap(), Config::default());
         assert_eq!(Config::default().pairing.default_grant, vec!["read".to_string()]);
+        assert_eq!(Config::default().upkeep.verify_command, "", "the lane is off until configured");
+    }
+
+    #[test]
+    fn a_verify_command_round_trips_commas_spaces_and_all() {
+        // A scalar is never comma-split — a real verify command is one shell
+        // line that may itself contain commas.
+        let c = parse(
+            "[upkeep]\nverifyCommand = \"nix flake check .#checks.x86_64-linux.{fmt,nix-lint}\"\n",
+            &probe(),
+        )
+        .unwrap();
+        assert_eq!(
+            c.upkeep.verify_command,
+            "nix flake check .#checks.x86_64-linux.{fmt,nix-lint}"
+        );
     }
 
     #[test]
@@ -778,7 +901,65 @@ mod tests {
 
     #[test]
     fn render_value_matches_what_the_file_holds() {
-        assert_eq!(render_value(&["read".to_string()]), "[\"read\"]");
-        assert_eq!(render_value(&[]), "[]");
+        let list = ValueKind::ClosedList(&[]);
+        assert_eq!(render_value(&list, &["read".to_string()]), "[\"read\"]");
+        assert_eq!(render_value(&list, &[]), "[]");
+        assert_eq!(render_value(&ValueKind::Scalar, &["cargo test".to_string()]), "\"cargo test\"");
+    }
+
+    #[test]
+    fn render_value_escapes_a_literal_quote_instead_of_rendering_a_lie() {
+        // Review finding: `sh -c "make check"`-shaped commands are ordinary,
+        // and an unescaped render used to produce
+        // `"sh -c "make check""` — text that does not even round-trip as one
+        // TOML string. This is a DISPLAY fix only: the file itself is never
+        // affected (`set_writes_and_reads_back_a_verify_command...` below
+        // proves the actual write/read round trip separately).
+        let escaped = render_value(&ValueKind::Scalar, &["sh -c \"make check\"".to_string()]);
+        assert_eq!(escaped, "\"sh -c \\\"make check\\\"\"");
+    }
+
+    // ── The verify command, end to end ─────────────────────────────────────
+
+    #[test]
+    fn set_writes_and_reads_back_a_verify_command_as_a_bare_toml_string_not_an_array_of_one() {
+        with_temp_root("verify-set", |dir| {
+            let out = set("upkeep.verifyCommand", "nix flake check").unwrap();
+            assert!(out.created);
+            assert!(out.changed);
+            assert_eq!(out.value, "\"nix flake check\"");
+            let text = std::fs::read_to_string(dir.join(CONFIG_FILE)).unwrap();
+            assert!(
+                text.contains("verifyCommand = \"nix flake check\""),
+                "a scalar must render as a bare string, never `[\"nix flake check\"]`: {text}"
+            );
+            let loaded = load().unwrap();
+            assert_eq!(loaded.config.upkeep.verify_command, "nix flake check");
+        });
+    }
+
+    #[test]
+    fn set_confirmation_line_escapes_a_verify_command_containing_a_literal_quote() {
+        with_temp_root("verify-quote", |_| {
+            let out = set("upkeep.verifyCommand", "sh -c \"make check\"").unwrap();
+            // The CONFIRMATION line (what an operator actually reads back) is
+            // escaped, not the broken `"sh -c "make check""` a naive render
+            // used to produce.
+            assert_eq!(out.value, "\"sh -c \\\"make check\\\"\"");
+            // The FILE itself round-trips correctly regardless — `toml_edit`
+            // did its own correct escaping the whole time; this was always a
+            // display-only bug.
+            assert_eq!(load().unwrap().config.upkeep.verify_command, "sh -c \"make check\"");
+        });
+    }
+
+    #[test]
+    fn setting_the_verify_command_to_empty_disables_the_lane_and_is_a_real_intent() {
+        with_temp_root("verify-empty", |_| {
+            set("upkeep.verifyCommand", "cargo test").unwrap();
+            let out = set("upkeep.verifyCommand", "").unwrap();
+            assert!(out.changed);
+            assert_eq!(load().unwrap().config.upkeep.verify_command, "");
+        });
     }
 }
