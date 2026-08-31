@@ -663,13 +663,13 @@ mod tests {
         // A scalar is never comma-split — a real verify command is one shell
         // line that may itself contain commas.
         let c = parse(
-            "[upkeep]\nverifyCommand = \"nix flake check .#checks.x86_64-linux.{fmt,nix-lint}\"\n",
+            "[upkeep]\nverifyCommand = \"nix build --no-link .#checks.x86_64-linux.{fmt,nix-lint}\"\n",
             &probe(),
         )
         .unwrap();
         assert_eq!(
             c.upkeep.verify_command,
-            "nix flake check .#checks.x86_64-linux.{fmt,nix-lint}"
+            "nix build --no-link .#checks.x86_64-linux.{fmt,nix-lint}"
         );
     }
 
