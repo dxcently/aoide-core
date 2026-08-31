@@ -5,7 +5,7 @@
 //!
 //! - **`pair ask`** — the INBOUND (approver) dialog: the SAME six-boxes-
 //!   plus-dash digit ENTRY surface `lyra secrets ask` (P3) renders,
-//!   spawned by `aoide peer pair watch --popup` in place of `zenity
+//!   spawned by `aoide pair watch --popup` in place of `zenity
 //!   --entry` once `aoide_client::pair_watch::resolve_lyra_bin` finds this
 //!   binary. The approver's code arrives from ELSEWHERE (the requester's
 //!   own screen, read aloud or glanced at out-of-band) and is TYPED here
@@ -65,7 +65,7 @@
 //! **The QML is paint only** (root `AGENTS.md` house rule 7's "delete
 //! every `.qml`" test) — the capability (approving a pairing request,
 //! inbound with a typed code or outbound with a confirm) stays reachable
-//! with nothing but a shell: `aoide peer pair approve <id> [--code
+//! with nothing but a shell: `aoide pair <id> [--code
 //! <code>]` and each command's own zenity fallback both work with this
 //! file deleted entirely.
 
@@ -79,7 +79,7 @@ use serde_json::json;
 pub fn register(r: &mut Registry) {
     r.insert(cmd!(
         path: ["pair", "ask"],
-        summary: "Render a quickshell code-entry dialog for one actionable INBOUND pairing request -- the same six-digit-boxes-plus-dash surface `lyra secrets ask` renders, collecting a TYPED SAS code read from the requester's own screen. CLI-only: the counterpart `aoide peer pair watch --popup` spawns in place of `zenity --entry` when this binary resolves.",
+        summary: "Render a quickshell code-entry dialog for one actionable INBOUND pairing request -- the same six-digit-boxes-plus-dash surface `lyra secrets ask` renders, collecting a TYPED SAS code read from the requester's own screen. CLI-only: the counterpart `aoide pair watch --popup` spawns in place of `zenity --entry` when this binary resolves.",
         args: [],
         flags: [
             flag!("id", "string", "The pairing request id (display + audit only)."),
@@ -92,7 +92,7 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["pair", "confirm"],
-        summary: "Render a quickshell confirm dialog for one actionable OUTBOUND pairing request -- shows this instance's own locally-derived SAS large and plain, a single Approve/Dismiss action, never a retype. CLI-only: the counterpart `aoide peer pair watch --popup` spawns in place of `zenity --question` when this binary resolves.",
+        summary: "Render a quickshell confirm dialog for one actionable OUTBOUND pairing request -- shows this instance's own locally-derived SAS large and plain, a single Approve/Dismiss action, never a retype. CLI-only: the counterpart `aoide pair watch --popup` spawns in place of `zenity --question` when this binary resolves.",
         args: [],
         flags: [
             flag!("id", "string", "The pairing request id (display + audit only)."),

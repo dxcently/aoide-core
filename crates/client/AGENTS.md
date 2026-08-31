@@ -198,7 +198,7 @@
   POSTs `build_pair_reveal_body(id, nonce)` to the SAME door before ever
   computing or printing a SAS — a reveal that fails (unreachable,
   HTTP error, or the peer refusing with a commitment mismatch) fails the
-  whole `peer pair` call (either arm — `pair_via_url`/`pair_via_hostname`,
+  whole `aoide pair` call (either arm — `pair_via_url`/`pair_via_hostname`,
   P-PV2, both call this one core); nothing is parked as a usable outbound
   entry with an unrevealed commitment on this side, since this side chose
   the nonce and always has it.
@@ -227,7 +227,7 @@
   never echoes the SAS (task #120 P3).** `approve_inbound`'s prompt and
   mismatch messages name the code's SHAPE (`NNN-NNN`), never its value —
   printing the expected code beside the input would collapse the
-  out-of-band comparison into a copy exercise (`peer pending` shows NO
+  out-of-band comparison into a copy exercise (bare `aoide pair` shows NO
   code at all, P-PV2 — the threat model is the comparison, not secrecy,
   but a listing either operator can glance at defeats it just the same
   as an echoed prompt would). A wrong
@@ -241,7 +241,7 @@
   outbound (requester) half, whose confirm is unchanged: the requester's
   own screen already printed the code, so a typed-code gate there would
   be this side typing its own output back at itself.
-- **`reject_by_id(cmd, id)` is `handle_peer_pair_reject`'s entire body,
+- **`reject_by_id(cmd, id)` is `handle_pair_reject`'s entire body,
   extracted (P-P5) so a caller with only an id — no `&Invocation` to
   construct — can reject a pairing request too.** Keep it a pure
   `(cmd, id) -> Outcome`; don't grow it a `skip_confirm`-shaped parameter
@@ -249,7 +249,7 @@
   refusal"), so there is nothing for a caller to skip.
 - **`pair_watch::reconcile` is a SEPARATE, independent re-implementation
   of the SAS-deriving arg orders `approve_inbound`/`approve_outbound`
-  hold — not a shared helper, DELIBERATELY (P-P5).** `peer pending`
+  hold — not a shared helper, DELIBERATELY (P-P5).** Bare `aoide pair`
   itself carries NO SAS at all (P-PV2, the User's locked spec) — the
   code is read off the requester's own screen and typed on the
   approver's, never shown in a listing either operator could just glance
@@ -309,7 +309,7 @@
   derived, unit-tested directly (no dial, no tempdir), so a future change
   to that derivation touches one pure function, never two call sites that
   could drift. CONTRACTS.md §6's "Discovery advertisement" subsection
-  promises `peer pair`'s hostname arm "runs the ceremony," and this is
+  promises `pair`'s hostname arm "runs the ceremony," and this is
   what makes that literally true rather than aspirational: a future
   change to the ceremony's wire calls, its outbound-parking shape, or its
   SAS derivation touches ONE function and every caller inherits it
@@ -325,7 +325,7 @@
   `aoide_storage::advertise::parse_and_validate` validated before it was
   ever displayed. Don't move the `valid_peer_name` check INTO `run_pair_request`
   "for symmetry" — it would just re-run a check that has already passed on
-  the hostname arm, for no benefit, and would misattribute a `peer.pair`
+  the hostname arm, for no benefit, and would misattribute a `pair`
   usage error to a check that only ever fires for the OTHER arm in
   practice.
 - **`discover`'s `run_sweep`/`resolve_invite_target` never touch
@@ -335,8 +335,9 @@
   nothing
   (`docs/architecture/PAIRING.md`'s "Discovery (advertise-but-locked)"
   section) — the only peer-record write path in this crate is, and stays,
-  `run_pair_request`'s `park_outbound` plus `handle_peer_pair_approve`'s
-  `upsert_paired_peer` calls. A future `peer discover`/`peer pair` edit
+  `run_pair_request`'s `park_outbound` plus `approve_inbound_leg`/
+  `resume_outbound_leg`'s
+  `upsert_paired_peer` calls. A future `peer discover`/`aoide pair` edit
   that seems to want a registry write (e.g. "remember what was last
   discovered") belongs in a NEW, explicitly-named cache, never folded into
   `state/peers.json` itself.

@@ -272,7 +272,7 @@
   **A caller passing `None` must mean "nothing to say," never "clear
   it"** — `approve_outbound` (`aoide-client`) only calls `set_peer_via` at
   all when the ceremony resolved an actual via; a re-pair that named none
-  leaves a previously-recorded `via` (e.g. one `peer pair`'s hostname arm set) exactly
+  leaves a previously-recorded `via` (e.g. one `aoide pair`'s hostname arm set) exactly
   as it was, the same untouched-unless-named stance `upsert_paired_peer`
   itself holds for `autogate`/`tokenFile`/`bearerSecret`/`hub`/`allows`.
 - **`pairing`'s request ids are deliberately NOT `state/stage/pending.json`'s
@@ -311,7 +311,7 @@
   a nonce — only a commitment) and gains it only once `reveal_inbound`
   verifies the commitment. A caller deriving a SAS from an inbound entry
   MUST check `is_some()` first (`aoide-client::pair_watch::reconcile`'s
-  own `Pending.sas: Option<..>`, `peer pair approve`'s "awaiting reveal"
+  own `Pending.sas: Option<..>`, `aoide pair`'s "awaiting reveal"
   refusal) — treating `None` as
   "empty string" or defaulting it would let an unrevealed entry's SAS
   silently derive from an attacker-guessable value instead of refusing.
@@ -495,7 +495,8 @@
   list|read|clear`, `identity`, and `config`/`config set`) adds a
   `cmd!`/`register` entry in `commands.rs`, wired into the owning app
   crate's `commands::all()`. The
-  pairing ceremony's own CLI commands (`peer pair *`) live in `aoide-client`
+  pairing ceremony's own CLI commands (`aoide pair`/`pair reject`/`pair
+  watch`) live in `aoide-client`
   instead — this crate exposes the `pairing`/`peer_store` library only,
   since the ceremony needs outbound HTTP transport this crate never holds.
 

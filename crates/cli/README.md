@@ -14,11 +14,11 @@ correspondence").
 - `cli`/`dispatch` — argv parsing and the dispatcher, over
   `aoide_protocol::door::run`'s shared skeleton with core's own `special`
   hook (`mcp serve --stdio`, `a2a serve`, `secrets serve`, `secrets exec`,
-  `secrets enroll`, `secrets watch`, `events tail`, `peer pair watch`
+  `secrets enroll`, `secrets watch`, `events tail`, `pair watch`
   (P-P5), `conductor`, `guide`/`schema` raw output).
-- `registry` — the golden command-path snapshot test (75 paths — this
-  number tracks `crates/cli/src/registry.rs`'s own golden list; that file
-  is the source of truth, this prose a restatement of it).
+- `registry` — the golden command-path snapshot test; its golden list
+  is the source of truth for the path set and its count (this prose
+  deliberately states no number).
 - `guide` — `aoide guide`, the onboarding tier map.
 - `commands` — the root-coupled groups that must read the ASSEMBLED
   registry: `meta` (guide/schema), `stubs` (not-yet-implemented
@@ -41,16 +41,17 @@ depends on it.
 
 ## How it composes
 
-75 command paths (core's headless-capable, agent-orchestration surface: the
+The command paths (count: the golden list in `src/registry.rs`, asserted
+as an exact set — core's headless-capable, agent-orchestration surface: the
 project/session graph (including `resurrect`, its ledger-backed
 session revival), A2A, peers (including the `peer hub` designation,
-P-D5, the `peer pair <target>`/`peer pending`/`peer pair approve|reject|watch`
-pairing ceremony, P-P2/P-P5/P-PV2, the `peer allow <name> <cap> on|off`
+P-D5, the `aoide pair [<name|url|id>]`/`pair reject`/`pair watch`
+one-verb pairing ceremony, P-P2/P-P5/P-PV2/task #135 P3', the `peer allow <name> <cap> on|off`
 closed-capability grant/revoke command backing the A2A spawn arm's hard
 gate, P-P3, `peer spawn <name> -- <text…>`, P-P5b, the signed
 spawn-shaped `message/send` that actually reaches that gate, and `peer
 discover [--secs N]`/`peer advertise on|off`, P-P6 + task #120, the LAN
-discovery advertisement's read-only sweep (`peer pair`'s own hostname arm
+discovery advertisement's read-only sweep (`pair`'s own hostname arm
 is the sugar-over-the-ceremony half, P-PV2), and this instance's
 own advertise switch), presence, the
 daemon, its own event bus (`events tail`), usage, hooks, the message

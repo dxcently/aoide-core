@@ -9,8 +9,8 @@
 //! from a forwarded notification's text).
 //!
 //! **Discovery grants NOTHING** (PAIRING.md, verbatim): an advertisement
-//! only ever feeds `peer discover`'s printed table and `peer invite`'s
-//! target resolution — the pairing ceremony (`peer pair request`, P-P2) is
+//! only ever feeds `peer discover`'s printed table and `pair`'s
+//! hostname-arm target resolution — the pairing ceremony (`pair`, P-P2) is
 //! the only thing that ever writes `state/peers.json`. This module has no
 //! dependency on `peer_store` for writing anything, and never will; it
 //! reaches into it for exactly one READ (`valid_peer_name`, the same

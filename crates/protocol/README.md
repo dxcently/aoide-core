@@ -92,7 +92,7 @@ other crate in this workspace sits above.
   for once it has — `choose`/`choose_many` (single/multi-select),
   `confirm` (y/N), `hidden_input` (password entry), `text_input` (one
   echoed line — `hidden_input`'s visible sibling, for input the typist
-  must see, like `peer pair approve`'s typed pairing code). Each forks on
+  must see, like `aoide pair`'s typed pairing code). Each forks on
   whether stdin/stdout are a capable terminal: a capable tty backs
   `choose`/`choose_many`/`confirm` with `inquire::Select`/`MultiSelect`/
   `Confirm`, and is the ONLY backend `hidden_input` (`inquire::Password`,

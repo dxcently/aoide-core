@@ -1,11 +1,11 @@
-//! `aoide peer pair watch` (P-P5): a foreground, line-mode follow of
+//! `aoide pair watch` (P-P5): a foreground, line-mode follow of
 //! `aoided`'s own events feed for the pairing-ceremony milestones
 //! `aoide_server::a2a::emit_pairing_event` writes (`pair-parked`/
 //! `pair-revealed`, `class: "gate"`, `source: "a2a-door"`, CONTRACTS.md
 //! §6's "Pairing events feed" subsection) — the SAME tail/reconcile/
 //! narrate shape. The third kind, `pair-awaiting-confirm`, is DORMANT
 //! since task #119 retired the approver→requester callback that was its
-//! only emitter: approval is learned by `peer pair approve`'s own
+//! only emitter: approval is learned by `pair <id>`'s own
 //! synchronous poll, so the watcher can no longer self-trigger on an
 //! outbound approval (CONTRACTS.md's feed subsection carries the same
 //! note; active polling in this watch loop is the named follow-on, not
@@ -245,13 +245,13 @@ pub fn narrate(event: &PairEvent) -> String {
         }
         PairEvent::Revealed { id, name, ts } => {
             format!(
-                "  {}  revealed    pairing request {id} from `{name}` \u{2014} run `aoide peer pair approve {id}` \
+                "  {}  revealed    pairing request {id} from `{name}` \u{2014} run `aoide pair {id}` \
                  and type the code read from the requester's own screen",
                 hms(*ts)
             )
         }
         PairEvent::AwaitingConfirm { id, name, ts } => {
-            format!("  {}  approved    `{name}` approved pairing {id} \u{2014} confirm with `aoide peer pair approve {id}`", hms(*ts))
+            format!("  {}  approved    `{name}` approved pairing {id} \u{2014} confirm with `aoide pair {id}`", hms(*ts))
         }
     }
 }
@@ -304,7 +304,7 @@ pub struct Pending {
 /// use per direction (inbound: `(entry.pubkeyHex, own_pubkey, requester_nonce,
 /// entry.approverNonceHex)`; outbound: `(own_pubkey, entry.pubkeyHex,
 /// requester_nonce, approver_nonce)`) — a swap here would silently derive
-/// a DIFFERENT code than `peer pair approve` shows, which is
+/// a DIFFERENT code than `pair <id>` shows, which is
 /// exactly what this module's own byte-equality test catches. An
 /// identity-load failure degrades to an empty list (best-effort,
 /// consistent with a watcher's own "can't answer this tick, try again
@@ -352,7 +352,7 @@ pub fn reconcile(now_epoch: i64) -> Vec<Pending> {
     out
 }
 
-/// Is `p` actionable RIGHT NOW — worth a `peer pair approve`, or (with
+/// Is `p` actionable RIGHT NOW — worth a `pair <id>`, or (with
 /// `--popup`) a confirm dialog? An inbound entry only once it carries a
 /// SAS (unrevealed means nothing to confirm yet, `approve_inbound`'s own
 /// `awaiting-reveal` refusal) AND is still `awaiting-approval` — an
@@ -442,11 +442,11 @@ fn run_ask_dialog(lyra_cmd: Option<&str>, zenity_cmd: &str, id: &str, name: &str
     let result = run_lyra_entry(lyra, id, name, context, &mut should_cancel);
     match &result {
         DialogResult::SpawnError(e) | DialogResult::DialogFailure(e) => {
-            eprintln!("aoide peer pair watch --popup: lyra pair ask failed for request {id}: {e} \u{2014} falling back to zenity for this request");
+            eprintln!("aoide pair watch --popup: lyra pair ask failed for request {id}: {e} \u{2014} falling back to zenity for this request");
             if zenity_available(zenity_cmd) {
                 run_zenity_entry(zenity_cmd, title, context, should_cancel)
             } else {
-                eprintln!("aoide peer pair watch --popup: zenity is not available either \u{2014} request {id} stays parked, will retry");
+                eprintln!("aoide pair watch --popup: zenity is not available either \u{2014} request {id} stays parked, will retry");
                 result
             }
         }
@@ -512,11 +512,11 @@ fn run_confirm_dialog(
     let result = run_lyra_confirm(lyra, id, name, context, code, &mut should_cancel);
     match &result {
         DialogResult::SpawnError(e) | DialogResult::DialogFailure(e) => {
-            eprintln!("aoide peer pair watch --popup: lyra pair confirm failed for request {id}: {e} \u{2014} falling back to zenity for this request");
+            eprintln!("aoide pair watch --popup: lyra pair confirm failed for request {id}: {e} \u{2014} falling back to zenity for this request");
             if zenity_available(zenity_cmd) {
                 run_zenity_confirm(zenity_cmd, title, text, should_cancel)
             } else {
-                eprintln!("aoide peer pair watch --popup: zenity is not available either \u{2014} request {id} stays parked, will retry");
+                eprintln!("aoide pair watch --popup: zenity is not available either \u{2014} request {id} stays parked, will retry");
                 result
             }
         }
@@ -626,16 +626,16 @@ fn commit_approval(p: &Pending, code: &str, now_epoch: i64) -> aoide_protocol::o
     let now = aoide_storage::time::now_iso_utc();
     match p.direction.as_str() {
         "inbound" => match aoide_storage::pairing::list_inbound(now_epoch).into_iter().find(|e| e.id == p.id) {
-            Some(entry) => crate::commands::approve_inbound(crate::commands::InboundGate::Code(code.to_string()), "peer.pair.approve", &p.id, entry, &now, now_epoch, None),
+            Some(entry) => crate::commands::approve_inbound(crate::commands::InboundGate::Code(code.to_string()), "pair", &p.id, entry, &now, now_epoch, None),
             None => aoide_protocol::output::Outcome::error(
-                "peer.pair.approve",
+                "pair",
                 format!("pairing request `{}` is no longer pending — nothing to confirm", p.id),
             ),
         },
         _ => match aoide_storage::pairing::list_outbound(now_epoch).into_iter().find(|e| e.id == p.id) {
-            Some(entry) => crate::commands::approve_outbound(true, "peer.pair.approve", &p.id, entry, &now, now_epoch, None),
+            Some(entry) => crate::commands::approve_outbound(true, "pair", &p.id, entry, &now, now_epoch, None),
             None => aoide_protocol::output::Outcome::error(
-                "peer.pair.approve",
+                "pair",
                 format!("pairing request `{}` is no longer pending — nothing to confirm", p.id),
             ),
         },
@@ -694,7 +694,7 @@ fn popup_tick(ignored: &mut HashSet<String>, spawn_backoff: &mut Duration, spawn
         *spawn_failing = false;
         *spawn_backoff = SPAWN_BACKOFF_INITIAL;
         if !json_mode {
-            println!("  aoide peer pair watch --popup: the dialog is spawning again \u{2014} backoff cleared");
+            println!("  aoide pair watch --popup: the dialog is spawning again \u{2014} backoff cleared");
         }
     }
 
@@ -707,7 +707,7 @@ fn popup_tick(ignored: &mut HashSet<String>, spawn_backoff: &mut Duration, spawn
             }
         }
         PopupDecision::Reject => {
-            let outcome = crate::commands::reject_by_id("peer.pair.reject", &p.id);
+            let outcome = crate::commands::reject_by_id("pair.reject", &p.id);
             if !json_mode {
                 println!("  {}", outcome.message);
             }
@@ -725,7 +725,7 @@ fn popup_tick(ignored: &mut HashSet<String>, spawn_backoff: &mut Duration, spawn
                 *spawn_failing = true;
                 if !json_mode {
                     eprintln!(
-                        "  aoide peer pair watch --popup: request {} has no working dialog right now \u{2014} backing off, retrying up to every {}s",
+                        "  aoide pair watch --popup: request {} has no working dialog right now \u{2014} backing off, retrying up to every {}s",
                         p.id,
                         SPAWN_BACKOFF_MAX.as_secs()
                     );
@@ -756,12 +756,12 @@ fn wait_for_follower(events_path: &Path, poll_interval: Duration) -> Result<Foll
             Ok(f) => return Ok(f),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if !narrated {
-                    eprintln!("aoide peer pair watch: waiting for the events feed to appear at {}", events_path.display());
+                    eprintln!("aoide pair watch: waiting for the events feed to appear at {}", events_path.display());
                     narrated = true;
                 }
             }
             Err(e) => {
-                eprintln!("aoide peer pair watch: opening {}: {e}", events_path.display());
+                eprintln!("aoide pair watch: opening {}: {e}", events_path.display());
                 return Err(1);
             }
         }
@@ -775,7 +775,7 @@ fn wait_for_follower(events_path: &Path, poll_interval: Duration) -> Result<Foll
     }
 }
 
-/// The full `aoide peer pair watch` command — foreground, blocks until
+/// The full `aoide pair watch` command — foreground, blocks until
 /// Ctrl-C. `events_path` is resolved ONCE by the caller (`cli`'s own
 /// `special` hook, the SAME "resolve once, pass as a parameter"
 /// discipline `events tail`/`secrets watch` already hold) — this function
@@ -796,8 +796,8 @@ pub fn run(events_path: &Path, json_mode: bool, popup_mode: bool) -> i32 {
     let lyra_cmd = resolve_lyra_bin();
     if popup_mode && lyra_cmd.is_none() && !zenity_available(ZENITY_CMD) {
         eprintln!(
-            "aoide peer pair watch --popup: neither `lyra` nor `zenity` was found \u{2014} install \
-             one of them, or run `aoide peer pair watch` (without --popup) instead"
+            "aoide pair watch --popup: neither `lyra` nor `zenity` was found \u{2014} install \
+             one of them, or run `aoide pair watch` (without --popup) instead"
         );
         return 1;
     }
@@ -853,7 +853,7 @@ pub fn run(events_path: &Path, json_mode: bool, popup_mode: bool) -> i32 {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
             if !json_mode {
                 for p in reconcile(now_epoch).iter().filter(|p| actionable(p)) {
-                    println!("  {} is actionable \u{2014} run `aoide peer pair approve {}` (or `reject`)", p.id, p.id);
+                    println!("  {} is actionable \u{2014} run `aoide pair {}` (or `aoide pair reject`)", p.id, p.id);
                 }
                 let _ = std::io::stdout().flush();
             }
@@ -959,8 +959,8 @@ mod tests {
 
     /// The swap-catcher: `reconcile`'s own SAS-derivation arg order must
     /// stay byte-identical to `approve_inbound`'s (the AUTHORITATIVE
-    /// derivation an approver's own `peer pair approve` commits against) —
-    /// `peer pending` itself carries no SAS to compare against any more
+    /// derivation an approver's own `pair <id>` commits against) —
+    /// bare `pair` itself carries no SAS to compare against any more
     /// (P-PV2, the User's locked spec), so this pins against the approve
     /// path directly instead.
     #[test]
@@ -1484,7 +1484,7 @@ mod tests {
             }
 
             // The MAX_CODE_TRIESrd wrong code auto-denies: entry removed,
-            // nothing committed — the same clean removal `peer pair reject`
+            // nothing committed — the same clean removal `pair reject`
             // performs.
             let pending = reconcile(now_epoch);
             assert_eq!(pending.len(), 1);
@@ -1606,7 +1606,7 @@ mod tests {
             assert_eq!(decide(DialogResult::Cancelled), PopupDecision::Ignore);
             // `Dismissed` — `decide` sends it to `Reject`, `popup_tick`'s
             // own arm calls `reject_by_id`, never `commit_approval`.
-            let out = crate::commands::reject_by_id("peer.pair.reject", "deadbeef");
+            let out = crate::commands::reject_by_id("pair.reject", "deadbeef");
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
             assert!(aoide_storage::peer_store::load_peers().is_empty(), "nothing was ever committed");

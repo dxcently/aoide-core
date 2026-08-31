@@ -171,6 +171,18 @@ mod tests {
         // `aoide_storage::config`): core is cargo-buildable on any host, so
         // a core command's configuration cannot live in a NixOS option —
         // reached 82.
+        //
+        // Task #135 P3' collapses the pairing surface AGAIN, net 82 -> 79
+        // (the User: "the command set can just be aoide pair"): `peer.pair`,
+        // `peer.pair.approve`, `peer.pair.reject`, `peer.pair.watch` and
+        // `peer.pending` all DIE — hard cutover, no aliases, same as
+        // `peer.invite` before them. Bare `pair` (already registered)
+        // becomes the ONE verb, routed by what already exists (approve an
+        // inbound match, resume an outbound one, else request), plus
+        // `pair.reject` (+1) and `pair.watch` (+1). The `peer` family keeps
+        // the ROSTER (add/list/allow/hub/spawn/pull/status/discover/
+        // advertise); `pair` mints the verified records those operate on.
+        // Net: 82 - 5 + 2 = 79.
         let mut expected: Vec<&str> = vec![
             "a2a.serve",
             "adapter.melete",
@@ -200,17 +212,14 @@ mod tests {
             "melete.status",
             "onboard",
             "pair",
+            "pair.reject",
+            "pair.watch",
             "peer.add",
             "peer.advertise",
             "peer.allow",
             "peer.discover",
             "peer.hub",
             "peer.list",
-            "peer.pair",
-            "peer.pair.approve",
-            "peer.pair.reject",
-            "peer.pair.watch",
-            "peer.pending",
             "peer.pull",
             "peer.remove",
             "peer.spawn",

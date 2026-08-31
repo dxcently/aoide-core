@@ -15,8 +15,8 @@
 //! **Discovery is read-only.** This module never writes `state/peers.json`
 //! — it doesn't even import `peer_store` for writing anything, only
 //! `aoide_storage::advertise` for the wire format. The pairing ceremony
-//! (`commands::run_pair_request`, shared by `peer pair request` and `peer
-//! invite`) is the only thing in this crate that ever commits a peer
+//! (`commands::run_pair_request`, shared by `pair`'s url arm and its
+//! hostname arm) is the only thing in this crate that ever commits a peer
 //! record.
 //!
 //! **No resident listener.** Every call to [`run_sweep`] is one bounded,
@@ -193,7 +193,7 @@ pub fn describe_sweep_error(e: &std::io::Error) -> String {
     }
 }
 
-/// Why `peer pair <hostname>` can't proceed straight to the ceremony —
+/// Why `pair <hostname>` can't proceed straight to the ceremony —
 /// mirrors the shape `pair_via_url`'s own refusals already
 /// take (a reason string plus the taught detail), kept as a typed enum
 /// here so the command handler builds the exact `Outcome` shape without

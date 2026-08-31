@@ -29,7 +29,7 @@
 //! [`interactive`] gate establishes upstream of `choose`), and
 //! [`text_input`] is `hidden_input`'s VISIBLE sibling (`inquire::Text`,
 //! tty-only the same way) for a line the typist must see as they enter it
-//! — `peer pair approve`'s typed pairing code (task #120 P3) is its first
+//! — `pair`'s typed pairing code (task #120 P3) is its first
 //! caller. `inquire` lives in THIS crate's `Cargo.toml` only — every other
 //! crate reaches these entry points, never `inquire` directly (ONBOARD.md's
 //! "wrap, don't scatter").
@@ -395,7 +395,7 @@ pub fn hidden_input(prompt: &str) -> Result<String, String> {
 
 /// [`hidden_input`]'s visible sibling — one line of ordinary, echoed text
 /// (`inquire::Text`), for input the typist must be able to SEE as they
-/// enter it: `peer pair approve`'s typed pairing code (task #120 P3, the
+/// enter it: `pair`'s typed pairing code (task #120 P3, the
 /// first caller) is read off another box's screen and typed here, where a
 /// hidden field would only manufacture typos on a value that is not a
 /// secret from its own typist. Tty-only, exactly like [`hidden_input`]:

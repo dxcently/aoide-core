@@ -74,7 +74,7 @@ are core `aoide` identity, root `AGENTS.md`).
   constant, kept at this path since `lib.rs`'s `special` hook already
   reads it here.
 - `commands::pair` — the pairing ceremony's own TWO dialog commands
-  (P-PV3, task #132), one per direction, spawned by `aoide peer pair watch
+  (P-PV3, task #132), one per direction, spawned by `aoide pair watch
   --popup` in place of the matching zenity invocation once
   `aoide_client::pair_watch::resolve_lyra_bin` finds this binary:
   **`lyra pair ask`** (INBOUND/approver) is the six-box entry surface —

@@ -11,7 +11,7 @@
 //! remembers it sent one ([`OutboundPairingRequest`],
 //! `state/peer-pairing-outbound.json`) so its own A2A door can finish the
 //! ceremony when B's approval callback arrives, possibly long after the
-//! `peer pair request` CLI process that sent it has exited. Same `state/`
+//! `pair` CLI process that sent it has exited. Same `state/`
 //! dir family as `peer_store`'s own `state/peers.json` (account/global
 //! runtime, not song-scoped), same tolerate-missing/additive-round-trip
 //! discipline, same atomic writes.
@@ -31,19 +31,19 @@
 //! counterpart choosing its own values after seeing the commit cannot force
 //! SAS equality. B may reveal its own nonce immediately in its synchronous
 //! response (nothing to hide on B's side — it moves second). A then POSTs
-//! `aoide/pairReveal {id, nonceHex}` right after, in the same `peer pair
-//! request` invocation ([`reveal_inbound`]); B verifies the revealed nonce
+//! `aoide/pairReveal {id, nonceHex}` right after, in the same `pair`
+//! invocation ([`reveal_inbound`]); B verifies the revealed nonce
 //! against the stored commitment and DROPS the parked entry outright on a
 //! mismatch — a wrong nonce means either a bug or a tamper, and there is
 //! nothing left worth keeping parked either way. An inbound entry with no
 //! revealed nonce yet ([`InboundPairingRequest::requester_nonce_hex`]
-//! still `None`) has no SAS to show and cannot be approved — `peer pair
-//! pending` lists it without a code, `peer pair approve` refuses it
+//! still `None`) has no SAS to show and cannot be approved — bare `pair`
+//! (the pending listing) lists it without a code, `pair <id>` refuses it
 //! outright (`docs/architecture/PAIRING.md`'s "awaiting reveal" wording).
 //!
 //! **Neither side commits a peer record on the FIRST human confirmation
 //! alone (review-bounce fix, decision 4's mutual confirmation, for real).**
-//! B's `peer pair approve` still commits B's own record right away — but,
+//! B's `pair <id>` still commits B's own record right away — but,
 //! since Design A (task #119, poll-based completion — B's own door may be
 //! loopback-only, so nothing dials OUT to A anymore), that commit is now
 //! PURELY LOCAL: B marks its own parked entry [`InboundPairingRequest::approved`]
@@ -51,7 +51,7 @@
 //! outbound entry does NOT auto-commit the moment A happens to poll and see
 //! `approved: true` either — that would let a network round trip stand in
 //! for A's OWN operator ever looking at the code, same as before. Instead A's
-//! `peer pair approve <id>` POLLS B's door (`aoide/pairPoll`, over the SAME
+//! `pair <id>` POLLS B's door (`aoide/pairPoll`, over the SAME
 //! forward dial the original request/reveal already used — no callback, no
 //! reverse leg); on a verified `approved` response it calls
 //! [`mark_outbound_awaiting_confirm`] to transition the entry to
@@ -59,7 +59,7 @@
 //! confirm-then-commit y/N prompt B's own approve already holds, only THEN
 //! calling `upsert_paired_peer` — the poll REPLACES the callback as the
 //! trigger for this transition; the state machine and the human-confirm gate
-//! it protects are otherwise unchanged. `peer pair reject <id>` aborts an
+//! it protects are otherwise unchanged. `pair reject <id>` aborts an
 //! outbound entry at EITHER state ([`OutboundState::AwaitingApproval`] or
 //! [`OutboundState::AwaitingConfirm`]) — the ceremony's own missing abort
 //! command, closed without a new command (golden count unchanged).
@@ -105,7 +105,7 @@
 //! (`inbox::receive`'s doc: "one process-wide lock file is enough … a
 //! second lock file would be a new abstraction for zero added
 //! correctness"): the resident `a2a serve` process and a concurrent CLI
-//! invocation (`peer pair approve`/`reject`, a poll release) mutate the
+//! invocation (`pair`/`pair reject`, a poll release) mutate the
 //! same `state/peer-pairing-{inbound,outbound}.json`, and an unserialized
 //! pair of read-modify-writes would silently drop an `approved` flag or a
 //! `tries` increment. `PARK_LOCK` stays alongside it as the in-process cap
@@ -115,7 +115,7 @@
 //! the cap, [`park_inbound`] refuses with a taught error naming the cap
 //! and its env knob — the caller (`aoide-server::a2a::pair_request`) maps
 //! that refusal to a JSON-RPC error, never a silent drop. Outbound entries
-//! are operator-created (one `peer pair request` invocation, one entry)
+//! are operator-created (one `pair` invocation, one entry)
 //! and carry no equivalent cap — nothing unauthenticated can grow that
 //! queue.
 //!
@@ -287,9 +287,9 @@ pub fn derive_commit(pubkey_hex: &str, nonce_hex: &str) -> String {
 // ── Inbound (approver-side): a request PARKED for this instance to approve ──
 
 /// One pairing request parked on the APPROVER's own instance — everything
-/// the approver needs to display it (`peer pair pending`), derive the SAS
+/// the approver needs to display it (the bare `pair` pending listing), derive the SAS
 /// once revealed (`derive_sas` against this instance's own identity), and
-/// commit a peer record on approval (`peer pair approve`), all without any
+/// commit a peer record on approval (`pair <id>`), all without any
 /// further wire round trip to the requester until the approval callback
 /// itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -298,10 +298,10 @@ pub struct InboundPairingRequest {
     /// The requester's public key, hex, no separator.
     #[serde(rename = "pubkeyHex")]
     pub pubkey_hex: String,
-    /// The requester's self-claimed local nickname (`peer pair request
+    /// The requester's self-claimed local nickname (`pair
     /// <url> --name <n>`, or that command's own URL-derived default) — used,
     /// self-asserted, as the approver's OWN nickname for this peer too
-    /// (`peer pair approve` takes no separate `--name`).
+    /// (`pair <id>` takes no separate `--name`).
     pub name: String,
     /// The connecting TCP peer's own address, as classified by
     /// [`crate` — server crate's] `PeerOrigin` at park time — display-only
@@ -318,8 +318,8 @@ pub struct InboundPairingRequest {
     #[serde(rename = "commitHex")]
     pub commit_hex: String,
     /// The requester's own nonce, hex — `None` until [`reveal_inbound`]
-    /// verifies it matches [`Self::commit_hex`]; `peer pair pending` shows
-    /// no SAS and `peer pair approve` refuses this entry while it stays
+    /// verifies it matches [`Self::commit_hex`]; the bare `pair` pending listing shows
+    /// no SAS and `pair <id>` refuses this entry while it stays
     /// `None`.
     #[serde(rename = "requesterNonceHex", default, skip_serializing_if = "Option::is_none")]
     pub requester_nonce_hex: Option<String>,
@@ -334,7 +334,7 @@ pub struct InboundPairingRequest {
     #[serde(rename = "expiresAt")]
     pub expires_at: String,
     /// Design A (poll-based completion, task #119): `true` once this
-    /// instance's own operator has run `peer pair approve` on this entry —
+    /// instance's own operator has run `pair <id>` on this entry —
     /// set by [`mark_inbound_approved`], never unset. An approved entry
     /// stays PARKED (never taken/removed the way the old callback-delivered
     /// design removed it on success) so the requester's own `aoide/pairPoll`
@@ -348,7 +348,7 @@ pub struct InboundPairingRequest {
     /// Typed-code approval (task #120 P3): how many WRONG pairing codes have
     /// been entered against this entry so far — interactive prompt
     /// mismatches and scripted `--code` mismatches both count, cumulatively,
-    /// persisted here so tries survive across `peer pair approve`
+    /// persisted here so tries survive across `pair <id>`
     /// invocations. Bumped by [`record_inbound_code_try`]; the CLI
     /// auto-denies (a clean [`take_inbound`] removal) the moment the count
     /// reaches 3. A crash between the third increment's save and the deny
@@ -368,8 +368,8 @@ pub struct InboundPairingRequest {
     /// connection itself can ever answer "how do I dial this peer back."
     /// `self_via` is the requester's own claim of that hop — same trust
     /// class as [`Self::url`] (self-asserted DATA, a transport marker only;
-    /// trust stays in pubkeys + SAS) — carried through so `peer pair
-    /// approve`'s own commit ([`crate` client crate's `approve_inbound`])
+    /// trust stays in pubkeys + SAS) — carried through so `pair
+    /// <id>`'s own commit ([`crate` client crate's `approve_inbound`])
     /// can record a peer `via` that actually reaches back out.
     /// `#[serde(default, skip_serializing_if = "Option::is_none")]` so a
     /// parked entry predating this field loads `None` and a `None` here
@@ -409,8 +409,8 @@ fn save_inbound(requests: &[InboundPairingRequest]) -> Result<(), String> {
 }
 
 /// List every currently-unexpired inbound request, sweeping (and persisting
-/// the removal of) any that expired since the last touch. `peer pair
-/// pending`'s whole reply (inbound half) — an entry with
+/// the removal of) any that expired since the last touch. The bare `pair`
+/// pending listing's whole reply (inbound half) — an entry with
 /// `requester_nonce_hex: None` has no SAS to show yet (module doc).
 pub fn list_inbound(now_epoch: i64) -> Vec<InboundPairingRequest> {
     with_stage_lock(|| {
@@ -489,8 +489,8 @@ pub fn park_inbound(
 /// Remove and return one inbound request by id, `None` if it never existed
 /// OR has already expired (sweeping happens here too, so an approve/reject
 /// against a just-expired id gets the same honest "unknown id" a genuinely
-/// unknown one would). `peer pair reject`'s inbound-side lookup, and
-/// `peer pair approve`'s final removal once a callback has succeeded.
+/// unknown one would). `pair reject`'s inbound-side lookup, and
+/// `pair <id>`'s final removal once a callback has succeeded.
 pub fn take_inbound(id: &str, now_epoch: i64) -> Result<Option<InboundPairingRequest>, String> {
     with_stage_lock(|| {
         let all = load_inbound_raw();
@@ -524,10 +524,10 @@ pub enum RevealError {
 /// Finding 1) for one parked inbound request: verify `nonce_hex` hashes to
 /// the entry's stored `commit_hex` (`derive_commit(entry.pubkey_hex,
 /// nonce_hex) == entry.commit_hex`) and, on a match, store it as
-/// `requester_nonce_hex` so `peer pair pending`/`approve` can finally
+/// `requester_nonce_hex` so bare `pair`/`pair <id>` can finally
 /// derive a SAS for this entry. A MISMATCH drops the entry outright rather
 /// than leaving it parked — `aoide-server::a2a::pair_reveal` is the wire
-/// caller (`aoide/pairReveal`), `peer pair request`'s second POST (client
+/// caller (`aoide/pairReveal`), `pair`'s second POST (client
 /// crate) is the one production caller of that method.
 pub fn reveal_inbound(id: &str, nonce_hex: &str, now_epoch: i64) -> Result<InboundPairingRequest, RevealError> {
     with_stage_lock(|| {
@@ -641,7 +641,7 @@ pub fn record_inbound_code_try(id: &str, now_epoch: i64) -> Result<u32, MarkAppr
 /// review-bounce Finding 2) — never conflated with [`InboundPairingRequest`]
 /// simply lacking a revealed nonce; an outbound entry only ever exists
 /// AFTER its own reveal already succeeded (`park_outbound`'s one caller,
-/// `peer pair request`, parks only on a successful reveal).
+/// `pair`, parks only on a successful reveal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OutboundState {
     /// Waiting on the approver's own human to confirm the SAS and approve
@@ -652,8 +652,8 @@ pub enum OutboundState {
     AwaitingApproval,
     /// A poll answered `approved` with a matching pubkey
     /// ([`mark_outbound_awaiting_confirm`]) — THIS instance's own operator
-    /// still has to confirm the SAS before anything commits (`peer pair
-    /// approve <id>` on this entry, the requester-side confirm path).
+    /// still has to confirm the SAS before anything commits (`pair
+    /// <id>` on this entry, the requester-side confirm path).
     #[serde(rename = "awaiting-confirm")]
     AwaitingConfirm,
 }
@@ -691,7 +691,7 @@ pub struct OutboundPairingRequest {
     /// `url` on commit.
     pub url: String,
     /// THIS instance's own local nickname for the approver
-    /// (`peer pair request <url> --name <n>`, or its URL-derived default).
+    /// (`pair <url> --name <n>`, or its URL-derived default).
     pub name: String,
     /// The approver's public key, hex — learned from the synchronous
     /// `aoide/pairRequest` response.
@@ -760,7 +760,7 @@ fn save_outbound(requests: &[OutboundPairingRequest]) -> Result<(), String> {
 }
 
 /// Remember that THIS instance sent a request out and its own reveal
-/// already succeeded — `peer pair request`'s own write
+/// already succeeded — `pair`'s own write
 /// ([`OutboundState::AwaitingApproval`] by default). Replaces by id rather
 /// than duplicating (operator-created, no cap needed — module doc).
 pub fn park_outbound(entry: OutboundPairingRequest) -> Result<(), String> {
@@ -772,7 +772,7 @@ pub fn park_outbound(entry: OutboundPairingRequest) -> Result<(), String> {
     })
 }
 
-/// Remove and return one outbound request by id — `peer pair reject`'s
+/// Remove and return one outbound request by id — `pair reject`'s
 /// outbound-side lookup (any state), and the requester-side confirm's
 /// final removal once its own operator has committed.
 pub fn take_outbound(id: &str, now_epoch: i64) -> Result<Option<OutboundPairingRequest>, String> {
@@ -787,7 +787,7 @@ pub fn take_outbound(id: &str, now_epoch: i64) -> Result<Option<OutboundPairingR
 }
 
 /// List every currently-unexpired outbound request, sweeping expired ones
-/// the same way [`list_inbound`] does. `peer pair pending`'s outbound half
+/// the same way [`list_inbound`] does. The bare `pair` pending listing's outbound half
 /// (review-bounce Finding 2 — this used to be a diagnostic-only seam with
 /// no CLI reader; it is now load-bearing).
 pub fn list_outbound(now_epoch: i64) -> Vec<OutboundPairingRequest> {
@@ -822,7 +822,7 @@ pub enum ConfirmMarkError {
 /// (task #119; formerly the `aoide/pairApprove` callback's handler-side
 /// effect): on a pubkey match, transition the outbound entry to
 /// [`OutboundState::AwaitingConfirm`] — deliberately NOT a commit. This
-/// instance's OWN operator still has to run `peer pair approve <id>` and
+/// instance's OWN operator still has to run `pair <id>` and
 /// confirm the SAS before `upsert_paired_peer` ever runs on this side
 /// (module doc: mutual confirmation, for real).
 pub fn mark_outbound_awaiting_confirm(id: &str, pubkey_hex: &str, now_epoch: i64) -> Result<OutboundPairingRequest, ConfirmMarkError> {

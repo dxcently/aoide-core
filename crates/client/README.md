@@ -104,7 +104,7 @@ never the inbound/serve half (that's `aoide-server`).
   env/hostname only) and the self-heard broadcast arrives on the
   physical interface, so such a self-invite proceeds — confusion, not
   compromise; the SAS ceremony backstops it. `resolve_invite_target(heard, name)` is the same
-  shape one layer up: `peer pair`'s hostname arm's zero/one/many-match
+  shape one layer up: `pair`'s hostname arm's zero/one/many-match
   resolution against an already-swept result, also pure, and returns the
   whole `Heard` so `src_addr` reaches that arm for free. Three consumers
   drive `run_sweep`: `handle_peer_discover`, `pair_via_hostname`, and
@@ -228,7 +228,7 @@ never the inbound/serve half (that's `aoide-server`).
   `via_override: None` wrapper so `aoide-conduct`'s existing call site
   needs no change. `--via` (`ssh://[user@]host[:port]`,
   `aoide_storage::tunnel::parse_via`) is a FLAG on `peer.add`/
-  `peer.pair`/`peer.spawn` — never a new command
+  `pair`/`peer.spawn` — never a new command
   path — parsed by the shared `parse_via_flag` (absent is `None`,
   malformed is a usage error, the same `parse_secs_flag` stance).
   **`peer add`'s AgentCard verification (its ONE network call) dials
@@ -247,7 +247,7 @@ never the inbound/serve half (that's `aoide-server`).
   expects). The peer is recorded exactly as the verified path records it:
   `verified` was already hardcoded `false` on this path regardless of the
   fetch (a card fetch is reachability, never identity — that only ever
-  comes from `peer pair`), so skipping it changes nothing about what gets
+  comes from `aoide pair`), so skipping it changes nothing about what gets
   written, only whether the GET runs first.
   The session id a tunnel opens under (`tunnel_session_id`) is
   `AOIDE_SESSION_ID` when a conducted session set it, else a
@@ -276,7 +276,7 @@ never the inbound/serve half (that's `aoide-server`).
   safe against a real, non-autogate peer, not merely possible.
 - `commands` — this crate's CLI commands:
   `peer add/remove/pull/status/hub/allow/spawn/discover`,
-  `peer pair/pending` + `peer pair approve/reject/watch` (P-P2, P-PV2,
+  `aoide pair` + `pair.reject`/`pair.watch` (P-P2, P-PV2, task #135 P3',
   CONTRACTS.md §6/§7 —
   `handle_peer_allow` (`peer allow <name> <cap> on|off`, P-P3, `docs/
   architecture/PAIRING.md` decision 5) is a thin wire around
@@ -286,14 +286,14 @@ never the inbound/serve half (that's `aoide-server`).
   for its own `allows` grants) —
   `poll_outbound_once`/`commit_outbound` are the requester's half as TWO
   named seams (task #135 P2), with `approve_outbound` reduced to calling
-  each once and `wait_and_commit` — `peer pair`'s own blocking tail —
+  each once and `wait_and_commit` — `aoide pair`'s own blocking tail —
   calling the poll on a `PAIR_POLL_CADENCE` until the approver releases.
-  `PairFinish` carries what `peer pair` does after parking (`--wait`,
+  `PairFinish` carries what `aoide pair` does after parking (`--wait`,
   `--yes`, `--allow`); `PairFinish::detached()` is the pre-P2 shape and
   what every test drives so none of them sit on a poll. `--wait 0` is the
   documented escape for a scripted caller that cannot sit on a human, and a
-  timeout returns Ok with the request still parked — `peer pair approve`
-  finishes it later, which is also what makes Ctrl-C safe. The deadline is
+  timeout returns Ok with the request still parked — targeting the same
+  id again finishes it later, which is also what makes Ctrl-C safe. The deadline is
   MONOTONIC (`Instant`, never `now_iso_utc`): a wall-clock deadline is
   defeated outright by an NTP step or a suspend/resume during the wait, which
   would leave the loop polling past the bound the command promised. The wall
@@ -305,12 +305,12 @@ never the inbound/serve half (that's `aoide-server`).
   a substituted reveal; its `PollOutcome::Pending` is the only arm a caller
   may retry, every other being terminal, so a `--wait` loop cannot hammer an
   unreachable box or a refused reveal. A second copy of that loop anywhere is
-  the design error the split exists to prevent — a blocking `peer pair` and
+  the design error the split exists to prevent — a blocking `aoide pair` and
   `mesh pair` both consume these rather than reimplementing them.
   `resolve_grant`/`parse_allow_flag`/`grant_note` are the grant seam both
   commit directions share (task #135 P1): what a FIRST verification stamps
   is `config.toml`'s `[pairing] defaultGrant` (`["read"]` by default), or
-  the `--allow read,spawn` typed on that one `peer pair approve` — parsed by
+  the `--allow read,spawn` typed on that one `aoide pair` — parsed by
   `aoide_storage::config::parse_value` over `PEER_CAPABILITIES`, the same
   validator and the same closed vocabulary `config set` uses, never a second
   list. Comma-separated, not a repeated flag, because `Invocation::flags` is
@@ -326,13 +326,15 @@ never the inbound/serve half (that's `aoide-server`).
   P-I1) rather than a hand-rolled stdin read — `inquire::Confirm` on a tty,
   the identical `y/N` stdin read otherwise; the question text is unchanged,
   `confirm` owns the `[y/N]` decoration now). `pair_via_url`/`pair_via_hostname`
-  (the SMART TARGET dispatch of `peer pair <target>`'s two arms, P-PV2)
+  (the SMART TARGET dispatch of a NEW request's two arms, P-PV2)
   both bottom out in `run_pair_request`, which sends
   the commitment and its reveal as two sequential POSTs in one invocation
-  before ever computing a SAS. `handle_peer_pair_approve`
-  dispatches by direction (Design A, task #119 — REPLACES the old
+  before ever computing a SAS. `approve_inbound_leg`/`resume_outbound_leg`
+  (task #135 P3' — the two legs `pair_continue_or_request` routes a
+  matched target to, replacing the old single `handle_peer_pair_approve`)
+  dispatch by direction (Design A, task #119 — REPLACES the old
   `aoide/pairApprove` reverse callback): on an INBOUND entry
-  (`approve_inbound`) it refuses an unrevealed one outright, then gates on
+  (`approve_inbound_leg` → `approve_inbound`) it refuses an unrevealed one outright, then gates on
   the TYPED pairing code (task #120 P3, `InboundGate` — the operator types
   the code as read off the REQUESTER's screen, compared against the
   locally derived SAS via the pure `code_matches`; the prompt never echoes
@@ -361,7 +363,8 @@ never the inbound/serve half (that's `aoide-server`).
   (the sibling-writer shape `approve_outbound`'s own equivalent call,
   below, already holds). Absent — an old requester, or one with nothing to
   claim — the commit is exactly what it always was: `entry.url` verbatim,
-  `via` left unset. On an OUTBOUND entry (`approve_outbound`) it POLLS
+  `via` left unset. On an OUTBOUND entry (`resume_outbound_leg` →
+  `approve_outbound`) it POLLS
   `aoide/pairPoll` first (over the SAME forward dial `request` already
   used — `entry.via` if one was recorded) and, once the poll comes back
   approved, re-derives the SAME SAS and confirms `y/N` (`--yes` scripted;
@@ -374,17 +377,18 @@ never the inbound/serve half (that's `aoide-server`).
   Code` too now (P-PV3, task #132: the popup collects a typed code the
   SAME way the CLI tty/`--code` paths do, so it runs through the identical
   gate rather than a separate no-prompt variant; the old `DialogConfirmed`
-  variant is retired, nothing constructs it any more). `handle_peer_pair_reject` tries
-  the inbound queue then the outbound queue, aborting an outbound entry at
+  variant is retired, nothing constructs it any more). `handle_pair_reject` tries
+  the inbound queue then the outbound queue by id OR by a name matching
+  exactly one pending request, aborting an outbound entry at
   any stage — the ceremony's abort command; `reject_by_id(cmd, id)` (P-P5)
   is its shared body, extracted so `pair_watch`'s popup arm can reject by
   id alone, with no `Invocation` to construct for a dialog button.
-  `handle_peer_pair_watch` (`peer pair watch [--popup] [--json]`, P-P5,
+  `handle_pair_watch` (`aoide pair watch [--popup] [--json]`, P-P5,
   CONTRACTS.md §6) is the launch-record handler for `pair_watch::run`
   (below) — the SAME "gate the door and the flag combo here, run the
   blocking loop from `cli`'s own `special` hook" split `handle_events_tail`/
-  `handle_secrets_watch` already hold, appended newest in
-  `register_peer_pair`.
+  `handle_secrets_watch` already hold, registered as `pair.watch` in
+  `register_pair`.
   **`pair_watch` (P-P5, a NEW module, CONTRACTS.md §6's "Pairing events
   feed" subsection)** is the pairing ceremony's own watcher: `parse_pair_line`
   reads the `class: "gate"`/`source: "a2a-door"` milestones
@@ -398,7 +402,7 @@ never the inbound/serve half (that's `aoide-server`).
   AUTHORITY — the feed line is only ever a trigger to re-check them,
   mirroring `aoide_secrets::watch`'s identical "tail is a trigger" stance
   for its own feed), using the EXACT SAS arg order per direction
-  `approve_inbound`/`approve_outbound` above already use — `peer pending`
+  `approve_inbound`/`approve_outbound` above already use — bare `aoide pair`
   itself carries no SAS at all, P-PV2; `actionable` decides
   whether a `Pending` is worth surfacing (an inbound entry once revealed
   and only while still `awaiting-approval` — approval leaves the entry
@@ -466,11 +470,17 @@ never the inbound/serve half (that's `aoide-server`).
   with no dial), called from `pair_with_heard(cmd, hit, via_flag,
   self_via_flag)`, the settled-target tail `pair_via_hostname` and bare
   `pair`'s picker (below) both call so neither ever forks the ceremony.
-  `handle_peer_pair(inv)` is the ONE registered entry point (P-PV2, the
-  User's locked spec) — SMART TARGET dispatch on the first positional arg
-  (`"://"` present → `pair_via_url`, else → `pair_via_hostname`), never a
-  second command path; `peer invite`/`peer pair request` died outright,
-  hard cutover, no aliases.
+  `handle_pair(inv)` is the ONE registered entry point (task #135 P3', the
+  User's locked spec: "the command set can just be `aoide pair`") — with
+  no target it calls `pair_overview` (below); with a target, SMART TARGET
+  dispatch on the first positional arg (`"://"` present → `pair_via_url`,
+  else → `pair_continue_or_request`, which checks the pending queues
+  before ever falling to `pair_via_hostname`), refusing a second
+  positional outright rather than reading only the first — never a second
+  command path; `peer invite`/`peer pair request` died outright at
+  P-PV2, and `peer pair`/`peer pair approve`/`peer pair reject`/
+  `peer pair watch`/`peer pending` died outright at task #135 P3' — hard
+  cutover, no aliases either time.
   `dial_via`/`record_via` are related but distinct: `record_via` is
   UNCONDITIONAL — the advertisement's observed address plus its claimed
   login, string-rendered via `default_via`, even when that login is empty
@@ -493,7 +503,8 @@ never the inbound/serve half (that's `aoide-server`).
   `self_url` ([`crate::peer::build_pair_request_body`] below) so the
   approver — which can only ever OBSERVE this request arriving over the
   tunnel, i.e. loopback — has something to record a working `via` from at
-  ITS OWN `peer pair approve` commit time (`approve_inbound`, below).
+  ITS OWN `aoide pair` commit time (`approve_inbound_leg` →
+  `approve_inbound`, below).
   **The HOST half is deliberately NOT `aoide_storage::display::
   local_host_name`'s claimed hostname (review finding, task #131) — a live
   LAN check found hostnames resolving only through the router's DHCP-DNS,
@@ -509,7 +520,7 @@ never the inbound/serve half (that's `aoide-server`).
   a tunnel (the ssh target, not the logical `url`, which the tunnel may
   make unreachable directly), else the `url`'s own host.
   `handle_peer_discover`/`pair_via_hostname` (`peer
-  discover [--secs N]`/`peer pair <name> [--secs N] [--yes]`) are thin
+  discover [--secs N]`/`aoide pair <name> [--secs N] [--yes]`) are thin
   wrappers around `discover::run_sweep`/`discover::resolve_invite_target`
   above — `confirm_invite` is this pair's own local helper, still the
   original hand-rolled `y/N` stdin read `confirm_sas`/`confirm_spawn` used
@@ -526,16 +537,20 @@ never the inbound/serve half (that's `aoide-server`).
   vs already-so; the emitting `a2a serve` reads the switch every tick,
   so the message names the ~40s pickup and that nothing emits without a
   running `a2a serve`.
-  `handle_pair` (bare `aoide pair`, task #120 P3, `register_pair` —
-  appended newest at the END of `cli`'s assembly) is the friendly
+  `pair_overview` (task #120 P3, called from `handle_pair` when no target
+  is given, registered as bare `pair` in `register_pair`) is the friendly
   interactive entry: CLI-door + real-tty only (`pick::interactive`, the
-  same gate bare `session` holds; non-tty/non-CLI/`--json` get a taught
-  pointer at the scripted spellings), one bounded ~2s sweep
+  same gate bare `session` holds; non-tty/non-CLI/`--json` fall to
+  `pending_listing` — the JSON-friendly machine face the old `peer
+  pending` folded into at task #135 P3'), one bounded ~2s sweep
   (`PAIR_SWEEP_SECS`), self-advertisements filtered via `is_self_target`,
-  then `pick::choose` over rows rendering the already-validated claim
-  beside the observed source — the picked row IS the proceed-confirmation
-  and goes straight through `pair_with_heard`; hearing nothing teaches
-  `peer advertise on` and the manual `peer pair <url>` path.
+  then `pick::choose` over ONE menu spanning both pending requests (pick
+  one to approve or resume, via `approve_inbound_leg`/
+  `resume_outbound_leg`) and the sweep's candidates (pick one to request
+  — the pick IS the proceed-confirmation, so no second `confirm_invite`
+  y/N rides on top) and goes straight through `pair_with_heard`; hearing
+  nothing and nothing pending teaches `peer advertise on` and the manual
+  `aoide pair <url>` path.
   `adapter melete` (`peer hub
   <name> [--clear]`, P-D5, designates at most one registered peer as the
   hub `aoide_storage::addr::resolve_with_hub` prefers as a last-resort

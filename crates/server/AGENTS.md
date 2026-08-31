@@ -216,8 +216,8 @@
   earlier request with no signature needed yet (an active MITM cannot
   force a shared SAS by choosing its own values after seeing the real
   ones), and the SAS confirmation (`aoide_storage::pairing::derive_sas`) is
-  the actual human-verified gate — it lives in the CLIENT's `peer pair
-  approve` prompt (BOTH times it fires — once on each end), not in this
+  the actual human-verified gate — it lives in the CLIENT's `aoide pair`
+  prompt (BOTH times it fires — once on each end), not in this
   door. Don't add a bearer check to either handler "for consistency with
   `message/send`" — that would break the bootstrap the whole ceremony
   exists to solve. `pair_poll` (Design A, task #119, REPLACES the old

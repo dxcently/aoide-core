@@ -13,7 +13,7 @@
 //! own nonce, never the nonce itself — the commit-then-reveal fix,
 //! `aoide_storage::pairing`'s module doc), [`build_pair_reveal_body`]/
 //! [`check_pair_reveal_response`] for the requester's immediate follow-up
-//! `aoide/pairReveal` call (same `peer pair request` invocation, two
+//! `aoide/pairReveal` call (same `pair` invocation, two
 //! sequential POSTs), and [`build_pair_poll_body`]/[`parse_pair_poll_response`]
 //! for the requester's `aoide/pairPoll` call (Design A, task #119 — REPLACES
 //! the old `aoide/pairApprove` reverse callback: the requester POLLS the
@@ -74,10 +74,10 @@ pub fn parse_graph_summary_response(resp: &Value, name: &str, fetched_at: &str) 
 
 // ── The pairing ceremony (P-P2, CONTRACTS.md §6) ─────────────────────────
 
-/// Build the JSON-RPC `aoide/pairRequest` body `peer pair request` POSTs to
+/// Build the JSON-RPC `aoide/pairRequest` body `pair` POSTs to
 /// the approver's door: this instance's own public key, its own SELF-CLAIMED
 /// instance name (`aoide_storage::display::local_host_name`'s chain — the
-/// approver's `peer pair approve` records this instance under this exact
+/// approver's `pair <id>` records this instance under this exact
 /// name, so it must name THIS box, never the caller's nickname for the
 /// approver; the live yomi↔sakaki ceremony 2026-08-26 caught the crossed
 /// reading), a COMMITMENT to a fresh nonce (`commit_hex` —
@@ -146,8 +146,8 @@ pub fn parse_pair_request_response(resp: &Value) -> Result<PairRequestAck, Strin
     Ok(PairRequestAck { id, pubkey_hex, nonce_hex, expires_at })
 }
 
-/// Build the JSON-RPC `aoide/pairReveal` body the REQUESTER's `peer pair
-/// request` POSTs immediately after `aoide/pairRequest` (same invocation,
+/// Build the JSON-RPC `aoide/pairReveal` body the REQUESTER's `pair`
+/// POSTs immediately after `aoide/pairRequest` (same invocation,
 /// two sequential POSTs) — `id` is the id the approver's `aoide/pairRequest`
 /// response returned; `nonce_hex` is the nonce `commit_hex` already
 /// committed to. Pure.
@@ -161,8 +161,8 @@ pub fn build_pair_reveal_body(id: &str, nonce_hex: &str) -> Value {
     serde_json::to_value(&req).expect("JsonRpcRequest always serializes")
 }
 
-/// Build the JSON-RPC `aoide/pairPoll` body the REQUESTER's `peer pair
-/// approve <id>` POSTs to the APPROVER's door (Design A, task #119 — REPLACES
+/// Build the JSON-RPC `aoide/pairPoll` body the REQUESTER's `pair
+/// <id>` POSTs to the APPROVER's door (Design A, task #119 — REPLACES
 /// the old `aoide/pairApprove` reverse callback), asking "has this been
 /// approved yet?" `id` is the SAME id `aoide/pairRequest` returned;
 /// `timestamp_iso`/`nonce_hex`/`signature_hex` are the requester's own

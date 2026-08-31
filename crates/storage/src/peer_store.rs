@@ -436,7 +436,7 @@ pub fn resolve_peer<'a>(peers: &'a [Peer], addr: Option<IpAddr>, presented_token
     peers.iter().find(|p| peer_url_matches_addr(&p.url, addr)).map(|p| (p, PeerRung::Addr))
 }
 
-/// A default local nickname for a peer named only by URL (`aoide peer pair
+/// A default local nickname for a peer named only by URL (`aoide pair
 /// <url>` with no `--name`) — [`url_host`]'s bare authority,
 /// lowercased and sanitized to [`valid_peer_name`]'s shape (`.`/`:` become
 /// `-`, anything else not in `[a-z0-9-]` is dropped), leading/trailing/

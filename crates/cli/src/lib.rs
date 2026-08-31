@@ -52,7 +52,7 @@ use daemon::Door;
 /// `--json` — `events tail` (P-D3, `docs/architecture/AOIDED.md`) is the
 /// SAME shape once more: a foreground, line-mode follow of aoided's own
 /// events feed that blocks until Ctrl-C, `--class` filtering to matching
-/// event classes — `peer pair watch` (P-P5, CONTRACTS.md §6) is the SAME
+/// event classes — `pair watch` (P-P5, CONTRACTS.md §6) is the SAME
 /// shape once more, over the pairing-ceremony's own three milestones on
 /// that SAME events feed — `conductor` hands off
 /// to the interactive terminal loop, `guide`/`schema` bypass the generic
@@ -291,12 +291,12 @@ pub fn run_cli(argv: &[String]) -> i32 {
             return Some(server::events::tail(&events_path, &classes, json));
         }
 
-        // `peer pair watch` (P-P5, CONTRACTS.md §6's "Pairing events feed"
+        // `pair watch` (P-P5, CONTRACTS.md §6's "Pairing events feed"
         // subsection) is a foreground, line-mode follow of the SAME
         // aoided-owned events feed `events tail` just above reads —
         // special-cased the SAME way: dispatch FIRST (audits the launch
         // attempt, refuses a non-Cli door AND a `--popup`+`--json` combo via
-        // `client::commands::handle_peer_pair_watch`), then hand off to
+        // `client::commands::handle_pair_watch`), then hand off to
         // `client::pair_watch::run`, which blocks until Ctrl-C.
         // `events_path` is resolved ONCE here — `server::daemon::events_path`
         // applied to `server::daemon::socket_path()`, the IDENTICAL
@@ -304,7 +304,7 @@ pub fn run_cli(argv: &[String]) -> i32 {
         // and aoided's general events feed are the SAME file (`a2a serve`
         // appends directly onto it, CONTRACTS.md §6), so there is no second
         // resolution to keep in sync.
-        if inv.path == ["peer", "pair", "watch"] {
+        if inv.path == ["pair", "watch"] {
             let launch = dispatch::dispatch(inv);
             if launch.status != output::Status::Ok {
                 let (body, code) = launch.render(json);

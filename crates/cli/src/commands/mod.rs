@@ -34,14 +34,13 @@ use crate::registry::Registry;
 /// (the aoided event bus's own terminal-reachable follow
 /// command, P-D3, `docs/architecture/AOIDED.md`'s "L1" section), identity
 /// (this instance's ed25519 identity show command, P-P1 of the pairing
-/// workstream), peer pair/pending/approve/reject/watch (
-/// the pairing ceremony's CLI half, P-P2, `docs/architecture/PAIRING.md`),
-/// melete status/graph/call (the Melete MCP client, M2, task #14), peer
-/// advertise/list (task #120), bare `pair` (task #120 P3 — the friendly
-/// interactive entry into the pairing ceremony: one sweep, a select menu,
-/// then the SAME `run_pair_request` core the ceremony's own request path
-/// drives), config + config set (task #135 P-C — the portable runtime config
-/// file, `$AOIDE_ROOT/config.toml`).
+/// workstream), melete status/graph/call (the Melete MCP client, M2, task
+/// #14), peer advertise/list (task #120), pair/pair reject/pair watch (the
+/// pairing ceremony's whole CLI face — P-P2 built it, P-PV2 and task #135
+/// P3' each collapsed it further, ending in ONE smart verb: bare `pair`
+/// resolves/approves/starts, `pair reject`, `pair watch`; see
+/// `docs/architecture/PAIRING.md`), config + config set (task #135 P-C —
+/// the portable runtime config file, `$AOIDE_ROOT/config.toml`).
 ///
 /// P-A5 (binary-split workstream) removed the register lines for the
 /// graphical bundle — rice/draft/mode/cover/livery/rice-late-stubs/
@@ -76,11 +75,10 @@ pub fn all() -> Registry {
     aoide_secrets::commands::register(&mut r); // secrets serve/exec/add/rm/grant/revoke — the secrets broker (Workstream SECRETS P-V2, appended newest)
     aoide_server::commands::register_events(&mut r); // events tail — aoided's own feed follow command (P-D3, appended newest)
     aoide_storage::commands::register_identity(&mut r); // identity — this instance's ed25519 identity show command (pairing workstream P-P1, appended newest)
-    aoide_client::commands::register_peer_pair(&mut r); // peer pair/pending + peer pair approve/reject/watch — the pairing ceremony's CLI half (P-P2, P-PV2, appended newest)
     aoide_client::commands::register_peer_discovery(&mut r); // peer discover/advertise — LAN discovery's CLI half (P-P6 + task #120, appended newest)
     aoide_client::mcp_client::register_melete(&mut r); // melete status/graph/call — the Melete MCP client (M2, task #14, appended newest)
     aoide_conduct::commands::peer_list::register(&mut r); // peer list — the one-glance mesh roster over the roster core's probe (formerly who's) + one discovery sweep (task #120 P2, appended newest)
-    aoide_client::commands::register_pair(&mut r); // pair — the interactive pairing picker over one sweep, driving the same ceremony core (task #120 P3, appended newest)
+    aoide_client::commands::register_pair(&mut r); // pair + pair reject/watch — the pairing ceremony's whole CLI face, one smart verb (task #135 P3', superseding the peer pair family — hard cutover)
     aoide_storage::commands::register_config(&mut r); // config, config set — the portable runtime config file (task #135 P-C, appended newest)
 
     r

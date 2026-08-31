@@ -1,5 +1,5 @@
 //! The client domain's CLI commands: `peer add|remove|allow|hub|pull|
-//! status` and `peer pair|pending` + `peer pair approve|reject|watch` +
+//! status` and `pair` + `pair reject|watch` +
 //! `peer discover|advertise` (CONTRACTS.md §7, same-network federation and
 //! its pairing ceremony) and `adapter melete` (the neutral-event consumer).
 //!
@@ -470,7 +470,7 @@ fn post_json_via(
 }
 
 /// Parse the `--via` flag shared by every CLI command that accepts the
-/// ssh-transport marker (`peer.add`, `peer.invite`, `peer.pair.request`,
+/// ssh-transport marker (`peer.add`, `peer.invite`, `pair`,
 /// `peer.spawn`, P-S4): absent is `Ok(None)` (today's direct-dial default,
 /// unchanged); present-but-unparsable is `Err` with
 /// [`aoide_storage::tunnel::parse_via`]'s own taught message. A malformed
@@ -671,7 +671,7 @@ fn handle_peer_add(inv: &Invocation) -> Outcome {
     // fetch expects). The peer is still recorded exactly as the verified
     // path records it below: `verified` was already hardcoded `false` on
     // this path regardless (a card fetch is reachability, never identity
-    // — that only ever comes from `peer pair`), so skipping the fetch
+    // — that only ever comes from `pair`), so skipping the fetch
     // changes nothing about what gets written, only whether this one GET
     // runs first.
     if !no_verify {
@@ -1063,7 +1063,7 @@ fn confirm_spawn(name: &str, text: &str) -> Result<bool, String> {
 /// local peer at all."** The local check below exists SOLELY to catch the
 /// obviously-doomed case (no verified peer → no identity to sign with →
 /// the remote can never resolve a `Signature` rung) with a clear, LOCAL
-/// taught error naming `peer pair`. Every OTHER refusal shape —
+/// taught error naming `pair`. Every OTHER refusal shape —
 /// `allows` lacking `spawn`, clock skew, a revoked pairing — is the remote
 /// door's OWN call; this function never second-guesses it, and surfaces
 /// whatever JSON-RPC error the door returns VERBATIM (taught), per
@@ -1196,7 +1196,7 @@ fn handle_peer_spawn(inv: &Invocation) -> Outcome {
                 format!(
                     "peer `{name}` is registered but not paired — spawn requires a signed request \
                      from a VERIFIED peer (docs/architecture/PAIRING.md decision 6); pair first with \
-                     `aoide peer pair <url> --name {name}`"
+                     `aoide pair <url> --name {name}`"
                 ),
             )
             .with_data(json!({ "reason": "unpaired-peer", "name": name }));
@@ -1206,7 +1206,7 @@ fn handle_peer_spawn(inv: &Invocation) -> Outcome {
                 cmd,
                 format!(
                     "no peer named `{name}` — spawn requires a paired peer; register and pair it \
-                     first with `aoide peer pair <url> --name {name}`"
+                     first with `aoide pair <url> --name {name}`"
                 ),
             )
             .with_data(json!({ "reason": "unknown-peer", "name": name }));
@@ -1411,13 +1411,13 @@ pub fn register_peers(r: &mut Registry) {
     ));
 }
 
-// ── The `peer pair`/`peer pending` commands (P-P2, P-PV2, CONTRACTS.md §6
-// ── — the pairing ceremony's wire + CLI ceremony) ─────────────────────────
+// ── The `pair`/`pair reject`/`pair watch` commands (P-P2 through task #135
+// ── P3', CONTRACTS.md §6 — the pairing ceremony's wire + CLI ceremony) ────
 //
-// `peer add`/`peer pair` are two SEPARATE paths onto the same registry
+// `peer add`/`pair` are two SEPARATE paths onto the same registry
 // (`docs/architecture/PAIRING.md`'s "Settled decisions" #2): `peer add` is
 // the legacy escape for an UNPAIRED peer (a hand-set URL, never verified by
-// key), `peer pair` is the ONE ceremony that mints a `pubkey`/`verified`
+// key), `pair` is the ONE ceremony that mints a `pubkey`/`verified`
 // peer record on BOTH ends — request/reveal/park/approve/reject over the
 // A2A door (`aoide-server::a2a::pair_request`/`pair_reveal`/`pair_poll`),
 // SAS derivation + display (`aoide_storage::pairing::derive_sas`), commit via
@@ -1431,8 +1431,8 @@ pub fn register_peers(r: &mut Registry) {
 // here — and a re-pairing never re-grants, so a revoked capability survives
 // a key rotation.
 //
-// **Both humans confirm, for real (review-bounce Finding 2).** `peer pair
-// approve <id>` does double duty by DIRECTION, never a fifth command (golden
+// **Both humans confirm, for real (review-bounce Finding 2).** `pair
+// <id>` does double duty by DIRECTION, never a fifth command (golden
 // count unchanged by Design A, task #119 — no new command path, only the
 // completion trigger moved): on an INBOUND id (this instance is the
 // APPROVER) it re-derives the SAS, gates on the TYPED pairing code (task
@@ -1440,11 +1440,11 @@ pub fn register_peers(r: &mut Registry) {
 // commits LOCALLY, and marks the entry approved for the requester's own poll
 // to find (no wire call at all — [`approve_inbound`]'s own doc). On an OUTBOUND
 // id (this instance is the REQUESTER) it POLLS the approver's door first
-// (over the SAME forward dial `peer pair`'s own request/reveal already
+// (over the SAME forward dial `pair`'s own request/reveal already
 // used), and only
 // once that poll comes back `approved` does it re-derive the SAME SAS and
 // confirm-then-commit ([`approve_outbound`]'s own doc has the full poll
-// mechanics). `peer pair reject <id>` doubles the same way, and on an
+// mechanics). `pair reject <id>` doubles the same way, and on an
 // outbound id is also the ceremony's missing ABORT command: it removes the
 // entry at either outbound state, whether or not a poll has succeeded yet.
 
@@ -1475,7 +1475,7 @@ fn confirm_sas(sas: &str, name: &str) -> Result<bool, String> {
 /// REFUSES the commit here rather than quietly falling back to the built-in
 /// default — the ceremony is exactly where a wrong grant is expensive.
 ///
-/// Both directions of `peer pair approve` and both popup arms call this, so
+/// Both directions of `pair <id>` and both popup arms call this, so
 /// there is one answer to "what is this pairing worth" per commit.
 fn resolve_grant(grant: Option<&[String]>) -> Result<Vec<String>, String> {
     match grant {
@@ -1524,11 +1524,11 @@ fn grant_note(first_pairing: bool, allows: &[String]) -> String {
 /// and across the interactive prompt and the scripted `--code` path alike.
 pub(crate) const MAX_CODE_TRIES: u32 = 3;
 
-/// How `peer pair approve <id>` on an INBOUND entry collects its typed-code
+/// How `pair <id>` on an INBOUND entry collects its typed-code
 /// confirmation (task #120 P3) — the approver-side gate: the operator
 /// proves they hold the SAME code the requester's screen shows by TYPING
 /// it, out-of-band (a phone call, a glance), never by y/N-ing a code this
-/// side already printed. Resolved by `handle_peer_pair_approve` from the
+/// side already printed. Resolved by [`approve_inbound_leg`] from the
 /// invocation; [`approve_inbound`] consumes it AFTER the idempotent
 /// already-approved and awaiting-reveal checks, so those short-circuits
 /// behave identically whichever variant rides in.
@@ -1566,7 +1566,7 @@ fn inbound_code_refusal(cmd: &str, id: &str) -> Outcome {
         cmd,
         format!(
             "approving an inbound pairing request takes the TYPED pairing code as read from the \
-             requester's screen — run `aoide peer pair approve {id}` on a real terminal to type it, \
+             requester's screen — run `aoide pair {id}` on a real terminal to type it, \
              or pass `--code NNN-NNN` (scripted); `--yes` does not bypass the approver's code"
         ),
     )
@@ -1590,7 +1590,7 @@ fn record_code_try(cmd: &str, id: &str, now_epoch: i64) -> Result<u32, Outcome> 
 }
 
 /// Three cumulative code mismatches — the auto-deny (task #120 P3): the
-/// SAME clean removal `peer pair reject` performs (parked entry taken,
+/// SAME clean removal `pair reject` performs (parked entry taken,
 /// nothing committed, no wire call), surfaced as its own distinct outcome
 /// so the single audit log records the deny as `auto-deny-on-code-mismatch`
 /// rather than an operator-initiated reject.
@@ -1602,7 +1602,7 @@ fn auto_deny_inbound(cmd: &str, id: &str, name: &str, now_epoch: i64) -> Outcome
         cmd,
         format!(
             "{MAX_CODE_TRIES} code mismatches — auto-denied pairing request `{id}` from `{name}`: \
-             parked entry removed, nothing committed; a fresh `peer pair` on their side starts a new ceremony"
+             parked entry removed, nothing committed; a fresh `aoide pair` on their side starts a new ceremony"
         ),
     )
     .with_data(json!({ "reason": "auto-deny-on-code-mismatch", "id": id, "name": name, "tries": MAX_CODE_TRIES, "rejected": true, "direction": "inbound" }))
@@ -1616,7 +1616,7 @@ fn auto_deny_inbound(cmd: &str, id: &str, name: &str, now_epoch: i64) -> Outcome
 /// house default `8710`; the host is `aoide_storage::display::
 /// local_host_name` (already the shared fallback chain `a2a::
 /// resolve_peer_name` itself delegates to). `--self-url` overrides this
-/// outright — the one flag `peer pair`'s url arm needs when the door binds
+/// outright — the one flag `pair`'s url arm needs when the door binds
 /// somewhere this default can't guess (a non-default port, a reverse
 /// proxy/tunnel hostname).
 fn default_self_url() -> String {
@@ -1677,10 +1677,10 @@ fn outbound_ip_toward(toward: &str) -> Option<std::net::IpAddr> {
 
 /// The house A2A door port this box assumes for itself AND for a
 /// discovered peer: `AOIDE_A2A_PORT` (the same env the `aoide-a2a`
-/// systemd unit sets) or the house default `8710`. `peer pair`'s hostname
+/// systemd unit sets) or the house default `8710`. `pair`'s hostname
 /// arm composes its dial target with this (task #120 — the advertisement
 /// carries no door URL, so there is no per-peer port to read off the
-/// wire); a peer on a non-default port takes the explicit `peer pair
+/// wire); a peer on a non-default port takes the explicit `pair
 /// <url>` path instead.
 fn default_a2a_port() -> u16 {
     std::env::var("AOIDE_A2A_PORT")
@@ -1701,48 +1701,7 @@ fn port_from_url(url: &str) -> Option<u16> {
     port_str.parse::<u16>().ok()
 }
 
-/// `peer pair <target> [--name <n>] [--self-url <url>] [--self-via …]
-/// [--via …] [--secs N] [--wait SECS] [--allow read,spawn] [--yes] [--json]` — the ONE entry point into the
-/// pairing ceremony's REQUEST half (the User's locked spec, P-PV2,
-/// superseding the old `peer pair request`/`peer invite` split). SMART
-/// TARGET dispatch decides which of the two ceremony arms `<target>`
-/// means, by SHAPE alone, never a flag: a URL (`target.contains("://")`)
-/// is an EXPLICIT DIAL — [`pair_via_url`], byte-identical to the old `peer
-/// pair request <url>` path (P-PV1's via/self-via defaults included).
-/// Anything else is a HOSTNAME — [`pair_via_hostname`], the old `peer
-/// invite <name>` path: one beacon sweep, resolved by advertisement name.
-/// Both arms bottom out in the SAME [`run_pair_request`] core — reused,
-/// never forked.
-fn handle_peer_pair(inv: &Invocation) -> Outcome {
-    let cmd = "peer.pair";
-    const USAGE: &str = "usage: aoide peer pair <url-or-hostname> [--name <n>] [--self-url <url>] [--self-via ssh://[user@]host] [--via ssh://[user@]host[:port]] [--secs N] [--wait SECS] [--allow read,spawn] [--yes] [--json] — takes exactly ONE positional target; the old `peer pair request <url>`/`peer invite <name>` folded into this single `peer pair <target>` (P-PV2, hard cutover, no alias)";
-    let target = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        Some(t) => t.to_string(),
-        None => return Outcome::usage(cmd, USAGE),
-    };
-    // `peer pair` takes EXACTLY one positional (review finding, P-PV2
-    // follow-up): a second one is never valid syntax. The registry has no
-    // third `peer.pair.request` path to greedily match anymore, so old
-    // `peer pair request <url>` muscle memory lands its `request`/`<url>`
-    // pair here as THIS command's own `args`, past its single declared
-    // `target`. Silently reading only `args[0]` ("request") and discarding
-    // the real url would burn a full hostname-arm sweep window looking for
-    // an advertiser literally named "request" before failing with a
-    // message that never mentions the URL was even seen — worse than an
-    // ordinary unknown-command refusal. Refuse loudly instead, uniformly:
-    // the fold explanation lives in `USAGE` itself (shown on every arity
-    // error alike), never a special case keyed on `target == "request"`.
-    if inv.args.len() > 1 {
-        return Outcome::usage(cmd, USAGE);
-    }
-    if target.contains("://") {
-        pair_via_url(cmd, inv, &target, USAGE)
-    } else {
-        pair_via_hostname(cmd, inv, &target, USAGE)
-    }
-}
-
-/// `peer pair <target>`'s EXPLICIT-DIAL arm (`target` is a URL) — the old
+/// `pair <target>`'s EXPLICIT-DIAL arm (`target` is a URL) — the old
 /// `peer pair request <url>` handler's own body, unchanged: mints this
 /// instance's identity if it doesn't exist yet
 /// (`aoide_storage::identity::load_or_mint`), mints a fresh nonce, POSTs
@@ -1755,7 +1714,7 @@ fn handle_peer_pair(inv: &Invocation) -> Outcome {
 /// its own copy of the SAS (it already has everything: its own pubkey and
 /// nonce, the approver's pubkey and nonce from the first response) and
 /// remember the outbound request (`aoide_storage::pairing::park_outbound`,
-/// `OutboundState::AwaitingApproval`) so a LATER `peer pair approve <id>`
+/// `OutboundState::AwaitingApproval`) so a LATER `pair <id>`
 /// invocation — run whenever, long after this CLI process exits — can poll
 /// the approver's door for the release ([`approve_outbound`]'s own doc, task
 /// #119) and finish the ceremony. `--secs`/`--yes` are the hostname arm's
@@ -1815,13 +1774,16 @@ fn pair_via_url(cmd: &str, inv: &Invocation, url: &str, usage: &str) -> Outcome 
         Ok(f) => f,
         Err(e) => return Outcome::usage(cmd, format!("{usage} — {e}")),
     };
+    if let Some(out) = refuse_detached_grant(cmd, &finish) {
+        return out;
+    }
 
     run_pair_request(cmd, url, &name, &self_url, self_via.as_deref(), via.as_ref(), via.as_ref().map(|v| v.to_string()), &finish)
 }
 
 /// The requester's half of the ceremony, shared verbatim by
-/// [`pair_via_url`] (`peer pair <url>` — a CLI-typed url/`--name`,
-/// validated above) AND [`pair_with_heard`] (`peer pair <hostname>`/bare
+/// [`pair_via_url`] (`pair <url>` — a CLI-typed url/`--name`,
+/// validated above) AND [`pair_with_heard`] (`pair <hostname>`/bare
 /// `pair` — a `url`/`name` already lifted straight off an
 /// already-validated, already-confirmed discovery advertisement, so it
 /// needs no SECOND `valid_peer_name` check here). Extracted so the
@@ -1837,15 +1799,15 @@ fn pair_via_url(cmd: &str, inv: &Invocation, url: &str, usage: &str) -> Outcome 
 ///
 /// **P-S4's two additions, deliberately kept separate.** `dial_via` is what
 /// the ceremony's OWN two POSTs below actually tunnel through — `None` for
-/// a plain `peer pair <url>` (no observed address to derive a
+/// a plain `pair <url>` (no observed address to derive a
 /// default from) and, for the hostname arm/bare `pair`, an explicit
 /// `--via` or else [`pair_with_heard`]'s own src_addr-derived default
 /// (P-PV1: loopback-only doors, task #131 — a discovered peer's door is
 /// reached only through its ssh tunnel, so the ceremony's OWN dial needs
 /// that same default, not only the record). `record_via` is the string
 /// parked into [`aoide_storage::pairing::OutboundPairingRequest::via`] for
-/// LATER commit onto the resulting peer record, in the SEPARATE `peer pair
-/// approve <id>` invocation that actually writes it (`approve_outbound`).
+/// LATER commit onto the resulting peer record, in the SEPARATE `pair
+/// <id>` invocation that actually writes it (`approve_outbound`).
 /// `self_via` (P-PV1) is this instance's OWN reach-back hop claim —
 /// `ssh://<local login>@<local address routed toward the peer>` by default
 /// ([`default_self_via`] — the HOST half is the local outbound address the
@@ -1957,7 +1919,7 @@ fn run_pair_request(
             format!(
                 "pairing request sent to `{name}` ({url}) — confirmation code {sas} — \
                  read this aloud (or otherwise out-of-band) to {name}'s operator; once they run \
-                 `aoide peer pair approve {}`, run the SAME command here too and confirm the SAME code \
+                 `aoide pair {}`, run the SAME command here too and confirm the SAME code \
                  to complete the pair on both ends",
                 ack.id
             ),
@@ -1967,14 +1929,14 @@ fn run_pair_request(
 
     eprintln!(
         "pairing request sent to `{name}` — confirmation code {sas}\n\
-         read it aloud to {name}'s operator; they type it into `aoide peer pair approve`.\n\
+         read it aloud to {name}'s operator; they type it into `aoide pair`.\n\
          waiting up to {}s — Ctrl-C leaves the request pending as `{}`.",
         finish.wait_secs, ack.id
     );
     wait_and_commit(cmd, &ack.id, name, &sas, finish)
 }
 
-/// What `peer pair` does once the request is parked — the difference between
+/// What `pair` does once the request is parked — the difference between
 /// the pre-P2 detached shape and the one-command ceremony (task #135 P2).
 #[derive(Debug)]
 pub(crate) struct PairFinish {
@@ -1991,8 +1953,10 @@ pub(crate) struct PairFinish {
 }
 
 impl PairFinish {
-    /// Park and return — what every caller wanted before `--wait` existed,
-    /// and what the tests drive so none of them sit on a poll.
+    /// Park and return — the pre-`--wait` shape, kept for the tests so none
+    /// of them sit on a poll (every production caller builds from flags via
+    /// `pair_finish_from` now).
+    #[cfg(test)]
     pub(crate) fn detached() -> Self {
         PairFinish { wait_secs: 0, skip_confirm: false, grant: None }
     }
@@ -2003,7 +1967,7 @@ impl PairFinish {
 /// audit lines — the cadence is bounded by politeness, not by log volume.
 const PAIR_POLL_CADENCE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How long `peer pair` waits for the far operator by default: ten minutes,
+/// How long `pair` waits for the far operator by default: ten minutes,
 /// the span of a phone call in which two people read a code to each other.
 const DEFAULT_PAIR_WAIT_SECS: u64 = 600;
 
@@ -2016,7 +1980,7 @@ fn wait_is_over(elapsed_secs: u64, wait_secs: u64) -> bool {
     elapsed_secs >= wait_secs
 }
 
-/// Build the post-request behaviour off `peer pair`'s own flags. `--wait 0`
+/// Build the post-request behaviour off `pair`'s own flags. `--wait 0`
 /// is the documented escape back to the pre-P2 detached shape, for anything
 /// scripted that cannot sit on a human.
 fn pair_finish_from(inv: &Invocation) -> Result<PairFinish, String> {
@@ -2024,21 +1988,25 @@ fn pair_finish_from(inv: &Invocation) -> Result<PairFinish, String> {
         Some(raw) => raw.trim().parse::<u64>().map_err(|_| format!("--wait takes whole seconds (0 to park and return), not `{raw}`"))?,
         None => DEFAULT_PAIR_WAIT_SECS,
     };
-    let grant = parse_allow_flag(inv)?;
-    // `--wait 0` returns before anything commits, so a grant named here has
-    // nowhere to land — and the ceremony deliberately does NOT persist one on
-    // a detached entry (the User's decision: the grant stays attached to a
-    // live human at commit time). Accepting the pair silently would drop the
-    // flag, the same silent no-op `grant_note` exists to prevent one step
-    // later. Refuse by name instead.
-    if wait_secs == 0 && grant.is_some() {
-        return Err(
+    Ok(PairFinish { wait_secs, skip_confirm: inv.flag_present("yes"), grant: parse_allow_flag(inv)? })
+}
+
+/// A NEW request with `--wait 0` parks and returns before anything commits,
+/// so an `--allow` beside it has nowhere to land — the ceremony deliberately
+/// never persists a grant on a parked entry (the User's decision: the grant
+/// stays attached to a live human at commit time), and accepting the pair
+/// silently would drop the flag, the same silent no-op `grant_note` exists
+/// to prevent one step later (review finding). Checked by the two REQUEST
+/// arms only: the RESUME leg keeps the combination legal, because its
+/// `--wait 0` still polls once and can commit.
+fn refuse_detached_grant(cmd: &str, finish: &PairFinish) -> Option<Outcome> {
+    (finish.wait_secs == 0 && finish.grant.is_some()).then(|| {
+        Outcome::usage(
+            cmd,
             "--allow needs a wait to land in: `--wait 0` parks the request and returns before anything commits, and a grant is never persisted on a parked entry — \
-             retype `--allow` on the `peer pair approve <id>` that finishes the pair"
-                .to_string(),
-        );
-    }
-    Ok(PairFinish { wait_secs, skip_confirm: inv.flag_present("yes"), grant })
+             retype --allow when completing (`aoide pair <id> --allow ...`)",
+        )
+    })
 }
 
 /// Block until the approver releases `id`, then confirm and commit — the
@@ -2051,7 +2019,7 @@ fn pair_finish_from(inv: &Invocation) -> Result<PairFinish, String> {
 /// malformed `config.toml` refuses now rather than after ten minutes.
 ///
 /// A timeout is not a failure of the pair — the request stays parked and
-/// `peer pair approve <id>` still finishes it whenever the far operator gets
+/// `pair <id>` still finishes it whenever the far operator gets
 /// to it. That is the "nobody there" outcome, and it is why Ctrl-C is safe:
 /// nothing here holds state the parked entry does not already have.
 fn wait_and_commit(cmd: &str, id: &str, name: &str, sas: &str, finish: &PairFinish) -> Outcome {
@@ -2091,8 +2059,8 @@ fn wait_and_commit(cmd: &str, id: &str, name: &str, sas: &str, finish: &PairFini
                 cmd,
                 format!(
                     "no answer from `{name}` within {}s — the request is still pending as `{id}` (code {sas}); \
-                     run `aoide peer pair approve {id}` once they've approved on their side, or \
-                     `aoide peer pair reject {id}` to abort",
+                     run `aoide pair {id}` once they've approved on their side, or \
+                     `aoide pair reject {id}` to abort",
                     finish.wait_secs
                 ),
             )
@@ -2108,13 +2076,14 @@ fn wait_and_commit(cmd: &str, id: &str, name: &str, sas: &str, finish: &PairFini
     }
 }
 
-/// `peer pending` — every pairing request THIS instance is still holding
+/// The pending listing (bare `pair` off a tty, and its --json face) — every
+/// pairing request THIS instance is still holding
 /// open, BOTH directions (review-bounce Finding 2: an outbound entry
 /// awaiting THIS instance's own confirm is exactly as "pending" as an
 /// inbound one awaiting approval — before that fix, nothing ever surfaced
 /// it). Inbound rows carry `revealed` (`requester_nonce_hex.is_some()`,
 /// review-bounce Finding 1) — an unrevealed entry shows `"awaiting
-/// reveal"`, and `peer pair approve` refuses it. An APPROVED inbound entry
+/// reveal"`, and `pair <id>` refuses it. An APPROVED inbound entry
 /// (Design A, task #119 — [`InboundPairingRequest::approved`]) stays
 /// listed here too, showing `"approved · awaiting their poll"` — it
 /// remains parked (never taken) until the requester's own `aoide/pairPoll`
@@ -2127,12 +2096,11 @@ fn wait_and_commit(cmd: &str, id: &str, name: &str, sas: &str, finish: &PairFini
 /// APPROVER's — printing it here too would defeat the whole point of that
 /// out-of-band comparison (an operator could just read both sides off this
 /// one listing instead of actually comparing two independent screens).
-/// `peer pair approve` still independently re-derives it from this
+/// `pair <id>` still independently re-derives it from this
 /// instance's own identity plus the entry's stored transcript fields —
 /// never trusted from the wire — exactly as before; only THIS row listing
 /// stops showing it.
-pub(crate) fn handle_peer_pending(_inv: &Invocation) -> Outcome {
-    let cmd = "peer.pending";
+fn pending_listing(cmd: &str) -> Outcome {
     let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
     let inbound = aoide_storage::pairing::list_inbound(now_epoch);
     let outbound = aoide_storage::pairing::list_outbound(now_epoch);
@@ -2163,7 +2131,7 @@ pub(crate) fn handle_peer_pending(_inv: &Invocation) -> Outcome {
             let status = match dir {
                 "inbound" if r["revealed"].as_bool() == Some(false) => "awaiting reveal".to_string(),
                 "inbound" if r["approved"].as_bool() == Some(true) => "approved · awaiting their poll".to_string(),
-                "inbound" => "revealed · run `peer pair approve` with the code from their screen".to_string(),
+                "inbound" => "revealed · run `aoide pair <id>` with the code from their screen".to_string(),
                 _ => r["state"].as_str().unwrap_or("").to_string(),
             };
             format!(
@@ -2178,82 +2146,7 @@ pub(crate) fn handle_peer_pending(_inv: &Invocation) -> Outcome {
         .with_data(json!({ "requests": rows }))
 }
 
-/// Resolve `peer pair approve`'s (P-PV2) OPTIONAL `<id>` when omitted: the
-/// sole pending request across BOTH directions (`aoide_storage::pairing::
-/// list_inbound`/`list_outbound`), or a taught `Outcome::usage` — zero
-/// pending names nothing to approve, multiple pending lists every id
-/// (`aoide peer pending` shows the same set) and requires the caller name
-/// one explicitly. Never a silent guess.
-fn sole_pending_id(cmd: &str, now_epoch: i64) -> Result<String, Outcome> {
-    let mut ids: Vec<String> = aoide_storage::pairing::list_inbound(now_epoch).into_iter().map(|e| e.id).collect();
-    ids.extend(aoide_storage::pairing::list_outbound(now_epoch).into_iter().map(|e| e.id));
-    match ids.as_slice() {
-        [one] => Ok(one.clone()),
-        [] => Err(Outcome::usage(cmd, "no pending pairing requests to approve — see `aoide peer pending`")),
-        _ => Err(Outcome::usage(
-            cmd,
-            format!(
-                "multiple pending pairing requests — an id is required: {} (see `aoide peer pending`)",
-                ids.join(", ")
-            ),
-        )
-        .with_data(json!({ "reason": "ambiguous-id", "ids": ids }))),
-    }
-}
-
-/// `peer pair approve [<id>] [--yes] [--code NNN-NNN]` — dispatches by
-/// DIRECTION (module doc on this section): an INBOUND id runs
-/// [`approve_inbound`] (this instance is the APPROVER, gated by the TYPED
-/// pairing code — task #120 P3 — collected per [`InboundGate`]: `--code`
-/// scripted, a `text_input` prompt on a real CLI tty, a taught refusal
-/// anywhere no code can be collected; `--yes` deliberately maps to that
-/// refusal too, never a bypass); an OUTBOUND id runs [`approve_outbound`]
-/// (this instance is the REQUESTER, polling the approver's door then
-/// confirming — `--yes` keeps its original skip-the-y/N meaning THERE,
-/// since the requester's own screen already printed the code it would be
-/// typing back to itself); an id in neither queue is `unknown-id`.
-///
-/// **`<id>` is OPTIONAL (P-PV2, the User's locked spec).** Omitted with
-/// EXACTLY ONE pending request (either direction — [`sole_pending_id`]):
-/// that one is approved, no id-copying required for the common case.
-/// Omitted with zero or multiple pending: a taught error (zero: nothing to
-/// approve; multiple: the id is required, every pending id is listed) —
-/// never a silent guess at which request the operator meant.
-fn handle_peer_pair_approve(inv: &Invocation) -> Outcome {
-    let cmd = "peer.pair.approve";
-    let now = aoide_storage::time::now_iso_utc();
-    let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap_or(0);
-
-    let id = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        Some(i) => i.to_string(),
-        None => match sole_pending_id(cmd, now_epoch) {
-            Ok(i) => i,
-            Err(out) => return out,
-        },
-    };
-
-    let allow = match parse_allow_flag(inv) {
-        Ok(a) => a,
-        Err(e) => return Outcome::usage(cmd, e),
-    };
-
-    if let Some(entry) = aoide_storage::pairing::list_inbound(now_epoch).into_iter().find(|e| e.id == id) {
-        let gate = match inv.flags.get("code").cloned().filter(|c| !c.trim().is_empty()) {
-            Some(code) => InboundGate::Code(code),
-            None if inv.flag_present("yes") => InboundGate::Unavailable,
-            None if aoide_protocol::pick::interactive(inv.door) => InboundGate::Prompt,
-            None => InboundGate::Unavailable,
-        };
-        return approve_inbound(gate, cmd, &id, entry, &now, now_epoch, allow.as_deref());
-    }
-    if let Some(entry) = aoide_storage::pairing::list_outbound(now_epoch).into_iter().find(|e| e.id == id) {
-        return approve_outbound(inv.flag_present("yes"), cmd, &id, entry, &now, now_epoch, allow.as_deref());
-    }
-    Outcome::error(cmd, format!("no pending pairing request with id `{id}` (unknown, already resolved, or expired)"))
-        .with_data(json!({ "reason": "unknown-id", "id": id }))
-}
-
-/// The APPROVER's half of `peer pair approve` (this instance holds the
+/// The APPROVER's half of `pair <id>` (this instance holds the
 /// INBOUND entry). Refuses outright while the entry is still `awaiting
 /// reveal` (review-bounce Finding 1 — no nonce yet means no SAS to confirm
 /// against). Otherwise re-derives the SAS from this instance's own identity
@@ -2289,7 +2182,7 @@ fn handle_peer_pair_approve(inv: &Invocation) -> Outcome {
 /// counts one persisted try ([`aoide_storage::pairing::record_inbound_code_try`],
 /// cumulative across invocations and across the interactive/scripted
 /// paths); the [`MAX_CODE_TRIES`]rd mismatch auto-denies
-/// ([`auto_deny_inbound`] — the same clean removal `peer pair reject`
+/// ([`auto_deny_inbound`] — the same clean removal `pair reject`
 /// performs, audited under its own reason). An abort (`Esc`, `Ctrl-C`)
 /// leaves the entry pending with no try counted — an abort is not a wrong
 /// code. **`pair_watch --popup`'s own dialog is `InboundGate::Code`
@@ -2308,7 +2201,7 @@ pub(crate) fn approve_inbound(
     if entry.approved {
         return Outcome::ok(
             cmd,
-            format!("already approved `{}` — waiting for their own `peer pair approve {id}` to complete their side", entry.name),
+            format!("already approved `{}` — waiting for their own `aoide pair {id}` to complete their side", entry.name),
         )
         .with_data(json!({ "confirmed": true, "id": id, "peer": entry.name, "alreadyApproved": true }));
     }
@@ -2326,7 +2219,7 @@ pub(crate) fn approve_inbound(
             cmd,
             format!(
                 "pairing request `{id}` from `{}` is awaiting the requester's reveal step — nothing to confirm yet; \
-                 try again shortly, or `aoide peer pair reject {id}` to refuse it outright",
+                 try again shortly, or `aoide pair reject {id}` to refuse it outright",
                 entry.name
             ),
         )
@@ -2385,7 +2278,7 @@ pub(crate) fn approve_inbound(
             let Some(typed) = typed else {
                 return Outcome::ok(
                     cmd,
-                    format!("not confirmed — the request remains pending; run `aoide peer pair reject {id}` to refuse it outright"),
+                    format!("not confirmed — the request remains pending; run `aoide pair reject {id}` to refuse it outright"),
                 )
                 .with_data(json!({ "confirmed": false, "id": id }));
             };
@@ -2457,7 +2350,7 @@ pub(crate) fn approve_inbound(
     Outcome::ok(
         cmd,
         format!(
-            "{word} `{}` (code {sas}) — verified{}; awaiting their own `peer pair approve {id}` to poll and complete their side",
+            "{word} `{}` (code {sas}) — verified{}; awaiting their own `aoide pair {id}` to poll and complete their side",
             entry.name,
             grant_note(first_pairing, &allows)
         ),
@@ -2466,8 +2359,8 @@ pub(crate) fn approve_inbound(
     .with_data(json!({ "confirmed": true, "sas": sas, "peer": entry.name, "pubkeyHex": entry.pubkey_hex, "direction": "inbound", "grant": allows, "grantStamped": first_pairing }))
 }
 
-/// The REQUESTER's poll-then-confirm-then-commit half of `peer pair
-/// approve` (this instance holds the OUTBOUND entry, review-bounce
+/// The REQUESTER's poll-then-confirm-then-commit half of `pair
+/// <id>` (this instance holds the OUTBOUND entry, review-bounce
 /// Finding 2's mutual confirmation, preserved) — ONE poll
 /// ([`poll_outbound_once`]) then the commit ([`commit_outbound`]), which is
 /// all this function is since task #135 P2 lifted both halves out.
@@ -2509,8 +2402,8 @@ pub(crate) fn approve_outbound(
                 cmd,
                 format!(
                     "pairing request `{id}` to `{}` is still awaiting the peer's own approval — nothing to confirm yet; \
-                     try again once they've run `aoide peer pair approve {id}` on their side, or \
-                     `aoide peer pair reject {id}` to abort",
+                     try again once they've run `aoide pair {id}` on their side, or \
+                     `aoide pair reject {id}` to abort",
                     entry.name
                 ),
             )
@@ -2522,8 +2415,8 @@ pub(crate) fn approve_outbound(
 }
 
 /// What one `aoide/pairPoll` round trip learned. Split out (task #135 P2) so
-/// the poll has ONE implementation: `peer pair approve` calls it once, a
-/// blocking `peer pair` calls it on a cadence, and `mesh pair` will too. A
+/// the poll has ONE implementation: `pair <id>` calls it once, a
+/// blocking `pair` calls it on a cadence, and `mesh pair` will too. A
 /// second copy of this loop anywhere is the design error this exists to
 /// prevent — the SAS/transcript binding below is the whole security of the
 /// requester's half, and it must not be re-derived per caller.
@@ -2543,7 +2436,7 @@ pub(crate) enum PollOutcome {
 }
 
 /// Poll the approver's door once for `id`'s release (`aoide/pairPoll`, over
-/// the SAME forward dial `peer pair`'s own request/reveal already used).
+/// the SAME forward dial `pair`'s own request/reveal already used).
 ///
 /// An entry already at `AwaitingConfirm` is [`PollOutcome::Released`]
 /// immediately with no wire call: it was released by an earlier poll whose
@@ -2572,7 +2465,7 @@ pub(crate) fn poll_outbound_once(cmd: &str, id: &str, entry: &aoide_storage::pai
             return PollOutcome::Refused(
                 Outcome::error(
                     cmd,
-                    format!("polling `{}` at {}: {e} — retry `aoide peer pair approve {id}` once it's reachable", entry.name, entry.url),
+                    format!("polling `{}` at {}: {e} — retry `aoide pair {id}` once it's reachable", entry.name, entry.url),
                 )
                 .with_data(json!({ "reason": "poll-unreachable", "id": id })),
             )
@@ -2618,7 +2511,7 @@ pub(crate) fn poll_outbound_once(cmd: &str, id: &str, entry: &aoide_storage::pai
 
 /// The REQUESTER's confirm-then-commit half, on an entry a poll already
 /// released. Split out beside [`poll_outbound_once`] (task #135 P2) for the
-/// same reason: a blocking `peer pair` and `mesh pair` both finish a ceremony
+/// same reason: a blocking `pair` and `mesh pair` both finish a ceremony
 /// here, and neither may re-derive the SAS or re-implement the commit.
 ///
 /// The SAS comes from this instance's own identity plus the entry's STORED
@@ -2655,7 +2548,7 @@ pub(crate) fn commit_outbound(
                     cmd,
                     format!(
                         "not confirmed — the request remains pending (confirmation code was {sas}); \
-                         run `aoide peer pair reject {id}` to abort"
+                         run `aoide pair reject {id}` to abort"
                     ),
                 )
                 .with_data(json!({ "confirmed": false, "sas": sas, "id": id }))
@@ -2667,14 +2560,14 @@ pub(crate) fn commit_outbound(
     let mut peers = aoide_storage::peer_store::load_peers();
     let first_pairing = !peers.iter().any(|p| p.name == entry.name && p.verified);
     let change = aoide_storage::peer_store::upsert_paired_peer(&mut peers, &entry.name, &entry.url, &entry.pubkey_hex, now, allows);
-    // P-S4: the via this ceremony resolved back at `peer pair` request
+    // P-S4: the via this ceremony resolved back at `pair` request
     // time (K1's src_addr-derived default, or an explicit `--via`) rode
     // the parked entry here — commit it onto the peer record in the SAME
     // write as the pairing commit above, via the sibling writer
     // (`set_peer_via`'s own doc on why it's separate from
     // `upsert_paired_peer`'s signature). ONLY when `entry.via` is `Some`
     // (review fix, P-S4 follow-up) — a plain re-pair with no `--via` must
-    // LEAVE a previously-recorded via (e.g. one earlier `peer pair` set)
+    // LEAVE a previously-recorded via (e.g. one earlier `pair` set)
     // exactly as it was, the same "untouched unless this call names a change"
     // stance `upsert_paired_peer` itself already holds for `autogate`/
     // `tokenFile`/`bearerSecret`/`hub`/`allows` on re-pairing; calling
@@ -2701,7 +2594,7 @@ pub(crate) fn commit_outbound(
         .with_data(json!({ "confirmed": true, "sas": sas, "peer": entry.name, "pubkeyHex": entry.pubkey_hex, "direction": "outbound", "grant": allows, "grantStamped": first_pairing }))
 }
 
-/// `peer pair reject <id>` — a clean refusal: removes the parked entry
+/// `pair reject <id|name>` — a clean refusal: removes the parked entry
 /// (whichever direction it's in — an OUTBOUND id at EITHER state is the
 /// ceremony's own missing ABORT command, review-bounce Finding 2), no peer
 /// record on either end. Never notifies the other side (no wire call); an
@@ -2709,22 +2602,43 @@ pub(crate) fn commit_outbound(
 /// timeout (PAIRING.md names no explicit reject-notification requirement,
 /// and a same-shaped "clean refusal" is exactly what `secrets dismiss`
 /// gives an operator without a wire round trip either).
-fn handle_peer_pair_reject(inv: &Invocation) -> Outcome {
-    let cmd = "peer.pair.reject";
-    let id = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        Some(i) => i.to_string(),
-        None => return Outcome::usage(cmd, "usage: aoide peer pair reject <id> [--json]"),
+fn handle_pair_reject(inv: &Invocation) -> Outcome {
+    let cmd = "pair.reject";
+    let target = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(t) => t.to_string(),
+        None => return Outcome::usage(cmd, "usage: aoide pair reject <id|name> [--json]"),
     };
-    reject_by_id(cmd, &id)
+    let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
+    let inbound = aoide_storage::pairing::list_inbound(now_epoch);
+    let outbound = aoide_storage::pairing::list_outbound(now_epoch);
+    // An exact id wins outright (ids come from this family's own messages);
+    // otherwise a name matching exactly ONE pending request resolves to its
+    // id, several refuse with the ids, and none falls through to
+    // `reject_by_id`'s own taught unknown-id error, verbatim.
+    if inbound.iter().any(|e| e.id == target) || outbound.iter().any(|e| e.id == target) {
+        return reject_by_id(cmd, &target);
+    }
+    let ids: Vec<String> = inbound
+        .iter()
+        .filter(|e| e.name == target)
+        .map(|e| e.id.clone())
+        .chain(outbound.iter().filter(|e| e.name == target).map(|e| e.id.clone()))
+        .collect();
+    match ids.as_slice() {
+        [one] => reject_by_id(cmd, one),
+        [] => reject_by_id(cmd, &target),
+        _ => Outcome::usage(cmd, format!("multiple pending requests involve `{target}` — name one by id: {}", ids.join(", ")))
+            .with_data(json!({ "reason": "ambiguous-target", "target": target, "ids": ids })),
+    }
 }
 
-/// The shared body of `peer pair reject <id>` — extracted (P-P5) so
+/// The shared body of `pair reject` — extracted (P-P5) so
 /// `pair_watch`'s own popup arm (a `--yes`-shaped CLI invocation is the
 /// wrong shape for a dialog's "Reject request" button, which knows only
 /// the id) can call it directly with no [`Invocation`] to construct.
 /// Whichever direction the id is parked in, removes it — no peer record
 /// on either end, no wire notification to the other side (module doc on
-/// [`handle_peer_pair_reject`]).
+/// [`handle_pair_reject`]).
 pub(crate) fn reject_by_id(cmd: &str, id: &str) -> Outcome {
     let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
 
@@ -2746,7 +2660,7 @@ pub(crate) fn reject_by_id(cmd: &str, id: &str) -> Outcome {
     }
 }
 
-/// `peer pair watch [--popup] [--json]`'s launch-record handler (P-P5) —
+/// `pair watch [--popup] [--json]`'s launch-record handler (P-P5) —
 /// the SAME shape `aoide_server::commands::handle_events_tail`/
 /// `aoide_secrets::commands::handle_secrets_watch` already hold for a
 /// foreground/blocking command: this only gates the door and refuses a
@@ -2757,18 +2671,18 @@ pub(crate) fn reject_by_id(cmd: &str, id: &str) -> Outcome {
 /// until Ctrl-C makes no sense over MCP/A2A, the same reasoning
 /// `secrets watch`/`events tail` already established for the same shape
 /// of command.
-fn handle_peer_pair_watch(inv: &Invocation) -> Outcome {
-    let cmd = "peer.pair.watch";
+fn handle_pair_watch(inv: &Invocation) -> Outcome {
+    let cmd = "pair.watch";
     if inv.door != aoide_protocol::Door::Cli {
         return Outcome::usage(
             cmd,
-            "peer pair watch is a foreground follow that blocks until Ctrl-C; run it from a terminal (not over this door)",
+            "pair watch is a foreground follow that blocks until Ctrl-C; run it from a terminal (not over this door)",
         );
     }
     if inv.flag_present("popup") && inv.flag_present("json") {
         return Outcome::usage(
             cmd,
-            "peer pair watch: --popup and --json are mutually exclusive — --popup replaces the terminal narration with a \
+            "pair watch: --popup and --json are mutually exclusive — --popup replaces the terminal narration with a \
              confirm dialog, --json emits narration-only machine-readable lines; pick one",
         );
     }
@@ -2889,7 +2803,7 @@ fn confirm_invite(name: &str, host: &str, user: &str, src_addr: &str) -> Result<
 /// practice — task #129's known miss. 45s comfortably spans one tick.
 const PAIR_TARGET_SWEEP_SECS: u64 = 45;
 
-/// `peer pair <target>`'s HOSTNAME arm (`target` is not a URL) — the old
+/// `pair <target>`'s HOSTNAME arm (`target` is not a URL) — the old
 /// `peer invite <name>` handler's own body, unchanged apart from the
 /// sweep default (above): runs its OWN discover sweep (never reuses a
 /// previous one — an advertisement is only ever as fresh as the sweep that
@@ -2907,7 +2821,7 @@ const PAIR_TARGET_SWEEP_SECS: u64 = 45;
 /// (P-S1), on the house door port ([`default_a2a_port`]) — the
 /// advertisement deliberately carries NO door URL (rendezvous, not
 /// authentication; `aoide_storage::advertise`'s module doc), so a
-/// non-default far-end port needs the explicit url arm (`peer pair
+/// non-default far-end port needs the explicit url arm (`pair
 /// <url>`) instead. Before dialing, the SELF-PAIR GUARD
 /// (`discover::is_self_target`) refuses when the heard name is this
 /// instance's own or the datagram came from loopback — the "you just
@@ -2987,10 +2901,13 @@ fn pair_via_hostname(cmd: &str, inv: &Invocation, target: &str, usage: &str) -> 
         Ok(f) => f,
         Err(e) => return Outcome::usage(cmd, format!("{usage} — {e}")),
     };
+    if let Some(out) = refuse_detached_grant(cmd, &finish) {
+        return out;
+    }
     pair_with_heard(cmd, &hit, via_flag.as_ref(), self_via_flag.as_deref(), &finish)
 }
 
-/// The tail `peer pair`'s hostname arm ([`pair_via_hostname`]) and bare
+/// The tail `pair`'s hostname arm ([`pair_via_hostname`]) and bare
 /// `pair` share once a [`crate::discover::Heard`] target is settled (each
 /// having already run its own guard/confirmation): compose the dial URL
 /// from the hit's OBSERVED source address on the house door port
@@ -3003,7 +2920,7 @@ fn pair_via_hostname(cmd: &str, inv: &Invocation, target: &str, usage: &str) -> 
 /// the advertisement's OBSERVED source address plus its claimed ssh login
 /// (task #120 — the one thing the wire exists to carry), so its own FUTURE
 /// calls (pull/spawn/send) can reach it through an ssh tunnel — recorded at
-/// `peer pair approve` commit time, exactly as before. The SAME derived
+/// `pair <id>` commit time, exactly as before. The SAME derived
 /// default now ALSO rides the ceremony's OWN dial (`dial_via` below):
 /// against a door that binds loopback-only, a direct dial to the observed
 /// address never connects at all, so the ceremony itself needs the tunnel
@@ -3051,77 +2968,6 @@ fn resolve_pair_vias(
     (dial_via, record_via)
 }
 
-/// `peer pair`/`peer pending` (P-PV2, the User's locked spec, superseding
-/// P-P2's `peer pair request`/`peer pair pending` split) plus `peer pair
-/// approve|reject|watch`, registered directly after the six legacy `peer`
-/// commands — same-network federation's pairing ceremony joins the group
-/// it extends, nothing existing reorders.
-pub fn register_peer_pair(r: &mut Registry) {
-    r.insert(cmd!(
-        path: ["peer", "pair"],
-        summary: "Send a pairing request and display the confirmation code (SAS) plus its pending id to compare out-of-band. A URL-shaped target (contains \"://\") dials it directly; anything else is a hostname, resolved by a discovery beacon sweep.",
-        args: [arg!("target", "string", true, "A URL (e.g. http://host:8710/) to dial directly, or a hostname to resolve via a discovery sweep.")],
-        flags: [
-            flag!("name", "string", "A local nickname for the other instance (URL target only); defaults to a sanitized form of the URL's host."),
-            flag!("self-url", "string", "This instance's own advertised A2A door URL, recorded on the resulting peer record for the approver's future non-ceremony calls (the ceremony itself now polls, so this is no longer dialed to complete pairing); defaults to http://<host>:<AOIDE_A2A_PORT or 8710>/."),
-            flag!("self-via", "string", "This instance's own ssh://[user@]host reach-back hop claim, sent on the wire beside --self-url so an approver that only ever observes this request over a tunnel (loopback) can still record a working via; defaults to ssh://<local user>@<the local address routed toward the peer>."),
-            flag!("via", "string", "An ssh://[user@]host[:port] transport marker — both the ceremony's own dial AND the resulting peer's recorded via. Absent = direct dial (today's behavior)."),
-            flag!("secs", "int", "Hostname target only: how many seconds to sweep for the advertisement (default 45)."),
-            flag!("wait", "int", "How many seconds to block waiting for the other operator to approve, completing the pair in this one command (default 600). --wait 0 parks the request and returns immediately, leaving `peer pair approve <id>` to finish it later."),
-            flag!("yes", "bool", "Skip THIS side's own confirmations — the hostname arm's proceed prompt and, once the peer approves, the final code confirmation. Never touches the far side's typed code, which is the gate that secures the pair."),
-            flag!("allow", "string", "The capabilities to grant the peer on this pairing, comma-separated (read, spawn) — overriding config.toml's `[pairing] defaultGrant`, and empty (--allow \"\") to grant nothing. Only meaningful when the pair completes here, so it pairs with --wait; a peer's grant is stamped once, at its FIRST verification."),
-        ],
-        gated: false,
-        implemented: true,
-        handler: handle_peer_pair,
-    ));
-    r.insert(cmd!(
-        path: ["peer", "pending"],
-        summary: "List pairing requests parked on this instance. Never shows the confirmation code (SAS) — that is read off the requester's own screen and typed on the approver's, out-of-band; see `peer pair approve`.",
-        args: [],
-        flags: [],
-        gated: false,
-        implemented: true,
-        handler: handle_peer_pending,
-    ));
-    r.insert(cmd!(
-        path: ["peer", "pair", "approve"],
-        summary: "Approve a pending pairing request — the approver TYPES the pairing code as read from the requester's screen (3 cumulative mismatches auto-deny; --code NNN-NNN scripted) and commits locally; the requester polls for the release, confirms y/N (--yes scripted), then commits; run on both ends. <id> may be omitted when exactly one request is pending.",
-        args: [arg!("id", "string", false, "The pending pairing request's id (see `peer pending`); required when more than one request is pending.")],
-        flags: [
-            flag!("yes", "bool", "Skip the interactive y/N confirmation on an OUTBOUND (requester-side) id (scripted use); an inbound id takes --code instead — --yes never bypasses the approver's typed code."),
-            flag!("code", "string", "The pairing code, read from the requester's screen, for approving an INBOUND id without a terminal prompt (scripted use); a wrong code counts one persisted try, and 3 cumulative mismatches auto-deny the request."),
-            flag!("allow", "string", "The capabilities this commit grants the peer, comma-separated (read, spawn) — overriding config.toml's `[pairing] defaultGrant` for this pairing only, and empty (--allow \"\") to grant nothing. Applies ONLY on a peer's FIRST verification: re-pairing an already-verified peer never re-grants, so use `peer allow` to change a live grant."),
-        ],
-        gated: false,
-        implemented: true,
-        handler: handle_peer_pair_approve,
-    ));
-    r.insert(cmd!(
-        path: ["peer", "pair", "reject"],
-        summary: "Refuse a pending pairing request — a clean removal, no peer record on either end.",
-        args: [arg!("id", "string", true, "The pending pairing request's id (see `peer pending`).")],
-        flags: [],
-        gated: false,
-        implemented: true,
-        handler: handle_peer_pair_reject,
-    ));
-    r.insert(cmd!(
-        path: ["peer", "pair", "watch"],
-        summary: "Foreground, line-mode follow of the pairing-ceremony events feed (parked/revealed/awaiting-confirm) plus a 30s reconcile safety tick. --json emits one event object per line instead of narration. --popup (opt-in, aoide.a2a.pairingPopup) swaps the terminal narration for a dialog shaped by direction on each actionable request: typed-code entry on an inbound reveal, a single Approve/Reject on an outbound awaiting-confirm — lyra when it resolves, zenity otherwise — mutually exclusive with --json. CLI-only — blocks until Ctrl-C.",
-        args: [],
-        flags: [flag!(
-            "popup",
-            "bool",
-            "Surface each actionable request as a dialog instead of terminal narration: typed-code entry (inbound reveal) or a single Approve/Reject (outbound awaiting-confirm) — lyra when it resolves, zenity otherwise. Requires one of the two on PATH. Mutually exclusive with --json."
-        )],
-        gated: false,
-        implemented: true,
-        handler: handle_peer_pair_watch,
-        examples: ["peer pair watch", "peer pair watch --json", "peer pair watch --popup"],
-    ));
-}
-
 /// `peer advertise on|off` (task #120): flip this instance's discovery
 /// advertise switch (`aoide_storage::advertise::set_enabled`,
 /// `state/advertise.json`). Idempotent, and says which of the two it was —
@@ -3160,13 +3006,11 @@ fn handle_peer_advertise(inv: &Invocation) -> Outcome {
 
 /// `peer discover`/`peer advertise` (P-P6 + task #120,
 /// `docs/architecture/PAIRING.md`'s "Discovery (advertise-but-locked)"
-/// section), registered directly after `register_peer_pair` — discovery is
-/// sugar OVER the ceremony that group already owns, never a parallel
-/// mechanism, so it joins the group it extends the same way
-/// `register_peer_pair` itself did for the six legacy `peer` commands.
-/// `peer pair <hostname>`'s own hostname arm ([`pair_via_hostname`], P-PV2)
-/// is the sugar-over-the-ceremony command now — `peer invite` died in the
-/// same phase, hard cutover, no alias.
+/// section) — discovery is sugar OVER the ceremony `pair` owns, never a
+/// parallel mechanism. `pair <hostname>`'s own hostname arm
+/// ([`pair_via_hostname`], P-PV2) is the sugar-over-the-ceremony command —
+/// `peer invite` died in the same phase, hard cutover, no alias, and the
+/// whole `peer pair` family followed it in task #135 P3'.
 pub fn register_peer_discovery(r: &mut Registry) {
     r.insert(cmd!(
         path: ["peer", "discover"],
@@ -3195,42 +3039,196 @@ pub fn register_peer_discovery(r: &mut Registry) {
 /// `peer discover --secs N`).
 const PAIR_SWEEP_SECS: u64 = 2;
 
-/// Bare `aoide pair` (task #120 P3) — the friendly entry into the pairing
-/// ceremony: one bounded advertisement sweep ([`crate::discover::run_sweep`],
-/// [`PAIR_SWEEP_SECS`]), then an interactive SELECT menu over the
-/// advertising candidates (`aoide_protocol::pick::choose` — the same
-/// `inquire`-backed picker substrate bare `session` opens), and the picked
-/// row drives the EXISTING [`pair_with_heard`] → [`run_pair_request`] path
-/// — reuse, never a fork; `run_pair_request`'s own success message then
-/// prints the SAS and teaches the approve step on both ends. Picking a row
-/// IS the proceed-confirmation — no second `confirm_invite`-style y/N on
-/// top (`peer pair <hostname>` needs one because its target arrives as a
-/// typed argument, not a choice made looking at the candidate).
+/// `aoide pair [<target>]` — the pairing ceremony's ONE entry point (task
+/// #135 P3', the User's collapse: "the command set can just be aoide
+/// pair"). No target: [`pair_overview`] — a menu on a real tty, the
+/// pending listing anywhere else. A URL target: the explicit dial
+/// ([`pair_via_url`], the scalpel, ungated). Anything else:
+/// [`pair_continue_or_request`], the smart leg.
+///
+/// The arity guard is inherited from `peer pair` (review finding, P-PV2
+/// follow-up): a second positional is never valid syntax, and old
+/// muscle-memory spellings (`pair request <url>`) must refuse loudly
+/// rather than sweep for an advertiser literally named "request".
+fn handle_pair(inv: &Invocation) -> Outcome {
+    let cmd = "pair";
+    const USAGE: &str = "usage: aoide pair [<name|url|id>] [--code NNN-NNN] [--wait SECS] [--allow read,spawn] [--yes] [--name <n>] [--via ssh://[user@]host[:port]] [--self-url <url>] [--self-via ssh://[user@]host] [--secs N] [--json] — bare `pair` lists pending requests (interactive menu on a tty); a target continues whatever leg of the ceremony already exists with it (approving an inbound request, resuming an outbound one), or starts a new request (a URL dials directly, anything else sweeps for an advertisement) and waits for the far approval";
+    if inv.args.len() > 1 {
+        return Outcome::usage(cmd, USAGE);
+    }
+    let Some(target) = inv.args.first().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+        return pair_overview(cmd, inv);
+    };
+    if target.contains("://") {
+        return pair_via_url(cmd, inv, &target, USAGE);
+    }
+    pair_continue_or_request(cmd, inv, &target, USAGE)
+}
+
+/// `pair <target>` where the target is NOT a URL — one verb, "make us
+/// paired", routed by whatever half of a ceremony already exists with that
+/// target. An exact pending-ID match wins over a name match, so an id
+/// pasted from this command's own messages always lands; an inbound match
+/// APPROVES (the old approve's inbound arm), an outbound match RESUMES
+/// (poll → confirm → commit), and only when nothing is pending does this
+/// become a NEW request (the hostname sweep arm), gated by
+/// [`confirm_repair_if_verified`] when the name is already a verified peer.
+///
+/// A hijack worry falls to the gate, not the routing: a stranger parking a
+/// request under a known name only steers `pair <name>` into the
+/// typed-code gate, where a code matching nothing commits nothing and
+/// three mismatches auto-deny the stranger's own entry.
+fn pair_continue_or_request(cmd: &str, inv: &Invocation, target: &str, usage: &str) -> Outcome {
+    let now = aoide_storage::time::now_iso_utc();
+    let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap_or(0);
+    let inbound = aoide_storage::pairing::list_inbound(now_epoch);
+    let outbound = aoide_storage::pairing::list_outbound(now_epoch);
+
+    if let Some(e) = inbound.iter().find(|e| e.id == target) {
+        return approve_inbound_leg(cmd, inv, e.clone(), &now, now_epoch, usage);
+    }
+    if let Some(e) = outbound.iter().find(|e| e.id == target) {
+        return resume_outbound_leg(cmd, inv, e.clone(), &now, now_epoch, usage);
+    }
+
+    let in_matches: Vec<&aoide_storage::pairing::InboundPairingRequest> = inbound.iter().filter(|e| e.name == target).collect();
+    let out_matches: Vec<&aoide_storage::pairing::OutboundPairingRequest> = outbound.iter().filter(|e| e.name == target).collect();
+    if in_matches.len() + out_matches.len() > 1 {
+        let ids: Vec<&str> = in_matches.iter().map(|e| e.id.as_str()).chain(out_matches.iter().map(|e| e.id.as_str())).collect();
+        return Outcome::usage(cmd, format!("multiple pending requests involve `{target}` — name one by id: {}", ids.join(", ")))
+            .with_data(json!({ "reason": "ambiguous-target", "target": target, "ids": ids }));
+    }
+    if let Some(e) = in_matches.first() {
+        return approve_inbound_leg(cmd, inv, (*e).clone(), &now, now_epoch, usage);
+    }
+    if let Some(e) = out_matches.first() {
+        return resume_outbound_leg(cmd, inv, (*e).clone(), &now, now_epoch, usage);
+    }
+
+    if let Err(out) = confirm_repair_if_verified(cmd, inv, target) {
+        return out;
+    }
+    pair_via_hostname(cmd, inv, target, usage)
+}
+
+/// The APPROVER's leg of `pair <target>` — gate selection verbatim from the
+/// old `peer pair approve` inbound arm ([`InboundGate`]): `--code`
+/// scripted, a typed prompt on a real CLI tty, a taught refusal anywhere no
+/// code can be collected. `--yes` deliberately maps to that refusal too —
+/// it is never a bypass of the typed code, which is the gate that secures
+/// the pair.
+fn approve_inbound_leg(
+    cmd: &str,
+    inv: &Invocation,
+    entry: aoide_storage::pairing::InboundPairingRequest,
+    now: &str,
+    now_epoch: i64,
+    usage: &str,
+) -> Outcome {
+    let allow = match parse_allow_flag(inv) {
+        Ok(a) => a,
+        Err(e) => return Outcome::usage(cmd, format!("{usage} — {e}")),
+    };
+    let gate = match inv.flags.get("code").cloned().filter(|c| !c.trim().is_empty()) {
+        Some(code) => InboundGate::Code(code),
+        None if inv.flag_present("yes") => InboundGate::Unavailable,
+        None if aoide_protocol::pick::interactive(inv.door) => InboundGate::Prompt,
+        None => InboundGate::Unavailable,
+    };
+    let id = entry.id.clone();
+    approve_inbound(gate, cmd, &id, entry, now, now_epoch, allow.as_deref())
+}
+
+/// The REQUESTER's leg of `pair <target>` on an entry this instance already
+/// parked — the old outbound `peer pair approve`, plus the wait: a nonzero
+/// `--wait` blocks through [`wait_and_commit`] exactly as a fresh request
+/// does, so "come back later" and "start one now" are the same command
+/// either way. `--wait 0` is the scripted single-shot the old approve was:
+/// one poll, commit if released, the park report if not — and unlike a NEW
+/// request's `--wait 0`, `--allow` stays legal here because this leg can
+/// commit.
+fn resume_outbound_leg(
+    cmd: &str,
+    inv: &Invocation,
+    entry: aoide_storage::pairing::OutboundPairingRequest,
+    now: &str,
+    now_epoch: i64,
+    usage: &str,
+) -> Outcome {
+    let finish = match pair_finish_from(inv) {
+        Ok(f) => f,
+        Err(e) => return Outcome::usage(cmd, format!("{usage} — {e}")),
+    };
+    if finish.wait_secs == 0 {
+        let id = entry.id.clone();
+        return approve_outbound(finish.skip_confirm, cmd, &id, entry, now, now_epoch, finish.grant.as_deref());
+    }
+    let (kp, _) = match aoide_storage::identity::load_or_mint() {
+        Ok(v) => v,
+        Err(e) => {
+            return Outcome::error(cmd, format!("loading this instance's identity: {e}"))
+                .with_data(json!({ "reason": "identity-io-failed" }))
+        }
+    };
+    let sas = aoide_storage::pairing::derive_sas(&kp.info().pubkey_hex, &entry.pubkey_hex, &entry.requester_nonce_hex, &entry.approver_nonce_hex);
+    eprintln!(
+        "resuming the pairing with `{}` (code {sas}) — waiting up to {}s; Ctrl-C leaves it pending as `{}`",
+        entry.name, finish.wait_secs, entry.id
+    );
+    wait_and_commit(cmd, &entry.id, &entry.name, &sas, &finish)
+}
+
+/// `pair <name>` when `<name>` is ALREADY a verified peer and no ceremony
+/// is pending: under the smart verb this is the thing an operator types
+/// just to poke at a peer, and a re-pair replaces key material — so it is
+/// confirmed (interactive y/N; `--yes` scripted) rather than fired. Only
+/// this NAME leg is gated: the explicit URL dial stays ungated, the
+/// scalpel it always was, and `Err` here is the finished Outcome to return
+/// (a decline is an Ok "nothing sent", not an error).
+fn confirm_repair_if_verified(cmd: &str, inv: &Invocation, name: &str) -> Result<(), Outcome> {
+    if !aoide_storage::peer_store::load_peers().iter().any(|p| p.name == name && p.verified) {
+        return Ok(());
+    }
+    if inv.flag_present("yes") {
+        return Ok(());
+    }
+    if !aoide_protocol::pick::interactive(inv.door) {
+        return Err(Outcome::error(
+            cmd,
+            format!("`{name}` is already a verified peer — re-pairing replaces its key material; re-run with --yes to proceed"),
+        )
+        .with_data(json!({ "reason": "already-paired", "name": name })));
+    }
+    match aoide_protocol::pick::confirm(&format!("`{name}` is already a verified peer — re-pair (replaces its key material)?")) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(Outcome::ok(cmd, "not re-paired — nothing sent").with_data(json!({ "confirmed": false, "name": name }))),
+        Err(e) => Err(Outcome::error(cmd, e)),
+    }
+}
+
+/// Bare `pair` — the ceremony's overview, shaped by the door. Non-tty,
+/// `--json`, or a non-CLI door: [`pending_listing`], both directions — the
+/// machine face agents drive (the old `peer pending`, which died into
+/// this). A real CLI tty: one menu over everything actionable — pending
+/// requests first (pick one to approve or resume it), then a
+/// [`PAIR_SWEEP_SECS`]s advertisement sweep's candidates (pick one to
+/// request — the pick IS the proceed confirmation, so no second
+/// `confirm_invite` y/N rides on top). Same facts either way; only the
+/// door differs.
 ///
 /// Row text renders only already-validated advertisement fields
 /// (`advertise::parse_and_validate` gates every one — house rule 4) plus
-/// the OBSERVED source address, claim and observation side by side, the
-/// same untrusted-display stance `peer list`'s `◆` candidate rows hold.
-/// Own advertisements are filtered out up front
-/// (`discover::is_self_target` — a broadcast always loops back to its own
-/// sender), so the menu never offers a self-pair.
-///
-/// CLI-door + real-tty only (`pick::interactive`, the same gate bare
-/// `session` holds; `--json` steers to the taught refusal too — a picker's
-/// prompts have no business interleaving with a machine-readable stream):
-/// every other shape gets a taught refusal naming the scripted spellings,
-/// never a hang on a stdin nobody is typing into.
-fn handle_pair(inv: &Invocation) -> Outcome {
-    let cmd = "pair";
-    let taught = "bare `pair` opens an interactive pairing picker on a real CLI terminal; scripted path: \
-                  `aoide peer advertise on` on the other box, then `aoide peer pair <name> --yes` \
-                  (hostname) or `aoide peer pair <url> [--via ssh://[user@]host]` (explicit dial) here";
-    if inv.door != aoide_protocol::Door::Cli {
-        return Outcome::usage(cmd, format!("{taught} (this door is not the CLI)"));
-    }
+/// the OBSERVED source address, claim and observation side by side. Own
+/// advertisements are filtered up front (`discover::is_self_target`), so
+/// the menu never offers a self-pair.
+fn pair_overview(cmd: &str, inv: &Invocation) -> Outcome {
     if inv.flag_present("json") || !aoide_protocol::pick::interactive(inv.door) {
-        return Outcome::usage(cmd, taught);
+        return pending_listing(cmd);
     }
+    let now = aoide_storage::time::now_iso_utc();
+    let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap_or(0);
+    let inbound = aoide_storage::pairing::list_inbound(now_epoch);
+    let outbound = aoide_storage::pairing::list_outbound(now_epoch);
 
     let swept = match crate::discover::run_sweep(PAIR_SWEEP_SECS) {
         Ok(s) => s,
@@ -3245,49 +3243,126 @@ fn handle_pair(inv: &Invocation) -> Outcome {
         .into_iter()
         .filter(|h| !crate::discover::is_self_target(h, &own_name))
         .collect();
-    if candidates.is_empty() {
+
+    if inbound.is_empty() && outbound.is_empty() && candidates.is_empty() {
         return Outcome::ok(
             cmd,
             format!(
-                "heard no advertising instances in {PAIR_SWEEP_SECS}s ({} malformed dropped) — on the OTHER box, \
+                "nothing pending, and no advertising instances heard in {PAIR_SWEEP_SECS}s ({} malformed dropped) — on the OTHER box, \
                  switch advertising on with `aoide peer advertise on` (a running `a2a serve` emits it within ~40s) \
-                 and run `aoide pair` here again; or pair manually with \
-                 `aoide peer pair <url> [--via ssh://[user@]host]`",
+                 and run `aoide pair` here again; or dial explicitly with \
+                 `aoide pair <url> [--via ssh://[user@]host]`",
                 swept.dropped
             ),
         )
         .with_data(json!({ "heard": 0, "dropped": swept.dropped }));
     }
 
-    let rows: Vec<String> = candidates
-        .iter()
-        .map(|h| {
-            format!(
-                "{} — claims ssh {}@{}, observed at {}",
-                h.advertisement.name, h.advertisement.user, h.advertisement.host, h.src_addr
-            )
-        })
-        .collect();
-    match aoide_protocol::pick::choose("pair with which instance?", &rows, None) {
+    // Parallel row/action vectors: the row is what the operator reads, the
+    // action is which leg the pick runs — kept side by side so they cannot
+    // drift apart.
+    enum Row {
+        In(aoide_storage::pairing::InboundPairingRequest),
+        Out(aoide_storage::pairing::OutboundPairingRequest),
+        Heard(crate::discover::Heard),
+    }
+    let mut labels: Vec<String> = Vec::new();
+    let mut actions: Vec<Row> = Vec::new();
+    for e in inbound {
+        let status = if e.approved {
+            "approved; awaiting their poll"
+        } else if e.requester_nonce_hex.is_some() {
+            "awaiting your code"
+        } else {
+            "awaiting their reveal"
+        };
+        labels.push(format!("approve `{}` — inbound request {} ({status})", e.name, e.id));
+        actions.push(Row::In(e));
+    }
+    for e in outbound {
+        labels.push(format!("resume `{}` — outbound request {} ({})", e.name, e.id, e.state.as_str()));
+        actions.push(Row::Out(e));
+    }
+    for h in candidates {
+        labels.push(format!(
+            "request `{}` — claims ssh {}@{}, observed at {}",
+            h.advertisement.name, h.advertisement.user, h.advertisement.host, h.src_addr
+        ));
+        actions.push(Row::Heard(h));
+    }
+
+    match aoide_protocol::pick::choose("pair — which?", &labels, None) {
         None => Outcome::ok(cmd, "nothing chosen — nothing sent"),
-        Some(i) => pair_with_heard(cmd, &candidates[i], None, None, &PairFinish::detached()),
+        Some(i) => match actions.swap_remove(i) {
+            Row::In(e) => approve_inbound_leg(cmd, inv, e, &now, now_epoch, "aoide pair"),
+            Row::Out(e) => resume_outbound_leg(cmd, inv, e, &now, now_epoch, "aoide pair"),
+            Row::Heard(h) => {
+                if let Err(out) = confirm_repair_if_verified(cmd, inv, &h.advertisement.name) {
+                    return out;
+                }
+                let finish = match pair_finish_from(inv) {
+                    Ok(f) => f,
+                    Err(e) => return Outcome::usage(cmd, e),
+                };
+                if let Some(out) = refuse_detached_grant(cmd, &finish) {
+                    return out;
+                }
+                pair_with_heard(cmd, &h, None, None, &finish)
+            }
+        },
     }
 }
 
-/// Bare `pair` (task #120 P3), registered at the END of assembly like
-/// every appended-newest command — the top-level friendly entry into the
-/// ceremony `register_peer_pair`/`register_peer_discovery` own the
-/// scripted spellings of.
+/// The `pair` family — the pairing ceremony's whole CLI face (task #135
+/// P3', superseding P-PV2's `peer pair`/`peer pending`/`peer pair
+/// approve|reject|watch`, which DIED in this collapse — hard cutover, no
+/// aliases, the same way `peer invite` died before them). The split it
+/// leaves behind: `pair` MINTS verified peer records; `peer` operates on
+/// the roster those records live in (list/allow/hub/spawn/add/discover/
+/// advertise).
 pub fn register_pair(r: &mut Registry) {
     r.insert(cmd!(
         path: ["pair"],
-        summary: "Open the interactive pairing picker on a real CLI terminal: one ~2s advertisement sweep, a select menu over the advertising instances heard (name, claimed ssh hop, observed source), and the picked one runs the same ceremony `peer pair` drives — then prints the code to compare and the approve step for both ends. Non-tty or non-CLI invocations get a taught pointer at the scripted spellings instead.",
-        args: [],
-        flags: [],
+        summary: "Make this instance and a target paired — one verb for the whole ceremony, routed by what already exists: a pending inbound request from the target is approved (typed pairing code; --code scripted), a pending outbound one is resumed (poll then y/N confirm; --yes scripted), and nothing pending starts a new request (a URL dials directly, a name sweeps for its advertisement) then blocks up to --wait seconds for the far approval. Bare `pair` is the overview: an interactive menu over pending requests and heard advertisers on a real CLI tty, the pending listing (JSON-friendly) anywhere else.",
+        args: [arg!("target", "string", false, "A peer name/hostname, a pending request id, or a URL (e.g. http://host:8710/) to dial directly. Omitted: the overview/menu.")],
+        flags: [
+            flag!("code", "string", "The pairing code as read from the requester's screen, approving an INBOUND request without a prompt (scripted use); a wrong code counts one persisted try, and 3 cumulative mismatches auto-deny the request."),
+            flag!("wait", "int", "Seconds to block for the far operator (default 600). On a new request: park, then poll until approved or the wait runs out. On a resume: the same poll loop. --wait 0 parks a new request and returns immediately, or polls a resumed one exactly once."),
+            flag!("allow", "string", "The capabilities this commit grants the peer, comma-separated (read, spawn) — overriding config.toml's `[pairing] defaultGrant`, and empty (--allow \"\") to grant nothing. First verification only: re-pairing an already-verified peer never re-grants, so use `peer allow` to change a live grant."),
+            flag!("yes", "bool", "Skip THIS side's own confirmations — the sweep proceed prompt, the already-paired re-pair confirm, and the final code y/N. Never touches the far side's typed code, which is the gate that secures the pair."),
+            flag!("name", "string", "URL target only: a local nickname for the other instance; defaults to a sanitized form of the URL's host."),
+            flag!("via", "string", "An ssh://[user@]host[:port] transport marker — both the ceremony's own dial AND the resulting peer's recorded via. Absent = direct dial."),
+            flag!("self-url", "string", "This instance's own advertised A2A door URL, recorded on the far side's peer record; defaults to http://<host>:<AOIDE_A2A_PORT or 8710>/."),
+            flag!("self-via", "string", "This instance's own ssh://[user@]host reach-back hop claim, sent on the wire so an approver that only observes this request over a tunnel (loopback) can still record a working via; defaults to ssh://<local user>@<the local address routed toward the peer>."),
+            flag!("secs", "int", "Name target only: how many seconds to sweep for the advertisement (default 45)."),
+        ],
         gated: false,
         implemented: true,
         handler: handle_pair,
-        examples: ["pair"],
+        examples: ["pair", "pair osaka", "pair osaka --code 839-035", "pair http://box:8710/ --wait 0"],
+    ));
+    r.insert(cmd!(
+        path: ["pair", "reject"],
+        summary: "Refuse (inbound) or abort (outbound) a pending pairing request, by id or by a name matching exactly one — a clean removal, no peer record on either end, no wire call.",
+        args: [arg!("target", "string", true, "The pending request's id, or a name matching exactly one pending request (see bare `pair`).")],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_pair_reject,
+    ));
+    r.insert(cmd!(
+        path: ["pair", "watch"],
+        summary: "Foreground, line-mode follow of the pairing-ceremony events feed (parked/revealed/awaiting-confirm) plus a 30s reconcile safety tick. --json emits one event object per line instead of narration. --popup (opt-in, aoide.a2a.pairingPopup) swaps the terminal narration for a dialog shaped by direction on each actionable request: typed-code entry on an inbound reveal, a single Approve/Reject on an outbound awaiting-confirm — lyra when it resolves, zenity otherwise — mutually exclusive with --json. CLI-only — blocks until Ctrl-C.",
+        args: [],
+        flags: [flag!(
+            "popup",
+            "bool",
+            "Surface each actionable request as a dialog instead of terminal narration: typed-code entry (inbound reveal) or a single Approve/Reject (outbound awaiting-confirm) — lyra when it resolves, zenity otherwise. Requires one of the two on PATH. Mutually exclusive with --json."
+        )],
+        gated: false,
+        implemented: true,
+        handler: handle_pair_watch,
+        examples: ["pair watch", "pair watch --json", "pair watch --popup"],
     ));
 }
 
@@ -3656,7 +3731,7 @@ mod tests {
             assert_eq!(out.status, aoide_protocol::output::Status::Error);
             assert_eq!(out.data.as_ref().unwrap()["reason"], "unknown-peer");
             assert!(
-                out.message.contains("peer pair"),
+                out.message.contains("aoide pair"),
                 "taught error must name the pairing ceremony: {}",
                 out.message
             );
@@ -3675,7 +3750,7 @@ mod tests {
             assert_eq!(out.status, aoide_protocol::output::Status::Error);
             assert_eq!(out.data.as_ref().unwrap()["reason"], "unpaired-peer");
             assert!(
-                out.message.contains("peer pair"),
+                out.message.contains("aoide pair"),
                 "taught error must name the pairing ceremony: {}",
                 out.message
             );
@@ -3856,7 +3931,7 @@ mod tests {
         }
     }
 
-    // ── `peer pair`'s hostname arm bottoms out in the exact same
+    // ── `pair`'s hostname arm bottoms out in the exact same
     // ── `run_pair_request` its url arm runs (P-PV2) — proven directly by
     // ── calling it through both entry points against the SAME unreachable
     // ── door and asserting byte-identical outcomes, rather than trusting
@@ -3877,25 +3952,25 @@ mod tests {
             let self_url = default_self_url();
 
             // `pair_via_url`'s own documented tail.
-            let direct = run_pair_request("peer.pair", url, name, &self_url, None, None, None, &PairFinish::detached());
+            let direct = run_pair_request("pair", url, name, &self_url, None, None, None, &PairFinish::detached());
             // The same ceremony tail `pair_via_hostname` reaches on its
             // single-match branch — it composes an OBSERVED dial url first
             // (src_addr + `default_a2a_port`, P-S1/task #120) and passes
             // that, but the tail function is still this one; reproduced
-            // here under the identical `peer.pair` command name both arms
+            // here under the identical `pair` command name both arms
             // now share.
-            let via_hostname = run_pair_request("peer.pair", url, name, &self_url, None, None, None, &PairFinish::detached());
+            let via_hostname = run_pair_request("pair", url, name, &self_url, None, None, None, &PairFinish::detached());
 
             assert_eq!(direct.status, aoide_protocol::output::Status::Error, "{direct:?}");
-            assert_eq!(direct.command, "peer.pair");
+            assert_eq!(direct.command, "pair");
             assert_eq!(via_hostname.status, direct.status);
-            assert_eq!(via_hostname.command, "peer.pair");
+            assert_eq!(via_hostname.command, "pair");
             // Same failure MESSAGE from both call sites — proves it is one
             // function's error path taken twice, not two independently
             // drifting implementations that merely happen to agree today.
             assert_eq!(
                 via_hostname.message, direct.message,
-                "peer pair's url arm and hostname arm must produce an identical failure message here"
+                "pair's url arm and hostname arm must produce an identical failure message here"
             );
         });
     }
@@ -4509,7 +4584,7 @@ mod tests {
             let saved_path = std::env::var("PATH").ok();
             std::env::set_var("PATH", format!("{}:{}", shim_dir.display(), saved_path.clone().unwrap_or_default()));
 
-            let outcome = approve_inbound(InboundGate::Code(sas), "peer.pair.approve", &id, entry, &now, now_epoch, None);
+            let outcome = approve_inbound(InboundGate::Code(sas), "pair", &id, entry, &now, now_epoch, None);
 
             match saved_path {
                 Some(p) => std::env::set_var("PATH", p),
@@ -4561,7 +4636,7 @@ mod tests {
     /// [`spawn_fake_pair_poll_server`]'s stateful sibling: answers `pending`
     /// for the first `pending_answers` POSTs and `approved` after, which is
     /// the only way to prove the `--wait` loop actually RE-polls rather than
-    /// giving up on the first `pending` the way `peer pair approve` does.
+    /// giving up on the first `pending` the way `pair <id>` does.
     fn spawn_fake_pair_poll_server_pending_then_approved(pending_answers: usize, approved_body: String) -> (std::net::TcpListener, u16) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -4628,7 +4703,7 @@ mod tests {
 
             let now = aoide_storage::time::now_iso_utc();
             let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
-            let outcome = approve_outbound(true, "peer.pair.approve", "deadbeef", entry, &now, now_epoch, None);
+            let outcome = approve_outbound(true, "pair", "deadbeef", entry, &now, now_epoch, None);
             assert_eq!(outcome.status, aoide_protocol::output::Status::Ok, "{outcome:?}");
 
             let peers = aoide_storage::peer_store::load_peers();
@@ -4668,25 +4743,29 @@ mod tests {
         assert_eq!(f.grant, Some(vec!["read".to_string(), "spawn".to_string()]));
     }
 
-    /// `--wait 0` returns before anything commits, so an `--allow` beside it
-    /// has nowhere to land — and the ceremony never persists a grant on a
-    /// parked entry. Silently accepting the pair would drop the flag, the
-    /// same silent no-op `grant_note` refuses one step later.
+    /// A NEW request with `--wait 0` returns before anything commits, so an
+    /// `--allow` beside it has nowhere to land — refused by the request
+    /// arms via [`refuse_detached_grant`], never dropped. The RESUME leg is
+    /// deliberately NOT covered by the guard: its `--wait 0` still polls
+    /// once and can commit, so the combination is legal there.
     #[test]
-    fn allow_beside_wait_zero_is_refused_rather_than_dropped() {
-        let mut inv = pair_approve_inv(&[]);
-        inv.flags.insert("wait".to_string(), "0".to_string());
-        inv.flags.insert("allow".to_string(), "read,spawn".to_string());
-        let err = pair_finish_from(&inv).unwrap_err();
-        assert!(err.contains("--allow"), "{err}");
-        assert!(err.contains("peer pair approve"), "and it names where to retype it: {err}");
+    fn allow_beside_wait_zero_is_refused_on_a_new_request_never_dropped() {
+        let refusal = |wait: &str, allow: Option<&str>| {
+            let mut inv = pair_approve_inv(&[]);
+            inv.flags.insert("wait".to_string(), wait.to_string());
+            if let Some(a) = allow {
+                inv.flags.insert("allow".to_string(), a.to_string());
+            }
+            refuse_detached_grant("pair", &pair_finish_from(&inv).unwrap())
+        };
+        let out = refusal("0", Some("read,spawn")).expect("the contradiction is refused");
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{out:?}");
+        assert!(out.message.contains("--allow"), "{}", out.message);
+        assert!(out.message.contains("aoide pair"), "and it names where to retype it: {}", out.message);
 
         // Either alone is fine — only the combination is the contradiction.
-        inv.flags.remove("allow");
-        assert_eq!(pair_finish_from(&inv).unwrap().wait_secs, 0);
-        inv.flags.insert("allow".to_string(), "read".to_string());
-        inv.flags.insert("wait".to_string(), "600".to_string());
-        assert!(pair_finish_from(&inv).is_ok());
+        assert!(refusal("0", None).is_none());
+        assert!(refusal("600", Some("read")).is_none());
     }
 
     /// The deadline compares two `u64`s and casts neither. The first shape
@@ -4715,7 +4794,7 @@ mod tests {
 
             let began = std::time::Instant::now();
             let finish = PairFinish { wait_secs: 600, skip_confirm: true, grant: None };
-            let out = wait_and_commit("peer.pair", "deadbeef", "box-b", "111-222", &finish);
+            let out = wait_and_commit("pair", "deadbeef", "box-b", "111-222", &finish);
             assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
             assert_eq!(out.data.as_ref().unwrap()["reason"], "poll-unreachable");
             assert!(began.elapsed() < std::time::Duration::from_secs(60), "a terminal refusal must not sit out the wait — took {:?}", began.elapsed());
@@ -4733,11 +4812,11 @@ mod tests {
             // `wait_secs: 0` reaches the timeout on the first tick with no
             // sleep at all — the deadline is checked before the cadence.
             let finish = PairFinish { wait_secs: 0, skip_confirm: true, grant: None };
-            let out = wait_and_commit("peer.pair", "deadbeef", "box-b", "111-222", &finish);
+            let out = wait_and_commit("pair", "deadbeef", "box-b", "111-222", &finish);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "a timeout is not a failed pair: {out:?}");
             assert_eq!(out.data.as_ref().unwrap()["reason"], "wait-timeout");
             assert!(out.message.contains("still pending"), "{}", out.message);
-            assert!(out.message.contains("peer pair approve"), "it names the command that finishes later: {}", out.message);
+            assert!(out.message.contains("aoide pair"), "it names the command that finishes later: {}", out.message);
 
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             assert_eq!(aoide_storage::pairing::list_outbound(now_epoch).len(), 1, "the request survives the timeout — that is what makes Ctrl-C safe");
@@ -4746,7 +4825,7 @@ mod tests {
     }
 
     /// The whole point of P2: a `pending` answer is RE-polled, where
-    /// `peer pair approve` gives up on it. Costs one real 5s cadence tick —
+    /// `pair <id>` gives up on it. Costs one real 5s cadence tick —
     /// the only way to prove the loop without inventing a test-only knob.
     #[test]
     fn the_wait_repolls_a_pending_answer_and_completes_when_it_turns_approved() {
@@ -4758,13 +4837,13 @@ mod tests {
             aoide_storage::pairing::park_outbound(sample_outbound_awaiting_approval("deadbeef", &url, &pubkey_b)).unwrap();
 
             let finish = PairFinish { wait_secs: 600, skip_confirm: true, grant: Some(vec!["read".to_string(), "spawn".to_string()]) };
-            let out = wait_and_commit("peer.pair", "deadbeef", "box-b", "111-222", &finish);
+            let out = wait_and_commit("pair", "deadbeef", "box-b", "111-222", &finish);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
             let peers = aoide_storage::peer_store::load_peers();
             assert_eq!(peers.len(), 1);
             assert!(peers[0].verified, "the pair completes inside the one command — no second invocation");
-            assert_eq!(peers[0].allows, vec!["read".to_string(), "spawn".to_string()], "`peer pair --allow` reaches the commit, which is why the flag belongs here now");
+            assert_eq!(peers[0].allows, vec!["read".to_string(), "spawn".to_string()], "`pair --allow` reaches the commit, which is why the flag belongs here now");
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "the entry is consumed on commit");
         });
@@ -4774,7 +4853,7 @@ mod tests {
     fn the_wait_says_so_when_the_request_vanishes_underneath_it() {
         with_peer_state("wait-request-gone", || {
             let finish = PairFinish { wait_secs: 600, skip_confirm: true, grant: None };
-            let out = wait_and_commit("peer.pair", "nosuchid", "box-b", "111-222", &finish);
+            let out = wait_and_commit("pair", "nosuchid", "box-b", "111-222", &finish);
             assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
             assert_eq!(out.data.as_ref().unwrap()["reason"], "request-gone");
             assert!(out.message.contains("expired"), "{}", out.message);
@@ -4796,7 +4875,7 @@ mod tests {
 
             let now = aoide_storage::time::now_iso_utc();
             let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
-            let outcome = approve_outbound(true, "peer.pair.approve", "deadbeef", entry, &now, now_epoch, None);
+            let outcome = approve_outbound(true, "pair", "deadbeef", entry, &now, now_epoch, None);
             assert_eq!(outcome.status, aoide_protocol::output::Status::Error, "{outcome:?}");
             assert_eq!(outcome.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("awaiting-peer-approval"));
 
@@ -4827,7 +4906,7 @@ mod tests {
 
             let now = aoide_storage::time::now_iso_utc();
             let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
-            let outcome = approve_outbound(true, "peer.pair.approve", "deadbeef", entry, &now, now_epoch, None);
+            let outcome = approve_outbound(true, "pair", "deadbeef", entry, &now, now_epoch, None);
             assert_eq!(outcome.status, aoide_protocol::output::Status::Error, "{outcome:?}");
             assert_eq!(outcome.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("reveal-mismatch"));
 
@@ -4918,7 +4997,7 @@ mod tests {
             // "xxx-xxx" can never equal a digits-only SAS — a guaranteed mismatch.
             for expected_tries in 1..=2u32 {
                 let fresh = aoide_storage::pairing::list_inbound(now_epoch).into_iter().find(|e| e.id == id).unwrap();
-                let out = approve_inbound(InboundGate::Code("xxx-xxx".into()), "peer.pair.approve", &id, fresh, &now, now_epoch, None);
+                let out = approve_inbound(InboundGate::Code("xxx-xxx".into()), "pair", &id, fresh, &now, now_epoch, None);
                 assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
                 assert_eq!(out.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("code-mismatch"));
                 assert_eq!(out.data.as_ref().and_then(|d| d.get("tries")).and_then(Value::as_u64), Some(expected_tries as u64));
@@ -4929,7 +5008,7 @@ mod tests {
             // The third mismatch auto-denies: the same clean removal reject
             // performs, nothing committed, its own audited reason.
             let fresh = aoide_storage::pairing::list_inbound(now_epoch).into_iter().find(|e| e.id == id).unwrap();
-            let out = approve_inbound(InboundGate::Code("xxx-xxx".into()), "peer.pair.approve", &id, fresh, &now, now_epoch, None);
+            let out = approve_inbound(InboundGate::Code("xxx-xxx".into()), "pair", &id, fresh, &now, now_epoch, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
             assert_eq!(out.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("auto-deny-on-code-mismatch"));
             assert!(aoide_storage::pairing::list_inbound(now_epoch).is_empty(), "the parked entry is removed, exactly like a reject");
@@ -4947,7 +5026,7 @@ mod tests {
 
             // The undashed spelling exercises code_matches' normalization on
             // the real path, not just the pure test above.
-            let out = approve_inbound(InboundGate::Code(sas.replace('-', "")), "peer.pair.approve", &id, entry, &now, now_epoch, None);
+            let out = approve_inbound(InboundGate::Code(sas.replace('-', "")), "pair", &id, entry, &now, now_epoch, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
             let peers = aoide_storage::peer_store::load_peers();
@@ -4973,7 +5052,7 @@ mod tests {
         let now = aoide_storage::time::iso_utc_from_epoch(now_epoch);
         let (entry, sas) = parked_revealed_inbound(now_epoch);
         let id = entry.id.clone();
-        approve_inbound(InboundGate::Code(sas), "peer.pair.approve", &id, entry, &now, now_epoch, grant)
+        approve_inbound(InboundGate::Code(sas), "pair", &id, entry, &now, now_epoch, grant)
     }
 
     #[test]
@@ -5095,7 +5174,7 @@ mod tests {
             let (entry, sas) = parked_revealed_inbound_with_self_via(now_epoch, Some("ssh://khoa@box-a"));
             let id = entry.id.clone();
 
-            let out = approve_inbound(InboundGate::Code(sas), "peer.pair.approve", &id, entry, &now, now_epoch, None);
+            let out = approve_inbound(InboundGate::Code(sas), "pair", &id, entry, &now, now_epoch, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
             let peers = aoide_storage::peer_store::load_peers();
@@ -5127,7 +5206,7 @@ mod tests {
             let id = entry.id.clone();
             assert_ne!(9999, default_a2a_port(), "the fixture port must differ from the default for this test to prove anything");
 
-            let out = approve_inbound(InboundGate::Code(sas), "peer.pair.approve", &id, entry, &now, now_epoch, None);
+            let out = approve_inbound(InboundGate::Code(sas), "pair", &id, entry, &now, now_epoch, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
             let peers = aoide_storage::peer_store::load_peers();
@@ -5149,7 +5228,7 @@ mod tests {
             let entry_url = entry.url.clone();
             let id = entry.id.clone();
 
-            let out = approve_inbound(InboundGate::Code(sas), "peer.pair.approve", &id, entry, &now, now_epoch, None);
+            let out = approve_inbound(InboundGate::Code(sas), "pair", &id, entry, &now, now_epoch, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
             let peers = aoide_storage::peer_store::load_peers();
@@ -5167,143 +5246,169 @@ mod tests {
             let (entry, _sas) = parked_revealed_inbound(now_epoch);
             let id = entry.id.clone();
 
-            let out = approve_inbound(InboundGate::Unavailable, "peer.pair.approve", &id, entry, &now, now_epoch, None);
+            let out = approve_inbound(InboundGate::Unavailable, "pair", &id, entry, &now, now_epoch, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{out:?}");
             assert!(out.message.contains("--code"), "the refusal teaches the scripted spelling: {}", out.message);
             assert_eq!(aoide_storage::pairing::list_inbound(now_epoch)[0].tries, 0, "a refusal is not a wrong code");
         });
     }
 
-    fn approve_inv(id: &str, flags: &[(&str, &str)]) -> Invocation {
+    fn pair_inv(args: &[&str], flags: &[(&str, &str)]) -> Invocation {
         Invocation {
-            path: vec!["peer".into(), "pair".into(), "approve".into()],
-            args: vec![id.to_string()],
+            path: vec!["pair".into()],
+            args: args.iter().map(|s| s.to_string()).collect(),
             flags: flags.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             door: aoide_protocol::Door::Cli,
         }
     }
 
-    /// The handler's own gate resolution, driven through the real
-    /// `handle_peer_pair_approve`: `--yes` on an inbound id maps to the
-    /// taught refusal (never a bypass), and so does a bare non-tty CLI
-    /// invocation (cargo test's stdio is never a terminal — the exact
-    /// non-tty shape a scripted caller hits).
+    /// The dispatch's own gate resolution, driven through the real
+    /// [`handle_pair`]: `--yes` on an inbound target maps to the taught
+    /// refusal (never a bypass), and so does a bare non-tty CLI invocation
+    /// (cargo test's stdio is never a terminal — the exact non-tty shape a
+    /// scripted caller hits).
     #[test]
-    fn handle_approve_inbound_refuses_yes_and_non_tty_without_code() {
+    fn pair_on_an_inbound_target_refuses_yes_and_non_tty_without_code() {
         with_peer_state("approve-inbound-handler-gate", || {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             let (entry, _sas) = parked_revealed_inbound(now_epoch);
 
             for flags in [vec![("yes", "true")], vec![]] {
-                let out = handle_peer_pair_approve(&approve_inv(&entry.id, &flags));
+                let out = handle_pair(&pair_inv(&[&entry.id], &flags));
                 assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{out:?}");
                 assert!(out.message.contains("--code"), "{}", out.message);
             }
         });
     }
 
-    /// Bare `pair` never hangs where nobody can answer a menu: a non-CLI
-    /// door, a `--json` ask, and a non-tty CLI invocation (cargo test's
-    /// stdio) all get the taught refusal BEFORE any sweep runs — pinned
-    /// here by the refusal arriving instantly with the scripted spellings
-    /// in it.
+    /// Bare `pair` off a tty is the pending LISTING, not a hang and not a
+    /// refusal (task #135 P3' — the old `peer pending`, which died into
+    /// this): a non-CLI door, a `--json` ask, and a non-tty CLI invocation
+    /// all get the listing instantly, before any sweep could run — the
+    /// machine face agents drive.
     #[test]
-    fn bare_pair_refuses_non_tty_non_cli_and_json_with_the_taught_message() {
-        let inv = |door, flags: &[(&str, &str)]| Invocation {
-            path: vec!["pair".into()],
-            args: vec![],
-            flags: flags.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
-            door,
-        };
-        for (invocation, why) in [
-            (inv(aoide_protocol::Door::Mcp, &[]), "non-CLI door"),
-            (inv(aoide_protocol::Door::A2a, &[]), "non-CLI door"),
-            (inv(aoide_protocol::Door::Cli, &[("json", "true")]), "--json"),
-            (inv(aoide_protocol::Door::Cli, &[]), "non-tty CLI (test harness stdio)"),
-        ] {
-            let out = handle_pair(&invocation);
-            assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{why}: {out:?}");
-            assert!(out.message.contains("peer advertise on"), "{why} refusal teaches the advertise switch: {}", out.message);
-            assert!(out.message.contains("peer pair"), "{why} refusal teaches the manual path: {}", out.message);
-        }
+    fn bare_pair_off_a_tty_is_the_pending_listing_never_a_menu() {
+        with_peer_state("bare-pair-listing", || {
+            let inv = |door, flags: &[(&str, &str)]| Invocation {
+                path: vec!["pair".into()],
+                args: vec![],
+                flags: flags.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+                door,
+            };
+            for (invocation, why) in [
+                (inv(aoide_protocol::Door::Mcp, &[]), "non-CLI door"),
+                (inv(aoide_protocol::Door::A2a, &[]), "non-CLI door"),
+                (inv(aoide_protocol::Door::Cli, &[("json", "true")]), "--json"),
+                (inv(aoide_protocol::Door::Cli, &[]), "non-tty CLI (test harness stdio)"),
+            ] {
+                let out = handle_pair(&invocation);
+                assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{why}: {out:?}");
+                assert!(out.data.as_ref().and_then(|d| d.get("requests")).is_some(), "{why}: the listing carries `requests`: {out:?}");
+            }
+
+            // And it lists what is actually pending, both directions.
+            let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
+            let (entry, _sas) = parked_revealed_inbound(now_epoch);
+            let out = handle_pair(&pair_inv(&[], &[]));
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
+            let rows = out.data.as_ref().unwrap()["requests"].as_array().unwrap().clone();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["id"].as_str(), Some(entry.id.as_str()));
+        });
     }
 
     /// Idempotency survives the gate swap: an ALREADY-approved inbound
     /// entry short-circuits to the no-op success before any gate is
     /// consulted, so a re-run (scripted or not) never trips the refusal.
     #[test]
-    fn handle_approve_inbound_already_approved_is_still_a_no_op_success() {
+    fn pair_on_an_already_approved_inbound_target_is_still_a_no_op_success() {
         with_peer_state("approve-inbound-idempotent", || {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             let (entry, _sas) = parked_revealed_inbound(now_epoch);
             aoide_storage::pairing::mark_inbound_approved(&entry.id, now_epoch).unwrap();
 
-            let out = handle_peer_pair_approve(&approve_inv(&entry.id, &[("yes", "true")]));
+            let out = handle_pair(&pair_inv(&[&entry.id], &[("yes", "true")]));
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
             assert_eq!(out.data.as_ref().and_then(|d| d.get("alreadyApproved")).and_then(Value::as_bool), Some(true));
         });
     }
 
-    // ── P-PV2 (the User's locked spec): the collapsed command surface ────
+    // ── Task #135 P3': the ONE-verb dispatch ─────────────────────────────
 
-    fn approve_inv_no_id(flags: &[(&str, &str)]) -> Invocation {
-        Invocation {
-            path: vec!["peer".into(), "pair".into(), "approve".into()],
-            args: vec![],
-            flags: flags.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
-            door: aoide_protocol::Door::Cli,
-        }
-    }
-
-    /// `peer pair approve` with NO id, exactly one pending request: that
-    /// one is resolved and approved — no id-copying required for the
-    /// common case (the User's locked spec, point 4).
+    /// `pair <name>` routes to the pending INBOUND request under that name
+    /// — the collapse's whole point: no separate approve spelling, and the
+    /// scripted `--code` rides the same verb.
     #[test]
-    fn approve_with_no_id_resolves_the_sole_pending_request() {
-        with_peer_state("approve-no-id-sole-pending", || {
+    fn pair_routes_a_name_to_its_pending_inbound_request() {
+        with_peer_state("pair-routes-name-inbound", || {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             let (entry, sas) = parked_revealed_inbound(now_epoch);
 
-            let out = handle_peer_pair_approve(&approve_inv_no_id(&[("code", &sas)]));
+            let out = handle_pair(&pair_inv(&[&entry.name], &[("code", &sas)]));
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
             assert_eq!(out.data.as_ref().and_then(|d| d.get("peer")).and_then(Value::as_str), Some(entry.name.as_str()));
+            assert!(aoide_storage::peer_store::load_peers()[0].verified, "the routed approve really commits");
         });
     }
 
-    /// `peer pair approve` with NO id, ZERO pending: a taught refusal
-    /// naming there is nothing to approve — never a silent no-op.
+    /// A name matching MORE than one pending request (either direction) is
+    /// refused with every id listed — never a silent guess at which one the
+    /// operator meant. An exact ID always routes unambiguously, which is
+    /// why this family's own messages print ids.
     #[test]
-    fn approve_with_no_id_and_nothing_pending_is_a_taught_refusal() {
-        with_peer_state("approve-no-id-zero-pending", || {
-            let out = handle_peer_pair_approve(&approve_inv_no_id(&[]));
-            assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{out:?}");
-            assert!(out.message.contains("no pending"), "{}", out.message);
-        });
-    }
-
-    /// `peer pair approve` with NO id, MULTIPLE pending: a taught refusal
-    /// requiring an explicit id, listing every id currently pending —
-    /// never a silent guess at which request the operator meant.
-    #[test]
-    fn approve_with_no_id_and_multiple_pending_requires_the_id_and_lists_them() {
-        with_peer_state("approve-no-id-multiple-pending", || {
+    fn pair_refuses_an_ambiguous_name_listing_the_ids() {
+        with_peer_state("pair-ambiguous-name", || {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
-            let (first, _) = parked_revealed_inbound(now_epoch);
+            let (inbound_entry, sas) = parked_revealed_inbound(now_epoch);
             let pubkey_b = "b".repeat(64);
-            let outbound = sample_outbound_awaiting_approval("deadbeef", "http://box-b/", &pubkey_b);
+            // An OUTBOUND entry under the SAME name — the box we asked is
+            // also asking us, the exact crossing the ambiguity guard exists
+            // for.
+            let mut outbound = sample_outbound_awaiting_approval("deadbeef", "http://box-b/", &pubkey_b);
+            outbound.name = inbound_entry.name.clone();
             aoide_storage::pairing::park_outbound(outbound).unwrap();
 
-            let out = handle_peer_pair_approve(&approve_inv_no_id(&[]));
+            let out = handle_pair(&pair_inv(&[&inbound_entry.name], &[]));
             assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{out:?}");
-            assert!(out.message.contains(&first.id), "{}", out.message);
+            assert!(out.message.contains(&inbound_entry.id), "{}", out.message);
             assert!(out.message.contains("deadbeef"), "{}", out.message);
             let ids = out.data.as_ref().and_then(|d| d.get("ids")).and_then(Value::as_array).cloned().unwrap_or_default();
             assert_eq!(ids.len(), 2, "{out:?}");
+
+            // The exact id still routes past the ambiguity.
+            let out = handle_pair(&pair_inv(&[&inbound_entry.id], &[("code", &sas)]));
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
         });
     }
 
-    /// `peer pending` (P-PV2, the User's locked spec point 3) NEVER shows
-    /// the SAS/pairing code — neither in the human message nor anywhere in
+    /// `pair <name>` on an ALREADY-verified peer with nothing pending is
+    /// gated (task #135 P3' — a re-pair replaces key material, and the
+    /// smart verb makes accidental invocation likely): off a tty and
+    /// without `--yes` it refuses by name; `--yes` proceeds into the
+    /// ordinary request arm (proven by reaching the sweep's own no-match).
+    #[test]
+    fn pair_on_an_already_verified_name_is_gated_before_any_request() {
+        with_peer_state("pair-repair-gate", || {
+            let mut peers = Vec::new();
+            aoide_storage::peer_store::upsert_paired_peer(&mut peers, "box-v", "http://box-v:8710/", &"a".repeat(64), "2026-08-30T00:00:00Z", &["read".to_string()]);
+            aoide_storage::peer_store::save_peers(&peers).unwrap();
+
+            let out = handle_pair(&pair_inv(&["box-v"], &[]));
+            assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
+            assert_eq!(out.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("already-paired"));
+            assert!(out.message.contains("--yes"), "the refusal teaches the scripted override: {}", out.message);
+
+            let out = handle_pair(&pair_inv(&["box-v"], &[("yes", "true"), ("secs", "1")]));
+            assert_eq!(
+                out.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str),
+                Some("no-match"),
+                "--yes must proceed past the gate into the ordinary sweep arm: {out:?}"
+            );
+        });
+    }
+
+    /// The bare `pair` pending listing (P-PV2, the User's locked spec point
+    /// 3) NEVER shows the SAS/pairing code — neither in the human message nor anywhere in
     /// the JSON data — for an inbound OR an outbound row, whether revealed,
     /// approved, or freshly parked. The code is read off the requester's
     /// own screen and typed on the approver's; showing it here would defeat
@@ -5323,29 +5428,24 @@ mod tests {
             );
             aoide_storage::pairing::park_outbound(outbound).unwrap();
 
-            let out = handle_peer_pending(&Invocation {
-                path: vec!["peer".into(), "pending".into()],
-                args: vec![],
-                flags: Default::default(),
-                door: aoide_protocol::Door::Cli,
-            });
+            let out = pending_listing("pair");
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
             let rows = out.data.as_ref().unwrap()["requests"].as_array().unwrap();
             assert_eq!(rows.len(), 2, "{rows:?}");
             for row in rows {
-                assert!(row.get("sas").is_none(), "peer pending must never carry a `sas` field: {row}");
+                assert!(row.get("sas").is_none(), "the pending listing must never carry a `sas` field: {row}");
             }
 
             let rendered = serde_json::to_string(out.data.as_ref().unwrap()).unwrap();
-            assert!(!rendered.contains(&inbound_sas), "the inbound code must never appear in peer pending's data: {rendered}");
-            assert!(!rendered.contains(&outbound_sas), "the outbound code must never appear in peer pending's data: {rendered}");
+            assert!(!rendered.contains(&inbound_sas), "the inbound code must never appear in the pending listing's data: {rendered}");
+            assert!(!rendered.contains(&outbound_sas), "the outbound code must never appear in the pending listing's data: {rendered}");
             assert!(!out.message.contains(&inbound_sas), "nor in its human message: {}", out.message);
             assert!(!out.message.contains(&outbound_sas), "nor in its human message: {}", out.message);
         });
     }
 
-    /// `peer pair <target>` SMART TARGET dispatch (the User's locked spec,
+    /// `pair <target>` SMART TARGET dispatch (the User's locked spec,
     /// point 1): a URL-shaped target (`"://"`) takes the EXPLICIT DIAL arm
     /// — proven here by its own distinct failure shape (`fetch-failed`,
     /// [`pair_via_url`]'s own reason, no sweep ever runs). A bare word
@@ -5359,12 +5459,12 @@ mod tests {
             // Port 1 is reserved and never listened on in practice — an
             // immediate, deterministic connection refusal, never a sweep.
             let inv = Invocation {
-                path: vec!["peer".into(), "pair".into()],
+                path: vec!["pair".into()],
                 args: vec!["http://127.0.0.1:1/".to_string()],
                 flags: Default::default(),
                 door: aoide_protocol::Door::Cli,
             };
-            let out = handle_peer_pair(&inv);
+            let out = handle_pair(&inv);
             assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
             let reason = out.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str).unwrap_or("");
             assert!(
@@ -5381,12 +5481,12 @@ mod tests {
             // second `.lock()` here on the same (non-reentrant) mutex, on
             // the SAME thread, would deadlock rather than merely block.
             let inv = Invocation {
-                path: vec!["peer".into(), "pair".into()],
+                path: vec!["pair".into()],
                 args: vec!["nobody-is-advertising-this-name".to_string()],
                 flags: [("secs".to_string(), "1".to_string())].into_iter().collect(),
                 door: aoide_protocol::Door::Cli,
             };
-            let out = handle_peer_pair(&inv);
+            let out = handle_pair(&inv);
             assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
             assert_eq!(
                 out.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str),
@@ -5399,65 +5499,60 @@ mod tests {
 
     /// Review finding (P-PV2 follow-up): old `peer pair request <url>`
     /// muscle memory has no third `peer.pair.request` path to greedily
-    /// match anymore, so it lands here as `peer.pair`'s OWN two args
+    /// match anymore, so it lands here as `pair`'s OWN two args
     /// (`["request", "<url>"]`) — reading only `args[0]` and discarding the
     /// url would silently burn a full sweep window looking for an
     /// advertiser named "request" before failing with no mention the url
-    /// was ever seen. `peer pair` now refuses ANY second positional
+    /// was ever seen. `pair` now refuses ANY second positional
     /// outright — proven here by asserting Usage AND that no sweep or dial
     /// ever ran (no `data.reason` at all: neither arm's error shape, since
     /// neither arm is ever reached). The taught text lives in `USAGE`
     /// itself, shown identically for every arity error — never a special
     /// case keyed on the first arg spelling "request".
     #[test]
-    fn peer_pair_refuses_a_second_positional_naming_the_dead_dual_command_fold() {
+    fn pair_refuses_a_second_positional_before_either_arm_runs() {
         let inv = Invocation {
-            path: vec!["peer".into(), "pair".into()],
+            path: vec!["pair".into()],
             args: vec!["request".to_string(), "http://127.0.0.1:1/".to_string()],
             flags: Default::default(),
             door: aoide_protocol::Door::Cli,
         };
-        let out = handle_peer_pair(&inv);
+        let out = handle_pair(&inv);
         assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{out:?}");
         assert!(
             out.data.as_ref().and_then(|d| d.get("reason")).is_none(),
             "neither arm's error shape must appear — this refusal fires before either arm ever runs: {out:?}"
         );
-        assert!(out.message.contains("peer pair request"), "{}", out.message);
-        assert!(out.message.contains("peer invite"), "{}", out.message);
-        assert!(out.message.contains("peer pair <target>"), "{}", out.message);
+        assert!(out.message.contains("usage: aoide pair"), "{}", out.message);
     }
 
-    /// `peer pair approve`/`reject`/`watch` are SUBCOMMANDS of `peer pair`
-    /// and WIN over a hostname positional of the same literal spelling
-    /// (the User's locked spec, point 4) — the registry's own greedy
-    /// longest-prefix match ([`aoide_protocol::door::parse`]) resolves
-    /// `aoide peer pair approve` to the 3-segment subcommand before it ever
-    /// considers the 2-segment `peer pair <target>` with `"approve"` riding
-    /// as the target; an ordinary hostname resolves to the smart-target
-    /// command instead, with the word riding as its positional arg. A box
-    /// literally named "approve" (or "reject"/"watch") therefore cannot be
-    /// paired by bare hostname — it needs the explicit URL form, which is
-    /// documented on `peer pair`'s own registered usage line.
+    /// `pair reject`/`pair watch` are SUBCOMMANDS of `pair` and WIN over a
+    /// target positional of the same literal spelling — the registry's own
+    /// greedy longest-prefix match ([`aoide_protocol::door::parse`])
+    /// resolves `aoide pair reject` to the 2-segment subcommand before it
+    /// ever considers 1-segment `pair <target>` with `"reject"` riding as
+    /// the target; an ordinary name resolves to the smart verb instead,
+    /// riding as its positional arg. A box literally named "reject" or
+    /// "watch" therefore cannot be paired by bare name — it needs the
+    /// explicit URL form, documented on `pair`'s own registered usage line.
     #[test]
-    fn peer_pair_approve_reject_watch_subcommand_names_win_over_a_hostname_positional() {
+    fn pair_reject_and_watch_subcommand_names_win_over_a_target_positional() {
         let mut r = Registry::new();
-        register_peer_pair(&mut r);
-        register_peer_discovery(&mut r);
         register_pair(&mut r);
+        register_peer_discovery(&mut r);
 
-        for sub in ["approve", "reject", "watch"] {
-            let argv = vec!["peer".to_string(), "pair".to_string(), sub.to_string()];
+        for sub in ["reject", "watch"] {
+            let argv = vec!["pair".to_string(), sub.to_string()];
             let (inv, _json) = aoide_protocol::door::parse(&argv, aoide_protocol::Door::Cli, "aoide", &r)
-                .unwrap_or_else(|e| panic!("`peer pair {sub}` must parse as the subcommand: {e:?}"));
-            assert_eq!(inv.path, vec!["peer".to_string(), "pair".to_string(), sub.to_string()], "{sub} must resolve to the subcommand, not a hostname target");
+                .unwrap_or_else(|e| panic!("`pair {sub}` must parse as the subcommand: {e:?}"));
+            assert_eq!(inv.path, vec!["pair".to_string(), sub.to_string()], "{sub} must resolve to the subcommand, not a target");
         }
 
-        // An ordinary hostname (no collision) resolves to the smart-target
-        // command, with the word riding as its own positional arg.
-        let argv = vec!["peer".to_string(), "pair".to_string(), "yomi-strix".to_string()];
+        // An ordinary name (no collision) resolves to the smart verb, with
+        // the word riding as its own positional arg.
+        let argv = vec!["pair".to_string(), "yomi-strix".to_string()];
         let (inv, _json) = aoide_protocol::door::parse(&argv, aoide_protocol::Door::Cli, "aoide", &r).unwrap();
-        assert_eq!(inv.path, vec!["peer".to_string(), "pair".to_string()]);
+        assert_eq!(inv.path, vec!["pair".to_string()]);
         assert_eq!(inv.args, vec!["yomi-strix".to_string()]);
     }
 }

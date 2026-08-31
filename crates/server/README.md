@@ -226,7 +226,7 @@ the inbound half of the two-door contract (the outbound half is
   itself can answer "how do I dial the requester back") with no
   validation of its own: absent, wrong type, or empty all collapse to
   `None` alike, since the field is never load-bearing enough to refuse a
-  pairing request over — only to enrich the eventual `peer pair approve`
+  pairing request over — only to enrich the eventual `aoide pair`
   commit when present. `pair_reveal` is the ceremony's
   third message: it checks a POSTed nonce against the parked entry's
   earlier commitment (`aoide_storage::pairing::reveal_inbound`) — a match
@@ -361,7 +361,7 @@ the inbound half of the two-door contract (the outbound half is
   plain `thread::spawn` for connection handlers — that one is reserved for
   a NEW socket-based door, not a background worker thread) — a refused OS
   thread costs discovery only, never the door. The RECEIVE half
-  (`peer discover`/`peer pair`'s hostname-target sweep) lives in
+  (`peer discover`/`aoide pair`'s hostname-target sweep) lives in
   `aoide-client::discover` instead; this crate stays inbound/serve-only.
 - `commands` — this crate's CLI commands: `daemon`, `shellbridge` (registration
   only — the files stay in `conduct`), `a2a serve`, `events tail` (P-D3,

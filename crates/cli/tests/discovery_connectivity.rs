@@ -20,10 +20,10 @@
 //!
 //! Every OTHER shape this feature's tests need — advertisement
 //! serialize/validate, the malformed-variant drops, the bounded
-//! dedupe-by-(name, source) fold, `peer pair`'s hostname arm's
+//! dedupe-by-(name, source) fold, `pair`'s hostname arm's
 //! zero/one/many-match resolution, the advertise switch's off-by-default
 //! idempotence, `peer discover` never writing `state/peers.json`, the
-//! loopback-path sweep round trip, and `peer pair`'s hostname arm calling
+//! loopback-path sweep round trip, and `pair`'s hostname arm calling
 //! the identical `run_pair_request` its url arm runs — is proven WITHOUT
 //! leaving the sandbox, in `aoide-storage::advertise::tests`,
 //! `aoide-client::discover::tests` (whose
@@ -34,7 +34,7 @@
 //! and `aoide-server::a2a::tests::resolve_discovery_advertise_*`. This
 //! file holds only the two tests that genuinely need a live, routable
 //! network: the bare advertise→discover round trip over real broadcast,
-//! and the full `peer pair <hostname>`-drives-a-real-pairing-ceremony
+//! and the full `pair <hostname>`-drives-a-real-pairing-ceremony
 //! round trip below it.
 
 use aoide::dispatch::{dispatch, registry, Invocation};
@@ -138,7 +138,7 @@ fn advertise_then_discover_and_invite_resolve_round_trip_over_real_broadcast() {
     assert_eq!(heard.advertisement.user, user);
     assert!(heard.count >= 1);
 
-    // `peer pair`'s hostname arm's own real-network half: the SAME
+    // `pair`'s hostname arm's own real-network half: the SAME
     // already-swept result, resolved by name — proves the discover→resolve
     // pipeline `pair_via_hostname` drives, without needing a second real
     // A2A door up to prove the (already-shared, already-tested)
@@ -153,7 +153,7 @@ fn advertise_then_discover_and_invite_resolve_round_trip_over_real_broadcast() {
     assert!(matches!(miss, Err(aoide_client::discover::InviteResolveError::NoMatch { .. })));
 }
 
-/// `peer pair`'s hostname arm's single-match path must reach the EXACT
+/// `pair`'s hostname arm's single-match path must reach the EXACT
 /// same `run_pair_request` body its url arm runs (client/AGENTS.md's own
 /// invariant on this). `aoide-client`'s own unit tests (`commands::tests::
 /// peer_pair_hostname_arm_and_url_arm_are_the_same_function_not_two_copies`)
@@ -162,7 +162,7 @@ fn advertise_then_discover_and_invite_resolve_round_trip_over_real_broadcast() {
 /// the wiring in between — `pair_via_hostname`'s own discover → resolve
 /// pipeline actually producing a real `Heard` to feed the shared function.
 /// This test closes that gap for real: a REAL second A2A door ("peer B"),
-/// its REAL discovery advertisement, and `aoide peer pair <name> --yes`
+/// its REAL discovery advertisement, and `aoide pair <name> --yes`
 /// dispatched exactly as an operator would type it — then the SAME
 /// observable state change the url arm itself produces is asserted
 /// directly: an outbound pairing request parked in
@@ -207,15 +207,17 @@ fn peer_pair_hostname_arm_single_match_reaches_the_shared_run_pair_request_over_
 
     // Advertise B by name + ssh hop over a real broadcast — the exact wire
     // `discover::run_sweep` on the pairing side parses. The name must
-    // differ from this box's own hostname or `peer pair`'s self-guard
+    // differ from this box's own hostname or `pair`'s self-guard
     // (rightly) refuses it.
     let name = "advertise-peer-b";
     let _advertiser = aoide_server::discovery::spawn_advertiser(name, "peer-b-host", "khoa", true);
 
-    // `peer pair <hostname>` end to end — the exact command an operator
+    // `pair <hostname>` end to end — the exact command an operator
     // types. `--secs 20` covers the advertiser's real send jitter on a
     // loaded box.
-    let pair_out = dispatch(&cli_invocation(&["peer", "pair"], &[name], &[("yes", "true"), ("secs", "20")]));
+    // --wait 0: this test asserts the PARKED entry (nobody will ever
+    // approve advertise-peer-b), so it drives the detached shape.
+    let pair_out = dispatch(&cli_invocation(&["pair"], &[name], &[("yes", "true"), ("secs", "20"), ("wait", "0")]));
     assert_eq!(pair_out.status, aoide_protocol::output::Status::Ok, "{}", pair_out.message);
 
     // The SAME state change the url arm itself would produce: an

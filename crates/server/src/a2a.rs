@@ -1211,8 +1211,8 @@ fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path, peer_name: &str) ->
 /// attributed to that peer; behind any NAT/reverse-proxy deployment an
 /// address match is exactly the shared-source-IP situation that would
 /// otherwise let one tenant spawn "as" another. The refusal is `-32006`,
-/// naming both remaining prerequisites: the pairing ceremony (`peer pair
-/// request`) and a configured `token_file` (`peer add --token-file`).
+/// naming both remaining prerequisites: the pairing ceremony (`pair`)
+/// and a configured `token_file` (`peer add --token-file`).
 ///
 /// **Amendment (P-P4, `docs/architecture/PAIRING.md`'s "Wire authentication
 /// (paired peers)" section): the Spawn rung requirement moves a THIRD time
@@ -1498,7 +1498,7 @@ fn spawn_refusal(resolved: Option<(&aoide_storage::peer_store::Peer, aoide_stora
             -32006,
             "spawn refused: spawn requires the caller be identified via a verified, per-request \
              SIGNED request from a paired peer (an address match, or an unverified token match, \
-             never admits spawn) — pair first via `peer pair`, then `peer allow <name> spawn on`"
+             never admits spawn) — pair first via `aoide pair`, then `peer allow <name> spawn on`"
                 .to_string(),
         ),
     }
@@ -1542,18 +1542,18 @@ fn graph_summary(peer_name: &str, self_url: &str) -> Result<Value, (i64, String)
 // active on-path attacker choose four of the SAS transcript's six fields
 // after observing the real ones; see `aoide_storage::pairing`'s module doc
 // for the full commit-then-reveal reasoning, the Bluetooth SSP idiom this
-// borrows). `aoide/pairReveal` is A's immediate follow-up (same `peer pair
-// request` invocation, two sequential POSTs) that hands over the nonce the
+// borrows). `aoide/pairReveal` is A's immediate follow-up (same `pair`
+// invocation, two sequential POSTs) that hands over the nonce the
 // commitment already fixed; B verifies it and only THEN has a SAS to show.
 //
 // `aoide/pairPoll` (Design A, task #119 — REPLACES the old `aoide/pairApprove`
 // reverse callback) is A's own follow-up, POSTed to B's door over the SAME
 // forward dial `aoide/pairRequest`/`aoide/pairReveal` already used — never a
 // callback B initiates back to A. B's own operator approving
-// (`peer pair approve` on the inbound entry) is now PURELY LOCAL: it commits
+// (`pair <id>` on the inbound entry) is now PURELY LOCAL: it commits
 // B's own peer record for A and marks B's parked entry `approved`
 // ([`aoide_storage::pairing::mark_inbound_approved`]) but dials nobody. A's
-// `peer pair approve <id>` then POLLS this method until it sees `approved`,
+// `pair <id>` then POLLS this method until it sees `approved`,
 // verifies the release is bound to the SAME transcript A already committed
 // to, and only THEN runs its own confirm-then-commit. This is the whole
 // point: a REQUESTER whose own A2A door is loopback-only ([[doors-loopback-only]])
@@ -1562,7 +1562,7 @@ fn graph_summary(peer_name: &str, self_url: &str) -> Result<Value, (i64, String)
 // discipline it holds.
 
 /// [`PeerOrigin`] rendered for DISPLAY only — [`InboundPairingRequest`]'s
-/// `originAddr` field (`peer pair pending`'s own column, PAIRING.md: "parks
+/// `originAddr` field (the bare `pair` pending listing's own column, PAIRING.md: "parks
 /// pending (id, ... origin addr)"). Never a security decision in this
 /// phase — there is no pairing yet to gate origin against.
 fn origin_display(origin: PeerOrigin) -> String {
@@ -1692,7 +1692,7 @@ fn emit_pairing_event(kind: &str, payload: Value) {
 /// requester, or when A has no such claim to make. THIS instance (box B)
 /// parks it whole, `selfVia` included ([`aoide_storage::pairing::
 /// park_inbound`], cap-checked — a full queue is `-32000`, review-bounce
-/// Finding 3), for its own LATER `peer pair approve` commit to read
+/// Finding 3), for its own LATER `pair <id>` commit to read
 /// (`aoide-client::commands::approve_inbound`'s own doc), and answers
 /// SYNCHRONOUSLY with its OWN public key and a freshly-minted nonce —
 /// public material, same "freely shown" stance `docs/architecture/
@@ -1702,7 +1702,7 @@ fn emit_pairing_event(kind: &str, payload: Value) {
 ///
 /// `name` is validated against [`aoide_storage::peer_store::valid_peer_name`]
 /// HERE, at park time — not merely at `peer add`'s door the way a
-/// legacy-path name is — because `peer pair approve` reuses this
+/// legacy-path name is — because `pair <id>` reuses this
 /// self-claimed name VERBATIM as the approver's own local nickname (no
 /// separate `--name` flag on `approve`), and that nickname later joins a
 /// `state/peer-cache/<name>.json` path; a traversal-shaped name must never
@@ -1789,13 +1789,13 @@ fn pair_request(params: &Value, origin: PeerOrigin, audit_log: &Path) -> Result<
 }
 
 /// `aoide/pairReveal` (CONTRACTS.md §6, P-P2, review-bounce Finding 1): box
-/// A's immediate follow-up to `aoide/pairRequest` (same `peer pair request`
+/// A's immediate follow-up to `aoide/pairRequest` (same `pair`
 /// invocation, two sequential POSTs), handing over the nonce its earlier
 /// `commitHex` already fixed. `{id, nonceHex}` — `id` is the SAME id
 /// [`pair_request`] handed back synchronously. THIS instance (box B) checks
 /// `derive_commit(entry.pubkeyHex, nonceHex) == entry.commitHex`
 /// ([`aoide_storage::pairing::reveal_inbound`]); a match stores the nonce
-/// (so `peer pair pending`/`approve` can finally derive a SAS for this
+/// (so bare `pair`/`pair <id>` can finally derive a SAS for this
 /// entry) and a MISMATCH drops the parked entry outright — there is nothing
 /// left worth keeping once the commitment fails to check out (a genuine
 /// tamper, or a bug; either way the honest path is to start over, not to
@@ -1856,7 +1856,7 @@ fn pair_reveal(params: &Value, audit_log: &Path) -> Result<Value, (i64, String)>
 }
 
 /// `aoide/pairPoll` (Design A, task #119, CONTRACTS.md §6 — REPLACES the old
-/// `aoide/pairApprove` reverse callback): the REQUESTER's `peer pair approve
+/// `aoide/pairApprove` reverse callback): the REQUESTER's `pair
 /// <id>` POSTs this to the APPROVER's door, over the SAME forward dial
 /// `aoide/pairRequest`/`aoide/pairReveal` already used, asking "has the
 /// entry I parked with you been approved yet?" `{id, timestampIso, nonceHex,
@@ -4595,14 +4595,14 @@ mod tests {
 
         let (code, msg) = spawn_refusal(None);
         assert_eq!(code, -32006);
-        assert!(msg.contains("peer pair"), "no resolution at all must point at the pairing ceremony: {msg:?}");
+        assert!(msg.contains("aoide pair"), "no resolution at all must point at the pairing ceremony: {msg:?}");
 
         let mut unverified = fixture_peer("box-c", "http://10.0.0.6:8710/", false);
         unverified.allows = vec!["spawn".to_string()]; // allows populated but never actually paired.
         let (code, msg) = spawn_refusal(Some((&unverified, PeerRung::Token)));
         assert_eq!(code, -32006);
         assert!(
-            msg.contains("peer pair"),
+            msg.contains("aoide pair"),
             "Token rung but NOT verified is the generic 'never paired' message, not the 'must sign' one: {msg:?}"
         );
     }
@@ -7684,7 +7684,7 @@ mod tests {
     /// A then box B then box A again (see [`act_as`]'s own doc for why this
     /// test cannot be a genuine two-thread two-identity proof the way
     /// `cli/tests/peer_connectivity.rs` is for the read-only `graphSummary`
-    /// pull). A's OWN final confirm-then-commit step (`peer pair approve` on
+    /// pull). A's OWN final confirm-then-commit step (`pair <id>` on
     /// a polled-approved outbound entry) lives in `aoide-client::commands` —
     /// simulated here by calling the same library functions that handler
     /// calls (`mark_outbound_awaiting_confirm`/`upsert_paired_peer`/
@@ -7821,7 +7821,7 @@ mod tests {
         // callback handler used to call — only the TRIGGER moved), rejecting
         // a mismatched pubkey the same way a substituted reveal would be
         // rejected (review-bounce Finding 2, preserved). A's OWN operator
-        // then confirms the SAS on THIS side (`peer pair approve <id>` a
+        // then confirms the SAS on THIS side (`pair <id>` a
         // second time, requester-side —
         // `aoide-client::commands::approve_outbound`'s own confirm branch;
         // simulated here via the same library calls that handler makes,

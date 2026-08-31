@@ -423,7 +423,7 @@ fn peer_pair_url_target_rejects_an_invalid_name_without_touching_the_network_or_
     // (not a fetch error) proves the name check fired before any network
     // I/O or identity mint.
     let out = dispatch(&cli_invocation(
-        &["peer", "pair"],
+        &["pair"],
         &["http://127.0.0.1:1/"],
         &[("name", "../../evil")],
     ));
@@ -439,13 +439,17 @@ fn peer_pair_url_target_rejects_an_invalid_name_without_touching_the_network_or_
 }
 
 #[test]
-fn peer_pair_with_no_target_is_a_usage_error() {
+fn bare_pair_off_a_tty_is_the_pending_listing() {
     let _guard = aoide_test_support::env_lock().lock().unwrap();
     let root = unique_root("pair-request-no-url");
     let _stage = setup_env(&root);
 
-    let out = dispatch(&cli_invocation(&["peer", "pair"], &[], &[]));
-    assert_eq!(out.status, Status::Usage);
+    // Task #135 P3': bare `pair` off a tty (test-harness stdio) is the
+    // pending LISTING — the old `peer pending`, which died into this —
+    // never a usage error and never a hung menu.
+    let out = dispatch(&cli_invocation(&["pair"], &[], &[]));
+    assert_eq!(out.status, Status::Ok);
+    assert_eq!(out.data.unwrap()["requests"].as_array().unwrap().len(), 0);
 
     let _ = std::fs::remove_dir_all(&root);
     std::env::remove_var("AOIDE_STAGE_DIR");
@@ -454,34 +458,32 @@ fn peer_pair_with_no_target_is_a_usage_error() {
     std::env::remove_var("AOIDE_AUDIT_LOG");
 }
 
-/// Review finding (P-PV2 follow-up): old `peer pair request <url>` muscle
-/// memory has no third `peer.pair.request` path left to greedily match —
+/// The arity guard survives the collapse (review finding, P-PV2
+/// follow-up, re-proven for `pair`): a second positional still parses —
 /// `door::parse`'s own longest-prefix match (the REAL argv parser, not a
-/// hand-built `Invocation`) resolves it to the 2-segment `peer.pair` with
-/// `["request", "<url>"]` as ITS OWN two args. Proven end to end: the real
-/// parser produces exactly that path/args split, and dispatching it refuses
-/// fast (well under the 45s hostname-arm sweep window — proof no sweep or
-/// dial ever ran) with a usage error naming the fold, never silently
-/// treating "request" as a hostname to sweep for and discarding the url.
+/// hand-built `Invocation`) resolves `pair request <url>` to the
+/// 1-segment `pair` with `["request", "<url>"]` as ITS OWN two args — and
+/// dispatching it refuses fast (well under a sweep window — proof no sweep
+/// or dial ever ran), never silently treating "request" as a name to sweep
+/// for while discarding the url.
 #[test]
-fn peer_pair_request_old_spelling_is_a_fast_taught_usage_error_never_a_silent_sweep() {
+fn pair_with_a_second_positional_is_a_fast_taught_usage_error_never_a_silent_sweep() {
     let _guard = aoide_test_support::env_lock().lock().unwrap();
     let root = unique_root("pair-request-old-spelling");
     let _stage = setup_env(&root);
 
-    let argv: Vec<String> = ["peer", "pair", "request", "http://127.0.0.1:1/"].iter().map(|s| s.to_string()).collect();
+    let argv: Vec<String> = ["pair", "request", "http://127.0.0.1:1/"].iter().map(|s| s.to_string()).collect();
     let (inv, _json) = aoide_protocol::door::parse(&argv, Door::Cli, "aoide", registry())
-        .expect("`peer pair request <url>` still parses — just not as its own command anymore");
-    assert_eq!(inv.path, vec!["peer", "pair"], "no `peer.pair.request` path exists to match anymore");
-    assert_eq!(inv.args, vec!["request", "http://127.0.0.1:1/"], "both old tokens land as peer.pair's own args");
+        .expect("`pair request <url>` still parses — just not as its own command");
+    assert_eq!(inv.path, vec!["pair"], "no `pair.request` path exists to match");
+    assert_eq!(inv.args, vec!["request", "http://127.0.0.1:1/"], "both tokens land as pair's own args");
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let out = dispatch(&inv);
     assert!(Instant::now() < deadline, "must refuse fast, never burn a sweep window on the discarded url");
     assert_eq!(out.status, Status::Usage, "{out:?}");
     assert!(out.data.is_none(), "no `reason` field — this refusal fires before either arm ever runs: {out:?}");
-    assert!(out.message.contains("peer pair request"), "{}", out.message);
-    assert!(out.message.contains("peer invite"), "{}", out.message);
+    assert!(out.message.contains("usage: aoide pair"), "{}", out.message);
 
     let _ = std::fs::remove_dir_all(&root);
     std::env::remove_var("AOIDE_STAGE_DIR");
@@ -491,17 +493,17 @@ fn peer_pair_request_old_spelling_is_a_fast_taught_usage_error_never_a_silent_sw
 }
 
 #[test]
-fn peer_pair_approve_and_reject_on_an_unknown_id_leave_no_record_change() {
+fn pair_reject_on_an_unknown_id_leaves_no_record_change() {
     let _guard = aoide_test_support::env_lock().lock().unwrap();
     let root = unique_root("pair-unknown-id");
     let _stage = setup_env(&root);
 
-    let approve = dispatch(&cli_invocation(&["peer", "pair", "approve"], &["nosuchid"], &[("yes", "true")]));
-    assert_eq!(approve.status, Status::Error);
-    assert_eq!(approve.data.unwrap()["reason"], "unknown-id");
-    assert!(aoide_storage::peer_store::load_peers().is_empty(), "approve of an unknown id writes no peer");
-
-    let reject = dispatch(&cli_invocation(&["peer", "pair", "reject"], &["nosuchid"], &[]));
+    // The old `peer pair approve nosuchid` unknown-id refusal is GONE by
+    // design: under the one-verb dispatch an unknown target means "request
+    // a pair with that name", which is the feature, not a typo. `pair
+    // reject` keeps the taught unknown-id error — there is nothing to
+    // remove.
+    let reject = dispatch(&cli_invocation(&["pair", "reject"], &["nosuchid"], &[]));
     assert_eq!(reject.status, Status::Error);
     assert_eq!(reject.data.unwrap()["reason"], "unknown-id");
     assert!(aoide_storage::peer_store::load_peers().is_empty(), "reject of an unknown id writes no peer");
@@ -513,25 +515,8 @@ fn peer_pair_approve_and_reject_on_an_unknown_id_leave_no_record_change() {
     std::env::remove_var("AOIDE_AUDIT_LOG");
 }
 
-#[test]
-fn peer_pending_on_an_empty_registry_is_ok_with_an_empty_list() {
-    let _guard = aoide_test_support::env_lock().lock().unwrap();
-    let root = unique_root("pair-pending-empty");
-    let _stage = setup_env(&root);
-
-    let out = dispatch(&cli_invocation(&["peer", "pending"], &[], &[]));
-    assert_eq!(out.status, Status::Ok);
-    assert_eq!(out.data.unwrap()["requests"].as_array().unwrap().len(), 0);
-
-    let _ = std::fs::remove_dir_all(&root);
-    std::env::remove_var("AOIDE_STAGE_DIR");
-    std::env::remove_var("AOIDE_STATE_DIR");
-    std::env::remove_var("XDG_RUNTIME_DIR");
-    std::env::remove_var("AOIDE_AUDIT_LOG");
-}
-
 // ── Review-bounce fix forward on cad70ad — direction-dispatching
-// ── `peer pair approve`/`reject` (Finding 2) and the unrevealed-inbound
+// ── `pair`'s approve path and `pair reject` (Finding 2) and the unrevealed-inbound
 // ── refusal (Finding 1). These drive the storage-level `pairing` functions
 // ── directly to park/transition entries (the same way the network-free
 // ── tests above bypass `run_curl`), rather than standing up a real loopback
@@ -554,7 +539,7 @@ fn peer_pair_approve_on_an_unrevealed_inbound_entry_is_refused_with_awaiting_rev
     let entry = aoide_storage::pairing::park_inbound(&"a".repeat(64), "box-a", "127.0.0.1", "http://a/", &commit, &now, &expires, None).unwrap();
     assert!(entry.requester_nonce_hex.is_none(), "freshly parked, never revealed");
 
-    let out = dispatch(&cli_invocation(&["peer", "pair", "approve"], &[entry.id.as_str()], &[("yes", "true")]));
+    let out = dispatch(&cli_invocation(&["pair"], &[entry.id.as_str()], &[("yes", "true"), ("wait", "0")]));
     assert_eq!(out.status, Status::Error);
     assert_eq!(out.data.unwrap()["reason"], "awaiting-reveal");
     assert!(aoide_storage::peer_store::load_peers().is_empty(), "an unrevealed entry never commits a peer record");
@@ -591,7 +576,7 @@ fn peer_pair_reject_on_an_outbound_entry_aborts_before_the_approvers_callback() 
     };
     aoide_storage::pairing::park_outbound(entry).unwrap();
 
-    let out = dispatch(&cli_invocation(&["peer", "pair", "reject"], &["abcd1234"], &[]));
+    let out = dispatch(&cli_invocation(&["pair", "reject"], &["abcd1234"], &[]));
     assert_eq!(out.status, Status::Ok, "{}", out.message);
     assert_eq!(out.data.as_ref().unwrap()["direction"], "outbound");
     assert!(aoide_storage::peer_store::load_peers().is_empty(), "reject writes no peer record");
@@ -631,7 +616,7 @@ fn peer_pair_reject_on_an_outbound_entry_aborts_after_the_approvers_callback() {
     let after_callback = aoide_storage::pairing::mark_outbound_awaiting_confirm("abcd5678", &"b".repeat(64), now_epoch).unwrap();
     assert_eq!(after_callback.state, aoide_storage::pairing::OutboundState::AwaitingConfirm);
 
-    let out = dispatch(&cli_invocation(&["peer", "pair", "reject"], &["abcd5678"], &[]));
+    let out = dispatch(&cli_invocation(&["pair", "reject"], &["abcd5678"], &[]));
     assert_eq!(out.status, Status::Ok, "{}", out.message);
     assert_eq!(out.data.as_ref().unwrap()["direction"], "outbound");
     assert!(aoide_storage::peer_store::load_peers().is_empty(), "reject writes no peer record even mid-ceremony");
@@ -673,7 +658,7 @@ fn spawn_fake_pair_poll_server(body: &'static str) -> (TcpListener, u16) {
     (listener, port)
 }
 
-/// Design A (task #119): `peer pair approve` on an `awaiting-approval`
+/// Design A (task #119): `pair <target>` on an `awaiting-approval`
 /// outbound entry now POLLS the approver's door (real curl, real socket —
 /// the whole point is proving no callback is needed, only a forward dial)
 /// instead of making a network-free local state check. `#[ignore]`'d for
@@ -706,7 +691,10 @@ fn peer_pair_approve_on_an_outbound_entry_still_awaiting_the_peers_own_approval_
     };
     aoide_storage::pairing::park_outbound(entry).unwrap();
 
-    let out = dispatch(&cli_invocation(&["peer", "pair", "approve"], &["efgh1234"], &[("yes", "true")]));
+    // `--wait 0` is the ONE-SHOT poll (task #135 P2) — without it the resume
+    // leg blocks the full default 600s against a server that only ever
+    // answers "pending", then returns Ok-still-parked instead of this refusal.
+    let out = dispatch(&cli_invocation(&["pair"], &["efgh1234"], &[("yes", "true"), ("wait", "0")]));
     assert_eq!(out.status, Status::Error, "{}", out.message);
     assert_eq!(out.data.unwrap()["reason"], "awaiting-peer-approval");
     assert!(aoide_storage::peer_store::load_peers().is_empty());
@@ -748,7 +736,7 @@ fn peer_pair_approve_on_an_outbound_entry_awaiting_confirm_commits_with_yes() {
         state: aoide_storage::pairing::OutboundState::AwaitingApproval,
         // P-S4: the via this ceremony resolved at request time (a --via
         // flag, or peer invite's observed src_addr) rides the parked
-        // entry to this later, separate `peer pair approve` invocation —
+        // entry to this later, separate `pair <target>` invocation —
         // asserted below, committed onto the peer record only here.
         via: Some("ssh://khoa@box-b".to_string()),
     };
@@ -758,7 +746,7 @@ fn peer_pair_approve_on_an_outbound_entry_awaiting_confirm_commits_with_yes() {
 
     let expected_sas = aoide_storage::pairing::derive_sas(&own_pubkey, &"b".repeat(64), &"c".repeat(32), &"d".repeat(32));
 
-    let out = dispatch(&cli_invocation(&["peer", "pair", "approve"], &["ijkl1234"], &[("yes", "true")]));
+    let out = dispatch(&cli_invocation(&["pair"], &["ijkl1234"], &[("yes", "true"), ("wait", "0")]));
     assert_eq!(out.status, Status::Ok, "{}", out.message);
     let data = out.data.unwrap();
     assert_eq!(data["sas"], expected_sas);
@@ -829,7 +817,7 @@ fn peer_pair_approve_on_an_outbound_entry_with_no_via_leaves_a_previously_record
         requested_at: now.clone(),
         expires_at: expires,
         state: aoide_storage::pairing::OutboundState::AwaitingApproval,
-        // The re-pair itself carries NO via — a plain `peer pair request`
+        // The re-pair itself carries NO via — a plain `pair <url>`
         // with no `--via` this time.
         via: None,
     };
@@ -839,7 +827,7 @@ fn peer_pair_approve_on_an_outbound_entry_with_no_via_leaves_a_previously_record
 
     let expected_sas = aoide_storage::pairing::derive_sas(&own_pubkey, &"e".repeat(64), &"f".repeat(32), &"1".repeat(32));
 
-    let out = dispatch(&cli_invocation(&["peer", "pair", "approve"], &["mnop1234"], &[("yes", "true")]));
+    let out = dispatch(&cli_invocation(&["pair"], &["mnop1234"], &[("yes", "true"), ("wait", "0")]));
     assert_eq!(out.status, Status::Ok, "{}", out.message);
     let data = out.data.unwrap();
     assert_eq!(data["sas"], expected_sas);
