@@ -122,7 +122,7 @@ use aoide_protocol::dialog::{
 };
 use aoide_protocol::feed::Follower;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -160,6 +160,37 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// regardless of what the tail saw — the safety backstop a missed or
 /// malformed feed line can never defeat (module doc).
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long either popup dialog shape stays open before this watcher gives
+/// up on THIS attempt and lets it close — 60s, the User's own number (task
+/// #135 popup-phase spec, part 1). Neither the inbound typed-code entry nor
+/// the outbound confirm may sit open forever: a stale dialog blocks the
+/// operator's own desktop (a modal window that outlives the moment they'd
+/// have actually noticed it) for a request that stays perfectly answerable
+/// later. Closing a dialog this way is a TIMEOUT — see [`decide`]'s own
+/// `CancelledExternally` arm — never Cancel/Dismiss, and it must never land
+/// the id in `ignored` (module doc part 2: "didn't answer within a minute"
+/// is not "no").
+const DIALOG_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a timed-out id sits out before [`popup_tick`] offers its
+/// dialog again — reuses [`RECONCILE_INTERVAL`]'s own already-justified 30s
+/// safety cadence rather than inventing a second arbitrary number (part 2's
+/// own ask: a dialog must not re-raise on the very next [`POLL_INTERVAL`]
+/// tick, or the operator can never use their own desktop in between).
+const DIALOG_TIMEOUT_COOLDOWN: Duration = RECONCILE_INTERVAL;
+
+/// How often [`run`]'s popup loop actively polls every outbound entry still
+/// `awaiting-approval`, through [`poll_pending_outbound`] —
+/// `commands::poll_outbound_once` is the ONLY production site that ever
+/// advances an outbound entry to `awaiting-confirm` (module doc), and
+/// nothing else in this watcher calls it: with no timer of its own, a
+/// detached `--wait 0` (or timed-out) outbound request would sit unpolled
+/// forever and its confirm dialog could never fire from `--popup` at all.
+/// Its OWN timer, deliberately never folded into [`POLL_INTERVAL`]'s 200ms
+/// cadence — a network call at that cadence is the one thing [`popup_tick`]
+/// must never make (part 3's own ask). ~60s, the User's own number.
+const OUTBOUND_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The default `zenity` binary name `run` checks for before ever entering
 /// `--popup` mode, and [`spawn_zenity_entry`]'s own default target —
@@ -585,16 +616,36 @@ enum PopupDecision {
     /// silently stop offering a request just because it failed to show
     /// once.
     Backoff,
+    /// [`DIALOG_TIMEOUT`] elapsed with no answer — `should_cancel` closed
+    /// the dialog itself, and the request is STILL actionable (task #135
+    /// popup-phase spec, part 1/2). Distinct from `Noop` on purpose: this
+    /// id must be offered again later (after [`DIALOG_TIMEOUT_COOLDOWN`]),
+    /// and it must NEVER land in `ignored` — "didn't answer within a
+    /// minute" is not "no."
+    TimedOut,
     /// The request resolved elsewhere while the dialog sat open
-    /// (`should_cancel` fired) — already handled, nothing left to do.
+    /// (`should_cancel` fired, and the request is no longer actionable) —
+    /// already handled, nothing left to do.
     Noop,
 }
 
-fn decide(result: DialogResult) -> PopupDecision {
+/// What a finished dialog round means for the request it was shown for —
+/// pure (module doc, and this variant's own doc). `still_actionable` is the
+/// ONE extra input `CancelledExternally` needs to tell its two causes apart
+/// (`should_cancel` returns `true` for EITHER "no longer actionable —
+/// resolved elsewhere" OR "[`DIALOG_TIMEOUT`] elapsed," and a bare
+/// `DialogResult` cannot distinguish them): a request that timed out is
+/// still sitting there, unchanged, so `still_actionable` reads `true`; one
+/// that resolved elsewhere does not, so it reads `false`. Every other
+/// `DialogResult` was never subject to `should_cancel` at all (`
+/// run_entry_dialog`'s own doc — it is the ONLY producer of
+/// `CancelledExternally`), so `still_actionable` is simply ignored for them.
+fn decide(result: DialogResult, still_actionable: bool) -> PopupDecision {
     match result {
         DialogResult::Approved(code) => PopupDecision::Approve(code),
         DialogResult::Dismissed => PopupDecision::Reject,
         DialogResult::Cancelled => PopupDecision::Ignore,
+        DialogResult::CancelledExternally if still_actionable => PopupDecision::TimedOut,
         DialogResult::CancelledExternally => PopupDecision::Noop,
         DialogResult::SpawnError(_) | DialogResult::DialogFailure(_) => PopupDecision::Backoff,
     }
@@ -607,6 +658,29 @@ fn decide(result: DialogResult) -> PopupDecision {
 /// from the real I/O so it stays independently testable).
 fn popup_allowed(locked: bool) -> bool {
     !locked
+}
+
+/// Pure: has a timed-out id's cooldown elapsed enough to offer its dialog
+/// again? Takes the elapsed [`Duration`] since the id's last timeout
+/// directly (this file's clock-as-parameter discipline — `reconcile`,
+/// `popup_allowed`, and [`decide`] all take their inputs pre-resolved
+/// rather than reading a clock themselves), so the boundary is provable
+/// with no real sleep. `None` (never timed out, or no longer tracked at
+/// all) always reads as elapsed — there is nothing to cool down from.
+fn cooldown_elapsed(elapsed_since_timeout: Option<Duration>) -> bool {
+    elapsed_since_timeout.is_none_or(|elapsed| elapsed >= DIALOG_TIMEOUT_COOLDOWN)
+}
+
+/// Pure: is `p` eligible for a NEW dialog RIGHT NOW? [`actionable`] plus
+/// every gate this phase adds beside `ignored` — its own cooldown
+/// ([`cooldown_elapsed`]) and a LIVE blocking `aoide pair`'s own marker
+/// (`marker_live`, task #135 popup-phase spec part 4) — each pre-resolved
+/// and passed in rather than read here, so this is the ONE place
+/// [`popup_tick`]'s own candidate selection is decided (module doc's
+/// discipline for `decide`/`popup_allowed`) and a synthetic case never
+/// needs a real dialog, a real clock, or a real marker file.
+fn eligible_for_dialog(p: &Pending, ignored: bool, cooldown_ok: bool, marker_live: bool) -> bool {
+    actionable(p) && !ignored && cooldown_ok && !marker_live
 }
 
 /// Commit `p`'s pairing on a dialog Approve — looks up ITS FRESH entry by
@@ -642,22 +716,183 @@ fn commit_approval(p: &Pending, code: &str, now_epoch: i64) -> aoide_protocol::o
     }
 }
 
-/// One popup iteration: pick the next un-ignored actionable [`Pending`],
-/// skip while the screen is locked (F8 — re-offered next tick, never
-/// shown behind a lock screen), show its dialog — [`run_ask_dialog`]
-/// (typed-code entry) on the INBOUND arm, [`run_confirm_dialog`] (a single
-/// Approve/Reject over the already-known code) on the OUTBOUND one — and
-/// act on [`decide`]'s mapping. `should_cancel` re-derives [`reconcile`]
-/// fresh on every ~200ms poll (`run_entry_dialog`'s own interval) rather
-/// than reading a cached queue — this arm's request volume is low enough
-/// that the extra `list_inbound`/`list_outbound`/identity-load cost per
-/// poll is cheaper than the machinery a shared, mutex-guarded queue would
-/// add.
-fn popup_tick(ignored: &mut HashSet<String>, spawn_backoff: &mut Duration, spawn_failing: &mut bool, json_mode: bool, lyra_cmd: Option<&str>) {
+// ── the outbound poll timer (F6, task #135 popup phase, part 3) ─────────
+
+/// Pure: does `state` ever need [`poll_pending_outbound`]'s wire round
+/// trip at all? Only `awaiting-approval` does — an entry already
+/// `awaiting-confirm` has everything it needs (this end's own operator is
+/// the actor now; `commands::poll_outbound_once`'s own early return for
+/// exactly this state confirms a second call would be a no-op anyway).
+fn needs_outbound_poll(state: aoide_storage::pairing::OutboundState) -> bool {
+    state == aoide_storage::pairing::OutboundState::AwaitingApproval
+}
+
+/// [`OUTBOUND_POLL_INTERVAL`]'s own tick: poll every outbound entry still
+/// `awaiting-approval` once, through [`crate::commands::poll_outbound_once`]
+/// — the single seam (module doc, part 3): this never re-implements the
+/// wire call or the `awaiting-confirm` state transition, only decides WHEN
+/// to trigger it. Best-effort per entry, and the outcome is discarded on
+/// purpose — a `Refused`/`Pending` answer is simply left for the next
+/// tick, the SAME "can't answer this tick, try again next tick" posture
+/// [`reconcile`]'s own doc already holds for an identity-load failure; a
+/// `Released` answer needs no reaction here at all, since [`popup_tick`]'s
+/// own very next 200ms tick re-derives [`reconcile`] from scratch and
+/// notices the entry is `actionable` now.
+fn poll_pending_outbound(now_epoch: i64) {
+    for entry in aoide_storage::pairing::list_outbound(now_epoch) {
+        if !needs_outbound_poll(entry.state) {
+            continue;
+        }
+        let id = entry.id.clone();
+        let _ = crate::commands::poll_outbound_once("pair.watch", &id, &entry, now_epoch);
+    }
+}
+
+// ── the pid-marker arbiter (F6, task #135 popup phase, part 4) ──────────
+
+/// `$XDG_RUNTIME_DIR/aoide/` — RE-DERIVED here rather than imported
+/// (`aoide_storage::tunnel`'s own module doc states the identical rule for
+/// this SAME directory, and re-derives it rather than depending upward for
+/// the identical reason [`ZENITY_CMD`]'s own doc gives for its literal: a
+/// three-line resolution carries none of the "no cross-crate copying"
+/// weight a moved TYPE or FUNCTION would).
+fn marker_runtime_dir() -> std::path::PathBuf {
+    let runtime = std::env::var("XDG_RUNTIME_DIR").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/run/user/1000".into());
+    std::path::PathBuf::from(runtime).join("aoide")
+}
+
+/// Where a LIVE blocking `aoide pair <id>`'s own pid marker lives —
+/// `$XDG_RUNTIME_DIR/aoide/pair-active/<id>.pid`. `None` for an id that is
+/// not safe to join onto a path with no further checking (empty, a path
+/// separator, a NUL byte, a leading `.`) — the same traversal guard
+/// `aoide_storage::tunnel::is_safe_id` holds for its own session-id path
+/// segment, re-derived here for the identical reason [`marker_runtime_dir`]
+/// gives; a pairing id is minted, never operator-typed, but nothing here
+/// trusts that instead of checking.
+fn marker_path(id: &str) -> Option<std::path::PathBuf> {
+    let safe = !id.is_empty() && !id.contains('/') && !id.contains('\\') && !id.contains('\0') && !id.starts_with('.');
+    safe.then(|| marker_runtime_dir().join("pair-active").join(format!("{id}.pid")))
+}
+
+/// Is `pid` a live process? `aoide_client::tunnel::proc_exists`'s exact
+/// `/proc/<pid>` check, RE-DERIVED here — that function is private to its
+/// own module (not even `pub(crate)`), and a two-line check carries none of
+/// the "no cross-crate copying" weight a moved TYPE or FUNCTION would
+/// ([`marker_runtime_dir`]'s own doc gives the identical reasoning).
+fn pid_is_alive(pid: u32) -> bool {
+    std::path::Path::new("/proc").join(pid.to_string()).exists()
+}
+
+/// Pure: does a marker naming `marker_pid` mean "a blocking `aoide pair`
+/// is live for this id right now"? Takes the liveness ANSWER as a
+/// parameter rather than probing `/proc` itself — the same injected-probe
+/// discipline [`popup_allowed`] already holds for `locked_state`'s own OR.
+/// `None` (no marker file, or one that failed to parse) never suppresses —
+/// an unanswerable probe reads as "not live," never as "live"
+/// (`aoide_protocol::dialog::probe_loginctl_locked`'s own doc gives the
+/// identical posture for its own OR term).
+fn marker_suppresses(marker_pid: Option<u32>, is_alive: impl FnOnce(u32) -> bool) -> bool {
+    marker_pid.is_some_and(is_alive)
+}
+
+/// Read `id`'s marker pid off disk, tolerating a missing file, an
+/// unreadable one, or unparseable content as `None` — the same
+/// tolerate-missing-as-absent discipline `aoide_storage::tunnel::load`
+/// already holds for its own record.
+fn read_marker_pid(id: &str) -> Option<u32> {
+    let path = marker_path(id)?;
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Is a LIVE blocking `aoide pair <id>` currently holding `id`'s marker?
+/// [`popup_tick`]'s own read side (part 4): a marker naming a pid that is
+/// no longer alive is STALE, never suppresses, and is cleaned up here
+/// (best-effort) so a later read never has to re-discover the same
+/// staleness — "a stale marker must not suppress forever" (module doc),
+/// not "a stale marker suppresses once more before it's noticed."
+fn is_marker_live(id: &str) -> bool {
+    let pid = read_marker_pid(id);
+    if marker_suppresses(pid, pid_is_alive) {
+        return true;
+    }
+    if pid.is_some() {
+        if let Some(path) = marker_path(id) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    false
+}
+
+/// The blocking `pair` path's own marker (`commands::wait_and_commit`'s
+/// one caller) — [`Self::acquire`] writes it, [`Drop`] removes it
+/// unconditionally, so every return path out of a blocking poll loop (a
+/// terminal answer, a timeout, a future early return) clears it the same
+/// way, with no per-branch bookkeeping to keep in sync. Since P2
+/// (`commands::wait_and_commit`'s own doc), a blocking `aoide pair` polls
+/// and can commit an outbound request entirely on its own — without this
+/// marker, `--popup`'s own outbound poll timer (part 3) racing the SAME id
+/// would let two processes both try to commit it (module doc, part 4).
+pub(crate) struct PairActiveMarker {
+    id: String,
+}
+
+impl PairActiveMarker {
+    /// Claim `id`'s marker for as long as this guard lives, naming THIS
+    /// process's own pid. Best-effort: a write failure (an unwritable
+    /// runtime dir) degrades to "no suppression," never a hard error
+    /// surfaced through the blocking loop this guards — the storage commit
+    /// underneath (`commit_approval`/`commit_outbound`) is still the single
+    /// source of truth either the popup or the tty path gates through, so a
+    /// missed suppression risks a double DIALOG, never a double commit.
+    pub(crate) fn acquire(id: &str) -> Self {
+        if let Some(path) = marker_path(id) {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&path, std::process::id().to_string());
+        }
+        Self { id: id.to_string() }
+    }
+}
+
+impl Drop for PairActiveMarker {
+    fn drop(&mut self) {
+        if let Some(path) = marker_path(&self.id) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// One popup iteration: pick the next [`eligible_for_dialog`] [`Pending`]
+/// (actionable, un-ignored, its timeout cooldown elapsed, no LIVE blocking
+/// `aoide pair` marker — task #135 popup-phase spec, parts 2/4), skip while
+/// the screen is locked (F8 — re-offered next tick, never shown behind a
+/// lock screen), show its dialog — [`run_ask_dialog`] (typed-code entry) on
+/// the INBOUND arm, [`run_confirm_dialog`] (a single Approve/Reject over
+/// the already-known code) on the OUTBOUND one, EITHER capped at
+/// [`DIALOG_TIMEOUT`] (part 1) — and act on [`decide`]'s mapping.
+/// `should_cancel` re-derives [`reconcile`] fresh on every ~200ms poll
+/// (`run_entry_dialog`'s own interval) rather than reading a cached queue —
+/// this arm's request volume is low enough that the extra
+/// `list_inbound`/`list_outbound`/identity-load cost per poll is cheaper
+/// than the machinery a shared, mutex-guarded queue would add. The
+/// OUTBOUND leg's own network poll (part 3, [`poll_pending_outbound`]) is
+/// deliberately NOT here — this function must never make a network call on
+/// [`POLL_INTERVAL`]'s own 200ms cadence; [`run`]'s own loop calls it
+/// separately, on [`OUTBOUND_POLL_INTERVAL`].
+fn popup_tick(ignored: &mut HashSet<String>, timed_out: &mut HashMap<String, Instant>, spawn_backoff: &mut Duration, spawn_failing: &mut bool, json_mode: bool, lyra_cmd: Option<&str>) {
     let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
     let pending = reconcile(now_epoch);
     ignored.retain(|id| pending.iter().any(|p| &p.id == id));
-    let Some(p) = pending.into_iter().find(|p| actionable(p) && !ignored.contains(&p.id)) else {
+    timed_out.retain(|id, _| pending.iter().any(|p| &p.id == id));
+    let Some(p) = pending.into_iter().find(|p| {
+        eligible_for_dialog(
+            p,
+            ignored.contains(&p.id),
+            cooldown_elapsed(timed_out.get(&p.id).map(Instant::elapsed)),
+            is_marker_live(&p.id),
+        )
+    }) else {
         return;
     };
 
@@ -668,12 +903,15 @@ fn popup_tick(ignored: &mut HashSet<String>, spawn_backoff: &mut Duration, spawn
     let title = confirm_title(&p);
     let context = dialog_context(&p);
     let id = p.id.clone();
+    let deadline = Instant::now() + DIALOG_TIMEOUT;
 
     let result = if p.direction == "inbound" {
         let cancel_id = id.clone();
         run_ask_dialog(lyra_cmd, ZENITY_CMD, &id, &p.name, &title, &context, move || {
-            let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
-            !reconcile(now_epoch).iter().any(|q| q.id == cancel_id && actionable(q))
+            Instant::now() >= deadline || {
+                let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
+                !reconcile(now_epoch).iter().any(|q| q.id == cancel_id && actionable(q))
+            }
         })
     } else {
         // The zenity `--text` mirrors the SAME context/code lines
@@ -685,8 +923,10 @@ fn popup_tick(ignored: &mut HashSet<String>, spawn_backoff: &mut Duration, spawn
         let text = format!("{context}\ncode: {code}");
         let cancel_id = id.clone();
         run_confirm_dialog(lyra_cmd, ZENITY_CMD, &id, &p.name, &title, &text, &context, &code, move || {
-            let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
-            !reconcile(now_epoch).iter().any(|q| q.id == cancel_id && actionable(q))
+            Instant::now() >= deadline || {
+                let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
+                !reconcile(now_epoch).iter().any(|q| q.id == cancel_id && actionable(q))
+            }
         })
     };
 
@@ -698,7 +938,15 @@ fn popup_tick(ignored: &mut HashSet<String>, spawn_backoff: &mut Duration, spawn
         }
     }
 
-    match decide(result) {
+    // `still_actionable` is only ever consulted by `decide` on a
+    // `CancelledExternally` result (its own doc) — the fresh reconcile it
+    // costs is skipped for every other, far more common, outcome.
+    let still_actionable = matches!(result, DialogResult::CancelledExternally) && {
+        let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
+        reconcile(now_epoch).iter().any(|q| q.id == id && actionable(q))
+    };
+
+    match decide(result, still_actionable) {
         PopupDecision::Approve(code) => {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
             let outcome = commit_approval(&p, &code, now_epoch);
@@ -714,6 +962,16 @@ fn popup_tick(ignored: &mut HashSet<String>, spawn_backoff: &mut Duration, spawn
         }
         PopupDecision::Ignore => {
             ignored.insert(p.id.clone());
+        }
+        PopupDecision::TimedOut => {
+            timed_out.insert(p.id.clone(), Instant::now());
+            if !json_mode {
+                println!(
+                    "  pairing request {} timed out waiting for an answer \u{2014} still pending, offered again in {}s",
+                    p.id,
+                    DIALOG_TIMEOUT_COOLDOWN.as_secs()
+                );
+            }
         }
         PopupDecision::Noop => {
             if !json_mode {
@@ -815,7 +1073,9 @@ pub fn run(events_path: &Path, json_mode: bool, popup_mode: bool) -> i32 {
     }
 
     let mut last_reconcile = Instant::now();
+    let mut last_outbound_poll = Instant::now();
     let mut ignored: HashSet<String> = HashSet::new();
+    let mut timed_out: HashMap<String, Instant> = HashMap::new();
     let mut spawn_backoff = SPAWN_BACKOFF_INITIAL;
     let mut spawn_failing = false;
     loop {
@@ -847,7 +1107,16 @@ pub fn run(events_path: &Path, json_mode: bool, popup_mode: bool) -> i32 {
         }
 
         if popup_mode {
-            popup_tick(&mut ignored, &mut spawn_backoff, &mut spawn_failing, json_mode, lyra_cmd.as_deref());
+            // Part 3's own timer — NEVER folded into the 200ms cadence
+            // `popup_tick` itself runs on ([`OUTBOUND_POLL_INTERVAL`]'s own
+            // doc): this is the only place a network call happens in the
+            // popup arm's own loop.
+            if last_outbound_poll.elapsed() >= OUTBOUND_POLL_INTERVAL {
+                last_outbound_poll = Instant::now();
+                let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
+                poll_pending_outbound(now_epoch);
+            }
+            popup_tick(&mut ignored, &mut timed_out, &mut spawn_backoff, &mut spawn_failing, json_mode, lyra_cmd.as_deref());
         } else if last_reconcile.elapsed() >= RECONCILE_INTERVAL {
             last_reconcile = Instant::now();
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
@@ -1138,16 +1407,33 @@ mod tests {
 
     #[test]
     fn decide_maps_every_dialog_result_and_a_spawn_failure_is_never_ignore() {
-        assert_eq!(decide(DialogResult::Approved("740-729".to_string())), PopupDecision::Approve("740-729".to_string()));
-        assert_eq!(decide(DialogResult::Dismissed), PopupDecision::Reject);
-        assert_eq!(decide(DialogResult::Cancelled), PopupDecision::Ignore);
-        assert_eq!(decide(DialogResult::CancelledExternally), PopupDecision::Noop);
+        assert_eq!(decide(DialogResult::Approved("740-729".to_string()), false), PopupDecision::Approve("740-729".to_string()));
+        assert_eq!(decide(DialogResult::Dismissed, false), PopupDecision::Reject);
+        assert_eq!(decide(DialogResult::Cancelled, false), PopupDecision::Ignore);
         // The swap-catcher: a spawn failure must back off, and must NEVER
         // read as `Ignore` — `Ignore` would permanently stop offering a
         // request just because the dialog binary glitched once.
-        assert_eq!(decide(DialogResult::SpawnError("no such file".to_string())), PopupDecision::Backoff);
-        assert_ne!(decide(DialogResult::SpawnError("no such file".to_string())), PopupDecision::Ignore);
-        assert_eq!(decide(DialogResult::DialogFailure("exit 3".to_string())), PopupDecision::Backoff);
+        assert_eq!(decide(DialogResult::SpawnError("no such file".to_string()), false), PopupDecision::Backoff);
+        assert_ne!(decide(DialogResult::SpawnError("no such file".to_string()), false), PopupDecision::Ignore);
+        assert_eq!(decide(DialogResult::DialogFailure("exit 3".to_string()), false), PopupDecision::Backoff);
+    }
+
+    /// Task #135 popup-phase spec, part 1/2: `CancelledExternally` is the
+    /// ONE `DialogResult` `should_cancel` ever produces, for EITHER of two
+    /// reasons (`decide`'s own doc) — `still_actionable` is what tells
+    /// them apart. Still actionable (nothing changed underneath the
+    /// dialog) means IT gave up — a timeout, offered again later, never
+    /// `ignored`. No longer actionable (resolved elsewhere) means the
+    /// SAME `Noop` this arm always gave.
+    #[test]
+    fn decide_tells_a_timeout_from_a_resolved_elsewhere_cancel() {
+        assert_eq!(decide(DialogResult::CancelledExternally, true), PopupDecision::TimedOut);
+        assert_eq!(decide(DialogResult::CancelledExternally, false), PopupDecision::Noop);
+        assert_ne!(
+            decide(DialogResult::CancelledExternally, true),
+            PopupDecision::Ignore,
+            "a timeout must never be indistinguishable from an explicit Cancel/Dismiss"
+        );
     }
 
     #[test]
@@ -1161,6 +1447,184 @@ mod tests {
         assert!(!popup_allowed(aoide_protocol::dialog::locked_state(Some(true), false)));
         assert!(!popup_allowed(aoide_protocol::dialog::locked_state(None, true)));
         assert!(popup_allowed(aoide_protocol::dialog::locked_state(Some(false), false)));
+    }
+
+    // ── cooldown_elapsed / eligible_for_dialog (part 2/4's own gates) ────
+
+    #[test]
+    fn cooldown_elapsed_gates_on_the_boundary_inclusive() {
+        assert!(cooldown_elapsed(None), "never timed out — nothing to cool down from");
+        assert!(!cooldown_elapsed(Some(DIALOG_TIMEOUT_COOLDOWN - Duration::from_millis(1))), "just under the cooldown must still suppress");
+        assert!(cooldown_elapsed(Some(DIALOG_TIMEOUT_COOLDOWN)), "the boundary itself has cooled down");
+        assert!(cooldown_elapsed(Some(DIALOG_TIMEOUT_COOLDOWN + Duration::from_secs(1))));
+    }
+
+    #[test]
+    fn eligible_for_dialog_requires_actionable_and_every_new_gate_clear() {
+        let p = fixture_pending("outbound", Some("111-222"));
+        assert!(eligible_for_dialog(&p, false, true, false), "actionable, unignored, cooled down, unmarked — eligible");
+        assert!(!eligible_for_dialog(&p, true, true, false), "explicitly ignored");
+        assert!(!eligible_for_dialog(&p, false, false, false), "still cooling down from a timeout");
+        assert!(!eligible_for_dialog(&p, false, true, true), "a live marker suppresses regardless of every other gate");
+
+        // The inbound fixture's own `state` is never `awaiting-approval`
+        // (`fixture_pending`'s own shape) — never actionable, so every
+        // other gate being wide open must not matter.
+        let never_actionable = fixture_pending("inbound", Some("111-222"));
+        assert!(!eligible_for_dialog(&never_actionable, false, true, false));
+    }
+
+    // ── needs_outbound_poll (part 3) ──────────────────────────────────────
+
+    #[test]
+    fn needs_outbound_poll_is_true_only_for_awaiting_approval() {
+        assert!(needs_outbound_poll(aoide_storage::pairing::OutboundState::AwaitingApproval));
+        assert!(!needs_outbound_poll(aoide_storage::pairing::OutboundState::AwaitingConfirm));
+    }
+
+    /// End to end (real local listener, this crate's own established
+    /// pattern — `commands.rs`'s own `spawn_fake_pair_poll_server`,
+    /// duplicated here because it is `#[cfg(test)]`-private to that
+    /// module: a few lines crossing a MODULE boundary carries none of the
+    /// "no cross-crate copying" weight a moved TYPE or FUNCTION would
+    /// (`marker_runtime_dir`'s own doc gives the identical reasoning for a
+    /// crate boundary)): proves [`poll_pending_outbound`] is the thing that
+    /// actually unlocks the outbound confirm dialog for a detached
+    /// (`--wait 0`) request sitting at `awaiting-approval` — without this
+    /// wiring, `commands::poll_outbound_once` (the only production site
+    /// that ever advances the state) is never called by the watcher at
+    /// all.
+    fn spawn_fake_pair_poll_server(body: &'static str) -> (std::net::TcpListener, u16) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepter = listener.try_clone().unwrap();
+        std::thread::spawn(move || {
+            use std::io::Read as _;
+            loop {
+                let Ok((mut stream, _)) = accepter.accept() else { break };
+                let mut buf = [0u8; 4096];
+                if stream.read(&mut buf).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (listener, port)
+    }
+
+    #[test]
+    fn poll_pending_outbound_advances_an_awaiting_approval_entry_to_awaiting_confirm() {
+        with_peer_state("poll-pending-outbound", || {
+            let pubkey_b = "b".repeat(64);
+            let body = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"status":"approved","pubkeyHex":"{pubkey_b}"}}}}"#);
+            let body: &'static str = Box::leak(body.into_boxed_str());
+            let (_listener, port) = spawn_fake_pair_poll_server(body);
+            let url = format!("http://127.0.0.1:{port}/");
+            let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
+            aoide_storage::pairing::park_outbound(aoide_storage::pairing::OutboundPairingRequest {
+                id: "deadbeef".to_string(),
+                url,
+                name: "box-b".to_string(),
+                pubkey_hex: pubkey_b,
+                requester_nonce_hex: "c".repeat(32),
+                approver_nonce_hex: "d".repeat(32),
+                requested_at: aoide_storage::time::now_iso_utc(),
+                expires_at: aoide_storage::pairing::expires_at_from(now_epoch),
+                state: aoide_storage::pairing::OutboundState::AwaitingApproval,
+                via: None,
+            })
+            .unwrap();
+
+            poll_pending_outbound(now_epoch);
+
+            let listed = aoide_storage::pairing::list_outbound(now_epoch);
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].state, aoide_storage::pairing::OutboundState::AwaitingConfirm, "the ONLY way this ever advances without a live wait_and_commit loop");
+            let pending = reconcile(now_epoch);
+            assert!(actionable(&pending.into_iter().find(|p| p.id == "deadbeef").unwrap()), "now the outbound confirm dialog has something to fire on");
+        });
+    }
+
+    // ── the pid-marker arbiter (part 4) ───────────────────────────────────
+
+    fn with_temp_marker_runtime_dir<T>(tag: &str, f: impl FnOnce() -> T) -> T {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("XDG_RUNTIME_DIR").ok();
+        let dir = std::env::temp_dir().join(format!(
+            "aoide-client-pair-watch-marker-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &dir);
+        let out = f();
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+        out
+    }
+
+    #[test]
+    fn marker_suppresses_only_when_a_pid_is_present_and_reads_alive() {
+        assert!(marker_suppresses(Some(123), |_| true));
+        assert!(!marker_suppresses(Some(123), |_| false));
+        assert!(!marker_suppresses(None, |_| true), "no marker at all is never live, regardless of what the probe would say");
+    }
+
+    #[test]
+    fn pair_active_marker_is_live_while_held_and_gone_after_drop() {
+        with_temp_marker_runtime_dir("live-drop", || {
+            assert!(!is_marker_live("abc12345"), "no marker written yet");
+            {
+                let _marker = PairActiveMarker::acquire("abc12345");
+                assert!(is_marker_live("abc12345"), "this process's own pid is alive by definition");
+            }
+            assert!(!is_marker_live("abc12345"), "Drop must remove the marker unconditionally");
+        });
+    }
+
+    /// Part 4's own ask: "a stale marker (dead pid) must not suppress
+    /// forever." A pid this large will never exist on a real Linux box
+    /// (default `pid_max` sits far below `u32::MAX`) — the same
+    /// "definitely-dead, never a recycled pid we might collide with"
+    /// caution `client::tunnel`'s own module doc holds for its liveness
+    /// probe.
+    #[test]
+    fn a_marker_naming_a_dead_pid_is_stale_never_suppresses_and_is_cleaned_up() {
+        with_temp_marker_runtime_dir("stale", || {
+            let path = marker_path("deadbeef").unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "999999999").unwrap();
+            assert!(!is_marker_live("deadbeef"), "a dead pid's marker must never suppress");
+            assert!(!path.exists(), "a stale marker is cleaned up once read, never left to suppress on a later read too");
+        });
+    }
+
+    #[test]
+    fn a_missing_or_corrupt_marker_reads_as_not_live() {
+        with_temp_marker_runtime_dir("missing-corrupt", || {
+            assert!(!is_marker_live("nosuchid-at-all"), "no file at all");
+            let path = marker_path("corrupt-id").unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "not-a-pid").unwrap();
+            assert!(!is_marker_live("corrupt-id"), "unparseable content is never live");
+        });
+    }
+
+    #[test]
+    fn marker_path_refuses_traversal_shaped_ids() {
+        assert!(marker_path("../etc").is_none());
+        assert!(marker_path("a/b").is_none());
+        assert!(marker_path("").is_none());
+        assert!(marker_path(".hidden").is_none());
     }
 
     #[test]
@@ -1603,7 +2067,7 @@ mod tests {
 
             // `Cancelled` (a bare Esc/close) — `decide` sends it to
             // `Ignore`, which never calls `commit_approval` at all.
-            assert_eq!(decide(DialogResult::Cancelled), PopupDecision::Ignore);
+            assert_eq!(decide(DialogResult::Cancelled, false), PopupDecision::Ignore);
             // `Dismissed` — `decide` sends it to `Reject`, `popup_tick`'s
             // own arm calls `reject_by_id`, never `commit_approval`.
             let out = crate::commands::reject_by_id("pair.reject", "deadbeef");

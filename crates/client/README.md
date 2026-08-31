@@ -416,10 +416,21 @@ never the inbound/serve half (that's `aoide-server`).
   `lyra` nor `zenity` resolves (`resolve_lyra_bin`, the SAME three-tier
   check `aoide_secrets::watch::resolve_lyra_bin` runs, repeated here since
   neither crate may depend on the other); past that, `popup_tick` replaces
-  the plain narrate-only reconcile with: pick the next un-ignored
-  actionable `Pending`, skip while the screen is locked (F8,
-  `aoide_protocol::dialog::is_locked`), show its dialog, and act on
-  `decide`'s mapping. **INBOUND (approver): `run_ask_dialog`** — `lyra
+  the plain narrate-only reconcile with: pick the next `Pending` that
+  `eligible_for_dialog` admits — `actionable`, un-ignored, its timeout
+  cooldown elapsed (`cooldown_elapsed`, pure), and no LIVE blocking
+  `aoide pair` holding that id's pid marker (`PairActiveMarker`, the
+  RAII guard `wait_and_commit` acquires; `marker_suppresses` is the pure
+  half, a dead pid's marker is stale and cleaned up) — skip while the
+  screen is locked (F8, `aoide_protocol::dialog::is_locked`), show its
+  dialog under `DIALOG_TIMEOUT` (60s; `should_cancel` closes it), and
+  act on `decide`'s mapping — `decide` takes `still_actionable` to tell
+  a TIMEOUT (re-offer after `DIALOG_TIMEOUT_COOLDOWN`, never `ignored`)
+  from a resolved-elsewhere cancel. `run`'s loop also drives
+  `poll_pending_outbound` on `OUTBOUND_POLL_INTERVAL` (60s):
+  `poll_outbound_once` on every entry `needs_outbound_poll` admits
+  (`awaiting-approval` only) — the ONLY way a detached request's confirm
+  dialog ever becomes actionable, and never from the 200ms tick. **INBOUND (approver): `run_ask_dialog`** — `lyra
   pair ask` (the SAME six-box entry surface `lyra secrets ask` renders)
   when `resolve_lyra_bin` found one, falling back to `zenity --entry` on a
   `lyra` `SpawnError`/`DialogFailure` for that one attempt

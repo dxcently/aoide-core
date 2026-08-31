@@ -2027,6 +2027,12 @@ fn wait_and_commit(cmd: &str, id: &str, name: &str, sas: &str, finish: &PairFini
         Ok(a) => a,
         Err(e) => return Outcome::error(cmd, e).with_data(json!({ "reason": "grant-unresolved", "id": id })),
     };
+    // Task #135 popup-phase spec, part 4: this loop is the ONLY production
+    // site that polls-and-can-commit an outbound request on its own — the
+    // SAME id's `--popup` confirm dialog must not race it to the SAME
+    // commit. Held for the rest of this function, however it returns
+    // (`Drop`), so a timeout or an early bail never leaves a stale marker.
+    let _pair_active_marker = crate::pair_watch::PairActiveMarker::acquire(id);
     // MONOTONIC, never the wall clock (review finding): an NTP step or a
     // suspend/resume during the wait moves `now_iso_utc` backward, and a
     // deadline measured against it then never arrives — the loop would poll
