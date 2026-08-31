@@ -683,6 +683,37 @@ fn eligible_for_dialog(p: &Pending, ignored: bool, cooldown_ok: bool, marker_liv
     actionable(p) && !ignored && cooldown_ok && !marker_live
 }
 
+/// Pure: should an ALREADY-OPEN dialog be cancelled RIGHT NOW? The three
+/// reasons `should_cancel` ORs together inside [`popup_tick`]'s own
+/// closures — [`DIALOG_TIMEOUT`] elapsed, the request stopped being
+/// actionable (resolved elsewhere), or a LIVE blocking `aoide pair` now
+/// holds this id's marker. The third is a review finding (defect 1) on
+/// this phase's own first landing: [`eligible_for_dialog`]'s marker gate
+/// only ever ran at candidate-SELECTION time, so a dialog already open
+/// when the marker appeared sat there, oblivious, for up to the REST of
+/// its 60s window — racing the SAME commit
+/// ([`PairActiveMarker`]'s own doc) the marker exists to prevent, and
+/// `peer_store::save_peers` has no cross-process lock of its own
+/// (plain load → modify → atomic write), so two concurrent commits are a
+/// genuine lost update, not a cosmetic double-dialog. Extracted as its
+/// own pure function (rather than left inline in the closures) so this
+/// exact condition is provable with three synthetic bools, no real
+/// dialog, clock, or marker file required.
+fn should_cancel_dialog(deadline_passed: bool, still_actionable: bool, marker_live: bool) -> bool {
+    deadline_passed || !still_actionable || marker_live
+}
+
+/// Pure: should an `Approve` verdict actually commit, or has a live
+/// blocking `aoide pair` already claimed this id (defect 1's
+/// belt-and-suspenders check, right before [`popup_tick`] would call
+/// [`commit_approval`])? Only the OUTBOUND direction can ever race a
+/// marker — nothing ever marks an INBOUND id (`PairActiveMarker`'s own
+/// doc) — so an inbound `Approve` always commits regardless of
+/// `marker_live`.
+fn should_commit_approve(direction: &str, marker_live: bool) -> bool {
+    direction != "outbound" || !marker_live
+}
+
 /// Commit `p`'s pairing on a dialog Approve — looks up ITS FRESH entry by
 /// id and direction (never trusts anything cached from an earlier
 /// `reconcile` call, the same "re-check before acting" discipline
@@ -727,24 +758,98 @@ fn needs_outbound_poll(state: aoide_storage::pairing::OutboundState) -> bool {
     state == aoide_storage::pairing::OutboundState::AwaitingApproval
 }
 
+/// Outbound-poll backoff floor (review defect 2): after a `Refused`
+/// answer, this id is not polled again until at least this long has
+/// passed — one whole [`OUTBOUND_POLL_INTERVAL`] BEYOND the normal
+/// cadence, so a single failure already skips the very next tick rather
+/// than retrying immediately at the next 60s boundary.
+const OUTBOUND_POLL_BACKOFF_INITIAL: Duration = OUTBOUND_POLL_INTERVAL;
+
+/// Ceiling [`next_outbound_poll_backoff`] never exceeds — 30 minutes,
+/// well inside a pairing request's own 4-hour default expiry
+/// (`aoide_storage::pairing::DEFAULT_PAIRING_TIMEOUT_SECS`), so a
+/// persistently unreachable peer still gets checked roughly every half
+/// hour rather than the ~240 blind round trips a flat 60s cadence would
+/// cost over the same window (review defect 2's own arithmetic: 4h / 60s).
+const OUTBOUND_POLL_BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
+
+/// The doubling step for a per-id outbound-poll backoff — [`next_spawn_backoff`]'s
+/// own SHAPE (double, then cap), NOT that function itself:
+/// `next_spawn_backoff` hardcodes [`SPAWN_BACKOFF_MAX`] (60s), calibrated
+/// for the dialog-spawn retry's own ~200ms-poll problem. At THIS poll's
+/// own 60s-tick granularity, a 60s ceiling is a no-op — it can never
+/// exceed even ONE tick of [`OUTBOUND_POLL_INTERVAL`] — so this reuses the
+/// ALGORITHM with its own constants scaled to its own, much coarser,
+/// cadence instead of literally calling `next_spawn_backoff`.
+fn next_outbound_poll_backoff(current: Duration) -> Duration {
+    current.saturating_mul(2).min(OUTBOUND_POLL_BACKOFF_MAX)
+}
+
+/// Pure: has this id's own outbound-poll backoff elapsed? Same
+/// clock-as-parameter split [`cooldown_elapsed`] already holds — `elapsed`
+/// is `None` when no prior failure is on record for this id (always reads
+/// as elapsed, nothing to back off from); `Some` compares directly
+/// against `backoff`, this id's own current threshold
+/// ([`next_outbound_poll_backoff`]'s own doubling, not a fixed constant
+/// the way [`cooldown_elapsed`]'s comparison target is).
+fn outbound_backoff_elapsed(elapsed: Option<Duration>, backoff: Duration) -> bool {
+    elapsed.is_none_or(|e| e >= backoff)
+}
+
 /// [`OUTBOUND_POLL_INTERVAL`]'s own tick: poll every outbound entry still
-/// `awaiting-approval` once, through [`crate::commands::poll_outbound_once`]
-/// — the single seam (module doc, part 3): this never re-implements the
-/// wire call or the `awaiting-confirm` state transition, only decides WHEN
-/// to trigger it. Best-effort per entry, and the outcome is discarded on
-/// purpose — a `Refused`/`Pending` answer is simply left for the next
-/// tick, the SAME "can't answer this tick, try again next tick" posture
-/// [`reconcile`]'s own doc already holds for an identity-load failure; a
-/// `Released` answer needs no reaction here at all, since [`popup_tick`]'s
-/// own very next 200ms tick re-derives [`reconcile`] from scratch and
-/// notices the entry is `actionable` now.
-fn poll_pending_outbound(now_epoch: i64) {
-    for entry in aoide_storage::pairing::list_outbound(now_epoch) {
+/// `awaiting-approval` (and past its own backoff, if any) once, through
+/// [`crate::commands::poll_outbound_once`] — the single seam (module doc,
+/// part 3): this never re-implements the wire call or the
+/// `awaiting-confirm` state transition, only decides WHEN to trigger it.
+///
+/// **Review defect 2: a `Refused` answer now backs off, it is never
+/// silently retried forever at the flat 60s cadence.** A `Pending` answer
+/// is the ORDINARY steady state while waiting (not a failure) and clears
+/// any backoff on record — only `Refused` (unreachable, an HTTP error, a
+/// malformed reply — `poll_outbound_once`'s own `Refused` arms) engages
+/// [`next_outbound_poll_backoff`], the SAME log-once-when-it-starts-
+/// failing/reset-on-recovery shape [`popup_tick`]'s own `spawn_backoff`/
+/// `spawn_failing` state already holds for repeated dialog-spawn
+/// failures, applied per id here since more than one outbound entry can
+/// be `awaiting-approval` at once, each with its own independent history.
+/// `backoff` is pruned of any id no longer `awaiting-approval` at all —
+/// the SAME retain-on-no-longer-pending discipline [`popup_tick`]'s own
+/// `ignored`/`timed_out` maps already hold.
+fn poll_pending_outbound(now_epoch: i64, backoff: &mut HashMap<String, (Duration, Instant)>, json_mode: bool) {
+    let outbound = aoide_storage::pairing::list_outbound(now_epoch);
+    backoff.retain(|id, _| outbound.iter().any(|e| &e.id == id && needs_outbound_poll(e.state)));
+
+    for entry in outbound {
         if !needs_outbound_poll(entry.state) {
             continue;
         }
+        let current_backoff = backoff.get(&entry.id).map_or(OUTBOUND_POLL_BACKOFF_INITIAL, |(b, _)| *b);
+        let elapsed = backoff.get(&entry.id).map(|(_, failed_at)| failed_at.elapsed());
+        if !outbound_backoff_elapsed(elapsed, current_backoff) {
+            continue;
+        }
+
         let id = entry.id.clone();
-        let _ = crate::commands::poll_outbound_once("pair.watch", &id, &entry, now_epoch);
+        let name = entry.name.clone();
+        match crate::commands::poll_outbound_once("pair.watch", &id, &entry, now_epoch) {
+            crate::commands::PollOutcome::Refused(out) => {
+                let was_failing = backoff.contains_key(&id);
+                let next = if was_failing { next_outbound_poll_backoff(current_backoff) } else { OUTBOUND_POLL_BACKOFF_INITIAL };
+                backoff.insert(id.clone(), (next, Instant::now()));
+                if !was_failing && !json_mode {
+                    eprintln!(
+                        "  aoide pair watch --popup: polling `{name}` for pairing request {id} failed ({}) \u{2014} backing off, retrying up to every {}s",
+                        out.message,
+                        OUTBOUND_POLL_BACKOFF_MAX.as_secs()
+                    );
+                }
+            }
+            _ => {
+                if backoff.remove(&id).is_some() && !json_mode {
+                    println!("  aoide pair watch --popup: polling `{name}` for pairing request {id} is working again \u{2014} backoff cleared");
+                }
+            }
+        }
     }
 }
 
@@ -908,10 +1013,17 @@ fn popup_tick(ignored: &mut HashSet<String>, timed_out: &mut HashMap<String, Ins
     let result = if p.direction == "inbound" {
         let cancel_id = id.clone();
         run_ask_dialog(lyra_cmd, ZENITY_CMD, &id, &p.name, &title, &context, move || {
-            Instant::now() >= deadline || {
+            let still_actionable = {
                 let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
-                !reconcile(now_epoch).iter().any(|q| q.id == cancel_id && actionable(q))
-            }
+                reconcile(now_epoch).iter().any(|q| q.id == cancel_id && actionable(q))
+            };
+            // No production writer ever marks an INBOUND id
+            // (`PairActiveMarker`'s own doc — only `wait_and_commit`, the
+            // OUTBOUND blocking leg, ever acquires one), so this always
+            // reads `false` here; checked anyway so this closure's shape
+            // matches the outbound one byte for byte and never silently
+            // drifts if that ever changes.
+            should_cancel_dialog(Instant::now() >= deadline, still_actionable, is_marker_live(&cancel_id))
         })
     } else {
         // The zenity `--text` mirrors the SAME context/code lines
@@ -923,10 +1035,20 @@ fn popup_tick(ignored: &mut HashSet<String>, timed_out: &mut HashMap<String, Ins
         let text = format!("{context}\ncode: {code}");
         let cancel_id = id.clone();
         run_confirm_dialog(lyra_cmd, ZENITY_CMD, &id, &p.name, &title, &text, &context, &code, move || {
-            Instant::now() >= deadline || {
+            let still_actionable = {
                 let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
-                !reconcile(now_epoch).iter().any(|q| q.id == cancel_id && actionable(q))
-            }
+                reconcile(now_epoch).iter().any(|q| q.id == cancel_id && actionable(q))
+            };
+            // Defect 1's own fix: `wait_and_commit`'s `PairActiveMarker` can
+            // become live at ANY point while this dialog sits open — checked
+            // on the SAME ~200ms cadence `run_entry_dialog` already polls
+            // `should_cancel` at, no coarser: `reconcile` (a JSON read plus
+            // an identity-key load) already runs unthrottled on this exact
+            // cadence for the `still_actionable` check above, so one more
+            // small-file-read-plus-`/proc`-stat is not a meaningfully hotter
+            // poll — throttling only this one check would just widen the
+            // very race this exists to close.
+            should_cancel_dialog(Instant::now() >= deadline, still_actionable, is_marker_live(&cancel_id))
         })
     };
 
@@ -940,18 +1062,36 @@ fn popup_tick(ignored: &mut HashSet<String>, timed_out: &mut HashMap<String, Ins
 
     // `still_actionable` is only ever consulted by `decide` on a
     // `CancelledExternally` result (its own doc) — the fresh reconcile it
-    // costs is skipped for every other, far more common, outcome.
+    // costs is skipped for every other, far more common, outcome. A LIVE
+    // marker counts as "not still actionable" here too (defect 1's fix):
+    // if a blocking `aoide pair` claimed this id while the dialog was
+    // closing, that reads as `Noop` ("handled elsewhere"), never
+    // `TimedOut` — offering it again on a cooldown would just reopen the
+    // SAME race a moment later.
     let still_actionable = matches!(result, DialogResult::CancelledExternally) && {
         let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
-        reconcile(now_epoch).iter().any(|q| q.id == id && actionable(q))
+        reconcile(now_epoch).iter().any(|q| q.id == id && actionable(q)) && !is_marker_live(&id)
     };
 
     match decide(result, still_actionable) {
         PopupDecision::Approve(code) => {
-            let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
-            let outcome = commit_approval(&p, &code, now_epoch);
-            if !json_mode {
-                println!("  {}", outcome.message);
+            // Belt and suspenders beyond `should_cancel_dialog` (defect 1):
+            // an `Approved` exit and a marker becoming live can still land
+            // in the SAME ~200ms poll window (`run_entry_dialog` checks
+            // `try_wait` BEFORE `should_cancel` — module doc). One more,
+            // near-free marker read right before the commit closes that
+            // window down from "up to 200ms" to "up to this one check."
+            if should_commit_approve(&p.direction, is_marker_live(&p.id)) {
+                let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
+                let outcome = commit_approval(&p, &code, now_epoch);
+                if !json_mode {
+                    println!("  {}", outcome.message);
+                }
+            } else if !json_mode {
+                println!(
+                    "  pairing request {} is now held by a live blocking `aoide pair` \u{2014} the popup is standing down without committing",
+                    p.id
+                );
             }
         }
         PopupDecision::Reject => {
@@ -1076,6 +1216,7 @@ pub fn run(events_path: &Path, json_mode: bool, popup_mode: bool) -> i32 {
     let mut last_outbound_poll = Instant::now();
     let mut ignored: HashSet<String> = HashSet::new();
     let mut timed_out: HashMap<String, Instant> = HashMap::new();
+    let mut outbound_poll_backoff: HashMap<String, (Duration, Instant)> = HashMap::new();
     let mut spawn_backoff = SPAWN_BACKOFF_INITIAL;
     let mut spawn_failing = false;
     loop {
@@ -1114,7 +1255,7 @@ pub fn run(events_path: &Path, json_mode: bool, popup_mode: bool) -> i32 {
             if last_outbound_poll.elapsed() >= OUTBOUND_POLL_INTERVAL {
                 last_outbound_poll = Instant::now();
                 let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
-                poll_pending_outbound(now_epoch);
+                poll_pending_outbound(now_epoch, &mut outbound_poll_backoff, json_mode);
             }
             popup_tick(&mut ignored, &mut timed_out, &mut spawn_backoff, &mut spawn_failing, json_mode, lyra_cmd.as_deref());
         } else if last_reconcile.elapsed() >= RECONCILE_INTERVAL {
@@ -1474,6 +1615,33 @@ mod tests {
         assert!(!eligible_for_dialog(&never_actionable, false, true, false));
     }
 
+    // ── should_cancel_dialog / should_commit_approve (review defect 1:
+    // ── the marker must retract an ALREADY-OPEN dialog, not just gate
+    // ── candidate selection) ────────────────────────────────────────────
+
+    #[test]
+    fn should_cancel_dialog_fires_on_deadline_resolution_or_a_live_marker() {
+        assert!(!should_cancel_dialog(false, true, false), "nothing has changed yet — keep the dialog open");
+        assert!(should_cancel_dialog(true, true, false), "the deadline passed");
+        assert!(should_cancel_dialog(false, false, false), "resolved elsewhere");
+        // The defect-1 fix itself: a marker going live while the dialog is
+        // open must retract it even though NEITHER the deadline NOR
+        // actionability changed — before this fix, an already-open dialog
+        // had no way to learn a blocking `aoide pair` had claimed the SAME
+        // id and would sit open for up to the rest of its 60s window.
+        assert!(should_cancel_dialog(false, true, true), "a live marker must retract an already-open dialog");
+    }
+
+    #[test]
+    fn should_commit_approve_only_a_live_marker_on_the_outbound_leg_ever_blocks_it() {
+        assert!(should_commit_approve("outbound", false), "no marker — commit as usual");
+        assert!(!should_commit_approve("outbound", true), "a live marker on the OUTBOUND leg must stand down, never double-commit");
+        // No production writer ever marks an inbound id — the inbound leg
+        // always commits regardless of what `marker_live` happens to read.
+        assert!(should_commit_approve("inbound", true));
+        assert!(should_commit_approve("inbound", false));
+    }
+
     // ── needs_outbound_poll (part 3) ──────────────────────────────────────
 
     #[test]
@@ -1540,13 +1708,110 @@ mod tests {
             })
             .unwrap();
 
-            poll_pending_outbound(now_epoch);
+            let mut backoff = HashMap::new();
+            poll_pending_outbound(now_epoch, &mut backoff, false);
 
             let listed = aoide_storage::pairing::list_outbound(now_epoch);
             assert_eq!(listed.len(), 1);
             assert_eq!(listed[0].state, aoide_storage::pairing::OutboundState::AwaitingConfirm, "the ONLY way this ever advances without a live wait_and_commit loop");
             let pending = reconcile(now_epoch);
             assert!(actionable(&pending.into_iter().find(|p| p.id == "deadbeef").unwrap()), "now the outbound confirm dialog has something to fire on");
+            assert!(backoff.is_empty(), "a successful poll must never leave backoff state behind");
+        });
+    }
+
+    // ── outbound-poll backoff (review defect 2) ───────────────────────────
+
+    #[test]
+    fn next_outbound_poll_backoff_doubles_from_the_floor_and_caps() {
+        assert_eq!(next_outbound_poll_backoff(OUTBOUND_POLL_BACKOFF_INITIAL), OUTBOUND_POLL_BACKOFF_INITIAL * 2);
+        assert_eq!(next_outbound_poll_backoff(OUTBOUND_POLL_BACKOFF_MAX), OUTBOUND_POLL_BACKOFF_MAX, "never exceeds the ceiling");
+        assert_eq!(next_outbound_poll_backoff(OUTBOUND_POLL_BACKOFF_MAX / 2 + Duration::from_secs(1)), OUTBOUND_POLL_BACKOFF_MAX, "a doubling that would overshoot clamps to the ceiling, never wraps");
+    }
+
+    #[test]
+    fn outbound_backoff_elapsed_gates_on_the_boundary_inclusive() {
+        assert!(outbound_backoff_elapsed(None, OUTBOUND_POLL_BACKOFF_INITIAL), "no prior failure — nothing to back off from");
+        assert!(!outbound_backoff_elapsed(Some(OUTBOUND_POLL_BACKOFF_INITIAL - Duration::from_secs(1)), OUTBOUND_POLL_BACKOFF_INITIAL));
+        assert!(outbound_backoff_elapsed(Some(OUTBOUND_POLL_BACKOFF_INITIAL), OUTBOUND_POLL_BACKOFF_INITIAL), "the boundary itself has elapsed");
+    }
+
+    /// The defect-2 fix, end to end: a `Refused` answer (nothing listening
+    /// on this port) must NOT be retried on the very next call —
+    /// [`poll_pending_outbound`] discarding the outcome and gating only on
+    /// `AwaitingApproval` (the ORIGINAL shape) would hit this same
+    /// unreachable port again immediately; the fix must record a backoff
+    /// that suppresses that immediate re-poll.
+    #[test]
+    fn poll_pending_outbound_backs_off_after_a_refused_answer_instead_of_retrying_immediately() {
+        with_peer_state("poll-pending-outbound-backoff", || {
+            let pubkey_b = "b".repeat(64);
+            let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
+            // Port 1 on loopback: nothing listens, so the poll fails fast
+            // with a `Refused` (`poll-unreachable`) every single call —
+            // this test is not exercising a lucky race, EVERY attempt fails.
+            aoide_storage::pairing::park_outbound(aoide_storage::pairing::OutboundPairingRequest {
+                id: "deadbeef".to_string(),
+                url: "http://127.0.0.1:1/".to_string(),
+                name: "box-b".to_string(),
+                pubkey_hex: pubkey_b,
+                requester_nonce_hex: "c".repeat(32),
+                approver_nonce_hex: "d".repeat(32),
+                requested_at: aoide_storage::time::now_iso_utc(),
+                expires_at: aoide_storage::pairing::expires_at_from(now_epoch),
+                state: aoide_storage::pairing::OutboundState::AwaitingApproval,
+                via: None,
+            })
+            .unwrap();
+
+            let mut backoff = HashMap::new();
+            poll_pending_outbound(now_epoch, &mut backoff, true);
+            assert_eq!(backoff.get("deadbeef").map(|(b, _)| *b), Some(OUTBOUND_POLL_BACKOFF_INITIAL), "the FIRST refusal records the floor backoff");
+
+            // Called again immediately (same tick, `Instant::now()` barely
+            // moved) — WITHOUT the fix, this would poll port 1 again; WITH
+            // it, `outbound_backoff_elapsed` refuses because no real time
+            // has passed. Provable without a real sleep: doubling never
+            // happens on an id that was correctly skipped this round.
+            poll_pending_outbound(now_epoch, &mut backoff, true);
+            assert_eq!(
+                backoff.get("deadbeef").map(|(b, _)| *b),
+                Some(OUTBOUND_POLL_BACKOFF_INITIAL),
+                "an immediate re-call must be suppressed by the still-fresh backoff, never re-attempted (which would have doubled it)"
+            );
+        });
+    }
+
+    #[test]
+    fn poll_pending_outbound_clears_backoff_once_a_poll_stops_being_refused() {
+        with_peer_state("poll-pending-outbound-backoff-clears", || {
+            let pubkey_b = "b".repeat(64);
+            let body = r#"{"jsonrpc":"2.0","id":1,"result":{"status":"pending"}}"#;
+            let (_listener, port) = spawn_fake_pair_poll_server(body);
+            let url = format!("http://127.0.0.1:{port}/");
+            let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
+            aoide_storage::pairing::park_outbound(aoide_storage::pairing::OutboundPairingRequest {
+                id: "deadbeef".to_string(),
+                url,
+                name: "box-b".to_string(),
+                pubkey_hex: pubkey_b,
+                requester_nonce_hex: "c".repeat(32),
+                approver_nonce_hex: "d".repeat(32),
+                requested_at: aoide_storage::time::now_iso_utc(),
+                expires_at: aoide_storage::pairing::expires_at_from(now_epoch),
+                state: aoide_storage::pairing::OutboundState::AwaitingApproval,
+                via: None,
+            })
+            .unwrap();
+
+            // Seed a pre-existing backoff as if an earlier tick had already
+            // failed, but far enough in the past that it has elapsed.
+            let mut backoff = HashMap::new();
+            backoff.insert("deadbeef".to_string(), (OUTBOUND_POLL_BACKOFF_INITIAL, Instant::now() - OUTBOUND_POLL_BACKOFF_INITIAL));
+
+            poll_pending_outbound(now_epoch, &mut backoff, true);
+
+            assert!(backoff.is_empty(), "a `Pending` (ordinary, non-failure) answer must clear the backoff entirely, not just leave it un-doubled");
         });
     }
 
