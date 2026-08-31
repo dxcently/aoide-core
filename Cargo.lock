@@ -31,7 +31,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "aoide-cli"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aoide-client",
  "aoide-conduct",
@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "aoide-client"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aoide-protocol",
  "aoide-secrets",
@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "aoide-conduct"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aoide-client",
  "aoide-protocol",
@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "aoide-conductor"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aoide-conduct",
  "aoide-protocol",
@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "aoide-lyra"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aoide-conduct",
  "aoide-protocol",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "aoide-protocol"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "inquire",
  "serde",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "aoide-screen"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aoide-conduct",
  "aoide-protocol",
@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "aoide-secrets"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aoide-protocol",
  "aoide-storage",
@@ -140,7 +140,7 @@ dependencies = [
 
 [[package]]
 name = "aoide-server"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aoide-client",
  "aoide-conduct",
@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "aoide-song"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aoide-protocol",
  "aoide-storage",
@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "aoide-storage"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aoide-protocol",
  "aoide-test-support",
@@ -181,14 +181,14 @@ dependencies = [
 
 [[package]]
 name = "aoide-test-support"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aoide-protocol",
 ]
 
 [[package]]
 name = "aoide-upkeep"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aoide-protocol",
  "aoide-storage",

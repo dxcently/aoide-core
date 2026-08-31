@@ -1702,7 +1702,7 @@ fn port_from_url(url: &str) -> Option<u16> {
 }
 
 /// `peer pair <target> [--name <n>] [--self-url <url>] [--self-via …]
-/// [--via …] [--secs N] [--yes] [--json]` — the ONE entry point into the
+/// [--via …] [--secs N] [--wait SECS] [--allow read,spawn] [--yes] [--json]` — the ONE entry point into the
 /// pairing ceremony's REQUEST half (the User's locked spec, P-PV2,
 /// superseding the old `peer pair request`/`peer invite` split). SMART
 /// TARGET dispatch decides which of the two ceremony arms `<target>`
@@ -1715,7 +1715,7 @@ fn port_from_url(url: &str) -> Option<u16> {
 /// never forked.
 fn handle_peer_pair(inv: &Invocation) -> Outcome {
     let cmd = "peer.pair";
-    const USAGE: &str = "usage: aoide peer pair <url-or-hostname> [--name <n>] [--self-url <url>] [--self-via ssh://[user@]host] [--via ssh://[user@]host[:port]] [--secs N] [--yes] [--json] — takes exactly ONE positional target; the old `peer pair request <url>`/`peer invite <name>` folded into this single `peer pair <target>` (P-PV2, hard cutover, no alias)";
+    const USAGE: &str = "usage: aoide peer pair <url-or-hostname> [--name <n>] [--self-url <url>] [--self-via ssh://[user@]host] [--via ssh://[user@]host[:port]] [--secs N] [--wait SECS] [--allow read,spawn] [--yes] [--json] — takes exactly ONE positional target; the old `peer pair request <url>`/`peer invite <name>` folded into this single `peer pair <target>` (P-PV2, hard cutover, no alias)";
     let target = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         Some(t) => t.to_string(),
         None => return Outcome::usage(cmd, USAGE),
@@ -1811,8 +1811,12 @@ fn pair_via_url(cmd: &str, inv: &Invocation, url: &str, usage: &str) -> Outcome 
         .cloned()
         .filter(|s| !s.is_empty())
         .or_else(|| default_self_via(&toward));
+    let finish = match pair_finish_from(inv) {
+        Ok(f) => f,
+        Err(e) => return Outcome::usage(cmd, format!("{usage} — {e}")),
+    };
 
-    run_pair_request(cmd, url, &name, &self_url, self_via.as_deref(), via.as_ref(), via.as_ref().map(|v| v.to_string()))
+    run_pair_request(cmd, url, &name, &self_url, self_via.as_deref(), via.as_ref(), via.as_ref().map(|v| v.to_string()), &finish)
 }
 
 /// The requester's half of the ceremony, shared verbatim by
@@ -1859,6 +1863,7 @@ fn run_pair_request(
     self_via: Option<&str>,
     dial_via: Option<&aoide_storage::tunnel::Via>,
     record_via: Option<String>,
+    finish: &PairFinish,
 ) -> Outcome {
     let (kp, _) = match aoide_storage::identity::load_or_mint() {
         Ok(v) => v,
@@ -1946,17 +1951,131 @@ fn run_pair_request(
         return Outcome::error(cmd, format!("remembering the outbound pairing request: {e}"));
     }
 
-    Outcome::ok(
-        cmd,
-        format!(
-            "pairing request sent to `{name}` ({url}) — confirmation code {sas} — \
-             read this aloud (or otherwise out-of-band) to {name}'s operator; once they run \
-             `aoide peer pair approve {}`, run the SAME command here too and confirm the SAME code \
-             to complete the pair on both ends",
-            ack.id
-        ),
-    )
-    .with_data(json!({ "id": ack.id, "name": name, "url": url, "sas": sas, "expiresAt": ack.expires_at }))
+    if finish.wait_secs == 0 {
+        return Outcome::ok(
+            cmd,
+            format!(
+                "pairing request sent to `{name}` ({url}) — confirmation code {sas} — \
+                 read this aloud (or otherwise out-of-band) to {name}'s operator; once they run \
+                 `aoide peer pair approve {}`, run the SAME command here too and confirm the SAME code \
+                 to complete the pair on both ends",
+                ack.id
+            ),
+        )
+        .with_data(json!({ "id": ack.id, "name": name, "url": url, "sas": sas, "expiresAt": ack.expires_at }));
+    }
+
+    eprintln!(
+        "pairing request sent to `{name}` — confirmation code {sas}\n\
+         read it aloud to {name}'s operator; they type it into `aoide peer pair approve`.\n\
+         waiting up to {}s — Ctrl-C leaves the request pending as `{}`.",
+        finish.wait_secs, ack.id
+    );
+    wait_and_commit(cmd, &ack.id, name, &sas, finish)
+}
+
+/// What `peer pair` does once the request is parked — the difference between
+/// the pre-P2 detached shape and the one-command ceremony (task #135 P2).
+#[derive(Debug)]
+pub(crate) struct PairFinish {
+    /// Seconds to block polling for the approver's release. `0` parks and
+    /// returns immediately: the pre-P2 behaviour, kept as the scripted escape
+    /// for anything that cannot sit on a human.
+    pub wait_secs: u64,
+    /// `--yes` — skip THIS side's own confirmations, the sweep's proceed
+    /// prompt and the final code confirm alike. It never reaches the far
+    /// side's typed code, which is the gate that actually secures the pair.
+    pub skip_confirm: bool,
+    /// `--allow`, or `None` to read `[pairing] defaultGrant`.
+    pub grant: Option<Vec<String>>,
+}
+
+impl PairFinish {
+    /// Park and return — what every caller wanted before `--wait` existed,
+    /// and what the tests drive so none of them sit on a poll.
+    pub(crate) fn detached() -> Self {
+        PairFinish { wait_secs: 0, skip_confirm: false, grant: None }
+    }
+}
+
+/// How often the wait re-polls the approver's door. `aoide/pairPoll` audits
+/// only on RELEASE (`a2a.rs`), so a ten-minute wait costs the approver zero
+/// audit lines — the cadence is bounded by politeness, not by log volume.
+const PAIR_POLL_CADENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long `peer pair` waits for the far operator by default: ten minutes,
+/// the span of a phone call in which two people read a code to each other.
+const DEFAULT_PAIR_WAIT_SECS: u64 = 600;
+
+/// Build the post-request behaviour off `peer pair`'s own flags. `--wait 0`
+/// is the documented escape back to the pre-P2 detached shape, for anything
+/// scripted that cannot sit on a human.
+fn pair_finish_from(inv: &Invocation) -> Result<PairFinish, String> {
+    let wait_secs = match inv.flags.get("wait") {
+        Some(raw) => raw.trim().parse::<u64>().map_err(|_| format!("--wait takes whole seconds (0 to park and return), not `{raw}`"))?,
+        None => DEFAULT_PAIR_WAIT_SECS,
+    };
+    Ok(PairFinish { wait_secs, skip_confirm: inv.flag_present("yes"), grant: parse_allow_flag(inv)? })
+}
+
+/// Block until the approver releases `id`, then confirm and commit — the
+/// whole requester half in one command (task #135 P2, the User's ask: "`peer
+/// pair <target>` BLOCKS until done, timeout = nobody there").
+///
+/// Every terminal answer returns immediately: only [`PollOutcome::Pending`]
+/// loops, so an unreachable box or a refused reveal fails on the first tick
+/// rather than after the full wait. The grant resolves BEFORE the loop, so a
+/// malformed `config.toml` refuses now rather than after ten minutes.
+///
+/// A timeout is not a failure of the pair — the request stays parked and
+/// `peer pair approve <id>` still finishes it whenever the far operator gets
+/// to it. That is the "nobody there" outcome, and it is why Ctrl-C is safe:
+/// nothing here holds state the parked entry does not already have.
+fn wait_and_commit(cmd: &str, id: &str, name: &str, sas: &str, finish: &PairFinish) -> Outcome {
+    let allows = match resolve_grant(finish.grant.as_deref()) {
+        Ok(a) => a,
+        Err(e) => return Outcome::error(cmd, e).with_data(json!({ "reason": "grant-unresolved", "id": id })),
+    };
+    let started = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
+    let mut announced_minutes = 0_i64;
+
+    loop {
+        let now = aoide_storage::time::now_iso_utc();
+        let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap_or(0);
+        let Some(entry) = aoide_storage::pairing::list_outbound(now_epoch).into_iter().find(|e| e.id == id) else {
+            return Outcome::error(
+                cmd,
+                format!("pairing request `{id}` to `{name}` is gone — it expired, or was rejected here, while this command waited"),
+            )
+            .with_data(json!({ "reason": "request-gone", "id": id }));
+        };
+        match poll_outbound_once(cmd, id, &entry, now_epoch) {
+            PollOutcome::Released(released) => return commit_outbound(finish.skip_confirm, cmd, id, released, &now, now_epoch, &allows),
+            PollOutcome::Refused(out) => return out,
+            PollOutcome::Pending => {}
+        }
+
+        let elapsed = now_epoch - started;
+        if elapsed >= finish.wait_secs as i64 {
+            return Outcome::ok(
+                cmd,
+                format!(
+                    "no answer from `{name}` within {}s — the request is still pending as `{id}` (code {sas}); \
+                     run `aoide peer pair approve {id}` once they've approved on their side, or \
+                     `aoide peer pair reject {id}` to abort",
+                    finish.wait_secs
+                ),
+            )
+            .with_data(json!({ "reason": "wait-timeout", "id": id, "name": name, "sas": sas, "waitSecs": finish.wait_secs }));
+        }
+        // One line a minute, never one per tick: a wait this long must show
+        // it is alive, and 120 lines of dots is not showing anything.
+        if elapsed / 60 > announced_minutes {
+            announced_minutes = elapsed / 60;
+            eprintln!("still waiting on `{name}` ({elapsed}s elapsed of {})", finish.wait_secs);
+        }
+        std::thread::sleep(PAIR_POLL_CADENCE);
+    }
 }
 
 /// `peer pending` — every pairing request THIS instance is still holding
@@ -2834,7 +2953,11 @@ fn pair_via_hostname(cmd: &str, inv: &Invocation, target: &str, usage: &str) -> 
         }
     }
 
-    pair_with_heard(cmd, &hit, via_flag.as_ref(), self_via_flag.as_deref())
+    let finish = match pair_finish_from(inv) {
+        Ok(f) => f,
+        Err(e) => return Outcome::usage(cmd, format!("{usage} — {e}")),
+    };
+    pair_with_heard(cmd, &hit, via_flag.as_ref(), self_via_flag.as_deref(), &finish)
 }
 
 /// The tail `peer pair`'s hostname arm ([`pair_via_hostname`]) and bare
@@ -2863,6 +2986,7 @@ fn pair_with_heard(
     hit: &crate::discover::Heard,
     via_flag: Option<&aoide_storage::tunnel::Via>,
     self_via_flag: Option<&str>,
+    finish: &PairFinish,
 ) -> Outcome {
     let dial_url = format!("http://{}:{}/", hit.src_addr, default_a2a_port());
     let self_url = default_self_url();
@@ -2871,7 +2995,7 @@ fn pair_with_heard(
     // for `default_self_via`'s outbound-route trick.
     let self_via = self_via_flag.map(|s| s.to_string()).or_else(|| default_self_via(&hit.src_addr));
     let (dial_via, record_via) = resolve_pair_vias(hit, via_flag);
-    run_pair_request(cmd, &dial_url, &hit.advertisement.name, &self_url, self_via.as_deref(), dial_via.as_ref(), record_via)
+    run_pair_request(cmd, &dial_url, &hit.advertisement.name, &self_url, self_via.as_deref(), dial_via.as_ref(), record_via, &finish)
 }
 
 /// The pure decision [`pair_with_heard`] otherwise buries inline (P-PV1,
@@ -2913,7 +3037,9 @@ pub fn register_peer_pair(r: &mut Registry) {
             flag!("self-via", "string", "This instance's own ssh://[user@]host reach-back hop claim, sent on the wire beside --self-url so an approver that only ever observes this request over a tunnel (loopback) can still record a working via; defaults to ssh://<local user>@<the local address routed toward the peer>."),
             flag!("via", "string", "An ssh://[user@]host[:port] transport marker — both the ceremony's own dial AND the resulting peer's recorded via. Absent = direct dial (today's behavior)."),
             flag!("secs", "int", "Hostname target only: how many seconds to sweep for the advertisement (default 45)."),
-            flag!("yes", "bool", "Hostname target only: skip the interactive y/N proceed confirmation (scripted use) — the ceremony's own SAS confirmation is untouched."),
+            flag!("wait", "int", "How many seconds to block waiting for the other operator to approve, completing the pair in this one command (default 600). --wait 0 parks the request and returns immediately, leaving `peer pair approve <id>` to finish it later."),
+            flag!("yes", "bool", "Skip THIS side's own confirmations — the hostname arm's proceed prompt and, once the peer approves, the final code confirmation. Never touches the far side's typed code, which is the gate that secures the pair."),
+            flag!("allow", "string", "The capabilities to grant the peer on this pairing, comma-separated (read, spawn) — overriding config.toml's `[pairing] defaultGrant`, and empty (--allow \"\") to grant nothing. Only meaningful when the pair completes here, so it pairs with --wait; a peer's grant is stamped once, at its FIRST verification."),
         ],
         gated: false,
         implemented: true,
@@ -3114,7 +3240,7 @@ fn handle_pair(inv: &Invocation) -> Outcome {
         .collect();
     match aoide_protocol::pick::choose("pair with which instance?", &rows, None) {
         None => Outcome::ok(cmd, "nothing chosen — nothing sent"),
-        Some(i) => pair_with_heard(cmd, &candidates[i], None, None),
+        Some(i) => pair_with_heard(cmd, &candidates[i], None, None, &PairFinish::detached()),
     }
 }
 
@@ -3721,14 +3847,14 @@ mod tests {
             let self_url = default_self_url();
 
             // `pair_via_url`'s own documented tail.
-            let direct = run_pair_request("peer.pair", url, name, &self_url, None, None, None);
+            let direct = run_pair_request("peer.pair", url, name, &self_url, None, None, None, &PairFinish::detached());
             // The same ceremony tail `pair_via_hostname` reaches on its
             // single-match branch — it composes an OBSERVED dial url first
             // (src_addr + `default_a2a_port`, P-S1/task #120) and passes
             // that, but the tail function is still this one; reproduced
             // here under the identical `peer.pair` command name both arms
             // now share.
-            let via_hostname = run_pair_request("peer.pair", url, name, &self_url, None, None, None);
+            let via_hostname = run_pair_request("peer.pair", url, name, &self_url, None, None, None, &PairFinish::detached());
 
             assert_eq!(direct.status, aoide_protocol::output::Status::Error, "{direct:?}");
             assert_eq!(direct.command, "peer.pair");
@@ -4402,6 +4528,36 @@ mod tests {
         (listener, port)
     }
 
+    /// [`spawn_fake_pair_poll_server`]'s stateful sibling: answers `pending`
+    /// for the first `pending_answers` POSTs and `approved` after, which is
+    /// the only way to prove the `--wait` loop actually RE-polls rather than
+    /// giving up on the first `pending` the way `peer pair approve` does.
+    fn spawn_fake_pair_poll_server_pending_then_approved(pending_answers: usize, approved_body: String) -> (std::net::TcpListener, u16) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepter = listener.try_clone().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut seen = 0usize;
+            loop {
+                let Ok((mut stream, _)) = accepter.accept() else { break };
+                let mut buf = [0u8; 4096];
+                if stream.read(&mut buf).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let body = if seen < pending_answers { r#"{"jsonrpc":"2.0","id":1,"result":{"status":"pending"}}"#.to_string() } else { approved_body.clone() };
+                seen += 1;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (listener, port)
+    }
+
     fn sample_outbound_awaiting_approval(id: &str, url: &str, pubkey_hex: &str) -> aoide_storage::pairing::OutboundPairingRequest {
         // Relative to REAL current time (not a fixed historical epoch like
         // this module's other `sample_outbound` fixtures use) — the tests
@@ -4451,6 +4607,113 @@ mod tests {
             assert_eq!(peers[0].pubkey.as_deref(), Some(pubkey_b.as_str()));
             assert!(peers[0].verified);
             assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "the outbound entry is consumed on commit");
+        });
+    }
+
+    // ── The blocking wait (task #135 P2) ─────────────────────────────────────
+
+    #[test]
+    fn pair_finish_reads_the_wait_and_grant_off_the_flags() {
+        let mut inv = pair_approve_inv(&[]);
+        let f = pair_finish_from(&inv).unwrap();
+        assert_eq!(f.wait_secs, DEFAULT_PAIR_WAIT_SECS, "blocking is the default — the User's ask");
+        assert!(!f.skip_confirm);
+        assert_eq!(f.grant, None, "no --allow means `read the config`, never the empty grant");
+
+        inv.flags.insert("wait".to_string(), "0".to_string());
+        assert_eq!(pair_finish_from(&inv).unwrap().wait_secs, 0, "--wait 0 is the documented escape back to parking");
+
+        inv.flags.insert("wait".to_string(), " 30 ".to_string());
+        assert_eq!(pair_finish_from(&inv).unwrap().wait_secs, 30);
+
+        inv.flags.insert("wait".to_string(), "soon".to_string());
+        let err = pair_finish_from(&inv).unwrap_err();
+        assert!(err.contains("whole seconds"), "a bad --wait is refused by name, never silently defaulted: {err}");
+
+        inv.flags.insert("wait".to_string(), "600".to_string());
+        inv.flags.insert("allow".to_string(), "read,spawn".to_string());
+        inv.flags.insert("yes".to_string(), "true".to_string());
+        let f = pair_finish_from(&inv).unwrap();
+        assert!(f.skip_confirm);
+        assert_eq!(f.grant, Some(vec!["read".to_string(), "spawn".to_string()]));
+    }
+
+    /// The property that keeps a ten-minute wait from becoming a ten-minute
+    /// hammer: every `PollOutcome` except `Pending` is terminal, so an
+    /// unreachable box returns on the FIRST tick rather than after the wait.
+    #[test]
+    fn the_wait_returns_at_once_on_a_terminal_refusal_it_never_retries() {
+        with_peer_state("wait-terminal-refusal", || {
+            let pubkey_b = "b".repeat(64);
+            // Port 1 on loopback: nothing listens, so the dial fails fast.
+            let entry = sample_outbound_awaiting_approval("deadbeef", "http://127.0.0.1:1/", &pubkey_b);
+            aoide_storage::pairing::park_outbound(entry).unwrap();
+
+            let began = std::time::Instant::now();
+            let finish = PairFinish { wait_secs: 600, skip_confirm: true, grant: None };
+            let out = wait_and_commit("peer.pair", "deadbeef", "box-b", "111-222", &finish);
+            assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
+            assert_eq!(out.data.as_ref().unwrap()["reason"], "poll-unreachable");
+            assert!(began.elapsed() < std::time::Duration::from_secs(60), "a terminal refusal must not sit out the wait — took {:?}", began.elapsed());
+        });
+    }
+
+    #[test]
+    fn the_wait_times_out_leaving_the_request_pending_and_finishable_later() {
+        with_peer_state("wait-timeout", || {
+            let pubkey_b = "b".repeat(64);
+            let (_listener, port) = spawn_fake_pair_poll_server(r#"{"jsonrpc":"2.0","id":1,"result":{"status":"pending"}}"#);
+            let url = format!("http://127.0.0.1:{port}/");
+            aoide_storage::pairing::park_outbound(sample_outbound_awaiting_approval("deadbeef", &url, &pubkey_b)).unwrap();
+
+            // `wait_secs: 0` reaches the timeout on the first tick with no
+            // sleep at all — the deadline is checked before the cadence.
+            let finish = PairFinish { wait_secs: 0, skip_confirm: true, grant: None };
+            let out = wait_and_commit("peer.pair", "deadbeef", "box-b", "111-222", &finish);
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "a timeout is not a failed pair: {out:?}");
+            assert_eq!(out.data.as_ref().unwrap()["reason"], "wait-timeout");
+            assert!(out.message.contains("still pending"), "{}", out.message);
+            assert!(out.message.contains("peer pair approve"), "it names the command that finishes later: {}", out.message);
+
+            let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
+            assert_eq!(aoide_storage::pairing::list_outbound(now_epoch).len(), 1, "the request survives the timeout — that is what makes Ctrl-C safe");
+            assert!(aoide_storage::peer_store::load_peers().is_empty(), "nothing commits on a timeout");
+        });
+    }
+
+    /// The whole point of P2: a `pending` answer is RE-polled, where
+    /// `peer pair approve` gives up on it. Costs one real 5s cadence tick —
+    /// the only way to prove the loop without inventing a test-only knob.
+    #[test]
+    fn the_wait_repolls_a_pending_answer_and_completes_when_it_turns_approved() {
+        with_peer_state("wait-repoll", || {
+            let pubkey_b = "b".repeat(64);
+            let approved = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"status":"approved","pubkeyHex":"{pubkey_b}"}}}}"#);
+            let (_listener, port) = spawn_fake_pair_poll_server_pending_then_approved(1, approved);
+            let url = format!("http://127.0.0.1:{port}/");
+            aoide_storage::pairing::park_outbound(sample_outbound_awaiting_approval("deadbeef", &url, &pubkey_b)).unwrap();
+
+            let finish = PairFinish { wait_secs: 600, skip_confirm: true, grant: Some(vec!["read".to_string(), "spawn".to_string()]) };
+            let out = wait_and_commit("peer.pair", "deadbeef", "box-b", "111-222", &finish);
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
+
+            let peers = aoide_storage::peer_store::load_peers();
+            assert_eq!(peers.len(), 1);
+            assert!(peers[0].verified, "the pair completes inside the one command — no second invocation");
+            assert_eq!(peers[0].allows, vec!["read".to_string(), "spawn".to_string()], "`peer pair --allow` reaches the commit, which is why the flag belongs here now");
+            let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
+            assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "the entry is consumed on commit");
+        });
+    }
+
+    #[test]
+    fn the_wait_says_so_when_the_request_vanishes_underneath_it() {
+        with_peer_state("wait-request-gone", || {
+            let finish = PairFinish { wait_secs: 600, skip_confirm: true, grant: None };
+            let out = wait_and_commit("peer.pair", "nosuchid", "box-b", "111-222", &finish);
+            assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
+            assert_eq!(out.data.as_ref().unwrap()["reason"], "request-gone");
+            assert!(out.message.contains("expired"), "{}", out.message);
         });
     }
 

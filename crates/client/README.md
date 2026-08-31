@@ -286,7 +286,14 @@ never the inbound/serve half (that's `aoide-server`).
   for its own `allows` grants) —
   `poll_outbound_once`/`commit_outbound` are the requester's half as TWO
   named seams (task #135 P2), with `approve_outbound` reduced to calling
-  each once. `poll_outbound_once` is the ONE implementation of the
+  each once and `wait_and_commit` — `peer pair`'s own blocking tail —
+  calling the poll on a `PAIR_POLL_CADENCE` until the approver releases.
+  `PairFinish` carries what `peer pair` does after parking (`--wait`,
+  `--yes`, `--allow`); `PairFinish::detached()` is the pre-P2 shape and
+  what every test drives so none of them sit on a poll. `--wait 0` is the
+  documented escape for a scripted caller that cannot sit on a human, and a
+  timeout returns Ok with the request still parked — `peer pair approve`
+  finishes it later, which is also what makes Ctrl-C safe. `poll_outbound_once` is the ONE implementation of the
   `aoide/pairPoll` round trip and of the SAS/transcript binding that refuses
   a substituted reveal; its `PollOutcome::Pending` is the only arm a caller
   may retry, every other being terminal, so a `--wait` loop cannot hammer an
