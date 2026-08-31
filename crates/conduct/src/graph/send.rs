@@ -48,7 +48,7 @@ use super::session_store::{
     do_session_end, do_session_phase, do_session_phase_if, do_session_start, do_subagent_end,
     do_subagent_rekey, do_subagent_spawn, ensure_session_ceiling, now_iso_utc,
     refresh_subagent_says, refresh_transcript_fields, set_owner_activity, stamp_harness_session_id,
-    stamp_hook_ancestry,
+    stamp_hook_ancestry, stored_phase,
 };
 use super::window::{discover_window, ensure_session_window, pid_ancestry, windowless_by_lineage_from_parent};
 use aoide_protocol::agents::{agent_profile, known_agents, AgentProfile, HookClass, CLAUDE_PROFILE};
@@ -1706,12 +1706,17 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
         }
         return noop("unmapped-or-missing-event");
     };
-    // The check lane (task #139): a message ONLY at the two triggers the
-    // design names — SessionStart (below, the `HookAction::Start` arm) and
-    // the real Stop event (the `HookAction::Phase` arm, gated on
-    // `phase == "stopped"`, the one phase string `HookClass::Stop` alone
-    // produces — see `map_hook`). Folded onto the final Outcome's message
-    // after the match so every OTHER event stays exactly as chatty as it was.
+    // The check lane (task #139 phase 2): "Stop records, the next
+    // context-reaching event speaks." SessionStart (below, `HookAction::
+    // Start`) drains any pending note and, when settled, runs the lane fresh;
+    // `phase == "working"` (the one string only `UserPromptSubmit` produces
+    // — see `map_hook`) drains it too, the normal case since a prompt
+    // follows every Stop; `phase == "stopped"` (the one string only Stop
+    // produces) runs the lane and stores the delta as pending WITHOUT
+    // assigning it here — Stop's own stdout never reaches the model
+    // (`checklane`'s module doc), so it has nothing to say to this Outcome.
+    // Folded onto the final Outcome's message after the match so every OTHER
+    // event stays exactly as chatty as it was.
     let mut lane_note: Option<String> = None;
     let inner = match action {
         HookAction::Start { id, cwd } => {
@@ -1750,6 +1755,16 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
             // [`payload_pid`]) — pi reports `process.pid`, so a pi that dies
             // inside a still-open terminal still trips the reaper's `/proc`
             // signal.
+            // The check lane's own settled/mid-turn split (task #139 phase
+            // 2): read the STORED phase before either mutating call below
+            // touches it — `do_session_phase_if` just past this block is the
+            // only thing in this arm that can change `id`'s hooks.json phase
+            // — so `mid_turn` reflects the phase as it stood when THIS event
+            // fired, never one this same event already moved. `working` is
+            // the one canonical phase a turn in flight produces; anything
+            // else (a fresh id, `idle`, `stopped`, `done`) is a settled
+            // boundary.
+            let mid_turn = stored_phase(&id) == "working";
             let pid = payload_pid(&payload).or(discovered);
             let out = do_session_start(
                 &id,
@@ -1763,12 +1778,16 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
                 pid,
             );
             stamp_hook_ancestry(&id, &my_hook_ancestry());
-            // The check lane's own SessionStart trigger: run it, record the
-            // baseline, flag an already-red or already-.nix-carrying tree.
+            // The check lane's own SessionStart trigger. Settled: run the
+            // lane, drain any pending note, flag an already-red or
+            // already-.nix-carrying tree. Mid-turn: no lane run, just replay
+            // the stored baseline's own message (`checklane`'s module doc —
+            // this is the half that closes the compaction-laundering bug).
             // Best-effort (`None` on a missing `cwd`, a disabled lane, or an
             // unloadable config) — never fails this hook.
             if let Some(cwd_str) = cwd.as_deref() {
-                lane_note = aoide_upkeep::checklane::on_session_start(&id, Path::new(cwd_str));
+                lane_note =
+                    aoide_upkeep::checklane::on_session_start(&id, Path::new(cwd_str), mid_turn);
             }
             // A FRESH id is inserted `idle` by `upsert_session`. A RESUME (same id,
             // SessionStart source=resume/compact/clear) deliberately preserves the
@@ -1816,17 +1835,29 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
                     payload.get("message").and_then(Value::as_str),
                 );
             }
+            // The check lane's own PromptSubmit trigger — `phase == "working"`
+            // is the one string only `UserPromptSubmit` produces in this arm
+            // (`map_hook`; PreToolUse routes through `ToolStart`, idle pings
+            // through `PhaseIfRunning`), so this is a clean "new prompt" gate.
+            // Drains whatever `on_stop` persisted last turn — no config load,
+            // no subprocess, no `cwd` needed (`checklane`'s module doc).
+            if phase == "working" {
+                lane_note = aoide_upkeep::checklane::on_prompt_submit(&id);
+            }
             // The check lane's own Stop trigger — `phase == "stopped"` is the
             // one string `HookClass::Stop` alone produces (`map_hook`), so
             // this never fires on a mere `working`/`awaiting` transition.
-            // Re-runs the lane and reports only the DELTA against the
-            // baseline `on_session_start` recorded, off the raw payload's
-            // OWN `cwd` (not a stage lookup — every hook payload carries it).
-            // Best-effort, same as the SessionStart arm: `None` on a missing
-            // `cwd`, a disabled lane, or an unloadable config.
+            // Re-runs the lane and persists the DELTA against the baseline
+            // `on_session_start` recorded as this session's PENDING note, off
+            // the raw payload's OWN `cwd` (not a stage lookup — every hook
+            // payload carries it) — never assigned to `lane_note`: Stop's own
+            // stdout never reaches the model, so there is nothing for this
+            // Outcome to carry (`checklane`'s module doc). Best-effort, same
+            // as the SessionStart arm: a no-op on a missing `cwd`, a disabled
+            // lane, or an unloadable config.
             if phase == "stopped" {
                 if let Some(cwd_str) = payload.get("cwd").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-                    lane_note = aoide_upkeep::checklane::on_stop(&id, Path::new(cwd_str));
+                    aoide_upkeep::checklane::on_stop(&id, Path::new(cwd_str));
                 }
             }
             out
@@ -1972,11 +2003,12 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
         }
     }
     // Fold the inner outcome into an ok envelope — exit 0, no matter what.
-    // The check lane's note (if either trigger produced one) rides on the
-    // SAME message, separated by an em dash: this is the one text channel
-    // that actually reaches the harness (`hooks::door_command`'s claude
-    // wrapper stopped swallowing stdout for exactly this reason), so the
-    // note has nowhere else to go.
+    // The check lane's note (if SessionStart or the PromptSubmit drain
+    // produced one — Stop itself never does, see the `phase == "stopped"`
+    // gate above) rides on the SAME message, separated by an em dash: this is
+    // the one text channel that actually reaches the harness
+    // (`hooks::door_command`'s claude wrapper stopped swallowing stdout for
+    // exactly this reason), so the note has nowhere else to go.
     let note_for_data = lane_note.clone();
     let message = match lane_note {
         Some(note) => format!("{} — {note}", inner.message),
@@ -4732,15 +4764,157 @@ mod tests {
             "{data}"
         );
 
-        // Stop, nothing changed since the baseline: no note appended at all —
-        // the message and `checkLane` read exactly as they would with the
-        // lane off.
+        // Stop: silent to the harness UNCONDITIONALLY now — even with nothing
+        // changed since the baseline, `on_stop` never assigns `lane_note`
+        // (task #139 phase 2), so the message and `checkLane` read exactly
+        // as they would with the lane off.
         let out2 = hook_from_str(&format!(
             r#"{{ "session_id": "wire1", "hook_event_name": "Stop", "cwd": "{}" }}"#,
             tree.display()
         ));
         assert!(!out2.message.contains("check lane"), "{}", out2.message);
         assert!(out2.data.unwrap()["checkLane"].is_null());
+
+        let _ = std::fs::remove_dir_all(&stage);
+        let _ = std::fs::remove_dir_all(&config_root);
+        let _ = std::fs::remove_dir_all(&tree);
+    }
+    #[test]
+    fn check_lane_delta_at_stop_stays_silent_until_the_next_prompt_delivers_it_once() {
+        // Task #139 phase 2: the delivery sequence itself. `Stop` computes a
+        // REAL delta (a fresh untracked `.nix` file) and must stay silent to
+        // the harness regardless — the note only surfaces at the next
+        // `UserPromptSubmit`, and only once.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_ROOT", "AOIDE_CONFIG", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        std::env::remove_var("AOIDE_CONFIG");
+        let stage = unique_stage("check-lane-delivery-stage");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let config_root = unique_stage("check-lane-delivery-config");
+        std::env::set_var("AOIDE_ROOT", &config_root);
+        aoide_storage::config::set("upkeep.verifyCommand", "true").unwrap();
+
+        let tree = unique_stage("check-lane-delivery-tree");
+        let run_git = |args: &[&str]| {
+            let status =
+                std::process::Command::new("git").arg("-C").arg(&tree).args(args).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.email", "test@example.invalid"]);
+        run_git(&["config", "user.name", "test"]);
+        std::fs::write(tree.join("README.md"), "x\n").unwrap();
+        run_git(&["add", "README.md"]);
+        run_git(&["commit", "-q", "-m", "init"]);
+
+        // Settled start: green baseline, nothing to flag.
+        let start = hook_from_str(&format!(
+            r#"{{ "session_id": "wire2", "hook_event_name": "SessionStart", "cwd": "{}" }}"#,
+            tree.display()
+        ));
+        assert!(!start.message.contains("check lane"), "{}", start.message);
+
+        // A prompt with nothing pending: silent.
+        let prompt_silent = hook_from_str(
+            r#"{ "session_id": "wire2", "hook_event_name": "UserPromptSubmit", "user_prompt": "go" }"#,
+        );
+        assert!(!prompt_silent.message.contains("check lane"), "{}", prompt_silent.message);
+
+        // The agent drops a fresh, untracked `.nix` file mid-turn.
+        std::fs::write(tree.join("new-module.nix"), "{ }\n").unwrap();
+
+        // Stop: computes the delta but stays silent to the harness — no
+        // `check lane` text, no `checkLane` data.
+        let stop = hook_from_str(&format!(
+            r#"{{ "session_id": "wire2", "hook_event_name": "Stop", "cwd": "{}" }}"#,
+            tree.display()
+        ));
+        assert!(!stop.message.contains("check lane"), "{}", stop.message);
+        assert!(stop.data.unwrap()["checkLane"].is_null());
+
+        // The NEXT prompt drains it — the Outcome's own message carries the
+        // note, naming the file, and `checkLane` carries it separately.
+        let delivered = hook_from_str(
+            r#"{ "session_id": "wire2", "hook_event_name": "UserPromptSubmit", "user_prompt": "continue" }"#,
+        );
+        assert!(delivered.message.contains("new-module.nix"), "{}", delivered.message);
+        let data = delivered.data.unwrap();
+        assert!(
+            data["checkLane"].as_str().unwrap().contains("new-module.nix"),
+            "{data}"
+        );
+
+        // A further prompt with nothing new pending: silent — drained exactly
+        // once, never re-delivered.
+        let prompt_again = hook_from_str(
+            r#"{ "session_id": "wire2", "hook_event_name": "UserPromptSubmit", "user_prompt": "once more" }"#,
+        );
+        assert!(!prompt_again.message.contains("check lane"), "{}", prompt_again.message);
+
+        let _ = std::fs::remove_dir_all(&stage);
+        let _ = std::fs::remove_dir_all(&config_root);
+        let _ = std::fs::remove_dir_all(&tree);
+    }
+    #[test]
+    fn a_mid_turn_session_start_runs_no_lane_and_writes_no_baseline() {
+        // Task #139 phase 2: the settled/mid-turn split. A `SessionStart`
+        // firing while the stored phase is `working` (an auto-compact
+        // mid-turn) must not touch the baseline file at all — proven here by
+        // flipping the configured verify command between the settled start
+        // and the mid-turn one: if the mid-turn arm ran the lane fresh, the
+        // flip would flow straight into a different message and a rewritten
+        // file. Neither happens.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_ROOT", "AOIDE_CONFIG", "AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        std::env::remove_var("AOIDE_CONFIG");
+        let stage = unique_stage("check-lane-midturn-stage");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let config_root = unique_stage("check-lane-midturn-config");
+        std::env::set_var("AOIDE_ROOT", &config_root);
+        aoide_storage::config::set("upkeep.verifyCommand", "false").unwrap();
+
+        let tree = unique_stage("check-lane-midturn-tree");
+        std::fs::create_dir_all(&tree).unwrap();
+
+        // Settled start: baseline is red, flagged and inherited.
+        let start = hook_from_str(&format!(
+            r#"{{ "session_id": "wire3", "hook_event_name": "SessionStart", "cwd": "{}" }}"#,
+            tree.display()
+        ));
+        assert!(start.message.contains("already red"), "{}", start.message);
+
+        // A real prompt moves the stored phase to `working` — a turn is now
+        // in flight (this also drains the empty pending note; a no-op).
+        hook_from_str(
+            r#"{ "session_id": "wire3", "hook_event_name": "UserPromptSubmit", "user_prompt": "go" }"#,
+        );
+
+        let lane_file = aoide_storage::fs::state_dir().join("checklane").join("wire3.json");
+        let bytes_before = std::fs::read(&lane_file).unwrap();
+
+        // Flip the command green — a fresh lane run would see this and go
+        // quiet; the recorded baseline must not.
+        aoide_storage::config::set("upkeep.verifyCommand", "true").unwrap();
+
+        // An auto-compact fires SessionStart mid-turn (stored phase is still
+        // `working`).
+        let midturn = hook_from_str(&format!(
+            r#"{{ "session_id": "wire3", "hook_event_name": "SessionStart", "cwd": "{}" }}"#,
+            tree.display()
+        ));
+        assert!(
+            midturn.message.contains("already red"),
+            "mid-turn must replay the STORED (red) baseline, not a fresh (now-green) run: {}",
+            midturn.message
+        );
+
+        let bytes_after = std::fs::read(&lane_file).unwrap();
+        assert_eq!(
+            bytes_before, bytes_after,
+            "a mid-turn SessionStart must not write the baseline file at all"
+        );
 
         let _ = std::fs::remove_dir_all(&stage);
         let _ = std::fs::remove_dir_all(&config_root);

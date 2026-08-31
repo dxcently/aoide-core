@@ -40,29 +40,32 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   harness_session_id` (P-D7) from the raw hook payload's own `session_id`
   on every event that carries one, mapped-to-an-action or not — see
   `CONTRACTS.md`'s `sessions.json` entry for the full field contract.
-- **The check lane (task #139), wired into `session hook`'s two lifecycle
-  triggers.** `hook_for_profile`'s `HookAction::Start` arm calls
-  `aoide_upkeep::checklane::on_session_start(&id, cwd)`; its
-  `HookAction::Phase` arm calls `checklane::on_stop(&id, cwd)` exactly when
-  `phase == "stopped"` — the one phase string `HookClass::Stop` alone
-  produces (`map_hook`), so every other phase transition
-  (`working`/`awaiting`) is untouched. Either call's `Option<String>` note
-  (`lane_note`) rides on the SAME `Outcome` `session hook` already builds —
-  appended to `inner.message` after an em dash, and surfaced separately as
-  `data.checkLane` — never a second message, never a second door. This is
-  part of why `commands/hooks.rs::door_command`'s claude wrapper stopped
-  blanket-swallowing stdout (`aoide_protocol::door::run`'s `println!` on an
-  `Ok` outcome is the ONLY channel a rendered body ever reaches the harness
-  through) — but the wrapper only unmuffles `SessionStart`/
-  `UserPromptSubmit`, the two events Claude Code itself folds a hook's
-  stdout into the model's context for; `Stop` stays swallowed on purpose
-  (blocking the turn to force the note through was rejected on design
-  grounds — see `door_command`'s own doc). So on_stop's note is real, is
-  folded into the `Outcome`, and is inspectable via `--json`'s
-  `data.checkLane` — but on claude it does not yet reach the model live; see
-  `docs/Aoide-Wiki/protocol/dev/HARNESS-CLAUDE-CODE.md`'s "Traps" section
-  for the per-event rule this rests on, and `door_command`'s own doc for
-  the planned deferred-delivery fix.
+- **The check lane (task #139), wired into `session hook`'s three lifecycle
+  triggers — Stop records, the next context-reaching event speaks.**
+  `hook_for_profile`'s `HookAction::Start` arm reads the STORED `hooks.json`
+  phase for `id` (`session_store::stored_phase`, before this arm's own
+  mutating calls) to tell a fresh launch from a mid-turn resume, then calls
+  `aoide_upkeep::checklane::on_session_start(&id, cwd, mid_turn)`; its
+  `HookAction::Phase` arm calls `checklane::on_prompt_submit(&id)` when
+  `phase == "working"` (the one phase string only `UserPromptSubmit`
+  produces) and `checklane::on_stop(&id, cwd)` when `phase == "stopped"`
+  (the one phase string only `HookClass::Stop` produces — both via
+  `map_hook`), so `awaiting` transitions touch neither. `on_stop` itself
+  returns nothing — its own stdout never reaches the model — it persists the
+  rendered delta as a PENDING note that `on_session_start`/
+  `on_prompt_submit` drain. Whichever of those two calls actually produced a
+  note (`lane_note`) rides on the SAME `Outcome` `session hook` already
+  builds — appended to `inner.message` after an em dash, and surfaced
+  separately as `data.checkLane` — never a second message, never a second
+  door. This is part of why `commands/hooks.rs::door_command`'s claude
+  wrapper stopped blanket-swallowing stdout (`aoide_protocol::door::run`'s
+  `println!` on an `Ok` outcome is the ONLY channel a rendered body ever
+  reaches the harness through) — but the wrapper only unmuffles
+  `SessionStart`/`UserPromptSubmit`, the two events Claude Code itself folds
+  a hook's stdout into the model's context for
+  (`docs/Aoide-Wiki/protocol/dev/HARNESS-CLAUDE-CODE.md`'s "Traps" section);
+  `Stop` stays swallowed on purpose (blocking the turn to force the note
+  through was rejected on design grounds — see `door_command`'s own doc).
 - `graph` — the session DAG: build/merge/send/spawn/wrap, `normalize_addr`
   (widened to `pub` at P-A1 so `screen` could reach it without duplicating
   it), `SessionRecord`/`SessionsFile`/`load_stage`/`write_stage`. `--id`

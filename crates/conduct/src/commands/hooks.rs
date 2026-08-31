@@ -125,20 +125,20 @@ fn events_for(profile: &AgentProfile) -> Vec<&'static str> {
 /// leak routine chatter nobody reads.
 ///
 /// **`Stop` itself stays swallowed, deliberately — never a blocking exit
-/// code.** `checklane::on_stop`'s own delta note is computed and folded
-/// into `session hook`'s `Outcome` at Stop (`data.checkLane`,
-/// `graph/send.rs`), but reaching the model FROM Stop itself would require
-/// the blocking `exit 2`/`decision:"block"` contract Claude Code offers for
-/// that one event — rejected on design grounds: it FORCES continuation,
-/// turning a report into a command, exactly what "do not fix unless asked"
-/// exists to prevent (same page, same section). This wrapper's own
-/// `2>/dev/null; exit 0` (stderr suppressed, exit forced 0, unconditionally)
-/// is part of what forecloses that channel on purpose, not by omission. A
-/// deferred-delivery mechanism — carrying the Stop-computed note forward
-/// onto a later context-reaching event instead — is a separate, not-yet-
-/// landed change to `aoide-upkeep`/`send.rs`; this wrapper's own live-event
-/// set already matches what that mechanism will need and does not change
-/// again when it lands.
+/// code.** `checklane::on_stop` computes the delta at `Stop` but persists it
+/// as this session's PENDING note rather than returning it — reaching the
+/// model FROM Stop itself would require the blocking `exit 2`/
+/// `decision:"block"` contract Claude Code offers for that one event —
+/// rejected on design grounds: it FORCES continuation, turning a report
+/// into a command, exactly what "do not fix unless asked" exists to prevent
+/// (same page, same section). This wrapper's own `2>/dev/null; exit 0`
+/// (stderr suppressed, exit forced 0, unconditionally) is part of what
+/// forecloses that channel on purpose, not by omission. The pending note
+/// travels to the model instead via the next context-reaching event —
+/// `UserPromptSubmit`'s own `phase == "working"` gate drains it, and a
+/// settled `SessionStart` does too — both in `graph/send.rs`'s
+/// `hook_for_profile`; this wrapper's live-event set already matched what
+/// that relay needed and did not change when it landed.
 ///
 /// Stderr stays suppressed on every event (a panic's backtrace has no
 /// business in an agent's transcript); the trailing `; exit 0` is

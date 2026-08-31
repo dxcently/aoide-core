@@ -16,14 +16,34 @@
   out to whatever command `aoide_storage::config::Upkeep::verify_command`
   hands it; this crate never spawns `nix` itself and never parses that
   command's own output — only its exit code. See `checklane`'s module doc.
-- **A hook never fails.** `checklane`'s two entry points degrade to `None`
-  on a missing config, an unloadable config, a lane left disabled, or a
-  verify command that can't even launch — never a panic, never an error
-  that would abort the calling hook.
+- **A hook never fails.** `checklane`'s three entry points degrade to `None`
+  (or, for `on_stop`, silently write nothing) on a missing config, an
+  unloadable config, a lane left disabled, or a verify command that can't
+  even launch — never a panic, never an error that would abort the calling
+  hook.
 - **`checklane`'s own state stays under this crate's state dir**
   (`state/checklane/<session-id>.json`), never inside `aoide-conduct`'s
   session store — a session's conduct record is what HAPPENED to the
-  session; a lane baseline is this crate's own bookkeeping about a run.
+  session; a `SessionLane` (baseline + pending note) is this crate's own
+  bookkeeping about a run.
+- **Stop records, the next context-reaching event speaks.** `on_stop` never
+  returns a note to its caller — only `SessionStart`/`UserPromptSubmit` fold
+  a hook's stdout into the model's context, per
+  `docs/Aoide-Wiki/protocol/dev/HARNESS-CLAUDE-CODE.md`'s "Traps" section —
+  it persists the rendered delta as a pending note instead. Don't reintroduce
+  an `Option<String>` return on `on_stop`, and don't have it emit anything a
+  caller might be tempted to surface directly; the relay is the only path.
+- **The persisted shape fails loudly on a stranger key, never guesses.**
+  `LaneRun` and `SessionLane` both carry `#[serde(deny_unknown_fields)]` —
+  the guard has to sit on `SessionLane` itself (the struct `load_lane`
+  actually parses), not only on the nested `LaneRun`, or a bare old-shaped
+  file's keys are never even compared against it (review finding, task #139
+  phase 2: a phase-1-shaped file silently read as a default-valued, falsely
+  CLEAN baseline — no panic, no signal, and load-bearing for attribution).
+  A file that fails to parse reads as "no baseline recorded", which is
+  safe; a wrong baseline is not. A future field on either struct needs
+  `#[serde(default)]` to stay backward-compatible on ADDITION, but must
+  never relax this guard to accept a field it does not recognize.
 
 ## Extension points
 

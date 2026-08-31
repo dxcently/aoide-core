@@ -97,37 +97,47 @@
   put an extra writer on a file the undying store's own atomic-write CRUD
   already lets multiple call sites share safely (each call is load-mutate-
   save on the whole set, never a partial write).
-- **The check lane's two hook calls are best-effort and gated on the EXACT
+- **The check lane's three hook calls are best-effort and gated on the EXACT
   event, never on a broader phase family (task #139).**
   `graph/send.rs::hook_for_profile` calls `aoide_upkeep::checklane::
-  on_session_start` only from `HookAction::Start`, and `checklane::on_stop`
-  only inside `HookAction::Phase` guarded on `phase == "stopped"` — the one
-  phase string `HookClass::Stop` alone produces (`map_hook`); don't widen
-  that guard to fire on `working`/`awaiting` too, or the lane's own delta
+  on_session_start` only from `HookAction::Start`, `checklane::
+  on_prompt_submit` only inside `HookAction::Phase` guarded on
+  `phase == "working"`, and `checklane::on_stop` only inside the same arm
+  guarded on `phase == "stopped"` — the one phase string each of
+  `UserPromptSubmit`/`HookClass::Stop` alone produces (`map_hook`); don't
+  widen either guard to fire on `awaiting` too, or the lane's own delta
   arithmetic (baseline vs. "what changed") stops meaning what its message
-  claims. Both calls take the raw payload's OWN `cwd` (present on every real
-  hook payload, not a stage-file lookup) and degrade to `None` on a missing
-  `cwd`, a disabled lane, or an unloadable config — same best-effort stance
-  every other hook action in this function already holds; a check-lane
-  failure must never fail the hook. **`commands/hooks.rs::door_command`'s
-  claude wrapper must keep letting `SessionStart`/`UserPromptSubmit`'s
-  stdout through** (`2>/dev/null` for exactly those two events; every other
-  event, `Stop` included, keeps the original `>/dev/null 2>&1` swallow ON
-  PURPOSE — don't widen either direction). Stdout is the only PIPE a
-  `session hook` `Outcome` ever reaches the harness through
-  (`aoide_protocol::door::run`'s `println!` on `Ok`) — reaching the harness
-  is not reaching the model; which events Claude Code actually folds into
-  context is `docs/Aoide-Wiki/protocol/dev/HARNESS-CLAUDE-CODE.md`'s call
-  (its "Traps" section), not restated here, and it names exactly
-  `SessionStart`/`UserPromptSubmit`. Restoring the old blanket swallow on
-  those two silently kills every lane note without touching a single
-  assertion in this crate's own test suite, since none of those tests
-  observe the harness's actual stdout — only the returned `Outcome`
-  in-process. Conversely, unmuffling `Stop` (or any other event) would only
-  leak routine hook chatter into a channel nobody reads on that event —
-  don't "fix" `on_stop`'s own not-yet-live delivery by widening the
-  wrapper; that fix is a deferred-delivery change in `aoide-upkeep`/this
-  file's Start/Phase arms, not a wrapper change.
+  claims. `on_session_start`/`on_stop` take the raw payload's OWN `cwd`
+  (present on every real hook payload, not a stage-file lookup);
+  `on_prompt_submit` takes neither `cwd` nor config — it only drains a file.
+  All three degrade to a no-op on a missing `cwd`, a disabled lane, or an
+  unloadable config — same best-effort stance every other hook action in
+  this function already holds; a check-lane failure must never fail the
+  hook. **The `HookAction::Start` arm reads `session_store::stored_phase(id)`
+  BEFORE its own mutating calls** (`do_session_start`, then
+  `do_session_phase_if`) to derive `mid_turn` — reading it after either
+  would risk observing a phase this same event already changed. Never
+  substitute the hook payload's own `source` field for this: a manual
+  between-turns `/compact` says `source: "compact"` too, but IS a settled
+  boundary — only the stored phase tells the two apart.
+  **`commands/hooks.rs::door_command`'s claude wrapper must keep letting
+  `SessionStart`/`UserPromptSubmit`'s stdout through** (`2>/dev/null` for
+  exactly those two events; every other event, `Stop` included, keeps the
+  original `>/dev/null 2>&1` swallow ON PURPOSE — don't widen either
+  direction). Stdout is the only PIPE a `session hook` `Outcome` ever
+  reaches the harness through (`aoide_protocol::door::run`'s `println!` on
+  `Ok`) — reaching the harness is not reaching the model; which events
+  Claude Code actually folds into context is
+  `docs/Aoide-Wiki/protocol/dev/HARNESS-CLAUDE-CODE.md`'s call (its "Traps"
+  section), not restated here, and it names exactly `SessionStart`/
+  `UserPromptSubmit`. Restoring the old blanket swallow on those two
+  silently kills every lane note without touching a single assertion in
+  this crate's own test suite, since none of those tests observe the
+  harness's actual stdout — only the returned `Outcome` in-process.
+  Conversely, unmuffling `Stop` (or any other event) would only leak routine
+  hook chatter into a channel nobody reads on that event — `on_stop`'s
+  delivery is the pending-note relay through `on_prompt_submit`/
+  `on_session_start`, never a wrapper change.
 - **The undying transfer is one `save_undying` call, never two.**
   `resurrect.rs`'s `resurrect_one` adds the new id and drops the old one in
   the SAME in-memory `Vec<UndyingSession>` before writing — the new id goes

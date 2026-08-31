@@ -14,11 +14,14 @@ forever — neither ever moves, deletes, formats, or repairs anything.
 - `scan` — the individual checks `soundcheck` runs.
 - `commands` — this crate's CLI command, `soundcheck` (registration +
   finding-report format).
-- `checklane` — `on_session_start`/`on_stop`, the two hook-fired entry
-  points `aoide-conduct`'s `session hook` calls; runs the operator-configured
-  verify command (`aoide_storage::config::Upkeep::verify_command`) plus an
-  untracked-`.nix` scan, and reports only what's new since the last call for
-  the same session id.
+- `checklane` — `on_session_start`/`on_stop`/`on_prompt_submit`, the three
+  hook-fired entry points `aoide-conduct`'s `session hook` calls; runs the
+  operator-configured verify command (`aoide_storage::config::Upkeep::
+  verify_command`) plus an untracked-`.nix` scan, and reports only what's new
+  since the last call for the same session id. `on_stop` never returns a
+  note directly — Stop's own stdout never reaches the model — it persists
+  the rendered delta as a PENDING note that `on_prompt_submit` (or a settled
+  `on_session_start`) drains at the next event that does.
 
 ## What it consumes
 

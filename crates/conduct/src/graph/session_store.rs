@@ -1050,6 +1050,29 @@ fn do_session_phase_inner(id: &str, phase: &str) -> Outcome {
         }))
 }
 
+/// The session's stored phase, canonicalized — the same authority
+/// [`do_session_phase_if`] compares `expected` against, exposed standalone so
+/// a caller can inspect it BEFORE a mutating call changes it. Task #139
+/// phase 2's Start arm reads this ahead of `do_session_start`/
+/// `do_session_phase_if` to tell a fresh launch from a mid-turn resume
+/// (`working` ⇔ a turn is in flight) — the one authority for that fact, never
+/// a second turn-tracking flag and never the hook payload's own `source`
+/// string (a manual between-turns `/compact` says the same word as an
+/// auto-compact but is a settled boundary; the stored phase tells them
+/// apart). An id with no hook record yet reads as `idle`
+/// (`canonical_state`'s own default for an empty string), matching every
+/// other reader of this file.
+pub(in crate::graph) fn stored_phase(id: &str) -> String {
+    let file: HooksFile = load_stage(&hooks_path()).unwrap_or_default();
+    let raw = file
+        .hooks
+        .iter()
+        .find(|h| h.session_id == id)
+        .map(|h| h.phase.clone())
+        .unwrap_or_default();
+    canonical_state(&raw).to_string()
+}
+
 /// Conditional sibling of [`do_session_phase`]: UPSERT `phase` for `id` ONLY when
 /// its CURRENT hook phase equals `expected`, else an ok no-op that writes nothing.
 /// hooks.json is loaded ONCE — the guard read and the write share the same load,
