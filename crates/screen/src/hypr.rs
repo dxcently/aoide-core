@@ -216,16 +216,24 @@ impl From<RawMonitor> for Monitor {
         for (slot, v) in reserved.iter_mut().zip(r.reserved.iter()) {
             *slot = *v;
         }
+        // `width`/`height` are the panel MODE, not the logical rect: on an
+        // odd transform (1/3/5/7 — 90°/270°, with or without flip) Hyprland
+        // rotates the layout so the two axes swap, while `reserved` is
+        // already reported in logical space. Every consumer of `size`/
+        // `usable` (capture's whole-layout/`--output` rects, `screen info`)
+        // wants the logical rect, so the swap happens once, here, at the
+        // only place a `RawMonitor` becomes a `Monitor`.
+        let (w, h) = if r.transform % 2 == 1 { (r.height, r.width) } else { (r.width, r.height) };
         let usable = Region {
             x: r.x + reserved[0],
             y: r.y + reserved[1],
-            w: r.width - reserved[0] - reserved[2],
-            h: r.height - reserved[1] - reserved[3],
+            w: w - reserved[0] - reserved[2],
+            h: h - reserved[1] - reserved[3],
         };
         Monitor {
             name: r.name,
             origin: Point { x: r.x, y: r.y },
-            size: Size { w: r.width, h: r.height },
+            size: Size { w, h },
             scale: r.scale,
             transform: r.transform,
             reserved,
@@ -703,6 +711,32 @@ mod tests {
         assert_eq!(m.size, Size { w: 1920, h: 1080 });
         // reserved = [left=0, top=36, right=0, bottom=0] (the bar).
         assert_eq!(m.usable, Region { x: 0, y: 36, w: 1920, h: 1044 });
+    }
+
+    // ── Transform 3 (270°, portrait) — real reading, yomi-strix HDMI-A-1,
+    // 2026-08-31: panel mode 1920x1080 scale 1, but the logical layout is
+    // 1080x1920 (proven independently by `hyprctl layers`' own
+    // `aoide-launcher` geometry, which reports usable as `0,36 1080x1884`
+    // for this exact reserved zone). `screen shot`'s whole-layout capture
+    // used the raw 1920x1080 mode dimensions before this fix.
+    const MONITOR_TRANSFORM_3_JSON: &str = r#"[{
+        "id": 0, "name": "HDMI-A-1", "width": 1920, "height": 1080,
+        "x": 0, "y": 0, "reserved": [0, 36, 0, 0], "scale": 1.00, "transform": 3
+    }]"#;
+
+    #[test]
+    fn monitor_conversion_swaps_dimensions_on_an_odd_transform() {
+        let raw: Vec<RawMonitor> = classify_json(true, MONITOR_TRANSFORM_3_JSON, "").unwrap();
+        let m = Monitor::from(raw.into_iter().next().unwrap());
+        assert_eq!(m.size, Size { w: 1080, h: 1920 }, "width/height swap on transform 3");
+        assert_eq!(m.usable, Region { x: 0, y: 36, w: 1080, h: 1884 });
+    }
+
+    #[test]
+    fn layout_bounds_over_a_rotated_monitor_uses_the_swapped_size() {
+        let raw: Vec<RawMonitor> = classify_json(true, MONITOR_TRANSFORM_3_JSON, "").unwrap();
+        let mons: Vec<Monitor> = raw.into_iter().map(Monitor::from).collect();
+        assert_eq!(layout_bounds(&mons), Some(Region { x: 0, y: 0, w: 1080, h: 1920 }));
     }
 
     #[test]
