@@ -224,20 +224,24 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   SUPER+Q/SIGKILL backstop for the session that never got to run that exit
   path, or the retry for one whose fast-path kill didn't finish in time —
   so an ssh child can never outlive its session and become a resident
-  daemon. `abandoned_headless_shells` adds ONE narrow carve-out into the
+  daemon. `abandoned_spawned_shells` adds ONE narrow carve-out into the
   kind gate that otherwise keeps every shell record out of staleness
-  judgment: a HEADLESS (never-windowed) conducted shell, ticked at least
+  judgment: a SPAWNED conducted shell (`spawned`), ticked at least
   once as a shell (`restore.is_some()`), sitting at a bare idle prompt with
   its per-session pty log (`log_path`) untouched past `REAP_IDLE_STALE_SECS`
   — the worker terminal an agent's own `spawn` left running and never
-  returned to. The touch signal is the log file's own mtime: any byte ever
+  returned to. **Windowed or not**: `spawn --windowed` execs a real terminal
+  running the same `aoide conduct`, and an agent abandons one as readily as
+  a headless one, so the gate is `spawned`, never `headless`. The touch
+  signal is the log file's own mtime: any byte ever
   crossing the pty, from the original spawned command's output through any
   later injected `aoide send`, resets it, so a human's later use of an
   agent-spawned terminal is safe from this signal without the injection
   door ever needing to attribute WHO sent it (`send.rs`'s own
   `resolve_sender` doc: that attribution is self-reported and never
-  enforced). No new field: `restore`/`log_path` are both P-C5/headless
-  fields the record already carries.
+  enforced). `restore`/`log_path` are P-C5/headless fields the record
+  already carries; `spawned` is the one new field, stamped by
+  `stamp_spawned` inside the child `spawn` re-execs.
 - `graph/window.rs` — window discovery/backfill/listener PLUS the
   automatic-parenting seam (task #89, corrected in review round 2):
   `is_windowless_wrap` (a conducted record is windowless when `headless` is

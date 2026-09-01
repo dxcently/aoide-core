@@ -517,13 +517,13 @@
   taught skip; don't widen the gate to bare `agent == "shell"`, which would
   resolve a candidate this crate has no captured facts about.
 - **`reap`'s one carve-out into the shell kind gate is `restore.is_some()` +
-  `headless` + `state == "idle"`, never `pid`-liveness alone
-  (`abandoned_headless_shells`, `reap.rs`).** The kind gate every other
+  `spawned` + `state == "idle"`, never `pid`-liveness alone
+  (`abandoned_spawned_shells`, `reap.rs`).** The kind gate every other
   signal in `is_session_dead` respects exists because "a shell record's pid
   IS its terminal" — a live pid must never be overruled by staleness. That
-  holds for an INTERACTIVE shell, where a live pid means a human is (or may
-  be) sitting at the window. It does not hold for a HEADLESS worker shell
-  `aoide spawn` leaves running with no window ever attached: there the
+  holds for a shell the operator opened, where a live pid means a human is
+  (or may be) sitting at the window. It does not hold for a worker shell
+  `aoide spawn` left running behind an agent: there the
   ONLY way anything ever reaches it again is the injection door
   (`aoide send`), which cannot tell an agent's own follow-up from a
   human's (`send.rs`'s own `resolve_sender` doc — attribution is
@@ -541,6 +541,17 @@
   door re-registers a falsely-reaped record on its next event) — this is
   why the carve-out stays this narrow, and why widening it needs the same
   bar this bullet documents, not a looser one.
+- **Gate the sweep on `spawned`, never on `headless` and never on
+  `parentSessionId`.** `headless` is the wrong axis: `spawn --windowed`
+  execs a real terminal running the same `aoide conduct`, and a windowed
+  worker terminal is abandoned exactly as readily as a headless one.
+  `parentSessionId` is worse than wrong — `graph/doc.rs` clears a child's
+  parent edge when the parent leaves the roster, so it is empty at
+  precisely the moment a shell becomes leftover, and a predicate keyed on
+  it would match only shells whose agent is still alive. `spawned` is
+  stamped once by `stamp_spawned` inside the child `spawn` re-execs and
+  never cleared, and `aoide spawn` is its only writer — which is what makes
+  "an agent left this, the operator did not" decidable at all.
 - **The nothing-to-restore warning fires at MARK time, not at resurrect
   time (task #100).** `undying.rs::nothing_to_restore_warning(agent,
   has_capture)` mirrors `resolve_candidate`'s own two arms — a registered

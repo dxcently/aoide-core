@@ -273,6 +273,27 @@ pub struct SessionRecord {
     /// the wire entirely — no "false" noise on the common case).
     #[serde(default, skip_serializing_if = "is_false")]
     pub headless: bool,
+    /// True for a record created by `aoide spawn` — the DETACHED launch an
+    /// agent uses to leave a worker terminal running behind it, in either
+    /// launch mode (`--windowed` no less than the headless default). A
+    /// PERMANENT registration fact stamped once, inside the spawned child at
+    /// its own registration, and never cleared. It has to be stamped there
+    /// rather than by `spawn` after the fact: `spawn` gives up waiting for
+    /// the child's control socket after `REGISTRATION_BUDGET` and returns
+    /// `registered: false` anyway, and a spawn that got that far wrong is
+    /// precisely the one most likely to be abandoned — the same reasoning
+    /// `headless` above records for stamping unconditionally.
+    ///
+    /// `parentSessionId` cannot answer this question: `graph/doc.rs` clears a
+    /// child's parent edge when the parent is removed, so the evidence an
+    /// agent created the shell disappears at exactly the moment the shell
+    /// becomes leftover. `reap`'s `abandoned_spawned_shells` keys off THIS
+    /// field for that reason.
+    ///
+    /// Additive/v0-safe: `false`/absent for every legacy record and for every
+    /// terminal a human opened themselves.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub spawned: bool,
     /// The harness's OWN session id, straight off the raw hook payload's own
     /// `session_id` field (P-D7) — stamped on every `graph session hook`
     /// event that carries one, regardless of whether it equals this

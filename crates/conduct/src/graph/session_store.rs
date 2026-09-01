@@ -467,6 +467,31 @@ pub(in crate::graph) fn stamp_headless(id: &str) {
     });
 }
 
+/// Mark a record as created by `aoide spawn`, permanently.
+///
+/// The `stamp_headless` sibling above, for the same reason and with the same
+/// once-only guard: the find already excludes an id whose flag is set, so a
+/// re-registration can never rewrite it and no caller has to check first.
+pub(in crate::graph) fn stamp_spawned(id: &str) {
+    with_stage_lock(|| {
+        let mut file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        if let Some(s) = file
+            .sessions
+            .iter_mut()
+            .find(|s| s.session_id == id && !s.spawned)
+        {
+            s.spawned = true;
+            if file.schema_version.is_empty() {
+                file.schema_version = STAGE_GRAPH_VERSION.to_string();
+            }
+            let _ = write_stage(&sessions_path(), &file);
+        }
+    });
+}
+
 /// Stamp `origin` on a just-registered session record (P-P3,
 /// `docs/architecture/PAIRING.md` decision 7). A PERMANENT birth fact, like
 /// `headless`/`hookAncestry`: stamped once, change-only (a no-op once

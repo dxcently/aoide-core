@@ -11,7 +11,10 @@ use super::model::{
     STAGE_GRAPH_VERSION,
 };
 use super::identity::peer_cred;
-use super::session_store::{do_session_end, do_session_start, set_session_log_path, stamp_headless, stamp_origin};
+use super::session_store::{
+    do_session_end, do_session_start, set_session_log_path, stamp_headless, stamp_origin,
+    stamp_spawned,
+};
 use super::window::{discover_window_address, resolve_registration_parent};
 use aoide_protocol::Invocation;
 use aoide_protocol::output::Outcome;
@@ -1136,6 +1139,15 @@ pub fn session_conduct(inv: &Invocation) -> Outcome {
     // survive a corrupted `windowAddress`.
     if headless {
         stamp_headless(&id);
+    }
+    // `spawned`, on the same footing and for the same reason: a registration
+    // fact about THIS record, stamped here in the child rather than by
+    // `spawn` after the fact, because `spawn` returns `registered: false`
+    // once its socket wait times out — and a spawn that went that wrong is
+    // the one most likely to end up abandoned. Both launch modes reach here;
+    // `--windowed` is a spawn no less than the headless default.
+    if inv.flag_present("spawned") {
+        stamp_spawned(&id);
     }
     // Origin, LOCAL-CLASS ONLY (P-P3, `docs/architecture/PAIRING.md`
     // decision 7; tightened at LANE IDENTITY P-ID0, G16/G5): inherited

@@ -288,6 +288,7 @@ pub fn register(r: &mut Registry) {
             flag!("parent", "string", "Spawning session id — records the spawned-by edge."),
             flag!("id", "string", "Session id override (default conduct-<pid>-<unixts>)."),
             flag!("headless", "bool", "No controlling tty: never touch the real terminal (no raw-mode, no stdin shuttle), and mirror the pty's output to state/sessions/<id>.log (logPath on the record) instead of stdout."),
+            flag!("spawned", "bool", "Mark the record as created by `aoide spawn` (spawned on the record), permanently. Set by spawn's own re-exec in both launch modes; reap's abandoned-shell sweep judges only records carrying it."),
         ],
         gated: false,
         implemented: true,

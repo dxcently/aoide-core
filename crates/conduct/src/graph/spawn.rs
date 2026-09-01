@@ -97,6 +97,10 @@ fn build_conduct_args(
     command: &[String],
 ) -> Vec<String> {
     let mut args: Vec<String> = vec!["conduct".to_string()];
+    // Unconditional, and deliberately not gated on `headless`: BOTH launch
+    // modes are a spawn, and `reap`'s abandoned-shell sweep judges the
+    // windowed one by the same rule as the headless one.
+    args.push("--spawned".to_string());
     if headless {
         args.push("--headless".to_string());
     }
@@ -902,7 +906,7 @@ mod tests {
                 "foot".to_string(),
                 "sh".to_string(),
                 "-c".to_string(),
-                "/usr/bin/aoide conduct --agent claude --id win-1 -- claude".to_string(),
+                "/usr/bin/aoide conduct --spawned --agent claude --id win-1 -- claude".to_string(),
             ]
         );
     }

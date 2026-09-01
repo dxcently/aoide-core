@@ -107,6 +107,11 @@ pub fn upsert_session(
             petname: Some(petname),
             hook_ancestry: Vec::new(),
             headless: false,
+            // Stamped moments later by `stamp_spawned`, only when this
+            // registration carries `conduct --spawned` — i.e. only for a
+            // record `aoide spawn` re-exec'd into being. A terminal the User
+            // opened themselves never gains it.
+            spawned: false,
             // Stamped later by `graph session hook` from the raw hook
             // payload's own `session_id` (P-D7); a fresh record starts
             // without one.
