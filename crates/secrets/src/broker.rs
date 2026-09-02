@@ -1090,7 +1090,7 @@ fn admin_gate(peer_uid: Option<u32>, secrets_home: &Path, subcommand: &str) -> O
     }
 }
 
-/// The `{op:"admin", verb:...}` op family (task #79): the live daemon
+/// The `{op:"admin", command:...}` op family (task #79): the live daemon
 /// becomes the single writer for `policy.json`/backend-store mutation, with
 /// the SAME commands `commands.rs`'s direct-home CRUD quintet always
 /// exposed (`add`/`rm`/`grant`/`revoke`/`set-totp`/`automate`/`expose`/
@@ -1115,8 +1115,8 @@ fn admin_gate(peer_uid: Option<u32>, secrets_home: &Path, subcommand: &str) -> O
 /// never a second usage-error vocabulary grown here.
 fn handle_admin(secrets_home: &Path, req: &Value, peer: Option<crate::peercred::PeerCred>) -> Value {
     let peer_uid = peer.map(|p| p.uid);
-    let Some(subcommand) = req.get("verb").and_then(Value::as_str) else {
-        return json!({"ok": false, "error": "malformed request: `verb` is required"});
+    let Some(subcommand) = req.get("command").and_then(Value::as_str) else {
+        return json!({"ok": false, "error": "malformed request: `command` is required"});
     };
     if let Some(reason) = admin_gate(peer_uid, secrets_home, subcommand) {
         audit_admin(secrets_home, subcommand, "", false, Some(&reason), peer_uid);
@@ -1167,7 +1167,7 @@ fn handle_admin(secrets_home: &Path, req: &Value, peer: Option<crate::peercred::
                     .map(|(outcome, ..)| outcome)
                     .map_err(|e| e.message)
             }
-            other => Err(format!("malformed request: unknown value in the `verb` field: `{other}`")),
+            other => Err(format!("malformed request: unknown value in the `command` field: `{other}`")),
         }
     };
 
@@ -1192,12 +1192,12 @@ fn handle_admin(secrets_home: &Path, req: &Value, peer: Option<crate::peercred::
 /// recorded. Deliberately command-generic (never a per-command bespoke message
 /// the way `commands::audit_migrate`'s `source -> target` detail is) —
 /// `name` is empty when a request never got far enough to know one (a
-/// missing `verb`, an `admin_gate` refusal before any field was read).
+/// missing `command`, an `admin_gate` refusal before any field was read).
 fn audit_admin(secrets_home: &Path, subcommand: &str, name: &str, granted: bool, reason: Option<&String>, peer_uid: Option<u32>) {
     let record = json!({
         "ts": aoide_protocol::audit::now_secs(),
         "op": "admin",
-        "verb": subcommand,
+        "command": subcommand,
         "name": name,
         "peerUid": peer_uid,
         "granted": granted,
@@ -4478,7 +4478,7 @@ mod tests {
 
     // ── task #79: `{op:"admin"}` over the broker socket ─────────────────
 
-    /// Task #79 item 6a: an `{op:"admin","verb":"add"}` request over a REAL
+    /// Task #79 item 6a: an `{op:"admin","command":"add"}` request over a REAL
     /// socket connection (`UnixStream::pair` + [`handle_conn`], the same
     /// pattern [`park_over_a_real_connection_writes_the_interim_line_then_the_final_reply`]
     /// already establishes) round-trips a genuine mutation into
@@ -4504,7 +4504,7 @@ mod tests {
 
             let mut writer = client_end.try_clone().expect("clone client end");
             let req = json!({
-                "op": "admin", "verb": "add", "name": "t", "backend": "scratch", "key": "k",
+                "op": "admin", "command": "add", "name": "t", "backend": "scratch", "key": "k",
                 "requireTotp": false, "consumers": [],
             });
             writer.write_all((req.to_string() + "\n").as_bytes()).unwrap();
@@ -4543,7 +4543,7 @@ mod tests {
         let wrong_uid = real_euid.wrapping_add(40_000);
 
         with_redirected_audit_log(&home, || {
-            let req = json!({"op": "admin", "verb": "add", "name": "t", "backend": "scratch", "key": "k"});
+            let req = json!({"op": "admin", "command": "add", "name": "t", "backend": "scratch", "key": "k"});
             let wrong_peer = Some(crate::peercred::PeerCred { uid: wrong_uid, gid: 0, pid: 0 });
             let reply = handle_admin(&home, &req, wrong_peer);
             assert_eq!(reply["ok"], false, "{reply}");
@@ -4564,7 +4564,7 @@ mod tests {
         let _guard = crate::env_lock().lock().unwrap();
         let home = tmp_home("admin-root");
         with_redirected_audit_log(&home, || {
-            let req = json!({"op": "admin", "verb": "add", "name": "t", "backend": "scratch", "key": "k"});
+            let req = json!({"op": "admin", "command": "add", "name": "t", "backend": "scratch", "key": "k"});
             let root_peer = Some(crate::peercred::PeerCred { uid: 0, gid: 0, pid: 0 });
             let reply = handle_admin(&home, &req, root_peer);
             assert_eq!(reply["ok"], false, "{reply}");
@@ -4584,7 +4584,7 @@ mod tests {
         let _guard = crate::env_lock().lock().unwrap();
         let home = tmp_home("admin-unidentified");
         with_redirected_audit_log(&home, || {
-            let req = json!({"op": "admin", "verb": "add", "name": "t", "backend": "scratch", "key": "k"});
+            let req = json!({"op": "admin", "command": "add", "name": "t", "backend": "scratch", "key": "k"});
             let reply = handle_admin(&home, &req, None);
             assert_eq!(reply["ok"], false, "{reply}");
             assert!(reply["error"].as_str().unwrap().contains("IDENTIFIED"), "{reply}");
@@ -4597,7 +4597,7 @@ mod tests {
     /// migrate`]'s own doc holds regardless of caller, proven here end to
     /// end over the real wire — the new backend already holds the value
     /// AND the old built-in's file is gone, both observed AFTER a single
-    /// `{op:"admin","verb":"migrate"}` round trip.
+    /// `{op:"admin","command":"migrate"}` round trip.
     #[test]
     fn admin_migrate_over_a_real_socket_connection_lands_the_new_value_and_removes_the_old_one() {
         if !age_tools_available() {
@@ -4623,7 +4623,7 @@ mod tests {
                 std::thread::spawn(move || handle_conn(&home_for_conn, &events_for_conn, server_end, &parked_for_conn));
 
             let mut writer = client_end.try_clone().expect("clone client end");
-            let req = json!({"op": "admin", "verb": "migrate", "name": "t", "target": "age"});
+            let req = json!({"op": "admin", "command": "migrate", "name": "t", "target": "age"});
             writer.write_all((req.to_string() + "\n").as_bytes()).unwrap();
 
             let mut reader = BufReader::new(client_end);
@@ -4672,7 +4672,7 @@ mod tests {
         std::env::set_var(crate::backend::BACKEND_TIMEOUT_ENV, "1");
 
         let (elapsed, reply, granted, result) = with_redirected_audit_log(&home, || {
-            let req = json!({"op": "admin", "verb": "migrate", "name": "t", "target": "scratch"});
+            let req = json!({"op": "admin", "command": "migrate", "name": "t", "target": "scratch"});
             let start = std::time::Instant::now();
             let reply = handle_admin(&home, &req, operator_peer());
             let elapsed = start.elapsed();

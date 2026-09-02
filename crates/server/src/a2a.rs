@@ -8212,7 +8212,7 @@ mod tests {
         // A one-shot method is NOT a streaming method.
         assert_eq!(streaming_method(&mk("POST", "/", r#"{"method":"message/send"}"#)), None);
         assert_eq!(streaming_method(&mk("POST", "/", r#"{"method":"tasks/get"}"#)), None);
-        // Wrong verb / path / unparseable body → not a stream.
+        // Wrong method / path / unparseable body → not a stream.
         assert_eq!(streaming_method(&mk("GET", "/", r#"{"method":"message/stream"}"#)), None);
         assert_eq!(streaming_method(&mk("POST", "/other", r#"{"method":"message/stream"}"#)), None);
         assert_eq!(streaming_method(&mk("POST", "/", "not json")), None);

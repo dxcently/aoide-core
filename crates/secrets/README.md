@@ -304,8 +304,8 @@ below) into something richer.
                                                        identity" below; the
                                                        ask stays parked)
 
--> {"op":"admin","verb":"add"|"rm"|"grant"|"revoke"|"set-totp"|"expose"
-    |"automate"|"migrate", ...verb-specific fields}
+-> {"op":"admin","command":"add"|"rm"|"grant"|"revoke"|"set-totp"|"expose"
+    |"automate"|"migrate", ...command-specific fields}
 <- {"ok":true,"message":"<summary>","changed":["policy:<name>"]}
                                                       (mutation applied —
                                                       `changed` is empty on
@@ -438,7 +438,7 @@ process from `secrets serve`, with no way to serialize against a live
 daemon's own `put_lock` (a `static Mutex` is per-process memory). Task #79
 makes the live daemon the SINGLE WRITER instead: every admin command's CLI
 handler now tries the broker socket FIRST, sending
-`{"op":"admin","verb":"<verb>",...verb-specific fields}`; the broker
+`{"op":"admin","command":"<command>",...command-specific fields}`; the broker
 executes the mutation inside the SAME `put_lock` critical section a `put`
 already runs under, so an admin command racing a live `put`/`exec` against the
 same secret can no longer interleave. Direct-write-to-`policy.json`
@@ -446,12 +446,12 @@ survives ONLY as the no-daemon fallback (`AGENTS.md`'s KNOWN LIMITATION —
 narrowed by this phase to exactly that one remaining case).
 
 ```
--> {"op":"admin","verb":"add","name":"<name>","backend":"<backend>","key":"<key>","requireTotp":<bool>?,"consumers":[<name>,...]?}
--> {"op":"admin","verb":"rm","name":"<name>"}
--> {"op":"admin","verb":"grant"|"revoke","name":"<name>","consumer":"<consumer>"}
--> {"op":"admin","verb":"set-totp"|"expose","name":"<name>","state":"on"|"off"}
--> {"op":"admin","verb":"automate","name":"<name>","action":"on"|"off"|"grant"|"revoke","consumer":"<consumer>"?}
--> {"op":"admin","verb":"migrate","name":"<name>","target":"<backend>"}
+-> {"op":"admin","command":"add","name":"<name>","backend":"<backend>","key":"<key>","requireTotp":<bool>?,"consumers":[<name>,...]?}
+-> {"op":"admin","command":"rm","name":"<name>"}
+-> {"op":"admin","command":"grant"|"revoke","name":"<name>","consumer":"<consumer>"}
+-> {"op":"admin","command":"set-totp"|"expose","name":"<name>","state":"on"|"off"}
+-> {"op":"admin","command":"automate","name":"<name>","action":"on"|"off"|"grant"|"revoke","consumer":"<consumer>"?}
+-> {"op":"admin","command":"migrate","name":"<name>","target":"<backend>"}
 ```
 
 **The peer-cred gate is strict where `dismiss`'s is permissive: ONLY the
@@ -1453,7 +1453,7 @@ operator -> aoide secrets migrate db-prod --backend age
 
 **Admin command — same socket-first, direct-write-fallback shape as
 `add`/`rm`/`grant`** (task #79, "Admin mutations over the socket" above):
-`secrets migrate` tries the running broker's `{"op":"admin","verb":
+`secrets migrate` tries the running broker's `{"op":"admin","command":
 "migrate",...}` FIRST, executed inside the SAME `put_lock` critical section
 a `put` already runs under, so a migrate racing a live `put`/`exec` against
 the same secret through a concurrently-running broker now serializes

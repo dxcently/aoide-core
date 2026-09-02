@@ -698,7 +698,7 @@ pub enum AdminError {
 }
 
 /// Task #79: connect to `socket_path`, send ONE `{"op":"admin",...}`
-/// request (`req` already carries `op` and `verb` — every field
+/// request (`req` already carries `op` and `command` — every field
 /// `commands.rs`'s admin commands need to send, this function adds none of
 /// its own), read ONE reply line, and return the parsed reply `Value` on
 /// `{"ok":true}` — the caller (`commands.rs`) reads `message`/`changed`

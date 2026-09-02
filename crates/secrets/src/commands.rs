@@ -489,8 +489,8 @@ fn require_admin_identity(cmd: &str, subcommand: &str) -> Option<Outcome> {
 /// brand-new `secrets add` with no `--backend` records.
 const DEFAULT_BACKEND: &str = "age";
 
-/// Task #79: try the broker socket first (an `{op:"admin",verb:...}`
-/// request carrying `fields` plus `op`/`verb`), falling back to the
+/// Task #79: try the broker socket first (an `{op:"admin",command:...}`
+/// request carrying `fields` plus `op`/`command`), falling back to the
 /// direct-write path — [`require_admin_identity`] then `direct()`, running
 /// the SAME mutation from [`crate::admin`] locally — ONLY when nothing is
 /// listening (`crate::client::AdminError::NoSocket`). Any other socket
@@ -508,7 +508,7 @@ fn admin_dispatch(
     direct: impl FnOnce() -> Result<crate::admin::AdminOutcome, String>,
 ) -> Outcome {
     fields.insert("op".to_string(), json!("admin"));
-    fields.insert("verb".to_string(), json!(subcommand));
+    fields.insert("command".to_string(), json!(subcommand));
     match crate::client::admin_request(&crate::socket::socket_path(), serde_json::Value::Object(fields)) {
         Ok(reply) => {
             let message = reply.get("message").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();

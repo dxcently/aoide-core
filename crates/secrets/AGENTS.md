@@ -146,7 +146,7 @@
   `broker::handle_admin` (reached only after `admin_gate` already passed).
   `commands.rs`'s admin commands never read/write `policy.json` themselves any
   more — `admin_dispatch` is the ONE place that decides which path ran: it
-  sends `{"op":"admin","verb":...}` over `client::admin_request` FIRST, and
+  sends `{"op":"admin","command":...}` over `client::admin_request` FIRST, and
   falls back to `require_admin_identity` + a direct `crate::admin` call
   ONLY on `client::AdminError::NoSocket` (`ENOENT`/`ConnectionRefused` —
   nothing listening). **Every other socket error is `AdminError::Other`
@@ -733,7 +733,7 @@
   a `put` already runs under: one process, one writer, one lock guarding
   every `policy.json`/backend-store read-modify-write this crate makes.**
   `commands.rs`'s own handlers (`admin_dispatch`) send an
-  `{"op":"admin","verb":...}` request over the socket FIRST; `broker::
+  `{"op":"admin","command":...}` request over the socket FIRST; `broker::
   handle_admin` peer-cred-gates it (`admin_gate`, ONLY the broker's own
   effective uid — root and an unidentified connection both refused, the
   identical taught error `home::admin_identity_error` already gives on the
