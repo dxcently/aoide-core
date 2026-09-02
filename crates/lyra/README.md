@@ -41,7 +41,12 @@ are core `aoide` identity, root `AGENTS.md`).
   a caller supplies only a window title, a styled header block
   (`HeaderLine::bold`/`italic`/`muted`), its own dismiss-control label,
   and its own `RESULT_MARKER` prefix (the confirm variant also takes the
-  code to display). Extracted from `commands::secrets` (P3's original
+  code to display). A header line WRAPS at the window's own width
+  (`win.width - 40`) and the window's height grows with the wrapped
+  content: the window is a fixed-size hint (that hint is what makes
+  Hyprland float it), so a line longer than 400px used to render at its
+  natural width and get cut at both edges — live-proven on the pairing
+  ask, which lost its peer name and its request id that way. Extracted from `commands::secrets` (P3's original
   module) the moment a SECOND caller needed the identical entry
   component; the confirm variant followed when `commands::pair` needed a
   SECOND surface for its own outbound direction — never a copy of either

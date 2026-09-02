@@ -299,6 +299,18 @@ fn qml_escape(s: &str) -> String {
     out
 }
 
+/// One header line, bound to the dialog's own width and WRAPPED there.
+///
+/// A bare `Text` sizes to its content, and the window is a FIXED-size hint
+/// (see [`render_code_entry_qml`] — that hint is what makes Hyprland float
+/// the dialog at all, so it cannot simply grow sideways). A context line
+/// longer than the window therefore rendered at its natural width, centred,
+/// and was CLIPPED at both edges — live-proven on the pairing ask, where
+/// `pairing request from `name` (host) . id <id>` lost its opening words AND
+/// its id, the two facts the operator is being asked to judge. `width:
+/// win.width - 40` reads the window as the one authority (no second copy of
+/// 400 here to drift), and the window's own height grows with the wrapped
+/// content so a long line can never be cut vertically instead.
 fn header_line_qml(line: &HeaderLine) -> String {
     let (color, size, extra) = match line.style {
         HeaderStyle::Bold => ("#cdd6f4", 16, "; font.bold: true"),
@@ -306,7 +318,7 @@ fn header_line_qml(line: &HeaderLine) -> String {
         HeaderStyle::Muted => ("#7f849c", 11, ""),
     };
     format!(
-        "            Text {{ anchors.horizontalCenter: parent.horizontalCenter; text: \"{}\"; color: \"{color}\"; font.pixelSize: {size}{extra} }}\n",
+        "            Text {{ width: win.width - 40; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.WordWrap; anchors.horizontalCenter: parent.horizontalCenter; text: \"{}\"; color: \"{color}\"; font.pixelSize: {size}{extra} }}\n",
         qml_escape(&line.text)
     )
 }
@@ -342,7 +354,7 @@ import QtQuick.Controls
 Window {
     id: win
     width: 400
-    height: 240
+    height: Math.max(240, content.implicitHeight + 48)
     minimumWidth: width
     maximumWidth: width
     minimumHeight: height
@@ -368,6 +380,7 @@ Window {
         color: "#1e1e2e"
 
         Column {
+            id: content
             anchors.centerIn: parent
             spacing: 12
 
@@ -515,7 +528,7 @@ import QtQuick.Controls
 Window {
     id: win
     width: 400
-    height: 220
+    height: Math.max(220, content.implicitHeight + 48)
     minimumWidth: width
     maximumWidth: width
     minimumHeight: height
@@ -547,6 +560,7 @@ Window {
         }
 
         Column {
+            id: content
             anchors.centerIn: parent
             spacing: 14
 
@@ -685,6 +699,30 @@ mod tests {
         assert!(qml.contains("boxIndex: index + 3"), "the second group's indices must continue 3..6, not restart at 0");
         assert!(qml.contains("text: \"-\""), "expected the dash separator as its own element");
         assert!(!qml.contains("Button {"), "the dismiss control is a flat text+MouseArea, never a default-styled Button");
+    }
+
+    #[test]
+    fn render_wraps_a_header_line_inside_the_window_instead_of_clipping_it() {
+        // The live defect this closes: a context line longer than the fixed
+        // 400px window rendered at its natural width and was cut at both
+        // edges, taking the peer name and the request id — the two facts the
+        // operator is being asked to judge — off screen with it. Both
+        // dialog shapes share `header_line_qml`, so both are asserted.
+        let long = "pairing request from `osaka` (192.168.1.201) · id demo-7f2a";
+        for qml in [
+            render_code_entry_qml("t", &[HeaderLine::bold(long)], "Reject request", "MARK:"),
+            render_code_confirm_qml("t", &[HeaderLine::bold(long)], "111-222", "Reject", "MARK:"),
+        ] {
+            assert!(qml.contains(long), "the full line must reach the QML");
+            assert!(qml.contains("wrapMode: Text.WordWrap"), "a long line must wrap, never overflow");
+            assert!(
+                qml.contains("width: win.width - 40"),
+                "the wrap width must read the window, not a second copy of its size"
+            );
+            // …and the height has to follow the wrap, or a line saved from a
+            // horizontal cut is simply cut vertically instead.
+            assert!(qml.contains("content.implicitHeight"), "the window must grow with its content");
+        }
     }
 
     #[test]
