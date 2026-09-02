@@ -60,6 +60,24 @@
   caller needing the widget-sync/hyprctl-apply tail reuses THAT, or the bare
   `crate::live`/`crate::widgets` primitives directly, never
   `handle_rice_stage`.
+- **`commands::rice::seed_songbook_from_templates` (task #41) is called
+  from the STAGING ENTRY POINTS, never from inside `handle_rice_stage`
+  itself.** `handle_rice_stage_entry` (`rice stage <name>`) and
+  `commands::mode::handle_mode_stage` (`rice mode stage <name>` — the
+  realistic fresh-host first call, since it unlocks AND stages in one go
+  where bare `rice stage` just refuses while still locked) each call it
+  before handing off to `handle_rice_stage`, the shared sync core that only
+  ever READS the songbook. Don't move the seed inside `handle_rice_stage`
+  itself — that would also fire it from `rice mode declarative <name>`'s
+  re-pin, turning a lock command into a write-adjacent one for no reason.
+  `lyra reload`'s staging arm doesn't need it either: it only ever runs
+  once `mode.json`'s `song` field is set, which only happens after one of
+  the two seed-checking entry points already resolved that song
+  successfully — reload calling `handle_rice_stage` directly is therefore
+  never a gap. The check itself is dir-level and existence-only
+  (`songbook_dir(name).exists()`) — never a per-file fill; a caller adding
+  a THIRD staging entry point must call the same function, not reimplement
+  the check.
 - **`aoide_storage::takes`' functions take `draft: Option<&str>`, not
   `&str` — `None` means staging-mode (`songbook/<song>/takes/`), `Some`
   means a routed draft (`songbook/<song>/drafts/<name>/takes/`).**
@@ -129,5 +147,9 @@
   nix-independence boundary shifts.
 - `CONTRACTS.md §5`'s "Elements" subsection when a descriptor field rule
   changes.
+- `CONTRACTS.md §4`'s "shipped score templates" paragraph when a new
+  consumer of `fs::song_templates_dir` is added — `rice compose --from`,
+  the widget registry/manifest regeneration, and `seed_songbook_from_templates`
+  are the three today.
 - `pkgs/aoide/crates/AGENTS.md` for cross-crate invariants — not restated
   here.

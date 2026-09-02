@@ -222,7 +222,30 @@ fn handle_mode_stage(inv: &Invocation) -> Outcome {
     }
 
     let mut changed: Vec<String> = Vec::new();
+    // Seed a first-stage runtime songbook entry from the shipped template
+    // BEFORE the sync below ever reads `songbook_dir(name)` (task #41) —
+    // this is the OTHER staging entry point `rice stage`'s own
+    // `handle_rice_stage_entry` needs the same seed at (see
+    // `commands::rice::seed_songbook_from_templates`'s doc): a fresh host's
+    // FIRST real interaction with a shipped-but-never-composed song is
+    // `rice mode stage <name>` (this command unlocks AND stages in one
+    // call — `rice stage` alone refuses while still locked), so this is the
+    // hook point that actually matters for that case, not an optional
+    // extra. No-op whenever the songbook already has anything for the
+    // song, or nothing is shipped for it either.
+    let mut seeded_from: Option<std::path::PathBuf> = None;
     if let Some(name) = &resolved_name {
+        seeded_from = match super::rice::seed_songbook_from_templates(name) {
+            Ok(Some(source)) => {
+                changed.push(shellbridge::songbook_dir(name).to_string_lossy().into_owned());
+                Some(source)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                return Outcome::error("rice.mode.stage", e)
+                    .with_data(json!({ "reason": "seed-failed" }));
+            }
+        };
         let stage_inv = Invocation {
             path: vec!["rice".to_string(), "stage".to_string()],
             args: vec![name.clone()],
@@ -234,7 +257,7 @@ fn handle_mode_stage(inv: &Invocation) -> Outcome {
             staged.command = "rice.mode.stage".to_string();
             return staged;
         }
-        changed = staged.changed;
+        changed.extend(staged.changed);
     }
 
     // `handle_rice_stage` above (the guard-free, marker-blind sibling of
@@ -264,12 +287,21 @@ fn handle_mode_stage(inv: &Invocation) -> Outcome {
     } else {
         format!(" — reaped {} stray process(es)", reaped.len())
     };
+    // Never silent (task #41's outcome contract) — same tier as `reap_note`.
+    let seed_note = match &seeded_from {
+        Some(source) => format!(" — seeded songbook from shipped template at {}", source.display()),
+        None => String::new(),
+    };
 
     Outcome::ok(
         "rice.mode.stage",
         match &resolved_name {
-            Some(n) if explicit_name.is_some() => format!("staging mode unlocked — staged `{n}` live{reap_note}"),
-            Some(n) => format!("staging mode unlocked — re-staged the current rice `{n}` live{reap_note}"),
+            Some(n) if explicit_name.is_some() => {
+                format!("staging mode unlocked — staged `{n}` live{seed_note}{reap_note}")
+            }
+            Some(n) => format!(
+                "staging mode unlocked — re-staged the current rice `{n}` live{seed_note}{reap_note}"
+            ),
             None => format!("staging mode unlocked — no current rice to stage (no stage/livery.json yet){reap_note}"),
         },
     )
@@ -277,6 +309,7 @@ fn handle_mode_stage(inv: &Invocation) -> Outcome {
     .with_data(json!({
         "mode": "staging",
         "song": marker.song,
+        "seeded": seeded_from.as_ref().map(|p| p.to_string_lossy().into_owned()),
         "reaped": reaped.iter().map(|p| json!({
             "pid": p.pid, "reason": p.reason, "cmdline": p.cmdline,
         })).collect::<Vec<_>>(),
@@ -572,6 +605,47 @@ mod tests {
         assert_eq!(marker.song, Some("moonlight".to_string()));
         assert!(out.changed.iter().any(|c| c.ends_with("stage/livery.json")));
         assert!(out.changed.iter().any(|c| c.ends_with("stage/mode.json")));
+        assert!(stage.join("livery.json").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The realistic fresh-host case task #41 exists for: `rice mode stage
+    /// <name>` unlocks AND stages in one call, so it — not bare `rice
+    /// stage`, which refuses while still locked — is what a host actually
+    /// runs FIRST for a shipped-but-never-composed song. No pre-existing
+    /// runtime songbook entry here at all, only a shipped template.
+    #[test]
+    fn stage_with_a_name_seeds_the_runtime_songbook_from_the_shipped_template_on_first_stage() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SONG_TEMPLATES"]);
+        let root = unique_tmp("mode-stage-seed");
+        let stage = root.join("stage");
+        let templates = root.join("templates");
+        let templated_song = templates.join("moonlight");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&templated_song).unwrap();
+        std::fs::write(templated_song.join("livery.json"), VALID_NOTES).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_SONG_TEMPLATES", &templates);
+
+        let out = handle_mode_stage(&inv(&["rice", "mode", "stage"], &["moonlight"]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert!(
+            out.message.contains("seeded songbook"),
+            "never silent: {}",
+            out.message
+        );
+        assert_eq!(out.data.unwrap()["seeded"], json!(templated_song.to_string_lossy()));
+
+        let marker = load_mode_marker();
+        assert_eq!(marker.mode, RiceMode::Staging);
+        assert_eq!(marker.song, Some("moonlight".to_string()));
+        assert_eq!(
+            std::fs::read_to_string(shellbridge::songbook_dir("moonlight").join("livery.json"))
+                .unwrap(),
+            VALID_NOTES,
+            "the shipped template landed in the runtime songbook"
+        );
         assert!(stage.join("livery.json").is_file());
         let _ = std::fs::remove_dir_all(&root);
     }

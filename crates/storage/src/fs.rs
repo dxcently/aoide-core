@@ -175,9 +175,14 @@ fn migrate_file(old: &std::path::Path, new: &std::path::Path) {
     }
 }
 
-/// Recursive directory copy for [`migrate_dir`]'s cross-filesystem fallback:
-/// every file and subdir, symlinks preserved as symlinks (never followed).
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+/// Recursive directory copy: every file and subdir, symlinks preserved as
+/// symlinks (never followed). Built for [`migrate_dir`]'s cross-filesystem
+/// fallback; `pub` (not crate-private) because `aoide-song`'s runtime
+/// songbook seed (`commands::rice::seed_songbook_from_templates`, task #41)
+/// reuses it verbatim for its own whole-tree copy rather than re-walking a
+/// second way — both callers want the SAME semantics (unconditional, no
+/// byte-diff/merge — the destination is always known-absent going in).
+pub fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;

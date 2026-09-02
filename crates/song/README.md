@@ -52,7 +52,18 @@ in `lyra`, not core.
   `songbook_dir(from)` first, else `<templates>/<from>/livery.json`
   (`fs::song_templates_dir`) — a repo-less host still has something to copy
   from. Compose TO always writes the host songbook under the runtime root,
-  never the templates dir. `element seed <song>` (L-E1) is the shell-reachable
+  never the templates dir. `commands::rice::seed_songbook_from_templates`
+  (task #41) reuses the SAME `fs::song_templates_dir` resolver for a
+  different write: the first `rice stage <name>`/`rice mode stage <name>`
+  for a SHIPPED song the runtime `songbook_dir(name)` lacks entirely copies
+  that song's whole template tree in — once, dir-level never-clobber (a
+  songbook dir with anything in it, even partially, is left alone), so
+  idempotent by construction. Both staging entry points call it before
+  `handle_rice_stage` (the sync) ever reads the songbook; `rice mode
+  declarative`'s re-pin and `lyra reload`'s staging arm reuse
+  `handle_rice_stage` directly and need nothing extra, since by then the
+  song already resolved through one of the two entry points. `element seed
+  <song>` (L-E1) is the shell-reachable
   bridge to `crate::elements::seed_song` — the render pipeline's only
   caller today; `rice stage` (L-E2) and the elements facet's activation
   hook (L-E3) call the same function later, not a fork of it.

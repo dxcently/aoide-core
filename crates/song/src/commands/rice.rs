@@ -180,7 +180,44 @@ fn handle_rice_stage_entry(inv: &Invocation) -> Outcome {
         inv
     };
 
+    // Seed a first-stage runtime songbook entry from the shipped template
+    // BEFORE `handle_rice_stage` (the sync) ever reads `songbook_dir(name)`
+    // — task #41, see `seed_songbook_from_templates`'s own doc for why this
+    // sits here and not inside the sync itself. No-op whenever the
+    // songbook already has ANYTHING for this song, or nothing is shipped
+    // for it either — the ordinary "song not found" error path still fires
+    // unchanged in that second case.
+    let name = inv.args.first().cloned();
+    let seeded_from = match &name {
+        Some(name) => match seed_songbook_from_templates(name) {
+            Ok(seeded) => seeded,
+            Err(msg) => {
+                return Outcome::error("rice.stage", msg)
+                    .with_data(json!({ "reason": "seed-failed" }));
+            }
+        },
+        None => None,
+    };
+
     let mut out = handle_rice_stage(inv);
+
+    // Never silent (task #41's outcome contract): a successful seed gets
+    // folded into the message and `changed` list, same tier as the
+    // reap-note pattern `rice mode stage` uses for its own best-effort
+    // side note below.
+    if out.status == aoide_protocol::output::Status::Ok {
+        if let (Some(source), Some(name)) = (&seeded_from, &name) {
+            out.message = format!(
+                "seeded songbook from shipped template at {} — {}",
+                source.display(),
+                out.message
+            );
+            out.changed.push(shellbridge::songbook_dir(name).to_string_lossy().into_owned());
+            if let Some(Value::Object(map)) = &mut out.data {
+                map.insert("seeded".to_string(), json!(source.to_string_lossy()));
+            }
+        }
+    }
 
     // Auto-take (phase A3, `references/fleshing-out-aoide-ricing.md` §5.2 —
     // the whole point of the feature: an agent's edits get snapshotted
@@ -535,6 +572,81 @@ fn resolve_from_notes_path(from: &str) -> Result<PathBuf, String> {
             songbook_notes.display(),
         )),
     }
+}
+
+/// Seed a first-stage runtime songbook entry for `name` from the shipped
+/// template tree (task #41) — a repo-less/fresh host's `songbook/` starts
+/// with nothing in it, so before the very first `rice stage <name>`/`rice
+/// mode stage <name>` for a SHIPPED (never-composed-on-this-host) song can
+/// do anything, the write-back home house rule 3's read-and-append loop
+/// needs — `songbook_dir(name)` — has to exist. Called from both staging
+/// entry points ([`handle_rice_stage_entry`] and `commands::mode`'s
+/// `handle_mode_stage`) before either hands off to [`handle_rice_stage`]
+/// (the sync proper, which only ever READS the songbook) — never from
+/// inside `handle_rice_stage` itself, so `rice mode declarative <name>`'s
+/// own re-pin (also routed through `handle_rice_stage`) stays a pure lock
+/// with no seeding side effect, and `lyra reload`'s staging arm (which
+/// calls `handle_rice_stage` directly too, `commands/reload.rs`) needs
+/// nothing extra: it only ever runs once `mode.json`'s `song` field is
+/// set, which only happens after one of the two seed-checking entry points
+/// already resolved that song successfully.
+///
+/// Reuses [`shellbridge::song_templates_dir`] — the SAME shipped/env
+/// templates resolver [`resolve_from_notes_path`] above already falls back
+/// to for `rice compose --from`, never a second resolver — and
+/// [`shellbridge::copy_dir_recursive`] (`aoide_storage::fs`'s existing
+/// cross-filesystem migration helper) for the whole-tree copy, landed via
+/// a sibling-tmp-dir-then-rename swap so a copy that fails partway never
+/// leaves a half-seeded `songbook_dir(name)` behind (same idiom
+/// `aoide_storage::fs::migrate_dir` already uses for its own cross-fs
+/// fallback).
+///
+/// **Dir-level, never-clobber, exactly per task #41's contract:**
+/// `songbook_dir(name)` existing AT ALL — even missing half its files from
+/// a prior partial edit — skips the seed outright and proceeds to the
+/// normal stage flow unchanged; never a per-file fill (mixing template
+/// halves into a user-edited song is worse than a missing file). A second
+/// stage of an already-seeded song is therefore automatically a no-op —
+/// idempotence falls out of this same existence check, nothing extra
+/// needed. Silently `Ok(None)` too when nothing is shipped for `name`
+/// either (no `$AOIDE_SONG_TEMPLATES` resolvable, or no `<templates>/<name>/`
+/// entry in it) — the caller's own existing "song not found" error already
+/// reports that honestly; this function has no error text of its own for
+/// the ordinary case.
+///
+/// `Ok(Some(source))` names the shipped dir a seed copy actually ran from
+/// — callers splice this into their own `Outcome` (`changed`/message) so
+/// the seed is never silent, per task #41's outcome contract. `Err` only
+/// for a copy that started and then failed partway.
+pub(crate) fn seed_songbook_from_templates(name: &str) -> Result<Option<PathBuf>, String> {
+    if !crate::compose::valid_song_name(name) {
+        // `handle_rice_stage` rejects an invalid name with its own clean,
+        // specific error; seeding has nothing safe to do with one (a
+        // traversal-shaped name joined into a path below, unvalidated).
+        return Ok(None);
+    }
+    let target = shellbridge::songbook_dir(name);
+    if target.exists() {
+        return Ok(None);
+    }
+    let Some(source) = shellbridge::song_templates_dir().map(|t| t.join(name)) else {
+        return Ok(None);
+    };
+    if !source.is_dir() {
+        return Ok(None);
+    }
+
+    let tmp = target.with_extension(format!("seed-tmp.{}", std::process::id()));
+    let result = shellbridge::copy_dir_recursive(&source, &tmp)
+        .and_then(|()| std::fs::rename(&tmp, &target));
+    if let Err(e) = result {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(format!(
+            "failed to seed songbook `{name}` from shipped template at {}: {e}",
+            source.display()
+        ));
+    }
+    Ok(Some(source))
 }
 
 /// `rice compose <name> [--from <song>] [--force]` — scaffold a new
@@ -2020,6 +2132,161 @@ mod tests {
             json!(["bar"]),
             "the helper component and asset file are carried but excluded from the manifest"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── rice stage: first-stage runtime songbook seed (task #41) ─────────────
+    //
+    // A repo-less/fresh host's runtime songbook starts with nothing in it —
+    // these prove `rice stage <name>` (`handle_rice_stage_entry`) copies a
+    // SHIPPED song's whole template tree in, once, idempotently, and never
+    // touches a songbook dir that already has anything in it, even
+    // partially. Same `$AOIDE_SONG_TEMPLATES` fixture shape
+    // `compose_falls_back_to_the_templates_dir_when_the_songbook_has_nothing`
+    // above already uses.
+
+    #[test]
+    fn stage_entry_seeds_the_runtime_songbook_from_the_shipped_template_on_first_stage() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SONG_TEMPLATES"]);
+        let root = unique_tmp("seed-when-absent");
+        let stage = root.join("stage");
+        let templates = root.join("templates");
+        let templated_song = templates.join("moonlight");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(templated_song.join("design")).unwrap();
+        std::fs::create_dir_all(templated_song.join("widgets")).unwrap();
+        std::fs::write(templated_song.join("livery.json"), VALID_NOTES).unwrap();
+        std::fs::write(templated_song.join("rice.nix"), "# shipped rice.nix\n").unwrap();
+        std::fs::write(templated_song.join("design").join("intent.md"), "# intent\n").unwrap();
+        std::fs::write(templated_song.join("widgets").join("bar.qml"), "// bar\n").unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_SONG_TEMPLATES", &templates);
+
+        aoide_storage::mode::save_mode_marker(&aoide_storage::mode::ModeMarker {
+            mode: aoide_storage::mode::RiceMode::Staging,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let out = handle_rice_stage_entry(&inv(&["rice", "stage"], &["moonlight"]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        assert!(
+            out.message.contains("seeded songbook"),
+            "the seed is reported honestly, never silent: {}",
+            out.message
+        );
+        assert_eq!(out.data.unwrap()["seeded"], json!(templated_song.to_string_lossy()));
+
+        // The whole shipped tree arrived, byte for byte.
+        let songbook_song = shellbridge::songbook_dir("moonlight");
+        assert_eq!(
+            std::fs::read_to_string(songbook_song.join("livery.json")).unwrap(),
+            VALID_NOTES
+        );
+        assert_eq!(
+            std::fs::read_to_string(songbook_song.join("rice.nix")).unwrap(),
+            "# shipped rice.nix\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(songbook_song.join("design").join("intent.md")).unwrap(),
+            "# intent\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(songbook_song.join("widgets").join("bar.qml")).unwrap(),
+            "// bar\n"
+        );
+        assert!(
+            out.changed
+                .iter()
+                .any(|c| c == &songbook_song.to_string_lossy().into_owned()),
+            "the seeded songbook dir is reported in `changed` too: {:?}",
+            out.changed
+        );
+
+        // And the stage flow proceeded normally on top of the freshly
+        // seeded songbook — never just a seed with nothing else happening.
+        assert!(stage.join("livery.json").is_file(), "stage proceeds after the seed");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stage_entry_seeds_nothing_on_a_second_stage_of_an_already_seeded_song() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SONG_TEMPLATES"]);
+        let root = unique_tmp("seed-idempotence");
+        let stage = root.join("stage");
+        let templates = root.join("templates");
+        let templated_song = templates.join("moonlight");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&templated_song).unwrap();
+        std::fs::write(templated_song.join("livery.json"), VALID_NOTES).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_SONG_TEMPLATES", &templates);
+
+        aoide_storage::mode::save_mode_marker(&aoide_storage::mode::ModeMarker {
+            mode: aoide_storage::mode::RiceMode::Staging,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let first = handle_rice_stage_entry(&inv(&["rice", "stage"], &["moonlight"]));
+        assert_eq!(first.status, Status::Ok, "{:?}", first.data);
+        assert!(first.message.contains("seeded songbook"), "{}", first.message);
+
+        let second = handle_rice_stage_entry(&inv(&["rice", "stage"], &["moonlight"]));
+        assert_eq!(second.status, Status::Ok, "{:?}", second.data);
+        assert!(
+            !second.message.contains("seeded songbook"),
+            "a second stage of an already-seeded song seeds nothing: {}",
+            second.message
+        );
+        assert_eq!(
+            second.data.unwrap()["seeded"], Value::Null,
+            "idempotence follows from the same dir-level existence check"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn seed_songbook_from_templates_never_clobbers_an_existing_even_partial_song_dir() {
+        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SONG_TEMPLATES"]);
+        let root = unique_tmp("seed-never-clobber");
+        let stage = root.join("stage");
+        let templates = root.join("templates");
+        let templated_song = templates.join("moonlight");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&templated_song).unwrap();
+        std::fs::write(templated_song.join("livery.json"), VALID_NOTES).unwrap();
+        std::fs::write(templated_song.join("rice.nix"), "# shipped rice.nix\n").unwrap();
+
+        // The runtime songbook already has SOMETHING for this song — a
+        // hand-edited `livery.json` and nothing else (a partial dir, the
+        // shape a prior interrupted edit could leave). Deliberately
+        // DIFFERENT content from the template's own, so a clobber would be
+        // caught immediately.
+        let existing_song = root.join("songbook").join("moonlight");
+        std::fs::create_dir_all(&existing_song).unwrap();
+        const HAND_EDITED: &str = r##"{"schemaVersion":"0","palette":{"bg":"#111111"}}"##;
+        std::fs::write(existing_song.join("livery.json"), HAND_EDITED).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_SONG_TEMPLATES", &templates);
+
+        let seeded = seed_songbook_from_templates("moonlight").unwrap();
+        assert!(seeded.is_none(), "an existing, even partial, songbook dir skips the seed entirely");
+        assert_eq!(
+            std::fs::read_to_string(existing_song.join("livery.json")).unwrap(),
+            HAND_EDITED,
+            "the existing file stays byte-identical"
+        );
+        assert!(
+            !existing_song.join("rice.nix").exists(),
+            "never a per-file fill — the missing rice.nix is NOT backfilled from the template"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

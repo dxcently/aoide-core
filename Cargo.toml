@@ -15,7 +15,7 @@ members = ["crates/protocol", "crates/storage", "crates/conduct", "crates/client
 # inherited manifest version via `env!("CARGO_PKG_VERSION")` — a bump is ONE
 # edit here and nothing downstream can drift from it.
 [workspace.package]
-version = "0.0.16"
+version = "0.0.17"
 
 # ONE version source for the whole workspace (the monorepo standard): every
 # crate inherits via `{ workspace = true }` — no per-manifest version repeats.
