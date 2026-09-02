@@ -1106,7 +1106,7 @@ impl App {
     /// but a thin CLI wrapper over [`graph::focus_session`], so Enter now
     /// calls it directly instead of round-tripping through the registry
     /// dispatcher, the same way the shellbridge socket loop already calls it
-    /// for a widget click (`shellbridge.rs`'s `focussession` verb). The
+    /// for a widget click (`shellbridge.rs`'s `focussession` command). The
     /// audit line this used to get for free from `dispatch` is written here
     /// by hand so the one-audit-log invariant still holds.
     fn cue_session(&mut self, rec: &SessionRecord) {

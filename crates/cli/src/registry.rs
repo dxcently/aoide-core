@@ -177,7 +177,7 @@ mod tests {
         // `peer.pair.approve`, `peer.pair.reject`, `peer.pair.watch` and
         // `peer.pending` all DIE — hard cutover, no aliases, same as
         // `peer.invite` before them. Bare `pair` (already registered)
-        // becomes the ONE verb, routed by what already exists (approve an
+        // becomes the ONE command, routed by what already exists (approve an
         // inbound match, resume an outbound one, else request), plus
         // `pair.reject` (+1) and `pair.watch` (+1). The `peer` family keeps
         // the ROSTER (add/list/allow/hub/spawn/pull/status/discover/

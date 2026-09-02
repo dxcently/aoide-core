@@ -103,8 +103,8 @@ pub(super) fn undying_grant(inv: &Invocation, cmd: &str, state: &str) -> Outcome
         .and_then(|f| f.sessions.into_iter().find(|s| s.session_id == id));
     let live = record.is_some();
 
-    let verb = if on { "undying" } else { "not undying" };
-    let mut message = format!("`{id}` is now {verb}");
+    let word = if on { "undying" } else { "not undying" };
+    let mut message = format!("`{id}` is now {word}");
     // Only worth warning on the way TO undying — turning it off never
     // promises a future restore. A dead/unknown id (not in the roster) has
     // no live signal to warn from either; silent there, same as `live`
@@ -118,7 +118,7 @@ pub(super) fn undying_grant(inv: &Invocation, cmd: &str, state: &str) -> Outcome
     }
     let mut out = Outcome::ok(cmd, message);
     if transitioned {
-        out = out.changed(vec![format!("{id}: {verb}")]);
+        out = out.changed(vec![format!("{id}: {word}")]);
     }
     out.with_data(json!({ "sessionId": id, "undying": on, "live": live }))
 }

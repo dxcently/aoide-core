@@ -499,7 +499,7 @@ fn pair_reject_on_an_unknown_id_leaves_no_record_change() {
     let _stage = setup_env(&root);
 
     // The old `peer pair approve nosuchid` unknown-id refusal is GONE by
-    // design: under the one-verb dispatch an unknown target means "request
+    // design: under the one-command dispatch an unknown target means "request
     // a pair with that name", which is the feature, not a typo. `pair
     // reject` keeps the taught unknown-id error — there is nothing to
     // remove.

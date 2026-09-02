@@ -1167,7 +1167,7 @@ fn handle_admin(secrets_home: &Path, req: &Value, peer: Option<crate::peercred::
                     .map(|(outcome, ..)| outcome)
                     .map_err(|e| e.message)
             }
-            other => Err(format!("malformed request: unknown admin verb `{other}`")),
+            other => Err(format!("malformed request: unknown value in the `verb` field: `{other}`")),
         }
     };
 

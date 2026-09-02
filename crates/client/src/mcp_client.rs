@@ -7,7 +7,7 @@
 //! HTTP POST — `initialize`/`tools/list`/`tools/call`) over
 //! [`crate::commands::post_json`], the SAME curl transport `peer`'s own
 //! calls use — no new Cargo dependency, TLS comes free with curl. Three
-//! verbs, one POST each:
+//! commands, one POST each:
 //!
 //! - `melete status` — an `initialize` handshake; reports reachability plus
 //!   the server's own `serverInfo`/`protocolVersion`.
@@ -19,7 +19,7 @@
 //! - `melete call <tool> [--args <json>]` — a generic gated `tools/call`
 //!   passthrough covering `job_status`/`run_code_task`/`schedule_*`/
 //!   `stop_run`/`steer_run` and anything else Melete exposes. Deliberately
-//!   NO per-tool verbs: a change to Melete's own tool list never needs a
+//!   NO per-tool commands: a change to Melete's own tool list never needs a
 //!   matching aoide release.
 //!
 //! **Configuration (`AOIDE_MELETE_URL`/`AOIDE_MELETE_TOKEN`, env-only,
@@ -29,7 +29,7 @@
 //! AgentCard-verified, signed, per-peer `allows` — over aoide's OWN wire
 //! protocol; Melete is a third-party claude.ai service speaking plain MCP,
 //! never an aoide peer, so that shape doesn't fit. `aoide_storage::commands`'s
-//! `usage` verb (its `live` block) is the closer precedent — a single,
+//! `usage` command (its `live` block) is the closer precedent — a single,
 //! external, bearer-authenticated endpoint — but its token rides a LOCAL
 //! FILE Claude Code itself already maintains (`~/.claude/.credentials.json`);
 //! aoide has no equivalent on-disk source for a Melete connector url/token,
@@ -40,10 +40,10 @@
 //! taught [`Outcome::error`] naming the two var names, never a silent
 //! degrade and never an invented credential.
 //!
-//! **Door gate.** All three verbs are CLI-only, matching `aoide-secrets`'s
+//! **Door gate.** All three commands are CLI-only, matching `aoide-secrets`'s
 //! blanket stance for its own command family (`crate::secrets::commands
 //! ::require_cli`, gating the WHOLE `secrets` group, not just its admin
-//! quartet): every Melete verb here sends a live bearer token to an
+//! quartet): every Melete command here sends a live bearer token to an
 //! external service and `call` can trigger real, potentially
 //! cost-incurring action (job triggers, schedule mutations, run control —
 //! Melete's own docs single these out as the one class of call it holds
@@ -54,10 +54,10 @@
 //! for its own externally-consequential surface.
 //!
 //! **Assumed wire shape (documented here since this is a first integration,
-//! not yet proven against a live Melete instance).** Each verb is ONE POST
+//! not yet proven against a live Melete instance).** Each command is ONE POST
 //! — no `initialize`→session-id handshake is threaded into `graph`/`call`;
 //! Melete's connector is treated as a stateless-per-request bearer-token
-//! API, the minimal shape the three verbs need. A response is parsed as
+//! API, the minimal shape the three commands need. A response is parsed as
 //! plain JSON first; failing that, defensively as an SSE-framed body
 //! (`data: ` lines, per streamable-HTTP MCP) — [`parse_response_body`].
 //! Neither the request nor the response is forced through
@@ -107,7 +107,7 @@ struct MeleteConfig {
 /// Resolve [`MELETE_URL_VAR`]/[`MELETE_TOKEN_VAR`], or a structured, taught
 /// error naming both — never a silent degrade (unlike `usage`'s `live`
 /// block, there is no "local" half here to fall back to: every one of
-/// these three verbs has nothing to do without reaching Melete).
+/// these three commands has nothing to do without reaching Melete).
 fn resolve_config(cmd: &str) -> Result<MeleteConfig, Outcome> {
     let url = std::env::var(MELETE_URL_VAR).ok().filter(|s| !s.trim().is_empty());
     let token = std::env::var(MELETE_TOKEN_VAR).ok().filter(|s| !s.trim().is_empty());
@@ -130,7 +130,7 @@ fn resolve_config(cmd: &str) -> Result<MeleteConfig, Outcome> {
 }
 
 /// Shared door gate for the whole `melete` family — see this module's doc
-/// for why the READ-only verbs (`status`/`graph`) are gated identically to
+/// for why the READ-only commands (`status`/`graph`) are gated identically to
 /// `call`, not just the consequential one.
 fn require_cli(inv: &Invocation, cmd: &str) -> Option<Outcome> {
     match inv.door {
@@ -355,7 +355,7 @@ pub fn register_melete(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["melete", "call"],
-        summary: "Generic gated passthrough to any Melete MCP tool (job_status/run_code_task/schedule_*/stop_run/steer_run/…) — deliberately no per-tool verbs, so a change to Melete's own tool list never needs a matching aoide release.",
+        summary: "Generic gated passthrough to any Melete MCP tool (job_status/run_code_task/schedule_*/stop_run/steer_run/…) — deliberately no per-tool commands, so a change to Melete's own tool list never needs a matching aoide release.",
         args: [arg!("tool", "string", true, "The Melete MCP tool name to call verbatim, e.g. job_status.")],
         flags: [flag!("args", "string", "The tool's arguments as a JSON object, e.g. '{\"run_id\":\"...\"}'. Defaults to {} when omitted.")],
         gated: false,
@@ -486,10 +486,10 @@ mod tests {
         clear_melete_env();
     }
 
-    // ── door gate — every verb, not just `call` ──────────────────────────────
+    // ── door gate — every command, not just `call` ───────────────────────────
 
     #[test]
-    fn every_melete_verb_refuses_a_non_cli_door_without_touching_config() {
+    fn every_melete_command_refuses_a_non_cli_door_without_touching_config() {
         let _g = env_guard();
         clear_melete_env(); // proves the gate runs BEFORE resolve_config too
         for door in [Door::Mcp, Door::A2a, Door::Daemon] {

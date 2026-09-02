@@ -3301,7 +3301,7 @@ fn handle_pair(inv: &Invocation) -> Outcome {
     pair_continue_or_request(cmd, inv, &target, USAGE)
 }
 
-/// `pair <target>` where the target is NOT a URL — one verb, "make us
+/// `pair <target>` where the target is NOT a URL — one command, "make us
 /// paired", routed by whatever half of a ceremony already exists with that
 /// target. An exact pending-ID match wins over a name match, so an id
 /// pasted from this command's own messages always lands; an inbound match
@@ -3415,7 +3415,7 @@ fn resume_outbound_leg(
 }
 
 /// `pair <name>` when `<name>` is ALREADY a verified peer and no ceremony
-/// is pending: under the smart verb this is the thing an operator types
+/// is pending: under the smart command this is the thing an operator types
 /// just to poke at a peer, and a re-pair replaces key material — so it is
 /// confirmed (interactive y/N; `--yes` scripted) rather than fired. Only
 /// this NAME leg is gated: the explicit URL dial stays ungated, the
@@ -3562,7 +3562,7 @@ fn pair_overview(cmd: &str, inv: &Invocation) -> Outcome {
 pub fn register_pair(r: &mut Registry) {
     r.insert(cmd!(
         path: ["pair"],
-        summary: "Make this instance and a target paired — one verb for the whole ceremony, routed by what already exists: a pending inbound request from the target is approved (typed pairing code; --code scripted), a pending outbound one is resumed (poll, then typed reply code; --code scripted), and nothing pending starts a new request (a URL dials directly, a name sweeps for its advertisement) then blocks up to --wait seconds for the far approval. Bare `pair` is the overview: an interactive menu over pending requests and heard advertisers on a real CLI tty, the pending listing (JSON-friendly) anywhere else.",
+        summary: "Make this instance and a target paired — one command for the whole ceremony, routed by what already exists: a pending inbound request from the target is approved (typed pairing code; --code scripted), a pending outbound one is resumed (poll, then typed reply code; --code scripted), and nothing pending starts a new request (a URL dials directly, a name sweeps for its advertisement) then blocks up to --wait seconds for the far approval. Bare `pair` is the overview: an interactive menu over pending requests and heard advertisers on a real CLI tty, the pending listing (JSON-friendly) anywhere else.",
         args: [arg!("target", "string", false, "A peer name/hostname, a pending request id, or a URL (e.g. http://host:8710/) to dial directly. Omitted: the overview/menu.")],
         flags: [
             flag!("code", "string", "The typed code, scripted: on an INBOUND request, the pairing code read from the requester's screen; on an OUTBOUND one, the reply code read from the approver's screen. A wrong code counts one persisted try; the 3rd cumulative mismatch auto-denies an inbound request or auto-aborts an outbound one."),
@@ -5818,11 +5818,11 @@ mod tests {
         });
     }
 
-    // ── Task #135 P3': the ONE-verb dispatch ─────────────────────────────
+    // ── Task #135 P3': the ONE-command dispatch ───────────────────────────
 
     /// `pair <name>` routes to the pending INBOUND request under that name
     /// — the collapse's whole point: no separate approve spelling, and the
-    /// scripted `--code` rides the same verb.
+    /// scripted `--code` rides the same command.
     #[test]
     fn pair_routes_a_name_to_its_pending_inbound_request() {
         with_peer_state("pair-routes-name-inbound", || {
@@ -5868,7 +5868,7 @@ mod tests {
 
     /// `pair <name>` on an ALREADY-verified peer with nothing pending is
     /// gated (task #135 P3' — a re-pair replaces key material, and the
-    /// smart verb makes accidental invocation likely): off a tty and
+    /// smart command makes accidental invocation likely): off a tty and
     /// without `--yes` it refuses by name; `--yes` proceeds into the
     /// ordinary request arm (proven by reaching the sweep's own no-match).
     #[test]
@@ -6016,7 +6016,7 @@ mod tests {
     /// greedy longest-prefix match ([`aoide_protocol::door::parse`])
     /// resolves `aoide pair reject` to the 2-segment subcommand before it
     /// ever considers 1-segment `pair <target>` with `"reject"` riding as
-    /// the target; an ordinary name resolves to the smart verb instead,
+    /// the target; an ordinary name resolves to the smart command instead,
     /// riding as its positional arg. A box literally named "reject" or
     /// "watch" therefore cannot be paired by bare name — it needs the
     /// explicit URL form, documented on `pair`'s own registered usage line.
@@ -6033,7 +6033,7 @@ mod tests {
             assert_eq!(inv.path, vec!["pair".to_string(), sub.to_string()], "{sub} must resolve to the subcommand, not a target");
         }
 
-        // An ordinary name (no collision) resolves to the smart verb, with
+        // An ordinary name (no collision) resolves to the smart command, with
         // the word riding as its own positional arg.
         let argv = vec!["pair".to_string(), "yomi-strix".to_string()];
         let (inv, _json) = aoide_protocol::door::parse(&argv, aoide_protocol::Door::Cli, "aoide", &r).unwrap();

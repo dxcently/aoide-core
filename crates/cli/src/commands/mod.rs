@@ -37,7 +37,7 @@ use crate::registry::Registry;
 /// workstream), melete status/graph/call (the Melete MCP client, M2, task
 /// #14), peer advertise/list (task #120), pair/pair reject/pair watch (the
 /// pairing ceremony's whole CLI face — P-P2 built it, P-PV2 and task #135
-/// P3' each collapsed it further, ending in ONE smart verb: bare `pair`
+/// P3' each collapsed it further, ending in ONE smart command: bare `pair`
 /// resolves/approves/starts, `pair reject`, `pair watch`; see
 /// `docs/architecture/PAIRING.md`), config + config set (task #135 P-C —
 /// the portable runtime config file, `$AOIDE_ROOT/config.toml`).
@@ -78,7 +78,7 @@ pub fn all() -> Registry {
     aoide_client::commands::register_peer_discovery(&mut r); // peer discover/advertise — LAN discovery's CLI half (P-P6 + task #120, appended newest)
     aoide_client::mcp_client::register_melete(&mut r); // melete status/graph/call — the Melete MCP client (M2, task #14, appended newest)
     aoide_conduct::commands::peer_list::register(&mut r); // peer list — the one-glance mesh roster over the roster core's probe (formerly who's) + one discovery sweep (task #120 P2, appended newest)
-    aoide_client::commands::register_pair(&mut r); // pair + pair reject/watch — the pairing ceremony's whole CLI face, one smart verb (task #135 P3', superseding the peer pair family — hard cutover)
+    aoide_client::commands::register_pair(&mut r); // pair + pair reject/watch — the pairing ceremony's whole CLI face, one smart command (task #135 P3', superseding the peer pair family — hard cutover)
     aoide_storage::commands::register_config(&mut r); // config, config set — the portable runtime config file (task #135 P-C, appended newest)
 
     r

@@ -177,9 +177,9 @@ fn peer_spec_dir(project_root: &Path, peer_cwd: &str) -> Option<String> {
 /// manifest `dir` — shared by [`build_rows`]'s pre-check (silently, via
 /// `None`) and [`apply_diff`]'s own reject-before-push (out loud, via
 /// `skipped[]`), so the wording lives in exactly one place.
-fn peer_cwd_unsavable_reason(peer: &str, cwd: &str, verb: &str) -> String {
+fn peer_cwd_unsavable_reason(peer: &str, cwd: &str, action: &str) -> String {
     format!(
-        "{peer}: cannot {verb} — peer cwd `{cwd}` is not under the local project root — \
+        "{peer}: cannot {action} — peer cwd `{cwd}` is not under the local project root — \
          write the spec by hand with a project-relative dir, or wait for the remote mapping (U4)"
     )
 }
@@ -314,9 +314,9 @@ pub(super) fn apply_diff(
             None => {
                 for (i, on) in &peer_touched {
                     if let RowTarget::Peer { peer, .. } = &rows[*i].target {
-                        let verb = if *on { "mark" } else { "unmark" };
+                        let action = if *on { "mark" } else { "unmark" };
                         skipped.push(format!(
-                            "{peer}: cannot {verb} — no project manifest above cwd; run from a project root (or create .aoide/project.json first)"
+                            "{peer}: cannot {action} — no project manifest above cwd; run from a project root (or create .aoide/project.json first)"
                         ));
                     }
                 }
@@ -335,8 +335,8 @@ pub(super) fn apply_diff(
                         let dir = match peer_spec_dir(root, cwd) {
                             Some(d) => d,
                             None => {
-                                let verb = if *on { "mark" } else { "unmark" };
-                                skipped.push(peer_cwd_unsavable_reason(peer, cwd, verb));
+                                let action = if *on { "mark" } else { "unmark" };
+                                skipped.push(peer_cwd_unsavable_reason(peer, cwd, action));
                                 continue;
                             }
                         };
@@ -382,8 +382,8 @@ pub(super) fn apply_diff(
                             // false `changed` entry for a write that never
                             // landed.
                             for (peer, dir, on) in pending {
-                                let verb = if on { "mark" } else { "unmark" };
-                                skipped.push(format!("{peer}/{dir}: {verb} not saved — manifest write failed: {e}"));
+                                let action = if on { "mark" } else { "unmark" };
+                                skipped.push(format!("{peer}/{dir}: {action} not saved — manifest write failed: {e}"));
                             }
                         }
                     }

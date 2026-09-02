@@ -188,7 +188,7 @@ fn door_command(profile: &AgentProfile, capture: bool, event: &str) -> String {
 /// false positive just meant "reported present"; post-#109 it means
 /// "command overwritten"). Two independent substrings, both required:
 /// `aoide` (the door binary name every real spelling invokes) and
-/// `session hook` (the verb every real spelling names). Neither alone is
+/// `session hook` (the command every real spelling names). Neither alone is
 /// safe — `session hook` alone matches a user's own prose (`echo "logging
 /// session hook state" >> audit.log`), and `aoide` alone would match any
 /// unrelated hook that happens to shell out to the binary. Checked as two

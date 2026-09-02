@@ -15,7 +15,7 @@
 //! list|approve|deny|reap|prune` (ex-`graph session *`/`graph permit`/`graph
 //! pending *`/`graph reap`/`graph prune`), `project add|list|remove`
 //! (ex-`graph project *`). A hard cutover — no aliases, the old `graph
-//! <verb>` spellings are plain unknown commands now, same as a typo. Handler
+//! <command>` spellings are plain unknown commands now, same as a typo. Handler
 //! functions and their own file layout are UNCHANGED; only the registered
 //! `path:` (and the `examples:`/summary prose that quotes an invocation)
 //! moved. See `pkgs/aoide/crates/AGENTS.md` on why the handler names staying
