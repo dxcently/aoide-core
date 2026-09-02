@@ -124,9 +124,13 @@
 //! shown large with a Copy control and a Done control, no reject control at
 //! all: the approver's own commit already happened, so there is nothing
 //! left here to approve or reject, only to relay out-of-band and dismiss.
-//! Never spawned for an outbound commit — that leg's own ceremony is
-//! already complete the moment its reply code validates, with nothing
-//! further to relay.
+//! The SAME commit also fires [`notify_reply_code`] — a `notify-send`
+//! toast carrying the same reply code, spawned FIRST and independently of
+//! the dialog, so a popup-infra failure (`lyra`/`zenity` both missing)
+//! still leaves the code somewhere durable beside the terminal's own
+//! `println!`. Never spawned for an outbound commit — that leg's own
+//! ceremony is already complete the moment its reply code validates, with
+//! nothing further to relay.
 //!
 //! **No pairing dialog closes on a timer any more (R2).** The old 60s
 //! per-dialog timeout and its 30s cooldown existed only to keep a stale
@@ -627,7 +631,8 @@ fn run_show_dialog(
 /// terminal states (module doc's "no pairing dialog closes on a timer any
 /// more" section); a spawn/infra failure is logged, never panics, since
 /// the code already reached the operator via [`popup_tick`]'s own
-/// `println!` of [`commit_approval`]'s outcome message moments earlier.
+/// `println!` of [`commit_approval`]'s outcome message and
+/// [`notify_reply_code`]'s own toast moments earlier.
 fn show_reply_code(lyra_cmd: Option<&str>, p: &Pending, code: &str, json_mode: bool) {
     let title = dialog_title(p);
     let context = show_context(p);
@@ -635,6 +640,52 @@ fn show_reply_code(lyra_cmd: Option<&str>, p: &Pending, code: &str, json_mode: b
     if let DialogResult::SpawnError(e) | DialogResult::DialogFailure(e) = &result {
         if !json_mode {
             eprintln!("  aoide pair watch --popup: could not show the reply code dialog for {} \u{2014} it already printed above: {e}", p.id);
+        }
+    }
+}
+
+/// The reply-code toast's SUMMARY and BODY — pure (module doc's structural
+/// rule 1 applies here too: built only from what [`commit_approval`]'s own
+/// outcome already handed back, never a feed line), so it is unit-testable
+/// with no `notify-send` spawn involved. `name` is the PEER's own display
+/// name (peer-supplied, root `AGENTS.md` house rule 4's untrusted-display-
+/// data rule) — it lands in the returned strings as plain text and reaches
+/// `notify-send` as a single argv element in [`notify_reply_code`], never
+/// through a shell, so nothing in it is ever interpreted.
+fn reply_notification_text(name: &str, code: &str) -> (String, String) {
+    let summary = format!("pairing reply code for {name}");
+    let body = format!("{code}\n\nrelay this to {name} \u{2014} they type it into their own pairing prompt to finish");
+    (summary, body)
+}
+
+/// Toast the reply code through the stock freedesktop client, detached —
+/// fired BEFORE and independently of [`show_reply_code`]'s own popup (the
+/// User's ask): a popup-infra failure (`lyra`/`zenity` both missing, or a
+/// headless session) must still land the code somewhere durable beside the
+/// terminal's own `println!`, and the toast is orthogonal machinery the
+/// popup path never depends on either way. Same idiom
+/// `aoide_conduct::reap::announce_reap` already holds: `notify-send` by
+/// BARE NAME (bare-name lookup needs `pkgs.libnotify` on the deployed
+/// unit's own `path`, `modules/nucleus/aoided.nix`, the same reason
+/// `pkgs.zenity` rides there already), spawned and collected on a detached
+/// thread so a slow/hung notifier can never delay the ceremony, and a
+/// spawn failure is an `eprintln`, never a panic or a return that blocks
+/// anything — the code already reached the operator by the time this
+/// could fail. The reply code is this instance's own derived value,
+/// already shown openly on stdout and in the popup (CONTRACTS.md §6), so
+/// it needs no masking here either.
+fn notify_reply_code(name: &str, code: &str, json_mode: bool) {
+    let (summary, body) = reply_notification_text(name, code);
+    match std::process::Command::new("notify-send").args(["--app-name=aoide", &summary]).arg(&body).spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(e) => {
+            if !json_mode {
+                eprintln!("  aoide pair watch --popup: could not toast the reply code \u{2014} it already printed above: {e}");
+            }
         }
     }
 }
@@ -1072,9 +1123,13 @@ fn popup_tick(ignored: &mut HashSet<String>, spawn_backoff: &mut Duration, spawn
                 // (`replySas`) gets its own stay-open display dialog (R2) —
                 // never for an outbound commit, whose own ceremony is
                 // already complete the moment its reply code validates
-                // (module doc's "reply-code display dialog" section).
+                // (module doc's "reply-code display dialog" section). The
+                // toast fires FIRST and independently of the dialog — a
+                // popup-infra failure (`lyra`/`zenity` both missing) must
+                // still land the code somewhere durable beside stdout.
                 if p.direction == "inbound" && outcome.status == aoide_protocol::output::Status::Ok {
                     if let Some(reply_sas) = outcome.data.as_ref().and_then(|d| d.get("replySas")).and_then(Value::as_str) {
+                        notify_reply_code(&p.name, reply_sas, json_mode);
                         show_reply_code(lyra_cmd, &p, reply_sas, json_mode);
                     }
                 }
@@ -2039,6 +2094,41 @@ mod tests {
         assert!(text.contains(&p.name), "{text}");
         assert!(text.contains(&p.id), "{text}");
         assert!(!text.contains("222-333"), "the context line must never carry the code itself: {text}");
+    }
+
+    // ── reply_notification_text (the reply-code toast) ─────────────────────
+
+    #[test]
+    fn reply_notification_text_names_the_peer_and_the_code_prominently() {
+        let (summary, body) = reply_notification_text("box-a", "222-333");
+        assert!(summary.contains("box-a"), "{summary}");
+        assert!(summary.to_lowercase().contains("pairing"), "{summary}");
+        assert!(body.starts_with("222-333"), "the code should lead the body: {body}");
+        assert!(body.contains("box-a"), "{body}");
+    }
+
+    #[test]
+    fn reply_notification_text_survives_a_hostile_peer_name_as_plain_data() {
+        // Same discipline as `dialog_context_and_title_survive_hostile_name_
+        // intact_and_never_carry_the_sas`: the builder never escapes or
+        // truncates a hostile name — it just formats what it was given.
+        // Safety here comes from argv (each `.args`/`.arg` element reaches
+        // `execve` as one opaque string, never a shell), not from this
+        // function stripping anything.
+        let hostile = "box-<b>evil</b>-&-$(rm -rf ~)-`whoami`";
+        let (summary, body) = reply_notification_text(hostile, "999-000");
+        assert!(summary.contains(hostile), "{summary}");
+        assert!(body.contains(hostile), "{body}");
+        assert!(body.starts_with("999-000"), "{body}");
+
+        // A `--`-leading name must never make an argv element that
+        // `notify-send` could read as a FLAG: both elements are
+        // literal-prefixed, so the fixed text always leads. Guards against a
+        // future edit that drops the prefix down to a bare `{name}`.
+        let dashed = "--icon=/etc/shadow";
+        let (dsum, dbody) = reply_notification_text(dashed, "111-222");
+        assert!(!dsum.starts_with("--"), "summary must not start with a flag: {dsum}");
+        assert!(!dbody.starts_with("--"), "body must not start with a flag: {dbody}");
     }
 
     #[test]
