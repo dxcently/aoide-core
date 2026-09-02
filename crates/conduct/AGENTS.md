@@ -552,6 +552,32 @@
   stamped once by `stamp_spawned` inside the child `spawn` re-execs and
   never cleared, and `aoide spawn` is its only writer — which is what makes
   "an agent left this, the operator did not" decidable at all.
+- **The abandoned-shell band is `REAP_SPAWNED_SHELL_STALE_SECS` (2 days) and
+  stays its own constant.** Don't fold it back into `REAP_IDLE_STALE_SECS`
+  to save a line: that band guards a session that might still be someone's
+  and has to clear a weekend, while this one judges a terminal an agent
+  created and walked away from, where being early costs an untracked shell
+  that keeps running (no signal in `reap.rs` kills a process) and being late
+  costs a roster full of worker terminals. The two move for different
+  reasons and will keep diverging.
+- **A human gesture waives that band, and is resolved AT THE DOOR
+  (`with_human_gesture`), never inside the sweep.** `reap_and_announce`
+  normalizes it onto the invocation as `--now` BEFORE `daemon_dispatch`,
+  because a resident `aoided` runs the sweep over there with no tty and a
+  `Door::Daemon` invocation: a `pick::interactive` probe made on the far
+  side answers false for every gesture, and the dock button's behaviour
+  would then depend on whether the daemon happened to be up. **The flag is
+  the fact; the probe is only how the CLI door computes it** — a new caller
+  that means the gesture passes `--now` itself (`shellbridge.rs`'s
+  `dispatch_recheck_sessions` does, since a detached child has no tty to
+  probe). Waiving drops ONLY the staleness clause: `spawned` +
+  `restore.is_some()` + `state == "idle"` all still hold, and no other band
+  in the pass moves.
+- **`--announce` is not a second spelling of `--now`.** It means "toast even
+  on a quiet pass" — a display concern — and welding the two together would
+  leave a caller that wants the answer without the sweeping-now no way to
+  say so. Both flags happen to ride the dock button; that is the button's
+  choice, not an implication.
 - **The nothing-to-restore warning fires at MARK time, not at resurrect
   time (task #100).** `undying.rs::nothing_to_restore_warning(agent,
   has_capture)` mirrors `resolve_candidate`'s own two arms — a registered

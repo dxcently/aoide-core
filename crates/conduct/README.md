@@ -228,12 +228,21 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   kind gate that otherwise keeps every shell record out of staleness
   judgment: a SPAWNED conducted shell (`spawned`), ticked at least
   once as a shell (`restore.is_some()`), sitting at a bare idle prompt with
-  its per-session pty log (`log_path`) untouched past `REAP_IDLE_STALE_SECS`
-  — the worker terminal an agent's own `spawn` left running and never
-  returned to. **Windowed or not**: `spawn --windowed` execs a real terminal
-  running the same `aoide conduct`, and an agent abandons one as readily as
-  a headless one, so the gate is `spawned`, never `headless`. The touch
-  signal is the log file's own mtime: any byte ever
+  its per-session pty log (`log_path`) untouched past
+  `REAP_SPAWNED_SHELL_STALE_SECS` (2 days) — the worker terminal an agent's
+  own `spawn` left running and never returned to. **Windowed or not**:
+  `spawn --windowed` execs a real terminal running the same `aoide conduct`,
+  and an agent abandons one as readily as a headless one, so the gate is
+  `spawned`, never `headless`. This is the only sweep here with two speeds.
+  The band belongs to the UNATTENDED pass (the ~12s timer, the daemon's
+  tick); a HUMAN GESTURE waives it and takes every idle spawned shell on the
+  spot, carried as `--now` and resolved at the door by `with_human_gesture` —
+  the dock's `[ reap ]` control passes the flag itself, and a bare
+  `aoide session reap` typed at a terminal picks it up off
+  `pick::interactive`. It must be decided at the door: `daemon_dispatch`
+  forwards the flags to a resident `aoided` that has no tty of its own, so a
+  probe made on the far side would read every gesture as the timer. No other
+  band moves with it. The touch signal is the log file's own mtime: any byte ever
   crossing the pty, from the original spawned command's output through any
   later injected `aoide send`, resets it, so a human's later use of an
   agent-spawned terminal is safe from this signal without the injection
@@ -241,7 +250,13 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   `resolve_sender` doc: that attribution is self-reported and never
   enforced). `restore`/`log_path` are P-C5/headless fields the record
   already carries; `spawned` is the one new field, stamped by
-  `stamp_spawned` inside the child `spawn` re-execs.
+  `stamp_spawned` inside the child `spawn` re-execs. **The unattended band
+  reaches less than the guards do:** only a headless conduct opens
+  `state/sessions/<id>.log`, so a `spawn --windowed` worker has no touch
+  signal at all and no silence ever accrues against it — the timer never
+  takes one, the gesture always can, and the band starts covering it the day
+  interactive conduct tees its own pty to the same log (the session
+  streaming lane), with no change here.
 - `graph/window.rs` — window discovery/backfill/listener PLUS the
   automatic-parenting seam (task #89, corrected in review round 2):
   `is_windowless_wrap` (a conducted record is windowless when `headless` is

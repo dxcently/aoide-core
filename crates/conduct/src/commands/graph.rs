@@ -267,15 +267,19 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["session", "reap"],
-        summary: "Reap dead sessions: mark every KILLED session (window gone per hyprctl, or pid's /proc gone) done and drop it, decay every `stopped` session at rest over an hour to `idle`, then re-stage. Also collects the three ghosts no liveness signal catches — a record whose every timestamp predates this boot (a recycled pid reads as alive forever), a sub-agent whose parent has left the roster, and the control socket a killed `conduct` left in $XDG_RUNTIME_DIR (only ever one nothing is listening on). Automatic liveness sweep for SUPER+Q / SIGKILL'd terminals whose own cleanup could never run. Falls back to pid-only liveness off Hyprland; never errors on nothing-to-reap.",
+        summary: "Reap dead sessions: mark every KILLED session (window gone per hyprctl, or pid's /proc gone) done and drop it, decay every `stopped` session at rest over an hour to `idle`, then re-stage. Also collects the three ghosts no liveness signal catches — a record whose every timestamp predates this boot (a recycled pid reads as alive forever), a sub-agent whose parent has left the roster, and the control socket a killed `conduct` left in $XDG_RUNTIME_DIR (only ever one nothing is listening on). Plus the worker shells `aoide spawn` left running that no one has typed in for two days — see `--now`, which takes those on the spot. Automatic liveness sweep for SUPER+Q / SIGKILL'd terminals whose own cleanup could never run. Falls back to pid-only liveness off Hyprland; never errors on nothing-to-reap.",
         args: [],
-        flags: [flag!("announce", "bool", "Always raise the desktop toast, even on a quiet pass — for the dock's reap control, where a human pressed something and is owed an answer. Unflagged, the sweep only toasts when it actually changed the roster.")],
+        flags: [
+            flag!("announce", "bool", "Always raise the desktop toast, even on a quiet pass — for the dock's reap control, where a human pressed something and is owed an answer. Unflagged, the sweep only toasts when it actually changed the roster."),
+            flag!("now", "bool", "Take every idle worker shell `aoide spawn` left running, however recently it was touched — the unattended sweep otherwise waits out a two-day silence on the shell's pty log. Implied by a human gesture: the dock's reap control passes it, and a bare `aoide session reap` typed at a terminal picks it up. No other band moves."),
+        ],
         gated: false,
         implemented: true,
         handler: crate::reap::reap_and_announce,
         examples: [
             "session reap",
             "session reap --announce",
+            "session reap --now",
         ],
     ));
     // ── conduct: the PTY-backed conductable wrap (concepts/Conductor-Channel) ─

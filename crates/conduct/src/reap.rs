@@ -49,6 +49,14 @@
 //! is the SUPER+Q/SIGKILL backstop, so an ssh child can never outlive its
 //! session and become a resident daemon.
 //!
+//! Last and narrowest: the worker shell an agent's own `aoide spawn` left
+//! running and never came back to (see [`abandoned_spawned_shells`]) — the
+//! one carve-out into the kind gate that otherwise keeps every shell out of
+//! staleness judgment, and the only sweep here with two speeds. The
+//! unattended pass waits out [`REAP_SPAWNED_SHELL_STALE_SECS`]; a human
+//! gesture (`--now`) waives the band and takes every idle spawned shell on
+//! the spot.
+//!
 //! A false reap of a merely-quiet live session self-heals: the hook door
 //! re-registers the record on the session's next event.
 //!
@@ -113,6 +121,24 @@ pub const REAP_WORKING_STALE_SECS: i64 = 7 * 24 * 3600; // 7 days (~168 hours)
 /// one — the two ghost records that motivated this constant were still
 /// `working` 11+ hours after their parent's Task call had already returned.
 pub const REAP_SUBAGENT_STALE_SECS: i64 = 2 * 3600; // 2 hours
+
+/// How long a SPAWNED worker shell (see [`abandoned_spawned_shells`]) may sit
+/// idle with its pty log untouched before the UNATTENDED sweep calls it
+/// leftover. Its own constant rather than a share of
+/// [`REAP_IDLE_STALE_SECS`], because the two answer different questions: that
+/// band guards a session that might still be someone's, so it has to clear a
+/// whole weekend, while this one judges a terminal an agent created and
+/// walked away from. Being early there costs a shell that keeps running
+/// untracked (no signal in this file ever kills a process); being late costs
+/// a roster that fills with worker terminals nobody will ever type in again.
+/// Two days sits past any turn an agent legitimately returns to and short of
+/// the pile-up.
+///
+/// The band belongs to the unattended sweep alone — the ~12s timer and the
+/// daemon's own tick. A human gesture waives it outright (`--now`; see
+/// [`with_human_gesture`] for what resolves to one, and
+/// [`abandoned_spawned_shells`]'s `band` parameter for what waiving does).
+pub const REAP_SPAWNED_SHELL_STALE_SECS: i64 = 48 * 3600; // 48 hours (2 days)
 
 /// Is a session DEAD — orphaned so that NO process will ever clean it up? Pure
 /// and unit-tested (feed a fake live-address set + window-owner map, a fake
@@ -613,10 +639,18 @@ fn orphaned_subagents(
 
 /// A SPAWNED conducted SHELL — the worker terminal `aoide spawn` leaves
 /// running once whatever an agent launched inside it has finished, in
-/// EITHER launch mode — whose per-session pty log has gained not one byte since
-/// [`REAP_IDLE_STALE_SECS`] ago. PURE — `log_mtime` is injected (the real
-/// caller reads the log file's own mtime off disk), exactly like every
-/// other staleness probe in this file.
+/// EITHER launch mode — that nobody has come back to. PURE — `log_mtime` is
+/// injected (the real caller reads the log file's own mtime off disk),
+/// exactly like every other staleness probe in this file.
+///
+/// `band` is how long that terminal's pty log may have gone untouched before
+/// the record counts as leftover: `Some(secs)` —
+/// [`REAP_SPAWNED_SHELL_STALE_SECS`] — for the unattended sweep, and `None`
+/// for a human gesture, which waives the wait outright. A person pressing
+/// `[ reap ]` IS the "nobody came back to this" evidence the band otherwise
+/// sits two days to infer, so making them wait for it adds nothing they have
+/// not already said. Waiving drops ONLY the staleness clause; all three
+/// guards below still have to hold.
 ///
 /// The one new carve-out into the kind gate [`is_session_dead`] otherwise
 /// holds absolute (`is_agent_kind`'s own doc: "a shell record's pid IS its
@@ -659,19 +693,27 @@ fn orphaned_subagents(
 /// `resolve_sender` doc: attribution there is self-reported and never
 /// enforced at the receiving socket, so it is never a trust boundary).
 /// "Silent past the band" therefore means exactly "nothing has happened in
-/// this terminal, from anyone, in over [`REAP_IDLE_STALE_SECS`]" — the only
-/// decidable meaning of "unused" this codebase can stand behind. The moment
+/// this terminal, from anyone, in over [`REAP_SPAWNED_SHELL_STALE_SECS`]" —
+/// the only decidable meaning of "unused" this codebase can stand behind. The moment
 /// anything is sent into it — the spawning agent's own follow-up, a
 /// different agent, or a human who found and used it — the log grows and
 /// the clock resets, which is what keeps a human's later use of an
 /// agent-spawned terminal safe from this signal without this file ever
 /// needing to know WHO touched it.
 ///
-/// No log evidence at all (`log_mtime` returns `None` — the log was never
-/// opened, or the session degraded to stdout because opening it failed,
-/// `graph/conduct.rs`'s own best-effort fallback) never counts as
+/// No log evidence at all (`log_mtime` returns `None`) never counts as
 /// staleness: absence of evidence is never evidence of death, the same
-/// guard [`is_session_dead`] holds for `last_seen`.
+/// guard [`is_session_dead`] holds for `last_seen`. **That is the reach of
+/// the unattended band today, and it is narrower than the three guards
+/// above:** only a HEADLESS conduct opens `state/sessions/<id>.log` at all
+/// (`graph/conduct.rs`'s log block sits inside its own `if headless`), so a
+/// `spawn --windowed` worker terminal has no `log_path`, no touch signal,
+/// and is never reaped by the timer however long it sits. It is reached by
+/// the human gesture instead, which needs no touch signal to waive a band it
+/// isn't applying — and it comes under the band for free the day interactive
+/// conduct tees its own pty to the same per-session log (the session
+/// streaming lane). Nothing here changes when it does: the probe already
+/// reads `log_path`, whoever wrote it.
 ///
 /// This never KILLS the underlying process — the same posture every other
 /// signal in this file takes toward a still-alive pid (the one exception,
@@ -683,13 +725,17 @@ fn abandoned_spawned_shells(
     sessions: &[SessionRecord],
     now_epoch: i64,
     log_mtime: impl Fn(&SessionRecord) -> Option<i64>,
+    band: Option<i64>,
 ) -> Vec<String> {
     sessions
         .iter()
         .filter(|s| s.state != "done")
         .filter(|s| s.spawned && s.restore.is_some() && canonical_state(&s.state) == "idle")
-        .filter(|s| {
-            log_mtime(s).is_some_and(|seen| now_epoch.saturating_sub(seen) > REAP_IDLE_STALE_SECS)
+        .filter(|s| match band {
+            Some(secs) => {
+                log_mtime(s).is_some_and(|seen| now_epoch.saturating_sub(seen) > secs)
+            }
+            None => true,
         })
         .map(|s| s.session_id.clone())
         .collect()
@@ -994,6 +1040,40 @@ pub fn reap(inv: &Invocation) -> Outcome {
     outcome
 }
 
+/// Resolve "a person asked for this" AT THE DOOR and normalize it onto the
+/// invocation as `--now`, before anything is dispatched or swept. Pure over
+/// its input (the tty probe aside) and returns the invocation to use.
+///
+/// Two gestures mean the same thing and both land here as one flag:
+///   * the dock's `[ reap ]` control, which passes `--now` itself
+///     (`shellbridge.rs`'s `dispatch_recheck_sessions`) — it runs as a
+///     detached child with no tty, so nothing could infer it after the fact;
+///   * `aoide session reap` typed at a real terminal, which
+///     [`aoide_protocol::pick::interactive`] recognises — this repo's one
+///     probe for "a person is at a keyboard", the same one the pickers gate
+///     on, door-checked first so no non-CLI door can ever read as a human.
+/// Everything else — the ~12s systemd timer, the daemon's own tick, an
+/// agent's piped shell — is the unattended sweep and keeps the band.
+///
+/// It has to happen HERE rather than inside the sweep. `daemon_dispatch`
+/// forwards path/args/FLAGS to a resident `aoided` and the sweep then runs
+/// over there, with no tty and a `Door::Daemon` invocation: a probe made on
+/// the far side would answer false for every gesture, and the button's
+/// behaviour would silently depend on whether the daemon happened to be up.
+/// The flag is the fact; this probe is only how the CLI door computes it.
+///
+/// `--announce` is deliberately NOT a second way in. It means "toast even on
+/// a quiet pass", which is a display concern, and a caller that wants the
+/// answer without the sweeping it now would have no way to say so if the two
+/// were welded together.
+fn with_human_gesture(inv: &Invocation) -> Invocation {
+    let mut inv = inv.clone();
+    if aoide_protocol::pick::interactive(inv.door) {
+        inv.flags.insert("now".to_string(), "true".to_string());
+    }
+    inv
+}
+
 /// The `session reap` COMMAND — [`reap`], plus the desktop toast that says what it
 /// did. Registered as the command handler while `reap` itself stays toast-free,
 /// so every in-crate caller (and every unit test) gets the sweep without
@@ -1009,6 +1089,10 @@ pub fn reap(inv: &Invocation) -> Outcome {
 ///     `[ reap ]` control, via shellbridge), and a pressed button must answer
 ///     even when the answer is "nothing to reap".
 ///
+/// [`with_human_gesture`] runs FIRST, before the daemon hop: a bare
+/// `aoide session reap` typed at a terminal is a person asking, and picks up
+/// `--now` (the abandoned-shell band waived) on the way past.
+///
 /// Whether the toast was actually handed off lands in `data.announced`, so the
 /// shellbridge's audit log answers "did the button ring the daemon" on its own
 /// — a missing notifier is otherwise an `eprintln` into a systemd child's
@@ -1023,6 +1107,7 @@ pub fn reap(inv: &Invocation) -> Outcome {
 /// mechanism (the daemon's own tick also runs this same reap internally —
 /// `aoide_server::daemon::run_loop`).
 pub fn reap_and_announce(inv: &Invocation) -> Outcome {
+    let inv = &with_human_gesture(inv);
     if let Some(outcome) = aoide_client::daemon::daemon_dispatch(inv) {
         return outcome;
     }
@@ -1133,7 +1218,7 @@ fn refresh_live_agents() -> Vec<String> {
 /// that work AFTER `with_stage_lock` returns; see `sweep_orphan_tunnels`'s
 /// own doc for why the kill phase must never run in here.
 fn reap_inner(
-    _inv: &Invocation,
+    inv: &Invocation,
     gathered_addrs: Option<HashSet<String>>,
     window_owners: Option<HashMap<String, u32>>,
 ) -> (Outcome, Vec<aoide_storage::tunnel::TunnelRecord>) {
@@ -1253,11 +1338,17 @@ fn reap_inner(
     }
 
     // And the abandoned worker shells: a conducted shell `aoide spawn`
-    // created and no one returned to — windowed or not — sitting idle with
-    // its pty log untouched past the same at-rest band any other record
-    // is judged against (see `abandoned_spawned_shells`). The
-    // log-mtime probe mirrors `last_seen`'s transcript-mtime read above — a
-    // per-session file, read fresh off disk every pass, never cached.
+    // created and no one returned to, sitting idle with its pty log
+    // untouched past `REAP_SPAWNED_SHELL_STALE_SECS` (see
+    // `abandoned_spawned_shells`). The log-mtime probe mirrors `last_seen`'s
+    // transcript-mtime read above — a per-session file, read fresh off disk
+    // every pass, never cached.
+    //
+    // `--now` waives that band: the flag marks a human gesture, already
+    // resolved at the door by `with_human_gesture` (never re-probed here —
+    // this code also runs inside `aoided`, where there is no tty to probe).
+    // The other bands in this pass are untouched by it; a person asking for
+    // the leftover worker terminals is not asking to judge their agents.
     let log_mtime = |s: &SessionRecord| -> Option<i64> {
         s.log_path
             .as_deref()
@@ -1266,7 +1357,8 @@ fn reap_inner(
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
     };
-    for id in abandoned_spawned_shells(&s_file.sessions, now_epoch, log_mtime) {
+    let spawned_shell_band = (!inv.flag_present("now")).then_some(REAP_SPAWNED_SHELL_STALE_SECS);
+    for id in abandoned_spawned_shells(&s_file.sessions, now_epoch, log_mtime, spawned_shell_band) {
         if !reaped.contains(&id) {
             reaped.push(id);
         }
@@ -2621,7 +2713,7 @@ mod tests {
         let rec = spawned_shell("worker", "idle");
         let stale = |_: &SessionRecord| Some(now - 100 * 3600); // 100h silent
         assert_eq!(
-            abandoned_spawned_shells(&[rec], now, stale),
+            abandoned_spawned_shells(&[rec], now, stale, Some(REAP_SPAWNED_SHELL_STALE_SECS)),
             vec!["worker".to_string()],
         );
     }
@@ -2636,7 +2728,7 @@ mod tests {
         let now = 1_800_000_000_i64;
         let rec = spawned_shell("worker", "idle");
         let recent = |_: &SessionRecord| Some(now - 3600); // 1h ago, well under the band
-        assert!(abandoned_spawned_shells(&[rec], now, recent).is_empty());
+        assert!(abandoned_spawned_shells(&[rec], now, recent, Some(REAP_SPAWNED_SHELL_STALE_SECS)).is_empty());
     }
 
     #[test]
@@ -2644,13 +2736,16 @@ mod tests {
         // The User's rule: a leftover worker terminal is judged the same way
         // whether or not it had a window. `spawn --windowed` execs a real
         // terminal running the same `aoide conduct`, and an agent abandons
-        // one exactly as readily as a headless one.
+        // one exactly as readily as a headless one. The window is not a
+        // guard and never becomes one — what a windowed spawn lacks today is
+        // the LOG the band reads, not standing here (the function's own doc);
+        // the gesture path below reaches it regardless.
         let now = 1_800_000_000_i64;
         let mut rec = spawned_shell("windowed-worker", "idle");
         rec.window_address = "0xAAA".into();
         let stale = |_: &SessionRecord| Some(now - 100 * 3600);
         assert_eq!(
-            abandoned_spawned_shells(&[rec], now, stale),
+            abandoned_spawned_shells(&[rec], now, stale, Some(REAP_SPAWNED_SHELL_STALE_SECS)),
             vec!["windowed-worker".to_string()],
         );
     }
@@ -2667,7 +2762,7 @@ mod tests {
         rec.spawned = false;
         rec.window_address = "0xAAA".into();
         let stale = |_: &SessionRecord| Some(now - 100 * 3600);
-        assert!(abandoned_spawned_shells(&[rec], now, stale).is_empty());
+        assert!(abandoned_spawned_shells(&[rec], now, stale, Some(REAP_SPAWNED_SHELL_STALE_SECS)).is_empty());
     }
 
     #[test]
@@ -2679,7 +2774,7 @@ mod tests {
         let mut rec = spawned_shell("agent-headless", "idle");
         rec.restore = None;
         let stale = |_: &SessionRecord| Some(now - 100 * 3600);
-        assert!(abandoned_spawned_shells(&[rec], now, stale).is_empty());
+        assert!(abandoned_spawned_shells(&[rec], now, stale, Some(REAP_SPAWNED_SHELL_STALE_SECS)).is_empty());
     }
 
     #[test]
@@ -2689,8 +2784,8 @@ mod tests {
         // doing-nothing prompt is.
         let now = 1_800_000_000_i64;
         let stale = |_: &SessionRecord| Some(now - 100 * 3600);
-        assert!(abandoned_spawned_shells(&[spawned_shell("w", "working")], now, stale).is_empty());
-        assert!(abandoned_spawned_shells(&[spawned_shell("a", "awaiting")], now, stale).is_empty());
+        assert!(abandoned_spawned_shells(&[spawned_shell("w", "working")], now, stale, Some(REAP_SPAWNED_SHELL_STALE_SECS)).is_empty());
+        assert!(abandoned_spawned_shells(&[spawned_shell("a", "awaiting")], now, stale, Some(REAP_SPAWNED_SHELL_STALE_SECS)).is_empty());
     }
 
     #[test]
@@ -2701,7 +2796,78 @@ mod tests {
         // unreadable.
         let now = 1_800_000_000_i64;
         let rec = spawned_shell("no-log", "idle");
-        assert!(abandoned_spawned_shells(&[rec], now, |_| None).is_empty());
+        assert!(abandoned_spawned_shells(&[rec], now, |_| None, Some(REAP_SPAWNED_SHELL_STALE_SECS)).is_empty());
+    }
+
+    #[test]
+    fn abandoned_spawned_shells_band_is_two_days() {
+        // Pins the constant from both sides, and the strict `>`: exactly at
+        // the band is not yet past it.
+        let now = 1_800_000_000_i64;
+        let band = Some(REAP_SPAWNED_SHELL_STALE_SECS);
+        let at = |secs: i64| move |_: &SessionRecord| Some(now - secs);
+        assert!(
+            abandoned_spawned_shells(&[spawned_shell("w", "idle")], now, at(48 * 3600), band)
+                .is_empty(),
+            "48h silent is exactly AT the band, not past it"
+        );
+        assert_eq!(
+            abandoned_spawned_shells(&[spawned_shell("w", "idle")], now, at(48 * 3600 + 1), band),
+            vec!["w".to_string()],
+        );
+        // And the move this band exists for: 60h is leftover now, where the
+        // at-rest band it used to borrow (72h) would still have spared it.
+        assert_eq!(
+            abandoned_spawned_shells(&[spawned_shell("w", "idle")], now, at(60 * 3600), band),
+            vec!["w".to_string()],
+        );
+        assert!(60 * 3600 < REAP_IDLE_STALE_SECS, "the 60h case must be under the at-rest band");
+    }
+
+    #[test]
+    fn abandoned_spawned_shells_waives_the_band_for_a_human_gesture() {
+        // `band: None` is what `--now` resolves to. A worker shell touched
+        // an hour ago — nowhere near stale — goes on the spot: the person
+        // pressing `[ reap ]` IS the evidence the band waits two days for.
+        let now = 1_800_000_000_i64;
+        let recent = |_: &SessionRecord| Some(now - 3600);
+        assert_eq!(
+            abandoned_spawned_shells(&[spawned_shell("worker", "idle")], now, recent, None),
+            vec!["worker".to_string()],
+        );
+    }
+
+    #[test]
+    fn abandoned_spawned_shells_waived_reaches_a_windowed_spawn_with_no_log_at_all() {
+        // The case the unattended band structurally cannot reach: a
+        // `spawn --windowed` worker terminal has no `log_path` (only a
+        // headless conduct opens one), so `log_mtime` is `None` forever and
+        // no silence ever accrues. A waived band needs no touch signal.
+        let now = 1_800_000_000_i64;
+        let mut rec = spawned_shell("windowed-worker", "idle");
+        rec.window_address = "0xAAA".into();
+        rec.log_path = None;
+        assert_eq!(
+            abandoned_spawned_shells(&[rec], now, |_| None, None),
+            vec!["windowed-worker".to_string()],
+        );
+    }
+
+    #[test]
+    fn abandoned_spawned_shells_waived_still_holds_all_three_guards() {
+        // Waiving drops the staleness clause and NOTHING else. The User's
+        // own terminal, an agent/one-shot record that never ticked as a
+        // shell, and a shell mid-command are all out of reach of the button.
+        let now = 1_800_000_000_i64;
+        let recent = |_: &SessionRecord| Some(now - 60);
+        let mut mine = spawned_shell("mine", "idle");
+        mine.spawned = false;
+        let mut agent = spawned_shell("agent", "idle");
+        agent.restore = None;
+        let busy = spawned_shell("busy", "working");
+        assert!(
+            abandoned_spawned_shells(&[mine, agent, busy], now, recent, None).is_empty(),
+        );
     }
 
     #[test]
@@ -2709,11 +2875,11 @@ mod tests {
         let now = 1_800_000_000_i64;
         let rec = spawned_shell("gone", "done");
         let stale = |_: &SessionRecord| Some(now - 100 * 3600);
-        assert!(abandoned_spawned_shells(&[rec], now, stale).is_empty());
+        assert!(abandoned_spawned_shells(&[rec], now, stale, Some(REAP_SPAWNED_SHELL_STALE_SECS)).is_empty());
     }
 
     /// End-to-end through `reap()`: a spawned worker shell whose pty log
-    /// has sat untouched past `REAP_IDLE_STALE_SECS` is reaped — proving
+    /// has sat untouched past `REAP_SPAWNED_SHELL_STALE_SECS` is reaped — proving
     /// `reap_inner`'s `log_mtime` closure actually reads the real log
     /// file's mtime off disk, not just the pure predicate above.
     #[test]
@@ -2733,7 +2899,7 @@ mod tests {
 
         let log = stage.join("worker.log");
         std::fs::write(&log, b"$ the last thing that ever ran here\n").unwrap();
-        let backdate_secs = REAP_IDLE_STALE_SECS + 3600; // an hour past the band
+        let backdate_secs = REAP_SPAWNED_SHELL_STALE_SECS + 3600; // an hour past the band
         let t = (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2807,6 +2973,83 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    /// The third leg, end to end: the SAME roster the test above spares —
+    /// a worker shell whose log was written a moment ago — is taken once
+    /// `--now` is on the invocation. Proves the flag actually reaches
+    /// `reap_inner`'s band decision through `reap`, not just the pure
+    /// predicate.
+    #[test]
+    fn reap_now_takes_a_spawned_worker_shell_the_band_would_have_spared() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = crate::graph::testutil::EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_STATE_DIR",
+            "HYPRLAND_INSTANCE_SIGNATURE",
+        ]);
+        std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
+        let stage = crate::graph::testutil::unique_stage("reap-spawned-shell-now");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", stage.join("state"));
+
+        let log = stage.join("worker.log");
+        std::fs::write(&log, b"$ someone just ran another command here\n").unwrap();
+        let mut rec = spawned_shell("worker", "idle");
+        rec.log_path = Some(log.to_string_lossy().into_owned());
+        write_stage(
+            &sessions_path(),
+            &SessionsFile { schema_version: "0".into(), sessions: vec![rec] },
+        )
+        .unwrap();
+
+        let out = reap(&crate::graph::testutil::flag_invocation(
+            &["session", "reap"],
+            &[("now", "true")],
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let reaped: Vec<String> = out.data.as_ref().unwrap()["reaped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(reaped.contains(&"worker".to_string()), "reaped: {reaped:?}");
+
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn with_human_gesture_adds_nothing_off_a_tty() {
+        // A test harness (and the systemd timer, and the daemon's own tick)
+        // has piped stdio, so `pick::interactive` reads false and the
+        // invocation goes through untouched — the unattended band holds.
+        let inv = with_human_gesture(&crate::graph::testutil::invocation(&["session", "reap"], &[]));
+        assert!(!inv.flag_present("now"));
+    }
+
+    #[test]
+    fn with_human_gesture_never_reads_announce_as_the_gesture() {
+        // The two flags stay separate on purpose: `--announce` is about the
+        // toast. The dock's control passes `--now` itself (shellbridge);
+        // nothing infers one from the other.
+        let inv = with_human_gesture(&crate::graph::testutil::flag_invocation(
+            &["session", "reap"],
+            &[("announce", "true")],
+        ));
+        assert!(!inv.flag_present("now"));
+    }
+
+    #[test]
+    fn with_human_gesture_carries_the_invocation_through_intact() {
+        // Whatever it decides, it must hand the sweep back the same command
+        // — the flags travel over the daemon hop verbatim.
+        let inv = with_human_gesture(&crate::graph::testutil::flag_invocation(
+            &["session", "reap"],
+            &[("announce", "true"), ("json", "true"), ("now", "true")],
+        ));
+        assert_eq!(inv.path, vec!["session".to_string(), "reap".to_string()]);
+        assert!(inv.flag_present("announce") && inv.flag_present("json") && inv.flag_present("now"));
     }
 
     #[test]

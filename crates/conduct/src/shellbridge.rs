@@ -525,6 +525,13 @@ fn classify_recheck(exited_ok: bool, stdout: &str, stderr: &str) -> Result<Strin
 /// unless they actually changed the roster (see `reap::reap_and_announce`). The
 /// notification is raised by the child, not here — this thread only audits.
 ///
+/// `--now` is the other half of "a human pressed something": the click takes
+/// every idle worker shell `aoide spawn` left behind, rather than waiting out
+/// the two-day silence the unattended sweep requires
+/// (`reap::REAP_SPAWNED_SHELL_STALE_SECS`). It is passed EXPLICITLY here and
+/// not inferred — this runs on a detached thread with no tty, so
+/// `reap::with_human_gesture`'s own probe would read it as the timer.
+///
 /// Runs on a DETACHED thread. `session reap` shells out to `hyprctl clients -j`
 /// for window liveness; that is normally instant, but a hung compositor query
 /// must never freeze the single-threaded accept loop (session-jumps, power,
@@ -539,7 +546,7 @@ fn classify_recheck(exited_ok: bool, stdout: &str, stderr: &str) -> Result<Strin
 fn dispatch_recheck_sessions() {
     std::thread::spawn(|| {
         let result = match std::process::Command::new(daemon::bin::core_bin())
-            .args(["session", "reap", "--announce", "--json"])
+            .args(["session", "reap", "--announce", "--now", "--json"])
             .output()
         {
             Ok(out) => classify_recheck(

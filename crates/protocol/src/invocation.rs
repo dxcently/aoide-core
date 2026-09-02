@@ -4,7 +4,7 @@ use crate::audit::Door;
 use std::collections::BTreeMap;
 
 /// Parsed invocation handed to the dispatcher.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Invocation {
     /// Command path, e.g. `["rice", "gen"]`.
     pub path: Vec<String>,
