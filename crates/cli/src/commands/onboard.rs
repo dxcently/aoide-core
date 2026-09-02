@@ -127,11 +127,11 @@ fn handle_onboard(inv: &Invocation) -> Outcome {
 
 /// The invoking checkout's root: `hooks::skill_source()`'s own walk-up (the
 /// only repo-root detector in the tree, ONBOARD.md decision 10) returns
-/// `<root>/.claude/skills/aoide`; three `.parent()` calls strip
-/// `aoide`/`skills`/`.claude` back to `<root>`.
+/// `<root>/.claude/skills`; two `.parent()` calls strip `skills`/`.claude`
+/// back to `<root>`.
 fn checkout_root() -> Option<PathBuf> {
-    let skill_dir = crate::conduct::commands::hooks::skill_source()?;
-    skill_dir.parent()?.parent()?.parent().map(Path::to_path_buf)
+    let skills_dir = crate::conduct::commands::hooks::skill_source()?;
+    skills_dir.parent()?.parent().map(Path::to_path_buf)
 }
 
 /// "register the clone" (ONBOARD.md's stub-summary contract, decision 1):

@@ -7,11 +7,14 @@
 //! 2. The `SessionStart` onboarding pointer ([`POINTER_CMD`], the same bare
 //!    `printf` one-liner the repo's own `.claude/settings.json` carries),
 //!    keyed independently of the graph entries.
-//! 3. A symlink of the repo's skill directory (`.claude/skills/aoide`, found
-//!    by walking up from the cwd — the invoking checkout IS the source) into
-//!    the profile's `skills_dir`. A profile with no skills directory skips
-//!    with a taught message; an existing non-matching file/link is a refusal,
-//!    never an overwrite.
+//! 3. A symlink of EVERY skill the repo ships under `.claude/skills/` (each
+//!    directory holding a `SKILL.md`; a child without one is not a skill and
+//!    is skipped silently) into the profile's `skills_dir`, one link per
+//!    skill — the checkout is found by walking up from the cwd, the
+//!    invoking checkout IS the source. A profile with no skills directory
+//!    skips with a taught message; an existing non-matching file/link at one
+//!    skill's path is a refusal for THAT skill only — a conflict on one
+//!    never blocks another from linking.
 //!
 //! The merge is text/structure-level and NEVER a clobber (the kimi
 //! config holds providers/credentials; the claude settings are hand-written).
@@ -32,8 +35,8 @@
 //! (NOT `~/Aoide/log` — that path is the audit log FILE) — a DISTINCT
 //! idempotency key, so capture entries coexist with plain ones
 //! (installing without `--capture` replaces nothing) and are removed manually.
-//! The pointer and skill link are mode-independent: a `--capture` run neither
-//! duplicates nor replaces them.
+//! The pointer and skill links are mode-independent: a `--capture` run
+//! neither duplicates nor replaces them.
 
 use aoide_protocol::Invocation;
 use aoide_protocol::output::Outcome;
@@ -45,7 +48,7 @@ use std::path::{Path, PathBuf};
 pub fn register(r: &mut Registry) {
     r.insert(cmd!(
         path: ["hooks", "install"],
-        summary: "Wire an agent harness's settings file to pipe its hooks into `session hook`, and symlink the repo's skill directory into the harness's skills dir when it has one (idempotent merge; never clobbers existing config or an unrelated file at the link path).",
+        summary: "Wire an agent harness's settings file to pipe its hooks into `session hook`, and symlink each of the repo's skills into the harness's skills dir when it has one (idempotent merge; never clobbers existing config or an unrelated file at the link path).",
         args: [arg!("agent", "string", true, "Agent harness to wire up (claude | kimi | pi).")],
         flags: [flag!("capture", "bool", "TEMPORARY debugging: wrap the hook command to tee raw payloads to $AOIDE_ROOT/state/<agent>-hooks.jsonl. Capture entries coexist with the plain ones (installing without --capture replaces nothing); remove them manually when done.")],
         gated: false,
@@ -71,8 +74,15 @@ const POINTER_MARKER: &str = "Aoide onboarding:";
 /// entries are labelled by event name).
 const POINTER_LABEL: &str = "onboarding-pointer";
 
-/// The skill directory shipped in the repo, relative to the checkout root.
-const SKILL_REPO_PATH: &str = ".claude/skills/aoide";
+/// The skills directory shipped in the repo, relative to the checkout root
+/// -- every skill `hooks install` links lives directly under it
+/// (`repo_skills`).
+const SKILLS_REPO_DIR: &str = ".claude/skills";
+
+/// This repo's own tier-0 skill: always shipped, so it anchors
+/// `skill_source()`'s checkout-detection probe. Not the only skill linked --
+/// see `repo_skills`.
+const ANCHOR_SKILL: &str = "aoide";
 
 /// The hook events wired per harness: the nine core events both profiles map,
 /// plus kimi's dedicated needs-input event (claude signals that via
@@ -222,40 +232,55 @@ struct InstallReport {
     updated: Vec<&'static str>,
 }
 
-/// What the skill-link pass did (or why it didn't).
-enum SkillLink {
+/// What happened to ONE skill's link attempt.
+#[derive(Debug)]
+enum SkillOutcome {
     /// Created the symlink: (link, source).
     Linked(PathBuf, PathBuf),
     /// The link already exists and resolves to the repo skill — a no-op.
     Present(PathBuf),
-    /// The profile has no skills directory (kimi) — skipped with a taught
-    /// message, exactly like the Declarative settings short-circuit.
-    NoSkillsDir,
-    /// Not invoked from inside an Aoide checkout, so there is no source to
-    /// link — hooks still install; the skill is skipped with a taught message.
-    NoSource,
     /// Something else already sits at the link path — a refusal (taught
-    /// message), never an overwrite.
+    /// message), never an overwrite. Never blocks another skill's outcome.
     Conflict(PathBuf, String),
 }
 
-/// Locate the invoking checkout's skill directory: walk up from the cwd to
-/// the first directory holding `.claude/skills/aoide/SKILL.md`. `hooks
-/// install` has no repo-locating pattern to reuse (its door commands resolve
-/// `aoide` from PATH), so the invoking checkout IS the source — the
+/// What the skill-link PASS did across every skill the repo ships (or why it
+/// didn't run at all).
+#[derive(Debug)]
+enum SkillLink {
+    /// One entry per skill found under the repo's skills directory
+    /// (`repo_skills`), name-sorted, each independently Linked/Present/
+    /// Conflict — a conflict on one is never allowed to block another.
+    Results(Vec<(String, SkillOutcome)>),
+    /// The profile has no skills directory (kimi) — skipped with a taught
+    /// message, exactly like the Declarative settings short-circuit. A
+    /// whole-pass outcome: about the profile, not any one skill.
+    NoSkillsDir,
+    /// Not invoked from inside an Aoide checkout, so there is no source to
+    /// link — hooks still install; skills are skipped with a taught message.
+    /// A whole-pass outcome: about the checkout, not any one skill.
+    NoSource,
+}
+
+/// Locate the invoking checkout's skills DIRECTORY: walk up from the cwd to
+/// the first directory holding `.claude/skills/<ANCHOR_SKILL>/SKILL.md`.
+/// `hooks install` has no repo-locating pattern to reuse (its door commands
+/// resolve `aoide` from PATH), so the invoking checkout IS the source — the
 /// documented assumption; run the command from inside the repo to link.
+/// `ANCHOR_SKILL` (this repo's own tier-0 skill, always shipped) is only the
+/// PROBE that confirms a real checkout; the returned directory is enumerated
+/// by `repo_skills` for every skill it holds, not just the anchor.
 ///
 /// `pub`, not `pub(crate)` (crates/AGENTS.md's "widen it, don't fork it"):
 /// `onboard`'s own from-a-checkout refusal (ONBOARD.md decision 10) reaches
 /// this exact walk-up rather than duplicating it — the only repo-root
-/// detector in the tree, so `onboard` climbs three parents off its result
-/// (`aoide/skills/.claude` back to the checkout root) instead of a second
-/// probe.
+/// detector in the tree, so `onboard` climbs two parents off its result
+/// (`skills/.claude` back to the checkout root) instead of a second probe.
 pub fn skill_source() -> Option<PathBuf> {
     let mut dir = std::env::current_dir().ok()?;
     loop {
-        let cand = dir.join(SKILL_REPO_PATH);
-        if cand.join("SKILL.md").is_file() {
+        let cand = dir.join(SKILLS_REPO_DIR);
+        if cand.join(ANCHOR_SKILL).join("SKILL.md").is_file() {
             return Some(cand);
         }
         if !dir.pop() {
@@ -264,35 +289,80 @@ pub fn skill_source() -> Option<PathBuf> {
     }
 }
 
-/// Link the repo's skill directory into the profile's skills directory as
-/// `<skills_dir>/aoide`. Idempotent (an existing correct link is a no-op) and
-/// never-clobbering (anything else at the path is a refusal).
-fn link_skill(profile: &AgentProfile) -> Result<SkillLink, String> {
+/// Every skill the repo ships under `skills_dir`: each child directory that
+/// carries a `SKILL.md`, name-sorted for deterministic output. A child
+/// without `SKILL.md` (a scratch dir, a WIP draft) is not a skill and is
+/// skipped silently, never an error.
+fn repo_skills(skills_dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut skills = Vec::new();
+    let Ok(entries) = std::fs::read_dir(skills_dir) else {
+        return skills;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() || !path.join("SKILL.md").is_file() {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        skills.push((name, path));
+    }
+    skills.sort_by(|a, b| a.0.cmp(&b.0));
+    skills
+}
+
+/// Link every skill the repo ships into the profile's skills directory.
+fn link_skills(profile: &AgentProfile) -> Result<SkillLink, String> {
     let Some(rel) = profile.skills_dir else {
         return Ok(SkillLink::NoSkillsDir);
     };
-    let Some(source) = skill_source() else {
+    let Some(skills_dir) = skill_source() else {
         return Ok(SkillLink::NoSource);
     };
+    link_skills_from(&skills_dir, rel)
+}
+
+/// The skills-linking pass body, taking the repo skills directory and the
+/// profile's relative skills path directly — split out from `link_skills` so
+/// tests can exercise multi-skill scenarios (a non-skill child, a conflict
+/// alongside a clean link, idempotence) against a synthetic fixture
+/// directory instead of depending on, or mutating, the checkout's OWN live
+/// `.claude/skills/`.
+fn link_skills_from(skills_dir: &Path, rel: &str) -> Result<SkillLink, String> {
     let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
-    let link = PathBuf::from(home).join(rel).join("aoide");
-    match std::fs::symlink_metadata(&link) {
+    let target_dir = PathBuf::from(home).join(rel);
+    let mut results = Vec::new();
+    for (name, source) in repo_skills(skills_dir) {
+        let link = target_dir.join(&name);
+        let outcome = link_one_skill(&link, &source)?;
+        results.push((name, outcome));
+    }
+    Ok(SkillLink::Results(results))
+}
+
+/// Link one skill's repo directory to `link`. Idempotent (an existing
+/// correct link is a no-op) and never-clobbering (anything else at the path
+/// is a refusal, taught, never overwritten) — this is the per-skill body the
+/// pass above calls once per entry `repo_skills` finds.
+fn link_one_skill(link: &Path, source: &Path) -> Result<SkillOutcome, String> {
+    match std::fs::symlink_metadata(link) {
         Ok(meta) if meta.file_type().is_symlink() => {
             // Canonicalize both sides so `Present` means "resolves to the
             // same directory", however the link was spelled. A dangling link
             // canonicalizes to Err and lands in the conflict arm.
             let resolves = matches!(
-                (std::fs::canonicalize(&link), std::fs::canonicalize(&source)),
+                (std::fs::canonicalize(link), std::fs::canonicalize(source)),
                 (Ok(l), Ok(s)) if l == s
             );
             if resolves {
-                Ok(SkillLink::Present(link))
+                Ok(SkillOutcome::Present(link.to_path_buf()))
             } else {
-                let target = std::fs::read_link(&link)
+                let target = std::fs::read_link(link)
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|_| "<unreadable>".to_string());
-                Ok(SkillLink::Conflict(
-                    link.clone(),
+                Ok(SkillOutcome::Conflict(
+                    link.to_path_buf(),
                     format!(
                         "{} is already a symlink to {target}, not to {} — refusing to overwrite it; remove it yourself to relink",
                         link.display(),
@@ -301,8 +371,8 @@ fn link_skill(profile: &AgentProfile) -> Result<SkillLink, String> {
                 ))
             }
         }
-        Ok(_) => Ok(SkillLink::Conflict(
-            link.clone(),
+        Ok(_) => Ok(SkillOutcome::Conflict(
+            link.to_path_buf(),
             format!(
                 "{} already exists and is not a symlink to the repo skill — refusing to overwrite it; move it aside to let `hooks install` link {}",
                 link.display(),
@@ -314,11 +384,92 @@ fn link_skill(profile: &AgentProfile) -> Result<SkillLink, String> {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
             }
-            std::os::unix::fs::symlink(&source, &link).map_err(|e| {
+            std::os::unix::fs::symlink(source, link).map_err(|e| {
                 format!("cannot link {} -> {}: {e}", link.display(), source.display())
             })?;
-            Ok(SkillLink::Linked(link, source))
+            Ok(SkillOutcome::Linked(link.to_path_buf(), source.to_path_buf()))
         }
+    }
+}
+
+/// One skill's link outcome as `--json` detail (`skills` array).
+fn skill_json(name: &str, outcome: &SkillOutcome) -> Value {
+    match outcome {
+        SkillOutcome::Linked(link, source) => json!({
+            "name": name,
+            "status": "linked",
+            "link": link.to_string_lossy(),
+            "source": source.to_string_lossy(),
+        }),
+        SkillOutcome::Present(link) => json!({
+            "name": name,
+            "status": "present",
+            "link": link.to_string_lossy(),
+        }),
+        SkillOutcome::Conflict(link, message) => json!({
+            "name": name,
+            "status": "conflict",
+            "link": link.to_string_lossy(),
+            "message": message,
+        }),
+    }
+}
+
+/// Digest of one `link_skills` pass, computed once and shared by the
+/// message, the `changed` entries, and the `--json` `skills` field.
+struct SkillsDigest {
+    json: Vec<Value>,
+    note: String,
+    conflicts: Vec<String>,
+    linked_names: Vec<String>,
+}
+
+/// Reduce a `SkillLink` pass to its `SkillsDigest` — the one place that
+/// turns per-skill outcomes (or a whole-pass NoSkillsDir/NoSource) into the
+/// human-readable note and the `--json` detail `hooks_install` reports.
+fn digest_skills(profile: &AgentProfile, skills: &SkillLink) -> SkillsDigest {
+    match skills {
+        SkillLink::Results(results) if results.is_empty() => SkillsDigest {
+            json: Vec::new(),
+            note: "no skills found to link".to_string(),
+            conflicts: Vec::new(),
+            linked_names: Vec::new(),
+        },
+        SkillLink::Results(results) => {
+            let mut json = Vec::new();
+            let mut parts = Vec::new();
+            let mut conflicts = Vec::new();
+            let mut linked_names = Vec::new();
+            for (name, outcome) in results {
+                json.push(skill_json(name, outcome));
+                match outcome {
+                    SkillOutcome::Linked(..) => {
+                        parts.push(format!("{name} linked"));
+                        linked_names.push(name.clone());
+                    }
+                    SkillOutcome::Present(..) => parts.push(format!("{name} already linked")),
+                    SkillOutcome::Conflict(_, message) => {
+                        parts.push(format!("{name} conflict"));
+                        conflicts.push(message.clone());
+                    }
+                }
+            }
+            SkillsDigest { json, note: format!("skills: {}", parts.join(", ")), conflicts, linked_names }
+        }
+        SkillLink::NoSkillsDir => SkillsDigest {
+            json: Vec::new(),
+            note: format!("{} has no skills directory; skills not linked", profile.name),
+            conflicts: Vec::new(),
+            linked_names: Vec::new(),
+        },
+        SkillLink::NoSource => SkillsDigest {
+            json: Vec::new(),
+            note: format!(
+                "not inside an Aoide checkout (no {SKILLS_REPO_DIR}/{ANCHOR_SKILL}/SKILL.md above the cwd); skills not linked — run from the repo to link them"
+            ),
+            conflicts: Vec::new(),
+            linked_names: Vec::new(),
+        },
     }
 }
 
@@ -599,9 +750,9 @@ fn hooks_install(inv: &Invocation) -> Outcome {
     if capture {
         let _ = std::fs::create_dir_all(aoide_storage::fs::state_dir());
     }
-    // The skill link, after the settings merge (a skill refusal must not
+    // The skill links, after the settings merge (a skill refusal must not
     // block the hook wiring, and the report below carries both outcomes).
-    let skill = match link_skill(profile) {
+    let skills = match link_skills(profile) {
         Ok(s) => s,
         Err(e) => {
             return Outcome::error(cmd, e).with_data(json!({
@@ -613,42 +764,19 @@ fn hooks_install(inv: &Invocation) -> Outcome {
             }))
         }
     };
-    if let SkillLink::Conflict(link, taught) = &skill {
-        return Outcome::error(cmd, taught.clone()).with_data(json!({
+    let digest = digest_skills(profile, &skills);
+    if !digest.conflicts.is_empty() {
+        return Outcome::error(cmd, digest.conflicts.join("; ")).with_data(json!({
             "reason": "skill-link-conflict",
             "agent": profile.name,
-            "skill_link": link.to_string_lossy(),
+            "skills": digest.json,
             "added": report.added,
             "present": report.present,
             "updated": report.updated,
         }));
     }
-    let (skill_status, skill_note): (&str, String) = match &skill {
-        SkillLink::Linked(link, source) => (
-            "linked",
-            format!("skill linked: {} -> {}", link.display(), source.display()),
-        ),
-        SkillLink::Present(link) => (
-            "present",
-            format!("skill already linked ({})", link.display()),
-        ),
-        SkillLink::NoSkillsDir => (
-            "no-skills-dir",
-            format!(
-                "{} has no skills directory; skill not linked",
-                profile.name
-            ),
-        ),
-        SkillLink::NoSource => (
-            "no-source",
-            format!(
-                "not inside an Aoide checkout (no {SKILL_REPO_PATH} above the cwd); skill not linked — run from the repo to link it"
-            ),
-        ),
-        SkillLink::Conflict(..) => unreachable!("returned above"),
-    };
-    let skill_linked = matches!(skill, SkillLink::Linked(..));
-    let changed = !report.added.is_empty() || !report.updated.is_empty() || skill_linked;
+    let skill_note = digest.note;
+    let changed = !report.added.is_empty() || !report.updated.is_empty() || !digest.linked_names.is_empty();
     let message = if report.added.is_empty() && report.updated.is_empty() {
         format!(
             "all {} hooks already installed for {} ({}); {skill_note}",
@@ -684,9 +812,12 @@ fn hooks_install(inv: &Invocation) -> Outcome {
                 .iter()
                 .map(|e| format!("hook updated: {e} ({})", profile.name)),
         );
-        if skill_linked {
-            changes.push(format!("skill linked ({})", profile.name));
-        }
+        changes.extend(
+            digest
+                .linked_names
+                .iter()
+                .map(|name| format!("skill linked: {name} ({})", profile.name)),
+        );
         out.changed(changes)
     } else {
         out
@@ -697,7 +828,7 @@ fn hooks_install(inv: &Invocation) -> Outcome {
         "added": report.added,
         "present": report.present,
         "updated": report.updated,
-        "skill": skill_status,
+        "skills": digest.json,
         "capture": capture,
         "changed": changed,
     }))
@@ -745,7 +876,7 @@ mod tests {
         assert_eq!(data["added"].as_array().unwrap().len(), 11);
         assert_eq!(data["settings"], json!(path.to_string_lossy()));
         // kimi has no skills directory — the skill pass short-circuits.
-        assert_eq!(data["skill"], "no-skills-dir");
+        assert_eq!(data["skills"], json!([]));
         assert!(out.message.contains("kimi has no skills directory"), "msg: {}", out.message);
 
         let text = std::fs::read_to_string(&path).unwrap();
@@ -1038,14 +1169,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // ── The three claude tests below exercise the skill-link pass, which
-    // ── resolves the LINK SOURCE by walking up from the cwd to the repo's
-    // ── own `.claude/skills/aoide` (`skill_source`). The package build's
-    // ── sandbox unpacks only `pkgs/aoide`, so no checkout exists above the
-    // ── cwd there — each probes and skips with a note, the same
+    // ── The claude tests below exercise the skill-link pass, which resolves
+    // ── the LINK SOURCE by walking up from the cwd to the repo's own
+    // ── `.claude/skills/` (`skill_source`). The package build's sandbox
+    // ── unpacks only `pkgs/aoide`, so no checkout exists above the cwd
+    // ── there — each probes and skips with a note, the same
     // ── capability-probe pattern `aoide-secrets`' age-binary tests hold.
-    // ── Production needs no gate: `link_skill` already reports the
-    // ── condition as its taught `no-source` outcome. ─────────────────────
+    // ── Production needs no gate: `link_skills` already reports the
+    // ── condition as its taught `no-source` outcome. The multi-skill-
+    // ── specific tests (a non-skill child, a conflict beside a clean link)
+    // ── use `link_skills_from` against a synthetic fixture instead, further
+    // ── below, so they run everywhere and never touch the live repo. ─────
 
     #[test]
     fn claude_install_reports_present_and_preserves_the_document() {
@@ -1083,10 +1217,17 @@ mod tests {
         let doc = json!({ "model": "sonnet", "hooks": hooks, "theme": "auto" });
         std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap() + "\n").unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
-        // And the skill already correctly linked.
+        // And every repo skill already correctly linked.
         let skills = root.join(".claude/skills");
         std::fs::create_dir_all(&skills).unwrap();
-        std::os::unix::fs::symlink(skill_source().unwrap(), skills.join("aoide")).unwrap();
+        let repo_skills_list = repo_skills(&skill_source().unwrap());
+        assert!(
+            repo_skills_list.len() >= 2,
+            "fixture assumes the repo ships at least two skills (aoide, memory-handoff)"
+        );
+        for (name, source) in &repo_skills_list {
+            std::os::unix::fs::symlink(source, skills.join(name)).unwrap();
+        }
 
         let out = hooks_install(&install_inv("claude", false));
         let data = out.data.unwrap();
@@ -1094,7 +1235,9 @@ mod tests {
         assert_eq!(data["added"], json!([]));
         // 9 graph events + the pointer.
         assert_eq!(data["present"].as_array().unwrap().len(), 10);
-        assert_eq!(data["skill"], "present");
+        let skills_data = data["skills"].as_array().unwrap();
+        assert_eq!(skills_data.len(), repo_skills_list.len());
+        assert!(skills_data.iter().all(|s| s["status"] == "present"), "{skills_data:?}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "untouched when complete");
 
         // A missing event gets exactly one new entry, in the existing shape,
@@ -1229,14 +1372,23 @@ mod tests {
         std::env::set_var("HOME", &root);
         let path = root.join(".claude/settings.json");
 
-        // Fresh install: 9 graph events + the pointer, and the skill linked.
+        let repo_skills_list = repo_skills(&skill_source().unwrap());
+        assert!(
+            repo_skills_list.len() >= 2,
+            "fixture assumes the repo ships at least two skills (aoide, memory-handoff)"
+        );
+
+        // Fresh install: 9 graph events + the pointer, and every repo skill
+        // linked.
         let out = hooks_install(&install_inv("claude", false));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         let data = out.data.unwrap();
         assert_eq!(data["changed"], true);
         assert_eq!(data["added"].as_array().unwrap().len(), 10);
         assert!(data["added"].as_array().unwrap().contains(&json!(POINTER_LABEL)));
-        assert_eq!(data["skill"], "linked");
+        let skills_data = data["skills"].as_array().unwrap();
+        assert_eq!(skills_data.len(), repo_skills_list.len());
+        assert!(skills_data.iter().all(|s| s["status"] == "linked"), "{skills_data:?}");
 
         // The pointer entry is the shared constant, in its own group.
         let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -1244,24 +1396,29 @@ mod tests {
         assert_eq!(session_start.len(), 2, "graph entry + pointer entry");
         assert_eq!(session_start[1]["hooks"][0]["command"], POINTER_CMD);
 
-        // The symlink resolves to the invoking checkout's skill directory.
-        let link = root.join(".claude/skills/aoide");
-        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
-        assert_eq!(
-            std::fs::canonicalize(&link).unwrap(),
-            std::fs::canonicalize(skill_source().unwrap()).unwrap()
-        );
-        assert!(link.join("SKILL.md").is_file());
+        // Every repo skill's symlink resolves to its own source directory.
+        for (name, source) in &repo_skills_list {
+            let link = root.join(".claude/skills").join(name);
+            assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "{name}");
+            assert_eq!(
+                std::fs::canonicalize(&link).unwrap(),
+                std::fs::canonicalize(source).unwrap(),
+                "{name}"
+            );
+            assert!(link.join("SKILL.md").is_file(), "{name}");
+        }
 
-        // Second run: zero added, pointer and link reported present, settings
-        // byte-identical.
+        // Second run: zero added, pointer and every link reported present,
+        // settings byte-identical.
         let before = std::fs::read_to_string(&path).unwrap();
         let out2 = hooks_install(&install_inv("claude", false));
         let data2 = out2.data.unwrap();
         assert_eq!(data2["changed"], false);
         assert_eq!(data2["added"], json!([]));
         assert_eq!(data2["present"].as_array().unwrap().len(), 10);
-        assert_eq!(data2["skill"], "present");
+        let skills_data2 = data2["skills"].as_array().unwrap();
+        assert_eq!(skills_data2.len(), repo_skills_list.len());
+        assert!(skills_data2.iter().all(|s| s["status"] == "present"), "{skills_data2:?}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1291,6 +1448,17 @@ mod tests {
         // The hooks themselves DID merge before the refusal — reported.
         assert_eq!(data["added"].as_array().unwrap().len(), 10);
         assert_eq!(std::fs::read_to_string(&link).unwrap(), "someone else's skill");
+        // aoide's conflict never blocked the other repo skill(s) from linking.
+        let skills_data = data["skills"].as_array().unwrap();
+        let aoide_entry = skills_data.iter().find(|s| s["name"] == "aoide").unwrap();
+        assert_eq!(aoide_entry["status"], "conflict");
+        let others: Vec<_> = skills_data.iter().filter(|s| s["name"] != "aoide").collect();
+        assert!(!others.is_empty(), "fixture assumes a second repo skill exists");
+        assert!(others.iter().all(|s| s["status"] == "linked"), "{skills_data:?}");
+        for other in &others {
+            let name = other["name"].as_str().unwrap();
+            assert!(root.join(".claude/skills").join(name).join("SKILL.md").is_file(), "{name}");
+        }
 
         // A symlink to somewhere else: same refusal, naming both targets.
         std::fs::remove_file(&link).unwrap();
@@ -1301,6 +1469,95 @@ mod tests {
         assert_eq!(out2.status, aoide_protocol::output::Status::Error);
         assert!(out2.message.contains("already a symlink to"), "msg: {}", out2.message);
         assert_eq!(std::fs::read_link(&link).unwrap(), elsewhere, "link untouched");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── The two tests below exercise `link_skills_from` directly, against a
+    // ── synthetic skills fixture -- deterministic, runs everywhere (no
+    // ── checkout-above-cwd requirement), and never touches the real repo's
+    // ── own `.claude/skills/`. ────────────────────────────────────────────
+
+    #[test]
+    fn link_skills_from_links_every_skill_and_skips_non_skill_children() {
+        let _g = crate::env_lock().lock().unwrap();
+        let _env = EnvSaver::capture(&["HOME"]);
+        let root = unique_tmp("hooks-skills-multi");
+        let skills_src = root.join("repo-skills");
+        std::fs::create_dir_all(skills_src.join("alpha")).unwrap();
+        std::fs::write(skills_src.join("alpha/SKILL.md"), "# alpha").unwrap();
+        std::fs::create_dir_all(skills_src.join("beta")).unwrap();
+        std::fs::write(skills_src.join("beta/SKILL.md"), "# beta").unwrap();
+        // A non-skill child (no SKILL.md) -- skipped silently, never an error.
+        std::fs::create_dir_all(skills_src.join("scratch")).unwrap();
+        std::fs::write(skills_src.join("scratch/notes.txt"), "wip").unwrap();
+        // A stray file directly under the skills dir -- also not a skill.
+        std::fs::write(skills_src.join("README.md"), "index").unwrap();
+
+        let home = root.join("home");
+        std::env::set_var("HOME", &home);
+        let profile = agent_profile("claude").unwrap();
+        let rel = profile.skills_dir.unwrap();
+
+        let result = link_skills_from(&skills_src, rel).unwrap();
+        let SkillLink::Results(results) = result else { panic!("expected Results") };
+        // Name-sorted, exactly the two real skills -- scratch/README skipped.
+        assert_eq!(
+            results.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+        for (name, outcome) in &results {
+            assert!(matches!(outcome, SkillOutcome::Linked(..)), "{name}: {outcome:?}");
+        }
+        let target = home.join(".claude/skills");
+        assert!(target.join("alpha").join("SKILL.md").is_file());
+        assert!(target.join("beta").join("SKILL.md").is_file());
+        assert!(!target.join("scratch").exists());
+        assert!(!target.join("README.md").exists());
+
+        // Idempotent re-run: both now report Present, filesystem unchanged.
+        let result2 = link_skills_from(&skills_src, rel).unwrap();
+        let SkillLink::Results(results2) = result2 else { panic!("expected Results") };
+        for (name, outcome) in &results2 {
+            assert!(matches!(outcome, SkillOutcome::Present(..)), "{name}: {outcome:?}");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn link_skills_from_one_conflict_never_blocks_another_skill_from_linking() {
+        let _g = crate::env_lock().lock().unwrap();
+        let _env = EnvSaver::capture(&["HOME"]);
+        let root = unique_tmp("hooks-skills-conflict");
+        let skills_src = root.join("repo-skills");
+        std::fs::create_dir_all(skills_src.join("alpha")).unwrap();
+        std::fs::write(skills_src.join("alpha/SKILL.md"), "# alpha").unwrap();
+        std::fs::create_dir_all(skills_src.join("beta")).unwrap();
+        std::fs::write(skills_src.join("beta/SKILL.md"), "# beta").unwrap();
+
+        let home = root.join("home");
+        let target = home.join(".claude/skills");
+        std::fs::create_dir_all(&target).unwrap();
+        // alpha's link path is already occupied by something else -- a
+        // conflict; beta's is untouched.
+        std::fs::write(target.join("alpha"), "not a symlink").unwrap();
+        std::env::set_var("HOME", &home);
+        let profile = agent_profile("claude").unwrap();
+        let rel = profile.skills_dir.unwrap();
+
+        let result = link_skills_from(&skills_src, rel).unwrap();
+        let SkillLink::Results(results) = result else { panic!("expected Results") };
+        let alpha = &results.iter().find(|(n, _)| n == "alpha").unwrap().1;
+        let beta = &results.iter().find(|(n, _)| n == "beta").unwrap().1;
+        assert!(matches!(alpha, SkillOutcome::Conflict(..)), "{alpha:?}");
+        assert!(matches!(beta, SkillOutcome::Linked(..)), "{beta:?}");
+        assert_eq!(
+            std::fs::read_to_string(target.join("alpha")).unwrap(),
+            "not a symlink",
+            "conflict path untouched"
+        );
+        assert!(target.join("beta/SKILL.md").is_file(), "beta still linked despite alpha's conflict");
 
         let _ = std::fs::remove_dir_all(&root);
     }
