@@ -75,7 +75,7 @@
   resolved through the secrets broker) models AOIDE-TO-AOIDE federation —
   AgentCard-verified, signed, per-peer `allows` — over aoide's OWN wire
   protocol; Melete is a third-party claude.ai service speaking plain MCP,
-  never an aoide peer, so that shape doesn't fit. The `usage` verb's `live`
+  never an aoide peer, so that shape doesn't fit. The `usage` command's `live`
   block (`aoide_storage::commands::fetch_live_usage`) is the closer
   precedent — a single, external, bearer-authenticated endpoint — but its
   token rides a LOCAL FILE Claude Code itself already maintains; aoide has
@@ -86,7 +86,7 @@
   credential. The eventual live wiring (most likely a secrets-broker-
   resolved secret, mirroring `peer add --bearer-secret`) is a KNOWN future
   step, not something to backfill speculatively here.
-- **Every `melete` verb is `Door::Cli`-only, not just `melete call` (M2,
+- **Every `melete` command is `Door::Cli`-only, not just `melete call` (M2,
   task #14) — match `aoide-secrets`' BLANKET family gate, not its
   per-command one.** `aoide-secrets` gates its entire command family
   `Door::Cli`-only (`require_cli`, called from nearly every one of its
@@ -95,7 +95,7 @@
   live bearer token outward and can trigger real action, the same risk
   class, so `handle_melete_status`/`handle_melete_graph` gate identically
   to `handle_melete_call`, not just the one that obviously mutates. A new
-  `melete` verb gates the same way by default; carving out an exception
+  `melete` command gates the same way by default; carving out an exception
   needs the same justification `aoide-secrets` would need for one of its
   own.
 - **`mcp_client::call` reads a Melete response defensively off a raw
@@ -110,15 +110,15 @@
   strictly would turn an unexpected-but-valid Melete reply shape into a
   hard parse failure instead of the taught error the untyped path
   produces today.
-- **`mcp_client` makes exactly ONE POST per verb — no `initialize`-then-
+- **`mcp_client` makes exactly ONE POST per command — no `initialize`-then-
   session-id handshake is threaded into `graph`/`call` (M2, task #14).**
   Documented as an ASSUMPTION (this crate's module doc), not a proven
   wire fact — Melete's connector is treated as a stateless-per-request
-  bearer-token API, the minimal shape the three verbs need. If a live
+  bearer-token API, the minimal shape the three commands need. If a live
   integration later proves Melete requires a real MCP session
   (`Mcp-Session-Id` carried from `initialize` into subsequent calls),
-  thread it through `mcp_client::call` centrally — every verb already
-  funnels through that one function — rather than adding a per-verb
+  thread it through `mcp_client::call` centrally — every command already
+  funnels through that one function — rather than adding a per-command
   workaround.
 - **`daemon::daemon_dispatch` is outbound too, not an exception to "outbound
   only."** It is the CLIENT side of the fourth door (P-D6): a routed
@@ -486,7 +486,7 @@
 - **A new Melete tool** needs NO new command — `melete call <tool>
   --args <json>` already reaches any tool name by construction (M2, task
   #14's whole point: immune to Melete's own tool-list drift). Only a tool
-  worth a FIRST-CLASS verb (its own parsed args, its own state-dir write —
+  worth a FIRST-CLASS command (its own parsed args, its own state-dir write —
   `melete graph`'s own shape) earns a new `cmd!` entry in `mcp_client.rs`,
   built the same `resolve_config` → `require_cli` → `mcp_client::call`
   pipeline the existing three already share.

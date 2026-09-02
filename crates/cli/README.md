@@ -46,7 +46,7 @@ as an exact set — core's headless-capable, agent-orchestration surface: the
 project/session graph (including `resurrect`, its ledger-backed
 session revival), A2A, peers (including the `peer hub` designation,
 P-D5, the `aoide pair [<name|url|id>]`/`pair reject`/`pair watch`
-one-verb pairing ceremony, P-P2/P-P5/P-PV2/task #135 P3', the `peer allow <name> <cap> on|off`
+one-command pairing ceremony, P-P2/P-P5/P-PV2/task #135 P3', the `peer allow <name> <cap> on|off`
 closed-capability grant/revoke command backing the A2A spawn arm's hard
 gate, P-P3, `peer spawn <name> -- <text…>`, P-P5b, the signed
 spawn-shaped `message/send` that actually reaches that gate, and `peer
