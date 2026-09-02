@@ -10,8 +10,10 @@
 //! revert added `pair confirm`; `quickshell healthcheck` — the
 //! placeholder-screen watchdog — followed; R2 (the mutual-code redesign's
 //! popup phase) repurposed `pair confirm` into `pair show`, the ceremony's
-//! reply-code display dialog (net zero — one path dies, one lands). See
-//! `commands/mod.rs::all()` for the assembly order.
+//! reply-code display dialog (net zero — one path dies, one lands). `lyra
+//! reload` (design settled 2026-08-31) repurposed `quickshell.reload` into
+//! `reload`, the one mode-aware iteration command — the SAME net-zero swap
+//! shape. See `commands/mod.rs::all()` for the assembly order.
 
 pub use aoide_protocol::registry::*;
 
@@ -87,7 +89,7 @@ mod tests {
             "pair.ask",
             "pair.show",
             "quickshell.healthcheck",
-            "quickshell.reload",
+            "reload",
             "rice.back",
             "rice.compose",
             "rice.declare",

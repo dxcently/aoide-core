@@ -511,6 +511,74 @@ struct SongbookEval {
     registry: serde_json::Value,
 }
 
+/// Capture `<song>/songbook/<name>/widgets/` as `{ "<relative path>":
+/// "<utf-8 content>" }` — the take store's own widget-body payload (`lyra
+/// reload` design, settled 2026-08-31: "Takes gain WIDGET BODIES in both
+/// modes", closing the gap that widget QML was never snapshotted). Reads
+/// the SONGBOOK tree, the same source [`sync_song_widgets`] itself copies
+/// from — not the deployed `run/qml` copy — because widget bodies are
+/// song-scoped git substrate (this module's own header), the same source of
+/// truth a take is meant to remember. An absent `widgets/` dir captures as
+/// `{}` (no widgets), the same clean-skip [`sync_song_widgets`] uses for a
+/// missing local tree. Unfiltered, recursive, matching
+/// [`copy_tree_atomic`]'s own walk (helper components, asset subdirs,
+/// `.gitkeep`, everything) — a take is a full-content snapshot, not a
+/// filtered one. A non-UTF-8 file is a hard error: QML source is always
+/// text, so an unreadable file here means something is already wrong, not
+/// something to silently skip.
+pub fn snapshot_widget_bodies(song: &str) -> Result<serde_json::Value, WidgetSyncErr> {
+    let src = aoide_storage::fs::songbook_dir(song).join("widgets");
+    let mut map = serde_json::Map::new();
+    if src.is_dir() {
+        capture_tree(&src, &src, &mut map)?;
+    }
+    Ok(serde_json::Value::Object(map))
+}
+
+/// [`snapshot_widget_bodies`]'s own recursive walk: `root` stays fixed
+/// across the recursion (every captured key is relative to it), `dir` is
+/// the directory currently being read.
+fn capture_tree(
+    root: &Path,
+    dir: &Path,
+    out: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<(), WidgetSyncErr> {
+    let entries = std::fs::read_dir(dir).map_err(|e| WidgetSyncErr {
+        error: e.to_string(),
+        target: dir.to_string_lossy().into_owned(),
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|e| WidgetSyncErr {
+            error: e.to_string(),
+            target: dir.to_string_lossy().into_owned(),
+        })?;
+        let file_type = entry.file_type().map_err(|e| WidgetSyncErr {
+            error: e.to_string(),
+            target: entry.path().to_string_lossy().into_owned(),
+        })?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            capture_tree(root, &path, out)?;
+            continue;
+        }
+        let bytes = std::fs::read(&path).map_err(|e| WidgetSyncErr {
+            error: e.to_string(),
+            target: path.to_string_lossy().into_owned(),
+        })?;
+        let text = String::from_utf8(bytes).map_err(|e| WidgetSyncErr {
+            error: format!("{} is not valid UTF-8, cannot snapshot: {e}", path.display()),
+            target: path.to_string_lossy().into_owned(),
+        })?;
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        out.insert(rel, serde_json::Value::String(text));
+    }
+    Ok(())
+}
+
 /// Sync `<song>/songbook/<name>/widgets/` into `run/qml/songs/<name>/` and
 /// regenerate `manifest.json` WHOLE (every committed song, via
 /// [`eval_songbook`]) — the live-desktop half of `rice stage`.

@@ -13,5 +13,6 @@ pub mod elements;
 pub mod livery;
 pub mod mode;
 pub mod quickshell;
+pub mod reload;
 pub mod rice;
 pub mod take;

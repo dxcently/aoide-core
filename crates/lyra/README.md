@@ -59,8 +59,8 @@ are core `aoide` identity, root `AGENTS.md`).
   instead) — never a copy of either template. Writes the generated QML to
   a scratch temp path and spawns
   `quickshell -p <path>` as a genuinely standalone process
-  (`song::commands::quickshell`'s own `quickshell reload` only ever sends
-  IPC into an ALREADY-running instance, by contrast); `PR_SET_PDEATHSIG`
+  (`song::commands::reload`'s own IPC-reload beat only ever sends IPC into
+  an ALREADY-running instance, by contrast); `PR_SET_PDEATHSIG`
   (`libc::prctl`) keeps a killed dialog from ever orphaning its own window
   (`AGENTS.md`'s own invariant has the full ownership-chain reasoning);
   `qml_escape` covers backslash/quote, `\n`/`\r`/`\t`, U+2028/U+2029 (JS

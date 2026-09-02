@@ -16,35 +16,41 @@
 //! before `mcp.serve`, matching core's own relative placement of `onboard`
 //! in `crates/cli/src/commands/mod.rs::all()`), rice, draft,
 //! mode, cover, livery, rice-late stubs (declare/transpose only — NOT
-//! content/make/update, which stay core), shellbridge, quickshell, screen,
-//! herald, take, element (L-E1, docs/architecture/ELEMENTS.md: `element
-//! seed`, the render pipeline's shell-reachable bridge), secrets (P3:
-//! `secrets ask`, the rice-shaped TOTP code-entry popup), pair (`pair ask` +
-//! `pair show`, the pairing-ceremony's own two dialog shapes — a typed-code
-//! entry surface on either direction and a reply-code display surface,
-//! sharing `secrets ask`'s six-box QML component's PARENT module
-//! (`dialog_qml`) without sharing its entry surface — root-coupled like
-//! `meta`/`onboard` in shape, all appended LAST per golden discipline's
-//! "append, never reorder," `pkgs/aoide/crates/AGENTS.md`). Core-only groups
-//! (graph, adapter melete, conductor, a2a serve, agents, peers, usage,
-//! hooks, daemon, soundcheck) are absent — lyra never registers them.
+//! content/make/update, which stay core), shellbridge, quickshell
+//! (healthcheck only — the placeholder-screen watchdog), reload (the one
+//! mode-aware iteration command, `lyra reload` design settled 2026-08-31 —
+//! absorbed `quickshell reload` outright, registered right after
+//! `quickshell` where that path used to sit), screen, herald, take, element
+//! (L-E1, docs/architecture/ELEMENTS.md: `element seed`, the render
+//! pipeline's shell-reachable bridge), secrets (P3: `secrets ask`, the
+//! rice-shaped TOTP code-entry popup), pair (`pair ask` + `pair show`, the
+//! pairing-ceremony's own two dialog shapes — a typed-code entry surface on
+//! either direction and a reply-code display surface, sharing `secrets
+//! ask`'s six-box QML component's PARENT module (`dialog_qml`) without
+//! sharing its entry surface — root-coupled like `meta`/`onboard` in shape,
+//! all appended LAST per golden discipline's "append, never reorder,"
+//! `pkgs/aoide/crates/AGENTS.md`). Core-only groups (graph, adapter melete,
+//! conductor, a2a serve, agents, peers, usage, hooks, daemon, soundcheck)
+//! are absent — lyra never registers them.
 //!
 //! Path count: 2 (meta) + 1 (onboard) + 1 (mcp.serve) + 3 (rice) + 3 (draft)
-//! + 4 (mode) + 1 (cover) + 3 (livery) + 2 (rice-late) + 1 (shellbridge) + 2
-//! (quickshell: reload, healthcheck) + 14 (screen) + 1 (herald) + 6 (take) +
-//! 1 (element.seed) + 1 (secrets ask) + 2 (pair ask, pair show) = 48 (P-I3:
-//! 42 -> 43; P3: 43 -> 44; L-E1: 44 -> 45; P-PV3 landing: 45 -> 46; P-PV3
-//! revert (`pair confirm` added): 46 -> 47; `quickshell healthcheck`: 47 ->
-//! 48; R2's own repurpose (`pair confirm` -> `pair show`): 48 -> 48, net
-//! zero). The plan's phase description estimated 41 (the named groups
-//! alone, without `mcp.serve`); verified by generating (`lyra schema --json
-//! | jq '.commands|length'`) — `mcp.serve` must be a registered path for
-//! `aoide_protocol::door::parse` to ever reach `lib.rs`'s `special` closure
-//! on `mcp serve --stdio`, exactly like core's own `mcp.serve` entry. See
-//! `crates/lyra/src/registry.rs`'s golden test for the exact path list —
-//! that list, not this arithmetic, is the authority
-//! (`pkgs/aoide/crates/AGENTS.md`'s "no count or tally lives anywhere
-//! else").
+//! + 4 (mode) + 1 (cover) + 3 (livery) + 2 (rice-late) + 1 (shellbridge) + 1
+//! (quickshell: healthcheck) + 1 (reload) + 14 (screen) + 1 (herald) + 6
+//! (take) + 1 (element.seed) + 1 (secrets ask) + 2 (pair ask, pair show) =
+//! 48 (P-I3: 42 -> 43; P3: 43 -> 44; L-E1: 44 -> 45; P-PV3 landing: 45 ->
+//! 46; P-PV3 revert (`pair confirm` added): 46 -> 47; `quickshell
+//! healthcheck`: 47 -> 48; R2's own repurpose (`pair confirm` -> `pair
+//! show`): 48 -> 48, net zero; `reload`'s absorption of `quickshell reload`
+//! (`lyra reload` design, settled 2026-08-31): 48 -> 48, net zero — one path
+//! dies, one lands, same as R2's own swap). The plan's phase description
+//! estimated 41 (the named groups alone, without `mcp.serve`); verified by
+//! generating (`lyra schema --json | jq '.commands|length'`) — `mcp.serve`
+//! must be a registered path for `aoide_protocol::door::parse` to ever reach
+//! `lib.rs`'s `special` closure on `mcp serve --stdio`, exactly like core's
+//! own `mcp.serve` entry. See `crates/lyra/src/registry.rs`'s golden test
+//! for the exact path list — that list, not this arithmetic, is the
+//! authority (`pkgs/aoide/crates/AGENTS.md`'s "no count or tally lives
+//! anywhere else").
 pub mod dialog_qml;
 pub mod infra;
 pub mod meta;
@@ -68,7 +74,8 @@ pub fn all() -> Registry {
     aoide_song::commands::livery::register(&mut r); // livery emit, resolve, lint
     stubs::register_rice_late(&mut r); // rice declare, transpose
     aoide_conduct::commands::shellbridge::register(&mut r); // shellbridge (own module since P-A2)
-    aoide_song::commands::quickshell::register(&mut r); // quickshell reload — IPC hot-reload trigger
+    aoide_song::commands::quickshell::register(&mut r); // quickshell healthcheck — placeholder-screen watchdog
+    aoide_song::commands::reload::register(&mut r); // reload — the one mode-aware iteration command (absorbed quickshell reload)
     aoide_screen::commands::register(&mut r); // screen info, shot, point *, ocr, diff, send (own crate since P-A1)
     aoide_conduct::commands::herald::register(&mut r); // herald push — dunst's script hook into the notification ledger
     aoide_song::commands::take::register(&mut r); // rice take/take.*, rice back — explicit take-store snapshot

@@ -1,4 +1,11 @@
-//! `quickshell reload` — trigger Quickshell's in-process reload via IPC.
+//! `quickshell healthcheck` — the placeholder-screen lockup watchdog.
+//!
+//! `quickshell reload` DIED into the top-level `reload` command
+//! (`commands/reload.rs`, `lyra reload` design settled 2026-08-31): the
+//! declarative arm of that command's mode-aware dispatch IS this file's old
+//! `handle_quickshell_reload` byte-for-byte — hard cutover, no alias, the
+//! `peer invite` precedent. `healthcheck` is a watchdog, not an iteration
+//! step, so it stays here, untouched, its own command.
 //!
 //! Named `quickshell`, not `shell` (the User, 2026-08-15): a top-level command
 //! whose first path segment is `shell` collides with `--agent shell`, the
@@ -20,15 +27,6 @@ use serde_json::json;
 
 pub fn register(r: &mut Registry) {
     r.insert(cmd!(
-        path: ["quickshell", "reload"],
-        summary: "Trigger Quickshell's in-process reload via IPC — rebuilds the whole scene from shell.qml, picking up dynamically-loaded widget/facet QML the file watcher can't track. No systemd restart. No-ops gracefully if quickshell isn't running.",
-        args: [],
-        flags: [],
-        gated: false,
-        implemented: true,
-        handler: handle_quickshell_reload,
-    ));
-    r.insert(cmd!(
         path: ["quickshell", "healthcheck"],
         summary: "Detect and recover the placeholder-screen lockup: aoide-quickshell.service alive but rendered onto Qt's internal placeholder screen after a transient output blip, painting no layer-shell surfaces anywhere. Restarts the service to reattach, spacing repeated attempts along a retry ladder (immediate, then 15s/60s/5m, settling at 15m) that slows down but never stops. Meant to run off a systemd timer, not interactively.",
         args: [],
@@ -39,43 +37,12 @@ pub fn register(r: &mut Registry) {
     ));
 }
 
-/// `quickshell reload` — best-effort, always `Outcome::ok` regardless of
-/// whether the underlying IPC call actually reached a live instance: not
-/// running, or the call itself failing, are reported facts, not command
-/// failures (same posture as `rice stage`'s own `hyprctl`/reload folding).
-fn handle_quickshell_reload(_inv: &Invocation) -> Outcome {
-    let status = crate::ipc::quickshell_ipc_reload();
-    Outcome::ok("quickshell.reload", status.message())
-        .with_data(json!({ "status": status.tag() }))
-}
-
 /// `quickshell healthcheck` — best-effort, always `Outcome::ok`: whether
 /// nothing was wrong, a restart was fired, or a restart was withheld under
 /// backoff are all reported facts, not command failures (same posture as
-/// `handle_quickshell_reload` above).
+/// `reload`'s declarative arm, `commands/reload.rs`).
 fn handle_quickshell_healthcheck(_inv: &Invocation) -> Outcome {
     let outcome = crate::health::run_healthcheck();
     Outcome::ok("quickshell.healthcheck", outcome.message())
         .with_data(json!({ "status": outcome.tag() }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use aoide_protocol::output::Status;
-
-    /// Always `Ok`, whatever the live reload attempt actually resolved to —
-    /// `not-running`/`failed`/`reloaded` are reported facts in `data.status`,
-    /// never a command failure (best-effort tier, `ipc.rs`'s own doc
-    /// comment). Deliberately doesn't assert WHICH tag: that depends on
-    /// whether `aoide-quickshell.service` happens to be live on the machine
-    /// running this test.
-    #[test]
-    fn quickshell_reload_is_always_ok_and_carries_a_status_tag() {
-        let out = handle_quickshell_reload(&aoide_test_support::inv(&["quickshell", "reload"], &[]));
-        assert_eq!(out.status, Status::Ok);
-        assert_eq!(out.command, "quickshell.reload");
-        let data = out.data.unwrap();
-        assert!(data["status"].is_string(), "{data:?}");
-    }
 }

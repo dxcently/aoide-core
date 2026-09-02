@@ -190,9 +190,14 @@ fn handle_rice_stage_entry(inv: &Invocation) -> Outcome {
     // before `handle_rice_stage` ran — because this entrypoint deliberately
     // leaves `mode.json` untouched for a Draft-mode write (see this
     // function's own doc comment above); it cannot have changed underneath
-    // us. Outside Draft mode there is no draft directory to nest a `takes/`
-    // under at all, so nothing fires — `take::resolve_draft` would refuse it
-    // anyway, this just skips the call.
+    // us. Draft-only ON PURPOSE, not because anything would refuse otherwise:
+    // `take::resolve_scope` now ALSO resolves in `Staging` mode (the
+    // staging-mode take/back reach, `lyra reload` design, settled
+    // 2026-08-31), so this gate is the one thing standing between a bare
+    // `rice stage <name>` and minting a take on every single staging-mode
+    // call — `lyra reload` is the deliberate, deduped staging-mode snapshot
+    // point instead (`commands/reload.rs`); this hook stays Draft-only so
+    // the two never double-mint.
     //
     // Unconditional `snapshot`, not the drift-checking core: a take records
     // every write, not just the ones that changed something —
@@ -224,12 +229,12 @@ fn handle_rice_stage_entry(inv: &Invocation) -> Outcome {
             Ok(record) => {
                 if let (Some(song), Some(draft)) = (&mode_marker.song, &mode_marker.draft) {
                     out.changed.push(
-                        aoide_storage::takes::take_path(song, draft, record.take)
+                        aoide_storage::takes::take_path(song, Some(draft), record.take)
                             .to_string_lossy()
                             .into_owned(),
                     );
                     out.changed.push(
-                        aoide_storage::takes::head_path(song, draft)
+                        aoide_storage::takes::head_path(song, Some(draft))
                             .to_string_lossy()
                             .into_owned(),
                     );
@@ -1075,7 +1080,7 @@ mod tests {
         assert!(out.changed.iter().any(|c| c.ends_with("takes/0001.json")));
         assert!(out.changed.iter().any(|c| c.ends_with("takes/head.json")));
 
-        let record = aoide_storage::takes::load_take("moonlight", "neon-night", 1).unwrap();
+        let record = aoide_storage::takes::load_take("moonlight", Some("neon-night"), 1).unwrap();
         assert_eq!(record.cause, "stage", "auto-take from rice stage carries cause \"stage\"");
         assert_eq!(record.parent, None, "first take in an empty store has no parent");
         let _ = std::fs::remove_dir_all(&root);
@@ -1108,10 +1113,10 @@ mod tests {
         );
         assert!(second.changed.iter().any(|c| c.ends_with("takes/0002.json")));
 
-        let record = aoide_storage::takes::load_take("moonlight", "neon-night", 2).unwrap();
+        let record = aoide_storage::takes::load_take("moonlight", Some("neon-night"), 2).unwrap();
         assert_eq!(record.parent, Some(1), "the second take hangs off the first");
         assert_eq!(
-            aoide_storage::takes::list_takes("moonlight", "neon-night").len(),
+            aoide_storage::takes::list_takes("moonlight", Some("neon-night")).len(),
             2,
             "both writes are on record, even though their content is identical"
         );

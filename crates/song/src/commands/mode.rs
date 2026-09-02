@@ -100,7 +100,10 @@ pub fn register(r: &mut Registry) {
     ));
 }
 
-fn mode_word(m: RiceMode) -> &'static str {
+/// `pub(crate)`, not private: `commands/reload.rs` reuses this SAME mapping
+/// to report which arm `lyra reload`'s dispatch took, rather than growing a
+/// second `RiceMode -> &str` match elsewhere.
+pub(crate) fn mode_word(m: RiceMode) -> &'static str {
     match m {
         RiceMode::Staging => "staging",
         RiceMode::Declarative => "declarative",

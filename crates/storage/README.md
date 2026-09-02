@@ -403,7 +403,13 @@ by decision — no embedded database yet
   itself lives in `aoide-client::tunnel` (P-S3), the same `peer_store`
   (storage) / `commands` (client) split this crate already holds for peer
   transport.
-- `takes` — the per-draft take store behind `rice back`/`rice take`.
+- `takes` — the take store behind `rice back`/`rice take`, hanging off
+  `songbook/<song>/takes/` when staged directly or
+  `songbook/<song>/drafts/<name>/takes/` when routed into a draft
+  (`lyra reload` design, settled 2026-08-31 — the staging-mode take/back
+  reach; every function takes `draft: Option<&str>`, `None` selecting the
+  song-scoped root). `TakeRecord` also carries `widgets: Value` — the
+  song's widget QML bodies at mint time.
 - `petname`/`display` — the adjective-noun petname mint and its
   render-time-only display grammar.
 - `addr` — the pure address resolver (messaging/presence plan, P-C1),

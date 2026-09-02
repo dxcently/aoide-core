@@ -35,11 +35,19 @@ in `lyra`, not core.
   prebaked `manifest.json`/`registry.json` as the baseline for every OTHER
   committed song and patches in the currently-staged song's own entry from
   a direct, nix-free scan (`scan_own_entry`) — the only shape `rice
-  compose` can ever produce (no `_widgets/` shelf).
+  compose` can ever produce (no `_widgets/` shelf). `snapshot_widget_bodies`
+  (`lyra reload` design, settled 2026-08-31) captures the same
+  `songbook/<song>/widgets/` tree `sync_song_widgets` copies FROM — never
+  `run/qml`'s deployed copy — as the take store's own widget-body payload;
+  read-only, no restore counterpart (`rice back` still never touches widget
+  bodies — they stay git's substrate).
 - `ipc`, `lint`, `reap` — the song IPC surface, `rice lint`, and stale-song
   reaping.
 - `commands` — this crate's CLI commands: `rice *`, `livery *`, `cover set`,
-  `element seed`. `rice compose --from <song>` resolves its source via
+  `element seed`, `rice take`/`take.*`/`rice back`, `quickshell healthcheck`,
+  and `reload` (`lyra reload` design, settled 2026-08-31 — the one
+  mode-aware iteration command; absorbed `quickshell reload` outright).
+  `rice compose --from <song>` resolves its source via
   `commands::rice::resolve_from_notes_path` (L-C3, task #107):
   `songbook_dir(from)` first, else `<templates>/<from>/livery.json`
   (`fs::song_templates_dir`) — a repo-less host still has something to copy

@@ -46,6 +46,31 @@
 - **Staging/draft/declarative-mode gating lives in `commands`, not here.**
   `rice stage`/`cover set` refuse outside an unlocked mode — that gate is a
   `commands` concern layered over these pure/near-pure engine modules.
+- **`commands::rice::handle_rice_stage` is Staging's write path, NEVER
+  Draft's — don't call it from a Draft-mode code path.** It reads the
+  COMMITTED songbook and writes the result into `stage/livery.json`. In
+  `Staging` mode that file is a plain file, so this is exactly "re-derive
+  declared content" — correct by design. While routed into a `Draft`,
+  `stage/livery.json` is a SYMLINK into the draft's own file
+  (`commands/mode.rs`'s own doc), and `atomic_write` is symlink-transparent
+  — calling `handle_rice_stage` there would silently overwrite the draft
+  with plain committed truth, destroying the edits draft mode exists to
+  hold. `commands/reload.rs`'s own `sync_draft_in_place` is the guard this
+  bit live once (`lyra reload` design, settled 2026-08-31) — a Draft-mode
+  caller needing the widget-sync/hyprctl-apply tail reuses THAT, or the bare
+  `crate::live`/`crate::widgets` primitives directly, never
+  `handle_rice_stage`.
+- **`aoide_storage::takes`' functions take `draft: Option<&str>`, not
+  `&str` — `None` means staging-mode (`songbook/<song>/takes/`), `Some`
+  means a routed draft (`songbook/<song>/drafts/<name>/takes/`).**
+  `commands/take.rs::resolve_scope` is the one place that resolves which
+  scope applies, off `mode.json` — every take/back/prune command in that
+  file threads its `Option<&str>` straight through rather than re-deriving
+  it. `TakeRecord` also carries `widgets: Value` (the song's widget bodies
+  at mint time, `widgets.rs::snapshot_widget_bodies`) — captured on every
+  take in both scopes, but never restored by `rice back` (see the
+  `handle_rice_stage` bullet above: widget bodies stay git's substrate,
+  deliberately out of the revert path).
 - **`health.rs` is a second liveness mechanism, deliberately — not a
   violation of `aoide-conduct`'s "don't add a second liveness mechanism"
   rule.** That rule (`pkgs/aoide/crates/conduct/AGENTS.md`) guards ONE

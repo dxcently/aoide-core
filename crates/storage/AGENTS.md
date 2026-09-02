@@ -109,6 +109,15 @@
   `docs/architecture/PACKAGE-LAYOUT.md`'s "Charter exceptions" note — `mode`
   is read by `shellbridge` (which stays in `conduct`), so moving it would
   create the cross-crate edge the split exists to avoid.
+- **`takes`' functions take `draft: Option<&str>`, not `&str`** (`lyra
+  reload` design, settled 2026-08-31): `None` resolves the take root to
+  `songbook/<song>/takes/` (staging mode, no draft to nest under); `Some`
+  resolves it to `songbook/<song>/drafts/<draft>/takes/`, the original
+  shape. `takes_dir` is the one function that branches on it; every other
+  function in the module derives its path through `takes_dir`/`take_path`/
+  `head_path`/`marks_path` and just forwards the `Option` — don't
+  reintroduce a `&str`-only overload "for convenience", it would fork the
+  root-resolution logic in two places.
 - **Test env mutation is serialized.** Any test touching
   `AOIDE_STAGE_DIR`/`AOIDE_STATE_DIR` (or similar process-global env) takes
   this crate's `env_lock()` (delegates to `aoide-test-support`).
