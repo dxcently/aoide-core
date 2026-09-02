@@ -294,6 +294,30 @@ pub struct SessionRecord {
     /// terminal a human opened themselves.
     #[serde(default, skip_serializing_if = "is_false")]
     pub spawned: bool,
+    /// True while this session is EXEMPT from the reaper's staleness
+    /// judgments (task #20, `aoide session grant exempt on|off`) — the
+    /// safety valve for `session reap --now`, which otherwise takes every
+    /// idle spawned shell including one an agent is merely between commands
+    /// on. Set/cleared by `graph/grant.rs::exempt_grant`, the same
+    /// `#[serde(default, skip_serializing_if = "is_false")]` shape as
+    /// `spawned` above — additive/v0-safe, absent on a legacy record.
+    ///
+    /// Unlike `undying` (a separate, POST-MORTEM state file whose meaning
+    /// starts at death), this field's meaning ENDS at death: a resurrected
+    /// session mints a fresh id, so the mark has nothing to survive onto and
+    /// belongs on the record itself, not a durable set — it vanishes with
+    /// the record the moment a REAL death signal (window-gone, pid-gone, a
+    /// pre-boot ghost, an orphaned subagent) takes it. `reap.rs`'s
+    /// `is_session_dead` (the `stale_abandoned` signal) and
+    /// `abandoned_spawned_shells` are the only two judgments it vetoes —
+    /// staleness is the only signal class that can ever take a LIVE
+    /// session, so vetoing exactly those two is "never reap a live exempt
+    /// session, never lie about a dead one." It survives `--now`
+    /// structurally: both reap arms filter exempt records out of candidacy
+    /// before any band/gesture question is asked, so a human pressing
+    /// `[ reap ]` still cannot take a live exempt session.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub exempt: bool,
     /// The harness's OWN session id, straight off the raw hook payload's own
     /// `session_id` field (P-D7) — stamped on every `graph session hook`
     /// event that carries one, regardless of whether it equals this

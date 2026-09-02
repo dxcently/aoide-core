@@ -3,9 +3,8 @@
 //! POSITIONAL `<kind>` grammar, matching `secrets automate <name> on|off`
 //! (`crates/secrets/src/commands.rs`) rather than growing a second flag on
 //! bare `session` — which no longer picks anything: it renders the roster
-//! instead (`who.rs`'s module doc, "The roster core"). One kind exists
-//! today, `undying` — [`GRANTABLE_KINDS`] — the U1/U3 mark, relocated here
-//! verbatim, nothing about its own mechanics changed:
+//! instead (`who.rs`'s module doc, "The roster core"). Two kinds exist today
+//! — [`GRANTABLE_KINDS`]:
 //!
 //! - `session grant undying` (bare, no state) opens the interactive
 //!   PICKER — [`undying_picker`], U3's exact body, only relocated. A
@@ -18,12 +17,25 @@
 //!   from the standalone `session undying` command, which this absorbs and
 //!   retires (hard cutover, no alias: `session undying` is now unknown,
 //!   same as a typo).
+//! - `session grant exempt on|off [--self | --id <id>]` (task #20) is the
+//!   OTHER scripted mark — [`exempt_grant`] — vetoing the reaper's
+//!   staleness judgments for a LIVE session (`reap.rs`'s `is_session_dead`
+//!   third signal and its `abandoned_spawned_shells` arm), never its
+//!   window-gone/pid-gone/ghost/orphan signals. This kind has NO picker:
+//!   bare `session grant exempt` is a taught refusal naming the scripted
+//!   form, since the motivating caller is a script (`--self`/`--id`), not
+//!   an interactive session at a tty. Unlike `undying`, its mark lives on
+//!   `SessionRecord::exempt` — a stage-tree field, not a durable state
+//!   file — because an exemption's meaning ENDS at death (a resurrected
+//!   session mints a fresh id) where undying's begins there; see
+//!   `exempt_grant`'s own doc for the full contrast.
 //! - `session grant` (no kind at all) teaches the grantable set; an
 //!   unknown kind is a taught refusal. The dispatch in [`session_grant`] is
-//!   a plain match arm — a future kind (#127, secret grants) adds one arm,
-//!   and if it wants a picker too, reuses [`undying_picker`]'s own
-//!   CLI+tty gate shape ([`require_cli_tty`]) rather than re-deriving it —
-//!   there is still only one multi-select primitive in this crate.
+//!   a plain match arm — a future kind (#127, secret grants is the next one
+//!   named, not yet built) adds one arm, and if it wants a picker too,
+//!   reuses [`undying_picker`]'s own CLI+tty gate shape
+//!   ([`require_cli_tty`]) rather than re-deriving it — there is still only
+//!   one multi-select primitive in this crate.
 //!
 //! **CLI-only, tty-only — the picker branch only.** [`undying_picker`]
 //! gates on [`aoide_protocol::Door::Cli`] FIRST (the same `require_cli`
@@ -98,10 +110,16 @@
 //! refusal above, or a plain I/O error) folds every pending peer change for
 //! that confirm into `skipped[]` instead, never a false `changed` entry.
 
-use super::model::{merged_sessions, resolved_parent, HookRecord, SessionRecord};
+use super::common::stage_error;
+use super::doc::restage_graph;
+use super::model::{
+    load_stage, merged_sessions, resolved_parent, sessions_path, write_stage, HookRecord,
+    SessionRecord, SessionsFile,
+};
 use super::who::{sessions_from_graph, SessionView};
 use aoide_protocol::output::Outcome;
 use aoide_protocol::{pick, Door, Invocation};
+use aoide_storage::fs::with_stage_lock;
 use aoide_storage::manifest::{self, Manifest, SessionSpec};
 use aoide_storage::peer_store::{self, Peer};
 use aoide_storage::undying::{self, UndyingSession};
@@ -395,9 +413,9 @@ fn require_cli_tty(inv: &Invocation, cmd: &str) -> Option<Outcome> {
     None
 }
 
-/// Grantable kinds — one today. A future kind (#127, secret grants) is one
-/// more entry here plus one more `match` arm in [`session_grant`].
-const GRANTABLE_KINDS: &[&str] = &["undying"];
+/// Grantable kinds. A future kind (#127, secret grants) is one more entry
+/// here plus one more `match` arm in [`session_grant`].
+const GRANTABLE_KINDS: &[&str] = &["undying", "exempt"];
 
 /// `session grant <kind> [on|off] [--id <id> | --self]` — the registered
 /// entry point (module doc has the full grammar). Bare (no `<kind>`) teaches
@@ -418,11 +436,118 @@ pub fn session_grant(inv: &Invocation) -> Outcome {
             None => undying_picker(inv, cmd),
             Some(state) => super::undying::undying_grant(inv, cmd, state),
         },
+        // No picker for this kind (module doc's "Fork 1" — the design record
+        // this landed under, task #20): bare `session grant exempt` is a
+        // taught refusal naming the scripted form, never a multi-select.
+        "exempt" => match inv.args.get(1).map(String::as_str) {
+            None => Outcome::usage(
+                cmd,
+                format!("`exempt` takes a state — `on` or `off` (no picker for this kind)\n{usage}"),
+            ),
+            Some(state) => exempt_grant(inv, cmd, state),
+        },
         other => Outcome::usage(
             cmd,
             format!("`{other}` is not a grantable kind — grantable: {}\n{usage}", GRANTABLE_KINDS.join(", ")),
         ),
     }
+}
+
+/// `session grant exempt (on|off) [--self | --id <id>] [--json]` — the
+/// SCRIPTED exempt mark (task #20's design record). Mirrors [`super::
+/// undying::undying_grant`]'s on/off/`--self`/`--id` shape, but the
+/// lifecycle runs the OPPOSITE direction: an exemption's meaning ENDS at
+/// death (a resurrected session mints a fresh id), so it lives on
+/// `SessionRecord::exempt` — a stage-tree field — rather than a durable
+/// state file, and it MUST route through `aoide_client::daemon::
+/// daemon_dispatch` first, the same L4 dual-writer discipline every other
+/// stage-writing `session *` handler in this crate holds
+/// (`session_store.rs`'s `session_start`/`session_phase`/`session_end`,
+/// `reap.rs`'s `reap_and_announce`). `undying_grant` is this file's one
+/// exception to that discipline, and stays one — `undying.json` sits
+/// outside the stage tree entirely; this function is not that case.
+///
+/// Unlike `undying_grant`, `--id`/`--self` MUST resolve to a session
+/// CURRENTLY on the roster: an exemption vetoes a LIVE reap judgment, so a
+/// mark with no record to carry it means nothing — deliberately the
+/// opposite of undying's own post-mortem posture (module doc's "Fork 2").
+fn exempt_grant(inv: &Invocation, cmd: &str, state: &str) -> Outcome {
+    if let Some(outcome) = aoide_client::daemon::daemon_dispatch(inv) {
+        return outcome;
+    }
+    let usage = "usage: aoide session grant exempt (on|off) [--self | --id <id>] [--json]";
+
+    let on = match state {
+        "on" => true,
+        "off" => false,
+        other => {
+            return Outcome::usage(
+                cmd,
+                format!("`{other}` is not an exempt state — the only two are `on` and `off`\n{usage}"),
+            );
+        }
+    };
+
+    let self_flag = inv.flag_present("self");
+    let id_flag = inv
+        .flags
+        .get("id")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if self_flag && id_flag.is_some() {
+        return Outcome::usage(cmd, format!("--self and --id are mutually exclusive\n{usage}"));
+    }
+
+    let id = match id_flag {
+        Some(id) => id,
+        None => match std::env::var("AOIDE_SESSION_ID").ok().filter(|s| !s.is_empty()) {
+            Some(id) => id,
+            None => {
+                return Outcome::usage(
+                    cmd,
+                    format!(
+                        "no session to mark exempt: pass --self (reads $AOIDE_SESSION_ID) or \
+                         --id <id> — neither was given and $AOIDE_SESSION_ID is unset\n{usage}"
+                    ),
+                );
+            }
+        },
+    };
+
+    with_stage_lock(|| {
+        let mut s_file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(f) => f,
+            Err(e) => return stage_error(cmd, e),
+        };
+        let Some(idx) = s_file.sessions.iter().position(|s| s.session_id == id) else {
+            return Outcome::usage(
+                cmd,
+                format!("`{id}` is not on the roster — an exemption lives on a live session's record"),
+            );
+        };
+        let message = if on {
+            format!("`{id}` is now exempt from the reaper's staleness sweep")
+        } else {
+            format!("`{id}` is no longer exempt")
+        };
+        if s_file.sessions[idx].exempt == on {
+            // Idempotent — the same "a re-mark is not a transition" contract
+            // `undying_grant` holds: nothing to persist or restage.
+            return Outcome::ok(cmd, message).with_data(json!({ "sessionId": id, "exempt": on }));
+        }
+        s_file.sessions[idx].exempt = on;
+        if let Err(e) = write_stage(&sessions_path(), &s_file) {
+            return stage_error(cmd, e);
+        }
+        let mut changed = vec![format!("{id}: {}", if on { "exempt" } else { "not exempt" })];
+        match restage_graph() {
+            Ok(g) => changed.push(g.to_string_lossy().into_owned()),
+            Err(e) => return stage_error(cmd, e),
+        }
+        Outcome::ok(cmd, message)
+            .changed(changed)
+            .with_data(json!({ "sessionId": id, "exempt": on }))
+    })
 }
 
 /// `session grant undying` (bare, no state) — the interactive picker, U3's
@@ -522,6 +647,7 @@ mod tests {
             state: state.to_string(),
             presence: "online",
             cwd: cwd.to_string(),
+            exempt: false,
         }
     }
 
@@ -946,6 +1072,7 @@ mod tests {
         let out = session_grant(&grant_inv(&[]));
         assert_eq!(out.status, aoide_protocol::output::Status::Usage);
         assert!(out.message.contains("undying"), "msg: {}", out.message);
+        assert!(out.message.contains("exempt"), "msg: {}", out.message);
     }
 
     #[test]
@@ -972,5 +1099,161 @@ mod tests {
         let out = session_grant(&grant_inv(&["undying", "sideways"]));
         assert_eq!(out.status, aoide_protocol::output::Status::Usage);
         assert!(out.message.contains("not an undying state"), "msg: {}", out.message);
+    }
+
+    // ── exempt kind (task #20): session grant exempt on|off [--self | --id] ──
+
+    /// Isolated stage+state dir per test — the exact shape `undying.rs`'s own
+    /// `setup` uses; unlike `undying_grant`, `exempt_grant` reads/writes
+    /// `sessions.json` directly, so it needs the stage half too.
+    fn setup(tag: &str) -> std::path::PathBuf {
+        let root = crate::graph::testutil::unique_stage(tag);
+        let stage = root.join("stage");
+        let state = root.join("state");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        root
+    }
+
+    fn exempt_invocation(args: &[&str], flags: &[(&str, &str)]) -> Invocation {
+        Invocation {
+            path: vec!["session".into(), "grant".into()],
+            args: args.iter().map(|s| s.to_string()).collect(),
+            flags: flags.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            door: Door::Cli,
+        }
+    }
+
+    #[test]
+    fn bare_exempt_kind_is_a_taught_refusal_naming_the_scripted_form() {
+        // No picker for this kind (module doc's "Fork 1") — unlike
+        // `undying`, a missing state is a usage error, not a picker dispatch.
+        let out = session_grant(&grant_inv(&["exempt"]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage);
+        assert!(out.message.contains("takes a state"), "msg: {}", out.message);
+        assert!(out.message.contains("no picker for this kind"), "msg: {}", out.message);
+    }
+
+    #[test]
+    fn exempt_grant_on_then_off_round_trips_through_the_record() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = crate::graph::testutil::EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_STATE_DIR",
+            "AOIDE_SESSION_ID",
+        ]);
+        let root = setup("exempt-roundtrip");
+        write_stage(
+            &sessions_path(),
+            &SessionsFile { schema_version: "0".into(), sessions: vec![session("sess-1", "/x", "idle", "1", None)] },
+        )
+        .unwrap();
+
+        let on = exempt_grant(&exempt_invocation(&[], &[("id", "sess-1")]), "session.grant", "on");
+        assert_eq!(on.status, aoide_protocol::output::Status::Ok, "msg: {}", on.message);
+        assert_eq!(on.data.as_ref().unwrap()["exempt"], true);
+        // `changed` also carries the restage-graph path (`restage_graph`'s
+        // own convention, same as `session_store.rs`'s other stage writers)
+        // — the transition line is the part this test pins.
+        assert!(on.changed.contains(&"sess-1: exempt".to_string()), "{:?}", on.changed);
+        let f: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert!(f.sessions.iter().find(|s| s.session_id == "sess-1").unwrap().exempt);
+
+        let off = exempt_grant(&exempt_invocation(&[], &[("id", "sess-1")]), "session.grant", "off");
+        assert_eq!(off.status, aoide_protocol::output::Status::Ok, "msg: {}", off.message);
+        assert_eq!(off.data.as_ref().unwrap()["exempt"], false);
+        assert!(off.changed.contains(&"sess-1: not exempt".to_string()), "{:?}", off.changed);
+        let f: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert!(!f.sessions.iter().find(|s| s.session_id == "sess-1").unwrap().exempt);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exempt_grant_a_remark_is_ok_but_reports_no_transition() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = crate::graph::testutil::EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
+        let root = setup("exempt-remark");
+        write_stage(
+            &sessions_path(),
+            &SessionsFile { schema_version: "0".into(), sessions: vec![session("sess-1", "/x", "idle", "1", None)] },
+        )
+        .unwrap();
+
+        let first = exempt_grant(&exempt_invocation(&[], &[("id", "sess-1")]), "session.grant", "on");
+        assert!(!first.changed.is_empty());
+        let second = exempt_grant(&exempt_invocation(&[], &[("id", "sess-1")]), "session.grant", "on");
+        assert_eq!(second.status, aoide_protocol::output::Status::Ok);
+        assert!(second.changed.is_empty(), "a re-mark is not a transition: {:?}", second.changed);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exempt_grant_rejects_an_unknown_state() {
+        // `exempt_grant` tries `daemon_dispatch` first (unlike
+        // `undying_grant`) — the crate-wide `env_lock` guard is what floors
+        // `AOIDE_DAEMON_SOCKET` to a path that can never have a real
+        // listener (`lib.rs`'s own P-D6 safety net), so this test needs it
+        // even though it never touches the stage tree.
+        let _guard = crate::env_lock().lock().unwrap();
+        let out = exempt_grant(&exempt_invocation(&[], &[("id", "sess-1")]), "session.grant", "maybe");
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage);
+        assert!(out.message.contains("not an exempt state"), "msg: {}", out.message);
+        assert!(out.message.contains("on"), "msg: {}", out.message);
+        assert!(out.message.contains("off"), "msg: {}", out.message);
+    }
+
+    #[test]
+    fn exempt_grant_rejects_self_and_id_together() {
+        let _guard = crate::env_lock().lock().unwrap(); // see the daemon-socket-floor note above
+        let out = exempt_grant(&exempt_invocation(&[], &[("self", "true"), ("id", "sess-1")]), "session.grant", "on");
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage);
+        assert!(out.message.contains("mutually exclusive"), "msg: {}", out.message);
+    }
+
+    #[test]
+    fn exempt_grant_rejects_no_id_and_no_env() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = crate::graph::testutil::EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
+        let root = setup("exempt-no-target");
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        let out = exempt_grant(&exempt_invocation(&[], &[]), "session.grant", "on");
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage);
+        assert!(out.message.contains("--self"), "msg: {}", out.message);
+        assert!(out.message.contains("--id"), "msg: {}", out.message);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exempt_grant_rejects_an_id_absent_from_the_roster() {
+        // The one deliberate divergence from `undying_grant`'s post-mortem
+        // posture (module doc's "Fork 2") — an exemption lives on a LIVE
+        // record, so a dead/unknown id is a refusal here, never a valid
+        // post-mortem target.
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = crate::graph::testutil::EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
+        let root = setup("exempt-off-roster");
+        // sessions.json stays empty -- "long-dead-id" is never in it.
+
+        let out = exempt_grant(&exempt_invocation(&[], &[("id", "long-dead-id")]), "session.grant", "on");
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage);
+        assert!(out.message.contains("is not on the roster"), "msg: {}", out.message);
+        assert!(out.message.contains("live session's record"), "msg: {}", out.message);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exempt_kind_with_a_bogus_state_is_a_usage_error_from_the_scripted_path_not_a_picker() {
+        // Routing proof through `session_grant` itself (mirrors the undying
+        // dispatch test above) -- `exempt` has no picker branch to fall to.
+        let _guard = crate::env_lock().lock().unwrap(); // reaches exempt_grant -> daemon_dispatch
+        let out = session_grant(&grant_inv(&["exempt", "sideways"]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage);
+        assert!(out.message.contains("not an exempt state"), "msg: {}", out.message);
     }
 }

@@ -387,6 +387,7 @@ mod tests {
             state: state.to_string(),
             presence: if state == "done" { "done" } else { "online" },
             cwd: "/x".to_string(),
+            exempt: false,
         }
     }
 

@@ -171,6 +171,11 @@ pub const REAP_SPAWNED_SHELL_STALE_SECS: i64 = 48 * 3600; // 48 hours (2 days)
 ///     top: a live pid that is NOT its window's owning pid is the agent's OWN
 ///     process (the payload-pid seam) — positive proof of life, governed by
 ///     the pid signal alone.
+///   One more veto, orthogonal to all of the above: `rec.exempt` (task #20,
+///   `aoide session grant exempt on|off`) vetoes `stale_abandoned` alone —
+///   window-gone and pid-gone still fire on an exempt record, since only
+///   staleness can ever take a LIVE session and that is exactly what the
+///   exemption promises against.
 ///
 /// The never-false-reap guards:
 ///   * `live_addresses` is an `Option`: `None` means the compositor could not be
@@ -237,6 +242,7 @@ pub fn is_session_dead(
     };
     let stale_abandoned = stale_eligible
         && !live_agent_pid
+        && !rec.exempt
         && ((at_rest && stale_beyond(REAP_IDLE_STALE_SECS))
             || (mid_turn && stale_beyond(working_band)));
     window_signal || pid_signal || stale_abandoned
@@ -659,7 +665,7 @@ fn orphaned_subagents(
 /// agent's hook door re-registers a falsely-reaped AGENT on its very next
 /// event ([`is_session_dead`]'s own "never-false-reap" doc), but nothing
 /// ever re-registers a shell mid-life, so a false positive here is
-/// unrecoverable in a way this file's other signals are not. Three guards
+/// unrecoverable in a way this file's other signals are not. Four guards
 /// keep it to exactly the shape an agent-spawned, unattended worker
 /// terminal has, and never a human's:
 ///   * `spawned` — a PERMANENT registration fact stamped once inside the
@@ -684,6 +690,10 @@ fn orphaned_subagents(
 ///     foreground command, however quiet) or `awaiting` (a sudo prompt
 ///     mid-conversation). Only a terminal doing NOTHING right now is even
 ///     considered.
+///   * `!exempt` (task #20, `aoide session grant exempt on|off`) — an agent
+///     that wants ITS OWN spawned worker terminal safe from this arm marks
+///     it after spawn; the veto holds banded AND waived alike, so `--now`
+///     cannot take an exempt shell either.
 ///
 /// The touch signal is the per-session pty LOG FILE's own mtime
 /// (`state/sessions/<id>.log`, `log_path`): every byte that crosses this
@@ -721,22 +731,59 @@ fn orphaned_subagents(
 /// OWNING session is already gone, never as the primary death signal
 /// itself). A record this catches drops off the roster; a still-running
 /// shell behind it keeps running, untracked, until its own natural exit.
+///
+/// `rec.exempt` (task #20) vetoes this arm too — an exempt worker terminal
+/// is never abandoned-shell candidacy, banded or waived alike. Shared with
+/// [`spared_exempt_spawned_shells`] below via [`spawned_shell_shape`], the
+/// ONE definition of "shaped like a leftover spawned shell" both read, so a
+/// record can never be both reaped and reported spared, or neither.
 fn abandoned_spawned_shells(
     sessions: &[SessionRecord],
     now_epoch: i64,
     log_mtime: impl Fn(&SessionRecord) -> Option<i64>,
     band: Option<i64>,
 ) -> Vec<String> {
+    spawned_shell_shape(sessions, now_epoch, log_mtime, band)
+        .filter(|s| !s.exempt)
+        .map(|s| s.session_id.clone())
+        .collect()
+}
+
+/// The staleness/idle/spawned shape [`abandoned_spawned_shells`] looks for
+/// — WITHOUT the `exempt` veto, so both that function and
+/// [`spared_exempt_spawned_shells`] read the exact same candidacy test and
+/// differ only in which side of `exempt` they keep. See
+/// `abandoned_spawned_shells`'s own doc for what each clause means.
+fn spawned_shell_shape<'a>(
+    sessions: &'a [SessionRecord],
+    now_epoch: i64,
+    log_mtime: impl Fn(&SessionRecord) -> Option<i64>,
+    band: Option<i64>,
+) -> impl Iterator<Item = &'a SessionRecord> {
     sessions
         .iter()
         .filter(|s| s.state != "done")
         .filter(|s| s.spawned && s.restore.is_some() && canonical_state(&s.state) == "idle")
-        .filter(|s| match band {
+        .filter(move |s| match band {
             Some(secs) => {
                 log_mtime(s).is_some_and(|seen| now_epoch.saturating_sub(seen) > secs)
             }
             None => true,
         })
+}
+
+/// The exempt idle spawned shells the waived arm (`band: None`, a human
+/// gesture) skipped — reported by `reap_inner` on `--now` only (module doc:
+/// "Sweep visibility"), never on the unattended pass, which would otherwise
+/// name them on every ~12s tick forever. `band` is always `None` here: the
+/// unattended pass never waives, so it has nothing waived to report.
+fn spared_exempt_spawned_shells(
+    sessions: &[SessionRecord],
+    now_epoch: i64,
+    log_mtime: impl Fn(&SessionRecord) -> Option<i64>,
+) -> Vec<String> {
+    spawned_shell_shape(sessions, now_epoch, log_mtime, None)
+        .filter(|s| s.exempt)
         .map(|s| s.session_id.clone())
         .collect()
 }
@@ -1364,6 +1411,18 @@ fn reap_inner(
         }
     }
 
+    // The exempt idle spawned shells the waived arm just skipped — a human
+    // gesture only (`spawned_shell_band.is_none()` iff `--now`); the
+    // unattended pass reports nothing here (module doc's "Sweep
+    // visibility" — it would otherwise name them on every ~12s tick
+    // forever). Folded into `message`/`data.spared` below, NEVER `changed`:
+    // nothing moves on the roster, so this must not toast the timer.
+    let spared: Vec<String> = if spawned_shell_band.is_none() {
+        spared_exempt_spawned_shells(&s_file.sessions, now_epoch, log_mtime)
+    } else {
+        Vec::new()
+    };
+
     // And the tombstones a re-identified terminal leaves behind: `done` agent
     // records whose window already holds a LIVE agent (see
     // `superseded_done_siblings`). Kept OUT of `reaped` deliberately — these
@@ -1458,8 +1517,20 @@ fn reap_inner(
         && orphan_sockets.is_empty()
         && tunnel_candidates.is_empty()
     {
+        // A pressed button that spares something says so, even on an
+        // otherwise quiet pass — the whole point of `--now` sparing an
+        // exempt shell is invisible to the operator if a quiet pass says
+        // nothing at all (module doc's "Sweep visibility").
+        let message = if spared.is_empty() {
+            "nothing to reap (all sessions live)".to_string()
+        } else {
+            format!(
+                "nothing to reap (all sessions live); spared {} exempt idle spawned shell(s)",
+                spared.len()
+            )
+        };
         return (
-            Outcome::ok(cmd, "nothing to reap (all sessions live)").with_data(json!({
+            Outcome::ok(cmd, message).with_data(json!({
                 "reaped": [],
                 "decayed": [],
                 "orphanHooks": [],
@@ -1467,6 +1538,7 @@ fn reap_inner(
                 "orphanSockets": [],
                 "orphanTunnels": [],
                 "hyprctlAvailable": hyprctl_available,
+                "spared": spared,
             })),
             Vec::new(),
         );
@@ -1599,31 +1671,36 @@ fn reap_inner(
         Ok(g) => changed.push(g.to_string_lossy().into_owned()),
         Err(e) => return (stage_error(cmd, e), Vec::new()),
     }
-    let outcome = Outcome::ok(
-        cmd,
-        format!(
-            "reaped {} dead session(s); dropped {} total; decayed {} stopped → idle; cleared {} orphaned parent link(s); dropped {} orphaned hook record(s); dropped {} superseded session(s); unlinked {} orphaned socket(s)",
-            reaped.len(),
-            removed.len(),
-            decayed.len(),
-            cleared.len(),
-            orphan_hooks.len(),
-            superseded_done.len(),
-            orphan_sockets.len()
-        ),
-    )
-    .changed(changed)
-    .with_data(json!({
-        "reaped": reaped,
-        "removed": removed,
-        "decayed": decayed,
-        "clearedParents": cleared,
-        "orphanHooks": orphan_hooks,
-        "supersededDone": superseded_done,
-        "orphanSockets": orphan_sockets,
-        "orphanTunnels": Vec::<String>::new(),
-        "hyprctlAvailable": hyprctl_available,
-    }));
+    let mut message = format!(
+        "reaped {} dead session(s); dropped {} total; decayed {} stopped → idle; cleared {} orphaned parent link(s); dropped {} orphaned hook record(s); dropped {} superseded session(s); unlinked {} orphaned socket(s)",
+        reaped.len(),
+        removed.len(),
+        decayed.len(),
+        cleared.len(),
+        orphan_hooks.len(),
+        superseded_done.len(),
+        orphan_sockets.len()
+    );
+    // A pressed button that spares something says so (module doc's "Sweep
+    // visibility") — folded into the message and `data.spared`, never
+    // `changed`: nothing moved on the roster for these ids.
+    if !spared.is_empty() {
+        message = format!("{message}; spared {} exempt idle spawned shell(s)", spared.len());
+    }
+    let outcome = Outcome::ok(cmd, message)
+        .changed(changed)
+        .with_data(json!({
+            "reaped": reaped,
+            "removed": removed,
+            "decayed": decayed,
+            "clearedParents": cleared,
+            "orphanHooks": orphan_hooks,
+            "supersededDone": superseded_done,
+            "orphanSockets": orphan_sockets,
+            "orphanTunnels": Vec::<String>::new(),
+            "hyprctlAvailable": hyprctl_available,
+            "spared": spared,
+        }));
     (outcome, tunnel_candidates)
 }
 
@@ -1799,6 +1876,60 @@ mod tests {
             now,
             eleven_hours,
         ));
+    }
+
+    // ── exempt (task #20): vetoes `stale_abandoned` alone, in every band —
+    // window-gone and pid-gone are untouched by it ───────────────────────
+
+    #[test]
+    fn exempt_record_survives_stale_abandonment_in_every_band() {
+        let now = 1_800_000_000_i64;
+        let hundred_hours = |_: &SessionRecord| Some(now - 100 * 3600); // past at-rest (72h) and subagent (2h) bands
+        let two_hundred_hours = |_: &SessionRecord| Some(now - 200 * 3600); // past the working band (7d)
+
+        let mut idle = hook_only("shielded-idle", "idle");
+        idle.exempt = true;
+        assert!(
+            !is_session_dead(&idle, None, None, |_| true, now, hundred_hours),
+            "the at-rest band must not condemn an exempt record"
+        );
+
+        let mut working = hook_only("shielded-working", "working");
+        working.exempt = true;
+        assert!(
+            !is_session_dead(&working, None, None, |_| true, now, two_hundred_hours),
+            "the mid-turn band must not condemn an exempt record"
+        );
+
+        let mut sub = subagent("shielded-sub", "working");
+        sub.exempt = true;
+        assert!(
+            !is_session_dead(&sub, None, None, |_| true, now, hundred_hours),
+            "the subagent band must not condemn an exempt record either"
+        );
+    }
+
+    #[test]
+    fn exempt_record_is_still_reaped_by_the_window_gone_signal() {
+        // Staleness is the only signal class the exemption vetoes -- a
+        // vanished window is positive proof the session is gone, and the
+        // exemption never promises otherwise.
+        let now = 1_800_000_000_i64;
+        let fresh = |_: &SessionRecord| Some(now); // no staleness in play at all
+        let mut rec = agent("shielded", "0xAAA", "2026-07-30T00:00:00Z");
+        rec.exempt = true;
+        let live: HashSet<String> = HashSet::new(); // the window is NOT among the live set
+        assert!(is_session_dead(&rec, Some(&live), None, |_| true, now, fresh));
+    }
+
+    #[test]
+    fn exempt_record_is_still_reaped_by_the_pid_gone_signal() {
+        let now = 1_800_000_000_i64;
+        let fresh = |_: &SessionRecord| Some(now);
+        let mut rec = hook_only("shielded-pid", "working");
+        rec.exempt = true;
+        rec.pid = Some(42);
+        assert!(is_session_dead(&rec, None, None, |_| false, now, fresh)); // pid 42 gone
     }
 
     #[test]
@@ -2876,6 +3007,58 @@ mod tests {
         let rec = spawned_shell("gone", "done");
         let stale = |_: &SessionRecord| Some(now - 100 * 3600);
         assert!(abandoned_spawned_shells(&[rec], now, stale, Some(REAP_SPAWNED_SHELL_STALE_SECS)).is_empty());
+    }
+
+    // ── exempt (task #20): vetoes abandoned_spawned_shells, banded AND
+    // waived alike — never reaped, and spared_exempt_spawned_shells reports
+    // it back only on the waived (`--now`) shape ─────────────────────────
+
+    #[test]
+    fn abandoned_spawned_shells_spares_an_exempt_shell_under_the_band() {
+        let now = 1_800_000_000_i64;
+        let mut rec = spawned_shell("worker", "idle");
+        rec.exempt = true;
+        let stale = |_: &SessionRecord| Some(now - 100 * 3600); // well past the band
+        assert!(
+            abandoned_spawned_shells(&[rec], now, stale, Some(REAP_SPAWNED_SHELL_STALE_SECS)).is_empty(),
+            "an exempt shell must survive the unattended band even 100h silent"
+        );
+    }
+
+    #[test]
+    fn abandoned_spawned_shells_spares_an_exempt_shell_even_waived() {
+        // `band: None` is what `--now` resolves to -- a human gesture takes
+        // every OTHER idle spawned shell on the spot, but the exemption
+        // survives `--now` structurally: it is filtered out of candidacy
+        // before any band question is asked.
+        let now = 1_800_000_000_i64;
+        let mut rec = spawned_shell("worker", "idle");
+        rec.exempt = true;
+        let recent = |_: &SessionRecord| Some(now - 60);
+        assert!(abandoned_spawned_shells(&[rec], now, recent, None).is_empty());
+    }
+
+    #[test]
+    fn spared_exempt_spawned_shells_reports_the_ones_the_waived_arm_skipped() {
+        let now = 1_800_000_000_i64;
+        let mut exempt_rec = spawned_shell("shielded", "idle");
+        exempt_rec.exempt = true;
+        let ordinary = spawned_shell("ordinary", "idle");
+        let recent = |_: &SessionRecord| Some(now - 60);
+        let spared = spared_exempt_spawned_shells(&[exempt_rec, ordinary], now, recent);
+        assert_eq!(spared, vec!["shielded".to_string()], "only the exempt row is spared, never the ordinary one");
+    }
+
+    #[test]
+    fn spared_exempt_spawned_shells_never_names_a_record_outside_the_shape() {
+        // An exempt record that is not even a spawned-shell candidate (still
+        // `working`, say) has nothing to be spared FROM -- `spared` must stay
+        // empty, not just "not reaped".
+        let now = 1_800_000_000_i64;
+        let mut busy = spawned_shell("busy", "working");
+        busy.exempt = true;
+        let recent = |_: &SessionRecord| Some(now - 60);
+        assert!(spared_exempt_spawned_shells(&[busy], now, recent).is_empty());
     }
 
     /// End-to-end through `reap()`: a spawned worker shell whose pty log

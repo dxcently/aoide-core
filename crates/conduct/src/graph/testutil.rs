@@ -58,6 +58,7 @@ pub(crate) fn session(
         hook_ancestry: Vec::new(),
         headless: false,
         spawned: false,
+        exempt: false,
         harness_session_id: None,
         resumed_from: None,
         origin: None,

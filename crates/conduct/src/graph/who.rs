@@ -115,6 +115,11 @@ pub(super) struct SessionView {
     pub(super) state: String,
     pub(super) presence: &'static str,
     pub(super) cwd: String,
+    /// `SessionRecord::exempt` (task #20), carried through for the roster's
+    /// one-word tag. Local rows read the real record; a peer row has no
+    /// cross-host exempt story yet (`grant.rs`'s module doc — out of scope,
+    /// not a regression) and always reads `false`.
+    pub(super) exempt: bool,
 }
 
 /// One node (this box, or one registered peer) as the host-grouped rendering
@@ -164,6 +169,7 @@ pub(super) fn build_local_node(sessions: &[SessionRecord], hooks: &[HookRecord],
                 state: s.state.clone(),
                 presence: session_presence(&s.state),
                 cwd: s.cwd.clone(),
+                exempt: s.exempt,
             }
         })
         .collect();
@@ -208,6 +214,11 @@ pub(super) fn sessions_from_graph(graph: &Value, host: &str) -> Vec<SessionView>
                 cwd: n["cwd"].as_str().unwrap_or("").to_string(),
                 session_id,
                 petname,
+                // No cross-host exempt story yet (module doc's widening
+                // note on `SessionView::exempt`) — a peer's own graph.json
+                // never carries the field either, so this always reads
+                // `false`.
+                exempt: false,
             }
         })
         .collect()
@@ -374,7 +385,8 @@ fn render_nodes(nodes: &[NodeView]) -> String {
         out.push(head);
         for (i, s) in n.sessions.iter().enumerate() {
             let branch = if i + 1 == n.sessions.len() { "└─ " } else { "├─ " };
-            out.push(format!("{branch}{}  {}  {}  {}", s.label, s.agent, s.state, s.cwd));
+            let tag = if s.exempt { " exempt" } else { "" };
+            out.push(format!("{branch}{}  {}  {}  {}{tag}", s.label, s.agent, s.state, s.cwd));
         }
     }
     if out.is_empty() {
@@ -398,6 +410,7 @@ fn node_json(n: &NodeView) -> Value {
             "state": s.state,
             "presence": s.presence,
             "cwd": s.cwd,
+            "exempt": s.exempt,
         })).collect::<Vec<_>>(),
     })
 }
@@ -477,7 +490,8 @@ fn render_groups(groups: &[ProjectGroup]) -> String {
         out.push(format!("◆ {}", g.name));
         for (i, s) in g.sessions.iter().enumerate() {
             let branch = if i + 1 == g.sessions.len() { "└─ " } else { "├─ " };
-            out.push(format!("{branch}{}  {}  {}  {}", s.label, s.agent, s.state, s.cwd));
+            let tag = if s.exempt { " exempt" } else { "" };
+            out.push(format!("{branch}{}  {}  {}  {}{tag}", s.label, s.agent, s.state, s.cwd));
         }
     }
     if out.is_empty() {
@@ -497,6 +511,7 @@ fn group_json(g: &ProjectGroup) -> Value {
             "state": s.state,
             "presence": s.presence,
             "cwd": s.cwd,
+            "exempt": s.exempt,
         })).collect::<Vec<_>>(),
     })
 }
@@ -748,6 +763,60 @@ mod tests {
         assert!(by_name["gamma"].is_ok());
     }
 
+    // ── exempt (task #20): build_local_node carries the flag, both text
+    // renders tag the row ──────────────────────────────────────────────
+
+    #[test]
+    fn build_local_node_carries_the_exempt_flag_off_the_record() {
+        let sessions = vec![
+            SessionRecord { exempt: true, ..session("s1", "/x", "idle", "1", None) },
+            session("s2", "/x", "idle", "2", None),
+        ];
+        let node = build_local_node(&sessions, &[], "sakaki");
+        let s1 = node.sessions.iter().find(|s| s.session_id == "s1").unwrap();
+        let s2 = node.sessions.iter().find(|s| s.session_id == "s2").unwrap();
+        assert!(s1.exempt);
+        assert!(!s2.exempt);
+    }
+
+    #[test]
+    fn render_nodes_tags_an_exempt_row_and_leaves_an_ordinary_one_bare() {
+        let nodes = vec![NodeView {
+            name: "sakaki".to_string(),
+            is_local: true,
+            presence: "online",
+            fetched_at: None,
+            error: None,
+            sessions: vec![
+                SessionView { session_id: "s1".into(), label: "l1".into(), petname: None, agent: "claude".into(), state: "idle".into(), presence: "online", cwd: "/x".into(), exempt: true },
+                SessionView { session_id: "s2".into(), label: "l2".into(), petname: None, agent: "claude".into(), state: "idle".into(), presence: "online", cwd: "/x".into(), exempt: false },
+            ],
+        }];
+        let rendered = render_nodes(&nodes);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert!(lines[1].ends_with(" exempt"), "{}", lines[1]);
+        assert!(!lines[2].ends_with(" exempt"), "{}", lines[2]);
+    }
+
+    #[test]
+    fn render_groups_tags_an_exempt_row_the_same_way() {
+        let groups = vec![ProjectGroup {
+            name: "aoide".to_string(),
+            sessions: vec![SessionView {
+                session_id: "s1".into(),
+                label: "l1".into(),
+                petname: None,
+                agent: "claude".into(),
+                state: "idle".into(),
+                presence: "online",
+                cwd: "/x".into(),
+                exempt: true,
+            }],
+        }];
+        let rendered = render_groups(&groups);
+        assert!(rendered.lines().last().unwrap().ends_with(" exempt"), "{rendered}");
+    }
+
     // ── apply_filter: local id / peer+query / substring fallback ─────────
 
     fn sample_nodes() -> (Vec<NodeView>, Vec<SessionRecord>) {
@@ -774,6 +843,7 @@ mod tests {
                 state: "working".to_string(),
                 presence: "online",
                 cwd: "/y".to_string(),
+                exempt: false,
             }],
         };
         (vec![local_node, peer_node], locals)
@@ -864,9 +934,9 @@ mod tests {
             fetched_at: None,
             error: None,
             sessions: vec![
-                SessionView { session_id: "s1".into(), label: "l1".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/z/nowhere".into() },
-                SessionView { session_id: "s2".into(), label: "l2".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/proj/zeta/x".into() },
-                SessionView { session_id: "s3".into(), label: "l3".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/proj/alpha/x".into() },
+                SessionView { session_id: "s1".into(), label: "l1".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/z/nowhere".into(), exempt: false },
+                SessionView { session_id: "s2".into(), label: "l2".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/proj/zeta/x".into(), exempt: false },
+                SessionView { session_id: "s3".into(), label: "l3".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/proj/alpha/x".into(), exempt: false },
             ],
         }];
         let projects = vec![project("zeta", "/proj/zeta"), project("alpha", "/proj/alpha")];
@@ -897,6 +967,7 @@ mod tests {
                 state: "working".into(),
                 presence: "online",
                 cwd: "/home/k/Aoide/pkgs/aoide".into(),
+                exempt: false,
             }],
         }];
         let projects = vec![project("aoide", "/home/k/Aoide")];

@@ -326,18 +326,19 @@ pub fn register(r: &mut Registry) {
     // command-defrag lane X) — a POSITIONAL <kind> grammar (`secrets
     // automate <name> on|off` style) replacing the old standalone `session
     // undying` command, which this absorbs and retires (hard cutover, no
-    // alias). One kind today: `undying` (U1/U3's mark, relocated verbatim).
-    // Registered last — landed after every entry above it.
+    // alias). Two kinds today: `undying` (U1/U3's mark, relocated verbatim)
+    // and `exempt` (task #20, the reaper's staleness safety valve — no
+    // picker). Registered last — landed after every entry above it.
     r.insert(cmd!(
         path: ["session", "grant"],
-        summary: "Grant (or open a picker to grant) a session capability. Bare (no <kind>) teaches the grantable set; an unknown kind is a taught refusal. `undying` (the only kind today): with no state, opens the interactive PICKER on a real CLI terminal — a multi-select over this box's own sessions plus every registered peer's CACHED sessions (no live pulls), each row pre-checked by its current undying state, confirmed in one Enter (non-tty/non-CLI/--json steers to the scripted form below instead); with on|off, marks or unmarks a session as durable in state/undying.json directly, so a project's whole undying set can later be resurrected together. Bare and --self both resolve the target from $AOIDE_SESSION_ID; --id targets any session id directly, including one already gone from the roster.",
+        summary: "Grant (or open a picker to grant) a session capability. Bare (no <kind>) teaches the grantable set; an unknown kind is a taught refusal. `undying`: with no state, opens the interactive PICKER on a real CLI terminal — a multi-select over this box's own sessions plus every registered peer's CACHED sessions (no live pulls), each row pre-checked by its current undying state, confirmed in one Enter (non-tty/non-CLI/--json steers to the scripted form below instead); with on|off, marks or unmarks a session as durable in state/undying.json directly, so a project's whole undying set can later be resurrected together — --id targets any session id directly, including one already gone from the roster. `exempt`: no picker (bare `exempt` is a taught refusal naming the scripted form); on|off vetoes the reaper's staleness judgments for a LIVE session only (never its window-gone/pid-gone/ghost/orphan signals, and never `--now`, which waives only the abandoned-shell band) — --id must name a session currently on the roster, since an exemption has nothing to mean once the record is gone. Bare and --self both resolve the target from $AOIDE_SESSION_ID for either kind.",
         args: [
-            arg!("kind", "string", true, "The grant kind — `undying` today."),
-            arg!("state", "string", false, "For `undying`: the state to set, `on` or `off`. Omit to open the interactive picker instead."),
+            arg!("kind", "string", true, "The grant kind — `undying` or `exempt`."),
+            arg!("state", "string", false, "The state to set, `on` or `off`. For `undying` only, omit to open the interactive picker instead — `exempt` has none."),
         ],
         flags: [
             flag!("self", "bool", "Target this session, resolved from $AOIDE_SESSION_ID (the default when neither --self nor --id is given)."),
-            flag!("id", "string", "Target session id directly (mutually exclusive with --self); no roster lookup gates it, so a dead id is a valid target."),
+            flag!("id", "string", "Target session id directly (mutually exclusive with --self). For `undying`, no roster lookup gates it, so a dead id is a valid target; for `exempt`, the id must currently be on the roster — an off-roster id is a refusal."),
         ],
         gated: false,
         implemented: true,
@@ -346,6 +347,8 @@ pub fn register(r: &mut Registry) {
             "session grant undying",
             "session grant undying on --self",
             "session grant undying off --id <session-id>",
+            "session grant exempt on --self",
+            "session grant exempt off --id <session-id>",
         ],
     ));
 }

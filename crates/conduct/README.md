@@ -145,10 +145,11 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   takes) or when marking OFF (a future restore is no longer promised
   either way, so there is nothing to warn about).
 - **The grant family (session-surface redesign, command-defrag lane X,
-  2026-08-28 — supersedes U3/U1):** `graph/grant.rs`'s `session_grant` is
-  `session grant`'s handler — a POSITIONAL `<kind>` grammar (`secrets
-  automate <name> on|off` style, not a second registered path per kind).
-  One kind today, `undying`: bare `session grant undying` (no state)
+  2026-08-28 — supersedes U3/U1; task #20 adds the second kind):**
+  `graph/grant.rs`'s `session_grant` is `session grant`'s handler — a
+  POSITIONAL `<kind>` grammar (`secrets automate <name> on|off` style, not
+  a second registered path per kind). Two kinds today, `undying` and
+  `exempt`. `undying`: bare `session grant undying` (no state)
   dispatches to the interactive PICKER (`undying_picker`, U3's exact body
   relocated verbatim from what used to be bare `session`'s own handler —
   bare `session` now renders the roster instead, see the `who`/roster-core
@@ -187,10 +188,29 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   confirm; `changed[]` only ever names what the save actually persisted.
   Unmarking removes EVERY spec matching `{host, dir, agent}`, not just the
   first. The kind dispatch in `session_grant` is a plain match arm — a
-  future kind (#127, secret grants) adds one arm, reusing the picker's own
-  CLI+tty gate shape rather than re-deriving it. See `CONTRACTS.md`'s
-  `.aoide/project.json` section for the exact spec-derivation and dedupe
-  rules.
+  future kind (#127, secret grants is the next one named, not yet built)
+  adds one arm, reusing the picker's own CLI+tty gate shape rather than
+  re-deriving it. See `CONTRACTS.md`'s `.aoide/project.json` section for the
+  exact spec-derivation and dedupe rules.
+  **`exempt` (task #20) — the reaper's safety valve, no picker:**
+  `session grant exempt on|off [--self | --id <id>]` (`grant.rs::
+  exempt_grant`) sets or clears `SessionRecord::exempt`, vetoing `reap`'s
+  staleness judgments (`is_session_dead`'s third signal,
+  `abandoned_spawned_shells`'s own arm) for a session that IS them — never
+  window-gone/pid-gone/ghosts/orphans, which fire on positive evidence a
+  session is gone or is structural cruft, and never `resurrect`'s job. Bare
+  `session grant exempt` (no state) is a taught refusal naming the scripted
+  form — this kind has no picker at all, since its caller is a script
+  (`--self`/`--id`), not an interactive tty session. Unlike `undying`,
+  `--id` must name a session CURRENTLY on the roster (an off-roster id is a
+  refusal, not a valid post-mortem target) and the write routes through
+  `aoide_client::daemon::daemon_dispatch` FIRST, stage-lock fallback second
+  — the same L4 dual-writer discipline `session_store.rs`'s
+  `session_start`/`session_phase`/`session_end` and `reap_and_announce`
+  hold, since `sessions.json` (unlike `undying.json`) is a stage-tree file.
+  The mark dies with the record: no state file, no inheritance (a spawned
+  child mints its own record, `exempt` absent by default), nothing to sweep
+  post-mortem — an exemption's meaning ends exactly where undying's begins.
 - `reap` — liveness reaping (`aoide session reap`), sweeping sessions a
   `SIGKILL`'d terminal could never mark `done`. `reap_and_announce` (the
   registered CLI handler) routes through `daemon_dispatch` first like every
@@ -242,7 +262,15 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   `pick::interactive`. It must be decided at the door: `daemon_dispatch`
   forwards the flags to a resident `aoided` that has no tty of its own, so a
   probe made on the far side would read every gesture as the timer. No other
-  band moves with it. The touch signal is the log file's own mtime: any byte ever
+  band moves with it. **`exempt` (task #20) sits ABOVE the band, not inside
+  it:** an agent-marked exempt shell is filtered out of candidacy before
+  either the banded or the waived question is even asked, so `--now` cannot
+  take it either — the same veto `is_session_dead`'s third signal holds for
+  an exempt agent record. `--now` sparing an exempt shell is reported back
+  in the sweep's own message and `data.spared` (never `changed` — nothing
+  moved on the roster), the unattended pass staying silent about it the same
+  way `refresh_live_agents`'s own report never toasts a quiet 12s tick. The
+  touch signal is the log file's own mtime: any byte ever
   crossing the pty, from the original spawned command's output through any
   later injected `aoide send`, resets it, so a human's later use of an
   agent-spawned terminal is safe from this signal without the injection

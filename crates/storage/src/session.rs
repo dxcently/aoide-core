@@ -112,6 +112,10 @@ pub fn upsert_session(
             // record `aoide spawn` re-exec'd into being. A terminal the User
             // opened themselves never gains it.
             spawned: false,
+            // No inheritance (task #20): a fresh registration always starts
+            // un-exempt, spawned child or not — an agent that wants its own
+            // worker shell shielded marks it after spawn.
+            exempt: false,
             // Stamped later by `graph session hook` from the raw hook
             // payload's own `session_id` (P-D7); a fresh record starts
             // without one.

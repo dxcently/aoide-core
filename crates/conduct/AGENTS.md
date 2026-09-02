@@ -571,8 +571,22 @@
   that means the gesture passes `--now` itself (`shellbridge.rs`'s
   `dispatch_recheck_sessions` does, since a detached child has no tty to
   probe). Waiving drops ONLY the staleness clause: `spawned` +
-  `restore.is_some()` + `state == "idle"` all still hold, and no other band
-  in the pass moves.
+  `restore.is_some()` + `state == "idle"` + `!exempt` all still hold, and no
+  other band in the pass moves.
+- **`exempt` (task #20) is filtered out of candidacy BEFORE the band
+  question, in both `is_session_dead`'s third signal and
+  `abandoned_spawned_shells`, so it survives `--now` structurally rather
+  than as a special case inside either.** Don't implement it as "skip this
+  id in the sweep loop" bolted on after the fact — the veto belongs inside
+  the SAME predicates every other guard in this file lives in
+  (`spawned_shell_shape` is the one shared shape both
+  `abandoned_spawned_shells` and `spared_exempt_spawned_shells` read, so a
+  record can never be both reaped and reported spared, or neither). It
+  vetoes staleness ONLY: window-gone, pid-gone, pre-boot ghosts, superseded
+  duplicates, orphaned subagents, and done-sibling tombstones all still fire
+  on an exempt record, because those are positive-evidence signals, not
+  staleness — the exemption's whole promise is "never take a LIVE session,"
+  not "never take this id."
 - **`--announce` is not a second spelling of `--now`.** It means "toast even
   on a quiet pass" — a display concern — and welding the two together would
   leave a caller that wants the answer without the sweeping-now no way to
@@ -858,14 +872,17 @@
 - **A new `graph`/`conduct`/`hooks` command** adds a `cmd!`/`register` entry in
   `commands/`, wired into `cli`'s `commands::all()` (this crate's commands are
   core, never `lyra`'s).
-- **A new `session grant` kind** (#127's secret grants are the next one
-  named, not yet built) adds one `match` arm in `grant.rs::session_grant` —
-  no new registered path, no `commands/` entry: `<kind>` is a positional
-  argument on the ONE `["session", "grant"]` path, `secrets automate <name>
-  on|off` style. If the new kind wants a picker too, reuse
-  `grant.rs::require_cli_tty`'s CLI+tty gate shape rather than re-deriving
-  it — there is still only one multi-select primitive
-  (`aoide_protocol::pick::choose_many`) in this crate.
+- **A new `session grant` kind** (`exempt`, task #20, is the second one
+  landed after `undying`; #127's secret grants are the next one named, not
+  yet built) adds one `match` arm in `grant.rs::session_grant` — no new
+  registered path, no `commands/` entry: `<kind>` is a positional argument
+  on the ONE `["session", "grant"]` path, `secrets automate <name> on|off`
+  style. A picker is OPT-IN, not mandatory — `exempt` has none at all (bare
+  `session grant exempt` is a taught refusal naming the scripted form
+  directly, since its caller is a script, not a tty session). If a new kind
+  DOES want a picker, reuse `grant.rs::require_cli_tty`'s CLI+tty gate shape
+  rather than re-deriving it — there is still only one multi-select
+  primitive (`aoide_protocol::pick::choose_many`) in this crate.
 - **A new hook event or harness profile** extends `aoide_protocol::agents`,
   not this crate — the harness-profile table lives one layer down.
 

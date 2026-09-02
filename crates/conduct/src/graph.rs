@@ -89,8 +89,9 @@ pub use self::spawn::session_spawn;
 pub use self::resurrect::session_resurrect;
 // `session grant` (session-surface redesign, command-defrag lane X,
 // 2026-08-28): the GRANT family — `undying` (U1/U3's mark, relocated
-// verbatim) is the only kind today; the standalone `session undying`
-// command this absorbs is retired — see `graph/grant.rs`'s module doc.
+// verbatim) and `exempt` (task #20's reaper shield); the standalone
+// `session undying` command this absorbs is retired — see
+// `graph/grant.rs`'s module doc.
 pub use self::grant::session_grant;
 pub use self::manage::{link, project_add, project_list, project_remove, prune, view};
 // Bare `session` (session-surface redesign, command-defrag lane X): the

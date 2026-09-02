@@ -363,3 +363,124 @@ fn dispatched_session_start_produces_no_false_hand_edit_event() {
     std::fs::remove_file(&daemon_socket).ok();
     std::fs::remove_file(&events_path).ok();
 }
+
+fn grant_exempt_inv(id: &str, state: &str) -> Invocation {
+    let mut flags = BTreeMap::new();
+    flags.insert("id".to_string(), id.to_string());
+    Invocation {
+        path: vec!["session".to_string(), "grant".to_string()],
+        args: vec!["exempt".to_string(), state.to_string()],
+        flags,
+        door: Door::Cli,
+    }
+}
+
+/// Task #20's own routing claim (`grant.rs`'s module doc: `exempt_grant`
+/// "MUST route through `aoide_client::daemon::daemon_dispatch` first, the
+/// same L4 dual-writer discipline every other stage-writing `session *`
+/// handler in this crate holds") has never been exercised over a REAL
+/// socket — `grant.rs`'s own `exempt_grant`/`session_grant` unit tests all
+/// floor `AOIDE_DAEMON_SOCKET` to a dead path (`crate::env_lock`'s P-D6
+/// safety net), so only the direct fallback in that file ever runs. This is
+/// the twin of `routed_session_start_produces_byte_identical_sessions_json_
+/// to_the_direct_path` above for THIS write path: `session grant exempt on
+/// --id <id>` is dispatched against an IDENTICAL roster fixture staged in
+/// two directories, once with `$AOIDE_DAEMON_SOCKET` pointed at nothing
+/// (direct fallback) and once at a REAL, freshly-started daemon (routed —
+/// the write happens on the daemon's own accept thread, same as
+/// `session_start`'s own proof above), and `sessions.json`'s bytes are
+/// compared in full — unlike the `session_start` twin, no field here is
+/// randomized (toggling `exempt` touches no other field), so no
+/// normalization is needed before the comparison.
+///
+/// Also covers the cheap adjacent property on the already-routed file:
+/// `exempt` carries the same `#[serde(skip_serializing_if = "is_false")]`
+/// shape as `spawned` (`records.rs`'s own doc on the field) — present as
+/// `"exempt": true` once `on` lands, and gone from the byte stream entirely
+/// (not merely flipped to `false`) once a second, routed `off` call lands
+/// on the same record — proving the omit-when-false shape survives the
+/// socket round trip exactly like the write itself does.
+#[test]
+fn routed_session_grant_exempt_produces_byte_identical_sessions_json_to_the_direct_path() {
+    let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _saver = aoide_test_support::EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_DAEMON_SOCKET", "XDG_RUNTIME_DIR"]);
+
+    let dir_direct = unique_dir("grant-exempt-direct-stage");
+    let dir_daemon = unique_dir("grant-exempt-daemon-stage");
+    std::fs::create_dir_all(&dir_direct).unwrap();
+    std::fs::create_dir_all(&dir_daemon).unwrap();
+
+    // Start the daemon EARLY, same as the `session_start` twin above.
+    let daemon_socket = start_daemon("grant-exempt");
+    let dead_socket = unique_dir("grant-exempt-dead").with_extension("sock");
+
+    // An identical roster fixture in BOTH stage dirs — `exempt_grant`
+    // requires the target id to already be on the roster (`grant.rs`'s
+    // "Fork 2": a dead/unknown id is a refusal, unlike `undying`), so this
+    // test needs a fixture-then-dispatch shape (the reap test's own shape
+    // above), not the session_start twin's from-nothing shape.
+    let fixture = aoide_storage::records::SessionsFile {
+        schema_version: "0".to_string(),
+        sessions: vec![aoide_storage::records::SessionRecord {
+            session_id: "pd6-grant-exempt".to_string(),
+            agent: "claude".to_string(),
+            state: "idle".to_string(),
+            started_at: aoide_storage::time::now_iso_utc(),
+            ..Default::default()
+        }],
+    };
+    std::env::set_var("AOIDE_STAGE_DIR", &dir_direct);
+    aoide_storage::stage::write_stage(&aoide_storage::stage::sessions_path(), &fixture).unwrap();
+    std::env::set_var("AOIDE_STAGE_DIR", &dir_daemon);
+    aoide_storage::stage::write_stage(&aoide_storage::stage::sessions_path(), &fixture).unwrap();
+
+    // Pass 1: direct fallback — no daemon reachable at this socket path.
+    std::env::set_var("AOIDE_STAGE_DIR", &dir_direct);
+    std::env::set_var("AOIDE_DAEMON_SOCKET", &dead_socket);
+    let direct_outcome = dispatch(&grant_exempt_inv("pd6-grant-exempt", "on"));
+    assert_eq!(direct_outcome.status, aoide_protocol::output::Status::Ok, "{direct_outcome:?}");
+    assert_eq!(direct_outcome.data.as_ref().unwrap()["exempt"], true, "{direct_outcome:?}");
+
+    // Pass 2: routed — the SAME invocation, now with a live daemon to reach.
+    std::env::set_var("AOIDE_STAGE_DIR", &dir_daemon);
+    std::env::set_var("AOIDE_DAEMON_SOCKET", &daemon_socket);
+    let routed_outcome = dispatch(&grant_exempt_inv("pd6-grant-exempt", "on"));
+    assert_eq!(routed_outcome.status, aoide_protocol::output::Status::Ok, "{routed_outcome:?}");
+    assert_eq!(routed_outcome.data.as_ref().unwrap()["exempt"], true, "{routed_outcome:?}");
+
+    let direct_bytes = std::fs::read(dir_direct.join("sessions.json")).unwrap();
+    let daemon_bytes = std::fs::read(dir_daemon.join("sessions.json")).unwrap();
+    assert_eq!(
+        direct_bytes, daemon_bytes,
+        "direct-path sessions.json:\n{}\n\nrouted (through the daemon) sessions.json:\n{}",
+        String::from_utf8_lossy(&direct_bytes),
+        String::from_utf8_lossy(&daemon_bytes),
+    );
+    assert_eq!(routed_outcome.command, direct_outcome.command);
+
+    let daemon_str = String::from_utf8_lossy(&daemon_bytes);
+    assert!(
+        daemon_str.contains("\"exempt\": true"),
+        "the `on` mark must be present with the skip-if-false shape: {daemon_str}"
+    );
+
+    // The cheap adjacent proof: a SECOND routed call, `off`, on the SAME
+    // daemon-routed record — `is_false` must omit the field entirely, not
+    // merely flip it to `false`, and that omission must survive the socket
+    // round trip too.
+    let routed_off = dispatch(&grant_exempt_inv("pd6-grant-exempt", "off"));
+    assert_eq!(routed_off.status, aoide_protocol::output::Status::Ok, "{routed_off:?}");
+    assert_eq!(routed_off.data.as_ref().unwrap()["exempt"], false, "{routed_off:?}");
+    let after_off = std::fs::read_to_string(dir_daemon.join("sessions.json")).unwrap();
+    assert!(
+        // NB: the session id itself is `pd6-grant-exempt`, so the bare
+        // substring `"exempt"` alone would always match — the JSON KEY
+        // (quoted, with its colon) is the thing that must be gone.
+        !after_off.contains("\"exempt\":"),
+        "`off`, routed through the daemon, must omit `exempt` entirely (skip-if-false), not just flip it to false: {after_off}"
+    );
+
+    std::fs::remove_dir_all(&dir_direct).ok();
+    std::fs::remove_dir_all(&dir_daemon).ok();
+    std::fs::remove_file(&daemon_socket).ok();
+}
