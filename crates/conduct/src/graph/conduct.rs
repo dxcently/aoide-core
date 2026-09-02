@@ -266,38 +266,78 @@ fn write_all_fd(fd: RawFd, mut data: &[u8]) {
     }
 }
 
-/// Where the pty-master's output goes: the real stdout (interactive conduct,
-/// unchanged) or an append-only session-log file (headless conduct — no
-/// controlling tty to write to). `Stdout` is the ENTIRE interactive path
-/// today, byte-identical; `Log` is new for headless mode.
+/// Where the pty-master's output goes. `Stdout` alone never happens
+/// anymore in practice (every conduct opens its log — see
+/// [`open_session_log`]) but stays as the pre-open-failure default and the
+/// shape a headless-only reader still exercises directly in tests. `Log`
+/// is headless conduct: no controlling tty, so the log IS the only sink.
+/// `StdoutAndLog` is interactive conduct (task #15, "everything tees"):
+/// the real stdout, unchanged, PLUS the same master-read bytes mirrored
+/// into the per-session log.
 enum OutputSink {
     Stdout,
     Log(std::fs::File),
+    StdoutAndLog(std::fs::File),
 }
 impl OutputSink {
     /// Mirror `bytes` to the sink. The `Stdout` arm is exactly today's
-    /// `write_all_fd(stdout_fd, …)` call. The `Log` arm appends (retrying a
-    /// short write, same as `write_all_fd`'s own retry loop) and, on a write
-    /// error, DEGRADES rather than killing the session — mirroring
-    /// `write_all_fd` itself, which just stops mirroring on an unrecoverable
-    /// write error instead of tearing down the conducted child.
+    /// `write_all_fd(stdout_fd, …)` call. The `Log`/`StdoutAndLog` log
+    /// write appends (retrying a short write, same as `write_all_fd`'s own
+    /// retry loop) and, on a write error, DEGRADES rather than killing the
+    /// session — mirroring `write_all_fd` itself, which just stops
+    /// mirroring on an unrecoverable write error instead of tearing down
+    /// the conducted child. This matters most for `StdoutAndLog`: the
+    /// interactive pump is raw-mode and latency-sensitive, so a full disk
+    /// or a yanked log file must never stall or kill a live terminal —
+    /// only the log side of the tee drops.
     fn write(&mut self, bytes: &[u8]) {
         match self {
             OutputSink::Stdout => write_all_fd(libc::STDOUT_FILENO, bytes),
-            OutputSink::Log(f) => {
-                use std::io::Write as _;
-                let mut data = bytes;
-                while !data.is_empty() {
-                    match f.write(data) {
-                        Ok(0) => break,
-                        Ok(n) => data = &data[n..],
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(_) => break,
-                    }
-                }
+            OutputSink::Log(f) => Self::write_log(f, bytes),
+            OutputSink::StdoutAndLog(f) => {
+                write_all_fd(libc::STDOUT_FILENO, bytes);
+                Self::write_log(f, bytes);
             }
         }
     }
+    fn write_log(f: &mut std::fs::File, bytes: &[u8]) {
+        use std::io::Write as _;
+        let mut data = bytes;
+        while !data.is_empty() {
+            match f.write(data) {
+                Ok(0) => break,
+                Ok(n) => data = &data[n..],
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+/// Open (creating if needed) this session's per-session pty log at
+/// `state/sessions/<id>.log`, the ONE open+stamp path both the headless and
+/// interactive arms of [`session_conduct`] call — never duplicated per
+/// path. Private end to end and structurally so, not by umask luck: the
+/// directory is force-set to `0700` and the file opened with an explicit
+/// `0600` mode via `OpenOptionsExt`, so a permissive umask (e.g. `0000`)
+/// can never widen either past what the ruling requires (task #15: local,
+/// private, no opt-out flag). Returns `None` on any failure (an unwritable
+/// state dir, a permissions call that errors, …) — the caller degrades to
+/// `OutputSink::Stdout` on `None`, same best-effort posture as every other
+/// side-channel write in this file.
+fn open_session_log(id: &str) -> Option<(std::fs::File, PathBuf)> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let dir = session_logs_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+    let log_path = dir.join(format!("{id}.log"));
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&log_path)
+        .ok()?;
+    Some((f, log_path))
 }
 
 /// Read `/proc/<pid>/cwd` — the live working directory (follows the shell's `cd`).
@@ -1169,26 +1209,26 @@ pub fn session_conduct(inv: &Invocation) -> Outcome {
         }
     }
 
-    // `--headless`: no controlling tty at all — the pty's output goes to a
-    // per-session log file instead of stdout, and the multiplexer never reads
-    // stdin (there is nothing to read it from). Everything else about conduct
-    // (registration, injection socket, exit mirroring) is identical. (The
-    // flag itself is read above, where the pty winsize fallback needs it.)
+    // Every conduct-owned pty tees its master-read output to the per-session
+    // log (task #15, the "everything tees" ruling — no opt-out, interactive
+    // included, not just `--headless`). `--headless` has no controlling tty
+    // at all, so the log is the ONLY sink and the multiplexer never reads
+    // stdin (there is nothing to read it from); interactive keeps writing
+    // to the real stdout exactly as before and additionally mirrors the
+    // same bytes into the log. Only the pty's OWN output crosses this tee —
+    // what the pty emits, master-read side — never raw typed stdin: a
+    // no-echo `sudo` password prompt is never echoed back down the master
+    // by anything but the child's own tty, so it never lands in the log
+    // either, headless or interactive. (The `headless` flag itself is read
+    // above, where the pty winsize fallback needs it.)
     let mut sink = OutputSink::Stdout;
-    if headless {
-        let _ = std::fs::create_dir_all(session_logs_dir());
-        let log_path = session_logs_dir().join(format!("{id}.log"));
-        match std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-            Ok(f) => {
-                set_session_log_path(&id, &log_path.to_string_lossy());
-                sink = OutputSink::Log(f);
-            }
-            // A log file that can't be opened (e.g. an unwritable state dir) must
-            // not kill the session — degrade to stdout, same posture as the
-            // socket-bind best-effort above.
-            Err(_) => {}
-        }
+    if let Some((f, log_path)) = open_session_log(&id) {
+        set_session_log_path(&id, &log_path.to_string_lossy());
+        sink = if headless { OutputSink::Log(f) } else { OutputSink::StdoutAndLog(f) };
     }
+    // A log that can't be opened (e.g. an unwritable state dir, or a
+    // permissions call that fails) must not kill the session — degrade to
+    // `Stdout` alone, same posture as the socket-bind best-effort above.
 
     // Raw-mode the real tty + arm resize passthrough (interactive only — a
     // headless session has no controlling tty to raw-mode or resize). The
@@ -2083,6 +2123,76 @@ mod tests {
             "a failed exec must register no ghost session — found one: {:?}",
             s.sessions.iter().find(|r| r.session_id == "conduct-missing-bin")
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    /// The interactive twin of the test above (task #15, "everything
+    /// tees" — no `--headless` flag here at all): an ordinary conducted
+    /// session mirrors its pty output into the SAME per-session log a
+    /// headless session always has, IN ADDITION to stdout, and stamps
+    /// `logPath` exactly the same way.
+    #[test]
+    fn conduct_interactive_also_mirrors_pty_output_to_the_log_and_stamps_log_path() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR"]);
+
+        let root = unique_stage("conduct-interactive-tee");
+        let stage = root.join("stage");
+        let state = root.join("state");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+
+        let out = session_conduct(&conduct_invocation(
+            &["sh", "-c", "echo mark-interactive"],
+            &[("id", "conduct-interactive-tee")],
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(out.data.as_ref().unwrap()["exitCode"], 0);
+
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let rec = s.sessions.iter().find(|r| r.session_id == "conduct-interactive-tee").unwrap();
+        assert_eq!(rec.state, "done");
+        let log_path = rec.log_path.clone().expect("interactive conduct also stamps logPath");
+        assert!(log_path.ends_with("conduct-interactive-tee.log"));
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert!(logged.contains("mark-interactive"), "log contents: {logged:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    /// Structural, not umask luck (task #15): the log lands `0600` and its
+    /// `state/sessions/` parent `0700`, regardless of whatever umask the
+    /// test process happens to run under.
+    #[test]
+    fn session_log_and_its_directory_are_created_with_private_permissions() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR"]);
+
+        let root = unique_stage("conduct-log-perms");
+        let stage = root.join("stage");
+        let state = root.join("state");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+
+        let out = session_conduct(&conduct_invocation(
+            &["sh", "-c", "echo mark-perms"],
+            &[("id", "conduct-log-perms"), ("headless", "true")],
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let rec = s.sessions.iter().find(|r| r.session_id == "conduct-log-perms").unwrap();
+        let log_path = rec.log_path.clone().expect("logPath must be stamped");
+
+        use std::os::unix::fs::PermissionsExt;
+        let file_mode = std::fs::metadata(&log_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "log file mode: {file_mode:o}");
+        let dir_mode =
+            std::fs::metadata(session_logs_dir()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "sessions dir mode: {dir_mode:o}");
 
         let _ = std::fs::remove_dir_all(&root);
     }

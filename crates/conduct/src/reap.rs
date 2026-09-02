@@ -718,17 +718,21 @@ fn orphaned_subagents(
 ///
 /// No log evidence at all (`log_mtime` returns `None`) never counts as
 /// staleness: absence of evidence is never evidence of death, the same
-/// guard [`is_session_dead`] holds for `last_seen`. **That is the reach of
-/// the unattended band today, and it is narrower than the three guards
-/// above:** only a HEADLESS conduct opens `state/sessions/<id>.log` at all
-/// (`graph/conduct.rs`'s log block sits inside its own `if headless`), so a
-/// `spawn --windowed` worker terminal has no `log_path`, no touch signal,
-/// and is never reaped by the timer however long it sits. It is reached by
-/// the human gesture instead, which needs no touch signal to waive a band it
-/// isn't applying — and it comes under the band for free the day interactive
-/// conduct tees its own pty to the same per-session log (the session
-/// streaming lane). Nothing here changes when it does: the probe already
-/// reads `log_path`, whoever wrote it.
+/// guard [`is_session_dead`] holds for `last_seen`. **The unattended band
+/// reaches exactly as far as the three guards above, windowed or not:**
+/// every conduct-owned pty opens `state/sessions/<id>.log` and tees its
+/// master-read output into it — headless conduct and interactive conduct
+/// alike, and therefore a `spawn --windowed` worker terminal too, since a
+/// windowed worker's terminal runs ordinary interactive conduct
+/// (task #15, the "everything tees" ruling; `graph/conduct.rs`'s
+/// `open_session_log` is the one open+stamp path both arms call). A
+/// windowed worker carries a real `log_path` and a real touch signal the
+/// same as a headless one, so it sits under the timer the same way and can
+/// go stale and get reaped by the unattended pass on its own, with no
+/// human ever visiting it. The human gesture still needs no touch signal
+/// to fire — `--now` waives the staleness clause outright whether or not
+/// one exists — it is simply no longer the only way a windowed worker's
+/// abandonment is ever noticed.
 ///
 /// This never KILLS the underlying process — the same posture every other
 /// signal in this file takes toward a still-alive pid (the one exception,
@@ -2974,11 +2978,14 @@ mod tests {
     }
 
     #[test]
-    fn abandoned_spawned_shells_waived_reaches_a_windowed_spawn_with_no_log_at_all() {
-        // The case the unattended band structurally cannot reach: a
-        // `spawn --windowed` worker terminal has no `log_path` (only a
-        // headless conduct opens one), so `log_mtime` is `None` forever and
-        // no silence ever accrues. A waived band needs no touch signal.
+    fn abandoned_spawned_shells_waived_reaches_a_record_with_no_log_at_all() {
+        // Every conduct-owned pty opens `state/sessions/<id>.log` now
+        // (task #15), so `log_path` absent on a `spawn --windowed` worker
+        // is no longer a structural gap — just the residual degrade case
+        // (the log failed to open, or the record predates this lane).
+        // `log_mtime` is `None` forever for such a record, so the
+        // unattended band can never accrue silence against it; a waived
+        // band needs no touch signal and reaches it anyway.
         let now = 1_800_000_000_i64;
         let mut rec = spawned_shell("windowed-worker", "idle");
         rec.window_address = "0xAAA".into();
@@ -3114,6 +3121,65 @@ mod tests {
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         assert!(reaped.contains(&"worker".to_string()), "reaped: {reaped:?}");
+
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    /// Task #15's "everything tees" ruling closes the one gap
+    /// `abandoned_spawned_shells` used to leave open: a `spawn --windowed`
+    /// worker now opens the same per-session log a headless one always
+    /// did, so its staleness evidence is read the exact same way.
+    /// `spawned_shell_shape` deliberately never reads `headless` (see its
+    /// own doc), so this pins that at the probe level too — a headless and
+    /// a windowed record, each carrying a stamped `log_path` pointing at
+    /// an equally stale on-disk file, are reaped identically through the
+    /// real [`log_mtime`]-style disk read, not a fake closure.
+    #[test]
+    fn abandoned_spawned_shells_reaches_a_stale_log_the_same_way_headless_or_windowed() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let stage = crate::graph::testutil::unique_stage("reap-headless-vs-windowed");
+        std::fs::create_dir_all(&stage).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let stale_mtime = now - REAP_SPAWNED_SHELL_STALE_SECS - 3600; // an hour past the band
+        let tv = [libc::timeval { tv_sec: stale_mtime as libc::time_t, tv_usec: 0 }; 2];
+
+        let headless_log = stage.join("headless.log");
+        std::fs::write(&headless_log, b"$ headless conduct's own log\n").unwrap();
+        let windowed_log = stage.join("windowed.log");
+        std::fs::write(&windowed_log, b"$ interactive conduct's own log\n").unwrap();
+        for p in [&headless_log, &windowed_log] {
+            let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::utimes(c.as_ptr(), tv.as_ptr()) }, 0);
+        }
+
+        let mut headless = spawned_shell("headless-worker", "idle");
+        headless.headless = true;
+        headless.log_path = Some(headless_log.to_string_lossy().into_owned());
+        let mut windowed = spawned_shell("windowed-worker", "idle");
+        windowed.headless = false;
+        windowed.window_address = "0xAAA".into();
+        windowed.log_path = Some(windowed_log.to_string_lossy().into_owned());
+
+        let log_mtime = |s: &SessionRecord| -> Option<i64> {
+            s.log_path
+                .as_deref()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+        };
+        let mut reaped = abandoned_spawned_shells(
+            &[headless, windowed],
+            now,
+            log_mtime,
+            Some(REAP_SPAWNED_SHELL_STALE_SECS),
+        );
+        reaped.sort();
+        assert_eq!(reaped, vec!["headless-worker".to_string(), "windowed-worker".to_string()]);
 
         let _ = std::fs::remove_dir_all(&stage);
     }

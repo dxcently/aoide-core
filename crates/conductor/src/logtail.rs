@@ -1,12 +1,18 @@
-//! The headless-session log tail — a STRIPPED MIRROR of a pty transcript,
+//! The conducted-session log tail — a STRIPPED MIRROR of a pty transcript,
 //! never a terminal.
 //!
-//! A `--headless` `aoide conduct` session has no controlling tty for the
-//! conductor to focus (CONTRACTS §4 ~829: raw pty bytes, append-only,
-//! UNROTATED, mirrored verbatim, "not necessarily valid UTF-8"). This module
-//! is the read side of that contract: [`tail_file`] takes the last slice of
-//! that log and [`render_tail`] turns it into plain lines a ratatui overlay
-//! can paint. It does not interpret cursor moves, colour, or alternate-screen
+//! Every conduct-owned pty mirrors its master-read bytes into
+//! `state/sessions/<id>.log` — headless and interactive conduct alike
+//! (task #15, the "everything tees" ruling; CONTRACTS §4 ~829: raw pty
+//! bytes, append-only, UNROTATED, mirrored verbatim, "not necessarily valid
+//! UTF-8"). This module is the read side of that contract for ANY
+//! conducted session's log, though the conductor UI reaches for it
+//! specifically when a session has no controlling tty for the conductor to
+//! focus instead — a `--headless` `aoide conduct` session, today's only
+//! caller (`ui.rs`'s Enter handler: cue the window if one exists, else tail
+//! the log). [`tail_file`] takes the last slice of that log and
+//! [`render_tail`] turns it into plain lines a ratatui overlay can paint.
+//! It does not interpret cursor moves, colour, or alternate-screen
 //! flips — a full-screen TUI in the log reads back as its own redraw
 //! chatter, not a picture. That is accepted, not fixed: teaching this reader
 //! real terminal semantics (a vt100 dependency) is exactly the complexity

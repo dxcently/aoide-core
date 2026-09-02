@@ -547,6 +547,18 @@
   door re-registers a falsely-reaped record on its next event) — this is
   why the carve-out stays this narrow, and why widening it needs the same
   bar this bullet documents, not a looser one.
+- **Every conduct-owned pty tees to `state/sessions/<id>.log` (task #15,
+  "everything tees" — no opt-out flag), through the ONE `open_session_log`
+  open+stamp path `graph/conduct.rs::session_conduct` calls for both arms.**
+  Three properties stay load-bearing if this is ever touched: (1) it tees
+  the MASTER-READ side only — what the pty emits — never raw stdin, so a
+  no-echo `sudo` password prompt never lands in the log; (2) a log write
+  failure DEGRADES (`OutputSink::write_log` just stops mirroring) and must
+  never block or kill the interactive pump, which is raw-mode and
+  latency-sensitive; (3) the directory (`0700`) and file (`0600`) modes are
+  set explicitly via `OpenOptionsExt`/`PermissionsExt`, never left to
+  umask. Don't reintroduce a second open/stamp call site for either arm —
+  headless and interactive both go through the one function.
 - **Gate the sweep on `spawned`, never on `headless` and never on
   `parentSessionId`.** `headless` is the wrong axis: `spawn --windowed`
   execs a real terminal running the same `aoide conduct`, and a windowed

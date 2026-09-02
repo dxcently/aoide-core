@@ -372,8 +372,10 @@ pub(in crate::graph) fn ensure_session_ceiling(id: &str, ceiling: u64) {
     });
 }
 
-/// Stamp a headless `aoide conduct` session's `logPath` — the absolute path of
-/// its pty-master transcript (`state/sessions/<id>.log`). A locked
+/// Stamp a conducted session's `logPath` — the absolute path of its
+/// pty-master transcript (`state/sessions/<id>.log`), opened by every
+/// conduct-owned pty (task #15: interactive and headless alike, "everything
+/// tees"). A locked
 /// read-modify-write like [`ensure_session_ceiling`]: change-only (a second
 /// identical call is a no-op that never re-stages), and a silent no-op for an
 /// unknown id — conduct calls this right after `do_session_start`, so the id

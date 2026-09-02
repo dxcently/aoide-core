@@ -276,15 +276,15 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   agent-spawned terminal is safe from this signal without the injection
   door ever needing to attribute WHO sent it (`send.rs`'s own
   `resolve_sender` doc: that attribution is self-reported and never
-  enforced). `restore`/`log_path` are P-C5/headless fields the record
-  already carries; `spawned` is the one new field, stamped by
-  `stamp_spawned` inside the child `spawn` re-execs. **The unattended band
-  reaches less than the guards do:** only a headless conduct opens
-  `state/sessions/<id>.log`, so a `spawn --windowed` worker has no touch
-  signal at all and no silence ever accrues against it — the timer never
-  takes one, the gesture always can, and the band starts covering it the day
-  interactive conduct tees its own pty to the same log (the session
-  streaming lane), with no change here.
+  enforced). `restore`/`log_path` are P-C5 fields the record already
+  carries — `log_path` now stamped by every conduct-owned pty, headless and
+  interactive alike (task #15, "everything tees"); `spawned` is the one new
+  field, stamped by `stamp_spawned` inside the child `spawn` re-execs.
+  **The unattended band reaches exactly as far as the guards do:** a
+  `spawn --windowed` worker's terminal runs ordinary interactive conduct,
+  which opens `state/sessions/<id>.log` the same as a headless one, so it
+  carries a real touch signal and the timer can take it on its own —
+  the gesture (`--now`) is no longer the only path in.
 - `graph/window.rs` — window discovery/backfill/listener PLUS the
   automatic-parenting seam (task #89, corrected in review round 2):
   `is_windowless_wrap` (a conducted record is windowless when `headless` is
