@@ -2,8 +2,8 @@
 //!
 //! One crate, two binaries (`aoide`, `aoided`), one schema. Everything the CLI
 //! door and the MCP door can do is described once in [`schema`] and executed
-//! once in [`dispatch`]; the two doors cannot drift (concepts/Agent-Interface).
-//! A2A (`a2a.rs`, CONTRACTS.md §6) is a third door onto the same schema — its
+//! once in [`dispatch`]; the three doors cannot drift (concepts/Agent-Interface).
+//! A2A (`a2a.rs`, CONTRACTS.md §6) is the third door onto the same schema — its
 //! AgentCard derives from it too, and `message/send` reuses these same
 //! command handlers rather than dispatching every JSON-RPC method through
 //! here.

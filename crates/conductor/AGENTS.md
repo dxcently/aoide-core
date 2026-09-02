@@ -5,8 +5,9 @@
 - **Frontend only — never a second implementation.** Every action the TUI
   performs is `dispatch::dispatch(Invocation { door: Door::Cli, .. })`
   through the injected `DispatchFn`. Adding logic here that computes an
-  outcome instead of dispatching for one breaks the "two doors, one schema"
-  contract — the conductor would drift from what the CLI/MCP doors do.
+  outcome instead of dispatching for one breaks the "three doors, one
+  schema" contract — the conductor would drift from what the CLI/MCP/A2A
+  doors do.
 - **The DI seam is one-way.** `App` takes a `DispatchFn` fn-pointer
   parameter rather than calling a trunk's assembled registry directly — this
   crate must never depend on `cli` (or `lyra`) to get one; the app crate

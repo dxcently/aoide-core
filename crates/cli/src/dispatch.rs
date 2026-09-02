@@ -2,10 +2,10 @@
 //!
 //! Both the CLI door (`bin/aoide.rs`) and the MCP door (`mcp.rs`) call
 //! [`dispatch`] with a command path + parsed args/flags. There is ONE
-//! implementation of every command; the two doors cannot drift (concepts/Agent-Interface: "two doors, one schema" — now three
-//! doors onto that one schema: A2A (`a2a.rs`, CONTRACTS.md §6) reuses these
-//! same command handlers directly rather than dispatching every JSON-RPC
-//! method through here).
+//! implementation of every command; the doors cannot drift ("three doors,
+//! one schema", concepts/Agent-Interface). A2A (`a2a.rs`, CONTRACTS.md §6)
+//! reuses these same command handlers directly rather than dispatching
+//! every JSON-RPC method through here.
 //!
 //! `dispatch()` itself is thin: it looks up the [`crate::registry::Registry`]
 //! (built once via [`registry`]) and either calls the matched command's
