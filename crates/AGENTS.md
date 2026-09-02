@@ -25,7 +25,10 @@ updates the matching golden list in the SAME commit as the `register()`
 change — a red golden test is never "expected," it's the signal a
 `commands::all()` edit forgot its snapshot. These golden lists are the SOLE
 authority for each binary's command set — no count or tally lives anywhere
-else.
+else. An external subcommand (task #138 — `aoide foo` falling through to
+`aoide-foo` on `PATH`) never enters it: it cannot become a `Command`
+(`aoide-protocol::registry::Command` is entirely `&'static`), so it never
+reaches `Registry::insert` and the golden never sees it.
 
 ## No cross-crate copying
 

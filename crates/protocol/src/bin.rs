@@ -29,7 +29,7 @@
 //! those three cross the lock either, but the reasoning doesn't transfer:
 //! this module is only ever the CROSS-binary case.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Pure tier logic: no env or filesystem reads of its own, every input
 /// supplied by the caller. `exe_dir` is the directory `current_exe()`
@@ -94,17 +94,88 @@ pub fn on_path(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Shared `PATH`-mutation lock for this crate's `on_path` regression tests.
+/// Is `path` a regular file with at least one executable bit set? The check
+/// `on_path` above deliberately skips (`is_file()` alone) — a caller that
+/// means to SPAWN the result, not merely note its presence, must not treat a
+/// same-named non-executable file as a hit.
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// Resolve `name` to an absolute path if an EXECUTABLE file by that name
+/// sits on `PATH` — task #138's external-subcommand probe
+/// (`aoide_protocol::door::run`) needs both the resolved path (to spawn)
+/// and true executability (a stray non-executable `aoide-foo` must fall
+/// through to the ordinary unknown-command error, same as a miss). Kept as
+/// its own walk rather than widening `on_path`'s contract: `on_path`'s
+/// existing callers (`agents::on_path`, onboard's own lyra probe) and its
+/// own regression test intentionally accept a non-executable same-named
+/// file as "found," and that must not change under them.
+pub fn resolve_executable_on_path(name: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths).map(|dir| dir.join(name)).find(|p| is_executable_file(p))
+}
+
+/// Every `<bin_name>-<name>` executable found on `PATH` — the plugin
+/// inventory `schema --json`'s additive `external` key (CONTRACTS.md §3)
+/// and `--help`'s own trailing external section (`door::usage_root`) both
+/// list. Walks each `PATH` directory in order, keeping the FIRST match for
+/// a given name — a later directory shadowing an earlier one on `PATH`
+/// never overrides what a shell would actually run. Returns `(name,
+/// resolved absolute path)` pairs sorted by name (directory read order is
+/// not guaranteed, and both consumers need a deterministic document).
+pub fn discover_external(bin_name: &str) -> Vec<(String, PathBuf)> {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return Vec::new();
+    };
+    let prefix = format!("{bin_name}-");
+    let mut found: std::collections::BTreeMap<String, PathBuf> = std::collections::BTreeMap::new();
+    for dir in std::env::split_paths(&paths) {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let Some(file_name) = entry.file_name().to_str().map(str::to_string) else { continue };
+            let Some(name) = file_name.strip_prefix(&prefix) else { continue };
+            if name.is_empty() {
+                continue;
+            }
+            let path = entry.path();
+            if !is_executable_file(&path) {
+                continue;
+            }
+            found.entry(name.to_string()).or_insert(path);
+        }
+    }
+    found.into_iter().collect()
+}
+
+/// Shared `PATH`-mutation lock for this crate's own PATH-touching tests.
 /// `bin::tests` and `agents::tests` (`agents::on_path` delegates straight
 /// into the function above) both mutate the real `PATH` env var, so they
 /// share ONE mutex rather than each guarding a different one
 /// (crates/AGENTS.md's "process-global env... must share ONE mutex or they
-/// race"). `pub(crate)`, not module-local: the whole reason this lives
+/// race") — `door::tests` (the external-command probe) and `registry::tests`
+/// (the `external` schema key) share it too, same reason. `pub(crate)`, not
+/// module-local: the whole reason this lives
 /// outside `mod tests` below.
 #[cfg(test)]
 pub(crate) fn path_test_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     &LOCK
+}
+
+/// Mark a just-written file executable (owner bit only, `0o755` — every
+/// caller's file is scratch, never shared). `pub(crate)`, alongside
+/// [`path_test_lock`], so `door::tests` and `registry::tests` can build a
+/// fake plugin without reimplementing the `PermissionsExt` dance.
+#[cfg(test)]
+pub(crate) fn mark_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms).unwrap();
 }
 
 #[cfg(test)]
@@ -210,6 +281,82 @@ mod tests {
         std::env::remove_var("PATH");
 
         assert!(!on_path("anything"));
+
+        match saved {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+    }
+
+    #[test]
+    fn resolve_executable_on_path_requires_the_executable_bit() {
+        let _guard = path_test_lock().lock().unwrap();
+        let saved = std::env::var_os("PATH");
+        let dir = std::env::temp_dir().join(format!("aoide_bin_resolve_exec_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("plain-file"), "").unwrap();
+        std::fs::write(dir.join("real-plugin"), "#!/bin/sh\n").unwrap();
+        mark_executable(&dir.join("real-plugin"));
+        std::env::set_var("PATH", &dir);
+
+        assert_eq!(resolve_executable_on_path("real-plugin"), Some(dir.join("real-plugin")));
+        assert_eq!(
+            resolve_executable_on_path("plain-file"),
+            None,
+            "a same-named non-executable file must not count as a hit"
+        );
+        assert_eq!(resolve_executable_on_path("nowhere"), None);
+
+        match saved {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discover_external_finds_every_prefixed_executable_and_skips_the_rest() {
+        let _guard = path_test_lock().lock().unwrap();
+        let saved = std::env::var_os("PATH");
+        let dir = std::env::temp_dir().join(format!("aoide_bin_discover_external_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Two real plugins, in a deliberately non-alphabetical write order.
+        std::fs::write(dir.join("aoide-zebra"), "").unwrap();
+        mark_executable(&dir.join("aoide-zebra"));
+        std::fs::write(dir.join("aoide-deploy"), "").unwrap();
+        mark_executable(&dir.join("aoide-deploy"));
+        // A non-executable same-prefix file: must not appear.
+        std::fs::write(dir.join("aoide-unexecutable"), "").unwrap();
+        // An unrelated executable and a bare "aoide-": neither is a plugin.
+        std::fs::write(dir.join("unrelated"), "").unwrap();
+        mark_executable(&dir.join("unrelated"));
+        std::fs::write(dir.join("aoide-"), "").unwrap();
+        mark_executable(&dir.join("aoide-"));
+        std::env::set_var("PATH", &dir);
+
+        let got = discover_external("aoide");
+        assert_eq!(
+            got,
+            vec![("deploy".to_string(), dir.join("aoide-deploy")), ("zebra".to_string(), dir.join("aoide-zebra"))],
+            "sorted by name, non-executable/unrelated/bare-prefix entries excluded"
+        );
+
+        match saved {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discover_external_is_empty_when_path_is_unset() {
+        let _guard = path_test_lock().lock().unwrap();
+        let saved = std::env::var_os("PATH");
+        std::env::remove_var("PATH");
+
+        assert!(discover_external("aoide").is_empty());
 
         match saved {
             Some(v) => std::env::set_var("PATH", v),

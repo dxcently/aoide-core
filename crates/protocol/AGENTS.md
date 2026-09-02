@@ -56,6 +56,20 @@
   A binary that needs to bypass the generic `Outcome` envelope (raw stdout,
   a long-running server) adds a case to its own `special` closure — never a
   second run loop.
+- **The external-command probe (task #138) stays in `door::run`, immediately
+  before `parse`, and nowhere else.** Its CLI-only reach is structural — `run`
+  is called from exactly the two CLI entry points — not enforced by a
+  `Door` check; NEVER add one, and never migrate the probe into
+  `dispatch()`'s `None =>` arm (a per-app-crate module this crate cannot see,
+  but the invariant holds regardless): `dispatch()` is the one door-agnostic
+  point every non-CLI door reaches directly, so probing there would silently
+  grant `PATH` execution to MCP, A2A, and the aoided socket. The reservation
+  (a first-SEGMENT check against every registered head + every `ALIASES`
+  head) must keep reading RAW argv, before flags are split into a
+  `BTreeMap` — an external command's argv must reach it byte-for-byte.
+  `crates/cli/src/dispatch.rs`'s `an_unregistered_path_on_a_non_cli_door_is_
+  still_unknown_command` test (mirrored in `aoide-lyra`) is the tripwire
+  that catches a future violation of this.
 - **`feed::Follower::poll` MUST stat the PATH on every call, never only the
   open fd.** A producer restart under a `RuntimeDirectory=`-shaped tmpfs
   unlinks the file the fd still refers to; Linux keeps that deleted inode

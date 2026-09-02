@@ -33,7 +33,7 @@ fn handle_guide(_inv: &Invocation) -> Outcome {
 }
 
 fn handle_schema(_inv: &Invocation) -> Outcome {
-    let doc = crate::dispatch::registry().schema();
+    let doc = crate::dispatch::registry().schema("aoide");
     let val = serde_json::to_value(&doc).unwrap_or(Value::Null);
     Outcome::ok("schema", "emitted the v0 command + state-file schema").with_data(val)
 }

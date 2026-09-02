@@ -10,7 +10,13 @@ other crate in this workspace sits above.
 - `registry` — `Registry`/`Command`/`Arg`/`Flag` + the `cmd!`/`arg!`/`flag!`
   registration macros. Every domain crate's `commands::register` builds one
   of these; `schema --json`, the MCP tool list, and the A2A `AgentCard` all
-  derive from the assembled `Registry`.
+  derive from the assembled `Registry`. `Registry::schema` takes `bin_name`
+  and additionally builds `Schema::external` (task #138) via `bin::
+  discover_external` — `ExternalCommand` entries, never `Command`s: an
+  external subcommand cannot become one (`Command` is entirely `&'static`;
+  `Registry::insert` panics on a duplicate path), so it is structurally
+  excluded from the MCP tool list and the A2A `AgentCard` the same way it
+  never enters the golden.
 - `invocation` — `Invocation`, the parsed call handed to a dispatcher.
 - `output` — `Outcome` + exit codes, the generic envelope every command
   returns. `Outcome`/`Status` derive `Deserialize` as well as `Serialize`
@@ -42,7 +48,19 @@ other crate in this workspace sits above.
   keeps `alice` positional), a valued flag consumes exactly one, and any
   token that reads both ways — a value colliding with a command-path
   segment, or a flag bool-for-one-candidate valued-for-another — is a loud
-  usage error naming both spellings, never a silent guess.
+  usage error naming both spellings, never a silent guess. `run` also
+  probes raw argv, immediately BEFORE `parse` runs, for a fallthrough to an
+  executable `<bin_name>-<name>` on `PATH` (task #138, the git/cargo
+  pattern) — a first-segment reservation (every registered command's own
+  head, plus every `ALIASES` head) means a built-in always wins and a typo
+  of one still reaches `parse`'s own did-you-mean; a hit audits one line
+  then spawns `argv[1..]` verbatim, `Stdio::inherit()` throughout,
+  returning the child's own exit code unchanged. The door boundary here is
+  structural, not a guard: `run` is called from exactly the two CLI entry
+  points (`aoide-cli`'s `run_cli`, lyra's `run_lyra`), so this is reachable
+  from `Door::Cli` only — no `Door` check is added, because `dispatch` (the
+  one door-agnostic dispatch point MCP/A2A/the aoided socket call directly)
+  has no PATH-probing logic of its own and must never gain any.
 - `feed` — the append-only JSON-lines feed primitive: `FeedWriter` (append
   one JSON object per line, capped and truncated-in-place rather than
   rotated) and `Follower` (tail one file from EOF, delta-reads only,
@@ -85,7 +103,15 @@ other crate in this workspace sits above.
   ONBOARD.md decision 3): the proactive `PATH` probe the resolver's own
   bare-name tier deliberately leaves for `Command::spawn` to resolve at
   exec time — the caller onboard's own lyra probe needs, checked BEFORE
-  spawning rather than caught as an `ENOENT` after.
+  spawning rather than caught as an `ENOENT` after. `resolve_executable_on_
+  path` (task #138) is the SPAWNABLE sibling of `on_path`: it additionally
+  checks the executable bit and returns the resolved absolute path rather
+  than a bool — kept as its own walk rather than widening `on_path`'s
+  contract, since `on_path`'s existing callers accept a non-executable
+  same-named file as "found." `discover_external` walks all of `PATH` for
+  every `<bin_name>-<name>` executable, sorted by name — the one PATH-scan
+  `door::run`'s external-command probe and `registry::Schema`'s additive
+  `external` key (CONTRACTS.md §3) both build on.
 - `pick` — the interactive prompt substrate (ONBOARD.md's "Prompt substrate"
   section, P-I1): `interactive`, the [`Door::Cli`] + tty gate a caller checks
   BEFORE opening any prompt at all, and five entry points a caller reaches

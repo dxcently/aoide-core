@@ -109,6 +109,26 @@ pub struct Schema {
     #[serde(rename = "stageNotesVersion")]
     pub stage_notes_version: &'static str,
     pub commands: Vec<Command>,
+    /// External subcommands (task #138): every `<bin_name>-<name>` executable
+    /// found on `PATH` at the moment `schema` ran, name-only — never a second
+    /// command inventory. **Additive**, same discipline as `implemented`/
+    /// `examples`/`internal` above: omitted entirely when no plugin is
+    /// installed, so a host with none emits a schema byte-identical to
+    /// before this field existed. An external command never becomes a
+    /// [`Command`] (CONTRACTS.md §3's "never gated" sentence covers why) —
+    /// this is the ONLY place it appears in this document.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub external: Vec<ExternalCommand>,
+}
+
+/// One entry in [`Schema::external`] — a name, the resolved command spelling,
+/// and where it lives. No summary, no args/flags: aoide cannot make that
+/// contract for a foreign binary (`<name> --help` answers for itself).
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalCommand {
+    pub name: String,
+    pub command: String,
+    pub path: String,
 }
 
 /// `serde(skip_serializing_if)` predicate for `internal` — skip the key
@@ -174,12 +194,25 @@ impl Registry {
     }
 
     /// Build the full `schema --json` document from this registry.
-    pub fn schema(&self) -> Schema {
+    /// `bin_name` names the invoking binary (`"aoide"`/`"lyra"`) — it drives
+    /// `external`'s own `PATH` probe (`crate::bin::discover_external`), the
+    /// same parameter every usage/did-you-mean string in `door.rs` already
+    /// takes.
+    pub fn schema(&self, bin_name: &str) -> Schema {
+        let external = crate::bin::discover_external(bin_name)
+            .into_iter()
+            .map(|(name, path)| ExternalCommand {
+                command: format!("{bin_name}-{name}"),
+                path: path.to_string_lossy().into_owned(),
+                name,
+            })
+            .collect();
         Schema {
             schema_version: SCHEMA_VERSION,
             aoide: AOIDE_VERSION,
             stage_notes_version: STAGE_NOTES_VERSION,
             commands: self.entries.clone(),
+            external,
         }
     }
 }

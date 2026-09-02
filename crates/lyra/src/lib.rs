@@ -62,7 +62,7 @@ pub fn run_lyra(argv: &[String]) -> i32 {
                 "ok",
                 "emitted schema",
             );
-            let doc = dispatch::registry().schema();
+            let doc = dispatch::registry().schema("lyra");
             let body = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into());
             println!("{body}");
             return Some(output::exit::OK);

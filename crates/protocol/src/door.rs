@@ -18,12 +18,52 @@
 //! code; `None` falls through to the uniform dispatch+render path. This is
 //! how one parser + one run loop serves binaries with different special-case
 //! command sets without duplicating either.
+//!
+//! **External subcommands (task #138, the git/cargo pattern).** Immediately
+//! BEFORE `parse` runs, `run` probes raw argv for a fallthrough to an
+//! executable `<bin_name>-<name>` on `PATH` — `aoide deploy` becomes
+//! `aoide-deploy` the same way `git foo` becomes `git-foo`:
+//!
+//! ```text
+//!   1. argv.first() absent          → parse   (bare `aoide`)
+//!   2. name starts with '-'         → parse   (--help, -h, --json)
+//!   3. name is a RESERVED HEAD      → parse   (a built-in always wins;
+//!      reserved := every registered command's path[0] ∪ every ALIASES head)
+//!   4. probe `<bin_name>-<name>` on PATH, executable
+//!        miss  → parse                        (did-you-mean survives)
+//!        hit   → audit, spawn argv[1..] verbatim, return the child's own
+//!                exit code unchanged
+//! ```
+//!
+//! This is why the probe reads RAW argv rather than hooking in after
+//! `parse`: by the time `parse` has split flags into a `BTreeMap`, a
+//! wrapped command's own flag order/repeats/`--f=v` vs `--f v` spelling is
+//! already destroyed, and an external command must receive its argv
+//! byte-for-byte. Step 3's reservation is a first-SEGMENT check, not a
+//! full-path check, so `aoide graph vie` (a typo of the built-in `graph`
+//! group) never probes `aoide-graph` — it lands in `parse`'s own
+//! `unknown_command_outcome` with `did_you_mean` intact, same as before this
+//! existed. The trust boundary is structural, not a guard: `run` is called
+//! from exactly the two CLI entry points (`aoide-cli`'s `run_cli`, lyra's
+//! `run_lyra`), so an external command is reachable from `Door::Cli` only —
+//! no `Door` check is added here, because there is nothing else to check.
+//! MCP/A2A/the aoided socket reach `dispatch()` directly, never `run`, and
+//! `dispatch()` has no PATH-probing logic of its own (`crates/cli/src/
+//! dispatch.rs`'s `an_unregistered_path_on_a_non_cli_door_is_still_unknown_
+//! command` test is the tripwire: the probe must never migrate into
+//! `dispatch()`'s own `None =>` arm). An external command never becomes a
+//! [`Command`] — it is never gated, never enters the MCP tool list or the
+//! A2A `AgentCard`, and the golden command-path snapshot never sees it
+//! (CONTRACTS.md §3 states the "never gated" rule as permanent, by
+//! construction, not merely by omission today).
 
-use crate::audit::Door;
+use crate::audit::{audit, default_audit_log, Door, EventClass};
 use crate::invocation::Invocation;
 use crate::output::{exit, Outcome};
 use crate::registry::{Command, Registry};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::process::{Command as Process, Stdio};
 
 /// CLI-only ergonomic shorthands for a canonical command path, resolved HERE
 /// — before the greedy path match below — so a shorthand never becomes a
@@ -628,7 +668,102 @@ fn usage_root(registry: &Registry, bin_name: &str) -> Outcome {
         "\n\nRun '{bin_name} <command> --help' for args, flags, and examples. \
          '{bin_name} guide' prints the tier map."
     ));
+
+    // A SEPARATE trailing section for external subcommands (task #138,
+    // Fork C) — never interleaved with the built-in groups above, since
+    // interleaving would imply a contract (`--json`, an exit-code map,
+    // `gated`) aoide cannot make for a foreign binary. Deliberately absent
+    // from `aoide guide` (tier-0 onboarding is a fixed narrative about
+    // aoide's own four tiers, not a host-dependent plugin list); `schema
+    // --json`'s own `external` key is the machine-readable form of the same
+    // PATH probe. Empty when nothing is installed, so `--help` on a host
+    // with no plugins is unchanged from before this existed — same
+    // discipline as `schema --json`'s additive `external` key.
+    let external = crate::bin::discover_external(bin_name);
+    if !external.is_empty() {
+        let ext_width = external.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
+        s.push_str(&format!("\n\nexternal ({bin_name}-* on PATH, not part of this schema):"));
+        for (name, path) in &external {
+            s.push_str(&format!("\n  {name:<ext_width$}  {}", path.display()));
+        }
+    }
+
     Outcome::usage(bin_name, s)
+}
+
+/// Every first path segment a registered command begins with, plus every
+/// [`ALIASES`] entry's own first segment — the set an external-command probe
+/// must never shadow (module doc's step 3). A built-in always wins, and a
+/// TYPO of a built-in head still falls through to `parse`'s own
+/// `unknown_command_outcome`/did-you-mean rather than a silent PATH probe
+/// pre-empting it. Today's one alias head (`peer`) is already a registered
+/// head on its own, so including `ALIASES` here is free insurance against a
+/// future alias whose head is not itself a command.
+fn reserved_heads(registry: &Registry) -> std::collections::HashSet<&'static str> {
+    let mut heads: std::collections::HashSet<&'static str> = registry.commands().map(|c| c.path[0]).collect();
+    heads.extend(ALIASES.iter().map(|(from, _)| from[0]));
+    heads
+}
+
+/// Step 4 of the module doc's EXTERNAL PROBE: is `argv[0]` an eligible name
+/// (present, not `-`-leading, not a reserved head), and if so, is
+/// `<bin_name>-<name>` an executable file on `PATH`? A hit resolves to the
+/// absolute path to spawn; anything else (ineligible, or nothing found)
+/// returns `None` so `parse`'s ordinary path runs completely unchanged — this
+/// is a filter in front of that path, never a replacement for it.
+fn probe_external(argv: &[String], bin_name: &str, registry: &Registry) -> Option<PathBuf> {
+    let name = argv.first()?;
+    if name.starts_with('-') {
+        return None;
+    }
+    if reserved_heads(registry).contains(name.as_str()) {
+        return None;
+    }
+    crate::bin::resolve_executable_on_path(&format!("{bin_name}-{name}"))
+}
+
+/// Spawn a resolved external command with `args` verbatim and
+/// `Stdio::inherit()` throughout (the `spawn_with_secret` precedent,
+/// `crates/secrets/src/client.rs`), returning the CHILD's own exit code
+/// unchanged — never aoide's own exit-code vocabulary. Audits ONE line at
+/// LAUNCH (right after `spawn` succeeds, before `wait`) so a plugin that
+/// never exits — a watcher, a TUI — still leaves a record, the same
+/// audit-then-block shape `a2a serve` uses for the same reason. The
+/// message carries the resolved path and the argument COUNT, never the
+/// argument VALUES (`crates/secrets/src/client.rs`'s "never argv" rule) —
+/// `aoide deploy --token abc` must never put `abc` in a world-readable log.
+/// A spawn failure (bad binary, permission denied) is audited `"error"` and
+/// exits [`exit::ERROR`], reason on stderr, same shape `session_conduct`
+/// (`crates/conduct/src/graph/conduct.rs`) uses for its own spawn failure.
+fn run_external(path: &std::path::Path, args: &[String], bin_name: &str, name: &str) -> i32 {
+    let log = default_audit_log();
+    let command = format!("external.{name}");
+    let mut child = match Process::new(path)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = audit(&log, Door::Cli, EventClass::Audit, &command, "error", &format!("{}: {e}", path.display()));
+            eprintln!("{bin_name} {name}: spawning `{}`: {e}", path.display());
+            return exit::ERROR;
+        }
+    };
+    let _ = audit(
+        &log,
+        Door::Cli,
+        EventClass::Audit,
+        &command,
+        "ok",
+        &format!("{} ({} arg{})", path.display(), args.len(), if args.len() == 1 { "" } else { "s" }),
+    );
+    match child.wait() {
+        Ok(status) => status.code().unwrap_or(exit::ERROR),
+        Err(_) => exit::ERROR,
+    }
 }
 
 /// Exit code for a usage error surfaced during parsing.
@@ -656,6 +791,10 @@ pub fn run(
     dispatch: fn(&Invocation) -> Outcome,
     special: impl FnOnce(&Invocation, bool) -> Option<i32>,
 ) -> i32 {
+    if let Some(path) = probe_external(argv, bin_name, registry) {
+        return run_external(&path, &argv[1..], bin_name, &argv[0]);
+    }
+
     let (inv, json) = match parse(argv, door, bin_name, registry) {
         Ok(v) => v,
         Err(o) => {
@@ -703,6 +842,41 @@ mod tests {
 
     fn noop(_inv: &Invocation) -> Outcome {
         Outcome::ok("noop", "ok")
+    }
+
+    /// Point `PATH` at a fresh, empty scratch dir for the duration of a
+    /// PATH-touching test, returning the dir (for planting fake plugins) and
+    /// the real `PATH` to restore afterward. Callers must hold
+    /// `crate::bin::path_test_lock()` for the whole test — `std::env::
+    /// set_var` is process-global (crates/AGENTS.md). Every existing
+    /// `parse`/`run` test that never plants a plugin still needs this once
+    /// the external probe exists: `usage_root` (root `--help`/bare argv) now
+    /// reads the AMBIENT `PATH` for its own trailing section, so a bare
+    /// `parse(&argv(&[]), ..)` must not depend on what happens to sit there.
+    fn scoped_empty_path(tag: &str) -> (PathBuf, Option<std::ffi::OsString>) {
+        let saved = std::env::var_os("PATH");
+        let dir = std::env::temp_dir().join(format!("aoide_protocol_door_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("PATH", &dir);
+        (dir, saved)
+    }
+
+    fn restore_path(dir: PathBuf, saved: Option<std::ffi::OsString>) {
+        match saved {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write `contents` to `dir.join(name)` and mark it executable —
+    /// `crate::bin::mark_executable` is the shared `PermissionsExt` dance.
+    fn write_executable(dir: &std::path::Path, name: &str, contents: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        crate::bin::mark_executable(&path);
+        path
     }
 
     /// A tiny hand-built registry standing in for a real crate's
@@ -1090,6 +1264,13 @@ mod tests {
     /// own name in every usage/help/did-you-mean string, never `aoide`'s.
     #[test]
     fn bin_name_names_the_invoking_binary_everywhere() {
+        // Scoped: `usage_root` (the bare-argv branch below) now reads the
+        // ambient `PATH` for its own trailing external section (task #138) —
+        // pin it to empty so this test's `!contains("aoide")` assertion
+        // never depends on what the real machine's PATH happens to hold.
+        let _guard = crate::bin::path_test_lock().lock().unwrap();
+        let (dir, saved) = scoped_empty_path("bin_name_everywhere");
+
         let reg = test_registry();
 
         let root = parse(&argv(&[]), Door::Cli, "lyra", &reg).unwrap_err();
@@ -1106,6 +1287,162 @@ mod tests {
             unknown.message
         );
         assert!(unknown.message.contains("run 'lyra --help'"), "{}", unknown.message);
+
+        restore_path(dir, saved);
+    }
+
+    // ── external-command probe (task #138) ──────────────────────────────────
+
+    /// A registered head must never probe `PATH`, no matter what sits
+    /// there — the reservation (module doc's step 3) wins structurally, not
+    /// by luck of what happens to be installed.
+    #[test]
+    fn a_registered_head_never_probes_path_even_with_a_matching_binary_present() {
+        let _guard = crate::bin::path_test_lock().lock().unwrap();
+        let (dir, saved) = scoped_empty_path("reserved_head");
+        write_executable(&dir, "aoide-graph", "#!/bin/sh\nexit 0\n");
+
+        let reg = test_registry();
+        assert!(
+            probe_external(&argv(&["graph", "vie"]), "aoide", &reg).is_none(),
+            "`graph` is a registered head — it must never reach the PATH probe"
+        );
+
+        restore_path(dir, saved);
+    }
+
+    /// A typo of a registered head (not itself a reserved head) DOES reach
+    /// the PATH probe, misses on an empty `PATH`, and falls through to the
+    /// exact same taught did-you-mean error as before the probe existed —
+    /// the probe is a filter in front of `parse`'s own path, never a
+    /// replacement for it.
+    #[test]
+    fn a_typo_of_a_registered_head_falls_through_to_did_you_mean() {
+        let _guard = crate::bin::path_test_lock().lock().unwrap();
+        let (dir, saved) = scoped_empty_path("typo_head");
+
+        let reg = test_registry();
+        assert!(
+            probe_external(&argv(&["grph", "view"]), "aoide", &reg).is_none(),
+            "no `aoide-grph` exists on this scoped PATH"
+        );
+        let err = parse(&argv(&["grph", "view"]), Door::Cli, "aoide", &reg).unwrap_err();
+        assert_eq!(err.status, Status::Usage);
+        assert!(err.message.contains("unknown command: `grph view`"), "{}", err.message);
+        assert!(err.message.contains("did you mean:\n  aoide graph view"), "{}", err.message);
+
+        restore_path(dir, saved);
+    }
+
+    /// An eligible, non-reserved name with a matching executable on `PATH`
+    /// resolves to that executable's absolute path.
+    #[test]
+    fn an_eligible_name_with_a_matching_binary_resolves_to_its_absolute_path() {
+        let _guard = crate::bin::path_test_lock().lock().unwrap();
+        let (dir, saved) = scoped_empty_path("eligible_hit");
+        let plugin = write_executable(&dir, "aoide-deploy", "#!/bin/sh\nexit 0\n");
+
+        let reg = test_registry();
+        assert_eq!(probe_external(&argv(&["deploy", "--env", "prod"]), "aoide", &reg), Some(plugin));
+
+        restore_path(dir, saved);
+    }
+
+    /// `--help`/`-h`-leading argv never probes (module doc's step 2), even
+    /// when a same-named executable exists — flags are never mistaken for a
+    /// plugin name.
+    #[test]
+    fn a_flag_leading_argv_never_probes_path() {
+        let _guard = crate::bin::path_test_lock().lock().unwrap();
+        let (dir, saved) = scoped_empty_path("flag_leading");
+        write_executable(&dir, "aoide---help", "#!/bin/sh\nexit 0\n");
+
+        let reg = test_registry();
+        assert!(probe_external(&argv(&["--help"]), "aoide", &reg).is_none());
+        assert!(probe_external(&argv(&[]), "aoide", &reg).is_none(), "bare argv never probes");
+
+        restore_path(dir, saved);
+    }
+
+    /// End-to-end through `run`: a hit spawns the child with `argv[1..]`
+    /// VERBATIM and returns the CHILD's own exit code unchanged, never
+    /// aoide's own vocabulary.
+    #[test]
+    fn run_spawns_the_resolved_external_command_with_argv_verbatim_and_returns_its_exit_code() {
+        let _guard = crate::bin::path_test_lock().lock().unwrap();
+        let (dir, saved) = scoped_empty_path("run_spawn");
+        write_executable(
+            &dir,
+            "aoide-deploy",
+            "#!/bin/sh\n[ \"$1\" = \"--env\" ] && [ \"$2\" = \"prod\" ] && [ \"$3\" = \"x\" ] && exit 42\nexit 99\n",
+        );
+
+        let reg = test_registry();
+        let code = run(&argv(&["deploy", "--env", "prod", "x"]), Door::Cli, "aoide", &reg, noop, |_inv, _json| None);
+        assert_eq!(code, 42, "argv[1..] must reach the child verbatim");
+
+        restore_path(dir, saved);
+    }
+
+    /// A spawn failure (nonexistent binary resolved a moment ago, then
+    /// removed — the realistic TOCTOU shape) exits `exit::ERROR`, not a
+    /// panic and not aoide's usage/not-implemented vocabulary.
+    #[test]
+    fn run_external_reports_a_spawn_failure_as_a_plain_error_exit() {
+        // Scoped: the error arm still audits one line, and this test must
+        // never touch the real machine's `~/.aoide/log`.
+        let _guard = crate::bin::path_test_lock().lock().unwrap();
+        let log = std::env::temp_dir().join(format!("aoide_protocol_door_spawn_failure_{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&log);
+        let saved_log = std::env::var_os("AOIDE_AUDIT_LOG");
+        std::env::set_var("AOIDE_AUDIT_LOG", &log);
+
+        let path = std::path::PathBuf::from("/definitely/not/a/real/path/aoide-deploy");
+        let code = run_external(&path, &[], "aoide", "deploy");
+        assert_eq!(code, exit::ERROR);
+
+        match saved_log {
+            Some(v) => std::env::set_var("AOIDE_AUDIT_LOG", v),
+            None => std::env::remove_var("AOIDE_AUDIT_LOG"),
+        }
+        let _ = std::fs::remove_file(&log);
+    }
+
+    /// The audit line lands at LAUNCH: resolved path + argument COUNT only —
+    /// never an argument VALUE (`crates/secrets/src/client.rs`'s "never
+    /// argv" rule). A secret-looking flag value must never reach the log.
+    #[test]
+    fn run_audits_the_launch_with_path_and_arg_count_never_argument_values() {
+        let _guard = crate::bin::path_test_lock().lock().unwrap();
+        let (dir, saved) = scoped_empty_path("run_audit");
+        let plugin = write_executable(&dir, "aoide-deploy", "#!/bin/sh\nexit 0\n");
+
+        let log = dir.join("audit.log");
+        let saved_log = std::env::var_os("AOIDE_AUDIT_LOG");
+        std::env::set_var("AOIDE_AUDIT_LOG", &log);
+
+        let reg = test_registry();
+        let code = run(
+            &argv(&["deploy", "--token", "super-secret-value"]),
+            Door::Cli,
+            "aoide",
+            &reg,
+            noop,
+            |_inv, _json| None,
+        );
+        assert_eq!(code, 0);
+
+        let contents = std::fs::read_to_string(&log).unwrap();
+        assert!(contents.contains("\"command\":\"external.deploy\""), "{contents}");
+        assert!(contents.contains(&plugin.display().to_string()), "{contents}");
+        assert!(contents.contains("2 arg"), "carries the argument COUNT: {contents}");
+        assert!(!contents.contains("super-secret-value"), "must never carry an argument VALUE: {contents}");
+
+        match saved_log {
+            Some(v) => std::env::set_var("AOIDE_AUDIT_LOG", v),
+            None => std::env::remove_var("AOIDE_AUDIT_LOG"),
+        }
+        restore_path(dir, saved);
     }
 
     #[test]

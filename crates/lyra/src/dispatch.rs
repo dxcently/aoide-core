@@ -105,4 +105,49 @@ mod tests {
         assert_eq!(out.status, Status::Ok);
         assert!(out.data.unwrap()["text"].as_str().unwrap().contains("Lyra"));
     }
+
+    /// Task #138's design record §5 reviewer checklist item 3, mirroring
+    /// `aoide-cli`'s own `dispatch.rs` twin test: the external-command probe
+    /// (`aoide_protocol::door::run`) must stay OUT of `dispatch()`'s own
+    /// `None =>` arm above — that "simplification" would leave the golden
+    /// green while silently granting `PATH` execution to MCP, A2A, and the
+    /// aoided socket, since `dispatch()` (unlike `run`) is the one
+    /// door-agnostic point every non-CLI door reaches directly. This is the
+    /// tripwire: even with a real `lyra-foo` executable sitting on `PATH`,
+    /// dispatching an unregistered path on any non-CLI door must still be a
+    /// plain unknown-command usage error.
+    #[test]
+    fn an_unregistered_path_on_a_non_cli_door_is_still_unknown_command() {
+        let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var_os("PATH");
+        let dir = std::env::temp_dir().join(format!("aoide_lyra_dispatch_non_cli_door_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plugin = dir.join("lyra-foo");
+        std::fs::write(&plugin, "#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&plugin).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&plugin, perms).unwrap();
+        }
+        std::env::set_var("PATH", &dir);
+
+        for door in [Door::Mcp, Door::Daemon, Door::A2a] {
+            let out = dispatch(&Invocation {
+                path: vec!["foo".to_string()],
+                args: vec![],
+                flags: BTreeMap::new(),
+                door,
+            });
+            assert_eq!(out.status, Status::Usage, "door {door:?}: {}", out.message);
+            assert!(out.message.contains("unknown command"), "door {door:?}: {}", out.message);
+        }
+
+        match saved {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
