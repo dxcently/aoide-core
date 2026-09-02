@@ -78,7 +78,12 @@ use std::collections::{HashMap, HashSet};
 
 /// Does `/proc/<pid>` still exist? The real liveness probe for [`is_session_dead`]
 /// (injected as a closure in tests so the predicate stays pure).
-fn proc_exists(pid: u32) -> bool {
+///
+/// `pub` (task #33): `aoide-server`'s A2A `tasks/get` resolution feeds this
+/// SAME probe into `is_session_dead` at read time, so a session that died
+/// after its spawn ack reads `failed` instead of stale `submitted` —
+/// widened rather than forked (`crates/AGENTS.md` "no cross-crate copying").
+pub fn proc_exists(pid: u32) -> bool {
     std::path::Path::new("/proc").join(pid.to_string()).exists()
 }
 

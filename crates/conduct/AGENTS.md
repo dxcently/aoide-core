@@ -20,6 +20,12 @@
   directly for its from-a-checkout refusal (the only repo-root detector in
   the tree) rather than re-deriving the walk-up. Don't narrow it back
   without checking that dependency first.
+- **`reap::proc_exists` is `pub`, not private, on purpose** (task #33) —
+  `aoide-server`'s A2A `tasks/get` resolution feeds this SAME `/proc` probe
+  into `is_session_dead` at read time, so a session that dies after its
+  spawn ack reads `failed` instead of stale `submitted`, without a second
+  `/proc`-reading predicate forked into `server`. Don't narrow it back
+  without checking that dependency first.
 - **A killed terminal never self-reports `done`.** `reap` is the only
   sanctioned sweep of dead sessions; don't add a second liveness mechanism.
   Reaping now also runs IN the daemon's own tick (P-D6, ~12s cadence) when

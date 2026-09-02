@@ -547,7 +547,8 @@ fn stripped_card(full: &Value) -> Value {
 /// | `awaiting` (no needsSudo) | `input-required` |
 /// | `awaiting` + `needsSudo`  | `auth-required` (precedence: needsSudo is a signal alongside state, not a state of its own) |
 /// | `idle`                  | `submitted` (aoide's at-rest/cold state — acknowledged but not actively processing; NOT `working`, which is reserved for the active-turn case above) |
-/// | `done`                  | `completed` (MVP simplification — CONTRACTS.md §6 flags the richer terminal vocabulary, FAILED/CANCELED/REJECTED, as unresolved in v0) |
+/// | `done`                  | `completed` (MVP simplification — CONTRACTS.md §6 flags the richer terminal vocabulary, CANCELED/REJECTED, as unresolved in v0; FAILED is now produced — see the dead-session row below) |
+/// | *(dead session, any of the above)* | `failed` — read-time override (task #33): `aoide_conduct::reap::is_session_dead` resolving true for the session overrides whatever the row above would have said, regardless of its last WRITTEN state; see [`a2a_task_state_checked`] |
 pub fn a2a_task_state(canonical: &str, needs_sudo: bool) -> &'static str {
     match canonical {
         "working" => "working",
@@ -564,6 +565,32 @@ pub fn a2a_task_state(canonical: &str, needs_sudo: bool) -> &'static str {
         // canonical_state's own vocabulary is closed to the five states
         // above; a sensible default rather than a panic if it ever grows.
         _ => "working",
+    }
+}
+
+/// The read-time override task #33 adds beside [`a2a_task_state`]: a session
+/// `is_session_dead` (`aoide_conduct::reap` — the reaper's own, sole liveness
+/// authority) resolves DEAD reads `failed` regardless of its last WRITTEN
+/// state. A session that dies between two polls is not still `submitted`
+/// just because nothing has swept a `done` over it yet — the reaper stays
+/// the only record MUTATOR; this only changes what a read reports.
+///
+/// Pure: `dead` is the caller's already-resolved verdict (`task_from_sessions`
+/// probes `is_session_dead` at the edge and feeds the bool in here), so this
+/// stays a fold, never a second liveness predicate. `dead == false` is
+/// BYTE-IDENTICAL to [`a2a_task_state`] alone — this can only override that
+/// function's answer, never narrow it.
+///
+/// Applies uniformly to every resolved session, spawned or not: a human
+/// terminal SUPER+Q'd mid-poll is exactly as dead as an A2A-spawned agent
+/// whose process died after its ack, and `exempt`/`undying` (which veto
+/// REAPING, not truth-telling) never enter into `is_session_dead`'s window-
+/// or pid-gone signals, so a dead exempt session reads `failed` too.
+pub fn a2a_task_state_checked(dead: bool, canonical: &str, needs_sudo: bool) -> &'static str {
+    if dead {
+        "failed"
+    } else {
+        a2a_task_state(canonical, needs_sudo)
     }
 }
 
@@ -585,7 +612,30 @@ fn task_from_sessions(sessions: &[SessionRecord], id: &str) -> Result<Value, (i6
         .ok_or_else(|| (-32001_i64, "task not found".to_string()))?;
     let canonical = canonical_state(&rec.state);
     let needs_sudo = rec.needs_sudo.unwrap_or(false);
-    let state = a2a_task_state(canonical, needs_sudo);
+    // Read-time liveness probe (task #33) — the SAME predicate `reap.rs`
+    // sweeps the roster with, fed live here rather than waiting for the
+    // next sweep pass to write `done` over a session that already died.
+    // No hyprctl round trip on this read path: `live_addresses`/
+    // `window_owners` pass `None` (`is_session_dead`'s own "compositor
+    // unqueried" degrade — the window signal never fires, never a false
+    // dead) and `last_seen` returns `None` for the same reason (absence of
+    // staleness evidence is never staleness). That leaves exactly the
+    // pid-gone signal live here off a REAL `/proc` probe — which is the one
+    // that fires for the case #33 exists to catch: a spawned process that
+    // died after its fast ack.
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let dead = aoide_conduct::reap::is_session_dead(
+        rec,
+        None,
+        None,
+        aoide_conduct::reap::proc_exists,
+        now_epoch,
+        |_| None,
+    );
+    let state = a2a_task_state_checked(dead, canonical, needs_sudo);
     let task = Task {
         id: rec.session_id.clone(),
         // MVP simplification: task id == sessionId, contextId == sessionId —
@@ -3442,6 +3492,40 @@ mod tests {
         assert_eq!(a2a_task_state("done", false), "completed");
     }
 
+    // (b2) task #33 — the dead-session override, pure: dead=true -> `failed`
+    // for every canonical state; dead=false is byte-identical to the plain
+    // fold `task_state_mapping_matches_contracts_section_6` already pins.
+    #[test]
+    fn task_state_checked_dead_overrides_every_canonical_state_to_failed() {
+        for (canonical, needs_sudo) in [
+            ("working", false),
+            ("stopped", false),
+            ("awaiting", false),
+            ("awaiting", true),
+            ("idle", false),
+            ("done", false),
+        ] {
+            assert_eq!(a2a_task_state_checked(true, canonical, needs_sudo), "failed");
+        }
+    }
+
+    #[test]
+    fn task_state_checked_alive_matches_the_plain_fold_exactly() {
+        for (canonical, needs_sudo) in [
+            ("working", false),
+            ("stopped", false),
+            ("awaiting", false),
+            ("awaiting", true),
+            ("idle", false),
+            ("done", false),
+        ] {
+            assert_eq!(
+                a2a_task_state_checked(false, canonical, needs_sudo),
+                a2a_task_state(canonical, needs_sudo),
+            );
+        }
+    }
+
     fn fixture_session(id: &str, state: &str, needs_sudo: Option<bool>) -> SessionRecord {
         SessionRecord {
             session_id: id.to_string(),
@@ -3809,6 +3893,77 @@ mod tests {
         let req = json!({ "jsonrpc": "2.0", "id": 8, "method": "tasks/get", "params": { "id": "ghost" } });
         let resp = handle_jsonrpc(&req, &test_ctx(Path::new("/dev/null"), ""));
         assert_eq!(resp["error"]["code"], -32001);
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    /// Task #33, end to end: a session whose recorded `pid` is
+    /// guaranteed-absent — `999_999_999`, the same "no real process anywhere
+    /// near this pid" fixture value `graph_residency_p_d6.rs`'s reap-over-
+    /// the-socket test uses, since `/proc/999999999` does not exist on any
+    /// Linux box — reads `failed` over `tasks/get`, not stale `submitted`/
+    /// `working`. `state: "working"` (mid-turn) on purpose: `is_session_dead`'s
+    /// `pid_signal` fires unconditionally off the real `/proc` probe,
+    /// independent of state/staleness timers, so this is deterministic
+    /// without a wall-clock wait or a live compositor.
+    ///
+    /// The inverse guard sits in the SAME test, against the SAME stage: a
+    /// pid-less, windowless "hook-only" record (`fixture_session`'s default
+    /// shape) must NOT read dead. `is_session_dead`'s other arms that could
+    /// otherwise catch it — window-gone (no `windowAddress` to be gone),
+    /// pre-boot-ghost and orphaned-subagent (both sweep-level checks outside
+    /// `is_session_dead` itself, never consulted here) — are structurally
+    /// out of reach; the one arm that IS in reach, `stale_abandoned`, cannot
+    /// fire either, because `task_from_sessions` feeds `is_session_dead` a
+    /// `last_seen` that always answers `None` on this read path (no hyprctl
+    /// round trip, no reap-style evidence gathering) — and absence of
+    /// evidence is never evidence of staleness (`is_session_dead`'s own
+    /// "never-false-reap" guard).
+    #[test]
+    fn tasks_get_end_to_end_a_dead_pid_reads_failed_and_a_hook_only_record_does_not() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = std::env::temp_dir().join(format!(
+            "aoide-server-a2a-dead-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let dead_pid_session = SessionRecord {
+            session_id: "s-dead".to_string(),
+            state: "working".to_string(),
+            // No real process anywhere near this pid — see the doc comment.
+            pid: Some(999_999_999),
+            ..Default::default()
+        };
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![
+                dead_pid_session,
+                fixture_session("s-hook-only", "idle", None),
+            ],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let req = json!({ "jsonrpc": "2.0", "id": 9, "method": "tasks/get", "params": { "id": "s-dead" } });
+        let resp = handle_jsonrpc(&req, &test_ctx(Path::new("/dev/null"), ""));
+        assert_eq!(resp["result"]["status"]["state"], "failed");
+
+        let req = json!({ "jsonrpc": "2.0", "id": 10, "method": "tasks/get", "params": { "id": "s-hook-only" } });
+        let resp = handle_jsonrpc(&req, &test_ctx(Path::new("/dev/null"), ""));
+        assert_eq!(
+            resp["result"]["status"]["state"], "submitted",
+            "a pid-less hook-only record must read its plain idle->submitted mapping, never failed"
+        );
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
