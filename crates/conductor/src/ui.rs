@@ -962,6 +962,7 @@ mod tests {
             petname: None,
             hook_ancestry: Vec::new(),
             headless: false,
+            spawned: false,
             harness_session_id: None,
             resumed_from: None,
             origin: None,
