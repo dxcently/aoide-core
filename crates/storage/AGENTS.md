@@ -293,6 +293,20 @@
   the SAS rendering identically on both boxes, which is the entire point
   of the ceremony. A change here needs new pinned vectors AND a
   CONTRACTS.md §6 update in the same commit, never a silent drift.
+- **`pairing::derive_reply_sas` (the mutual-code redesign, R1) is a
+  SEPARATE derivation from `derive_sas`, never the same code re-shown.**
+  Same four fields, same order, same canonicalization — PLUS a leading
+  domain-separation tag (`REPLY_SAS_DOMAIN_TAG`, `"aoide-pair-reply"`,
+  NUL-separated the same way the other four fields are) so the two codes
+  can never coincide even on an identical transcript. Pinned by its own
+  `tests::derive_reply_sas_stability_vectors_never_drift` — the same
+  "changing the hash, the field order, the separator, the truncation, or
+  now the domain tag breaks both boxes identically" stance `derive_sas`'s
+  own bullet holds, and the same CONTRACTS.md §6 same-commit requirement.
+  Don't collapse the two functions into one with a bool flag — they are
+  called from different legs (`approve_inbound` vs. `commit_outbound`) at
+  different points in the ceremony, and a shared implementation risks a
+  caller passing the wrong flag silently producing the OTHER leg's code.
 - **`pairing::derive_commit` is a separate, one-way commitment, never
   folded into `derive_sas`.** It hashes exactly
   two fields (a pubkey and a nonce, same canonical lowercased/trimmed/
@@ -338,6 +352,28 @@
   contract (a lock hiccup runs the closure unlocked), the mutex is not.
   Outbound entries (`park_outbound`) are operator-created, one per `peer
   pair` invocation, and carry no cap.
+- **`park_inbound` SUPERSEDES a same-pubkey live entry, never refuses one
+  (R3) — the eviction happens under the SAME `PARK_LOCK` acquisition,
+  BEFORE the cap check, never a separate check outside it.** A fresh
+  request whose `pubkey_hex` matches an entry already parked for this
+  approver evicts it first (approved-but-unpolled entries included — the
+  superseding request comes from the SAME keyholder, i.e. the requester
+  abandoning its own ceremony), so a same-identity retry against a full
+  queue still succeeds on the slot its own prior entry frees. The return
+  type is `Result<(InboundPairingRequest, Option<String>), String>` — the
+  second element is the evicted id, for `aoide-server::a2a::pair_request`
+  to audit as a supersede; it is never reported on the wire (CONTRACTS.md
+  §6 — a gratuitous existence disclosure to an unauthenticated caller). Any
+  new caller of `park_inbound` destructures this tuple; don't collapse it
+  back to a bare `InboundPairingRequest` return without carrying the
+  evicted id somewhere the caller can still audit it. `park_outbound`
+  mirrors the rule on the requester's own side — replaces by id OR by the
+  approver's `pubkey_hex`, one live outbound entry per far identity, return
+  type unchanged (`Result<(), String>`, no evicted id to report — nothing
+  audits the requester's own local file). A cross-direction pair (inbound
+  FROM X alongside outbound TO X) is untouched by either rule — the two
+  park files never reference each other, and neither mutator should ever
+  start doing so.
 - **`OutboundPairingRequest.state` defers the requester's own peer-record
   commit past the approver's approval — never collapse the two-state
   machine back to an implicit "the poll answered means paired."** An entry
@@ -369,6 +405,18 @@
   never be able to burn or deny an entry by reaching a storage function
   that does both. Additive `#[serde(default)]` — a legacy record loads
   `0`, same discipline as `approved`.
+- **`OutboundPairingRequest.tries` is the exact mirror on the requester's
+  own leg (the mutual-code redesign, R1) — same split, same reasoning,
+  never merged into `InboundPairingRequest.tries` despite counting the
+  same kind of thing.** `record_outbound_code_try` only
+  increments-and-persists; `aoide-client::commands::commit_outbound` is
+  its ONLY production caller and performs the auto-abort itself via
+  `take_outbound`, against the SAME `MAX_CODE_TRIES` constant the inbound
+  leg reads. Two fields rather than one shared counter because the two
+  legs count mismatches against two DIFFERENT derived codes
+  (`derive_sas` vs. `derive_reply_sas`) on two separate park files —
+  conflating them would let a wrong guess on one leg burn the other leg's
+  budget. Additive `#[serde(default)]`, same discipline.
 - **`InboundPairingRequest.self_via` is carried, never validated or parsed,
   by this crate (task #131).** `park_inbound`'s `self_via: Option<&str>`
   param stores whatever `aoide-server::a2a::pair_request` hands it

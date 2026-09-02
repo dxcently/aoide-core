@@ -136,27 +136,34 @@ pub(crate) fn run_code_entry_dialog(
     result
 }
 
-/// The CONFIRM variant (P-PV3 revert, task #132) — same orchestration as
-/// [`run_code_entry_dialog`], [`render_code_confirm_qml`] in place of
-/// [`render_code_entry_qml`]: no boxes, no `TextInput`, `code` rendered
-/// large as plain display text, two actions (a clean Approve, the quiet
-/// flat `dismiss_text` control). This is `lyra pair ask`'s ORIGINAL sibling
-/// on the outbound (requester) side of the pairing ceremony — that
-/// direction generates its own code locally and only needs the operator to
-/// confirm they saw it, never to retype a code that arrived from
-/// elsewhere (`crates/client/src/pair_watch.rs`'s own module doc has the
-/// full reasoning for why the two pairing directions get two different
-/// dialog shapes sharing this one visual family).
-pub(crate) fn run_code_confirm_dialog(
+/// The SHOW variant (R2, the mutual-code redesign's popup phase) — same
+/// orchestration as [`run_code_entry_dialog`], [`render_code_show_qml`] in
+/// place of [`render_code_entry_qml`]: no boxes, no visible `TextInput`,
+/// `code` rendered large as plain display text, a **Copy** control and a
+/// **Done** control — no reject control at all. This is the pairing
+/// ceremony's REPLY-code display, spawned by `aoide pair watch --popup`
+/// immediately after a popup-driven INBOUND commit succeeds: the approver
+/// already committed their own peer record (this dialog fires AFTER that,
+/// never before), so there is nothing left here to approve OR reject — the
+/// operator's only job is to relay the code shown out-of-band and dismiss
+/// the window once they have, by whichever of Done/Esc/close they reach for
+/// first (`render_code_show_qml`'s own doc has the "all three are
+/// Done-equivalent" reasoning). `lyra pair confirm` (P-PV3, task #132) was
+/// this ceremony's OUTBOUND confirm shape before the mutual-code redesign
+/// (R1) gave the outbound leg its own typed-entry gate
+/// (`crates/client/src/pair_watch.rs`'s own module doc has that reversal's
+/// reasoning) — this function is that same command's name and QML family,
+/// repurposed for the ceremony's new display-only surface rather than
+/// duplicated.
+pub(crate) fn run_code_show_dialog(
     quickshell_cmd: &str,
     file_prefix: &str,
     window_title: &str,
     header_lines: &[HeaderLine],
     code: &str,
-    dismiss_text: &str,
     result_marker: &str,
 ) -> Result<AskResult, String> {
-    let qml = render_code_confirm_qml(window_title, header_lines, code, dismiss_text, result_marker);
+    let qml = render_code_show_qml(window_title, header_lines, code, result_marker);
     let qml_path = write_temp_qml(file_prefix, &qml).map_err(|e| format!("writing the dialog's QML: {e}"))?;
     let result = spawn_and_wait_for_marker(quickshell_cmd, &qml_path, result_marker);
     let _ = std::fs::remove_file(&qml_path);
@@ -259,11 +266,14 @@ fn parse_marker_line(line: &str, result_marker: &str) -> Option<AskResult> {
     let rest = line[idx + result_marker.len()..].trim_end();
     if let Some(code) = rest.strip_prefix("CODE:") {
         Some(AskResult::Approved(code.to_string()))
-    } else if rest == "APPROVE" {
-        // The confirm variant's own marker (P-PV3 revert, task #132) — no
-        // value was ever typed, so `Approved` carries an empty string, the
-        // same "irrelevant payload" shape a zenity `--question`'s plain OK
-        // produces on stdout.
+    } else if rest == "DONE" {
+        // The show variant's own marker (R2) — Done, Esc, and the native
+        // window close are all Done-equivalent (`render_code_show_qml`'s
+        // own doc: nothing is at stake once the code is on screen, this
+        // dialog commits nothing and rejects nothing), so all three emit
+        // this one marker. No value was ever typed, so `Approved` carries
+        // an empty string, the same "irrelevant payload" shape a zenity
+        // `--question`'s plain OK once produced on stdout.
         Some(AskResult::Approved(String::new()))
     } else if rest == "DISMISS" {
         Some(AskResult::Dismissed)
@@ -498,30 +508,38 @@ __HEADER_BLOCK__
 }
 "##;
 
-/// Render the CONFIRM variant's QML (P-PV3 revert, task #132) — same
-/// visual family as [`render_code_entry_qml`] (title, header lines, fixed-
-/// size float hints, the flat dismiss control) but the six-box `TextInput`
-/// is replaced by `code` rendered as large plain display text, and two
-/// actions: a filled "Approve" rectangle button and the quiet flat
-/// `dismiss_text` control underneath. Esc cancels (the Rectangle holds
-/// keyboard focus, same "Keys on the one focused item" shape
-/// [`render_code_entry_qml`]'s own `codeInput` holds). `code` is UNTRUSTED-
-/// ADJACENT in the sense that it is this instance's OWN locally-derived
-/// value (never peer-supplied) but still routed through [`qml_escape`] on
-/// principle, the same "escape every value this function touches, don't
-/// special-case one as trusted" posture `header_line_qml` already holds.
-pub(crate) fn render_code_confirm_qml(window_title: &str, header_lines: &[HeaderLine], code: &str, dismiss_text: &str, result_marker: &str) -> String {
+/// Render the SHOW variant's QML (R2) — same visual family as
+/// [`render_code_entry_qml`] (title, header lines, fixed-size float hints)
+/// but the six-box `TextInput` is replaced by `code` rendered as large
+/// plain display text, plus a HIDDEN, read-only `TextInput` holding that
+/// same text purely so **Copy** has something to `selectAll()`/`copy()` on
+/// — pure QtQuick, no external clipboard dependency. Two controls sit below
+/// the code, side by side: **Copy** (copies, the dialog stays open) and
+/// **Done** (closes it) — no reject control at all, because this dialog
+/// fires AFTER the approver's own commit already succeeded (`run_code_show_
+/// dialog`'s own doc): there is nothing left to approve or reject, only to
+/// relay and dismiss. Esc is Done-equivalent (the Rectangle holds keyboard
+/// focus, same "Keys on the one focused item" shape [`render_code_entry_
+/// qml`]'s own `codeInput` holds), and so is the native window close
+/// (`onClosing`) — all three emit the identical `DONE` marker
+/// ([`parse_marker_line`]'s own doc), since nothing distinguishes "clicked
+/// Done" from "closed the window" when nothing is at stake either way.
+/// `code` is UNTRUSTED-ADJACENT in the sense that it is this instance's OWN
+/// locally-derived value (never peer-supplied) but still routed through
+/// [`qml_escape`] on principle, the same "escape every value this function
+/// touches, don't special-case one as trusted" posture `header_line_qml`
+/// already holds.
+pub(crate) fn render_code_show_qml(window_title: &str, header_lines: &[HeaderLine], code: &str, result_marker: &str) -> String {
     let header_block: String = header_lines.iter().map(header_line_qml).collect();
 
-    CONFIRM_TEMPLATE
+    SHOW_TEMPLATE
         .replace("__TITLE__", &qml_escape(window_title))
         .replace("__HEADER_BLOCK__\n", &header_block)
         .replace("__CODE__", &qml_escape(code))
-        .replace("__DISMISS_TEXT__", &qml_escape(dismiss_text))
         .replace("__RESULT_MARKER__", result_marker)
 }
 
-const CONFIRM_TEMPLATE: &str = r##"import QtQuick
+const SHOW_TEMPLATE: &str = r##"import QtQuick
 import QtQuick.Window
 import QtQuick.Controls
 
@@ -538,13 +556,10 @@ Window {
     color: "#1e1e2e"
     flags: Qt.Dialog
 
-    function approveAsk() {
-        console.log("__RESULT_MARKER__APPROVE");
+    function doneAsk() {
+        console.log("__RESULT_MARKER__DONE");
     }
-    function dismissAsk() {
-        console.log("__RESULT_MARKER__DISMISS");
-    }
-    onClosing: console.log("__RESULT_MARKER__CANCEL")
+    onClosing: console.log("__RESULT_MARKER__DONE")
     Component.onCompleted: keyCatcher.forceActiveFocus()
 
     Rectangle {
@@ -554,7 +569,7 @@ Window {
         focus: true
         Keys.onPressed: (event) => {
             if (event.key === Qt.Key_Escape) {
-                console.log("__RESULT_MARKER__CANCEL");
+                doneAsk();
                 event.accepted = true;
             }
         }
@@ -575,43 +590,67 @@ __HEADER_BLOCK__
                 font.family: "monospace"
             }
 
-            Rectangle {
-                id: approveButton
-                anchors.horizontalCenter: parent.horizontalCenter
-                width: 110
-                height: 38
-                radius: 6
-                color: approveArea.containsMouse ? "#89b4fa" : "#313244"
-                border.width: 1
-                border.color: "#89b4fa"
-                Text {
-                    anchors.centerIn: parent
-                    text: "Approve"
-                    color: approveArea.containsMouse ? "#1e1e2e" : "#cdd6f4"
-                    font.pixelSize: 14
-                    font.bold: true
-                }
-                MouseArea {
-                    id: approveArea
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: approveAsk()
-                }
+            TextInput {
+                id: codeHolder
+                text: "__CODE__"
+                visible: false
+                readOnly: true
             }
 
-            Text {
-                text: "__DISMISS_TEXT__"
-                color: "#7f849c"
-                font.pixelSize: 12
-                font.underline: dismissArea.containsMouse
+            Row {
                 anchors.horizontalCenter: parent.horizontalCenter
-                MouseArea {
-                    id: dismissArea
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: dismissAsk()
+                spacing: 12
+
+                Rectangle {
+                    id: copyButton
+                    width: 90
+                    height: 38
+                    radius: 6
+                    color: copyArea.containsMouse ? "#89b4fa" : "#313244"
+                    border.width: 1
+                    border.color: "#89b4fa"
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Copy"
+                        color: copyArea.containsMouse ? "#1e1e2e" : "#cdd6f4"
+                        font.pixelSize: 14
+                        font.bold: true
+                    }
+                    MouseArea {
+                        id: copyArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            codeHolder.selectAll();
+                            codeHolder.copy();
+                            keyCatcher.forceActiveFocus();
+                        }
+                    }
+                }
+
+                Rectangle {
+                    id: doneButton
+                    width: 90
+                    height: 38
+                    radius: 6
+                    color: doneArea.containsMouse ? "#89b4fa" : "#313244"
+                    border.width: 1
+                    border.color: "#89b4fa"
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Done"
+                        color: doneArea.containsMouse ? "#1e1e2e" : "#cdd6f4"
+                        font.pixelSize: 14
+                        font.bold: true
+                    }
+                    MouseArea {
+                        id: doneArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: doneAsk()
+                    }
                 }
             }
         }
@@ -642,11 +681,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_marker_line_reads_approve_as_an_empty_approved() {
-        // The confirm variant's own marker (P-PV3 revert) — no value was
-        // ever typed, so this must be `Approved("")`, never a distinct
-        // variant the caller has to special-case.
-        assert_eq!(parse_marker_line("MARK:APPROVE", "MARK:"), Some(AskResult::Approved(String::new())));
+    fn parse_marker_line_reads_done_as_an_empty_approved() {
+        // The show variant's own marker (R2) — Done, Esc, and the native
+        // window close all emit this one marker; no value was ever typed,
+        // so this must be `Approved("")`, never a distinct variant the
+        // caller has to special-case.
+        assert_eq!(parse_marker_line("MARK:DONE", "MARK:"), Some(AskResult::Approved(String::new())));
     }
 
     #[test]
@@ -711,7 +751,7 @@ mod tests {
         let long = "pairing request from `osaka` (192.168.1.201) · id demo-7f2a";
         for qml in [
             render_code_entry_qml("t", &[HeaderLine::bold(long)], "Reject request", "MARK:"),
-            render_code_confirm_qml("t", &[HeaderLine::bold(long)], "111-222", "Reject", "MARK:"),
+            render_code_show_qml("t", &[HeaderLine::bold(long)], "111-222", "MARK:"),
         ] {
             assert!(qml.contains(long), "the full line must reach the QML");
             assert!(qml.contains("wrapMode: Text.WordWrap"), "a long line must wrap, never overflow");
@@ -745,41 +785,59 @@ mod tests {
         assert!(!qml.contains("Dismiss ask"));
     }
 
-    // ── render_code_confirm_qml (pure, P-PV3 revert) ──────────────────────
+    // ── render_code_show_qml (pure, R2) ────────────────────────────────────
 
     #[test]
-    fn render_confirm_embeds_title_header_code_and_dismiss_text() {
-        let qml = render_code_confirm_qml("aoide · box-b", &[HeaderLine::bold("confirm pairing with `box-b`")], "740-729", "Reject request", "MARK:");
+    fn render_show_embeds_title_header_and_code() {
+        let qml = render_code_show_qml("aoide · box-b", &[HeaderLine::bold("read this code back to `box-b`'s operator")], "740-729", "MARK:");
         assert!(qml.contains("title: \"aoide · box-b\""));
-        assert!(qml.contains("confirm pairing with `box-b`"));
+        assert!(qml.contains("read this code back to `box-b`'s operator"));
         assert!(qml.contains("text: \"740-729\""), "the code must render as plain display text: {qml}");
-        assert!(qml.contains("\"Reject request\""));
-        assert!(qml.contains("\"Approve\""));
+        assert!(qml.contains("\"Copy\""));
+        assert!(qml.contains("\"Done\""));
     }
 
     #[test]
-    fn render_confirm_carries_no_box_or_text_input_chrome() {
-        // The whole point of the revert: no six-box entry surface, no
-        // underlying TextInput to type into — a plain Approve button and a
-        // dismiss control only.
-        let qml = render_code_confirm_qml("t", &[HeaderLine::bold("x")], "111-222", "Dismiss ask", "MARK:");
-        assert!(!qml.contains("model: 3"), "confirm must carry no digit-box repeaters: {qml}");
-        assert!(!qml.contains("TextInput"), "confirm must carry no typed-entry field: {qml}");
+    fn render_show_carries_no_box_chrome_but_one_hidden_text_input_for_copy() {
+        // No six-box entry surface — this dialog collects nothing. It DOES
+        // carry exactly one `TextInput`, hidden and read-only, purely so
+        // Copy has something to `selectAll()`/`copy()` on.
+        let qml = render_code_show_qml("t", &[HeaderLine::bold("x")], "111-222", "MARK:");
+        assert!(!qml.contains("model: 3"), "show must carry no digit-box repeaters: {qml}");
         assert!(!qml.contains("boxIndex"));
+        assert_eq!(qml.matches("TextInput").count(), 1, "exactly one hidden TextInput backs Copy: {qml}");
+        assert!(qml.contains("visible: false"), "the copy-backing TextInput must be hidden: {qml}");
     }
 
     #[test]
-    fn render_confirm_uses_the_callers_own_result_marker_and_approve_dismiss_cancel_markers() {
-        let qml = render_code_confirm_qml("t", &[HeaderLine::bold("x")], "111-222", "Reject request", "AOIDE_PAIR_ASK_RESULT:");
-        assert!(qml.contains("AOIDE_PAIR_ASK_RESULT:APPROVE"));
-        assert!(qml.contains("AOIDE_PAIR_ASK_RESULT:DISMISS"));
-        assert!(qml.contains("AOIDE_PAIR_ASK_RESULT:CANCEL"));
+    fn render_show_carries_no_reject_control() {
+        // This dialog fires AFTER the approver's own commit already
+        // succeeded — nothing left to approve or reject, so no reject/
+        // dismiss control exists at all (unlike the entry/confirm shapes).
+        let qml = render_code_show_qml("t", &[HeaderLine::bold("x")], "111-222", "MARK:");
+        assert!(!qml.contains("Reject"), "show must carry no reject control: {qml}");
+        assert!(!qml.contains("Dismiss"), "show must carry no dismiss control: {qml}");
+        assert!(!qml.to_uppercase().contains("DISMISS"), "show must never emit a DISMISS marker: {qml}");
     }
 
     #[test]
-    fn render_confirm_floats_via_fixed_size_hints_and_escapes_a_hostile_code() {
+    fn render_show_uses_the_callers_own_result_marker_for_done_esc_and_close_alike() {
+        let qml = render_code_show_qml("t", &[HeaderLine::bold("x")], "111-222", "AOIDE_PAIR_ASK_RESULT:");
+        // Two literal emission sites (`doneAsk()`'s own body, and
+        // `onClosing`) cover all three closing paths — the Done button and
+        // Esc both CALL `doneAsk()` rather than each printing their own
+        // line, so the native window close is the only one that needs a
+        // second, separate `console.log`.
+        assert_eq!(qml.matches("AOIDE_PAIR_ASK_RESULT:DONE").count(), 2, "doneAsk() and onClosing must both emit the marker: {qml}");
+        assert!(qml.contains("doneAsk()"), "Esc and the Done button must both route through the one doneAsk() function: {qml}");
+        assert!(!qml.contains("AOIDE_PAIR_ASK_RESULT:APPROVE"), "the old confirm marker must be gone: {qml}");
+        assert!(!qml.contains("AOIDE_PAIR_ASK_RESULT:CANCEL"), "show has no distinct cancel outcome: {qml}");
+    }
+
+    #[test]
+    fn render_show_floats_via_fixed_size_hints_and_escapes_a_hostile_code() {
         let hostile = "111\"; Qt.quit(); //\u{2028}222";
-        let qml = render_code_confirm_qml("t", &[HeaderLine::bold("x")], hostile, "Dismiss ask", "MARK:");
+        let qml = render_code_show_qml("t", &[HeaderLine::bold("x")], hostile, "MARK:");
         assert!(qml.contains("flags: Qt.Dialog"));
         assert!(qml.contains("minimumWidth: width"));
         assert!(qml.contains(&qml_escape(hostile)), "the code must be escaped, never embedded raw: {qml}");
@@ -907,49 +965,34 @@ mod tests {
         assert!(err.contains("spawning quickshell"), "{err}");
     }
 
-    // ── run_code_confirm_dialog / the output contract (P-PV3 revert) ──────
+    // ── run_code_show_dialog / the output contract (R2) ────────────────────
+    // No dismissed/cancelled cases here (unlike the entry dialog's own
+    // tests): the SHOW template has no reject control and never emits
+    // anything but `DONE`, already covered generically by
+    // `parse_marker_line_reads_dismiss_and_cancel` at the unit level — this
+    // block only pins what IS specific to this function.
 
     #[test]
-    fn run_code_confirm_dialog_returns_approved_with_no_typed_value_when_the_shim_approves() {
+    fn run_code_show_dialog_returns_approved_with_no_typed_value_when_the_shim_signals_done() {
         let _guard = shim_lock();
-        let shim = write_shim("confirm-approve", "#!/bin/sh\necho MARK:APPROVE\nexit 0\n");
-        let result = run_code_confirm_dialog(shim.to_str().unwrap(), "aoide-dialog-qml-confirm-test", "t", &[HeaderLine::bold("x")], "111-222", "Dismiss ask", "MARK:").unwrap();
+        let shim = write_shim("show-done", "#!/bin/sh\necho MARK:DONE\nexit 0\n");
+        let result = run_code_show_dialog(shim.to_str().unwrap(), "aoide-dialog-qml-show-test", "t", &[HeaderLine::bold("x")], "111-222", "MARK:").unwrap();
         assert_eq!(result, AskResult::Approved(String::new()));
         remove_shim(&shim);
     }
 
     #[test]
-    fn run_code_confirm_dialog_returns_dismissed_when_the_shim_prints_dismiss() {
+    fn run_code_show_dialog_returns_failed_when_the_shim_never_prints_a_marker() {
         let _guard = shim_lock();
-        let shim = write_shim("confirm-dismiss", "#!/bin/sh\necho MARK:DISMISS\nexit 0\n");
-        let result = run_code_confirm_dialog(shim.to_str().unwrap(), "aoide-dialog-qml-confirm-test", "t", &[HeaderLine::bold("x")], "111-222", "Dismiss ask", "MARK:").unwrap();
-        assert_eq!(result, AskResult::Dismissed);
-        remove_shim(&shim);
-    }
-
-    #[test]
-    fn run_code_confirm_dialog_returns_cancelled_when_the_shim_prints_cancel() {
-        let _guard = shim_lock();
-        let shim = write_shim("confirm-cancel", "#!/bin/sh\necho MARK:CANCEL\nexit 0\n");
-        let result = run_code_confirm_dialog(shim.to_str().unwrap(), "aoide-dialog-qml-confirm-test", "t", &[HeaderLine::bold("x")], "111-222", "Dismiss ask", "MARK:").unwrap();
-        assert_eq!(result, AskResult::Cancelled);
-        remove_shim(&shim);
-    }
-
-    #[test]
-    fn run_code_confirm_dialog_returns_failed_when_the_shim_never_prints_a_marker() {
-        let _guard = shim_lock();
-        let shim = write_shim("confirm-silent", "#!/bin/sh\nexit 0\n");
-        let result = run_code_confirm_dialog(shim.to_str().unwrap(), "aoide-dialog-qml-confirm-test", "t", &[HeaderLine::bold("x")], "111-222", "Dismiss ask", "MARK:").unwrap();
+        let shim = write_shim("show-silent", "#!/bin/sh\nexit 0\n");
+        let result = run_code_show_dialog(shim.to_str().unwrap(), "aoide-dialog-qml-show-test", "t", &[HeaderLine::bold("x")], "111-222", "MARK:").unwrap();
         assert!(matches!(result, AskResult::Failed(_)), "expected Failed, got {result:?}");
         remove_shim(&shim);
     }
 
     #[test]
-    fn run_code_confirm_dialog_reports_a_spawn_error_for_a_nonexistent_binary() {
-        let err =
-            run_code_confirm_dialog("/no/such/aoide-lyra-quickshell-confirm-shim", "aoide-dialog-qml-confirm-test", "t", &[], "111-222", "Dismiss ask", "MARK:")
-                .unwrap_err();
+    fn run_code_show_dialog_reports_a_spawn_error_for_a_nonexistent_binary() {
+        let err = run_code_show_dialog("/no/such/aoide-lyra-quickshell-show-shim", "aoide-dialog-qml-show-test", "t", &[], "111-222", "MARK:").unwrap_err();
         assert!(err.contains("spawning quickshell"), "{err}");
     }
 

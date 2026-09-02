@@ -175,10 +175,17 @@ by decision — no embedded database yet
   arbitrarily later). Expiry is swept lazily on every `list_inbound`/
   `list_outbound`/`take_inbound`/`take_outbound` call, never a timer
   (`pairing_timeout_secs`, `AOIDE_PAIRING_TIMEOUT` env, 4-hour default).
-  `derive_sas` is the ONE SAS (short authentication string) derivation —
-  SHA-256 over the four public transcript values (both pubkeys, both
-  nonces, NUL-separated, order-sensitive), pinned by stability test
-  vectors so it renders identically on both boxes forever. `derive_commit`
+  `derive_sas` is the FIRST of two SAS (short authentication string)
+  derivations — SHA-256 over the four public transcript values (both
+  pubkeys, both nonces, NUL-separated, order-sensitive), pinned by
+  stability test vectors so it renders identically on both boxes forever.
+  `derive_reply_sas` (the mutual-code redesign, R1) is the SECOND, over
+  the SAME four fields in the SAME order plus a leading domain-separation
+  tag (`"aoide-pair-reply"`, NUL-separated the same way) so the two codes
+  can never collide even transcript-for-transcript — the approver's own
+  reply code, which the requester's operator types back to complete its
+  own leg, never the code `derive_sas` already produced for the approver's
+  side; also pinned by stability test vectors. `derive_commit`
   is a SEPARATE, one-way, untruncated SHA-256 over just a pubkey + a
   nonce — the
   requester commits to its own nonce (`park_inbound`'s `commit_hex`) BEFORE
@@ -194,7 +201,17 @@ by decision — no embedded database yet
   `fs::with_stage_lock` — the same flock `inbox::receive` reuses for a
   `state/` file — so the `a2a serve` process and a concurrent CLI never
   race each other's read-modify-write on
-  `state/peer-pairing-{inbound,outbound}.json`.
+  `state/peer-pairing-{inbound,outbound}.json`. One live parked request
+  per requester identity (R3): `park_inbound` SUPERSEDES — never refuses —
+  any entry already parked for the SAME `pubkey_hex` (approved-but-unpolled
+  included), evicted under the same `PARK_LOCK` acquisition BEFORE the cap
+  check runs; it returns `(InboundPairingRequest, Option<String>)`, the
+  second element the evicted id for the caller (`aoide-server::a2a::
+  pair_request`) to audit — never reported on the wire. `park_outbound`
+  mirrors this on the requester's own side: replaces by id OR by the
+  approver's own `pubkey_hex`, one live outbound entry per far identity.
+  A cross-direction pair (an inbound entry FROM X alongside an outbound
+  entry TO X) is left alone — the two files never reference each other.
   `OutboundPairingRequest.state` (`AwaitingApproval` → `AwaitingConfirm`,
   `mark_outbound_awaiting_confirm`) defers the REQUESTER's own peer-record
   commit until its own operator confirms a second time, after this
@@ -217,6 +234,12 @@ by decision — no embedded database yet
   between the third increment's save and the deny can persist a value at
   the limit; the approve path denies such an entry up front on next sight,
   so it is never approvable.
+  `OutboundPairingRequest.tries` (the mutual-code redesign, R1, additive,
+  `#[serde(default)]`) is the exact mirror on the requester's own leg —
+  counts wrong REPLY codes typed against the entry, bumped by
+  `record_outbound_code_try` (same `MarkApprovedError` refusal shape,
+  same cumulative-across-invocations discipline), while the auto-abort at
+  3 is the CLI caller's own `take_outbound`, never a state written here.
   `OutboundPairingRequest.via` (P-S4, additive, `#[serde(default)]`) carries
   the ssh-transport marker THIS instance resolved at request time (an
   explicit `--via`, or `pair`'s hostname arm/bare `pair`'s src_addr-derived

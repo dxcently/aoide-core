@@ -8,7 +8,9 @@
 //! P-A4 minted the base bundle; P-I3 added `onboard`; P3 added `secrets
 //! ask`; L-E1 added `element seed`; P-PV3 added `pair ask`, then its own
 //! revert added `pair confirm`; `quickshell healthcheck` — the
-//! placeholder-screen watchdog — is the newest addition. See
+//! placeholder-screen watchdog — followed; R2 (the mutual-code redesign's
+//! popup phase) repurposed `pair confirm` into `pair show`, the ceremony's
+//! reply-code display dialog (net zero — one path dies, one lands). See
 //! `commands/mod.rs::all()` for the assembly order.
 
 pub use aoide_protocol::registry::*;
@@ -83,7 +85,7 @@ mod tests {
             "mcp.serve",
             "onboard",
             "pair.ask",
-            "pair.confirm",
+            "pair.show",
             "quickshell.healthcheck",
             "quickshell.reload",
             "rice.back",

@@ -1692,7 +1692,10 @@ fn emit_pairing_event(kind: &str, payload: Value) {
 /// requester, or when A has no such claim to make. THIS instance (box B)
 /// parks it whole, `selfVia` included ([`aoide_storage::pairing::
 /// park_inbound`], cap-checked — a full queue is `-32000`, review-bounce
-/// Finding 3), for its own LATER `pair <id>` commit to read
+/// Finding 3; a SAME-pubkey retry supersedes whatever this identity had
+/// parked already, audited as a supersede but never named as one on the
+/// wire — R3, `aoide_storage::pairing`'s own module doc), for its own
+/// LATER `pair <id>` commit to read
 /// (`aoide-client::commands::approve_inbound`'s own doc), and answers
 /// SYNCHRONOUSLY with its OWN public key and a freshly-minted nonce —
 /// public material, same "freely shown" stance `docs/architecture/
@@ -1744,7 +1747,7 @@ fn pair_request(params: &Value, origin: PeerOrigin, audit_log: &Path) -> Result<
     let now_epoch = aoide_storage::time::parse_iso_utc(&requested_at).unwrap_or_else(|| unix_ts_now() as i64);
     let expires_at = aoide_storage::pairing::expires_at_from(now_epoch);
 
-    let entry = aoide_storage::pairing::park_inbound(
+    let (entry, evicted_id) = aoide_storage::pairing::park_inbound(
         pubkey_hex,
         name,
         &origin_display(origin),
@@ -1756,12 +1759,21 @@ fn pair_request(params: &Value, origin: PeerOrigin, audit_log: &Path) -> Result<
     )
     .map_err(|e| (-32000_i64, e))?;
 
+    // R3 (one live parked request per requester identity,
+    // `aoide_storage::pairing`'s own module doc): a same-pubkey retry
+    // superseded whatever was parked before it. The audit STATUS names the
+    // supersede and its evicted id; the WIRE response below never does —
+    // an ordinary fresh-id response either way (CONTRACTS.md §6).
+    let status = match &evicted_id {
+        Some(old_id) => format!("parked (superseding {old_id})"),
+        None => "parked".to_string(),
+    };
     let _ = audit(
         audit_log,
         Door::A2a,
         EventClass::Audit,
         "a2a.pairRequest",
-        "parked",
+        &status,
         &format!(
             "pairing request `{}` parked (claimed name `{name}`, origin {})",
             entry.id,
@@ -7136,12 +7148,17 @@ mod tests {
         std::env::set_var(aoide_storage::pairing::PAIRING_PARK_CAP_ENV, "1");
         let audit_log = root.join("log");
 
-        let request = |name: &str| {
-            let commit = aoide_storage::pairing::derive_commit(&"a".repeat(64), &"c".repeat(16));
-            json!({ "pubkeyHex": "a".repeat(64), "name": name, "commitHex": commit, "url": "http://a/" })
+        // DISTINCT pubkeys (R3, `aoide_storage::pairing`'s own module doc) —
+        // a SAME-pubkey retry now supersedes rather than refusing, so this
+        // cap-refusal test needs two genuinely different identities to
+        // still exercise the cap itself.
+        let request = |pubkey_byte: char, name: &str| {
+            let pubkey = pubkey_byte.to_string().repeat(64);
+            let commit = aoide_storage::pairing::derive_commit(&pubkey, &"c".repeat(16));
+            json!({ "pubkeyHex": pubkey, "name": name, "commitHex": commit, "url": "http://a/" })
         };
-        pair_request(&request("box-a"), PeerOrigin::Loopback, &audit_log).expect("first request is under the cap");
-        let err = pair_request(&request("box-c"), PeerOrigin::Loopback, &audit_log).unwrap_err();
+        pair_request(&request('a', "box-a"), PeerOrigin::Loopback, &audit_log).expect("first request is under the cap");
+        let err = pair_request(&request('b', "box-c"), PeerOrigin::Loopback, &audit_log).unwrap_err();
         assert_eq!(err.0, -32000, "a distinct code from ordinary invalid-params -32602");
 
         let now_epoch = aoide_storage::time::parse_iso_utc(&now_iso_utc()).unwrap();
@@ -7159,6 +7176,115 @@ mod tests {
         match saved_cap {
             Some(v) => std::env::set_var(aoide_storage::pairing::PAIRING_PARK_CAP_ENV, v),
             None => std::env::remove_var(aoide_storage::pairing::PAIRING_PARK_CAP_ENV),
+        }
+    }
+
+    /// R3, door level: a second `aoide/pairRequest` from the SAME pubkey
+    /// evicts the first parked entry rather than coexisting with it — the
+    /// audit line names the evicted id, but the WIRE response stays the
+    /// ordinary fresh-id shape (CONTRACTS.md §6 — the evicted id never
+    /// rides the wire).
+    #[test]
+    fn pair_request_from_the_same_pubkey_supersedes_the_prior_parked_request_and_audits_it() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-pairrequest-supersede-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        act_as(&root, "b");
+        let audit_log = root.join("log");
+
+        let pubkey = "a".repeat(64);
+        let request = |name: &str, nonce_byte: char| {
+            let commit = aoide_storage::pairing::derive_commit(&pubkey, &nonce_byte.to_string().repeat(16));
+            json!({ "pubkeyHex": pubkey, "name": name, "commitHex": commit, "url": "http://a/" })
+        };
+
+        let resp1 = pair_request(&request("box-a", 'c'), PeerOrigin::Loopback, &audit_log).unwrap();
+        let id1 = resp1["id"].as_str().unwrap().to_string();
+
+        let resp2 = pair_request(&request("box-a-retry", 'd'), PeerOrigin::Loopback, &audit_log).unwrap();
+        let id2 = resp2["id"].as_str().unwrap().to_string();
+        assert_ne!(id1, id2, "the superseding request gets its own fresh id");
+
+        // Exactly one parked entry survives — the newer one.
+        let now_epoch = aoide_storage::time::parse_iso_utc(&now_iso_utc()).unwrap();
+        let pending = aoide_storage::pairing::list_inbound(now_epoch);
+        assert_eq!(pending.len(), 1, "the first entry is superseded, not left coexisting");
+        assert_eq!(pending[0].id, id2);
+        assert_eq!(pending[0].name, "box-a-retry");
+
+        // The wire response stays exactly the ordinary four keys.
+        let keys: std::collections::BTreeSet<String> = resp2.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(
+            keys,
+            ["expiresAt", "id", "nonceHex", "pubkeyHex"].iter().map(|s| s.to_string()).collect::<std::collections::BTreeSet<_>>(),
+            "the wire response never grows an evicted-id field"
+        );
+
+        // The audit log names the supersede and the evicted id.
+        let log = std::fs::read_to_string(&audit_log).unwrap_or_default();
+        assert!(log.contains(&format!("superseding {id1}")), "{log}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+    }
+
+    #[test]
+    fn pair_request_from_a_case_varied_pubkey_still_supersedes_the_prior_parked_request() {
+        let _guard = crate::env_lock().lock().unwrap();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-pairrequest-supersede-case-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        act_as(&root, "b");
+        let audit_log = root.join("log");
+
+        let pubkey_lower = "a".repeat(64);
+        let pubkey_case_varied = format!("{}A", "a".repeat(63));
+        let request = |pubkey: &str, name: &str, nonce_byte: char| {
+            let commit = aoide_storage::pairing::derive_commit(pubkey, &nonce_byte.to_string().repeat(16));
+            json!({ "pubkeyHex": pubkey, "name": name, "commitHex": commit, "url": "http://a/" })
+        };
+
+        let resp1 = pair_request(&request(&pubkey_lower, "box-a", 'c'), PeerOrigin::Loopback, &audit_log).unwrap();
+        let id1 = resp1["id"].as_str().unwrap().to_string();
+
+        // Same key, one hex character uppercased on the retry — the wire's
+        // own `valid_pubkey_hex` already accepts either case.
+        let resp2 = pair_request(&request(&pubkey_case_varied, "box-a-retry", 'd'), PeerOrigin::Loopback, &audit_log).unwrap();
+        let id2 = resp2["id"].as_str().unwrap().to_string();
+        assert_ne!(id1, id2, "the superseding request gets its own fresh id");
+
+        let now_epoch = aoide_storage::time::parse_iso_utc(&now_iso_utc()).unwrap();
+        let pending = aoide_storage::pairing::list_inbound(now_epoch);
+        assert_eq!(pending.len(), 1, "a hex-case-varied pubkey is still the same requester — one survivor, not two");
+        assert_eq!(pending[0].id, id2);
+
+        let log = std::fs::read_to_string(&audit_log).unwrap_or_default();
+        assert!(log.contains(&format!("superseding {id1}")), "{log}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
         }
     }
 
@@ -7308,7 +7434,7 @@ mod tests {
         let now = now_iso_utc();
         let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
         let commit = aoide_storage::pairing::derive_commit(&requester_pubkey, &"c".repeat(32));
-        let entry = aoide_storage::pairing::park_inbound(
+        let (entry, _evicted) = aoide_storage::pairing::park_inbound(
             &requester_pubkey, "box-a", "10.0.0.5", "http://box-a:8710/", &commit, &now,
             &aoide_storage::pairing::expires_at_from(now_epoch),
             None,
@@ -7379,7 +7505,7 @@ mod tests {
         let now = now_iso_utc();
         let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
         let commit = aoide_storage::pairing::derive_commit(&requester_pubkey, &"c".repeat(32));
-        let entry = aoide_storage::pairing::park_inbound(
+        let (entry, _evicted) = aoide_storage::pairing::park_inbound(
             &requester_pubkey, "box-a", "10.0.0.5", "http://box-a:8710/", &commit, &now,
             &aoide_storage::pairing::expires_at_from(now_epoch),
             None,
@@ -7669,29 +7795,41 @@ mod tests {
         }
     }
 
-    /// The full ceremony, end to end: request -> reveal -> pending -> SAS
-    /// shown (both sides derive the SAME code independently) -> B approves
-    /// PURELY LOCALLY (commits B's own record, marks its parked entry
-    /// approved — NO network call to A) -> A polls B (`aoide/pairPoll`,
-    /// signed with A's OWN identity, over the SAME forward dial the
-    /// request/reveal already used) -> A's own operator confirms (commits
-    /// A's own record) — PAIRING.md's own "The ceremony" diagram under
-    /// Design A (task #119), review-bounce Findings 1 and 2 both still
-    /// exercised end to end, driven through the real handler functions
+    /// The full ceremony, end to end, over BOTH its typed codes (the
+    /// mutual-code redesign, R1): request -> reveal -> pending -> B's own
+    /// gate code shown (both sides derive the SAME `derive_sas` value
+    /// independently) -> B approves PURELY LOCALLY (commits B's own
+    /// record, marks its parked entry approved — NO network call to A —
+    /// and derives its OWN reply code, `derive_reply_sas`, the code A's
+    /// operator will need) -> A polls B (`aoide/pairPoll`, signed with A's
+    /// OWN identity, over the SAME forward dial the request/reveal already
+    /// used) -> A's own operator confirms against B's reply code (commits
+    /// A's own record only once its own independently-derived
+    /// `derive_reply_sas` matches B's) — PAIRING.md's own "The ceremony"
+    /// diagram under Design A (task #119) and decision 4's mutual
+    /// confirmation, review-bounce Findings 1 and 2 both still exercised
+    /// end to end, driven through the real handler functions
     /// (`pair_request`/`pair_reveal`/`pair_poll`) and the real
     /// `aoide_storage::peer_store`/`pairing` state, with
     /// `AOIDE_STATE_DIR`/`AOIDE_STAGE_DIR` swapped between steps to play box
     /// A then box B then box A again (see [`act_as`]'s own doc for why this
     /// test cannot be a genuine two-thread two-identity proof the way
     /// `cli/tests/peer_connectivity.rs` is for the read-only `graphSummary`
-    /// pull). A's OWN final confirm-then-commit step (`pair <id>` on
-    /// a polled-approved outbound entry) lives in `aoide-client::commands` —
-    /// simulated here by calling the same library functions that handler
-    /// calls (`mark_outbound_awaiting_confirm`/`upsert_paired_peer`/
-    /// `take_outbound`), since this crate cannot depend on `aoide-client`
-    /// (wrong DAG direction). A's own advertised `url` is deliberately a
-    /// bogus, undialable address (`http://box-a-is-loopback-only.invalid/`)
-    /// — under the OLD callback design B would have had to dial it to
+    /// pull). B's own approve gate (`aoide-client::commands::
+    /// approve_inbound`) and A's OWN final confirm-then-commit step
+    /// (`pair <id>` on a polled-approved outbound entry,
+    /// `aoide-client::commands::commit_outbound`) both live in
+    /// `aoide-client` — simulated here by calling the same library
+    /// functions those handlers call
+    /// (`mark_outbound_awaiting_confirm`/`upsert_paired_peer`/
+    /// `take_outbound`) plus the SAME two derivations they gate on
+    /// (`derive_sas`/`derive_reply_sas`), since this crate cannot depend on
+    /// `aoide-client` (wrong DAG direction) — asserting both sides
+    /// independently reach the IDENTICAL value for each of the two codes
+    /// is what proves this end-to-end, not merely that a function of that
+    /// name was called. A's own advertised `url` is deliberately a bogus,
+    /// undialable address (`http://box-a-is-loopback-only.invalid/`) —
+    /// under the OLD callback design B would have had to dial it to
     /// deliver the approval and the ceremony could never have completed;
     /// under Design A nothing ever dials it, so the ceremony completing
     /// anyway is itself the proof that no approver->requester network
@@ -7752,12 +7890,18 @@ mod tests {
             expires_at: aoide_storage::pairing::expires_at_from(now_epoch),
             state: aoide_storage::pairing::OutboundState::AwaitingApproval,
             via: None,
+            tries: 0,
         })
         .unwrap();
 
-        // ── Step 4: box B's operator lists pending, derives the SAME code
-        // independently from its own stored (now-revealed) copy of the
-        // transcript, and approves — committing B's OWN peer record for A.
+        // ── Step 4: box B's operator lists pending, derives the SAME gate
+        // code independently from its own stored (now-revealed) copy of
+        // the transcript, and approves — committing B's OWN peer record
+        // for A. B also derives its OWN reply code here (`derive_reply_sas`
+        // — the mutual-code redesign, R1): the SAME transcript plus a
+        // leading domain tag, never the code just used above, since B's
+        // own approve is what `commands::approve_inbound` computes and
+        // relays to A's operator the moment it commits.
         act_as(&root, "b");
         let pending = aoide_storage::pairing::list_inbound(now_epoch);
         assert_eq!(pending.len(), 1);
@@ -7770,7 +7914,14 @@ mod tests {
             &requester_nonce,
             &entry.approver_nonce_hex,
         );
-        assert_eq!(sas_a, sas_b, "both sides must derive the IDENTICAL SAS from the same transcript");
+        assert_eq!(sas_a, sas_b, "both sides must derive the IDENTICAL gate code from the same transcript");
+        let reply_sas_b = aoide_storage::pairing::derive_reply_sas(
+            &entry.pubkey_hex,
+            &kp_b.info().pubkey_hex,
+            &requester_nonce,
+            &entry.approver_nonce_hex,
+        );
+        assert_ne!(sas_b, reply_sas_b, "the gate code and the reply code must never coincide");
 
         // A poll BEFORE approval must answer `pending` — never leak that the
         // id exists as anything more (module doc on `pair_poll`).
@@ -7821,17 +7972,18 @@ mod tests {
         // callback handler used to call — only the TRIGGER moved), rejecting
         // a mismatched pubkey the same way a substituted reveal would be
         // rejected (review-bounce Finding 2, preserved). A's OWN operator
-        // then confirms the SAS on THIS side (`pair <id>` a
-        // second time, requester-side —
-        // `aoide-client::commands::approve_outbound`'s own confirm branch;
-        // simulated here via the same library calls that handler makes,
-        // since this crate cannot depend on `aoide-client`).
+        // then confirms — gating on B's REPLY code, never the gate code A's
+        // own screen already showed (`pair <id>` a second time,
+        // requester-side — `aoide-client::commands::commit_outbound`'s own
+        // confirm branch; simulated here via the same library calls that
+        // handler makes, since this crate cannot depend on `aoide-client`).
         act_as(&root, "a");
         let polled_pubkey = poll_resp["pubkeyHex"].as_str().unwrap();
         let marked = aoide_storage::pairing::mark_outbound_awaiting_confirm(&id, polled_pubkey, now_epoch).unwrap();
         assert_eq!(marked.state, aoide_storage::pairing::OutboundState::AwaitingConfirm);
-        let sas_a_confirm = aoide_storage::pairing::derive_sas(&pubkey_a, &marked.pubkey_hex, &marked.requester_nonce_hex, &marked.approver_nonce_hex);
-        assert_eq!(sas_a_confirm, sas_a, "A re-derives the identical code at its own confirm step");
+        let reply_sas_a = aoide_storage::pairing::derive_reply_sas(&pubkey_a, &marked.pubkey_hex, &marked.requester_nonce_hex, &marked.approver_nonce_hex);
+        assert_eq!(reply_sas_a, reply_sas_b, "A independently re-derives the IDENTICAL reply code B already computed at approve time");
+        assert_ne!(reply_sas_a, sas_a, "A's own confirm gates on the reply code, never the gate code its own screen already showed");
         let mut peers_a = aoide_storage::peer_store::load_peers();
         aoide_storage::peer_store::upsert_paired_peer(&mut peers_a, &marked.name, &marked.url, &marked.pubkey_hex, &now_iso_utc(), &["read".to_string()]);
         aoide_storage::peer_store::save_peers(&peers_a).unwrap();

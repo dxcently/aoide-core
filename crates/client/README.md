@@ -320,12 +320,9 @@ never the inbound/serve half (that's `aoide-server`).
   decline to commit. `grant_note` exists because a `--allow` on a RE-pairing
   legitimately does nothing (`upsert_paired_peer` never re-grants), and that
   must not be silent —
-  `confirm_sas`/`default_self_url`/`default_self_via` are this group's own local helpers:
-  `confirm_sas` (like `confirm_spawn` below) is a thin wrapper around
-  `aoide_protocol::pick::confirm` (ONBOARD.md's prompt substrate section,
-  P-I1) rather than a hand-rolled stdin read — `inquire::Confirm` on a tty,
-  the identical `y/N` stdin read otherwise; the question text is unchanged,
-  `confirm` owns the `[y/N]` decoration now). `pair_via_url`/`pair_via_hostname`
+  `default_self_url`/`default_self_via` are this group's own local helpers
+  (their own doc comments in `commands.rs` state what each derives and how
+  `--self-url`/`--self-via` override them). `pair_via_url`/`pair_via_hostname`
   (the SMART TARGET dispatch of a NEW request's two arms, P-PV2)
   both bottom out in `run_pair_request`, which sends
   the commitment and its reveal as two sequential POSTs in one invocation
@@ -335,7 +332,7 @@ never the inbound/serve half (that's `aoide-server`).
   dispatch by direction (Design A, task #119 — REPLACES the old
   `aoide/pairApprove` reverse callback): on an INBOUND entry
   (`approve_inbound_leg` → `approve_inbound`) it refuses an unrevealed one outright, then gates on
-  the TYPED pairing code (task #120 P3, `InboundGate` — the operator types
+  the TYPED pairing code (task #120 P3, `CodeGate` — the operator types
   the code as read off the REQUESTER's screen, compared against the
   locally derived SAS via the pure `code_matches`; the prompt never echoes
   the SAS; a mismatch persists one cumulative try through
@@ -367,17 +364,25 @@ never the inbound/serve half (that's `aoide-server`).
   `approve_outbound`) it POLLS
   `aoide/pairPoll` first (over the SAME forward dial `request` already
   used — `entry.via` if one was recorded) and, once the poll comes back
-  approved, re-derives the SAME SAS and confirms `y/N` (`--yes` scripted;
-  the requester's own screen already printed the code, so a typed-code
-  gate there would be this side typing its own output back at itself) —
+  approved, gates on a SECOND, DIFFERENT typed code (the mutual-code
+  redesign, R1) — `derive_reply_sas`, the approver's own reply code, read
+  off the APPROVER's screen and relayed back out-of-band, never the code
+  this instance already showed at request time (that would just be typing
+  its own output back at itself) — through the identical `CodeGate`/
+  `MAX_CODE_TRIES` machinery the inbound leg already holds: a mismatch
+  persists one cumulative try through
+  `aoide_storage::pairing::record_outbound_code_try`, and the third
+  mismatch auto-aborts via `auto_abort_outbound`, audited as
+  `auto-abort-on-code-mismatch`; `--code NNN-NNN` is the scripted spelling,
+  `--yes` maps to the same taught refusal as inbound, never a bypass —
   then commits THIS instance's own record (decision 4's mutual
-  confirmation, on both ends, unchanged). `approve_outbound` takes a
-  `skip_confirm: bool` (P-P5); `approve_inbound` takes the `InboundGate`
-  enum instead — `pair_watch`'s popup arm (below) passes `InboundGate::
-  Code` too now (P-PV3, task #132: the popup collects a typed code the
-  SAME way the CLI tty/`--code` paths do, so it runs through the identical
-  gate rather than a separate no-prompt variant; the old `DialogConfirmed`
-  variant is retired, nothing constructs it any more). `handle_pair_reject` tries
+  confirmation, on both ends, unchanged, now over two DISTINCT codes
+  rather than one shared one). `approve_outbound` takes the SAME `CodeGate`
+  enum `approve_inbound` does now (was `skip_confirm: bool`, P-P5) —
+  `pair_watch`'s popup arm (below) passes `CodeGate::Code` on BOTH legs
+  (R1 supersedes P-PV3's own outbound confirm dialog; that reversal's own
+  reasoning lives in `pair_watch`'s module doc, not repeated here).
+  `handle_pair_reject` tries
   the inbound queue then the outbound queue by id OR by a name matching
   exactly one pending request, aborting an outbound entry at
   any stage — the ceremony's abort command; `reject_by_id(cmd, id)` (P-P5)
@@ -430,7 +435,11 @@ never the inbound/serve half (that's `aoide-server`).
   `poll_pending_outbound` on `OUTBOUND_POLL_INTERVAL` (60s):
   `poll_outbound_once` on every entry `needs_outbound_poll` admits
   (`awaiting-approval` only) — the ONLY way a detached request's confirm
-  dialog ever becomes actionable, and never from the 200ms tick. **INBOUND (approver): `run_ask_dialog`** — `lyra
+  dialog ever becomes actionable, and never from the 200ms tick. **ONE
+  dialog shape on BOTH directions now (the mutual-code redesign, R1 —
+  this reverses P-PV3's own outbound CONFIRM dialog; `pair_watch`'s
+  module doc has the theater-argument reasoning for why that reversal
+  doesn't repeat P-PV3's original mistake): `run_ask_dialog`** — `lyra
   pair ask` (the SAME six-box entry surface `lyra secrets ask` renders)
   when `resolve_lyra_bin` found one, falling back to `zenity --entry` on a
   `lyra` `SpawnError`/`DialogFailure` for that one attempt
@@ -438,32 +447,24 @@ never the inbound/serve half (that's `aoide-server`).
   unchanged), `--no-markup` load-bearing on the zenity path for the same
   Pango-corruption reasoning `aoide_secrets::watch::spawn_zenity_entry`
   already carries. Exit 0 hands back the TYPED code, gated through
-  `commit_approval`'s inbound arm: `InboundGate::Code` — the SAME SAS
-  comparison and `MAX_CODE_TRIES` auto-deny machinery the CLI tty/`--code`
-  paths already hold, byte-identical. **OUTBOUND (requester):
-  `run_confirm_dialog`** — `lyra pair confirm`/`zenity --question`
-  (restored to the ceremony's ORIGINAL confirm argv shape), the SAME
-  lyra-then-zenity-fallback pattern. Exit 0 is an unconditional Approve —
-  `commit_approval`'s outbound arm IGNORES whatever string rides along and
-  calls `approve_outbound(true, ...)` regardless, the dialog itself being
-  the confirmation exactly as it always was (P-PV3's own review round
-  reverted an interim design that retyped the code here too, correctly
-  called copy-the-pixels theater since the code was already on screen in
-  the same window). Both arms share: the `REJECT_LABEL` extra
-  button/dismiss control → `reject_by_id`; a bare Cancel → session-only
-  `ignored`; a spawn/infra failure on BOTH binaries → backoff, NEVER
-  `ignored`, the same "a broken binary doesn't silently stop offering the
-  request" stance `aoide_secrets::watch::popup_loop` already holds.
-  `confirm_title`/`dialog_context`/`dialog_code` are pure and read ONLY
+  `commit_approval` — `CodeGate::Code` on EITHER arm, inbound against
+  `derive_sas`, outbound against `derive_reply_sas` — the SAME comparison
+  and `MAX_CODE_TRIES` auto-deny/auto-abort machinery the CLI tty/`--code`
+  paths already hold, byte-identical. Both arms share: the `REJECT_LABEL`
+  extra button/dismiss control → `reject_by_id`; a bare Cancel →
+  session-only `ignored`; a spawn/infra failure on BOTH binaries →
+  backoff, NEVER `ignored`, the same "a broken binary doesn't silently
+  stop offering the request" stance `aoide_secrets::watch::popup_loop`
+  already holds. `confirm_title`/`dialog_context` are pure and read ONLY
   from a `Pending` `reconcile` already produced — never a `PairEvent`'s
-  own feed-sourced fields. `dialog_code` returns `None` UNCONDITIONALLY
-  for an inbound `Pending` (the approver's whole gate is typing a code
-  read from elsewhere — showing it would collapse the out-of-band
-  comparison, `approve_inbound`'s own doc gives the identical reasoning
-  for the tty prompt) and `Some(sas)` for an outbound one, fed straight
-  into the confirm dialog's own display (this instance generated that SAS
-  itself — not a leak, and the CLI's own `confirm_sas` already prints it
-  for the identical reason).
+  own feed-sourced fields; `dialog_context` is the only per-direction
+  wording left to build (`dialog_code`, whose only job was showing an
+  outbound confirm's plain code, is GONE along with the dialog it
+  belonged to). Neither direction's dialog carries a code-display line
+  this phase — an inbound commit's reply code (the approver's own,
+  `derive_reply_sas`) reaches the outbound operator via `popup_tick`'s own
+  printed outcome line instead, an interim measure until a stay-open
+  display dialog (`lyra pair show`, a later phase) lands.
   **`run_pair_request(cmd, url, name, self_url, self_via, dial_via,
   record_via)` (P-P6, `dial_via`/`record_via` added P-S4, `self_via` added
   P-PV1/task #131) is `pair_via_url`'s own body, extracted so
@@ -534,9 +535,10 @@ never the inbound/serve half (that's `aoide-server`).
   discover [--secs N]`/`aoide pair <name> [--secs N] [--yes]`) are thin
   wrappers around `discover::run_sweep`/`discover::resolve_invite_target`
   above — `confirm_invite` is this pair's own local helper, still the
-  original hand-rolled `y/N` stdin read `confirm_sas`/`confirm_spawn` used
-  to share before their P-I1 retrofit onto `aoide_protocol::pick::confirm`
-  above — out of that phase's own scope, not an oversight; it shows both
+  original hand-rolled `y/N` stdin read this family's OTHER confirms
+  (`confirm_spawn`) shared before their P-I1 retrofit onto
+  `aoide_protocol::pick::confirm` above — out of that phase's own scope,
+  not an oversight; it shows both
   the advertisement's claimed ssh hop and its observed `src_addr` side
   by side, so an operator sees claim and observation before anything
   dials. `pair_via_hostname` refuses before dialing anything when
@@ -633,7 +635,7 @@ never the inbound/serve half (that's `aoide-server`).
   unsigned request could never satisfy the remote's `PeerRung::Signature`
   -only requirement regardless), refusing with a taught error naming `peer
   pair`, then confirms (`--yes` skips only this LOCAL `y`/`N`
-  prompt, `confirm_spawn`, mirroring `confirm_sas`'s idiom) before calling
+  prompt, `confirm_spawn`, mirroring `confirm_invite`'s idiom) before calling
   `spawn_on_peer` and shaping the `Outcome`. **`aoide-conduct`'s manifest
   remote-summon path** (U4, command-defrag lane U — `graph::resurrect::
   summon_remote`, the `conduct` → `client` edge documented in `conduct`'s

@@ -329,7 +329,7 @@ fn choose_many_tty(prompt: &str, rows: &[String], default: &[usize]) -> Option<V
 }
 
 /// `choose`'s y/N sibling (ONBOARD.md's prompt substrate section) —
-/// `client`'s `confirm_spawn`/`confirm_sas` retrofit onto this. `prompt` is
+/// `client`'s `confirm_spawn` retrofit onto this. `prompt` is
 /// the caller's own question with NO trailing `[y/N]` decoration — this
 /// function owns that suffix itself on the non-tty path, the same way
 /// [`choose_reading`] owns its own `[1-N, q to abort]` hint text, so a
@@ -356,8 +356,8 @@ pub fn confirm(prompt: &str) -> Result<bool, String> {
 }
 
 /// The testable non-tty core behind [`confirm`] — byte-identical to every
-/// hand-rolled `confirm_*` helper it replaces (`client::confirm_spawn`/
-/// `confirm_sas`, before this phase): prompt text plus a literal `[y/N] `
+/// hand-rolled `confirm_*` helper it replaces (`client::confirm_spawn`,
+/// before this phase): prompt text plus a literal `[y/N] `
 /// suffix to STDERR, one line read from `reader`, `true` only for `y`/`yes`
 /// (case-insensitive, trimmed) — an EOF (`read_line` returning `Ok(0)`) or
 /// any other input defaults to `false`, never a reprompt (a confirm gets

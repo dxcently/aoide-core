@@ -536,7 +536,7 @@ fn peer_pair_approve_on_an_unrevealed_inbound_entry_is_refused_with_awaiting_rev
     let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
     let expires = aoide_storage::pairing::expires_at_from(now_epoch);
     let commit = aoide_storage::pairing::derive_commit(&"a".repeat(64), &"c".repeat(32));
-    let entry = aoide_storage::pairing::park_inbound(&"a".repeat(64), "box-a", "127.0.0.1", "http://a/", &commit, &now, &expires, None).unwrap();
+    let (entry, _) = aoide_storage::pairing::park_inbound(&"a".repeat(64), "box-a", "127.0.0.1", "http://a/", &commit, &now, &expires, None).unwrap();
     assert!(entry.requester_nonce_hex.is_none(), "freshly parked, never revealed");
 
     let out = dispatch(&cli_invocation(&["pair"], &[entry.id.as_str()], &[("yes", "true"), ("wait", "0")]));
@@ -573,6 +573,7 @@ fn peer_pair_reject_on_an_outbound_entry_aborts_before_the_approvers_callback() 
         expires_at: expires,
         state: aoide_storage::pairing::OutboundState::AwaitingApproval,
         via: None,
+        tries: 0,
     };
     aoide_storage::pairing::park_outbound(entry).unwrap();
 
@@ -610,6 +611,7 @@ fn peer_pair_reject_on_an_outbound_entry_aborts_after_the_approvers_callback() {
         expires_at: expires,
         state: aoide_storage::pairing::OutboundState::AwaitingApproval,
         via: None,
+        tries: 0,
     };
     aoide_storage::pairing::park_outbound(entry).unwrap();
     let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
@@ -688,6 +690,7 @@ fn peer_pair_approve_on_an_outbound_entry_still_awaiting_the_peers_own_approval_
         expires_at: expires,
         state: aoide_storage::pairing::OutboundState::AwaitingApproval,
         via: None,
+        tries: 0,
     };
     aoide_storage::pairing::park_outbound(entry).unwrap();
 
@@ -712,8 +715,15 @@ fn peer_pair_approve_on_an_outbound_entry_still_awaiting_the_peers_own_approval_
     std::env::remove_var("AOIDE_AUDIT_LOG");
 }
 
+/// The mutual-code redesign (R1) replaced this leg's old bare `--yes`
+/// confirm with a typed reply code gate — `commit_outbound` derives
+/// `derive_reply_sas` from THIS process's own identity plus the entry's
+/// stored transcript and only commits on a match, the exact mirror of the
+/// approver's own `derive_sas` gate. `--yes` alone no longer reaches this
+/// commit (see `..._with_yes_alone_is_the_taught_refusal` below); this
+/// test now drives it with the correct scripted `--code`.
 #[test]
-fn peer_pair_approve_on_an_outbound_entry_awaiting_confirm_commits_with_yes() {
+fn peer_pair_approve_on_an_outbound_entry_awaiting_confirm_commits_with_the_reply_code() {
     let _guard = aoide_test_support::env_lock().lock().unwrap();
     let root = unique_root("pair-approve-outbound-confirm");
     let _stage = setup_env(&root);
@@ -739,17 +749,18 @@ fn peer_pair_approve_on_an_outbound_entry_awaiting_confirm_commits_with_yes() {
         // entry to this later, separate `pair <target>` invocation —
         // asserted below, committed onto the peer record only here.
         via: Some("ssh://khoa@box-b".to_string()),
+        tries: 0,
     };
     aoide_storage::pairing::park_outbound(entry).unwrap();
     let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
     aoide_storage::pairing::mark_outbound_awaiting_confirm("ijkl1234", &"b".repeat(64), now_epoch).unwrap();
 
-    let expected_sas = aoide_storage::pairing::derive_sas(&own_pubkey, &"b".repeat(64), &"c".repeat(32), &"d".repeat(32));
+    let expected_reply_sas = aoide_storage::pairing::derive_reply_sas(&own_pubkey, &"b".repeat(64), &"c".repeat(32), &"d".repeat(32));
 
-    let out = dispatch(&cli_invocation(&["pair"], &["ijkl1234"], &[("yes", "true"), ("wait", "0")]));
+    let out = dispatch(&cli_invocation(&["pair"], &["ijkl1234"], &[("code", &expected_reply_sas), ("wait", "0")]));
     assert_eq!(out.status, Status::Ok, "{}", out.message);
     let data = out.data.unwrap();
-    assert_eq!(data["sas"], expected_sas);
+    assert_eq!(data["replySas"], expected_reply_sas);
     assert_eq!(data["direction"], "outbound");
 
     let peers = aoide_storage::peer_store::load_peers();
@@ -768,6 +779,59 @@ fn peer_pair_approve_on_an_outbound_entry_awaiting_confirm_commits_with_yes() {
     std::env::remove_var("AOIDE_AUDIT_LOG");
 }
 
+/// The mutual-code redesign (R1): `--yes` alone, with no `--code`, no
+/// longer reaches this leg's commit at all — `outbound_gate_from` resolves
+/// it to `CodeGate::Unavailable`, and `commit_outbound` refuses with a
+/// taught error rather than either bypassing the gate (the old shape) or
+/// silently prompting on a non-tty caller. Nothing commits, nothing is
+/// removed from the queue, and no try is counted — the refusal fires
+/// before `commit_outbound` ever compares a code.
+#[test]
+fn peer_pair_approve_on_an_outbound_entry_awaiting_confirm_with_yes_alone_is_the_taught_refusal() {
+    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let root = unique_root("pair-approve-outbound-confirm-yes-alone");
+    let _stage = setup_env(&root);
+
+    let now = aoide_storage::time::now_iso_utc();
+    let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
+    let expires = aoide_storage::pairing::expires_at_from(now_epoch);
+    let entry = aoide_storage::pairing::OutboundPairingRequest {
+        id: "ijkl5678".to_string(),
+        url: "http://b/".to_string(),
+        name: "box-b".to_string(),
+        pubkey_hex: "b".repeat(64),
+        requester_nonce_hex: "c".repeat(32),
+        approver_nonce_hex: "d".repeat(32),
+        requested_at: now.clone(),
+        expires_at: expires,
+        state: aoide_storage::pairing::OutboundState::AwaitingApproval,
+        via: None,
+        tries: 0,
+    };
+    aoide_storage::pairing::park_outbound(entry).unwrap();
+    let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
+    aoide_storage::pairing::mark_outbound_awaiting_confirm("ijkl5678", &"b".repeat(64), now_epoch).unwrap();
+
+    let out = dispatch(&cli_invocation(&["pair"], &["ijkl5678"], &[("yes", "true"), ("wait", "0")]));
+    assert_eq!(out.status, Status::Usage, "{}", out.message);
+    assert!(
+        out.message.contains("does not bypass"),
+        "the refusal must teach why --yes alone isn't enough here: {}",
+        out.message
+    );
+
+    assert!(aoide_storage::peer_store::load_peers().is_empty(), "nothing was ever committed");
+    let listed = aoide_storage::pairing::list_outbound(now_epoch);
+    assert_eq!(listed.len(), 1, "the entry stays parked, never removed by a refused confirm");
+    assert_eq!(listed[0].tries, 0, "a refusal with no code offered counts no try");
+
+    let _ = std::fs::remove_dir_all(&root);
+    std::env::remove_var("AOIDE_STAGE_DIR");
+    std::env::remove_var("AOIDE_STATE_DIR");
+    std::env::remove_var("XDG_RUNTIME_DIR");
+    std::env::remove_var("AOIDE_AUDIT_LOG");
+}
+
 /// Review finding (P-S4 follow-up): a plain re-pair with NO `--via` must
 /// never wipe a `via` a previous ceremony (e.g. `peer invite`) already
 /// recorded — `set_peer_via` is only called at all when the entry names
@@ -776,7 +840,11 @@ fn peer_pair_approve_on_an_outbound_entry_awaiting_confirm_commits_with_yes() {
 /// `allows`. Seeds `box-b` already paired WITH a `via` (as if a prior
 /// `peer invite` had run), then re-pairs it through an outbound entry
 /// carrying `via: None` — the re-pair's own pubkey/url land as usual, but
-/// the existing `via` must survive untouched.
+/// the existing `via` must survive untouched. Driven through the CORRECT
+/// `--code` (the mutual-code redesign, R1, made `--yes` alone insufficient
+/// here — `..._with_yes_alone_is_the_taught_refusal` above covers that
+/// half) so this test still isolates the property it exists for: the via
+/// preservation, not the code gate.
 #[test]
 fn peer_pair_approve_on_an_outbound_entry_with_no_via_leaves_a_previously_recorded_via_untouched() {
     let _guard = aoide_test_support::env_lock().lock().unwrap();
@@ -820,17 +888,18 @@ fn peer_pair_approve_on_an_outbound_entry_with_no_via_leaves_a_previously_record
         // The re-pair itself carries NO via — a plain `pair <url>`
         // with no `--via` this time.
         via: None,
+        tries: 0,
     };
     aoide_storage::pairing::park_outbound(entry).unwrap();
     let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
     aoide_storage::pairing::mark_outbound_awaiting_confirm("mnop1234", &"e".repeat(64), now_epoch).unwrap();
 
-    let expected_sas = aoide_storage::pairing::derive_sas(&own_pubkey, &"e".repeat(64), &"f".repeat(32), &"1".repeat(32));
+    let expected_reply_sas = aoide_storage::pairing::derive_reply_sas(&own_pubkey, &"e".repeat(64), &"f".repeat(32), &"1".repeat(32));
 
-    let out = dispatch(&cli_invocation(&["pair"], &["mnop1234"], &[("yes", "true"), ("wait", "0")]));
+    let out = dispatch(&cli_invocation(&["pair"], &["mnop1234"], &[("code", &expected_reply_sas), ("wait", "0")]));
     assert_eq!(out.status, Status::Ok, "{}", out.message);
     let data = out.data.unwrap();
-    assert_eq!(data["sas"], expected_sas);
+    assert_eq!(data["replySas"], expected_reply_sas);
 
     let peers = aoide_storage::peer_store::load_peers();
     assert_eq!(peers.len(), 1);

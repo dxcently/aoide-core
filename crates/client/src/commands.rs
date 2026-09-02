@@ -1013,9 +1013,10 @@ pub fn send_message_to_peer(
 }
 
 /// Prompt `y/N` before spawning on a peer — a LOCAL UX confirmation only
-/// (mirrors `confirm_sas`'s exact idiom), never a security gate: the remote
-/// door's own paired+signature+allows∋spawn check (PAIRING.md decision 6)
-/// is the sole authority either way. Retrofit onto `aoide_protocol::pick::
+/// (mirrors `confirm_invite`'s exact idiom), never a security gate: the
+/// remote door's own paired+signature+allows∋spawn check (PAIRING.md
+/// decision 6) is the sole authority either way. Retrofit onto
+/// `aoide_protocol::pick::
 /// confirm` (ONBOARD.md's prompt substrate section, P-I1): `inquire::
 /// Confirm` on a tty, the identical stdin `y/N` read otherwise — the
 /// question text itself is unchanged, `confirm` owns the `[y/N]` decoration
@@ -1431,36 +1432,27 @@ pub fn register_peers(r: &mut Registry) {
 // here — and a re-pairing never re-grants, so a revoked capability survives
 // a key rotation.
 //
-// **Both humans confirm, for real (review-bounce Finding 2).** `pair
-// <id>` does double duty by DIRECTION, never a fifth command (golden
-// count unchanged by Design A, task #119 — no new command path, only the
-// completion trigger moved): on an INBOUND id (this instance is the
-// APPROVER) it re-derives the SAS, gates on the TYPED pairing code (task
-// #120 P3, [`InboundGate`] — max 3 cumulative mismatches, then auto-deny),
-// commits LOCALLY, and marks the entry approved for the requester's own poll
-// to find (no wire call at all — [`approve_inbound`]'s own doc). On an OUTBOUND
-// id (this instance is the REQUESTER) it POLLS the approver's door first
-// (over the SAME forward dial `pair`'s own request/reveal already
-// used), and only
-// once that poll comes back `approved` does it re-derive the SAME SAS and
-// confirm-then-commit ([`approve_outbound`]'s own doc has the full poll
-// mechanics). `pair reject <id>` doubles the same way, and on an
-// outbound id is also the ceremony's missing ABORT command: it removes the
-// entry at either outbound state, whether or not a poll has succeeded yet.
-
-/// Confirm the pairing SAS code matches — `true` only for `y`/`yes`
-/// (case-insensitive), EOF or anything else `false` (the ceremony's own
-/// "never silently commit" stance). Retrofit onto `aoide_protocol::pick::
-/// confirm` (ONBOARD.md's prompt substrate section, P-I1) — `inquire::
-/// Confirm` on a tty, the identical stdin `y/N` read otherwise; the
-/// question text is unchanged, `confirm` owns the `[y/N]` decoration.
-/// REQUESTER-side only since task #120 P3: [`approve_outbound`]'s confirm
-/// step is the one caller — the approver's own gate is the typed pairing
-/// code ([`approve_inbound`], [`InboundGate`]), never a y/N over a code
-/// this side already printed.
-fn confirm_sas(sas: &str, name: &str) -> Result<bool, String> {
-    aoide_protocol::pick::confirm(&format!("pairing request from `{name}` — confirmation code {sas} — do the codes match?"))
-}
+// **Both humans confirm, for real, with a code EACH — never a code and a
+// y/N (the mutual-code redesign, R1).** `pair <id>` does double duty by
+// DIRECTION, never a fifth command (golden count unchanged — no new command
+// path, only the completion trigger moved): on an INBOUND id (this instance
+// is the APPROVER) it re-derives `derive_sas`, gates on the TYPED pairing
+// code ([`CodeGate`] — max [`MAX_CODE_TRIES`] cumulative mismatches, then
+// auto-deny), commits LOCALLY, and marks the entry approved for the
+// requester's own poll to find (no wire call at all — [`approve_inbound`]'s
+// own doc) — its Ok outcome hands back a SECOND code, `derive_reply_sas`,
+// for this operator to read back to the requester. On an OUTBOUND id (this
+// instance is the REQUESTER) it POLLS the approver's door first (over the
+// SAME forward dial `pair`'s own request/reveal already used), and only
+// once that poll comes back `approved` does it gate on the SAME
+// [`CodeGate`] shape — this time against `derive_reply_sas`, the code the
+// approver just read back — before committing ([`commit_outbound`]'s own
+// doc has the full poll-then-gate mechanics). Neither leg's gate is ever a
+// y/N: a code generated on the FAR screen, typed blind on this one, three
+// strikes, `--yes` never a bypass, symmetric in both directions. `pair
+// reject <id>` doubles the same way, and on an outbound id is also the
+// ceremony's missing ABORT command: it removes the entry at either outbound
+// state, whether or not a poll has succeeded yet.
 
 /// The capability set a pairing commit stamps on a FIRST verification (task
 /// #135 P1) — `Some` is the `--allow` an operator typed at this commit,
@@ -1518,32 +1510,40 @@ fn grant_note(first_pairing: bool, allows: &[String]) -> String {
     }
 }
 
-/// How many wrong pairing codes an inbound entry tolerates before the CLI
-/// auto-denies it (task #120 P3) — cumulative across invocations
-/// (`aoide_storage::pairing::InboundPairingRequest::tries` persists them)
-/// and across the interactive prompt and the scripted `--code` path alike.
+/// How many wrong pairing codes either leg's entry tolerates before the CLI
+/// auto-resolves it (approver: auto-DENY via [`auto_deny_inbound`];
+/// requester: auto-ABORT via [`auto_abort_outbound`]) — cumulative across
+/// invocations (`aoide_storage::pairing::InboundPairingRequest::tries`/
+/// `OutboundPairingRequest::tries` persist them, one file per direction) and
+/// across the interactive prompt and the scripted `--code` path alike.
 pub(crate) const MAX_CODE_TRIES: u32 = 3;
 
-/// How `pair <id>` on an INBOUND entry collects its typed-code
-/// confirmation (task #120 P3) — the approver-side gate: the operator
-/// proves they hold the SAME code the requester's screen shows by TYPING
-/// it, out-of-band (a phone call, a glance), never by y/N-ing a code this
-/// side already printed. Resolved by [`approve_inbound_leg`] from the
-/// invocation; [`approve_inbound`] consumes it AFTER the idempotent
-/// already-approved and awaiting-reveal checks, so those short-circuits
-/// behave identically whichever variant rides in.
-pub(crate) enum InboundGate {
-    /// Scripted `--code NNN-NNN`: validated once against the derived SAS;
+/// How `pair <id>` collects its typed-code confirmation, EITHER direction
+/// (the mutual-code redesign, R1 — this enum was `InboundGate` before this
+/// phase, approver-only; it is now direction-neutral because the variant
+/// set, the resolution logic, and the mismatch bookkeeping are
+/// byte-identical on both legs). The operator proves they hold the SAME
+/// code the FAR screen shows by TYPING it, out-of-band (a phone call, a
+/// glance), never by y/N-ing a code this side already printed — the
+/// approver gates on `derive_sas`, the requester on `derive_reply_sas`, but
+/// the gate SHAPE is one enum. Resolved by [`approve_inbound_leg`]
+/// (approver)/[`outbound_gate_from`] (requester) from the invocation;
+/// [`approve_inbound`]/[`commit_outbound`] each consume it AFTER their own
+/// idempotent/state short-circuits, so those behave identically whichever
+/// variant rides in.
+pub(crate) enum CodeGate {
+    /// Scripted `--code NNN-NNN`: validated once against the derived code;
     /// a mismatch counts one persisted try
-    /// (`aoide_storage::pairing::record_inbound_code_try`).
+    /// (`aoide_storage::pairing::record_inbound_code_try`/
+    /// `record_outbound_code_try`, per direction).
     Code(String),
     /// Interactive CLI tty: prompt to type the code
     /// (`aoide_protocol::pick::text_input`), re-prompting on mismatch up
     /// to [`MAX_CODE_TRIES`] cumulative failures.
     Prompt,
     /// No way to collect a code — a non-CLI door, a non-tty CLI without
-    /// `--code`, or `--yes` (which no longer bypasses the approver's code):
-    /// a taught refusal, once the short-circuits above don't apply.
+    /// `--code`, or `--yes` (which bypasses neither leg's code): a taught
+    /// refusal, once the short-circuits above don't apply.
     Unavailable,
 }
 
@@ -1558,7 +1558,7 @@ fn code_matches(input: &str, sas: &str) -> bool {
     !typed.is_empty() && typed == norm(sas)
 }
 
-/// The taught refusal for [`InboundGate::Unavailable`] — one message for
+/// The taught refusal for [`CodeGate::Unavailable`] — one message for
 /// every no-code shape (non-tty, non-CLI door, `--yes`), naming both the
 /// terminal prompt and the scripted spelling.
 fn inbound_code_refusal(cmd: &str, id: &str) -> Outcome {
@@ -1606,6 +1606,59 @@ fn auto_deny_inbound(cmd: &str, id: &str, name: &str, now_epoch: i64) -> Outcome
         ),
     )
     .with_data(json!({ "reason": "auto-deny-on-code-mismatch", "id": id, "name": name, "tries": MAX_CODE_TRIES, "rejected": true, "direction": "inbound" }))
+}
+
+/// [`inbound_code_refusal`]'s exact mirror for the REQUESTER'S own gate
+/// (the mutual-code redesign, R1): `CodeGate::Unavailable` on an outbound
+/// completion — no code can be collected here either — names the reply
+/// code's own scripted spelling rather than the approver's.
+fn outbound_code_refusal(cmd: &str, id: &str) -> Outcome {
+    Outcome::usage(
+        cmd,
+        format!(
+            "completing an outbound pairing request takes the TYPED reply code as read from the \
+             approver's screen — run `aoide pair {id}` on a real terminal to type it, \
+             or pass `--code NNN-NNN` (scripted); `--yes` does not bypass the requester's own gate"
+        ),
+    )
+}
+
+/// [`record_code_try`]'s exact mirror against
+/// [`aoide_storage::pairing::record_outbound_code_try`] — both `Code` and
+/// `Prompt` arms of [`commit_outbound`] land here.
+fn record_outbound_try(cmd: &str, id: &str, now_epoch: i64) -> Result<u32, Outcome> {
+    match aoide_storage::pairing::record_outbound_code_try(id, now_epoch) {
+        Ok(t) => Ok(t),
+        Err(aoide_storage::pairing::MarkApprovedError::Unknown) => Err(Outcome::error(
+            cmd,
+            format!("no pending pairing request with id `{id}` (unknown, already resolved, or expired)"),
+        )
+        .with_data(json!({ "reason": "unknown-id", "id": id }))),
+        Err(aoide_storage::pairing::MarkApprovedError::Io(e)) => Err(Outcome::error(cmd, format!("recording the reply-code mismatch: {e}"))),
+    }
+}
+
+/// [`auto_deny_inbound`]'s exact mirror on the REQUESTER'S own leg (the
+/// mutual-code redesign, R1): the third cumulative reply-code mismatch is a
+/// clean [`aoide_storage::pairing::take_outbound`] — nothing of THIS
+/// instance's own commits. B is left holding a verified peer that answers
+/// nothing, which is PAIRING.md's own documented commit-asymmetry outcome
+/// ("resolved by an ordinary expiring re-pair") — the taught error says
+/// exactly that and names the re-pair, rather than inventing a special
+/// recovery path.
+fn auto_abort_outbound(cmd: &str, id: &str, name: &str, now_epoch: i64) -> Outcome {
+    if let Err(e) = aoide_storage::pairing::take_outbound(id, now_epoch) {
+        return Outcome::error(cmd, format!("removing the pairing request after {MAX_CODE_TRIES} reply-code mismatches: {e}"));
+    }
+    Outcome::error(
+        cmd,
+        format!(
+            "{MAX_CODE_TRIES} reply-code mismatches — auto-aborted pairing request `{id}` to `{name}`: \
+             nothing committed on this end; `{name}` is left holding a verified peer that answers nothing until \
+             an ordinary expiring re-pair resolves it"
+        ),
+    )
+    .with_data(json!({ "reason": "auto-abort-on-code-mismatch", "id": id, "name": name, "tries": MAX_CODE_TRIES, "rejected": true, "direction": "outbound" }))
 }
 
 /// This instance's own default advertised A2A door URL — `--peer-name`'s
@@ -1777,6 +1830,9 @@ fn pair_via_url(cmd: &str, inv: &Invocation, url: &str, usage: &str) -> Outcome 
     if let Some(out) = refuse_detached_grant(cmd, &finish) {
         return out;
     }
+    if let Some(out) = refuse_code_on_new_request(cmd, &finish) {
+        return out;
+    }
 
     run_pair_request(cmd, url, &name, &self_url, self_via.as_deref(), via.as_ref(), via.as_ref().map(|v| v.to_string()), &finish)
 }
@@ -1908,6 +1964,7 @@ fn run_pair_request(
         expires_at: ack.expires_at.clone(),
         state: aoide_storage::pairing::OutboundState::AwaitingApproval,
         via: record_via,
+        tries: 0,
     };
     if let Err(e) = aoide_storage::pairing::park_outbound(outbound) {
         return Outcome::error(cmd, format!("remembering the outbound pairing request: {e}"));
@@ -1919,9 +1976,9 @@ fn run_pair_request(
             format!(
                 "pairing request sent to `{name}` ({url}) — confirmation code {sas} — \
                  read this aloud (or otherwise out-of-band) to {name}'s operator; once they run \
-                 `aoide pair {}`, run the SAME command here too and confirm the SAME code \
-                 to complete the pair on both ends",
-                ack.id
+                 `aoide pair {}` and type it, they'll read back a REPLY code — \
+                 finish here with `aoide pair {} --code NNN-NNN`, then type their reply code here",
+                ack.id, ack.id
             ),
         )
         .with_data(json!({ "id": ack.id, "name": name, "url": url, "sas": sas, "expiresAt": ack.expires_at }));
@@ -1929,7 +1986,8 @@ fn run_pair_request(
 
     eprintln!(
         "pairing request sent to `{name}` — confirmation code {sas}\n\
-         read it aloud to {name}'s operator; they type it into `aoide pair`.\n\
+         read it aloud to {name}'s operator; they type it into `aoide pair`, then read a reply \
+         code back to you — type their reply code here when this command asks.\n\
          waiting up to {}s — Ctrl-C leaves the request pending as `{}`.",
         finish.wait_secs, ack.id
     );
@@ -1944,12 +2002,30 @@ pub(crate) struct PairFinish {
     /// returns immediately: the pre-P2 behaviour, kept as the scripted escape
     /// for anything that cannot sit on a human.
     pub wait_secs: u64,
-    /// `--yes` — skip THIS side's own confirmations, the sweep's proceed
-    /// prompt and the final code confirm alike. It never reaches the far
-    /// side's typed code, which is the gate that actually secures the pair.
+    /// `--yes` — skip THIS side's own PRE-REQUEST confirmations (the
+    /// sweep's proceed prompt, the already-verified-peer re-pair confirm).
+    /// **Narrowed by the mutual-code redesign (R1): it no longer reaches
+    /// the final gate.** The final commit is always a [`CodeGate`], built by
+    /// [`outbound_gate_from`] — `--yes` with no `--code` and no tty still
+    /// resolves to `CodeGate::Unavailable`, the same taught refusal the
+    /// approver's own `--yes` gives; it was never a bypass of the code that
+    /// actually secures the pair, only of the prompts that precede it.
     pub skip_confirm: bool,
     /// `--allow`, or `None` to read `[pairing] defaultGrant`.
     pub grant: Option<Vec<String>>,
+    /// `--code NNN-NNN` (the mutual-code redesign, R1) — the scripted reply
+    /// code, carried through so a resumed blocking wait
+    /// ([`wait_and_commit`]) can complete a poll-released entry without a
+    /// tty, the same way a zero-wait resume already could via
+    /// [`resume_outbound_leg`]. `None` on every NEW-request arm (refused
+    /// outright by [`refuse_code_on_new_request`] — no reply code can exist
+    /// yet at request time).
+    pub code: Option<String>,
+    /// Which door this invocation came through — [`outbound_gate_from`]'s
+    /// own `CodeGate::Prompt` arm needs it (`aoide_protocol::pick::
+    /// interactive`), and `wait_and_commit`'s poll loop has no
+    /// `&Invocation` of its own to read it from otherwise.
+    pub door: aoide_protocol::Door,
 }
 
 impl PairFinish {
@@ -1958,7 +2034,7 @@ impl PairFinish {
     /// `pair_finish_from` now).
     #[cfg(test)]
     pub(crate) fn detached() -> Self {
-        PairFinish { wait_secs: 0, skip_confirm: false, grant: None }
+        PairFinish { wait_secs: 0, skip_confirm: false, grant: None, code: None, door: aoide_protocol::Door::Cli }
     }
 }
 
@@ -1988,7 +2064,48 @@ fn pair_finish_from(inv: &Invocation) -> Result<PairFinish, String> {
         Some(raw) => raw.trim().parse::<u64>().map_err(|_| format!("--wait takes whole seconds (0 to park and return), not `{raw}`"))?,
         None => DEFAULT_PAIR_WAIT_SECS,
     };
-    Ok(PairFinish { wait_secs, skip_confirm: inv.flag_present("yes"), grant: parse_allow_flag(inv)? })
+    Ok(PairFinish {
+        wait_secs,
+        skip_confirm: inv.flag_present("yes"),
+        grant: parse_allow_flag(inv)?,
+        code: inv.flags.get("code").cloned().filter(|c| !c.trim().is_empty()),
+        door: inv.door,
+    })
+}
+
+/// A NEW request carries no reply code to validate yet (the mutual-code
+/// redesign, R1) — `derive_reply_sas` needs BOTH sides' nonces, which don't
+/// exist on this side as a completed transcript until the approver has
+/// approved and read their own reply code back. `--code` on a fresh request
+/// is a scripting mistake, not a shorthand for anything: refused with the
+/// spelling that DOES work once the id exists. Checked by both REQUEST arms
+/// only ([`pair_via_url`], the sweep arms feeding [`pair_with_heard`]) —
+/// the RESUME leg ([`resume_outbound_leg`]) is exactly where `--code` is
+/// legal, so it never calls this.
+fn refuse_code_on_new_request(cmd: &str, finish: &PairFinish) -> Option<Outcome> {
+    finish.code.as_ref().map(|_| {
+        Outcome::usage(
+            cmd,
+            "--code has nothing to validate yet on a NEW request — no reply code exists until the far side approves \
+             and reads their own reply code back; complete with `aoide pair <id> --code NNN-NNN` once they have",
+        )
+    })
+}
+
+/// The REQUESTER's own code gate, resolved off `finish` the SAME way
+/// [`approve_inbound_leg`] resolves the approver's off an `&Invocation`
+/// (the mutual-code redesign, R1) — `--code` scripted, a real CLI tty
+/// prompts, anything else (including `--yes`, which bypasses neither leg's
+/// gate) refuses. Shared by [`resume_outbound_leg`]'s zero-wait commit and
+/// [`wait_and_commit`]'s own poll-released commit so the two paths can
+/// never resolve a DIFFERENT gate for the same flags.
+fn outbound_gate_from(finish: &PairFinish) -> CodeGate {
+    match finish.code.clone() {
+        Some(code) => CodeGate::Code(code),
+        None if finish.skip_confirm => CodeGate::Unavailable,
+        None if aoide_protocol::pick::interactive(finish.door) => CodeGate::Prompt,
+        None => CodeGate::Unavailable,
+    }
 }
 
 /// A NEW request with `--wait 0` parks and returns before anything commits,
@@ -2054,7 +2171,29 @@ fn wait_and_commit(cmd: &str, id: &str, name: &str, sas: &str, finish: &PairFini
             .with_data(json!({ "reason": "request-gone", "id": id }));
         };
         match poll_outbound_once(cmd, id, &entry, now_epoch) {
-            PollOutcome::Released(released) => return commit_outbound(finish.skip_confirm, cmd, id, released, &now, now_epoch, &allows),
+            PollOutcome::Released(released) => {
+                let gate = outbound_gate_from(finish);
+                // No tty and no `--code` (the mutual-code redesign, R1):
+                // a blocking wait's own release is not the moment to hand
+                // back a hard Usage refusal the way the one-shot resume leg
+                // does — the entry is ALREADY parked at `awaiting-confirm`
+                // (the poll's own transition), nothing here auto-commits or
+                // counts a try either way, so this is the SAME "still
+                // pending, finish later" shape [`wait_is_over`]'s own
+                // timeout arm below already returns, not a distinct error
+                // path.
+                if matches!(gate, CodeGate::Unavailable) {
+                    return Outcome::ok(
+                        cmd,
+                        format!(
+                            "`{name}` approved — no terminal to type the reply code into; the request stays pending as `{id}`; \
+                             finish with `aoide pair {id} --code NNN-NNN`"
+                        ),
+                    )
+                    .with_data(json!({ "reason": "wait-no-code-available", "id": id, "name": name }));
+                }
+                return commit_outbound(gate, cmd, id, released, &now, now_epoch, &allows);
+            }
             PollOutcome::Refused(out) => return out,
             PollOutcome::Pending => {}
         }
@@ -2091,20 +2230,24 @@ fn wait_and_commit(cmd: &str, id: &str, name: &str, sas: &str, finish: &PairFini
 /// review-bounce Finding 1) — an unrevealed entry shows `"awaiting
 /// reveal"`, and `pair <id>` refuses it. An APPROVED inbound entry
 /// (Design A, task #119 — [`InboundPairingRequest::approved`]) stays
-/// listed here too, showing `"approved · awaiting their poll"` — it
-/// remains parked (never taken) until the requester's own `aoide/pairPoll`
-/// releases it or it expires, so the approver's own operator can still see
-/// it's done its part. Outbound rows carry their own `state`
-/// (`awaiting-approval`/`awaiting-confirm`).
+/// listed here too, showing `"approved · awaiting their poll"` plus a hint
+/// to re-run `aoide pair <id>` (the mutual-code redesign, R1 — that re-run
+/// re-derives and re-displays the reply code for an operator who lost it) —
+/// it remains parked (never taken) until the requester's own
+/// `aoide/pairPoll` releases it or it expires, so the approver's own
+/// operator can still see it's done its part. Outbound rows carry their own
+/// `state` (`awaiting-approval`/`awaiting-confirm`).
 ///
-/// **Never the SAS/pairing code (P-PV2, the User's locked spec).** The
-/// code is read off the REQUESTER's own terminal and typed on the
-/// APPROVER's — printing it here too would defeat the whole point of that
-/// out-of-band comparison (an operator could just read both sides off this
-/// one listing instead of actually comparing two independent screens).
-/// `pair <id>` still independently re-derives it from this
-/// instance's own identity plus the entry's stored transcript fields —
-/// never trusted from the wire — exactly as before; only THIS row listing
+/// **Never either pairing code (P-PV2, the User's locked spec; extends
+/// unchanged to the reply code, R1).** The plain code is read off the
+/// REQUESTER's own terminal and typed on the APPROVER's; the reply code
+/// runs the same comparison in reverse — printing either here too would
+/// defeat the whole point of an out-of-band comparison (an operator could
+/// just read both sides off this one listing instead of actually comparing
+/// two independent screens). `pair <id>` still independently re-derives
+/// whichever code its own leg needs from this instance's own identity plus
+/// the entry's stored transcript fields — never trusted from the wire —
+/// exactly as before; only THIS row listing
 /// stops showing it.
 fn pending_listing(cmd: &str) -> Outcome {
     let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
@@ -2136,7 +2279,9 @@ fn pending_listing(cmd: &str) -> Outcome {
             let dir = r["direction"].as_str().unwrap_or("");
             let status = match dir {
                 "inbound" if r["revealed"].as_bool() == Some(false) => "awaiting reveal".to_string(),
-                "inbound" if r["approved"].as_bool() == Some(true) => "approved · awaiting their poll".to_string(),
+                "inbound" if r["approved"].as_bool() == Some(true) => {
+                    "approved · awaiting their poll · re-run `aoide pair <id>` to re-show the reply code".to_string()
+                }
                 "inbound" => "revealed · run `aoide pair <id>` with the code from their screen".to_string(),
                 _ => r["state"].as_str().unwrap_or("").to_string(),
             };
@@ -2179,7 +2324,7 @@ fn pending_listing(cmd: &str) -> Outcome {
 /// operator may have run it twice, or the popup arm may re-offer a stale
 /// row before its own state catches up.
 ///
-/// **The gate is the TYPED pairing code (task #120 P3, [`InboundGate`]).**
+/// **The gate is the TYPED pairing code (task #120 P3, [`CodeGate`]).**
 /// The approver's operator types the code as read off the REQUESTER's
 /// screen (out-of-band — a phone call, a glance) and this compares it
 /// against the locally derived SAS; the prompt itself never echoes that SAS
@@ -2191,12 +2336,12 @@ fn pending_listing(cmd: &str) -> Outcome {
 /// ([`auto_deny_inbound`] — the same clean removal `pair reject`
 /// performs, audited under its own reason). An abort (`Esc`, `Ctrl-C`)
 /// leaves the entry pending with no try counted — an abort is not a wrong
-/// code. **`pair_watch --popup`'s own dialog is `InboundGate::Code`
+/// code. **`pair_watch --popup`'s own dialog is `CodeGate::Code`
 /// too** (P-PV3, task #132): it collects the SAME typed code this gate
 /// already validates everywhere else, so the popup arm runs through this
 /// exact match arm, not a separate no-prompt one.
 pub(crate) fn approve_inbound(
-    gate: InboundGate,
+    gate: CodeGate,
     cmd: &str,
     id: &str,
     entry: aoide_storage::pairing::InboundPairingRequest,
@@ -2205,11 +2350,24 @@ pub(crate) fn approve_inbound(
     grant: Option<&[String]>,
 ) -> Outcome {
     if entry.approved {
-        return Outcome::ok(
-            cmd,
-            format!("already approved `{}` — waiting for their own `aoide pair {id}` to complete their side", entry.name),
-        )
-        .with_data(json!({ "confirmed": true, "id": id, "peer": entry.name, "alreadyApproved": true }));
+        // The operator who lost the popup (or fat-fingered a relay) re-runs
+        // `aoide pair <id>` — re-derive and re-display the SAME reply code
+        // rather than leaving them with nothing to relay a second time.
+        // `None` only on an identity-load failure (best-effort — the
+        // idempotent success itself never depends on it).
+        let reply_sas = aoide_storage::identity::load_or_mint().ok().and_then(|(kp, _)| {
+            entry
+                .requester_nonce_hex
+                .as_deref()
+                .map(|n| aoide_storage::pairing::derive_reply_sas(&entry.pubkey_hex, &kp.info().pubkey_hex, n, &entry.approver_nonce_hex))
+        });
+        let name = &entry.name;
+        let message = match &reply_sas {
+            Some(code) => format!("already approved `{name}` — re-run `aoide pair {id}` to re-show the reply code, or relay THIS one if you haven't yet: {code}"),
+            None => format!("already approved `{name}` — waiting for their own `aoide pair {id}` to complete their side"),
+        };
+        return Outcome::ok(cmd, message)
+            .with_data(json!({ "confirmed": true, "id": id, "peer": entry.name, "alreadyApproved": true, "replySas": reply_sas }));
     }
 
     // Resolved BEFORE the code gate, not beside the commit that uses it: a
@@ -2251,8 +2409,8 @@ pub(crate) fn approve_inbound(
     let sas = aoide_storage::pairing::derive_sas(&entry.pubkey_hex, &own_pubkey, &requester_nonce, &entry.approver_nonce_hex);
 
     match gate {
-        InboundGate::Unavailable => return inbound_code_refusal(cmd, id),
-        InboundGate::Code(code) => {
+        CodeGate::Unavailable => return inbound_code_refusal(cmd, id),
+        CodeGate::Code(code) => {
             if !code_matches(&code, &sas) {
                 let tries = match record_code_try(cmd, id, now_epoch) {
                     Ok(t) => t,
@@ -2271,7 +2429,7 @@ pub(crate) fn approve_inbound(
                 .with_data(json!({ "reason": "code-mismatch", "id": id, "tries": tries }));
             }
         }
-        InboundGate::Prompt => loop {
+        CodeGate::Prompt => loop {
             // The prompt names the code's SHAPE, never its value (module
             // doc's echo invariant).
             let typed = match aoide_protocol::pick::text_input(&format!(
@@ -2301,6 +2459,15 @@ pub(crate) fn approve_inbound(
             eprintln!("code mismatch — {} more tr{} before this request is auto-denied", MAX_CODE_TRIES - tries, if MAX_CODE_TRIES - tries == 1 { "y" } else { "ies" });
         },
     }
+
+    // The mutual-code redesign (R1): B's own reply code, derived NOW
+    // (everything it needs — both pubkeys, both nonces — is already in
+    // hand) so the Ok outcome below can hand it back to this operator to
+    // relay out-of-band. `derive_reply_sas`'s arg order mirrors `derive_sas`
+    // above exactly (requester_pubkey, approver_pubkey, requester_nonce,
+    // approver_nonce) — never trusted from the wire, computed identically
+    // to how the requester will independently re-derive the SAME value.
+    let reply_sas = aoide_storage::pairing::derive_reply_sas(&entry.pubkey_hex, &own_pubkey, &requester_nonce, &entry.approver_nonce_hex);
 
     // P-S4/P-PV1: the APPROVER's own commit. `InboundPairingRequest` carries
     // no OBSERVED transport marker (through a tunnel, `origin_addr` reads
@@ -2356,13 +2523,15 @@ pub(crate) fn approve_inbound(
     Outcome::ok(
         cmd,
         format!(
-            "{word} `{}` (code {sas}) — verified{}; awaiting their own `aoide pair {id}` to poll and complete their side",
+            "{word} `{}` (code {sas}) — verified{}; read THIS code back to `{}`'s operator: {reply_sas} — \
+             they finish with `aoide pair {id} --code …`",
             entry.name,
-            grant_note(first_pairing, &allows)
+            grant_note(first_pairing, &allows),
+            entry.name,
         ),
     )
     .changed(vec![aoide_storage::peer_store::peers_path().to_string_lossy().into_owned()])
-    .with_data(json!({ "confirmed": true, "sas": sas, "peer": entry.name, "pubkeyHex": entry.pubkey_hex, "direction": "inbound", "grant": allows, "grantStamped": first_pairing }))
+    .with_data(json!({ "confirmed": true, "sas": sas, "replySas": reply_sas, "peer": entry.name, "pubkeyHex": entry.pubkey_hex, "direction": "inbound", "grant": allows, "grantStamped": first_pairing }))
 }
 
 /// The REQUESTER's poll-then-confirm-then-commit half of `pair
@@ -2381,10 +2550,13 @@ pub(crate) fn approve_inbound(
 /// operators are still comparing codes out loud, and the ONE arm a blocking
 /// caller retries instead of returning.
 ///
-/// `skip_confirm` (P-P5): same meaning as [`approve_inbound`]'s own
-/// parameter — the popup arm's dialog IS the confirmation.
+/// `gate` (the mutual-code redesign, R1 — was `skip_confirm: bool`): same
+/// meaning and shape as [`approve_inbound`]'s own `gate` parameter — this
+/// leg gates on [`aoide_storage::pairing::derive_reply_sas`] the identical
+/// way the approver's leg gates on `derive_sas`, threaded straight through
+/// to [`commit_outbound`].
 pub(crate) fn approve_outbound(
-    skip_confirm: bool,
+    gate: CodeGate,
     cmd: &str,
     id: &str,
     entry: aoide_storage::pairing::OutboundPairingRequest,
@@ -2417,7 +2589,7 @@ pub(crate) fn approve_outbound(
         }
     };
 
-    commit_outbound(skip_confirm, cmd, id, entry, now, now_epoch, &allows)
+    commit_outbound(gate, cmd, id, entry, now, now_epoch, &allows)
 }
 
 /// What one `aoide/pairPoll` round trip learned. Split out (task #135 P2) so
@@ -2515,20 +2687,30 @@ pub(crate) fn poll_outbound_once(cmd: &str, id: &str, entry: &aoide_storage::pai
     }
 }
 
-/// The REQUESTER's confirm-then-commit half, on an entry a poll already
-/// released. Split out beside [`poll_outbound_once`] (task #135 P2) for the
-/// same reason: a blocking `pair` and `mesh pair` both finish a ceremony
-/// here, and neither may re-derive the SAS or re-implement the commit.
+/// The REQUESTER's gate-then-commit half, on an entry a poll already
+/// released (the mutual-code redesign, R1 — the old shape's `y`/`N` over
+/// the SAME `derive_sas` code this side already printed at request time is
+/// GONE; this now gates on `derive_reply_sas`, the code the approver reads
+/// back after typing THIS side's own code). Split out beside
+/// [`poll_outbound_once`] (task #135 P2) for the same reason: a blocking
+/// `pair` and `mesh pair` both finish a ceremony here, and neither may
+/// re-derive the reply code or re-implement the commit.
 ///
-/// The SAS comes from this instance's own identity plus the entry's STORED
-/// transcript, never from the wire, and an explicit `y`/`yes` gates the
-/// commit — the same confirmation the approver's own side holds. The
-/// approver already committed its own record locally, before this instance
-/// ever polled; this writes only THIS end's.
-///
-/// `skip_confirm` (P-P5): the popup arm's dialog IS the confirmation.
+/// **The gate is the TYPED reply code — [`CodeGate`], the approver's own
+/// gate shape, mirrored.** Everything [`approve_inbound`]'s own doc states
+/// about its gate holds here identically, on the other leg: the reply code
+/// comes from this instance's own identity plus the entry's STORED
+/// transcript, never from the wire; the prompt never echoes it; a mismatch
+/// counts one persisted try ([`aoide_storage::pairing::
+/// record_outbound_code_try`]); the [`MAX_CODE_TRIES`]rd mismatch
+/// auto-aborts ([`auto_abort_outbound`] — a clean `take_outbound`, nothing
+/// of THIS instance's own commits). An entry already at the limit is denied
+/// up front, before the gate ever runs (the same crash-window guard
+/// [`approve_inbound`]'s own up-front check closes). The approver already
+/// committed its own record locally, before this instance ever polled; this
+/// writes only THIS end's.
 pub(crate) fn commit_outbound(
-    skip_confirm: bool,
+    gate: CodeGate,
     cmd: &str,
     id: &str,
     entry: aoide_storage::pairing::OutboundPairingRequest,
@@ -2536,6 +2718,10 @@ pub(crate) fn commit_outbound(
     now_epoch: i64,
     allows: &[String],
 ) -> Outcome {
+    if entry.tries >= MAX_CODE_TRIES {
+        return auto_abort_outbound(cmd, id, &entry.name, now_epoch);
+    }
+
     let (kp, _) = match aoide_storage::identity::load_or_mint() {
         Ok(v) => v,
         Err(e) => {
@@ -2544,23 +2730,62 @@ pub(crate) fn commit_outbound(
         }
     };
     let own_pubkey = kp.info().pubkey_hex;
-    let sas = aoide_storage::pairing::derive_sas(&own_pubkey, &entry.pubkey_hex, &entry.requester_nonce_hex, &entry.approver_nonce_hex);
+    let reply_sas = aoide_storage::pairing::derive_reply_sas(&own_pubkey, &entry.pubkey_hex, &entry.requester_nonce_hex, &entry.approver_nonce_hex);
 
-    if !skip_confirm {
-        match confirm_sas(&sas, &entry.name) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Outcome::ok(
+    match gate {
+        CodeGate::Unavailable => return outbound_code_refusal(cmd, id),
+        CodeGate::Code(code) => {
+            if !code_matches(&code, &reply_sas) {
+                let tries = match record_outbound_try(cmd, id, now_epoch) {
+                    Ok(t) => t,
+                    Err(out) => return out,
+                };
+                if tries >= MAX_CODE_TRIES {
+                    return auto_abort_outbound(cmd, id, &entry.name, now_epoch);
+                }
+                return Outcome::error(
                     cmd,
                     format!(
-                        "not confirmed — the request remains pending (confirmation code was {sas}); \
-                         run `aoide pair reject {id}` to abort"
+                        "reply-code mismatch — try {tries} of {MAX_CODE_TRIES}; {} more before this request is auto-aborted",
+                        MAX_CODE_TRIES - tries
                     ),
                 )
-                .with_data(json!({ "confirmed": false, "sas": sas, "id": id }))
+                .with_data(json!({ "reason": "code-mismatch", "id": id, "tries": tries }));
             }
-            Err(e) => return Outcome::error(cmd, e),
         }
+        CodeGate::Prompt => loop {
+            // The prompt names the code's SHAPE, never its value — the same
+            // echo invariant `approve_inbound`'s own prompt holds.
+            let typed = match aoide_protocol::pick::text_input(&format!(
+                "pairing with `{}` — type the REPLY code shown on their screen (NNN-NNN):",
+                entry.name
+            )) {
+                Ok(t) => t,
+                Err(e) => return Outcome::error(cmd, e),
+            };
+            let Some(typed) = typed else {
+                return Outcome::ok(
+                    cmd,
+                    format!("not confirmed — the request remains pending; run `aoide pair reject {id}` to abort"),
+                )
+                .with_data(json!({ "confirmed": false, "id": id }));
+            };
+            if code_matches(&typed, &reply_sas) {
+                break;
+            }
+            let tries = match record_outbound_try(cmd, id, now_epoch) {
+                Ok(t) => t,
+                Err(out) => return out,
+            };
+            if tries >= MAX_CODE_TRIES {
+                return auto_abort_outbound(cmd, id, &entry.name, now_epoch);
+            }
+            eprintln!(
+                "reply-code mismatch — {} more tr{} before this request is auto-aborted",
+                MAX_CODE_TRIES - tries,
+                if MAX_CODE_TRIES - tries == 1 { "y" } else { "ies" }
+            );
+        },
     }
 
     let mut peers = aoide_storage::peer_store::load_peers();
@@ -2595,9 +2820,9 @@ pub(crate) fn commit_outbound(
         PairChange::Inserted => "paired with",
         PairChange::Updated => "re-paired with",
     };
-    Outcome::ok(cmd, format!("{word} `{}` (code {sas}) — verified{}", entry.name, grant_note(first_pairing, allows)))
+    Outcome::ok(cmd, format!("{word} `{}` (reply code {reply_sas}) — verified{}", entry.name, grant_note(first_pairing, allows)))
         .changed(vec![aoide_storage::peer_store::peers_path().to_string_lossy().into_owned()])
-        .with_data(json!({ "confirmed": true, "sas": sas, "peer": entry.name, "pubkeyHex": entry.pubkey_hex, "direction": "outbound", "grant": allows, "grantStamped": first_pairing }))
+        .with_data(json!({ "confirmed": true, "replySas": reply_sas, "peer": entry.name, "pubkeyHex": entry.pubkey_hex, "direction": "outbound", "grant": allows, "grantStamped": first_pairing }))
 }
 
 /// `pair reject <id|name>` — a clean refusal: removes the parked entry
@@ -2783,10 +3008,12 @@ fn parse_secs_flag(inv: &Invocation) -> Result<u64, ()> {
 }
 
 /// Prompt `y/N` on stderr before running the pairing ceremony against a
-/// discovered peer — a LOCAL UX confirmation only (mirrors
-/// `confirm_spawn`/`confirm_sas`'s exact idiom), never a security gate:
-/// the ceremony's own SAS confirmation (both operators, both ends) is the
-/// sole authority either way. Shows BOTH the advertisement's claimed ssh
+/// discovered peer — a LOCAL UX confirmation only (the same hand-rolled
+/// stdin idiom this family's OTHER confirms shared before their P-I1
+/// retrofit onto `aoide_protocol::pick::confirm`), never a security gate:
+/// the ceremony's own typed-code confirmation (both operators, both ends,
+/// both directions since R1) is the sole authority either way. Shows BOTH
+/// the advertisement's claimed ssh
 /// hop (`user`@`host`) and `src_addr` (the packet's OBSERVED source
 /// address, P-S1) so the operator sees the claim and the observation side
 /// by side before anything is dialed.
@@ -2908,6 +3135,9 @@ fn pair_via_hostname(cmd: &str, inv: &Invocation, target: &str, usage: &str) -> 
         Err(e) => return Outcome::usage(cmd, format!("{usage} — {e}")),
     };
     if let Some(out) = refuse_detached_grant(cmd, &finish) {
+        return out;
+    }
+    if let Some(out) = refuse_code_on_new_request(cmd, &finish) {
         return out;
     }
     pair_with_heard(cmd, &hit, via_flag.as_ref(), self_via_flag.as_deref(), &finish)
@@ -3118,7 +3348,7 @@ fn pair_continue_or_request(cmd: &str, inv: &Invocation, target: &str, usage: &s
 }
 
 /// The APPROVER's leg of `pair <target>` — gate selection verbatim from the
-/// old `peer pair approve` inbound arm ([`InboundGate`]): `--code`
+/// old `peer pair approve` inbound arm ([`CodeGate`]): `--code`
 /// scripted, a typed prompt on a real CLI tty, a taught refusal anywhere no
 /// code can be collected. `--yes` deliberately maps to that refusal too —
 /// it is never a bypass of the typed code, which is the gate that secures
@@ -3136,10 +3366,10 @@ fn approve_inbound_leg(
         Err(e) => return Outcome::usage(cmd, format!("{usage} — {e}")),
     };
     let gate = match inv.flags.get("code").cloned().filter(|c| !c.trim().is_empty()) {
-        Some(code) => InboundGate::Code(code),
-        None if inv.flag_present("yes") => InboundGate::Unavailable,
-        None if aoide_protocol::pick::interactive(inv.door) => InboundGate::Prompt,
-        None => InboundGate::Unavailable,
+        Some(code) => CodeGate::Code(code),
+        None if inv.flag_present("yes") => CodeGate::Unavailable,
+        None if aoide_protocol::pick::interactive(inv.door) => CodeGate::Prompt,
+        None => CodeGate::Unavailable,
     };
     let id = entry.id.clone();
     approve_inbound(gate, cmd, &id, entry, now, now_epoch, allow.as_deref())
@@ -3167,7 +3397,7 @@ fn resume_outbound_leg(
     };
     if finish.wait_secs == 0 {
         let id = entry.id.clone();
-        return approve_outbound(finish.skip_confirm, cmd, &id, entry, now, now_epoch, finish.grant.as_deref());
+        return approve_outbound(outbound_gate_from(&finish), cmd, &id, entry, now, now_epoch, finish.grant.as_deref());
     }
     let (kp, _) = match aoide_storage::identity::load_or_mint() {
         Ok(v) => v,
@@ -3313,6 +3543,9 @@ fn pair_overview(cmd: &str, inv: &Invocation) -> Outcome {
                 if let Some(out) = refuse_detached_grant(cmd, &finish) {
                     return out;
                 }
+                if let Some(out) = refuse_code_on_new_request(cmd, &finish) {
+                    return out;
+                }
                 pair_with_heard(cmd, &h, None, None, &finish)
             }
         },
@@ -3329,13 +3562,13 @@ fn pair_overview(cmd: &str, inv: &Invocation) -> Outcome {
 pub fn register_pair(r: &mut Registry) {
     r.insert(cmd!(
         path: ["pair"],
-        summary: "Make this instance and a target paired — one verb for the whole ceremony, routed by what already exists: a pending inbound request from the target is approved (typed pairing code; --code scripted), a pending outbound one is resumed (poll then y/N confirm; --yes scripted), and nothing pending starts a new request (a URL dials directly, a name sweeps for its advertisement) then blocks up to --wait seconds for the far approval. Bare `pair` is the overview: an interactive menu over pending requests and heard advertisers on a real CLI tty, the pending listing (JSON-friendly) anywhere else.",
+        summary: "Make this instance and a target paired — one verb for the whole ceremony, routed by what already exists: a pending inbound request from the target is approved (typed pairing code; --code scripted), a pending outbound one is resumed (poll, then typed reply code; --code scripted), and nothing pending starts a new request (a URL dials directly, a name sweeps for its advertisement) then blocks up to --wait seconds for the far approval. Bare `pair` is the overview: an interactive menu over pending requests and heard advertisers on a real CLI tty, the pending listing (JSON-friendly) anywhere else.",
         args: [arg!("target", "string", false, "A peer name/hostname, a pending request id, or a URL (e.g. http://host:8710/) to dial directly. Omitted: the overview/menu.")],
         flags: [
-            flag!("code", "string", "The pairing code as read from the requester's screen, approving an INBOUND request without a prompt (scripted use); a wrong code counts one persisted try, and 3 cumulative mismatches auto-deny the request."),
+            flag!("code", "string", "The typed code, scripted: on an INBOUND request, the pairing code read from the requester's screen; on an OUTBOUND one, the reply code read from the approver's screen. A wrong code counts one persisted try; the 3rd cumulative mismatch auto-denies an inbound request or auto-aborts an outbound one."),
             flag!("wait", "int", "Seconds to block for the far operator (default 600). On a new request: park, then poll until approved or the wait runs out. On a resume: the same poll loop. --wait 0 parks a new request and returns immediately, or polls a resumed one exactly once."),
             flag!("allow", "string", "The capabilities this commit grants the peer, comma-separated (read, spawn) — overriding config.toml's `[pairing] defaultGrant`, and empty (--allow \"\") to grant nothing. First verification only: re-pairing an already-verified peer never re-grants, so use `peer allow` to change a live grant."),
-            flag!("yes", "bool", "Skip THIS side's own confirmations — the sweep proceed prompt, the already-paired re-pair confirm, and the final code y/N. Never touches the far side's typed code, which is the gate that secures the pair."),
+            flag!("yes", "bool", "Skip THIS side's own non-code confirmations — the sweep proceed prompt and the already-paired re-pair confirm. The final code gate, on either leg, still needs a real terminal prompt or --code; --yes alone there is a taught refusal, never a bypass."),
             flag!("name", "string", "URL target only: a local nickname for the other instance; defaults to a sanitized form of the URL's host."),
             flag!("via", "string", "An ssh://[user@]host[:port] transport marker — both the ceremony's own dial AND the resulting peer's recorded via. Absent = direct dial."),
             flag!("self-url", "string", "This instance's own advertised A2A door URL, recorded on the far side's peer record; defaults to http://<host>:<AOIDE_A2A_PORT or 8710>/."),
@@ -3358,12 +3591,12 @@ pub fn register_pair(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["pair", "watch"],
-        summary: "Foreground, line-mode follow of the pairing-ceremony events feed (parked/revealed/awaiting-confirm) plus a 30s reconcile safety tick. --json emits one event object per line instead of narration. --popup (opt-in, aoide.a2a.pairingPopup) swaps the terminal narration for a dialog shaped by direction on each actionable request: typed-code entry on an inbound reveal, a single Approve/Reject on an outbound awaiting-confirm — lyra when it resolves, zenity otherwise — mutually exclusive with --json. CLI-only — blocks until Ctrl-C.",
+        summary: "Foreground, line-mode follow of the pairing-ceremony events feed (parked/revealed/awaiting-confirm) plus a 30s reconcile safety tick. --json emits one event object per line instead of narration. --popup (opt-in, aoide.a2a.pairingPopup) swaps the terminal narration for a typed-code entry dialog on each actionable request, either direction — lyra when it resolves, zenity otherwise — mutually exclusive with --json. CLI-only — blocks until Ctrl-C.",
         args: [],
         flags: [flag!(
             "popup",
             "bool",
-            "Surface each actionable request as a dialog instead of terminal narration: typed-code entry (inbound reveal) or a single Approve/Reject (outbound awaiting-confirm) — lyra when it resolves, zenity otherwise. Requires one of the two on PATH. Mutually exclusive with --json."
+            "Surface each actionable request as a typed-code entry dialog instead of terminal narration, either direction — lyra when it resolves, zenity otherwise. Requires one of the two on PATH. Mutually exclusive with --json."
         )],
         gated: false,
         implemented: true,
@@ -4590,7 +4823,7 @@ mod tests {
             let saved_path = std::env::var("PATH").ok();
             std::env::set_var("PATH", format!("{}:{}", shim_dir.display(), saved_path.clone().unwrap_or_default()));
 
-            let outcome = approve_inbound(InboundGate::Code(sas), "pair", &id, entry, &now, now_epoch, None);
+            let outcome = approve_inbound(CodeGate::Code(sas), "pair", &id, entry, &now, now_epoch, None);
 
             match saved_path {
                 Some(p) => std::env::set_var("PATH", p),
@@ -4688,7 +4921,128 @@ mod tests {
             expires_at: aoide_storage::pairing::expires_at_from(now),
             state: aoide_storage::pairing::OutboundState::AwaitingApproval,
             via: None,
+            tries: 0,
         }
+    }
+
+    /// The expected reply code an outbound entry built by
+    /// [`sample_outbound_awaiting_approval`] gates its final commit on —
+    /// `derive_reply_sas` from THIS process's own freshly-minted identity
+    /// (`with_peer_state`'s sandboxed `AOIDE_STATE_DIR`) plus the fixture's
+    /// own transcript fields, the exact computation `commit_outbound`
+    /// itself performs.
+    fn expected_reply_sas(pubkey_b: &str) -> String {
+        let (kp, _) = aoide_storage::identity::load_or_mint().unwrap();
+        aoide_storage::pairing::derive_reply_sas(&kp.info().pubkey_hex, pubkey_b, &"c".repeat(32), &"d".repeat(32))
+    }
+
+    /// An outbound entry already `AwaitingConfirm` (a poll already
+    /// released it) — [`commit_outbound`]'s own gate-table tests drive it
+    /// directly, no network call needed, mirroring
+    /// [`parked_revealed_inbound`]'s equivalent shortcut on the approver's
+    /// leg.
+    fn awaiting_confirm_outbound(id: &str, pubkey_b: &str) -> aoide_storage::pairing::OutboundPairingRequest {
+        let mut entry = sample_outbound_awaiting_approval(id, "http://box-b/", pubkey_b);
+        entry.state = aoide_storage::pairing::OutboundState::AwaitingConfirm;
+        entry
+    }
+
+    // ── commit_outbound gate table (mutual ceremony, R1) ─────────────────
+    // ── the requester-side mirror of `approve_inbound`'s own scripted-code/
+    // ── auto-deny/no-code-collectable tests just below the approve_outbound
+    // ── poll tests. ────────────────────────────────────────────────────────
+
+    #[test]
+    fn commit_outbound_scripted_correct_reply_code_commits_and_takes_the_entry() {
+        with_peer_state("commit-outbound-code-match", || {
+            let pubkey_b = "b".repeat(64);
+            let entry = awaiting_confirm_outbound("deadbeef", &pubkey_b);
+            aoide_storage::pairing::park_outbound(entry.clone()).unwrap();
+            let now = aoide_storage::time::now_iso_utc();
+            let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
+
+            // The undashed spelling exercises `code_matches`' normalization
+            // on the real path, mirroring the inbound leg's own test.
+            let code = expected_reply_sas(&pubkey_b).replace('-', "");
+            let out = commit_outbound(CodeGate::Code(code), "pair", "deadbeef", entry, &now, now_epoch, &[]);
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
+
+            let peers = aoide_storage::peer_store::load_peers();
+            assert_eq!(peers.len(), 1);
+            assert!(peers[0].verified);
+            assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "commit takes the entry");
+        });
+    }
+
+    #[test]
+    fn commit_outbound_scripted_wrong_reply_codes_count_persisted_tries_then_auto_abort_at_three() {
+        with_peer_state("commit-outbound-code-mismatch", || {
+            let pubkey_b = "b".repeat(64);
+            let entry = awaiting_confirm_outbound("deadbeef", &pubkey_b);
+            aoide_storage::pairing::park_outbound(entry).unwrap();
+            let now = aoide_storage::time::now_iso_utc();
+            let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
+
+            for expected_tries in 1..=2u32 {
+                let fresh = aoide_storage::pairing::list_outbound(now_epoch).into_iter().find(|e| e.id == "deadbeef").unwrap();
+                let out = commit_outbound(CodeGate::Code("xxx-xxx".into()), "pair", "deadbeef", fresh, &now, now_epoch, &[]);
+                assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
+                assert_eq!(out.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("code-mismatch"));
+                assert_eq!(out.data.as_ref().and_then(|d| d.get("tries")).and_then(Value::as_u64), Some(expected_tries as u64));
+                assert_eq!(aoide_storage::pairing::list_outbound(now_epoch)[0].tries, expected_tries, "tries survive across invocations");
+            }
+
+            // The third mismatch auto-aborts: a clean `take_outbound`,
+            // nothing of THIS end's own commits, its own audited reason.
+            let fresh = aoide_storage::pairing::list_outbound(now_epoch).into_iter().find(|e| e.id == "deadbeef").unwrap();
+            let out = commit_outbound(CodeGate::Code("xxx-xxx".into()), "pair", "deadbeef", fresh, &now, now_epoch, &[]);
+            assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
+            assert_eq!(out.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("auto-abort-on-code-mismatch"));
+            assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "the parked entry is removed, exactly like a reject");
+            assert!(aoide_storage::peer_store::load_peers().is_empty(), "nothing of this end's own was ever committed");
+        });
+    }
+
+    #[test]
+    fn commit_outbound_refuses_where_no_code_can_be_collected_and_counts_no_try() {
+        with_peer_state("commit-outbound-no-code", || {
+            let pubkey_b = "b".repeat(64);
+            let entry = awaiting_confirm_outbound("deadbeef", &pubkey_b);
+            aoide_storage::pairing::park_outbound(entry.clone()).unwrap();
+            let now = aoide_storage::time::now_iso_utc();
+            let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
+
+            let out = commit_outbound(CodeGate::Unavailable, "pair", "deadbeef", entry, &now, now_epoch, &[]);
+            assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{out:?}");
+            assert!(out.message.contains("--code"), "the refusal teaches the scripted spelling: {}", out.message);
+            assert_eq!(aoide_storage::pairing::list_outbound(now_epoch)[0].tries, 0, "a refusal is not a wrong code");
+        });
+    }
+
+    /// A crash between the third try's persisted increment and its
+    /// auto-abort can leave an entry parked with `tries >= MAX_CODE_TRIES`
+    /// on disk — the same window [`approve_inbound`]'s own up-front check
+    /// closes on the approver's leg. [`commit_outbound`] must deny such an
+    /// entry before the gate ever runs, never re-offer one more try.
+    #[test]
+    fn commit_outbound_denies_up_front_when_already_at_the_try_limit() {
+        with_peer_state("commit-outbound-limit-reached", || {
+            let pubkey_b = "b".repeat(64);
+            let mut entry = awaiting_confirm_outbound("deadbeef", &pubkey_b);
+            entry.tries = MAX_CODE_TRIES;
+            aoide_storage::pairing::park_outbound(entry.clone()).unwrap();
+            let now = aoide_storage::time::now_iso_utc();
+            let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
+
+            // A CORRECT code doesn't matter — the up-front check runs
+            // before the gate is ever consulted.
+            let code = expected_reply_sas(&pubkey_b);
+            let out = commit_outbound(CodeGate::Code(code), "pair", "deadbeef", entry, &now, now_epoch, &[]);
+            assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
+            assert_eq!(out.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("auto-abort-on-code-mismatch"));
+            assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "an entry already at the limit is never approvable");
+            assert!(aoide_storage::peer_store::load_peers().is_empty());
+        });
     }
 
     /// `approve_outbound`'s own poll step, proven end to end through a REAL
@@ -4709,7 +5063,7 @@ mod tests {
 
             let now = aoide_storage::time::now_iso_utc();
             let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
-            let outcome = approve_outbound(true, "pair", "deadbeef", entry, &now, now_epoch, None);
+            let outcome = approve_outbound(CodeGate::Code(expected_reply_sas(&pubkey_b)), "pair", "deadbeef", entry, &now, now_epoch, None);
             assert_eq!(outcome.status, aoide_protocol::output::Status::Ok, "{outcome:?}");
 
             let peers = aoide_storage::peer_store::load_peers();
@@ -4774,6 +5128,32 @@ mod tests {
         assert!(refusal("600", Some("read")).is_none());
     }
 
+    /// The mutual-code redesign (R1): `--code` on a NEW request is refused
+    /// outright — no reply code can exist until the far side has approved
+    /// and read one back — the taught error names the spelling that DOES
+    /// work once the id exists. Any `--wait` value is refused the same way:
+    /// unlike `--allow`, this has nothing to do with whether the request
+    /// commits synchronously.
+    #[test]
+    fn code_on_a_new_request_is_refused_never_silently_ignored() {
+        let with_code = |wait: &str| {
+            let mut inv = pair_approve_inv(&[]);
+            inv.flags.insert("wait".to_string(), wait.to_string());
+            inv.flags.insert("code".to_string(), "111-222".to_string());
+            refuse_code_on_new_request("pair", &pair_finish_from(&inv).unwrap())
+        };
+        for wait in ["0", "600"] {
+            let out = with_code(wait).unwrap_or_else(|| panic!("--code on a new request must be refused (--wait {wait})"));
+            assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{out:?}");
+            assert!(out.message.contains("--code"), "{}", out.message);
+        }
+
+        // No `--code` at all is fine — nothing to refuse.
+        let mut inv = pair_approve_inv(&[]);
+        inv.flags.insert("wait".to_string(), "0".to_string());
+        assert!(refuse_code_on_new_request("pair", &pair_finish_from(&inv).unwrap()).is_none());
+    }
+
     /// The deadline compares two `u64`s and casts neither. The first shape
     /// compared against `wait_secs as i64`, so a `--wait` above `i64::MAX`
     /// read as NEGATIVE and "timed out" on the first tick — an operator
@@ -4799,7 +5179,7 @@ mod tests {
             aoide_storage::pairing::park_outbound(entry).unwrap();
 
             let began = std::time::Instant::now();
-            let finish = PairFinish { wait_secs: 600, skip_confirm: true, grant: None };
+            let finish = PairFinish { wait_secs: 600, skip_confirm: true, grant: None, code: None, door: aoide_protocol::Door::Cli };
             let out = wait_and_commit("pair", "deadbeef", "box-b", "111-222", &finish);
             assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
             assert_eq!(out.data.as_ref().unwrap()["reason"], "poll-unreachable");
@@ -4817,7 +5197,7 @@ mod tests {
 
             // `wait_secs: 0` reaches the timeout on the first tick with no
             // sleep at all — the deadline is checked before the cadence.
-            let finish = PairFinish { wait_secs: 0, skip_confirm: true, grant: None };
+            let finish = PairFinish { wait_secs: 0, skip_confirm: true, grant: None, code: None, door: aoide_protocol::Door::Cli };
             let out = wait_and_commit("pair", "deadbeef", "box-b", "111-222", &finish);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "a timeout is not a failed pair: {out:?}");
             assert_eq!(out.data.as_ref().unwrap()["reason"], "wait-timeout");
@@ -4827,6 +5207,38 @@ mod tests {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             assert_eq!(aoide_storage::pairing::list_outbound(now_epoch).len(), 1, "the request survives the timeout — that is what makes Ctrl-C safe");
             assert!(aoide_storage::peer_store::load_peers().is_empty(), "nothing commits on a timeout");
+        });
+    }
+
+    /// The mutual-code redesign (R1): a blocking wait whose poll releases
+    /// with NO tty and NO `--code` (cargo test's own stdio is never a
+    /// terminal — the exact shape a scripted `--wait` hits) returns the
+    /// SAME "still pending, finish later" Ok shape the wait-timeout arm
+    /// gives, never a hard Usage refusal — the entry is left exactly where
+    /// the poll's own transition put it (`awaiting-confirm`), nothing
+    /// auto-commits, and no try is counted.
+    #[test]
+    fn the_wait_release_with_no_code_available_parks_at_awaiting_confirm_never_refuses() {
+        with_peer_state("wait-release-no-code", || {
+            let pubkey_b = "b".repeat(64);
+            let body = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"status":"approved","pubkeyHex":"{pubkey_b}"}}}}"#);
+            let body: &'static str = Box::leak(body.into_boxed_str());
+            let (_listener, port) = spawn_fake_pair_poll_server(body);
+            let url = format!("http://127.0.0.1:{port}/");
+            aoide_storage::pairing::park_outbound(sample_outbound_awaiting_approval("deadbeef", &url, &pubkey_b)).unwrap();
+
+            let finish = PairFinish { wait_secs: 600, skip_confirm: false, grant: None, code: None, door: aoide_protocol::Door::Cli };
+            let out = wait_and_commit("pair", "deadbeef", "box-b", "111-222", &finish);
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
+            assert_eq!(out.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("wait-no-code-available"));
+            assert!(out.message.contains("--code"), "it names the finisher: {}", out.message);
+
+            let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
+            let listed = aoide_storage::pairing::list_outbound(now_epoch);
+            assert_eq!(listed.len(), 1, "the entry stays parked, never taken");
+            assert_eq!(listed[0].state, aoide_storage::pairing::OutboundState::AwaitingConfirm, "the poll's own release already transitioned it");
+            assert_eq!(listed[0].tries, 0, "no try is counted — there was no code to compare");
+            assert!(aoide_storage::peer_store::load_peers().is_empty(), "nothing auto-commits");
         });
     }
 
@@ -4842,7 +5254,13 @@ mod tests {
             let url = format!("http://127.0.0.1:{port}/");
             aoide_storage::pairing::park_outbound(sample_outbound_awaiting_approval("deadbeef", &url, &pubkey_b)).unwrap();
 
-            let finish = PairFinish { wait_secs: 600, skip_confirm: true, grant: Some(vec!["read".to_string(), "spawn".to_string()]) };
+            let finish = PairFinish {
+                wait_secs: 600,
+                skip_confirm: true,
+                grant: Some(vec!["read".to_string(), "spawn".to_string()]),
+                code: Some(expected_reply_sas(&pubkey_b)),
+                door: aoide_protocol::Door::Cli,
+            };
             let out = wait_and_commit("pair", "deadbeef", "box-b", "111-222", &finish);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
@@ -4858,7 +5276,7 @@ mod tests {
     #[test]
     fn the_wait_says_so_when_the_request_vanishes_underneath_it() {
         with_peer_state("wait-request-gone", || {
-            let finish = PairFinish { wait_secs: 600, skip_confirm: true, grant: None };
+            let finish = PairFinish { wait_secs: 600, skip_confirm: true, grant: None, code: None, door: aoide_protocol::Door::Cli };
             let out = wait_and_commit("pair", "nosuchid", "box-b", "111-222", &finish);
             assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
             assert_eq!(out.data.as_ref().unwrap()["reason"], "request-gone");
@@ -4881,7 +5299,7 @@ mod tests {
 
             let now = aoide_storage::time::now_iso_utc();
             let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
-            let outcome = approve_outbound(true, "pair", "deadbeef", entry, &now, now_epoch, None);
+            let outcome = approve_outbound(CodeGate::Unavailable, "pair", "deadbeef", entry, &now, now_epoch, None);
             assert_eq!(outcome.status, aoide_protocol::output::Status::Error, "{outcome:?}");
             assert_eq!(outcome.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("awaiting-peer-approval"));
 
@@ -4912,7 +5330,7 @@ mod tests {
 
             let now = aoide_storage::time::now_iso_utc();
             let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
-            let outcome = approve_outbound(true, "pair", "deadbeef", entry, &now, now_epoch, None);
+            let outcome = approve_outbound(CodeGate::Unavailable, "pair", "deadbeef", entry, &now, now_epoch, None);
             assert_eq!(outcome.status, aoide_protocol::output::Status::Error, "{outcome:?}");
             assert_eq!(outcome.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("reveal-mismatch"));
 
@@ -4927,7 +5345,7 @@ mod tests {
     // ── typed-code approval (task #120 P3) — the approver-side gate's
     // ── tty-free halves: the pure comparison, the scripted `--code` path,
     // ── the persisted tries, the auto-deny at 3, and the no-code refusal.
-    // ── The interactive `InboundGate::Prompt` loop renders through a real
+    // ── The interactive `CodeGate::Prompt` loop renders through a real
     // ── terminal (`pick::text_input`) and is exercised by hand, the same
     // ── way `pick`'s own tty backends always have been. ──────────────────
 
@@ -4975,7 +5393,7 @@ mod tests {
         let requester_pk = "e".repeat(64);
         let nonce = "aabbccdd11223344";
         let commit = aoide_storage::pairing::derive_commit(&requester_pk, nonce);
-        let entry = aoide_storage::pairing::park_inbound(
+        let (entry, _) = aoide_storage::pairing::park_inbound(
             &requester_pk,
             "box-a",
             "10.0.0.5",
@@ -5003,7 +5421,7 @@ mod tests {
             // "xxx-xxx" can never equal a digits-only SAS — a guaranteed mismatch.
             for expected_tries in 1..=2u32 {
                 let fresh = aoide_storage::pairing::list_inbound(now_epoch).into_iter().find(|e| e.id == id).unwrap();
-                let out = approve_inbound(InboundGate::Code("xxx-xxx".into()), "pair", &id, fresh, &now, now_epoch, None);
+                let out = approve_inbound(CodeGate::Code("xxx-xxx".into()), "pair", &id, fresh, &now, now_epoch, None);
                 assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
                 assert_eq!(out.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("code-mismatch"));
                 assert_eq!(out.data.as_ref().and_then(|d| d.get("tries")).and_then(Value::as_u64), Some(expected_tries as u64));
@@ -5014,7 +5432,7 @@ mod tests {
             // The third mismatch auto-denies: the same clean removal reject
             // performs, nothing committed, its own audited reason.
             let fresh = aoide_storage::pairing::list_inbound(now_epoch).into_iter().find(|e| e.id == id).unwrap();
-            let out = approve_inbound(InboundGate::Code("xxx-xxx".into()), "pair", &id, fresh, &now, now_epoch, None);
+            let out = approve_inbound(CodeGate::Code("xxx-xxx".into()), "pair", &id, fresh, &now, now_epoch, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
             assert_eq!(out.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("auto-deny-on-code-mismatch"));
             assert!(aoide_storage::pairing::list_inbound(now_epoch).is_empty(), "the parked entry is removed, exactly like a reject");
@@ -5032,7 +5450,7 @@ mod tests {
 
             // The undashed spelling exercises code_matches' normalization on
             // the real path, not just the pure test above.
-            let out = approve_inbound(InboundGate::Code(sas.replace('-', "")), "pair", &id, entry, &now, now_epoch, None);
+            let out = approve_inbound(CodeGate::Code(sas.replace('-', "")), "pair", &id, entry, &now, now_epoch, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
             let peers = aoide_storage::peer_store::load_peers();
@@ -5041,6 +5459,44 @@ mod tests {
             let listed = aoide_storage::pairing::list_inbound(now_epoch);
             assert_eq!(listed.len(), 1, "an approved entry stays parked for the requester's poll (Design A)");
             assert!(listed[0].approved);
+        });
+    }
+
+    /// The mutual-code redesign (R1): a successful commit hands back a
+    /// SECOND code, `replySas`, in both the message and the data — and a
+    /// re-run against the now-already-approved entry (the operator who
+    /// lost the popup, or wants to relay it again) re-derives and
+    /// re-displays the SAME value rather than the bare "waiting for their
+    /// poll" text alone.
+    #[test]
+    fn approve_inbound_ok_outcome_carries_the_reply_code_including_on_an_idempotent_rerun() {
+        with_peer_state("approve-inbound-reply-sas", || {
+            let now_epoch = 1_700_000_000_i64;
+            let now = aoide_storage::time::iso_utc_from_epoch(now_epoch);
+            let (entry, sas) = parked_revealed_inbound(now_epoch);
+            let id = entry.id.clone();
+            let (kp, _) = aoide_storage::identity::load_or_mint().unwrap();
+            let expected_reply = aoide_storage::pairing::derive_reply_sas(
+                &entry.pubkey_hex,
+                &kp.info().pubkey_hex,
+                entry.requester_nonce_hex.as_deref().unwrap(),
+                &entry.approver_nonce_hex,
+            );
+            assert_ne!(expected_reply, sas, "the reply code must differ from the plain code the gate was just checked against");
+
+            let out = approve_inbound(CodeGate::Code(sas), "pair", &id, entry, &now, now_epoch, None);
+            assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
+            assert_eq!(out.data.as_ref().and_then(|d| d.get("replySas")).and_then(Value::as_str), Some(expected_reply.as_str()));
+            assert!(out.message.contains(&expected_reply), "the reply code rides the human message too: {}", out.message);
+
+            // Re-run against the now-approved entry: idempotent success,
+            // and the SAME reply code re-derived and re-shown.
+            let fresh = aoide_storage::pairing::list_inbound(now_epoch).into_iter().find(|e| e.id == id).unwrap();
+            let rerun = approve_inbound(CodeGate::Unavailable, "pair", &id, fresh, &now, now_epoch, None);
+            assert_eq!(rerun.status, aoide_protocol::output::Status::Ok, "{rerun:?}");
+            assert_eq!(rerun.data.as_ref().and_then(|d| d.get("alreadyApproved")).and_then(Value::as_bool), Some(true));
+            assert_eq!(rerun.data.as_ref().and_then(|d| d.get("replySas")).and_then(Value::as_str), Some(expected_reply.as_str()));
+            assert!(rerun.message.contains(&expected_reply), "{}", rerun.message);
         });
     }
 
@@ -5058,7 +5514,7 @@ mod tests {
         let now = aoide_storage::time::iso_utc_from_epoch(now_epoch);
         let (entry, sas) = parked_revealed_inbound(now_epoch);
         let id = entry.id.clone();
-        approve_inbound(InboundGate::Code(sas), "pair", &id, entry, &now, now_epoch, grant)
+        approve_inbound(CodeGate::Code(sas), "pair", &id, entry, &now, now_epoch, grant)
     }
 
     #[test]
@@ -5180,7 +5636,7 @@ mod tests {
             let (entry, sas) = parked_revealed_inbound_with_self_via(now_epoch, Some("ssh://khoa@box-a"));
             let id = entry.id.clone();
 
-            let out = approve_inbound(InboundGate::Code(sas), "pair", &id, entry, &now, now_epoch, None);
+            let out = approve_inbound(CodeGate::Code(sas), "pair", &id, entry, &now, now_epoch, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
             let peers = aoide_storage::peer_store::load_peers();
@@ -5212,7 +5668,7 @@ mod tests {
             let id = entry.id.clone();
             assert_ne!(9999, default_a2a_port(), "the fixture port must differ from the default for this test to prove anything");
 
-            let out = approve_inbound(InboundGate::Code(sas), "pair", &id, entry, &now, now_epoch, None);
+            let out = approve_inbound(CodeGate::Code(sas), "pair", &id, entry, &now, now_epoch, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
             let peers = aoide_storage::peer_store::load_peers();
@@ -5234,7 +5690,7 @@ mod tests {
             let entry_url = entry.url.clone();
             let id = entry.id.clone();
 
-            let out = approve_inbound(InboundGate::Code(sas), "pair", &id, entry, &now, now_epoch, None);
+            let out = approve_inbound(CodeGate::Code(sas), "pair", &id, entry, &now, now_epoch, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
             let peers = aoide_storage::peer_store::load_peers();
@@ -5252,7 +5708,7 @@ mod tests {
             let (entry, _sas) = parked_revealed_inbound(now_epoch);
             let id = entry.id.clone();
 
-            let out = approve_inbound(InboundGate::Unavailable, "pair", &id, entry, &now, now_epoch, None);
+            let out = approve_inbound(CodeGate::Unavailable, "pair", &id, entry, &now, now_epoch, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{out:?}");
             assert!(out.message.contains("--code"), "the refusal teaches the scripted spelling: {}", out.message);
             assert_eq!(aoide_storage::pairing::list_inbound(now_epoch)[0].tries, 0, "a refusal is not a wrong code");
@@ -5284,6 +5740,29 @@ mod tests {
                 assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{out:?}");
                 assert!(out.message.contains("--code"), "{}", out.message);
             }
+        });
+    }
+
+    /// [`pair_on_an_inbound_target_refuses_yes_and_non_tty_without_code`]'s
+    /// exact mirror on the REQUESTER'S own leg (the mutual-code redesign,
+    /// R1): `--yes` maps to the SAME taught refusal on an outbound
+    /// completion, never a bypass — the entry is already `AwaitingConfirm`
+    /// (a poll already released it) so `--wait 0` reaches
+    /// [`commit_outbound`]'s own gate with no network call at all.
+    #[test]
+    fn pair_on_an_outbound_target_refuses_yes_and_non_tty_without_code() {
+        with_peer_state("resume-outbound-handler-gate", || {
+            let pubkey_b = "b".repeat(64);
+            let mut entry = sample_outbound_awaiting_approval("deadbeef", "http://box-b/", &pubkey_b);
+            entry.state = aoide_storage::pairing::OutboundState::AwaitingConfirm;
+            aoide_storage::pairing::park_outbound(entry.clone()).unwrap();
+
+            for flags in [vec![("yes", "true"), ("wait", "0")], vec![("wait", "0")]] {
+                let out = handle_pair(&pair_inv(&[&entry.id], &flags));
+                assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{out:?}");
+                assert!(out.message.contains("--code"), "{}", out.message);
+            }
+            assert!(aoide_storage::peer_store::load_peers().is_empty(), "a refusal must never commit");
         });
     }
 

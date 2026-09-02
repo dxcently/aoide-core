@@ -207,40 +207,44 @@
   `OutboundState` aborts cleanly on reject; this is the ceremony's only
   abort command, so collapsing this back to inbound-only would leave a
   requester with no way to cancel a pairing it no longer wants.
-- **Neither approve half reads `&Invocation` — `approve_outbound` takes
-  `skip_confirm: bool` (P-P5), `approve_inbound` takes the `InboundGate`
-  enum (task #120 P3).** Don't reach for `inv.flag_present(..)` inside
-  either function; the ONLY caller that reads flags is
-  `handle_peer_pair_approve`, which resolves them into the parameter. A
-  caller with no `Invocation` at all (`pair_watch`'s popup arm is the
-  first) passes `InboundGate::Code(<typed>)`/`true` directly — the popup's
-  own dialog (P-PV3, task #132) collects a typed code exactly like the CLI
-  tty/`--code` paths do, so it rides the SAME gate rather than a separate
-  no-prompt variant. `InboundGate::DialogConfirmed` (the old "the dialog
-  itself IS the confirmation, no code check" variant) is RETIRED — nothing
-  constructs it any more; don't reintroduce a no-check gate variant for a
-  future dialog surface without re-deriving why the typed-code gate
-  doesn't apply there (`pair_watch`'s own module doc has the outbound
-  arm's own reasoning for why ITS dialog shows the code where inbound's
-  never does).
-- **The approver's gate is the TYPED pairing code, and the approve prompt
-  never echoes the SAS (task #120 P3).** `approve_inbound`'s prompt and
-  mismatch messages name the code's SHAPE (`NNN-NNN`), never its value —
-  printing the expected code beside the input would collapse the
-  out-of-band comparison into a copy exercise (bare `aoide pair` shows NO
-  code at all, P-PV2 — the threat model is the comparison, not secrecy,
-  but a listing either operator can glance at defeats it just the same
-  as an echoed prompt would). A wrong
-  code — interactive or `--code` — persists ONE cumulative try
-  (`aoide_storage::pairing::record_inbound_code_try`); the third
-  cumulative mismatch auto-denies (`auto_deny_inbound`: `take_inbound`,
-  nothing committed, `reason: "auto-deny-on-code-mismatch"` for the audit
-  log). An abort (`Esc`/EOF) counts no try. `--yes` maps to
-  `InboundGate::Unavailable`'s taught refusal on an inbound id — never a
-  bypass — while keeping its original skip-the-y/N meaning on the
-  outbound (requester) half, whose confirm is unchanged: the requester's
-  own screen already printed the code, so a typed-code gate there would
-  be this side typing its own output back at itself.
+- **Neither approve half reads `&Invocation` — `approve_outbound` and
+  `approve_inbound` take the SAME `CodeGate` enum now (task #120 P3; the
+  mutual-code redesign, R1, unified them — `approve_outbound` used to take
+  a bare `skip_confirm: bool`, P-P5).** Don't reach for
+  `inv.flag_present(..)` inside either function; the ONLY callers that
+  read flags are `pair_finish_from`/`outbound_gate_from`, which resolve
+  them into the parameter for `approve_inbound_leg`/`resume_outbound_leg`
+  to pass on. A caller with no `Invocation` at all (`pair_watch`'s popup
+  arm is the first) passes `CodeGate::Code(<typed>)` directly on EITHER
+  leg — the popup's own dialog (P-PV3, task #132; unified across both
+  directions by R1) collects a typed code exactly like the CLI tty/
+  `--code` paths do, so it rides the SAME gate rather than a separate
+  no-prompt variant. Don't reintroduce a no-check gate variant (the old
+  `InboundGate::DialogConfirmed`, "the dialog itself IS the confirmation,
+  no code check", was already retired before R1) for a future dialog
+  surface without re-deriving why the typed-code gate doesn't apply there.
+- **BOTH approve halves gate on a TYPED code now, and neither approve
+  prompt echoes the expected value (task #120 P3; R1 extended this from
+  inbound-only to both legs).** `approve_inbound` gates on `derive_sas`
+  (the code the REQUESTER's screen shows); `commit_outbound` gates on
+  `derive_reply_sas` (the code the APPROVER's screen shows) — a SECOND,
+  DIFFERENT code from the first, never the same value re-typed (`pairing.rs`'s
+  own module doc has the two-code construction; typing a value back at its
+  own source would prove nothing, the entire reason R1 exists). Both
+  prompts and mismatch messages name only the code's SHAPE (`NNN-NNN`),
+  never its value — printing the expected code beside the input would
+  collapse the out-of-band comparison into a copy exercise (bare
+  `aoide pair` shows NO code at all, P-PV2 — the threat model is the
+  comparison, not secrecy, but a listing either operator can glance at
+  defeats it just the same as an echoed prompt would). A wrong code —
+  interactive or `--code` — persists ONE cumulative try per direction
+  (`aoide_storage::pairing::record_inbound_code_try`/
+  `record_outbound_code_try`); the third cumulative mismatch auto-resolves
+  (`auto_deny_inbound`/`auto_abort_outbound`: the parked entry taken,
+  nothing committed, `reason: "auto-deny-on-code-mismatch"`/
+  `"auto-abort-on-code-mismatch"` for the audit log). An abort (`Esc`/EOF)
+  counts no try on either leg. `--yes` maps to `CodeGate::Unavailable`'s
+  taught refusal on BOTH directions now — never a bypass on either.
 - **`reject_by_id(cmd, id)` is `handle_pair_reject`'s entire body,
   extracted (P-P5) so a caller with only an id — no `&Invocation` to
   construct — can reject a pairing request too.** Keep it a pure

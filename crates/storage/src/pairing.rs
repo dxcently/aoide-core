@@ -119,6 +119,43 @@
 //! and carry no equivalent cap — nothing unauthenticated can grow that
 //! queue.
 //!
+//! **One live parked request per requester identity (R3): [`park_inbound`]
+//! SUPERSEDES, never refuses.** A fresh request whose `pubkey_hex` matches
+//! an entry already parked for this approver evicts that entry — the SAME
+//! keyholder retrying, never a stranger's squat — under the SAME
+//! [`PARK_LOCK`] + [`with_stage_lock`] acquisition the park itself takes,
+//! never a separate check outside it, and BEFORE the cap check runs, so a
+//! retry never burns cap headroom it shouldn't. An `approved`-but-unpolled
+//! entry is superseded too: the superseding request comes from the same
+//! keyholder, i.e. the requester abandoning its own ceremony, and shielding
+//! an approved entry from its own requester's retry would violate
+//! one-per-machine for no honest gain. [`park_inbound`] returns the
+//! evicted id alongside the fresh entry so `aoide-server::a2a::pair_request`
+//! can audit the supersede; the WIRE response never mentions it
+//! (CONTRACTS.md §6) — the requester's own [`park_outbound`]
+//! replace-by-pubkey already retires its local stale entry without wire
+//! help, and naming the evicted id to an unauthenticated caller would be a
+//! gratuitous existence disclosure. [`park_outbound`] mirrors this on the
+//! requester's own side: one live outbound entry per APPROVER identity,
+//! replacing by id OR by the approver's `pubkey_hex`. A cross-direction
+//! pair — an inbound entry FROM X alongside an outbound entry TO X — is a
+//! legitimate simultaneous mutual pairing and is left alone; the two files
+//! never reference each other, so nothing here needs to special-case it.
+//! **Accepted eviction threat, the same denial-of-one-attempt class
+//! CONTRACTS.md §6 already accepts for a bogus [`reveal_inbound`] mismatch
+//! (this same file's own [`RevealError::Mismatch`] drop), never an
+//! impersonation:** supersede widens who can evict a pending request from
+//! "on-path" to "knows the pubkey" — a public value [`derive_sas`] already
+//! hands out freely by design. This holds only because every A2A door stays
+//! loopback-bound by default (`aoide.a2a.bindAddress`,
+//! `docs/architecture/PAIRING.md`'s Transport section): reaching
+//! `pair_request` at all already requires a shell on the box or an ssh
+//! tunnel into it, and that same reach already grants a direct read of
+//! `state/peer-pairing-inbound.json` — the eviction discloses nothing that
+//! access does not already hand over. Bound routably instead, the calculus
+//! flips (CONTRACTS.md §6's own park-cap paragraph states the same
+//! condition).
+//!
 //! **The SAS ([`derive_sas`]) is a transcript hash over the FOUR public
 //! values every ceremony makes visible to both sides: the requester's
 //! pubkey, the approver's pubkey, the requester's nonce, the approver's
@@ -139,6 +176,40 @@
 //! pinned vectors); this exact derivation is pinned by
 //! [`tests::derive_sas_stability_vectors_never_drift`] so it renders
 //! identically on both boxes forever (PAIRING.md's own requirement).
+//!
+//! **The ceremony is mutual: [`derive_reply_sas`] is B's own code, typed
+//! back on A's screen (the mutual-code redesign).** By the time B approves,
+//! both boxes already hold the identical public transcript
+//! `(pubkey_A, pubkey_B, nonce_A, nonce_B)` — `derive_reply_sas` is a
+//! SECOND, domain-separated reduction of that same transcript, never a
+//! second wire round trip (a wire-carried reply code would only prove B's
+//! number equals B's number, adding no strength [`derive_sas`] doesn't
+//! already have). It shares [`transcript_digest`]'s exact canonicalization
+//! and [`derive_sas`]'s exact mod-1,000,000/`NNN-NNN` reduction, over the
+//! SAME four fields in the SAME order, with the domain-separation tag
+//! [`REPLY_SAS_DOMAIN_TAG`] prepended as a FIFTH, LEADING field — the tag
+//! is what keeps the reply code from being the plain code under a
+//! relabeling; the two are not otherwise guaranteed to differ (a shared
+//! ~1-in-1,000,000 accident of the truncation is harmless and nothing here
+//! re-rolls to dodge it). Both codes are computable by BOTH boxes from the
+//! moment the reveal lands — each is only ever DISPLAYED on one side and
+//! TYPED on the other: A's screen shows [`derive_sas`] for B to type, B's
+//! screen shows [`derive_reply_sas`] for A to type back. Pinned by
+//! [`tests::derive_reply_sas_stability_vectors_never_drift`], independently
+//! computed the same `sha256sum`-over-the-exact-byte-transcript method
+//! [`tests::derive_sas_stability_vectors_never_drift`] already uses.
+//!
+//! **`OutboundPairingRequest::tries` mirrors [`InboundPairingRequest::
+//! tries`] for the SAME reason, on the other leg.** A's own typed-code gate
+//! against [`derive_reply_sas`] (the requester-side leg of the mutual
+//! ceremony) needs the identical cumulative-mismatch bookkeeping the
+//! approver's leg already holds — [`record_outbound_code_try`] is
+//! [`record_inbound_code_try`]'s exact mirror against the outbound file,
+//! sharing its error shape ([`MarkApprovedError`]) since the failure modes
+//! (unknown/expired id, file I/O) are identical; the auto-abort threshold
+//! itself stays CLI policy (`aoide-client::commands::MAX_CODE_TRIES`),
+//! never a limit this crate enforces, the same split
+//! [`InboundPairingRequest::tries`]'s own doc states.
 
 use crate::fs::{atomic_write, state_dir, with_stage_lock};
 use serde::{Deserialize, Serialize};
@@ -272,6 +343,38 @@ pub fn derive_sas(
     format!("{:03}-{:03}", n / 1000, n % 1000)
 }
 
+/// The domain-separation tag [`derive_reply_sas`] prepends as a fifth,
+/// leading transcript field — module doc's "mutual ceremony" section. Its
+/// only job is keeping the reply code from being [`derive_sas`]'s own code
+/// under a relabeling; the two derivations are otherwise the SAME reduction
+/// of the SAME four public values.
+const REPLY_SAS_DOMAIN_TAG: &str = "aoide-pair-reply";
+
+/// The REPLY SAS derivation (module doc's "mutual ceremony" section) — B's
+/// own code, typed back on A's screen. Same [`transcript_digest`]
+/// canonicalization and mod-1,000,000/`NNN-NNN` reduction as [`derive_sas`],
+/// over the identical four fields in the identical order, with
+/// [`REPLY_SAS_DOMAIN_TAG`] prepended as a fifth leading field — pure,
+/// deterministic, order-sensitive, computable by either box from values it
+/// already holds (never trusted from the wire — no wire message ever
+/// carries this value, module doc's settled constraint).
+pub fn derive_reply_sas(
+    requester_pubkey_hex: &str,
+    approver_pubkey_hex: &str,
+    requester_nonce_hex: &str,
+    approver_nonce_hex: &str,
+) -> String {
+    let digest = transcript_digest(&[
+        REPLY_SAS_DOMAIN_TAG,
+        requester_pubkey_hex,
+        approver_pubkey_hex,
+        requester_nonce_hex,
+        approver_nonce_hex,
+    ]);
+    let n = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
+    format!("{:03}-{:03}", n / 1000, n % 1000)
+}
+
 /// The commitment [`park_inbound`]'s `commit_hex` param carries and
 /// [`reveal_inbound`] verifies (module doc, review-bounce Finding 1) — the
 /// FULL SHA-256 digest, hex-encoded, over `(pubkey_hex, nonce_hex)`. Full
@@ -282,6 +385,16 @@ pub fn derive_sas(
 pub fn derive_commit(pubkey_hex: &str, nonce_hex: &str) -> String {
     let digest = transcript_digest(&[pubkey_hex, nonce_hex]);
     digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Whether two `pubkey_hex` values name the SAME requester for R3's
+/// supersede/replace matching — trimmed and compared ASCII-case-
+/// insensitively, the identical canonicalization [`transcript_digest`]
+/// already applies to every field before hashing, so a hex-case-varied
+/// resubmission of the same key already commits and reveals identically
+/// and must supersede too.
+fn same_pubkey(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
 }
 
 // ── Inbound (approver-side): a request PARKED for this instance to approve ──
@@ -424,15 +537,20 @@ pub fn list_inbound(now_epoch: i64) -> Vec<InboundPairingRequest> {
 }
 
 /// Park a fresh inbound request — the approver's `aoide/pairRequest`
-/// handler's whole job. Cap-checked under [`PARK_LOCK`] (module doc,
+/// handler's whole job. Also SUPERSEDES (R3, module doc) any live entry
+/// already parked from the SAME `pubkey_hex`, removed before the cap check
+/// even runs. Cap-checked under [`PARK_LOCK`] (module doc,
 /// review-bounce Finding 3) with the whole load-modify-write inside
 /// [`with_stage_lock`] like every other mutator here (module doc, #119
 /// review finding 4): a full queue refuses BEFORE any id is minted
 /// or anything is written. Returns the freshly-minted
 /// [`InboundPairingRequest`] (including its new `id`,
 /// `requester_nonce_hex: None`, and freshly-generated
-/// `approver_nonce_hex`) so the caller can build the synchronous wire
-/// response from it directly. `self_via` (P-PV1, task #131) is the
+/// `approver_nonce_hex`) plus the id of whatever entry the supersede
+/// evicted (`None` when nothing was), so the caller can build the
+/// synchronous wire response from the first element directly and audit
+/// the second — the wire response itself never carries the evicted id
+/// (module doc, CONTRACTS.md §6). `self_via` (P-PV1, task #131) is the
 /// requester's OPTIONAL self-asserted reach-back hop claim off the wire's
 /// `selfVia` — carried straight through onto [`InboundPairingRequest::
 /// self_via`] with no validation here (the same "never eagerly parsed,
@@ -448,7 +566,7 @@ pub fn park_inbound(
     requested_at: &str,
     expires_at: &str,
     self_via: Option<&str>,
-) -> Result<InboundPairingRequest, String> {
+) -> Result<(InboundPairingRequest, Option<String>), String> {
     let _guard = PARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     with_stage_lock(|| {
         // `requested_at` is the caller's own "now" (module doc) — reused as the
@@ -456,6 +574,16 @@ pub fn park_inbound(
         // against the live queue.
         let now_epoch = crate::time::parse_iso_utc(requested_at).unwrap_or(i64::MAX);
         let (mut requests, _expired) = sweep(load_inbound_raw(), now_epoch);
+
+        // R3 (module doc): one live parked request per requester identity —
+        // a fresh request from the SAME pubkey supersedes any entry already
+        // parked for it (approved-but-unpolled included), removed BEFORE
+        // the cap check so a retry never burns cap headroom.
+        let evicted_id = requests
+            .iter()
+            .position(|r| same_pubkey(&r.pubkey_hex, pubkey_hex))
+            .map(|i| requests.remove(i).id);
+
         let cap = pairing_park_cap();
         if requests.len() >= cap {
             return Err(format!(
@@ -482,7 +610,7 @@ pub fn park_inbound(
         };
         requests.push(entry.clone());
         save_inbound(&requests)?;
-        Ok(entry)
+        Ok((entry, evicted_id))
     })
 }
 
@@ -728,6 +856,19 @@ pub struct OutboundPairingRequest {
     /// additive discipline `state` above already holds) loads `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
+    /// Typed-code approval, mutual-ceremony leg (module doc's
+    /// `OutboundPairingRequest::tries` paragraph): how many WRONG reply
+    /// codes have been entered against this entry so far — the exact
+    /// mirror of [`InboundPairingRequest::tries`] on the requester's own
+    /// leg, cumulative across `aoide pair <id>` invocations and across the
+    /// interactive prompt and scripted `--code` paths alike. Bumped by
+    /// [`record_outbound_code_try`]; the CLI auto-aborts (a clean
+    /// [`take_outbound`] removal) the moment the count reaches its own
+    /// limit (`aoide-client::commands::MAX_CODE_TRIES`). `#[serde(default)]`
+    /// loads `0` on a record predating the field — the same additive
+    /// discipline [`InboundPairingRequest::tries`] holds.
+    #[serde(default)]
+    pub tries: u32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -761,12 +902,15 @@ fn save_outbound(requests: &[OutboundPairingRequest]) -> Result<(), String> {
 
 /// Remember that THIS instance sent a request out and its own reveal
 /// already succeeded — `pair`'s own write
-/// ([`OutboundState::AwaitingApproval`] by default). Replaces by id rather
-/// than duplicating (operator-created, no cap needed — module doc).
+/// ([`OutboundState::AwaitingApproval`] by default). Replaces by id OR by
+/// the approver's `pubkey_hex` rather than duplicating (R3, module doc —
+/// one live outbound entry per far identity, so a re-request retires this
+/// instance's own stale entry in the same write); operator-created, no cap
+/// needed either way.
 pub fn park_outbound(entry: OutboundPairingRequest) -> Result<(), String> {
     with_stage_lock(move || {
         let mut requests = load_outbound_raw();
-        requests.retain(|r| r.id != entry.id);
+        requests.retain(|r| r.id != entry.id && !same_pubkey(&r.pubkey_hex, &entry.pubkey_hex));
         requests.push(entry);
         save_outbound(&requests)
     })
@@ -848,6 +992,37 @@ pub fn mark_outbound_awaiting_confirm(id: &str, pubkey_hex: &str, now_epoch: i64
         let out = kept[idx].clone();
         if let Err(e) = save_outbound(&kept) {
             return Err(ConfirmMarkError::Io(e));
+        }
+        Ok(out)
+    })
+}
+
+/// Typed-code approval, mutual-ceremony leg (module doc): record ONE wrong
+/// REPLY code entered against a parked outbound entry — increments
+/// [`OutboundPairingRequest::tries`], persists it, and returns the new
+/// cumulative count so the caller (`aoide-client::commands::commit_outbound`,
+/// the only production caller) can auto-abort without a second read. The
+/// exact mirror of [`record_inbound_code_try`] against the outbound file,
+/// sharing its refusal shape ([`MarkApprovedError`]) for the identical
+/// reason: the failure modes (unknown/expired id, file I/O) don't differ by
+/// direction.
+pub fn record_outbound_code_try(id: &str, now_epoch: i64) -> Result<u32, MarkApprovedError> {
+    with_stage_lock(|| {
+        let all = load_outbound_raw();
+        let (mut kept, _expired) = sweep_outbound(all, now_epoch);
+        let idx = match kept.iter().position(|r| r.id == id) {
+            Some(i) => i,
+            None => {
+                if let Err(e) = save_outbound(&kept) {
+                    return Err(MarkApprovedError::Io(e));
+                }
+                return Err(MarkApprovedError::Unknown);
+            }
+        };
+        kept[idx].tries = kept[idx].tries.saturating_add(1);
+        let out = kept[idx].tries;
+        if let Err(e) = save_outbound(&kept) {
+            return Err(MarkApprovedError::Io(e));
         }
         Ok(out)
     })
@@ -937,6 +1112,52 @@ mod tests {
             assert!(a.chars().all(|c| c.is_ascii_digit()));
             assert!(b.chars().all(|c| c.is_ascii_digit()));
         }
+    }
+
+    // ── derive_reply_sas (mutual ceremony, R1) ───────────────────────────
+
+    /// Pinned stability vectors (module doc), computed independently the
+    /// SAME `sha256sum`-over-the-exact-byte-transcript method
+    /// [`derive_sas_stability_vectors_never_drift`] uses, over the tag
+    /// [`REPLY_SAS_DOMAIN_TAG`] plus the identical four fields in the
+    /// identical order.
+    #[test]
+    fn derive_reply_sas_stability_vectors_never_drift() {
+        let pubkey_a = "a".repeat(64);
+        let pubkey_b = "b".repeat(64);
+        let nonce_a = "c".repeat(16);
+        let nonce_b = "d".repeat(16);
+        assert_eq!(derive_reply_sas(&pubkey_a, &pubkey_b, &nonce_a, &nonce_b), "027-564");
+
+        // Role-swapped (and their matching nonces) must NOT reproduce the
+        // same code — ordering is load-bearing here too.
+        assert_eq!(derive_reply_sas(&pubkey_b, &pubkey_a, &nonce_b, &nonce_a), "699-857");
+    }
+
+    /// The domain tag is the ENTIRE reason the reply code differs from the
+    /// plain code on the SAME transcript — without it, `derive_reply_sas`
+    /// would just be `derive_sas` under a new name.
+    #[test]
+    fn derive_reply_sas_differs_from_derive_sas_on_the_same_transcript() {
+        let pubkey_a = "a".repeat(64);
+        let pubkey_b = "b".repeat(64);
+        let nonce_a = "c".repeat(16);
+        let nonce_b = "d".repeat(16);
+        let plain = derive_sas(&pubkey_a, &pubkey_b, &nonce_a, &nonce_b);
+        let reply = derive_reply_sas(&pubkey_a, &pubkey_b, &nonce_a, &nonce_b);
+        assert_ne!(plain, reply, "the domain tag must separate the two codes on an identical transcript");
+    }
+
+    #[test]
+    fn derive_reply_sas_is_case_and_whitespace_insensitive_but_content_sensitive() {
+        let lower = derive_reply_sas("aabbcc", "ddeeff", "1122", "3344");
+        let upper = derive_reply_sas("AABBCC", "DDEEFF", "1122", "3344");
+        let padded = derive_reply_sas("  aabbcc  ", "ddeeff", "1122", "3344");
+        assert_eq!(lower, upper, "hex case must not change the derived reply code");
+        assert_eq!(lower, padded, "surrounding whitespace must not change the derived reply code");
+
+        let different = derive_reply_sas("aabbcd", "ddeeff", "1122", "3344");
+        assert_ne!(lower, different, "a genuinely different field must change the reply code");
     }
 
     // ── derive_commit ────────────────────────────────────────────────────
@@ -1049,7 +1270,7 @@ mod tests {
 
         let now = 1_700_000_000_i64;
         let commit = derive_commit("requesterpubkeyhex", "requesternoncehex");
-        let entry = park_inbound(
+        let (entry, evicted) = park_inbound(
             "requesterpubkeyhex",
             "box-a",
             "10.0.0.5",
@@ -1063,6 +1284,7 @@ mod tests {
         assert_eq!(entry.id.len(), 8);
         assert!(!entry.approver_nonce_hex.is_empty());
         assert!(entry.requester_nonce_hex.is_none(), "unrevealed at park time");
+        assert_eq!(evicted, None, "nothing else was parked yet — no supersede");
 
         let listed = list_inbound(now);
         assert_eq!(listed.len(), 1);
@@ -1092,7 +1314,7 @@ mod tests {
 
         let requested_at = 1_700_000_000_i64;
         let commit = derive_commit("pk", "nonce");
-        let entry = park_inbound(
+        let (entry, _evicted) = park_inbound(
             "pk", "name", "addr", "url", &commit,
             &crate::time::iso_utc_from_epoch(requested_at),
             &crate::time::iso_utc_from_epoch(requested_at + 10), // expires in 10s
@@ -1130,16 +1352,201 @@ mod tests {
         let expires_at = expires_at_from(now);
         let park = |pk: &str| park_inbound(pk, "name", "addr", "url", &derive_commit(pk, "n"), &requested_at, &expires_at, None);
 
-        let first = park("pk1").expect("first park is under the cap");
+        let (first, _) = park("pk1").expect("first park is under the cap");
         park("pk2").expect("second park is exactly at the cap");
         let refused = park("pk3");
-        assert!(refused.is_err(), "a third park must refuse at cap 2");
+        assert!(refused.is_err(), "a third park must refuse at cap 2 — a DISTINCT pubkey never supersedes");
         assert_eq!(list_inbound(now).len(), 2, "the refused park wrote nothing");
 
         // Freeing a slot admits the next one again.
         take_inbound(&first.id, now).unwrap();
         park("pk4").expect("a freed slot admits a new park");
         assert_eq!(list_inbound(now).len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved_dir {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+        match saved_cap {
+            Some(v) => std::env::set_var(PAIRING_PARK_CAP_ENV, v),
+            None => std::env::remove_var(PAIRING_PARK_CAP_ENV),
+        }
+    }
+
+    // ── R3: one live parked request per requester identity (supersede) ───
+
+    /// The core R3 case: a second request from the SAME pubkey evicts the
+    /// first rather than coexisting with it — module doc's "supersede,
+    /// never refuse."
+    #[test]
+    fn park_inbound_supersedes_a_live_entry_from_the_same_pubkey() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-pairing-supersede-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        env(&dir);
+
+        let now = 1_700_000_000_i64;
+        let requested_at = crate::time::iso_utc_from_epoch(now);
+        let expires_at = expires_at_from(now);
+
+        let (first, evicted) = park_inbound("pk", "box-a", "addr1", "url1", &derive_commit("pk", "n1"), &requested_at, &expires_at, None).unwrap();
+        assert_eq!(evicted, None, "nothing was parked yet — no supersede on the first request");
+
+        let (second, evicted) = park_inbound("pk", "box-a-retry", "addr2", "url2", &derive_commit("pk", "n2"), &requested_at, &expires_at, None).unwrap();
+        assert_eq!(evicted, Some(first.id.clone()), "the retry's return value names the evicted id");
+        assert_ne!(second.id, first.id, "the superseding request gets its own fresh id");
+
+        let listed = list_inbound(now);
+        assert_eq!(listed.len(), 1, "the first entry is gone, superseded — not coexisting");
+        assert_eq!(listed[0].id, second.id);
+        assert_eq!(listed[0].name, "box-a-retry", "the newer entry's own data, not the evicted one's");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    /// R3's match is case-insensitive ([`same_pubkey`], module doc): a
+    /// retry whose `pubkey_hex` differs from an already-parked entry only in
+    /// hex case still supersedes it — `transcript_digest` already lowercases
+    /// every field before hashing, so the two submissions already commit and
+    /// reveal as the SAME key; treating them as different machines would let
+    /// one keypair hold multiple parked entries at once.
+    #[test]
+    fn park_inbound_supersedes_a_live_entry_whose_pubkey_hex_case_differs() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-pairing-supersede-case-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        env(&dir);
+
+        let now = 1_700_000_000_i64;
+        let requested_at = crate::time::iso_utc_from_epoch(now);
+        let expires_at = expires_at_from(now);
+
+        let (first, evicted) =
+            park_inbound("abcdef", "box-a", "addr1", "url1", &derive_commit("abcdef", "n1"), &requested_at, &expires_at, None).unwrap();
+        assert_eq!(evicted, None, "nothing was parked yet — no supersede on the first request");
+
+        // Same key, one hex character uppercased on the retry.
+        let (second, evicted) =
+            park_inbound("abcdeF", "box-a-retry", "addr2", "url2", &derive_commit("abcdeF", "n2"), &requested_at, &expires_at, None).unwrap();
+        assert_eq!(evicted, Some(first.id.clone()), "a hex-case-varied pubkey_hex still supersedes the same machine's earlier entry");
+
+        let listed = list_inbound(now);
+        assert_eq!(listed.len(), 1, "one survivor — the case variants are the same requester, not two");
+        assert_eq!(listed[0].id, second.id);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    /// An `approved`-but-unpolled entry is superseded too (module doc): the
+    /// superseding request comes from the SAME keyholder — the requester
+    /// abandoning its own ceremony — so protecting the approved flag from
+    /// its own requester's retry would violate one-per-machine for no
+    /// honest gain.
+    #[test]
+    fn park_inbound_supersedes_an_approved_but_unpolled_entry_from_the_same_pubkey() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-pairing-supersede-approved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        env(&dir);
+
+        let now = 1_700_000_000_i64;
+        let requested_at = crate::time::iso_utc_from_epoch(now);
+        let expires_at = expires_at_from(now);
+
+        let (first, _) = park_inbound("pk", "box-a", "addr1", "url1", &derive_commit("pk", "n1"), &requested_at, &expires_at, None).unwrap();
+        reveal_inbound(&first.id, "n1", now).unwrap();
+        mark_inbound_approved(&first.id, now).unwrap();
+        assert!(list_inbound(now)[0].approved, "approved and still parked, awaiting the requester's own poll");
+
+        let (second, evicted) = park_inbound("pk", "box-a-retry", "addr2", "url2", &derive_commit("pk", "n2"), &requested_at, &expires_at, None).unwrap();
+        assert_eq!(evicted, Some(first.id), "an approved-but-unpolled entry is superseded too");
+
+        let listed = list_inbound(now);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, second.id);
+        assert!(!listed[0].approved, "the superseding entry starts fresh, unapproved");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    /// Distinct pubkeys never interact — R3 keys on identity, never on
+    /// name/origin/anything else self-asserted.
+    #[test]
+    fn park_inbound_leaves_distinct_pubkeys_parked_side_by_side() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-pairing-supersede-distinct-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        env(&dir);
+
+        let now = 1_700_000_000_i64;
+        let requested_at = crate::time::iso_utc_from_epoch(now);
+        let expires_at = expires_at_from(now);
+
+        let (a, evicted_a) = park_inbound("pka", "box-a", "addr1", "url1", &derive_commit("pka", "n1"), &requested_at, &expires_at, None).unwrap();
+        let (b, evicted_b) = park_inbound("pkb", "box-b", "addr2", "url2", &derive_commit("pkb", "n2"), &requested_at, &expires_at, None).unwrap();
+        assert_eq!(evicted_a, None);
+        assert_eq!(evicted_b, None, "a different pubkey never evicts another identity's entry");
+
+        let listed = list_inbound(now);
+        assert_eq!(listed.len(), 2, "both stay parked side by side");
+        assert!(listed.iter().any(|r| r.id == a.id));
+        assert!(listed.iter().any(|r| r.id == b.id));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    /// The eviction runs BEFORE the cap check (module doc): a same-pubkey
+    /// retry against a FULL queue still succeeds, because its own prior
+    /// entry frees the slot it needs.
+    #[test]
+    fn park_inbound_supersede_frees_a_slot_under_the_cap() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved_dir = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_cap = std::env::var(PAIRING_PARK_CAP_ENV).ok();
+        let dir = std::env::temp_dir().join(format!("aoide-pairing-supersede-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        env(&dir);
+        std::env::set_var(PAIRING_PARK_CAP_ENV, "1");
+
+        let now = 1_700_000_000_i64;
+        let requested_at = crate::time::iso_utc_from_epoch(now);
+        let expires_at = expires_at_from(now);
+
+        let (first, _) = park_inbound("pk", "box-a", "addr1", "url1", &derive_commit("pk", "n1"), &requested_at, &expires_at, None).unwrap();
+        assert_eq!(list_inbound(now).len(), 1, "the single slot is full");
+
+        // A DISTINCT pubkey would refuse here (cap 1, already full) — but
+        // the SAME pubkey retrying supersedes first, freeing its own slot.
+        let (second, evicted) = park_inbound("pk", "box-a-retry", "addr2", "url2", &derive_commit("pk", "n2"), &requested_at, &expires_at, None)
+            .expect("a same-pubkey retry must never burn cap headroom it already owns");
+        assert_eq!(evicted, Some(first.id));
+        assert_eq!(list_inbound(now).len(), 1);
+        assert_eq!(list_inbound(now)[0].id, second.id);
+
+        // Confirm the cap is still live for a genuinely distinct pubkey.
+        let refused = park_inbound("pk-other", "box-c", "addr3", "url3", &derive_commit("pk-other", "n3"), &requested_at, &expires_at, None);
+        assert!(refused.is_err(), "the cap still refuses a distinct identity once the one slot is occupied");
 
         let _ = std::fs::remove_dir_all(&dir);
         match saved_dir {
@@ -1166,7 +1573,7 @@ mod tests {
         let requested_at = crate::time::iso_utc_from_epoch(now);
         let expires_at = expires_at_from(now);
         let commit = derive_commit("pk", "the-real-nonce");
-        let entry = park_inbound("pk", "name", "addr", "url", &commit, &requested_at, &expires_at, None).unwrap();
+        let (entry, _evicted) = park_inbound("pk", "name", "addr", "url", &commit, &requested_at, &expires_at, None).unwrap();
         assert!(entry.requester_nonce_hex.is_none());
 
         let revealed = reveal_inbound(&entry.id, "the-real-nonce", now).unwrap();
@@ -1195,7 +1602,7 @@ mod tests {
         let requested_at = crate::time::iso_utc_from_epoch(now);
         let expires_at = expires_at_from(now);
         let commit = derive_commit("pk", "the-real-nonce");
-        let entry = park_inbound("pk", "name", "addr", "url", &commit, &requested_at, &expires_at, None).unwrap();
+        let (entry, _evicted) = park_inbound("pk", "name", "addr", "url", &commit, &requested_at, &expires_at, None).unwrap();
 
         let err = reveal_inbound(&entry.id, "a-different-nonce", now).unwrap_err();
         assert_eq!(err, RevealError::Mismatch);
@@ -1241,7 +1648,7 @@ mod tests {
         let requested_at = crate::time::iso_utc_from_epoch(now);
         let expires_at = expires_at_from(now);
         let commit = derive_commit("pk", "nonce");
-        let entry = park_inbound("pk", "name", "addr", "url", &commit, &requested_at, &expires_at, None).unwrap();
+        let (entry, _evicted) = park_inbound("pk", "name", "addr", "url", &commit, &requested_at, &expires_at, None).unwrap();
         reveal_inbound(&entry.id, "nonce", now).unwrap();
         assert!(!entry.approved, "unapproved at park time");
 
@@ -1293,7 +1700,7 @@ mod tests {
 
         let requested_at = 1_700_000_000_i64;
         let commit = derive_commit("pk", "nonce");
-        let entry = park_inbound(
+        let (entry, _evicted) = park_inbound(
             "pk", "name", "addr", "url", &commit,
             &crate::time::iso_utc_from_epoch(requested_at),
             &crate::time::iso_utc_from_epoch(requested_at + 10),
@@ -1323,7 +1730,7 @@ mod tests {
 
         let now = 1_700_000_000_i64;
         let commit = derive_commit("pk", "nonce");
-        let entry = park_inbound(
+        let (entry, _evicted) = park_inbound(
             "pk", "name", "addr", "url", &commit,
             &crate::time::iso_utc_from_epoch(now),
             &expires_at_from(now),
@@ -1381,6 +1788,7 @@ mod tests {
             expires_at: expires_at_from(now),
             state,
             via: None,
+            tries: 0,
         }
     }
 
@@ -1466,7 +1874,7 @@ mod tests {
 
         let now = 1_700_000_000_i64;
         let commit = derive_commit("pk", "n");
-        let with_claim = park_inbound(
+        let (with_claim, _evicted) = park_inbound(
             "pk", "with-claim", "10.0.0.5", "http://with-claim/", &commit,
             &crate::time::iso_utc_from_epoch(now), &expires_at_from(now),
             Some("ssh://khoa@with-claim"),
@@ -1474,7 +1882,7 @@ mod tests {
         .unwrap();
         assert_eq!(with_claim.self_via.as_deref(), Some("ssh://khoa@with-claim"));
 
-        let no_claim = park_inbound(
+        let (no_claim, _evicted) = park_inbound(
             "pk2", "no-claim", "10.0.0.6", "http://no-claim/", &derive_commit("pk2", "n2"),
             &crate::time::iso_utc_from_epoch(now), &expires_at_from(now),
             None,
@@ -1524,6 +1932,77 @@ mod tests {
         let listed = list_outbound(now);
         assert_eq!(listed.len(), 1, "re-parking the same id replaces, never duplicates");
         assert_eq!(listed[0].url, "http://new/");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    /// R3's outbound leg: replacing by APPROVER pubkey too, not only by id
+    /// — a re-request under a fresh id still retires this instance's own
+    /// stale entry for the same far identity in one write.
+    #[test]
+    fn park_outbound_replaces_by_approver_pubkey_even_with_a_different_id() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-pairing-outbound-pubkey-dup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        env(&dir);
+
+        let now = 1_700_000_000_i64;
+        let mut first = sample_outbound("firstid0", OutboundState::AwaitingApproval);
+        first.pubkey_hex = "sameapprover".to_string();
+        park_outbound(first).unwrap();
+
+        let mut second = sample_outbound("secondid", OutboundState::AwaitingApproval);
+        second.pubkey_hex = "sameapprover".to_string();
+        second.url = "http://retry/".to_string();
+        park_outbound(second).unwrap();
+
+        let listed = list_outbound(now);
+        assert_eq!(listed.len(), 1, "one live outbound entry per approver identity — a re-request retires the stale one, even under a new id");
+        assert_eq!(listed[0].id, "secondid");
+        assert_eq!(listed[0].url, "http://retry/");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    /// A cross-direction pair — an inbound entry FROM X alongside an
+    /// outbound entry TO X — is a legitimate simultaneous mutual pairing
+    /// (module doc): the two park files never reference each other, so
+    /// neither supersede rule touches the other file.
+    #[test]
+    fn a_cross_direction_pair_for_the_same_pubkey_coexists() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-pairing-cross-direction-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        env(&dir);
+
+        let now = 1_700_000_000_i64;
+        let requested_at = crate::time::iso_utc_from_epoch(now);
+        let expires_at = expires_at_from(now);
+        let shared_pubkey = "sharedidentity";
+
+        // An inbound entry FROM `shared_pubkey` (it is the requester here).
+        let (inbound, evicted) =
+            park_inbound(shared_pubkey, "box-x", "addr1", "url1", &derive_commit(shared_pubkey, "n1"), &requested_at, &expires_at, None).unwrap();
+        assert_eq!(evicted, None);
+
+        // An outbound entry TO the SAME pubkey (it is the approver here).
+        let mut outbound_entry = sample_outbound("outboundid", OutboundState::AwaitingApproval);
+        outbound_entry.pubkey_hex = shared_pubkey.to_string();
+        park_outbound(outbound_entry).unwrap();
+
+        assert_eq!(list_inbound(now).len(), 1, "the inbound entry survives");
+        assert_eq!(list_inbound(now)[0].id, inbound.id);
+        assert_eq!(list_outbound(now).len(), 1, "the outbound entry survives too — cross-direction is not a supersede");
 
         let _ = std::fs::remove_dir_all(&dir);
         match saved {
@@ -1601,6 +2080,53 @@ mod tests {
         }
     }
 
+    // ── record_outbound_code_try (mutual ceremony, R1) ────────────────────
+
+    /// [`record_inbound_code_try_increments_cumulatively_and_persists`]'s
+    /// exact mirror against the outbound file.
+    #[test]
+    fn record_outbound_code_try_increments_cumulatively_and_persists() {
+        let _g = crate::env_lock().lock().unwrap();
+        let saved = std::env::var("AOIDE_STATE_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("aoide-pairing-outbound-code-try-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        env(&dir);
+
+        let now = 1_700_000_000_i64;
+        park_outbound(sample_outbound("id1", OutboundState::AwaitingConfirm)).unwrap();
+        assert_eq!(list_outbound(now)[0].tries, 0, "a fresh park starts at zero tries");
+
+        assert_eq!(record_outbound_code_try("id1", now).unwrap(), 1);
+        assert_eq!(record_outbound_code_try("id1", now).unwrap(), 2);
+        // The count is READ back from disk, not carried in memory.
+        assert_eq!(list_outbound(now)[0].tries, 2, "tries survive across loads");
+        assert_eq!(record_outbound_code_try("id1", now).unwrap(), 3);
+
+        assert_eq!(record_outbound_code_try("nosuchid", now).unwrap_err(), MarkApprovedError::Unknown);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    /// `tries` is additive (`#[serde(default)]`): an outbound record
+    /// predating the field loads `0`, never a deserialize failure — the
+    /// same discipline [`inbound_tries_is_additive_and_defaults_to_zero_on_a_legacy_record`]
+    /// pins for the inbound side.
+    #[test]
+    fn outbound_tries_is_additive_and_defaults_to_zero_on_a_legacy_record() {
+        let now = 1_700_000_000_i64;
+        let raw_old = serde_json::json!({
+            "id": "legacy01", "url": "http://box-b/", "name": "box-b",
+            "pubkeyHex": "k", "requesterNonceHex": "r", "approverNonceHex": "a",
+            "requestedAt": crate::time::iso_utc_from_epoch(now), "expiresAt": expires_at_from(now),
+        });
+        let back: OutboundPairingRequest = serde_json::from_value(raw_old).unwrap();
+        assert_eq!(back.tries, 0);
+    }
+
     // ── cross-process lock (with_stage_lock) on both park files ──────────
 
     /// A held `.stage.lock` flock BLOCKS a park-file mutator until released —
@@ -1621,7 +2147,7 @@ mod tests {
         std::env::set_var("AOIDE_STAGE_DIR", dir.join("stage"));
 
         let now = 1_700_000_000_i64;
-        let entry = park_inbound(
+        let (entry, _evicted) = park_inbound(
             "pk", "name", "addr", "url", &derive_commit("pk", "n"),
             &crate::time::iso_utc_from_epoch(now),
             &expires_at_from(now),
@@ -1690,7 +2216,7 @@ mod tests {
         std::env::set_var("AOIDE_STAGE_DIR", dir.join("stage"));
 
         let now = 1_700_000_000_i64;
-        let entry = park_inbound(
+        let (entry, _evicted) = park_inbound(
             "pk", "name", "addr", "url", &derive_commit("pk", "n"),
             &crate::time::iso_utc_from_epoch(now),
             &expires_at_from(now),
@@ -1707,7 +2233,14 @@ mod tests {
         let park_threads: Vec<_> = (0..6)
             .map(|i| {
                 std::thread::spawn(move || {
-                    park_outbound(sample_outbound(&format!("id{i:05x}"), OutboundState::AwaitingApproval)).unwrap()
+                    // Distinct pubkeys (R3, module doc): `sample_outbound`'s
+                    // shared fixture pubkey would make these 6 concurrent
+                    // parks supersede one another down to 1 — this test is
+                    // about the FLOCK race, not about identity dedup, so
+                    // each thread gets its own far identity.
+                    let mut entry = sample_outbound(&format!("id{i:05x}"), OutboundState::AwaitingApproval);
+                    entry.pubkey_hex = format!("approverpubkeyhex{i}");
+                    park_outbound(entry).unwrap()
                 })
             })
             .collect();

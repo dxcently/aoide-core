@@ -147,28 +147,27 @@ pub fn run_lyra(argv: &[String]) -> i32 {
             });
         }
 
-        // `pair confirm` (P-PV3 revert, task #132) — the OUTBOUND sibling
-        // of `pair ask` above, speaking the SAME zenity-`--question`-shaped
-        // contract rather than `--entry`'s: exit 0 on approve with NOTHING
-        // meaningful on stdout (an empty approval — this dialog never
-        // collects a typed value), `Reject request` on stdout + exit 1 on
-        // dismiss, a bare cancel (exit 1, nothing on stdout), and
+        // `pair show` (R2, the mutual-code redesign's popup phase) — the
+        // pairing ceremony's REPLY-CODE DISPLAY dialog, `pair confirm`
+        // (P-PV3, task #132) repurposed and renamed: it fires AFTER an
+        // approver's own commit already succeeded, so there is nothing left
+        // to approve or reject — `crates/lyra/src/commands/pair.rs`'s
+        // module doc has the full rundown. Exit 0 with NOTHING meaningful
+        // on stdout regardless of which of Done/Esc/close the operator
+        // reached for (an empty completion — this dialog never collects a
+        // typed value and has no dismiss path to report), and
         // `EXIT_INFRA_FAILURE` for a spawn/marker-less failure. Don't print
-        // anything on the approved arm — a stray "code" here would be read
-        // as a typed value by `aoide_client::pair_watch::run_entry_dialog`,
-        // which is exactly what this revert removed.
-        if inv.path == ["pair", "confirm"] {
+        // anything on the shown arm — a stray line here would be read as a
+        // typed value by `aoide_client::pair_watch::run_entry_dialog`'s
+        // shared reader, the same reason `pair ask`'s own approved arm
+        // stays silent beyond the code itself.
+        if inv.path == ["pair", "show"] {
             let outcome = dispatch::dispatch(inv);
             let result = outcome.data.as_ref().and_then(|d| d.get("result")).and_then(|r| r.as_str());
             return Some(match result {
-                Some("approved") => output::exit::OK,
-                Some("dismissed") => {
-                    println!("Reject request");
-                    output::exit::ERROR
-                }
-                Some("cancelled") => output::exit::ERROR,
+                Some("shown") => output::exit::OK,
                 Some("failed") => {
-                    eprintln!("aoide lyra pair confirm: {}", outcome.message);
+                    eprintln!("aoide lyra pair show: {}", outcome.message);
                     commands::pair::EXIT_INFRA_FAILURE
                 }
                 _ => {

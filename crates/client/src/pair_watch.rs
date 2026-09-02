@@ -39,13 +39,14 @@
 //! dispatched handler) and "run the blocking loop" (this module,
 //! special-cased in `cli`'s own `run_cli`).
 //!
-//! **The popup arm (F6, upgraded P-PV3/task #132): TWO dialog shapes, one
-//! per pairing direction — never a single bare yes/no.**
-//! [`resolve_lyra_bin`] feature-detects `lyra` the SAME three-tier way
-//! `aoide_secrets::watch::resolve_lyra_bin` does (env override,
-//! `current_exe()` sibling, bare-name-on-`PATH` — duplicated here rather
-//! than imported, since neither crate may depend on the other or on
-//! `aoide-cli`); when it resolves, the dialog spawns a `lyra pair`
+//! **The popup arm (F6, upgraded first by P-PV3/task #132, then made
+//! genuinely mutual by R1): ONE dialog SHAPE, both directions — never a
+//! bare yes/no, and never a surface that shows the value it is about to
+//! validate.** [`resolve_lyra_bin`] feature-detects `lyra` the SAME
+//! three-tier way `aoide_secrets::watch::resolve_lyra_bin` does (env
+//! override, `current_exe()` sibling, bare-name-on-`PATH` — duplicated
+//! here rather than imported, since neither crate may depend on the other
+//! or on `aoide-cli`); when it resolves, the dialog spawns a `lyra pair`
 //! subcommand instead of a `zenity` invocation, falling back to zenity on
 //! a `lyra` `SpawnError`/`DialogFailure` for that one attempt
 //! (`aoide_secrets::watch::run_ask_dialog`'s own fallback shape, reused
@@ -53,68 +54,103 @@
 //! rule 7, is that the fancy surface degrades to the plain one, never that
 //! a fancy-surface failure strands the request).
 //!
-//! **INBOUND (approver): a TYPED-CODE entry dialog** — [`run_ask_dialog`]
-//! spawns `lyra pair ask` (the SAME six-boxes-plus-dash surface `lyra
-//! secrets ask` renders) or `zenity --entry`. The operator TYPES the
-//! confirmation code they read off the REQUESTER's own screen,
-//! out-of-band — matching the CLI tty path's own `InboundGate::Prompt`
-//! gate byte for byte: [`commit_approval`] runs `InboundGate::Code(<typed>)`
-//! through `approve_inbound`, so the SAME SAS comparison and
-//! [`crate::commands::MAX_CODE_TRIES`] auto-deny machinery the CLI already
-//! holds applies identically here — `InboundGate::DialogConfirmed` (a bare
-//! "the dialog itself IS the confirmation," no code check at all) is
-//! RETIRED by this upgrade; nothing constructs it any more (`crate::
-//! commands`' own doc has the removal). The dialog NEVER shows the code
-//! (the approver's whole gate is typing a code read from elsewhere;
-//! showing it would collapse the out-of-band comparison into a copy
-//! exercise, the same reasoning `crate::commands::approve_inbound`'s own
-//! doc gives for why its tty prompt never echoes the SAS either).
+//! **Both directions run [`run_ask_dialog`] — a TYPED-CODE entry surface,
+//! never a display.** [`run_ask_dialog`] spawns `lyra pair ask` (the SAME
+//! six-boxes-plus-dash surface `lyra secrets ask` renders) or
+//! `zenity --entry`, differing only in [`dialog_context`]'s own wording:
+//! INBOUND (approver) reads "pairing request from `<name>` ... id <id>"
+//! and types the code shown on the REQUESTER's screen; OUTBOUND
+//! (requester) reads "type the reply code shown on `<name>`'s screen ...
+//! id <id>" and types the reply code shown on the APPROVER's screen — a
+//! genuinely different, far surface either way, out-of-band — matching
+//! the CLI tty path's own `CodeGate::Prompt` gate byte for byte on BOTH
+//! legs: [`commit_approval`] runs `CodeGate::Code(<typed>)` through
+//! `approve_inbound`/`approve_outbound` respectively, so the SAME code
+//! comparison and [`crate::commands::MAX_CODE_TRIES`] auto-deny/
+//! auto-abort machinery the CLI already holds applies identically on
+//! either arm. NEITHER dialog ever shows the code it is about to validate
+//! — the whole gate is typing a value read from elsewhere; showing it
+//! would collapse the out-of-band comparison into a copy exercise, the
+//! reasoning `crate::commands::approve_inbound`'s own doc always gave for
+//! its tty prompt, now holding unconditionally on both legs rather than
+//! only one.
 //!
-//! **OUTBOUND (requester): a CONFIRM dialog, never a retype** —
-//! [`run_confirm_dialog`] spawns `lyra pair confirm` or `zenity
-//! --question`. This instance GENERATED the SAS itself
-//! (`reconcile`'s own outbound arm) before the dialog ever opens, so the
-//! dialog SHOWS it large and plain (not a leak — the CLI's own
-//! `confirm_sas` prints the identical value) and the operator's whole job
-//! is a single Approve/Reject action — `commit_approval`'s outbound arm
-//! commits UNCONDITIONALLY on Approve (`approve_outbound(true, ...)`,
-//! `skip_confirm` — the dialog itself IS the confirmation, exactly as it
-//! was before this whole phase). **This is a deliberate REVERT within
-//! P-PV3 itself** (a design-review round on this same task): an earlier
-//! pass on this phase collected a typed retype on the outbound arm too —
-//! reusing the SAME six-box entry surface with the code pre-shown as
-//! context — which a review correctly called out as copy-the-pixels
-//! theater: the code is already on screen in the SAME window the boxes
-//! sit in, so retyping it proves nothing an Approve click doesn't already
-//! prove, while visually borrowing the INBOUND arm's security-critical
-//! typed-entry language for a step that was never a security gate
-//! (`crate::commands::code_matches`'s own outbound-comparison call, and
-//! the whole notion of a typed value crossing this arm, is GONE — don't
-//! reintroduce it here without re-deriving why the copy-the-pixels
-//! critique doesn't apply to whatever prompted the reintroduction).
+//! **This reverses P-PV3's own outbound CONFIRM dialog — the theater
+//! argument that justified it no longer applies (the mutual-code
+//! redesign, R1).** This module's own prior doc argued at length that an
+//! outbound retype was copy-the-pixels theater, because the code shown
+//! then was the PLAIN code — this instance generated it itself
+//! (`reconcile`'s own outbound arm) and had already displayed it at
+//! request time, so retyping it proved nothing an Approve click didn't
+//! already prove. That argument was never about typed entry in general —
+//! it named its own boundary: retyping is theater only when the value
+//! sits on screen in the SAME window. The REPLY code the outbound
+//! operator now types fails that test on purpose — it comes from a
+//! genuinely DIFFERENT surface (the approver's own screen, relayed
+//! out-of-band), precisely the condition the argument itself named as the
+//! one where typed entry has real meaning. `run_confirm_dialog`,
+//! `spawn_zenity_confirm`, `spawn_lyra_confirm`, and `dialog_code` (whose
+//! only job was showing the plain code on the outbound confirm) are GONE
+//! — don't reintroduce a bare-confirm outbound surface without
+//! re-deriving why this reversal doesn't apply to whatever prompted it.
 //!
-//! Four structural rules hold throughout this arm, all provable at the
+//! Three structural rules hold throughout this arm, all provable at the
 //! text-builder/argv level rather than by trusting a comment: (1) a feed
-//! line is a TRIGGER, never a display source — [`dialog_context`]/
-//! [`dialog_code`] are built ONLY from a [`Pending`] `reconcile` itself
-//! produced, never from a [`PairEvent`]'s fields; (2) the INBOUND SAS is
-//! NEVER shown in the dialog — [`dialog_code`] returns `None` for an
-//! inbound `Pending` unconditionally; the OUTBOUND SAS is shown
-//! deliberately, on a CONFIRM surface, never an entry one (see above);
-//! (3) argv carries identifiers and display text only, never a value used
-//! to VALIDATE anything on the dialog's own side — neither
-//! [`spawn_zenity_entry`]/[`spawn_lyra_entry`] (inbound) nor
-//! [`spawn_zenity_confirm`]/[`spawn_lyra_confirm`] (outbound) ever receive
-//! an expected code to compare against; the inbound dialogs render
-//! whatever the operator typed back to the caller for THIS process to
-//! compare, the outbound ones render only a boolean Approve/Reject; (4)
-//! nothing is ever executed on this instance's behalf by a dialog's own
-//! output — no `sh -c`, no shell interpolation; a hostile `name`/`url`
-//! reaches dialog text as inert display text, protected from Pango
-//! corruption by `--no-markup` on the zenity path (`aoide_secrets::
-//! watch::spawn_zenity_entry`'s own doc has the live-verified reasoning)
-//! and from breaking a QML string literal by `dialog_qml::qml_escape` on
-//! the lyra path (`crates/lyra/src/commands/dialog_qml.rs`'s own doc).
+//! line is a TRIGGER, never a display source — [`dialog_context`] is built
+//! ONLY from a [`Pending`] `reconcile` itself produced, never from a
+//! [`PairEvent`]'s fields; (2) NEITHER direction's dialog is ever handed
+//! the code it is about to validate — the never-echo-the-expected-value
+//! rule holds unconditionally now, not only on the inbound leg; (3) argv
+//! carries identifiers and display text only, never a value used to
+//! VALIDATE anything on the dialog's own side — [`spawn_zenity_entry`]/
+//! [`spawn_lyra_entry`] never receive an expected code to compare against
+//! on EITHER leg; both render whatever the operator typed back to the
+//! caller for THIS process to compare; (4) nothing is ever executed on
+//! this instance's behalf by a dialog's own output — no `sh -c`, no shell
+//! interpolation; a hostile `name`/`url` reaches dialog text as inert
+//! display text, protected from Pango corruption by `--no-markup` on the
+//! zenity path (`aoide_secrets::watch::spawn_zenity_entry`'s own doc has
+//! the live-verified reasoning) and from breaking a QML string literal by
+//! `dialog_qml::qml_escape` on the lyra path
+//! (`crates/lyra/src/commands/dialog_qml.rs`'s own doc).
+//!
+//! **After a popup-driven INBOUND commit succeeds, the approver's own reply
+//! code gets a stay-open display dialog of its own (R2, the mutual-code
+//! redesign's popup phase).** [`popup_tick`]'s `Approve` arm reads
+//! `replySas` straight off [`commit_approval`]'s outcome data
+//! (`approve_inbound`'s own Ok text already carries it, `crate::commands`'
+//! own doc) and hands it to [`run_show_dialog`] — `lyra pair show` when
+//! [`resolve_lyra_bin`] finds one, `zenity --info --no-markup` otherwise —
+//! shown large with a Copy control and a Done control, no reject control at
+//! all: the approver's own commit already happened, so there is nothing
+//! left here to approve or reject, only to relay out-of-band and dismiss.
+//! Never spawned for an outbound commit — that leg's own ceremony is
+//! already complete the moment its reply code validates, with nothing
+//! further to relay.
+//!
+//! **No pairing dialog closes on a timer any more (R2).** The old 60s
+//! per-dialog timeout and its 30s cooldown existed only to keep a stale
+//! dialog from pinning the operator's desktop for a request that stayed
+//! perfectly answerable later; both are gone outright, along with the
+//! `TimedOut` decision and the cooldown bookkeeping that offered a
+//! timed-out id again after a wait. An open dialog — either the typed-code
+//! entry [`run_ask_dialog`] or the reply-code display [`run_show_dialog`]
+//! — now sits open until the operator answers it, the request it belongs
+//! to is resolved elsewhere, a live blocking `aoide pair` claims the same
+//! id (the pid-marker arbiter, part 4, unchanged), or Ctrl-C interrupts
+//! this process outright ([`should_cancel_dialog`]'s first parameter reads
+//! `interrupted`, not a deadline, since nothing else can close a dialog
+//! that never times out). **Accepted consequence, stated plainly rather
+//! than rediscovered later:** while a dialog sits open, [`popup_tick`]
+//! itself is blocked inside it — feed narration queues up and
+//! [`poll_pending_outbound`]'s own timer pauses — previously bounded at
+//! 60s, now unbounded. On a single-operator desktop, with R3's
+//! one-live-request-per-machine rule holding on both the inbound and
+//! outbound side, this is one modal question at a time either way, which
+//! is the point; the alternative (threading the dialog wait so [`run`]'s
+//! loop never blocks on it) buys machinery for a contention this system
+//! now structurally avoids. If it ever bites, that's the named escape —
+//! not a reason to bring the timer back.
 
 use aoide_protocol::dialog::{
     is_locked, locker_process_name, next_spawn_backoff, run_entry_dialog, sleep_backoff_interruptible, zenity_available, DialogResult,
@@ -161,25 +197,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// malformed feed line can never defeat (module doc).
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 
-/// How long either popup dialog shape stays open before this watcher gives
-/// up on THIS attempt and lets it close — 60s, the User's own number (task
-/// #135 popup-phase spec, part 1). Neither the inbound typed-code entry nor
-/// the outbound confirm may sit open forever: a stale dialog blocks the
-/// operator's own desktop (a modal window that outlives the moment they'd
-/// have actually noticed it) for a request that stays perfectly answerable
-/// later. Closing a dialog this way is a TIMEOUT — see [`decide`]'s own
-/// `CancelledExternally` arm — never Cancel/Dismiss, and it must never land
-/// the id in `ignored` (module doc part 2: "didn't answer within a minute"
-/// is not "no").
-const DIALOG_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// How long a timed-out id sits out before [`popup_tick`] offers its
-/// dialog again — reuses [`RECONCILE_INTERVAL`]'s own already-justified 30s
-/// safety cadence rather than inventing a second arbitrary number (part 2's
-/// own ask: a dialog must not re-raise on the very next [`POLL_INTERVAL`]
-/// tick, or the operator can never use their own desktop in between).
-const DIALOG_TIMEOUT_COOLDOWN: Duration = RECONCILE_INTERVAL;
-
 /// How often [`run`]'s popup loop actively polls every outbound entry still
 /// `awaiting-approval`, through [`poll_pending_outbound`] —
 /// `commands::poll_outbound_once` is the ONLY production site that ever
@@ -205,9 +222,10 @@ const OUTBOUND_POLL_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) const ZENITY_CMD: &str = "zenity";
 
 /// The `--extra-button`/dismiss-control label EVERY dialog this module
-/// spawns carries — [`spawn_zenity_entry`]/[`spawn_zenity_confirm`] and
-/// `lyra pair ask`/`lyra pair confirm` alike — and [`run_entry_dialog`]
-/// compares stdout against (F6) — deliberately its OWN string, never
+/// spawns carries — [`spawn_zenity_entry`] and `lyra pair ask` alike, on
+/// BOTH directions now (the mutual-code redesign, R1) — and
+/// [`run_entry_dialog`] compares stdout against (F6) — deliberately its
+/// OWN string, never
 /// `aoide_protocol::dialog::DISMISS_LABEL`: two different ceremonies, two
 /// different labels, sharing only the reader (`run_entry_dialog`'s own
 /// doc on `dismiss_label`).
@@ -459,13 +477,15 @@ fn run_lyra_entry(lyra_cmd: &str, id: &str, name: &str, context: &str, should_ca
     run_entry_dialog(|| spawn_lyra_entry(lyra_cmd, id, name, context), REJECT_LABEL, should_cancel)
 }
 
-/// The INBOUND dialog CHOICE — `lyra pair ask` when [`resolve_lyra_bin`]
-/// found one, falling back to `zenity --entry` for the SAME attempt on a
-/// `lyra` `SpawnError`/`DialogFailure` (`aoide_secrets::watch::
-/// run_ask_dialog`'s own fallback shape, reused unchanged — module doc's
-/// popup-arm section). `context` doubles as zenity's own `--text` — the
-/// inbound dialog never has a second, code-carrying line to append
-/// ([`dialog_code`] is unconditionally `None` for this direction).
+/// The dialog CHOICE for EITHER direction now — `lyra pair ask` when
+/// [`resolve_lyra_bin`] found one, falling back to `zenity --entry` for the
+/// SAME attempt on a `lyra` `SpawnError`/`DialogFailure`
+/// (`aoide_secrets::watch::run_ask_dialog`'s own fallback shape, reused
+/// unchanged — module doc's popup-arm section). `context` doubles as
+/// zenity's own `--text` — neither direction has a second, code-carrying
+/// line to append: this is an ENTRY dialog, never a display (structural
+/// rule 2, module doc) — the OUTBOUND leg's own reply code, once it
+/// exists, gets its own separate display dialog, [`run_show_dialog`].
 fn run_ask_dialog(lyra_cmd: Option<&str>, zenity_cmd: &str, id: &str, name: &str, title: &str, context: &str, mut should_cancel: impl FnMut() -> bool) -> DialogResult {
     let Some(lyra) = lyra_cmd else {
         return run_zenity_entry(zenity_cmd, title, context, should_cancel);
@@ -485,69 +505,115 @@ fn run_ask_dialog(lyra_cmd: Option<&str>, zenity_cmd: &str, id: &str, name: &str
     }
 }
 
-/// The zenity CONFIRM dialog's own argv (OUTBOUND only, P-PV3 revert) —
-/// `--question` (never `--entry`: this direction shows a code already
-/// GENERATED and known, it never collects one typed back),
-/// `--ok-label`/`--cancel-label` name the two ordinary buttons,
-/// `--extra-button` [`REJECT_LABEL`] the third — restored to the EXACT
-/// pre-P-PV3 argv shape this ceremony's confirm dialog always held
-/// (`spawn_pair_confirm`, this module's own git history), since nothing
-/// about outbound's own confirmation ever needed to change.
-fn spawn_zenity_confirm(zenity_cmd: &str, title: &str, text: &str) -> std::io::Result<Child> {
+/// The dialog's title — pure (module doc's structural rule 1): built ONLY
+/// from a [`Pending`] `reconcile` produced, never from a [`PairEvent`]'s
+/// own fields.
+fn dialog_title(p: &Pending) -> String {
+    format!("aoide \u{b7} pairing with {}", p.name)
+}
+
+/// The dialog's CONTEXT line — pure, same sourcing rule as
+/// [`dialog_title`]. Never carries a code on EITHER direction (structural
+/// rule 2, module doc) — this line is the ONLY thing either entry dialog
+/// ever shows, since R1 retired the outbound arm's separate code-display
+/// line along with the confirm surface it belonged to. INBOUND names the
+/// requester and where the request came from; OUTBOUND (the mutual-code
+/// redesign) names what to type and whose screen it's read off, mirroring
+/// the inbound wording's own shape rather than a bare "confirm pairing
+/// with" that no longer describes what this dialog collects.
+fn dialog_context(p: &Pending) -> String {
+    match p.direction.as_str() {
+        "inbound" => format!("pairing request from `{}` ({}) \u{b7} id {}", p.name, p.origin_addr.as_deref().unwrap_or(""), p.id),
+        _ => format!("type the reply code shown on `{}`'s screen \u{b7} id {}", p.name, p.id),
+    }
+}
+
+// ── the reply-code display dialog (R2) ───────────────────────────────────
+
+/// The show dialog's own CONTEXT line — pure, same sourcing rule as
+/// [`dialog_context`], but this one DOES describe a code (never the code
+/// itself — that is a separate `--code`/`--text` argument on either spawn
+/// path, never interpolated into this line): this dialog fires only after
+/// an inbound commit already succeeded, so `p.name` here is the PEER whose
+/// operator needs the code relayed back to them, out-of-band.
+fn show_context(p: &Pending) -> String {
+    format!("read this code back to `{}`'s operator \u{b7} id {}", p.name, p.id)
+}
+
+/// The zenity DISPLAY dialog's own argv — `--info --no-markup` (a single
+/// acknowledgement control, no typed entry, no extra reject button: zenity
+/// has none to give it — module doc's popup-arm section states this
+/// fallback gap plainly rather than papering over it with a fake control),
+/// the code appended to `--text` since zenity has no separate "large code"
+/// element the way the lyra dialog's own QML does.
+fn spawn_zenity_show(zenity_cmd: &str, title: &str, context: &str, code: &str) -> std::io::Result<Child> {
     Command::new(zenity_cmd)
-        .args(["--question", "--no-markup", "--title", title, "--text", text, "--ok-label", "Approve", "--cancel-label", "Ignore", "--extra-button", REJECT_LABEL])
+        .args(["--info", "--no-markup", "--title", title, "--text", &format!("{context}\n\n{code}")])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
 }
 
-/// `lyra pair confirm`'s own argv (OUTBOUND only) — `--id`/`--name`/
-/// `--context`/`--code`, the last ALWAYS present (a confirm dialog with
-/// nothing to show would be a blank window — `lyra pair confirm`'s own
-/// `handle_pair_confirm` refuses without it).
-fn spawn_lyra_confirm(lyra_cmd: &str, id: &str, name: &str, context: &str, code: &str) -> std::io::Result<Child> {
+/// `lyra pair show`'s own argv — `--id`/`--name`/`--context`/`--code`, the
+/// last carrying THIS instance's own locally-derived reply SAS
+/// (`commit_approval`'s Ok outcome data, `replySas`) for the dialog to
+/// render large and plain with a Copy control (`crates/lyra/src/commands/
+/// pair.rs`'s own module doc has the full rundown).
+fn spawn_lyra_show(lyra_cmd: &str, id: &str, name: &str, context: &str, code: &str) -> std::io::Result<Child> {
     let mut cmd = Command::new(lyra_cmd);
-    cmd.args(["pair", "confirm", "--id", id, "--name", name, "--context", context, "--code", code]);
+    cmd.args(["pair", "show", "--id", id, "--name", name, "--context", context, "--code", code]);
+    // Same live-incident fix `spawn_lyra_entry`'s own doc gives: `lyra pair
+    // show`'s own failure `eprintln!`s land directly in this process's
+    // stderr, which the deployed unit routes to the journal.
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()
 }
 
-fn run_zenity_confirm(zenity_cmd: &str, title: &str, text: &str, should_cancel: impl FnMut() -> bool) -> DialogResult {
-    run_entry_dialog(|| spawn_zenity_confirm(zenity_cmd, title, text), REJECT_LABEL, should_cancel)
+fn run_zenity_show(zenity_cmd: &str, title: &str, context: &str, code: &str, should_cancel: impl FnMut() -> bool) -> DialogResult {
+    // `REJECT_LABEL` is passed only because `run_entry_dialog`'s own
+    // signature requires SOME dismiss label to compare a non-zero exit's
+    // stdout against — neither this dialog nor its zenity fallback ever
+    // offers a control that could print it (no reject control exists at
+    // all, module doc), so the comparison never matches in practice; any
+    // non-zero exit here reads as a bare `Cancelled`, never `Dismissed`.
+    run_entry_dialog(|| spawn_zenity_show(zenity_cmd, title, context, code), REJECT_LABEL, should_cancel)
 }
 
-fn run_lyra_confirm(lyra_cmd: &str, id: &str, name: &str, context: &str, code: &str, should_cancel: impl FnMut() -> bool) -> DialogResult {
-    run_entry_dialog(|| spawn_lyra_confirm(lyra_cmd, id, name, context, code), REJECT_LABEL, should_cancel)
+fn run_lyra_show(lyra_cmd: &str, id: &str, name: &str, context: &str, code: &str, should_cancel: impl FnMut() -> bool) -> DialogResult {
+    run_entry_dialog(|| spawn_lyra_show(lyra_cmd, id, name, context, code), REJECT_LABEL, should_cancel)
 }
 
-/// The OUTBOUND dialog CHOICE — `lyra pair confirm` when [`resolve_lyra_bin`]
-/// found one, falling back to `zenity --question` for the SAME attempt on
-/// a `lyra` `SpawnError`/`DialogFailure`, mirroring [`run_ask_dialog`]'s
-/// own fallback shape exactly, just against the confirm pair instead of
-/// the entry pair.
-#[allow(clippy::too_many_arguments)]
-fn run_confirm_dialog(
+/// The display-dialog CHOICE — `lyra pair show` when [`resolve_lyra_bin`]
+/// found one, falling back to `zenity --info --no-markup` for the SAME
+/// attempt on a `lyra` `SpawnError`/`DialogFailure`, the identical
+/// fallback shape [`run_ask_dialog`] already holds for the entry dialog.
+/// `should_cancel` is Ctrl-C ONLY (`popup_tick`'s own call site) — this
+/// dialog fires strictly after the commit it belongs to already succeeded,
+/// so there is no "resolved elsewhere" or marker race left to guard
+/// against, unlike the entry dialog's own three-reason `should_cancel`.
+fn run_show_dialog(
     lyra_cmd: Option<&str>,
     zenity_cmd: &str,
     id: &str,
     name: &str,
     title: &str,
-    text: &str,
     context: &str,
     code: &str,
     mut should_cancel: impl FnMut() -> bool,
 ) -> DialogResult {
     let Some(lyra) = lyra_cmd else {
-        return run_zenity_confirm(zenity_cmd, title, text, should_cancel);
+        return run_zenity_show(zenity_cmd, title, context, code, should_cancel);
     };
-    let result = run_lyra_confirm(lyra, id, name, context, code, &mut should_cancel);
+    let result = run_lyra_show(lyra, id, name, context, code, &mut should_cancel);
     match &result {
         DialogResult::SpawnError(e) | DialogResult::DialogFailure(e) => {
-            eprintln!("aoide pair watch --popup: lyra pair confirm failed for request {id}: {e} \u{2014} falling back to zenity for this request");
+            eprintln!("aoide pair watch --popup: lyra pair show failed for request {id}: {e} \u{2014} falling back to zenity for this request");
             if zenity_available(zenity_cmd) {
-                run_zenity_confirm(zenity_cmd, title, text, should_cancel)
+                run_zenity_show(zenity_cmd, title, context, code, should_cancel)
             } else {
-                eprintln!("aoide pair watch --popup: zenity is not available either \u{2014} request {id} stays parked, will retry");
+                eprintln!(
+                    "aoide pair watch --popup: zenity is not available either \u{2014} the reply code for {id} already printed above this line"
+                );
                 result
             }
         }
@@ -555,39 +621,21 @@ fn run_confirm_dialog(
     }
 }
 
-/// The dialog's title — pure (module doc's structural rule 1): built ONLY
-/// from a [`Pending`] `reconcile` produced, never from a [`PairEvent`]'s
-/// own fields.
-fn confirm_title(p: &Pending) -> String {
-    format!("aoide \u{b7} pairing with {}", p.name)
-}
-
-/// The dialog's CONTEXT line — pure, same sourcing rule as
-/// [`confirm_title`]. Never carries a SAS on EITHER direction (structural
-/// rule 2, module doc): the code — when it is ever shown at all — is
-/// [`dialog_code`]'s own, separate line.
-fn dialog_context(p: &Pending) -> String {
-    match p.direction.as_str() {
-        "inbound" => format!("pairing request from `{}` ({}) \u{b7} id {}", p.name, p.origin_addr.as_deref().unwrap_or(""), p.id),
-        _ => format!("confirm pairing with `{}` \u{b7} id {}", p.name, p.id),
-    }
-}
-
-/// The dialog's own code line — `None` for an INBOUND [`Pending`],
-/// UNCONDITIONALLY (structural rule 2, module doc: the approver's whole
-/// gate is typing a code read from elsewhere — showing it here would
-/// collapse the comparison into a copy exercise, the same reasoning
-/// `crate::commands::approve_inbound`'s own doc gives for why its tty
-/// prompt never echoes the SAS either). `Some(sas)` for an OUTBOUND
-/// [`Pending`] — this instance generated that SAS itself
-/// (`reconcile`'s own outbound arm), so showing it is not a leak; the CLI's
-/// own `confirm_sas` prints the identical value for the identical reason.
-/// The outbound direction always carries `Some` in practice
-/// (`Pending::sas`'s own doc: "always `Some` for an outbound entry").
-fn dialog_code(p: &Pending) -> Option<&str> {
-    match p.direction.as_str() {
-        "inbound" => None,
-        _ => p.sas.as_deref(),
+/// Spawn the reply-code display dialog for `p` (an INBOUND request whose
+/// popup-driven commit just succeeded) and block until it closes — Done,
+/// Esc, the native window close, or Ctrl-C are all this dialog's own
+/// terminal states (module doc's "no pairing dialog closes on a timer any
+/// more" section); a spawn/infra failure is logged, never panics, since
+/// the code already reached the operator via [`popup_tick`]'s own
+/// `println!` of [`commit_approval`]'s outcome message moments earlier.
+fn show_reply_code(lyra_cmd: Option<&str>, p: &Pending, code: &str, json_mode: bool) {
+    let title = dialog_title(p);
+    let context = show_context(p);
+    let result = run_show_dialog(lyra_cmd, ZENITY_CMD, &p.id, &p.name, &title, &context, code, || INTERRUPTED.load(Ordering::SeqCst));
+    if let DialogResult::SpawnError(e) | DialogResult::DialogFailure(e) = &result {
+        if !json_mode {
+            eprintln!("  aoide pair watch --popup: could not show the reply code dialog for {} \u{2014} it already printed above: {e}", p.id);
+        }
     }
 }
 
@@ -598,11 +646,11 @@ fn dialog_code(p: &Pending) -> Option<&str> {
 /// out with no clone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PopupDecision {
-    /// Exit 0. On the INBOUND arm the `String` is the operator's TYPED
-    /// code, gated through `commit_approval`'s `InboundGate::Code`; on the
-    /// OUTBOUND arm it is an irrelevant empty string (a confirm dialog has
-    /// no value to carry) and `commit_approval` ignores it outright —
-    /// module doc's popup-arm section has the full split.
+    /// Exit 0. The `String` is the operator's TYPED code on EITHER arm now
+    /// (the mutual-code redesign, R1) — inbound gates it through
+    /// `commit_approval`'s `CodeGate::Code` against `derive_sas`, outbound
+    /// against `derive_reply_sas` — module doc's popup-arm section has the
+    /// full split.
     Approve(String),
     /// Exit 1, stdout was [`REJECT_LABEL`] — `reject_by_id`.
     Reject,
@@ -616,36 +664,24 @@ enum PopupDecision {
     /// silently stop offering a request just because it failed to show
     /// once.
     Backoff,
-    /// [`DIALOG_TIMEOUT`] elapsed with no answer — `should_cancel` closed
-    /// the dialog itself, and the request is STILL actionable (task #135
-    /// popup-phase spec, part 1/2). Distinct from `Noop` on purpose: this
-    /// id must be offered again later (after [`DIALOG_TIMEOUT_COOLDOWN`]),
-    /// and it must NEVER land in `ignored` — "didn't answer within a
-    /// minute" is not "no."
-    TimedOut,
-    /// The request resolved elsewhere while the dialog sat open
-    /// (`should_cancel` fired, and the request is no longer actionable) —
-    /// already handled, nothing left to do.
+    /// `should_cancel` closed an already-open dialog because the request it
+    /// belonged to was withdrawn — resolved elsewhere, or claimed by a live
+    /// blocking `aoide pair` — while it sat open (R2: no timer exists any
+    /// more to close one for any OTHER reason, so `CancelledExternally` now
+    /// has exactly this one meaning). Already handled; nothing left to do.
     Noop,
 }
 
 /// What a finished dialog round means for the request it was shown for —
-/// pure (module doc, and this variant's own doc). `still_actionable` is the
-/// ONE extra input `CancelledExternally` needs to tell its two causes apart
-/// (`should_cancel` returns `true` for EITHER "no longer actionable —
-/// resolved elsewhere" OR "[`DIALOG_TIMEOUT`] elapsed," and a bare
-/// `DialogResult` cannot distinguish them): a request that timed out is
-/// still sitting there, unchanged, so `still_actionable` reads `true`; one
-/// that resolved elsewhere does not, so it reads `false`. Every other
-/// `DialogResult` was never subject to `should_cancel` at all (`
-/// run_entry_dialog`'s own doc — it is the ONLY producer of
-/// `CancelledExternally`), so `still_actionable` is simply ignored for them.
-fn decide(result: DialogResult, still_actionable: bool) -> PopupDecision {
+/// pure (module doc, and this variant's own doc). `CancelledExternally` is
+/// the ONLY way `should_cancel` ever closes a dialog now (R2 deleted the
+/// timeout branch that used to race it), so it maps to exactly one
+/// [`PopupDecision`] with no second parameter needed to tell causes apart.
+fn decide(result: DialogResult) -> PopupDecision {
     match result {
         DialogResult::Approved(code) => PopupDecision::Approve(code),
         DialogResult::Dismissed => PopupDecision::Reject,
         DialogResult::Cancelled => PopupDecision::Ignore,
-        DialogResult::CancelledExternally if still_actionable => PopupDecision::TimedOut,
         DialogResult::CancelledExternally => PopupDecision::Noop,
         DialogResult::SpawnError(_) | DialogResult::DialogFailure(_) => PopupDecision::Backoff,
     }
@@ -660,38 +696,29 @@ fn popup_allowed(locked: bool) -> bool {
     !locked
 }
 
-/// Pure: has a timed-out id's cooldown elapsed enough to offer its dialog
-/// again? Takes the elapsed [`Duration`] since the id's last timeout
-/// directly (this file's clock-as-parameter discipline — `reconcile`,
-/// `popup_allowed`, and [`decide`] all take their inputs pre-resolved
-/// rather than reading a clock themselves), so the boundary is provable
-/// with no real sleep. `None` (never timed out, or no longer tracked at
-/// all) always reads as elapsed — there is nothing to cool down from.
-fn cooldown_elapsed(elapsed_since_timeout: Option<Duration>) -> bool {
-    elapsed_since_timeout.is_none_or(|elapsed| elapsed >= DIALOG_TIMEOUT_COOLDOWN)
-}
-
 /// Pure: is `p` eligible for a NEW dialog RIGHT NOW? [`actionable`] plus
-/// every gate this phase adds beside `ignored` — its own cooldown
-/// ([`cooldown_elapsed`]) and a LIVE blocking `aoide pair`'s own marker
-/// (`marker_live`, task #135 popup-phase spec part 4) — each pre-resolved
-/// and passed in rather than read here, so this is the ONE place
-/// [`popup_tick`]'s own candidate selection is decided (module doc's
-/// discipline for `decide`/`popup_allowed`) and a synthetic case never
-/// needs a real dialog, a real clock, or a real marker file.
-fn eligible_for_dialog(p: &Pending, ignored: bool, cooldown_ok: bool, marker_live: bool) -> bool {
-    actionable(p) && !ignored && cooldown_ok && !marker_live
+/// every gate this phase adds beside `ignored` — a LIVE blocking
+/// `aoide pair`'s own marker (`marker_live`, task #135 popup-phase spec
+/// part 4), pre-resolved and passed in rather than read here, so this is
+/// the ONE place [`popup_tick`]'s own candidate selection is decided
+/// (module doc's discipline for `decide`/`popup_allowed`) and a synthetic
+/// case never needs a real dialog, a real clock, or a real marker file.
+fn eligible_for_dialog(p: &Pending, ignored: bool, marker_live: bool) -> bool {
+    actionable(p) && !ignored && !marker_live
 }
 
 /// Pure: should an ALREADY-OPEN dialog be cancelled RIGHT NOW? The three
 /// reasons `should_cancel` ORs together inside [`popup_tick`]'s own
-/// closures — [`DIALOG_TIMEOUT`] elapsed, the request stopped being
-/// actionable (resolved elsewhere), or a LIVE blocking `aoide pair` now
-/// holds this id's marker. The third is a review finding (defect 1) on
-/// this phase's own first landing: [`eligible_for_dialog`]'s marker gate
-/// only ever ran at candidate-SELECTION time, so a dialog already open
-/// when the marker appeared sat there, oblivious, for up to the REST of
-/// its 60s window — racing the SAME commit
+/// closures — this process was INTERRUPTED (Ctrl-C; R2 — with no deadline
+/// left to fall back on, an open dialog would otherwise pin [`run`]'s own
+/// loop past a shutdown signal forever, since the `INTERRUPTED` check at
+/// the top of that loop is unreachable while blocked inside
+/// `run_entry_dialog`), the request stopped being actionable (resolved
+/// elsewhere), or a LIVE blocking `aoide pair` now holds this id's marker.
+/// The third is a review finding (defect 1) on this arm's own first
+/// landing: [`eligible_for_dialog`]'s marker gate only ever ran at
+/// candidate-SELECTION time, so a dialog already open when the marker
+/// appeared sat there, oblivious — racing the SAME commit
 /// ([`PairActiveMarker`]'s own doc) the marker exists to prevent, and
 /// `peer_store::save_peers` has no cross-process lock of its own
 /// (plain load → modify → atomic write), so two concurrent commits are a
@@ -699,8 +726,8 @@ fn eligible_for_dialog(p: &Pending, ignored: bool, cooldown_ok: bool, marker_liv
 /// own pure function (rather than left inline in the closures) so this
 /// exact condition is provable with three synthetic bools, no real
 /// dialog, clock, or marker file required.
-fn should_cancel_dialog(deadline_passed: bool, still_actionable: bool, marker_live: bool) -> bool {
-    deadline_passed || !still_actionable || marker_live
+fn should_cancel_dialog(interrupted: bool, still_actionable: bool, marker_live: bool) -> bool {
+    interrupted || !still_actionable || marker_live
 }
 
 /// Pure: should an `Approve` verdict actually commit, or has a live
@@ -717,28 +744,26 @@ fn should_commit_approve(direction: &str, marker_live: bool) -> bool {
 /// Commit `p`'s pairing on a dialog Approve — looks up ITS FRESH entry by
 /// id and direction (never trusts anything cached from an earlier
 /// `reconcile` call, the same "re-check before acting" discipline
-/// [`actionable`]'s own callers hold). **Inbound: runs
-/// `InboundGate::Code(code)` through `approve_inbound`** — the SAME SAS
-/// comparison and [`crate::commands::MAX_CODE_TRIES`] auto-deny machinery
-/// the CLI tty path already holds, byte-identical (`InboundGate::
-/// DialogConfirmed` is RETIRED — nothing constructs it any more,
-/// `crate::commands`' own doc on the removal). **Outbound: `code` is
-/// IGNORED and the commit is UNCONDITIONAL** (`approve_outbound(true,
-/// ...)`, `skip_confirm` — the dialog itself IS the confirmation, module
-/// doc's popup-arm section: a confirm dialog has no typed value to gate
-/// on in the first place, this is the ceremony's original shape, restored).
+/// [`actionable`]'s own callers hold). **Both directions run
+/// `CodeGate::Code(code)` (the mutual-code redesign, R1) — inbound through
+/// `approve_inbound`, outbound through `approve_outbound`** — the SAME code
+/// comparison and [`crate::commands::MAX_CODE_TRIES`] auto-deny/auto-abort
+/// machinery the CLI tty path already holds, byte-identical on either leg
+/// (the old outbound shape, `approve_outbound(true, ...)` ignoring `code`
+/// outright, is GONE along with the confirm dialog it belonged to —
+/// module doc's popup-arm section has the reversal's own reasoning).
 fn commit_approval(p: &Pending, code: &str, now_epoch: i64) -> aoide_protocol::output::Outcome {
     let now = aoide_storage::time::now_iso_utc();
     match p.direction.as_str() {
         "inbound" => match aoide_storage::pairing::list_inbound(now_epoch).into_iter().find(|e| e.id == p.id) {
-            Some(entry) => crate::commands::approve_inbound(crate::commands::InboundGate::Code(code.to_string()), "pair", &p.id, entry, &now, now_epoch, None),
+            Some(entry) => crate::commands::approve_inbound(crate::commands::CodeGate::Code(code.to_string()), "pair", &p.id, entry, &now, now_epoch, None),
             None => aoide_protocol::output::Outcome::error(
                 "pair",
                 format!("pairing request `{}` is no longer pending — nothing to confirm", p.id),
             ),
         },
         _ => match aoide_storage::pairing::list_outbound(now_epoch).into_iter().find(|e| e.id == p.id) {
-            Some(entry) => crate::commands::approve_outbound(true, "pair", &p.id, entry, &now, now_epoch, None),
+            Some(entry) => crate::commands::approve_outbound(crate::commands::CodeGate::Code(code.to_string()), "pair", &p.id, entry, &now, now_epoch, None),
             None => aoide_protocol::output::Outcome::error(
                 "pair",
                 format!("pairing request `{}` is no longer pending — nothing to confirm", p.id),
@@ -786,12 +811,12 @@ fn next_outbound_poll_backoff(current: Duration) -> Duration {
 }
 
 /// Pure: has this id's own outbound-poll backoff elapsed? Same
-/// clock-as-parameter split [`cooldown_elapsed`] already holds — `elapsed`
-/// is `None` when no prior failure is on record for this id (always reads
-/// as elapsed, nothing to back off from); `Some` compares directly
-/// against `backoff`, this id's own current threshold
-/// ([`next_outbound_poll_backoff`]'s own doubling, not a fixed constant
-/// the way [`cooldown_elapsed`]'s comparison target is).
+/// clock-as-parameter split this file's own pure gates all hold (
+/// `reconcile`, `popup_allowed`, [`decide`]) — `elapsed` is `None` when no
+/// prior failure is on record for this id (always reads as elapsed,
+/// nothing to back off from); `Some` compares directly against `backoff`,
+/// this id's own current threshold ([`next_outbound_poll_backoff`]'s own
+/// doubling, not a fixed constant).
 fn outbound_backoff_elapsed(elapsed: Option<Duration>, backoff: Duration) -> bool {
     elapsed.is_none_or(|e| e >= backoff)
 }
@@ -814,7 +839,7 @@ fn outbound_backoff_elapsed(elapsed: Option<Duration>, backoff: Duration) -> boo
 /// be `awaiting-approval` at once, each with its own independent history.
 /// `backoff` is pruned of any id no longer `awaiting-approval` at all —
 /// the SAME retain-on-no-longer-pending discipline [`popup_tick`]'s own
-/// `ignored`/`timed_out` maps already hold.
+/// `ignored` set already holds.
 fn poll_pending_outbound(now_epoch: i64, backoff: &mut HashMap<String, (Duration, Instant)>, json_mode: bool) {
     let outbound = aoide_storage::pairing::list_outbound(now_epoch);
     backoff.retain(|id, _| outbound.iter().any(|e| &e.id == id && needs_outbound_poll(e.state)));
@@ -969,13 +994,13 @@ impl Drop for PairActiveMarker {
 }
 
 /// One popup iteration: pick the next [`eligible_for_dialog`] [`Pending`]
-/// (actionable, un-ignored, its timeout cooldown elapsed, no LIVE blocking
-/// `aoide pair` marker — task #135 popup-phase spec, parts 2/4), skip while
-/// the screen is locked (F8 — re-offered next tick, never shown behind a
-/// lock screen), show its dialog — [`run_ask_dialog`] (typed-code entry) on
-/// the INBOUND arm, [`run_confirm_dialog`] (a single Approve/Reject over
-/// the already-known code) on the OUTBOUND one, EITHER capped at
-/// [`DIALOG_TIMEOUT`] (part 1) — and act on [`decide`]'s mapping.
+/// (actionable, un-ignored, no LIVE blocking `aoide pair` marker — task
+/// #135 popup-phase spec parts 2/4), skip while the screen is locked (F8 —
+/// re-offered next tick, never shown behind a lock screen), show its dialog
+/// — [`run_ask_dialog`] (typed-code entry), the SAME shape on BOTH
+/// directions now (the mutual-code redesign, R1) — and act on [`decide`]'s
+/// mapping. No timer bounds the dialog any more (R2, module doc): it sits
+/// open until answered, withdrawn, or this process is interrupted.
 /// `should_cancel` re-derives [`reconcile`] fresh on every ~200ms poll
 /// (`run_entry_dialog`'s own interval) rather than reading a cached queue —
 /// this arm's request volume is low enough that the extra
@@ -985,19 +1010,11 @@ impl Drop for PairActiveMarker {
 /// deliberately NOT here — this function must never make a network call on
 /// [`POLL_INTERVAL`]'s own 200ms cadence; [`run`]'s own loop calls it
 /// separately, on [`OUTBOUND_POLL_INTERVAL`].
-fn popup_tick(ignored: &mut HashSet<String>, timed_out: &mut HashMap<String, Instant>, spawn_backoff: &mut Duration, spawn_failing: &mut bool, json_mode: bool, lyra_cmd: Option<&str>) {
+fn popup_tick(ignored: &mut HashSet<String>, spawn_backoff: &mut Duration, spawn_failing: &mut bool, json_mode: bool, lyra_cmd: Option<&str>) {
     let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
     let pending = reconcile(now_epoch);
     ignored.retain(|id| pending.iter().any(|p| &p.id == id));
-    timed_out.retain(|id, _| pending.iter().any(|p| &p.id == id));
-    let Some(p) = pending.into_iter().find(|p| {
-        eligible_for_dialog(
-            p,
-            ignored.contains(&p.id),
-            cooldown_elapsed(timed_out.get(&p.id).map(Instant::elapsed)),
-            is_marker_live(&p.id),
-        )
-    }) else {
+    let Some(p) = pending.into_iter().find(|p| eligible_for_dialog(p, ignored.contains(&p.id), is_marker_live(&p.id))) else {
         return;
     };
 
@@ -1005,52 +1022,28 @@ fn popup_tick(ignored: &mut HashSet<String>, timed_out: &mut HashMap<String, Ins
         return;
     }
 
-    let title = confirm_title(&p);
+    let title = dialog_title(&p);
     let context = dialog_context(&p);
     let id = p.id.clone();
-    let deadline = Instant::now() + DIALOG_TIMEOUT;
 
-    let result = if p.direction == "inbound" {
-        let cancel_id = id.clone();
-        run_ask_dialog(lyra_cmd, ZENITY_CMD, &id, &p.name, &title, &context, move || {
-            let still_actionable = {
-                let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
-                reconcile(now_epoch).iter().any(|q| q.id == cancel_id && actionable(q))
-            };
-            // No production writer ever marks an INBOUND id
-            // (`PairActiveMarker`'s own doc — only `wait_and_commit`, the
-            // OUTBOUND blocking leg, ever acquires one), so this always
-            // reads `false` here; checked anyway so this closure's shape
-            // matches the outbound one byte for byte and never silently
-            // drifts if that ever changes.
-            should_cancel_dialog(Instant::now() >= deadline, still_actionable, is_marker_live(&cancel_id))
-        })
-    } else {
-        // The zenity `--text` mirrors the SAME context/code lines
-        // `dialog_qml::render_code_confirm_qml` renders for the lyra path,
-        // so both dialogs show byte-identical wording (module doc's "one
-        // place this wording lives" precedent, `aoide_secrets::watch::
-        // format_origin_line`'s own doc has the same discipline).
-        let code = dialog_code(&p).unwrap_or("").to_string();
-        let text = format!("{context}\ncode: {code}");
-        let cancel_id = id.clone();
-        run_confirm_dialog(lyra_cmd, ZENITY_CMD, &id, &p.name, &title, &text, &context, &code, move || {
-            let still_actionable = {
-                let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
-                reconcile(now_epoch).iter().any(|q| q.id == cancel_id && actionable(q))
-            };
-            // Defect 1's own fix: `wait_and_commit`'s `PairActiveMarker` can
-            // become live at ANY point while this dialog sits open — checked
-            // on the SAME ~200ms cadence `run_entry_dialog` already polls
-            // `should_cancel` at, no coarser: `reconcile` (a JSON read plus
-            // an identity-key load) already runs unthrottled on this exact
-            // cadence for the `still_actionable` check above, so one more
-            // small-file-read-plus-`/proc`-stat is not a meaningfully hotter
-            // poll — throttling only this one check would just widen the
-            // very race this exists to close.
-            should_cancel_dialog(Instant::now() >= deadline, still_actionable, is_marker_live(&cancel_id))
-        })
-    };
+    // Both directions run the SAME entry dialog now (the mutual-code
+    // redesign, R1 — `dialog_context` is the only per-direction thing left
+    // to build; module doc's popup-arm section has the reversal). The
+    // `should_cancel` closure below is shared for the identical reason: a
+    // LIVE blocking `aoide pair` marker can appear at any point while
+    // EITHER direction's dialog sits open (defect 1's own fix, preserved)
+    // — `PairActiveMarker`'s own doc notes only the outbound blocking leg
+    // ever acquires one today, so this reads `false` for an inbound id in
+    // practice, but the check runs regardless so this never silently
+    // drifts if that ever changes.
+    let cancel_id = id.clone();
+    let result = run_ask_dialog(lyra_cmd, ZENITY_CMD, &id, &p.name, &title, &context, move || {
+        let still_actionable = {
+            let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
+            reconcile(now_epoch).iter().any(|q| q.id == cancel_id && actionable(q))
+        };
+        should_cancel_dialog(INTERRUPTED.load(Ordering::SeqCst), still_actionable, is_marker_live(&cancel_id))
+    });
 
     if !matches!(result, DialogResult::SpawnError(_) | DialogResult::DialogFailure(_)) && *spawn_failing {
         *spawn_failing = false;
@@ -1060,20 +1053,7 @@ fn popup_tick(ignored: &mut HashSet<String>, timed_out: &mut HashMap<String, Ins
         }
     }
 
-    // `still_actionable` is only ever consulted by `decide` on a
-    // `CancelledExternally` result (its own doc) — the fresh reconcile it
-    // costs is skipped for every other, far more common, outcome. A LIVE
-    // marker counts as "not still actionable" here too (defect 1's fix):
-    // if a blocking `aoide pair` claimed this id while the dialog was
-    // closing, that reads as `Noop` ("handled elsewhere"), never
-    // `TimedOut` — offering it again on a cooldown would just reopen the
-    // SAME race a moment later.
-    let still_actionable = matches!(result, DialogResult::CancelledExternally) && {
-        let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
-        reconcile(now_epoch).iter().any(|q| q.id == id && actionable(q)) && !is_marker_live(&id)
-    };
-
-    match decide(result, still_actionable) {
+    match decide(result) {
         PopupDecision::Approve(code) => {
             // Belt and suspenders beyond `should_cancel_dialog` (defect 1):
             // an `Approved` exit and a marker becoming live can still land
@@ -1086,6 +1066,17 @@ fn popup_tick(ignored: &mut HashSet<String>, timed_out: &mut HashMap<String, Ins
                 let outcome = commit_approval(&p, &code, now_epoch);
                 if !json_mode {
                     println!("  {}", outcome.message);
+                }
+                // After a popup-driven INBOUND commit succeeds, the reply
+                // code `approve_inbound`'s own outcome data already carries
+                // (`replySas`) gets its own stay-open display dialog (R2) —
+                // never for an outbound commit, whose own ceremony is
+                // already complete the moment its reply code validates
+                // (module doc's "reply-code display dialog" section).
+                if p.direction == "inbound" && outcome.status == aoide_protocol::output::Status::Ok {
+                    if let Some(reply_sas) = outcome.data.as_ref().and_then(|d| d.get("replySas")).and_then(Value::as_str) {
+                        show_reply_code(lyra_cmd, &p, reply_sas, json_mode);
+                    }
                 }
             } else if !json_mode {
                 println!(
@@ -1103,18 +1094,12 @@ fn popup_tick(ignored: &mut HashSet<String>, timed_out: &mut HashMap<String, Ins
         PopupDecision::Ignore => {
             ignored.insert(p.id.clone());
         }
-        PopupDecision::TimedOut => {
-            timed_out.insert(p.id.clone(), Instant::now());
-            if !json_mode {
-                println!(
-                    "  pairing request {} timed out waiting for an answer \u{2014} still pending, offered again in {}s",
-                    p.id,
-                    DIALOG_TIMEOUT_COOLDOWN.as_secs()
-                );
-            }
-        }
         PopupDecision::Noop => {
-            if !json_mode {
+            // An interrupt closes the dialog too (should_cancel_dialog's first
+            // reason) — the loop exits on its own check next tick, and calling
+            // that "resolved elsewhere" would misreport a Ctrl-C as far-side
+            // activity.
+            if !json_mode && !INTERRUPTED.load(Ordering::SeqCst) {
                 println!("  pairing request {} resolved elsewhere while its popup was open \u{2014} closing the dialog", p.id);
             }
         }
@@ -1215,7 +1200,6 @@ pub fn run(events_path: &Path, json_mode: bool, popup_mode: bool) -> i32 {
     let mut last_reconcile = Instant::now();
     let mut last_outbound_poll = Instant::now();
     let mut ignored: HashSet<String> = HashSet::new();
-    let mut timed_out: HashMap<String, Instant> = HashMap::new();
     let mut outbound_poll_backoff: HashMap<String, (Duration, Instant)> = HashMap::new();
     let mut spawn_backoff = SPAWN_BACKOFF_INITIAL;
     let mut spawn_failing = false;
@@ -1257,7 +1241,7 @@ pub fn run(events_path: &Path, json_mode: bool, popup_mode: bool) -> i32 {
                 let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
                 poll_pending_outbound(now_epoch, &mut outbound_poll_backoff, json_mode);
             }
-            popup_tick(&mut ignored, &mut timed_out, &mut spawn_backoff, &mut spawn_failing, json_mode, lyra_cmd.as_deref());
+            popup_tick(&mut ignored, &mut spawn_backoff, &mut spawn_failing, json_mode, lyra_cmd.as_deref());
         } else if last_reconcile.elapsed() >= RECONCILE_INTERVAL {
             last_reconcile = Instant::now();
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
@@ -1447,6 +1431,7 @@ mod tests {
                 expires_at: aoide_storage::pairing::expires_at_from(now_epoch),
                 state: aoide_storage::pairing::OutboundState::AwaitingApproval,
                 via: None,
+                tries: 0,
             })
             .unwrap();
 
@@ -1473,6 +1458,7 @@ mod tests {
                 None,
             )
             .unwrap()
+            .0
             .id;
             aoide_storage::pairing::reveal_inbound(&id, &nonce, now_epoch).unwrap();
 
@@ -1548,32 +1534,28 @@ mod tests {
 
     #[test]
     fn decide_maps_every_dialog_result_and_a_spawn_failure_is_never_ignore() {
-        assert_eq!(decide(DialogResult::Approved("740-729".to_string()), false), PopupDecision::Approve("740-729".to_string()));
-        assert_eq!(decide(DialogResult::Dismissed, false), PopupDecision::Reject);
-        assert_eq!(decide(DialogResult::Cancelled, false), PopupDecision::Ignore);
+        assert_eq!(decide(DialogResult::Approved("740-729".to_string())), PopupDecision::Approve("740-729".to_string()));
+        assert_eq!(decide(DialogResult::Dismissed), PopupDecision::Reject);
+        assert_eq!(decide(DialogResult::Cancelled), PopupDecision::Ignore);
         // The swap-catcher: a spawn failure must back off, and must NEVER
         // read as `Ignore` — `Ignore` would permanently stop offering a
         // request just because the dialog binary glitched once.
-        assert_eq!(decide(DialogResult::SpawnError("no such file".to_string()), false), PopupDecision::Backoff);
-        assert_ne!(decide(DialogResult::SpawnError("no such file".to_string()), false), PopupDecision::Ignore);
-        assert_eq!(decide(DialogResult::DialogFailure("exit 3".to_string()), false), PopupDecision::Backoff);
+        assert_eq!(decide(DialogResult::SpawnError("no such file".to_string())), PopupDecision::Backoff);
+        assert_ne!(decide(DialogResult::SpawnError("no such file".to_string())), PopupDecision::Ignore);
+        assert_eq!(decide(DialogResult::DialogFailure("exit 3".to_string())), PopupDecision::Backoff);
     }
 
-    /// Task #135 popup-phase spec, part 1/2: `CancelledExternally` is the
-    /// ONE `DialogResult` `should_cancel` ever produces, for EITHER of two
-    /// reasons (`decide`'s own doc) — `still_actionable` is what tells
-    /// them apart. Still actionable (nothing changed underneath the
-    /// dialog) means IT gave up — a timeout, offered again later, never
-    /// `ignored`. No longer actionable (resolved elsewhere) means the
-    /// SAME `Noop` this arm always gave.
+    /// R2: with the timeout branch gone, `CancelledExternally` has exactly
+    /// ONE meaning left — the request was withdrawn (resolved elsewhere, or
+    /// claimed by a live blocking `aoide pair`) while the dialog sat open —
+    /// so `decide` needs no second parameter to tell causes apart any more.
     #[test]
-    fn decide_tells_a_timeout_from_a_resolved_elsewhere_cancel() {
-        assert_eq!(decide(DialogResult::CancelledExternally, true), PopupDecision::TimedOut);
-        assert_eq!(decide(DialogResult::CancelledExternally, false), PopupDecision::Noop);
+    fn decide_maps_cancelled_externally_to_noop_unconditionally() {
+        assert_eq!(decide(DialogResult::CancelledExternally), PopupDecision::Noop);
         assert_ne!(
-            decide(DialogResult::CancelledExternally, true),
+            decide(DialogResult::CancelledExternally),
             PopupDecision::Ignore,
-            "a timeout must never be indistinguishable from an explicit Cancel/Dismiss"
+            "a withdrawn request must never be indistinguishable from an explicit Cancel/Dismiss"
         );
     }
 
@@ -1590,29 +1572,20 @@ mod tests {
         assert!(popup_allowed(aoide_protocol::dialog::locked_state(Some(false), false)));
     }
 
-    // ── cooldown_elapsed / eligible_for_dialog (part 2/4's own gates) ────
-
-    #[test]
-    fn cooldown_elapsed_gates_on_the_boundary_inclusive() {
-        assert!(cooldown_elapsed(None), "never timed out — nothing to cool down from");
-        assert!(!cooldown_elapsed(Some(DIALOG_TIMEOUT_COOLDOWN - Duration::from_millis(1))), "just under the cooldown must still suppress");
-        assert!(cooldown_elapsed(Some(DIALOG_TIMEOUT_COOLDOWN)), "the boundary itself has cooled down");
-        assert!(cooldown_elapsed(Some(DIALOG_TIMEOUT_COOLDOWN + Duration::from_secs(1))));
-    }
+    // ── eligible_for_dialog (part 4's own gate; R2 dropped the cooldown one) ─
 
     #[test]
     fn eligible_for_dialog_requires_actionable_and_every_new_gate_clear() {
         let p = fixture_pending("outbound", Some("111-222"));
-        assert!(eligible_for_dialog(&p, false, true, false), "actionable, unignored, cooled down, unmarked — eligible");
-        assert!(!eligible_for_dialog(&p, true, true, false), "explicitly ignored");
-        assert!(!eligible_for_dialog(&p, false, false, false), "still cooling down from a timeout");
-        assert!(!eligible_for_dialog(&p, false, true, true), "a live marker suppresses regardless of every other gate");
+        assert!(eligible_for_dialog(&p, false, false), "actionable, unignored, unmarked — eligible");
+        assert!(!eligible_for_dialog(&p, true, false), "explicitly ignored");
+        assert!(!eligible_for_dialog(&p, false, true), "a live marker suppresses regardless of every other gate");
 
         // The inbound fixture's own `state` is never `awaiting-approval`
         // (`fixture_pending`'s own shape) — never actionable, so every
         // other gate being wide open must not matter.
         let never_actionable = fixture_pending("inbound", Some("111-222"));
-        assert!(!eligible_for_dialog(&never_actionable, false, true, false));
+        assert!(!eligible_for_dialog(&never_actionable, false, false));
     }
 
     // ── should_cancel_dialog / should_commit_approve (review defect 1:
@@ -1620,15 +1593,16 @@ mod tests {
     // ── candidate selection) ────────────────────────────────────────────
 
     #[test]
-    fn should_cancel_dialog_fires_on_deadline_resolution_or_a_live_marker() {
+    fn should_cancel_dialog_fires_on_interrupt_resolution_or_a_live_marker() {
         assert!(!should_cancel_dialog(false, true, false), "nothing has changed yet — keep the dialog open");
-        assert!(should_cancel_dialog(true, true, false), "the deadline passed");
+        assert!(should_cancel_dialog(true, true, false), "Ctrl-C interrupted this process (R2 — no deadline left to fall back on)");
         assert!(should_cancel_dialog(false, false, false), "resolved elsewhere");
         // The defect-1 fix itself: a marker going live while the dialog is
-        // open must retract it even though NEITHER the deadline NOR
+        // open must retract it even though NEITHER interruption NOR
         // actionability changed — before this fix, an already-open dialog
         // had no way to learn a blocking `aoide pair` had claimed the SAME
-        // id and would sit open for up to the rest of its 60s window.
+        // id and would sit open, racing it, for as long as the operator
+        // left it unanswered.
         assert!(should_cancel_dialog(false, true, true), "a live marker must retract an already-open dialog");
     }
 
@@ -1705,6 +1679,7 @@ mod tests {
                 expires_at: aoide_storage::pairing::expires_at_from(now_epoch),
                 state: aoide_storage::pairing::OutboundState::AwaitingApproval,
                 via: None,
+                tries: 0,
             })
             .unwrap();
 
@@ -1761,6 +1736,7 @@ mod tests {
                 expires_at: aoide_storage::pairing::expires_at_from(now_epoch),
                 state: aoide_storage::pairing::OutboundState::AwaitingApproval,
                 via: None,
+                tries: 0,
             })
             .unwrap();
 
@@ -1801,6 +1777,7 @@ mod tests {
                 expires_at: aoide_storage::pairing::expires_at_from(now_epoch),
                 state: aoide_storage::pairing::OutboundState::AwaitingApproval,
                 via: None,
+                tries: 0,
             })
             .unwrap();
 
@@ -1893,21 +1870,6 @@ mod tests {
     }
 
     #[test]
-    fn dialog_code_is_none_for_inbound_regardless_of_a_derived_sas() {
-        // Structural rule 2 (module doc): the approver's dialog must NEVER
-        // show the code, or the whole out-of-band comparison collapses into
-        // a copy exercise.
-        let p = fixture_pending("inbound", Some("111-222"));
-        assert_eq!(dialog_code(&p), None);
-    }
-
-    #[test]
-    fn dialog_code_is_some_for_outbound_carrying_its_own_sas() {
-        let p = fixture_pending("outbound", Some("777-888"));
-        assert_eq!(dialog_code(&p), Some("777-888"));
-    }
-
-    #[test]
     fn dialog_context_never_contains_another_requests_id_or_origin() {
         let a = fixture_pending("inbound", Some("111-222"));
         let mut b = fixture_pending("inbound", Some("333-444"));
@@ -1934,7 +1896,7 @@ mod tests {
         p.name = "box-<b>evil</b>-&-more".to_string();
         p.origin_addr = Some("10.0.0.5&x=1".to_string());
 
-        let title = confirm_title(&p);
+        let title = dialog_title(&p);
         let text = dialog_context(&p);
         assert!(title.contains(&p.name), "{title}");
         assert!(text.contains(&p.name), "{text}");
@@ -1943,15 +1905,18 @@ mod tests {
     }
 
     #[test]
-    fn dialog_context_outbound_carries_no_origin_addr_field() {
+    fn dialog_context_outbound_carries_no_origin_addr_field_or_the_code() {
         let p = fixture_pending("outbound", Some("777-888"));
         let text = dialog_context(&p);
         // An outbound entry has no connecting-peer address of its own
         // (`Pending::origin_addr`'s own doc) — an "origin:"-shaped
-        // substring must never appear for one, and the SAS lives in
-        // `dialog_code`, never inline here.
+        // substring must never appear for one, and (R1) the outbound
+        // dialog is now an entry surface too — it must never carry the
+        // code it's about to validate, the same rule the inbound context
+        // always held.
         assert!(!text.contains("origin"), "{text}");
-        assert!(!text.contains("777-888"), "the SAS lives in dialog_code, never inline in the context: {text}");
+        assert!(!text.contains("777-888"), "the outbound dialog must never show the code it is about to validate: {text}");
+        assert!(text.contains("reply code"), "the outbound context names what it collects: {text}");
     }
 
     /// Serializes this module's own write-a-shim-then-exec-it tests
@@ -2065,72 +2030,69 @@ mod tests {
         remove_shim(&zenity_shim);
     }
 
-    // ── run_zenity_confirm / run_confirm_dialog (P-PV3 revert, outbound) ──
+    // ── show_context / run_show_dialog (R2) ────────────────────────────────
 
     #[test]
-    fn run_zenity_confirm_exit_zero_is_approved_with_no_typed_value() {
-        let _guard = shim_lock();
-        let shim = write_shim("confirm-approve", "#!/bin/sh\nexit 0\n");
-        let result = run_zenity_confirm(shim.to_str().unwrap(), "t", "x", || false);
-        assert_eq!(result_code(&result), Some(String::new()), "a plain OK carries no payload -- the confirm never collects a typed value");
-        remove_shim(&shim);
+    fn show_context_names_the_recipient_and_never_carries_the_code() {
+        let p = fixture_pending("inbound", Some("222-333"));
+        let text = show_context(&p);
+        assert!(text.contains(&p.name), "{text}");
+        assert!(text.contains(&p.id), "{text}");
+        assert!(!text.contains("222-333"), "the context line must never carry the code itself: {text}");
     }
 
     #[test]
-    fn run_zenity_confirm_reject_label_on_stdout_is_dismissed() {
+    fn run_show_dialog_prefers_lyra_when_a_bin_resolves() {
         let _guard = shim_lock();
-        let shim = write_shim("confirm-reject", "#!/bin/sh\necho 'Reject request'\nexit 1\n");
-        let result = run_zenity_confirm(shim.to_str().unwrap(), "t", "x", || false);
-        assert!(matches!(result, DialogResult::Dismissed), "expected Dismissed, got {result:?}");
-        remove_shim(&shim);
-    }
-
-    #[test]
-    fn run_zenity_confirm_bare_cancel_is_cancelled_not_dismissed() {
-        let _guard = shim_lock();
-        let shim = write_shim("confirm-cancel", "#!/bin/sh\nexit 1\n");
-        let result = run_zenity_confirm(shim.to_str().unwrap(), "t", "x", || false);
-        assert!(matches!(result, DialogResult::Cancelled), "expected Cancelled, got {result:?}");
-        remove_shim(&shim);
-    }
-
-    #[test]
-    fn run_confirm_dialog_prefers_lyra_when_a_bin_resolves() {
-        let _guard = shim_lock();
-        let lyra_shim = write_shim("confirm-lyra-ok", "#!/bin/sh\nexit 0\n");
-        let zenity_shim = write_shim("confirm-zenity-unused", "#!/bin/sh\necho should-not-run\nexit 1\n");
-        let result = run_confirm_dialog(Some(lyra_shim.to_str().unwrap()), zenity_shim.to_str().unwrap(), "id1", "box-b", "t", "x", "ctx", "111-222", || false);
-        assert_eq!(result_code(&result), Some(String::new()), "lyra's own answer must win when it resolves");
+        let lyra_shim = write_shim("show-lyra-ok", "#!/bin/sh\nexit 0\n");
+        let zenity_shim = write_shim("show-zenity-unused", "#!/bin/sh\nexit 1\n");
+        let result = run_show_dialog(Some(lyra_shim.to_str().unwrap()), zenity_shim.to_str().unwrap(), "id1", "box-b", "t", "ctx", "111-222", || false);
+        assert!(matches!(result, DialogResult::Approved(_)), "lyra's own exit must win when it resolves: {result:?}");
         remove_shim(&lyra_shim);
         remove_shim(&zenity_shim);
     }
 
     #[test]
-    fn run_confirm_dialog_falls_back_to_zenity_on_a_lyra_spawn_error() {
+    fn run_show_dialog_falls_back_to_zenity_on_a_lyra_spawn_error() {
         let _guard = shim_lock();
-        let zenity_shim = write_shim("confirm-zenity-fallback", "#!/bin/sh\nexit 0\n");
-        let result = run_confirm_dialog(
-            Some("/no/such/aoide-pair-confirm-lyra-shim-never-exists"),
+        let zenity_shim = write_shim("show-zenity-fallback", "#!/bin/sh\nexit 0\n");
+        let result = run_show_dialog(
+            Some("/no/such/aoide-pair-show-lyra-shim-never-exists"),
             zenity_shim.to_str().unwrap(),
             "id1",
             "box-b",
             "t",
-            "x",
             "ctx",
             "111-222",
             || false,
         );
-        assert_eq!(result_code(&result), Some(String::new()), "a lyra spawn failure must fall back to zenity for the SAME attempt");
+        assert!(matches!(result, DialogResult::Approved(_)), "a lyra spawn failure must fall back to zenity for the SAME attempt: {result:?}");
         remove_shim(&zenity_shim);
     }
 
     #[test]
-    fn run_confirm_dialog_with_no_lyra_bin_goes_straight_to_zenity() {
+    fn run_show_dialog_with_no_lyra_bin_goes_straight_to_zenity() {
         let _guard = shim_lock();
-        let zenity_shim = write_shim("confirm-zenity-only", "#!/bin/sh\nexit 0\n");
-        let result = run_confirm_dialog(None, zenity_shim.to_str().unwrap(), "id1", "box-b", "t", "x", "ctx", "111-222", || false);
-        assert_eq!(result_code(&result), Some(String::new()));
+        let zenity_shim = write_shim("show-zenity-only", "#!/bin/sh\nexit 0\n");
+        let result = run_show_dialog(None, zenity_shim.to_str().unwrap(), "id1", "box-b", "t", "ctx", "111-222", || false);
+        assert!(matches!(result, DialogResult::Approved(_)), "{result:?}");
         remove_shim(&zenity_shim);
+    }
+
+    #[test]
+    fn run_show_dialog_cancels_on_interrupt_with_no_deadline_involved() {
+        // R2's own point: there is no timer left to race — `should_cancel`
+        // returning `true` here can only mean Ctrl-C, and a dialog that
+        // never exits on its own must still be killed and reported as
+        // `CancelledExternally`, never left hanging.
+        let _guard = shim_lock();
+        // Busy-loop via the `:` builtin, never an external `sleep` (this
+        // file's own `write_shim` doc: the nix build sandbox provides no
+        // interpreter but `/bin/sh` and none of its own external commands).
+        let lyra_shim = write_shim("show-hangs", "#!/bin/sh\nwhile :; do :; done\n");
+        let result = run_show_dialog(Some(lyra_shim.to_str().unwrap()), ZENITY_CMD, "id1", "box-b", "t", "ctx", "111-222", || true);
+        assert!(matches!(result, DialogResult::CancelledExternally), "expected CancelledExternally, got {result:?}");
+        remove_shim(&lyra_shim);
     }
 
     // ── commit_approval: same peers.json the CLI's `--yes` path writes ────
@@ -2180,7 +2142,7 @@ mod tests {
     }
 
     /// P-PV3 (task #132): `commit_approval`'s inbound arm now runs
-    /// `InboundGate::Code` — a wrong typed code must count a persisted try
+    /// `CodeGate::Code` — a wrong typed code must count a persisted try
     /// exactly the way the CLI tty/`--code` path already does, and the
     /// [`crate::commands::MAX_CODE_TRIES`]rd wrong code must auto-deny —
     /// through THIS function, the popup's own entry point, not just
@@ -2225,21 +2187,36 @@ mod tests {
         });
     }
 
+    /// The expected reply code an outbound entry built inline by these
+    /// tests gates its final commit on — `derive_reply_sas` from THIS
+    /// process's own freshly-minted identity (`with_peer_state`'s
+    /// sandboxed `AOIDE_STATE_DIR`) plus the fixture's own transcript
+    /// fields, the exact computation `commit_outbound` itself performs
+    /// (`commands.rs`'s own `expected_reply_sas` test helper, mirrored
+    /// here since `pair_watch`'s test module has no access to a private
+    /// helper defined in a sibling module).
+    fn expected_reply_sas(pubkey_b: &str) -> String {
+        let (kp, _) = aoide_storage::identity::load_or_mint().unwrap();
+        aoide_storage::pairing::derive_reply_sas(&kp.info().pubkey_hex, pubkey_b, &"c".repeat(32), &"d".repeat(32))
+    }
+
     #[test]
     fn commit_approval_on_an_outbound_entry_writes_the_same_peers_json_the_cli_would() {
         with_peer_state("commit-approval-outbound", || {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
+            let pubkey_b = "b".repeat(64);
             aoide_storage::pairing::park_outbound(aoide_storage::pairing::OutboundPairingRequest {
                 id: "deadbeef".to_string(),
                 url: "http://box-b/".to_string(),
                 name: "box-b".to_string(),
-                pubkey_hex: "b".repeat(64),
+                pubkey_hex: pubkey_b.clone(),
                 requester_nonce_hex: "c".repeat(32),
                 approver_nonce_hex: "d".repeat(32),
                 requested_at: aoide_storage::time::now_iso_utc(),
                 expires_at: aoide_storage::pairing::expires_at_from(now_epoch),
                 state: aoide_storage::pairing::OutboundState::AwaitingConfirm,
                 via: None,
+                tries: 0,
             })
             .unwrap();
 
@@ -2247,10 +2224,11 @@ mod tests {
             assert_eq!(pending.len(), 1);
             assert!(actionable(&pending[0]));
 
-            // The confirm dialog carries no typed value (P-PV3 revert) —
-            // `commit_approval` is called with an EMPTY string here on
-            // purpose, proving the outbound arm never looks at it.
-            let outcome = commit_approval(&pending[0], "", now_epoch);
+            // The mutual-code redesign (R1): the outbound arm's dialog
+            // collects a TYPED reply code now, gated the same way the
+            // inbound arm's always been — the correct code, not an empty
+            // string, is what commits.
+            let outcome = commit_approval(&pending[0], &expected_reply_sas(&pubkey_b), now_epoch);
             assert_eq!(outcome.status, aoide_protocol::output::Status::Ok, "{outcome:?}");
 
             let peers = aoide_storage::peer_store::load_peers();
@@ -2262,18 +2240,17 @@ mod tests {
         });
     }
 
-    /// P-PV3 revert (task #132, review round): the outbound arm's `code`
-    /// parameter is IGNORED entirely — a confirm dialog has no typed value
-    /// to gate on, so approval commits unconditionally regardless of what
-    /// string `commit_approval` happens to be called with. This is the
-    /// ceremony's ORIGINAL shape, restored: an earlier pass on this same
-    /// phase added a `code_matches` comparison here (retyping the
-    /// already-shown code), which review correctly called copy-the-pixels
-    /// theater — this test pins that the comparison is genuinely gone, not
-    /// merely undocumented.
+    /// The mutual-code redesign (R1): the outbound arm's `code` parameter
+    /// is now gated exactly the way the inbound arm's always been — a
+    /// WRONG reply code must count a persisted try and must NOT commit,
+    /// mirroring `commit_approval_inbound_wrong_code_counts_a_try_then_
+    /// auto_denies_at_max_tries` on the other leg. (The P-PV3 confirm
+    /// dialog this test once pinned as unconditional is gone along with
+    /// the shape it belonged to — module doc's popup-arm section has the
+    /// reversal's own reasoning.)
     #[test]
-    fn commit_approval_on_an_outbound_entry_commits_regardless_of_the_code_argument() {
-        with_peer_state("commit-approval-outbound-unconditional", || {
+    fn commit_approval_on_an_outbound_entry_with_a_wrong_code_counts_a_try_and_does_not_commit() {
+        with_peer_state("commit-approval-outbound-wrong-code", || {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             aoide_storage::pairing::park_outbound(aoide_storage::pairing::OutboundPairingRequest {
                 id: "deadbeef".to_string(),
@@ -2286,6 +2263,7 @@ mod tests {
                 expires_at: aoide_storage::pairing::expires_at_from(now_epoch),
                 state: aoide_storage::pairing::OutboundState::AwaitingConfirm,
                 via: None,
+                tries: 0,
             })
             .unwrap();
 
@@ -2293,15 +2271,10 @@ mod tests {
             assert_eq!(pending.len(), 1);
             assert!(actionable(&pending[0]));
 
-            // "xxx-xxx" would have failed the old code_matches comparison —
-            // it must commit anyway, proving no comparison runs at all.
             let outcome = commit_approval(&pending[0], "xxx-xxx", now_epoch);
-            assert_eq!(outcome.status, aoide_protocol::output::Status::Ok, "{outcome:?}");
-
-            let peers = aoide_storage::peer_store::load_peers();
-            assert_eq!(peers.len(), 1);
-            assert!(peers[0].verified);
-            assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "the parked entry is taken on commit");
+            assert_eq!(outcome.status, aoide_protocol::output::Status::Error, "{outcome:?}");
+            assert_eq!(aoide_storage::pairing::list_outbound(now_epoch)[0].tries, 1);
+            assert!(aoide_storage::peer_store::load_peers().is_empty(), "nothing was ever committed on a wrong code");
         });
     }
 
@@ -2327,12 +2300,13 @@ mod tests {
                 expires_at: aoide_storage::pairing::expires_at_from(now_epoch),
                 state: aoide_storage::pairing::OutboundState::AwaitingConfirm,
                 via: None,
+                tries: 0,
             })
             .unwrap();
 
             // `Cancelled` (a bare Esc/close) — `decide` sends it to
             // `Ignore`, which never calls `commit_approval` at all.
-            assert_eq!(decide(DialogResult::Cancelled, false), PopupDecision::Ignore);
+            assert_eq!(decide(DialogResult::Cancelled), PopupDecision::Ignore);
             // `Dismissed` — `decide` sends it to `Reject`, `popup_tick`'s
             // own arm calls `reject_by_id`, never `commit_approval`.
             let out = crate::commands::reject_by_id("pair.reject", "deadbeef");

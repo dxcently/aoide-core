@@ -6,8 +6,8 @@
   (root `AGENTS.md`) — adding either here reopens the exact boundary P-A4
   drew. If a paint feature seems to need the graph or A2A, that's a signal
   it belongs in core, not a reason to add the dependency here.
-- **Lyra's golden is independent of core's.** `registry.rs`'s snapshot (46
-  paths) is its own list, not a subset check against `cli`'s 80 — the two
+- **Lyra's golden is independent of core's.** `registry.rs`'s snapshot (48
+  paths) is its own list, not a subset check against `cli`'s own — the two
   evolve separately.
 - **`commands::all()`'s order is byte-stable**, same discipline as `cli`'s —
   append, never reorder (see `pkgs/aoide/crates/AGENTS.md`).
@@ -30,7 +30,7 @@
   don't duplicate or move them here.
 - **`commands::dialog_qml::spawn_quickshell` arms `PR_SET_PDEATHSIG` on the
   quickshell child BEFORE it execs — this is what actually closes an ask
-  dialog when `lyra secrets ask`/`lyra pair ask`/`lyra pair confirm` itself is killed, not this
+  dialog when `lyra secrets ask`/`lyra pair ask`/`lyra pair show` itself is killed, not this
   process's own cleanup code (originally a `commands::secrets` review fix;
   moved here at the P-PV3 extraction, unchanged — the ownership chain,
   since it crosses this crate and `aoide-secrets`/`aoide-client`, is
@@ -88,18 +88,22 @@
   every side duplicates the literal `3` in its own doc comments) reads
   exit `1` as a bare user cancel, never as a failure worth retrying.
 - **`commands::dialog_qml` is the ONE place either surface renders — the
-  six-box ENTRY component and the plain-code CONFIRM component alike — a
+  six-box ENTRY component and the plain-code SHOW component alike — a
   caller adds wording/flags, never a second QML template of either shape
   (P-PV3: the extraction `commands::pair`'s own `pair ask` forced the
   entry side; `pair confirm`'s own design revert, same phase, forced the
-  confirm side).** A future caller needing either shape reuses this
-  module the same way `commands::pair` does; don't copy
+  ORIGINAL confirm side, which R2 (the mutual-code redesign's popup phase)
+  repurposed into the show side once the outbound leg's own gate moved
+  onto the entry surface instead).** A future caller needing either shape
+  reuses this module the same way `commands::pair` does; don't copy
   `commands::secrets`' pre-extraction shape again "since it's just one
-  file," and don't reach for the ENTRY surface to build a confirm-shaped
-  dialog "since it's already there" — `commands::pair`'s own module doc
-  has the review finding that makes that substitution actively misleading
-  (a retype over an already-visible code proves nothing an Approve click
-  doesn't).
+  file," and don't reach for the ENTRY surface to build a display-only
+  dialog "since it's already there" — a typed-entry component asks the
+  operator to prove something; a display component has nothing left for
+  them to prove (`commands::pair`'s own module doc has the full
+  reasoning both ways: the entry surface is for a code from a genuinely
+  different screen, the show surface is for a code this instance already
+  committed to and is merely relaying).
 
 ## Extension points
 
