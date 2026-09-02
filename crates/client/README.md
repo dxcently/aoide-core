@@ -44,18 +44,18 @@ never the inbound/serve half (that's `aoide-server`).
   (`aoide_storage::fs::state_dir()` — never a hardcoded path); `melete call
   <tool> [--args <json>]` is a generic gated `tools/call` passthrough
   (`job_status`/`run_code_task`/`schedule_*`/`stop_run`/`steer_run`/…) —
-  deliberately no per-tool verbs, so a change to Melete's own tool list
+  deliberately no per-tool commands, so a change to Melete's own tool list
   never needs a matching aoide release. The connector's endpoint/token ride
   `AOIDE_MELETE_URL`/`AOIDE_MELETE_TOKEN` (env-only, read fresh per call,
   the token never touching argv or disk) rather than `peer_store` — Melete
   is a third-party MCP service, never an aoide peer, so the AgentCard-
   verified/signed federation shape doesn't fit; unconfigured is a
   structured, taught `Outcome::error` naming both vars, never an invented
-  credential. All three verbs are `Door::Cli`-only, matching
+  credential. All three commands are `Door::Cli`-only, matching
   `aoide-secrets`' own blanket stance for its whole command family: every
   call sends a live bearer token outward and `call` can trigger real,
   possibly cost-incurring action, so the family is refused over MCP/A2A/
-  Daemon wholesale rather than gating only the consequential verb.
+  Daemon wholesale rather than gating only the consequential command.
   A response is read defensively off a raw `Value` (never forced through
   `aoide_protocol::wire::mcp`'s server-side result structs) and, failing a
   plain-JSON parse, as an SSE-framed (`data: `-line) body — Melete is
@@ -422,16 +422,15 @@ never the inbound/serve half (that's `aoide-server`).
   check `aoide_secrets::watch::resolve_lyra_bin` runs, repeated here since
   neither crate may depend on the other); past that, `popup_tick` replaces
   the plain narrate-only reconcile with: pick the next `Pending` that
-  `eligible_for_dialog` admits — `actionable`, un-ignored, its timeout
-  cooldown elapsed (`cooldown_elapsed`, pure), and no LIVE blocking
-  `aoide pair` holding that id's pid marker (`PairActiveMarker`, the
-  RAII guard `wait_and_commit` acquires; `marker_suppresses` is the pure
-  half, a dead pid's marker is stale and cleaned up) — skip while the
-  screen is locked (F8, `aoide_protocol::dialog::is_locked`), show its
-  dialog under `DIALOG_TIMEOUT` (60s; `should_cancel` closes it), and
-  act on `decide`'s mapping — `decide` takes `still_actionable` to tell
-  a TIMEOUT (re-offer after `DIALOG_TIMEOUT_COOLDOWN`, never `ignored`)
-  from a resolved-elsewhere cancel. `run`'s loop also drives
+  `eligible_for_dialog` admits — `actionable`, un-ignored, and no LIVE
+  blocking `aoide pair` holding that id's pid marker (`PairActiveMarker`,
+  the RAII guard `wait_and_commit` acquires; `marker_suppresses` is the
+  pure half, a dead pid's marker is stale and cleaned up) — skip while
+  the screen is locked (F8, `aoide_protocol::dialog::is_locked`), show
+  its dialog and leave it up until the OPERATOR acts (R2: no timeout, no
+  self-close — `should_cancel_dialog` closes it only for an interrupt,
+  the request resolving elsewhere, or a live blocking marker appearing),
+  and act on `decide`'s mapping. `run`'s loop also drives
   `poll_pending_outbound` on `OUTBOUND_POLL_INTERVAL` (60s):
   `poll_outbound_once` on every entry `needs_outbound_poll` admits
   (`awaiting-approval` only) — the ONLY way a detached request's confirm
@@ -455,16 +454,22 @@ never the inbound/serve half (that's `aoide-server`).
   session-only `ignored`; a spawn/infra failure on BOTH binaries →
   backoff, NEVER `ignored`, the same "a broken binary doesn't silently
   stop offering the request" stance `aoide_secrets::watch::popup_loop`
-  already holds. `confirm_title`/`dialog_context` are pure and read ONLY
+  already holds. `dialog_title`/`dialog_context` are pure and read ONLY
   from a `Pending` `reconcile` already produced — never a `PairEvent`'s
   own feed-sourced fields; `dialog_context` is the only per-direction
   wording left to build (`dialog_code`, whose only job was showing an
   outbound confirm's plain code, is GONE along with the dialog it
-  belonged to). Neither direction's dialog carries a code-display line
-  this phase — an inbound commit's reply code (the approver's own,
-  `derive_reply_sas`) reaches the outbound operator via `popup_tick`'s own
-  printed outcome line instead, an interim measure until a stay-open
-  display dialog (`lyra pair show`, a later phase) lands.
+  belonged to). The entry dialog itself still carries no code-display
+  line on either direction; an inbound APPROVAL's reply code (the
+  approver's own, `derive_reply_sas`) is instead handed onward three
+  ways, in order: `notify_reply_code` fires a best-effort desktop
+  notification (`notify-send` as bare argv — the untrusted peer name
+  rides as an argument, never a shell string — skipped under `--json`),
+  `show_reply_code` raises the stay-open display dialog (`lyra pair
+  show`: code large, Copy + Done, no reject; `zenity --info` fallback),
+  and `popup_tick` prints the same code on its outcome line. The
+  operator relays that code to the requester, who types it into their
+  own still-pending prompt to finish the ceremony.
   **`run_pair_request(cmd, url, name, self_url, self_via, dial_via,
   record_via)` (P-P6, `dial_via`/`record_via` added P-S4, `self_via` added
   P-PV1/task #131) is `pair_via_url`'s own body, extracted so
