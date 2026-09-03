@@ -13,19 +13,32 @@
 //! it only fires on a nix switch, not live mid-session — this closes that
 //! gap with a periodic check (`aoide-quickshell-healthcheck.timer`).
 //!
-//! Detection combines two signals because neither is reliable alone:
-//! Quickshell's own journal line (`There are no outputs - creating
+//! Two signals, asked in the order below, because they answer different
+//! questions. `hyprctl layers` showing zero `aoide-*` surfaces anywhere is
+//! the CURRENT state, and it is the user-visible failure itself: the desktop
+//! is blank. Quickshell's own journal line (`There are no outputs - creating
 //! placeholder screen`, emitted by Qt's QPA layer at the exact moment of the
-//! failure) confirms the EVENT happened, but not whether it's still true —
-//! a blip that self-healed before this runs would still show the line.
-//! `hyprctl layers` showing zero `aoide-*` surfaces anywhere confirms the
-//! CURRENT state, but is also true for the first second or two after any
-//! normal start/reload, which is not a lockup. Requiring both, scoped to the
-//! journal since the unit's own `ActiveEnterTimestamp` (so an old, already-
-//! recovered-from occurrence can never re-trigger after a restart moves that
-//! timestamp forward), rules out the reload-window false positive.
+//! failure) names a MECHANISM, and only one — it confirms the event happened
+//! but not whether it is still true, so a blip that self-healed before this
+//! runs would still show the line.
 //!
-//! The second signal counts the shell's OWN surfaces system-wide rather than
+//! So the surface count decides health on its own, and the journal line
+//! decides only whether this watchdog may act: zero surfaces with the line
+//! present is the placeholder lockup, restartable on the ladder below; zero
+//! surfaces without it is [`HealthOutcome::Blank`], reported and left alone.
+//! Asking the journal first instead would let one unrecognized mechanism
+//! report a blank desktop as healthy — incident #40, a pre-QML deadlock in
+//! the `QApplication` constructor that emits no QPA line, went unseen for 22
+//! minutes on two hosts that way.
+//!
+//! The journal read is scoped to the unit's own `ActiveEnterTimestamp`, so
+//! an old, already-recovered-from occurrence can never re-trigger after a
+//! restart moves that timestamp forward. That same timestamp is what keeps
+//! the surface count honest across a reload: zero surfaces is also true for
+//! the first second or two after any normal start, and a restart resets the
+//! window the journal is read over.
+//!
+//! That count sums the shell's OWN surfaces system-wide rather than
 //! checking any one monitor: none of `modules/facets/quickshell/qml/`'s
 //! `PanelWindow`s are per-screen (no `Variants`, no `Quickshell.screens`, no
 //! `screen:` binding anywhere in that tree — each is declared once,
@@ -76,6 +89,18 @@ pub enum HealthOutcome {
     /// No lockup detected (including: the service isn't running at all —
     /// nothing to watch).
     Healthy,
+    /// Painting nothing, and this watchdog cannot say why: zero `aoide-*`
+    /// layer surfaces anywhere, but no placeholder-screen line in the
+    /// journal since the unit went active. The desktop is blank — the same
+    /// user-visible failure [`Restarted`](HealthOutcome::Restarted) exists
+    /// for — but the one mechanism this watchdog knows how to attribute is
+    /// absent, so it reports and does not act. Incident #40 was exactly this
+    /// shape: a pre-QML deadlock in the `QApplication` constructor, which
+    /// emits no QPA line at all, and it sat unreported for 22 minutes on two
+    /// hosts. Naming that state is this variant's whole job — a blank
+    /// desktop with no recognized mechanism must never collapse into
+    /// [`Healthy`](HealthOutcome::Healthy).
+    Blank,
     /// Confirmed stuck; the service was restarted.
     Restarted,
     /// Confirmed stuck again, but [`ladder_permits_restart`] says the retry
@@ -91,6 +116,7 @@ impl HealthOutcome {
     pub fn tag(&self) -> &'static str {
         match self {
             HealthOutcome::Healthy => "healthy",
+            HealthOutcome::Blank => "blank",
             HealthOutcome::Restarted => "restarted",
             HealthOutcome::Deferred { .. } => "deferred",
         }
@@ -99,6 +125,11 @@ impl HealthOutcome {
     pub fn message(&self) -> String {
         match self {
             HealthOutcome::Healthy => "quickshell is healthy".to_string(),
+            HealthOutcome::Blank => {
+                "quickshell is painting nothing, and no placeholder-screen line explains it; \
+                 not restarting"
+                    .to_string()
+            }
             HealthOutcome::Restarted => {
                 "quickshell was stuck on a placeholder screen; restarted".to_string()
             }
@@ -142,15 +173,21 @@ pub(crate) fn total_aoide_layers(layers: &Value) -> usize {
         .count()
 }
 
-/// Pure: is the shell painting nothing anywhere? `true` is the stuck signal
-/// — zero `aoide-*` surfaces across the whole `hyprctl layers -j` map, which
-/// is also true for the first second or two after any normal start/reload
-/// (not a lockup on its own; the journal-line signal in [`run_healthcheck`]
-/// is what rules that window out). Requires `layers` to actually be the
-/// object `hyprctl -j layers` returns — a failed/malformed call comes back
-/// as [`Value::Null`] from `hyprctl_json` and must read as "unconfirmed",
-/// never as the stuck signal itself, matching [`run_healthcheck`]'s
-/// guarded-optional posture toward system calls it doesn't own.
+/// Pure: is the shell painting nothing anywhere? `true` is the blank
+/// desktop — zero `aoide-*` surfaces across the whole `hyprctl layers -j`
+/// map. It is also true for the first second or two after any normal
+/// start/reload, which is why it decides [`HealthOutcome::Healthy`] but
+/// never a restart on its own: the journal line in [`run_healthcheck`]
+/// separates the placeholder lockup, which is restartable, from
+/// [`HealthOutcome::Blank`], which is only reported.
+///
+/// Requires `layers` to actually be the object `hyprctl -j layers` returns
+/// — a failed/malformed call comes back as [`Value::Null`] from
+/// `hyprctl_json` and must read as "unconfirmed", never as a blank desktop,
+/// matching [`run_healthcheck`]'s guarded-optional posture toward system
+/// calls it doesn't own. That guard is load-bearing because this signal is
+/// asked first: without it a missing `hyprctl` would report every tick as
+/// [`HealthOutcome::Blank`].
 pub(crate) fn shell_has_zero_layers(layers: &Value) -> bool {
     layers.is_object() && total_aoide_layers(layers) == 0
 }
@@ -352,12 +389,19 @@ pub fn run_healthcheck() -> HealthOutcome {
     let Some(since) = active_enter_timestamp() else {
         return HealthOutcome::Healthy;
     };
-    if !journal_shows_placeholder(&journal_tail_since(&since)) {
-        return HealthOutcome::Healthy;
-    }
+    // Current state first, cause second. The surface count is the only
+    // signal that speaks to NOW (module header), so it decides `Healthy` on
+    // its own; the journal line only chooses between acting and reporting
+    // once the desktop is already known to be blank. Reading them the other
+    // way round is what made incident #40 invisible, and it spends a full
+    // `journalctl` read on every healthy tick; this order pays that only
+    // when something is actually wrong.
     let layers = hyprctl_json("layers");
     if !shell_has_zero_layers(&layers) {
         return HealthOutcome::Healthy;
+    }
+    if !journal_shows_placeholder(&journal_tail_since(&since)) {
+        return HealthOutcome::Blank;
     }
 
     let now = now_epoch();
@@ -478,6 +522,8 @@ mod tests {
         // call — that must read as "unconfirmed", the same guarded-optional
         // posture the rest of `run_healthcheck` takes, never as the stuck
         // signal itself.
+        // Also what keeps a missing `hyprctl` from reporting every tick as
+        // `HealthOutcome::Blank`, since this signal is asked first.
         assert!(!shell_has_zero_layers(&Value::Null));
         assert_eq!(total_aoide_layers(&Value::Null), 0);
     }
@@ -717,6 +763,13 @@ mod tests {
         assert_eq!(HealthOutcome::Healthy.tag(), "healthy");
         assert_eq!(HealthOutcome::Restarted.tag(), "restarted");
         assert!(HealthOutcome::Restarted.message().contains("restarted"));
+
+        // A blank desktop must never render as the healthy one — that
+        // collapse is what left incident #40 unreported for 22 minutes.
+        assert_eq!(HealthOutcome::Blank.tag(), "blank");
+        let blank = HealthOutcome::Blank.message();
+        assert!(blank.contains("painting nothing"), "{blank}");
+        assert!(blank.contains("not restarting"), "{blank}");
 
         let deferred = HealthOutcome::Deferred { next_attempt_in_secs: 847, recent_restarts: 4 };
         assert_eq!(deferred.tag(), "deferred");

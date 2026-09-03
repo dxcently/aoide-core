@@ -97,10 +97,10 @@
   the word "liveness" — a quickshell process that is very much alive (no
   crash, no exit) but has silently lost its Wayland output and rendered
   onto Qt's internal placeholder screen. Different subject (screen
-  attachment, not a session), different predicate (a journal placeholder-
-  screen line AND a live `hyprctl layers` zero-surface reading, not a pid/
-  window-address probe), different crate (`lyra`-only, vs `conduct`'s
-  core-only `reap`). Don't fold this into `reap` or generalize `reap` to
+  attachment, not a session), different predicate (a live `hyprctl layers`
+  zero-surface reading, then a journal placeholder-screen line to decide
+  whether a restart is the known cure, not a pid/window-address probe),
+  different crate (`lyra`-only, vs `conduct`'s core-only `reap`). Don't fold this into `reap` or generalize `reap` to
   cover it — the two mechanisms check unrelated things on unrelated
   subjects, and merging them would only muddy both.
 - **`elements::seed_tree` takes explicit paths and touches no global
