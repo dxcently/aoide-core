@@ -80,11 +80,11 @@ by decision — no embedded database yet
   typo is the exact failure the format choice refuses (TOML, because the
   reasoning behind a grant has to live beside it, which JSON has nowhere to
   put; not YAML, whose implicit coercion is the opposite of failing loudly).
-  `SCHEMA` is a walkable const TABLE — sections, their keys, each key's
-  value vocabulary, and a `read` fn projecting that key off a typed
-  `Config` — and `validate`, `set`, and `aoide config`'s own listing all
-  walk it rather than restating it in match arms. v0 carries exactly one
-  section: `[pairing]`'s `defaultGrant`, whose vocabulary IS
+  `SCHEMA` is a walkable const TABLE of the SETTABLE surface — sections,
+  their keys, each key's value vocabulary, and a `read` fn projecting that
+  key off a typed `Config` — and `validate`, `set`, and `aoide config`'s own
+  listing all walk it rather than restating it in match arms. v0 carries
+  exactly one section: `[pairing]`'s `defaultGrant`, whose vocabulary IS
   `peer_store::PEER_CAPABILITIES` (the same closed set `peer allow`
   enforces, never a second list). `set` is the only writer: it refuses a
   managed config, an unknown key, a value outside its vocabulary, and a
@@ -93,6 +93,19 @@ by decision — no embedded database yet
   `toml_edit` so an operator's comments survive, re-parses the result
   through the same gate the next `load` will apply, and commits it with
   `fs::atomic_write`.
+
+  `[mesh.<name>]` (task #135 P4) is the one DECLARED-but-not-SETTABLE
+  section: zero or more operator-named meshes, each a `grant`/`sameOperator`
+  pair plus a `peers` map (`name -> ssh hop`, `tunnel::parse_via`'s own
+  shape). `validate` fully type- and vocabulary-checks it — same closed
+  `PEER_CAPABILITIES` grant vocabulary, `peer_store::valid_peer_name`-shaped
+  names, no peer name declared in two meshes — but it never joins `SCHEMA`:
+  the section's KEYS are the operator's own mesh/peer names, not a static
+  table `&'static str` can enumerate, so `config set` structurally cannot
+  reach into it (`SetRefusal::UnknownKey` for any `mesh.*` key, same as a
+  typo). Writing a mesh is a text edit to `config.toml` — reading what it
+  implies about the live peer registry is `aoide mesh`
+  (`aoide_client::mesh`), not this crate.
 - `session` — pure session/hook upsert operations.
 - `peer_store` — the peer-federation registry + pull cache (CONTRACTS.md §7).
   `Peer` carries two independent, opposite-direction credential fields:

@@ -476,6 +476,39 @@
   arm while the self-heard broadcast arrives on the physical interface
   (missing the loopback arm) — such a pair dials this box's own door; the
   SAS ceremony backstops it (both codes land in front of one operator).
+- **`mesh::drift` stays pure — no I/O, no clock, no env (task #135 P4).**
+  `handle_mesh` is the one impure edge; every ruling below is enforced
+  THERE, in the comparison, never smuggled into a handler-only code path
+  that a unit test can't reach.
+  - **`Peer` gains no field for this.** A mesh's shape lives entirely in
+    `config.toml`'s `[mesh.*]`; the live registry (`peer_store::Peer`) is
+    read, never written, by this comparison, and never grows a
+    mesh-shaped column to go stale against the declaration it would be
+    shadowing.
+  - **`allows` divergence is not a drift class.** `mesh.<name>.grant` is
+    declared, validated, stored, and shown back only — what, if anything,
+    ever reads it to set a peer's capability set is not yet decided
+    (`config::Mesh::grant`'s doc, `docs/architecture/PAIRING.md`'s "Mesh
+    declaration" section). Even if that lands, the natural place is
+    first-verify only: a human narrowing or widening `allows` afterward
+    via `peer allow` is a decision this comparison would have no standing
+    to re-flag on every subsequent call. Do not add a fourth class that
+    compares `grant` against live `allows`.
+  - **`undeclared` (paired, named in no mesh) is reported, never accused.**
+    It is its own field on `MeshReport`, outside every drift count, and
+    its rendering never suggests an action. Plenty of legitimate peers are
+    undeclared forever; stating the fact and stopping is the whole
+    contract.
+  - **The local host is skipped silently**, in the comparison itself
+    (never filtered post hoc by a caller) — a mesh declared identically
+    across every member box will list that box's own name among its
+    peers, and that is not a peer relationship to report on.
+  - **`via: None` on an otherwise-matched peer is the severe sub-case of
+    `ViaMismatch`**, not a fourth class: a call with no `via` dials the
+    peer's bare `url` directly, which for an already-paired peer is
+    commonly a loopback address, so it silently dials THIS box's own
+    loopback. Severity is derived at render time (`recorded.is_none()`),
+    never stored as a second field redundant with `recorded`.
 
 ## Extension points
 
@@ -496,6 +529,12 @@
   in `conduct` already uses; nothing in THIS crate changes for a new
   routed command, since `daemon_dispatch` is already generic over any
   `Invocation`.
+- **A new `mesh::DriftClass` variant** is a new match arm in `drift` (still
+  pure — see the invariant above) plus a new `render_row` arm; the variant
+  itself stays internally tagged (`#[serde(tag = "class", rename_all =
+  "kebab-case")]`) so `--json` keeps emitting one flat `{"peer": …, "class":
+  …}` object per row. Add the unit tests for the new class beside the
+  existing per-class tests in `mesh::tests` before touching the handler.
 
 ## Docs update required in the same commit
 

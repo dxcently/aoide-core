@@ -871,6 +871,31 @@ fn handle_config(_inv: &Invocation) -> Outcome {
         }
     }
 
+    // `[mesh.*]` is validated but deliberately outside SCHEMA (see the
+    // config module doc), so it never joins the walk above. Still list it —
+    // `aoide config` is the one place the file's whole effective shape
+    // shows up — but mark it as read elsewhere: `aoide mesh` is what turns
+    // this declaration into a drift report.
+    for (name, mesh) in &loaded.config.mesh {
+        // Render what the file holds, nothing substituted: `pairing.
+        // defaultGrant` is a SEPARATE key with its own SCHEMA line above,
+        // and folding it in here — as an earlier version of this listing
+        // did — reads as if the file declared a value it never wrote.
+        let grant = match &mesh.grant {
+            Some(list) => crate::config::render_value(
+                &crate::config::ValueKind::ClosedList(crate::peer_store::PEER_CAPABILITIES),
+                list,
+            ),
+            None => "absent (no override declared here — not the same as pairing.defaultGrant)".to_string(),
+        };
+        lines.push(format!(
+            "mesh.{name}  peers={}  grant={}  sameOperator={}   (file-declared; `aoide mesh` reads it)",
+            mesh.peers.len(),
+            grant,
+            mesh.same_operator,
+        ));
+    }
+
     let provenance = format!(
         "{} ({}{})",
         loaded.path.display(),

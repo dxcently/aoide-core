@@ -223,6 +223,11 @@ mod tests {
         // the ROSTER (add/list/allow/hub/spawn/pull/status/discover/
         // advertise); `pair` mints the verified records those operate on.
         // Net: 82 - 5 + 2 = 79.
+        //
+        // Task #135 P4 adds `mesh` (+1) — a read-only drift report
+        // comparing every declared `[mesh.<name>]` in config.toml against
+        // the live peer registry (`aoide_client::mesh`); writes neither
+        // side. Net: 79 + 1 = 80.
         let mut expected: Vec<&str> = vec![
             "a2a.serve",
             "adapter.melete",
@@ -250,6 +255,7 @@ mod tests {
             "melete.call",
             "melete.graph",
             "melete.status",
+            "mesh",
             "onboard",
             "pair",
             "pair.reject",

@@ -44,6 +44,7 @@ pub mod commands;
 pub mod daemon;
 pub mod discover;
 pub mod mcp_client;
+pub mod mesh;
 pub mod pair_watch;
 pub mod peer;
 pub mod tunnel;

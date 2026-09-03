@@ -541,13 +541,29 @@
 
 - **A new durable record shape** adds a type to `records` and a read/write
   pair to `fs`/`stage`; existing consumers never touch raw file paths for it.
-- **A new config key** is one row in `config::SCHEMA` plus its field on the
-  matching `Config` sub-struct (`#[serde(rename)]` when the file spelling is
-  camelCase, `#[serde(default = …)]` so an absent key still reads its
-  default). Nothing else changes — the validator, the `config` listing, and
-  `config set` all pick it up by walking the table. A new SECTION lands with
-  the consumer that reads it, never ahead of one, and updates CONTRACTS.md
-  §4's `config.toml` subsection in the same commit.
+- **A new SETTABLE config key** — one whose section name and key name are
+  both fixed, known ahead of time — is one row in `config::SCHEMA` plus its
+  field on the matching `Config` sub-struct (`#[serde(rename)]` when the
+  file spelling is camelCase, `#[serde(default = …)]` so an absent key
+  still reads its default). Nothing else changes — the validator, the
+  `config` listing, and `config set` all pick it up by walking the table. A
+  new SECTION lands with the consumer that reads it, never ahead of one,
+  and updates CONTRACTS.md §4's `config.toml` subsection in the same
+  commit.
+- **A new DECLARED-but-not-settable section** — one whose KEYS are
+  operator-chosen (a name, a hostname, anything not fixed ahead of time),
+  the shape `[mesh.<name>]` established (task #135 P4) — is a field on
+  `Config` plus its own struct, validated by a dedicated function `validate`
+  calls directly (never a `SCHEMA` row: a `&'static` table cannot enumerate
+  keys the operator invents). `config set` cannot reach it —
+  `SetRefusal::UnknownKey` refuses any key under that section by name, same
+  as a typo — so the ONLY writer is a direct edit to `config.toml`'s text.
+  Reading what the declaration implies about live state (if it implies
+  anything) is the consuming crate's job, never this one's — `aoide mesh`
+  (`aoide_client::mesh`) reads `[mesh.*]` plus `peer_store::load_peers()` to
+  report drift; this crate only parses and validates the declaration.
+  Updates CONTRACTS.md §4's `config.toml` subsection in the same commit,
+  same as a settable section.
 - **A new CLI command** (this crate has four groups today, `usage`, `inbox
   list|read|clear`, `identity`, and `config`/`config set`) adds a
   `cmd!`/`register` entry in `commands.rs`, wired into the owning app
