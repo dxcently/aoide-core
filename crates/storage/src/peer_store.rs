@@ -789,7 +789,7 @@ mod tests {
 
     #[test]
     fn load_save_peers_round_trip_through_a_temp_state_dir() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-peer-reg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -982,7 +982,7 @@ mod tests {
 
     #[test]
     fn peer_cache_round_trips_and_preserves_last_good_data_on_a_stale_mark() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-peer-cache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1067,7 +1067,7 @@ mod tests {
 
     #[test]
     fn is_autogated_peer_token_matches_only_an_autogated_peers_own_token_file() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("aoide-peer-token-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

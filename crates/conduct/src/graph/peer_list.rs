@@ -577,7 +577,7 @@ mod tests {
     }
     impl Env {
         fn set_up(tag: &str) -> Self {
-            let guard = crate::env_lock().lock().unwrap();
+            let guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
             let saved = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR"]);
             let stage = unique_stage(tag);
             let state = unique_stage(&format!("{tag}-state"));

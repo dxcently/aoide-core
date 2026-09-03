@@ -1313,7 +1313,7 @@ mod tests {
 
     #[test]
     fn a_no_resume_args_harness_is_skipped_with_a_taught_message() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
         let (root, proj_path) = setup("resurrect-skip");
 
@@ -1352,7 +1352,7 @@ mod tests {
         // folded into `failed`, never turned into a hard `Outcome::error`, so
         // the daemon's boot-time trigger can call this in a loop without ever
         // treating a display-less box as a failure worth crashing a tick over.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "AOIDE_STATE_DIR",
@@ -1404,7 +1404,7 @@ mod tests {
     /// transfer, not registration, which `resurrect_one` never gates it on.
     #[test]
     fn a_successful_resurrect_transfers_the_undying_mark_from_old_to_new() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "AOIDE_STATE_DIR",
@@ -1495,7 +1495,7 @@ mod tests {
     /// crate's.
     #[test]
     fn a_peer_origin_ledger_entry_never_derails_an_ordinary_resurrect() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "AOIDE_STATE_DIR",
@@ -1529,7 +1529,7 @@ mod tests {
     /// must leave the old id undying, so the next sweep retries it.
     #[test]
     fn a_failed_resurrect_leaves_the_old_id_undying() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "AOIDE_STATE_DIR",
@@ -1570,7 +1570,7 @@ mod tests {
     /// call it no longer is.
     #[test]
     fn transfer_is_idempotent_when_the_pair_has_already_transferred() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "AOIDE_STATE_DIR",
@@ -1627,7 +1627,7 @@ mod tests {
 
     #[test]
     fn no_ledger_history_for_the_project_is_an_ok_no_op() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
         let (root, _proj_path) = setup("resurrect-empty");
 
@@ -1640,7 +1640,7 @@ mod tests {
 
     #[test]
     fn unknown_project_is_an_error() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
         let (root, _proj_path) = setup("resurrect-unknown-project");
 
@@ -1660,7 +1660,7 @@ mod tests {
         // a fresh temp dir is guaranteed manifest-free, the same
         // assumption `aoide_storage::manifest`'s own walk-up-none test
         // already leans on).
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let scratch = unique_stage("resurrect-no-manifest-no-flags");
         let _cwd = CwdGuard::enter(&scratch);
 
@@ -1709,7 +1709,7 @@ mod tests {
     /// entry below is ever undying, and both still resolve.
     #[test]
     fn all_widens_to_every_anchored_entry_and_id_narrows_to_one_regardless_of_the_mark() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
         let (root, proj_path) = setup("resurrect-all-id");
 
@@ -1747,7 +1747,7 @@ mod tests {
     /// the same project — bare `--project` resurrects exactly the three.
     #[test]
     fn bare_default_resurrects_exactly_the_undying_set() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
         let (root, proj_path) = setup("resurrect-undying-set");
 
@@ -1779,7 +1779,7 @@ mod tests {
     /// per-id (P-C4's own scope line).
     #[test]
     fn bare_default_excludes_an_undying_id_still_live_in_the_roster() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
         let (root, proj_path) = setup("resurrect-undying-live");
 
@@ -1815,7 +1815,7 @@ mod tests {
     /// silently treated as "nothing to do" without saying why.
     #[test]
     fn bare_default_is_an_ok_no_op_when_the_undying_set_is_empty() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
         let (root, proj_path) = setup("resurrect-undying-empty");
 
@@ -1849,7 +1849,7 @@ mod tests {
     /// `endedAt`, so only one candidate is ever selected.
     #[test]
     fn bare_default_dedups_a_repeated_undying_id_keeping_the_newest_ended_at() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
         let (root, proj_path) = setup("resurrect-undying-dedup");
 
@@ -1940,7 +1940,7 @@ mod tests {
     /// `projects.json` registration at all.
     #[test]
     fn bare_mode_finds_the_manifest_and_clean_spawns_an_unmatched_spec() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG",
             "AOIDE_TERMINAL", "WAYLAND_DISPLAY", "DISPLAY",
@@ -1979,7 +1979,7 @@ mod tests {
     /// a `command` on the spec still clean-spawns it.
     #[test]
     fn bare_mode_clean_spawn_prefers_the_specs_own_command_over_a_default_launch() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG",
             "AOIDE_TERMINAL", "WAYLAND_DISPLAY", "DISPLAY",
@@ -2008,7 +2008,7 @@ mod tests {
     /// taught `failed[]` entry, never a guessed argv.
     #[test]
     fn bare_mode_clean_spawn_fails_taught_when_neither_command_nor_default_launch_exists() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
         let this_host = aoide_storage::display::local_host_name();
         let (root, cwd) = setup_manifest(
@@ -2039,7 +2039,7 @@ mod tests {
     /// taught to name `peer add`.
     #[test]
     fn bare_mode_remote_summon_fails_taught_against_an_unregistered_host() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
         let (root, cwd) = setup_manifest(
             "resurrect-manifest-remote-unknown",
@@ -2071,7 +2071,7 @@ mod tests {
     /// holds toward its own CLI callers.
     #[test]
     fn bare_mode_remote_summon_fails_taught_against_an_unverified_peer() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
         let (root, cwd) = setup_manifest(
             "resurrect-manifest-remote-unverified",
@@ -2103,7 +2103,7 @@ mod tests {
     /// before `spawn_on_peer` gets a chance to fail for a DIFFERENT reason.
     #[test]
     fn bare_mode_remote_summon_fails_taught_with_nothing_to_summon() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
         let (root, cwd) = setup_manifest(
             "resurrect-manifest-remote-no-command",
@@ -2134,7 +2134,7 @@ mod tests {
     /// refusals).
     #[test]
     fn bare_mode_remote_summon_fails_taught_when_the_peer_is_unreachable() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
         let (root, cwd) = setup_manifest(
             "resurrect-manifest-remote-unreachable",
@@ -2161,7 +2161,7 @@ mod tests {
     /// per-spec isolation every other row in this loop already holds.
     #[test]
     fn bare_mode_local_and_remote_specs_isolate_in_one_manifest() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG",
             "AOIDE_TERMINAL", "WAYLAND_DISPLAY", "DISPLAY",
@@ -2221,7 +2221,7 @@ mod tests {
     /// manifest lives in.
     #[test]
     fn bare_mode_rejects_a_dir_that_escapes_the_project_root() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
         let this_host = aoide_storage::display::local_host_name();
         let (root, cwd) = setup_manifest(
@@ -2246,7 +2246,7 @@ mod tests {
     /// already holds, now proven at the per-SPEC level.
     #[test]
     fn bare_mode_one_failing_spec_never_aborts_the_rest() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG",
             "AOIDE_TERMINAL", "WAYLAND_DISPLAY", "DISPLAY",
@@ -2280,7 +2280,7 @@ mod tests {
     /// without needing a real spawn either.
     #[test]
     fn bare_mode_enrichment_picks_the_newest_matching_ledger_entry() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
         let this_host = aoide_storage::display::local_host_name();
         let (root, cwd) = setup_manifest(
@@ -2318,7 +2318,7 @@ mod tests {
     /// `resurrect_one`-shaped row missing the key entirely.
     #[test]
     fn bare_mode_enrichment_spawn_failure_gets_a_failed_disposition_too() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG",
             "AOIDE_TERMINAL", "WAYLAND_DISPLAY", "DISPLAY",
@@ -2365,7 +2365,7 @@ mod tests {
     /// proving enrichment — not a fresh launch — is what actually fired).
     #[test]
     fn bare_mode_enrichment_revives_a_matched_restore_bearing_entry_via_the_terminal_arm() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG",
             "AOIDE_TERMINAL", "WAYLAND_DISPLAY", "DISPLAY",
@@ -2415,7 +2415,7 @@ mod tests {
     /// path above.
     #[test]
     fn bare_mode_clean_spawn_marks_the_new_session_undying() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG",
             "AOIDE_TERMINAL", "WAYLAND_DISPLAY", "DISPLAY",

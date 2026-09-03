@@ -1811,7 +1811,7 @@ mod tests {
     }
     #[test]
     fn conduct_injects_socket_bytes_into_the_child() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "XDG_RUNTIME_DIR"]);
 
         let root = unique_stage("conduct-inject");
@@ -1875,7 +1875,7 @@ mod tests {
     /// EMPTY is the refusal, not a hang.
     #[test]
     fn accept_refuses_a_connection_from_within_its_own_session_subtree() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "XDG_RUNTIME_DIR"]);
 
         let root = unique_stage("conduct-self-refuse");
@@ -1963,7 +1963,7 @@ mod tests {
     /// sits one level up in its real `/proc` ancestry.
     #[test]
     fn accept_delivers_from_a_distinct_child_session_that_is_a_real_os_descendant() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "XDG_RUNTIME_DIR"]);
 
         let root = unique_stage("conduct-child-delivers");
@@ -2055,7 +2055,7 @@ mod tests {
     }
     #[test]
     fn conduct_mirrors_a_nonzero_child_exit() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "XDG_RUNTIME_DIR"]);
 
         let root = unique_stage("conduct-fail");
@@ -2092,7 +2092,7 @@ mod tests {
     /// to it.
     #[test]
     fn conduct_of_a_nonexistent_binary_registers_no_session_at_all() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "XDG_RUNTIME_DIR"]);
 
         let root = unique_stage("conduct-missing-bin");
@@ -2133,7 +2133,7 @@ mod tests {
     /// `logPath` exactly the same way.
     #[test]
     fn conduct_interactive_also_mirrors_pty_output_to_the_log_and_stamps_log_path() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR"]);
 
         let root = unique_stage("conduct-interactive-tee");
@@ -2166,7 +2166,7 @@ mod tests {
     /// test process happens to run under.
     #[test]
     fn session_log_and_its_directory_are_created_with_private_permissions() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR"]);
 
         let root = unique_stage("conduct-log-perms");
@@ -2206,7 +2206,7 @@ mod tests {
     /// what it is labelled.
     #[test]
     fn a_shell_conducted_under_a_non_shell_agent_label_still_gets_captured() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR"]);
 
         let root = unique_stage("conduct-non-shell-label");
@@ -2235,7 +2235,7 @@ mod tests {
     }
     #[test]
     fn conduct_headless_mirrors_pty_output_to_the_log_and_stamps_log_path() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR"]);
 
         let root = unique_stage("conduct-headless");
@@ -2275,7 +2275,7 @@ mod tests {
     /// permanent regardless of what any discovery path does or doesn't find.
     #[test]
     fn headless_conduct_registration_stamps_the_permanent_headless_marker() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR"]);
 
         let root = unique_stage("conduct-headless-marker");
@@ -2332,7 +2332,7 @@ mod tests {
         // by `aoide-server::a2a::do_spawn` calling `stamp_origin` directly
         // on the record (proven in that crate's own test, which this crate
         // cannot see).
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_SESSION_ORIGIN"]);
 
         let root = unique_stage("conduct-origin-marker");
@@ -2386,7 +2386,7 @@ mod tests {
 
     #[test]
     fn session_refresh_drives_shell_cwd_command_and_state() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("refresh");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);

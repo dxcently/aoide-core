@@ -72,14 +72,14 @@ mod tests {
 
     #[test]
     fn seed_rejects_a_missing_song_argument() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let out = handle_element_seed(&aoide_test_support::inv(&["element", "seed"], &[]));
         assert_eq!(out.status, aoide_protocol::output::Status::Usage);
     }
 
     #[test]
     fn seed_rejects_an_invalid_song_name() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let out = handle_element_seed(&aoide_test_support::inv(&["element", "seed"], &["Bad Name"]));
         assert_eq!(out.status, aoide_protocol::output::Status::Error);
         assert_eq!(out.data.unwrap()["reason"], "invalid-name");
@@ -90,7 +90,7 @@ mod tests {
         // `songbook_dir`/`run_elements_dir` both hang off `AOIDE_STAGE_DIR`
         // (`root/stage` → song tree resolves at `root`) — mirrors
         // `commands/rice.rs`'s own test rig.
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("element-seed-cmd");
         std::env::set_var("AOIDE_STAGE_DIR", root.join("stage"));

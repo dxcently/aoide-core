@@ -87,6 +87,16 @@ pub const NOTES_WITH_INTERPOLATION: &str = r##"{ "schemaVersion":"0",
 /// (`AOIDE_STAGE_DIR`, `PATH`, …). `std::env::set_var` is
 /// process-global, so env-touching tests across modules must share ONE mutex or
 /// they race each other under the multithreaded test harness.
+///
+/// Acquisition is poison-tolerant everywhere, by convention:
+/// `.lock().unwrap_or_else(|e| e.into_inner())`, never a bare `.unwrap()`.
+/// A test that panics while holding this guard has already failed ITSELF, and
+/// every critical section sets the env it needs at entry — there is no
+/// predecessor state to trust, so the poison carries no information. A bare
+/// `.unwrap()` here converts one real failure into a suite-wide cascade that
+/// buries the root under dozens of `PoisonError` panics (worst on a loaded
+/// builder, where a timing-sensitive test is likeliest to trip first). The
+/// same rule applies to every crate-local test guard shaped like this one.
 pub fn env_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     &LOCK

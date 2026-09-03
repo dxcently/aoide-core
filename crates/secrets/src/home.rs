@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn env_override_wins_when_set_and_non_blank() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_SECRETS_HOME").ok();
         std::env::set_var("AOIDE_SECRETS_HOME", "/tmp/aoide-secrets-test-home");
         assert_eq!(secrets_home(), PathBuf::from("/tmp/aoide-secrets-test-home"));
@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn default_is_the_documented_placeholder_path() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_SECRETS_HOME").ok();
         std::env::remove_var("AOIDE_SECRETS_HOME");
         assert_eq!(secrets_home(), PathBuf::from("/var/lib/aoide-secrets"));
@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn blank_env_value_falls_back_to_default() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_SECRETS_HOME").ok();
         std::env::set_var("AOIDE_SECRETS_HOME", "   ");
         assert_eq!(secrets_home(), PathBuf::from("/var/lib/aoide-secrets"));

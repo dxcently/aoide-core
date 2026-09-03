@@ -2119,7 +2119,7 @@ mod tests {
         assert!(!sender_is_parent(Some(""), Some("orch")));
 
         // The gate resolves in priority order: --yes ▸ global env ▸ parent ▸ pending.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_CONDUCT_AUTOGATE"]);
         std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
         assert_eq!(send_gate(true, false, false), SendGate::Yes); // --yes wins outright
@@ -2149,7 +2149,7 @@ mod tests {
         assert!(!siblings_share_live_parent(Some("orch"), Some("other"), true));
 
         // The env opt-out: absent/anything-else → enabled; {0,false,no} → disabled.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_CONDUCT_SIBLING_AUTOGATE"]);
         std::env::remove_var("AOIDE_CONDUCT_SIBLING_AUTOGATE");
         assert!(sibling_autogate_enabled());
@@ -2175,7 +2175,7 @@ mod tests {
     }
     #[test]
     fn send_yes_delivers_and_autorenames_the_title() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -2258,7 +2258,7 @@ mod tests {
         // `graph --json` emits node ids as `session:<id>` (doc.rs's
         // `render`); an agent copying that field verbatim into `--id`
         // must resolve to the exact same session a bare `--id` would.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -2334,7 +2334,7 @@ mod tests {
         // seam that files a delivered message into `state/inbox.json` — see
         // `aoide_storage::inbox`'s module doc for why the A2A door's
         // `do_inject` does not need (and must not add) a second append.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "AOIDE_STATE_DIR",
@@ -2397,7 +2397,7 @@ mod tests {
     fn a_send_left_pending_is_not_filed_into_the_inbox_until_approved() {
         // Only a SUCCESSFUL delivery files — a held-pending send must not
         // appear in the inbox at all yet.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "AOIDE_STATE_DIR",
@@ -2455,7 +2455,7 @@ mod tests {
         assert!(!names_the_node("  2  "));
         assert!(!names_the_node("")); // an empty send names nothing either
 
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -2559,7 +2559,7 @@ mod tests {
     }
     #[test]
     fn resolve_sender_is_tri_state_absent_present_or_explicitly_anonymous() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_SESSION_ID"]);
 
         // Neither source present → None.
@@ -2596,7 +2596,7 @@ mod tests {
         // newline is legal in either — but the provenance prefix built from
         // this value crosses into a TUI's input stream, where an unsanitized
         // newline would submit a bogus extra line ahead of the real text.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_SESSION_ID"]);
 
         std::env::remove_var("AOIDE_SESSION_ID");
@@ -2617,7 +2617,7 @@ mod tests {
     }
     #[test]
     fn delivered_payload_carries_the_provenance_prefix_but_the_title_does_not() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -2698,7 +2698,7 @@ mod tests {
     /// instead of `"claude"`.
     #[test]
     fn send_to_a_shell_target_from_another_session_is_delivered_verbatim_no_provenance_prefix() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -2764,7 +2764,7 @@ mod tests {
     /// 900` and bash threw a syntax error instead of restoring anything.
     #[test]
     fn a_send_attributed_to_the_target_itself_is_delivered_unprefixed() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -2830,7 +2830,7 @@ mod tests {
         // verdict (or a hand-typed answer of the same shape) must reach the
         // socket as EXACTLY the digit + newline — a provenance prefix here
         // would corrupt the keystroke the target's TUI is waiting to read.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -2893,7 +2893,7 @@ mod tests {
         // unsanitized sender would inject a second, EARLY-SUBMITTED line into
         // the target's TUI ahead of the real text. The delivered bytes must
         // carry EXACTLY the one newline `--submit` asked for.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -2961,7 +2961,7 @@ mod tests {
         // the delivered payload must carry exactly that byte, resolved from
         // the TARGET's own registered agent, not a fixed `\n` at the call
         // site.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -3111,7 +3111,7 @@ mod tests {
         // An unregistered ("shell") or empty agent string falls back to the
         // claude profile's `\n` — the same fallback `profile_for_agent`
         // already applies for `session permit`.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -3178,7 +3178,7 @@ mod tests {
         // already collapses an embedded `\r` in `--from` to a space, and the
         // ONE `\r` in the delivered payload must be the trailing submit
         // keystroke — never one smuggled in early by an unsanitized sender.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -3248,7 +3248,7 @@ mod tests {
         // the ALREADY-LOADED roster at delivery time, not the raw session id
         // `resolve_sender` produced. Every session minted since P2 carries a
         // petname automatically, so a registered sender always hits this path.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -3327,7 +3327,7 @@ mod tests {
         // the raw id — the same fallback a legacy/petname-less record would
         // hit, exercised here via the far more common real-world case: an
         // unknown sender.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -3386,7 +3386,7 @@ mod tests {
     }
     #[test]
     fn send_without_yes_is_held_pending_not_delivered() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -3497,7 +3497,7 @@ mod tests {
 
     #[test]
     fn send_delivers_when_sender_is_the_targets_parent() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG", "AOIDE_CONDUCT_AUTOGATE"]);
 
         let root = unique_stage("send-parent");
@@ -3581,7 +3581,7 @@ mod tests {
     }
     #[test]
     fn send_delivers_between_siblings_of_a_live_parent() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -3708,7 +3708,7 @@ mod tests {
     /// sees the responsibility named here, not silently missing.
     #[test]
     fn send_to_self_gate_arithmetic_would_deliver_the_block_now_lives_at_the_socket() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -3778,7 +3778,7 @@ mod tests {
         // predicate is true, the label must be the global arm's ("autogate"),
         // never "autogate-sibling" — a future refactor that reorders the `if`
         // chain in `send_gate` should trip this, not silently relabel deliveries.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_CONDUCT_AUTOGATE"]);
         std::env::set_var("AOIDE_CONDUCT_AUTOGATE", "1");
         let gate = send_gate(false, false, true);
@@ -3791,7 +3791,7 @@ mod tests {
         // already unit-tested; this proves the RESOLUTION through a real
         // SessionsFile record actually feeds it — a parent whose on-disk state
         // is `done` must gate the sibling send, not just the bool parameter.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -3863,7 +3863,7 @@ mod tests {
     /// (module doc), not a special case carved out for the test.
     #[test]
     fn send_ignores_a_forged_aoide_session_id_env_the_real_production_path() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -3919,7 +3919,7 @@ mod tests {
     }
     #[test]
     fn send_unknown_or_unconductable_is_a_clean_error() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_AUDIT_LOG"]);
 
         let root = unique_stage("send-err");
@@ -4079,7 +4079,7 @@ mod tests {
         // for `--id`, driven through `--to` instead — proving resolution
         // funnels into `deliver_local` unmodified, not a parallel
         // reimplementation of the gate/delivery/rename path.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -4139,7 +4139,7 @@ mod tests {
 
     #[test]
     fn to_local_ambiguous_petname_is_a_hard_error_never_first_match() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_AUDIT_LOG"]);
 
         let root = unique_stage("to-ambiguous");
@@ -4165,7 +4165,7 @@ mod tests {
 
     #[test]
     fn to_unknown_bare_peer_name_hints_the_slash_form() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_AUDIT_LOG"]);
 
         let root = unique_stage("to-bare-peer");
@@ -4197,7 +4197,7 @@ mod tests {
         // a local session nor a known peer at all (no registered peers, and
         // not slash-shaped), so the "did you mean `peer/<rest>`?" hint must
         // NOT fire — a bare, unrecognized token gets the plain message.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_AUDIT_LOG"]);
 
         let root = unique_stage("to-plain-notfound");
@@ -4240,7 +4240,7 @@ mod tests {
 
     #[test]
     fn to_remote_with_no_cache_points_at_peer_pull() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_AUDIT_LOG"]);
 
         let root = unique_stage("to-remote-no-cache");
@@ -4282,7 +4282,7 @@ mod tests {
     /// "not-found" error.
     #[test]
     fn send_to_an_unmatched_target_routes_via_the_hub_peer() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_AUDIT_LOG"]);
 
         let root = unique_stage("to-hub-fallback");
@@ -4320,7 +4320,7 @@ mod tests {
         // actually attempted the network delivery (the part THIS phase
         // owns) — not that the delivery succeeds, which is `aoide-client`'s
         // own transport, untouched here beyond threading `context_id`.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_AUDIT_LOG"]);
 
         let root = unique_stage("to-remote-deliver");
@@ -4371,7 +4371,7 @@ mod tests {
 
     #[test]
     fn to_remote_ambiguous_in_the_cache_lists_peer_session_labels() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_AUDIT_LOG"]);
 
         let root = unique_stage("to-remote-ambiguous");
@@ -4407,7 +4407,7 @@ mod tests {
 
     #[test]
     fn to_remote_not_found_in_the_cache_lists_available_sessions() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_AUDIT_LOG"]);
 
         let root = unique_stage("to-remote-notfound");
@@ -4651,7 +4651,7 @@ mod tests {
     }
     #[test]
     fn hook_lifecycle_start_running_waiting_end() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("sess-hook");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -4722,7 +4722,7 @@ mod tests {
         // usual convention here) AND the config root (`AOIDE_ROOT`) — the
         // check lane reads `aoide_storage::config`, which every OTHER test in
         // this module never touches and must not start touching by accident.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_ROOT", "AOIDE_CONFIG", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         std::env::remove_var("AOIDE_CONFIG");
@@ -4785,7 +4785,7 @@ mod tests {
         // REAL delta (a fresh untracked `.nix` file) and must stay silent to
         // the harness regardless — the note only surfaces at the next
         // `UserPromptSubmit`, and only once.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_ROOT", "AOIDE_CONFIG", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         std::env::remove_var("AOIDE_CONFIG");
@@ -4865,7 +4865,7 @@ mod tests {
         // and the mid-turn one: if the mid-turn arm ran the lane fresh, the
         // flip would flow straight into a different message and a rewritten
         // file. Neither happens.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_ROOT", "AOIDE_CONFIG", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         std::env::remove_var("AOIDE_CONFIG");
@@ -4922,7 +4922,7 @@ mod tests {
     }
     #[test]
     fn hook_notification_blocks_and_the_clearing_set_lifts_it() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("sess-blocked");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -4997,7 +4997,7 @@ mod tests {
     }
     #[test]
     fn first_user_prompt_names_the_session_set_once() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("name");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -5031,7 +5031,7 @@ mod tests {
     }
     #[test]
     fn subagent_task_builds_nests_and_collapses_the_tree() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("subagent");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -5129,7 +5129,7 @@ mod tests {
         // completion — so it must NOT tear the node down. It re-keys the node to
         // `sub:<agentId>`, and only the much-later SubagentStop (agent_id only)
         // ends it.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("async-agent");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -5212,7 +5212,7 @@ mod tests {
         // established per-dispatch by each call's OWN PostToolUse. Prove each node
         // re-keys to its own agent_id with zero cross-contamination, and each
         // SubagentStop ends only its own node.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("async-concurrent");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -5282,7 +5282,7 @@ mod tests {
     }
     #[test]
     fn kimi_hook_lifecycle_start_prompt_permission_end() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("kimi-hook");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -5349,7 +5349,7 @@ mod tests {
     }
     #[test]
     fn kimi_hook_normalizes_native_fields_and_drives_the_subagent_lifecycle() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("kimi-norm");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -5428,7 +5428,7 @@ mod tests {
     }
     #[test]
     fn pi_hook_lifecycle_start_prompt_tools_stop_end() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("pi-hook");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -5515,7 +5515,7 @@ mod tests {
         // self-reports `process.pid`; the door must store THAT as the
         // session's pid (at Start AND as a refresh on any later hook), so the
         // reaper's /proc signal fires when the agent dies, terminal or not.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("pi-pid");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -5576,7 +5576,7 @@ mod tests {
         // included) and the transcript refresh must PREFER it over the aoide
         // catalog — a custom/provider model the catalog has never heard of
         // gets the right meter instead of the conservative default.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("pi-ceil");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -5656,7 +5656,7 @@ mod tests {
         // event this door has no action for (kimi's PreCompact) must land
         // it, but an unmapped event for a session that never registered
         // must stay a silent no-op (no ghost record).
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("harness-sid");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -5722,7 +5722,7 @@ mod tests {
         // could ever re-register it — SessionStart fires only at harness
         // launch. The door must treat the first event for an unknown id as an
         // implicit start.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("hook-heal");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -5774,7 +5774,7 @@ mod tests {
     fn hook_end_for_an_unknown_session_stays_a_noop() {
         // SessionEnd must NOT create a session — ending something that never
         // existed is a no-op, not an implicit start.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("hook-end-noop");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);

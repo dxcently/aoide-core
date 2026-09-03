@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn receive_writes_atomically_and_load_round_trips() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("aoide-inbox-recv-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn mark_read_flips_only_the_named_index_and_positions_stay_stable() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("aoide-inbox-read-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
@@ -331,7 +331,7 @@ mod tests {
 
     #[test]
     fn clear_empties_and_reports_how_many_were_dropped() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("aoide-inbox-clear-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
@@ -352,7 +352,7 @@ mod tests {
 
     #[test]
     fn load_on_a_missing_file_is_an_empty_ok() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("aoide-inbox-missing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let saved = std::env::var("AOIDE_STATE_DIR").ok();

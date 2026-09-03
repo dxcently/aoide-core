@@ -89,7 +89,7 @@ mod tests {
 
     #[test]
     fn env_override_wins_when_set_and_non_blank() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_SECRETS_SOCKET").ok();
         std::env::set_var("AOIDE_SECRETS_SOCKET", "/tmp/av-test.sock");
         assert_eq!(socket_path(), PathBuf::from("/tmp/av-test.sock"));
@@ -104,7 +104,7 @@ mod tests {
         // P-V4d: the default no longer derives from AOIDE_SECRETS_HOME — a
         // client shell with only AOIDE_SECRETS_HOME set (never
         // AOIDE_SECRETS_SOCKET) must still resolve the real deployed socket.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_sock = std::env::var("AOIDE_SECRETS_SOCKET").ok();
         let saved_home = std::env::var("AOIDE_SECRETS_HOME").ok();
         std::env::remove_var("AOIDE_SECRETS_SOCKET");
@@ -122,7 +122,7 @@ mod tests {
 
     #[test]
     fn blank_env_value_falls_back_to_the_canonical_default() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_sock = std::env::var("AOIDE_SECRETS_SOCKET").ok();
         let saved_home = std::env::var("AOIDE_SECRETS_HOME").ok();
         std::env::set_var("AOIDE_SECRETS_SOCKET", "  ");
@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn events_default_is_a_sibling_of_the_socket_path() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_SECRETS_EVENTS").ok();
         std::env::remove_var("AOIDE_SECRETS_EVENTS");
         assert_eq!(
@@ -164,7 +164,7 @@ mod tests {
 
     #[test]
     fn events_env_override_wins_over_the_derived_sibling() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_SECRETS_EVENTS").ok();
         std::env::set_var("AOIDE_SECRETS_EVENTS", "/tmp/av-test-events.jsonl");
         assert_eq!(
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn events_blank_env_value_falls_back_to_the_derived_sibling() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_SECRETS_EVENTS").ok();
         std::env::set_var("AOIDE_SECRETS_EVENTS", "   ");
         assert_eq!(

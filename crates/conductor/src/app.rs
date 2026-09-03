@@ -1817,7 +1817,7 @@ mod tests {
     /// not a fixture. `AOIDE_STAGE_DIR` overrides both at once, same as
     /// today — see `App::stage`/`App::rice_stage`.
     fn with_isolated_stage<R>(f: impl FnOnce() -> R) -> R {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tmp_dir("stage-isolated");
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_audit = std::env::var("AOIDE_AUDIT_LOG").ok();
@@ -2009,7 +2009,7 @@ mod tests {
     #[test]
     fn roster_tick_with_a_fresh_cache_does_not_redispatch() {
         with_isolated_stage(|| {
-            let _rguard = ROSTER_TEST_LOCK.lock().unwrap();
+            let _rguard = ROSTER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             ROSTER_CALLS.store(0, Ordering::SeqCst);
 
             let mut app = App::for_test_with_dispatch(counting_roster_dispatch);
@@ -2026,7 +2026,7 @@ mod tests {
     #[test]
     fn roster_tick_with_a_stale_cache_while_visible_redispatches() {
         with_isolated_stage(|| {
-            let _rguard = ROSTER_TEST_LOCK.lock().unwrap();
+            let _rguard = ROSTER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             ROSTER_CALLS.store(0, Ordering::SeqCst);
 
             let mut app = App::for_test_with_dispatch(counting_roster_dispatch);
@@ -2046,7 +2046,7 @@ mod tests {
     #[test]
     fn roster_tick_while_hidden_never_dispatches_even_when_stale() {
         with_isolated_stage(|| {
-            let _rguard = ROSTER_TEST_LOCK.lock().unwrap();
+            let _rguard = ROSTER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             ROSTER_CALLS.store(0, Ordering::SeqCst);
 
             let mut app = App::for_test_with_dispatch(counting_roster_dispatch);
@@ -2061,7 +2061,7 @@ mod tests {
 
     #[test]
     fn switching_into_roster_with_a_stale_cache_dispatches_immediately() {
-        let _rguard = ROSTER_TEST_LOCK.lock().unwrap();
+        let _rguard = ROSTER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         ROSTER_CALLS.store(0, Ordering::SeqCst);
 
         let mut app = App::for_test_with_dispatch(counting_roster_dispatch);
@@ -2079,7 +2079,7 @@ mod tests {
 
     #[test]
     fn switching_into_roster_with_a_fresh_cache_does_not_redispatch() {
-        let _rguard = ROSTER_TEST_LOCK.lock().unwrap();
+        let _rguard = ROSTER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         ROSTER_CALLS.store(0, Ordering::SeqCst);
 
         let mut app = App::for_test_with_dispatch(counting_roster_dispatch);
@@ -2093,7 +2093,7 @@ mod tests {
 
     #[test]
     fn manual_refresh_key_forces_a_dispatch_even_with_a_fresh_cache() {
-        let _rguard = ROSTER_TEST_LOCK.lock().unwrap();
+        let _rguard = ROSTER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         ROSTER_CALLS.store(0, Ordering::SeqCst);
 
         let mut app = App::for_test_with_dispatch(counting_roster_dispatch);
@@ -2112,7 +2112,7 @@ mod tests {
 
     #[test]
     fn a_fetch_already_in_flight_is_never_duplicated() {
-        let _rguard = ROSTER_TEST_LOCK.lock().unwrap();
+        let _rguard = ROSTER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         ROSTER_CALLS.store(0, Ordering::SeqCst);
 
         let mut app = App::for_test_with_dispatch(counting_roster_dispatch);
@@ -2312,7 +2312,7 @@ mod tests {
 
     #[test]
     fn compose_builds_the_exact_expected_invocation() {
-        let _g = COMPOSE_TEST_LOCK.lock().unwrap();
+        let _g = COMPOSE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         COMPOSE_CALLS.lock().unwrap().clear();
 
         with_isolated_stage(|| {
@@ -2376,7 +2376,7 @@ mod tests {
 
     #[test]
     fn r_on_the_projects_panel_resurrects_the_focused_project() {
-        let _g = PROJECTS_TEST_LOCK.lock().unwrap();
+        let _g = PROJECTS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         RESURRECT_CALLS.lock().unwrap().clear();
 
         let mut app = App::for_test_with_dispatch(recording_resurrect_dispatch);
@@ -2410,7 +2410,7 @@ mod tests {
 
     #[test]
     fn r_on_the_projects_panel_with_no_projects_is_a_no_op() {
-        let _g = PROJECTS_TEST_LOCK.lock().unwrap();
+        let _g = PROJECTS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         RESURRECT_CALLS.lock().unwrap().clear();
 
         let mut app = App::for_test_with_dispatch(recording_resurrect_dispatch);
@@ -2473,7 +2473,7 @@ mod tests {
 
     #[test]
     fn approve_dispatches_pending_approve_then_relists_and_positions_shift() {
-        let _g = PENDING_TEST_LOCK.lock().unwrap();
+        let _g = PENDING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         PENDING_CALLS.lock().unwrap().clear();
         *PENDING_QUEUE.lock().unwrap() =
             vec![("s0".into(), "a".into()), ("s1".into(), "b".into()), ("s2".into(), "c".into())];
@@ -2502,7 +2502,7 @@ mod tests {
 
     #[test]
     fn deny_dispatches_pending_deny_then_relists() {
-        let _g = PENDING_TEST_LOCK.lock().unwrap();
+        let _g = PENDING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         PENDING_CALLS.lock().unwrap().clear();
         *PENDING_QUEUE.lock().unwrap() = vec![("s0".into(), "a".into()), ("s1".into(), "b".into())];
 
@@ -2532,7 +2532,7 @@ mod tests {
         // WAS at the selected index before the first resolve, not what's
         // there now. Three entries, approve twice at index 0: must take s0
         // then s1 (never s0 twice, never skip to s2).
-        let _g = PENDING_TEST_LOCK.lock().unwrap();
+        let _g = PENDING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         PENDING_CALLS.lock().unwrap().clear();
         *PENDING_QUEUE.lock().unwrap() =
             vec![("s0".into(), "a".into()), ("s1".into(), "b".into()), ("s2".into(), "c".into())];
@@ -2553,7 +2553,7 @@ mod tests {
 
     #[test]
     fn resolve_on_an_empty_pending_list_does_not_panic() {
-        let _g = PENDING_TEST_LOCK.lock().unwrap();
+        let _g = PENDING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         PENDING_CALLS.lock().unwrap().clear();
         *PENDING_QUEUE.lock().unwrap() = Vec::new();
 
@@ -2572,7 +2572,7 @@ mod tests {
 
     #[test]
     fn pending_selection_walks_rows_and_clamps() {
-        let _g = PENDING_TEST_LOCK.lock().unwrap();
+        let _g = PENDING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         PENDING_CALLS.lock().unwrap().clear();
         *PENDING_QUEUE.lock().unwrap() = vec![("s0".into(), "a".into()), ("s1".into(), "b".into())];
 

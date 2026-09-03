@@ -250,7 +250,7 @@ mod tests {
     /// this test.
     #[test]
     fn declarative_mode_is_shell_reload_only_and_always_ok() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("reload-declarative");
         let stage = root.join("stage");
@@ -273,7 +273,7 @@ mod tests {
     /// all.
     #[test]
     fn declarative_mode_never_mints_a_take() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("reload-declarative-no-take");
         let stage = root.join("stage");
@@ -300,7 +300,7 @@ mod tests {
     /// reloads successfully.
     #[test]
     fn staging_mode_reload_takes_off_the_song_and_succeeds() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let root = unique_tmp("reload-staging-routing");
@@ -342,7 +342,7 @@ mod tests {
     /// User's own settled rule, 2026-08-31.
     #[test]
     fn staging_mode_reload_dedupes_against_an_unchanged_head() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let root = unique_tmp("reload-staging-dedupe");
@@ -410,7 +410,7 @@ mod tests {
     /// would be caught immediately: the draft's own content must survive.
     #[test]
     fn draft_mode_reload_takes_off_the_draft_and_never_clobbers_it() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let root = unique_tmp("reload-draft-routing");

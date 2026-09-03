@@ -1997,7 +1997,7 @@ mod tests {
     /// (not just the pure predicate above).
     #[test]
     fn reap_spares_a_headless_session_kept_alive_by_a_fresh_hook_updated_at() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env =
             crate::graph::testutil::EnvVars::save(&["AOIDE_STAGE_DIR", "HYPRLAND_INSTANCE_SIGNATURE"]);
         std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"); // pid-only/no-window liveness
@@ -2051,7 +2051,7 @@ mod tests {
     /// nothing. A live session's own hook is untouched.
     #[test]
     fn reap_drops_orphaned_hook_records_with_no_session() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env =
             crate::graph::testutil::EnvVars::save(&["AOIDE_STAGE_DIR", "HYPRLAND_INSTANCE_SIGNATURE"]);
         std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"); // pid-only/no-window liveness
@@ -2375,7 +2375,7 @@ mod tests {
     /// live sibling and an unrelated lone tombstone both survive.
     #[test]
     fn reap_refreshes_a_live_agents_say_and_tool_from_its_transcript() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = crate::graph::testutil::EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "HYPRLAND_INSTANCE_SIGNATURE",
@@ -2438,7 +2438,7 @@ mod tests {
     }
     #[test]
     fn reap_drops_superseded_done_siblings_on_an_otherwise_quiet_pass() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env =
             crate::graph::testutil::EnvVars::save(&["AOIDE_STAGE_DIR", "HYPRLAND_INSTANCE_SIGNATURE"]);
         std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"); // pid-only/no-window liveness
@@ -2523,7 +2523,7 @@ mod tests {
         // stream predates `boot_epoch()`) is used to guarantee a REAL reap
         // deterministically, with no dependency on a real `/proc/<pid>`
         // probe finding a pid absent.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = crate::graph::testutil::EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "AOIDE_STATE_DIR",
@@ -3081,7 +3081,7 @@ mod tests {
     fn reap_collects_a_spawned_worker_shell_whose_log_has_gone_stale() {
         use std::os::unix::ffi::OsStrExt;
 
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = crate::graph::testutil::EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "AOIDE_STATE_DIR",
@@ -3194,7 +3194,7 @@ mod tests {
     /// signal — this test isolates `abandoned_spawned_shells` alone.)
     #[test]
     fn reap_spares_a_spawned_worker_shell_whose_log_was_touched_after_spawn() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = crate::graph::testutil::EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "AOIDE_STATE_DIR",
@@ -3236,7 +3236,7 @@ mod tests {
     /// predicate.
     #[test]
     fn reap_now_takes_a_spawned_worker_shell_the_band_would_have_spared() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = crate::graph::testutil::EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "AOIDE_STATE_DIR",
@@ -3311,7 +3311,7 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::net::UnixListener;
 
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = crate::graph::testutil::EnvVars::save(&["XDG_RUNTIME_DIR"]);
         let runtime = crate::graph::testutil::unique_stage("reap-sockets");
         std::fs::create_dir_all(runtime.join("aoide")).unwrap();
@@ -3385,7 +3385,7 @@ mod tests {
     fn orphan_ssh_tunnels_are_swept_only_when_roster_less_and_settled() {
         use std::os::unix::ffi::OsStrExt;
 
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = crate::graph::testutil::EnvVars::save(&["XDG_RUNTIME_DIR"]);
         let runtime = crate::graph::testutil::unique_stage("reap-tunnels");
         std::fs::create_dir_all(runtime.join("aoide")).unwrap();
@@ -3507,7 +3507,7 @@ mod tests {
     fn sweep_orphan_tunnels_keeps_a_record_whose_child_survives_the_kill() {
         use std::os::unix::process::CommandExt;
 
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = crate::graph::testutil::EnvVars::save(&["XDG_RUNTIME_DIR"]);
         let runtime = crate::graph::testutil::unique_stage("reap-tunnel-survivor");
         std::fs::create_dir_all(runtime.join("aoide")).unwrap();
@@ -3598,7 +3598,7 @@ mod tests {
     /// it stays `prune_done`'s own job, on its own schedule).
     #[test]
     fn reap_treats_a_done_but_unpruned_sessions_settled_tunnel_as_a_candidate() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = crate::graph::testutil::EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",

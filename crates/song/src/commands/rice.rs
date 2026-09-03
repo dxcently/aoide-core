@@ -813,7 +813,7 @@ mod tests {
 
     #[test]
     fn lint_no_arg_without_staged_notes_is_usage_exit_2() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("lint-nostage"); // exists, but no livery.json
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -826,7 +826,7 @@ mod tests {
 
     #[test]
     fn lint_no_arg_resolves_staged_default_and_passes_natively() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("lint-staged");
         std::fs::write(stage.join("livery.json"), VALID_NOTES).unwrap();
@@ -848,7 +848,7 @@ mod tests {
 
     #[test]
     fn lint_bare_name_resolves_to_songbook_notes_not_a_literal_path() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("lint-name");
         let stage = root.join("stage");
@@ -871,7 +871,7 @@ mod tests {
 
     #[test]
     fn lint_existing_path_arg_is_taken_literally() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("lint-path");
         let file = root.join("elsewhere.json");
@@ -887,7 +887,7 @@ mod tests {
 
     #[test]
     fn lint_invalid_notes_report_the_schema_errors_natively() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("lint-invalid");
         let file = root.join("bad.json");
@@ -907,7 +907,7 @@ mod tests {
 
     #[test]
     fn stage_writes_notes_and_reports_no_derivable_cover() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("stage-ok");
         let stage = root.join("stage");
@@ -944,7 +944,7 @@ mod tests {
 
     #[test]
     fn stage_writes_a_derivable_cover_from_the_covers_library() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("stage-cover");
         let stage = root.join("stage");
@@ -969,7 +969,7 @@ mod tests {
 
     #[test]
     fn stage_missing_song_is_error_exit_1() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("stage-missing").join("stage");
         std::fs::create_dir_all(&stage).unwrap();
@@ -990,7 +990,7 @@ mod tests {
 
     #[test]
     fn stage_rejects_a_path_traversal_name_before_reading_or_writing_anything() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("stage-traversal");
         let stage = root.join("stage");
@@ -1011,7 +1011,7 @@ mod tests {
 
     #[test]
     fn stage_entry_refuses_while_declarative_mode_is_locked() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("stage-entry-locked");
         let stage = root.join("stage");
@@ -1032,7 +1032,7 @@ mod tests {
 
     #[test]
     fn stage_entry_allows_writes_once_staging_mode_is_unlocked() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("stage-entry-unlocked");
         let stage = root.join("stage");
@@ -1060,7 +1060,7 @@ mod tests {
 
     #[test]
     fn stage_entry_with_no_name_resolves_the_current_song() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("stage-entry-bare-resolve");
         let stage = root.join("stage");
@@ -1105,7 +1105,7 @@ mod tests {
         // `mode.json` completely alone: the routing (mode/song/draft) is
         // unaffected by this write, so touching the marker here would be
         // both unnecessary and risk contradicting it.
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("stage-entry-draft-mode-symlink");
         let stage = root.join("stage");
@@ -1178,7 +1178,7 @@ mod tests {
 
     #[test]
     fn stage_entry_in_draft_mode_mints_an_auto_take_on_a_real_change() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, _stage, song) = draft_routed_for_auto_take("stage-autotake-fires");
         std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
@@ -1208,7 +1208,7 @@ mod tests {
         // take tree an incomplete record of write events; the resulting
         // duplicate-take noise is `rice take prune`'s problem (phase A9),
         // not this hook's.
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, _stage, song) = draft_routed_for_auto_take("stage-autotake-repeat");
         std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
@@ -1237,7 +1237,7 @@ mod tests {
 
     #[test]
     fn stage_entry_with_no_name_and_nothing_resolvable_is_usage_exit_2() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("stage-entry-bare-unresolvable").join("stage");
         std::fs::create_dir_all(&stage).unwrap();
@@ -1262,7 +1262,7 @@ mod tests {
         // The common test path: no compositor, `hyprctl` may not even exist on
         // PATH — the guard must trip on the env var alone, never touching the
         // process spawn.
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "HYPRLAND_INSTANCE_SIGNATURE"]);
         std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
         let root = unique_tmp("stage-hypr-off");
@@ -1284,7 +1284,7 @@ mod tests {
 
     #[test]
     fn stage_with_no_window_or_geometry_reports_an_empty_batch() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "HYPRLAND_INSTANCE_SIGNATURE"]);
         std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
         let root = unique_tmp("stage-hypr-empty");
@@ -1348,7 +1348,7 @@ mod tests {
 
     #[test]
     fn stage_syncs_an_edited_widget_body_into_the_runtime_tree() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR]);
         let (root, stage, run_qml) = widget_sync_tmp("stage-widget-edit");
         let song = root.join("aoide").join("song").join("songbook").join("moonlight");
@@ -1379,7 +1379,7 @@ mod tests {
 
     #[test]
     fn stage_leaves_an_unchanged_widget_body_untouched() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR]);
         let (root, stage, run_qml) = widget_sync_tmp("stage-widget-unchanged");
         let song = root.join("aoide").join("song").join("songbook").join("moonlight");
@@ -1455,7 +1455,7 @@ mod tests {
         // a real `nix eval` of the committed songbook: this test is about
         // THIS crate's whole-file-regeneration behaviour, which a fixture
         // proves just as well and hermetically.
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR]);
         let (root, stage, run_qml) = widget_sync_tmp("stage-manifest-heal");
         let song = root.join("aoide").join("song").join("songbook").join("sonata");
@@ -1515,7 +1515,7 @@ mod tests {
 
     #[test]
     fn stage_skips_widget_sync_when_no_runtime_tree_exists() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, stage, _run_qml) = widget_sync_tmp("stage-widget-no-runtime");
         let song = root.join("aoide").join("song").join("songbook").join("moonlight");
@@ -1537,7 +1537,7 @@ mod tests {
 
     #[test]
     fn stage_skips_widget_sync_when_song_has_no_widgets_dir() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR]);
         let (root, stage, run_qml) = widget_sync_tmp("stage-widget-no-widgets-dir");
         let song = root.join("aoide").join("song").join("songbook").join("moonlight");
@@ -1597,7 +1597,7 @@ mod tests {
         // — across both widget kinds the schema carries — comes out
         // correct: etude's `demo` (surface, with namespace/shortcut/blur)
         // and nocturne's `vigil` (dock, with `order`).
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, stage, run_qml) = widget_sync_tmp("stage-registry-real-kinds");
         let song = root.join("aoide").join("song").join("songbook").join("etude");
@@ -1645,7 +1645,7 @@ mod tests {
         // call must report no registry.json write at all. Content doesn't
         // matter here — only that it's stable across the two calls, so an
         // arbitrary fixture stands in for the real songbook eval.
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR]);
         let (root, stage, run_qml) = widget_sync_tmp("stage-registry-unchanged");
         let song = root.join("aoide").join("song").join("songbook").join("fugue");
@@ -1691,7 +1691,7 @@ mod tests {
 
     #[test]
     fn stage_regenerates_manifest_and_registry_from_templates_on_a_repo_less_host() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&[
             "AOIDE_STAGE_DIR",
             "AOIDE_FLAKE_ROOT",
@@ -1775,7 +1775,7 @@ mod tests {
         // it must refuse with a taught error rather than guess. `rice
         // compose` never writes a shelf, so this only bites a hand-authored
         // one on a repo-less host.
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&[
             "AOIDE_STAGE_DIR",
             "AOIDE_FLAKE_ROOT",
@@ -1816,7 +1816,7 @@ mod tests {
     fn stage_teaches_both_checked_locations_when_neither_flake_nor_templates_exist() {
         // A host with neither a real flake checkout nor a templates dir
         // gets a taught error, not a panic (L-C3's own requirement).
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&[
             "AOIDE_STAGE_DIR",
             "AOIDE_FLAKE_ROOT",
@@ -1915,7 +1915,7 @@ mod tests {
         // it copies the EXISTING on-disk entries for any song that still has
         // a songbook directory before patching in the currently-staged
         // song's own fresh entry.
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&[
             "AOIDE_STAGE_DIR",
             "AOIDE_FLAKE_ROOT",
@@ -1971,7 +1971,7 @@ mod tests {
         // removed, the next regen for a DIFFERENT song must drop it — it is
         // in neither the frozen baseline nor the on-disk overlay's
         // surviving set.
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&[
             "AOIDE_STAGE_DIR",
             "AOIDE_FLAKE_ROOT",
@@ -2029,7 +2029,7 @@ mod tests {
 
     #[test]
     fn stage_entry_refuses_and_syncs_nothing_while_declarative_locked() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, stage, run_qml) = widget_sync_tmp("stage-entry-widget-locked");
         let song = root.join("aoide").join("song").join("songbook").join("moonlight");
@@ -2055,7 +2055,7 @@ mod tests {
 
     #[test]
     fn stage_entry_with_no_name_syncs_the_current_songs_widgets() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR]);
         let (root, stage, run_qml) = widget_sync_tmp("stage-entry-widget-bare");
         let song = root.join("aoide").join("song").join("songbook").join("moonlight");
@@ -2094,7 +2094,7 @@ mod tests {
 
     #[test]
     fn stage_copies_helper_and_asset_files_not_just_slots() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR]);
         let (root, stage, run_qml) = widget_sync_tmp("stage-widget-helpers");
         let song = root.join("aoide").join("song").join("songbook").join("moonlight");
@@ -2147,7 +2147,7 @@ mod tests {
 
     #[test]
     fn stage_entry_seeds_the_runtime_songbook_from_the_shipped_template_on_first_stage() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SONG_TEMPLATES"]);
         let root = unique_tmp("seed-when-absent");
         let stage = root.join("stage");
@@ -2213,7 +2213,7 @@ mod tests {
 
     #[test]
     fn stage_entry_seeds_nothing_on_a_second_stage_of_an_already_seeded_song() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SONG_TEMPLATES"]);
         let root = unique_tmp("seed-idempotence");
         let stage = root.join("stage");
@@ -2252,7 +2252,7 @@ mod tests {
 
     #[test]
     fn seed_songbook_from_templates_never_clobbers_an_existing_even_partial_song_dir() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SONG_TEMPLATES"]);
         let root = unique_tmp("seed-never-clobber");
         let stage = root.join("stage");
@@ -2299,7 +2299,7 @@ mod tests {
 
     #[test]
     fn compose_neutralizes_nix_interpolation_in_notes() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("compose-interpolation");
         let stage = root.join("stage");
@@ -2339,7 +2339,7 @@ mod tests {
 
     #[test]
     fn compose_rejects_invalid_from() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("compose-badfrom");
         let stage = root.join("stage");
@@ -2363,7 +2363,7 @@ mod tests {
 
     #[test]
     fn compose_rejects_from_equal_to_name() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("compose-fromeqname");
         let stage = root.join("stage");
@@ -2396,7 +2396,7 @@ mod tests {
         // `AOIDE_SONG_TEMPLATES` unset with no real `share/lyra/songbook`
         // beside the test binary — `song_templates_dir()` resolves to
         // `None`. Taught error naming both, never a panic.
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SONG_TEMPLATES"]);
         std::env::remove_var("AOIDE_SONG_TEMPLATES");
         let root = unique_tmp("compose-nofrom");
@@ -2422,7 +2422,7 @@ mod tests {
         // absent, `$AOIDE_SONG_TEMPLATES` set and has it — the repo-less
         // host case. Compose TO still always writes the HOST songbook
         // (under the runtime root), never the templates dir itself.
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SONG_TEMPLATES"]);
         let root = unique_tmp("compose-templates-fallback");
         let stage = root.join("stage");
@@ -2455,7 +2455,7 @@ mod tests {
         // Resolution ladder, tier ordering: `songbook_dir(from)` wins even
         // when `$AOIDE_SONG_TEMPLATES` ALSO has an entry for the same name —
         // the templates dir is a fallback, never a shadow.
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SONG_TEMPLATES"]);
         let root = unique_tmp("compose-templates-precedence");
         let stage = root.join("stage");
@@ -2481,7 +2481,7 @@ mod tests {
 
     #[test]
     fn compose_scaffolds_every_file_from_a_from_song_with_no_window_or_geometry() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("compose-ok");
         let stage = root.join("stage");
@@ -2532,7 +2532,7 @@ mod tests {
 
     #[test]
     fn compose_with_geometry_and_window_copies_every_field_including_nulls() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("compose-geo");
         let stage = root.join("stage");
@@ -2569,7 +2569,7 @@ mod tests {
 
     #[test]
     fn compose_refuses_to_overwrite_without_force_then_succeeds_with_it() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("compose-exists");
         let stage = root.join("stage");

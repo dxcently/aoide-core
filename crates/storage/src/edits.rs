@@ -588,7 +588,7 @@ mod tests {
 
     #[test]
     fn one_line_round_trips_through_append_and_read_all() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STATE_DIR"]);
         routed("edits-roundtrip");
 
@@ -609,7 +609,7 @@ mod tests {
 
     #[test]
     fn a_corrupt_line_is_skipped_without_losing_its_neighbours() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STATE_DIR"]);
         routed("edits-corrupt");
 

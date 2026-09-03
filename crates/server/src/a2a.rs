@@ -3769,7 +3769,7 @@ mod tests {
 
     #[test]
     fn message_send_end_to_end_unknown_and_unconductable_contexts_are_clean_errors() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = std::env::temp_dir().join(format!(
             "aoide-server-a2a-send-test-{}-{}",
@@ -3829,7 +3829,7 @@ mod tests {
     /// so the retry loop finds it on its very first poll.
     #[test]
     fn stamp_spawn_origin_lands_a_peer_origin_on_an_already_registered_record() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = std::env::temp_dir().join(format!(
             "aoide-server-a2a-stamp-origin-test-{}-{}",
@@ -3867,7 +3867,7 @@ mod tests {
 
     #[test]
     fn tasks_get_end_to_end_reads_the_stage_sessions_file() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = std::env::temp_dir().join(format!(
             "aoide-server-a2a-test-{}-{}",
@@ -3925,7 +3925,7 @@ mod tests {
     /// "never-false-reap" guard).
     #[test]
     fn tasks_get_end_to_end_a_dead_pid_reads_failed_and_a_hook_only_record_does_not() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = std::env::temp_dir().join(format!(
             "aoide-server-a2a-dead-{}-{}",
@@ -3978,7 +3978,7 @@ mod tests {
     /// valid bearer passes through to the normal handler.
     #[test]
     fn read_commands_are_token_gated_when_a_token_is_configured() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = std::env::temp_dir().join(format!(
             "aoide-server-a2a-gate-{}-{}",
@@ -4041,7 +4041,7 @@ mod tests {
     /// commands stay open exactly as before — the gate only bites when armed.
     #[test]
     fn read_commands_stay_open_when_no_token_is_configured() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = std::env::temp_dir().join(format!(
             "aoide-server-a2a-nogate-{}-{}",
@@ -4093,7 +4093,7 @@ mod tests {
     /// state is never read.
     #[test]
     fn stream_task_tasks_resubscribe_denies_before_reading_a_real_session_when_a_token_is_configured() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = std::env::temp_dir().join(format!(
             "aoide-server-a2a-sse-gate-{}-{}",
@@ -4162,7 +4162,7 @@ mod tests {
     /// rather than merely "delivery was skipped".
     #[test]
     fn stream_task_message_stream_denies_before_message_send_runs_when_a_token_is_configured() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -4259,7 +4259,7 @@ mod tests {
     /// and returns — no `STREAM_POLL` sleep, nowhere near `MAX_STREAM`.
     #[test]
     fn stream_task_tasks_resubscribe_reaches_the_real_terminal_state_when_no_token_is_configured() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = std::env::temp_dir().join(format!(
             "aoide-server-a2a-sse-nogate-{}-{}",
@@ -4534,7 +4534,7 @@ mod tests {
 
     #[test]
     fn resolve_token_file_prefers_flag_then_env_then_defaults_empty() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_A2A_TOKEN_FILE").ok();
 
         let mut flags = std::collections::BTreeMap::new();
@@ -4885,7 +4885,7 @@ mod tests {
 
     #[test]
     fn verify_signed_request_round_trips_a_genuine_signature() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
             "aoide-a2a-verify-sig-ok-{}-{}",
@@ -4919,7 +4919,7 @@ mod tests {
         // but never verified) refuses with the EXACT code+message a merely
         // tampered/bad signature earns — an outsider can never distinguish
         // "your key isn't registered here" from "your signature is wrong".
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
             "aoide-a2a-verify-sig-unknown-{}-{}",
@@ -4979,7 +4979,7 @@ mod tests {
 
     #[test]
     fn verify_signed_request_refuses_a_tampered_body_or_path() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
             "aoide-a2a-verify-sig-tamper-{}-{}",
@@ -5022,7 +5022,7 @@ mod tests {
 
     #[test]
     fn verify_signed_request_refuses_clock_skew_beyond_the_window_naming_both_timestamps() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
             "aoide-a2a-verify-sig-skew-{}-{}",
@@ -5058,7 +5058,7 @@ mod tests {
 
     #[test]
     fn verify_signed_request_refuses_a_replayed_nonce_inside_the_window() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
             "aoide-a2a-verify-sig-replay-{}-{}",
@@ -5105,7 +5105,7 @@ mod tests {
         // wire claims `box-b` (a different, genuinely registered peer) —
         // resolution follows the KEY, the claimed name survives only as
         // attribution, and the mismatch produces a drift audit line.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
             "aoide-a2a-verify-by-key-{}-{}",
@@ -5149,7 +5149,7 @@ mod tests {
         // known-limitation note): the operator renamed the record, the far
         // end still claims its old self name — the key hasn't changed, so
         // authentication must not break.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
             "aoide-a2a-verify-renamed-{}-{}",
@@ -5186,7 +5186,7 @@ mod tests {
         // Both hold the same PROVEN key, so the claimed name may pick among
         // them (equal security, possibly different allows/autogate); with no
         // exact-name match, refusing beats guessing which grants apply.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
             "aoide-a2a-verify-shared-key-{}-{}",
@@ -5239,7 +5239,7 @@ mod tests {
         // (`NONCE_CACHE`'s doc): `X-Aoide-Peer` is outside the canonical
         // string, so a captured request replayed under a shared-key twin's
         // name still lands on the same cache key and refuses.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
             "aoide-a2a-verify-twin-replay-{}-{}",
@@ -5335,7 +5335,7 @@ mod tests {
     /// it is this suite's documented choice, not a gap.
     #[test]
     fn peer_spawn_signed_and_allowed_is_admitted_up_to_the_do_spawn_boundary() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
             "aoide-a2a-peer-spawn-admitted-{}-{}",
@@ -5384,7 +5384,7 @@ mod tests {
     /// directly.
     #[test]
     fn peer_spawn_revoked_is_refused_through_the_real_message_send_wire_path() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -5433,7 +5433,7 @@ mod tests {
 
     #[test]
     fn message_send_spawn_refuses_a_paired_peer_whose_allows_lacks_spawn() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
             "aoide-a2a-spawn-denied-{}-{}",
@@ -5471,7 +5471,7 @@ mod tests {
         // deployment a shared source address is exactly the unsigned
         // signal that must never itself authorize launching a process
         // attributed to this peer.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
             "aoide-a2a-spawn-addr-only-{}-{}",
@@ -5513,7 +5513,7 @@ mod tests {
         // no address can match either. Under the pre-P-P3 gate this would
         // have passed (`token_authorized` was the whole gate); now it must
         // still refuse.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
             "aoide-a2a-spawn-doorwide-{}-{}",
@@ -5546,7 +5546,7 @@ mod tests {
 
     #[test]
     fn non_loopback_message_send_is_held_pending_not_delivered() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -5629,7 +5629,7 @@ mod tests {
         // carries that resolved peer's identity — even an UNPAIRED,
         // non-autogated one (attribution, not a gate — same "ATTRIBUTION,
         // NOT SECURITY" posture `resolve_sender`/`--from` already document).
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -5695,7 +5695,7 @@ mod tests {
         // test suite above), proving the resulting `PeerRung::Signature`
         // attribution reaches `pending.json` the same way Token/Addr
         // already did before this phase.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -5765,7 +5765,7 @@ mod tests {
         // back a name it just confirmed is registered+verified — must
         // resolve to NOTHING, never silently fall back to whatever the
         // presented token/address WOULD otherwise have resolved to.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -5853,7 +5853,7 @@ mod tests {
     /// must stay unattributed no matter what `AOIDE_SESSION_ID` says.
     #[test]
     fn an_unattributed_inject_never_falls_back_to_this_processs_own_ambient_session_id() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_session_id = std::env::var("AOIDE_SESSION_ID").ok();
@@ -5942,7 +5942,7 @@ mod tests {
         // loopback semantics at all — a loopback origin still auto-delivers,
         // byte-for-byte the same as `do_inject`'s pre-amendment unconditional
         // `--yes` behavior.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -6007,7 +6007,7 @@ mod tests {
         // Messaging plan P-C6: `do_inject` files no entry of its own (see its
         // doc comment) — this proves the SHARED seam actually fires for an
         // A2A-delivered message, end to end through `message_send`.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -6094,7 +6094,7 @@ mod tests {
         // listener is the same boundary `aoide_conduct::graph::conduct`'s
         // own PTY-injection test already uses for the underlying
         // socket-write mechanism (see `spawn_inject_prompt`'s doc comment).
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_runtime = std::env::var("XDG_RUNTIME_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -6146,7 +6146,7 @@ mod tests {
         // The existing early return (`if prompt.is_empty() { return; }`) —
         // an empty prompt never connects at all, so it must not file an
         // inbox entry either.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
             "aoide-a2a-spawninject-empty-{}-{}",
@@ -6179,7 +6179,7 @@ mod tests {
         // used to (a hold-pending Task, one queued entry); now it's a
         // synthetic submitted Task and the queue stays untouched, closing
         // the unauthenticated-queue-write half of #50.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -6252,7 +6252,7 @@ mod tests {
         // The other half of the same coupling: presenting the CORRECT token
         // restores exactly the original loopback behavior — this amendment
         // narrows trust, it doesn't remove the ability to be trusted.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -6317,7 +6317,7 @@ mod tests {
 
     #[test]
     fn autogated_peer_delivers_despite_being_non_loopback() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -6410,7 +6410,7 @@ mod tests {
         // the hop. No global A2A token is configured here at all — this is
         // entirely the peer_store-level identification, independent of the
         // `message_send` expected_token/presented_token plumbing.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -6506,7 +6506,7 @@ mod tests {
 
     #[test]
     fn signed_inject_from_a_non_autogate_peer_on_a_loopback_connection_is_held_pending() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -6574,7 +6574,7 @@ mod tests {
 
     #[test]
     fn signed_inject_from_an_autogate_peer_on_a_loopback_connection_still_auto_delivers() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -6670,7 +6670,7 @@ mod tests {
 
     #[test]
     fn uniform_response_hides_existence_and_never_queues_when_unauthenticated() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -6766,7 +6766,7 @@ mod tests {
 
     #[test]
     fn uniform_response_guard_lets_a_valid_bearer_reach_the_real_decision() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -6846,7 +6846,7 @@ mod tests {
 
     #[test]
     fn uniform_response_guard_is_a_no_op_when_no_token_is_configured() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -6938,7 +6938,7 @@ mod tests {
         // `session_ref_lookup`/`do_inject` machinery and queues into
         // `pending.json` at all, which the #50 guard's own synthetic path
         // never does.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -7027,7 +7027,7 @@ mod tests {
 
     #[test]
     fn resolve_peer_name_prefers_flag_then_env_then_falls_back() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_A2A_PEER_NAME").ok();
 
         let mut flags = std::collections::BTreeMap::new();
@@ -7065,7 +7065,7 @@ mod tests {
 
     #[test]
     fn resolve_discovery_advertise_is_off_by_default() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_DISCOVERY_ADVERTISE").ok();
         std::env::remove_var("AOIDE_DISCOVERY_ADVERTISE");
 
@@ -7080,7 +7080,7 @@ mod tests {
 
     #[test]
     fn resolve_discovery_advertise_honors_the_flag_and_the_truthy_env_vocabulary() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_DISCOVERY_ADVERTISE").ok();
 
         let mut flags = std::collections::BTreeMap::new();
@@ -7109,7 +7109,7 @@ mod tests {
 
     #[test]
     fn graph_summary_wraps_the_resolved_graph_document_verbatim() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = std::env::temp_dir().join(format!(
             "aoide-a2a-graphsummary-{}-{}",
@@ -7140,7 +7140,7 @@ mod tests {
 
     #[test]
     fn handle_jsonrpc_routes_aoide_graph_summary_and_still_32601s_everything_else() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = std::env::temp_dir().join(format!(
             "aoide-a2a-graphsummary-rpc-{}-{}",
@@ -7192,7 +7192,7 @@ mod tests {
 
     #[test]
     fn pair_request_parks_and_returns_the_approvers_public_identity_and_nonce() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -7245,7 +7245,7 @@ mod tests {
 
     #[test]
     fn pair_request_rejects_malformed_pubkey_name_commit_or_url_before_parking_anything() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -7290,7 +7290,7 @@ mod tests {
 
     #[test]
     fn pair_request_refuses_beyond_the_park_cap() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_cap = std::env::var(aoide_storage::pairing::PAIRING_PARK_CAP_ENV).ok();
@@ -7341,7 +7341,7 @@ mod tests {
     /// rides the wire).
     #[test]
     fn pair_request_from_the_same_pubkey_supersedes_the_prior_parked_request_and_audits_it() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -7397,7 +7397,7 @@ mod tests {
 
     #[test]
     fn pair_request_from_a_case_varied_pubkey_still_supersedes_the_prior_parked_request() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -7445,7 +7445,7 @@ mod tests {
 
     #[test]
     fn pair_reveal_completes_the_commitment_and_the_entry_gains_a_sas() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -7486,7 +7486,7 @@ mod tests {
 
     #[test]
     fn pair_reveal_rejects_a_wrong_nonce_and_drops_the_parked_entry() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -7521,7 +7521,7 @@ mod tests {
 
     #[test]
     fn pair_reveal_rejects_an_unknown_id() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -7565,7 +7565,7 @@ mod tests {
     /// unauthenticated or wrongly-authenticated caller.
     #[test]
     fn pair_poll_returns_pending_uniformly_for_unknown_id_wrong_signer_and_not_yet_approved() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -7639,7 +7639,7 @@ mod tests {
     /// parked entry. One audit line records the release.
     #[test]
     fn pair_poll_releases_the_approvers_pubkey_only_once_approved_and_correctly_signed() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -7705,7 +7705,7 @@ mod tests {
 
     #[test]
     fn pair_poll_rejects_malformed_params_before_any_lookup() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -7758,7 +7758,7 @@ mod tests {
 
     #[test]
     fn pair_request_emits_one_gate_classed_parked_line() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -7801,7 +7801,7 @@ mod tests {
 
     #[test]
     fn pairing_feed_lines_never_carry_a_sas_pubkey_nonce_or_commitment() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -7850,7 +7850,7 @@ mod tests {
 
     #[test]
     fn pair_reveal_emits_revealed_on_ok_and_nothing_on_a_mismatch() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -7911,7 +7911,7 @@ mod tests {
         if aoide_secrets::home::effective_uid() == 0 {
             return;
         }
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -7991,7 +7991,7 @@ mod tests {
     /// callback exists.
     #[test]
     fn full_pairing_ceremony_request_reveal_pending_approve_poll_confirm_writes_records_on_both_ends() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let root = std::env::temp_dir().join(format!(

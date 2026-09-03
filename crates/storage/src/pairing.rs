@@ -1188,7 +1188,7 @@ mod tests {
 
     #[test]
     fn pairing_timeout_defaults_to_four_hours_and_honors_a_valid_override() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var(PAIRING_TIMEOUT_ENV).ok();
         std::env::remove_var(PAIRING_TIMEOUT_ENV);
         assert_eq!(pairing_timeout_secs(), 4 * 60 * 60);
@@ -1212,7 +1212,7 @@ mod tests {
 
     #[test]
     fn pairing_park_cap_defaults_to_32_and_honors_a_valid_override() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var(PAIRING_PARK_CAP_ENV).ok();
         std::env::remove_var(PAIRING_PARK_CAP_ENV);
         assert_eq!(pairing_park_cap(), 32);
@@ -1260,7 +1260,7 @@ mod tests {
 
     #[test]
     fn park_inbound_then_list_then_take_round_trips_through_a_temp_state_dir() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-inbound-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1306,7 +1306,7 @@ mod tests {
 
     #[test]
     fn expired_inbound_requests_are_swept_on_list_and_take_finds_nothing() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-inbound-expiry-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1339,7 +1339,7 @@ mod tests {
 
     #[test]
     fn park_inbound_refuses_beyond_the_cap_and_admits_again_after_a_take() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_dir = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_cap = std::env::var(PAIRING_PARK_CAP_ENV).ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-cap-{}", std::process::id()));
@@ -1381,7 +1381,7 @@ mod tests {
     /// never refuse."
     #[test]
     fn park_inbound_supersedes_a_live_entry_from_the_same_pubkey() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-supersede-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1418,7 +1418,7 @@ mod tests {
     /// one keypair hold multiple parked entries at once.
     #[test]
     fn park_inbound_supersedes_a_live_entry_whose_pubkey_hex_case_differs() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-supersede-case-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1455,7 +1455,7 @@ mod tests {
     /// honest gain.
     #[test]
     fn park_inbound_supersedes_an_approved_but_unpolled_entry_from_the_same_pubkey() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-supersede-approved-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1489,7 +1489,7 @@ mod tests {
     /// name/origin/anything else self-asserted.
     #[test]
     fn park_inbound_leaves_distinct_pubkeys_parked_side_by_side() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-supersede-distinct-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1521,7 +1521,7 @@ mod tests {
     /// entry frees the slot it needs.
     #[test]
     fn park_inbound_supersede_frees_a_slot_under_the_cap() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_dir = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_cap = std::env::var(PAIRING_PARK_CAP_ENV).ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-supersede-cap-{}", std::process::id()));
@@ -1563,7 +1563,7 @@ mod tests {
 
     #[test]
     fn reveal_inbound_on_a_matching_nonce_stores_it_and_round_trips() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-reveal-ok-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1592,7 +1592,7 @@ mod tests {
 
     #[test]
     fn reveal_inbound_on_a_wrong_nonce_is_refused_and_drops_the_entry() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-reveal-mismatch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1619,7 +1619,7 @@ mod tests {
 
     #[test]
     fn reveal_inbound_on_an_unknown_id_is_refused() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-reveal-unknown-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1638,7 +1638,7 @@ mod tests {
 
     #[test]
     fn mark_inbound_approved_sets_the_flag_and_leaves_the_entry_parked() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-mark-approved-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1675,7 +1675,7 @@ mod tests {
 
     #[test]
     fn mark_inbound_approved_on_an_unknown_id_is_refused() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-mark-approved-unknown-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1692,7 +1692,7 @@ mod tests {
 
     #[test]
     fn mark_inbound_approved_on_an_expired_entry_is_refused_the_same_as_unknown() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-mark-approved-expired-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1722,7 +1722,7 @@ mod tests {
 
     #[test]
     fn record_inbound_code_try_increments_cumulatively_and_persists() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-code-try-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1794,7 +1794,7 @@ mod tests {
 
     #[test]
     fn park_outbound_then_take_round_trips_and_is_removed_after_taking() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-outbound-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1826,7 +1826,7 @@ mod tests {
     /// `state`'s own `#[serde(default)]` already holds one field over.
     #[test]
     fn outbound_via_is_additive_absent_by_default_and_round_trips_when_present() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-outbound-via-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1866,7 +1866,7 @@ mod tests {
     /// phase) loads `None`, never a deserialize failure.
     #[test]
     fn inbound_self_via_is_additive_absent_by_default_and_round_trips_when_present() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-inbound-self-via-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1917,7 +1917,7 @@ mod tests {
 
     #[test]
     fn park_outbound_on_a_repeated_id_replaces_rather_than_duplicates() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-outbound-dup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1945,7 +1945,7 @@ mod tests {
     /// stale entry for the same far identity in one write.
     #[test]
     fn park_outbound_replaces_by_approver_pubkey_even_with_a_different_id() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-outbound-pubkey-dup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1979,7 +1979,7 @@ mod tests {
     /// neither supersede rule touches the other file.
     #[test]
     fn a_cross_direction_pair_for_the_same_pubkey_coexists() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-cross-direction-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2015,7 +2015,7 @@ mod tests {
 
     #[test]
     fn mark_outbound_awaiting_confirm_on_a_matching_pubkey_transitions_the_state() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-confirm-ok-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2040,7 +2040,7 @@ mod tests {
 
     #[test]
     fn mark_outbound_awaiting_confirm_on_a_pubkey_mismatch_leaves_the_entry_untouched() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-confirm-mismatch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2065,7 +2065,7 @@ mod tests {
 
     #[test]
     fn mark_outbound_awaiting_confirm_on_an_unknown_id_is_refused() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-confirm-unknown-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2086,7 +2086,7 @@ mod tests {
     /// exact mirror against the outbound file.
     #[test]
     fn record_outbound_code_try_increments_cumulatively_and_persists() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-outbound-code-try-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2138,7 +2138,7 @@ mod tests {
     /// CLI race the lock exists to serialize.
     #[test]
     fn a_held_stage_flock_blocks_an_inbound_mutation_until_released() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-flock-{}", std::process::id()));
@@ -2207,7 +2207,7 @@ mod tests {
     /// finding-4 symptom.
     #[test]
     fn racing_mutators_lose_no_increment_and_no_parked_entry() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-pairing-race-{}", std::process::id()));
@@ -2267,7 +2267,7 @@ mod tests {
 
     #[test]
     fn expires_at_from_adds_the_configured_timeout() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var(PAIRING_TIMEOUT_ENV).ok();
         std::env::set_var(PAIRING_TIMEOUT_ENV, "100");
         let base = 1_700_000_000_i64;

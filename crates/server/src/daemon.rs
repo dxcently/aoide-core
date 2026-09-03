@@ -1674,7 +1674,7 @@ mod tests {
         // own doc) — this spawns a background thread it never joins, so it
         // needs `env_lock`'s one-time `AOIDE_STAGE_DIR` floor in place before
         // that thread's first tick, never the real `~/Aoide/state/stage/*`.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let socket_path = short_tmp("loop").with_extension("sock");
         let events_path = short_tmp("loop-events").with_extension("jsonl");
         let log_path = short_tmp("loop-log");
@@ -1712,7 +1712,7 @@ mod tests {
     // ── P-D6 graph residency: reconcile + reap in the tick ──────────────
 
     fn isolated_stage() -> (std::sync::MutexGuard<'static, ()>, PathBuf, Option<String>) {
-        let guard = crate::env_lock().lock().unwrap();
+        let guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = short_tmp("stage");
         std::fs::create_dir_all(&stage).unwrap();
@@ -2094,7 +2094,7 @@ mod tests {
     /// wants to inspect or pre-seed that marker needs its OWN isolated dir,
     /// the same reasoning `isolated_stage` already applies to the stage.
     fn isolated_stage_and_state() -> (std::sync::MutexGuard<'static, ()>, PathBuf, PathBuf, Option<String>, Option<String>) {
-        let guard = crate::env_lock().lock().unwrap();
+        let guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let stage = short_tmp("dstage");

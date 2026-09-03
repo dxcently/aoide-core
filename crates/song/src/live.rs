@@ -249,7 +249,7 @@ mod tests {
         // `HYPRLAND_INSTANCE_SIGNATURE`-touching tests included) — this used
         // to lock a separate crate-local mutex, racing rice.rs tests that
         // touch the SAME env var under the other lock.
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = aoide_test_support::EnvSaver::capture(&["HYPRLAND_INSTANCE_SIGNATURE"]);
         std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
 

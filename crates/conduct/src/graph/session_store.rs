@@ -1338,7 +1338,7 @@ mod tests {
 
     #[test]
     fn do_subagent_spawn_mints_a_petname_on_create() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("subagent-spawn-petname");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -1439,7 +1439,7 @@ mod tests {
     }
     #[test]
     fn registration_evicts_a_same_window_agent_sibling_immediately() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("regi-evict");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -1493,7 +1493,7 @@ mod tests {
     }
     #[test]
     fn registration_never_evicts_a_conducted_pty_host() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("regi-host");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -1568,7 +1568,7 @@ mod tests {
     /// same-window twins.
     #[test]
     fn nested_headless_lineage_is_windowless_ancestry_parented_and_never_evicted() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("lineage-nested");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -1716,7 +1716,7 @@ mod tests {
     }
     #[test]
     fn session_start_upserts_restages_and_anchors_under_a_project() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("sess-start");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -1776,7 +1776,7 @@ mod tests {
     }
     #[test]
     fn session_start_refuses_a_cyclic_parent() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("sess-cycle");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -1804,7 +1804,7 @@ mod tests {
     }
     #[test]
     fn session_end_unknown_id_is_ok_noop() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("sess-end-unknown");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -1830,7 +1830,7 @@ mod tests {
         // produce one ledger line, never two" — `reap`'s own half lives in
         // `reap.rs`'s test suite; both route through the SAME
         // `ledger_session_exit` (`doc.rs`).
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR"]);
         let stage = unique_stage("sess-end-ledger");
         let state = stage.join("state");
@@ -1875,7 +1875,7 @@ mod tests {
         // (`aoide_client::tunnel::close_all_for_session`) without touching a
         // different session's — the reaper's `sweep_orphan_tunnels` is only
         // the backstop for the session that never gets to run this path.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR"]);
         let stage = unique_stage("sess-end-tunnels");
         let state = stage.join("state");
@@ -1925,7 +1925,7 @@ mod tests {
     }
     #[test]
     fn set_session_log_path_is_change_only_and_noops_on_an_unknown_id() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("sess-log-path");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -1968,7 +1968,7 @@ mod tests {
         // no stage/env setup of its own, but still needs `env_lock`'s own
         // one-time `AOIDE_DAEMON_SOCKET` isolation stamp (`lib.rs`'s own
         // doc) so a real resident daemon on this box is never reached.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let out = session_start(&flag_invocation(&["session", "start"], &[]));
         assert_eq!(out.status, aoide_protocol::output::Status::Usage);
         assert_eq!(out.render(false).1, aoide_protocol::output::exit::USAGE);
@@ -2069,7 +2069,7 @@ mod tests {
     }
     #[test]
     fn reap_drops_killed_sessions_but_spares_the_living() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "HYPRLAND_INSTANCE_SIGNATURE"]);
         // Force pid-only liveness: with no compositor the window signal is
         // suppressed, so the reap decision rests purely on /proc/<pid> — fully
@@ -2156,7 +2156,7 @@ mod tests {
     }
     #[test]
     fn reap_cascades_an_orphaned_subagent_when_its_top_level_parent_is_reaped() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "HYPRLAND_INSTANCE_SIGNATURE"]);
         std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"); // pid-only liveness
         let stage = unique_stage("reap-subagent-cascade");
@@ -2214,7 +2214,7 @@ mod tests {
         // that has emitted NO hook — its hook stream went quiet across a
         // reload/restart window — must survive the sweep. (hooks.json is left
         // absent, so the session is maximally hook-silent.)
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "HYPRLAND_INSTANCE_SIGNATURE"]);
         std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"); // pid-only liveness
         let stage = unique_stage("reap-hooksilent");
@@ -2293,7 +2293,7 @@ mod tests {
         // resumedFrom set" — no spawn involved, just the stage-write + the
         // graph.json projection it triggers (unlike `stamp_harness_session_id`,
         // this one DOES restage).
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("stamp-resumed-from");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -2334,7 +2334,7 @@ mod tests {
         // P-P3: `stamp_origin` is `graph.json`-invisible, like
         // `hookAncestry`/`headless` — unlike `stamp_resumed_from`, which
         // DOES restage.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("stamp-origin");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -2369,7 +2369,7 @@ mod tests {
     fn stamp_seal_lands_the_field_and_never_restages_graph_json() {
         // LANE IDENTITY P-ID1: `stamp_seal` is `graph.json`-invisible, the
         // same shape `stamp_origin`'s own sibling test just above proves.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("stamp-seal");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);

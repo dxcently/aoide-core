@@ -238,7 +238,7 @@ mod tests {
 
     #[test]
     fn render_qr_returns_none_when_qrencode_is_absent_from_path() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_path = std::env::var("PATH").ok();
         std::env::set_var("PATH", "/nonexistent-dir-for-aoide-secrets-test");
         assert_eq!(render_qr("otpauth://totp/x"), None);
@@ -255,7 +255,7 @@ mod tests {
     /// discards it) and the shim's stdout is what `render_qr` returns.
     #[test]
     fn render_qr_returns_the_shim_output_when_qrencode_is_present() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "aoide-secrets-enroll-test-qrshim-{}-{}",
             std::process::id(),

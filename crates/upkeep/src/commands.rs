@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn a_fixture_with_one_finding_per_class_reports_all_three_and_fails_on_the_errors() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_FLAKE_ROOT"]);
         let root = plant_fixture();
 
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn a_clean_tree_exits_ok_with_zero_findings() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_FLAKE_ROOT"]);
         let root = unique_tmp("upkeep-cmd-clean");
         run_git(&root, &["init", "-q"]);
@@ -214,7 +214,7 @@ mod tests {
         // A tarball checkout: no `.git` at all. The git-sourced checks (C1/C2)
         // degrade to no findings (`scan`'s own graceful-degrade contract);
         // the filesystem-only check (C3) still runs.
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_FLAKE_ROOT"]);
         let root = unique_tmp("upkeep-cmd-not-a-repo");
         std::env::set_var("AOIDE_FLAKE_ROOT", &root);
@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn stable_ids_never_collide_across_findings_in_the_same_run() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_FLAKE_ROOT"]);
         let root = plant_fixture();
         // A second clutter symlink, so this run carries >1 finding of the

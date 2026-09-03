@@ -332,7 +332,7 @@ mod tests {
         // `link`/`prune` target and must never break either command. This
         // is the "confirm it, don't assume it generalizes for free" test
         // the plan called for.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let stage = unique_stage("peer-ids-ignored");
@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn project_add_restages_graph_json_consistent_with_view() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("restage");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -451,7 +451,7 @@ mod tests {
     fn project_add_rejects_a_relative_path_as_a_usage_error() {
         // The "intergration"-incident guard: anchoring is prefix matching, so
         // a relative path can never anchor — refuse it (exit 2), loudly.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("reject-relative");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -474,7 +474,7 @@ mod tests {
 
     #[test]
     fn project_add_rejects_a_nonexistent_absolute_path_as_a_usage_error() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("reject-nonexistent");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -497,7 +497,7 @@ mod tests {
 
     #[test]
     fn project_add_defaults_path_to_cwd() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_cwd = std::env::current_dir().ok();
         let stage = unique_stage("cwd-default");

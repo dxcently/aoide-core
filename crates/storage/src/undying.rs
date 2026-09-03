@@ -169,7 +169,7 @@ mod tests {
     use super::*;
 
     fn with_temp_state_dir<T>(name: &str, f: impl FnOnce() -> T) -> T {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-undying-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

@@ -201,7 +201,7 @@ mod tests {
 
     #[test]
     fn no_composed_song_is_a_taught_error() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_FLAKE_ROOT"]);
         let stage_root = unique_tmp("declare-nosong");
         std::env::set_var("AOIDE_STAGE_DIR", stage_root.join("song").join("stage"));
@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn no_checkout_is_a_taught_error() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_FLAKE_ROOT"]);
         let stage_root = unique_tmp("declare-nocheckout");
         std::env::set_var("AOIDE_STAGE_DIR", stage_root.join("song").join("stage"));
@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn copies_the_composed_song_into_the_checkout_and_is_idempotent() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_FLAKE_ROOT"]);
         let stage_root = unique_tmp("declare-copy");
         std::env::set_var("AOIDE_STAGE_DIR", stage_root.join("song").join("stage"));

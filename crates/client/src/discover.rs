@@ -399,7 +399,7 @@ mod tests {
     /// this crate's own tests should ever manufacture against themselves.
     #[test]
     fn run_sweep_hears_an_advertisement_sent_over_the_real_loopback_stack() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let sent = advertise::build("test-sender", "test-sender", "khoa");
         let line = advertise::encode(&sent).expect("a well-formed test advertisement always encodes");
 

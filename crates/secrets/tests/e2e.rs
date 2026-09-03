@@ -73,7 +73,7 @@ fn read_to_string(path: &Path) -> String {
 
 #[test]
 fn end_to_end_resolve_denies_and_grants_env_round_trip() {
-    let _guard = audit_env_lock().lock().unwrap();
+    let _guard = audit_env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let secrets_home = short_tmp("home");
     std::fs::create_dir_all(&secrets_home).unwrap();
     let socket_path = PathBuf::from(format!("{}.sock", short_tmp("sock").display()));
@@ -198,7 +198,7 @@ fn end_to_end_resolve_denies_and_grants_env_round_trip() {
 /// isolation.
 #[test]
 fn put_then_get_round_trips_through_the_real_socket_with_the_seeded_file_backend() {
-    let _guard = audit_env_lock().lock().unwrap();
+    let _guard = audit_env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let secrets_home = short_tmp("puthome");
     std::fs::create_dir_all(&secrets_home).unwrap();
     let socket_path = PathBuf::from(format!("{}.sock", short_tmp("putsock").display()));
@@ -286,7 +286,7 @@ fn put_then_get_round_trips_through_the_real_socket_with_the_seeded_file_backend
 /// through the real socket, not the pure `resolve_gate` function.
 #[test]
 fn end_to_end_requiretotp_resolve_grants_then_denies_replay_through_the_socket() {
-    let _guard = audit_env_lock().lock().unwrap();
+    let _guard = audit_env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let secrets_home = short_tmp("totphome");
     std::fs::create_dir_all(&secrets_home).unwrap();
     let socket_path = PathBuf::from(format!("{}.sock", short_tmp("totpsock").display()));
@@ -366,7 +366,7 @@ fn end_to_end_requiretotp_resolve_grants_then_denies_replay_through_the_socket()
 /// socket" half the phase brief calls for explicitly).
 #[test]
 fn park_then_approve_over_the_real_socket_releases_the_value_to_the_original_caller() {
-    let _guard = audit_env_lock().lock().unwrap();
+    let _guard = audit_env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let secrets_home = short_tmp("parkhome");
     std::fs::create_dir_all(&secrets_home).unwrap();
     let socket_path = PathBuf::from(format!("{}.sock", short_tmp("parksock").display()));
@@ -452,7 +452,7 @@ fn park_then_approve_over_the_real_socket_releases_the_value_to_the_original_cal
 /// fails this test instead of hanging the suite.
 #[test]
 fn a_second_connection_is_accepted_and_served_while_the_first_sits_parked() {
-    let _guard = audit_env_lock().lock().unwrap();
+    let _guard = audit_env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let secrets_home = short_tmp("concurrenthome");
     std::fs::create_dir_all(&secrets_home).unwrap();
     let socket_path = PathBuf::from(format!("{}.sock", short_tmp("concurrentsock").display()));
@@ -558,7 +558,7 @@ fn secrets_home_resolves_through_the_env_override() {
 /// exercises `append_events_feed`/`Follower` against a real file on disk.
 #[test]
 fn watch_follower_sees_a_parked_event_within_about_a_second_through_the_real_events_feed() {
-    let _guard = audit_env_lock().lock().unwrap();
+    let _guard = audit_env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let secrets_home = short_tmp("eventslatencyhome");
     std::fs::create_dir_all(&secrets_home).unwrap();
     let socket_path = PathBuf::from(format!("{}.sock", short_tmp("eventslatencysock").display()));

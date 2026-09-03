@@ -373,7 +373,7 @@ mod tests {
 
     #[test]
     fn checkout_root_finds_the_repo_root_by_walking_up_to_flake_and_pkgs_aoide() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let root = unique_tmp("lyra-onboard-checkout-found");
         std::fs::write(root.join("flake.nix"), "").unwrap();
         std::fs::create_dir_all(root.join("pkgs/aoide")).unwrap();
@@ -394,7 +394,7 @@ mod tests {
 
     #[test]
     fn checkout_root_is_none_outside_a_checkout() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let root = unique_tmp("lyra-onboard-checkout-missing");
         std::fs::create_dir_all(&root).unwrap();
 
@@ -409,7 +409,7 @@ mod tests {
 
     #[test]
     fn checkout_root_requires_both_markers_not_just_one() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let root = unique_tmp("lyra-onboard-checkout-partial");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("flake.nix"), "").unwrap();

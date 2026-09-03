@@ -185,7 +185,7 @@ mod tests {
 
     #[test]
     fn on_then_off_round_trips_through_the_undying_store() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
         let root = setup("undying-roundtrip");
 
@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn bare_invocation_defaults_to_the_ambient_session_id() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
         let root = setup("undying-bare-env");
         std::env::set_var("AOIDE_SESSION_ID", "env-sess");
@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn explicit_self_flag_reads_the_same_ambient_session_id() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
         let root = setup("undying-self-flag");
         std::env::set_var("AOIDE_SESSION_ID", "self-sess");
@@ -238,7 +238,7 @@ mod tests {
     /// the mark flippable post-mortem off a bare ledger id.
     #[test]
     fn id_marks_a_session_absent_from_the_roster() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
         let root = setup("undying-post-mortem");
         // sessions.json stays empty for this test — the id below is never in it.
@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn live_reports_true_for_an_id_still_in_the_roster() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
         let root = setup("undying-live-true");
         let file = SessionsFile {
@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn no_id_and_no_env_is_a_usage_error_naming_both() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
         let root = setup("undying-no-target");
         std::env::remove_var("AOIDE_SESSION_ID");
@@ -314,7 +314,7 @@ mod tests {
     /// contract (`aoide_storage::undying`).
     #[test]
     fn a_remark_is_ok_but_reports_no_transition() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
         let root = setup("undying-remark");
 
@@ -367,7 +367,7 @@ mod tests {
     /// marked undying.
     #[test]
     fn marking_a_captureless_non_harness_session_undying_warns_in_the_message() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
         let root = setup("undying-warn-neither-arm");
         let file = SessionsFile {
@@ -395,7 +395,7 @@ mod tests {
     /// even under a caller-chosen agent label a profile lookup would miss.
     #[test]
     fn marking_a_captured_session_undying_is_silent() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
         let root = setup("undying-warn-captured");
         let file = SessionsFile {
@@ -424,7 +424,7 @@ mod tests {
     /// arm (`agent_profile("claude").resume_args`) resolves instead.
     #[test]
     fn marking_a_harness_session_undying_is_silent_even_without_capture() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
         let root = setup("undying-warn-harness");
         let file = SessionsFile {
@@ -445,7 +445,7 @@ mod tests {
     /// `off` no longer promises at all.
     #[test]
     fn marking_undying_off_never_warns() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
         let root = setup("undying-warn-off");
         let file = SessionsFile {
@@ -469,7 +469,7 @@ mod tests {
     /// warn from — silent, the same posture `live` already takes.
     #[test]
     fn marking_an_unrostered_id_undying_never_warns() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
         let root = setup("undying-warn-unrostered");
         // sessions.json stays empty — the id below is never in it.

@@ -619,7 +619,7 @@ mod tests {
     /// the file) → prompt (silent, drained exactly once).
     #[test]
     fn the_delivery_sequence_speaks_once_at_the_next_prompt_and_never_again() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = aoide_test_support::EnvSaver::capture(&["AOIDE_ROOT", "AOIDE_CONFIG"]);
         let (state_root, tree) = e2e_fixture("checklane-delivery-state", "checklane-delivery-tree", "true");
         let session_id = "checklane-delivery-session";
@@ -661,7 +661,7 @@ mod tests {
     /// mid-turn call — proof that it truly took no write path at all.
     #[test]
     fn a_mid_turn_session_start_never_launders_this_turns_own_regression() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = aoide_test_support::EnvSaver::capture(&["AOIDE_ROOT", "AOIDE_CONFIG"]);
         let (state_root, tree) =
             e2e_fixture("checklane-compaction-state", "checklane-compaction-tree", "true");
@@ -698,7 +698,7 @@ mod tests {
 
     #[test]
     fn on_session_start_and_on_prompt_submit_are_both_none_when_the_lane_is_disabled() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = aoide_test_support::EnvSaver::capture(&["AOIDE_ROOT", "AOIDE_CONFIG"]);
         let state_root = aoide_test_support::unique_tmp("checklane-disabled-state");
         std::env::set_var("AOIDE_ROOT", &state_root);
@@ -734,7 +734,7 @@ mod tests {
     /// it into a plausible-looking default.
     #[test]
     fn load_lane_refuses_a_phase_1_shaped_file_rather_than_reading_it_as_a_clean_baseline() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = aoide_test_support::EnvSaver::capture(&["AOIDE_ROOT"]);
         let state_root = aoide_test_support::unique_tmp("checklane-old-shape-state");
         std::env::set_var("AOIDE_ROOT", &state_root);

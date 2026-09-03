@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn sign_and_verify_round_trip_a_real_keypair() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = aoide_test_support::EnvSaver::capture(&["AOIDE_STATE_DIR"]);
         let root = aoide_test_support::unique_tmp("wire-auth-sign-verify");
         std::env::set_var("AOIDE_STATE_DIR", &root);
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn signature_skew_secs_defaults_to_120_and_honors_a_valid_override() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var(SIGNATURE_SKEW_ENV).ok();
         std::env::remove_var(SIGNATURE_SKEW_ENV);
         assert_eq!(signature_skew_secs(), 120);

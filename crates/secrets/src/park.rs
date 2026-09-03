@@ -681,7 +681,7 @@ mod tests {
 
     #[test]
     fn park_timeout_defaults_to_300_seconds() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var(PARK_TIMEOUT_ENV).ok();
         std::env::remove_var(PARK_TIMEOUT_ENV);
         assert_eq!(park_timeout(), Duration::from_secs(300));
@@ -693,7 +693,7 @@ mod tests {
 
     #[test]
     fn park_timeout_env_override_wins() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var(PARK_TIMEOUT_ENV).ok();
         std::env::set_var(PARK_TIMEOUT_ENV, "7");
         assert_eq!(park_timeout(), Duration::from_secs(7));
@@ -705,7 +705,7 @@ mod tests {
 
     #[test]
     fn park_timeout_blank_or_unparsable_env_falls_back_to_default() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var(PARK_TIMEOUT_ENV).ok();
         std::env::set_var(PARK_TIMEOUT_ENV, "   ");
         assert_eq!(park_timeout(), Duration::from_secs(300));

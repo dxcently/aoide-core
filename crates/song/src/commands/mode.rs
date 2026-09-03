@@ -538,7 +538,7 @@ mod tests {
         // process) with a traversal `"song"` must resolve to nothing at all,
         // same as a missing/absent one, rather than resolving to something
         // a caller then treats as a safe directory component.
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("current-staged-song-traversal");
         std::fs::create_dir_all(&stage).unwrap();
@@ -555,7 +555,7 @@ mod tests {
 
     #[test]
     fn status_reports_the_declarative_default_with_no_marker_file() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("mode-status-default");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -571,7 +571,7 @@ mod tests {
 
     #[test]
     fn stage_with_no_name_just_unlocks() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("mode-stage-bare").join("stage");
         std::fs::create_dir_all(&stage).unwrap();
@@ -588,7 +588,7 @@ mod tests {
 
     #[test]
     fn stage_with_a_name_stages_it_and_unlocks() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("mode-stage-named");
         let stage = root.join("stage");
@@ -616,7 +616,7 @@ mod tests {
     /// runtime songbook entry here at all, only a shipped template.
     #[test]
     fn stage_with_a_name_seeds_the_runtime_songbook_from_the_shipped_template_on_first_stage() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SONG_TEMPLATES"]);
         let root = unique_tmp("mode-stage-seed");
         let stage = root.join("stage");
@@ -652,7 +652,7 @@ mod tests {
 
     #[test]
     fn stage_with_no_name_resolves_and_restages_the_current_song() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("mode-stage-resolve-current");
         let stage = root.join("stage");
@@ -692,7 +692,7 @@ mod tests {
 
     #[test]
     fn stage_with_an_unknown_song_name_fails_and_never_unlocks() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("mode-stage-badname").join("stage");
         std::fs::create_dir_all(&stage).unwrap();
@@ -712,7 +712,7 @@ mod tests {
         // no longer freezes the stage as-is — it mirrors `rice mode stage`'s
         // own no-arg auto-resolve and re-pins from the COMMITTED songbook
         // notes before locking.
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("mode-declarative-autoresolve");
         let stage = root.join("stage");
@@ -755,7 +755,7 @@ mod tests {
         // The unchanged fallback: a genuinely fresh box with no stage file
         // yet has nothing to resolve, so this is still a no-op freeze, not an
         // error and not a fabricated re-pin.
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("mode-declarative-bare");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -776,7 +776,7 @@ mod tests {
 
     #[test]
     fn declarative_with_a_name_repins_then_locks_even_from_the_default_state() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("mode-declarative-named");
         let stage = root.join("stage");
@@ -801,7 +801,7 @@ mod tests {
 
     #[test]
     fn stage_then_declarative_round_trip_toggles_cleanly() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("mode-roundtrip");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -829,7 +829,7 @@ mod tests {
 
     #[test]
     fn staging_song_survives_a_declarative_lock_and_a_bare_stage_resolves_back_to_it() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("mode-staging-song-survives-lock");
         let stage = root.join("stage");
@@ -886,7 +886,7 @@ mod tests {
         // `staging_song` (a fresh box, or one predating this field) must
         // still resolve a bare `rice mode stage` off `current_staged_song()`
         // — the old behavior — rather than failing to resolve at all.
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("mode-staging-song-cold-start");
         let stage = root.join("stage");
@@ -918,7 +918,7 @@ mod tests {
 
     #[test]
     fn mode_draft_forks_a_new_draft_and_routes_the_symlink() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("mode-draft-fork");
         let stage = root.join("stage");
@@ -955,7 +955,7 @@ mod tests {
 
     #[test]
     fn mode_draft_routes_to_an_existing_draft_without_reforking() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("mode-draft-existing");
         let stage = root.join("stage");
@@ -989,7 +989,7 @@ mod tests {
 
     #[test]
     fn mode_draft_replaces_a_symlink_routed_to_a_different_draft() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("mode-draft-reroute");
         let stage = root.join("stage");
@@ -1021,7 +1021,7 @@ mod tests {
 
     #[test]
     fn mode_draft_refuses_while_declarative_locked() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("mode-draft-locked");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -1035,7 +1035,7 @@ mod tests {
 
     #[test]
     fn mode_draft_missing_name_is_usage() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("mode-draft-noname");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -1049,7 +1049,7 @@ mod tests {
 
     #[test]
     fn mode_draft_with_no_resolvable_song_errors() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("mode-draft-nosong").join("stage");
         std::fs::create_dir_all(&stage).unwrap();
@@ -1065,7 +1065,7 @@ mod tests {
 
     #[test]
     fn mode_stage_tears_down_an_active_draft_symlink() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("mode-stage-teardown");
         let stage = root.join("stage");
@@ -1103,7 +1103,7 @@ mod tests {
 
     #[test]
     fn mode_declarative_tears_down_an_active_draft_symlink() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("mode-declarative-teardown");
         let stage = root.join("stage");

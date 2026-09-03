@@ -347,7 +347,7 @@ mod tests {
 
     #[test]
     fn register_clone_links_song_when_absent_and_is_idempotent_on_rerun() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvSaver::capture(&["HOME", "AOIDE_STAGE_DIR"]);
         let root = unique_tmp("onboard-clone-fresh");
         std::fs::create_dir_all(root.join("song")).unwrap();
@@ -380,7 +380,7 @@ mod tests {
 
     #[test]
     fn register_clone_leaves_a_wrong_target_symlink_alone_with_a_note() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvSaver::capture(&["HOME", "AOIDE_STAGE_DIR"]);
         let root = unique_tmp("onboard-clone-wrong");
         std::fs::create_dir_all(root.join("song")).unwrap();
@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn register_clone_leaves_a_regular_file_alone_with_a_note() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvSaver::capture(&["HOME", "AOIDE_STAGE_DIR"]);
         let root = unique_tmp("onboard-clone-file");
         std::fs::create_dir_all(root.join("song")).unwrap();
@@ -433,7 +433,7 @@ mod tests {
         // The cosmetic fix: a symlink aimed at the RIGHT path whose target
         // doesn't exist yet must not be misreported as "elsewhere" just
         // because `canonicalize` can't resolve a dangling target.
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvSaver::capture(&["HOME", "AOIDE_STAGE_DIR"]);
         let root = unique_tmp("onboard-clone-dangling");
         // Deliberately no `root/song` directory yet -- the link below points
@@ -509,7 +509,7 @@ mod tests {
 
     #[test]
     fn checkout_root_finds_the_repo_root_by_walking_up_to_the_skill_marker() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let root = unique_tmp("onboard-checkout-found");
         std::fs::create_dir_all(root.join(".claude/skills/aoide")).unwrap();
         std::fs::write(root.join(".claude/skills/aoide/SKILL.md"), "").unwrap();
@@ -530,7 +530,7 @@ mod tests {
 
     #[test]
     fn checkout_root_is_none_outside_a_checkout() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let root = unique_tmp("onboard-checkout-missing");
 
         let saved_cwd = std::env::current_dir().unwrap();

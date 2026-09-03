@@ -1118,7 +1118,7 @@ mod tests {
 
     #[test]
     fn handle_usage_writes_state_usage_json_and_degrades_live_cleanly() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&[
             "AOIDE_STATE_DIR",
             "AOIDE_CLAUDE_PROJECTS_DIR",
@@ -1297,7 +1297,7 @@ mod tests {
 
     #[test]
     fn inbox_list_hides_read_entries_by_default_and_shows_them_with_all() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STATE_DIR"]);
         let root = unique_tmp("inbox-list");
         inbox_env(&root);
@@ -1326,7 +1326,7 @@ mod tests {
 
     #[test]
     fn inbox_list_on_an_empty_inbox_is_a_clean_ok_no_op() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STATE_DIR"]);
         let root = unique_tmp("inbox-list-empty");
         inbox_env(&root);
@@ -1340,7 +1340,7 @@ mod tests {
 
     #[test]
     fn inbox_read_marks_by_position_and_reports_the_entry() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STATE_DIR"]);
         let root = unique_tmp("inbox-read");
         inbox_env(&root);
@@ -1364,7 +1364,7 @@ mod tests {
 
     #[test]
     fn inbox_read_on_a_bad_or_missing_id_fails_cleanly() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STATE_DIR"]);
         let root = unique_tmp("inbox-read-bad");
         inbox_env(&root);
@@ -1383,7 +1383,7 @@ mod tests {
 
     #[test]
     fn inbox_clear_empties_and_reports_the_count() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STATE_DIR"]);
         let root = unique_tmp("inbox-clear");
         inbox_env(&root);
@@ -1423,7 +1423,7 @@ mod tests {
 
     #[test]
     fn handle_identity_mints_once_then_reports_a_no_op_read() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STATE_DIR"]);
         let root = unique_tmp("identity-handler");
         std::env::set_var("AOIDE_STATE_DIR", &root);

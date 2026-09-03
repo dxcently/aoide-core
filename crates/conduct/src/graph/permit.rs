@@ -645,7 +645,7 @@ mod tests {
 
     #[test]
     fn permit_refuses_an_unconductable_session_without_raising_a_card() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = aoide_test_support::EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = aoide_test_support::unique_tmp("permit-unconductable");
         std::fs::create_dir_all(&stage).unwrap();

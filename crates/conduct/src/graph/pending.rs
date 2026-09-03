@@ -456,7 +456,7 @@ mod tests {
 
     #[test]
     fn list_reads_real_and_malformed_entries_without_dying() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG", "AOIDE_CONDUCT_AUTOGATE", "AOIDE_SESSION_ID"]);
         let root = setup("pnd-ls");
 
@@ -491,7 +491,7 @@ mod tests {
         // through the terse petname+tail tag — but `data.pending[]`'s
         // `sessionId`/`from` are the machine contract and must stay the
         // entry's raw canonical ids, untouched.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -575,7 +575,7 @@ mod tests {
 
     #[test]
     fn approve_routes_through_session_send_and_removes_the_entry() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -640,7 +640,7 @@ mod tests {
         // `session_send` door, so a previously-held entry lands in the
         // inbox naturally the moment it is actually delivered, never at
         // queue time.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "AOIDE_STATE_DIR",
@@ -705,7 +705,7 @@ mod tests {
         // Queue under sender A, approve under sender B → the delivered bytes
         // must name A (the original queuer), never B (the approver) — the
         // whole point of carrying `from` through the queue.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -772,7 +772,7 @@ mod tests {
         // an orchestrating conducted session always has one, so an unguarded
         // re-drive would silently misattribute an anonymous send to whoever
         // happened to approve it.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -835,7 +835,7 @@ mod tests {
     fn a_legacy_pending_entry_with_no_from_field_still_lists_and_approves_cleanly() {
         // An entry written before this field existed (serde default on read)
         // must not fail to list or approve.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -898,7 +898,7 @@ mod tests {
 
     #[test]
     fn deny_removes_without_touching_the_socket() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",
@@ -955,7 +955,7 @@ mod tests {
 
     #[test]
     fn approve_and_deny_on_a_malformed_or_missing_id_fail_cleanly() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG", "AOIDE_CONDUCT_AUTOGATE", "AOIDE_SESSION_ID"]);
         let root = setup("pnd-mf");
 
@@ -988,7 +988,7 @@ mod tests {
 
     #[test]
     fn list_on_a_missing_queue_is_an_empty_ok_no_op() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
         let root = setup("pnd-ok");
         let out = pending_list(&pending_invocation(&["session", "pending", "list"], &[]));

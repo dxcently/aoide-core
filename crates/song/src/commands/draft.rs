@@ -457,7 +457,7 @@ mod tests {
 
     #[test]
     fn save_creates_the_draft_dir_nested_under_its_song_and_files() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("draft-save-ok");
         let stage = root.join("stage");
@@ -492,7 +492,7 @@ mod tests {
 
     #[test]
     fn save_without_a_staged_livery_errors() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("draft-save-nostage");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -505,7 +505,7 @@ mod tests {
 
     #[test]
     fn save_with_a_songless_staged_livery_errors_no_resolvable_song() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("draft-save-nosong");
         std::fs::create_dir_all(&stage).unwrap();
@@ -521,7 +521,7 @@ mod tests {
 
     #[test]
     fn save_upserts_an_existing_draft() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("draft-save-upsert");
         let stage = root.join("stage");
@@ -546,7 +546,7 @@ mod tests {
 
     #[test]
     fn save_clears_a_stale_cover_when_the_current_stage_has_none() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("draft-save-stale-cover");
         let stage = root.join("stage");
@@ -569,7 +569,7 @@ mod tests {
 
     #[test]
     fn saving_one_draft_never_touches_another() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("draft-save-independent");
         let stage = root.join("stage");
@@ -598,7 +598,7 @@ mod tests {
 
     #[test]
     fn drafts_of_two_different_songs_never_collide_even_with_the_same_name() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("draft-save-cross-song");
         let stage = root.join("stage");
@@ -635,7 +635,7 @@ mod tests {
         // `rice draft save <new-name>` still reads the live content fine —
         // std::fs::read_to_string follows symlinks transparently, same as
         // any other reader — and forks it into a brand-new draft.
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("draft-save-through-symlink");
         let stage = root.join("stage");
@@ -661,7 +661,7 @@ mod tests {
 
     #[test]
     fn list_with_no_songbook_at_all_is_ok_with_an_empty_list() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("draft-list-absent");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -674,7 +674,7 @@ mod tests {
 
     #[test]
     fn list_scoped_to_a_song_with_no_drafts_is_ok_with_an_empty_list() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("draft-list-scoped-empty");
         let stage = root.join("stage");
@@ -690,7 +690,7 @@ mod tests {
 
     #[test]
     fn list_surfaces_multiple_drafts_of_one_song_with_the_current_one_flagged() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("draft-list-multi");
         let stage = root.join("stage");
@@ -724,7 +724,7 @@ mod tests {
 
     #[test]
     fn list_with_no_arg_walks_every_song_and_scoping_by_name_narrows_it() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("draft-list-allsongs");
         let stage = root.join("stage");
@@ -754,7 +754,7 @@ mod tests {
 
     #[test]
     fn drop_removes_a_draft() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("draft-drop-ok");
         let stage = root.join("stage");
@@ -774,7 +774,7 @@ mod tests {
 
     #[test]
     fn drop_rejects_a_path_traversal_name_before_touching_the_filesystem() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("draft-drop-traversal");
         let stage = root.join("stage");
@@ -793,7 +793,7 @@ mod tests {
 
     #[test]
     fn drop_on_a_missing_draft_errors() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("draft-drop-missing");
         std::fs::create_dir_all(&stage).unwrap();
@@ -809,7 +809,7 @@ mod tests {
 
     #[test]
     fn drop_with_no_resolvable_song_errors() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("draft-drop-nosong");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -822,7 +822,7 @@ mod tests {
 
     #[test]
     fn drop_of_the_live_draft_is_refused_not_silently_torn_down() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("draft-drop-live");
         let stage = root.join("stage");
@@ -857,7 +857,7 @@ mod tests {
 
     #[test]
     fn drop_of_a_different_draft_succeeds_while_another_is_live() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("draft-drop-other");
         let stage = root.join("stage");

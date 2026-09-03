@@ -997,7 +997,7 @@ mod tests {
     fn stage_dir_honors_absolute_env_override() {
         // `stage_dir()` reads process-global env; the crate-wide lock serialises
         // this against every other env-touching test.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
 
         std::env::set_var("AOIDE_STAGE_DIR", "/tmp/aoide-test-stage");
@@ -1027,7 +1027,7 @@ mod tests {
 
     #[test]
     fn song_tree_resolves_under_the_stage_override() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
 
         // Point the stage at `<tmp>/stage`; the song tree is its parent, so
@@ -1061,7 +1061,7 @@ mod tests {
         // Mirrors `song_tree_resolves_under_the_stage_override`: a draft nests
         // under ITS song's songbook dir, not a flat top-level `drafts/` —
         // a draft is a variation of an already-composed song.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
 
         std::env::set_var("AOIDE_STAGE_DIR", "/tmp/aoide-drafts-test/stage");
@@ -1101,7 +1101,7 @@ mod tests {
         // override's tmp root plays the role of the runtime root, its
         // child the role of `song/`, so `run/qml` lands as THAT root's sibling
         // `run/qml`, one level up from where `song_dir()` resolves.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
 
         std::env::set_var("AOIDE_STAGE_DIR", "/tmp/aoide-run-qml-test/stage");
@@ -1129,7 +1129,7 @@ mod tests {
     fn run_elements_dir_resolves_as_a_sibling_of_run_qml_under_the_stage_override() {
         // Mirrors `run_qml_dir_resolves_as_a_sibling_of_song_under_the_stage_override`
         // exactly — same runtime root, `run/elements` instead of `run/qml`.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
 
         std::env::set_var("AOIDE_STAGE_DIR", "/tmp/aoide-run-elements-test/stage");
@@ -1162,7 +1162,7 @@ mod tests {
         // every other path above) — see its own doc for why: the committed
         // git checkout `nix eval` reads doesn't move just because a test
         // relocated the runtime trees.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_flake = std::env::var("AOIDE_FLAKE_ROOT").ok();
 
@@ -1250,7 +1250,7 @@ mod tests {
         // wins outright regardless of whatever `current_exe()`'s own
         // sibling resolves to in this test binary (which never has a real
         // `share/lyra/songbook` beside it).
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_SONG_TEMPLATES").ok();
 
         std::env::set_var("AOIDE_SONG_TEMPLATES", "/tmp/aoide-song-templates-test");
@@ -1501,7 +1501,7 @@ mod tests {
         // show up as a would-be-0666 window rather than a merely-0644 one)
         // to prove the FINAL path is 0600 regardless of what the process
         // umask would otherwise have widened a plain `File::create` to.
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("aoide-atomic-private-umask-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1528,7 +1528,7 @@ mod tests {
 
     #[test]
     fn captures_dir_nests_under_state_dir_and_honors_its_override() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
 
         std::env::set_var("AOIDE_STATE_DIR", "/tmp/aoide-captures-test/state");
@@ -1552,7 +1552,7 @@ mod tests {
 
     #[test]
     fn pointer_state_file_nests_under_state_dir_and_honors_its_override() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
 
         std::env::set_var("AOIDE_STATE_DIR", "/tmp/aoide-pointer-test/state");
@@ -1651,7 +1651,7 @@ mod tests {
 
     #[test]
     fn migrate_conducting_stage_moves_every_core_file_from_old_to_new() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = MigrationEnvGuard::capture_and_clear();
         let home = std::env::temp_dir().join(format!("aoide-migrate-basic-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
@@ -1678,7 +1678,7 @@ mod tests {
 
     #[test]
     fn migrate_conducting_stage_second_run_is_a_no_op() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = MigrationEnvGuard::capture_and_clear();
         let home = std::env::temp_dir().join(format!("aoide-migrate-idempotent-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
@@ -1708,7 +1708,7 @@ mod tests {
 
     #[test]
     fn migrate_conducting_stage_never_clobbers_a_newer_new_path_file() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = MigrationEnvGuard::capture_and_clear();
         let home = std::env::temp_dir().join(format!("aoide-migrate-no-clobber-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
@@ -1736,7 +1736,7 @@ mod tests {
 
     #[test]
     fn migrate_conducting_stage_leaves_rice_files_where_they_are() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = MigrationEnvGuard::capture_and_clear();
         let home = std::env::temp_dir().join(format!("aoide-migrate-rice-untouched-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
@@ -1778,7 +1778,7 @@ mod tests {
     /// its own isolated proof.
     #[test]
     fn conducting_stage_dir_resolves_under_state_and_migrates_on_first_call() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = MigrationEnvGuard::capture_and_clear();
         let home = std::env::temp_dir().join(format!("aoide-migrate-wiring-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
@@ -1808,7 +1808,7 @@ mod tests {
         // directly, no migration side effect to worry about. `RootEnvGuard`
         // is skipped here on purpose: this test's whole point IS the
         // unset/empty/relative fallback shape.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_root = std::env::var("AOIDE_ROOT").ok();
         let saved_home = std::env::var("HOME").ok();
         let saved_user = std::env::var("AOIDE_USER").ok();
@@ -1851,7 +1851,7 @@ mod tests {
     /// calls it directly and is independent of every other.
     #[test]
     fn migrate_root_once_moves_every_pre_lc2_tree() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = MigrationEnvGuard::capture_and_clear();
         let home = std::env::temp_dir().join(format!("aoide-migrate-root-basic-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
@@ -1888,7 +1888,7 @@ mod tests {
 
     #[test]
     fn migrate_root_once_second_run_is_a_no_op() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = MigrationEnvGuard::capture_and_clear();
         let home = std::env::temp_dir().join(format!("aoide-migrate-root-idempotent-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
@@ -1917,7 +1917,7 @@ mod tests {
 
     #[test]
     fn migrate_root_once_never_clobbers_a_newer_new_root_tree() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = MigrationEnvGuard::capture_and_clear();
         let home = std::env::temp_dir().join(format!("aoide-migrate-root-no-clobber-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
@@ -1948,7 +1948,7 @@ mod tests {
         // and `$AOIDE_AUDIT_LOG` are both absent and DO migrate — each piece
         // is gated on its OWN override independently (see `migrate_root_once`'s
         // own doc).
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = MigrationEnvGuard::capture_and_clear();
         let home = std::env::temp_dir().join(format!("aoide-migrate-root-piecewise-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
@@ -1991,7 +1991,7 @@ mod tests {
     /// different custom root.
     #[test]
     fn migrate_root_once_targets_a_custom_aoide_root_not_the_default() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = MigrationEnvGuard::capture_and_clear();
         let home = std::env::temp_dir().join(format!("aoide-migrate-root-custom-{}", std::process::id()));
         let custom_root =

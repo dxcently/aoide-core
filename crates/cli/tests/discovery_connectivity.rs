@@ -102,7 +102,7 @@ fn cli_invocation(path: &[&str], args: &[&str], flags: &[(&str, &str)]) -> Invoc
 #[test]
 #[ignore = "real UDP broadcast — no network in the nix sandbox; run with --ignored"]
 fn advertise_then_discover_and_invite_resolve_round_trip_over_real_broadcast() {
-    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
 
     let name = "discovery-connectivity-test-box";
     let host = "discovery-connectivity-test-box";
@@ -181,7 +181,7 @@ fn advertise_then_discover_and_invite_resolve_round_trip_over_real_broadcast() {
 #[test]
 #[ignore = "real UDP broadcast + real TCP on a routable bind — no network in the nix sandbox; run with --ignored"]
 fn peer_pair_hostname_arm_single_match_reaches_the_shared_run_pair_request_over_real_broadcast_and_tcp() {
-    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("invite-ceremony");
     setup_env(&root);
 

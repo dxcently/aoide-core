@@ -367,7 +367,7 @@ mod tests {
     /// process-env mutation, so serialized on the shared env lock like
     /// every other env-touching test in this crate.
     fn with_temp_state<F: FnOnce()>(tag: &str, f: F) {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let mut dir = std::env::temp_dir();
         dir.push(format!(
             "aoide-advertise-switch-{tag}-{}-{}",

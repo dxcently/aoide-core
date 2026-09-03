@@ -939,7 +939,7 @@ mod tests {
         // within-TTL) pulled cache folds in as a `kind:"peer"` root node
         // whose own resolved graph nests as `children` — never flattened
         // into this document's own top-level `nodes`/`edges`.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-peer-fold-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1004,7 +1004,7 @@ mod tests {
         // pull ever succeeds — and stays visible (never silently dropped)
         // once a pull goes stale. Either way: an explicit `state`, no
         // `children`, never a crash.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-peer-fold-stale-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1109,7 +1109,7 @@ mod tests {
     }
     #[test]
     fn resolve_graph_document_matches_build_graph_off_the_current_stage() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let stage = unique_stage("resolve-graph-doc");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -1182,7 +1182,7 @@ mod tests {
         // back off `state`. This test pins the projection directly against
         // `ledger_session_exit`, independent of which roster-exit path
         // called it.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STATE_DIR"]);
         let state = unique_stage("ledger-restore");
         std::env::set_var("AOIDE_STATE_DIR", &state);
@@ -1207,7 +1207,7 @@ mod tests {
     }
     #[test]
     fn ledger_session_exit_writes_explicit_null_when_no_restore() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STATE_DIR"]);
         let state = unique_stage("ledger-restore-null");
         std::env::set_var("AOIDE_STATE_DIR", &state);

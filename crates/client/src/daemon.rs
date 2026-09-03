@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn socket_path_honors_the_env_override() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_DAEMON_SOCKET").ok();
         std::env::set_var("AOIDE_DAEMON_SOCKET", "/tmp/example-override.sock");
         assert_eq!(socket_path(), PathBuf::from("/tmp/example-override.sock"));
@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn daemon_dispatch_against_a_dead_socket_is_none() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_DAEMON_SOCKET").ok();
         std::env::set_var("AOIDE_DAEMON_SOCKET", short_tmp("dead"));
         let out = daemon_dispatch(&inv(&["session", "start"], Door::Cli));
@@ -242,7 +242,7 @@ mod tests {
     /// never even attempts a connect, regardless of what's listening.
     #[test]
     fn daemon_dispatch_short_circuits_on_door_daemon() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let socket_path = short_tmp("guard").with_extension("sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
         let sp = socket_path.clone();
@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn daemon_dispatch_round_trips_against_a_fake_daemon() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let socket_path = short_tmp("roundtrip").with_extension("sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
         let handle = std::thread::spawn(move || {
@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn daemon_dispatch_surfaces_a_post_connect_failure_as_an_error_outcome_not_none() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let socket_path = short_tmp("badreply").with_extension("sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
         let handle = std::thread::spawn(move || {
@@ -336,7 +336,7 @@ mod tests {
 
     #[test]
     fn daemon_seal_pubkey_hex_round_trips_against_a_fake_daemon() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let socket_path = short_tmp("pubkey-roundtrip").with_extension("sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
         let handle = std::thread::spawn(move || {
@@ -371,7 +371,7 @@ mod tests {
     /// never a fabricated key — a caller MUST treat this as "cannot verify".
     #[test]
     fn daemon_seal_pubkey_hex_against_a_dead_socket_is_none() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let socket_path = short_tmp("pubkey-dead").with_extension("sock");
         let saved = std::env::var("AOIDE_DAEMON_SOCKET").ok();
         std::env::set_var("AOIDE_DAEMON_SOCKET", &socket_path);
@@ -387,7 +387,7 @@ mod tests {
     /// never a partial/garbage key.
     #[test]
     fn daemon_seal_pubkey_hex_missing_field_is_none() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let socket_path = short_tmp("pubkey-missing").with_extension("sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
         let handle = std::thread::spawn(move || {

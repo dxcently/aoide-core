@@ -531,7 +531,7 @@ mod tests {
     use std::sync::Mutex;
 
     fn with_temp_runtime_dir<T>(tag: &str, f: impl FnOnce() -> T) -> T {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("XDG_RUNTIME_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-client-tunnel-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1119,7 +1119,7 @@ mod tests {
 
     #[test]
     fn open_timeout_secs_falls_back_on_unparsable_or_zero() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var(TUNNEL_OPEN_TIMEOUT_ENV).ok();
 
         std::env::remove_var(TUNNEL_OPEN_TIMEOUT_ENV);
@@ -1142,7 +1142,7 @@ mod tests {
 
     #[test]
     fn resolve_login_prefers_vias_own_user_then_env_then_refuses() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_user = std::env::var("USER").ok();
         let saved_logname = std::env::var("LOGNAME").ok();
 

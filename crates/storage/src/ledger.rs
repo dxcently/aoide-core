@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn append_then_read_round_trips_every_field() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let state = unique_state("roundtrip");
         std::env::set_var("AOIDE_STATE_DIR", &state);
 
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn append_never_truncates_across_multiple_calls() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let state = unique_state("multi");
         std::env::set_var("AOIDE_STATE_DIR", &state);
 
@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn read_ledger_skips_a_malformed_line_rather_than_failing() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let state = unique_state("malformed");
         std::env::set_var("AOIDE_STATE_DIR", &state);
 
@@ -239,7 +239,7 @@ mod tests {
 
     #[test]
     fn missing_ledger_reads_as_empty_never_an_error() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let state = unique_state("missing");
         std::env::set_var("AOIDE_STATE_DIR", &state);
 

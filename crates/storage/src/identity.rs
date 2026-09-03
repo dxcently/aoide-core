@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn mint_once_is_idempotent_and_the_second_call_reports_no_mint() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = aoide_test_support::EnvSaver::capture(&["AOIDE_STATE_DIR"]);
         let root = aoide_test_support::unique_tmp("identity-mint-once");
         env(&root);
@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn the_private_key_file_is_locked_to_0600() {
         use std::os::unix::fs::PermissionsExt;
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = aoide_test_support::EnvSaver::capture(&["AOIDE_STATE_DIR"]);
         let root = aoide_test_support::unique_tmp("identity-0600");
         env(&root);
@@ -327,7 +327,7 @@ mod tests {
         // stay world-listable under `create_dir_all`'s umask-derived
         // default.
         use std::os::unix::fs::PermissionsExt;
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = aoide_test_support::EnvSaver::capture(&["AOIDE_STATE_DIR"]);
         let root = aoide_test_support::unique_tmp("identity-dir-0700");
         env(&root);
@@ -343,7 +343,7 @@ mod tests {
 
     #[test]
     fn pubkey_round_trips_load_to_load_with_the_same_fingerprint() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = aoide_test_support::EnvSaver::capture(&["AOIDE_STATE_DIR"]);
         let root = aoide_test_support::unique_tmp("identity-roundtrip");
         env(&root);
@@ -379,7 +379,7 @@ mod tests {
 
     #[test]
     fn sign_and_verify_round_trip_against_the_dependency() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = aoide_test_support::EnvSaver::capture(&["AOIDE_STATE_DIR"]);
         let root = aoide_test_support::unique_tmp("identity-sign-verify");
         env(&root);
@@ -418,7 +418,7 @@ mod tests {
         // in the brief: a state dir that already has OTHER files (the way
         // every real ~/Aoide/state predates this phase) but no `identity/`
         // subtree at all must mint on first touch, not error.
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = aoide_test_support::EnvSaver::capture(&["AOIDE_STATE_DIR"]);
         let root = aoide_test_support::unique_tmp("identity-legacy-dir");
         std::fs::create_dir_all(&root).unwrap();
@@ -434,7 +434,7 @@ mod tests {
 
     #[test]
     fn a_key_file_of_the_wrong_length_is_refused_not_silently_reminted() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = aoide_test_support::EnvSaver::capture(&["AOIDE_STATE_DIR"]);
         let root = aoide_test_support::unique_tmp("identity-bad-length");
         env(&root);
@@ -454,7 +454,7 @@ mod tests {
 
     #[test]
     fn a_missing_created_at_sidecar_next_to_a_good_key_degrades_to_load_time() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = aoide_test_support::EnvSaver::capture(&["AOIDE_STATE_DIR"]);
         let root = aoide_test_support::unique_tmp("identity-no-sidecar");
         env(&root);

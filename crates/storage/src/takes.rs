@@ -370,7 +370,7 @@ mod tests {
 
     #[test]
     fn a_take_record_round_trips_through_atomic_write_with_its_parent_pointer_intact() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (song, draft) = routed("takes-roundtrip");
 
@@ -399,7 +399,7 @@ mod tests {
 
     #[test]
     fn load_take_is_none_for_a_missing_or_corrupt_file() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (song, draft) = routed("takes-missing");
 
@@ -414,7 +414,7 @@ mod tests {
 
     #[test]
     fn next_take_number_is_one_for_an_empty_store() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (song, draft) = routed("takes-next-empty");
         assert_eq!(next_take_number(&song, Some(&draft)), 1);
@@ -422,7 +422,7 @@ mod tests {
 
     #[test]
     fn next_take_number_is_gap_tolerant_not_first_free_slot() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (song, draft) = routed("takes-next-gap");
         save_take(&song, Some(&draft), &rec(1, None)).unwrap();
@@ -434,7 +434,7 @@ mod tests {
 
     #[test]
     fn list_and_next_sort_by_parsed_number_not_filename_lexical_order() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (song, draft) = routed("takes-numeric-sort");
         // "10000.json" < "0002.json" as strings — a lexicographic sort would
@@ -450,7 +450,7 @@ mod tests {
 
     #[test]
     fn list_takes_skips_head_marks_and_unparseable_entries() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (song, draft) = routed("takes-list-skip");
         save_take(&song, Some(&draft), &rec(1, None)).unwrap();
@@ -466,7 +466,7 @@ mod tests {
 
     #[test]
     fn load_head_is_none_for_an_empty_store_and_falls_back_to_max_when_absent() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (song, draft) = routed("takes-head-absent-empty");
         assert_eq!(load_head(&song, Some(&draft)), None, "nothing minted yet");
@@ -479,7 +479,7 @@ mod tests {
 
     #[test]
     fn load_head_falls_back_to_max_when_the_claimed_head_take_no_longer_exists() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (song, draft) = routed("takes-head-stale");
         save_take(&song, Some(&draft), &rec(1, None)).unwrap();
@@ -494,7 +494,7 @@ mod tests {
 
     #[test]
     fn save_head_round_trips_a_valid_claim() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (song, draft) = routed("takes-head-valid");
         save_take(&song, Some(&draft), &rec(1, None)).unwrap();
@@ -507,7 +507,7 @@ mod tests {
 
     #[test]
     fn marks_round_trip_and_moving_a_letter_is_one_atomic_write_of_the_map() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (song, draft) = routed("takes-marks-move");
 
@@ -528,7 +528,7 @@ mod tests {
 
     #[test]
     fn load_marks_tolerates_a_missing_or_corrupt_file_as_empty() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (song, draft) = routed("takes-marks-missing");
         assert!(load_marks(&song, Some(&draft)).is_empty());

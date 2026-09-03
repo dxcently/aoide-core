@@ -65,7 +65,7 @@ mod tests {
         // separate crate-local mutex, so its `set_var("AOIDE_STAGE_DIR", …)`
         // could race a rice.rs/mode.rs test holding the OTHER lock and clobber
         // its env mid-flight.
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         std::env::set_var("AOIDE_STAGE_DIR", "/tmp/aoide-cover-test/stage");
 
@@ -78,7 +78,7 @@ mod tests {
 
     #[test]
     fn derive_cover_finds_the_first_matching_extension_or_none() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root =
             std::env::temp_dir().join(format!("aoide-song-derive-cover-{}", std::process::id()));

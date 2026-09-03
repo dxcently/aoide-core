@@ -563,7 +563,7 @@ mod tests {
 
     #[test]
     fn spawn_registers_a_detached_headless_child_and_mirrors_its_log() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "AOIDE_STATE_DIR",
@@ -629,7 +629,7 @@ mod tests {
 
     #[test]
     fn spawn_of_a_nonexistent_binary_registers_no_ghost_session() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "AOIDE_STATE_DIR",
@@ -679,7 +679,7 @@ mod tests {
     /// the undying store directly, never on a process.
     #[test]
     fn undying_flag_marks_the_spawned_id_once_registered() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "AOIDE_STATE_DIR",
@@ -725,7 +725,7 @@ mod tests {
     /// registered one — must mark nothing.
     #[test]
     fn without_undying_flag_a_spawn_marks_nothing() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "AOIDE_STATE_DIR",
@@ -765,7 +765,7 @@ mod tests {
 
     #[test]
     fn prompt_is_skipped_honestly_when_registration_never_happens() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "AOIDE_STATE_DIR",
@@ -891,7 +891,7 @@ mod tests {
         // here with no process ever spawned — the LIVE gate (a real
         // terminal opening under the compositor) is the orchestrator's and
         // the User's, never this crate's tests.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_TERMINAL", "WAYLAND_DISPLAY", "DISPLAY"]);
         std::env::set_var("AOIDE_TERMINAL", "foot sh -c '{cmd}'");
         std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
@@ -913,7 +913,7 @@ mod tests {
 
     #[test]
     fn windowed_spawn_without_a_template_is_a_taught_error_naming_the_env_var() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_TERMINAL", "WAYLAND_DISPLAY", "DISPLAY"]);
         std::env::remove_var("AOIDE_TERMINAL");
         std::env::set_var("WAYLAND_DISPLAY", "wayland-0"); // a display IS present —
@@ -930,7 +930,7 @@ mod tests {
         // The taught error is a pure pre-flight — it must return before ANY
         // process spawn or session-registration attempt (unlike a bad
         // `<command>`, which still registers-then-fails inside `conduct`).
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_TERMINAL",
             "WAYLAND_DISPLAY",
@@ -963,7 +963,7 @@ mod tests {
 
     #[test]
     fn windowed_spawn_without_a_display_is_a_taught_error_naming_the_fallback() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_TERMINAL", "WAYLAND_DISPLAY", "DISPLAY"]);
         std::env::set_var("AOIDE_TERMINAL", "kitty -e {cmd}");
         std::env::remove_var("WAYLAND_DISPLAY");
@@ -979,7 +979,7 @@ mod tests {
     fn windowed_spawn_accepts_either_display_variable() {
         // Only $DISPLAY (no Wayland) must still pass the display check — the
         // taught error is "both absent", not "Wayland absent".
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_TERMINAL", "WAYLAND_DISPLAY", "DISPLAY"]);
         std::env::set_var("AOIDE_TERMINAL", "kitty -e {cmd}");
         std::env::remove_var("WAYLAND_DISPLAY");
@@ -993,7 +993,7 @@ mod tests {
         // `--windowed`'s pre-flight — a headless host with neither
         // $AOIDE_TERMINAL nor a display must still spawn headless exactly as
         // before P-D7.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "AOIDE_STATE_DIR",

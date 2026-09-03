@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn cover_set_stages_an_absolute_path() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("cover-abs");
         let stage = root.join("stage");
@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn cover_set_resolves_a_bare_name_against_the_covers_library() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("cover-name");
         let stage = root.join("stage");
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn cover_set_missing_file_is_error_exit_1() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("cover-missing");
         let stage = root.join("stage");
@@ -226,7 +226,7 @@ mod tests {
 
     #[test]
     fn cover_set_entry_refuses_while_declarative_mode_is_locked() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("cover-entry-locked");
         let stage = root.join("stage");
@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn cover_set_entry_allows_writes_once_staging_mode_is_unlocked() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("cover-entry-unlocked");
         let stage = root.join("stage");
@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn cover_set_entry_in_draft_mode_mints_an_auto_take_on_a_real_change() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("cover-autotake-fires");
         let stage = root.join("stage");
@@ -309,7 +309,7 @@ mod tests {
         // take tree an incomplete record of write events; the resulting
         // duplicate-take noise is `rice take prune`'s problem (phase A9),
         // not this hook's.
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("cover-autotake-repeat");
         let stage = root.join("stage");

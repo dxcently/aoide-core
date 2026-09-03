@@ -859,7 +859,7 @@ mod tests {
 
     #[test]
     fn kimi_install_creates_merges_and_is_idempotent() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvSaver::capture(&["KIMI_CODE_HOME", "HOME"]);
         let root = unique_tmp("hooks-kimi");
         std::env::set_var("KIMI_CODE_HOME", root.join("kimi"));
@@ -906,7 +906,7 @@ mod tests {
 
     #[test]
     fn kimi_capture_entries_coexist_with_plain_and_are_idempotent() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         // This test asserts `state_dir()`'s $HOME fallback, so both overrides
         // that outrank $HOME (the crate lock's own AOIDE_STATE_DIR floor
         // included) are cleared for its duration.
@@ -952,7 +952,7 @@ mod tests {
         // (`graph session hook`) still carries the `session hook` marker, so
         // the presence-only check called it "already installed" forever and
         // never rewrote it — the kimi harness kept running a dead command.
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvSaver::capture(&["KIMI_CODE_HOME", "HOME"]);
         let root = unique_tmp("hooks-kimi-stale-cmd");
         std::env::set_var("KIMI_CODE_HOME", root.join("kimi"));
@@ -1015,7 +1015,7 @@ mod tests {
         // wrap from the retired `~/Aoide/state` to `${AOIDE_ROOT:-...}`, but
         // both spellings carry the same `-hooks.jsonl` marker — so a
         // presence-only check kept the retired path installed forever.
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvSaver::capture(&["KIMI_CODE_HOME", "HOME"]);
         let root = unique_tmp("hooks-kimi-stale-wrap");
         std::env::set_var("KIMI_CODE_HOME", root.join("kimi"));
@@ -1061,7 +1061,7 @@ mod tests {
         // "session hook" (in prose, not an invocation) must never be
         // identified as ours — post-#109 that identification means an
         // in-place OVERWRITE, not just a `present` report.
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvSaver::capture(&["KIMI_CODE_HOME", "HOME"]);
         let root = unique_tmp("hooks-kimi-nearmiss");
         std::env::set_var("KIMI_CODE_HOME", root.join("kimi"));
@@ -1150,7 +1150,7 @@ mod tests {
         // Install-time, the capture log dir is pre-created via
         // `aoide_storage::fs::state_dir()` — proving it tracks a CONFIGURED
         // `AOIDE_ROOT` (a scratch path here), not the retired `~/Aoide`.
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvSaver::capture(&["KIMI_CODE_HOME", "HOME", "AOIDE_ROOT", "AOIDE_STATE_DIR"]);
         std::env::remove_var("AOIDE_STATE_DIR");
         let root = unique_tmp("hooks-kimi-cap-root");
@@ -1187,7 +1187,7 @@ mod tests {
             eprintln!("skipping claude_install_reports_present_and_preserves_the_document: not inside an Aoide checkout (no .claude/skills/aoide above the cwd)");
             return;
         }
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvSaver::capture(&["HOME"]);
         let root = unique_tmp("hooks-claude");
         std::env::set_var("HOME", &root);
@@ -1268,7 +1268,7 @@ mod tests {
             eprintln!("skipping claude_reinstall_converges_a_stale_command_and_preserves_user_hook: not inside an Aoide checkout (no .claude/skills/aoide above the cwd)");
             return;
         }
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvSaver::capture(&["HOME"]);
         let root = unique_tmp("hooks-claude-stale");
         std::env::set_var("HOME", &root);
@@ -1326,7 +1326,7 @@ mod tests {
             eprintln!("skipping claude_a_prose_hook_that_merely_mentions_session_hook_is_never_identified_as_ours: not inside an Aoide checkout (no .claude/skills/aoide above the cwd)");
             return;
         }
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvSaver::capture(&["HOME"]);
         let root = unique_tmp("hooks-claude-nearmiss");
         std::env::set_var("HOME", &root);
@@ -1366,7 +1366,7 @@ mod tests {
             eprintln!("skipping claude_pointer_and_skill_install_and_are_idempotent: not inside an Aoide checkout (no .claude/skills/aoide above the cwd)");
             return;
         }
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvSaver::capture(&["HOME"]);
         let root = unique_tmp("hooks-claude-skill");
         std::env::set_var("HOME", &root);
@@ -1430,7 +1430,7 @@ mod tests {
             eprintln!("skipping claude_skill_conflict_is_a_taught_refusal_never_an_overwrite: not inside an Aoide checkout (no .claude/skills/aoide above the cwd)");
             return;
         }
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvSaver::capture(&["HOME"]);
         let root = unique_tmp("hooks-claude-conflict");
         std::env::set_var("HOME", &root);
@@ -1480,7 +1480,7 @@ mod tests {
 
     #[test]
     fn link_skills_from_links_every_skill_and_skips_non_skill_children() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvSaver::capture(&["HOME"]);
         let root = unique_tmp("hooks-skills-multi");
         let skills_src = root.join("repo-skills");
@@ -1527,7 +1527,7 @@ mod tests {
 
     #[test]
     fn link_skills_from_one_conflict_never_blocks_another_skill_from_linking() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvSaver::capture(&["HOME"]);
         let root = unique_tmp("hooks-skills-conflict");
         let skills_src = root.join("repo-skills");
@@ -1564,7 +1564,7 @@ mod tests {
 
     #[test]
     fn pi_install_is_declarative_and_writes_nothing() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvSaver::capture(&["HOME"]);
         let root = unique_tmp("hooks-pi");
         std::env::set_var("HOME", &root);

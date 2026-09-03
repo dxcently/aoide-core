@@ -105,7 +105,7 @@ fn setup_env(root: &std::path::Path) -> PathBuf {
 #[test]
 #[ignore = "real loopback TCP + real curl — no network/curl in the nix sandbox; run with --ignored"]
 fn peer_add_and_pull_round_trip_over_real_http_between_two_loopback_instances() {
-    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("main");
     let _stage = setup_env(&root);
 
@@ -233,7 +233,7 @@ fn peer_add_and_pull_round_trip_over_real_http_between_two_loopback_instances() 
 #[test]
 #[ignore = "real loopback TCP + real curl — no network/curl in the nix sandbox; run with --ignored"]
 fn peer_add_against_an_unreachable_url_never_registers_and_pull_of_a_down_peer_marks_stale_without_breaking_others() {
-    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("unreachable");
     let _stage = setup_env(&root);
 
@@ -331,7 +331,7 @@ fn peer_add_against_an_unreachable_url_never_registers_and_pull_of_a_down_peer_m
 
 #[test]
 fn peer_add_rejects_a_path_traversal_name_without_touching_the_network_or_registry() {
-    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("add-traversal");
     let _stage = setup_env(&root);
 
@@ -353,7 +353,7 @@ fn peer_add_rejects_a_path_traversal_name_without_touching_the_network_or_regist
 
 #[test]
 fn peer_remove_rejects_a_path_traversal_name_before_touching_the_cache_file() {
-    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("remove-traversal");
     let _stage = setup_env(&root);
 
@@ -380,7 +380,7 @@ fn peer_remove_rejects_a_path_traversal_name_before_touching_the_cache_file() {
 /// consumer of the registry.
 #[test]
 fn peer_rm_is_a_parser_alias_for_peer_remove_and_never_a_second_schema_entry() {
-    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("rm-alias");
     let _stage = setup_env(&root);
 
@@ -414,7 +414,7 @@ fn peer_rm_is_a_parser_alias_for_peer_remove_and_never_a_second_schema_entry() {
 
 #[test]
 fn peer_pair_url_target_rejects_an_invalid_name_without_touching_the_network_or_registry() {
-    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("pair-request-invalid-name");
     let _stage = setup_env(&root);
 
@@ -440,7 +440,7 @@ fn peer_pair_url_target_rejects_an_invalid_name_without_touching_the_network_or_
 
 #[test]
 fn bare_pair_off_a_tty_is_the_pending_listing() {
-    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("pair-request-no-url");
     let _stage = setup_env(&root);
 
@@ -468,7 +468,7 @@ fn bare_pair_off_a_tty_is_the_pending_listing() {
 /// for while discarding the url.
 #[test]
 fn pair_with_a_second_positional_is_a_fast_taught_usage_error_never_a_silent_sweep() {
-    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("pair-request-old-spelling");
     let _stage = setup_env(&root);
 
@@ -494,7 +494,7 @@ fn pair_with_a_second_positional_is_a_fast_taught_usage_error_never_a_silent_swe
 
 #[test]
 fn pair_reject_on_an_unknown_id_leaves_no_record_change() {
-    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("pair-unknown-id");
     let _stage = setup_env(&root);
 
@@ -528,7 +528,7 @@ fn pair_reject_on_an_unknown_id_leaves_no_record_change() {
 
 #[test]
 fn peer_pair_approve_on_an_unrevealed_inbound_entry_is_refused_with_awaiting_reveal() {
-    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("pair-approve-unrevealed");
     let _stage = setup_env(&root);
 
@@ -555,7 +555,7 @@ fn peer_pair_approve_on_an_unrevealed_inbound_entry_is_refused_with_awaiting_rev
 
 #[test]
 fn peer_pair_reject_on_an_outbound_entry_aborts_before_the_approvers_callback() {
-    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("pair-reject-outbound-pre-callback");
     let _stage = setup_env(&root);
 
@@ -593,7 +593,7 @@ fn peer_pair_reject_on_an_outbound_entry_aborts_before_the_approvers_callback() 
 
 #[test]
 fn peer_pair_reject_on_an_outbound_entry_aborts_after_the_approvers_callback() {
-    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("pair-reject-outbound-post-callback");
     let _stage = setup_env(&root);
 
@@ -670,7 +670,7 @@ fn spawn_fake_pair_poll_server(body: &'static str) -> (TcpListener, u16) {
 #[test]
 #[ignore = "real loopback TCP + real curl (Design A's poll) — no network/curl in the nix sandbox; run with --ignored"]
 fn peer_pair_approve_on_an_outbound_entry_still_awaiting_the_peers_own_approval_is_refused() {
-    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("pair-approve-outbound-too-early");
     let _stage = setup_env(&root);
 
@@ -724,7 +724,7 @@ fn peer_pair_approve_on_an_outbound_entry_still_awaiting_the_peers_own_approval_
 /// test now drives it with the correct scripted `--code`.
 #[test]
 fn peer_pair_approve_on_an_outbound_entry_awaiting_confirm_commits_with_the_reply_code() {
-    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("pair-approve-outbound-confirm");
     let _stage = setup_env(&root);
 
@@ -788,7 +788,7 @@ fn peer_pair_approve_on_an_outbound_entry_awaiting_confirm_commits_with_the_repl
 /// before `commit_outbound` ever compares a code.
 #[test]
 fn peer_pair_approve_on_an_outbound_entry_awaiting_confirm_with_yes_alone_is_the_taught_refusal() {
-    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("pair-approve-outbound-confirm-yes-alone");
     let _stage = setup_env(&root);
 
@@ -847,7 +847,7 @@ fn peer_pair_approve_on_an_outbound_entry_awaiting_confirm_with_yes_alone_is_the
 /// preservation, not the code gate.
 #[test]
 fn peer_pair_approve_on_an_outbound_entry_with_no_via_leaves_a_previously_recorded_via_untouched() {
-    let _guard = aoide_test_support::env_lock().lock().unwrap();
+    let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("pair-approve-outbound-preserves-via");
     let _stage = setup_env(&root);
 

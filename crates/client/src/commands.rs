@@ -3718,7 +3718,7 @@ mod tests {
     /// way.
     #[test]
     fn default_self_via_formats_login_at_the_outbound_address_toward_the_peer() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_user = std::env::var("USER").ok();
         let saved_logname = std::env::var("LOGNAME").ok();
         std::env::set_var("USER", "testuser");
@@ -3754,7 +3754,7 @@ mod tests {
     /// with the code under test. Inside the sandbox the file is absent, so
     /// every `grant: None` path resolves the built-in `["read"]`.
     fn with_peer_state<T>(tag: &str, f: impl FnOnce() -> T) -> T {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_root = std::env::var("AOIDE_ROOT").ok();
         let saved_config = std::env::var("AOIDE_CONFIG").ok();
@@ -4226,7 +4226,7 @@ mod tests {
     // ── the public record API instead of the private `SpawnFn` closure. ──
 
     fn with_temp_runtime_dir<T>(tag: &str, f: impl FnOnce() -> T) -> T {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_runtime = std::env::var("XDG_RUNTIME_DIR").ok();
         let saved_session = std::env::var("AOIDE_SESSION_ID").ok();
         let dir = std::env::temp_dir().join(format!(
@@ -4430,7 +4430,7 @@ mod tests {
     /// `with_temp_runtime_dir` each lock it themselves, so nesting them
     /// would deadlock (a plain `std::sync::Mutex` is not reentrant).
     fn with_peer_state_and_temp_runtime_dir<T>(tag: &str, f: impl FnOnce() -> T) -> T {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_runtime = std::env::var("XDG_RUNTIME_DIR").ok();
         let saved_session = std::env::var("AOIDE_SESSION_ID").ok();
@@ -4509,7 +4509,7 @@ mod tests {
     /// test above already established for proving what does/doesn't reach
     /// `run_curl`.
     fn with_fake_curl<T>(tag: &str, script: &str, f: impl FnOnce() -> T) -> T {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let shim_dir = std::env::temp_dir().join(format!(
             "aoide-client-curlshim-{tag}-{}-{}",
             std::process::id(),

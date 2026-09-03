@@ -2113,7 +2113,7 @@ mod tests {
     /// through the new call path) and is admitted again.
     #[test]
     fn handle_resolve_refuses_an_attested_remote_origin_caller_end_to_end() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_audit = std::env::var("AOIDE_AUDIT_LOG").ok();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_sock = std::env::var("AOIDE_DAEMON_SOCKET").ok();
@@ -2532,7 +2532,7 @@ mod tests {
         // (`env_lock`, restored after) so the test never touches the real
         // `~/Aoide/log`. The broker's OWN `audit.log` lives under `home`
         // regardless, no redirection needed for that half.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_AUDIT_LOG").ok();
         let home = tmp_home("fullline");
         std::env::set_var("AOIDE_AUDIT_LOG", home.join("mirrored-aoide-log"));
@@ -2558,7 +2558,7 @@ mod tests {
     /// `audit_resolve`'s `reason` field on both logs.
     #[test]
     fn a_backend_stderr_sentinel_never_reaches_the_wire_reply_or_either_audit_log() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_AUDIT_LOG").ok();
         let home = tmp_home("stderrleak");
         std::env::set_var("AOIDE_AUDIT_LOG", home.join("mirrored-aoide-log"));
@@ -2692,7 +2692,7 @@ mod tests {
             );
             return;
         }
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("put-age-mint-notify");
         crate::backend::seed_default_backends(&home).unwrap();
         crate::store::save_policies(&home, &[Policy::new("t", "age", "t")]).unwrap();
@@ -2743,7 +2743,7 @@ mod tests {
     /// `age_tools_available()` skip.
     #[test]
     fn put_never_mints_an_age_identity_for_a_backend_not_configured_in_backends_json() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("put-age-unconfigured-no-mint");
         std::fs::create_dir_all(&home).unwrap();
         // Pre-P-G1 shape: `file` only, no `age` entry at all.
@@ -2925,7 +2925,7 @@ mod tests {
             std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("put-hung-mint-bounded");
         let out = home.join("out.txt");
         let p_age = Policy::new("mints", "age", "k");
@@ -3028,7 +3028,7 @@ mod tests {
 
     #[test]
     fn a_full_put_line_round_trips_through_handle_line_with_no_value_in_the_reply() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_AUDIT_LOG").ok();
         let home = tmp_home("put-fullline");
         std::env::set_var("AOIDE_AUDIT_LOG", home.join("mirrored-aoide-log"));
@@ -3066,7 +3066,7 @@ mod tests {
     #[test]
     fn put_sentinel_value_never_leaks_on_missing_policy_or_missing_set_template() {
         const SENTINEL: &str = "SENTINEL-PUT-VALUE-XYZ";
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_AUDIT_LOG").ok();
         let home = tmp_home("put-sentinel");
         std::env::set_var("AOIDE_AUDIT_LOG", home.join("mirrored-aoide-log"));
@@ -3142,7 +3142,7 @@ mod tests {
     /// requirement) — no thread, no blocking, no ask ever created.
     #[test]
     fn resolve_with_wait_false_gets_the_old_immediate_refusal_and_never_parks() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("wait-false");
         let p = Policy::new("t", "scratch", "stored-value");
         seed_enrolled(&home, p);
@@ -3167,7 +3167,7 @@ mod tests {
     /// approver's), and the approver's own reply carries no value at all.
     #[test]
     fn park_then_approve_releases_the_value_to_the_original_caller_only() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("park-approve");
         let mut p = Policy::new("t", "scratch", "stored-value");
         p.consumers = vec!["m".to_string()];
@@ -3215,7 +3215,7 @@ mod tests {
     /// dismisser gets `{"ok":true}`.
     #[test]
     fn park_then_dismiss_refuses_the_parked_caller_cleanly() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("park-dismiss");
         let p = Policy::new("t", "scratch", "stored-value");
         seed_enrolled(&home, p);
@@ -3259,7 +3259,7 @@ mod tests {
     /// gone from the registry afterward (never left dangling parked).
     #[test]
     fn park_then_revoke_the_consumer_then_approve_denies_the_parked_caller() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("park-revoke-then-approve");
         let mut p = Policy::new("t", "scratch", "stored-value");
         p.consumers = vec!["m".to_string()];
@@ -3317,7 +3317,7 @@ mod tests {
     /// past `AOIDE_SECRETS_PARK_CAP`.
     #[test]
     fn a_codeless_resolve_at_the_park_cap_is_refused_immediately_and_never_parks() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_cap = std::env::var(crate::park::PARK_CAP_ENV).ok();
         std::env::set_var(crate::park::PARK_CAP_ENV, "1");
 
@@ -3376,7 +3376,7 @@ mod tests {
     /// exactly one final" framing (module doc; `CONTRACTS.md`).
     #[test]
     fn park_over_a_real_connection_writes_the_interim_line_then_the_final_reply() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("park-interim-two-lines");
         let p = Policy::new("t", "scratch", "stored-value");
         seed_enrolled(&home, p);
@@ -3439,7 +3439,7 @@ mod tests {
     /// first, then the CORRECT code still working afterward on the SAME ask.
     #[test]
     fn approve_with_an_invalid_code_leaves_the_ask_parked_and_the_ledger_unburned() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("park-invalidcode");
         let p = Policy::new("t", "scratch", "stored-value");
         let secret = seed_enrolled(&home, p);
@@ -3480,7 +3480,7 @@ mod tests {
 
     #[test]
     fn approve_on_an_unknown_id_is_a_taught_error() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("approve-unknown");
         let parked = ParkRegistry::new();
         with_redirected_audit_log(&home, || {
@@ -3493,7 +3493,7 @@ mod tests {
 
     #[test]
     fn dismiss_on_an_unknown_id_is_a_taught_error() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("dismiss-unknown");
         let parked = ParkRegistry::new();
         with_redirected_audit_log(&home, || {
@@ -3560,7 +3560,7 @@ mod tests {
     /// parked (never silently consumed by a failed unauthorized attempt).
     #[test]
     fn dismiss_by_a_mismatched_peer_uid_is_refused_and_the_ask_stays_parked() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("dismiss-wrong-peer-uid");
         let parked = ParkRegistry::new();
         let real_euid = unsafe { libc::geteuid() };
@@ -3595,7 +3595,7 @@ mod tests {
     /// stamped with succeeds.
     #[test]
     fn dismiss_by_the_asks_own_matching_peer_uid_succeeds() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("dismiss-matching-peer-uid");
         let parked = ParkRegistry::new();
         let real_euid = unsafe { libc::geteuid() };
@@ -3620,7 +3620,7 @@ mod tests {
 
     #[test]
     fn approve_missing_totp_is_a_malformed_request_and_leaves_the_ask_parked() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("approve-missingtotp");
         let p = Policy::new("t", "scratch", "stored-value");
         seed_enrolled(&home, p);
@@ -3690,7 +3690,7 @@ mod tests {
     /// this whole phase — the fast path never touches `ParkRegistry` at all.
     #[test]
     fn resolve_with_a_code_never_parks_the_fast_path_is_unchanged() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("fastpath-unchanged");
         let mut p = Policy::new("t", "scratch", "stored-value");
         p.consumers = vec!["m".to_string()];
@@ -3719,7 +3719,7 @@ mod tests {
     /// requirement) and removes the ask.
     #[test]
     fn park_times_out_and_names_the_knob_and_both_completion_paths() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_timeout = std::env::var(crate::park::PARK_TIMEOUT_ENV).ok();
         std::env::set_var(crate::park::PARK_TIMEOUT_ENV, "1");
 
@@ -3757,7 +3757,7 @@ mod tests {
     /// can't reach.)
     #[test]
     fn an_unrelated_resolve_completes_while_another_is_parked() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("park-concurrency");
         let mut gated = Policy::new("locked", "scratch", "locked-value");
         gated.consumers = vec!["m".to_string()];
@@ -3995,7 +3995,7 @@ mod tests {
     /// baseline TOTP-free case.
     #[test]
     fn released_fires_on_a_requiretotp_false_resolve() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("notify-released-free");
         let mut p = Policy::new("t", "scratch", "stored-value");
         p.consumers = vec!["m".to_string()];
@@ -4034,7 +4034,7 @@ mod tests {
     /// wording ("automation-skip or requireTotp=false") names both.
     #[test]
     fn released_fires_on_an_automation_skip_resolve() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("notify-released-automation");
         let mut p = Policy::new("t", "scratch", "stored-value");
         p.consumers = vec!["m".to_string()];
@@ -4066,7 +4066,7 @@ mod tests {
     /// tell them.
     #[test]
     fn released_does_not_fire_when_an_inline_totp_code_is_used() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("notify-no-release-on-code");
         let mut p = Policy::new("t", "scratch", "stored-value");
         p.consumers = vec!["m".to_string()];
@@ -4099,7 +4099,7 @@ mod tests {
     /// timeoutSecs}`) — the popup's future trigger, fired once per park.
     #[test]
     fn parked_fires_with_the_id_and_timeout_when_a_resolve_parks() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("notify-parked");
         let p = Policy::new("t", "scratch", "stored-value");
         seed_enrolled(&home, p);
@@ -4140,7 +4140,7 @@ mod tests {
     /// fires once, on the APPROVER's own side, when a parked ask releases.
     #[test]
     fn completed_fires_on_a_successful_approve() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("notify-completed");
         let mut p = Policy::new("t", "scratch", "stored-value");
         p.consumers = vec!["m".to_string()];
@@ -4185,7 +4185,7 @@ mod tests {
     /// fires when an operator dismisses a parked ask.
     #[test]
     fn dismissed_fires_on_a_dismiss() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("notify-dismissed");
         let p = Policy::new("t", "scratch", "stored-value");
         seed_enrolled(&home, p);
@@ -4228,7 +4228,7 @@ mod tests {
     /// the_knob_and_both_completion_paths` above already uses.
     #[test]
     fn expired_fires_on_a_park_timeout() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_timeout = std::env::var(crate::park::PARK_TIMEOUT_ENV).ok();
         std::env::set_var(crate::park::PARK_TIMEOUT_ENV, "1");
 
@@ -4264,7 +4264,7 @@ mod tests {
     #[test]
     fn notify_never_carries_a_value_across_the_full_lifecycle() {
         const SENTINEL: &str = "SENTINEL-NOTIFY-VALUE-XYZ";
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("notify-no-value-leak");
         let mut p = Policy::new("t", "scratch", SENTINEL);
         p.consumers = vec!["m".to_string()];
@@ -4398,7 +4398,7 @@ mod tests {
         if crate::home::effective_uid() == 0 {
             return;
         }
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("notify-sink-unavailable");
         let mut p = Policy::new("t", "scratch", "stored-value");
         p.consumers = vec!["m".to_string()];
@@ -4490,7 +4490,7 @@ mod tests {
     /// the real gate honestly.
     #[test]
     fn admin_add_over_a_real_socket_connection_round_trips_into_policy_json() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("admin-add-real-socket");
         let parked = Arc::new(ParkRegistry::new());
 
@@ -4537,7 +4537,7 @@ mod tests {
     /// genuinely different uid in-test).
     #[test]
     fn admin_op_from_a_mismatched_peer_uid_is_refused_and_policy_json_is_untouched() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("admin-wrong-uid");
         let real_euid = unsafe { libc::geteuid() };
         let wrong_uid = real_euid.wrapping_add(40_000);
@@ -4561,7 +4561,7 @@ mod tests {
     /// plain `sudo` is still wrong over the socket too, never a bypass.
     #[test]
     fn admin_op_from_root_is_refused_the_same_taught_error_the_direct_path_gives() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("admin-root");
         with_redirected_audit_log(&home, || {
             let req = json!({"op": "admin", "command": "add", "name": "t", "backend": "scratch", "key": "k"});
@@ -4581,7 +4581,7 @@ mod tests {
     /// safe answer is refusal, never a permissive fallback.
     #[test]
     fn admin_op_from_an_unidentified_connection_is_refused() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("admin-unidentified");
         with_redirected_audit_log(&home, || {
             let req = json!({"op": "admin", "command": "add", "name": "t", "backend": "scratch", "key": "k"});
@@ -4607,7 +4607,7 @@ mod tests {
             );
             return;
         }
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("admin-migrate-real-socket");
         crate::backend::seed_default_backends(&home).unwrap();
         crate::store::save_policies(&home, &[Policy::new("t", "file", "k")]).unwrap();
@@ -4656,7 +4656,7 @@ mod tests {
     /// backend shell-out -> `put_lock`) was never exercised by those two.
     #[test]
     fn a_hung_admin_migrate_no_longer_wedges_put_lock_forever() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("admin-migrate-hung-bounded");
         let out = home.join("out.txt");
         let p_hangs = Policy::new("t", "hangs", "k");

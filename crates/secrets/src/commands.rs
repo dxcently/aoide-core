@@ -1026,7 +1026,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn with_secrets_home<T>(tag: &str, f: impl FnOnce(&std::path::Path) -> T) -> T {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_SECRETS_HOME").ok();
         let dir = std::env::temp_dir().join(format!(
             "aoide-secrets-commands-test-{tag}-{}-{}",
@@ -1890,7 +1890,7 @@ mod tests {
         if home::effective_uid() == 0 {
             return;
         }
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_SECRETS_HOME").ok();
         std::env::set_var("AOIDE_SECRETS_HOME", "/");
         // Task #79: guarantee the `NoSocket` fallback branch (`with_secrets_
@@ -2098,7 +2098,7 @@ mod tests {
         if home::effective_uid() == 0 {
             return;
         }
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_SECRETS_HOME").ok();
         std::env::set_var("AOIDE_SECRETS_HOME", "/");
         // Task #79: same real-broker hazard as `automate_and_expose_refuse_
@@ -2153,7 +2153,7 @@ mod tests {
     /// policy_json`).
     #[test]
     fn add_over_a_real_broker_socket_takes_the_broker_path_and_lands_in_the_brokers_own_home() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_home = std::env::var("AOIDE_SECRETS_HOME").ok();
         let saved_socket = std::env::var("AOIDE_SECRETS_SOCKET").ok();
 

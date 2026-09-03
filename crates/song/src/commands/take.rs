@@ -1808,7 +1808,7 @@ mod tests {
 
     #[test]
     fn first_snapshot_in_a_routed_draft_is_0001_with_no_parent() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, song, draft) = routed_draft("take-first");
@@ -1824,7 +1824,7 @@ mod tests {
 
     #[test]
     fn second_snapshot_parents_off_the_first() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, song, draft) = routed_draft("take-second");
@@ -1847,7 +1847,7 @@ mod tests {
 
     #[test]
     fn snapshot_outside_staging_or_draft_mode_refuses() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let root = unique_tmp("take-not-staged-or-drafted");
         let stage = root.join("stage");
@@ -1874,7 +1874,7 @@ mod tests {
     /// never nested under one that doesn't exist in this mode.
     #[test]
     fn snapshot_in_staging_mode_takes_off_the_song_directly() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let root = unique_tmp("take-staging-routing");
@@ -1915,7 +1915,7 @@ mod tests {
 
     #[test]
     fn snapshot_unlocked_refusal_reports_the_invoking_command_not_rice_take() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("take-cmd-thread-snapshot");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -1930,7 +1930,7 @@ mod tests {
 
     #[test]
     fn snapshot_if_drifted_unlocked_refusal_reports_the_invoking_command_not_rice_take() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("take-cmd-thread-drift");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -1951,7 +1951,7 @@ mod tests {
 
     #[test]
     fn snapshot_if_drifted_unlocked_is_a_noop_when_unchanged_and_mints_when_changed() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, song, draft) = routed_draft("take-drift");
@@ -1984,7 +1984,7 @@ mod tests {
 
     #[test]
     fn snapshot_if_drifted_unlocked_mints_unconditionally_on_an_empty_store() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, _song, _draft) = routed_draft("take-drift-empty");
@@ -2003,7 +2003,7 @@ mod tests {
 
     #[test]
     fn take_carries_session_id_when_set_and_omits_when_not() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         let (root, _song, _draft) = routed_draft("take-session");
         std::fs::write(shellbridge::stage_dir().join("livery.json"), VALID_NOTES).unwrap();
@@ -2022,7 +2022,7 @@ mod tests {
 
     #[test]
     fn rice_take_handler_mints_and_reports_the_take_and_head_files_changed() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, song, draft) = routed_draft("take-handler-ok");
@@ -2042,7 +2042,7 @@ mod tests {
 
     #[test]
     fn rice_take_handler_refuses_outside_draft_mode() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("take-handler-not-draft");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -2070,7 +2070,7 @@ mod tests {
 
     #[test]
     fn mark_stamps_the_current_head_by_default() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, song, draft) = routed_draft("mark-head-default");
@@ -2092,7 +2092,7 @@ mod tests {
 
     #[test]
     fn mark_take_flag_targets_a_specific_take_not_the_head() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, song, draft) = routed_draft("mark-take-flag");
@@ -2117,7 +2117,7 @@ mod tests {
 
     #[test]
     fn mark_restamping_a_letter_moves_it_take_files_stay_untouched_one_map_entry() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, song, draft) = routed_draft("mark-move");
@@ -2166,7 +2166,7 @@ mod tests {
 
     #[test]
     fn mark_rejects_lowercase_multichar_and_non_letter_marks() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, _song, _draft) = routed_draft("mark-invalid");
@@ -2183,7 +2183,7 @@ mod tests {
 
     #[test]
     fn mark_missing_letter_arg_is_a_usage_error() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, _song, _draft) = routed_draft("mark-missing-arg");
 
@@ -2195,7 +2195,7 @@ mod tests {
 
     #[test]
     fn mark_refuses_outside_draft_mode() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("mark-not-draft");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -2208,7 +2208,7 @@ mod tests {
 
     #[test]
     fn mark_on_a_nonexistent_take_errors_take_not_found() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, _song, _draft) = routed_draft("mark-take-missing");
@@ -2223,7 +2223,7 @@ mod tests {
 
     #[test]
     fn mark_with_no_takes_at_all_and_no_take_flag_errors_take_not_found() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, _song, _draft) = routed_draft("mark-empty-store");
 
@@ -2237,7 +2237,7 @@ mod tests {
 
     #[test]
     fn mark_invalid_take_flag_is_a_usage_error() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, _song, _draft) = routed_draft("mark-take-flag-invalid");
@@ -2319,7 +2319,7 @@ mod tests {
     /// branch rather than being destroyed or renumbered.
     #[test]
     fn revert_to_a_mark_branches_and_leaves_the_old_line_intact() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, song, draft, draft_livery) = routed_draft_symlinked("back-branch-acceptance");
@@ -2380,7 +2380,7 @@ mod tests {
 
     #[test]
     fn revert_by_take_number_moves_head_and_restores_content() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, song, draft, draft_livery) = routed_draft_symlinked("back-by-take");
@@ -2410,7 +2410,7 @@ mod tests {
         // used, not whatever the resolved take happens to own. Both of this
         // file's other `--take` tests target unmarked takes, so this was
         // otherwise asserted nowhere.
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, song, draft, _draft_livery) = routed_draft_symlinked("back-take-target-has-mark");
@@ -2434,7 +2434,7 @@ mod tests {
 
     #[test]
     fn back_snapshots_an_untaken_hand_edit_before_overwriting_it() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, song, draft, draft_livery) = routed_draft_symlinked("back-drift-preserved");
@@ -2468,7 +2468,7 @@ mod tests {
 
     #[test]
     fn back_mints_no_drift_take_when_the_stage_already_matches_the_head() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, song, draft, _draft_livery) = routed_draft_symlinked("back-no-drift");
@@ -2498,7 +2498,7 @@ mod tests {
         // twice at the SAME target and checks the take count never grows
         // between the two calls — the second call's drift comparison is
         // against exactly what the first call's own write just produced.
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, song, draft, _draft_livery) = routed_draft_symlinked("back-repeat-same-target");
@@ -2529,7 +2529,7 @@ mod tests {
 
     #[test]
     fn back_clears_a_stale_stage_cover_when_the_target_take_has_none() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, _song, _draft, _draft_livery) = routed_draft_symlinked("back-cover-clear");
@@ -2557,7 +2557,7 @@ mod tests {
 
     #[test]
     fn back_refuses_when_the_routing_symlink_is_missing() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let root = unique_tmp("back-routing-broken");
@@ -2621,7 +2621,7 @@ mod tests {
         // No sibling command has two co-present selectors, so the reviewer
         // ruled a silent `--take`-wins priority defensible but unpinned —
         // this test is the pin.
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, song, draft, _draft_livery) = routed_draft_symlinked("back-both-flags-take-wins");
@@ -2644,7 +2644,7 @@ mod tests {
 
     #[test]
     fn back_take_not_found_and_mark_not_found() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, _song, _draft, _draft_livery) = routed_draft_symlinked("back-not-found");
@@ -2682,7 +2682,7 @@ mod tests {
 
     #[test]
     fn back_bare_invocation_refuses_without_reading_stdin_or_writing_anything() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, song, draft, _draft_livery) = routed_draft_symlinked("back-bare-refuses");
@@ -2724,7 +2724,7 @@ mod tests {
     /// promise that the picker is unbuilt.
     #[test]
     fn back_bare_invocation_off_a_tty_names_the_picker_and_still_refuses() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, song, draft, _draft_livery) = routed_draft_symlinked("back-bare-verbatim");
@@ -2747,7 +2747,7 @@ mod tests {
 
     #[test]
     fn back_refuses_outside_draft_mode() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("back-not-draft");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -2924,7 +2924,7 @@ mod tests {
 
     #[test]
     fn rice_take_list_handler_on_an_empty_store_is_ok_with_an_empty_list() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, _song, _draft) = routed_draft("take-list-empty");
 
@@ -2938,7 +2938,7 @@ mod tests {
 
     #[test]
     fn rice_take_list_handler_refuses_outside_draft_mode() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("take-list-not-draft");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -2951,7 +2951,7 @@ mod tests {
 
     #[test]
     fn rice_take_list_json_shape_carries_parent_and_mark_for_a_branching_store() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, song, draft) = routed_draft("take-list-json-shape");
@@ -2991,7 +2991,7 @@ mod tests {
         // (a flat list), never off `render_tree`'s walk — so it was never exposed to the tree
         // walk's orphan defect, but this pins that fact so it can't regress silently if the
         // builder ever gets rewritten to reuse the tree instead.
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, song, draft) = routed_draft("take-list-json-orphan");
 
@@ -3092,7 +3092,7 @@ mod tests {
     /// correct ancestry walk picks A/take 2.
     #[test]
     fn diff_default_base_is_the_nearest_ancestral_mark_on_the_current_branch_not_the_highest_letter() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, song, draft, _draft_livery) = routed_draft_symlinked("diff-nearest-ancestral-mark");
@@ -3153,7 +3153,7 @@ mod tests {
     /// instead — this asserts the real answer, take 1.
     #[test]
     fn diff_default_base_finds_a_mark_at_ancestry_depth_three_not_just_the_head_or_its_immediate_parent() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, _song, _draft) = routed_draft("diff-depth-three-mark");
@@ -3193,7 +3193,7 @@ mod tests {
 
     #[test]
     fn diff_falls_back_to_the_heads_parent_when_nothing_in_the_ancestry_is_marked() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, _song, _draft) = routed_draft("diff-fallback-parent");
@@ -3214,7 +3214,7 @@ mod tests {
 
     #[test]
     fn diff_on_an_entirely_empty_store_reports_nothing_to_diff_against() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, _song, _draft) = routed_draft("diff-empty-store");
 
@@ -3228,7 +3228,7 @@ mod tests {
 
     #[test]
     fn diff_with_a_single_unmarked_root_take_reports_nothing_to_diff_against() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, _song, _draft) = routed_draft("diff-root-only-unmarked");
@@ -3245,7 +3245,7 @@ mod tests {
 
     #[test]
     fn diff_identical_content_against_a_self_marked_head_is_an_empty_diff() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, _song, _draft) = routed_draft("diff-identical-self-mark");
@@ -3265,7 +3265,7 @@ mod tests {
 
     #[test]
     fn diff_take_flag_overrides_the_default_base() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, _song, _draft) = routed_draft("diff-take-flag");
@@ -3286,7 +3286,7 @@ mod tests {
 
     #[test]
     fn diff_mark_flag_overrides_the_default_base() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, _song, _draft) = routed_draft("diff-mark-flag");
@@ -3314,7 +3314,7 @@ mod tests {
     /// NEVER stamped — a different branch than a letter whose take existed and was then removed.
     #[test]
     fn diff_mark_flag_naming_a_take_that_no_longer_exists_is_mark_not_found_not_a_silent_default() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, song, draft) = routed_draft("diff-mark-dangling");
@@ -3343,7 +3343,7 @@ mod tests {
     /// it without a test noticing.
     #[test]
     fn diff_with_both_take_and_mark_given_take_wins() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, _song, _draft) = routed_draft("diff-both-flags-take-wins");
@@ -3365,7 +3365,7 @@ mod tests {
 
     #[test]
     fn diff_take_not_found_and_mark_not_found() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR", "AOIDE_SESSION_ID"]);
         std::env::remove_var("AOIDE_SESSION_ID");
         let (root, _song, _draft) = routed_draft("diff-not-found");
@@ -3400,7 +3400,7 @@ mod tests {
 
     #[test]
     fn diff_refuses_outside_draft_mode() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("diff-not-draft");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
@@ -3485,7 +3485,7 @@ mod tests {
 
     #[test]
     fn plan_prune_never_lets_the_head_or_its_ancestry_into_candidates_even_with_force() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, song, draft) = routed_draft("prune-plan-ancestry-rail");
         seed(&song, Some(&draft), 1, None, OLD_AT, None);
@@ -3505,7 +3505,7 @@ mod tests {
 
     #[test]
     fn prune_bare_non_tty_prints_the_dry_run_and_changes_nothing() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, song, draft) = routed_draft("prune-dry-run");
         seed(&song, Some(&draft), 1, None, OLD_AT, None);
@@ -3532,7 +3532,7 @@ mod tests {
 
     #[test]
     fn prune_never_selects_the_head_or_its_ancestry_under_force_and_all_but_marks() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, song, draft) = routed_draft("prune-force-ancestry-rail");
         seed(&song, Some(&draft), 1, None, OLD_AT, None);
@@ -3556,7 +3556,7 @@ mod tests {
 
     #[test]
     fn prune_keep_n_keeps_the_newest_n_eligible_takes() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, song, draft) = routed_draft("prune-keep-n");
         seed(&song, Some(&draft), 1, None, OLD_AT, None);
@@ -3575,7 +3575,7 @@ mod tests {
 
     #[test]
     fn prune_keep_n_exceeding_the_take_count_prunes_nothing() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, song, draft) = routed_draft("prune-keep-exceeds");
         seed(&song, Some(&draft), 1, None, OLD_AT, None);
@@ -3592,7 +3592,7 @@ mod tests {
 
     #[test]
     fn prune_older_than_selects_only_takes_past_the_threshold() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, song, draft) = routed_draft("prune-older-than");
         seed(&song, Some(&draft), 1, None, OLD_AT, None);
@@ -3609,7 +3609,7 @@ mod tests {
 
     #[test]
     fn prune_older_than_malformed_value_is_a_usage_error_that_changes_nothing() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, song, draft) = routed_draft("prune-older-than-bad");
         seed(&song, Some(&draft), 1, None, OLD_AT, None);
@@ -3638,7 +3638,7 @@ mod tests {
 
     #[test]
     fn prune_marks_survive_by_default_and_go_under_force_dropping_the_letter_from_the_map() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, song, draft) = routed_draft("prune-marks-protection");
         seed(&song, Some(&draft), 1, None, OLD_AT, None);
@@ -3670,7 +3670,7 @@ mod tests {
 
     #[test]
     fn prune_reparents_surviving_children_and_ancestry_still_resolves() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, song, draft) = routed_draft("prune-splice");
         seed(&song, Some(&draft), 1, None, OLD_AT, None);
@@ -3697,7 +3697,7 @@ mod tests {
     /// regardless of which order the doomed takes are folded in.
     #[test]
     fn prune_cascades_through_a_splice_target_that_is_also_pruned_in_the_same_pass() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
 
         for (tag, order) in [("prune-cascade-fwd", [9u32, 17]), ("prune-cascade-rev", [17, 9])] {
@@ -3724,7 +3724,7 @@ mod tests {
 
     #[test]
     fn prune_an_orphan_take_is_prunable_and_does_not_corrupt_the_store() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, song, draft) = routed_draft("prune-orphan");
         seed(&song, Some(&draft), 1, None, OLD_AT, None);
@@ -3751,7 +3751,7 @@ mod tests {
     /// inside `prune_unlocked` must strip it rather than trust the list.
     #[test]
     fn prune_re_checks_the_ancestry_rail_against_a_fresh_read_and_skips_a_stale_candidate() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, song, draft) = routed_draft("prune-stale-plan-race");
         seed(&song, Some(&draft), 1, None, OLD_AT, None);
@@ -3776,7 +3776,7 @@ mod tests {
     /// whole ancestry fresh, not just a bare `head == n` comparison.
     #[test]
     fn prune_re_checks_the_whole_fresh_ancestry_not_just_the_bare_head() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, song, draft) = routed_draft("prune-stale-plan-ancestry-race");
         seed(&song, Some(&draft), 1, None, OLD_AT, None);
@@ -3797,7 +3797,7 @@ mod tests {
     /// "changed" when nothing about it changed at all.
     #[test]
     fn prune_changed_never_lists_a_path_the_rail_re_check_stripped() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, song, draft) = routed_draft("prune-changed-accuracy-stale");
         seed(&song, Some(&draft), 1, None, OLD_AT, None);
@@ -3818,7 +3818,7 @@ mod tests {
     /// that must not be reported as a change either.
     #[test]
     fn prune_changed_never_lists_a_doomed_take_whose_file_was_already_gone() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let (root, song, draft) = routed_draft("prune-changed-accuracy-already-gone");
         seed(&song, Some(&draft), 1, None, OLD_AT, None);
@@ -3833,7 +3833,7 @@ mod tests {
 
     #[test]
     fn prune_refuses_outside_draft_mode() {
-        let _g = aoide_test_support::env_lock().lock().unwrap();
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
         let stage = unique_tmp("prune-not-draft");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);

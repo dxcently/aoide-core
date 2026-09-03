@@ -1389,7 +1389,7 @@ mod tests {
     // ── reconcile: the swap-catcher ──────────────────────────────────────
 
     fn with_peer_state<T>(tag: &str, f: impl FnOnce() -> T) -> T {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!(
             "aoide-client-pair-watch-{tag}-{}-{}",
@@ -1850,7 +1850,7 @@ mod tests {
     // ── the pid-marker arbiter (part 4) ───────────────────────────────────
 
     fn with_temp_marker_runtime_dir<T>(tag: &str, f: impl FnOnce() -> T) -> T {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("XDG_RUNTIME_DIR").ok();
         let dir = std::env::temp_dir().join(format!(
             "aoide-client-pair-watch-marker-{tag}-{}-{}",

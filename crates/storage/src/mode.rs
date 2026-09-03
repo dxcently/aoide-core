@@ -110,7 +110,7 @@ mod tests {
 
     #[test]
     fn missing_marker_file_loads_as_the_declarative_default() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-mode-missing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -129,7 +129,7 @@ mod tests {
 
     #[test]
     fn save_load_round_trips_through_a_temp_stage_dir() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-mode-rt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -162,7 +162,7 @@ mod tests {
 
     #[test]
     fn draft_mode_round_trips_with_a_draft_name_and_serializes_lowercase() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-mode-draft-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn corrupt_marker_file_loads_as_the_declarative_default() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STAGE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-mode-corrupt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

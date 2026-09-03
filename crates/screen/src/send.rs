@@ -433,7 +433,7 @@ mod tests {
 
     #[test]
     fn session_target_without_yes_is_held_pending_and_delivers_nothing() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = aoide_test_support::EnvSaver::capture(&["AOIDE_STAGE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
 
         let root = aoide_test_support::unique_tmp("screen-send-held");
@@ -486,7 +486,7 @@ mod tests {
         // Same synthetic-listener technique as the held test above and as
         // `graph::send`'s own `send_yes_delivers_and_autorenames_the_title`
         // — a local test fixture, NEVER a real live agent session.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = aoide_test_support::EnvSaver::capture(&[
             "AOIDE_STAGE_DIR",
             "XDG_RUNTIME_DIR",

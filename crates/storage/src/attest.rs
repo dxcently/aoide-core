@@ -475,7 +475,7 @@ mod tests {
 
     #[test]
     fn daemon_seal_pubkey_hex_round_trips_against_a_fake_daemon() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = aoide_test_support::EnvSaver::capture(&["AOIDE_DAEMON_SOCKET"]);
         let sock = short_tmp("ping");
         spawn_fake_daemon(&sock, &"a".repeat(64));
@@ -486,7 +486,7 @@ mod tests {
 
     #[test]
     fn daemon_seal_pubkey_hex_against_a_dead_socket_is_none() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = aoide_test_support::EnvSaver::capture(&["AOIDE_DAEMON_SOCKET"]);
         std::env::set_var("AOIDE_DAEMON_SOCKET", short_tmp("dead"));
         assert_eq!(daemon_seal_pubkey_hex(), None);
@@ -498,7 +498,7 @@ mod tests {
     /// the WRONG key, and no daemon at all, both resolve `None`.
     #[test]
     fn attested_caller_resolves_a_sealed_remote_origin_session_and_fails_to_none_otherwise() {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _s = aoide_test_support::EnvSaver::capture(&["AOIDE_DAEMON_SOCKET", "AOIDE_STAGE_DIR"]);
         let root = aoide_test_support::unique_tmp("attest-caller");
         // `AOIDE_STAGE_DIR` (not `AOIDE_STATE_DIR`): the absolute override

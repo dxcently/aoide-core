@@ -1451,7 +1451,7 @@ mod tests {
     fn hypr_event_socket_path_needs_a_signature() {
         // `hypr_event_socket_path()` reads process-global env; serialise it
         // against the other env-touching tests with the crate-wide lock.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
         let saved_rt = std::env::var("XDG_RUNTIME_DIR").ok();
 
@@ -1649,7 +1649,7 @@ mod tests {
     /// on a roster that includes a headless wrap when Hyprland is absent.
     #[test]
     fn resolve_pending_session_windows_is_a_safe_noop_off_hyprland() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
         std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
@@ -1731,7 +1731,7 @@ mod tests {
 
     #[test]
     fn resolve_registration_parent_precedence_explicit_then_ancestry_then_env() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_SESSION_ID"]);
 
         // Tier 1: an explicit `--parent` wins outright, even with a matching

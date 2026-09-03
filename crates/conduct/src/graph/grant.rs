@@ -818,7 +818,7 @@ mod tests {
     // ── apply_diff: local (one load/save) + peer (manifest, dedupe, no-manifest skip) ──
 
     fn with_temp_state_dir<T>(name: &str, f: impl FnOnce() -> T) -> T {
-        let _g = crate::env_lock().lock().unwrap();
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!("aoide-session-pick-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1137,7 +1137,7 @@ mod tests {
 
     #[test]
     fn exempt_grant_on_then_off_round_trips_through_the_record() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = crate::graph::testutil::EnvVars::save(&[
             "AOIDE_STAGE_DIR",
             "AOIDE_STATE_DIR",
@@ -1172,7 +1172,7 @@ mod tests {
 
     #[test]
     fn exempt_grant_a_remark_is_ok_but_reports_no_transition() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = crate::graph::testutil::EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
         let root = setup("exempt-remark");
         write_stage(
@@ -1197,7 +1197,7 @@ mod tests {
         // `AOIDE_DAEMON_SOCKET` to a path that can never have a real
         // listener (`lib.rs`'s own P-D6 safety net), so this test needs it
         // even though it never touches the stage tree.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let out = exempt_grant(&exempt_invocation(&[], &[("id", "sess-1")]), "session.grant", "maybe");
         assert_eq!(out.status, aoide_protocol::output::Status::Usage);
         assert!(out.message.contains("not an exempt state"), "msg: {}", out.message);
@@ -1207,7 +1207,7 @@ mod tests {
 
     #[test]
     fn exempt_grant_rejects_self_and_id_together() {
-        let _guard = crate::env_lock().lock().unwrap(); // see the daemon-socket-floor note above
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner()); // see the daemon-socket-floor note above
         let out = exempt_grant(&exempt_invocation(&[], &[("self", "true"), ("id", "sess-1")]), "session.grant", "on");
         assert_eq!(out.status, aoide_protocol::output::Status::Usage);
         assert!(out.message.contains("mutually exclusive"), "msg: {}", out.message);
@@ -1215,7 +1215,7 @@ mod tests {
 
     #[test]
     fn exempt_grant_rejects_no_id_and_no_env() {
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = crate::graph::testutil::EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
         let root = setup("exempt-no-target");
         std::env::remove_var("AOIDE_SESSION_ID");
@@ -1234,7 +1234,7 @@ mod tests {
         // posture (module doc's "Fork 2") — an exemption lives on a LIVE
         // record, so a dead/unknown id is a refusal here, never a valid
         // post-mortem target.
-        let _guard = crate::env_lock().lock().unwrap();
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = crate::graph::testutil::EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "AOIDE_SESSION_ID"]);
         let root = setup("exempt-off-roster");
         // sessions.json stays empty -- "long-dead-id" is never in it.
@@ -1251,7 +1251,7 @@ mod tests {
     fn exempt_kind_with_a_bogus_state_is_a_usage_error_from_the_scripted_path_not_a_picker() {
         // Routing proof through `session_grant` itself (mirrors the undying
         // dispatch test above) -- `exempt` has no picker branch to fall to.
-        let _guard = crate::env_lock().lock().unwrap(); // reaches exempt_grant -> daemon_dispatch
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner()); // reaches exempt_grant -> daemon_dispatch
         let out = session_grant(&grant_inv(&["exempt", "sideways"]));
         assert_eq!(out.status, aoide_protocol::output::Status::Usage);
         assert!(out.message.contains("not an exempt state"), "msg: {}", out.message);
