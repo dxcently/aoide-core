@@ -4502,12 +4502,17 @@ mod tests {
     }
 
     /// Drop a fake `curl` shim at the front of `PATH` running `script`
-    /// (its full `#!/bin/sh` body), restoring the previous `PATH` and
-    /// removing the shim directory when `f` returns. Reused by both
-    /// `MAX_RESPONSE_BYTES` tests below (#114) — no real network, no real
-    /// `curl` process, same no-mock-needed shim technique the no-verify
-    /// test above already established for proving what does/doesn't reach
-    /// `run_curl`.
+    /// (its body — this helper writes the `#!/bin/sh` line and the stdin
+    /// drain every fake curl owes its caller), restoring the previous
+    /// `PATH` and removing the shim directory when `f` returns. Reused by
+    /// both `MAX_RESPONSE_BYTES` tests below (#114) — no real network, no
+    /// real `curl` process, same no-mock-needed shim technique the
+    /// no-verify test above already established for proving what does/
+    /// doesn't reach `run_curl`.
+    ///
+    /// The drain is load-bearing — `post_json` always writes to curl's
+    /// stdin, and a shim that exits without reading turns a descheduled
+    /// caller's write into an EPIPE (`crates/AGENTS.md`).
     fn with_fake_curl<T>(tag: &str, script: &str, f: impl FnOnce() -> T) -> T {
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let shim_dir = std::env::temp_dir().join(format!(
@@ -4517,7 +4522,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&shim_dir).unwrap();
         let shim = shim_dir.join("curl");
-        std::fs::write(&shim, script).unwrap();
+        std::fs::write(&shim, format!("#!/bin/sh\ncat > /dev/null\n{script}")).unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -4549,7 +4554,7 @@ mod tests {
     #[test]
     fn run_curl_refuses_a_response_over_the_max_response_bytes_cap() {
         let over_cap_mib = (MAX_RESPONSE_BYTES / (1024 * 1024)) + 1;
-        let script = format!("#!/bin/sh\ndd if=/dev/zero bs=1M count={over_cap_mib} 2>/dev/null\n");
+        let script = format!("dd if=/dev/zero bs=1M count={over_cap_mib} 2>/dev/null\n");
         let result = with_fake_curl("over-cap", &script, || run_curl(&["--", "http://example.invalid/"], None));
         let err = result.expect_err("a response past MAX_RESPONSE_BYTES must refuse, never buffer to completion");
         assert!(
@@ -4564,7 +4569,7 @@ mod tests {
     /// mangle or truncate a normal response.
     #[test]
     fn run_curl_passes_an_ordinary_payload_under_the_cap() {
-        let script = "#!/bin/sh\nprintf '{\"ok\":true}\\n200'\n";
+        let script = "printf '{\"ok\":true}\\n200'\n";
         let result = with_fake_curl("under-cap", script, || run_curl(&["--", "http://example.invalid/"], None));
         let (code, body) = result.expect("a small, ordinary payload must pass through the cap untouched");
         assert_eq!(code, 200);
@@ -4597,7 +4602,7 @@ mod tests {
         // through byte-for-byte. `cat`'s own trailing newline is exactly
         // the separator `run_curl`'s `rsplit_once('\n')` expects before the
         // `-w "\n%{http_code}"` status line.
-        let script = format!("#!/bin/sh\ncat <<'JSONBODY'\n{body}\nJSONBODY\nprintf '200'\n");
+        let script = format!("cat <<'JSONBODY'\n{body}\nJSONBODY\nprintf '200'\n");
         let peer = fixture_peer(None);
         let result = with_fake_curl("spawn-refused", &script, || spawn_on_peer_via(&peer, "hello", None));
         let err = result.expect_err("a JSON-RPC error ack must surface as an Err, never as Ok");
@@ -4685,7 +4690,7 @@ mod tests {
             std::fs::create_dir_all(&shim_dir).unwrap();
             let marker = shim_dir.join("curl-was-invoked");
             let shim = shim_dir.join("curl");
-            std::fs::write(&shim, format!("#!/bin/sh\ntouch {}\nexit 1\n", marker.display())).unwrap();
+            std::fs::write(&shim, format!("#!/bin/sh\ncat > /dev/null\ntouch {}\nexit 1\n", marker.display())).unwrap();
             {
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -4815,7 +4820,7 @@ mod tests {
             std::fs::create_dir_all(&shim_dir).unwrap();
             let marker = shim_dir.join("curl-was-invoked");
             let shim = shim_dir.join("curl");
-            std::fs::write(&shim, format!("#!/bin/sh\ntouch {}\nexit 1\n", marker.display())).unwrap();
+            std::fs::write(&shim, format!("#!/bin/sh\ncat > /dev/null\ntouch {}\nexit 1\n", marker.display())).unwrap();
             {
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();

@@ -49,6 +49,15 @@ deadlocks locally. Each domain crate that touches process-global env
 so its tests serialize against each other without needing to coordinate
 across crates in the same process.
 
+A test that replaces a real binary with a shell shim on `PATH` gives that
+shim the real one's stdin manners. `post_json` writes the request body
+(`--data-binary @-`) or the bearer header (`-H @-`) into curl's stdin and
+`render_qr` writes the URI into `qrencode`'s, so every shim standing in for
+them opens with `cat > /dev/null`. One that exits without reading leaves the
+caller writing into a closed pipe as soon as a loaded machine deschedules it
+between spawn and write, and the EPIPE surfaces as an ordinary transport
+failure — green on an idle desktop, red on a busy builder.
+
 ## Extension points, cross-crate
 
 - **A new domain crate**: add it to `pkgs/aoide/Cargo.toml`'s `[workspace]

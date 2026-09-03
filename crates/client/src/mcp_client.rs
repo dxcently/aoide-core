@@ -544,7 +544,9 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let shim = dir.join("curl");
-        let mut script = String::from("#!/bin/sh\n");
+        // A fake curl drains its stdin because the real one always does;
+        // dropping the drain costs an EPIPE under load (`crates/AGENTS.md`).
+        let mut script = String::from("#!/bin/sh\ncat > /dev/null\n");
         if let Some(marker) = capture_body_into {
             script.push_str(&format!(
                 "prev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"--data-binary\" ]; then\n    f=$(echo \"$a\" | sed 's/^@//')\n    cp \"$f\" '{}'\n  fi\n  prev=\"$a\"\ndone\n",
@@ -615,7 +617,7 @@ mod tests {
         let curl_ran_marker = dir_marker.join("curl-was-invoked");
         std::fs::create_dir_all(&dir_marker).unwrap();
         let shim = dir_marker.join("curl");
-        std::fs::write(&shim, format!("#!/bin/sh\ntouch {}\nexit 1\n", curl_ran_marker.display())).unwrap();
+        std::fs::write(&shim, format!("#!/bin/sh\ncat > /dev/null\ntouch {}\nexit 1\n", curl_ran_marker.display())).unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
